@@ -142,6 +142,12 @@ pub struct SparseIndex {
     doc_count: usize,
 }
 
+impl Default for SparseIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SparseIndex {
     pub fn new() -> Self {
         Self {

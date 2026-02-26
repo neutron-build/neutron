@@ -469,7 +469,7 @@ fn cmd_routes() {
     println!("\n{:<method_w$}  {:<path_w$}  FILE", "METHOD", "PATH");
     println!("{}", "-".repeat(method_w + path_w + 20));
     for (method, path, file) in &routes {
-        println!("{:<method_w$}  {:<path_w$}  {file}", method, path);
+        println!("{method:<method_w$}  {path:<path_w$}  {file}");
     }
     println!();
     println!("{} route(s) found.", routes.len());

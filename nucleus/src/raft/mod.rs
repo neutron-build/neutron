@@ -198,9 +198,9 @@ impl RaftNode {
             self.leader_id = None;
         }
 
-        let vote_granted = if req.term < self.current_term {
-            false
-        } else if self.voted_for.is_some() && self.voted_for != Some(req.candidate_id) {
+        let vote_granted = if req.term < self.current_term
+            || (self.voted_for.is_some() && self.voted_for != Some(req.candidate_id))
+        {
             false
         } else {
             // Check log is at least as up-to-date
@@ -289,7 +289,7 @@ impl RaftNode {
 
         self.peers
             .iter()
-            .filter_map(|&peer| {
+            .map(|&peer| {
                 let next = self.next_index.get(&peer).copied().unwrap_or(1);
                 let prev_index = next - 1;
                 let prev_term = self.log_at(prev_index).map(|e| e.term).unwrap_or(0);
@@ -301,7 +301,7 @@ impl RaftNode {
                     .cloned()
                     .collect();
 
-                Some((
+                (
                     peer,
                     AppendEntriesRequest {
                         term: self.current_term,
@@ -311,7 +311,7 @@ impl RaftNode {
                         entries,
                         leader_commit: self.commit_index,
                     },
-                ))
+                )
             })
             .collect()
     }
@@ -362,7 +362,7 @@ impl RaftNode {
 
         // Append new entries (handle conflicts)
         for entry in &req.entries {
-            if entry.index as usize <= self.log.len() - 1 {
+            if (entry.index as usize) < self.log.len() {
                 // Existing entry — check for conflict
                 if let Some(existing) = self.log_at(entry.index) {
                     if existing.term != entry.term {

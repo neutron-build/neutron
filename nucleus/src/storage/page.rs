@@ -272,11 +272,7 @@ fn write_slot(page: &mut PageBuf, slot_idx: u16, entry: SlotEntry) {
 pub fn free_space(page: &PageBuf) -> usize {
     let start = read_u16(page, DATA_FREE_START) as usize;
     let end = read_u16(page, DATA_FREE_END) as usize;
-    if end > start {
-        end - start
-    } else {
-        0
-    }
+    end.saturating_sub(start)
 }
 
 /// Total reclaimable space (contiguous + fragmented).
@@ -332,7 +328,7 @@ pub fn insert_tuple(page: &mut PageBuf, data: &[u8]) -> Option<u16> {
 }
 
 /// Read tuple data for a given slot. Returns None if slot is dead.
-pub fn read_tuple<'a>(page: &'a PageBuf, slot_idx: u16) -> Option<&'a [u8]> {
+pub fn read_tuple(page: &PageBuf, slot_idx: u16) -> Option<&[u8]> {
     let slot_count = read_u16(page, DATA_SLOT_COUNT);
     if slot_idx >= slot_count {
         return None;

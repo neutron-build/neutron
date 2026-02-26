@@ -156,7 +156,7 @@ fn verify_es256_signature(
     uncompressed[0] = 0x04;
     uncompressed[1..33].copy_from_slice(&cose_key.x);
     uncompressed[33..].copy_from_slice(&cose_key.y);
-    let point = EncodedPoint::from_bytes(&uncompressed)
+    let point = EncodedPoint::from_bytes(uncompressed)
         .map_err(|_| WebAuthnError::InvalidSignature)?;
     let verifying_key = VerifyingKey::from_encoded_point(&point)
         .map_err(|_| WebAuthnError::InvalidSignature)?;

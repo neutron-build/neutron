@@ -26,6 +26,7 @@ impl FromRequest for GraphQlRequest {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_from_query(req: &Request) -> Result<GraphQlRequest, Response> {
     let qs = req.uri().query().unwrap_or("");
 
@@ -43,6 +44,7 @@ fn parse_from_query(req: &Request) -> Result<GraphQlRequest, Response> {
     Ok(GraphQlRequest { query, variables, operation_name })
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_from_body(req: &Request) -> Result<GraphQlRequest, Response> {
     let ct = req
         .headers()

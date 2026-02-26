@@ -177,6 +177,7 @@ pub fn authorization_header(p: &AuthParams<'_>) -> String {
 // ---------------------------------------------------------------------------
 
 /// Build a presigned URL (signature in query parameters, no Authorization header).
+#[allow(clippy::too_many_arguments)]
 pub fn presigned_url(
     method:     &str,
     scheme:     &str,

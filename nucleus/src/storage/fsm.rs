@@ -22,6 +22,12 @@ pub struct FreeSpaceMap {
     entries: Vec<u8>,
 }
 
+impl Default for FreeSpaceMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FreeSpaceMap {
     /// Create a new empty FSM.
     pub fn new() -> Self {

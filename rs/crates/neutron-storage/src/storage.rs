@@ -243,11 +243,9 @@ impl StorageClient {
         //
         // For a production client, you would plumb response headers through.
 
-        let headers = vec![
-            ("authorization",        auth),
+        let headers = [("authorization",        auth),
             ("x-amz-date",           datetime),
-            ("x-amz-content-sha256", payload_hash),
-        ];
+            ("x-amz-content-sha256", payload_hash)];
         let header_refs: Vec<(&str, &str)> = headers.iter()
             .map(|(k, v): &(&str, String)| (*k, v.as_str()))
             .collect();
@@ -314,11 +312,9 @@ impl StorageClient {
 
         let path_and_query = format!("{bucket_path}?{query}");
 
-        let headers = vec![
-            ("authorization",        auth),
+        let headers = [("authorization",        auth),
             ("x-amz-date",           datetime),
-            ("x-amz-content-sha256", payload_hash),
-        ];
+            ("x-amz-content-sha256", payload_hash)];
         let header_refs: Vec<(&str, &str)> = headers.iter()
             .map(|(k, v): &(&str, String)| (*k, v.as_str()))
             .collect();
@@ -430,7 +426,7 @@ fn parse_list_xml(xml: &str) -> Result<Vec<ObjectInfo>, StorageError> {
 }
 
 /// Extract the text content of the first occurrence of `<tag>...</tag>`.
-fn xml_tag<'a>(xml: &'a str, tag: &str) -> Option<String> {
+fn xml_tag(xml: &str, tag: &str) -> Option<String> {
     let open  = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();

@@ -149,17 +149,17 @@ pub fn max_f64(column: &[f64]) -> Option<f64> {
 // ============================================================================
 
 /// Filter string column: return indices where value starts with prefix.
-pub fn filter_str_starts_with<'a>(column: &[&'a str], prefix: &str) -> Vec<usize> {
+pub fn filter_str_starts_with(column: &[&str], prefix: &str) -> Vec<usize> {
     scalar::filter_str_starts_with(column, prefix)
 }
 
 /// Filter string column: return indices where value contains needle.
-pub fn filter_str_contains<'a>(column: &[&'a str], needle: &str) -> Vec<usize> {
+pub fn filter_str_contains(column: &[&str], needle: &str) -> Vec<usize> {
     scalar::filter_str_contains(column, needle)
 }
 
 /// Filter string column: return indices where value == target (case-insensitive).
-pub fn filter_str_eq_ignore_case<'a>(column: &[&'a str], target: &str) -> Vec<usize> {
+pub fn filter_str_eq_ignore_case(column: &[&str], target: &str) -> Vec<usize> {
     scalar::filter_str_eq_ignore_case(column, target)
 }
 

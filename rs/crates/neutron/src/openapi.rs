@@ -673,7 +673,7 @@ impl OpenApi {
 fn schema_to_ts_type(schema: &Value) -> String {
     if let Some(ref_path) = schema.get("$ref").and_then(|v| v.as_str()) {
         // "#/components/schemas/Foo" → "Foo"
-        return ref_path.split('/').last().unwrap_or("unknown").to_string();
+        return ref_path.split('/').next_back().unwrap_or("unknown").to_string();
     }
     let ty = schema.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match ty {
@@ -683,7 +683,7 @@ fn schema_to_ts_type(schema: &Value) -> String {
         "array"   => {
             let item_type = schema
                 .get("items")
-                .map(|items| schema_to_ts_type(items))
+                .map(schema_to_ts_type)
                 .unwrap_or_else(|| "unknown".to_string());
             format!("{item_type}[]")
         }
@@ -813,10 +813,10 @@ fn route_to_ts_function(route: &ApiRoute) -> String {
         }).collect();
         params.push(format!("query?: {{ {} }}", fields.join(", ")));
     }
-    if let Some((ct, schema)) = &route.request_body {
+    if let Some((_ct, schema)) = &route.request_body {
         let ts_type = schema_to_ts_type(&schema.0);
-        let param_name = if ct.contains("json") { "body" } else { "body" };
-        params.push(format!("{}: {}", param_name, ts_type));
+        let param_name = "body";
+        params.push(format!("{param_name}: {ts_type}"));
     }
 
     let params_str = params.join(", ");

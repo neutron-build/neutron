@@ -158,7 +158,7 @@ impl fmt::Display for DataType {
             DataType::Uuid => write!(f, "UUID"),
             DataType::Bytea => write!(f, "BYTEA"),
             DataType::Array(inner) => write!(f, "{inner}[]"),
-            DataType::Vector(dim) => write!(f, "VECTOR({})", dim),
+            DataType::Vector(dim) => write!(f, "VECTOR({dim})"),
             DataType::Interval => write!(f, "INTERVAL"),
             DataType::UserDefined(name) => write!(f, "{name}"),
         }
@@ -521,7 +521,7 @@ fn format_numeric(v: f64) -> String {
     if v.fract() == 0.0 && v.abs() < (i64::MAX as f64) {
         format!("{}", v as i64)
     } else {
-        let s = format!("{:.17}", v);
+        let s = format!("{v:.17}");
         let s = s.trim_end_matches('0');
         let s = s.trim_end_matches('.');
         s.to_string()

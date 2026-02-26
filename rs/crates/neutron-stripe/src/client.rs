@@ -176,7 +176,7 @@ impl StripeClient {
         let value: Value = serde_json::from_slice(&body)
             .map_err(|e| StripeError::ParseError(e.to_string()))?;
 
-        if status < 200 || status >= 300 {
+        if !(200..300).contains(&status) {
             let msg = value.get("error")
                 .and_then(|e| e.get("message"))
                 .and_then(|m| m.as_str())

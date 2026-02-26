@@ -225,6 +225,12 @@ pub struct TensorStore {
     tensors: HashMap<String, Vec<TensorVersion>>,
 }
 
+impl Default for TensorStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TensorStore {
     pub fn new() -> Self {
         Self {

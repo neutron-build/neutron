@@ -361,15 +361,14 @@ impl FailoverManager {
             return None;
         }
 
-        if now_ms.saturating_sub(self.peer_last_seen_ms) >= self.failover_timeout_ms {
-            if self.local_role == NodeRole::Replica {
+        if now_ms.saturating_sub(self.peer_last_seen_ms) >= self.failover_timeout_ms
+            && self.local_role == NodeRole::Replica {
                 let evt = FailoverEvent::PrimaryDown {
                     detected_at_ms: now_ms,
                 };
                 self.history.push(evt.clone());
                 return Some(evt);
             }
-        }
         None
     }
 
@@ -1833,6 +1832,12 @@ pub fn to_storage_wal_record(rec: &WalRecord) -> crate::storage::wal::WalRecord 
 pub struct WalBridge {
     /// Last LSN that was forwarded to the replication layer.
     last_forwarded_lsn: Lsn,
+}
+
+impl Default for WalBridge {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WalBridge {

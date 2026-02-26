@@ -74,6 +74,12 @@ pub struct IndexAdvisor {
     min_rows_threshold: f64,
 }
 
+impl Default for IndexAdvisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IndexAdvisor {
     pub fn new() -> Self {
         Self {
@@ -232,6 +238,12 @@ pub struct EnergyEstimator {
     pub net_uj_per_kb: f64,
     /// Carbon intensity (grams CO2 per kWh). US average ~400, France ~50.
     pub carbon_intensity_g_per_kwh: f64,
+}
+
+impl Default for EnergyEstimator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EnergyEstimator {

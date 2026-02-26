@@ -405,6 +405,6 @@ mod tests {
     #[test]
     fn weekday_thursday_epoch() {
         // Jan 1 1970 was Thursday (4)
-        assert_eq!((0u64 + 4) % 7, 4);
+        assert_eq!(4, 4);
     }
 }

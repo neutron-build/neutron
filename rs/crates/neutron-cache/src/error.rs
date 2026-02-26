@@ -36,14 +36,14 @@ mod tests {
     #[test]
     fn serialization_error_debug() {
         let e = CacheError::Serialization("oops".to_string());
-        let dbg = format!("{:?}", e);
+        let dbg = format!("{e:?}");
         assert!(dbg.contains("Serialization"));
     }
 
     #[test]
     fn backend_error_debug() {
         let e = CacheError::Backend("timeout".to_string());
-        let dbg = format!("{:?}", e);
+        let dbg = format!("{e:?}");
         assert!(dbg.contains("Backend"));
     }
 

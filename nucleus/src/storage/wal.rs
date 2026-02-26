@@ -46,6 +46,7 @@ pub enum SyncMode {
 
 impl SyncMode {
     /// Parse a sync mode string from config. Case-insensitive.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "fdatasync" => SyncMode::Fdatasync,
@@ -451,7 +452,7 @@ impl SegmentedWal {
         let seg_path = segment_path(dir, active_seg_num);
         let file = OpenOptions::new()
             .read(true)
-            .write(true)
+            
             .create(true)
             .append(true)
             .open(&seg_path)?;
@@ -654,7 +655,7 @@ impl SegmentedWal {
         let new_path = segment_path(&self.dir, new_seg_num);
         let file = OpenOptions::new()
             .read(true)
-            .write(true)
+            
             .create(true)
             .append(true)
             .open(&new_path)?;
@@ -706,6 +707,12 @@ impl std::fmt::Debug for SegmentedWal {
 pub struct GroupCommitter {
     /// The underlying WAL (either single-file or segmented).
     pending_syncs: AtomicU64,
+}
+
+impl Default for GroupCommitter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GroupCommitter {

@@ -324,15 +324,14 @@ impl BufferPool {
 
         // Read from disk
         self.disk
-            .read_page(page_id, &mut self.frame_data_mut(frame_id))?;
+            .read_page(page_id, self.frame_data_mut(frame_id))?;
 
         // Verify checksum (skip for freshly allocated pages with all zeros)
         let page_data = self.frame_data(frame_id);
-        if page::get_page_type(page_data) != page::PAGE_TYPE_FREE || page::read_u32(page_data, page::HEADER_CHECKSUM) != 0 {
-            if !page::verify_checksum(page_data) {
+        if (page::get_page_type(page_data) != page::PAGE_TYPE_FREE || page::read_u32(page_data, page::HEADER_CHECKSUM) != 0)
+            && !page::verify_checksum(page_data) {
                 return Err(BufferError::ChecksumMismatch(page_id));
             }
-        }
 
         // Setup descriptor
         let desc = &self.descriptors[frame_id as usize];
@@ -425,7 +424,7 @@ impl BufferPool {
                 // WAL protocol: log before flush
                 if let Some(ref wal) = self.wal {
                     let lsn = wal.log_page_write(0, page_id, data)
-                        .map_err(|e| BufferError::Io(e))?;
+                        .map_err(BufferError::Io)?;
                     page::set_page_lsn(data, lsn);
                 }
                 // Checksum must be computed AFTER LSN is set so on-disk page is valid
@@ -442,7 +441,7 @@ impl BufferPool {
     pub fn flush_all(&self) -> Result<(), BufferError> {
         // Flush WAL first (force all WAL records to disk)
         if let Some(ref wal) = self.wal {
-            wal.sync().map_err(|e| BufferError::Io(e))?;
+            wal.sync().map_err(BufferError::Io)?;
         }
         for i in 0..self.pool_size {
             let desc = &self.descriptors[i];
@@ -451,7 +450,7 @@ impl BufferPool {
                 let data = self.frame_data_mut(i as u32);
                 if let Some(ref wal) = self.wal {
                     let lsn = wal.log_page_write(0, page_id, data)
-                        .map_err(|e| BufferError::Io(e))?;
+                        .map_err(BufferError::Io)?;
                     page::set_page_lsn(data, lsn);
                 }
                 // Checksum must be computed AFTER LSN is set so on-disk page is valid
@@ -551,7 +550,7 @@ impl BufferPool {
             // WAL protocol: log before flush, set LSN first
             if let Some(ref wal) = self.wal {
                 let lsn = wal.log_page_write(0, old_page_id, data)
-                    .map_err(|e| BufferError::Io(e))?;
+                    .map_err(BufferError::Io)?;
                 page::set_page_lsn(data, lsn);
             }
             // Checksum must be computed AFTER LSN is set so on-disk page is valid

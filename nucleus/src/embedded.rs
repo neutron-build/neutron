@@ -38,6 +38,12 @@ pub struct DatabaseBuilder {
     mode: StorageMode,
 }
 
+impl Default for DatabaseBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DatabaseBuilder {
     /// Create a new builder with in-memory storage.
     pub fn new() -> Self {

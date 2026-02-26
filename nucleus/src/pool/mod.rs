@@ -368,7 +368,7 @@ impl ConnectionPool {
         // Track how many idle connections we've evicted so far
         let mut idle_evicted = 0u32;
         for id in to_close {
-            let is_idle = self.connections.get(&id).map_or(false, |c| c.state == ConnectionState::Idle);
+            let is_idle = self.connections.get(&id).is_some_and(|c| c.state == ConnectionState::Idle);
             if is_idle {
                 if idle_evicted >= max_evictable {
                     // Skip this eviction to preserve min_idle

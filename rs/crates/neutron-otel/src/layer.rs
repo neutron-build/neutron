@@ -89,7 +89,7 @@ where
                         self.0.push((field.name().to_string(), AttributeValue::Float(value)));
                     }
                     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                        self.0.push((field.name().to_string(), AttributeValue::String(format!("{:?}", value))));
+                        self.0.push((field.name().to_string(), AttributeValue::String(format!("{value:?}"))));
                     }
                 }
                 values.record(&mut Visitor(&mut storage.attributes));

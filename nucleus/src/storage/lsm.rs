@@ -174,6 +174,11 @@ impl SSTable {
         self.entries.len()
     }
 
+    /// Returns `true` if the SSTable contains no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Iterate over all entries.
     pub fn iter(&self) -> impl Iterator<Item = &(Vec<u8>, Option<Vec<u8>>)> {
         self.entries.iter()

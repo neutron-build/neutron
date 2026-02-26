@@ -140,11 +140,13 @@ pub trait WasmRuntime: Send + Sync {
     ) -> ProcResult;
 }
 
+type BuiltinProcFn = dyn Fn(&[ProcValue]) -> ProcResult + Send + Sync;
+
 /// Type-erased procedure body.
 enum ProcedureBody {
     Sql(SqlProcedure),
     Wasm { module_bytes: Vec<u8>, entry_point: String },
-    Builtin(Box<dyn Fn(&[ProcValue]) -> ProcResult + Send + Sync>),
+    Builtin(Box<BuiltinProcFn>),
 }
 
 /// A registered stored procedure.
@@ -174,6 +176,12 @@ pub struct ExecutionRecord {
     pub success: bool,
     pub duration_us: u64,
     pub timestamp: u64,
+}
+
+impl Default for ProcedureEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProcedureEngine {
@@ -446,10 +454,10 @@ impl ProcedureEngine {
                 if let Some(pos) = json_str.find(&pattern) {
                     let after = &json_str[pos + pattern.len()..];
                     let trimmed = after.trim_start();
-                    if trimmed.starts_with('"') {
+                    if let Some(after_quote) = trimmed.strip_prefix('"') {
                         // String value
-                        if let Some(end) = trimmed[1..].find('"') {
-                            return ProcResult::Ok(ProcValue::Text(trimmed[1..end + 1].to_string()));
+                        if let Some(end) = after_quote.find('"') {
+                            return ProcResult::Ok(ProcValue::Text(after_quote[..end].to_string()));
                         }
                     } else {
                         // Numeric or other value

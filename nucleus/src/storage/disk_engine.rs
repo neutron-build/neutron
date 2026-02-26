@@ -166,6 +166,7 @@ impl DiskEngine {
     /// 1. Replay WAL records to recover any dirty pages that weren't flushed before crash
     /// 2. Open a fresh WAL for new operations
     /// 3. Load the table directory from the (potentially recovered) meta page
+    ///
     /// Open with a custom buffer pool size (in frames). Each frame is 16 KB.
     pub fn open_with_pool_size(path: &Path, catalog: Arc<Catalog>, pool_frames: usize) -> Result<Self, StorageError> {
         Self::open_inner(path, catalog, pool_frames, false, 0, None, false, wal::SyncMode::Fsync)
@@ -239,6 +240,7 @@ impl DiskEngine {
         Self::open_inner(path, catalog, pool_frames, true, max_segment_size_mb, None, false, sync_mode)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_inner(
         path: &Path,
         catalog: Arc<Catalog>,

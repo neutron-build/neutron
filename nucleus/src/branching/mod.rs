@@ -64,6 +64,12 @@ pub struct BranchManager {
     next_snapshot_id: u64,
 }
 
+impl Default for BranchManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BranchManager {
     pub fn new() -> Self {
         let mut mgr = Self {

@@ -201,7 +201,7 @@ fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
         .collect()
 }
 
-fn find_cookie<'a>(header: &'a str, name: &str) -> Option<String> {
+fn find_cookie(header: &str, name: &str) -> Option<String> {
     for part in header.split(';') {
         let part = part.trim();
         if let Some(rest) = part.strip_prefix(name) {
