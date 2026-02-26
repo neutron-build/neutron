@@ -43,13 +43,13 @@ pub fn convert_data_type(dt: &ast::DataType) -> Result<DataType, ParseError> {
         ast::DataType::Array(inner) => {
             match inner {
                 ast::ArrayElemTypeDef::AngleBracket(dt) => {
-                    Ok(DataType::Array(Box::new(convert_data_type(&dt)?)))
+                    Ok(DataType::Array(Box::new(convert_data_type(dt)?)))
                 }
                 ast::ArrayElemTypeDef::SquareBracket(dt, _) => {
-                    Ok(DataType::Array(Box::new(convert_data_type(&dt)?)))
+                    Ok(DataType::Array(Box::new(convert_data_type(dt)?)))
                 }
                 ast::ArrayElemTypeDef::Parenthesis(dt) => {
-                    Ok(DataType::Array(Box::new(convert_data_type(&dt)?)))
+                    Ok(DataType::Array(Box::new(convert_data_type(dt)?)))
                 }
                 ast::ArrayElemTypeDef::None => {
                     Ok(DataType::Array(Box::new(DataType::Text)))

@@ -58,6 +58,12 @@ pub struct ChunkStore {
     stored_bytes: usize,
 }
 
+impl Default for ChunkStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ChunkStore {
     pub fn new() -> Self {
         Self {
@@ -127,6 +133,12 @@ pub struct BlobStore {
     /// key → blob metadata
     blobs: HashMap<String, BlobMetadata>,
     chunk_size: usize,
+}
+
+impl Default for BlobStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BlobStore {
@@ -203,7 +215,7 @@ impl BlobStore {
             let chunk_end = pos + chunk.len();
 
             if chunk_end > start && pos < end {
-                let chunk_start = if pos < start { start - pos } else { 0 };
+                let chunk_start = start.saturating_sub(pos);
                 let chunk_stop = if chunk_end > end {
                     end - pos
                 } else {
@@ -311,6 +323,12 @@ pub struct BlobDedup {
     total_logical_bytes: u64,
     /// Number of times a store call was deduplicated.
     dedup_count: u64,
+}
+
+impl Default for BlobDedup {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BlobDedup {

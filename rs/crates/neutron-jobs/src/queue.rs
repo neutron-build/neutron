@@ -126,7 +126,7 @@ impl JobQueue {
     /// Dequeue the next job ready to run (`run_at <= now`). Returns `None` if none is ready.
     pub(crate) fn try_dequeue(&self) -> Option<QueuedJob> {
         let mut heap = self.heap.lock().unwrap();
-        if heap.peek().map_or(false, |j| j.0.run_at <= Instant::now()) {
+        if heap.peek().is_some_and(|j| j.0.run_at <= Instant::now()) {
             Some(heap.pop().unwrap().0)
         } else {
             None

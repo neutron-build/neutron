@@ -58,6 +58,7 @@ pub struct RedisCacheLayer {
     pool:   RedisPool,
     ttl:    Duration,
     prefix: String,
+    #[allow(clippy::type_complexity)]
     key_fn: Option<std::sync::Arc<dyn Fn(&Request) -> Option<String> + Send + Sync>>,
 }
 
@@ -183,7 +184,7 @@ impl MiddlewareTrait for RedisCacheLayer {
             };
 
             if let Ok(serialised) = serde_json::to_vec(&entry) {
-                let ttl_secs = ttl.as_secs().max(1) as u64;
+                let ttl_secs = ttl.as_secs().max(1);
                 let _ = conn.set_ex::<_, _, ()>(&cache_key, serialised, ttl_secs).await;
             }
 

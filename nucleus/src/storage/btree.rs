@@ -289,7 +289,7 @@ impl BTreeIndex {
         entries.sort_by(|a, b| {
             let ka = extract_key(a);
             let kb = extract_key(b);
-            ka.cmp(&kb)
+            ka.cmp(kb)
         });
 
         // Split at midpoint
@@ -940,7 +940,7 @@ pub fn key_to_value(key: &[u8], dtype: &DataType) -> Value {
             }
         }
         DataType::Vector(dim) => {
-            if key.len() >= 1 + dim * 4 {
+            if key.len() > dim * 4 {
                 let mut vec = Vec::with_capacity(*dim);
                 for i in 0..*dim {
                     let pos = 1 + i * 4;

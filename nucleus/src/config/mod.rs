@@ -318,6 +318,7 @@ impl Default for LoggingConfig {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct NucleusConfig {
     #[serde(default)]
     pub server: ServerConfig,
@@ -337,20 +338,6 @@ pub struct NucleusConfig {
     pub logging: LoggingConfig,
 }
 
-impl Default for NucleusConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            storage: StorageConfig::default(),
-            wal: WalConfig::default(),
-            pool: PoolConfig::default(),
-            cache: CacheConfig::default(),
-            replication: ReplicationConfig::default(),
-            metrics: MetricsConfig::default(),
-            logging: LoggingConfig::default(),
-        }
-    }
-}
 
 impl NucleusConfig {
     /// Load config from a TOML file, then overlay environment variables.

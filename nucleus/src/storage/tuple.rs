@@ -18,7 +18,7 @@ pub fn serialize_row(row: &Row, col_types: &[DataType]) -> Vec<u8> {
     debug_assert_eq!(row.len(), col_types.len());
 
     let ncols = row.len();
-    let bitmap_bytes = (ncols + 7) / 8;
+    let bitmap_bytes = ncols.div_ceil(8);
     let mut buf = vec![0u8; bitmap_bytes];
 
     // Set null bitmap
@@ -114,7 +114,7 @@ pub fn serialize_row(row: &Row, col_types: &[DataType]) -> Vec<u8> {
 /// Deserialize a row from bytes given the column types.
 pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
     let ncols = col_types.len();
-    let bitmap_bytes = (ncols + 7) / 8;
+    let bitmap_bytes = ncols.div_ceil(8);
     if data.len() < bitmap_bytes {
         return None;
     }

@@ -131,6 +131,12 @@ pub struct JobQueue {
     next_id: u64,
 }
 
+impl Default for JobQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JobQueue {
     pub fn new() -> Self {
         Self {
@@ -425,6 +431,12 @@ pub struct Stream {
     pub last_id: StreamEntryId,
     pub groups: HashMap<String, ConsumerGroup>,
     pub max_len: Option<usize>,
+}
+
+impl Default for Stream {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Stream {

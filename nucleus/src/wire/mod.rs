@@ -1007,7 +1007,7 @@ impl CopyHandler for NucleusHandler {
             let col_clause = match &state.columns {
                 Some(cols) => format!(
                     " ({})",
-                    cols.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ")
+                    cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ")
                 ),
                 None => String::new(),
             };
@@ -1439,7 +1439,7 @@ fn split_copy_line(line: &str, delimiter: u8, is_csv: bool) -> Vec<Option<String
                     result.push(if current.is_empty() { None } else { Some(current) });
                     break;
                 }
-                Some(c) if c == '"' => {
+                Some('"') => {
                     // Quoted field.
                     loop {
                         match chars.next() {

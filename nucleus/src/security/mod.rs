@@ -94,17 +94,17 @@ impl RlsPredicate {
     pub fn evaluate(&self, row: &HashMap<String, String>, ctx: &SessionContext) -> bool {
         match self {
             RlsPredicate::ColumnEqStr { column, value } => {
-                row.get(column).map_or(false, |v| v == value)
+                row.get(column) == Some(value)
             }
             RlsPredicate::ColumnEqTenant { column } => {
                 if let Some(tenant) = &ctx.tenant_id {
-                    row.get(column).map_or(false, |v| v == tenant)
+                    row.get(column) == Some(tenant)
                 } else {
                     false
                 }
             }
             RlsPredicate::ColumnEqUser { column } => {
-                row.get(column).map_or(false, |v| v == &ctx.user)
+                row.get(column) == Some(&ctx.user)
             }
             RlsPredicate::HasRole { role } => ctx.has_role(role),
             RlsPredicate::And(a, b) => a.evaluate(row, ctx) && b.evaluate(row, ctx),
@@ -135,6 +135,12 @@ pub struct RlsEngine {
     policies: HashMap<String, Vec<RlsPolicy>>,
     /// Tables with RLS enabled.
     enabled_tables: std::collections::HashSet<String>,
+}
+
+impl Default for RlsEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RlsEngine {
@@ -344,6 +350,12 @@ pub struct MaskingEngine {
     policies: Vec<MaskingPolicy>,
 }
 
+impl Default for MaskingEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MaskingEngine {
     pub fn new() -> Self {
         Self {
@@ -406,6 +418,12 @@ pub struct AuditEntry {
 pub struct AuditLog {
     entries: Vec<AuditEntry>,
     next_id: u64,
+}
+
+impl Default for AuditLog {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AuditLog {
@@ -487,6 +505,12 @@ pub struct SecurityManager {
     pub audit: AuditLog,
 }
 
+impl Default for SecurityManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SecurityManager {
     pub fn new() -> Self {
         Self {
@@ -512,6 +536,12 @@ pub struct TenantKeyManager {
     default_key: Option<(u32, Vec<u8>)>,
     /// Next key ID counter.
     next_key_id: u32,
+}
+
+impl Default for TenantKeyManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TenantKeyManager {
@@ -567,11 +597,11 @@ impl TenantKeyManager {
             if *id == key_id { return Some(bytes.as_slice()); }
         }
         // Check active keys.
-        for (_, (id, bytes)) in &self.active_keys {
+        for (id, bytes) in self.active_keys.values() {
             if *id == key_id { return Some(bytes.as_slice()); }
         }
         // Check key history.
-        for (_, history) in &self.key_history {
+        for history in self.key_history.values() {
             for (id, bytes) in history {
                 if *id == key_id { return Some(bytes.as_slice()); }
             }
@@ -630,6 +660,12 @@ pub struct KeyRotationManager {
     keys: Vec<(u32, String, Vec<u8>, bool)>, // (id, algorithm, material, is_active)
     state: RotationState,
     rotation_history: Vec<RotationRecord>,
+}
+
+impl Default for KeyRotationManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl KeyRotationManager {

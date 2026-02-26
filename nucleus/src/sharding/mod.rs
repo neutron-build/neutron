@@ -383,8 +383,8 @@ impl Rebalancer {
         // Phase 1: ensure every shard is on an alive, geo-valid node.
         for shard in &all_shards {
             let current = shard.assigned_node;
-            let on_alive = current.map_or(false, |n| alive.contains(&n));
-            let geo_ok = current.map_or(false, |n| {
+            let on_alive = current.is_some_and(|n| alive.contains(&n));
+            let geo_ok = current.is_some_and(|n| {
                 Self::geo_check(shard, n, topology)
             });
 

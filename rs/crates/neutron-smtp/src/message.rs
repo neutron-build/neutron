@@ -266,7 +266,7 @@ mod tests {
     fn into_message_fallback_from() {
         let e = Email::new().to("recv@example.com").subject("x").text("y");
         let msg = e.into_message(Some("default@example.com"));
-        assert!(msg.is_ok(), "{:?}", msg);
+        assert!(msg.is_ok(), "{msg:?}");
     }
 
     #[test]

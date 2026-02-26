@@ -97,9 +97,9 @@ fn data_type_to_string(dt: &DataType) -> String {
         DataType::Uuid => "Uuid".to_string(),
         DataType::Bytea => "Bytea".to_string(),
         DataType::Array(inner) => format!("Array({})", data_type_to_string(inner)),
-        DataType::Vector(dim) => format!("Vector({})", dim),
+        DataType::Vector(dim) => format!("Vector({dim})"),
         DataType::Interval => "Interval".to_string(),
-        DataType::UserDefined(name) => format!("UserDefined({})", name),
+        DataType::UserDefined(name) => format!("UserDefined({name})"),
     }
 }
 
@@ -315,7 +315,7 @@ impl CatalogPersistence {
             let constraints: Vec<TableConstraint> = t
                 .constraints
                 .iter()
-                .map(|c| ser_to_constraint(c))
+                .map(ser_to_constraint)
                 .collect();
 
             let table_def = TableDef {
@@ -509,7 +509,7 @@ impl MvccRowStore {
     /// Create a table.
     pub fn create_table(&self, name: &str) {
         let mut tables = self.tables.write();
-        tables.entry(name.to_string()).or_insert_with(Vec::new);
+        tables.entry(name.to_string()).or_default();
     }
 
     /// Insert a row within a transaction.

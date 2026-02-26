@@ -337,6 +337,12 @@ pub struct ColumnarStore {
     tables: HashMap<String, Vec<ColumnBatch>>,
 }
 
+impl Default for ColumnarStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ColumnarStore {
     pub fn new() -> Self {
         Self {
@@ -364,7 +370,7 @@ impl ColumnarStore {
 
     /// Ensure a table entry exists (creates an empty table if absent).
     pub fn create_table(&mut self, table: &str) {
-        self.tables.entry(table.to_string()).or_insert_with(Vec::new);
+        self.tables.entry(table.to_string()).or_default();
     }
 
     /// Remove a table and all its batches. Returns true if the table existed.
@@ -651,12 +657,12 @@ impl ColumnZoneMap {
                     }
                 }
                 let min = if has_false || has_true {
-                    Some(ScalarValue::Bool(if has_false { false } else { true }))
+                    Some(ScalarValue::Bool(!has_false))
                 } else {
                     None
                 };
                 let max = if has_false || has_true {
-                    Some(ScalarValue::Bool(if has_true { true } else { false }))
+                    Some(ScalarValue::Bool(has_true))
                 } else {
                     None
                 };
@@ -768,7 +774,7 @@ pub struct NullBitmap {
 impl NullBitmap {
     /// Create a new bitmap for len rows, all initially non-null.
     pub fn new(len: usize) -> Self {
-        let num_words = (len + 63) / 64;
+        let num_words = len.div_ceil(64);
         NullBitmap {
             bits: vec![0u64; num_words],
             len,
@@ -1104,11 +1110,9 @@ fn select_codec_text(vals: &[Option<String>]) -> CompressionCodec {
     // Count distinct non-null values
     let mut distinct = std::collections::HashSet::new();
     let mut non_null_count = 0usize;
-    for v in vals {
-        if let Some(s) = v {
-            distinct.insert(s.as_str());
-            non_null_count += 1;
-        }
+    for s in vals.iter().flatten() {
+        distinct.insert(s.as_str());
+        non_null_count += 1;
     }
 
     if non_null_count == 0 {

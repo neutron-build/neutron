@@ -137,6 +137,12 @@ pub struct Catalog {
     enum_types: RwLock<HashMap<String, Vec<String>>>,
 }
 
+impl Default for Catalog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Catalog {
     pub fn new() -> Self {
         Self {

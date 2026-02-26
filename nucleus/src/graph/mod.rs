@@ -83,6 +83,12 @@ pub struct GraphStore {
     next_edge_id: EdgeId,
 }
 
+impl Default for GraphStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GraphStore {
     pub fn new() -> Self {
         Self {
@@ -258,7 +264,7 @@ impl GraphStore {
             edge_ids
                 .iter()
                 .filter_map(|eid| self.edges.get(eid))
-                .filter(|e| edge_type.map_or(true, |t| e.edge_type == t))
+                .filter(|e| edge_type.is_none_or(|t| e.edge_type == t))
                 .map(|e| (get_neighbor(e), e))
                 .collect::<Vec<_>>()
         };
@@ -1262,6 +1268,12 @@ pub struct GraphTransactionManager {
     next_txn_id: GraphTxnId,
     /// Track which nodes are being written by active transactions.
     write_locks: HashMap<NodeId, GraphTxnId>,
+}
+
+impl Default for GraphTransactionManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GraphTransactionManager {
