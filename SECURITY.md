@@ -15,7 +15,7 @@ If you discover a security vulnerability in any Neutron or Nucleus component, pl
 
 **Do not open a public issue.** Instead:
 
-1. Email **security@neutron.build** with a description of the vulnerability
+1. Email **SOON** with a description of the vulnerability
 2. Include steps to reproduce, affected versions, and any potential impact
 3. Allow up to 72 hours for an initial response
 
