@@ -188,6 +188,11 @@ impl CacheTier {
         self.entries.values().filter(|e| !e.is_expired()).count()
     }
 
+    /// Returns `true` if there are no non-expired entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Return the current memory usage in bytes.
     pub fn memory_usage(&self) -> usize {
         self.used_bytes

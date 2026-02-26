@@ -237,6 +237,12 @@ pub struct RTree {
     points: HashMap<u64, Point>,
 }
 
+impl Default for RTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RTree {
     pub fn new() -> Self {
         Self {
@@ -348,6 +354,7 @@ impl RTree {
         (left, right)
     }
 
+    #[allow(clippy::type_complexity)]
     fn split_internal(
         children: &mut Vec<(BBox, Box<RTreeNode>)>,
     ) -> (Vec<(BBox, Box<RTreeNode>)>, Vec<(BBox, Box<RTreeNode>)>) {

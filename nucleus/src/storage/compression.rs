@@ -255,7 +255,7 @@ pub fn rle_decode(encoded: &[u8]) -> Result<Vec<u8>, CompressionError> {
         }
         let byte = encoded[offset];
         offset += 1;
-        result.extend(std::iter::repeat(byte).take(count));
+        result.extend(std::iter::repeat_n(byte, count));
     }
 
     if result.len() != total_len {

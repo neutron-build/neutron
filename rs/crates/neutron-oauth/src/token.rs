@@ -66,9 +66,9 @@ pub async fn exchange_code(
 fn parse_form_response(body: &str) -> Result<TokenResponse, OAuthError> {
     let pairs: Vec<(&str, &str)> = body.split('&')
         .filter_map(|kv| {
-            let mut it = kv.splitn(2, '=');
-            let k = it.next()?;
-            let v = it.next()?;
+            let (k, v) = kv.split_once('=')?;
+            
+            
             Some((k, v))
         })
         .collect();

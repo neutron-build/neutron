@@ -15,9 +15,10 @@ pub enum StripeEventType {
     Other(String),
 }
 
-impl StripeEventType {
-    pub fn from_str(s: &str) -> Self {
-        match s {
+impl std::str::FromStr for StripeEventType {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "payment_intent.succeeded"       => StripeEventType::PaymentIntentSucceeded,
             "payment_intent.payment_failed"  => StripeEventType::PaymentIntentPaymentFailed,
             "payment_intent.created"         => StripeEventType::PaymentIntentCreated,
@@ -26,8 +27,11 @@ impl StripeEventType {
             "customer.deleted"               => StripeEventType::CustomerDeleted,
             "checkout.session.completed"     => StripeEventType::CheckoutSessionCompleted,
             other                            => StripeEventType::Other(other.to_string()),
-        }
+        })
     }
+}
+
+impl StripeEventType {
 
     pub fn as_str(&self) -> &str {
         match self {
@@ -57,7 +61,7 @@ pub struct StripeEvent {
 impl StripeEvent {
     /// Parse the event type into a [`StripeEventType`].
     pub fn kind(&self) -> StripeEventType {
-        StripeEventType::from_str(&self.event_type)
+        self.event_type.parse().unwrap()
     }
 }
 
@@ -128,7 +132,7 @@ mod tests {
             "checkout.session.completed",
         ];
         for kind in &kinds {
-            assert_eq!(StripeEventType::from_str(kind).as_str(), *kind);
+            assert_eq!(kind.parse::<StripeEventType>().unwrap().as_str(), *kind);
         }
     }
 

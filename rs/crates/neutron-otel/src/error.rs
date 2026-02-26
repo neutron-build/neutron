@@ -14,9 +14,9 @@ pub enum OtelError {
 impl fmt::Display for OtelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            OtelError::Connect(msg) => write!(f, "OtelError::Connect: {}", msg),
-            OtelError::Export(msg)  => write!(f, "OtelError::Export: {}", msg),
-            OtelError::Config(msg)  => write!(f, "OtelError::Config: {}", msg),
+            OtelError::Connect(msg) => write!(f, "OtelError::Connect: {msg}"),
+            OtelError::Export(msg)  => write!(f, "OtelError::Export: {msg}"),
+            OtelError::Config(msg)  => write!(f, "OtelError::Config: {msg}"),
         }
     }
 }

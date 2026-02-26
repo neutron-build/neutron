@@ -94,21 +94,15 @@ fn stem_german(word: &str) -> String {
         w.truncate(w.len() - 5);
     } else if w.ends_with("ung") && w.len() > 4 {
         w.truncate(w.len() - 3);
-    } else if w.ends_with("heit") && w.len() > 5 {
+    } else if (w.ends_with("heit")
+        || w.ends_with("keit")
+        || w.ends_with("isch")
+        || w.ends_with("lich")
+        || w.ends_with("igen"))
+        && w.len() > 5
+    {
         w.truncate(w.len() - 4);
-    } else if w.ends_with("keit") && w.len() > 5 {
-        w.truncate(w.len() - 4);
-    } else if w.ends_with("isch") && w.len() > 5 {
-        w.truncate(w.len() - 4);
-    } else if w.ends_with("lich") && w.len() > 5 {
-        w.truncate(w.len() - 4);
-    } else if w.ends_with("igen") && w.len() > 5 {
-        w.truncate(w.len() - 4);
-    } else if w.ends_with("en") && w.len() > 3 {
-        w.truncate(w.len() - 2);
-    } else if w.ends_with("er") && w.len() > 3 {
-        w.truncate(w.len() - 2);
-    } else if w.ends_with("es") && w.len() > 3 {
+    } else if (w.ends_with("en") || w.ends_with("er") || w.ends_with("es")) && w.len() > 3 {
         w.truncate(w.len() - 2);
     } else if w.ends_with('e') && w.len() > 3 {
         w.pop();
@@ -119,28 +113,18 @@ fn stem_german(word: &str) -> String {
 /// Simplified French stemmer.
 fn stem_french(word: &str) -> String {
     let mut w = word.to_string();
-    if w.ends_with("euses") && w.len() > 6 {
+    if (w.ends_with("euses") || w.ends_with("ement")) && w.len() > 6 {
         w.truncate(w.len() - 5);
-    } else if w.ends_with("ement") && w.len() > 6 {
-        w.truncate(w.len() - 5);
-    } else if w.ends_with("ment") && w.len() > 5 {
-        w.truncate(w.len() - 4);
     } else if w.ends_with("tion") && w.len() > 5 {
         w.truncate(w.len() - 4);
         w.push('t');
-    } else if w.ends_with("euse") && w.len() > 5 {
+    } else if (w.ends_with("ment") || w.ends_with("euse")) && w.len() > 5 {
         w.truncate(w.len() - 4);
-    } else if w.ends_with("eux") && w.len() > 4 {
+    } else if (w.ends_with("eux") || w.ends_with("ant")) && w.len() > 4 {
         w.truncate(w.len() - 3);
-    } else if w.ends_with("ant") && w.len() > 4 {
-        w.truncate(w.len() - 3);
-    } else if w.ends_with("er") && w.len() > 3 {
+    } else if (w.ends_with("er") || w.ends_with("es")) && w.len() > 3 {
         w.truncate(w.len() - 2);
-    } else if w.ends_with("es") && w.len() > 3 {
-        w.truncate(w.len() - 2);
-    } else if w.ends_with('e') && w.len() > 3 {
-        w.pop();
-    } else if w.ends_with('s') && !w.ends_with("ss") && w.len() > 3 {
+    } else if (w.ends_with('e') || (w.ends_with('s') && !w.ends_with("ss"))) && w.len() > 3 {
         w.pop();
     }
     w
@@ -151,17 +135,11 @@ fn stem_spanish(word: &str) -> String {
     let mut w = word.to_string();
     if w.ends_with("amente") && w.len() > 7 {
         w.truncate(w.len() - 6);
-    } else if w.ends_with("mente") && w.len() > 6 {
+    } else if (w.ends_with("mente") || w.ends_with("iendo")) && w.len() > 6 {
         w.truncate(w.len() - 5);
-    } else if w.ends_with("ador") && w.len() > 5 {
+    } else if (w.ends_with("ador") || w.ends_with("ando")) && w.len() > 5 {
         w.truncate(w.len() - 4);
-    } else if w.ends_with("ando") && w.len() > 5 {
-        w.truncate(w.len() - 4);
-    } else if w.ends_with("iendo") && w.len() > 6 {
-        w.truncate(w.len() - 5);
-    } else if w.ends_with("ado") && w.len() > 4 {
-        w.truncate(w.len() - 3);
-    } else if w.ends_with("ido") && w.len() > 4 {
+    } else if (w.ends_with("ado") || w.ends_with("ido")) && w.len() > 4 {
         w.truncate(w.len() - 3);
     } else if w.ends_with("ión") {
         // Handle UTF-8 multi-byte: ó is 2 bytes, ión is 4 bytes
@@ -169,13 +147,9 @@ fn stem_spanish(word: &str) -> String {
         if w.len() > byte_len + 1 {
             w.truncate(w.len() - byte_len);
         }
-    } else if w.ends_with("ar") && w.len() > 3 {
-        w.truncate(w.len() - 2);
-    } else if w.ends_with("er") && w.len() > 3 {
-        w.truncate(w.len() - 2);
-    } else if w.ends_with("ir") && w.len() > 3 {
-        w.truncate(w.len() - 2);
-    } else if w.ends_with("es") && w.len() > 3 {
+    } else if (w.ends_with("ar") || w.ends_with("er") || w.ends_with("ir") || w.ends_with("es"))
+        && w.len() > 3
+    {
         w.truncate(w.len() - 2);
     } else if w.ends_with('s') && w.len() > 3 {
         w.pop();
@@ -186,31 +160,21 @@ fn stem_spanish(word: &str) -> String {
 /// Simplified Italian stemmer.
 fn stem_italian(word: &str) -> String {
     let mut w = word.to_string();
-    if w.ends_with("mente") && w.len() > 6 {
+    if (w.ends_with("mente") || w.ends_with("zione")) && w.len() > 6 {
         w.truncate(w.len() - 5);
-    } else if w.ends_with("zione") && w.len() > 6 {
-        w.truncate(w.len() - 5);
-    } else if w.ends_with("ando") && w.len() > 5 {
+    } else if (w.ends_with("ando") || w.ends_with("endo")) && w.len() > 5 {
         w.truncate(w.len() - 4);
-    } else if w.ends_with("endo") && w.len() > 5 {
-        w.truncate(w.len() - 4);
-    } else if w.ends_with("ato") && w.len() > 4 {
+    } else if (w.ends_with("ato")
+        || w.ends_with("ito")
+        || w.ends_with("are")
+        || w.ends_with("ere")
+        || w.ends_with("ire"))
+        && w.len() > 4
+    {
         w.truncate(w.len() - 3);
-    } else if w.ends_with("ito") && w.len() > 4 {
-        w.truncate(w.len() - 3);
-    } else if w.ends_with("are") && w.len() > 4 {
-        w.truncate(w.len() - 3);
-    } else if w.ends_with("ere") && w.len() > 4 {
-        w.truncate(w.len() - 3);
-    } else if w.ends_with("ire") && w.len() > 4 {
-        w.truncate(w.len() - 3);
-    } else if w.ends_with("ia") && w.len() > 3 {
+    } else if (w.ends_with("ia") || w.ends_with("ie")) && w.len() > 3 {
         w.truncate(w.len() - 2);
-    } else if w.ends_with("ie") && w.len() > 3 {
-        w.truncate(w.len() - 2);
-    } else if w.ends_with('i') && w.len() > 3 {
-        w.pop();
-    } else if w.ends_with('e') && w.len() > 3 {
+    } else if (w.ends_with('i') || w.ends_with('e')) && w.len() > 3 {
         w.pop();
     }
     w
@@ -221,25 +185,17 @@ fn stem_portuguese(word: &str) -> String {
     let mut w = word.to_string();
     if w.ends_with("mente") && w.len() > 6 {
         w.truncate(w.len() - 5);
-    } else if w.ends_with("ando") && w.len() > 5 {
+    } else if (w.ends_with("ando") || w.ends_with("endo") || w.ends_with("indo")) && w.len() > 5 {
         w.truncate(w.len() - 4);
-    } else if w.ends_with("endo") && w.len() > 5 {
-        w.truncate(w.len() - 4);
-    } else if w.ends_with("indo") && w.len() > 5 {
-        w.truncate(w.len() - 4);
-    } else if w.ends_with("ado") && w.len() > 4 {
+    } else if (w.ends_with("ado") || w.ends_with("ido")) && w.len() > 4 {
         w.truncate(w.len() - 3);
-    } else if w.ends_with("ido") && w.len() > 4 {
-        w.truncate(w.len() - 3);
-    } else if w.ends_with("ar") && w.len() > 3 {
-        w.truncate(w.len() - 2);
-    } else if w.ends_with("er") && w.len() > 3 {
-        w.truncate(w.len() - 2);
-    } else if w.ends_with("ir") && w.len() > 3 {
-        w.truncate(w.len() - 2);
-    } else if w.ends_with("os") && w.len() > 3 {
-        w.truncate(w.len() - 2);
-    } else if w.ends_with("as") && w.len() > 3 {
+    } else if (w.ends_with("ar")
+        || w.ends_with("er")
+        || w.ends_with("ir")
+        || w.ends_with("os")
+        || w.ends_with("as"))
+        && w.len() > 3
+    {
         w.truncate(w.len() - 2);
     } else if w.ends_with('s') && w.len() > 3 {
         w.pop();
@@ -258,9 +214,7 @@ pub fn stem(word: &str) -> String {
         w.push('y');
     } else if w.ends_with("sses") {
         w.truncate(w.len() - 2);
-    } else if w.ends_with("ness") && w.len() > 5 {
-        w.truncate(w.len() - 4);
-    } else if w.ends_with("ment") && w.len() > 5 {
+    } else if (w.ends_with("ness") || w.ends_with("ment")) && w.len() > 5 {
         w.truncate(w.len() - 4);
     } else if w.ends_with("tion") && w.len() > 5 {
         w.truncate(w.len() - 4);
@@ -275,11 +229,7 @@ pub fn stem(word: &str) -> String {
         {
             w.pop(); // Remove doubled consonant
         }
-    } else if w.ends_with("ed") && w.len() > 4 {
-        w.truncate(w.len() - 2);
-    } else if w.ends_with("ly") && w.len() > 4 {
-        w.truncate(w.len() - 2);
-    } else if w.ends_with("er") && w.len() > 4 {
+    } else if (w.ends_with("ed") || w.ends_with("ly") || w.ends_with("er")) && w.len() > 4 {
         w.truncate(w.len() - 2);
     } else if w.ends_with("est") && w.len() > 5 {
         w.truncate(w.len() - 3);
@@ -320,6 +270,12 @@ pub struct InvertedIndex {
     doc_count: u64,
     /// Sum of all document lengths (for avgdl)
     total_length: usize,
+}
+
+impl Default for InvertedIndex {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InvertedIndex {
@@ -529,6 +485,12 @@ pub fn fuzzy_terms<'a>(
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocBitmap {
     docs: Vec<u64>,
+}
+
+impl Default for DocBitmap {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DocBitmap {
@@ -927,6 +889,12 @@ pub struct SegmentedIndex {
     pub merge_policy: MergePolicy,
 }
 
+impl Default for SegmentedIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SegmentedIndex {
     pub fn new() -> Self {
         SegmentedIndex {
@@ -968,7 +936,7 @@ impl SegmentedIndex {
         }
         let id = self.next_segment_id;
         self.next_segment_id += 1;
-        let old_writer = std::mem::replace(&mut self.writer, InvertedIndex::new());
+        let old_writer = std::mem::take(&mut self.writer);
         self.segments.push(Segment::new(id, old_writer));
 
         // Check merge policy
@@ -1020,14 +988,14 @@ impl SegmentedIndex {
                         continue;
                     }
                     // Re-insert into merged index's postings directly
-                    if !merged.docs.contains_key(&posting.doc_id) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = merged.docs.entry(posting.doc_id) {
                         let length = seg
                             .index
                             .docs
                             .get(&posting.doc_id)
                             .map(|d| d.length)
                             .unwrap_or(1);
-                        merged.docs.insert(posting.doc_id, DocInfo { length });
+                        e.insert(DocInfo { length });
                         merged.doc_count += 1;
                         merged.total_length += length;
                     }

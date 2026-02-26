@@ -241,6 +241,12 @@ pub struct TaskScheduler {
     next_id: u64,
 }
 
+impl Default for TaskScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TaskScheduler {
     pub fn new() -> Self {
         Self {
@@ -360,6 +366,12 @@ pub struct CdcLog {
     /// consumer_name → last consumed sequence
     consumers: HashMap<String, u64>,
     next_sequence: u64,
+}
+
+impl Default for CdcLog {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CdcLog {
@@ -483,6 +495,12 @@ pub struct CdcStream {
 /// Manager for multiple CDC streams.
 pub struct CdcManager {
     streams: HashMap<String, CdcStream>,
+}
+
+impl Default for CdcManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CdcManager {

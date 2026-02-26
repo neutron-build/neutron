@@ -11,6 +11,9 @@ use std::fmt;
 
 use super::{Direction, PropValue};
 
+type NodeInternals = (Option<String>, Vec<String>, BTreeMap<String, PropValue>);
+type EdgeInternals = (Option<String>, Option<String>, BTreeMap<String, PropValue>);
+
 // ============================================================================
 // AST types
 // ============================================================================
@@ -691,7 +694,6 @@ impl Parser {
 
             let from_idx = nodes.len() - 1;
 
-            let direction;
             let incoming = edge_start == Some(Token::Lt);
 
             if incoming {
@@ -734,12 +736,12 @@ impl Parser {
 
             // Consume arrow end
             self.expect_token(&Token::Dash)?;
-            if !incoming {
+            let direction = if !incoming {
                 self.expect_token(&Token::Gt)?;
-                direction = Direction::Outgoing;
+                Direction::Outgoing
             } else {
-                direction = Direction::Incoming;
-            }
+                Direction::Incoming
+            };
 
             // Parse target node
             nodes.push(self.parse_node_pattern()?);
@@ -775,7 +777,7 @@ impl Parser {
     /// Called after consuming `(` and before consuming `)`.
     fn parse_node_internals(
         &mut self,
-    ) -> Result<(Option<String>, Vec<String>, BTreeMap<String, PropValue>), CypherError> {
+    ) -> Result<NodeInternals, CypherError> {
         let mut variable = None;
         let mut labels = Vec::new();
         let mut properties = BTreeMap::new();
@@ -816,7 +818,7 @@ impl Parser {
     /// Called after consuming `[` and before consuming `]`.
     fn parse_edge_internals(
         &mut self,
-    ) -> Result<(Option<String>, Option<String>, BTreeMap<String, PropValue>), CypherError> {
+    ) -> Result<EdgeInternals, CypherError> {
         let mut variable = None;
         let mut edge_type = None;
         let mut properties = BTreeMap::new();

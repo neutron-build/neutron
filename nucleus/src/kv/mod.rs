@@ -46,6 +46,12 @@ pub struct KvStore {
     data: RwLock<HashMap<String, KvEntry>>,
 }
 
+impl Default for KvStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KvStore {
     pub fn new() -> Self {
         Self {
@@ -170,7 +176,7 @@ impl KvStore {
         let data = self.data.read();
         let now = Instant::now();
         data.iter()
-            .filter(|(_, entry)| entry.expires_at.map_or(true, |t| now < t))
+            .filter(|(_, entry)| entry.expires_at.is_none_or(|t| now < t))
             .filter(|(key, _)| match_pattern(pattern, key))
             .map(|(key, _)| key.clone())
             .collect()
@@ -181,7 +187,7 @@ impl KvStore {
         let data = self.data.read();
         let now = Instant::now();
         data.values()
-            .filter(|entry| entry.expires_at.map_or(true, |t| now < t))
+            .filter(|entry| entry.expires_at.is_none_or(|t| now < t))
             .count()
     }
 
@@ -258,15 +264,14 @@ fn match_pattern(pattern: &str, input: &str) -> bool {
     if pattern == "*" {
         return true;
     }
-    if pattern.starts_with('*') && pattern.ends_with('*') {
-        let inner = &pattern[1..pattern.len() - 1];
+    if let Some(inner) = pattern.strip_prefix('*').and_then(|s| s.strip_suffix('*')) {
         return input.contains(inner);
     }
-    if pattern.starts_with('*') {
-        return input.ends_with(&pattern[1..]);
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return input.ends_with(suffix);
     }
-    if pattern.ends_with('*') {
-        return input.starts_with(&pattern[..pattern.len() - 1]);
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return input.starts_with(prefix);
     }
     pattern == input
 }
@@ -317,6 +322,12 @@ pub struct SortedSetEntry {
 pub struct SortedSet {
     tree: BTreeMap<(OrderedF64, String), ()>,
     members: HashMap<String, f64>,
+}
+
+impl Default for SortedSet {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SortedSet {
@@ -416,6 +427,12 @@ impl SortedSet {
 pub struct HyperLogLog {
     registers: Vec<u8>,
     p: u8,
+}
+
+impl Default for HyperLogLog {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HyperLogLog {

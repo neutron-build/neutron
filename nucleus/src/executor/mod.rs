@@ -189,9 +189,15 @@ pub struct Session {
     prepared_stmts: RwLock<HashMap<String, String>>,
     cursors: RwLock<HashMap<String, CursorDef>>,
     settings: parking_lot::RwLock<HashMap<String, String>>,
-    active_ctes: parking_lot::RwLock<HashMap<String, (Vec<ColMeta>, Vec<Row>)>>,
+    active_ctes: parking_lot::RwLock<CteTableMap>,
     #[allow(dead_code)]
     session_context: parking_lot::RwLock<crate::security::SessionContext>,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Session {
@@ -279,6 +285,23 @@ struct ColMeta {
     name: String,
     dtype: DataType,
 }
+
+// -- Type aliases for complex types (clippy::type_complexity) --
+
+/// CTE table data: column metadata + rows, keyed by CTE name.
+type CteTableMap = HashMap<String, (Vec<ColMeta>, Vec<Row>)>;
+
+/// Result of column projection: column names+types paired with rows.
+type ProjectedResult = Result<(Vec<(String, DataType)>, Vec<Row>), ExecError>;
+
+/// Index predicate extraction: (equalities, range predicates, remaining expr).
+type IndexPredicates = (Vec<(String, Value)>, Vec<(String, Value, Value)>, Option<Expr>);
+
+/// Index scan result: column metadata, rows, remaining filter, and index name used.
+type IndexScanResult = Option<(Vec<ColMeta>, Vec<Row>, Option<Expr>, Option<String>)>;
+
+/// Boxed future for async recursive methods returning (Vec<ColMeta>, Vec<Row>).
+type BoxedExecFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Vec<ColMeta>, Vec<Row>), ExecError>> + Send + 'a>>;
 
 /// A live vector index backed by HNSW or IVFFlat.
 enum VectorIndexKind {
@@ -1782,20 +1805,17 @@ impl Executor {
                     | "ARRAY_AGG" | "STRING_AGG" | "JSON_AGG" | "BOOL_AND" | "BOOL_OR"
                     | "STDDEV" | "VARIANCE" | "STDDEV_POP" | "STDDEV_SAMP"
                     | "VAR_POP" | "VAR_SAMP" => {
-                        out.push(format!("{}", expr));
+                        out.push(format!("{expr}"));
                     }
                     _ => {}
                 }
                 // Also recurse into function args in case of nested aggregates
-                match &func.args {
-                    ast::FunctionArguments::List(arg_list) => {
-                        for arg in &arg_list.args {
-                            if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(inner)) = arg {
-                                Self::collect_aggregates_from_expr(inner, out);
-                            }
+                if let ast::FunctionArguments::List(arg_list) = &func.args {
+                    for arg in &arg_list.args {
+                        if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(inner)) = arg {
+                            Self::collect_aggregates_from_expr(inner, out);
                         }
                     }
-                    _ => {}
                 }
             }
             Expr::BinaryOp { left, right, .. } => {
@@ -2144,7 +2164,7 @@ impl Executor {
         left_meta: &[ColMeta],
         left_rows: &[Row],
         join: &ast::Join,
-        cte_tables: &HashMap<String, (Vec<ColMeta>, Vec<Row>)>,
+        cte_tables: &CteTableMap,
         pushdown: Option<&HashMap<String, Vec<Expr>>>,
     ) -> Result<Option<(Vec<ColMeta>, Vec<Row>)>, ExecError> {
         let (condition, join_type) = match &join.join_operator {
@@ -2424,8 +2444,8 @@ impl Executor {
     fn execute_plan_node<'a>(
         &'a self,
         plan: &'a planner::PlanNode,
-        cte_tables: &'a HashMap<String, (Vec<ColMeta>, Vec<Row>)>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Vec<ColMeta>, Vec<Row>), ExecError>> + Send + 'a>> {
+        cte_tables: &'a CteTableMap,
+    ) -> BoxedExecFuture<'a> {
         Box::pin(async move {
             match plan {
                 planner::PlanNode::SeqScan { table, filter, .. } => {
@@ -2725,7 +2745,7 @@ impl Executor {
                     }
                     // Compute per-group
                     let mut result_rows = Vec::new();
-                    for (_, group_rows) in &groups {
+                    for group_rows in groups.values() {
                         let mut row_out: Vec<Value> = key_indices.iter().map(|&i| {
                             group_rows[0].get(i).cloned().unwrap_or(Value::Null)
                         }).collect();
@@ -3179,14 +3199,11 @@ impl Executor {
         set: ast::Set,
     ) -> Result<ExecResult, ExecError> {
         // Store SET values for SHOW to retrieve
-        match &set {
-            ast::Set::SingleAssignment { variable, values, .. } => {
-                let var_name = variable.to_string().to_lowercase();
-                let val_str: Vec<String> = values.iter().map(|v| v.to_string()).collect();
-                let val = val_str.join(", ");
-                self.current_session().settings.write().insert(var_name, val);
-            }
-            _ => {}
+        if let ast::Set::SingleAssignment { variable, values, .. } = &set {
+            let var_name = variable.to_string().to_lowercase();
+            let val_str: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+            let val = val_str.join(", ");
+            self.current_session().settings.write().insert(var_name, val);
         }
         Ok(ExecResult::Command {
             tag: "SET".into(),
@@ -3753,7 +3770,7 @@ impl Executor {
         let sql = {
             let views = self.materialized_views.read().await;
             let mv = views.get(&view_name).ok_or_else(|| {
-                ExecError::TableNotFound(format!("materialized view '{}' not found", view_name))
+                ExecError::TableNotFound(format!("materialized view '{view_name}' not found"))
             })?;
             mv.sql.clone()
         };
@@ -4125,8 +4142,7 @@ impl Executor {
         // Check INSERT privilege
         if !self.check_privilege(&table_name, "INSERT").await {
             return Err(ExecError::PermissionDenied(format!(
-                "permission denied for table {}",
-                table_name
+                "permission denied for table {table_name}"
             )));
         }
 
@@ -4159,7 +4175,7 @@ impl Executor {
                 for row_exprs in values.rows {
                     let expected = if has_column_list { insert_columns.len() } else { table_def.columns.len() };
                     // Check for DEFAULT keyword values
-                    let has_defaults = row_exprs.iter().any(|e| Self::is_default_expr(e));
+                    let has_defaults = row_exprs.iter().any(Self::is_default_expr);
                     if row_exprs.len() != expected {
                         // Allow if we have defaults and the count matches
                         if !has_defaults || row_exprs.len() != expected {
@@ -4421,20 +4437,18 @@ impl Executor {
             if let Ok(stmts) = parsed {
                 if let Some(Statement::Query(q)) = stmts.into_iter().next() {
                     if let SetExpr::Select(sel) = *q.body {
-                        if let Some(item) = sel.projection.first() {
-                            if let SelectItem::UnnamedExpr(expr) = item {
-                                let empty_row: Row = Vec::new();
-                                let empty_meta: Vec<ColMeta> = Vec::new();
-                                if let Ok(val) = self.eval_row_expr(expr, &empty_row, &empty_meta) {
-                                    // Coerce the default value to match the column's declared type.
-                                    // This handles SERIAL (Int32) columns whose nextval() returns Int64.
-                                    let coerced = match (&col.data_type, &val) {
-                                        (DataType::Int32, Value::Int64(n)) => Value::Int32(*n as i32),
-                                        (DataType::Int64, Value::Int32(n)) => Value::Int64(*n as i64),
-                                        _ => val,
-                                    };
-                                    return Ok(coerced);
-                                }
+                        if let Some(SelectItem::UnnamedExpr(expr)) = sel.projection.first() {
+                            let empty_row: Row = Vec::new();
+                            let empty_meta: Vec<ColMeta> = Vec::new();
+                            if let Ok(val) = self.eval_row_expr(expr, &empty_row, &empty_meta) {
+                                // Coerce the default value to match the column's declared type.
+                                // This handles SERIAL (Int32) columns whose nextval() returns Int64.
+                                let coerced = match (&col.data_type, &val) {
+                                    (DataType::Int32, Value::Int64(n)) => Value::Int32(*n as i32),
+                                    (DataType::Int64, Value::Int32(n)) => Value::Int64(*n as i64),
+                                    _ => val,
+                                };
+                                return Ok(coerced);
                             }
                         }
                     }
@@ -4519,8 +4533,7 @@ impl Executor {
                         match self.storage.index_lookup_sync(table_name, &index_name, new_val) {
                             Ok(Some(rows)) if !rows.is_empty() => {
                                 return Err(ExecError::ConstraintViolation(format!(
-                                    "duplicate key value violates unique constraint on ({})",
-                                    col_name
+                                    "duplicate key value violates unique constraint on ({col_name})"
                                 )));
                             }
                             // Empty result from an index-capable backend: no duplicate.
@@ -4632,46 +4645,41 @@ impl Executor {
                 if let Ok(stmts) = parsed {
                     if let Some(Statement::Query(q)) = stmts.into_iter().next() {
                         if let SetExpr::Select(sel) = *q.body {
-                            if let Some(item) = sel.projection.first() {
-                                if let SelectItem::UnnamedExpr(check_expr) = item {
-                                    match self.eval_row_expr(check_expr, new_row, &col_meta) {
-                                        Ok(Value::Bool(true)) => {} // constraint satisfied
-                                        Ok(Value::Bool(false)) => {
-                                            let constraint_name = name
-                                                .as_deref()
-                                                .unwrap_or("unnamed");
-                                            return Err(ExecError::ConstraintViolation(
-                                                format!(
-                                                    "new row violates check constraint \"{}\"",
-                                                    constraint_name
-                                                ),
-                                            ));
-                                        }
-                                        Ok(Value::Null) => {
-                                            // NULL result in CHECK is treated as true (SQL standard)
-                                        }
-                                        Ok(other) => {
-                                            let constraint_name = name
-                                                .as_deref()
-                                                .unwrap_or("unnamed");
-                                            return Err(ExecError::ConstraintViolation(
-                                                format!(
-                                                    "check constraint \"{}\" evaluated to non-boolean: {:?}",
-                                                    constraint_name, other
-                                                ),
-                                            ));
-                                        }
-                                        Err(e) => {
-                                            let constraint_name = name
-                                                .as_deref()
-                                                .unwrap_or("unnamed");
-                                            return Err(ExecError::ConstraintViolation(
-                                                format!(
-                                                    "check constraint \"{}\" could not be evaluated: {}",
-                                                    constraint_name, e
-                                                ),
-                                            ));
-                                        }
+                            if let Some(SelectItem::UnnamedExpr(check_expr)) = sel.projection.first() {
+                                match self.eval_row_expr(check_expr, new_row, &col_meta) {
+                                    Ok(Value::Bool(true)) => {} // constraint satisfied
+                                    Ok(Value::Bool(false)) => {
+                                        let constraint_name = name
+                                            .as_deref()
+                                            .unwrap_or("unnamed");
+                                        return Err(ExecError::ConstraintViolation(
+                                            format!(
+                                                "new row violates check constraint \"{constraint_name}\""
+                                            ),
+                                        ));
+                                    }
+                                    Ok(Value::Null) => {
+                                        // NULL result in CHECK is treated as true (SQL standard)
+                                    }
+                                    Ok(other) => {
+                                        let constraint_name = name
+                                            .as_deref()
+                                            .unwrap_or("unnamed");
+                                        return Err(ExecError::ConstraintViolation(
+                                            format!(
+                                                "check constraint \"{constraint_name}\" evaluated to non-boolean: {other:?}"
+                                            ),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        let constraint_name = name
+                                            .as_deref()
+                                            .unwrap_or("unnamed");
+                                        return Err(ExecError::ConstraintViolation(
+                                            format!(
+                                                "check constraint \"{constraint_name}\" could not be evaluated: {e}"
+                                            ),
+                                        ));
                                     }
                                 }
                             }
@@ -4704,8 +4712,7 @@ impl Executor {
                 if let Some(labels) = self.catalog.get_enum_type(type_name).await {
                     if !labels.iter().any(|l| l == text_val) {
                         return Err(ExecError::ConstraintViolation(format!(
-                            "invalid input value for enum {}: \"{}\"",
-                            type_name, text_val
+                            "invalid input value for enum {type_name}: \"{text_val}\""
                         )));
                     }
                 }
@@ -4756,8 +4763,7 @@ impl Executor {
                     .collect();
                 if ref_col_indices.len() != ref_columns.len() {
                     return Err(ExecError::ConstraintViolation(format!(
-                        "foreign key references non-existent columns in table \"{}\"",
-                        ref_table
+                        "foreign key references non-existent columns in table \"{ref_table}\""
                     )));
                 }
 
@@ -4829,8 +4835,7 @@ impl Executor {
         // Check UPDATE privilege
         if !self.check_privilege(&table_name, "UPDATE").await {
             return Err(ExecError::PermissionDenied(format!(
-                "permission denied for table {}",
-                table_name
+                "permission denied for table {table_name}"
             )));
         }
 
@@ -4859,7 +4864,7 @@ impl Executor {
             };
             let idx = table_def
                 .column_index(&col_name)
-                .ok_or_else(|| ExecError::ColumnNotFound(col_name))?;
+                .ok_or(ExecError::ColumnNotFound(col_name))?;
             assign_targets.push((idx, &a.value));
         }
         let updated_col_indices: HashSet<usize> = assign_targets.iter().map(|(idx, _)| *idx).collect();
@@ -4973,8 +4978,7 @@ impl Executor {
         // Check DELETE privilege
         if !self.check_privilege(&table_name, "DELETE").await {
             return Err(ExecError::PermissionDenied(format!(
-                "permission denied for table {}",
-                table_name
+                "permission denied for table {table_name}"
             )));
         }
 
@@ -5215,12 +5219,12 @@ impl Executor {
     fn execute_set_expr<'a>(
         &'a self,
         body: SetExpr,
-        cte_tables: &'a HashMap<String, (Vec<ColMeta>, Vec<Row>)>,
+        cte_tables: &'a CteTableMap,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SelectResult, ExecError>> + Send + 'a>> {
         Box::pin(async move {
         match body {
             SetExpr::Select(select) => {
-                self.execute_select_inner_with_ctes(&*select, cte_tables).await
+                self.execute_select_inner_with_ctes(&select, cte_tables).await
             }
             SetExpr::SetOperation {
                 op,
@@ -5263,22 +5267,20 @@ impl Executor {
                     ast::SetOperator::Intersect => {
                         let mut result = Vec::new();
                         for row in &left_rows {
-                            if right_rows.contains(row) {
-                                if all || !result.contains(row) {
+                            if right_rows.contains(row)
+                                && (all || !result.contains(row)) {
                                     result.push(row.clone());
                                 }
-                            }
                         }
                         result
                     }
                     ast::SetOperator::Except => {
                         let mut result = Vec::new();
                         for row in &left_rows {
-                            if !right_rows.contains(row) {
-                                if all || !result.contains(row) {
+                            if !right_rows.contains(row)
+                                && (all || !result.contains(row)) {
                                     result.push(row.clone());
                                 }
-                            }
                         }
                         result
                     }
@@ -5361,7 +5363,7 @@ impl Executor {
     fn select_result_to_rows(
         &self,
         result: SelectResult,
-    ) -> Result<(Vec<(String, DataType)>, Vec<Row>), ExecError> {
+    ) -> ProjectedResult {
         match result {
             SelectResult::Projected(ExecResult::Select { columns, rows }) => Ok((columns, rows)),
             SelectResult::Full {
@@ -5383,7 +5385,7 @@ impl Executor {
     fn resolve_ctes(
         &self,
         with: &ast::With,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<HashMap<String, (Vec<ColMeta>, Vec<Row>)>, ExecError>> + Send + '_>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<CteTableMap, ExecError>> + Send + '_>> {
         let with = with.clone();
         Box::pin(async move {
             let mut cte_tables = HashMap::new();
@@ -5472,7 +5474,7 @@ impl Executor {
     fn extract_index_predicates(
         &self,
         expr: &Expr,
-    ) -> (Vec<(String, Value)>, Vec<(String, Value, Value)>, Option<Expr>) {
+    ) -> IndexPredicates {
         match expr {
             Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, right } => {
                 if let Some((col, val)) = self.try_extract_col_eq_literal(left, right) {
@@ -5632,7 +5634,7 @@ impl Executor {
     fn try_columnar_fast_aggregate(
         &self,
         select: &ast::Select,
-        cte_tables: &HashMap<String, (Vec<ColMeta>, Vec<Row>)>,
+        cte_tables: &CteTableMap,
     ) -> Result<Option<ExecResult>, ExecError> {
         // Guard 1: single FROM table, no JOINs
         if select.from.len() != 1 || !select.from[0].joins.is_empty() {
@@ -5987,7 +5989,7 @@ impl Executor {
     fn try_columnar_filtered_scan(
         &self,
         select: &ast::Select,
-        cte_tables: &HashMap<String, (Vec<ColMeta>, Vec<Row>)>,
+        cte_tables: &CteTableMap,
     ) -> Option<(Vec<ColMeta>, Vec<Row>)> {
         // Guard: single table, no JOINs
         if select.from.len() != 1 || !select.from[0].joins.is_empty() {
@@ -6032,7 +6034,7 @@ impl Executor {
         table_name: &str,
         label: &str,
         where_expr: &Expr,
-    ) -> Option<(Vec<ColMeta>, Vec<Row>, Option<Expr>, Option<String>)> {
+    ) -> IndexScanResult {
         let (eq_preds, range_preds, remaining) = self.extract_index_predicates(where_expr);
         if eq_preds.is_empty() && range_preds.is_empty() {
             return None;
@@ -6120,7 +6122,7 @@ impl Executor {
     async fn execute_select_inner_with_ctes(
         &self,
         select: &ast::Select,
-        cte_tables: &HashMap<String, (Vec<ColMeta>, Vec<Row>)>,
+        cte_tables: &CteTableMap,
     ) -> Result<SelectResult, ExecError> {
         // Expression-only query: SELECT 1, SELECT 'hello', SELECT 1+1
         if select.from.is_empty() {
@@ -6141,7 +6143,7 @@ impl Executor {
         // try to use a B-tree index instead of a full table scan.
         // All lookups use parking_lot (sync) to avoid async deadlocks in
         // the nested Box::pin future chain.
-        let index_result: Option<(Vec<ColMeta>, Vec<Row>, Option<Expr>, Option<String>)> = if select.from.len() == 1
+        let index_result: IndexScanResult = if select.from.len() == 1
             && select.from[0].joins.is_empty()
             && select.selection.is_some()
         {
@@ -6239,7 +6241,7 @@ impl Executor {
     async fn build_from_rows_with_ctes(
         &self,
         from: &[ast::TableWithJoins],
-        cte_tables: &HashMap<String, (Vec<ColMeta>, Vec<Row>)>,
+        cte_tables: &CteTableMap,
         pushdown: Option<&HashMap<String, Vec<Expr>>>,
     ) -> Result<(Vec<ColMeta>, Vec<Row>), ExecError> {
         if from.is_empty() {
@@ -6321,7 +6323,7 @@ impl Executor {
     async fn load_table_factor_with_ctes(
         &self,
         factor: &TableFactor,
-        cte_tables: &HashMap<String, (Vec<ColMeta>, Vec<Row>)>,
+        cte_tables: &CteTableMap,
         pushdown_expr: Option<&Expr>,
     ) -> Result<(Vec<ColMeta>, Vec<Row>), ExecError> {
         match factor {
@@ -6497,7 +6499,7 @@ impl Executor {
         left_rows: &[Row],
         right_factor: &TableFactor,
         join_operator: &ast::JoinOperator,
-        _cte_tables: &HashMap<String, (Vec<ColMeta>, Vec<Row>)>,
+        _cte_tables: &CteTableMap,
     ) -> Result<(Vec<ColMeta>, Vec<Row>), ExecError> {
         let TableFactor::Derived { subquery, alias, .. } = right_factor else {
             return Err(ExecError::Unsupported("LATERAL only supported on derived tables".into()));
@@ -6628,7 +6630,7 @@ impl Executor {
         // Build sort key descriptors: either a column index or a computed expression
         enum SortKey {
             Column(usize),
-            Expr(ast::Expr),
+            Expr(Box<ast::Expr>),
         }
         let mut sort_keys: Vec<(SortKey, bool, bool)> = Vec::new();
         for ob_expr in exprs {
@@ -6637,7 +6639,7 @@ impl Executor {
             let nulls_first = ob_expr.options.nulls_first.unwrap_or(!asc);
             match self.resolve_order_by_expr(&ob_expr.expr, columns, col_meta, projection) {
                 Ok(col_idx) => sort_keys.push((SortKey::Column(col_idx), asc, nulls_first)),
-                Err(_) => sort_keys.push((SortKey::Expr(ob_expr.expr.clone()), asc, nulls_first)),
+                Err(_) => sort_keys.push((SortKey::Expr(Box::new(ob_expr.expr.clone())), asc, nulls_first)),
             }
         }
 
@@ -6824,7 +6826,7 @@ impl Executor {
                 columns
                     .iter()
                     .position(|(name, _)| name == &qualified || name == col.as_str())
-                    .ok_or_else(|| ExecError::ColumnNotFound(qualified))
+                    .ok_or(ExecError::ColumnNotFound(qualified))
             }
             Expr::Value(v) => {
                 // ORDER BY 1, 2, 3 (positional)
@@ -7225,6 +7227,7 @@ impl Executor {
 
     /// Hash join: build a hash table on the build side, probe from the probe side.
     /// Dramatically faster than nested loop for equi-joins: O(N+M) vs O(N*M).
+    #[allow(clippy::too_many_arguments)]
     fn execute_hash_join(
         &self,
         left_meta: &[ColMeta],
@@ -7477,7 +7480,7 @@ impl Executor {
                         .iter()
                         .map(|expr| self.eval_row_expr(expr, &row, col_meta))
                         .collect::<Result<_, _>>()?;
-                    if map.last().map_or(true, |(last_key, _)| *last_key != key) {
+                    if map.last().is_none_or(|(last_key, _)| *last_key != key) {
                         map.push((key, vec![row]));
                     } else {
                         map.last_mut().unwrap().1.push(row);
@@ -7815,7 +7818,7 @@ impl Executor {
                 if !is_distinct && func.filter.is_none() {
                     if let Expr::Identifier(ident) = expr {
                         if let Some(col_idx) = col_meta.iter().position(|c| c.name.eq_ignore_ascii_case(&ident.value)) {
-                            let is_int = group_rows.first().map_or(false, |row| {
+                            let is_int = group_rows.first().is_some_and(|row| {
                                 matches!(row.get(col_idx), Some(Value::Int32(_) | Value::Int64(_)))
                             });
                             if is_int {
@@ -8090,7 +8093,7 @@ impl Executor {
         projection: &[SelectItem],
         col_meta: &[ColMeta],
         rows: &[Row],
-    ) -> Result<(Vec<(String, DataType)>, Vec<Row>), ExecError> {
+    ) -> ProjectedResult {
         // Handle SELECT *
         if projection.len() == 1 && matches!(&projection[0], SelectItem::Wildcard(_)) {
             let columns = col_meta
@@ -8283,6 +8286,7 @@ impl Executor {
         };
 
         // Build partition groups: (partition_key, Vec<(original_index, row)>)
+        #[allow(clippy::type_complexity)]
         let mut partitions: Vec<(Vec<Value>, Vec<(usize, &Row)>)> = Vec::new();
         for (idx, row) in all_rows.iter().enumerate() {
             let key: Vec<Value> = partition_by
@@ -8467,8 +8471,8 @@ impl Executor {
                             // PERCENT_RANK = (rank - 1) / (partition_size - 1)
                             // rank is computed like RANK (with ties)
                             let mut rank = 1usize;
-                            for i in 0..rank_in_partition {
-                                let prev_row = members[i].1;
+                            for member in members.iter().take(rank_in_partition) {
+                                let prev_row = member.1;
                                 let curr_row = row;
                                 let same = order_by_exprs.iter().all(|ob| {
                                     let va = self.eval_row_expr(&ob.expr, prev_row, col_meta).unwrap_or(Value::Null);
@@ -9040,13 +9044,14 @@ impl Executor {
 
     /// Evaluate JSONB arrow operator: `jsonb_val -> key` (returns JSONB).
     fn eval_json_arrow(&self, left: &Value, key: &Value) -> Result<Value, ExecError> {
+        let parsed_json;
         let json = match left {
             Value::Jsonb(v) => v,
             Value::Text(s) => {
-                return match serde_json::from_str::<serde_json::Value>(s) {
-                    Ok(v) => self.eval_json_arrow(&Value::Jsonb(v), key),
-                    Err(_) => Ok(Value::Null),
-                };
+                match serde_json::from_str::<serde_json::Value>(s) {
+                    Ok(v) => { parsed_json = v; &parsed_json }
+                    Err(_) => return Ok(Value::Null),
+                }
             }
             _ => return Ok(Value::Null),
         };
@@ -9610,7 +9615,7 @@ impl Executor {
                             }
                             "doy" | "dayofyear" => {
                                 let jan1 = crate::types::ymd_to_days(y, 1, 1);
-                                Ok(Value::Int32((d - jan1 + 1) as i32))
+                                Ok(Value::Int32(d - jan1 + 1))
                             }
                             "epoch" => Ok(Value::Int64(d as i64 * 86400)),
                             _ => Err(ExecError::Unsupported(format!("EXTRACT({field_str}) from date"))),
@@ -9649,7 +9654,7 @@ impl Executor {
                                 "doy" | "dayofyear" => {
                                     let d = crate::types::ymd_to_days(y, m, day);
                                     let jan1 = crate::types::ymd_to_days(y, 1, 1);
-                                    Ok(Value::Int32((d - jan1 + 1) as i32))
+                                    Ok(Value::Int32(d - jan1 + 1))
                                 }
                                 "epoch" => {
                                     let d = crate::types::ymd_to_days(y, m, day);
@@ -9760,9 +9765,7 @@ impl Executor {
                 let sub_result = sync_block_on(self.execute_query(resolved))?;
                 match sub_result {
                     ExecResult::Select { rows, .. } => {
-                        if rows.is_empty() {
-                            Ok(Value::Null)
-                        } else if rows[0].is_empty() {
+                        if rows.is_empty() || rows[0].is_empty() {
                             Ok(Value::Null)
                         } else {
                             Ok(rows[0][0].clone())
@@ -10520,11 +10523,11 @@ impl Executor {
                             "dow" | "dayofweek" => {
                                 // 0 = Sunday
                                 let jdn = *d + 2451545;
-                                Ok(Value::Int32((jdn.rem_euclid(7)) as i32))
+                                Ok(Value::Int32(jdn.rem_euclid(7)))
                             }
                             "doy" | "dayofyear" => {
                                 let jan1 = crate::types::ymd_to_days(y, 1, 1);
-                                Ok(Value::Int32((*d - jan1 + 1) as i32))
+                                Ok(Value::Int32(*d - jan1 + 1))
                             }
                             "epoch" => Ok(Value::Int64(*d as i64 * 86400)),
                             _ => Err(ExecError::Unsupported(format!("EXTRACT({field}) from date"))),
@@ -10533,7 +10536,7 @@ impl Executor {
                     Value::Timestamp(ts) => {
                         let total_secs = *ts / 1_000_000;
                         let days = (total_secs / 86400) as i32;
-                        let time_secs = (total_secs % 86400) as i64;
+                        let time_secs = total_secs % 86400;
                         let (y, m, day) = crate::types::days_to_ymd(days);
                         match field.as_str() {
                             "year" => Ok(Value::Int32(y)),
@@ -10545,7 +10548,7 @@ impl Executor {
                             "epoch" => Ok(Value::Int64(total_secs)),
                             "dow" | "dayofweek" => {
                                 let jdn = days + 2451545;
-                                Ok(Value::Int32((jdn.rem_euclid(7)) as i32))
+                                Ok(Value::Int32(jdn.rem_euclid(7)))
                             }
                             _ => Err(ExecError::Unsupported(format!("EXTRACT({field}) from timestamp"))),
                         }
@@ -12447,7 +12450,7 @@ impl Executor {
                 };
                 let stmt = parse_cypher(&cypher)
                     .map_err(|e| ExecError::Unsupported(format!("GRAPH_QUERY parse error: {e:?}")))?;
-                let result = execute_cypher(&mut *self.graph_store.write(), &stmt)
+                let result = execute_cypher(&mut self.graph_store.write(), &stmt)
                     .map_err(|e| ExecError::Unsupported(format!("GRAPH_QUERY exec error: {e:?}")))?;
                 // Serialize result to JSON
                 let cols_json = result.columns.iter()
@@ -12457,7 +12460,7 @@ impl Executor {
                 let rows_json = result.rows.iter()
                     .map(|row_vals| {
                         let vals = row_vals.iter()
-                            .map(|v| prop_value_to_json(v))
+                            .map(prop_value_to_json)
                             .collect::<Vec<_>>()
                             .join(",");
                         format!("[{vals}]")
@@ -12786,7 +12789,7 @@ impl Executor {
                     Value::Text(s) => s.parse::<i32>()
                         .map(Value::Int32)
                         .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to INT"))),
-                    _ => Err(ExecError::Unsupported(format!("cannot cast to INT"))),
+                    _ => Err(ExecError::Unsupported("cannot cast to INT".to_string())),
                 }
             }
             ast::DataType::BigInt(_) => {
@@ -12799,7 +12802,7 @@ impl Executor {
                     Value::Text(s) => s.parse::<i64>()
                         .map(Value::Int64)
                         .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to BIGINT"))),
-                    _ => Err(ExecError::Unsupported(format!("cannot cast to BIGINT"))),
+                    _ => Err(ExecError::Unsupported("cannot cast to BIGINT".to_string())),
                 }
             }
             ast::DataType::Float(_) | ast::DataType::Double(_) | ast::DataType::DoublePrecision => {
@@ -12812,7 +12815,7 @@ impl Executor {
                     Value::Text(s) => s.parse::<f64>()
                         .map(Value::Float64)
                         .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to FLOAT"))),
-                    _ => Err(ExecError::Unsupported(format!("cannot cast to FLOAT"))),
+                    _ => Err(ExecError::Unsupported("cannot cast to FLOAT".to_string())),
                 }
             }
             ast::DataType::Boolean => {
@@ -12827,7 +12830,7 @@ impl Executor {
                         "false" | "f" | "0" | "no" => Ok(Value::Bool(false)),
                         _ => Err(ExecError::Unsupported(format!("cannot cast '{s}' to BOOLEAN"))),
                     },
-                    _ => Err(ExecError::Unsupported(format!("cannot cast to BOOLEAN"))),
+                    _ => Err(ExecError::Unsupported("cannot cast to BOOLEAN".to_string())),
                 }
             }
             ast::DataType::Date => {
@@ -12843,7 +12846,7 @@ impl Executor {
                         Ok(Value::Date((ts / 1_000_000 / 86400) as i32))
                     }
                     Value::Int32(n) => Ok(Value::Date(n)),
-                    _ => Err(ExecError::Unsupported(format!("cannot cast to DATE"))),
+                    _ => Err(ExecError::Unsupported("cannot cast to DATE".to_string())),
                 }
             }
             ast::DataType::Timestamp(_, _) => {
@@ -12858,7 +12861,7 @@ impl Executor {
                     }
                     Value::Int64(n) => Ok(Value::Timestamp(n * 1_000_000)),
                     Value::Int32(n) => Ok(Value::Timestamp(n as i64 * 1_000_000)),
-                    _ => Err(ExecError::Unsupported(format!("cannot cast to TIMESTAMP"))),
+                    _ => Err(ExecError::Unsupported("cannot cast to TIMESTAMP".to_string())),
                 }
             }
             ast::DataType::Uuid => {
@@ -12881,14 +12884,14 @@ impl Executor {
                             Err(ExecError::Unsupported(format!("cannot cast '{s}' to UUID")))
                         }
                     }
-                    _ => Err(ExecError::Unsupported(format!("cannot cast to UUID"))),
+                    _ => Err(ExecError::Unsupported("cannot cast to UUID".to_string())),
                 }
             }
             ast::DataType::Bytea => {
                 match val {
                     Value::Bytea(_) => Ok(val),
                     Value::Text(s) => Ok(Value::Bytea(s.into_bytes())),
-                    _ => Err(ExecError::Unsupported(format!("cannot cast to BYTEA"))),
+                    _ => Err(ExecError::Unsupported("cannot cast to BYTEA".to_string())),
                 }
             }
             ast::DataType::Numeric(_) | ast::DataType::Decimal(_) | ast::DataType::Dec(_) => {
@@ -12898,7 +12901,7 @@ impl Executor {
                     Value::Int64(n) => Ok(Value::Numeric(n.to_string())),
                     Value::Float64(n) => Ok(Value::Numeric(n.to_string())),
                     Value::Text(s) => Ok(Value::Numeric(s)),
-                    _ => Err(ExecError::Unsupported(format!("cannot cast to NUMERIC"))),
+                    _ => Err(ExecError::Unsupported("cannot cast to NUMERIC".to_string())),
                 }
             }
             ast::DataType::Array(_) => {
@@ -12919,7 +12922,7 @@ impl Executor {
                     Value::Text(s) => s.parse::<f64>()
                         .map(Value::Float64)
                         .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to REAL"))),
-                    _ => Err(ExecError::Unsupported(format!("cannot cast to REAL"))),
+                    _ => Err(ExecError::Unsupported("cannot cast to REAL".to_string())),
                 }
             }
             ast::DataType::SmallInt(_) | ast::DataType::TinyInt(_) => {
@@ -12930,7 +12933,7 @@ impl Executor {
                     Value::Text(s) => s.parse::<i32>()
                         .map(Value::Int32)
                         .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to SMALLINT"))),
-                    _ => Err(ExecError::Unsupported(format!("cannot cast to SMALLINT"))),
+                    _ => Err(ExecError::Unsupported("cannot cast to SMALLINT".to_string())),
                 }
             }
             _ => Err(ExecError::Unsupported(format!("cast to {target}"))),
@@ -13434,11 +13437,8 @@ impl Executor {
         direction: &ast::FetchDirection,
     ) -> Result<ExecResult, ExecError> {
         let count = match direction {
-            ast::FetchDirection::Count { limit } => {
-                match limit {
-                    ast::Value::Number(n, _) => n.parse::<usize>().unwrap_or(1),
-                    _ => 1,
-                }
+            ast::FetchDirection::Count { limit: ast::Value::Number(n, _) } => {
+                n.parse::<usize>().unwrap_or(1)
             }
             ast::FetchDirection::Next | ast::FetchDirection::Forward { .. } => 1,
             ast::FetchDirection::All | ast::FetchDirection::ForwardAll => usize::MAX,
@@ -13692,47 +13692,11 @@ impl Executor {
     }
 
     fn value_to_csv_string(&self, value: &Value) -> String {
-        match value {
-            Value::Null => String::new(),
-            Value::Bool(b) => b.to_string(),
-            Value::Int32(i) => i.to_string(),
-            Value::Int64(i) => i.to_string(),
-            Value::Float64(f) => f.to_string(),
-            Value::Text(s) => s.clone(),
-            Value::Bytea(b) => format!("\\x{}", b.iter().map(|byte| format!("{:02x}", byte)).collect::<String>()),
-            Value::Timestamp(ts) => ts.to_string(),
-            Value::Date(d) => d.to_string(),
-            Value::TimestampTz(ts) => ts.to_string(),
-            Value::Numeric(n) => n.to_string(),
-            Value::Uuid(u) => format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]),
-            Value::Jsonb(j) => j.to_string(),
-            Value::Array(arr) => format!("{{{}}}", arr.iter().map(|v| self.value_to_csv_string(v)).collect::<Vec<_>>().join(",")),
-            Value::Vector(vec) => format!("[{}]", vec.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")),
-            Value::Interval { .. } => value.to_string(),
-        }
+        value_to_csv_string_impl(value)
     }
 
     fn value_to_text_string(&self, value: &Value) -> String {
-        match value {
-            Value::Null => "\\N".to_string(),
-            Value::Bool(b) => b.to_string(),
-            Value::Int32(i) => i.to_string(),
-            Value::Int64(i) => i.to_string(),
-            Value::Float64(f) => f.to_string(),
-            Value::Text(s) => s.clone(),
-            Value::Bytea(b) => format!("\\x{}", b.iter().map(|byte| format!("{:02x}", byte)).collect::<String>()),
-            Value::Timestamp(ts) => ts.to_string(),
-            Value::Date(d) => d.to_string(),
-            Value::TimestampTz(ts) => ts.to_string(),
-            Value::Numeric(n) => n.to_string(),
-            Value::Uuid(u) => format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]),
-            Value::Jsonb(j) => j.to_string(),
-            Value::Array(arr) => format!("{{{}}}", arr.iter().map(|v| self.value_to_text_string(v)).collect::<Vec<_>>().join(",")),
-            Value::Vector(vec) => format!("[{}]", vec.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")),
-            Value::Interval { .. } => value.to_string(),
-        }
+        value_to_text_string_impl(value)
     }
 
     fn parse_field(&self, field: &str, data_type: &DataType) -> Value {
@@ -14256,10 +14220,7 @@ impl Executor {
             let table_names = self.catalog.table_names().await;
             let mut snapshot = HashMap::new();
             for name in &table_names {
-                match self.storage.scan(name).await {
-                    Ok(rows) => { snapshot.insert(name.clone(), rows); }
-                    Err(_) => {}
-                }
+                if let Ok(rows) = self.storage.scan(name).await { snapshot.insert(name.clone(), rows); }
             }
             txn.snapshot = Some(snapshot);
         }
@@ -14353,7 +14314,7 @@ impl Executor {
         }
 
         Ok(ExecResult::Command {
-            tag: format!("SAVEPOINT"),
+            tag: "SAVEPOINT".to_string(),
             rows_affected: 0,
         })
     }
@@ -14988,12 +14949,58 @@ fn serde_to_doc(v: serde_json::Value) -> crate::document::JsonValue {
     }
 }
 
+/// Convert a Value to its CSV string representation.
+fn value_to_csv_string_impl(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int32(i) => i.to_string(),
+        Value::Int64(i) => i.to_string(),
+        Value::Float64(f) => f.to_string(),
+        Value::Text(s) => s.clone(),
+        Value::Bytea(b) => format!("\\x{}", b.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
+        Value::Timestamp(ts) => ts.to_string(),
+        Value::Date(d) => d.to_string(),
+        Value::TimestampTz(ts) => ts.to_string(),
+        Value::Numeric(n) => n.to_string(),
+        Value::Uuid(u) => format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]),
+        Value::Jsonb(j) => j.to_string(),
+        Value::Array(arr) => format!("{{{}}}", arr.iter().map(value_to_csv_string_impl).collect::<Vec<_>>().join(",")),
+        Value::Vector(vec) => format!("[{}]", vec.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")),
+        Value::Interval { .. } => value.to_string(),
+    }
+}
+
+/// Convert a Value to its text (tab-separated) string representation.
+fn value_to_text_string_impl(value: &Value) -> String {
+    match value {
+        Value::Null => "\\N".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int32(i) => i.to_string(),
+        Value::Int64(i) => i.to_string(),
+        Value::Float64(f) => f.to_string(),
+        Value::Text(s) => s.clone(),
+        Value::Bytea(b) => format!("\\x{}", b.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
+        Value::Timestamp(ts) => ts.to_string(),
+        Value::Date(d) => d.to_string(),
+        Value::TimestampTz(ts) => ts.to_string(),
+        Value::Numeric(n) => n.to_string(),
+        Value::Uuid(u) => format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]),
+        Value::Jsonb(j) => j.to_string(),
+        Value::Array(arr) => format!("{{{}}}", arr.iter().map(value_to_text_string_impl).collect::<Vec<_>>().join(",")),
+        Value::Vector(vec) => format!("[{}]", vec.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")),
+        Value::Interval { .. } => value.to_string(),
+    }
+}
+
 /// Strip dollar-quoting from a function body string (e.g., $$ SELECT 1 $$ → SELECT 1).
 fn strip_dollar_quotes(s: &str) -> String {
     let trimmed = s.trim();
     // Handle $tag$...$tag$ or $$...$$
-    if trimmed.starts_with('$') {
-        if let Some(end_tag_pos) = trimmed[1..].find('$') {
+    if let Some(stripped) = trimmed.strip_prefix('$') {
+        if let Some(end_tag_pos) = stripped.find('$') {
             let tag = &trimmed[..=end_tag_pos + 1];
             if trimmed.ends_with(tag) {
                 let inner = &trimmed[tag.len()..trimmed.len() - tag.len()];
@@ -15050,7 +15057,7 @@ fn substitute_outer_refs(expr: &Expr, outer_row: &Row, outer_meta: &[ColMeta]) -
             right: Box::new(substitute_outer_refs(right, outer_row, outer_meta)),
         },
         Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
-            op: op.clone(),
+            op: *op,
             expr: Box::new(substitute_outer_refs(inner, outer_row, outer_meta)),
         },
         Expr::IsNull(inner) => Expr::IsNull(Box::new(substitute_outer_refs(inner, outer_row, outer_meta))),
@@ -15228,7 +15235,7 @@ fn parse_point_wkt(s: &str) -> Option<geo::Point> {
         // Try bare "x y" format
         s
     };
-    let parts: Vec<&str> = inner.trim().split_whitespace().collect();
+    let parts: Vec<&str> = inner.split_whitespace().collect();
     if parts.len() == 2 {
         let x = parts[0].parse::<f64>().ok()?;
         let y = parts[1].parse::<f64>().ok()?;
@@ -15250,7 +15257,7 @@ fn parse_polygon_wkt(s: &str) -> Option<geo::Polygon> {
     let points: Option<Vec<geo::Point>> = inner
         .split(',')
         .map(|coord_str| {
-            let parts: Vec<&str> = coord_str.trim().split_whitespace().collect();
+            let parts: Vec<&str> = coord_str.split_whitespace().collect();
             if parts.len() == 2 {
                 let x = parts[0].parse::<f64>().ok()?;
                 let y = parts[1].parse::<f64>().ok()?;
@@ -15390,7 +15397,7 @@ fn parse_privileges(privs: &ast::Privileges) -> Vec<Privilege> {
                     ast::Action::Select { .. } => Privilege::Select,
                     ast::Action::Insert { .. } => Privilege::Insert,
                     ast::Action::Update { .. } => Privilege::Update,
-                    ast::Action::Delete { .. } => Privilege::Delete,
+                    ast::Action::Delete => Privilege::Delete,
                     ast::Action::Create { .. } => Privilege::Create,
                     ast::Action::Usage => Privilege::Usage,
                     _ => Privilege::Select,
@@ -15405,7 +15412,7 @@ fn parse_grant_objects(objects: &ast::GrantObjects) -> Vec<String> {
     match objects {
         ast::GrantObjects::Tables(tables) => tables.iter().map(|t| t.to_string()).collect(),
         ast::GrantObjects::AllTablesInSchema { schemas } => {
-            schemas.iter().map(|s| format!("{}.*", s)).collect()
+            schemas.iter().map(|s| format!("{s}.*")).collect()
         }
         ast::GrantObjects::Sequences(seqs) => seqs.iter().map(|s| s.to_string()).collect(),
         _ => vec!["*".to_string()],
@@ -15437,7 +15444,7 @@ fn parse_timestamp_parts(s: &str) -> Option<(i32, u32, u32, u32, u32, u32)> {
     // The day part might be followed by time: "15 14:30:00" or "15T14:30:00"
     let rest = parts[2];
     // Split on space or 'T'
-    let (day_str, time_str) = if let Some(idx) = rest.find(|c: char| c == ' ' || c == 'T') {
+    let (day_str, time_str) = if let Some(idx) = rest.find([' ', 'T']) {
         (&rest[..idx], Some(&rest[idx + 1..]))
     } else {
         (rest, None)

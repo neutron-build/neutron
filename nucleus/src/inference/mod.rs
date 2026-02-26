@@ -536,8 +536,8 @@ impl EmbeddingGenerator {
         let mut idx = 0usize;
         for doc in documents {
             for token in Self::tokenize(doc) {
-                if !self.vocabulary.contains_key(&token) {
-                    self.vocabulary.insert(token, idx);
+                if let std::collections::hash_map::Entry::Vacant(e) = self.vocabulary.entry(token) {
+                    e.insert(idx);
                     idx += 1;
                 }
             }

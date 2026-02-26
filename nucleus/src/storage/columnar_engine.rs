@@ -792,7 +792,7 @@ impl StorageEngine for ColumnarStorageEngine {
                     .extend(v.iter().map(|o| o.map(|n| n.to_string()))),
                 Some(ColumnData::Bool(v)) => key_vec
                     .extend(v.iter().map(|o| o.map(|b| b.to_string()))),
-                None => key_vec.extend(std::iter::repeat(None).take(n)),
+                None => key_vec.extend(std::iter::repeat_n(None, n)),
             }
             // Value column (optional) — numeric only.
             if let Some(ref vc) = val_col_name {
@@ -804,10 +804,10 @@ impl StorageEngine for ColumnarStorageEngine {
                     Some(ColumnData::Int32(v)) => {
                         val_vec.extend(v.iter().map(|o| o.map(|n| n as f64)))
                     }
-                    _ => val_vec.extend(std::iter::repeat(None).take(n)),
+                    _ => val_vec.extend(std::iter::repeat_n(None, n)),
                 }
             } else {
-                val_vec.extend(std::iter::repeat(None).take(n));
+                val_vec.extend(std::iter::repeat_n(None, n));
             }
         }
 
@@ -825,10 +825,8 @@ impl StorageEngine for ColumnarStorageEngine {
             // COUNT(*) only — count occurrences of each key directly.
             let mut counts: std::collections::HashMap<String, i64> =
                 std::collections::HashMap::new();
-            for key in key_vec {
-                if let Some(k) = key {
-                    *counts.entry(k).or_insert(0) += 1;
-                }
+            for k in key_vec.into_iter().flatten() {
+                *counts.entry(k).or_insert(0) += 1;
             }
             Some(
                 counts

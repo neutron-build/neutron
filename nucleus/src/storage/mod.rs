@@ -190,6 +190,12 @@ pub struct MemoryEngine {
     table_idx_names: SyncRwLock<HashMap<String, Vec<String>>>,
 }
 
+impl Default for MemoryEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryEngine {
     pub fn new() -> Self {
         Self {

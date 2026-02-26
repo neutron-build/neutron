@@ -582,6 +582,12 @@ pub struct TxnRecoveryLog {
     entries: Vec<TxnLogEntry>,
 }
 
+impl Default for TxnRecoveryLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TxnRecoveryLog {
     pub fn new() -> Self {
         Self { entries: Vec::new() }
@@ -1290,6 +1296,12 @@ pub struct ParallelCommitCoordinator {
     /// Transaction commit status.
     txn_status: HashMap<u64, IntentStatus>,
     next_txn_id: u64,
+}
+
+impl Default for ParallelCommitCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ParallelCommitCoordinator {

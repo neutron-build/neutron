@@ -58,11 +58,11 @@ impl IntoResponse for AppError {
                 }
             });
             let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
-            return http::Response::builder()
+            http::Response::builder()
                 .status(self.status)
                 .header("content-type", "application/json")
                 .body(Body::full(body_bytes))
-                .unwrap();
+                .unwrap()
         }
         // Without JSON: plain text fallback
         #[cfg(not(feature = "json"))]

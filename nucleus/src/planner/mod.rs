@@ -220,9 +220,9 @@ impl PlanNode {
                 if let Some(cond) = condition {
                     write!(f, "\n{pad}  Join Cond: {cond}")?;
                 }
-                write!(f, "\n")?;
+                writeln!(f)?;
                 left.fmt_indented(f, indent + 2)?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 right.fmt_indented(f, indent + 2)?;
             }
             PlanNode::HashJoin { left, right, join_type, hash_keys, estimated_rows, estimated_cost } => {
@@ -230,20 +230,20 @@ impl PlanNode {
                 if !hash_keys.is_empty() {
                     write!(f, "\n{pad}  Hash Key: {}", hash_keys.join(", "))?;
                 }
-                write!(f, "\n")?;
+                writeln!(f)?;
                 left.fmt_indented(f, indent + 2)?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 right.fmt_indented(f, indent + 2)?;
             }
             PlanNode::Filter { input, predicate, estimated_rows, estimated_cost } => {
                 write!(f, "{pad}Filter (cost={:.2} rows={estimated_rows})", estimated_cost.0)?;
                 write!(f, "\n{pad}  Predicate: {predicate}")?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 input.fmt_indented(f, indent + 2)?;
             }
             PlanNode::Sort { input, keys, estimated_cost } => {
                 write!(f, "{pad}Sort (cost={:.2})\n{pad}  Sort Key: {}", estimated_cost.0, keys.join(", "))?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 input.fmt_indented(f, indent + 2)?;
             }
             PlanNode::Limit { input, limit, offset, estimated_cost } => {
@@ -254,7 +254,7 @@ impl PlanNode {
                 if let Some(o) = offset {
                     write!(f, " offset={o}")?;
                 }
-                write!(f, ")\n")?;
+                writeln!(f, ")")?;
                 input.fmt_indented(f, indent + 2)?;
             }
             PlanNode::HashAggregate { input, group_keys, estimated_rows, estimated_cost, .. } => {
@@ -262,17 +262,17 @@ impl PlanNode {
                 if !group_keys.is_empty() {
                     write!(f, "\n{pad}  Group Key: {}", group_keys.join(", "))?;
                 }
-                write!(f, "\n")?;
+                writeln!(f)?;
                 input.fmt_indented(f, indent + 2)?;
             }
             PlanNode::Project { input, columns, estimated_cost } => {
                 write!(f, "{pad}Project [{}] (cost={:.2})", columns.join(", "), estimated_cost.0)?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 input.fmt_indented(f, indent + 2)?;
             }
             PlanNode::Aggregate { input, aggregates, estimated_cost } => {
                 write!(f, "{pad}Aggregate [{}] (cost={:.2})", aggregates.join(", "), estimated_cost.0)?;
-                write!(f, "\n")?;
+                writeln!(f)?;
                 input.fmt_indented(f, indent + 2)?;
             }
         }
@@ -429,6 +429,12 @@ impl TableStats {
 /// Global statistics store, updated by ANALYZE.
 pub struct StatsStore {
     stats: RwLock<HashMap<String, TableStats>>,
+}
+
+impl Default for StatsStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StatsStore {

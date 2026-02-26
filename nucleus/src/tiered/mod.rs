@@ -139,6 +139,12 @@ pub struct TierManager {
 const MS_PER_DAY: u64 = 86_400_000;
 const BYTES_PER_GB: f64 = 1_073_741_824.0; // 2^30
 
+impl Default for TierManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TierManager {
     /// Creates a new `TierManager` with sensible default tier configurations.
     ///

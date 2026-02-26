@@ -20,7 +20,7 @@ pub fn random_span_id() -> [u8; 8] {
 
 /// Hex-encode a byte slice into a lowercase hex string.
 pub fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]

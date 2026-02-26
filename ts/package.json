@@ -30,6 +30,7 @@
     "ci:bench:publish": "pnpm --dir benchmarks run compare:publish-grade",
     "ci:bench:publish:preflight": "pnpm --dir benchmarks run compare:publish:preflight",
     "ci:bench:publish:official": "pnpm --dir benchmarks run compare:publish:official",
+    "typecheck": "pnpm -r --if-present run typecheck",
     "ci:release": "node ./scripts/release-check.mjs"
   },
   "devDependencies": {

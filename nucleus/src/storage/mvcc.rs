@@ -339,6 +339,12 @@ pub struct MvccStorageAdapter {
     savepoints: parking_lot::RwLock<Vec<SavepointState>>,
 }
 
+impl Default for MvccStorageAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MvccStorageAdapter {
     pub fn new() -> Self {
         let txn_mgr = Arc::new(TransactionManager::new());

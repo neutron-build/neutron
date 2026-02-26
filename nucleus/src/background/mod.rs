@@ -297,6 +297,12 @@ pub struct SimpleTaskExecutor {
     pub executed: std::sync::Mutex<Vec<String>>,
 }
 
+impl Default for SimpleTaskExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SimpleTaskExecutor {
     pub fn new() -> Self {
         Self {
@@ -338,6 +344,12 @@ pub struct WorkerStats {
     pub tasks_completed: AtomicU64,
     pub tasks_failed: AtomicU64,
     pub last_execution_ms: AtomicU64,
+}
+
+impl Default for WorkerStats {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WorkerStats {
@@ -464,6 +476,12 @@ pub struct ScheduledTask {
 /// Manages cron-scheduled SQL tasks.
 pub struct CronScheduler {
     tasks: Vec<ScheduledTask>,
+}
+
+impl Default for CronScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CronScheduler {

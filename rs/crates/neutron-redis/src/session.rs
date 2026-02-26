@@ -110,7 +110,7 @@ impl SessionStore for RedisSessionStore {
     ) {
         let key          = self.redis_key(id);
         let mut conn     = self.pool.conn();
-        let ttl_secs     = ttl.as_secs().max(1) as u64;
+        let ttl_secs     = ttl.as_secs().max(1);
 
         let serialised = match serde_json::to_string(&data) {
             Ok(s)  => s,

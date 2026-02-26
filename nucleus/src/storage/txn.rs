@@ -178,6 +178,12 @@ pub struct TransactionManager {
     aborted: Mutex<HashSet<u64>>,
 }
 
+impl Default for TransactionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TransactionManager {
     pub fn new() -> Self {
         Self {

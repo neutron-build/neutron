@@ -92,9 +92,8 @@ impl LsmStorageEngine {
                         Ok(n) => n,
                         Err(_) => continue,
                     };
-                    match LsmTable::open(&path) {
-                        Ok(t) => { tables.insert(table_name, t); }
-                        Err(_) => {} // Skip unreadable tables.
+                    if let Ok(t) = LsmTable::open(&path) {
+                        tables.insert(table_name, t);
                     }
                 }
             }

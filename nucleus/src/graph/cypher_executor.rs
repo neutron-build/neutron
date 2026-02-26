@@ -164,9 +164,9 @@ fn evaluate_condition(
         Condition::PropertyEquals { variable, property, value } => {
             match bindings.get(variable) {
                 Some(Binding::Node(id)) => store.get_node(*id)
-                    .map_or(false, |n| n.properties.get(property) == Some(value)),
+                    .is_some_and(|n| n.properties.get(property) == Some(value)),
                 Some(Binding::Edge(id)) => store.get_edge(*id)
-                    .map_or(false, |e| e.properties.get(property) == Some(value)),
+                    .is_some_and(|e| e.properties.get(property) == Some(value)),
                 None => false,
             }
         }
@@ -284,11 +284,11 @@ fn execute_create(
             CreateItem::Edge { from_var, to_var, edge_type, properties } => {
                 let from_id = var_map.get(from_var).ok_or_else(|| {
                     CypherError::InvalidSyntax(
-                        format!("undefined variable in CREATE edge: {}", from_var))
+                        format!("undefined variable in CREATE edge: {from_var}"))
                 })?;
                 let to_id = var_map.get(to_var).ok_or_else(|| {
                     CypherError::InvalidSyntax(
-                        format!("undefined variable in CREATE edge: {}", to_var))
+                        format!("undefined variable in CREATE edge: {to_var}"))
                 })?;
                 let props: Properties = properties.clone();
                 let edge_id = store

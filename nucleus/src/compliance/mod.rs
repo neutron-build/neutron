@@ -31,6 +31,12 @@ pub struct PiiMatch {
 /// Heuristic-based PII detector that inspects column names and sample values.
 pub struct PiiDetector;
 
+impl Default for PiiDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PiiDetector {
     /// Create a new detector.
     pub fn new() -> Self {
@@ -334,6 +340,12 @@ pub struct DeletionCascade {
     foreign_keys: Vec<ForeignKey>,
 }
 
+impl Default for DeletionCascade {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeletionCascade {
     pub fn new() -> Self {
         Self {
@@ -419,7 +431,7 @@ impl DeletionCascade {
 
         steps.push(DeletionStep {
             table: table.to_string(),
-            condition: format!("{} = '{}'", id_column, id_value),
+            condition: format!("{id_column} = '{id_value}'"),
             cascade_from,
         });
     }
@@ -449,6 +461,12 @@ pub struct RetentionAction {
 /// Manages retention policies and checks for expired data.
 pub struct RetentionEngine {
     policies: Vec<RetentionPolicy>,
+}
+
+impl Default for RetentionEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RetentionEngine {
@@ -587,8 +605,7 @@ impl ResidencyEnforcer {
             // Denied takes priority.
             if rule.denied_regions.contains(target_region) {
                 return ResidencyVerdict::Denied(format!(
-                    "table '{}' cannot be stored in region {} (denied by rule)",
-                    table_name, target_region
+                    "table '{table_name}' cannot be stored in region {target_region} (denied by rule)"
                 ));
             }
             // If allowed_regions is specified and non-empty, target must be in it.
@@ -653,8 +670,7 @@ impl ResidencyEnforcer {
         if pattern == "*" {
             return true;
         }
-        if pattern.ends_with('*') {
-            let prefix = &pattern[..pattern.len() - 1];
+        if let Some(prefix) = pattern.strip_suffix('*') {
             return table_name.starts_with(prefix);
         }
         pattern == table_name

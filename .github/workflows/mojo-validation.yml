@@ -22,12 +22,11 @@ jobs:
 
       - name: Install pixi
         uses: prefix-dev/setup-pixi@v0.8.4
-
-      - name: Install neutron-mojo environment
-        run: pixi install --manifest-path mojo/neutron-mojo/mojoproject.toml
+        with:
+          manifest-path: mojo/neutron-mojo/mojoproject.toml
 
       - name: Run core validation
-        run: bash mojo/scripts/validate-core.sh
+        run: pixi run --manifest-path mojo/neutron-mojo/mojoproject.toml bash mojo/scripts/validate-core.sh
 
       - name: Upload validation reports
         if: always()

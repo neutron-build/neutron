@@ -195,7 +195,7 @@ impl TimeSeriesStore {
         let update = self
             .last_values
             .get(series_name)
-            .map_or(true, |last| point.timestamp >= last.timestamp);
+            .is_none_or(|last| point.timestamp >= last.timestamp);
         if update {
             self.last_values.insert(series_name.to_string(), point);
         }
@@ -312,6 +312,12 @@ pub struct ContinuousAggDef {
 #[derive(Debug)]
 pub struct ContinuousAggManager {
     pub aggregates: HashMap<String, ContinuousAggDef>,
+}
+
+impl Default for ContinuousAggManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ContinuousAggManager {

@@ -70,7 +70,7 @@ impl JsonValue {
         match (self, other) {
             (JsonValue::Object(a), JsonValue::Object(b)) => {
                 b.iter().all(|(k, bv)| {
-                    a.get(k).map_or(false, |av| av.contains(bv))
+                    a.get(k).is_some_and(|av| av.contains(bv))
                 })
             }
             (JsonValue::Array(a), JsonValue::Array(b)) => {
@@ -100,14 +100,14 @@ impl JsonValue {
                     let path = if prefix.is_empty() {
                         k.clone()
                     } else {
-                        format!("{}.{}", prefix, k)
+                        format!("{prefix}.{k}")
                     };
                     v.gin_extract_inner(path, out);
                 }
             }
             JsonValue::Array(arr) => {
                 for (i, v) in arr.iter().enumerate() {
-                    let path = format!("{}[{}]", prefix, i);
+                    let path = format!("{prefix}[{i}]");
                     v.gin_extract_inner(path, out);
                 }
             }
@@ -157,7 +157,7 @@ fn format_number(n: f64) -> String {
     if n.fract() == 0.0 && n.is_finite() {
         format!("{}", n as i64)
     } else {
-        format!("{}", n)
+        format!("{n}")
     }
 }
 
@@ -345,6 +345,12 @@ pub struct GinIndex {
     entries: HashMap<(String, Vec<u8>), HashSet<u64>>,
 }
 
+impl Default for GinIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GinIndex {
     pub fn new() -> Self {
         Self {
@@ -413,6 +419,12 @@ pub struct DocumentStore {
     next_id: u64,
 }
 
+impl Default for DocumentStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DocumentStore {
     pub fn new() -> Self {
         Self {
@@ -478,7 +490,7 @@ impl DocumentStore {
             .filter(|id| {
                 self.docs
                     .get(id)
-                    .map_or(false, |doc| doc.contains(query))
+                    .is_some_and(|doc| doc.contains(query))
             })
             .collect()
     }

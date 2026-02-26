@@ -74,6 +74,12 @@ pub struct VersionStore {
     next_commit_id: CommitId,
 }
 
+impl Default for VersionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VersionStore {
     pub fn new() -> Self {
         let mut store = Self {

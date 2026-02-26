@@ -984,29 +984,24 @@ impl TcpTransport {
         let auth_token = self.auth_token.clone();
         let tls = self.tls.clone();
         tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        let tx = inbox_tx.clone();
-                        let token = auth_token.clone();
-                        let tls_cfg = tls.clone();
-                        tokio::spawn(async move {
-                            if let Some(tls_cfg) = tls_cfg {
-                                match tls_cfg.acceptor.accept(stream).await {
-                                    Ok(tls_stream) => {
-                                        Self::handle_inbound(tls_stream, tx, token).await;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("cluster TLS accept failed: {e}");
-                                    }
-                                }
-                            } else {
-                                Self::handle_inbound(stream, tx, token).await;
+            while let Ok((stream, _)) = listener.accept().await {
+                let tx = inbox_tx.clone();
+                let token = auth_token.clone();
+                let tls_cfg = tls.clone();
+                tokio::spawn(async move {
+                    if let Some(tls_cfg) = tls_cfg {
+                        match tls_cfg.acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                Self::handle_inbound(tls_stream, tx, token).await;
                             }
-                        });
+                            Err(e) => {
+                                tracing::warn!("cluster TLS accept failed: {e}");
+                            }
+                        }
+                    } else {
+                        Self::handle_inbound(stream, tx, token).await;
                     }
-                    Err(_) => break,
-                }
+                });
             }
         });
         Ok(addr)
@@ -1027,14 +1022,9 @@ impl TcpTransport {
             }
         }
 
-        loop {
-            match Self::read_frame(&mut stream).await {
-                Ok(data) => {
-                    if let Ok(envelope) = Envelope::from_bytes(&data) {
-                        let _ = inbox_tx.send(envelope).await;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(data) = Self::read_frame(&mut stream).await {
+            if let Ok(envelope) = Envelope::from_bytes(&data) {
+                let _ = inbox_tx.send(envelope).await;
             }
         }
     }
@@ -1042,7 +1032,7 @@ impl TcpTransport {
     /// Send an envelope to a peer. Opens a connection if needed.
     pub async fn send(&self, to: NodeId, envelope: &Envelope) -> Result<(), TransportError> {
         let mut conns = self.connections.lock().await;
-        if !conns.contains_key(&to) {
+        if let std::collections::hash_map::Entry::Vacant(e) = conns.entry(to) {
             // Open new connection
             let addrs = self.peer_addrs.lock().await;
             let addr = addrs
@@ -1079,7 +1069,7 @@ impl TcpTransport {
                     Self::writer_loop(tcp_stream, rx).await;
                 });
             }
-            conns.insert(to, tx);
+            e.insert(tx);
         }
         let tx = conns.get(&to).unwrap();
         let data = envelope.to_bytes();

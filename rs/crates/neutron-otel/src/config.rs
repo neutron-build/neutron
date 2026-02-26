@@ -2,14 +2,13 @@ use crate::error::OtelError;
 
 /// Transport protocol for OTLP export.
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum OtlpProtocol {
     /// HTTP/JSON — POST to `{endpoint}/v1/traces`.
+    #[default]
     HttpJson,
 }
 
-impl Default for OtlpProtocol {
-    fn default() -> Self { OtlpProtocol::HttpJson }
-}
 
 /// Configuration for the OTLP exporter.
 #[derive(Debug, Clone)]
