@@ -1,0 +1,13 @@
+---
+const rows = Array.from({ length: 400 }, (_, i) => ({
+  id: i + 1,
+  value: `row-${i + 1}-${(i * 37) % 101}`,
+}));
+---
+
+<main>
+  <h1>Big Payload</h1>
+  <ul>
+    {rows.map((row) => <li>{row.value}</li>)}
+  </ul>
+</main>

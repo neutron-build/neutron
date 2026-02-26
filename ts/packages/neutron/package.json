@@ -1,0 +1,96 @@
+{
+  "name": "neutron",
+  "version": "0.1.0",
+  "description": "The unified TypeScript web framework. Static sites with zero JS, app routes with Preact SSR, one router, deploy anywhere.",
+  "author": "Tyler",
+  "license": "BUSL-1.1",
+  "homepage": "https://neutron.build",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/neutron-build/neutron",
+    "directory": "packages/neutron"
+  },
+  "keywords": [
+    "neutron",
+    "framework",
+    "typescript",
+    "vite",
+    "preact",
+    "ssr",
+    "ssg",
+    "islands",
+    "web-framework",
+    "fullstack"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "import": "./dist/config.js"
+    },
+    "./vite": {
+      "types": "./dist/vite/index.d.ts",
+      "import": "./dist/vite/index.js"
+    },
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "import": "./dist/server/index.js"
+    },
+    "./client": {
+      "types": "./dist/client/index.d.ts",
+      "import": "./dist/client/index.js"
+    },
+    "./content": {
+      "types": "./dist/content/index.d.ts",
+      "import": "./dist/content/index.js"
+    },
+    "./runtime-edge": {
+      "types": "./dist/runtime/edge.d.ts",
+      "import": "./dist/runtime/edge.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "tsc --noEmit --pretty false",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@mdx-js/mdx": "^3.1.0",
+    "@babel/parser": "^7.28.4",
+    "@hono/node-server": "^1.19.9",
+    "@preact/signals-core": "^1.8.1",
+    "@sinclair/typebox": "^0.34.16",
+    "devalue": "^5.5.0",
+    "gray-matter": "^4.0.3",
+    "hono": "^4.11.9",
+    "magic-string": "^0.30.21",
+    "marked": "^15.0.12",
+    "preact": "^10.25.4",
+    "preact-render-to-string": "^6.6.5",
+    "yaml": "^2.8.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "happy-dom": "^17.4.4",
+    "vite": "^6.4.1",
+    "vitest": "^2.1.8"
+  },
+  "peerDependencies": {
+    "sharp": ">=0.33.0"
+  },
+  "peerDependenciesMeta": {
+    "sharp": {
+      "optional": true
+    }
+  }
+}

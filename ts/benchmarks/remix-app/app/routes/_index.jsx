@@ -1,0 +1,8 @@
+export default function Index() {
+  return (
+    <main>
+      <h1>bench-home</h1>
+      <p>Framework benchmark static route.</p>
+    </main>
+  );
+}

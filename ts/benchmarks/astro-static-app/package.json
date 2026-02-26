@@ -1,0 +1,11 @@
+{
+  "name": "bench-astro-static",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "astro build"
+  },
+  "dependencies": {
+    "astro": "5.17.2"
+  }
+}

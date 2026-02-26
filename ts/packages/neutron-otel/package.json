@@ -1,0 +1,51 @@
+{
+  "name": "@neutron/otel",
+  "version": "0.1.0",
+  "description": "OpenTelemetry integration for Neutron. Automatic span and error tracing via server hooks.",
+  "author": "Tyler",
+  "license": "BUSL-1.1",
+  "homepage": "https://neutron.build",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/neutron-build/neutron",
+    "directory": "packages/neutron-otel"
+  },
+  "keywords": [
+    "neutron",
+    "opentelemetry",
+    "otel",
+    "tracing",
+    "observability"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "tsc --noEmit --pretty false",
+    "test": "tsc --noEmit --pretty false"
+  },
+  "dependencies": {
+    "neutron": "workspace:*"
+  },
+  "peerDependencies": {
+    "@opentelemetry/api": "^1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentelemetry/api": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "typescript": "^5.7.2"
+  }
+}

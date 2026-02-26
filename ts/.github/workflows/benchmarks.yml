@@ -1,0 +1,135 @@
+name: Benchmarks
+
+on:
+  pull_request:
+    paths:
+      - "packages/**"
+      - "apps/**"
+      - "benchmarks/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "turbo.json"
+      - ".github/workflows/benchmarks.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "packages/**"
+      - "apps/**"
+      - "benchmarks/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "turbo.json"
+      - ".github/workflows/benchmarks.yml"
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Benchmark profile to run"
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - full
+
+concurrency:
+  group: benchmarks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Smoke Benchmark
+    if: github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || github.event.inputs.profile == 'smoke')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            benchmarks/pnpm-lock.yaml
+            benchmarks/next-app/pnpm-lock.yaml
+            benchmarks/remix-app/pnpm-lock.yaml
+            benchmarks/remix3-fw/pnpm-lock.yaml
+            benchmarks/astro-app/pnpm-lock.yaml
+
+      - name: Install Workspace Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Benchmark Harness Dependencies
+        run: pnpm --dir benchmarks install --frozen-lockfile
+
+      - name: Run Smoke Benchmark
+        run: pnpm --dir benchmarks run compare:quick
+
+      - name: Enforce Smoke Regression Gate (Neutron)
+        run: pnpm --dir benchmarks run compare:gate:smoke
+
+      - name: Upload Smoke Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-smoke-${{ github.run_id }}
+          path: |
+            benchmarks/results/latest.json
+            benchmarks/results/run-*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  full:
+    name: Full Benchmark
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.profile == 'full')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            benchmarks/pnpm-lock.yaml
+            benchmarks/next-app/pnpm-lock.yaml
+            benchmarks/remix-app/pnpm-lock.yaml
+            benchmarks/remix3-fw/pnpm-lock.yaml
+            benchmarks/astro-app/pnpm-lock.yaml
+
+      - name: Install Workspace Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Benchmark Harness Dependencies
+        run: pnpm --dir benchmarks install --frozen-lockfile
+
+      - name: Run Full Benchmark
+        run: pnpm --dir benchmarks run compare:full
+
+      - name: Upload Full Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-full-${{ github.run_id }}
+          path: |
+            benchmarks/results/latest.json
+            benchmarks/results/run-*.json
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,24 @@
+{
+  "name": "__PACKAGE_NAME__",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "neutron dev",
+    "build": "neutron build",
+    "build:vercel": "neutron build --preset vercel",
+    "start": "neutron start",
+    "preview": "neutron preview",
+    "release:check": "neutron release-check --preset vercel"
+  },
+  "dependencies": {
+    "neutron": "__NEUTRON_VERSION__",
+    "neutron-cli": "__NEUTRON_CLI_VERSION__",
+    "preact": "^10.25.4"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.9.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  }
+}

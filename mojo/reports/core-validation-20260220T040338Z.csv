@@ -1,0 +1,14 @@
+test,status,exit_code
+test_activations.mojo,fail,1
+test_architecture.mojo,fail,1
+test_attention.mojo,fail,1
+test_auto_config.mojo,fail,1
+test_autograd_extended.mojo,fail,1
+test_autograd.mojo,fail,1
+test_batched_matmul.mojo,fail,1
+test_batch_prefill.mojo,fail,1
+test_bench.mojo,fail,1
+test_binary_reader.mojo,fail,1
+test_causal_lm.mojo,fail,1
+test_checkpoint.mojo,fail,1
+test_cli_commands.mojo,fail,1

@@ -1,0 +1,16 @@
+[package]
+name        = "neutron-cache"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "Tiered L1+L2 cache (in-process + optional Redis) for the Neutron web framework"
+
+[features]
+default = []
+redis   = ["dep:redis", "dep:tokio"]
+
+[dependencies]
+tokio   = { workspace = true, optional = true }
+redis   = { workspace = true, optional = true }
+tracing = { workspace = true }

@@ -1,0 +1,43 @@
+{
+  "name": "@neutron/ops",
+  "version": "0.1.0",
+  "description": "Observability middleware for Neutron. Request tracing, health checks, and structured JSON logging.",
+  "author": "Tyler",
+  "license": "BUSL-1.1",
+  "homepage": "https://neutron.build",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/neutron-build/neutron",
+    "directory": "packages/neutron-ops"
+  },
+  "keywords": [
+    "neutron",
+    "observability",
+    "health-check",
+    "logging",
+    "request-id"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "tsc --noEmit --pretty false",
+    "test": "tsc --noEmit --pretty false"
+  },
+  "dependencies": {
+    "neutron": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "typescript": "^5.7.2"
+  }
+}

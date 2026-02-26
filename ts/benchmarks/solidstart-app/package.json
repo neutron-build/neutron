@@ -1,0 +1,16 @@
+{
+  "name": "bench-solidstart",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vinxi dev",
+    "build": "vinxi build",
+    "start": "node .output/server/index.mjs"
+  },
+  "dependencies": {
+    "@solidjs/router": "^0.15.3",
+    "@solidjs/start": "^1.2.3",
+    "solid-js": "^1.9.7",
+    "vinxi": "^0.5.3"
+  }
+}

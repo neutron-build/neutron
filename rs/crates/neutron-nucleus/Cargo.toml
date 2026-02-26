@@ -1,0 +1,17 @@
+[package]
+name = "neutron-nucleus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Nucleus database integration for the Neutron framework"
+
+[dependencies]
+neutron        = { path = "../neutron", default-features = false }
+tokio-postgres = { workspace = true }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+http           = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

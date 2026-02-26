@@ -1,0 +1,23 @@
+[package]
+name        = "neutron-storage"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "S3-compatible object storage (AWS S3, Cloudflare R2, GCS) for the Neutron web framework"
+
+[dependencies]
+sha2         = { workspace = true }
+hmac         = { workspace = true }
+base64       = { workspace = true }
+# Outbound HTTPS (same stack as neutron-oauth)
+hyper        = { workspace = true }
+hyper-util   = { workspace = true }
+http-body-util = { workspace = true }
+tokio        = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls       = { workspace = true }
+webpki-roots = { workspace = true }
+bytes        = { workspace = true }
+http         = { workspace = true }
+tracing      = { workspace = true }

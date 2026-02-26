@@ -1,0 +1,82 @@
+# Neutron
+
+Neutron is a full-stack framework ecosystem. One mental model across web, mobile, desktop, and AI — backed by Nucleus, a multi-model database engine built in Rust.
+
+## Projects
+
+### rs/ — Neutron Rust (Web Framework)
+High-performance HTTP/1.1, HTTP/2, HTTP/3 web framework in Rust. Hyper-based, tokio async, middleware pipeline, file-based routing, WebSockets, SSE, multipart, TLS, gRPC, GraphQL.
+- Entry: `rs/crates/neutron/src/lib.rs`
+- Tests: `cargo test` in `rs/`
+- Key types: `App`, `Router`, `Request`, `Response`, `Middleware`, `Handler`
+
+### ts/ — Neutron TypeScript (UI Framework)
+SSR-first TypeScript framework with Preact components, file-based routing, signals, server actions, streaming. Think SvelteKit but Preact.
+- Entry: `ts/packages/neutron/src/`
+- Tests: `pnpm test` in `ts/`
+- Key APIs: `defineRoute`, `useSignal`, `cache()`, `revalidateTag()`, `ServerIsland`
+
+### mojo/ — Neutron Mojo (ML Library)
+Tensor operations, quantization (Q8/Q4/NF4/FP8), inference pipeline, training stack in Mojo. Runs on CPU with SIMD kernels.
+- Entry: `mojo/neutron-mojo/src/`
+- Tests: `pixi run mojo build -I src test/test_*.mojo`
+- Key types: `Tensor`, `Model`, `QuantizedModel`, `pipeline_generate`
+
+### nucleus/ — Nucleus Database Engine
+Multi-model database in Rust. One engine for SQL, Key-Value, Vector, Graph, Timeseries, Document, Full-Text Search, Geo, and Pub/Sub. PostgreSQL wire protocol compatible.
+- Entry: `nucleus/src/`
+- Tests: `cargo test --lib` in `nucleus/`
+- Key SQL functions: `kv_get/set`, `ts_insert/range`, `doc_insert/query`, `columnar_insert`
+- Port: 5432 (pgwire)
+
+### studio/ — Nucleus Studio
+Visual database management GUI. Browse all 9 data models (SQL, KV, Vector, Timeseries, Document etc.) in one UI with toggles. Schema designer + code generator + database browser.
+- Stack: Neutron TypeScript + Preact + Nucleus (dogfooding)
+
+### go/ — Neutron Go (SDK)
+Go language SDK — Nucleus client and Neutron server bindings for Go backends.
+
+### zig/ — Neutron Zig (Embedded Client)
+Nucleus client for embedded/IoT systems. 12KB binary, zero heap allocations, comptime SQL validation. Targets ARM, RISC-V, AVR, ESP32.
+
+### python/ — Neutron Python
+Python support via Mojo's Python interop. Call NumPy, pandas, PyTorch from Mojo. Nucleus Python client planned.
+
+### native/ — Neutron Native (Mobile Framework)
+Preact components rendering to native iOS/Android views via React Native bridge. Write once, render native.
+
+### mobile-preview/ — Neutron Mobile Preview
+On-device preview app for Neutron Native (Expo Go equivalent). Written in Go, compiles to iOS + Android. Scan QR code to preview native apps instantly.
+
+### desktop/ — Neutron Desktop
+Cross-platform desktop apps using Tauri 2.0 + Preact + Neutron Rust backend. ~10MB bundles vs Electron's 100MB+.
+
+## Nucleus ORM — Per Language
+
+Each language has an idiomatic ORM for Nucleus covering all 9 data models:
+
+- **TypeScript**: Drizzle-style — schema defined in code, no codegen, fully typed
+- **Rust**: Proc macros — `nucleus::schema!{}`, compile-time checked
+- **Zig**: Comptime — zero overhead, SQL validated at compile time
+- **Python**: Pydantic-style class definitions
+- **Go**: Struct tags (idiomatic Go)
+
+Single schema covers SQL tables, KV stores, vector collections, timeseries metrics, and document collections — unlike Drizzle/Prisma which only cover SQL.
+
+## Key Design Decisions
+
+- Neutron TS uses Preact (3KB) not React (42KB)
+- Nucleus uses PostgreSQL wire protocol (pgwire) — works with any Postgres client
+- Nucleus MVCC + WAL crash recovery — production-grade persistence
+- Neutron Rust uses hyper 1.x + tokio, no framework overhead
+- Mojo uses SIMD kernels for tensor ops (337x vs scalar dot product)
+- All projects are MIT licensed
+
+## File Conventions
+
+- `rs/crates/neutron/src/app.rs` — main App builder
+- `rs/crates/neutron/src/handler.rs` — Request/Response types
+- `rs/crates/neutron/src/router.rs` — routing
+- `nucleus/src/` — all database engine modules
+- `ts/packages/neutron/src/` — TypeScript framework source
+- `mojo/neutron-mojo/src/` — Mojo tensor library source

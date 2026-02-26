@@ -1,0 +1,61 @@
+name: TypeScript Framework
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ts/**"
+      - ".github/workflows/ts.yml"
+  pull_request:
+    paths:
+      - "ts/**"
+      - ".github/workflows/ts.yml"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ts/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install
+        working-directory: ts
+
+      - name: Build
+        run: pnpm build
+        working-directory: ts
+
+      - name: Test
+        run: pnpm test
+        working-directory: ts
+
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: latest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ts/pnpm-lock.yaml
+      - run: pnpm install
+        working-directory: ts
+      - run: pnpm typecheck
+        working-directory: ts

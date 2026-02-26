@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.turbo/
+*.log
+.DS_Store
+benchmarks/results/latest.json
+benchmarks/results/run-*.json

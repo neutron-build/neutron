@@ -1,0 +1,12 @@
+# Mojo toolchain environments and caches
+**/.pixi/
+**/.magic/
+
+# Python caches from bridge/reference scripts
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+
+# Local benchmark/test artifacts
+**/*.log

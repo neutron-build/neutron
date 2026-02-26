@@ -1,0 +1,18 @@
+[workspace]
+name = "neutron-mojo"
+version = "0.1.0"
+description = "GPU compute framework — typed tensors, kernel authoring, MLIR compilation"
+license = "Apache-2.0"
+authors = ["Tyler"]
+readme = "README.md"
+channels = ["https://conda.modular.com/max-nightly/", "conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+homepage = "https://github.com/neutron-build/neutron"
+repository = "https://github.com/neutron-build/neutron"
+
+[dependencies]
+max = ">=25.1"
+
+[tool.mojo]
+src = "src"
+test = "test"

@@ -1,0 +1,16 @@
+---
+const users = {
+  "1": { id: "1", name: "Alice", email: "alice@example.com" },
+  "2": { id: "2", name: "Bob", email: "bob@example.com" },
+  "3": { id: "3", name: "Charlie", email: "charlie@example.com" },
+};
+
+const { id } = Astro.params;
+const user = users[id] || { id, name: "Unknown", email: "unknown@example.com" };
+---
+
+<main>
+  <h1>User: {user.name}</h1>
+  <p>ID: {user.id}</p>
+  <p>Email: {user.email}</p>
+</main>
