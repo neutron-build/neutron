@@ -1,0 +1,102 @@
+# Build artifacts
+target/
+dist/
+build/
+.next/
+.svelte-kit/
+.solid/
+out/
+
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/settings.json
+.idea/
+
+# Logs
+*.log
+server_err.log
+
+# Temporary files
+*.tmp
+*.bak
+
+# Compiled Mojo outputs
+/tmp/test_*
+
+# Internal planning docs & research
+internal/
+**/ARCHITECTURE.md
+**/PLAN.md
+**/STATUS.md
+**/TODO-NEXT.md
+**/EXECUTION.md
+**/CHECKLIST.md
+**/NEUTRON_FINISH_CHECKLIST.md
+**/BENCHMARK_UPDATE.md
+**/competitive-analysis*.md
+**/COMPETITOR-GAPS.md
+**/AUDIT-REPORT.md
+**/ai-ml-database-research.md
+**/SPRINT-*.md
+**/SPRINTS-*.md
+**/IMPLEMENTATION-COMPLETE.md
+**/IMPLEMENTATION_PLAN.md
+**/COMPLETION_REPORT.md
+**/ENGINEERING_EFFORT_ANALYSIS.md
+**/PROJECT_STATUS_*.md
+**/ONE_WEEK_RELEASE_PLAN.md
+**/TECHNICAL_DEEP_DIVE.md
+**/FULL_STACK_ANALYSIS.md
+**/MULTI_LANGUAGE_CLIENT_ANALYSIS.md
+**/NUCLEUS_CLIENT_SPEC.md
+**/ORM_CLIENT_STUDIO_DECISION.md
+**/NEUTRON-VS-REMIX.md
+**/NEUTRON-FEATURE-AUDIT.md
+**/ECOSYSTEM_*.md
+**/DOCS_API_ECOSYSTEM.md
+**/rust-PLAN.md
+**/DEFER-EXAMPLE.md
+**/URGENT-NOTE.md
+**/QUICK-REFERENCE.md
+**/ASTRO6-NEXTJS16-FEATURES.md
+**/SVELTEKIT-SOLIDJS-FEATURES.md
+**/REMIX-FEATURES-TO-ADOPT.md
+
+# Scratch / dev tooling files
+**/do_edit.py
+**/edit_distributed.py
+**/coord_lines.py
+**/coord_methods.rs
+
+# Old location remnants (build artifacts only, source is in rs/ and nucleus/)
+rust/
+
+# Site (not ready for public release yet)
+site/
+
+# Claude internal
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Rust
+Cargo.lock
+!rs/Cargo.lock
+!nucleus/Cargo.lock

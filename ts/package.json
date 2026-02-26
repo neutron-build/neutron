@@ -1,0 +1,44 @@
+{
+  "name": "neutron-monorepo",
+  "private": true,
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/neutron-build/neutron",
+    "directory": "ts"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "pnpm -r --if-present run build",
+    "build:turbo": "turbo run build",
+    "test": "node ./scripts/check-workspace-tasks.mjs test && pnpm -r --if-present run test",
+    "test:turbo": "turbo run test",
+    "lint": "node ./scripts/check-workspace-tasks.mjs lint && pnpm -r --if-present run lint",
+    "lint:turbo": "turbo run lint",
+    "ci:deploy-presets": "pnpm --dir apps/playground run build:vercel && pnpm --dir apps/playground run deploy-check:vercel && pnpm --dir apps/playground run build:cloudflare && pnpm --dir apps/playground run deploy-check:cloudflare && pnpm --dir apps/playground run build:docker && pnpm --dir apps/playground run deploy-check:docker",
+    "ci:runtime-compat": "node ./scripts/runtime-compat-smoke.mjs",
+    "ci:data-profiles": "node ./scripts/data-profile-smoke.mjs",
+    "ci:naming": "node ./scripts/naming-check.mjs",
+    "ci:workspace": "node ./scripts/workspace-graph-check.mjs",
+    "ci:workspace:snapshot": "node ./scripts/workspace-graph-check.mjs --write",
+    "ci:mirror-sync": "node ./scripts/check-mirror-sync.mjs",
+    "ci:bench:smoke": "pnpm --dir benchmarks run compare:quick",
+    "ci:bench:full": "pnpm --dir benchmarks run compare:full",
+    "ci:bench:canonical": "pnpm --dir benchmarks run compare:canonical",
+    "ci:bench:publish": "pnpm --dir benchmarks run compare:publish-grade",
+    "ci:bench:publish:preflight": "pnpm --dir benchmarks run compare:publish:preflight",
+    "ci:bench:publish:official": "pnpm --dir benchmarks run compare:publish:official",
+    "ci:release": "node ./scripts/release-check.mjs"
+  },
+  "devDependencies": {
+    "happy-dom": "^17.4.4",
+    "turbo": "^2.3.3",
+    "typescript": "^5.7.2"
+  },
+  "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=20"
+  }
+}

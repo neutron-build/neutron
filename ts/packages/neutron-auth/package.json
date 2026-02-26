@@ -1,0 +1,55 @@
+{
+  "name": "@neutron/auth",
+  "version": "0.1.0",
+  "description": "Auth middleware for Neutron. Better Auth and Auth.js adapters with protected route helpers.",
+  "author": "Tyler",
+  "license": "BUSL-1.1",
+  "homepage": "https://neutron.build",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/neutron-build/neutron",
+    "directory": "packages/neutron-auth"
+  },
+  "keywords": [
+    "neutron",
+    "auth",
+    "authentication",
+    "better-auth",
+    "middleware"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "tsc --noEmit --pretty false",
+    "test": "tsc --noEmit --pretty false"
+  },
+  "dependencies": {
+    "neutron": "workspace:*"
+  },
+  "peerDependencies": {
+    "better-auth": "*",
+    "next-auth": "*"
+  },
+  "peerDependenciesMeta": {
+    "better-auth": {
+      "optional": true
+    },
+    "next-auth": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "typescript": "^5.7.2"
+  }
+}

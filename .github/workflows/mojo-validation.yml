@@ -1,0 +1,37 @@
+name: Mojo Core Validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "mojo/**"
+      - ".github/workflows/mojo-validation.yml"
+  pull_request:
+    paths:
+      - "mojo/**"
+      - ".github/workflows/mojo-validation.yml"
+
+jobs:
+  validate-core:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.8.4
+
+      - name: Install neutron-mojo environment
+        run: pixi install --manifest-path mojo/neutron-mojo/mojoproject.toml
+
+      - name: Run core validation
+        run: bash mojo/scripts/validate-core.sh
+
+      - name: Upload validation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mojo-core-validation-reports
+          path: mojo/reports/

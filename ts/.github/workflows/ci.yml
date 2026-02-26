@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  core:
+    name: Core Build And Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Naming Checks
+        run: pnpm run ci:naming
+
+      - name: Run Workspace Graph Checks
+        run: pnpm run ci:workspace
+
+      - name: Run Neutron Tests
+        run: pnpm --filter neutron test
+
+      - name: Build Workspace
+        run: pnpm -r build
+
+      - name: Run Data Profile Smoke (Memory)
+        run: pnpm run ci:data-profiles
+
+  deploy-presets:
+    name: Deploy Preset Check (${{ matrix.preset }})
+    runs-on: ubuntu-latest
+    needs: core
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [vercel, cloudflare, docker]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Workspace
+        run: pnpm -r build
+
+      - name: Build Preset
+        run: pnpm --dir apps/playground run build:${{ matrix.preset }}
+
+      - name: Validate Preset Output
+        run: pnpm --dir apps/playground run deploy-check:${{ matrix.preset }}
+
+  runtime-compat:
+    name: Runtime Compatibility (Preact + React Compat)
+    runs-on: ubuntu-latest
+    needs: core
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Workspace
+        run: pnpm -r build
+
+      - name: Run Runtime Compatibility Smoke
+        run: pnpm run ci:runtime-compat

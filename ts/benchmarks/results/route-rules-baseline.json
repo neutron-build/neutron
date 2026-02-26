@@ -1,0 +1,387 @@
+{
+  "timestamp": "2026-02-13T13:53:54.429Z",
+  "config": {
+    "profile": "baseline",
+    "connections": 80,
+    "durationSec": 5,
+    "pipelining": 1,
+    "warmupSec": 2,
+    "runs": 1,
+    "readyTimeoutMs": 60000,
+    "requestedTrack": "node",
+    "tracks": [
+      {
+        "id": "node",
+        "label": "Node parity",
+        "frameworks": [
+          "neutron"
+        ],
+        "scenarios": [
+          "static",
+          "dynamic",
+          "compute",
+          "big",
+          "mutate",
+          "login",
+          "protected",
+          "session-refresh"
+        ]
+      }
+    ],
+    "frameworks": [
+      "neutron"
+    ],
+    "scenarios": [
+      "static",
+      "dynamic",
+      "compute",
+      "big",
+      "mutate",
+      "login",
+      "protected",
+      "session-refresh"
+    ],
+    "conformanceEnabled": false
+  },
+  "results": [
+    {
+      "track": "node",
+      "frameworkId": "neutron",
+      "framework": "Neutron",
+      "scenario": "static",
+      "method": "GET",
+      "path": "/",
+      "url": "http://127.0.0.1:3004/",
+      "payloadSample": null,
+      "warmupSec": 2,
+      "runDurationSec": 5,
+      "runs": 1,
+      "median": {
+        "requestsPerSec": 19256,
+        "p50Ms": 3,
+        "p95Ms": 8,
+        "p99Ms": 10,
+        "throughputMBps": 31.24
+      },
+      "trials": [
+        {
+          "run": 1,
+          "requestsPerSec": 19256,
+          "p50Ms": 3,
+          "p95Ms": 8,
+          "p99Ms": 10,
+          "throughputMBps": 31.24
+        }
+      ]
+    },
+    {
+      "track": "node",
+      "frameworkId": "neutron",
+      "framework": "Neutron",
+      "scenario": "dynamic",
+      "method": "GET",
+      "path": "/users/1",
+      "url": "http://127.0.0.1:3004/users/1",
+      "payloadSample": null,
+      "warmupSec": 2,
+      "runDurationSec": 5,
+      "runs": 1,
+      "median": {
+        "requestsPerSec": 17125.6,
+        "p50Ms": 4,
+        "p95Ms": 8,
+        "p99Ms": 10,
+        "throughputMBps": 23.7
+      },
+      "trials": [
+        {
+          "run": 1,
+          "requestsPerSec": 17125.6,
+          "p50Ms": 4,
+          "p95Ms": 8,
+          "p99Ms": 10,
+          "throughputMBps": 23.7
+        }
+      ]
+    },
+    {
+      "track": "node",
+      "frameworkId": "neutron",
+      "framework": "Neutron",
+      "scenario": "compute",
+      "method": "GET",
+      "path": "/compute",
+      "url": "http://127.0.0.1:3004/compute",
+      "payloadSample": null,
+      "warmupSec": 2,
+      "runDurationSec": 5,
+      "runs": 1,
+      "median": {
+        "requestsPerSec": 1670.4,
+        "p50Ms": 46,
+        "p95Ms": 61,
+        "p99Ms": 75,
+        "throughputMBps": 1.72
+      },
+      "trials": [
+        {
+          "run": 1,
+          "requestsPerSec": 1670.4,
+          "p50Ms": 46,
+          "p95Ms": 61,
+          "p99Ms": 75,
+          "throughputMBps": 1.72
+        }
+      ]
+    },
+    {
+      "track": "node",
+      "frameworkId": "neutron",
+      "framework": "Neutron",
+      "scenario": "big",
+      "method": "GET",
+      "path": "/big",
+      "url": "http://127.0.0.1:3004/big",
+      "payloadSample": null,
+      "warmupSec": 2,
+      "runDurationSec": 5,
+      "runs": 1,
+      "median": {
+        "requestsPerSec": 4547,
+        "p50Ms": 16,
+        "p95Ms": 26,
+        "p99Ms": 29,
+        "throughputMBps": 36.95
+      },
+      "trials": [
+        {
+          "run": 1,
+          "requestsPerSec": 4547,
+          "p50Ms": 16,
+          "p95Ms": 26,
+          "p99Ms": 29,
+          "throughputMBps": 36.95
+        }
+      ]
+    },
+    {
+      "track": "node",
+      "frameworkId": "neutron",
+      "framework": "Neutron",
+      "scenario": "mutate",
+      "method": "POST",
+      "path": "/api/mutate",
+      "url": "http://127.0.0.1:3004/api/mutate",
+      "payloadSample": null,
+      "warmupSec": 2,
+      "runDurationSec": 5,
+      "runs": 1,
+      "median": {
+        "requestsPerSec": 5273.8,
+        "p50Ms": 14,
+        "p95Ms": 28,
+        "p99Ms": 34,
+        "throughputMBps": 2
+      },
+      "trials": [
+        {
+          "run": 1,
+          "requestsPerSec": 5273.8,
+          "p50Ms": 14,
+          "p95Ms": 28,
+          "p99Ms": 34,
+          "throughputMBps": 2
+        }
+      ]
+    },
+    {
+      "track": "node",
+      "frameworkId": "neutron",
+      "framework": "Neutron",
+      "scenario": "login",
+      "method": "GET",
+      "path": "/login",
+      "url": "http://127.0.0.1:3004/login",
+      "payloadSample": null,
+      "warmupSec": 2,
+      "runDurationSec": 5,
+      "runs": 1,
+      "median": {
+        "requestsPerSec": 18632.8,
+        "p50Ms": 3,
+        "p95Ms": 8,
+        "p99Ms": 9,
+        "throughputMBps": 21
+      },
+      "trials": [
+        {
+          "run": 1,
+          "requestsPerSec": 18632.8,
+          "p50Ms": 3,
+          "p95Ms": 8,
+          "p99Ms": 9,
+          "throughputMBps": 21
+        }
+      ]
+    },
+    {
+      "track": "node",
+      "frameworkId": "neutron",
+      "framework": "Neutron",
+      "scenario": "protected",
+      "method": "GET",
+      "path": "/protected",
+      "url": "http://127.0.0.1:3004/protected",
+      "payloadSample": null,
+      "warmupSec": 2,
+      "runDurationSec": 5,
+      "runs": 1,
+      "median": {
+        "requestsPerSec": 7542.8,
+        "p50Ms": 10,
+        "p95Ms": 14,
+        "p99Ms": 17,
+        "throughputMBps": 11.88
+      },
+      "trials": [
+        {
+          "run": 1,
+          "requestsPerSec": 7542.8,
+          "p50Ms": 10,
+          "p95Ms": 14,
+          "p99Ms": 17,
+          "throughputMBps": 11.88
+        }
+      ]
+    },
+    {
+      "track": "node",
+      "frameworkId": "neutron",
+      "framework": "Neutron",
+      "scenario": "session-refresh",
+      "method": "POST",
+      "path": "/api/session/refresh",
+      "url": "http://127.0.0.1:3004/api/session/refresh",
+      "payloadSample": null,
+      "warmupSec": 2,
+      "runDurationSec": 5,
+      "runs": 1,
+      "median": {
+        "requestsPerSec": 14471.2,
+        "p50Ms": 4,
+        "p95Ms": 10,
+        "p99Ms": 12,
+        "throughputMBps": 5.45
+      },
+      "trials": [
+        {
+          "run": 1,
+          "requestsPerSec": 14471.2,
+          "p50Ms": 4,
+          "p95Ms": 10,
+          "p99Ms": 12,
+          "throughputMBps": 5.45
+        }
+      ]
+    }
+  ],
+  "summary": [
+    {
+      "track": "node",
+      "framework": "Neutron",
+      "scenario": "static",
+      "method": "GET",
+      "path": "/",
+      "requestsPerSec": 19256,
+      "p50Ms": 3,
+      "p95Ms": 8,
+      "p99Ms": 10,
+      "throughputMBps": 31.24
+    },
+    {
+      "track": "node",
+      "framework": "Neutron",
+      "scenario": "dynamic",
+      "method": "GET",
+      "path": "/users/1",
+      "requestsPerSec": 17125.6,
+      "p50Ms": 4,
+      "p95Ms": 8,
+      "p99Ms": 10,
+      "throughputMBps": 23.7
+    },
+    {
+      "track": "node",
+      "framework": "Neutron",
+      "scenario": "compute",
+      "method": "GET",
+      "path": "/compute",
+      "requestsPerSec": 1670.4,
+      "p50Ms": 46,
+      "p95Ms": 61,
+      "p99Ms": 75,
+      "throughputMBps": 1.72
+    },
+    {
+      "track": "node",
+      "framework": "Neutron",
+      "scenario": "big",
+      "method": "GET",
+      "path": "/big",
+      "requestsPerSec": 4547,
+      "p50Ms": 16,
+      "p95Ms": 26,
+      "p99Ms": 29,
+      "throughputMBps": 36.95
+    },
+    {
+      "track": "node",
+      "framework": "Neutron",
+      "scenario": "mutate",
+      "method": "POST",
+      "path": "/api/mutate",
+      "requestsPerSec": 5273.8,
+      "p50Ms": 14,
+      "p95Ms": 28,
+      "p99Ms": 34,
+      "throughputMBps": 2
+    },
+    {
+      "track": "node",
+      "framework": "Neutron",
+      "scenario": "login",
+      "method": "GET",
+      "path": "/login",
+      "requestsPerSec": 18632.8,
+      "p50Ms": 3,
+      "p95Ms": 8,
+      "p99Ms": 9,
+      "throughputMBps": 21
+    },
+    {
+      "track": "node",
+      "framework": "Neutron",
+      "scenario": "protected",
+      "method": "GET",
+      "path": "/protected",
+      "requestsPerSec": 7542.8,
+      "p50Ms": 10,
+      "p95Ms": 14,
+      "p99Ms": 17,
+      "throughputMBps": 11.88
+    },
+    {
+      "track": "node",
+      "framework": "Neutron",
+      "scenario": "session-refresh",
+      "method": "POST",
+      "path": "/api/session/refresh",
+      "requestsPerSec": 14471.2,
+      "p50Ms": 4,
+      "p95Ms": 10,
+      "p99Ms": 12,
+      "throughputMBps": 5.45
+    }
+  ],
+  "conformance": null
+}

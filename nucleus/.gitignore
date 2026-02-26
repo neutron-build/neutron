@@ -1,0 +1,7 @@
+/target
+.pixi/
+*.bak
+*.backup
+*.new
+*.rs2
+*mod_new.rs

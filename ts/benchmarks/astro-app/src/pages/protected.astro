@@ -1,0 +1,11 @@
+---
+const authorized = Astro.request.headers.get("authorization") === "Bearer valid-token";
+if (!authorized) {
+  Astro.response.status = 401;
+}
+---
+
+<main>
+  <h1>bench-protected</h1>
+  <p>{authorized ? "authorized" : "unauthorized"}</p>
+</main>

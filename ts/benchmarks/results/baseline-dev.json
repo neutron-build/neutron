@@ -1,0 +1,108 @@
+{
+  "timestamp": "2026-02-12T09:28:33.928Z",
+  "config": {
+    "connections": 100,
+    "durationSec": 6,
+    "pipelining": 1,
+    "warmupSec": 2,
+    "runs": 2,
+    "readyTimeoutMs": 60000,
+    "frameworks": [
+      "neutron"
+    ],
+    "scenarios": [
+      "static",
+      "dynamic"
+    ]
+  },
+  "results": [
+    {
+      "frameworkId": "neutron",
+      "framework": "Neutron",
+      "scenario": "static",
+      "url": "http://127.0.0.1:3004/",
+      "warmupSec": 2,
+      "runDurationSec": 6,
+      "runs": 2,
+      "median": {
+        "requestsPerSec": 2210.59,
+        "p50Ms": 34,
+        "p95Ms": 115,
+        "p99Ms": 127,
+        "throughputMBps": 2.88
+      },
+      "trials": [
+        {
+          "run": 1,
+          "requestsPerSec": 2420.67,
+          "p50Ms": 30,
+          "p95Ms": 110,
+          "p99Ms": 120,
+          "throughputMBps": 3.15
+        },
+        {
+          "run": 2,
+          "requestsPerSec": 2000.5,
+          "p50Ms": 38,
+          "p95Ms": 120,
+          "p99Ms": 134,
+          "throughputMBps": 2.61
+        }
+      ]
+    },
+    {
+      "frameworkId": "neutron",
+      "framework": "Neutron",
+      "scenario": "dynamic",
+      "url": "http://127.0.0.1:3004/users/1",
+      "warmupSec": 2,
+      "runDurationSec": 6,
+      "runs": 2,
+      "median": {
+        "requestsPerSec": 7870.84,
+        "p50Ms": 12,
+        "p95Ms": 28.5,
+        "p99Ms": 35.5,
+        "throughputMBps": 8.38
+      },
+      "trials": [
+        {
+          "run": 1,
+          "requestsPerSec": 5646.67,
+          "p50Ms": 16,
+          "p95Ms": 33,
+          "p99Ms": 42,
+          "throughputMBps": 6.01
+        },
+        {
+          "run": 2,
+          "requestsPerSec": 10095,
+          "p50Ms": 8,
+          "p95Ms": 24,
+          "p99Ms": 29,
+          "throughputMBps": 10.75
+        }
+      ]
+    }
+  ],
+  "summary": [
+    {
+      "framework": "Neutron",
+      "scenario": "static",
+      "requestsPerSec": 2210.59,
+      "p50Ms": 34,
+      "p95Ms": 115,
+      "p99Ms": 127,
+      "throughputMBps": 2.88
+    },
+    {
+      "framework": "Neutron",
+      "scenario": "dynamic",
+      "requestsPerSec": 7870.84,
+      "p50Ms": 12,
+      "p95Ms": 28.5,
+      "p99Ms": 35.5,
+      "throughputMBps": 8.38
+    }
+  ]
+}

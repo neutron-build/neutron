@@ -1,0 +1,23 @@
+[project]
+name = "neutron-mojo-infer"
+version = "0.1.0"
+description = "LLM inference engine — FlashAttention, KV cache, quantization, serving"
+license = "Apache-2.0"
+authors = ["Tyler <tyler@tystack.dev>"]
+readme = "README.md"
+
+[project.urls]
+homepage = "https://github.com/tylerbarron/tystack"
+repository = "https://github.com/tylerbarron/tystack/tree/main/mojo/neutron-mojo-infer"
+
+[build-system]
+channels = ["conda-forge", "modular"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+
+[dependencies]
+max = ">=25.1"
+neutron-mojo = { path = "../neutron-mojo" }
+
+[tool.mojo]
+src = "src"
+test = "test"

@@ -1,0 +1,19 @@
+[package]
+name = "neutron-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PostgreSQL integration for the Neutron framework"
+
+[dependencies]
+neutron        = { path = "../neutron", default-features = false }
+tokio-postgres = { workspace = true }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+http           = { workspace = true }
+futures-util   = { workspace = true }
+bytes          = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

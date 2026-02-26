@@ -1,0 +1,22 @@
+{
+  "name": "@neutron/example-marketing-reference",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "neutron dev",
+    "build": "neutron build",
+    "start": "neutron start",
+    "preview": "neutron preview"
+  },
+  "dependencies": {
+    "neutron": "workspace:*",
+    "neutron-cli": "workspace:*",
+    "preact": "^10.25.4"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.9.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  }
+}

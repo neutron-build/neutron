@@ -1,0 +1,461 @@
+{
+  "timestamp": "2026-02-13T12:14:12.009Z",
+  "config": {
+    "connections": 60,
+    "durationSec": 4,
+    "warmupSec": 1,
+    "runs": 1,
+    "readyTimeoutMs": 60000,
+    "install": false
+  },
+  "runtime": "bun",
+  "frameworks": [
+    "neutron",
+    "next",
+    "astro"
+  ],
+  "scenarios": [
+    "static",
+    "dynamic",
+    "compute",
+    "big",
+    "mutate",
+    "login",
+    "protected",
+    "session-refresh"
+  ],
+  "summary": [
+    {
+      "runtime": "bun",
+      "frameworkId": "neutron",
+      "framework": "Neutron (Bun)",
+      "scenario": "static",
+      "method": "GET",
+      "path": "/",
+      "requestsPerSec": 26849.6,
+      "p50Ms": 2,
+      "p95Ms": 2,
+      "p99Ms": 5,
+      "throughputMBps": 42.35,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html; charset=utf-8",
+        "contentLength": 1263
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "neutron",
+      "framework": "Neutron (Bun)",
+      "scenario": "dynamic",
+      "method": "GET",
+      "path": "/users/1",
+      "requestsPerSec": 21140,
+      "p50Ms": 2,
+      "p95Ms": 3,
+      "p99Ms": 5,
+      "throughputMBps": 28.3,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html; charset=utf-8",
+        "contentLength": 994
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "neutron",
+      "framework": "Neutron (Bun)",
+      "scenario": "compute",
+      "method": "GET",
+      "path": "/compute",
+      "requestsPerSec": 1714.25,
+      "p50Ms": 33,
+      "p95Ms": 37,
+      "p99Ms": 54,
+      "throughputMBps": 1.69,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html; charset=utf-8",
+        "contentLength": 693
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "neutron",
+      "framework": "Neutron (Bun)",
+      "scenario": "big",
+      "method": "GET",
+      "path": "/big",
+      "requestsPerSec": 4482,
+      "p50Ms": 12,
+      "p95Ms": 16,
+      "p99Ms": 25,
+      "throughputMBps": 36.23,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html; charset=utf-8",
+        "contentLength": 8139
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "neutron",
+      "framework": "Neutron (Bun)",
+      "scenario": "mutate",
+      "method": "POST",
+      "path": "/api/mutate",
+      "requestsPerSec": 6254,
+      "p50Ms": 8,
+      "p95Ms": 12,
+      "p99Ms": 17,
+      "throughputMBps": 2.09,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "application/json",
+        "contentLength": 53
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "neutron",
+      "framework": "Neutron (Bun)",
+      "scenario": "login",
+      "method": "GET",
+      "path": "/login",
+      "requestsPerSec": 22940,
+      "p50Ms": 2,
+      "p95Ms": 3,
+      "p99Ms": 6,
+      "throughputMBps": 24.84,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html; charset=utf-8",
+        "contentLength": 745
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "neutron",
+      "framework": "Neutron (Bun)",
+      "scenario": "protected",
+      "method": "GET",
+      "path": "/protected",
+      "requestsPerSec": 7977.5,
+      "p50Ms": 6,
+      "p95Ms": 9,
+      "p99Ms": 13,
+      "throughputMBps": 12.21,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html; charset=utf-8",
+        "contentLength": 1156
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "neutron",
+      "framework": "Neutron (Bun)",
+      "scenario": "session-refresh",
+      "method": "POST",
+      "path": "/api/session/refresh",
+      "requestsPerSec": 15902,
+      "p50Ms": 3,
+      "p95Ms": 4,
+      "p99Ms": 11,
+      "throughputMBps": 5.28,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "application/json",
+        "contentLength": 50
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "next",
+      "framework": "Next.js (Bun)",
+      "scenario": "static",
+      "method": "GET",
+      "path": "/",
+      "requestsPerSec": 5195,
+      "p50Ms": 10,
+      "p95Ms": 16,
+      "p99Ms": 26,
+      "throughputMBps": 6.2,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html; charset=utf-8",
+        "contentLength": 1065
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "next",
+      "framework": "Next.js (Bun)",
+      "scenario": "dynamic",
+      "method": "GET",
+      "path": "/users/1",
+      "requestsPerSec": 972.25,
+      "p50Ms": 59,
+      "p95Ms": 72,
+      "p99Ms": 92,
+      "throughputMBps": 1.34,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html; charset=utf-8",
+        "contentLength": 1192
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "next",
+      "framework": "Next.js (Bun)",
+      "scenario": "compute",
+      "method": "GET",
+      "path": "/compute",
+      "requestsPerSec": 605.5,
+      "p50Ms": 91,
+      "p95Ms": 126,
+      "p99Ms": 163,
+      "throughputMBps": 0.78,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html; charset=utf-8",
+        "contentLength": 1091
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "next",
+      "framework": "Next.js (Bun)",
+      "scenario": "big",
+      "method": "GET",
+      "path": "/big",
+      "requestsPerSec": 400.5,
+      "p50Ms": 106,
+      "p95Ms": 267,
+      "p99Ms": 469,
+      "throughputMBps": 8.15,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html; charset=utf-8",
+        "contentLength": 21071
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "next",
+      "framework": "Next.js (Bun)",
+      "scenario": "mutate",
+      "method": "POST",
+      "path": "/api/mutate",
+      "requestsPerSec": 327,
+      "p50Ms": 141,
+      "p95Ms": 329,
+      "p99Ms": 618,
+      "throughputMBps": 0.07,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "application/json; charset=utf-8",
+        "contentLength": 53
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "next",
+      "framework": "Next.js (Bun)",
+      "scenario": "login",
+      "method": "GET",
+      "path": "/login",
+      "requestsPerSec": 1465.25,
+      "p50Ms": 40,
+      "p95Ms": 55,
+      "p99Ms": 74,
+      "throughputMBps": 1.79,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html; charset=utf-8",
+        "contentLength": 1098
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "next",
+      "framework": "Next.js (Bun)",
+      "scenario": "protected",
+      "method": "GET",
+      "path": "/protected",
+      "requestsPerSec": 565,
+      "p50Ms": 93,
+      "p95Ms": 158,
+      "p99Ms": 271,
+      "throughputMBps": 0.73,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html; charset=utf-8",
+        "contentLength": 1094
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "next",
+      "framework": "Next.js (Bun)",
+      "scenario": "session-refresh",
+      "method": "POST",
+      "path": "/api/session/refresh",
+      "requestsPerSec": 880.75,
+      "p50Ms": 56,
+      "p95Ms": 101,
+      "p99Ms": 183,
+      "throughputMBps": 0.18,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "application/json; charset=utf-8",
+        "contentLength": 50
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "astro",
+      "framework": "Astro (Bun)",
+      "scenario": "static",
+      "method": "GET",
+      "path": "/",
+      "requestsPerSec": 1582.75,
+      "p50Ms": 34,
+      "p95Ms": 56,
+      "p99Ms": 75,
+      "throughputMBps": 0.32,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html",
+        "contentLength": 90
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "astro",
+      "framework": "Astro (Bun)",
+      "scenario": "dynamic",
+      "method": "GET",
+      "path": "/users/1",
+      "requestsPerSec": 1720.25,
+      "p50Ms": 32,
+      "p95Ms": 53,
+      "p99Ms": 67,
+      "throughputMBps": 0.35,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html",
+        "contentLength": 95
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "astro",
+      "framework": "Astro (Bun)",
+      "scenario": "compute",
+      "method": "GET",
+      "path": "/compute",
+      "requestsPerSec": 673,
+      "p50Ms": 89,
+      "p95Ms": 122,
+      "p99Ms": 146,
+      "throughputMBps": 0.12,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html",
+        "contentLength": 66
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "astro",
+      "framework": "Astro (Bun)",
+      "scenario": "big",
+      "method": "GET",
+      "path": "/big",
+      "requestsPerSec": 777,
+      "p50Ms": 71,
+      "p95Ms": 106,
+      "p99Ms": 131,
+      "throughputMBps": 5.66,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html",
+        "contentLength": 7518
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "astro",
+      "framework": "Astro (Bun)",
+      "scenario": "mutate",
+      "method": "POST",
+      "path": "/api/mutate",
+      "requestsPerSec": 1368.6,
+      "p50Ms": 41,
+      "p95Ms": 60,
+      "p99Ms": 80,
+      "throughputMBps": 0.23,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "application/json",
+        "contentLength": 53
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "astro",
+      "framework": "Astro (Bun)",
+      "scenario": "login",
+      "method": "GET",
+      "path": "/login",
+      "requestsPerSec": 1321.25,
+      "p50Ms": 44,
+      "p95Ms": 59,
+      "p99Ms": 83,
+      "throughputMBps": 0.3,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html",
+        "contentLength": 118
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "astro",
+      "framework": "Astro (Bun)",
+      "scenario": "protected",
+      "method": "GET",
+      "path": "/protected",
+      "requestsPerSec": 1611,
+      "p50Ms": 34,
+      "p95Ms": 51,
+      "p99Ms": 77,
+      "throughputMBps": 0.29,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "text/html",
+        "contentLength": 72
+      }
+    },
+    {
+      "runtime": "bun",
+      "frameworkId": "astro",
+      "framework": "Astro (Bun)",
+      "scenario": "session-refresh",
+      "method": "POST",
+      "path": "/api/session/refresh",
+      "requestsPerSec": 1736.25,
+      "p50Ms": 32,
+      "p95Ms": 48,
+      "p99Ms": 67,
+      "throughputMBps": 0.29,
+      "payloadSample": {
+        "status": 200,
+        "contentType": "application/json",
+        "contentLength": 50
+      }
+    }
+  ]
+}

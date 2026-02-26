@@ -1,0 +1,64 @@
+{
+  "runId": "2026-02-13T14-19-30-212Z",
+  "createdAt": "2026-02-13T14:19:54.063Z",
+  "repeats": 1,
+  "benchEnv": {
+    "BENCH_TRACK": "node",
+    "BENCH_PROFILE": "baseline",
+    "BENCH_RUNS": "1",
+    "BENCH_DURATION": "2",
+    "BENCH_WARMUP": "1",
+    "BENCH_CONFORMANCE": "0",
+    "BENCH_PAYLOAD_AUDIT": "0"
+  },
+  "protocol": {
+    "settleSec": 10,
+    "idleSampleSec": 15,
+    "idleMaxCpuPct": 20,
+    "bootstraps": 2000
+  },
+  "sourceArtifacts": [
+    "results/publish-grade/repeat-01-2026-02-13T14-19-30-212Z.json"
+  ],
+  "summary": [
+    {
+      "track": "node",
+      "frameworkId": "neutron",
+      "framework": "Neutron",
+      "scenario": "static",
+      "method": "GET",
+      "path": "/",
+      "sampleCount": 1,
+      "rps": {
+        "medianOfMedians": 19304,
+        "mean": 19304,
+        "stddev": 0,
+        "covPct": 0,
+        "min": 19304,
+        "max": 19304,
+        "ci95": {
+          "low": 19304,
+          "high": 19304
+        },
+        "raw": [
+          19304
+        ]
+      },
+      "p95Ms": {
+        "medianOfMedians": 10,
+        "mean": 10,
+        "stddev": 0,
+        "covPct": 0,
+        "min": 10,
+        "max": 10,
+        "ci95": {
+          "low": 10,
+          "high": 10
+        },
+        "raw": [
+          10
+        ]
+      }
+    }
+  ]
+}

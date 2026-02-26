@@ -1,0 +1,29 @@
+{
+  "name": "neutron-benchmarks",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "compare:node": "node ./run-comparison.mjs",
+    "compare": "node ./run-comparison.mjs",
+    "compare:quick": "node ./quick-matrix.mjs",
+    "compare:full": "node ./full-matrix.mjs",
+    "compare:stress": "node ./stress-matrix.mjs",
+    "compare:saturation": "node ./saturation-matrix.mjs",
+    "compare:optimal": "node ./optimal-static-matrix.mjs",
+    "compare:tracks": "node ./dual-track-matrix.mjs",
+    "compare:bun:quick": "node ./bun-quick.mjs",
+    "compare:canonical": "node ./canonical-publish.mjs",
+    "compare:publish-grade": "node ./publish-grade.mjs",
+    "compare:publish:preflight": "node ./publish-preflight.mjs",
+    "compare:publish:official": "node ./publish-official.mjs",
+    "results:diff": "node ./compare-results.mjs",
+    "compare:gate:smoke": "node ./smoke-gate.mjs",
+    "baseline:pin": "node ./pin-baseline.mjs",
+    "baseline:pin:dev": "node ./pin-dev-baseline.mjs",
+    "dev:bench": "node ./dev-loop.mjs",
+    "dev:bench:gate": "node ./dev-loop.mjs --fail-rps-drop-pct 15"
+  },
+  "dependencies": {
+    "autocannon": "^8.0.0"
+  }
+}

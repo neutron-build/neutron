@@ -1,0 +1,38 @@
+{
+  "name": "create-neutron",
+  "version": "0.1.0",
+  "description": "Scaffold a new Neutron project. Run with: npm create neutron@latest",
+  "author": "Tyler",
+  "license": "BUSL-1.1",
+  "homepage": "https://neutron.build",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/neutron-build/neutron",
+    "directory": "packages/create-neutron"
+  },
+  "keywords": [
+    "neutron",
+    "create",
+    "scaffold",
+    "starter",
+    "template"
+  ],
+  "type": "module",
+  "bin": {
+    "create-neutron": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "templates"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "tsc --noEmit --pretty false",
+    "test": "tsc --noEmit --pretty false"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "typescript": "^5.7.2"
+  }
+}
