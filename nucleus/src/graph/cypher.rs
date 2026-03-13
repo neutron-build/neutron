@@ -25,6 +25,11 @@ pub enum CypherStatement {
         pattern: Pattern,
         where_clause: Option<WhereClause>,
         return_clause: ReturnClause,
+        optional: bool,
+        /// Optional WITH clause — projects intermediate columns between MATCH and RETURN.
+        with_clause: Option<WithClause>,
+        /// Optional WHERE after WITH (filters projected results).
+        with_where: Option<WhereClause>,
     },
     Create {
         items: Vec<CreateItem>,
@@ -32,6 +37,23 @@ pub enum CypherStatement {
     Delete {
         variables: Vec<String>,
     },
+}
+
+/// A WITH clause that projects intermediate results.
+///
+/// Syntax: `WITH n.name AS name, count(*) AS cnt`
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithClause {
+    pub items: Vec<WithItem>,
+}
+
+/// A single item in a WITH clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithItem {
+    /// The expression being projected (reuses ReturnItem for simplicity).
+    pub expr: ReturnItem,
+    /// Optional alias (AS name).
+    pub alias: Option<String>,
 }
 
 /// A graph pattern — sequence of nodes connected by edges.
@@ -475,7 +497,7 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<CypherStatement, CypherError> {
         match self.peek() {
-            Some(Token::Keyword(k)) if k == "MATCH" => self.parse_match(),
+            Some(Token::Keyword(k)) if k == "MATCH" || k == "OPTIONAL" => self.parse_match(),
             Some(Token::Keyword(k)) if k == "CREATE" => self.parse_create(),
             Some(Token::Keyword(k)) if k == "DELETE" => self.parse_delete(),
             Some(Token::Keyword(k)) => {
@@ -497,6 +519,14 @@ impl Parser {
     // ---- MATCH ----
 
     fn parse_match(&mut self) -> Result<CypherStatement, CypherError> {
+        // Check for OPTIONAL prefix
+        let optional = if self.check_keyword("OPTIONAL") {
+            self.advance()?;
+            true
+        } else {
+            false
+        };
+
         self.expect_keyword("MATCH")?;
         let pattern = self.parse_pattern()?;
 
@@ -506,6 +536,19 @@ impl Parser {
             None
         };
 
+        // Check for WITH clause (pipe intermediate results)
+        let (with_clause, with_where) = if self.check_keyword("WITH") {
+            let wc = self.parse_with_clause()?;
+            let ww = if self.check_keyword("WHERE") {
+                Some(self.parse_where()?)
+            } else {
+                None
+            };
+            (Some(wc), ww)
+        } else {
+            (None, None)
+        };
+
         self.expect_keyword("RETURN")?;
         let return_clause = self.parse_return_clause()?;
 
@@ -513,6 +556,9 @@ impl Parser {
             pattern,
             where_clause,
             return_clause,
+            optional,
+            with_clause,
+            with_where,
         })
     }
 
@@ -652,9 +698,10 @@ impl Parser {
         let tok = self.advance()?.clone();
         match tok {
             Token::Ident(name) => variables.push(name),
+            Token::IntLit(id) => variables.push(id.to_string()),
             other => {
                 return Err(CypherError::UnexpectedToken {
-                    expected: "identifier".into(),
+                    expected: "identifier or node ID".into(),
                     found: other.to_string(),
                 });
             }
@@ -665,9 +712,10 @@ impl Parser {
             let tok = self.advance()?.clone();
             match tok {
                 Token::Ident(name) => variables.push(name),
+                Token::IntLit(id) => variables.push(id.to_string()),
                 other => {
                     return Err(CypherError::UnexpectedToken {
-                        expected: "identifier".into(),
+                        expected: "identifier or node ID".into(),
                         found: other.to_string(),
                     });
                 }
@@ -977,6 +1025,43 @@ impl Parser {
 
     // ---- RETURN ----
 
+    fn parse_with_clause(&mut self) -> Result<WithClause, CypherError> {
+        self.expect_keyword("WITH")?;
+        let mut items = Vec::new();
+
+        items.push(self.parse_with_item()?);
+        while self.check_token(&Token::Comma) {
+            self.advance()?;
+            items.push(self.parse_with_item()?);
+        }
+
+        Ok(WithClause { items })
+    }
+
+    fn parse_with_item(&mut self) -> Result<WithItem, CypherError> {
+        // Parse the expression (reuse return item logic)
+        let expr = self.parse_return_item()?;
+
+        // Check for optional AS alias
+        let alias = if self.check_keyword("AS") {
+            self.advance()?; // consume AS
+            let tok = self.advance()?.clone();
+            match tok {
+                Token::Ident(name) => Some(name),
+                other => {
+                    return Err(CypherError::UnexpectedToken {
+                        expected: "alias name".into(),
+                        found: other.to_string(),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(WithItem { expr, alias })
+    }
+
     fn parse_return_clause(&mut self) -> Result<ReturnClause, CypherError> {
         let mut items = Vec::new();
 
@@ -1079,6 +1164,7 @@ mod tests {
                 pattern,
                 where_clause,
                 return_clause,
+                ..
             } => {
                 assert_eq!(pattern.nodes.len(), 1);
                 assert_eq!(pattern.edges.len(), 0);

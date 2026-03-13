@@ -186,8 +186,8 @@ impl BranchManager {
         }
 
         // Walk parent chain
-        if let Some(parent_id) = branch.parent_id {
-            if let Some(parent) = self.branches.get(&parent_id) {
+        if let Some(parent_id) = branch.parent_id
+            && let Some(parent) = self.branches.get(&parent_id) {
                 if parent.deleted_pages.contains(&page_id) {
                     return None;
                 }
@@ -195,7 +195,6 @@ impl BranchManager {
                     return Some(data.as_slice());
                 }
             }
-        }
 
         None
     }

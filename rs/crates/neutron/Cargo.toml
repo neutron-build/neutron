@@ -128,6 +128,9 @@ mimalloc        = ["dep:mimalloc"]
 # Adds quinn (QUIC transport) + h3 (HTTP/3 framing) + h3-quinn (glue).
 http3           = ["dep:quinn", "dep:h3", "dep:h3-quinn", "tls"]
 
+# Tower middleware compatibility — use tower-http layers alongside Neutron middleware.
+tower-compat    = ["dep:tower", "dep:tower-service", "dep:tower-layer", "dep:futures-util"]
+
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
@@ -180,6 +183,12 @@ mimalloc           = { version = "0.1", default-features = false, optional = tru
 quinn    = { workspace = true, optional = true }
 h3       = { workspace = true, optional = true }
 h3-quinn = { workspace = true, optional = true }
+
+# ── Tower compatibility ──────────────────────────────────────────────────────
+tower         = { version = "0.5", optional = true, default-features = false }
+tower-service = { version = "0.3", optional = true }
+tower-layer   = { version = "0.3", optional = true }
+futures-util  = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-stream = { workspace = true }

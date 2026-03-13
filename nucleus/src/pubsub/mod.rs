@@ -478,12 +478,11 @@ impl Stream {
     pub fn xadd_with_id(&mut self, id: StreamEntryId, fields: Vec<(String, String)>) -> StreamEntryId {
         self.last_id = id.clone();
         self.entries.push(StreamEntry { id: id.clone(), fields });
-        if let Some(max) = self.max_len {
-            if self.entries.len() > max {
+        if let Some(max) = self.max_len
+            && self.entries.len() > max {
                 let excess = self.entries.len() - max;
                 self.entries.drain(..excess);
             }
-        }
         id
     }
 
@@ -496,9 +495,8 @@ impl Stream {
         for entry in &self.entries {
             if entry.id >= *start && entry.id <= *end {
                 result.push(entry);
-                if let Some(c) = count {
-                    if result.len() >= c { break; }
-                }
+                if let Some(c) = count
+                    && result.len() >= c { break; }
             }
         }
         result

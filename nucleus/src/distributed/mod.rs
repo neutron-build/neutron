@@ -5,6 +5,9 @@
 //! routing into a working cluster. No external dependencies beyond `std`;
 //! everything is synchronous and testable without an async runtime.
 
+pub mod replicator;
+pub use replicator::RaftReplicator;
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::cmp::Ordering;
@@ -229,9 +232,8 @@ impl MultiRaftManager {
     }
 
     pub fn leader_for_shard(&self, shard_id: ShardId) -> Option<NodeId> {
-        if let Some(group) = self.groups.get(&shard_id) {
-            if let Some(leader) = group.leader_id { return Some(leader); }
-        }
+        if let Some(group) = self.groups.get(&shard_id)
+            && let Some(leader) = group.leader_id { return Some(leader); }
         self.shard_leaders.get(&shard_id).copied()
     }
 
@@ -840,8 +842,8 @@ impl QueryRouter {
             return RouteDecision::Standalone;
         }
         for &(shard_id, start, end) in &self.shard_ranges {
-            if key >= start && key < end {
-                if let Some(&owner) = self.shard_owners.get(&shard_id) {
+            if key >= start && key < end
+                && let Some(&owner) = self.shard_owners.get(&shard_id) {
                     if owner == self.local_node_id {
                         self.local_queries += 1;
                         return RouteDecision::Local { shard_id };
@@ -850,7 +852,6 @@ impl QueryRouter {
                         return RouteDecision::Forward { shard_id, target_node: owner };
                     }
                 }
-            }
         }
         RouteDecision::Standalone
     }
@@ -863,11 +864,10 @@ impl QueryRouter {
         }
         let mut matching: Vec<(ShardId, NodeId)> = Vec::new();
         for &(shard_id, s, e) in &self.shard_ranges {
-            if s < end_key && e > start_key {
-                if let Some(&owner) = self.shard_owners.get(&shard_id) {
+            if s < end_key && e > start_key
+                && let Some(&owner) = self.shard_owners.get(&shard_id) {
                     matching.push((shard_id, owner));
                 }
-            }
         }
         match matching.len() {
             0 => RouteDecision::Standalone,
@@ -1034,6 +1034,11 @@ impl ClusterCoordinator {
             .filter(|&&id| id != self.local_node_id)
             .copied()
             .collect()
+    }
+
+    /// Return the full node address map (all nodes including self).
+    pub fn cluster_nodes(&self) -> &HashMap<NodeId, String> {
+        &self.cluster_nodes
     }
 }
 

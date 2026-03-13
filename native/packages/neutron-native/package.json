@@ -1,0 +1,92 @@
+{
+  "name": "@neutron/native",
+  "version": "0.1.0",
+  "description": "Neutron Native — universal components, routing, and styling for React Native",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./native": {
+      "import": "./dist/native.js",
+      "types": "./dist/native.d.ts"
+    },
+    "./router": {
+      "import": "./dist/router/index.js",
+      "types": "./dist/router/index.d.ts"
+    },
+    "./platform": {
+      "import": "./dist/platform/index.js",
+      "types": "./dist/platform/index.d.ts"
+    },
+    "./navigation": {
+      "import": "./dist/navigation/index.js",
+      "types": "./dist/navigation/index.d.ts"
+    },
+    "./compat": {
+      "import": "./dist/compat/index.js",
+      "types": "./dist/compat/index.d.ts"
+    },
+    "./config": {
+      "import": "./dist/config/index.js",
+      "types": "./dist/config/index.d.ts"
+    },
+    "./turbomodule": {
+      "import": "./dist/turbomodule/index.js",
+      "types": "./dist/turbomodule/index.d.ts"
+    },
+    "./ota": {
+      "import": "./dist/ota/index.js",
+      "types": "./dist/ota/index.d.ts"
+    },
+    "./animated": {
+      "import": "./dist/animated/index.js",
+      "types": "./dist/animated/index.d.ts"
+    },
+    "./gesture": {
+      "import": "./dist/gesture/index.js",
+      "types": "./dist/gesture/index.d.ts"
+    },
+    "./virtualized": {
+      "import": "./dist/virtualized/index.js",
+      "types": "./dist/virtualized/index.d.ts"
+    },
+    "./accessibility": {
+      "import": "./dist/accessibility/index.js",
+      "types": "./dist/accessibility/index.d.ts"
+    },
+    "./device": {
+      "import": "./dist/device/index.js",
+      "types": "./dist/device/index.d.ts"
+    },
+    "./profiler": {
+      "import": "./dist/profiler/index.js",
+      "types": "./dist/profiler/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsc -p tsconfig.json --watch"
+  },
+  "peerDependencies": {
+    "react": "^18.2.0 || ^19.0.0",
+    "react-native": "^0.76.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": false
+    },
+    "react-native": {
+      "optional": false
+    }
+  },
+  "devDependencies": {
+    "@preact/signals-core": "^1.8.0",
+    "@types/react": "^19.2.14",
+    "@types/react-native": "^0.73.0",
+    "typescript": "^5.9.3"
+  }
+}

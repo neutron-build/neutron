@@ -62,9 +62,17 @@ impl PiiDetector {
             (&["diagnosis", "medical_record", "prescription", "icd_code", "health"], PiiCategory::Medical, 0.7, "column name contains medical keyword"),
         ];
 
+        // Split column name into words on underscore/hyphen boundaries for matching.
+        let words: Vec<&str> = lower.split(['_', '-']).collect();
+
         for (keywords, category, confidence, pattern) in name_hints {
             for kw in *keywords {
-                if lower == *kw || lower.contains(kw) {
+                // Exact full-name match OR exact word match to avoid substring false positives
+                // (e.g., "ip" inside "description" should NOT match IpAddress).
+                let hit = lower == *kw
+                    || words.contains(kw)
+                    || (kw.len() > 3 && lower.contains(kw));
+                if hit {
                     matches.push(PiiMatch {
                         column_name: column_name.to_string(),
                         category: category.clone(),
@@ -991,6 +999,7 @@ mod tests {
     fn test_audit_trail_recording() {
         // Simulate an audit trail that records compliance operations.
         #[derive(Debug, Clone, PartialEq)]
+        #[allow(dead_code)]
         enum AuditAction {
             PiiScanPerformed,
             DeletionPlanCreated,

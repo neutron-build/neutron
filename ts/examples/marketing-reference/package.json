@@ -4,10 +4,10 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
-    "dev": "neutron dev",
-    "build": "neutron build",
-    "start": "neutron start",
-    "preview": "neutron preview"
+    "dev": "neutron-ts dev",
+    "build": "neutron-ts build",
+    "start": "neutron-ts start",
+    "preview": "neutron-ts preview"
   },
   "dependencies": {
     "neutron": "workspace:*",

@@ -1722,6 +1722,7 @@ dependencies = [
  "criterion",
  "fastwebsockets",
  "flate2",
+ "futures-util",
  "h3",
  "h3-quinn",
  "hmac",
@@ -1751,6 +1752,9 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tower",
+ "tower-layer",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3405,6 +3409,22 @@ dependencies = [
  "pin-project-lite",
  "tokio",
 ]
+
+[[package]]
+name = "tower"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4"
+dependencies = [
+ "tower-layer",
+ "tower-service",
+]
+
+[[package]]
+name = "tower-layer"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e"
 
 [[package]]
 name = "tower-service"

@@ -893,11 +893,10 @@ impl RebalanceExecution {
     /// Apply all completed moves to the shard map.
     pub fn apply_completed(&self, shard_map: &mut ShardMap) {
         for (i, m) in self.plan.moves.iter().enumerate() {
-            if self.states[i] == TransferState::Completed {
-                if let Some(shard) = shard_map.get_shard_mut(m.shard_id) {
+            if self.states[i] == TransferState::Completed
+                && let Some(shard) = shard_map.get_shard_mut(m.shard_id) {
                     shard.assigned_node = Some(m.to_node);
                 }
-            }
         }
     }
 

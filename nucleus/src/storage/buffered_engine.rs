@@ -175,6 +175,24 @@ impl StorageEngine for BufferedDiskEngine {
         Ok(rows)
     }
 
+    fn fast_count_all(&self, table: &str) -> Option<usize> {
+        let mut count = self.inner.fast_count_all(table)?;
+        // Adjust for buffered transaction ops
+        let buf = self.txn_buf.read();
+        if let Some(ref txn) = *buf {
+            for op in &txn.ops {
+                match op {
+                    BufferedOp::Insert { table: t, .. } if t == table => count += 1,
+                    BufferedOp::Delete { table: t, positions } if t == table => {
+                        count = count.saturating_sub(positions.len());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some(count)
+    }
+
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
         if self.is_in_txn() {
             let count = positions.len();

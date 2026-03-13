@@ -264,14 +264,24 @@ impl Value {
             (Value::Int32(n), DataType::Numeric) => Ok(Value::Numeric(n.to_string())),
             (Value::Int32(n), DataType::Bool) => Ok(Value::Bool(*n != 0)),
             // Int64 conversions
-            (Value::Int64(n), DataType::Int32) => Ok(Value::Int32(*n as i32)),
+            (Value::Int64(n), DataType::Int32) => i32::try_from(*n).map(Value::Int32).map_err(|_| "integer out of range".to_string()),
             (Value::Int64(n), DataType::Float64) => Ok(Value::Float64(*n as f64)),
             (Value::Int64(n), DataType::Text) => Ok(Value::Text(n.to_string())),
             (Value::Int64(n), DataType::Numeric) => Ok(Value::Numeric(n.to_string())),
             (Value::Int64(n), DataType::Bool) => Ok(Value::Bool(*n != 0)),
             // Float64 conversions
-            (Value::Float64(n), DataType::Int32) => Ok(Value::Int32(*n as i32)),
-            (Value::Float64(n), DataType::Int64) => Ok(Value::Int64(*n as i64)),
+            (Value::Float64(n), DataType::Int32) => {
+                if n.is_nan() || n.is_infinite() { return Err("integer out of range".to_string()); }
+                let rounded = n.round();
+                if rounded < i32::MIN as f64 || rounded > i32::MAX as f64 { return Err("integer out of range".to_string()); }
+                Ok(Value::Int32(rounded as i32))
+            }
+            (Value::Float64(n), DataType::Int64) => {
+                if n.is_nan() || n.is_infinite() { return Err("integer out of range".to_string()); }
+                let rounded = n.round();
+                if rounded < i64::MIN as f64 || rounded > i64::MAX as f64 { return Err("integer out of range".to_string()); }
+                Ok(Value::Int64(rounded as i64))
+            }
             (Value::Float64(n), DataType::Text) => Ok(Value::Text(n.to_string())),
             (Value::Float64(n), DataType::Numeric) => Ok(Value::Numeric(n.to_string())),
             // Text conversions
@@ -390,7 +400,15 @@ impl Ord for Value {
             (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
             (Value::Int32(a), Value::Int64(b)) => (*a as i64).cmp(b),
             (Value::Int64(a), Value::Int32(b)) => a.cmp(&(*b as i64)),
-            (Value::Float64(a), Value::Float64(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+            (Value::Float64(a), Value::Float64(b)) => {
+                // NaN sorts greater than all other floats (PostgreSQL behavior)
+                match (a.is_nan(), b.is_nan()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+                }
+            }
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
             (Value::Numeric(a), Value::Numeric(b)) => {
                 // Parse as f64 for proper numeric ordering (not lexicographic)
@@ -410,7 +428,44 @@ impl Ord for Value {
                 let b_total = *bm as i64 * 30 * 86400 * 1_000_000 + *bd as i64 * 86400 * 1_000_000 + bus;
                 a_total.cmp(&b_total)
             }
-            // Cross-type: compare by type rank
+            // Cross-type numeric comparisons: coerce to common type
+            (Value::Int32(a), Value::Float64(b)) => {
+                let af = *a as f64;
+                match (af.is_nan(), b.is_nan()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    _ => af.partial_cmp(b).unwrap_or(Ordering::Equal),
+                }
+            }
+            (Value::Float64(a), Value::Int32(b)) => {
+                let bf = *b as f64;
+                match (a.is_nan(), bf.is_nan()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    _ => a.partial_cmp(&bf).unwrap_or(Ordering::Equal),
+                }
+            }
+            (Value::Int64(a), Value::Float64(b)) => {
+                let af = *a as f64;
+                match (af.is_nan(), b.is_nan()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    _ => af.partial_cmp(b).unwrap_or(Ordering::Equal),
+                }
+            }
+            (Value::Float64(a), Value::Int64(b)) => {
+                let bf = *b as f64;
+                match (a.is_nan(), bf.is_nan()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    _ => a.partial_cmp(&bf).unwrap_or(Ordering::Equal),
+                }
+            }
+            // Fallback: compare by type rank for truly incompatible types
             _ => self.type_rank().cmp(&other.type_rank()),
         }
     }

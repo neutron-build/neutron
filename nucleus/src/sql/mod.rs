@@ -4,8 +4,20 @@ use sqlparser::ast;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::catalog::ColumnDef;
+use crate::catalog::{ColumnDef, FkAction};
 use crate::types::DataType;
+
+/// Convert a sqlparser `ReferentialAction` to our internal `FkAction`.
+fn convert_referential_action(action: &Option<ast::ReferentialAction>) -> FkAction {
+    match action {
+        None => FkAction::NoAction,
+        Some(ast::ReferentialAction::NoAction) => FkAction::NoAction,
+        Some(ast::ReferentialAction::Restrict) => FkAction::Restrict,
+        Some(ast::ReferentialAction::Cascade) => FkAction::Cascade,
+        Some(ast::ReferentialAction::SetNull) => FkAction::SetNull,
+        Some(ast::ReferentialAction::SetDefault) => FkAction::SetDefault,
+    }
+}
 
 /// Parse a SQL string into sqlparser AST statements.
 pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
@@ -58,8 +70,8 @@ pub fn convert_data_type(dt: &ast::DataType) -> Result<DataType, ParseError> {
         }
         ast::DataType::Custom(name, args) => {
             // Handle VECTOR(n) custom type
-            if let Some(part) = name.0.first() {
-                if let Some(ident) = part.as_ident() {
+            if let Some(part) = name.0.first()
+                && let Some(ident) = part.as_ident() {
                     match ident.value.to_lowercase().as_str() {
                         "vector" => {
                             if args.is_empty() {
@@ -67,11 +79,10 @@ pub fn convert_data_type(dt: &ast::DataType) -> Result<DataType, ParseError> {
                                 return Ok(DataType::Vector(0));
                             }
                             // Extract dimensionality from args (args are Strings in sqlparser 0.61)
-                            if args.len() == 1 {
-                                if let Ok(dim) = args[0].parse::<usize>() {
+                            if args.len() == 1
+                                && let Ok(dim) = args[0].parse::<usize>() {
                                     return Ok(DataType::Vector(dim));
                                 }
-                            }
                             return Err(ParseError::UnsupportedDataType(
                                 "VECTOR type requires a numeric dimension, e.g., VECTOR(384)".into()
                             ));
@@ -85,7 +96,6 @@ pub fn convert_data_type(dt: &ast::DataType) -> Result<DataType, ParseError> {
                     // Fall through: treat as a user-defined type (e.g. an enum).
                     return Ok(DataType::UserDefined(ident.value.clone()));
                 }
-            }
             Err(ParseError::UnsupportedDataType(format!("{name}")))
         }
         other => Err(ParseError::UnsupportedDataType(format!("{other}"))),
@@ -200,6 +210,8 @@ pub fn extract_constraints(
                         columns: vec![col.name.value.clone()],
                         ref_table: fk.foreign_table.to_string(),
                         ref_columns: fk.referred_columns.iter().map(|c| c.value.clone()).collect(),
+                        on_delete: convert_referential_action(&fk.on_delete),
+                        on_update: convert_referential_action(&fk.on_update),
                     });
                 }
                 _ => {}
@@ -234,6 +246,8 @@ pub fn extract_constraints(
                     columns: fk.columns.iter().map(|c| c.value.clone()).collect(),
                     ref_table: fk.foreign_table.to_string(),
                     ref_columns: fk.referred_columns.iter().map(|c| c.value.clone()).collect(),
+                    on_delete: convert_referential_action(&fk.on_delete),
+                    on_update: convert_referential_action(&fk.on_update),
                 });
             }
             _ => {}
@@ -249,6 +263,8 @@ pub enum ParseError {
     SqlParser(#[from] sqlparser::parser::ParserError),
     #[error("unsupported data type: {0}")]
     UnsupportedDataType(String),
+    #[error("unexpected statement: expected {0}")]
+    UnexpectedStatement(String),
 }
 
 // ============================================================================
@@ -379,10 +395,10 @@ mod tests {
     }
 
     #[test]
-    fn extract_columns_basic() {
-        let stmts = parse("CREATE TABLE t (id INT NOT NULL, name TEXT, age BIGINT)").unwrap();
+    fn extract_columns_basic() -> Result<(), ParseError> {
+        let stmts = parse("CREATE TABLE t (id INT NOT NULL, name TEXT, age BIGINT)")?;
         if let ast::Statement::CreateTable(ct) = &stmts[0] {
-            let cols = extract_columns(&ct.columns).unwrap();
+            let cols = extract_columns(&ct.columns)?;
             assert_eq!(cols.len(), 3);
             assert_eq!(cols[0].name, "id");
             assert_eq!(cols[0].data_type, DataType::Int32);
@@ -393,19 +409,21 @@ mod tests {
             assert_eq!(cols[2].name, "age");
             assert_eq!(cols[2].data_type, DataType::Int64);
         } else {
-            panic!("expected create table");
+            return Err(ParseError::UnexpectedStatement("CREATE TABLE".into()));
         }
+        Ok(())
     }
 
     #[test]
-    fn extract_constraints_primary_key() {
-        let stmts = parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").unwrap();
+    fn extract_constraints_primary_key() -> Result<(), ParseError> {
+        let stmts = parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")?;
         if let ast::Statement::CreateTable(ct) = &stmts[0] {
             let constraints = extract_constraints(&ct.columns, &ct.constraints);
             assert!(constraints.iter().any(|c| matches!(c, crate::catalog::TableConstraint::PrimaryKey { columns } if columns == &["id"])));
         } else {
-            panic!("expected create table");
+            return Err(ParseError::UnexpectedStatement("CREATE TABLE".into()));
         }
+        Ok(())
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "neutron", about = "Neutron Rust framework CLI", version)]
+#[command(name = "neutron-rs", about = "Neutron Rust framework CLI. The global 'neutron' command is the universal CLI.", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -155,9 +155,9 @@ fn cmd_new(name: &str, template: &str) {
     println!();
     println!("Next steps:");
     println!("  cd {name}");
-    println!("  neutron dev          # start with auto-reload");
-    println!("  neutron build        # release binary");
-    println!("  neutron routes       # list registered routes");
+    println!("  neutron dev          # or: neutron-rs dev");
+    println!("  neutron-rs build     # release binary");
+    println!("  neutron-rs routes    # list registered routes");
     println!();
     println!("Then visit http://localhost:3000");
 }

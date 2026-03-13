@@ -51,3 +51,12 @@ jobs:
           workspaces: nucleus
       - run: cargo clippy -- -D warnings
         working-directory: nucleus
+
+  docs:
+    name: Doc Metrics Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate doc metrics match source code
+        run: sh scripts/metrics.sh --check
+        working-directory: nucleus

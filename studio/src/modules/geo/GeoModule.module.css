@@ -1,0 +1,199 @@
+.layout { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+
+.header {
+  display: flex; align-items: center; gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+.layerName { font-family: var(--font-mono); font-size: var(--text-sm); font-weight: 600; color: var(--text-primary); }
+.ptCount { font-size: var(--text-xs); color: var(--text-tertiary); }
+
+.queryPanel {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border); flex-shrink: 0;
+  display: flex; flex-direction: column; gap: var(--space-3);
+}
+.tabs { display: flex; gap: var(--space-1); }
+.tab {
+  padding: 4px var(--space-3); font-size: var(--text-xs);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text-secondary); transition: background var(--transition), color var(--transition);
+}
+.tab:hover { background: var(--bg-hover); color: var(--text-primary); }
+.tabActive { background: var(--bg-active); color: var(--text-primary); border-color: var(--accent); }
+
+.fields { display: flex; align-items: flex-end; gap: var(--space-3); flex-wrap: wrap; }
+.field { display: flex; flex-direction: column; gap: var(--space-1); }
+.fieldLabel { font-size: var(--text-xs); color: var(--text-tertiary); }
+.fieldInput { width: 110px; padding: 4px var(--space-2); font-size: var(--text-xs); border-radius: var(--radius-sm); font-family: var(--font-mono); }
+
+.runBtn {
+  padding: var(--space-2) var(--space-4); font-size: var(--text-xs);
+  background: var(--model-geo); color: #fff;
+  border-radius: var(--radius-sm); font-weight: 600;
+  transition: opacity var(--transition); margin-left: auto;
+}
+.runBtn:hover { opacity: 0.85; }
+.runBtn:disabled { opacity: 0.5; }
+
+.results { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+
+/* --- Toolbar with view toggle --- */
+
+.resultToolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-2) var(--space-4);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.resultMeta {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.viewToggle {
+  display: flex;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.toggleBtn {
+  padding: 3px var(--space-3);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: transparent;
+  border: none;
+  border-left: 1px solid var(--border);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+
+.toggleBtn:first-child {
+  border-left: none;
+}
+
+.toggleBtn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.toggleActive {
+  background: var(--bg-active);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.error {
+  padding: var(--space-4);
+  color: var(--danger);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.grid { flex: 1; overflow: hidden; }
+.hint { display: flex; align-items: center; justify-content: center; height: 100%; font-size: var(--text-sm); color: var(--text-tertiary); }
+
+/* --- SVG Coordinate Plot --- */
+
+.svgWrap {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-3);
+  background: var(--bg-subtle, var(--bg-secondary, #0d0d0d));
+}
+
+.plotSvg {
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.plotBg {
+  fill: var(--bg-primary, #111);
+  opacity: 0.5;
+}
+
+.plotBorder {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.gridLine {
+  stroke: var(--border);
+  stroke-width: 0.5;
+  stroke-dasharray: 4 3;
+  opacity: 0.5;
+}
+
+.axisLabel {
+  font-size: 9px;
+  fill: var(--text-tertiary);
+  font-family: var(--font-mono);
+}
+
+.axisTitle {
+  font-size: 11px;
+  fill: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+
+/* Data points */
+
+.pointGroup {
+  cursor: pointer;
+}
+
+.point {
+  fill: var(--model-geo, #06b6d4);
+  stroke: rgba(255, 255, 255, 0.3);
+  stroke-width: 1.5;
+  opacity: 0.85;
+  transition: r 0.15s ease, opacity 0.15s ease;
+}
+
+.point:hover {
+  opacity: 1;
+  stroke: rgba(255, 255, 255, 0.6);
+}
+
+.pointSelected {
+  fill: #f59e0b;
+  stroke: rgba(255, 255, 255, 0.8);
+  stroke-width: 2;
+  opacity: 1;
+  filter: drop-shadow(0 0 4px rgba(245, 158, 11, 0.4));
+}
+
+/* Tooltip */
+
+.tooltip {
+  fill: var(--bg-primary, #1a1a1a);
+  stroke: var(--border);
+  stroke-width: 1;
+  opacity: 0.95;
+  filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.3));
+}
+
+.tooltipTitle {
+  font-size: 11px;
+  fill: var(--text-primary);
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+
+.tooltipText {
+  font-size: 10px;
+  fill: var(--text-secondary);
+  font-family: var(--font-mono);
+}

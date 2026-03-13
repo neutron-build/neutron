@@ -1,0 +1,14 @@
+[package]
+name = "neutron-desktop-deeplink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Neutron Desktop custom URI scheme deep links plugin"
+
+[dependencies]
+tauri = { workspace = true }
+tauri-plugin = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+tracing = { workspace = true }

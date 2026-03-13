@@ -1,0 +1,59 @@
+name: Zig Systems Library
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "zig/**"
+      - ".github/workflows/zig.yml"
+  pull_request:
+    paths:
+      - "zig/**"
+      - ".github/workflows/zig.yml"
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        zig-version: ["0.14.0"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ matrix.zig-version }}
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ matrix.zig-version }}
+
+      - name: Build (full stack)
+        run: zig build
+        working-directory: zig
+
+      - name: Test
+        run: zig build test
+        working-directory: zig
+
+  build-layers:
+    name: Layer Combinations
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: "Wire only (Layer 0)"
+            flags: "-Dlayer1=false -Dlayer2=false -Dlayer3=false -Dnucleus=false"
+          - name: "Wire + HAL (Layers 0-1)"
+            flags: "-Dlayer2=false -Dlayer3=false -Dnucleus=false"
+          - name: "No Nucleus"
+            flags: "-Dnucleus=false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: "0.14.0"
+
+      - name: Build — ${{ matrix.name }}
+        run: zig build ${{ matrix.flags }}
+        working-directory: zig

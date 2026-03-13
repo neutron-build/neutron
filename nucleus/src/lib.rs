@@ -7,12 +7,11 @@ pub mod cache;
 pub mod catalog;
 pub mod cli;
 pub mod columnar;
-#[allow(dead_code)]
 pub mod compliance;
 pub mod config;
 pub mod cost;
+pub mod datalog;
 pub mod distributed;
-#[allow(dead_code)]
 pub mod document;
 pub mod embedded;
 pub mod executor;
@@ -20,20 +19,18 @@ pub mod fault;
 pub mod fts;
 pub mod geo;
 pub mod graph;
-#[allow(dead_code)]
 pub mod inference;
 pub mod kv;
 pub mod memory;
 pub mod metrics;
 pub mod planner;
 pub mod pool;
-#[allow(dead_code)]
 pub mod procedures;
 pub mod pubsub;
-#[allow(dead_code)]
 pub mod quantum;
 pub mod raft;
 pub mod reactive;
+pub mod resp;
 pub mod replication;
 pub mod runtime;
 pub mod security;

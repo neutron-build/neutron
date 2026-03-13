@@ -13,8 +13,35 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{Catalog, ColumnDef, IndexDef, IndexType, TableConstraint, TableDef};
+use crate::catalog::{Catalog, ColumnDef, FkAction, IndexDef, IndexType, TableConstraint, TableDef};
 use crate::types::DataType;
+
+/// Default FK action string for serde deserialization (backward compatibility).
+fn default_fk_action_str() -> String {
+    "NoAction".to_string()
+}
+
+/// Convert an `FkAction` to its string representation for persistence.
+fn fk_action_to_string(action: &FkAction) -> String {
+    match action {
+        FkAction::NoAction => "NoAction".to_string(),
+        FkAction::Restrict => "Restrict".to_string(),
+        FkAction::Cascade => "Cascade".to_string(),
+        FkAction::SetNull => "SetNull".to_string(),
+        FkAction::SetDefault => "SetDefault".to_string(),
+    }
+}
+
+/// Parse a string representation back into an `FkAction`.
+fn string_to_fk_action(s: &str) -> FkAction {
+    match s {
+        "Restrict" => FkAction::Restrict,
+        "Cascade" => FkAction::Cascade,
+        "SetNull" => FkAction::SetNull,
+        "SetDefault" => FkAction::SetDefault,
+        _ => FkAction::NoAction,
+    }
+}
 
 use super::txn::{IsolationLevel, RowVersion, Transaction, TransactionManager};
 use super::wal::{
@@ -48,6 +75,10 @@ enum TableConstraintSer {
         columns: Vec<String>,
         ref_table: String,
         ref_columns: Vec<String>,
+        #[serde(default = "default_fk_action_str")]
+        on_delete: String,
+        #[serde(default = "default_fk_action_str")]
+        on_update: String,
     },
 }
 
@@ -123,6 +154,13 @@ fn string_to_data_type(s: &str) -> Result<DataType, PersistenceError> {
             let inner = &other[6..other.len() - 1];
             Ok(DataType::Array(Box::new(string_to_data_type(inner)?)))
         }
+        other if other.starts_with("Vector(") && other.ends_with(')') => {
+            let dim_str = &other[7..other.len() - 1];
+            let dim = dim_str
+                .parse::<usize>()
+                .map_err(|_| PersistenceError::InvalidDataType(s.to_string()))?;
+            Ok(DataType::Vector(dim))
+        }
         other if other.starts_with("UserDefined(") && other.ends_with(')') => {
             let name = &other[12..other.len() - 1];
             Ok(DataType::UserDefined(name.to_string()))
@@ -177,11 +215,15 @@ fn constraint_to_ser(c: &TableConstraint) -> TableConstraintSer {
             columns,
             ref_table,
             ref_columns,
+            on_delete,
+            on_update,
         } => TableConstraintSer::ForeignKey {
             name: name.clone(),
             columns: columns.clone(),
             ref_table: ref_table.clone(),
             ref_columns: ref_columns.clone(),
+            on_delete: fk_action_to_string(on_delete),
+            on_update: fk_action_to_string(on_update),
         },
     }
 }
@@ -205,11 +247,15 @@ fn ser_to_constraint(c: &TableConstraintSer) -> TableConstraint {
             columns,
             ref_table,
             ref_columns,
+            on_delete,
+            on_update,
         } => TableConstraint::ForeignKey {
             name: name.clone(),
             columns: columns.clone(),
             ref_table: ref_table.clone(),
             ref_columns: ref_columns.clone(),
+            on_delete: string_to_fk_action(on_delete),
+            on_update: string_to_fk_action(on_update),
         },
     }
 }
@@ -544,7 +590,7 @@ impl MvccRowStore {
         for row in rows.iter_mut() {
             if row.version.is_visible(&txn.snapshot, &self.txn_manager) {
                 if visible_count == row_index {
-                    row.version.deleted_by = txn.id;
+                    row.version.deleted_by.store(txn.id, std::sync::atomic::Ordering::Release);
                     return Ok(());
                 }
                 visible_count += 1;
@@ -664,12 +710,11 @@ impl RecoveryManager {
                 continue;
             }
 
-            if record.record_type == RECORD_PAGE_WRITE && committed.contains(&record.txn_id) {
-                if let Some(ref page_image) = record.page_image {
+            if record.record_type == RECORD_PAGE_WRITE && committed.contains(&record.txn_id)
+                && let Some(ref page_image) = record.page_image {
                     pages.insert(record.page_id, page_image.clone());
                     records_replayed += 1;
                 }
-            }
         }
 
         let max_lsn = wal::max_lsn(&records);

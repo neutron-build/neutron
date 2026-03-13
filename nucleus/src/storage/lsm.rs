@@ -354,7 +354,9 @@ impl LsmTree {
         self.next_seq += 1;
         let sst = SSTable::from_sorted(entries, 0, seq, self.config.bloom_bits_per_key);
         // Write to disk before adding to in-memory levels (WAL semantics).
-        let _ = self.write_sst_to_disk(&sst);
+        if let Err(e) = self.write_sst_to_disk(&sst) {
+            eprintln!("LSM: failed to write SSTable L{}/seq{} to disk: {e}", sst.level, sst.seq);
+        }
         if !self.levels.is_empty() {
             self.levels[0].push(sst);
         }
@@ -416,7 +418,9 @@ impl LsmTree {
         self.next_seq += 1;
         let sst = SSTable::from_sorted(entries, level + 1, seq, self.config.bloom_bits_per_key);
         // Write merged SSTable to disk first, then delete superseded files.
-        let _ = self.write_sst_to_disk(&sst);
+        if let Err(e) = self.write_sst_to_disk(&sst) {
+            eprintln!("LSM: failed to write compacted SSTable L{}/seq{} to disk: {e}", sst.level, sst.seq);
+        }
         self.levels[level + 1].push(sst);
         self.compaction_count += 1;
 

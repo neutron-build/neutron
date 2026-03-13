@@ -19,21 +19,40 @@ pgwire = { version = "0.36", features = ["server-api-aws-lc-rs"] }
 rcgen = "0.13"
 rustls-pemfile = "2"
 rand = "0.8"
+rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlparser = "0.61"
+sqlparser = { version = "0.61", features = ["visitor"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5.58", features = ["derive"] }
 base64 = "0.22.1"
+blake3 = "1"
 toml = "0.8"
 core_affinity = "0.8"
 rustyline = "14"
 lz4_flex = "0.11"
+zstd = "0.13"
 regex = "1.12.3"
 tokio-postgres = { version = "0.7" }
+comfy-table = { version = "7", optional = true }
+redis = { version = "0.27", features = ["tokio-comp"], optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+opentelemetry = { version = "0.29", optional = true }
+opentelemetry_sdk = { version = "0.29", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.29", features = ["grpc-tonic"], optional = true }
+tracing-opentelemetry = { version = "0.30", optional = true }
+ort = { version = "2.0.0-rc.11", features = ["ndarray"], optional = true }
+ndarray = { version = "0.17", optional = true }
+tikv-jemallocator = { version = "0.6", optional = true }
+
+[features]
+bench-tools = ["comfy-table", "redis", "reqwest"]
+otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
+onnx = ["ort", "ndarray"]
+jemalloc = ["tikv-jemallocator"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -43,6 +62,16 @@ proptest = "1"
 [[bin]]
 name = "pg_compare"
 path = "src/bin/pg_compare.rs"
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"
+required-features = ["bench-tools"]
+
+[[bin]]
+name = "compete"
+path = "src/bin/compete.rs"
+required-features = ["bench-tools"]
 
 [[bench]]
 name = "query_bench"
@@ -54,6 +83,18 @@ harness = false
 
 [[bench]]
 name = "specialty_bench"
+harness = false
+
+[[bench]]
+name = "embedded_bench"
+harness = false
+
+[[bench]]
+name = "concurrent_bench"
+harness = false
+
+[[bench]]
+name = "phase4_bench"
 harness = false
 
 [target.'cfg(target_os = "linux")'.dependencies]

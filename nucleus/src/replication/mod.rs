@@ -9,6 +9,8 @@
 //! receipt. A [`FailoverManager`] monitors heartbeats and can promote the
 //! replica to primary when the original primary is unreachable.
 
+pub mod network;
+
 use std::fmt;
 
 use crate::tls::InternalTlsConfig;
@@ -802,6 +804,30 @@ pub fn encode_stream_message(msg: &StreamMessage) -> Vec<u8> {
     buf
 }
 
+/// Read a little-endian u64 from `data[offset..offset+8]`.
+///
+/// The caller must have already validated `data.len() >= offset + 8`; this
+/// returns a `ReplicationError` instead of panicking if the invariant is
+/// violated.
+#[inline]
+fn read_u64_le(data: &[u8], offset: usize) -> Result<u64, ReplicationError> {
+    let bytes: [u8; 8] = data
+        .get(offset..offset + 8)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| ReplicationError::ProtocolError("truncated u64 field".into()))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+/// Read a little-endian u32 from `data[offset..offset+4]`.
+#[inline]
+fn read_u32_le(data: &[u8], offset: usize) -> Result<u32, ReplicationError> {
+    let bytes: [u8; 4] = data
+        .get(offset..offset + 4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| ReplicationError::ProtocolError("truncated u32 field".into()))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
 /// Deserialize a `StreamMessage` from bytes (excluding the 4-byte length prefix).
 pub fn decode_stream_message(data: &[u8]) -> Result<StreamMessage, ReplicationError> {
     if data.is_empty() {
@@ -816,9 +842,9 @@ pub fn decode_stream_message(data: &[u8]) -> Result<StreamMessage, ReplicationEr
             if rest.len() < 20 {
                 return Err(ReplicationError::ProtocolError("truncated WalBatch".into()));
             }
-            let sender_id = u64::from_le_bytes(rest[..8].try_into().unwrap());
-            let batch_seq = u64::from_le_bytes(rest[8..16].try_into().unwrap());
-            let count = u32::from_le_bytes(rest[16..20].try_into().unwrap()) as usize;
+            let sender_id = read_u64_le(rest, 0)?;
+            let batch_seq = read_u64_le(rest, 8)?;
+            let count = read_u32_le(rest, 16)? as usize;
             let mut pos = 20;
             let mut records = Vec::with_capacity(count);
             for _ in 0..count {
@@ -838,9 +864,9 @@ pub fn decode_stream_message(data: &[u8]) -> Result<StreamMessage, ReplicationEr
                     "truncated WalBatchAck".into(),
                 ));
             }
-            let sender_id = u64::from_le_bytes(rest[..8].try_into().unwrap());
-            let confirmed_lsn = u64::from_le_bytes(rest[8..16].try_into().unwrap());
-            let batch_seq = u64::from_le_bytes(rest[16..24].try_into().unwrap());
+            let sender_id = read_u64_le(rest, 0)?;
+            let confirmed_lsn = read_u64_le(rest, 8)?;
+            let batch_seq = read_u64_le(rest, 16)?;
             Ok(StreamMessage::WalBatchAck {
                 sender_id,
                 confirmed_lsn,
@@ -853,10 +879,10 @@ pub fn decode_stream_message(data: &[u8]) -> Result<StreamMessage, ReplicationEr
                     "truncated Heartbeat".into(),
                 ));
             }
-            let sender_id = u64::from_le_bytes(rest[..8].try_into().unwrap());
+            let sender_id = read_u64_le(rest, 0)?;
             let role = decode_role(rest[8])?;
-            let current_lsn = u64::from_le_bytes(rest[9..17].try_into().unwrap());
-            let timestamp_ms = u64::from_le_bytes(rest[17..25].try_into().unwrap());
+            let current_lsn = read_u64_le(rest, 9)?;
+            let timestamp_ms = read_u64_le(rest, 17)?;
             Ok(StreamMessage::ReplicationHeartbeat {
                 sender_id,
                 role,
@@ -870,8 +896,8 @@ pub fn decode_stream_message(data: &[u8]) -> Result<StreamMessage, ReplicationEr
                     "truncated StartStreaming".into(),
                 ));
             }
-            let replica_id = u64::from_le_bytes(rest[..8].try_into().unwrap());
-            let from_lsn = u64::from_le_bytes(rest[8..16].try_into().unwrap());
+            let replica_id = read_u64_le(rest, 0)?;
+            let from_lsn = read_u64_le(rest, 8)?;
             Ok(StreamMessage::StartStreaming {
                 replica_id,
                 from_lsn,
@@ -883,8 +909,8 @@ pub fn decode_stream_message(data: &[u8]) -> Result<StreamMessage, ReplicationEr
                     "truncated StreamingStarted".into(),
                 ));
             }
-            let primary_id = u64::from_le_bytes(rest[..8].try_into().unwrap());
-            let wal_tip_lsn = u64::from_le_bytes(rest[8..16].try_into().unwrap());
+            let primary_id = read_u64_le(rest, 0)?;
+            let wal_tip_lsn = read_u64_le(rest, 8)?;
             Ok(StreamMessage::StreamingStarted {
                 primary_id,
                 wal_tip_lsn,
@@ -926,8 +952,8 @@ fn decode_wal_record(data: &[u8]) -> Result<(WalRecord, usize), ReplicationError
             "truncated WalRecord".into(),
         ));
     }
-    let lsn = u64::from_le_bytes(data[..8].try_into().unwrap());
-    let timestamp_ms = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    let lsn = read_u64_le(data, 0)?;
+    let timestamp_ms = read_u64_le(data, 8)?;
     let payload_tag = data[16];
     let rest = &data[17..];
 
@@ -938,8 +964,8 @@ fn decode_wal_record(data: &[u8]) -> Result<(WalRecord, usize), ReplicationError
                     "truncated PageWrite".into(),
                 ));
             }
-            let page_id = u64::from_le_bytes(rest[..8].try_into().unwrap());
-            let data_len = u32::from_le_bytes(rest[8..12].try_into().unwrap()) as usize;
+            let page_id = read_u64_le(rest, 0)?;
+            let data_len = read_u32_le(rest, 8)? as usize;
             if rest.len() < 12 + data_len {
                 return Err(ReplicationError::ProtocolError(
                     "truncated PageWrite data".into(),
@@ -958,14 +984,14 @@ fn decode_wal_record(data: &[u8]) -> Result<(WalRecord, usize), ReplicationError
             if rest.len() < 8 {
                 return Err(ReplicationError::ProtocolError("truncated Commit".into()));
             }
-            let txn_id = u64::from_le_bytes(rest[..8].try_into().unwrap());
+            let txn_id = read_u64_le(rest, 0)?;
             (WalPayload::Commit { txn_id }, 8)
         }
         PL_ABORT => {
             if rest.len() < 8 {
                 return Err(ReplicationError::ProtocolError("truncated Abort".into()));
             }
-            let txn_id = u64::from_le_bytes(rest[..8].try_into().unwrap());
+            let txn_id = read_u64_le(rest, 0)?;
             (WalPayload::Abort { txn_id }, 8)
         }
         PL_CHECKPOINT => (WalPayload::Checkpoint, 0),
@@ -1534,7 +1560,10 @@ impl ReplicationMessage {
                 if data.len() < pos + 8 {
                     return Err("truncated auth token length".into());
                 }
-                let tlen = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
+                let tlen = u64::from_le_bytes(
+                    data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                        .ok_or("truncated auth token length")?,
+                ) as usize;
                 pos += 8;
                 if data.len() < pos + tlen {
                     return Err("truncated auth token".into());
@@ -1548,16 +1577,25 @@ impl ReplicationMessage {
                 if data.len() < pos + 8 {
                     return Err("truncated batch count".into());
                 }
-                let count = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
+                let count = u64::from_le_bytes(
+                    data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                        .ok_or("truncated batch count")?,
+                ) as usize;
                 pos += 8;
                 let mut records = Vec::with_capacity(count);
                 for _ in 0..count {
                     if data.len() < pos + 16 {
                         return Err("truncated record header".into());
                     }
-                    let lsn = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                    let lsn = u64::from_le_bytes(
+                        data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                            .ok_or("truncated record lsn")?,
+                    );
                     pos += 8;
-                    let timestamp_ms = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                    let timestamp_ms = u64::from_le_bytes(
+                        data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                            .ok_or("truncated record timestamp")?,
+                    );
                     pos += 8;
                     if pos >= data.len() {
                         return Err("truncated payload tag".into());
@@ -1568,11 +1606,15 @@ impl ReplicationMessage {
                             if data.len() < pos + 16 {
                                 return Err("truncated page write".into());
                             }
-                            let page_id =
-                                u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                            let page_id = u64::from_le_bytes(
+                                data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                                    .ok_or("truncated page id")?,
+                            );
                             pos += 8;
-                            let dlen =
-                                u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
+                            let dlen = u64::from_le_bytes(
+                                data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                                    .ok_or("truncated page data length")?,
+                            ) as usize;
                             pos += 8;
                             if data.len() < pos + dlen {
                                 return Err("truncated page data".into());
@@ -1586,7 +1628,10 @@ impl ReplicationMessage {
                             if data.len() < pos + 8 {
                                 return Err("truncated commit".into());
                             }
-                            let txn_id = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                            let txn_id = u64::from_le_bytes(
+                                data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                                    .ok_or("truncated commit txn_id")?,
+                            );
                             pos += 8;
                             WalPayload::Commit { txn_id }
                         }
@@ -1595,7 +1640,10 @@ impl ReplicationMessage {
                             if data.len() < pos + 8 {
                                 return Err("truncated abort".into());
                             }
-                            let txn_id = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                            let txn_id = u64::from_le_bytes(
+                                data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                                    .ok_or("truncated abort txn_id")?,
+                            );
                             pos += 8;
                             WalPayload::Abort { txn_id }
                         }
@@ -1617,21 +1665,30 @@ impl ReplicationMessage {
                 if data.len() < pos + 8 {
                     return Err("truncated confirm".into());
                 }
-                let lsn = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                let lsn = u64::from_le_bytes(
+                    data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                        .ok_or("truncated confirm lsn")?,
+                );
                 Ok(ReplicationMessage::Confirm { applied_lsn: lsn })
             }
             3 => {
                 if data.len() < pos + 8 {
                     return Err("truncated heartbeat".into());
                 }
-                let lsn = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                let lsn = u64::from_le_bytes(
+                    data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                        .ok_or("truncated heartbeat lsn")?,
+                );
                 Ok(ReplicationMessage::Heartbeat { primary_lsn: lsn })
             }
             4 => {
                 if data.len() < pos + 8 {
                     return Err("truncated heartbeat response".into());
                 }
-                let lsn = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                let lsn = u64::from_le_bytes(
+                    data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                        .ok_or("truncated heartbeat response lsn")?,
+                );
                 Ok(ReplicationMessage::HeartbeatResponse { replica_lsn: lsn })
             }
             t => Err(format!("unknown message tag: {t}")),
@@ -1880,16 +1937,14 @@ impl WalBridge {
         let mut count = 0;
         for rrec in repl_records {
             let srec = to_storage_wal_record(rrec);
-            if srec.record_type == crate::storage::wal::RECORD_PAGE_WRITE {
-                if let Some(ref page_image) = srec.page_image {
-                    if storage_wal
+            if srec.record_type == crate::storage::wal::RECORD_PAGE_WRITE
+                && let Some(ref page_image) = srec.page_image
+                    && storage_wal
                         .log_page_write(srec.txn_id, srec.page_id, page_image)
                         .is_ok()
                     {
                         count += 1;
                     }
-                }
-            }
             // Control records (commit/abort/checkpoint) don't need to be written
             // to the local WAL — they're implicit in the replayed page state.
         }

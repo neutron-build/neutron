@@ -1,0 +1,127 @@
+/* Design tokens — dark-first, light mode via [data-theme="light"] */
+:root {
+  /* Spacing */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+
+  /* Typography */
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 15px;
+
+  /* Radius */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+
+  /* Transitions */
+  --transition: 120ms ease;
+
+  /* Accent */
+  --accent: #6366f1;
+  --accent-hover: #5254cc;
+  --accent-subtle: rgba(99, 102, 241, 0.12);
+  --accent-border: rgba(99, 102, 241, 0.3);
+
+  /* Status */
+  --color-success: #22c55e;
+  --color-warning: #f59e0b;
+  --color-error: #ef4444;
+  --color-info: #3b82f6;
+  /* Aliases */
+  --success: #22c55e;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+
+  /* Model badge colors (full + short aliases) */
+  --model-sql: #3b82f6;
+  --model-kv: #22c55e;
+  --model-vector: #a855f7;
+  --model-timeseries: #f97316;
+  --model-ts: #f97316;
+  --model-document: #14b8a6;
+  --model-doc: #14b8a6;
+  --model-graph: #ef4444;
+  --model-fts: #eab308;
+  --model-geo: #6366f1;
+  --model-blob: #94a3b8;
+  --model-pubsub: #ec4899;
+  --model-streams: #06b6d4;
+  --model-columnar: #f59e0b;
+  --model-datalog: #8b5cf6;
+  --model-cdc: #84cc16;
+}
+
+/* Dark theme (default) */
+:root,
+[data-theme="dark"] {
+  --bg-app: #0d0d10;
+  --bg-panel: #13131a;
+  --bg-overlay: #1a1a24;
+  --bg-hover: #1e1e28;
+  --bg-active: #25253a;
+  --bg-input: #0d0d10;
+
+  --border: #1e1e2e;
+  --border-focus: #6366f1;
+  --border-subtle: #16161f;
+
+  --text-primary: #e2e2f0;
+  --text-secondary: #8888aa;
+  --text-tertiary: #55556a;
+  --text-inverse: #0d0d10;
+  --text-accent: #818cf8;
+
+  --scrollbar-thumb: #2a2a3a;
+  --scrollbar-track: transparent;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.5);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.6);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.7);
+
+  /* Pending cell highlight */
+  --pending-bg: rgba(234, 179, 8, 0.1);
+  --pending-border: rgba(234, 179, 8, 0.4);
+
+  --bg-row-alt: rgba(255, 255, 255, 0.02);
+}
+
+/* Light theme */
+[data-theme="light"] {
+  --bg-app: #f5f5f8;
+  --bg-panel: #ffffff;
+  --bg-overlay: #f0f0f5;
+  --bg-hover: #e8e8f0;
+  --bg-active: #dcdcf0;
+  --bg-input: #ffffff;
+
+  --border: #e2e2ea;
+  --border-focus: #6366f1;
+  --border-subtle: #ececf2;
+
+  --text-primary: #111118;
+  --text-secondary: #55556a;
+  --text-tertiary: #9999b0;
+  --text-inverse: #ffffff;
+  --text-accent: #4f46e5;
+
+  --scrollbar-thumb: #ccccda;
+  --scrollbar-track: transparent;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.12);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.16);
+
+  --pending-bg: rgba(234, 179, 8, 0.08);
+  --pending-border: rgba(234, 179, 8, 0.5);
+
+  --bg-row-alt: rgba(0, 0, 0, 0.02);
+}

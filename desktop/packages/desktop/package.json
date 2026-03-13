@@ -1,0 +1,19 @@
+{
+  "name": "@neutron/desktop",
+  "version": "0.1.0",
+  "description": "Neutron Desktop — client-side bridge, hooks, and window API",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./bridge": "./src/bridge.ts",
+    "./window": "./src/window.ts",
+    "./platform": "./src/platform.ts"
+  },
+  "license": "MIT",
+  "peerDependencies": {
+    "preact": "^10.0.0",
+    "@preact/signals": "^1.0.0"
+  }
+}

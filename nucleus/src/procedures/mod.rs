@@ -690,6 +690,7 @@ pub struct SandboxedWasmRuntime {
 
 /// A registered WASM module.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // fields stored for runtime metadata
 struct WasmModule {
     name: String,
     bytes: Vec<u8>,

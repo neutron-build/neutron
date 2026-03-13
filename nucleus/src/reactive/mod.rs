@@ -7,7 +7,7 @@
 //!
 //! Replaces Supabase Realtime, Debezium+Kafka, pg_cron.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -111,6 +111,9 @@ pub struct SubscriptionManager {
     next_id: AtomicU64,
     /// Channel for sending diffs to listeners
     diff_tx: broadcast::Sender<Arc<QueryDiff>>,
+    /// Per-subscription diff buffer for polling via FETCH SUBSCRIPTION.
+    /// Capped at 1000 entries per subscription to bound memory.
+    pending_diffs: std::sync::Mutex<HashMap<u64, VecDeque<Arc<QueryDiff>>>>,
 }
 
 impl SubscriptionManager {
@@ -121,6 +124,7 @@ impl SubscriptionManager {
             table_deps: HashMap::new(),
             next_id: AtomicU64::new(1),
             diff_tx,
+            pending_diffs: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -147,6 +151,9 @@ impl SubscriptionManager {
         }
 
         self.subscriptions.insert(id, sub);
+        if let Ok(mut map) = self.pending_diffs.lock() {
+            map.insert(id, VecDeque::new());
+        }
         let rx = self.diff_tx.subscribe();
         (id, rx)
     }
@@ -159,6 +166,9 @@ impl SubscriptionManager {
                 if let Some(deps) = self.table_deps.get_mut(table) {
                     deps.retain(|&d| d != id);
                 }
+            }
+            if let Ok(mut map) = self.pending_diffs.lock() {
+                map.remove(&id);
             }
             true
         } else {
@@ -174,9 +184,33 @@ impl SubscriptionManager {
             .unwrap_or_default()
     }
 
-    /// Push a diff to all listeners.
+    /// Push a diff to all listeners and buffer it for polling.
     pub fn push_diff(&self, diff: QueryDiff) -> usize {
-        self.diff_tx.send(Arc::new(diff)).unwrap_or(0)
+        let diff = Arc::new(diff);
+        // Buffer for FETCH SUBSCRIPTION polling (cap 1000 per sub).
+        if let Ok(mut map) = self.pending_diffs.lock()
+            && let Some(queue) = map.get_mut(&diff.subscription_id) {
+                if queue.len() >= 1000 {
+                    queue.pop_front();
+                }
+                queue.push_back(Arc::clone(&diff));
+            }
+        self.diff_tx.send(diff).unwrap_or(0)
+    }
+
+    /// Fetch and drain up to `limit` buffered diffs for a subscription.
+    /// Returns diffs in order from oldest to newest and removes them from the buffer.
+    pub fn fetch_diffs(&self, sub_id: u64, limit: usize) -> Vec<Arc<QueryDiff>> {
+        if let Ok(mut map) = self.pending_diffs.lock() {
+            if let Some(queue) = map.get_mut(&sub_id) {
+                let n = limit.min(queue.len());
+                queue.drain(..n).collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
     }
 
     /// Number of active subscriptions.
@@ -1096,6 +1130,87 @@ mod tests {
         assert_eq!(a_cursor, 1);
         assert_eq!(b_events.len(), 2);
         assert_eq!(b_cursor, 2);
+    }
+
+    // ====================================================================
+    // Buffered diff / FETCH SUBSCRIPTION tests
+    // ====================================================================
+
+    #[test]
+    fn subscription_manager_buffered_push_and_fetch() {
+        let mut mgr = SubscriptionManager::new(16);
+        let (id, _rx) = mgr.subscribe("SELECT * FROM t", vec!["t".into()]);
+
+        // Initially no buffered diffs
+        assert!(mgr.fetch_diffs(id, 100).is_empty());
+
+        let diff1 = QueryDiff {
+            subscription_id: id,
+            added_rows: vec![make_row(&[("id", "1")])],
+            removed_rows: vec![],
+        };
+        let diff2 = QueryDiff {
+            subscription_id: id,
+            added_rows: vec![make_row(&[("id", "2")])],
+            removed_rows: vec![],
+        };
+        mgr.push_diff(diff1);
+        mgr.push_diff(diff2);
+
+        // Fetch 1 — oldest first, buffer drains
+        let fetched = mgr.fetch_diffs(id, 1);
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].added_rows[0]["id"], "1");
+
+        // Fetch remaining
+        let fetched2 = mgr.fetch_diffs(id, 100);
+        assert_eq!(fetched2.len(), 1);
+        assert_eq!(fetched2[0].added_rows[0]["id"], "2");
+
+        // Buffer now empty
+        assert!(mgr.fetch_diffs(id, 100).is_empty());
+    }
+
+    #[test]
+    fn subscription_manager_fetch_unknown_id() {
+        let mgr = SubscriptionManager::new(16);
+        // No subscription registered — fetch returns empty
+        assert!(mgr.fetch_diffs(999, 100).is_empty());
+    }
+
+    #[test]
+    fn subscription_manager_buffer_cleared_on_unsubscribe() {
+        let mut mgr = SubscriptionManager::new(16);
+        let (id, _rx) = mgr.subscribe("SELECT 1", vec!["t".into()]);
+
+        mgr.push_diff(QueryDiff { subscription_id: id, added_rows: vec![make_row(&[("x", "1")])], removed_rows: vec![] });
+        assert_eq!(mgr.fetch_diffs(id, 100).len(), 1); // puts it back... wait no - drain removes
+        // Re-push and then unsubscribe
+        mgr.push_diff(QueryDiff { subscription_id: id, added_rows: vec![make_row(&[("x", "2")])], removed_rows: vec![] });
+        mgr.unsubscribe(id);
+        // After unsubscribe the buffer is gone; fetching by ID returns empty
+        assert!(mgr.fetch_diffs(id, 100).is_empty());
+    }
+
+    #[test]
+    fn subscription_manager_buffer_capped_at_1000() {
+        let mut mgr = SubscriptionManager::new(16);
+        let (id, _rx) = mgr.subscribe("SELECT 1", vec!["t".into()]);
+
+        for i in 0..1100u64 {
+            mgr.push_diff(QueryDiff {
+                subscription_id: id,
+                added_rows: vec![make_row(&[("i", &i.to_string())])],
+                removed_rows: vec![],
+            });
+        }
+
+        // Buffer is capped at 1000; oldest 100 were evicted
+        let fetched = mgr.fetch_diffs(id, 2000);
+        assert_eq!(fetched.len(), 1000);
+        // First remaining entry should be i=100 (oldest 100 dropped)
+        assert_eq!(fetched[0].added_rows[0]["i"], "100");
+        assert_eq!(fetched[999].added_rows[0]["i"], "1099");
     }
 
     #[test]
