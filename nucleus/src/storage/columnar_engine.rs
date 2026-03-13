@@ -366,32 +366,29 @@ fn sum_masked(col: &ColumnData, mask: &[bool]) -> (f64, usize) {
     match col {
         ColumnData::Float64(v) => {
             for (opt, &keep) in v.iter().zip(mask) {
-                if keep {
-                    if let Some(f) = opt {
+                if keep
+                    && let Some(f) = opt {
                         sum += f;
                         count += 1;
                     }
-                }
             }
         }
         ColumnData::Int64(v) => {
             for (opt, &keep) in v.iter().zip(mask) {
-                if keep {
-                    if let Some(n) = opt {
+                if keep
+                    && let Some(n) = opt {
                         sum += *n as f64;
                         count += 1;
                     }
-                }
             }
         }
         ColumnData::Int32(v) => {
             for (opt, &keep) in v.iter().zip(mask) {
-                if keep {
-                    if let Some(n) = opt {
+                if keep
+                    && let Some(n) = opt {
                         sum += *n as f64;
                         count += 1;
                     }
-                }
             }
         }
         _ => {}
@@ -476,7 +473,7 @@ impl StorageEngine for ColumnarStorageEngine {
     async fn create_table(&self, table: &str) -> Result<(), StorageError> {
         self.store.write().create_table(table);
         if let Some(wal) = &self.wal {
-            let _ = wal.log_create_table(table);
+            wal.log_create_table(table).map_err(|e| StorageError::Io(e.to_string()))?;
         }
         Ok(())
     }
@@ -489,7 +486,7 @@ impl StorageEngine for ColumnarStorageEngine {
             return Err(StorageError::TableNotFound(table.to_string()));
         }
         if let Some(wal) = &self.wal {
-            let _ = wal.log_drop_table(table);
+            wal.log_drop_table(table).map_err(|e| StorageError::Io(e.to_string()))?;
         }
         // Remove index entries for this table.
         let names: Vec<String> = {
@@ -513,7 +510,8 @@ impl StorageEngine for ColumnarStorageEngine {
         // WAL: log the row immediately so it is durable even before the
         // write buffer flushes to the in-memory store.
         if let Some(wal) = &self.wal {
-            let _ = wal.log_insert_rows(table, std::slice::from_ref(&row));
+            wal.log_insert_rows(table, std::slice::from_ref(&row))
+                .map_err(|e| StorageError::Io(e.to_string()))?;
         }
         let should_flush = {
             let mut bufs = self.write_buffers.write();
@@ -546,7 +544,8 @@ impl StorageEngine for ColumnarStorageEngine {
             store.append(table, rows_to_batch(rows.clone()));
         }
         if let Some(wal) = &self.wal {
-            let _ = wal.log_insert_rows(table, &rows);
+            wal.log_insert_rows(table, &rows)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
         }
         // Rows are now in the store with stable positions — update indexes immediately.
         self.update_indexes_at_positions(table, &rows, starting_pos);
@@ -593,7 +592,7 @@ impl StorageEngine for ColumnarStorageEngine {
         if let Some(wal) = &self.wal {
             let tables = self.snapshot_tables();
             let refs: Vec<(&str, Vec<Row>)> = tables.iter().map(|(n, r)| (n.as_str(), r.clone())).collect();
-            let _ = wal.checkpoint(&refs);
+            wal.checkpoint(&refs).map_err(|e| StorageError::Io(e.to_string()))?;
         }
         Ok(count)
     }
@@ -638,7 +637,7 @@ impl StorageEngine for ColumnarStorageEngine {
         if let Some(wal) = &self.wal {
             let tables = self.snapshot_tables();
             let refs: Vec<(&str, Vec<Row>)> = tables.iter().map(|(n, r)| (n.as_str(), r.clone())).collect();
-            let _ = wal.checkpoint(&refs);
+            wal.checkpoint(&refs).map_err(|e| StorageError::Io(e.to_string()))?;
         }
         Ok(count)
     }

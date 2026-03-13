@@ -292,6 +292,147 @@ impl KNearestNeighbors {
 // Internal enum wrapping all built-in model kinds
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ONNX Runtime model (behind feature flag — zero cost when disabled)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "onnx")]
+pub struct OnnxModel {
+    /// Mutex because ort::Session::run takes &mut self.
+    session: std::sync::Mutex<ort::session::Session>,
+    /// Cached input name for the first input tensor.
+    input_name: String,
+    /// Expected dimensionality of the first input tensor (0 = dynamic).
+    input_dim: usize,
+}
+
+#[cfg(feature = "onnx")]
+impl OnnxModel {
+    /// Extract input metadata from a session.
+    fn extract_metadata(session: &ort::session::Session) -> (String, usize) {
+        let input_name = session
+            .inputs()
+            .first()
+            .map(|i| i.name().to_string())
+            .unwrap_or_else(|| "input".to_string());
+
+        let input_dim = session
+            .inputs()
+            .first()
+            .and_then(|i| {
+                if let ort::value::ValueType::Tensor { shape, .. } = i.dtype() {
+                    shape.last().and_then(|&d| if d > 0 { Some(d as usize) } else { None })
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        (input_name, input_dim)
+    }
+
+    /// Load an ONNX model from a file path.
+    pub fn from_file(path: &str) -> Result<Self, InferenceError> {
+        let session = ort::session::Session::builder()
+            .and_then(|b| b.with_intra_threads(1))
+            .and_then(|b| b.commit_from_file(path))
+            .map_err(|e| InferenceError::InvalidInput(format!("ONNX load error: {e}")))?;
+
+        let (input_name, input_dim) = Self::extract_metadata(&session);
+        Ok(Self {
+            session: std::sync::Mutex::new(session),
+            input_name,
+            input_dim,
+        })
+    }
+
+    /// Load an ONNX model from in-memory bytes.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, InferenceError> {
+        let session = ort::session::Session::builder()
+            .and_then(|b| b.with_intra_threads(1))
+            .and_then(|b| b.commit_from_memory(data))
+            .map_err(|e| InferenceError::InvalidInput(format!("ONNX load error: {e}")))?;
+
+        let (input_name, input_dim) = Self::extract_metadata(&session);
+        Ok(Self {
+            session: std::sync::Mutex::new(session),
+            input_name,
+            input_dim,
+        })
+    }
+
+    /// Run inference. Input is shaped as `[1, input.len()]`.
+    fn run_session(&self, input: &[f32]) -> Result<Vec<f32>, InferenceError> {
+        let arr = ndarray::Array2::from_shape_vec((1, input.len()), input.to_vec())
+            .map_err(|e| InferenceError::InvalidInput(format!("shape error: {e}")))?;
+        let input_tensor = ort::value::Tensor::from_array(arr)
+            .map_err(|e| InferenceError::InvalidInput(format!("tensor error: {e}")))?;
+
+        let mut session = self.session.lock()
+            .map_err(|e| InferenceError::InvalidInput(format!("session lock error: {e}")))?;
+        let outputs = session
+            .run(ort::inputs![input_tensor])
+            .map_err(|e| InferenceError::InvalidInput(format!("ONNX run error: {e}")))?;
+
+        let output = &outputs[0];
+        let (_, data) = output
+            .try_extract_tensor::<f32>()
+            .map_err(|e| InferenceError::InvalidInput(format!("output extract error: {e}")))?;
+
+        Ok(data.to_vec())
+    }
+
+    /// Run a single forward pass.
+    pub fn predict(&self, input: &[f32]) -> Result<Vec<f32>, InferenceError> {
+        if self.input_dim > 0 && input.len() != self.input_dim {
+            return Err(InferenceError::DimensionMismatch {
+                expected: self.input_dim,
+                got: input.len(),
+            });
+        }
+        self.run_session(input)
+    }
+
+    /// Batch predict — feeds multiple inputs as a single batched tensor.
+    pub fn batch_predict(&self, inputs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>, InferenceError> {
+        if inputs.is_empty() {
+            return Ok(vec![]);
+        }
+        let dim = inputs[0].len();
+        let batch_size = inputs.len();
+
+        let flat: Vec<f32> = inputs.iter().flat_map(|v| v.iter().copied()).collect();
+        let arr = ndarray::Array2::from_shape_vec((batch_size, dim), flat)
+            .map_err(|e| InferenceError::InvalidInput(format!("shape error: {e}")))?;
+        let input_tensor = ort::value::Tensor::from_array(arr)
+            .map_err(|e| InferenceError::InvalidInput(format!("tensor error: {e}")))?;
+
+        let mut session = self.session.lock()
+            .map_err(|e| InferenceError::InvalidInput(format!("session lock error: {e}")))?;
+        let outputs = session
+            .run(ort::inputs![input_tensor])
+            .map_err(|e| InferenceError::InvalidInput(format!("ONNX run error: {e}")))?;
+
+        let output = &outputs[0];
+        let (_, data) = output
+            .try_extract_tensor::<f32>()
+            .map_err(|e| InferenceError::InvalidInput(format!("output extract error: {e}")))?;
+
+        let out_dim = data.len() / batch_size;
+        Ok(data.chunks(out_dim).map(|c| c.to_vec()).collect())
+    }
+}
+
+#[cfg(feature = "onnx")]
+impl fmt::Debug for OnnxModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OnnxModel")
+            .field("input_name", &self.input_name)
+            .field("input_dim", &self.input_dim)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 enum BuiltinModel {
     Linear(LinearModel),
@@ -310,6 +451,9 @@ pub struct ModelRegistry {
     models: HashMap<String, (ModelMetadata, BuiltinModel)>,
     /// Class-label tables for classification models (softmax, KNN).
     class_labels: HashMap<String, Vec<String>>,
+    /// ONNX models stored separately (OnnxModel is not Clone).
+    #[cfg(feature = "onnx")]
+    onnx_models: HashMap<String, (ModelMetadata, OnnxModel)>,
 }
 
 impl ModelRegistry {
@@ -318,6 +462,8 @@ impl ModelRegistry {
         Self {
             models: HashMap::new(),
             class_labels: HashMap::new(),
+            #[cfg(feature = "onnx")]
+            onnx_models: HashMap::new(),
         }
     }
 
@@ -417,10 +563,71 @@ impl ModelRegistry {
         self.models.insert(name.to_string(), (meta, model));
     }
 
+    // -- ONNX model registration (feature-gated) ----------------------------
+
+    /// Register an ONNX model loaded from a file path.
+    ///
+    /// Only available when compiled with `--features onnx`. Has zero impact
+    /// on binary size or runtime when the feature is disabled.
+    #[cfg(feature = "onnx")]
+    pub fn register_onnx_file(
+        &mut self,
+        name: &str,
+        path: &str,
+        description: &str,
+    ) -> Result<(), InferenceError> {
+        let model = OnnxModel::from_file(path)?;
+        let meta = ModelMetadata {
+            name: name.to_string(),
+            format: ModelFormat::Onnx,
+            input_dims: vec![model.input_dim],
+            output_dims: vec![],
+            created_at: Self::now_epoch(),
+            description: description.to_string(),
+            version: "1.0".into(),
+        };
+        self.onnx_models.insert(name.to_string(), (meta, model));
+        Ok(())
+    }
+
+    /// Register an ONNX model from in-memory bytes.
+    #[cfg(feature = "onnx")]
+    pub fn register_onnx_bytes(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        description: &str,
+    ) -> Result<(), InferenceError> {
+        let model = OnnxModel::from_bytes(data)?;
+        let meta = ModelMetadata {
+            name: name.to_string(),
+            format: ModelFormat::Onnx,
+            input_dims: vec![model.input_dim],
+            output_dims: vec![],
+            created_at: Self::now_epoch(),
+            description: description.to_string(),
+            version: "1.0".into(),
+        };
+        self.onnx_models.insert(name.to_string(), (meta, model));
+        Ok(())
+    }
+
+    /// Check if a model name refers to an ONNX model.
+    #[cfg(feature = "onnx")]
+    pub fn is_onnx_model(&self, name: &str) -> bool {
+        self.onnx_models.contains_key(name)
+    }
+
     // -- inference -----------------------------------------------------------
 
     /// Single-input prediction.
     pub fn predict(&self, name: &str, input: &[f32]) -> Result<Vec<f32>, InferenceError> {
+        // Check ONNX models first (when feature enabled).
+        #[cfg(feature = "onnx")]
+        if let Some((_, onnx)) = self.onnx_models.get(name) {
+            return onnx.predict(input);
+        }
+
         let (_, model) = self.models.get(name).ok_or(InferenceError::ModelNotFound)?;
         match model {
             BuiltinModel::Linear(m) => m.predict(input),
@@ -430,16 +637,38 @@ impl ModelRegistry {
     }
 
     /// Batch prediction — runs [`predict`](Self::predict) for each input.
+    /// ONNX models use true batched inference for better throughput.
     pub fn batch_predict(
         &self,
         name: &str,
         inputs: &[Vec<f32>],
     ) -> Result<Vec<Vec<f32>>, InferenceError> {
+        #[cfg(feature = "onnx")]
+        if let Some((_, onnx)) = self.onnx_models.get(name) {
+            return onnx.batch_predict(inputs);
+        }
+
         inputs.iter().map(|inp| self.predict(name, inp)).collect()
     }
 
     /// Classification convenience: returns the winning class label.
     pub fn classify(&self, name: &str, input: &[f32]) -> Result<String, InferenceError> {
+        // ONNX models: run predict and return argmax index as class label.
+        #[cfg(feature = "onnx")]
+        if self.onnx_models.contains_key(name) {
+            let output = self.predict(name, input)?;
+            let (idx, _) = output
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or((0, &0.0));
+            let labels = self.class_labels.get(name);
+            return Ok(labels
+                .and_then(|l| l.get(idx))
+                .cloned()
+                .unwrap_or_else(|| format!("class_{idx}")));
+        }
+
         let (_, model) = self.models.get(name).ok_or(InferenceError::ModelNotFound)?;
         match model {
             BuiltinModel::Linear(_) => {
@@ -463,15 +692,21 @@ impl ModelRegistry {
 
     // -- management ----------------------------------------------------------
 
-    /// List metadata for every registered model.
+    /// List metadata for every registered model (including ONNX).
     pub fn list_models(&self) -> Vec<&ModelMetadata> {
-        self.models.values().map(|(meta, _)| meta).collect()
+        #[allow(unused_mut)]
+        let mut result: Vec<&ModelMetadata> = self.models.values().map(|(meta, _)| meta).collect();
+        #[cfg(feature = "onnx")]
+        result.extend(self.onnx_models.values().map(|(meta, _)| meta));
+        result
     }
 
     /// Remove a model from the registry.
     pub fn unregister(&mut self, name: &str) {
         self.models.remove(name);
         self.class_labels.remove(name);
+        #[cfg(feature = "onnx")]
+        self.onnx_models.remove(name);
     }
 }
 

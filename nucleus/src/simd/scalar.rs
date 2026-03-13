@@ -20,9 +20,54 @@ pub fn filter_i64_equals(column: &[i64], target: i64) -> Vec<usize> {
         .collect()
 }
 
+/// Scalar implementation of filter_i64_less.
+pub fn filter_i64_less(column: &[i64], threshold: i64) -> Vec<usize> {
+    column
+        .iter()
+        .enumerate()
+        .filter(|&(_, &val)| val < threshold)
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// Scalar implementation of filter_i64_greater_eq.
+pub fn filter_i64_greater_eq(column: &[i64], threshold: i64) -> Vec<usize> {
+    column
+        .iter()
+        .enumerate()
+        .filter(|&(_, &val)| val >= threshold)
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// Scalar implementation of filter_i64_less_eq.
+pub fn filter_i64_less_eq(column: &[i64], threshold: i64) -> Vec<usize> {
+    column
+        .iter()
+        .enumerate()
+        .filter(|&(_, &val)| val <= threshold)
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// Scalar implementation of filter_i64_not_equals.
+pub fn filter_i64_not_equals(column: &[i64], target: i64) -> Vec<usize> {
+    column
+        .iter()
+        .enumerate()
+        .filter(|&(_, &val)| val != target)
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
 /// Scalar implementation of sum_i64.
 pub fn sum_i64(column: &[i64]) -> i64 {
     column.iter().sum()
+}
+
+/// Checked scalar sum that returns None on overflow.
+pub fn sum_i64_checked(column: &[i64]) -> Option<i64> {
+    column.iter().try_fold(0i64, |acc, &x| acc.checked_add(x))
 }
 
 /// Scalar implementation of count_non_null_i64.
@@ -50,6 +95,46 @@ pub fn filter_f64_equals(column: &[f64], target: f64) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter(|&(_, &val)| val == target)
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// Scalar filter: return indices where value < threshold.
+pub fn filter_f64_less(column: &[f64], threshold: f64) -> Vec<usize> {
+    column
+        .iter()
+        .enumerate()
+        .filter(|&(_, &val)| val < threshold)
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// Scalar filter: return indices where value >= threshold.
+pub fn filter_f64_greater_eq(column: &[f64], threshold: f64) -> Vec<usize> {
+    column
+        .iter()
+        .enumerate()
+        .filter(|&(_, &val)| val >= threshold)
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// Scalar filter: return indices where value <= threshold.
+pub fn filter_f64_less_eq(column: &[f64], threshold: f64) -> Vec<usize> {
+    column
+        .iter()
+        .enumerate()
+        .filter(|&(_, &val)| val <= threshold)
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// Scalar filter: return indices where value != target.
+pub fn filter_f64_not_equals(column: &[f64], target: f64) -> Vec<usize> {
+    column
+        .iter()
+        .enumerate()
+        .filter(|&(_, &val)| val != target)
         .map(|(idx, _)| idx)
         .collect()
 }
@@ -217,5 +302,19 @@ mod tests {
         let data = vec!["Hello", "HELLO", "hello", "world"];
         let result = filter_str_eq_ignore_case(&data, "hello");
         assert_eq!(result, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_filter_i64_less() {
+        let data = vec![1, 5, 10, 15, 20];
+        let result = filter_i64_less(&data, 10);
+        assert_eq!(result, vec![0, 1]); // indices of 1, 5
+    }
+
+    #[test]
+    fn test_filter_f64_less() {
+        let data = vec![1.0, 5.5, 10.0, 15.5, 20.0];
+        let result = filter_f64_less(&data, 10.0);
+        assert_eq!(result, vec![0, 1]); // indices of 1.0, 5.5
     }
 }

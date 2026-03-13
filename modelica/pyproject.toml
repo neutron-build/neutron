@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "neutron-sim"
+version = "0.1.0"
+description = "Python orchestration layer for equation-based physics simulation"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+fmi = ["fmpy>=0.3"]
+julia = ["juliacall>=0.9"]
+ai = ["scikit-learn>=1.3"]
+dev = ["pytest>=7.4", "pytest-asyncio>=0.23"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["neutron_sim"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

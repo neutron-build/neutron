@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'julia/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'julia/**'
+
+defaults:
+  run:
+    working-directory: julia
+
+jobs:
+  test:
+    name: Julia ${{ matrix.julia-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        julia-version: ['1.10', '1.11', '1.12']
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Julia ${{ matrix.julia-version }}
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+
+      - name: Cache Julia packages
+        uses: julia-actions/cache@v2
+
+      - name: Install dependencies
+        run: julia --project=. -e 'import Pkg; Pkg.instantiate()'
+
+      - name: Run unit tests
+        run: julia --project=. test/runtests.jl
+
+  # Integration tests run only when NUCLEUS_TEST_URL is available (self-hosted or optional)
+  integration:
+    name: Integration (Nucleus)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    env:
+      NUCLEUS_TEST_URL: ${{ secrets.NUCLEUS_TEST_URL }}
+      NUCLEUS_TEST_NUCLEUS: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Julia 1.12
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
+
+      - name: Cache Julia packages
+        uses: julia-actions/cache@v2
+
+      - name: Install dependencies
+        run: julia --project=. -e 'import Pkg; Pkg.instantiate()'
+
+      - name: Run integration tests
+        if: env.NUCLEUS_TEST_URL != ''
+        run: julia --project=. test/runtests.jl

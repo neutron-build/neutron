@@ -14,43 +14,45 @@ use nucleus::storage::MemoryEngine;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
-/// Set up a test executor with sample data.
+/// Async inner setup — usable from inside an existing runtime.
+async fn setup_executor_async() -> Arc<Executor> {
+    let catalog = Arc::new(Catalog::new());
+    let storage = Arc::new(MemoryEngine::new());
+    let executor = Arc::new(Executor::new(catalog, storage));
+
+    // Create test tables
+    exec(&executor, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT, age INT, active BOOLEAN)").await;
+    exec(&executor, "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount FLOAT, created_at BIGINT)").await;
+    exec(&executor, "CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price FLOAT, category TEXT)").await;
+
+    // Insert sample data
+    for i in 0..1000 {
+        exec(&executor, &format!(
+            "INSERT INTO users VALUES ({}, 'User{}', 'user{}@example.com', {}, {})",
+            i, i, i, 20 + (i % 50), i % 2 == 0
+        )).await;
+    }
+
+    for i in 0..5000 {
+        exec(&executor, &format!(
+            "INSERT INTO orders VALUES ({}, {}, {}, {})",
+            i, i % 1000, 10.0 + (i as f64 * 0.5), 1704067200 + i * 60
+        )).await;
+    }
+
+    for i in 0..200 {
+        exec(&executor, &format!(
+            "INSERT INTO products VALUES ({}, 'Product{}', {}, '{}')",
+            i, i, 9.99 + (i as f64), if i % 3 == 0 { "Electronics" } else if i % 3 == 1 { "Books" } else { "Clothing" }
+        )).await;
+    }
+
+    executor
+}
+
+/// Set up a test executor with sample data (sync entry point — creates its own runtime).
 fn setup_executor() -> Arc<Executor> {
-    let rt = Runtime::new().unwrap();
-    rt.block_on(async {
-        let catalog = Arc::new(Catalog::new());
-        let storage = Arc::new(MemoryEngine::new());
-        let executor = Arc::new(Executor::new(catalog, storage));
-
-        // Create test tables
-        exec(&executor, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT, age INT, active BOOLEAN)").await;
-        exec(&executor, "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount FLOAT, created_at BIGINT)").await;
-        exec(&executor, "CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price FLOAT, category TEXT)").await;
-
-        // Insert sample data
-        for i in 0..1000 {
-            exec(&executor, &format!(
-                "INSERT INTO users VALUES ({}, 'User{}', 'user{}@example.com', {}, {})",
-                i, i, i, 20 + (i % 50), i % 2 == 0
-            )).await;
-        }
-
-        for i in 0..5000 {
-            exec(&executor, &format!(
-                "INSERT INTO orders VALUES ({}, {}, {}, {})",
-                i, i % 1000, 10.0 + (i as f64 * 0.5), 1704067200 + i * 60
-            )).await;
-        }
-
-        for i in 0..200 {
-            exec(&executor, &format!(
-                "INSERT INTO products VALUES ({}, 'Product{}', {}, '{}')",
-                i, i, 9.99 + (i as f64), if i % 3 == 0 { "Electronics" } else if i % 3 == 1 { "Books" } else { "Clothing" }
-            )).await;
-        }
-
-        executor
-    })
+    Runtime::new().unwrap().block_on(setup_executor_async())
 }
 
 async fn exec(executor: &Executor, sql: &str) {
@@ -118,18 +120,27 @@ fn bench_join(c: &mut Criterion) {
 
 fn bench_insert(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
+    // Pre-build executor outside async so setup_executor_async() doesn't nest runtimes.
+    let executor = rt.block_on(setup_executor_async());
+    let insert_counter = std::sync::atomic::AtomicU64::new(100_000);
 
     let mut group = c.benchmark_group("inserts");
     for batch_size in [1, 10, 100] {
+        let executor = executor.clone();
         group.bench_with_input(BenchmarkId::from_parameter(batch_size), &batch_size, |b, &size| {
-            b.to_async(&rt).iter(|| async {
-                let executor = setup_executor();
-                for i in 0..size {
-                    let result = executor.execute(black_box(&format!(
-                        "INSERT INTO users VALUES ({}, 'Test{}', 'test{}@example.com', 30, true)",
-                        10000 + i, i, i
-                    ))).await;
-                    let _ = black_box(result);
+            let executor = executor.clone();
+            b.to_async(&rt).iter(|| {
+                let executor = executor.clone();
+                let base = insert_counter.fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
+                async move {
+                    for i in 0..size {
+                        let id = base + i as u64;
+                        let result = executor.execute(black_box(&format!(
+                            "INSERT INTO users VALUES ({}, 'Test{}', 'test{}@example.com', 30, true)",
+                            id, id, id
+                        ))).await;
+                        let _ = black_box(result);
+                    }
                 }
             });
         });
@@ -181,31 +192,44 @@ fn bench_transaction(c: &mut Criterion) {
 
 fn bench_delete_single_row(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
+    // Pre-build executor; re-insert target row before each delete to keep it fresh.
+    let executor = rt.block_on(setup_executor_async());
 
     c.bench_function("delete_single_row_by_pk", |b| {
-        b.to_async(&rt).iter(|| async {
-            // Fresh executor each iteration so there is always a row to delete
-            let executor = setup_executor();
-            let result = executor.execute(black_box(
-                "DELETE FROM users WHERE id = 500"
-            )).await;
-            black_box(result)
+        let executor = executor.clone();
+        b.to_async(&rt).iter(|| {
+            let executor = executor.clone();
+            async move {
+                // Ensure the row exists (ignore error if it already does)
+                let _ = executor.execute("INSERT INTO users VALUES (500, 'User500', 'u@e.com', 30, true)").await;
+                let result = executor.execute(black_box(
+                    "DELETE FROM users WHERE id = 500"
+                )).await;
+                black_box(result)
+            }
         });
     });
 }
 
 fn bench_concurrent_inserts(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
+    let executor = rt.block_on(setup_executor_async());
+    let batch_counter = std::sync::atomic::AtomicU64::new(500_000);
 
     c.bench_function("concurrent_inserts_100_rows", |b| {
-        b.to_async(&rt).iter(|| async {
-            let executor = setup_executor();
-            for i in 0..100 {
-                let result = executor.execute(black_box(&format!(
-                    "INSERT INTO users VALUES ({}, 'Batch{}', 'batch{}@example.com', 25, true)",
-                    50000 + i, i, i
-                ))).await;
-                let _ = black_box(result);
+        let executor = executor.clone();
+        b.to_async(&rt).iter(|| {
+            let executor = executor.clone();
+            let base = batch_counter.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+            async move {
+                for i in 0..100u64 {
+                    let id = base + i;
+                    let result = executor.execute(black_box(&format!(
+                        "INSERT INTO users VALUES ({}, 'Batch{}', 'batch{}@example.com', 25, true)",
+                        id, id, id
+                    ))).await;
+                    let _ = black_box(result);
+                }
             }
         });
     });

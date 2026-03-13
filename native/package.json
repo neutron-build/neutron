@@ -1,0 +1,17 @@
+{
+  "name": "neutron-native-workspace",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "modules/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "dev": "pnpm --filter neutron-native-cli dev"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

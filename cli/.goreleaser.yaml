@@ -1,0 +1,55 @@
+version: 2
+project_name: neutron
+
+monorepo:
+  tag_prefix: cli/
+  dir: .
+
+builds:
+  - id: neutron
+    main: .
+    binary: neutron
+    ldflags:
+      - -s -w
+      - -X github.com/neutron-build/neutron/cli/cmd.version={{.Version}}
+      - -X github.com/neutron-build/neutron/cli/cmd.commit={{.Commit}}
+      - -X github.com/neutron-build/neutron/cli/cmd.date={{.Date}}
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CGO_ENABLED=0
+
+archives:
+  - id: default
+    formats: ['tar.gz']
+    format_overrides:
+      - goos: windows
+        formats: ['zip']
+    name_template: "neutron_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+brews:
+  - name: neutron
+    repository:
+      owner: neutron-build
+      name: homebrew-tap
+    homepage: https://neutron.build
+    description: "The universal CLI for the Neutron ecosystem"
+    license: BUSL-1.1
+    install: |
+      bin.install "neutron"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'

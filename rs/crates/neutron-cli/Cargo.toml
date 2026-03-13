@@ -6,5 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "CLI for the Neutron Rust framework"
 
+[[bin]]
+name = "neutron-rs"
+path = "src/main.rs"
+
 [dependencies]
 clap = { workspace = true }

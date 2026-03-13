@@ -1,0 +1,215 @@
+name: Nucleus Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "nucleus/**"
+      - ".github/workflows/nucleus-release.yml"
+    tags:
+      - "nucleus/v*"
+  pull_request:
+    paths:
+      - "nucleus/**"
+      - ".github/workflows/nucleus-release.yml"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # CI: runs on every push / PR that touches nucleus/
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+
+      - name: Build
+        run: cargo build --bin nucleus
+        working-directory: nucleus
+
+      - name: Test (lib only — skips slow stress tests)
+        run: cargo test --lib -q
+        working-directory: nucleus
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+      - run: cargo clippy -- -D warnings
+        working-directory: nucleus
+
+  # ---------------------------------------------------------------------------
+  # Release builds: only on nucleus/v* tags, after CI passes
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    needs: [test, clippy]
+    if: startsWith(github.ref, 'refs/tags/nucleus/v')
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            os: linux
+            arch: amd64
+            cross: false
+
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            os: linux
+            arch: arm64
+            cross: true
+
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            os: darwin
+            arch: arm64
+            cross: false
+
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            os: darwin
+            arch: amd64
+            cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+          key: release-${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --bin nucleus --target ${{ matrix.target }}
+        working-directory: nucleus
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: "true"
+          CARGO_PROFILE_RELEASE_LTO: "thin"
+
+      - name: Build (cross)
+        if: ${{ matrix.cross }}
+        run: cross build --release --bin nucleus --target ${{ matrix.target }}
+        working-directory: nucleus
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: "true"
+          CARGO_PROFILE_RELEASE_LTO: "thin"
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/nucleus/}" >> "$GITHUB_OUTPUT"
+
+      - name: Package
+        id: package
+        run: |
+          ARCHIVE="nucleus-${{ steps.version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
+          tar czf "$ARCHIVE" -C "nucleus/target/${{ matrix.target }}/release" nucleus
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nucleus-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ steps.package.outputs.archive }}
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # GitHub Release: collect all platform archives, checksum, publish
+  # ---------------------------------------------------------------------------
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/nucleus/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: |
+          sha256sum nucleus-*.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/nucleus/}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Nucleus ${{ steps.version.outputs.version }}"
+          generate_release_notes: true
+          files: |
+            artifacts/nucleus-*.tar.gz
+            artifacts/checksums.txt
+          body: |
+            ## Nucleus ${{ steps.version.outputs.version }}
+
+            Multi-model database engine — SQL, KV, Graph, Document, Vector, FTS, TimeSeries, Blob, Columnar, Datalog, PubSub, Geo, and Streams in a single binary.
+
+            ### Quick start
+
+            ```bash
+            # Download and extract
+            tar xzf nucleus-${{ steps.version.outputs.version }}-<os>-<arch>.tar.gz
+
+            # Start the server (PostgreSQL wire protocol on :5432)
+            ./nucleus serve
+
+            # Connect with any PostgreSQL client
+            psql -h 127.0.0.1 -p 5432
+            ```
+
+            ### Verify checksums
+
+            ```bash
+            sha256sum -c checksums.txt
+            ```
+
+            ### Platforms
+
+            | File | OS | Arch |
+            |------|----|------|
+            | `nucleus-${{ steps.version.outputs.version }}-linux-amd64.tar.gz` | Linux | x86_64 |
+            | `nucleus-${{ steps.version.outputs.version }}-linux-arm64.tar.gz` | Linux | aarch64 |
+            | `nucleus-${{ steps.version.outputs.version }}-darwin-arm64.tar.gz` | macOS | Apple Silicon |
+            | `nucleus-${{ steps.version.outputs.version }}-darwin-amd64.tar.gz` | macOS | Intel |

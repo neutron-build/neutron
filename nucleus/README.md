@@ -1,8 +1,8 @@
 # Nucleus
 
-Multi-model database engine. One pgwire endpoint, nine data models, unified MVCC transactions.
+Multi-model database engine. One pgwire endpoint, multiple data models, unified transactions.
 
-SQL, Key-Value, Vector, Timeseries, Document, Full-Text Search, Graph, Geo, and Pub/Sub — all accessed through standard SQL function calls over a single PostgreSQL-compatible connection. No secondary ports, no secondary protocols, no secondary clients.
+SQL, Key-Value, Columnar, Vector, Timeseries, Document, Full-Text Search, Graph, Geo, Blob, Datalog, and Pub/Sub -- all accessed through standard SQL function calls over a single PostgreSQL-compatible connection. No secondary ports, no secondary protocols, no secondary clients. Also supports the RESP (Redis) wire protocol for KV operations.
 
 ## Quick Start
 
@@ -28,7 +28,7 @@ SELECT * FROM users WHERE email LIKE '%@example.com';
 
 ### Key-Value
 
-Hash map with optional TTL. B-tree storage by default; LSM-tree variant for write-heavy workloads. TTL uses passive lazy expiry on read plus an active 100ms background sweep.
+Hash map with optional TTL. B-tree storage by default; LSM-tree variant for write-heavy workloads. TTL uses passive lazy expiry on read plus an active 100ms background sweep. Also accessible via RESP (Redis) wire protocol for drop-in Redis client compatibility.
 
 ```sql
 SELECT kv_set('session:abc', '{"user":1}', 3600);   -- set with 60-min TTL
@@ -39,9 +39,19 @@ SELECT kv_ttl('session:abc');                         -- remaining seconds
 SELECT kv_del('session:abc');                         -- delete
 ```
 
+### Columnar
+
+Column-oriented storage for analytics. Per-column vectors with vectorized aggregation. WAL-backed for durability.
+
+```sql
+SELECT columnar_create('events', 'timestamp,user_id,action,duration');
+SELECT columnar_insert('events', '2024-01-01T00:00:00,1,click,150');
+SELECT columnar_aggregate('events', 'duration', 'avg');
+```
+
 ### Vector
 
-HNSW index for approximate nearest-neighbor search. Validated configuration: `M=16`, `ef_construction=64`, `ef_search=40–128` (tuned per query). Switch to DiskANN for datasets exceeding 1 billion vectors.
+HNSW index for approximate nearest-neighbor search. Supports cosine, L2, and inner product distance metrics. WAL-backed.
 
 ```sql
 SELECT vector_insert('embeddings', 1, '[0.1, 0.2, ...]');
@@ -52,7 +62,7 @@ SELECT * FROM vector_search('embeddings', '[0.1, 0.2, ...]', 10, '{"category": "
 
 ### Timeseries
 
-Time-interval chunk storage (TimescaleDB model) with Gorilla XOR delta-of-delta compression. Typical compression ratio: 10–20× for homogenous sensor data. Chunks are indexed and compressed independently.
+Columnar time-series storage with Gorilla delta-of-delta timestamp compression and XOR value compression. Typical compression ratio: 10-20x for homogenous sensor data. Partitioned by time windows with per-partition statistics.
 
 ```sql
 SELECT ts_insert('temperature', 1700000000000, 23.5);
@@ -64,7 +74,7 @@ SELECT ts_retention('temperature', '30d');
 
 ### Document
 
-JSONB column with GIN index. No separate engine — row-oriented B-tree storage with path-based indexes. Competitive with MongoDB for KB-scale documents with <50% update-heavy workloads. Document-level MVCC is unified with SQL rows.
+JSONB TLV encoding with GIN index for path-based queries and containment checks. WAL-backed.
 
 ```sql
 SELECT doc_insert('posts', '{"title": "Hello", "author": "alice", "body": "..."}');
@@ -76,7 +86,7 @@ SELECT doc_count('posts');
 
 ### Full-Text Search
 
-Tantivy inverted index with BM25 ranking — 50× faster indexing and 20× faster ranking than PostgreSQL's native `tsvector`. Supports field boosting, phrase queries, fuzzy matching. Default BM25 parameters: `k1=1.2`, `b=0.75`.
+Custom inverted index with BM25 ranking. Supports field boosting, phrase queries, fuzzy matching (Levenshtein), and 6-language stemmers (English, German, French, Spanish, Italian, Portuguese). WAL-backed with binary persistence.
 
 ```sql
 SELECT fts_index('articles', 1, 'Machine learning transformers explained');
@@ -86,10 +96,10 @@ SELECT * FROM fts_search_ranked('articles', 'transformers', 10);
 
 ### Graph
 
-SQL recursive CTEs with materialized adjacency lists for hot nodes. Efficient for graphs under 1 billion relationships. Native graph engine (Cypher subset) is planned for a future release when billion-scale queries become a requirement.
+Native graph engine with adjacency lists, CSR format for read-heavy traversals, and a Cypher query subset. Supports BFS, DFS, Dijkstra shortest path, label indexes, and property indexes. WAL-backed.
 
 ```sql
-SELECT graph_add_node('person', '{"name": "Alice"}');
+SELECT graph_add_node(1, ARRAY['Person'], '{"name": "Alice"}');
 SELECT graph_add_edge(1, 2, 'follows', '{"since": "2024-01-01"}');
 SELECT * FROM graph_neighbors(1, 'follows');
 SELECT * FROM graph_path(1, 5, 'follows', 3);   -- shortest path, max depth 3
@@ -97,18 +107,39 @@ SELECT * FROM graph_path(1, 5, 'follows', 3);   -- shortest path, max depth 3
 
 ### Geo
 
-H3 hexagonal grid for discrete queries (radius search, aggregation) paired with PostGIS-compatible GIST index for arbitrary polygon containment. Both representations are stored and kept in sync. Use H3 for speed, GIST for precision.
+Custom R-tree spatial index with PostGIS-compatible function signatures. Supports point-in-radius queries, polygon containment, distance calculations (Haversine for geographic, Euclidean for Cartesian), and area computation.
 
 ```sql
 SELECT geo_insert('locations', 1, 37.7749, -122.4194);    -- (lat, lon)
 SELECT * FROM geo_radius('locations', 37.7749, -122.4194, 1000);  -- 1km radius
-SELECT * FROM geo_h3_aggregate('locations', 6);            -- H3 resolution 6 hexbins
 SELECT * FROM geo_polygon_contains('locations', '[[...]]'); -- GeoJSON polygon
+```
+
+### Blob/Object Store
+
+Content-addressed chunk storage with deduplication (BLAKE3 hashing). Supports byte-range reads, tagging, and multi-chunk large objects. WAL-backed.
+
+```sql
+SELECT blob_store('attachments', 'file.pdf', <binary_data>);
+SELECT blob_get('attachments', 'file.pdf');
+SELECT blob_get_range('attachments', 'file.pdf', 0, 1024);  -- first 1KB
+SELECT blob_tag('attachments', 'file.pdf', 'type', 'pdf');
+```
+
+### Datalog
+
+Logic programming engine with semi-naive bottom-up evaluation. Supports recursive rules, stratified negation, and cross-model fact import from relational tables and graph stores.
+
+```sql
+SELECT datalog_assert('parent(alice, bob)');
+SELECT datalog_rule('ancestor(X, Y) :- parent(X, Y)');
+SELECT datalog_rule('ancestor(X, Z) :- ancestor(X, Y), parent(Y, Z)');
+SELECT datalog_query('ancestor(alice, Who)');
 ```
 
 ### Pub/Sub
 
-PostgreSQL LISTEN/NOTIFY for up to ~1,000 msg/sec. Suitable for application dashboards, event notifications, and cross-process signaling. For high-throughput workloads, the pluggable broker tier (Redis, RabbitMQ) is available as a drop-in replacement without changing the client API.
+PostgreSQL LISTEN/NOTIFY for event notifications and cross-process signaling.
 
 ```sql
 SELECT pubsub_publish('notifications', '{"type": "message", "body": "Hello"}');
@@ -117,7 +148,7 @@ LISTEN notifications;   -- standard PostgreSQL LISTEN
 
 ## Transactions
 
-All nine data models participate in the same MVCC transaction. SQL inserts, KV sets, vector upserts, and document writes in a single `BEGIN`/`COMMIT` are atomic.
+All data models participate in the same transaction context. SQL inserts, KV sets, vector upserts, and document writes in a single `BEGIN`/`COMMIT` are atomic.
 
 ```sql
 BEGIN;
@@ -127,17 +158,16 @@ SELECT doc_insert('order_events', '{"order_id": 1, "event": "created"}');
 COMMIT;
 ```
 
-Isolation levels: Read Committed (default), Repeatable Read, Serializable (SSI). All models share the same MVCC epoch — consistent snapshots across SQL rows, KV keys, vector metadata, and document fields.
-
 ## Indexes
 
 | Index type | Used by | Configuration |
 |------------|---------|---------------|
 | B-tree | SQL, KV | Default; deterministic p99 latency |
-| GIN | Document, FTS | Path queries, full-text inverted lists |
-| HNSW | Vector | `M=16`, `ef_construction=64`, `ef_search=40–128` |
-| H3 + GIST | Geo | H3 for radius/aggregation, GIST for polygons |
-| Inverted (Tantivy) | FTS | BM25, field boosting, roaring bitmap doc sets |
+| GIN | Document | Path-based queries, containment |
+| HNSW | Vector | ANN graph traversal, cosine/L2/inner product |
+| R-tree | Geo | Spatial point/radius/polygon queries |
+| Inverted | FTS | BM25, field boosting, 6-language stemmers |
+| Adjacency + CSR | Graph | Label index, property B-tree |
 
 ## Connection
 
@@ -147,14 +177,7 @@ Nucleus speaks the PostgreSQL wire protocol (pgwire v3). Any standard PostgreSQL
 postgres://user:password@localhost:5432/nucleus
 ```
 
-Recommended pool settings (adjust for core count and storage type):
-
-| Setting | SSD | HDD |
-|---------|-----|-----|
-| Min connections | 4–8 | 4 |
-| Max connections | `cores × 4` | `cores × 2` |
-| Health check | 30s | 30s |
-| Idle timeout | 5 min | 5 min |
+For KV operations, Redis clients can connect via the RESP protocol module.
 
 ## Deployment
 
@@ -177,24 +200,39 @@ NUCLEUS_ENCRYPT_KEY=<key> nucleus --encrypt --compress --port 5432
 ```
 nucleus/
 ├── src/
-│   ├── server/       # pgwire listener, startup/auth, session management
-│   ├── sql/          # SQL parser (sqlparser 0.61), planner, executor
-│   ├── storage/      # DiskEngine (B-tree pages), WAL, MVCC, buffer pool
-│   ├── kv/           # KV store (B-tree + LSM variant, TTL sweep)
-│   ├── vector/       # HNSW index, filter-aware traversal
-│   ├── ts/           # Chunk manager, Gorilla XOR compression
-│   ├── doc/          # JSONB + GIN index
-│   ├── fts/          # Tantivy inverted index + BM25
-│   ├── graph/        # Adjacency list, recursive CTE rewriter
-│   ├── geo/          # H3 grid + PostGIS GIST
-│   ├── pubsub/       # LISTEN/NOTIFY + pluggable broker tier
-│   └── cluster/      # Raft log, query forwarding
+│   ├── wire/          # pgwire listener, startup/auth, session management
+│   ├── resp/          # RESP (Redis) wire protocol
+│   ├── sql/           # SQL parser (sqlparser), planner, executor
+│   ├── executor/      # Query execution engine
+│   ├── storage/       # DiskEngine (B-tree pages), WAL, MVCC, buffer pool,
+│   │                  #   LSM, columnar engine, compression, persistence
+│   ├── kv/            # KV store (HashMap + WAL, TTL, collections, tiered)
+│   ├── vector/        # HNSW index, WAL, tiered storage
+│   ├── timeseries/    # Columnar time-series, Gorilla compression
+│   ├── document/      # JSONB TLV + GIN index, WAL, tiered
+│   ├── fts/           # Custom inverted index + BM25, WAL, tiered
+│   ├── graph/         # Adjacency lists + CSR, Cypher engine, WAL, tiered
+│   ├── geo/           # R-tree spatial index
+│   ├── blob/          # Content-addressed chunk store, WAL
+│   ├── columnar/      # Column-oriented analytics engine
+│   ├── datalog/       # Datalog engine (parser, evaluator, WAL)
+│   ├── sparse/        # Sparse vector operations
+│   ├── tensor/        # Tensor operations
+│   ├── pubsub/        # LISTEN/NOTIFY
+│   ├── distributed/   # Distributed coordination
+│   ├── raft/          # Raft consensus
+│   ├── sharding/      # Shard management
+│   ├── replication/   # Replication protocol
+│   ├── cache/         # Query and page caching
+│   ├── simd/          # SIMD-accelerated operations
+│   ├── security/      # Auth, RLS, encryption
+│   └── config/        # Configuration management
 ```
 
 ## Status
 
-Active development. SQL, KV, Timeseries, Document, Vector, FTS, Geo, and Pub/Sub are implemented. See `STATUS.md` for current feature status and known gaps.
+Active development. See `STATUS.md` for current feature status and known gaps, and `NUCLEUS-ROADMAP.md` for the implementation roadmap.
 
 ## License
 
-Business Source License 1.1 — converts to MIT after 4 years. See [LICENSE](./LICENSE).
+Business Source License 1.1 -- converts to MIT after 4 years. See [LICENSE](./LICENSE).

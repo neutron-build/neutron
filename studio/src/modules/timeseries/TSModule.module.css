@@ -1,0 +1,109 @@
+.layout {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.metricName {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.statPills { display: flex; gap: var(--space-2); }
+
+.statPill {
+  font-size: var(--text-xs);
+  padding: 1px var(--space-2);
+  background: color-mix(in srgb, var(--model-ts) 12%, transparent);
+  color: var(--model-ts);
+  border: 1px solid color-mix(in srgb, var(--model-ts) 25%, transparent);
+  border-radius: var(--radius-sm);
+}
+
+.queryPanel {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.queryRow {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.fieldGroup {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.fieldLabel {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.fieldInput, .fieldSelect {
+  padding: 4px var(--space-2);
+  font-size: var(--text-xs);
+  border-radius: var(--radius-sm);
+}
+
+.runBtn {
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--text-xs);
+  background: var(--model-ts);
+  color: #fff;
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+  margin-left: auto;
+  transition: opacity var(--transition);
+}
+
+.runBtn:hover { opacity: 0.85; }
+.runBtn:disabled { opacity: 0.5; }
+
+.chartArea {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.sparkline {
+  display: block;
+}
+
+.chartLabel {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.grid {
+  flex: 1;
+  overflow: hidden;
+}
+
+.hint {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+}

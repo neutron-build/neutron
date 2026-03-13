@@ -186,15 +186,14 @@ impl EncryptedIndex {
     /// Returns `true` if the row ID was found and removed.
     pub fn remove(&mut self, plaintext: &[u8], row_id: u64) -> bool {
         let encrypted = self.encrypt_value(plaintext);
-        if let Some(ids) = self.entries.get_mut(&encrypted) {
-            if let Some(pos) = ids.iter().position(|&id| id == row_id) {
+        if let Some(ids) = self.entries.get_mut(&encrypted)
+            && let Some(pos) = ids.iter().position(|&id| id == row_id) {
                 ids.remove(pos);
                 if ids.is_empty() {
                     self.entries.remove(&encrypted);
                 }
                 return true;
             }
-        }
         false
     }
 

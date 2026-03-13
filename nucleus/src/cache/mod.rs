@@ -361,11 +361,10 @@ impl DistributedCacheRouter {
 
     /// Delete a key from the owning node.
     pub fn delete(&mut self, key: &str) -> bool {
-        if let Some(node_id) = self.route_key(key) {
-            if let Some(cache) = self.partitions.get_mut(&node_id) {
+        if let Some(node_id) = self.route_key(key)
+            && let Some(cache) = self.partitions.get_mut(&node_id) {
                 return cache.delete(key);
             }
-        }
         false
     }
 
@@ -726,11 +725,10 @@ impl LfShard {
             .min_by_key(|(_, e)| e.access_count.load(Ordering::Relaxed))
             .map(|(k, _)| k.clone());
 
-        if let Some(key) = victim {
-            if let Some(entry) = self.entries.remove(&key) {
+        if let Some(key) = victim
+            && let Some(entry) = self.entries.remove(&key) {
                 self.used_bytes -= entry.size_bytes;
             }
-        }
     }
 
     fn evict_expired(&mut self) {
@@ -882,6 +880,85 @@ impl LockFreeCache {
             h = h.wrapping_mul(0x100000001b3);
         }
         (h as usize) % self.shard_count
+    }
+}
+
+// ============================================================================
+// Pressurable implementation for CacheTier
+// ============================================================================
+
+impl crate::memory::Pressurable for CacheTier {
+    fn current_usage(&self) -> usize {
+        self.used_bytes
+    }
+
+    /// Shrink to `target` bytes by first expiring stale entries, then
+    /// evicting LRU entries until at or below the target.
+    /// Returns the number of bytes actually freed.
+    fn shrink_to(&mut self, target: usize) -> usize {
+        let initial = self.used_bytes;
+        // Phase 1: remove expired entries (free cost).
+        self.evict_expired();
+        // Phase 2: evict LRU entries until at or below target.
+        while self.used_bytes > target && !self.entries.is_empty() {
+            self.evict_lru();
+        }
+        initial.saturating_sub(self.used_bytes)
+    }
+
+    fn priority(&self) -> crate::memory::Priority {
+        crate::memory::Priority::Low
+    }
+
+    fn name(&self) -> &str {
+        "cache"
+    }
+}
+
+/// Pressurable adapter for `InvertedIndex` — reports estimated memory usage
+/// and checkpoints the WAL on pressure (reduces WAL file size, keeps all data).
+impl crate::memory::Pressurable for crate::fts::InvertedIndex {
+    fn current_usage(&self) -> usize {
+        // Estimate: stored text bytes + posting list overhead (24 bytes per posting).
+        let text_bytes: usize = self.original_texts().values().map(|s| s.len()).sum();
+        let posting_bytes = self.estimated_posting_bytes();
+        text_bytes + posting_bytes
+    }
+
+    fn shrink_to(&mut self, _target: usize) -> usize {
+        // FTS data is authoritative — can't evict without data loss.
+        // Checkpoint the WAL to compact it (reduces disk footprint).
+        let _ = self.checkpoint_wal();
+        0
+    }
+
+    fn priority(&self) -> crate::memory::Priority {
+        crate::memory::Priority::Normal
+    }
+
+    fn name(&self) -> &str {
+        "fts"
+    }
+}
+
+/// Pressurable adapter for `SparseIndex` — reports estimated memory usage.
+/// Sparse index data is authoritative; shrink is a no-op.
+impl crate::memory::Pressurable for crate::sparse::SparseIndex {
+    fn current_usage(&self) -> usize {
+        // Rough estimate: each document has ~256 bytes of posting list overhead.
+        self.doc_count() * 256
+    }
+
+    fn shrink_to(&mut self, _target: usize) -> usize {
+        0 // Data is authoritative — no eviction without data loss.
+    }
+
+    fn priority(&self) -> crate::memory::Priority {
+        crate::memory::Priority::Normal
+    }
+
+    fn name(&self) -> &str {
+        "sparse"
     }
 }
 

@@ -96,6 +96,24 @@ pub trait WalBackend: Send + Sync {
     fn sync(&self) -> std::io::Result<()>;
     /// Get WAL stats: (bytes_written, syncs).
     fn wal_stats(&self) -> (u64, u64) { (0, 0) }
+    /// Group-commit sync: leader performs the actual sync, followers piggyback.
+    fn group_sync(&self) {
+        if let Err(e) = self.sync() {
+            tracing::error!("WAL group_sync failed: {e}");
+        }
+    }
+    /// Log a COMMIT record for the given transaction. Returns the assigned LSN.
+    fn log_commit(&self, _txn_id: u64) -> std::io::Result<u64> { Ok(0) }
+    /// Log an ABORT record for the given transaction. Returns the assigned LSN.
+    fn log_abort(&self, _txn_id: u64) -> std::io::Result<u64> { Ok(0) }
+    /// Log a checkpoint record and return the checkpoint LSN.
+    fn log_checkpoint(&self) -> std::io::Result<u64> {
+        Ok(0)
+    }
+    /// Truncate WAL segments before the given LSN to reclaim disk space.
+    fn truncate_before(&self, _before_lsn: u64) -> std::io::Result<usize> {
+        Ok(0)
+    }
 }
 
 /// The write-ahead log.
@@ -114,6 +132,8 @@ pub struct Wal {
     pub syncs: AtomicU64,
     /// How to sync data to disk.
     sync_mode: SyncMode,
+    /// Group commit coordinator.
+    committer: GroupCommitter,
 }
 
 impl Wal {
@@ -145,6 +165,7 @@ impl Wal {
             bytes_written: AtomicU64::new(0),
             syncs: AtomicU64::new(0),
             sync_mode: SyncMode::Fsync,
+            committer: GroupCommitter::new(),
         })
     }
 
@@ -214,6 +235,20 @@ impl Wal {
         self.next_lsn.load(Ordering::Acquire)
     }
 
+    /// Convenience constructor: create a new WAL file with a specific sync mode.
+    pub fn new(path: &Path, sync_mode: SyncMode) -> std::io::Result<Self> {
+        Self::open_with_sync_mode(path, sync_mode)
+    }
+
+    /// Perform a group-commit sync. The leader calls fsync; followers piggyback.
+    pub fn group_sync(&self) {
+        self.committer.group_sync(|| {
+            if let Err(e) = self.sync() {
+                tracing::error!("WAL group_sync failed: {e}");
+            }
+        });
+    }
+
 }
 
 impl WalBackend for Wal {
@@ -231,6 +266,22 @@ impl WalBackend for Wal {
             self.syncs.load(Ordering::Relaxed),
         )
     }
+
+    fn group_sync(&self) {
+        Wal::group_sync(self)
+    }
+
+    fn log_commit(&self, txn_id: u64) -> std::io::Result<u64> {
+        Wal::log_commit(self, txn_id)
+    }
+
+    fn log_abort(&self, txn_id: u64) -> std::io::Result<u64> {
+        Wal::log_abort(self, txn_id)
+    }
+
+    fn log_checkpoint(&self) -> std::io::Result<u64> {
+        Wal::log_checkpoint(self)
+    }
 }
 
 impl Wal {
@@ -246,12 +297,12 @@ impl Wal {
         writer.write_all(&[record_type])?;
         writer.write_all(&0u32.to_le_bytes())?; // page_id = 0 (not applicable)
 
-        // CRC over the header fields
-        let mut crc_data = Vec::with_capacity(17);
-        crc_data.extend_from_slice(&lsn.to_le_bytes());
-        crc_data.extend_from_slice(&txn_id.to_le_bytes());
-        crc_data.push(record_type);
-        let crc = crc32c::crc32c(&crc_data);
+        // CRC over the header fields — stack array avoids heap allocation
+        let mut crc_buf = [0u8; 17]; // lsn(8) + txn_id(8) + record_type(1)
+        crc_buf[..8].copy_from_slice(&lsn.to_le_bytes());
+        crc_buf[8..16].copy_from_slice(&txn_id.to_le_bytes());
+        crc_buf[16] = record_type;
+        let crc = crc32c::crc32c(&crc_buf);
         writer.write_all(&crc.to_le_bytes())?;
 
         self.writes.fetch_add(1, Ordering::Relaxed);
@@ -320,25 +371,27 @@ pub fn read_wal_records(path: &Path) -> std::io::Result<Vec<WalRecord>> {
             if let Some(ref img) = page_image {
                 let computed = crc32c::crc32c(img.as_ref());
                 if computed != stored_crc {
-                    tracing::warn!(
-                        "WAL CRC mismatch at LSN {lsn} (page write), skipping record"
+                    tracing::error!(
+                        "WAL CORRUPTION: CRC mismatch at LSN {lsn} (page write): stored={stored_crc:#x}, computed={computed:#x}. \
+                         Skipping record — data loss may have occurred."
                     );
                     pos += record_len as u64;
                     continue;
                 }
             }
         } else {
-            // For control records, CRC is over header fields (lsn + txn_id + record_type)
-            let mut crc_data = Vec::with_capacity(17);
-            crc_data.extend_from_slice(&lsn_buf);
-            crc_data.extend_from_slice(&txn_buf);
-            crc_data.push(record_type);
+            // For control records, CRC is over header fields — stack array avoids heap alloc
+            let mut crc_data = [0u8; 17];
+            crc_data[..8].copy_from_slice(&lsn_buf);
+            crc_data[8..16].copy_from_slice(&txn_buf);
+            crc_data[16] = record_type;
             let computed = crc32c::crc32c(&crc_data);
             if computed != stored_crc {
-                tracing::warn!(
-                    "WAL CRC mismatch at LSN {lsn} (control record), skipping record"
+                tracing::error!(
+                    "WAL CORRUPTION: CRC mismatch at LSN {lsn} (control record): stored={stored_crc:#x}, computed={computed:#x}. \
+                     Skipping record — transaction state may be inconsistent."
                 );
-                pos += record_len as u64;
+                pos += 4 + record_len as u64;
                 continue;
             }
         }
@@ -404,6 +457,8 @@ pub struct SegmentedWal {
     pub syncs: AtomicU64,
     /// How to sync data to disk.
     sync_mode: SyncMode,
+    /// Group commit coordinator.
+    committer: GroupCommitter,
 }
 
 struct ActiveSegment {
@@ -472,6 +527,7 @@ impl SegmentedWal {
             bytes_written_total: AtomicU64::new(0),
             syncs: AtomicU64::new(0),
             sync_mode: SyncMode::Fsync,
+            committer: GroupCommitter::new(),
         })
     }
 
@@ -623,11 +679,11 @@ impl SegmentedWal {
         active.writer.write_all(&[record_type])?;
         active.writer.write_all(&0u32.to_le_bytes())?;
 
-        let mut crc_data = Vec::with_capacity(17);
-        crc_data.extend_from_slice(&lsn.to_le_bytes());
-        crc_data.extend_from_slice(&txn_id.to_le_bytes());
-        crc_data.push(record_type);
-        let crc = crc32c::crc32c(&crc_data);
+        let mut crc_buf = [0u8; 17];
+        crc_buf[..8].copy_from_slice(&lsn.to_le_bytes());
+        crc_buf[8..16].copy_from_slice(&txn_id.to_le_bytes());
+        crc_buf[16] = record_type;
+        let crc = crc32c::crc32c(&crc_buf);
         active.writer.write_all(&crc.to_le_bytes())?;
 
         active.bytes_written += record_len as u64;
@@ -666,6 +722,15 @@ impl SegmentedWal {
 
         Ok(())
     }
+
+    /// Perform a group-commit sync. The leader calls fsync; followers piggyback.
+    pub fn group_sync(&self) {
+        self.committer.group_sync(|| {
+            if let Err(e) = self.sync() {
+                tracing::error!("SegmentedWal group_sync failed: {e}");
+            }
+        });
+    }
 }
 
 impl WalBackend for SegmentedWal {
@@ -682,6 +747,26 @@ impl WalBackend for SegmentedWal {
             self.bytes_written_total.load(Ordering::Relaxed),
             self.syncs.load(Ordering::Relaxed),
         )
+    }
+
+    fn group_sync(&self) {
+        SegmentedWal::group_sync(self)
+    }
+
+    fn log_commit(&self, txn_id: u64) -> std::io::Result<u64> {
+        SegmentedWal::log_commit(self, txn_id)
+    }
+
+    fn log_abort(&self, txn_id: u64) -> std::io::Result<u64> {
+        SegmentedWal::log_abort(self, txn_id)
+    }
+
+    fn log_checkpoint(&self) -> std::io::Result<u64> {
+        SegmentedWal::log_checkpoint(self)
+    }
+
+    fn truncate_before(&self, before_lsn: u64) -> std::io::Result<usize> {
+        SegmentedWal::truncate_before(self, before_lsn)
     }
 }
 
@@ -701,12 +786,20 @@ impl std::fmt::Debug for SegmentedWal {
 
 /// Batched sync for group commit optimization.
 ///
-/// Instead of calling `fsync` for every individual commit, multiple
-/// transactions' commits are batched and flushed together, amortizing
-/// the fsync cost across the group.
+/// Uses a leader-follower pattern with parking_lot::Condvar:
+/// - First caller becomes the leader, performs the actual sync
+/// - Subsequent callers wait on the condvar for the leader to finish
+/// - After sync, leader increments epoch and wakes all followers
 pub struct GroupCommitter {
-    /// The underlying WAL (either single-file or segmented).
-    pending_syncs: AtomicU64,
+    state: parking_lot::Mutex<GroupCommitState>,
+    done: parking_lot::Condvar,
+}
+
+struct GroupCommitState {
+    syncing: bool,
+    epoch: u64,
+    waiters: u64,
+    sync_count: u64,
 }
 
 impl Default for GroupCommitter {
@@ -716,27 +809,55 @@ impl Default for GroupCommitter {
 }
 
 impl GroupCommitter {
-    /// Create a new group committer.
     pub fn new() -> Self {
         Self {
-            pending_syncs: AtomicU64::new(0),
+            state: parking_lot::Mutex::new(GroupCommitState {
+                syncing: false,
+                epoch: 0,
+                waiters: 0,
+                sync_count: 0,
+            }),
+            done: parking_lot::Condvar::new(),
         }
     }
 
-    /// Record that a transaction wants to sync. Returns the pending count.
-    pub fn request_sync(&self) -> u64 {
-        self.pending_syncs.fetch_add(1, Ordering::SeqCst)
+    /// Perform a group sync. Only the leader calls `sync_fn`; followers wait.
+    pub fn group_sync<F: FnOnce()>(&self, sync_fn: F) -> u64 {
+        let mut state = self.state.lock();
+        if state.syncing {
+            let my_epoch = state.epoch;
+            state.waiters += 1;
+            while state.epoch == my_epoch && state.syncing {
+                self.done.wait(&mut state);
+            }
+            state.waiters -= 1;
+            if state.epoch > my_epoch {
+                return state.epoch;
+            }
+        }
+        state.syncing = true;
+        drop(state);
+        sync_fn();
+        let mut state = self.state.lock();
+        state.syncing = false;
+        state.epoch += 1;
+        state.sync_count += 1;
+        let epoch = state.epoch;
+        drop(state);
+        self.done.notify_all();
+        epoch
     }
 
-    /// Perform the group sync. Resets the pending counter.
-    /// Returns the number of syncs that were batched.
-    pub fn perform_sync(&self) -> u64 {
-        self.pending_syncs.swap(0, Ordering::SeqCst)
+    pub fn sync_count(&self) -> u64 {
+        self.state.lock().sync_count
     }
 
-    /// Get the number of pending sync requests.
+    pub fn epoch(&self) -> u64 {
+        self.state.lock().epoch
+    }
+
     pub fn pending_count(&self) -> u64 {
-        self.pending_syncs.load(Ordering::Acquire)
+        self.state.lock().waiters
     }
 }
 
@@ -756,13 +877,11 @@ fn list_segments(dir: &Path) -> std::io::Result<Vec<u64>> {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(stripped) = name.strip_prefix("wal-") {
-            if let Some(num_str) = stripped.strip_suffix(".log") {
-                if let Ok(n) = num_str.parse::<u64>() {
+        if let Some(stripped) = name.strip_prefix("wal-")
+            && let Some(num_str) = stripped.strip_suffix(".log")
+                && let Ok(n) = num_str.parse::<u64>() {
                     segments.push(n);
                 }
-            }
-        }
     }
     Ok(segments)
 }
@@ -967,30 +1086,6 @@ mod tests {
         assert_eq!(wal.active_segment(), 3);
     }
 
-    // ── Group commit tests ──────────────────────────────────────────────
-
-    #[test]
-    fn group_committer_batching() {
-        let gc = GroupCommitter::new();
-        assert_eq!(gc.pending_count(), 0);
-
-        gc.request_sync();
-        gc.request_sync();
-        gc.request_sync();
-        assert_eq!(gc.pending_count(), 3);
-
-        let batched = gc.perform_sync();
-        assert_eq!(batched, 3);
-        assert_eq!(gc.pending_count(), 0);
-    }
-
-    #[test]
-    fn group_committer_empty_sync() {
-        let gc = GroupCommitter::new();
-        let batched = gc.perform_sync();
-        assert_eq!(batched, 0);
-    }
-
     // ========================================================================
     // Property-based tests (proptest)
     // ========================================================================
@@ -1150,6 +1245,46 @@ mod tests {
             }
         }
 
+        /// Write N random page images to the WAL, then replay all records and verify
+        /// byte-for-byte match of every page image.
+        #[test]
+        fn prop_wal_write_then_replay(
+            entries in proptest::collection::vec(
+                (any::<u64>(), any::<u32>(), any::<u8>()), 1..20
+            ),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let wal_path = dir.path().join("prop_replay.wal");
+            let wal = Wal::open(&wal_path).unwrap();
+
+            // Build expected page images and write them to the WAL.
+            let mut expected: Vec<(u64, u32, Box<PageBuf>)> = Vec::with_capacity(entries.len());
+            for (txn_id, page_id, fill_byte) in &entries {
+                let page = [*fill_byte; PAGE_SIZE];
+                let lsn = wal.log_page_write(*txn_id, *page_id, &page).unwrap();
+                expected.push((lsn, *page_id, Box::new(page)));
+            }
+            wal.sync().unwrap();
+
+            // Replay and verify.
+            let records = read_wal_records(&wal_path).unwrap();
+            prop_assert_eq!(records.len(), expected.len(),
+                "record count mismatch: expected {}, got {}", expected.len(), records.len());
+
+            for (i, rec) in records.iter().enumerate() {
+                let (exp_lsn, exp_pid, ref exp_page) = expected[i];
+                prop_assert_eq!(rec.lsn, exp_lsn,
+                    "LSN mismatch at record {}: expected {}, got {}", i, exp_lsn, rec.lsn);
+                prop_assert_eq!(rec.page_id, exp_pid,
+                    "page_id mismatch at record {}: expected {}, got {}", i, exp_pid, rec.page_id);
+                prop_assert_eq!(rec.record_type, RECORD_PAGE_WRITE);
+                let img = rec.page_image.as_ref()
+                    .expect("PAGE_WRITE record must have page_image");
+                prop_assert_eq!(img.as_ref(), exp_page.as_ref(),
+                    "page image mismatch at record {}", i);
+            }
+        }
+
         /// Page images with random byte patterns at specific offsets roundtrip correctly.
         #[test]
         fn prop_wal_page_image_partial_random(
@@ -1231,5 +1366,134 @@ mod tests {
         let seg_path = segment_path(&wal_dir, 1);
         let records = read_wal_records(&seg_path).unwrap();
         assert_eq!(records.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod group_commit_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+
+    #[test]
+    fn group_commit_single_thread() {
+        let gc = GroupCommitter::new();
+        let count = Arc::new(AtomicU64::new(0));
+        let c = count.clone();
+        gc.group_sync(move || { c.fetch_add(1, Ordering::SeqCst); });
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(gc.epoch(), 1);
+        assert_eq!(gc.sync_count(), 1);
+    }
+
+    #[test]
+    fn group_commit_epoch_advances() {
+        let gc = GroupCommitter::new();
+        assert_eq!(gc.epoch(), 0);
+        gc.group_sync(|| {});
+        assert_eq!(gc.epoch(), 1);
+        gc.group_sync(|| {});
+        assert_eq!(gc.epoch(), 2);
+    }
+
+    #[test]
+    fn group_commit_concurrent_batching() {
+        use std::sync::Barrier;
+        let gc = Arc::new(GroupCommitter::new());
+        let sync_count = Arc::new(AtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(10));
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let gc = gc.clone();
+            let sc = sync_count.clone();
+            let b = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                gc.group_sync(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    sc.fetch_add(1, Ordering::SeqCst);
+                });
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+        let total = sync_count.load(Ordering::SeqCst);
+        assert!(total < 10, "Expected batching: got {total} syncs for 10 callers");
+        assert!(total >= 1);
+    }
+
+    #[test]
+    fn group_commit_followers_unblock() {
+        use std::sync::Barrier;
+        let gc = Arc::new(GroupCommitter::new());
+        let barrier = Arc::new(Barrier::new(5));
+        let done = Arc::new(AtomicU64::new(0));
+        let mut handles = vec![];
+        for _ in 0..5 {
+            let gc = gc.clone();
+            let b = barrier.clone();
+            let d = done.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                gc.group_sync(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                });
+                d.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+        assert_eq!(done.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn group_commit_sequential_calls() {
+        let gc = GroupCommitter::new();
+        let count = Arc::new(AtomicU64::new(0));
+        for _ in 0..5 {
+            let c = count.clone();
+            gc.group_sync(move || { c.fetch_add(1, Ordering::SeqCst); });
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 5);
+        assert_eq!(gc.sync_count(), 5);
+    }
+
+    #[test]
+    fn group_commit_stress_100_threads() {
+        use std::sync::Barrier;
+        let gc = Arc::new(GroupCommitter::new());
+        let sync_count = Arc::new(AtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(100));
+        let mut handles = vec![];
+        for _ in 0..100 {
+            let gc = gc.clone();
+            let sc = sync_count.clone();
+            let b = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                gc.group_sync(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    sc.fetch_add(1, Ordering::SeqCst);
+                });
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+        let total = sync_count.load(Ordering::SeqCst);
+        assert!(total < 100, "Expected batching: got {total} syncs for 100 callers");
+        assert!(total >= 1);
+    }
+
+    #[test]
+    fn group_commit_no_waiters_initially() {
+        let gc = GroupCommitter::new();
+        assert_eq!(gc.pending_count(), 0);
+        assert_eq!(gc.epoch(), 0);
+        assert_eq!(gc.sync_count(), 0);
+    }
+
+    #[test]
+    fn group_commit_wal_has_group_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+        let wal = Wal::new(&path, SyncMode::None).unwrap();
+        wal.group_sync();
+        // Should work without error
     }
 }
