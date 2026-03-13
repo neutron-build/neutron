@@ -1,0 +1,12 @@
+[package]
+name = "neutron-desktop-biometrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Neutron Desktop TouchID / Windows Hello biometrics plugin"
+
+[dependencies]
+tauri = { workspace = true }
+tauri-plugin = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }

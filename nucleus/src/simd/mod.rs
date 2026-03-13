@@ -67,6 +67,27 @@ pub fn filter_i64_equals(column: &[i64], target: i64) -> Vec<usize> {
     scalar::filter_i64_equals(column, target)
 }
 
+/// Scan integer column and apply less-than predicate (WHERE column < threshold).
+/// Returns indices of rows that match.
+pub fn filter_i64_less(column: &[i64], threshold: i64) -> Vec<usize> {
+    scalar::filter_i64_less(column, threshold)
+}
+
+/// Scan integer column: WHERE column >= threshold.
+pub fn filter_i64_greater_eq(column: &[i64], threshold: i64) -> Vec<usize> {
+    scalar::filter_i64_greater_eq(column, threshold)
+}
+
+/// Scan integer column: WHERE column <= threshold.
+pub fn filter_i64_less_eq(column: &[i64], threshold: i64) -> Vec<usize> {
+    scalar::filter_i64_less_eq(column, threshold)
+}
+
+/// Scan integer column: WHERE column != target.
+pub fn filter_i64_not_equals(column: &[i64], target: i64) -> Vec<usize> {
+    scalar::filter_i64_not_equals(column, target)
+}
+
 /// Sum an integer column (SUM aggregate).
 pub fn sum_i64(column: &[i64]) -> i64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
@@ -84,6 +105,12 @@ pub fn sum_i64(column: &[i64]) -> i64 {
     }
 
     scalar::sum_i64(column)
+}
+
+/// Checked sum that returns None on integer overflow.
+pub fn sum_i64_checked(column: &[i64]) -> Option<i64> {
+    // Always use scalar checked path for correctness (SIMD paths wrap on overflow)
+    scalar::sum_i64_checked(column)
 }
 
 /// Count non-null values in a column (COUNT aggregate).
@@ -117,6 +144,26 @@ pub fn filter_f64_greater(column: &[f64], threshold: f64) -> Vec<usize> {
 /// Filter f64 column: return indices where value == target.
 pub fn filter_f64_equals(column: &[f64], target: f64) -> Vec<usize> {
     scalar::filter_f64_equals(column, target)
+}
+
+/// Filter f64 column: return indices where value < threshold.
+pub fn filter_f64_less(column: &[f64], threshold: f64) -> Vec<usize> {
+    scalar::filter_f64_less(column, threshold)
+}
+
+/// Filter f64 column: WHERE value >= threshold.
+pub fn filter_f64_greater_eq(column: &[f64], threshold: f64) -> Vec<usize> {
+    scalar::filter_f64_greater_eq(column, threshold)
+}
+
+/// Filter f64 column: WHERE value <= threshold.
+pub fn filter_f64_less_eq(column: &[f64], threshold: f64) -> Vec<usize> {
+    scalar::filter_f64_less_eq(column, threshold)
+}
+
+/// Filter f64 column: WHERE value != target.
+pub fn filter_f64_not_equals(column: &[f64], target: f64) -> Vec<usize> {
+    scalar::filter_f64_not_equals(column, target)
 }
 
 /// Filter f64 column: return indices in range [lo, hi].
@@ -307,5 +354,19 @@ mod tests {
         ];
         let col = extract_str_column(&rows, 1);
         assert_eq!(col, vec!["alice".to_string(), "bob".to_string()]);
+    }
+
+    #[test]
+    fn test_filter_i64_less_dispatch() {
+        let column = vec![1, 5, 10, 15, 20, 25, 30];
+        let result = filter_i64_less(&column, 15);
+        assert_eq!(result, vec![0, 1, 2]); // indices of 1, 5, 10
+    }
+
+    #[test]
+    fn test_filter_f64_less_dispatch() {
+        let column = vec![1.0, 5.5, 10.0, 15.5, 20.0];
+        let result = filter_f64_less(&column, 10.0);
+        assert_eq!(result, vec![0, 1]); // indices of 1.0, 5.5
     }
 }

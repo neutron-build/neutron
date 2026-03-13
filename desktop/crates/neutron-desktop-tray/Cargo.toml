@@ -1,0 +1,13 @@
+[package]
+name = "neutron-desktop-tray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Neutron Desktop system tray icon and menu plugin"
+
+[dependencies]
+tauri = { workspace = true, features = ["tray-icon"] }
+tauri-plugin = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

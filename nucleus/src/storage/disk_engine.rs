@@ -4,8 +4,9 @@
 //! tracked in a table directory (in-memory HashMap, persisted to the meta/catalog
 //! pages on flush). Rows are serialized to binary tuples and stored in slotted pages.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -128,6 +129,22 @@ struct IndexMeta {
     col_type: DataType,
 }
 
+/// In-transaction state for DiskEngine MVCC.
+struct DiskTxnState {
+    /// Page IDs of pre-existing pages dirtied during this transaction.
+    dirty_existing: HashSet<u32>,
+    /// Page IDs allocated for the first time during this transaction.
+    new_pages: HashSet<u32>,
+    /// Snapshot of the in-memory tables directory at BEGIN (metadata only, not page data).
+    tables_snapshot: HashMap<String, TableMeta>,
+    /// Free list head at BEGIN.
+    free_list_head: u32,
+    /// Free page count at BEGIN.
+    free_page_count: u32,
+    /// `pool.next_page_id()` value at BEGIN — pages with ID ≥ this were allocated during txn.
+    page_count_at_begin: u32,
+}
+
 /// Disk-backed storage engine.
 pub struct DiskEngine {
     pool: Arc<BufferPool>,
@@ -144,6 +161,10 @@ pub struct DiskEngine {
     /// Optional async I/O backend (io_uring on Linux, tokio::fs elsewhere).
     /// When present, `flush_all_dirty` uses async writes instead of the sync DiskManager.
     async_ops: Option<std::sync::Arc<Box<dyn super::io_uring::AsyncDiskOps>>>,
+    /// MVCC transaction state. `None` when no transaction is active.
+    txn_state: parking_lot::Mutex<Option<DiskTxnState>>,
+    /// Monotonically increasing transaction ID counter for WAL records.
+    next_txn_id: AtomicU64,
 }
 
 /// Linked-list pointers stored in the data page's reserved area.
@@ -157,6 +178,13 @@ fn get_next_page(pg: &PageBuf) -> u32 {
 
 fn set_next_page(pg: &mut PageBuf, next: u32) {
     page::write_u32(pg, NEXT_PAGE_OFFSET, next);
+}
+
+impl Drop for DiskEngine {
+    /// Flush all dirty pages and save the table directory on drop (clean shutdown).
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
 }
 
 impl DiskEngine {
@@ -323,6 +351,8 @@ impl DiskEngine {
             free_list_head: parking_lot::Mutex::new(fl_head),
             free_page_count: parking_lot::Mutex::new(fl_count),
             async_ops: None,
+            txn_state: parking_lot::Mutex::new(None),
+            next_txn_id: AtomicU64::new(1),
         };
 
         // For existing databases, load the table directory from the (potentially recovered) meta page
@@ -359,11 +389,10 @@ impl DiskEngine {
         // WAL records are in LSN order, so iterating forward gives us the latest.
         let mut latest_pages: HashMap<u32, (u64, Box<PageBuf>)> = HashMap::new();
         for record in &records {
-            if record.record_type == wal::RECORD_PAGE_WRITE {
-                if let Some(ref img) = record.page_image {
+            if record.record_type == wal::RECORD_PAGE_WRITE
+                && let Some(ref img) = record.page_image {
                     latest_pages.insert(record.page_id, (record.lsn, img.clone()));
                 }
-            }
         }
 
         let mut recovered = 0usize;
@@ -413,6 +442,38 @@ impl DiskEngine {
         // Save the table directory to the meta page first
         self.save_table_directory()?;
         self.pool.flush_all().map_err(|e| StorageError::Io(e.to_string()))
+    }
+
+    /// Record a page as dirtied during an active MVCC transaction.
+    ///
+    /// Called after every `pool.mark_dirty()` in insert/update/delete. If no
+    /// transaction is active the call is a no-op.
+    fn record_dirty_page(&self, page_id: u32) {
+        let mut guard = self.txn_state.lock();
+        if let Some(ref mut ts) = *guard {
+            if page_id >= ts.page_count_at_begin {
+                ts.new_pages.insert(page_id);
+            } else {
+                ts.dirty_existing.insert(page_id);
+            }
+        }
+    }
+
+    /// Perform a checkpoint: flush all dirty pages, write a WAL checkpoint record,
+    /// and truncate old WAL segments to reclaim disk space.
+    pub fn checkpoint(&self) -> Result<(), StorageError> {
+        // 1. Flush all dirty pages (including table directory)
+        self.flush()?;
+        // 2. Write a checkpoint record to the WAL
+        let cp_lsn = self.pool.wal_checkpoint()
+            .map_err(|e| StorageError::Io(e.to_string()))?;
+        // 3. Sync WAL to ensure checkpoint record is durable
+        self.pool.flush_all().map_err(|e| StorageError::Io(e.to_string()))?;
+        // 4. Truncate old WAL segments before the checkpoint LSN
+        if cp_lsn > 0 {
+            let _ = self.pool.wal_truncate_before(cp_lsn);
+        }
+        Ok(())
     }
 
     /// Save the table directory (table_name → first_page_id + col_types) to the meta page.
@@ -762,6 +823,7 @@ impl DiskEngine {
         page::init_data_page(pg, 1);
         set_next_page(pg, INVALID_PAGE_ID);
         self.pool.mark_dirty(frame_id);
+        self.record_dirty_page(page_id); // new page allocated during txn
         self.pool.unpin(frame_id);
 
         // Find the last page in the chain and link to the new page
@@ -785,6 +847,7 @@ impl DiskEngine {
                     let pg_mut = self.pool.frame_data_mut(fid);
                     set_next_page(pg_mut, page_id);
                     self.pool.mark_dirty(fid);
+                    self.record_dirty_page(cur); // existing page — NEXT_PAGE pointer changed
                     self.pool.unpin(fid);
                     break;
                 }
@@ -974,6 +1037,7 @@ impl StorageEngine for DiskEngine {
             let pg = self.pool.frame_data_mut(frame_id);
             if let Some(slot_idx) = page::insert_tuple(pg, &data) {
                 self.pool.mark_dirty(frame_id);
+                self.record_dirty_page(page_id);
                 self.pool.unpin(frame_id);
                 self.index_insert(table, page_id, slot_idx, &row);
                 return Ok(());
@@ -989,6 +1053,7 @@ impl StorageEngine for DiskEngine {
         let slot_idx = page::insert_tuple(pg, &data)
             .ok_or_else(|| StorageError::Io("failed to insert into fresh page".into()))?;
         self.pool.mark_dirty(frame_id);
+        self.record_dirty_page(page_id);
         self.pool.unpin(frame_id);
         self.index_insert(table, page_id, slot_idx, &row);
         Ok(())
@@ -999,7 +1064,24 @@ impl StorageEngine for DiskEngine {
         let pages = self.table_pages(table)?;
         let mut rows = Vec::new();
 
-        for &page_id in &pages {
+        // Parallel read-ahead: prefetch pages in batch windows (1 MB = 64 pages).
+        // With parallel prefetch, refill the window every PREFETCH_WINDOW pages
+        // so the next batch is in-flight while the current batch is processed.
+        const PREFETCH_WINDOW: usize = 64;
+        if pages.len() > 1 {
+            let first_batch = &pages[..pages.len().min(PREFETCH_WINDOW)];
+            self.pool.prefetch_pages(first_batch);
+        }
+
+        for (i, &page_id) in pages.iter().enumerate() {
+            // Refill: when we reach the start of a new window, prefetch the
+            // next full batch in parallel so I/O overlaps with tuple processing.
+            let next_batch_start = i + PREFETCH_WINDOW;
+            if i > 0 && i % PREFETCH_WINDOW == 0 && next_batch_start < pages.len() {
+                let end = (next_batch_start + PREFETCH_WINDOW).min(pages.len());
+                self.pool.prefetch_pages(&pages[next_batch_start..end]);
+            }
+
             let frame_id = self.pool.fetch_page(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
@@ -1012,6 +1094,103 @@ impl StorageEngine for DiskEngine {
         }
 
         Ok(rows)
+    }
+
+    async fn scan_projected(
+        &self,
+        table: &str,
+        projection: &[usize],
+    ) -> Result<Vec<Row>, StorageError> {
+        let col_types = self.col_types(table)?;
+        let pages = self.table_pages(table)?;
+        let mut rows = Vec::new();
+
+        const PREFETCH_WINDOW: usize = 64;
+        if pages.len() > 1 {
+            let first_batch = &pages[..pages.len().min(PREFETCH_WINDOW)];
+            self.pool.prefetch_pages(first_batch);
+        }
+
+        for (i, &page_id) in pages.iter().enumerate() {
+            let next_batch_start = i + PREFETCH_WINDOW;
+            if i > 0 && i % PREFETCH_WINDOW == 0 && next_batch_start < pages.len() {
+                let end = (next_batch_start + PREFETCH_WINDOW).min(pages.len());
+                self.pool.prefetch_pages(&pages[next_batch_start..end]);
+            }
+
+            let frame_id = self.pool.fetch_page(page_id)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            let pg = self.pool.frame_data(frame_id);
+            for (_slot_idx, tuple_data) in page::iter_tuples(pg) {
+                if let Some(row) = tuple::deserialize_row_projected(tuple_data, &col_types, projection) {
+                    rows.push(row);
+                }
+            }
+            self.pool.unpin(frame_id);
+        }
+
+        Ok(rows)
+    }
+
+    async fn scan_chunked(
+        &self,
+        table: &str,
+        tx: tokio::sync::mpsc::Sender<Vec<Row>>,
+        batch_size: usize,
+    ) -> Result<(), StorageError> {
+        let col_types = self.col_types(table)?;
+        let pages = self.table_pages(table)?;
+        let batch_size = batch_size.max(1);
+        let mut batch = Vec::with_capacity(batch_size);
+
+        const PREFETCH_WINDOW: usize = 64;
+        if pages.len() > 1 {
+            let first_batch = &pages[..pages.len().min(PREFETCH_WINDOW)];
+            self.pool.prefetch_pages(first_batch);
+        }
+
+        for (i, &page_id) in pages.iter().enumerate() {
+            let next_batch_start = i + PREFETCH_WINDOW;
+            if i > 0 && i % PREFETCH_WINDOW == 0 && next_batch_start < pages.len() {
+                let end = (next_batch_start + PREFETCH_WINDOW).min(pages.len());
+                self.pool.prefetch_pages(&pages[next_batch_start..end]);
+            }
+
+            let frame_id = self.pool.fetch_page(page_id)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            let pg = self.pool.frame_data(frame_id);
+            for (_slot_idx, tuple_data) in page::iter_tuples(pg) {
+                if let Some(row) = tuple::deserialize_row(tuple_data, &col_types) {
+                    batch.push(row);
+                    if batch.len() >= batch_size {
+                        let chunk = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
+                        if tx.send(chunk).await.is_err() {
+                            self.pool.unpin(frame_id);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            self.pool.unpin(frame_id);
+        }
+
+        // Send remaining rows
+        if !batch.is_empty() {
+            let _ = tx.send(batch).await;
+        }
+        Ok(())
+    }
+
+    fn fast_count_all(&self, table: &str) -> Option<usize> {
+        let pages = self.table_pages(table).ok()?;
+        let mut count = 0;
+        for &page_id in &pages {
+            let frame_id = self.pool.fetch_page(page_id).ok()?;
+            let pg = self.pool.frame_data(frame_id);
+            count += page::count_live_tuples(pg);
+            self.pool.unpin(frame_id);
+        }
+        Some(count)
     }
 
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
@@ -1063,6 +1242,7 @@ impl StorageEngine for DiskEngine {
             }
             if dirty {
                 self.pool.mark_dirty(frame_id);
+                self.record_dirty_page(page_id);
             }
             self.pool.unpin(frame_id);
         }
@@ -1133,6 +1313,7 @@ impl StorageEngine for DiskEngine {
                         } else {
                             // Need to insert on another page; release this frame first
                             self.pool.mark_dirty(frame_id);
+                            self.record_dirty_page(page_id);
                             self.pool.unpin(frame_id);
                             let (new_page_id, new_slot_idx) = self.insert_sync(table, &new_data)?;
                             if has_indexes {
@@ -1152,6 +1333,7 @@ impl StorageEngine for DiskEngine {
             }
             if dirty {
                 self.pool.mark_dirty(frame_id);
+                self.record_dirty_page(page_id);
             }
             self.pool.unpin(frame_id);
         }
@@ -1167,7 +1349,7 @@ impl StorageEngine for DiskEngine {
                 .collect_dirty_for_async_flush()
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             for (page_id, data) in &dirty {
-                ops.write_page(*page_id, data)
+                ops.write_page(*page_id, &**data)
                     .await
                     .map_err(|e| StorageError::Io(e.to_string()))?;
             }
@@ -1177,6 +1359,10 @@ impl StorageEngine for DiskEngine {
             // Sync fallback (default when async_ops not set).
             self.flush()
         }
+    }
+
+    async fn checkpoint(&self) -> Result<(), StorageError> {
+        self.checkpoint()
     }
 
     async fn create_index(&self, table: &str, index_name: &str, col_idx: usize) -> Result<(), StorageError> {
@@ -1231,6 +1417,83 @@ impl StorageEngine for DiskEngine {
         }
         Ok(total)
     }
+
+    fn supports_mvcc(&self) -> bool {
+        true
+    }
+
+    /// Begin a disk-engine MVCC transaction.
+    ///
+    /// 1. Flush all dirty pages to disk so the on-disk state is a clean pre-txn snapshot.
+    /// 2. Capture in-memory metadata (tables directory, free list) for rollback.
+    /// 3. Initialize dirty-page tracking.
+    async fn begin_txn(&self) -> Result<(), StorageError> {
+        // Flush pre-txn state to disk (this is the "undo base" for abort).
+        self.flush()?;
+
+        let page_count_at_begin = self.pool.next_page_id();
+        let tables_snapshot = self.tables.read().clone();
+        let free_list_head = *self.free_list_head.lock();
+        let free_page_count = *self.free_page_count.lock();
+
+        *self.txn_state.lock() = Some(DiskTxnState {
+            dirty_existing: HashSet::new(),
+            new_pages: HashSet::new(),
+            tables_snapshot,
+            free_list_head,
+            free_page_count,
+            page_count_at_begin,
+        });
+        Ok(())
+    }
+
+    /// Commit the transaction: write a WAL COMMIT record and clear tracking state.
+    async fn commit_txn(&self) -> Result<(), StorageError> {
+        let txn_id = self.next_txn_id.fetch_add(1, AtomicOrdering::Relaxed);
+        let _ = self.pool.wal_log_commit(txn_id);
+        *self.txn_state.lock() = None;
+        Ok(())
+    }
+
+    /// Abort the transaction: reload dirty pre-existing pages from disk, evict new pages,
+    /// and restore in-memory metadata to its pre-txn state.
+    async fn abort_txn(&self) -> Result<(), StorageError> {
+        let ts = {
+            let mut guard = self.txn_state.lock();
+            guard.take()
+        };
+
+        if let Some(ts) = ts {
+            // Reload pre-existing pages from disk (undo their in-memory changes).
+            let existing: Vec<u32> = ts.dirty_existing.into_iter().collect();
+            if !existing.is_empty() {
+                self.pool.reload_pages_from_disk(&existing)
+                    .map_err(|e| StorageError::Io(e.to_string()))?;
+            }
+
+            // Evict newly allocated pages from the buffer pool (they don't exist on disk).
+            // Simply removing them from the dirty set is enough — we'll also restore the
+            // tables directory so the page chain no longer references them.
+            if !ts.new_pages.is_empty() {
+                let new_page_list: Vec<u32> = ts.new_pages.into_iter().collect();
+                // Reload (blank out) these pages — they will be reclaimed by the free list restore.
+                let _ = self.pool.reload_pages_from_disk(&new_page_list);
+            }
+
+            // Restore in-memory table directory.
+            *self.tables.write() = ts.tables_snapshot;
+
+            // Restore free list state.
+            *self.free_list_head.lock() = ts.free_list_head;
+            *self.free_page_count.lock() = ts.free_page_count;
+
+            // Write WAL ABORT record for crash-recovery awareness.
+            let txn_id = self.next_txn_id.fetch_add(1, AtomicOrdering::Relaxed);
+            let _ = self.pool.wal_log_abort(txn_id);
+        }
+
+        Ok(())
+    }
 }
 
 impl DiskEngine {
@@ -1268,14 +1531,13 @@ impl DiskEngine {
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             for (slot_idx, tuple_data) in page::iter_tuples(pg) {
-                if let Some(row) = tuple::deserialize_row(tuple_data, &col_types) {
-                    if col_idx < row.len() {
+                if let Some(row) = tuple::deserialize_row(tuple_data, &col_types)
+                    && col_idx < row.len() {
                         let key = serialize_index_key(&row[col_idx]);
                         let rid = RowId { page_id, slot_idx };
                         btree.insert(&key, rid)
                             .map_err(|e| StorageError::Io(e.to_string()))?;
                     }
-                }
             }
             let next = get_next_page(pg);
             self.pool.unpin(frame_id);
@@ -1443,6 +1705,7 @@ impl DiskEngine {
             let pg = self.pool.frame_data_mut(frame_id);
             if let Some(slot_idx) = page::insert_tuple(pg, data) {
                 self.pool.mark_dirty(frame_id);
+                self.record_dirty_page(page_id);
                 self.pool.unpin(frame_id);
                 return Ok((page_id, slot_idx));
             }
@@ -1457,6 +1720,7 @@ impl DiskEngine {
         let slot_idx = page::insert_tuple(pg, data)
             .ok_or_else(|| StorageError::Io("failed to insert into fresh page".into()))?;
         self.pool.mark_dirty(frame_id);
+        self.record_dirty_page(page_id);
         self.pool.unpin(frame_id);
         Ok((page_id, slot_idx))
     }
@@ -3154,5 +3418,122 @@ mod tests {
             let rows = engine.scan("reborn").await.unwrap();
             assert_eq!(rows.len(), 3);
         }
+    }
+
+    // ── fast_count_all ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fast_count_all_empty_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup_engine(tmp.path()).await;
+        register_simple_table(&catalog, "t").await;
+        engine.create_table("t").await.unwrap();
+
+        assert_eq!(engine.fast_count_all("t"), Some(0));
+    }
+
+    #[tokio::test]
+    async fn fast_count_all_with_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup_engine(tmp.path()).await;
+        register_simple_table(&catalog, "t").await;
+        engine.create_table("t").await.unwrap();
+
+        for i in 0..25 {
+            engine.insert("t", simple_row(i, &format!("r{i}"))).await.unwrap();
+        }
+        assert_eq!(engine.fast_count_all("t"), Some(25));
+    }
+
+    #[tokio::test]
+    async fn fast_count_all_after_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup_engine(tmp.path()).await;
+        register_simple_table(&catalog, "t").await;
+        engine.create_table("t").await.unwrap();
+
+        for i in 0..10 {
+            engine.insert("t", simple_row(i, "x")).await.unwrap();
+        }
+        // Delete first 5 rows (positions 0..5)
+        let positions: Vec<usize> = (0..5).collect();
+        let deleted = engine.delete("t", &positions).await.unwrap();
+        assert_eq!(deleted, 5);
+        assert_eq!(engine.fast_count_all("t"), Some(5));
+    }
+
+    #[tokio::test]
+    async fn fast_count_all_nonexistent_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _catalog) = setup_engine(tmp.path()).await;
+        assert_eq!(engine.fast_count_all("no_such_table"), None);
+    }
+
+    // ── scan_limit ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn scan_limit_returns_at_most_n_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup_engine(tmp.path()).await;
+        register_simple_table(&catalog, "t").await;
+        engine.create_table("t").await.unwrap();
+
+        for i in 0..20 {
+            engine.insert("t", simple_row(i, "x")).await.unwrap();
+        }
+        let rows = engine.scan_limit("t", 5).await.unwrap();
+        assert_eq!(rows.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn scan_limit_larger_than_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup_engine(tmp.path()).await;
+        register_simple_table(&catalog, "t").await;
+        engine.create_table("t").await.unwrap();
+
+        for i in 0..3 {
+            engine.insert("t", simple_row(i, "x")).await.unwrap();
+        }
+        let rows = engine.scan_limit("t", 100).await.unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn scan_limit_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup_engine(tmp.path()).await;
+        register_simple_table(&catalog, "t").await;
+        engine.create_table("t").await.unwrap();
+
+        engine.insert("t", simple_row(1, "x")).await.unwrap();
+        let rows = engine.scan_limit("t", 0).await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    // ── count_live_tuples ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn count_live_tuples_matches_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup_engine(tmp.path()).await;
+        register_simple_table(&catalog, "t").await;
+        engine.create_table("t").await.unwrap();
+
+        for i in 0..50 {
+            engine.insert("t", simple_row(i, &format!("row{i}"))).await.unwrap();
+        }
+        // Delete some
+        // Delete rows at positions where id % 3 == 0
+        let rows = engine.scan("t").await.unwrap();
+        let positions: Vec<usize> = rows.iter().enumerate()
+            .filter(|(_, row)| matches!(row[0], Value::Int32(v) if v % 3 == 0))
+            .map(|(i, _)| i)
+            .collect();
+        engine.delete("t", &positions).await.unwrap();
+
+        let scan_count = engine.scan("t").await.unwrap().len();
+        let fast_count = engine.fast_count_all("t").unwrap();
+        assert_eq!(scan_count, fast_count);
     }
 }

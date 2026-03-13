@@ -1,0 +1,13 @@
+[package]
+name = "neutron-desktop-window-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Neutron Desktop persist/restore window size and position plugin"
+
+[dependencies]
+tauri = { workspace = true }
+tauri-plugin = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dirs = { workspace = true }

@@ -161,19 +161,18 @@ impl BTreeIndex {
                 let (key, row_id, next_pos) = read_leaf_entry(pg, pos);
                 pos = next_pos;
 
-                // Check range
-                if let Some(sk) = start_key {
-                    if key.as_slice() < sk {
+                // Check range — key is a borrowed slice, no allocation for skipped entries
+                if let Some(sk) = start_key
+                    && key < sk {
                         continue;
                     }
-                }
-                if let Some(ek) = end_key {
-                    if key.as_slice() > ek {
+                if let Some(ek) = end_key
+                    && key > ek {
                         self.pool.unpin(frame_id);
                         return Ok(results);
                     }
-                }
-                results.push((key, row_id));
+                // Only allocate for entries that pass the range filter
+                results.push((key.to_vec(), row_id));
             }
 
             let next = page::read_u32(pg, IDX_RIGHT_SIBLING);
@@ -500,9 +499,13 @@ fn index_free_space(pg: &PageBuf) -> usize {
 
 // ---- Leaf operations ----
 
-fn read_leaf_entry(pg: &PageBuf, pos: usize) -> (Vec<u8>, RowId, usize) {
+/// Read a leaf entry returning a borrowed key slice (zero-copy).
+///
+/// Returns `(key_slice, row_id, next_position)` where `key_slice` borrows
+/// directly from the page buffer, avoiding a heap allocation per entry.
+fn read_leaf_entry(pg: &PageBuf, pos: usize) -> (&[u8], RowId, usize) {
     let key_len = page::read_u16(pg, pos) as usize;
-    let key = pg[pos + 2..pos + 2 + key_len].to_vec();
+    let key = &pg[pos + 2..pos + 2 + key_len];
     let rid_start = pos + 2 + key_len;
     let row_id = RowId::decode(&pg[rid_start..rid_start + 6]);
     (key, row_id, rid_start + 6)
@@ -516,7 +519,7 @@ fn scan_leaf_for_key(pg: &PageBuf, key: &[u8]) -> Vec<RowId> {
         let (k, rid, next) = read_leaf_entry(pg, pos);
         if k == key {
             results.push(rid);
-        } else if k.as_slice() > key {
+        } else if k > key {
             break; // entries are sorted
         }
         pos = next;
@@ -993,6 +996,70 @@ pub enum BTreeError {
 }
 
 // ============================================================================
+// Hash Index — O(1) equality lookups
+// ============================================================================
+
+use std::collections::HashMap;
+
+/// A bucket-based hash index for O(1) equality lookups.
+///
+/// Stores (key_bytes → Vec<RowId>) in a standard HashMap. Unlike the B-tree
+/// index, hash indexes do NOT support range scans — only point lookups.
+///
+/// The optimizer prefers hash indexes for equality predicates (`WHERE col = value`)
+/// and B-tree indexes for range predicates (`WHERE col BETWEEN a AND b`).
+pub struct HashIndex {
+    /// Maps serialized key bytes to a list of matching RowIds.
+    buckets: HashMap<Vec<u8>, Vec<RowId>>,
+    /// Column data type (for reference).
+    #[allow(dead_code)]
+    key_type: DataType,
+}
+
+impl HashIndex {
+    /// Create a new, empty hash index.
+    pub fn new(key_type: DataType) -> Self {
+        Self {
+            buckets: HashMap::new(),
+            key_type,
+        }
+    }
+
+    /// Point lookup: find all RowIds matching exactly the given key.
+    pub fn lookup(&self, key: &[u8]) -> Vec<RowId> {
+        self.buckets.get(key).cloned().unwrap_or_default()
+    }
+
+    /// Insert a (key, row_id) entry into the hash index.
+    pub fn insert(&mut self, key: Vec<u8>, row_id: RowId) {
+        self.buckets.entry(key).or_default().push(row_id);
+    }
+
+    /// Delete a specific (key, row_id) entry. Returns true if found and removed.
+    pub fn delete(&mut self, key: &[u8], row_id: RowId) -> bool {
+        if let Some(ids) = self.buckets.get_mut(key)
+            && let Some(pos) = ids.iter().position(|r| *r == row_id) {
+                ids.swap_remove(pos);
+                if ids.is_empty() {
+                    self.buckets.remove(key);
+                }
+                return true;
+            }
+        false
+    }
+
+    /// Return total number of entries in the hash index.
+    pub fn len(&self) -> usize {
+        self.buckets.values().map(|v| v.len()).sum()
+    }
+
+    /// Check if the index is empty.
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1204,6 +1271,184 @@ mod tests {
         assert_eq!(all.len(), count as usize);
         for i in 0..all.len() - 1 {
             assert!(all[i].0 <= all[i + 1].0, "not sorted at index {i}");
+        }
+    }
+
+    // ====================================================================
+    // HashIndex tests
+    // ====================================================================
+
+    #[test]
+    fn hash_index_insert_lookup() {
+        let mut idx = HashIndex::new(DataType::Int32);
+        let key1 = vec![0, 0, 0, 42];
+        let key2 = vec![0, 0, 0, 99];
+        let rid1 = RowId { page_id: 1, slot_idx: 0 };
+        let rid2 = RowId { page_id: 1, slot_idx: 1 };
+        let rid3 = RowId { page_id: 2, slot_idx: 0 };
+
+        idx.insert(key1.clone(), rid1);
+        idx.insert(key1.clone(), rid2);
+        idx.insert(key2.clone(), rid3);
+
+        assert_eq!(idx.len(), 3);
+        assert_eq!(idx.lookup(&key1).len(), 2);
+        assert_eq!(idx.lookup(&key2).len(), 1);
+        assert_eq!(idx.lookup(&key2)[0], rid3);
+
+        // Non-existent key returns empty
+        assert!(idx.lookup(&[0, 0, 0, 0]).is_empty());
+    }
+
+    #[test]
+    fn hash_index_delete() {
+        let mut idx = HashIndex::new(DataType::Int32);
+        let key = vec![1, 2, 3, 4];
+        let rid1 = RowId { page_id: 1, slot_idx: 0 };
+        let rid2 = RowId { page_id: 1, slot_idx: 1 };
+
+        idx.insert(key.clone(), rid1);
+        idx.insert(key.clone(), rid2);
+        assert_eq!(idx.len(), 2);
+
+        // Delete one entry
+        assert!(idx.delete(&key, rid1));
+        assert_eq!(idx.len(), 1);
+        assert_eq!(idx.lookup(&key)[0], rid2);
+
+        // Delete last entry — key removed entirely
+        assert!(idx.delete(&key, rid2));
+        assert!(idx.is_empty());
+        assert!(idx.lookup(&key).is_empty());
+
+        // Delete non-existent returns false
+        assert!(!idx.delete(&key, rid1));
+    }
+
+    // ====================================================================
+    // Property-based tests (proptest)
+    // ====================================================================
+
+    use proptest::prelude::*;
+
+    /// Helper: create a BufferPool backed by a temporary database file.
+    fn make_pool(pool_size: usize) -> (BufferPool, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let disk = DiskManager::open(&db_path).unwrap();
+        let pool = BufferPool::new(disk, None, pool_size, 0);
+        (pool, dir)
+    }
+
+    proptest! {
+        /// Insert N random keys, then look up each one. All should be found.
+        #[test]
+        fn prop_insert_then_lookup(keys in proptest::collection::vec(any::<i32>(), 1..100)) {
+            let (pool, _dir) = make_pool(256);
+            let pool = Arc::new(pool);
+            let mut idx = BTreeIndex::create(pool.clone(), DataType::Int32).unwrap();
+
+            // Deduplicate keys to avoid ambiguity with duplicate inserts.
+            let mut seen = std::collections::HashSet::new();
+            let unique_keys: Vec<(i32, u16)> = keys.into_iter()
+                .enumerate()
+                .filter(|(_, k)| seen.insert(*k))
+                .map(|(i, k)| (k, i as u16))
+                .collect();
+
+            for &(k, i) in &unique_keys {
+                let key = value_to_key(&Value::Int32(k));
+                let rid = RowId { page_id: 0, slot_idx: i };
+                idx.insert(&key, rid).unwrap();
+            }
+
+            for &(k, i) in &unique_keys {
+                let key = value_to_key(&Value::Int32(k));
+                let results = idx.lookup(&key).unwrap();
+                prop_assert!(!results.is_empty(), "key {} not found after insert", k);
+                let rid = RowId { page_id: 0, slot_idx: i };
+                prop_assert!(results.contains(&rid),
+                    "expected RowId {:?} for key {}, got {:?}", rid, k, results);
+            }
+        }
+
+        /// Insert N random i32 keys, do a full range scan. Results should be sorted by key bytes.
+        #[test]
+        fn prop_range_scan_sorted(keys in proptest::collection::vec(any::<i32>(), 1..100)) {
+            let (pool, _dir) = make_pool(256);
+            let pool = Arc::new(pool);
+            let mut idx = BTreeIndex::create(pool.clone(), DataType::Int32).unwrap();
+
+            let mut seen = std::collections::HashSet::new();
+            for (i, &k) in keys.iter().enumerate() {
+                if seen.insert(k) {
+                    let key = value_to_key(&Value::Int32(k));
+                    let rid = RowId { page_id: 0, slot_idx: i as u16 };
+                    idx.insert(&key, rid).unwrap();
+                }
+            }
+
+            let results = idx.range_scan(None, None).unwrap();
+            prop_assert_eq!(results.len(), seen.len(),
+                "range scan count mismatch: expected {}, got {}", seen.len(), results.len());
+
+            for i in 0..results.len().saturating_sub(1) {
+                prop_assert!(results[i].0 <= results[i + 1].0,
+                    "range scan not sorted at index {}: {:?} > {:?}",
+                    i, results[i].0, results[i + 1].0);
+            }
+        }
+
+        /// Insert N keys, delete half, verify deleted keys are absent and remaining keys are present.
+        #[test]
+        fn prop_delete_then_absent(keys in proptest::collection::vec(any::<i32>(), 2..100)) {
+            let (pool, _dir) = make_pool(256);
+            let pool = Arc::new(pool);
+            let mut idx = BTreeIndex::create(pool.clone(), DataType::Int32).unwrap();
+
+            let mut seen = std::collections::HashSet::new();
+            let unique_keys: Vec<(i32, u16)> = keys.into_iter()
+                .enumerate()
+                .filter(|(_, k)| seen.insert(*k))
+                .map(|(i, k)| (k, i as u16))
+                .collect();
+
+            // Insert all keys.
+            for &(k, i) in &unique_keys {
+                let key = value_to_key(&Value::Int32(k));
+                let rid = RowId { page_id: 0, slot_idx: i };
+                idx.insert(&key, rid).unwrap();
+            }
+
+            // Delete the first half.
+            let half = unique_keys.len() / 2;
+            let (to_delete, to_keep) = unique_keys.split_at(half);
+
+            for &(k, i) in to_delete {
+                let key = value_to_key(&Value::Int32(k));
+                let rid = RowId { page_id: 0, slot_idx: i };
+                let deleted = idx.delete(&key, rid).unwrap();
+                prop_assert!(deleted, "delete returned false for key {}", k);
+            }
+
+            // Verify deleted keys are absent.
+            for &(k, _) in to_delete {
+                let key = value_to_key(&Value::Int32(k));
+                let results = idx.lookup(&key).unwrap();
+                prop_assert!(results.is_empty(),
+                    "key {} should have been deleted but lookup returned {:?}", k, results);
+            }
+
+            // Verify remaining keys are still present.
+            for &(k, i) in to_keep {
+                let key = value_to_key(&Value::Int32(k));
+                let results = idx.lookup(&key).unwrap();
+                prop_assert!(!results.is_empty(),
+                    "key {} should still exist but lookup returned empty", k);
+                let rid = RowId { page_id: 0, slot_idx: i };
+                prop_assert!(results.contains(&rid),
+                    "expected RowId {:?} for key {}, got {:?}", rid, k, results);
+            }
         }
     }
 }

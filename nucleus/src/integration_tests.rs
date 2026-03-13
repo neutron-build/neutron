@@ -3615,6 +3615,112 @@ mod tests {
     }
 
     // ========================================================================
+    // Concurrent session isolation tests
+    // ========================================================================
+
+    /// Two sessions that open transactions concurrently must not share txn state.
+    ///
+    /// Session A: BEGIN → INSERT → ROLLBACK
+    /// Session B: SELECT COUNT — must NOT see session A's INSERT at any point
+    /// Independent ROLLBACK in session B while not in a txn must produce a warning, not error.
+    #[tokio::test]
+    async fn test_two_sessions_txn_isolation() {
+        let ex = setup();
+        run(&ex, "CREATE TABLE iso_test (id INT PRIMARY KEY)").await;
+
+        let sid_a = ex.create_session();
+        let sid_b = ex.create_session();
+
+        // Session A: open a transaction and insert a row.
+        ex.execute_with_session(sid_a, "BEGIN").await.unwrap();
+        ex.execute_with_session(sid_a, "INSERT INTO iso_test VALUES (1)").await.unwrap();
+
+        // Session B: ROLLBACK while not in a transaction must warn, not error.
+        // If txn_state were shared, session B would try to roll back session A's work.
+        let rollback_b = ex.execute_with_session(sid_b, "ROLLBACK").await;
+        assert!(rollback_b.is_ok(), "session B ROLLBACK outside txn must not error");
+
+        // Session A: ROLLBACK undoes its own insert only.
+        ex.execute_with_session(sid_a, "ROLLBACK").await.unwrap();
+
+        let extract_count = |r: Vec<ExecResult>| match r.into_iter().next().unwrap() {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int64(n) => n,
+                Value::Int32(n) => n as i64,
+                _ => panic!("unexpected count type"),
+            },
+            _ => panic!("expected select"),
+        };
+
+        // Both sessions: table must be empty.
+        let count_a = ex.execute_with_session(sid_a, "SELECT COUNT(*) FROM iso_test").await.unwrap();
+        let count_b = ex.execute_with_session(sid_b, "SELECT COUNT(*) FROM iso_test").await.unwrap();
+        assert_eq!(extract_count(count_a), 0, "session A: rolled-back row gone");
+        assert_eq!(extract_count(count_b), 0, "session B: never saw the row");
+
+        // Session B BEGIN + INSERT must be independent from session A.
+        ex.execute_with_session(sid_b, "BEGIN").await.unwrap();
+        ex.execute_with_session(sid_b, "INSERT INTO iso_test VALUES (2)").await.unwrap();
+        // Session A must not be in a transaction — so its ROLLBACK should warn, not error.
+        let rollback_a = ex.execute_with_session(sid_a, "ROLLBACK").await;
+        assert!(rollback_a.is_ok(), "session A ROLLBACK outside txn after B's BEGIN must not error");
+        // Session B commits cleanly.
+        ex.execute_with_session(sid_b, "COMMIT").await.unwrap();
+
+        let count_final = ex.execute_with_session(sid_a, "SELECT COUNT(*) FROM iso_test").await.unwrap();
+        assert_eq!(extract_count(count_final), 1, "only session B's committed row present");
+
+        ex.drop_session(sid_a);
+        ex.drop_session(sid_b);
+    }
+
+    /// Two sessions with independent settings must not bleed into each other.
+    #[tokio::test]
+    async fn test_two_sessions_settings_isolation() {
+        let ex = setup();
+
+        let sid_a = ex.create_session();
+        let sid_b = ex.create_session();
+
+        ex.execute_with_session(sid_a, "SET timezone = 'US/Eastern'").await.unwrap();
+        ex.execute_with_session(sid_b, "SET timezone = 'US/Pacific'").await.unwrap();
+
+        // Each session retains its own setting.
+        assert_eq!(
+            ex.get_session_setting(sid_a, "timezone"),
+            Some("'US/Eastern'".into()),
+            "session A timezone should be US/Eastern"
+        );
+        assert_eq!(
+            ex.get_session_setting(sid_b, "timezone"),
+            Some("'US/Pacific'".into()),
+            "session B timezone should be US/Pacific"
+        );
+
+        ex.drop_session(sid_a);
+        ex.drop_session(sid_b);
+    }
+
+    /// Prepared statements are scoped to the session that created them.
+    #[tokio::test]
+    async fn test_two_sessions_prepared_stmt_isolation() {
+        let ex = setup();
+        run(&ex, "CREATE TABLE prep_iso (id INT NOT NULL)").await;
+
+        let sid_a = ex.create_session();
+        let sid_b = ex.create_session();
+
+        ex.execute_with_session(sid_a, "PREPARE my_stmt AS SELECT * FROM prep_iso").await.unwrap();
+
+        // Session B must not see session A's prepared statement — EXECUTE should fail.
+        let result = ex.execute_with_session(sid_b, "EXECUTE my_stmt").await;
+        assert!(result.is_err(), "session B must not see session A's prepared statement");
+
+        ex.drop_session(sid_a);
+        ex.drop_session(sid_b);
+    }
+
+    // ========================================================================
     // Disk engine integration tests
     // ========================================================================
 
@@ -3692,9 +3798,14 @@ mod tests {
         assert_eq!(r[1][1], Value::Int64(200));
     }
 
+    /// Create a fresh executor backed by DiskEngine MVCC.
+    fn setup_disk_mvcc() -> (Arc<Executor>, tempfile::TempDir) {
+        setup_disk() // DiskEngine now has supports_mvcc() == true
+    }
+
     #[tokio::test]
     async fn test_disk_engine_transaction_commit() {
-        let ex = setup_mvcc();
+        let (ex, _dir) = setup_disk_mvcc();
 
         run(&ex, "CREATE TABLE disk_txn (id INT NOT NULL, val TEXT)").await;
 
@@ -3705,6 +3816,84 @@ mod tests {
 
         let res = run(&ex, "SELECT val FROM disk_txn WHERE id = 1").await;
         assert_eq!(scalar(&res[0]), &Value::Text("committed".into()));
+    }
+
+    #[tokio::test]
+    async fn test_disk_engine_rollback_insert() {
+        let (ex, _dir) = setup_disk_mvcc();
+        run(&ex, "CREATE TABLE disk_rb (id INT NOT NULL, val TEXT)").await;
+        run(&ex, "INSERT INTO disk_rb VALUES (1, 'before')").await;
+
+        // Insert inside a transaction, then roll back
+        run(&ex, "BEGIN").await;
+        run(&ex, "INSERT INTO disk_rb VALUES (2, 'rolled_back')").await;
+        let res = run(&ex, "SELECT COUNT(*) FROM disk_rb").await;
+        assert_eq!(scalar(&res[0]), &Value::Int64(2));
+        run(&ex, "ROLLBACK").await;
+
+        // After rollback, only the pre-txn row should remain
+        let res = run(&ex, "SELECT COUNT(*) FROM disk_rb").await;
+        assert_eq!(scalar(&res[0]), &Value::Int64(1));
+        let res = run(&ex, "SELECT val FROM disk_rb WHERE id = 1").await;
+        assert_eq!(scalar(&res[0]), &Value::Text("before".into()));
+    }
+
+    #[tokio::test]
+    async fn test_disk_engine_rollback_update() {
+        let (ex, _dir) = setup_disk_mvcc();
+        run(&ex, "CREATE TABLE disk_rb_upd (id INT NOT NULL, val INT NOT NULL)").await;
+        run(&ex, "INSERT INTO disk_rb_upd VALUES (1, 100), (2, 200)").await;
+
+        run(&ex, "BEGIN").await;
+        run(&ex, "UPDATE disk_rb_upd SET val = 999 WHERE id = 1").await;
+        let res = run(&ex, "SELECT val FROM disk_rb_upd WHERE id = 1").await;
+        assert_eq!(scalar(&res[0]), &Value::Int32(999));
+        run(&ex, "ROLLBACK").await;
+
+        // After rollback, original values restored
+        let res = run(&ex, "SELECT val FROM disk_rb_upd WHERE id = 1").await;
+        assert_eq!(scalar(&res[0]), &Value::Int32(100));
+        let res = run(&ex, "SELECT val FROM disk_rb_upd WHERE id = 2").await;
+        assert_eq!(scalar(&res[0]), &Value::Int32(200));
+    }
+
+    #[tokio::test]
+    async fn test_disk_engine_rollback_delete() {
+        let (ex, _dir) = setup_disk_mvcc();
+        run(&ex, "CREATE TABLE disk_rb_del (id INT NOT NULL, name TEXT)").await;
+        run(&ex, "INSERT INTO disk_rb_del VALUES (1, 'keep'), (2, 'delete_me')").await;
+
+        run(&ex, "BEGIN").await;
+        run(&ex, "DELETE FROM disk_rb_del WHERE id = 2").await;
+        let res = run(&ex, "SELECT COUNT(*) FROM disk_rb_del").await;
+        assert_eq!(scalar(&res[0]), &Value::Int64(1));
+        run(&ex, "ROLLBACK").await;
+
+        // Both rows should be restored
+        let res = run(&ex, "SELECT COUNT(*) FROM disk_rb_del").await;
+        assert_eq!(scalar(&res[0]), &Value::Int64(2));
+    }
+
+    #[tokio::test]
+    async fn test_disk_engine_commit_persists() {
+        let (ex, _dir) = setup_disk_mvcc();
+        run(&ex, "CREATE TABLE disk_persist (id INT NOT NULL, v TEXT)").await;
+
+        run(&ex, "BEGIN").await;
+        run(&ex, "INSERT INTO disk_persist VALUES (1, 'a'), (2, 'b')").await;
+        run(&ex, "COMMIT").await;
+
+        // Committed rows are visible after commit
+        let res = run(&ex, "SELECT COUNT(*) FROM disk_persist").await;
+        assert_eq!(scalar(&res[0]), &Value::Int64(2));
+
+        // A subsequent rollback does not undo already-committed data
+        run(&ex, "BEGIN").await;
+        run(&ex, "INSERT INTO disk_persist VALUES (3, 'c')").await;
+        run(&ex, "ROLLBACK").await;
+
+        let res = run(&ex, "SELECT COUNT(*) FROM disk_persist").await;
+        assert_eq!(scalar(&res[0]), &Value::Int64(2));
     }
 
     #[tokio::test]

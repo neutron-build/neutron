@@ -76,3 +76,8 @@ export {
   InMemoryRealtimeBus,
   type RealtimeBus,
 } from "./realtime/index.js";
+export {
+  RedisRealtimeBus,
+  createRedisRealtimeBus,
+  type RedisRealtimeBusOptions,
+} from "./realtime/redis.js";

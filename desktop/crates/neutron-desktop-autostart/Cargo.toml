@@ -1,0 +1,13 @@
+[package]
+name = "neutron-desktop-autostart"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Neutron Desktop launch-at-OS-startup plugin"
+
+[dependencies]
+tauri = { workspace = true }
+tauri-plugin = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }

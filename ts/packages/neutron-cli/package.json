@@ -19,7 +19,7 @@
   ],
   "type": "module",
   "bin": {
-    "neutron": "./dist/index.js"
+    "neutron-ts": "./dist/index.js"
   },
   "exports": {
     ".": {

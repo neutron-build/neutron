@@ -1,0 +1,27 @@
+{
+  "name": "{{name}}",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "neutron-native dev",
+    "dev:ios": "neutron-native dev --ios",
+    "dev:android": "neutron-native dev --android",
+    "build:ios": "neutron-native build --ios",
+    "build:android": "neutron-native build --android",
+    "ios": "neutron-native run-ios",
+    "android": "neutron-native run-android",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@neutron/native": "workspace:*",
+    "react": "^18.3.0",
+    "react-native": "0.76.0"
+  },
+  "devDependencies": {
+    "@neutron/native-cli": "workspace:*",
+    "@neutron/native-styling": "workspace:*",
+    "@re-pack/dev-server": "^5.0.0",
+    "@types/react": "^18.2.0",
+    "typescript": "^5.7.0"
+  }
+}

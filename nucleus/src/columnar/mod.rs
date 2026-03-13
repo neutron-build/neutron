@@ -335,6 +335,9 @@ pub fn group_by_text_agg_f64(
 pub struct ColumnarStore {
     /// Table name → list of column batches.
     tables: HashMap<String, Vec<ColumnBatch>>,
+    /// Table name → (column name → dictionary-encoded column).
+    /// Populated by `append_with_dict` for eligible text columns.
+    dict_columns: HashMap<String, HashMap<String, DictColumn>>,
 }
 
 impl Default for ColumnarStore {
@@ -347,6 +350,7 @@ impl ColumnarStore {
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),
+            dict_columns: HashMap::new(),
         }
     }
 
@@ -1348,7 +1352,7 @@ pub fn decompress_column(compressed: &CompressedColumn) -> ColumnData {
                     if is_null {
                         None
                     } else {
-                        Some(dict[idx as usize].clone())
+                        dict.get(idx as usize).cloned()
                     }
                 })
                 .collect();
@@ -1386,6 +1390,255 @@ pub fn compressed_size(compressed: &CompressedColumn) -> usize {
             dict.iter().map(|s| s.len()).sum::<usize>() + indices.len() * 4 + nulls.len()
         }
         CompressedData::ForI64 { offsets, null_bitmap, .. } => 8 + offsets.len() * 2 + null_bitmap.len(), // min + offsets + bitmap
+    }
+}
+
+// ============================================================================
+// Dictionary Encoding for Low-Cardinality Text Columns
+// ============================================================================
+
+/// Dictionary-encoded text column — stores distinct values once and references
+/// them by integer codes. Dramatically reduces memory for low-cardinality
+/// columns like status, category, country, etc.
+///
+/// NULLs are represented as `u32::MAX` in the codes array.
+#[derive(Debug, Clone)]
+pub struct DictColumn {
+    /// The distinct values (dictionary). Index position = code.
+    pub dict: Vec<String>,
+    /// Per-row code indexing into `dict`. `u32::MAX` = NULL.
+    pub codes: Vec<u32>,
+}
+
+/// Sentinel code value representing NULL in a DictColumn.
+pub const DICT_NULL_CODE: u32 = u32::MAX;
+
+impl DictColumn {
+    /// Number of rows in this column.
+    pub fn len(&self) -> usize {
+        self.codes.len()
+    }
+
+    /// Whether the column has zero rows.
+    pub fn is_empty(&self) -> bool {
+        self.codes.is_empty()
+    }
+
+    /// Number of distinct non-NULL values (dictionary size).
+    pub fn cardinality(&self) -> usize {
+        self.dict.len()
+    }
+
+    /// Count of NULL rows.
+    pub fn null_count(&self) -> usize {
+        self.codes.iter().filter(|&&c| c == DICT_NULL_CODE).count()
+    }
+
+    /// Look up the value for a given row. Returns None for NULLs.
+    pub fn get(&self, row: usize) -> Option<&str> {
+        let code = self.codes[row];
+        if code == DICT_NULL_CODE {
+            None
+        } else {
+            self.dict.get(code as usize).map(|s| s.as_str())
+        }
+    }
+}
+
+/// Encode a slice of optional strings into a dictionary-encoded column.
+///
+/// Builds a dictionary of distinct values and maps each row to its dictionary
+/// index. NULLs are encoded as `DICT_NULL_CODE`.
+pub fn dict_encode(values: &[Option<String>]) -> DictColumn {
+    let mut dict = Vec::new();
+    let mut dict_map: HashMap<String, u32> = HashMap::new();
+    let mut codes = Vec::with_capacity(values.len());
+
+    for v in values {
+        match v {
+            Some(s) => {
+                let code = dict_map.entry(s.clone()).or_insert_with(|| {
+                    let idx = dict.len() as u32;
+                    dict.push(s.clone());
+                    idx
+                });
+                codes.push(*code);
+            }
+            None => {
+                codes.push(DICT_NULL_CODE);
+            }
+        }
+    }
+
+    DictColumn { dict, codes }
+}
+
+/// Decode a dictionary-encoded column back to a vector of optional strings.
+pub fn dict_decode(col: &DictColumn) -> Vec<Option<String>> {
+    col.codes
+        .iter()
+        .map(|&code| {
+            if code == DICT_NULL_CODE {
+                None
+            } else {
+                col.dict.get(code as usize).cloned()
+            }
+        })
+        .collect()
+}
+
+/// Perform GROUP BY COUNT on a dictionary-encoded column in O(cardinality) time.
+///
+/// Instead of hashing every row's string value, this counts occurrences of each
+/// dictionary code in a single pass, then maps codes back to strings. This is
+/// O(n) in rows but the counting array is only `cardinality` elements, making
+/// it extremely cache-friendly for low-cardinality columns.
+///
+/// Returns `(value, count)` pairs sorted by value. NULLs are excluded.
+pub fn dict_group_by_count(col: &DictColumn) -> Vec<(String, usize)> {
+    if col.dict.is_empty() {
+        return Vec::new();
+    }
+
+    // Count occurrences per code — array indexed by code, O(cardinality) space
+    let mut counts = vec![0usize; col.dict.len()];
+    for &code in &col.codes {
+        if code != DICT_NULL_CODE
+            && let Some(c) = counts.get_mut(code as usize) {
+                *c += 1;
+            }
+    }
+
+    // Map codes back to strings, skip zero-count entries
+    let mut result: Vec<(String, usize)> = col
+        .dict
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| counts[i] > 0)
+        .map(|(i, s)| (s.clone(), counts[i]))
+        .collect();
+
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
+/// Perform GROUP BY with SUM aggregation on a dictionary-encoded key column
+/// paired with a float64 value column.
+///
+/// Same O(cardinality) counting trick: accumulates sums in a cardinality-sized
+/// array instead of a hash map.
+pub fn dict_group_by_sum_f64(
+    key_col: &DictColumn,
+    val_col: &[Option<f64>],
+) -> Vec<(String, usize, f64)> {
+    if key_col.dict.is_empty() {
+        return Vec::new();
+    }
+    assert_eq!(
+        key_col.len(),
+        val_col.len(),
+        "key and value columns must have equal length"
+    );
+
+    let card = key_col.dict.len();
+    let mut counts = vec![0usize; card];
+    let mut sums = vec![0.0f64; card];
+
+    for (i, &code) in key_col.codes.iter().enumerate() {
+        if code != DICT_NULL_CODE
+            && let Some(v) = val_col[i] {
+                let idx = code as usize;
+                if idx < card {
+                    counts[idx] += 1;
+                    sums[idx] += v;
+                }
+            }
+    }
+
+    let mut result: Vec<(String, usize, f64)> = key_col
+        .dict
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| counts[i] > 0)
+        .map(|(i, s)| (s.clone(), counts[i], sums[i]))
+        .collect();
+
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
+/// Threshold: auto-apply dictionary encoding when a text column in a batch
+/// has fewer than this many distinct values.
+const DICT_AUTO_MAX_CARDINALITY: usize = 256;
+/// Threshold: minimum rows before auto-applying dictionary encoding.
+const DICT_AUTO_MIN_ROWS: usize = 1000;
+
+impl ColumnarStore {
+    /// Append a batch to a table, automatically dictionary-encoding eligible
+    /// text columns.
+    ///
+    /// A text column is eligible if the batch has >= `DICT_AUTO_MIN_ROWS` rows
+    /// and the column has < `DICT_AUTO_MAX_CARDINALITY` distinct values.
+    ///
+    /// Dictionary-encoded columns are stored alongside the batch in `dict_columns`.
+    pub fn append_with_dict(&mut self, table: &str, batch: ColumnBatch) {
+        let row_count = batch.row_count;
+        if row_count >= DICT_AUTO_MIN_ROWS {
+            // Check each text column for low cardinality
+            for (name, col) in &batch.columns {
+                if let ColumnData::Text(vals) = col {
+                    let mut distinct = std::collections::HashSet::new();
+                    let mut over_limit = false;
+                    for s in vals.iter().flatten() {
+                        distinct.insert(s.as_str());
+                        if distinct.len() > DICT_AUTO_MAX_CARDINALITY {
+                            over_limit = true;
+                            break;
+                        }
+                    }
+                    if !over_limit && !distinct.is_empty() {
+                        let dict_col = dict_encode(vals);
+                        self.dict_columns
+                            .entry(table.to_string())
+                            .or_default()
+                            .insert(name.clone(), dict_col);
+                    }
+                }
+            }
+        }
+        self.tables.entry(table.to_string()).or_default().push(batch);
+    }
+
+    /// Retrieve dictionary-encoded columns for a table, if any.
+    pub fn get_dict_columns(&self, table: &str) -> Option<&HashMap<String, DictColumn>> {
+        self.dict_columns.get(table)
+    }
+
+    /// Perform GROUP BY COUNT using dictionary encoding if available,
+    /// falling back to hash-based counting otherwise.
+    pub fn dict_group_by_count_for(
+        &self,
+        table: &str,
+        column: &str,
+    ) -> Vec<(String, usize)> {
+        // Try dictionary-encoded fast path first
+        if let Some(dict_cols) = self.dict_columns.get(table)
+            && let Some(dict_col) = dict_cols.get(column) {
+                return dict_group_by_count(dict_col);
+            }
+
+        // Fallback: scan all batches with HashMap
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for batch in self.batches(table) {
+            if let Some(ColumnData::Text(vals)) = batch.column(column) {
+                for v in vals.iter().flatten() {
+                    *counts.entry(v.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut result: Vec<(String, usize)> = counts.into_iter().collect();
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
     }
 }
 
@@ -1533,12 +1786,16 @@ impl MergeTree {
         let row_count = merged_batch.columns.first().map(|(_, c)| c.len()).unwrap_or(0);
         let zone_map = ZoneMap::from_batch(&merged_batch);
 
+        // Compress merged data using adaptive codec selection
+        let compressed = merged_batch.columns.iter()
+            .map(|(name, col)| (name.clone(), compress_adaptive(col)))
+            .collect::<Vec<_>>();
         let merged = MergeTreePart {
             id: self.next_part_id,
             data: merged_batch,
             row_count,
             zone_map,
-            compressed: None,
+            compressed: Some(compressed),
         };
         self.next_part_id += 1;
         self.parts.push(merged);
@@ -1673,6 +1930,328 @@ fn concat_columns(a: &ColumnData, b: &ColumnData) -> ColumnData {
             ColumnData::Bool(result)
         }
         _ => a.clone(),
+    }
+}
+
+// ============================================================================
+// Parallel Scan / Aggregation (std::thread::scope, zero new dependencies)
+// ============================================================================
+
+/// Default minimum number of batches required to justify spawning threads.
+/// Below this threshold, parallel methods fall back to single-threaded execution.
+pub const PAR_BATCH_THRESHOLD: usize = 4;
+
+/// Determine the number of worker threads to use for a given batch count.
+/// Returns 1 if below threshold, otherwise min(available_cpus, batch_count).
+fn par_thread_count(batch_count: usize, threshold: usize) -> usize {
+    if batch_count < threshold {
+        return 1;
+    }
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    cpus.min(batch_count)
+}
+
+// ---------------------------------------------------------------------------
+// Free functions operating on &[ColumnBatch] — safe to call from code that
+// already holds a read lock on the store.
+// ---------------------------------------------------------------------------
+
+/// Parallel SUM across column batches. Returns the total sum as f64.
+/// Falls back to single-threaded for small batch counts.
+pub fn par_sum_batches(batches: &[ColumnBatch], column: &str, threshold: usize) -> f64 {
+    let threads = par_thread_count(batches.len(), threshold);
+    if threads <= 1 {
+        return batches.iter().map(|b| aggregate_sum(b, column)).sum();
+    }
+    let chunk_size = batches.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = batches
+            .chunks(chunk_size)
+            .map(|chunk| {
+                s.spawn(|| chunk.iter().map(|b| aggregate_sum(b, column)).sum::<f64>())
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .sum::<f64>()
+    })
+}
+
+/// Parallel COUNT of total rows across column batches.
+/// Falls back to single-threaded for small batch counts.
+pub fn par_count_batches(batches: &[ColumnBatch], threshold: usize) -> usize {
+    let threads = par_thread_count(batches.len(), threshold);
+    if threads <= 1 {
+        return batches.iter().map(|b| b.row_count).sum();
+    }
+    let chunk_size = batches.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = batches
+            .chunks(chunk_size)
+            .map(|chunk| {
+                s.spawn(|| chunk.iter().map(|b| b.row_count).sum::<usize>())
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .sum::<usize>()
+    })
+}
+
+/// Parallel MIN across column batches. Returns the minimum f64 value found.
+/// Falls back to single-threaded for small batch counts.
+pub fn par_min_batches(batches: &[ColumnBatch], column: &str, threshold: usize) -> Option<f64> {
+    let threads = par_thread_count(batches.len(), threshold);
+    if threads <= 1 {
+        return batches
+            .iter()
+            .filter_map(|b| batch_min_f64(b, column))
+            .reduce(f64::min);
+    }
+    let chunk_size = batches.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = batches
+            .chunks(chunk_size)
+            .map(|chunk| {
+                s.spawn(|| {
+                    chunk
+                        .iter()
+                        .filter_map(|b| batch_min_f64(b, column))
+                        .reduce(f64::min)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().unwrap())
+            .reduce(f64::min)
+    })
+}
+
+/// Parallel MAX across column batches. Returns the maximum f64 value found.
+/// Falls back to single-threaded for small batch counts.
+pub fn par_max_batches(batches: &[ColumnBatch], column: &str, threshold: usize) -> Option<f64> {
+    let threads = par_thread_count(batches.len(), threshold);
+    if threads <= 1 {
+        return batches
+            .iter()
+            .filter_map(|b| batch_max_f64(b, column))
+            .reduce(f64::max);
+    }
+    let chunk_size = batches.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = batches
+            .chunks(chunk_size)
+            .map(|chunk| {
+                s.spawn(|| {
+                    chunk
+                        .iter()
+                        .filter_map(|b| batch_max_f64(b, column))
+                        .reduce(f64::max)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().unwrap())
+            .reduce(f64::max)
+    })
+}
+
+/// Parallel filtered scan: return all batches with only matching rows retained,
+/// where `column` equals `value` (AggValue).
+/// Falls back to single-threaded for small batch counts.
+pub fn par_scan_where_eq_batches(
+    batches: &[ColumnBatch],
+    column: &str,
+    value: &AggValue,
+    threshold: usize,
+) -> Vec<ColumnBatch> {
+    let threads = par_thread_count(batches.len(), threshold);
+    if threads <= 1 {
+        return batches
+            .iter()
+            .map(|b| scan_batch_eq(b, column, value))
+            .filter(|b| b.row_count > 0)
+            .collect();
+    }
+    let chunk_size = batches.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = batches
+            .chunks(chunk_size)
+            .map(|chunk| {
+                s.spawn(|| {
+                    chunk
+                        .iter()
+                        .map(|b| scan_batch_eq(b, column, value))
+                        .filter(|b| b.row_count > 0)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    })
+}
+
+/// Parallel full scan: collect all batches in parallel.
+/// Each thread processes a chunk of batches and returns them as-is.
+/// Falls back to single-threaded clone for small batch counts.
+pub fn par_scan_all_batches(batches: &[ColumnBatch], threshold: usize) -> Vec<ColumnBatch> {
+    let threads = par_thread_count(batches.len(), threshold);
+    if threads <= 1 {
+        return batches.to_vec();
+    }
+    let chunk_size = batches.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = batches
+            .chunks(chunk_size)
+            .map(|chunk| s.spawn(|| chunk.to_vec()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for per-batch min/max as f64 (works across Int32/Int64/Float64)
+// ---------------------------------------------------------------------------
+
+fn batch_min_f64(batch: &ColumnBatch, column: &str) -> Option<f64> {
+    match batch.column(column) {
+        Some(ColumnData::Int32(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .map(|&x| x as f64)
+            .reduce(f64::min),
+        Some(ColumnData::Int64(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .map(|&x| x as f64)
+            .reduce(f64::min),
+        Some(ColumnData::Float64(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .copied()
+            .reduce(f64::min),
+        _ => None,
+    }
+}
+
+fn batch_max_f64(batch: &ColumnBatch, column: &str) -> Option<f64> {
+    match batch.column(column) {
+        Some(ColumnData::Int32(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .map(|&x| x as f64)
+            .reduce(f64::max),
+        Some(ColumnData::Int64(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .map(|&x| x as f64)
+            .reduce(f64::max),
+        Some(ColumnData::Float64(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .copied()
+            .reduce(f64::max),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: equality filter on a single batch using AggValue
+// ---------------------------------------------------------------------------
+
+fn scan_batch_eq(batch: &ColumnBatch, column: &str, value: &AggValue) -> ColumnBatch {
+    let col = match batch.column(column) {
+        Some(c) => c,
+        None => return ColumnBatch::new(vec![]),
+    };
+    let mask: Vec<bool> = match (col, value) {
+        (ColumnData::Int32(v), AggValue::Int32(n)) => {
+            v.iter().map(|o| o == &Some(*n)).collect()
+        }
+        (ColumnData::Int64(v), AggValue::Int64(n)) => {
+            v.iter().map(|o| o == &Some(*n)).collect()
+        }
+        (ColumnData::Float64(v), AggValue::Float64(f)) => {
+            v.iter().map(|o| o == &Some(*f)).collect()
+        }
+        (ColumnData::Text(v), AggValue::Text(s)) => {
+            v.iter().map(|o| o.as_deref() == Some(s.as_str())).collect()
+        }
+        (ColumnData::Bool(v), AggValue::Bool(b)) => {
+            v.iter().map(|o| o == &Some(*b)).collect()
+        }
+        _ => vec![false; batch.row_count],
+    };
+    apply_mask(batch, &mask)
+}
+
+// ---------------------------------------------------------------------------
+// ColumnarStore convenience methods (take read lock once, then delegate)
+// ---------------------------------------------------------------------------
+
+impl ColumnarStore {
+    /// Parallel SUM of a numeric column across all batches of a table.
+    /// Returns `None` if the table does not exist, `Some(0.0)` if it is empty.
+    pub fn par_aggregate_sum(&self, table: &str, column: &str) -> Option<f64> {
+        let batches = self.tables.get(table)?;
+        Some(par_sum_batches(batches, column, PAR_BATCH_THRESHOLD))
+    }
+
+    /// Parallel COUNT of all rows across all batches of a table.
+    /// Returns `None` if the table does not exist.
+    pub fn par_aggregate_count(&self, table: &str) -> Option<usize> {
+        let batches = self.tables.get(table)?;
+        Some(par_count_batches(batches, PAR_BATCH_THRESHOLD))
+    }
+
+    /// Parallel MIN of a numeric column across all batches of a table.
+    /// Returns `None` if the table does not exist or has no non-null values.
+    pub fn par_aggregate_min(&self, table: &str, column: &str) -> Option<f64> {
+        let batches = self.tables.get(table)?;
+        par_min_batches(batches, column, PAR_BATCH_THRESHOLD)
+    }
+
+    /// Parallel MAX of a numeric column across all batches of a table.
+    /// Returns `None` if the table does not exist or has no non-null values.
+    pub fn par_aggregate_max(&self, table: &str, column: &str) -> Option<f64> {
+        let batches = self.tables.get(table)?;
+        par_max_batches(batches, column, PAR_BATCH_THRESHOLD)
+    }
+
+    /// Parallel filtered scan returning batches with only rows matching
+    /// `column == value`.
+    pub fn par_scan_where_eq(
+        &self,
+        table: &str,
+        column: &str,
+        value: &AggValue,
+    ) -> Vec<ColumnBatch> {
+        let batches = match self.tables.get(table) {
+            Some(b) => b,
+            None => return vec![],
+        };
+        par_scan_where_eq_batches(batches, column, value, PAR_BATCH_THRESHOLD)
+    }
+
+    /// Parallel full scan returning cloned batches.
+    pub fn par_scan_all(&self, table: &str) -> Vec<ColumnBatch> {
+        let batches = match self.tables.get(table) {
+            Some(b) => b,
+            None => return vec![],
+        };
+        par_scan_all_batches(batches, PAR_BATCH_THRESHOLD)
     }
 }
 
@@ -2582,5 +3161,547 @@ mod tests {
         assert_eq!(mt.part_count(), 0);
         assert_eq!(mt.total_rows(), 0);
         assert!(mt.scan_all().is_empty());
+    }
+
+    // ================================================================
+    // Dictionary Encoding tests
+    // ================================================================
+
+    #[test]
+    fn dict_encode_basic() {
+        let values = vec![
+            Some("red".into()),
+            Some("blue".into()),
+            Some("red".into()),
+            Some("green".into()),
+            Some("blue".into()),
+            Some("red".into()),
+        ];
+        let col = dict_encode(&values);
+        assert_eq!(col.len(), 6);
+        assert_eq!(col.cardinality(), 3); // red, blue, green
+        assert_eq!(col.null_count(), 0);
+
+        // Codes should be consistent: same value = same code
+        assert_eq!(col.codes[0], col.codes[2]); // red == red
+        assert_eq!(col.codes[0], col.codes[5]); // red == red
+        assert_eq!(col.codes[1], col.codes[4]); // blue == blue
+        assert_ne!(col.codes[0], col.codes[1]); // red != blue
+        assert_ne!(col.codes[0], col.codes[3]); // red != green
+
+        // get() should return the original values
+        assert_eq!(col.get(0), Some("red"));
+        assert_eq!(col.get(1), Some("blue"));
+        assert_eq!(col.get(3), Some("green"));
+    }
+
+    #[test]
+    fn dict_encode_with_nulls() {
+        let values = vec![
+            Some("active".into()),
+            None,
+            Some("inactive".into()),
+            None,
+            Some("active".into()),
+        ];
+        let col = dict_encode(&values);
+        assert_eq!(col.len(), 5);
+        assert_eq!(col.cardinality(), 2); // active, inactive
+        assert_eq!(col.null_count(), 2);
+
+        assert_eq!(col.codes[1], DICT_NULL_CODE);
+        assert_eq!(col.codes[3], DICT_NULL_CODE);
+        assert_eq!(col.get(0), Some("active"));
+        assert_eq!(col.get(1), None);
+        assert_eq!(col.get(2), Some("inactive"));
+        assert_eq!(col.get(3), None);
+    }
+
+    #[test]
+    fn dict_encode_all_nulls() {
+        let values: Vec<Option<String>> = vec![None, None, None];
+        let col = dict_encode(&values);
+        assert_eq!(col.len(), 3);
+        assert_eq!(col.cardinality(), 0);
+        assert_eq!(col.null_count(), 3);
+    }
+
+    #[test]
+    fn dict_encode_empty() {
+        let values: Vec<Option<String>> = vec![];
+        let col = dict_encode(&values);
+        assert!(col.is_empty());
+        assert_eq!(col.cardinality(), 0);
+    }
+
+    #[test]
+    fn dict_decode_roundtrip() {
+        let original = vec![
+            Some("US".into()),
+            Some("UK".into()),
+            None,
+            Some("US".into()),
+            Some("DE".into()),
+            None,
+            Some("UK".into()),
+        ];
+        let encoded = dict_encode(&original);
+        let decoded = dict_decode(&encoded);
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn dict_decode_single_value() {
+        let values: Vec<Option<String>> =
+            (0..100).map(|_| Some("constant".into())).collect();
+        let encoded = dict_encode(&values);
+        assert_eq!(encoded.cardinality(), 1);
+        let decoded = dict_decode(&encoded);
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn dict_group_by_count_basic() {
+        let values = vec![
+            Some("cat".into()),
+            Some("dog".into()),
+            Some("cat".into()),
+            Some("bird".into()),
+            Some("dog".into()),
+            Some("cat".into()),
+            Some("dog".into()),
+        ];
+        let col = dict_encode(&values);
+        let groups = dict_group_by_count(&col);
+
+        // Should be sorted alphabetically
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0], ("bird".to_string(), 1));
+        assert_eq!(groups[1], ("cat".to_string(), 3));
+        assert_eq!(groups[2], ("dog".to_string(), 3));
+    }
+
+    #[test]
+    fn dict_group_by_count_with_nulls() {
+        let values = vec![
+            Some("A".into()),
+            None,
+            Some("B".into()),
+            None,
+            Some("A".into()),
+            None,
+        ];
+        let col = dict_encode(&values);
+        let groups = dict_group_by_count(&col);
+
+        // NULLs should be excluded
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], ("A".to_string(), 2));
+        assert_eq!(groups[1], ("B".to_string(), 1));
+    }
+
+    #[test]
+    fn dict_group_by_count_empty() {
+        let col = dict_encode(&[]);
+        let groups = dict_group_by_count(&col);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn dict_group_by_sum_f64_basic() {
+        let keys = vec![
+            Some("X".into()),
+            Some("Y".into()),
+            Some("X".into()),
+            Some("Y".into()),
+            Some("X".into()),
+        ];
+        let vals = vec![
+            Some(10.0),
+            Some(20.0),
+            Some(30.0),
+            Some(40.0),
+            Some(50.0),
+        ];
+        let key_col = dict_encode(&keys);
+        let groups = dict_group_by_sum_f64(&key_col, &vals);
+        assert_eq!(groups.len(), 2);
+        // X: count=3, sum=90
+        assert_eq!(groups[0].0, "X");
+        assert_eq!(groups[0].1, 3);
+        assert!((groups[0].2 - 90.0).abs() < 1e-10);
+        // Y: count=2, sum=60
+        assert_eq!(groups[1].0, "Y");
+        assert_eq!(groups[1].1, 2);
+        assert!((groups[1].2 - 60.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn dict_store_auto_encoding() {
+        // Build a batch with 1500 rows and a low-cardinality text column
+        let statuses = ["pending", "active", "inactive", "suspended", "closed"];
+        let status_vals: Vec<Option<String>> = (0..1500)
+            .map(|i| Some(statuses[i % statuses.len()].to_string()))
+            .collect();
+        let id_vals: Vec<Option<i64>> = (0..1500).map(|i| Some(i as i64)).collect();
+
+        let batch = ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(id_vals)),
+            ("status".into(), ColumnData::Text(status_vals)),
+        ]);
+
+        let mut store = ColumnarStore::new();
+        store.append_with_dict("orders", batch);
+
+        // Should have auto-encoded the "status" column
+        let dict_cols = store.get_dict_columns("orders").unwrap();
+        let status_dict = dict_cols.get("status").unwrap();
+        assert_eq!(status_dict.cardinality(), 5);
+        assert_eq!(status_dict.len(), 1500);
+        assert_eq!(status_dict.null_count(), 0);
+
+        // Original data should still be in the store
+        assert_eq!(store.row_count("orders"), 1500);
+    }
+
+    #[test]
+    fn dict_store_no_encoding_small_batch() {
+        // Batch with < 1000 rows should not auto-encode
+        let values: Vec<Option<String>> = (0..500)
+            .map(|i| Some(if i % 2 == 0 { "A" } else { "B" }.to_string()))
+            .collect();
+        let batch = ColumnBatch::new(vec![
+            ("label".into(), ColumnData::Text(values)),
+        ]);
+
+        let mut store = ColumnarStore::new();
+        store.append_with_dict("small", batch);
+
+        // Should NOT have dict columns — batch too small
+        assert!(store.get_dict_columns("small").is_none());
+    }
+
+    #[test]
+    fn dict_store_group_by_count_uses_dict() {
+        let categories = ["electronics", "clothing", "food", "books"];
+        let cat_vals: Vec<Option<String>> = (0..2000)
+            .map(|i| Some(categories[i % categories.len()].to_string()))
+            .collect();
+
+        let batch = ColumnBatch::new(vec![
+            ("category".into(), ColumnData::Text(cat_vals)),
+        ]);
+
+        let mut store = ColumnarStore::new();
+        store.append_with_dict("products", batch);
+
+        // Use the dict-aware group by
+        let groups = store.dict_group_by_count_for("products", "category");
+        assert_eq!(groups.len(), 4);
+        // Each category appears 500 times (2000 / 4)
+        for (_, count) in &groups {
+            assert_eq!(*count, 500);
+        }
+        assert_eq!(groups[0].0, "books");
+        assert_eq!(groups[1].0, "clothing");
+        assert_eq!(groups[2].0, "electronics");
+        assert_eq!(groups[3].0, "food");
+    }
+
+    #[test]
+    fn dict_store_group_by_fallback() {
+        // When no dict encoding exists, should fall back to hash-based counting
+        let batch = ColumnBatch::new(vec![
+            ("color".into(), ColumnData::Text(vec![
+                Some("red".into()), Some("blue".into()), Some("red".into()),
+            ])),
+        ]);
+
+        let mut store = ColumnarStore::new();
+        store.append("colors", batch); // regular append, no dict
+
+        let groups = store.dict_group_by_count_for("colors", "color");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], ("blue".to_string(), 1));
+        assert_eq!(groups[1], ("red".to_string(), 2));
+    }
+
+    #[test]
+    fn dict_benchmark_100k_group_by() {
+        // Insert 100K rows with 10-value cardinality, then GROUP BY
+        let values_set = [
+            "pending", "active", "inactive", "completed", "cancelled",
+            "archived", "draft", "review", "approved", "rejected",
+        ];
+        let text_vals: Vec<Option<String>> = (0..100_000)
+            .map(|i| Some(values_set[i % values_set.len()].to_string()))
+            .collect();
+        let amount_vals: Vec<Option<f64>> = (0..100_000)
+            .map(|i| Some((i % 1000) as f64 * 1.5))
+            .collect();
+
+        // -- Encode
+        let col = dict_encode(&text_vals);
+        assert_eq!(col.len(), 100_000);
+        assert_eq!(col.cardinality(), 10);
+
+        // -- GROUP BY COUNT (dict-accelerated)
+        let start = std::time::Instant::now();
+        let groups = dict_group_by_count(&col);
+        let dict_elapsed = start.elapsed();
+        assert_eq!(groups.len(), 10);
+        // Each value appears 10K times
+        for (_, count) in &groups {
+            assert_eq!(*count, 10_000);
+        }
+
+        // -- GROUP BY SUM (dict-accelerated)
+        let start2 = std::time::Instant::now();
+        let sum_groups = dict_group_by_sum_f64(&col, &amount_vals);
+        let dict_sum_elapsed = start2.elapsed();
+        assert_eq!(sum_groups.len(), 10);
+
+        // -- Compare: hash-based GROUP BY
+        let start3 = std::time::Instant::now();
+        let mut hash_counts: HashMap<String, usize> = HashMap::new();
+        for v in text_vals.iter().flatten() {
+            *hash_counts.entry(v.clone()).or_insert(0) += 1;
+        }
+        let hash_elapsed = start3.elapsed();
+        assert_eq!(hash_counts.len(), 10);
+
+        // -- Decode roundtrip
+        let decoded = dict_decode(&col);
+        assert_eq!(decoded.len(), 100_000);
+        assert_eq!(decoded[0], Some("pending".to_string()));
+        assert_eq!(decoded[9], Some("rejected".to_string()));
+
+        // The dict approach should work (we can't assert times in CI,
+        // but we verify correctness and print times for manual inspection)
+        eprintln!(
+            "dict_group_by_count: {:?}, dict_group_by_sum: {:?}, hash_group_by: {:?}",
+            dict_elapsed, dict_sum_elapsed, hash_elapsed
+        );
+    }
+
+    #[test]
+    fn dict_memory_savings() {
+        // Verify dictionary encoding uses less memory than raw strings
+        let values: Vec<Option<String>> = (0..10_000)
+            .map(|i| Some(format!("category_{}", i % 5)))
+            .collect();
+
+        let col = dict_encode(&values);
+
+        // Raw: 10000 strings, each ~10 bytes + String overhead (~24 bytes)
+        let raw_approx = 10_000 * (10 + 24);
+        // Dict: 5 strings + 10000 u32 codes
+        let dict_approx = 5 * (10 + 24) + 10_000 * 4;
+
+        assert!(
+            dict_approx < raw_approx,
+            "dict ({}) should be smaller than raw ({})",
+            dict_approx,
+            raw_approx
+        );
+        assert_eq!(col.cardinality(), 5);
+        assert_eq!(col.len(), 10_000);
+    }
+
+    // ========================================================================
+    // Parallel scan / aggregation tests
+    // ========================================================================
+
+    /// Helper: create a store with `n_batches` batches, each containing
+    /// `rows_per_batch` rows of (id: Int64, val: Float64, name: Text).
+    fn make_par_store(n_batches: usize, rows_per_batch: usize) -> ColumnarStore {
+        let mut store = ColumnarStore::new();
+        store.create_table("t");
+        for batch_i in 0..n_batches {
+            let base = (batch_i * rows_per_batch) as i64;
+            let ids: Vec<Option<i64>> = (0..rows_per_batch)
+                .map(|r| Some(base + r as i64))
+                .collect();
+            let vals: Vec<Option<f64>> = (0..rows_per_batch)
+                .map(|r| Some((base + r as i64) as f64 * 1.5))
+                .collect();
+            let names: Vec<Option<String>> = (0..rows_per_batch)
+                .map(|r| {
+                    if r % 3 == 0 {
+                        Some("alpha".to_string())
+                    } else if r % 3 == 1 {
+                        Some("beta".to_string())
+                    } else {
+                        Some("gamma".to_string())
+                    }
+                })
+                .collect();
+            let batch = ColumnBatch::new(vec![
+                ("id".into(), ColumnData::Int64(ids)),
+                ("val".into(), ColumnData::Float64(vals)),
+                ("name".into(), ColumnData::Text(names)),
+            ]);
+            store.append("t", batch);
+        }
+        store
+    }
+
+    #[test]
+    fn par_aggregate_sum_matches_sequential() {
+        let store = make_par_store(8, 500);
+        // Sequential sum
+        let seq_sum: f64 = store
+            .batches("t")
+            .iter()
+            .map(|b| aggregate_sum(b, "val"))
+            .sum();
+        // Parallel sum (8 batches >= threshold 4)
+        let par = store.par_aggregate_sum("t", "val").unwrap();
+        assert!(
+            (par - seq_sum).abs() < 1e-6,
+            "par={} seq={}",
+            par,
+            seq_sum
+        );
+    }
+
+    #[test]
+    fn par_aggregate_count_matches_sequential() {
+        let store = make_par_store(6, 1000);
+        let seq_count: usize = store.batches("t").iter().map(|b| b.row_count).sum();
+        let par = store.par_aggregate_count("t").unwrap();
+        assert_eq!(par, seq_count);
+        assert_eq!(par, 6000);
+    }
+
+    #[test]
+    fn par_aggregate_small_data_fallback() {
+        // 2 batches — below threshold (4), should fall back to sequential
+        let store = make_par_store(2, 100);
+        let seq_sum: f64 = store
+            .batches("t")
+            .iter()
+            .map(|b| aggregate_sum(b, "val"))
+            .sum();
+        let par = store.par_aggregate_sum("t", "val").unwrap();
+        assert!(
+            (par - seq_sum).abs() < 1e-6,
+            "par={} seq={}",
+            par,
+            seq_sum
+        );
+        let par_count = store.par_aggregate_count("t").unwrap();
+        assert_eq!(par_count, 200);
+    }
+
+    #[test]
+    fn par_aggregate_min_max() {
+        let store = make_par_store(8, 500);
+        // Sequential reference
+        let seq_min = store
+            .batches("t")
+            .iter()
+            .filter_map(|b| batch_min_f64(b, "val"))
+            .reduce(f64::min);
+        let seq_max = store
+            .batches("t")
+            .iter()
+            .filter_map(|b| batch_max_f64(b, "val"))
+            .reduce(f64::max);
+        let par_min = store.par_aggregate_min("t", "val");
+        let par_max = store.par_aggregate_max("t", "val");
+        assert_eq!(par_min, seq_min);
+        assert_eq!(par_max, seq_max);
+        // val = id * 1.5; id ranges from 0 to (8*500-1)=3999
+        assert!((par_min.unwrap() - 0.0).abs() < 1e-6);
+        assert!((par_max.unwrap() - 3999.0 * 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn par_scan_where_eq_matches_sequential() {
+        let store = make_par_store(6, 500);
+        // Sequential filtered scan
+        let seq_results: Vec<ColumnBatch> = store
+            .batches("t")
+            .iter()
+            .map(|b| scan_batch_eq(b, "name", &AggValue::Text("alpha".into())))
+            .filter(|b| b.row_count > 0)
+            .collect();
+        let seq_total: usize = seq_results.iter().map(|b| b.row_count).sum();
+        // Parallel filtered scan
+        let par_results = store.par_scan_where_eq("t", "name", &AggValue::Text("alpha".into()));
+        let par_total: usize = par_results.iter().map(|b| b.row_count).sum();
+        assert_eq!(par_total, seq_total);
+        // Every 3rd row is "alpha" — 500 rows per batch, 167 per batch (ceil(500/3))
+        // 6 batches * 167 = 1002
+        // Actually: 0,3,6,...,498 => 167 values per batch => 167 * 6 = 1002
+        assert_eq!(par_total, 167 * 6);
+    }
+
+    #[test]
+    fn par_scan_where_eq_int64() {
+        let store = make_par_store(5, 100);
+        // id=42 should appear exactly once (in batch 0, row 42)
+        let results = store.par_scan_where_eq("t", "id", &AggValue::Int64(42));
+        let total: usize = results.iter().map(|b| b.row_count).sum();
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn par_many_batches_large_dataset() {
+        // 10 batches x 1000 rows = 10,000 rows — enough to exercise parallelism
+        let store = make_par_store(10, 1000);
+        let par_count = store.par_aggregate_count("t").unwrap();
+        assert_eq!(par_count, 10_000);
+        let par_sum = store.par_aggregate_sum("t", "id").unwrap();
+        // Sum of 0..9999 = 9999*10000/2 = 49995000
+        let expected_sum: f64 = (0..10_000i64).sum::<i64>() as f64;
+        assert!(
+            (par_sum - expected_sum).abs() < 1e-6,
+            "par={} expected={}",
+            par_sum,
+            expected_sum
+        );
+    }
+
+    #[test]
+    fn par_scan_all_returns_all_batches() {
+        let store = make_par_store(6, 200);
+        let all = store.par_scan_all("t");
+        assert_eq!(all.len(), 6);
+        let total: usize = all.iter().map(|b| b.row_count).sum();
+        assert_eq!(total, 1200);
+    }
+
+    #[test]
+    fn par_aggregate_nonexistent_table() {
+        let store = ColumnarStore::new();
+        assert!(store.par_aggregate_sum("nope", "x").is_none());
+        assert!(store.par_aggregate_count("nope").is_none());
+        assert!(store.par_aggregate_min("nope", "x").is_none());
+        assert!(store.par_aggregate_max("nope", "x").is_none());
+    }
+
+    #[test]
+    fn par_aggregate_empty_table() {
+        let mut store = ColumnarStore::new();
+        store.create_table("empty");
+        assert_eq!(store.par_aggregate_sum("empty", "x").unwrap(), 0.0);
+        assert_eq!(store.par_aggregate_count("empty").unwrap(), 0);
+        assert!(store.par_aggregate_min("empty", "x").is_none());
+        assert!(store.par_aggregate_max("empty", "x").is_none());
+    }
+
+    #[test]
+    fn par_free_functions_with_custom_threshold() {
+        let store = make_par_store(6, 100);
+        let batches = store.batches("t");
+        // Force parallelism with threshold=2
+        let sum = par_sum_batches(batches, "val", 2);
+        let seq_sum: f64 = batches.iter().map(|b| aggregate_sum(b, "val")).sum();
+        assert!((sum - seq_sum).abs() < 1e-6);
+        // Force single-threaded with threshold=100
+        let sum_st = par_sum_batches(batches, "val", 100);
+        assert!((sum_st - seq_sum).abs() < 1e-6);
     }
 }

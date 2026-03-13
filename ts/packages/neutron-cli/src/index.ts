@@ -34,25 +34,28 @@ async function main() {
       await worker();
       break;
     default:
-      console.log(`Neutron CLI
+      console.log(`Neutron TypeScript CLI
 
 Usage:
-  neutron dev      Start development server
-  neutron build    Build for production
+  neutron-ts dev      Start development server
+  neutron-ts build    Build for production
     --preset vercel|cloudflare|docker|static
     --cloudflare-mode pages|workers
-  neutron start    Start production server
-  neutron preview  Preview production build
-  neutron release-check
+  neutron-ts start    Start production server
+  neutron-ts preview  Preview production build
+  neutron-ts release-check
     --preset vercel|cloudflare|docker|static
     --dist dist
-  neutron worker   Run background worker module
+  neutron-ts worker   Run background worker module
     --entry src/worker.ts
     --mode development|production
     --once
-  neutron deploy-check
+  neutron-ts deploy-check
     --preset vercel|cloudflare|docker|static
     --dist dist
+
+NOTE: The global 'neutron' command is the universal CLI.
+TS-specific commands use 'neutron-ts' (or 'npx neutron-ts').
 `);
       process.exit(1);
   }

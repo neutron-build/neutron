@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/neutron-desktop",
+    "crates/neutron-desktop-fs",
+    "crates/neutron-desktop-notifications",
+    "crates/neutron-desktop-tray",
+    "crates/neutron-desktop-updater",
+    "crates/neutron-desktop-shell",
+    "crates/neutron-desktop-clipboard",
+    "crates/neutron-desktop-global-hotkeys",
+    "crates/neutron-desktop-autostart",
+    "crates/neutron-desktop-window-state",
+    "crates/neutron-desktop-deeplink",
+    "crates/neutron-desktop-biometrics",
+    "examples/starter/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/neutron-build/neutron"
+
+[workspace.dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-build = "2"
+tauri-plugin = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+tracing = "0.1"
+http = "1"
+bytes = "1"
+url = "2"
+dirs = "6"

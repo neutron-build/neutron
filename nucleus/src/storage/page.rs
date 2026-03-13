@@ -438,6 +438,19 @@ pub fn iter_tuples(page: &PageBuf) -> Vec<(u16, &[u8])> {
     result
 }
 
+/// Count live (non-dead) tuples on the page without allocating.
+pub fn count_live_tuples(page: &PageBuf) -> usize {
+    let slot_count = read_u16(page, DATA_SLOT_COUNT);
+    let mut count = 0;
+    for i in 0..slot_count {
+        let entry = read_slot(page, i);
+        if !entry.is_dead() {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Number of dead (deleted) tuples on the page.
 pub fn dead_tuple_count(page: &PageBuf) -> usize {
     let slot_count = read_u16(page, DATA_SLOT_COUNT);

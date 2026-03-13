@@ -291,11 +291,10 @@ impl StorageEngine for LsmStorageEngine {
     async fn drop_table(&self, table: &str) -> Result<(), StorageError> {
         self.tables.write().remove(table);
         // Remove disk directory for this table if disk-backed.
-        if let Some(dir) = self.table_dir(table) {
-            if dir.exists() {
+        if let Some(dir) = self.table_dir(table)
+            && dir.exists() {
                 let _ = std::fs::remove_dir_all(&dir);
             }
-        }
         Ok(())
     }
 

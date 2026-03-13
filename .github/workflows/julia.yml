@@ -1,0 +1,36 @@
+name: Julia SDK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "julia/**"
+      - ".github/workflows/julia.yml"
+  pull_request:
+    paths:
+      - "julia/**"
+      - ".github/workflows/julia.yml"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        julia-version: ["1.9", "1.10", "1"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Julia ${{ matrix.julia-version }}
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+
+      - name: Cache Julia packages
+        uses: julia-actions/cache@v2
+
+      - name: Install dependencies
+        run: julia --project=julia -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Run tests
+        run: julia --project=julia -e 'using Pkg; Pkg.test()'

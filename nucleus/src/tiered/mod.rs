@@ -233,15 +233,14 @@ impl TierManager {
 
         // Access-count promotion override: if the segment has been accessed
         // more than the threshold, it belongs in Hot regardless of age.
-        if let Some(threshold) = policy.access_count_override {
-            if seg.access_count > threshold {
+        if let Some(threshold) = policy.access_count_override
+            && seg.access_count > threshold {
                 return if seg.current_tier != StorageTier::Hot {
                     Some(StorageTier::Hot)
                 } else {
                     None
                 };
             }
-        }
 
         let ideal = if age_days < policy.hot_threshold_days as u64 {
             StorageTier::Hot
@@ -334,12 +333,11 @@ impl TierManager {
 
         // Compute utilization percentages.
         for (tier, stat) in stats.iter_mut() {
-            if let Some(cfg) = self.configs.get(tier) {
-                if cfg.capacity_bytes > 0 {
+            if let Some(cfg) = self.configs.get(tier)
+                && cfg.capacity_bytes > 0 {
                     stat.utilization_pct =
                         (stat.total_bytes as f64 / cfg.capacity_bytes as f64) * 100.0;
                 }
-            }
         }
 
         // Return in tier order: Hot, Warm, Cold, Archive.

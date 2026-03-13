@@ -4,12 +4,12 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
-    "dev": "neutron dev",
-    "build": "neutron build",
-    "build:static": "neutron build --preset static",
-    "start": "neutron start",
-    "preview": "neutron preview",
-    "release:check": "neutron release-check --preset static"
+    "dev": "neutron-ts dev",
+    "build": "neutron-ts build",
+    "build:static": "neutron-ts build --preset static",
+    "start": "neutron-ts start",
+    "preview": "neutron-ts preview",
+    "release:check": "neutron-ts release-check --preset static"
   },
   "dependencies": {
     "neutron": "workspace:*",

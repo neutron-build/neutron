@@ -189,6 +189,12 @@ pub mod ws;
 pub mod http3_server;
 
 // ---------------------------------------------------------------------------
+// Tower middleware compatibility
+// ---------------------------------------------------------------------------
+#[cfg(feature = "tower-compat")]
+pub mod tower_compat;
+
+// ---------------------------------------------------------------------------
 // Prelude — convenience re-exports, respects all feature gates above
 // ---------------------------------------------------------------------------
 pub mod prelude;

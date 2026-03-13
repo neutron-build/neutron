@@ -19,6 +19,7 @@ pub enum Codec {
     Dictionary = 2,
     RunLength = 3,
     Lz4 = 4,
+    Zstd = 5,
 }
 
 impl Codec {
@@ -29,6 +30,7 @@ impl Codec {
             2 => Some(Codec::Dictionary),
             3 => Some(Codec::RunLength),
             4 => Some(Codec::Lz4),
+            5 => Some(Codec::Zstd),
             _ => None,
         }
     }
@@ -377,6 +379,27 @@ impl PageCompressor {
         }
     }
 
+    /// Compress a page using ZSTD (better ratio than LZ4, slower).
+    /// ZSTD level 3 is a good balance between speed and ratio.
+    pub fn compress_page_zstd(page: &PageBuf) -> Vec<u8> {
+        match zstd::bulk::compress(page, 3) {
+            Ok(compressed) if compressed.len() + COMPRESSION_HEADER_SIZE < PAGE_SIZE => {
+                let mut out = Vec::with_capacity(COMPRESSION_HEADER_SIZE + compressed.len());
+                out.push(Codec::Zstd as u8);
+                out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+                out.extend_from_slice(&compressed);
+                out
+            }
+            _ => {
+                // Not worth compressing or error — store raw
+                let mut out = Vec::with_capacity(1 + PAGE_SIZE);
+                out.push(Codec::None as u8);
+                out.extend_from_slice(page);
+                out
+            }
+        }
+    }
+
     /// Decompress a compressed page back to a full PageBuf.
     /// Handles trailing padding bytes safely by using the stored compressed length.
     pub fn decompress_page(data: &[u8]) -> Result<PageBuf, CompressionError> {
@@ -419,6 +442,34 @@ impl PageCompressor {
                 if decompressed.len() != PAGE_SIZE {
                     return Err(CompressionError::InvalidData(format!(
                         "decompressed size {} != {PAGE_SIZE}",
+                        decompressed.len()
+                    )));
+                }
+                let mut page = [0u8; PAGE_SIZE];
+                page.copy_from_slice(&decompressed);
+                Ok(page)
+            }
+            Codec::Zstd => {
+                if data.len() < COMPRESSION_HEADER_SIZE {
+                    return Err(CompressionError::InvalidData(
+                        "ZSTD compressed page header too short".into(),
+                    ));
+                }
+                let compressed_len =
+                    u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+                let end = COMPRESSION_HEADER_SIZE + compressed_len;
+                if end > data.len() {
+                    return Err(CompressionError::InvalidData(format!(
+                        "ZSTD compressed length {compressed_len} exceeds buffer ({})",
+                        data.len() - COMPRESSION_HEADER_SIZE
+                    )));
+                }
+                let compressed_data = &data[COMPRESSION_HEADER_SIZE..end];
+                let decompressed = zstd::bulk::decompress(compressed_data, PAGE_SIZE)
+                    .map_err(|e| CompressionError::InvalidData(format!("ZSTD decompress: {e}")))?;
+                if decompressed.len() != PAGE_SIZE {
+                    return Err(CompressionError::InvalidData(format!(
+                        "ZSTD decompressed size {} != {PAGE_SIZE}",
                         decompressed.len()
                     )));
                 }
@@ -618,5 +669,50 @@ mod tests {
     #[test]
     fn codec_lz4_variant() {
         assert_eq!(Codec::from_u8(4), Some(Codec::Lz4));
+    }
+
+    #[test]
+    fn codec_zstd_variant() {
+        assert_eq!(Codec::from_u8(5), Some(Codec::Zstd));
+    }
+
+    #[test]
+    fn page_compress_zstd_zeros() {
+        let page = [0u8; PAGE_SIZE];
+        let compressed = PageCompressor::compress_page_zstd(&page);
+        // ZSTD should compress a page of zeros very well
+        assert!(compressed.len() < PAGE_SIZE / 2, "ZSTD should compress zeros well");
+        assert_eq!(compressed[0], Codec::Zstd as u8);
+        let decompressed = PageCompressor::decompress_page(&compressed).unwrap();
+        assert_eq!(page, decompressed);
+    }
+
+    #[test]
+    fn page_compress_zstd_structured() {
+        let mut page = [0u8; PAGE_SIZE];
+        // Fill with a repeating pattern
+        for (i, byte) in page.iter_mut().enumerate() {
+            *byte = (i % 256) as u8;
+        }
+        let compressed = PageCompressor::compress_page_zstd(&page);
+        assert_eq!(compressed[0], Codec::Zstd as u8);
+        let decompressed = PageCompressor::decompress_page(&compressed).unwrap();
+        assert_eq!(page, decompressed);
+    }
+
+    #[test]
+    fn page_compress_zstd_random() {
+        // Random data is hard to compress — should fall back to None
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut page = [0u8; PAGE_SIZE];
+        for i in 0..PAGE_SIZE {
+            let mut hasher = DefaultHasher::new();
+            i.hash(&mut hasher);
+            page[i] = hasher.finish() as u8;
+        }
+        let compressed = PageCompressor::compress_page_zstd(&page);
+        let decompressed = PageCompressor::decompress_page(&compressed).unwrap();
+        assert_eq!(page, decompressed);
     }
 }

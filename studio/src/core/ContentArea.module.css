@@ -1,0 +1,35 @@
+.area {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+}
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: var(--space-3);
+}
+
+.emptyIcon {
+  font-size: 40px;
+  color: var(--text-tertiary);
+  opacity: 0.3;
+}
+
+.emptyText {
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+}

@@ -74,6 +74,30 @@ internal/
 **/SVELTEKIT-SOLIDJS-FEATURES.md
 **/REMIX-FEATURES-TO-ADOPT.md
 
+# Planning & audit docs
+**/NUCLEUS-AUDIT.md
+**/NUCLEUS-ROADMAP.md
+LAUNCH_PROMPTS.md
+
+# Benchmark & debug artifacts
+**/benchmark_results.json
+**/compete_results.json
+**/clippy_out.txt
+**/clippy_remain.txt
+
+# Deprecated
+mobile-preview/
+
+# Zig build artifacts
+zig/.zig-cache/
+zig/zig-out/
+
+# Mojo validation reports
+mojo/reports/
+
+# Turbo internal
+**/.turbo-ls-normalized.json
+
 # Scratch / dev tooling files
 **/do_edit.py
 **/edit_distributed.py

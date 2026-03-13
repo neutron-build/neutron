@@ -593,9 +593,8 @@ impl TenantKeyManager {
     /// Get a specific key by key_id (searches active + history across all tenants).
     pub fn get_key_by_id(&self, key_id: u32) -> Option<&[u8]> {
         // Check default key.
-        if let Some((id, bytes)) = &self.default_key {
-            if *id == key_id { return Some(bytes.as_slice()); }
-        }
+        if let Some((id, bytes)) = &self.default_key
+            && *id == key_id { return Some(bytes.as_slice()); }
         // Check active keys.
         for (id, bytes) in self.active_keys.values() {
             if *id == key_id { return Some(bytes.as_slice()); }
@@ -749,11 +748,10 @@ impl KeyRotationManager {
             }
             self.state = RotationState::Idle;
             // Remove last history record (incomplete).
-            if let Some(last) = self.rotation_history.last() {
-                if last.old_key_id == old_key_id && last.new_key_id == new_key_id {
+            if let Some(last) = self.rotation_history.last()
+                && last.old_key_id == old_key_id && last.new_key_id == new_key_id {
                     self.rotation_history.pop();
                 }
-            }
             Ok(())
         } else {
             Err("no rotation in progress".into())

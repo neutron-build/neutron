@@ -1,0 +1,13 @@
+[package]
+name = "neutron-desktop-clipboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Neutron Desktop clipboard read/write plugin"
+
+[dependencies]
+tauri = { workspace = true }
+tauri-plugin = { workspace = true }
+serde = { workspace = true }
+arboard = "3"
+tracing = { workspace = true }

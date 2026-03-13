@@ -1,0 +1,12 @@
+[package]
+name = "neutron-desktop-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Neutron Desktop shell plugin — open files/URLs with OS default handler"
+
+[dependencies]
+tauri = { workspace = true }
+tauri-plugin = { workspace = true }
+serde = { workspace = true }
+open = "5"

@@ -91,6 +91,34 @@ pub struct AppendEntriesResponse {
     pub match_index: LogIndex,
 }
 
+/// InstallSnapshot RPC request (sent by leader to slow followers).
+#[derive(Debug, Clone)]
+pub struct InstallSnapshotRequest {
+    pub term: Term,
+    pub leader_id: NodeId,
+    pub last_included_index: LogIndex,
+    pub last_included_term: Term,
+    /// Serialized state machine snapshot data.
+    pub data: Vec<u8>,
+}
+
+/// InstallSnapshot RPC response.
+#[derive(Debug, Clone)]
+pub struct InstallSnapshotResponse {
+    pub term: Term,
+}
+
+/// A snapshot of the state machine at a given point in the log.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    /// The last log index included in this snapshot.
+    pub last_included_index: LogIndex,
+    /// The term of the last log entry included.
+    pub last_included_term: Term,
+    /// Serialized state machine data.
+    pub data: Vec<u8>,
+}
+
 // ============================================================================
 // Raft node state
 // ============================================================================
@@ -126,6 +154,17 @@ pub struct RaftNode {
     pub leader_id: Option<NodeId>,
     /// Applied commands (for state machine output).
     pub applied_commands: Vec<Command>,
+
+    // Snapshot state
+    /// The most recent snapshot, if any.
+    pub snapshot: Option<Snapshot>,
+
+    // Leadership lease
+    /// Number of successful heartbeat responses received in the current round.
+    /// The leader tracks this to detect network partitions.
+    pub lease_acks: usize,
+    /// Whether the leader's lease is currently valid (majority responded recently).
+    pub lease_valid: bool,
 }
 
 impl RaftNode {
@@ -149,6 +188,9 @@ impl RaftNode {
             votes_received: Vec::new(),
             leader_id: None,
             applied_commands: Vec::new(),
+            snapshot: None,
+            lease_acks: 0,
+            lease_valid: false,
         }
     }
 
@@ -364,12 +406,11 @@ impl RaftNode {
         for entry in &req.entries {
             if (entry.index as usize) < self.log.len() {
                 // Existing entry — check for conflict
-                if let Some(existing) = self.log_at(entry.index) {
-                    if existing.term != entry.term {
+                if let Some(existing) = self.log_at(entry.index)
+                    && existing.term != entry.term {
                         self.log.truncate(entry.index as usize);
                         self.log.push(entry.clone());
                     }
-                }
             } else {
                 self.log.push(entry.clone());
             }
@@ -426,11 +467,10 @@ impl RaftNode {
 
         for n in (self.commit_index + 1)..=self.last_log_index() {
             // Only commit entries from current term
-            if let Some(entry) = self.log_at(n) {
-                if entry.term != self.current_term {
+            if let Some(entry) = self.log_at(n)
+                && entry.term != self.current_term {
                     continue;
                 }
-            }
 
             // Count replications (leader counts itself)
             let mut count = 1; // self
@@ -459,6 +499,166 @@ impl RaftNode {
         }
 
         applied
+    }
+
+    // ========================================================================
+    // Snapshot support (Phase 8A)
+    // ========================================================================
+
+    /// Take a snapshot at the current `last_applied` index, compacting the log.
+    ///
+    /// `state_data` is the serialized state machine state provided by the caller.
+    /// After snapshotting, all log entries up to `last_applied` are discarded
+    /// (replaced by a single sentinel entry preserving the snapshot's index/term).
+    ///
+    /// Returns the snapshot or None if there's nothing to compact.
+    pub fn take_snapshot(&mut self, state_data: Vec<u8>) -> Option<&Snapshot> {
+        if self.last_applied == 0 {
+            return None;
+        }
+
+        let snap_index = self.last_applied;
+        let snap_term = self.log_at(snap_index).map(|e| e.term).unwrap_or(0);
+
+        self.snapshot = Some(Snapshot {
+            last_included_index: snap_index,
+            last_included_term: snap_term,
+            data: state_data,
+        });
+
+        // Compact the log: keep only entries after the snapshot index.
+        // Replace the prefix with a new sentinel at the snapshot point.
+        let keep_from = snap_index as usize;
+        if keep_from < self.log.len() {
+            self.log = std::iter::once(LogEntry {
+                index: snap_index,
+                term: snap_term,
+                command: Command::Noop,
+            })
+            .chain(self.log.drain((keep_from + 1)..))
+            .collect();
+        }
+
+        self.snapshot.as_ref()
+    }
+
+    /// Build an InstallSnapshot RPC for a follower that is too far behind
+    /// to receive log entries (their `next_index` is before our snapshot).
+    pub fn build_install_snapshot(&self) -> Option<InstallSnapshotRequest> {
+        let snap = self.snapshot.as_ref()?;
+        Some(InstallSnapshotRequest {
+            term: self.current_term,
+            leader_id: self.id,
+            last_included_index: snap.last_included_index,
+            last_included_term: snap.last_included_term,
+            data: snap.data.clone(),
+        })
+    }
+
+    /// Handle an InstallSnapshot RPC (as follower).
+    pub fn handle_install_snapshot(&mut self, req: &InstallSnapshotRequest) -> InstallSnapshotResponse {
+        if req.term < self.current_term {
+            return InstallSnapshotResponse { term: self.current_term };
+        }
+
+        if req.term > self.current_term {
+            self.current_term = req.term;
+            self.voted_for = None;
+        }
+        self.role = Role::Follower;
+        self.leader_id = Some(req.leader_id);
+
+        // Install the snapshot: replace log and state
+        self.snapshot = Some(Snapshot {
+            last_included_index: req.last_included_index,
+            last_included_term: req.last_included_term,
+            data: req.data.clone(),
+        });
+
+        // Reset log to a single sentinel at the snapshot point
+        self.log = vec![LogEntry {
+            index: req.last_included_index,
+            term: req.last_included_term,
+            command: Command::Noop,
+        }];
+
+        // Advance applied/committed indices
+        if req.last_included_index > self.commit_index {
+            self.commit_index = req.last_included_index;
+        }
+        if req.last_included_index > self.last_applied {
+            self.last_applied = req.last_included_index;
+        }
+
+        InstallSnapshotResponse { term: self.current_term }
+    }
+
+    /// Check if a follower needs a snapshot (their next_index is before our snapshot).
+    pub fn needs_snapshot(&self, peer: NodeId) -> bool {
+        if let Some(ref snap) = self.snapshot {
+            let next = self.next_index.get(&peer).copied().unwrap_or(1);
+            next <= snap.last_included_index
+        } else {
+            false
+        }
+    }
+
+    // ========================================================================
+    // Leadership lease (Phase 8B)
+    // ========================================================================
+
+    /// Start a new heartbeat round: reset the ack counter.
+    /// Call this before sending heartbeats (AppendEntries) to all followers.
+    pub fn start_heartbeat_round(&mut self) {
+        if self.role == Role::Leader {
+            self.lease_acks = 1; // Count self
+        }
+    }
+
+    /// Record a successful heartbeat response from a follower.
+    /// After processing all responses, call `check_lease()`.
+    pub fn record_heartbeat_ack(&mut self) {
+        if self.role == Role::Leader {
+            self.lease_acks += 1;
+        }
+    }
+
+    /// Check if the leader has received enough heartbeat acks to maintain its lease.
+    /// If not, the leader steps down to prevent serving stale reads during a partition.
+    /// Returns true if the lease is valid, false if the leader stepped down.
+    pub fn check_lease(&mut self) -> bool {
+        if self.role != Role::Leader {
+            self.lease_valid = false;
+            return false;
+        }
+
+        let total_nodes = self.peers.len() + 1;
+        let majority = total_nodes / 2 + 1;
+
+        if self.lease_acks >= majority {
+            self.lease_valid = true;
+            true
+        } else {
+            // Can't reach a majority — step down to prevent split-brain
+            self.lease_valid = false;
+            self.role = Role::Follower;
+            self.leader_id = None;
+            false
+        }
+    }
+
+    /// Whether the leader has a valid lease (can serve reads).
+    pub fn has_valid_lease(&self) -> bool {
+        self.role == Role::Leader && self.lease_valid
+    }
+
+    /// Force step-down from leader (e.g., on election timeout without majority).
+    pub fn step_down(&mut self) {
+        if self.role == Role::Leader {
+            self.role = Role::Follower;
+            self.leader_id = None;
+            self.lease_valid = false;
+        }
     }
 
     /// Get cluster status summary.

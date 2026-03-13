@@ -1,0 +1,58 @@
+[project]
+name = "neutron"
+version = "0.1.0"
+description = "The AI application development framework for Python"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "starlette>=0.38.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "uvicorn[standard]>=0.30.0",
+    "asyncpg>=0.29.0",
+    "structlog>=24.0",
+    "httpx>=0.27.0",
+    "cyclopts>=3.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27.0",
+]
+ai = [
+    "httpx>=0.27.0",
+]
+crypto = [
+    "PyJWT[crypto]>=2.8.0",
+    "argon2-cffi>=23.1.0",
+]
+granian = [
+    "granian>=2.0.0",
+]
+rich = [
+    "rich>=13.0",
+]
+all = [
+    "neutron[ai,crypto,granian,rich]",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["neutron"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+disallow_incomplete_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true

@@ -156,6 +156,18 @@ pub enum Message {
         shard_id: u64,
         success: bool,
     },
+
+    // -- Distributed pub/sub --------------------------------------------------
+    /// Forward a NOTIFY to a remote node so it delivers to its local subscribers.
+    PubSubPublish {
+        channel: String,
+        payload: String,
+    },
+    /// Gossip: inform a peer of the channels this node currently subscribes to.
+    PubSubGossip {
+        node_id: NodeId,
+        channels: Vec<String>,
+    },
 }
 
 // ============================================================================
@@ -286,6 +298,8 @@ const TAG_TRANSFER_SHARD: u8 = 11;
 const TAG_TRANSFER_SHARD_ACK: u8 = 12;
 const TAG_FORWARD_DML: u8 = 13;
 const TAG_FORWARD_DML_RESPONSE: u8 = 14;
+const TAG_PUBSUB_PUBLISH: u8 = 15;
+const TAG_PUBSUB_GOSSIP: u8 = 16;
 
 const CMD_SQL: u8 = 1;
 const CMD_NOOP: u8 = 2;
@@ -488,6 +502,19 @@ pub fn encode(msg: &Message) -> Vec<u8> {
                 }
             }
         }
+        Message::PubSubPublish { channel, payload } => {
+            w.write_u8(TAG_PUBSUB_PUBLISH);
+            w.write_string(channel);
+            w.write_string(payload);
+        }
+        Message::PubSubGossip { node_id, channels } => {
+            w.write_u8(TAG_PUBSUB_GOSSIP);
+            w.write_u64(*node_id);
+            w.write_u64(channels.len() as u64);
+            for ch in channels {
+                w.write_string(ch);
+            }
+        }
     }
     w.finish()
 }
@@ -626,6 +653,20 @@ pub fn decode(data: &[u8]) -> Result<Message, TransportError> {
                 rows_affected,
                 error,
             })
+        }
+        TAG_PUBSUB_PUBLISH => {
+            let channel = r.read_string()?;
+            let payload = r.read_string()?;
+            Ok(Message::PubSubPublish { channel, payload })
+        }
+        TAG_PUBSUB_GOSSIP => {
+            let node_id = r.read_u64()?;
+            let count = r.read_u64()? as usize;
+            let mut channels = Vec::with_capacity(count);
+            for _ in 0..count {
+                channels.push(r.read_string()?);
+            }
+            Ok(Message::PubSubGossip { node_id, channels })
         }
         other => Err(TransportError::UnknownMessageTag(other)),
     }
@@ -903,7 +944,8 @@ use pgwire::tokio::tokio_rustls::rustls;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::tls::InternalTlsConfig;
 
@@ -927,6 +969,10 @@ pub struct TcpTransport {
     inbox_tx: mpsc::Sender<Envelope>,
     /// Peer addresses for outbound connections.
     peer_addrs: Arc<Mutex<HashMap<NodeId, String>>>,
+    /// Pending request-response correlation channels (keyed by envelope ID).
+    pending_replies: Arc<Mutex<HashMap<MessageId, oneshot::Sender<Envelope>>>>,
+    /// Monotonically increasing message ID for request correlation.
+    next_msg_id: Arc<AtomicU64>,
 }
 
 impl TcpTransport {
@@ -961,7 +1007,14 @@ impl TcpTransport {
             inbox_rx: Mutex::new(inbox_rx),
             inbox_tx,
             peer_addrs: Arc::new(Mutex::new(HashMap::new())),
+            pending_replies: Arc::new(Mutex::new(HashMap::new())),
+            next_msg_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// Return this node's ID.
+    pub fn local_node_id(&self) -> NodeId {
+        self.local_node_id
     }
 
     /// Register a peer's address for outbound connections.
@@ -983,23 +1036,25 @@ impl TcpTransport {
         let inbox_tx = self.inbox_tx.clone();
         let auth_token = self.auth_token.clone();
         let tls = self.tls.clone();
+        let pending = self.pending_replies.clone();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let tx = inbox_tx.clone();
                 let token = auth_token.clone();
                 let tls_cfg = tls.clone();
+                let pr = pending.clone();
                 tokio::spawn(async move {
                     if let Some(tls_cfg) = tls_cfg {
                         match tls_cfg.acceptor.accept(stream).await {
                             Ok(tls_stream) => {
-                                Self::handle_inbound(tls_stream, tx, token).await;
+                                Self::handle_inbound(tls_stream, tx, token, pr).await;
                             }
                             Err(e) => {
                                 tracing::warn!("cluster TLS accept failed: {e}");
                             }
                         }
                     } else {
-                        Self::handle_inbound(stream, tx, token).await;
+                        Self::handle_inbound(stream, tx, token, pr).await;
                     }
                 });
             }
@@ -1012,19 +1067,30 @@ impl TcpTransport {
         mut stream: S,
         inbox_tx: mpsc::Sender<Envelope>,
         auth_token: Option<String>,
+        pending_replies: Arc<Mutex<HashMap<MessageId, oneshot::Sender<Envelope>>>>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        if let Some(expected) = auth_token.as_deref() {
-            if let Err(e) = Self::perform_server_auth(&mut stream, expected).await {
+        if let Some(expected) = auth_token.as_deref()
+            && let Err(e) = Self::perform_server_auth(&mut stream, expected).await {
                 tracing::warn!("cluster auth failed: {e}");
                 return;
             }
-        }
 
         while let Ok(data) = Self::read_frame(&mut stream).await {
             if let Ok(envelope) = Envelope::from_bytes(&data) {
-                let _ = inbox_tx.send(envelope).await;
+                // Route response to a pending send_request() waiter if ID matches.
+                if envelope.id != 0 {
+                    let mut pending = pending_replies.lock().await;
+                    if let Some(sender) = pending.remove(&envelope.id) {
+                        let _ = sender.send(envelope);
+                        continue;
+                    }
+                }
+                if inbox_tx.send(envelope).await.is_err() {
+                    tracing::debug!("transport inbox closed, stopping connection handler");
+                    break;
+                }
             }
         }
     }
@@ -1087,6 +1153,31 @@ impl TcpTransport {
             message,
         };
         self.send(to, &envelope).await
+    }
+
+    /// Send a message and wait for the direct response envelope (request-response).
+    ///
+    /// The remote handler must reply using the same envelope `id` for correlation.
+    /// Times out after 10 seconds.
+    pub async fn send_request(&self, to: NodeId, message: Message) -> Result<Envelope, TransportError> {
+        let id = self.next_msg_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        self.pending_replies.lock().await.insert(id, tx);
+
+        let envelope = Envelope { id, from: self.local_node_id, to, message };
+        if let Err(e) = self.send(to, &envelope).await {
+            self.pending_replies.lock().await.remove(&id);
+            return Err(e);
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_)) => Err(TransportError::Protocol("reply channel dropped".into())),
+            Err(_) => {
+                self.pending_replies.lock().await.remove(&id);
+                Err(TransportError::Protocol("request timeout".into()))
+            }
+        }
     }
 
     /// Receive the next inbound envelope.

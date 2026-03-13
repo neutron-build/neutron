@@ -1,0 +1,16 @@
+[package]
+name = "neutron-desktop-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Neutron Desktop file system plugin — read, write, watch, drag-and-drop"
+
+[dependencies]
+tauri = { workspace = true }
+tauri-plugin = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+notify = "7"

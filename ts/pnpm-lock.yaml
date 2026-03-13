@@ -314,6 +314,12 @@ importers:
         specifier: ^5.7.2
         version: 5.9.3
 
+  packages/neutron-nucleus:
+    devDependencies:
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
   packages/neutron-ops:
     dependencies:
       neutron:

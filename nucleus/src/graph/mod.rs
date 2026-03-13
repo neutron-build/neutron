@@ -11,8 +11,11 @@
 
 pub mod cypher;
 pub mod cypher_executor;
+pub mod tiered;
+pub mod wal;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 // ============================================================================
 // Graph types
@@ -65,11 +68,28 @@ pub enum Direction {
     Both,
 }
 
+/// Snapshot of graph state for transaction rollback.
+pub struct GraphTxnSnapshot {
+    nodes: HashMap<NodeId, Node>,
+    edges: HashMap<EdgeId, Edge>,
+    outgoing: HashMap<NodeId, Vec<EdgeId>>,
+    incoming: HashMap<NodeId, Vec<EdgeId>>,
+    label_index: HashMap<String, HashSet<NodeId>>,
+    type_index: HashMap<String, HashSet<EdgeId>>,
+    next_node_id: NodeId,
+    next_edge_id: EdgeId,
+}
+
 // ============================================================================
 // Graph store
 // ============================================================================
 
 /// In-memory property graph store with adjacency lists.
+///
+/// When created with [`GraphStore::open`], a cold LsmTree tier is created for
+/// property overflow storage. Properties of evicted nodes/edges are spilled to
+/// the cold tier when the hot node count exceeds `max_hot_nodes`. Graph
+/// structure (adjacency, labels, types) always stays in memory.
 pub struct GraphStore {
     nodes: HashMap<NodeId, Node>,
     edges: HashMap<EdgeId, Edge>,
@@ -79,8 +99,18 @@ pub struct GraphStore {
     incoming: HashMap<NodeId, Vec<EdgeId>>,
     /// Label → node IDs (index for label lookups)
     label_index: HashMap<String, HashSet<NodeId>>,
+    /// Edge type → edge IDs (index for fast edge-type lookups)
+    type_index: HashMap<String, HashSet<EdgeId>>,
     next_node_id: NodeId,
     next_edge_id: EdgeId,
+    /// Optional WAL for durability. Present when opened with `GraphStore::open()`.
+    wal: Option<Arc<wal::GraphWal>>,
+    /// Cold tier: disk-backed LsmTree for overflow node/edge properties (disk mode only).
+    cold_props: Option<parking_lot::Mutex<crate::storage::lsm::LsmTree>>,
+    /// Node IDs whose properties are still in-memory (hot).
+    hot_node_ids: HashSet<NodeId>,
+    /// Maximum hot nodes before property eviction to cold tier.
+    pub max_hot_nodes: usize,
 }
 
 impl Default for GraphStore {
@@ -97,9 +127,72 @@ impl GraphStore {
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             label_index: HashMap::new(),
+            type_index: HashMap::new(),
             next_node_id: 1,
             next_edge_id: 1,
+            wal: None,
+            cold_props: None,
+            hot_node_ids: HashSet::new(),
+            max_hot_nodes: usize::MAX,
         }
+    }
+
+    /// Open a durable graph store backed by a WAL in the given directory.
+    ///
+    /// On first call this creates the WAL file. On subsequent calls the WAL
+    /// is replayed to restore the full graph state (nodes, edges, adjacency
+    /// lists, label index, ID counters).
+    pub fn open(dir: &std::path::Path) -> std::io::Result<Self> {
+        let (graph_wal, state) = wal::GraphWal::open(dir)?;
+
+        // Open cold LsmTree tier for property overflow
+        let cold_dir = dir.join("graph_cold");
+        std::fs::create_dir_all(&cold_dir).ok();
+        let config = crate::storage::lsm::LsmConfig::default();
+        let cold_props = crate::storage::lsm::LsmTree::open(config, &cold_dir)
+            .ok()
+            .map(parking_lot::Mutex::new);
+
+        let mut store = Self::new();
+        store.wal = Some(Arc::new(graph_wal));
+        store.cold_props = cold_props;
+        store.max_hot_nodes = 100_000;
+
+        // Restore nodes.
+        for (id, wn) in &state.nodes {
+            for label in &wn.labels {
+                store.label_index.entry(label.clone()).or_default().insert(*id);
+            }
+            store.nodes.insert(*id, Node {
+                id: *id,
+                labels: wn.labels.clone(),
+                properties: wn.properties.clone(),
+            });
+            store.hot_node_ids.insert(*id);
+        }
+
+        // Restore edges + adjacency + type index.
+        for (id, we) in &state.edges {
+            store.type_index
+                .entry(we.edge_type.clone())
+                .or_default()
+                .insert(*id);
+            store.edges.insert(*id, Edge {
+                id: *id,
+                edge_type: we.edge_type.clone(),
+                from: we.from,
+                to: we.to,
+                properties: we.properties.clone(),
+            });
+            store.outgoing.entry(we.from).or_default().push(*id);
+            store.incoming.entry(we.to).or_default().push(*id);
+        }
+
+        // Restore ID counters.
+        store.next_node_id = if state.next_node_id > 0 { state.next_node_id } else { 1 };
+        store.next_edge_id = if state.next_edge_id > 0 { state.next_edge_id } else { 1 };
+
+        Ok(store)
     }
 
     // ---- Node operations ----
@@ -108,6 +201,11 @@ impl GraphStore {
     pub fn create_node(&mut self, labels: Vec<String>, properties: Properties) -> NodeId {
         let id = self.next_node_id;
         self.next_node_id += 1;
+
+        // WAL: log before mutation.
+        if let Some(ref w) = self.wal {
+            let _ = w.log_add_node(id, &labels, &properties);
+        }
 
         for label in &labels {
             self.label_index
@@ -124,16 +222,56 @@ impl GraphStore {
                 properties,
             },
         );
+        self.hot_node_ids.insert(id);
+        if self.cold_props.is_some() {
+            self.maybe_evict_props();
+        }
         id
     }
 
     /// Get a node by ID.
+    ///
+    /// If the node's properties have been evicted to the cold tier, they are
+    /// fetched from the LsmTree and the returned reference contains the full
+    /// properties. Note: if properties were evicted, this allocates via
+    /// `get_node_full()` internally.
     pub fn get_node(&self, id: NodeId) -> Option<&Node> {
         self.nodes.get(&id)
     }
 
+    /// Get a node by ID with cold-tier property fallback.
+    ///
+    /// If the node's properties map is empty and a cold tier exists, the
+    /// properties are fetched from the cold LsmTree and returned as an owned
+    /// `Node`. This avoids modifying the store for a read operation.
+    pub fn get_node_full(&self, id: NodeId) -> Option<Node> {
+        let node = self.nodes.get(&id)?;
+        if !node.properties.is_empty() || self.cold_props.is_none() {
+            return Some(node.clone());
+        }
+        // Properties might be in cold tier
+        if let Some(ref cold) = self.cold_props {
+            let key = format!("n:{id}").into_bytes();
+            let props_data = cold.lock().get(&key);
+            if let Some(data) = props_data
+                && let Some(props) = tiered::properties_from_bytes(&data) {
+                    return Some(Node {
+                        id: node.id,
+                        labels: node.labels.clone(),
+                        properties: props,
+                    });
+                }
+        }
+        Some(node.clone())
+    }
+
     /// Delete a node and all its edges.
     pub fn delete_node(&mut self, id: NodeId) -> bool {
+        // WAL: log before mutation.
+        if let Some(ref w) = self.wal {
+            let _ = w.log_del_node(id);
+        }
+
         let node = match self.nodes.remove(&id) {
             Some(n) => n,
             None => return false,
@@ -146,6 +284,13 @@ impl GraphStore {
             }
         }
 
+        // Remove from hot tracking and cold tier
+        self.hot_node_ids.remove(&id);
+        if let Some(ref cold) = self.cold_props {
+            let key = format!("n:{id}").into_bytes();
+            cold.lock().delete(key);
+        }
+
         // Collect edge IDs to remove
         let out_edges: Vec<EdgeId> = self.outgoing.remove(&id).unwrap_or_default();
         let in_edges: Vec<EdgeId> = self.incoming.remove(&id).unwrap_or_default();
@@ -155,12 +300,34 @@ impl GraphStore {
                 if let Some(inc) = self.incoming.get_mut(&edge.to) {
                     inc.retain(|e| *e != eid);
                 }
+                // Remove from type index.
+                if let Some(set) = self.type_index.get_mut(&edge.edge_type) {
+                    set.remove(&eid);
+                    if set.is_empty() {
+                        self.type_index.remove(&edge.edge_type);
+                    }
+                }
+                // Clean edge properties from cold tier
+                if let Some(ref cold) = self.cold_props {
+                    cold.lock().delete(format!("e:{eid}").into_bytes());
+                }
             }
         }
         for eid in in_edges {
             if let Some(edge) = self.edges.remove(&eid) {
                 if let Some(out) = self.outgoing.get_mut(&edge.from) {
                     out.retain(|e| *e != eid);
+                }
+                // Remove from type index.
+                if let Some(set) = self.type_index.get_mut(&edge.edge_type) {
+                    set.remove(&eid);
+                    if set.is_empty() {
+                        self.type_index.remove(&edge.edge_type);
+                    }
+                }
+                // Clean edge properties from cold tier
+                if let Some(ref cold) = self.cold_props {
+                    cold.lock().delete(format!("e:{eid}").into_bytes());
                 }
             }
         }
@@ -190,6 +357,11 @@ impl GraphStore {
         self.nodes.values().collect()
     }
 
+    /// Get all edges.
+    pub fn all_edges(&self) -> Vec<&Edge> {
+        self.edges.values().collect()
+    }
+
     // ---- Edge operations ----
 
     /// Create an edge between two nodes. Returns the edge ID, or None if nodes don't exist.
@@ -207,6 +379,15 @@ impl GraphStore {
         let id = self.next_edge_id;
         self.next_edge_id += 1;
 
+        // WAL: log before mutation.
+        if let Some(ref w) = self.wal {
+            let _ = w.log_add_edge(id, from, to, &edge_type, &properties);
+        }
+
+        self.type_index
+            .entry(edge_type.clone())
+            .or_default()
+            .insert(id);
         self.edges.insert(
             id,
             Edge {
@@ -228,8 +409,36 @@ impl GraphStore {
         self.edges.get(&id)
     }
 
+    /// Get an edge by ID with cold-tier property fallback.
+    pub fn get_edge_full(&self, id: EdgeId) -> Option<Edge> {
+        let edge = self.edges.get(&id)?;
+        if !edge.properties.is_empty() || self.cold_props.is_none() {
+            return Some(edge.clone());
+        }
+        if let Some(ref cold) = self.cold_props {
+            let key = format!("e:{id}").into_bytes();
+            let props_data = cold.lock().get(&key);
+            if let Some(data) = props_data
+                && let Some(props) = tiered::properties_from_bytes(&data) {
+                    return Some(Edge {
+                        id: edge.id,
+                        edge_type: edge.edge_type.clone(),
+                        from: edge.from,
+                        to: edge.to,
+                        properties: props,
+                    });
+                }
+        }
+        Some(edge.clone())
+    }
+
     /// Delete an edge.
     pub fn delete_edge(&mut self, id: EdgeId) -> bool {
+        // WAL: log before mutation.
+        if let Some(ref w) = self.wal {
+            let _ = w.log_del_edge(id);
+        }
+
         let edge = match self.edges.remove(&id) {
             Some(e) => e,
             None => return false,
@@ -241,6 +450,17 @@ impl GraphStore {
         if let Some(inc) = self.incoming.get_mut(&edge.to) {
             inc.retain(|e| *e != id);
         }
+        // Remove from type index.
+        if let Some(set) = self.type_index.get_mut(&edge.edge_type) {
+            set.remove(&id);
+            if set.is_empty() {
+                self.type_index.remove(&edge.edge_type);
+            }
+        }
+        // Clean edge properties from cold tier
+        if let Some(ref cold) = self.cold_props {
+            cold.lock().delete(format!("e:{id}").into_bytes());
+        }
         true
     }
 
@@ -249,9 +469,150 @@ impl GraphStore {
         self.edges.len()
     }
 
+    /// Fast lookup of edges by type using the type index. O(k) where k is the
+    /// number of edges with the given type, instead of O(E) linear scan.
+    pub fn edges_by_type(&self, edge_type: &str) -> Vec<&Edge> {
+        self.type_index
+            .get(edge_type)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| self.edges.get(id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // ---- Property mutation ----
+
+    /// Set (or overwrite) a property on a node.
+    pub fn set_node_property(&mut self, id: NodeId, key: String, value: PropValue) -> bool {
+        if let Some(ref w) = self.wal {
+            let _ = w.log_set_prop(0, id, &key, &value);
+        }
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.properties.insert(key, value);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set (or overwrite) a property on an edge.
+    pub fn set_edge_property(&mut self, id: EdgeId, key: String, value: PropValue) -> bool {
+        if let Some(ref w) = self.wal {
+            let _ = w.log_set_prop(1, id, &key, &value);
+        }
+        if let Some(edge) = self.edges.get_mut(&id) {
+            edge.properties.insert(key, value);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Create a `GraphSnapshot` for WAL checkpointing.
+    pub fn snapshot(&self) -> wal::GraphSnapshot<'_> {
+        wal::GraphSnapshot {
+            nodes: self.nodes.values().map(|n| (&n.id, &n.labels, &n.properties)).collect(),
+            edges: self.edges.values().map(|e| (&e.id, &e.from, &e.to, e.edge_type.as_str(), &e.properties)).collect(),
+            next_node_id: self.next_node_id,
+            next_edge_id: self.next_edge_id,
+        }
+    }
+
+    /// Checkpoint the WAL (compact it to a single snapshot entry). No-op if no WAL.
+    pub fn checkpoint_wal(&self) -> std::io::Result<()> {
+        if let Some(ref w) = self.wal {
+            let snap = self.snapshot();
+            w.checkpoint(&snap)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Capture full graph state for transaction rollback.
+    pub fn txn_snapshot(&self) -> GraphTxnSnapshot {
+        GraphTxnSnapshot {
+            nodes: self.nodes.clone(),
+            edges: self.edges.clone(),
+            outgoing: self.outgoing.clone(),
+            incoming: self.incoming.clone(),
+            label_index: self.label_index.clone(),
+            type_index: self.type_index.clone(),
+            next_node_id: self.next_node_id,
+            next_edge_id: self.next_edge_id,
+        }
+    }
+
+    /// Restore graph state from a transaction snapshot (for ROLLBACK).
+    pub fn txn_restore(&mut self, snap: GraphTxnSnapshot) {
+        self.nodes = snap.nodes;
+        self.edges = snap.edges;
+        self.outgoing = snap.outgoing;
+        self.incoming = snap.incoming;
+        self.label_index = snap.label_index;
+        self.type_index = snap.type_index;
+        self.next_node_id = snap.next_node_id;
+        self.next_edge_id = snap.next_edge_id;
+    }
+
+    // ========================================================================
+    // Cold tier helpers
+    // ========================================================================
+
+    /// Whether this store has a cold tier (disk mode).
+    pub fn has_cold_tier(&self) -> bool {
+        self.cold_props.is_some()
+    }
+
+    /// Return the count of hot (in-memory properties) nodes only.
+    pub fn node_count_hot(&self) -> usize {
+        self.hot_node_ids.len()
+    }
+
+    /// Evict node properties from the hot tier to the cold LsmTree when the
+    /// hot node count exceeds `max_hot_nodes`. Only properties are evicted;
+    /// adjacency structure stays in memory.
+    fn maybe_evict_props(&mut self) {
+        if self.hot_node_ids.len() <= self.max_hot_nodes {
+            return;
+        }
+        let Some(ref cold) = self.cold_props else { return };
+        let to_evict = self.hot_node_ids.len() - self.max_hot_nodes;
+
+        // Collect node IDs to evict
+        let evict_ids: Vec<NodeId> = self.hot_node_ids.iter().copied().take(to_evict).collect();
+
+        let mut c = cold.lock();
+        for nid in &evict_ids {
+            if let Some(node) = self.nodes.get_mut(nid)
+                && !node.properties.is_empty() {
+                    let bytes = tiered::properties_to_bytes(&node.properties);
+                    c.put(format!("n:{nid}").into_bytes(), bytes);
+                    node.properties.clear();
+                }
+            self.hot_node_ids.remove(nid);
+
+            // Also evict properties of outgoing edges from this node
+            if let Some(out_eids) = self.outgoing.get(nid) {
+                for &eid in out_eids {
+                    if let Some(edge) = self.edges.get_mut(&eid)
+                        && !edge.properties.is_empty() {
+                            let bytes = tiered::properties_to_bytes(&edge.properties);
+                            c.put(format!("e:{eid}").into_bytes(), bytes);
+                            edge.properties.clear();
+                        }
+                }
+            }
+        }
+    }
+
     // ---- Neighbor / traversal primitives ----
 
     /// Get neighbors of a node in a given direction, optionally filtered by edge type.
+    ///
+    /// When `edge_type` is `Some`, the type index is used to narrow candidate
+    /// edges before checking adjacency, avoiding a full linear scan.
     pub fn neighbors(
         &self,
         node_id: NodeId,
@@ -260,24 +621,47 @@ impl GraphStore {
     ) -> Vec<(NodeId, &Edge)> {
         let mut results = Vec::new();
 
-        let collect = |edge_ids: &[EdgeId], get_neighbor: fn(&Edge) -> NodeId| {
-            edge_ids
-                .iter()
-                .filter_map(|eid| self.edges.get(eid))
-                .filter(|e| edge_type.is_none_or(|t| e.edge_type == t))
-                .map(|e| (get_neighbor(e), e))
-                .collect::<Vec<_>>()
-        };
+        if let Some(et) = edge_type {
+            // Fast path: use the type index to only consider edges of the
+            // requested type, then check adjacency.
+            if let Some(type_eids) = self.type_index.get(et) {
+                if (direction == Direction::Outgoing || direction == Direction::Both)
+                    && let Some(out) = self.outgoing.get(&node_id) {
+                        for eid in out {
+                            if type_eids.contains(eid)
+                                && let Some(e) = self.edges.get(eid) {
+                                    results.push((e.to, e));
+                                }
+                        }
+                    }
+                if (direction == Direction::Incoming || direction == Direction::Both)
+                    && let Some(inc) = self.incoming.get(&node_id) {
+                        for eid in inc {
+                            if type_eids.contains(eid)
+                                && let Some(e) = self.edges.get(eid) {
+                                    results.push((e.from, e));
+                                }
+                        }
+                    }
+            }
+        } else {
+            // No type filter: scan all adjacency edges.
+            let collect = |edge_ids: &[EdgeId], get_neighbor: fn(&Edge) -> NodeId| {
+                edge_ids
+                    .iter()
+                    .filter_map(|eid| self.edges.get(eid))
+                    .map(|e| (get_neighbor(e), e))
+                    .collect::<Vec<_>>()
+            };
 
-        if direction == Direction::Outgoing || direction == Direction::Both {
-            if let Some(out) = self.outgoing.get(&node_id) {
-                results.extend(collect(out, |e| e.to));
-            }
-        }
-        if direction == Direction::Incoming || direction == Direction::Both {
-            if let Some(inc) = self.incoming.get(&node_id) {
-                results.extend(collect(inc, |e| e.from));
-            }
+            if (direction == Direction::Outgoing || direction == Direction::Both)
+                && let Some(out) = self.outgoing.get(&node_id) {
+                    results.extend(collect(out, |e| e.to));
+                }
+            if (direction == Direction::Incoming || direction == Direction::Both)
+                && let Some(inc) = self.incoming.get(&node_id) {
+                    results.extend(collect(inc, |e| e.from));
+                }
         }
 
         results
@@ -405,12 +789,26 @@ impl GraphStore {
         // Use BTreeMap as a poor-man's priority queue: (distance_bits, node_id)
         let mut pq: BTreeMap<(u64, NodeId), ()> = BTreeMap::new();
 
-        dist.insert(from, 0.0);
-        pq.insert((0u64, from), ());
+        // Convert f64 to u64 that preserves total ordering for BTreeMap use.
+        #[inline]
+        fn f64_to_ord(f: f64) -> u64 {
+            let bits = f.to_bits();
+            // Positive floats: set sign bit so they sort after negative.
+            // Negative floats: flip all bits to reverse their order.
+            if bits >> 63 == 0 { bits | (1u64 << 63) } else { !bits }
+        }
+        #[inline]
+        fn ord_to_f64(o: u64) -> f64 {
+            let bits = if o >> 63 == 1 { o & !(1u64 << 63) } else { !o };
+            f64::from_bits(bits)
+        }
 
-        while let Some((&(d_bits, current), _)) = pq.iter().next() {
-            pq.remove(&(d_bits, current));
-            let current_dist = f64::from_bits(d_bits);
+        dist.insert(from, 0.0);
+        pq.insert((f64_to_ord(0.0), from), ());
+
+        while let Some((&(d_ord, current), _)) = pq.iter().next() {
+            pq.remove(&(d_ord, current));
+            let current_dist = ord_to_f64(d_ord);
 
             if current == to {
                 let mut path = vec![to];
@@ -437,7 +835,7 @@ impl GraphStore {
                 if new_dist < *dist.get(&neighbor).unwrap_or(&f64::MAX) {
                     dist.insert(neighbor, new_dist);
                     parent.insert(neighbor, current);
-                    pq.insert((new_dist.to_bits(), neighbor), ());
+                    pq.insert((f64_to_ord(new_dist), neighbor), ());
                 }
             }
         }
@@ -486,11 +884,10 @@ impl GraphStore {
                 for &eid in out_edges {
                     if let Some(edge) = self.edges.get(&eid) {
                         // Check edge type filter
-                        if let Some(et) = edge_type {
-                            if edge.edge_type != et {
+                        if let Some(et) = edge_type
+                            && edge.edge_type != et {
                                 continue;
                             }
-                        }
                         // Check end label filter
                         if let Some(el) = end_label {
                             if let Some(end_node) = self.nodes.get(&edge.to) {
@@ -627,11 +1024,10 @@ impl GraphStore {
                     let share = damping * rank / out_degree as f64;
                     if let Some(out_edges) = self.outgoing.get(&node_id) {
                         for eid in out_edges {
-                            if let Some(edge) = self.edges.get(eid) {
-                                if let Some(r) = new_ranks.get_mut(&edge.to) {
+                            if let Some(edge) = self.edges.get(eid)
+                                && let Some(r) = new_ranks.get_mut(&edge.to) {
                                     *r += share;
                                 }
-                            }
                         }
                     }
                 }
@@ -641,6 +1037,346 @@ impl GraphStore {
         }
 
         ranks
+    }
+
+    // ---- Community Detection ----
+
+    /// Label Propagation community detection.
+    ///
+    /// Each node starts with its own label. In each iteration, every node
+    /// adopts the most common label among its neighbors. Converges when
+    /// no labels change.
+    pub fn label_propagation(&self, max_iterations: usize) -> HashMap<NodeId, usize> {
+        let node_ids: Vec<NodeId> = self.nodes.keys().copied().collect();
+        if node_ids.is_empty() {
+            return HashMap::new();
+        }
+
+        // Initialize: each node gets its own label (using index as label)
+        let mut labels: HashMap<NodeId, usize> = node_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, i))
+            .collect();
+
+        for _ in 0..max_iterations {
+            let mut changed = false;
+
+            for &node_id in &node_ids {
+                // Count neighbor labels
+                let mut label_counts: HashMap<usize, usize> = HashMap::new();
+
+                // Outgoing neighbors
+                if let Some(out_edges) = self.outgoing.get(&node_id) {
+                    for eid in out_edges {
+                        if let Some(edge) = self.edges.get(eid)
+                            && let Some(&label) = labels.get(&edge.to) {
+                                *label_counts.entry(label).or_insert(0) += 1;
+                            }
+                    }
+                }
+
+                // Incoming neighbors (undirected community detection)
+                if let Some(in_edges) = self.incoming.get(&node_id) {
+                    for eid in in_edges {
+                        if let Some(edge) = self.edges.get(eid)
+                            && let Some(&label) = labels.get(&edge.from) {
+                                *label_counts.entry(label).or_insert(0) += 1;
+                            }
+                    }
+                }
+
+                if let Some((&best_label, _)) = label_counts
+                    .iter()
+                    .max_by_key(|(_, count)| *count)
+                    && labels[&node_id] != best_label {
+                        labels.insert(node_id, best_label);
+                        changed = true;
+                    }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+
+        labels
+    }
+
+    /// Louvain-style community detection (simplified modularity optimization).
+    ///
+    /// Phase 1: Each node starts in its own community. Greedily move nodes
+    /// to the neighbor community that maximizes modularity gain. Repeat
+    /// until no improvement.
+    ///
+    /// Returns `node_id → community_id` mapping.
+    pub fn louvain_communities(&self) -> HashMap<NodeId, usize> {
+        let node_ids: Vec<NodeId> = self.nodes.keys().copied().collect();
+        if node_ids.is_empty() {
+            return HashMap::new();
+        }
+
+        let total_edges = self.edges.len() as f64;
+        if total_edges == 0.0 {
+            // Every node is its own community
+            return node_ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+        }
+
+        // Initialize: each node in its own community
+        let mut community: HashMap<NodeId, usize> = node_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, i))
+            .collect();
+
+        // Compute node degrees (in + out)
+        let mut degree: HashMap<NodeId, usize> = HashMap::new();
+        for &node_id in &node_ids {
+            let out = self.outgoing.get(&node_id).map_or(0, |v| v.len());
+            let inc = self.incoming.get(&node_id).map_or(0, |v| v.len());
+            degree.insert(node_id, out + inc);
+        }
+
+        let m2 = 2.0 * total_edges; // 2m for modularity formula
+
+        let max_iterations = 100;
+        for _iter in 0..max_iterations {
+            let mut moved = false;
+
+            for &node_id in &node_ids {
+                let current_comm = community[&node_id];
+                let ki = *degree.get(&node_id).unwrap_or(&0) as f64;
+
+                // Count edges to each neighboring community
+                let mut comm_edges: HashMap<usize, f64> = HashMap::new();
+                if let Some(out_edges) = self.outgoing.get(&node_id) {
+                    for eid in out_edges {
+                        if let Some(edge) = self.edges.get(eid) {
+                            let nc = community[&edge.to];
+                            *comm_edges.entry(nc).or_insert(0.0) += 1.0;
+                        }
+                    }
+                }
+                if let Some(in_edges) = self.incoming.get(&node_id) {
+                    for eid in in_edges {
+                        if let Some(edge) = self.edges.get(eid) {
+                            let nc = community[&edge.from];
+                            *comm_edges.entry(nc).or_insert(0.0) += 1.0;
+                        }
+                    }
+                }
+
+                // Sum of degrees in each candidate community (excluding node_id itself)
+                let mut comm_degree_sum: HashMap<usize, f64> = HashMap::new();
+                for (&nid, &comm) in &community {
+                    if nid == node_id {
+                        continue; // exclude the moving node
+                    }
+                    if comm_edges.contains_key(&comm) || comm == current_comm {
+                        *comm_degree_sum.entry(comm).or_insert(0.0) +=
+                            *degree.get(&nid).unwrap_or(&0) as f64;
+                    }
+                }
+
+                // Edges to current community (excluding self-loops)
+                let ki_current = comm_edges.get(&current_comm).copied().unwrap_or(0.0);
+                let sigma_current = comm_degree_sum.get(&current_comm).copied().unwrap_or(0.0);
+                // Cost of removing from current community
+                let remove_cost = ki_current / total_edges - ki * sigma_current / (m2 * m2);
+
+                // Find the community with best net modularity gain
+                let mut best_comm = current_comm;
+                let mut best_gain = 0.0f64;
+
+                for (&candidate_comm, &edges_to_comm) in &comm_edges {
+                    if candidate_comm == current_comm {
+                        continue;
+                    }
+                    let sigma_tot = comm_degree_sum.get(&candidate_comm).copied().unwrap_or(0.0);
+                    // Net gain = gain from joining new - cost of leaving current
+                    let join_gain = edges_to_comm / total_edges - ki * sigma_tot / (m2 * m2);
+                    let net_gain = join_gain - remove_cost;
+                    if net_gain > best_gain {
+                        best_gain = net_gain;
+                        best_comm = candidate_comm;
+                    }
+                }
+
+                if best_comm != current_comm {
+                    community.insert(node_id, best_comm);
+                    moved = true;
+                }
+            }
+
+            if !moved {
+                break;
+            }
+        }
+
+        community
+    }
+
+    // ---- Parallel operations ----
+
+    /// Filter a node's outgoing edges in parallel when there are many (100+).
+    ///
+    /// For small neighbor sets the filter runs sequentially. For large neighbor
+    /// sets the edge slice is partitioned across available CPUs and filtered in
+    /// parallel using `std::thread::scope` (zero extra dependencies).
+    pub fn par_neighbors_filtered(
+        &self,
+        node_id: NodeId,
+        filter_fn: impl Fn(&Edge) -> bool + Sync,
+    ) -> Vec<Edge> {
+        let edge_ids = match self.outgoing.get(&node_id) {
+            Some(ids) => ids.as_slice(),
+            None => return Vec::new(),
+        };
+
+        // Collect the actual Edge references we can resolve.
+        let edges: Vec<&Edge> = edge_ids
+            .iter()
+            .filter_map(|eid| self.edges.get(eid))
+            .collect();
+
+        if edges.len() < 100 {
+            return edges.into_iter().filter(|e| filter_fn(e)).cloned().collect();
+        }
+
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let chunk_size = edges.len().div_ceil(cpus);
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = edges
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    let f = &filter_fn;
+                    s.spawn(move || {
+                        chunk
+                            .iter()
+                            .filter(|e| f(e))
+                            .map(|e| (*e).clone())
+                            .collect::<Vec<Edge>>()
+                    })
+                })
+                .collect();
+
+            let mut result = Vec::new();
+            for h in handles {
+                result.extend(h.join().unwrap());
+            }
+            result
+        })
+    }
+
+    /// Run BFS from multiple source nodes simultaneously.
+    ///
+    /// Each BFS is independent and runs on its own thread via
+    /// `std::thread::scope`. Returns `(source, reachable_nodes)` pairs in the
+    /// same order as `sources`.
+    pub fn par_multi_bfs(
+        &self,
+        sources: &[NodeId],
+        direction: Direction,
+        edge_type: Option<&str>,
+    ) -> Vec<(NodeId, Vec<NodeId>)> {
+        if sources.len() < 2 {
+            return sources
+                .iter()
+                .map(|&src| (src, self.bfs(src, direction, edge_type)))
+                .collect();
+        }
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = sources
+                .iter()
+                .map(|&src| {
+                    s.spawn(move || (src, self.bfs(src, direction, edge_type)))
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        })
+    }
+
+    /// Run multiple shortest-path queries in parallel.
+    ///
+    /// Each query is independent. For a single query the call is sequential;
+    /// for two or more queries each runs on its own thread.
+    pub fn par_batch_shortest_path(
+        &self,
+        queries: &[(NodeId, NodeId)],
+        direction: Direction,
+        edge_type: Option<&str>,
+    ) -> Vec<Option<Vec<NodeId>>> {
+        if queries.len() < 2 {
+            return queries
+                .iter()
+                .map(|(src, dst)| self.shortest_path(*src, *dst, direction, edge_type))
+                .collect();
+        }
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = queries
+                .iter()
+                .map(|&(src, dst)| {
+                    s.spawn(move || self.shortest_path(src, dst, direction, edge_type))
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        })
+    }
+
+    /// Count edges per edge type in parallel.
+    ///
+    /// Uses the `type_index` for O(1) per-type counting. When there are many
+    /// distinct edge types the counting is parallelised across types.
+    pub fn par_edge_type_counts(&self) -> HashMap<String, usize> {
+        if self.type_index.len() < 4 {
+            // Small number of types — just count sequentially.
+            return self
+                .type_index
+                .iter()
+                .map(|(t, ids)| (t.clone(), ids.len()))
+                .collect();
+        }
+
+        let entries: Vec<(&String, &HashSet<EdgeId>)> = self.type_index.iter().collect();
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let chunk_size = entries.len().div_ceil(cpus);
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = entries
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|(t, ids)| ((*t).clone(), ids.len()))
+                            .collect::<Vec<(String, usize)>>()
+                    })
+                })
+                .collect();
+
+            let mut result = HashMap::new();
+            for h in handles {
+                for (t, count) in h.join().unwrap() {
+                    result.insert(t, count);
+                }
+            }
+            result
+        })
     }
 }
 
@@ -806,12 +1542,24 @@ impl CsrGraph {
         // BTreeMap<(distance_bits, node_id), ()> as a priority queue
         let mut pq: BTreeMap<(u64, NodeId), ()> = BTreeMap::new();
 
-        dist.insert(from, 0.0);
-        pq.insert((0u64, from), ());
+        // Convert f64 to u64 that preserves total ordering for BTreeMap use.
+        #[inline]
+        fn f64_to_ord(f: f64) -> u64 {
+            let bits = f.to_bits();
+            if bits >> 63 == 0 { bits | (1u64 << 63) } else { !bits }
+        }
+        #[inline]
+        fn ord_to_f64(o: u64) -> f64 {
+            let bits = if o >> 63 == 1 { o & !(1u64 << 63) } else { !o };
+            f64::from_bits(bits)
+        }
 
-        while let Some((&(d_bits, current), _)) = pq.iter().next() {
-            pq.remove(&(d_bits, current));
-            let current_dist = f64::from_bits(d_bits);
+        dist.insert(from, 0.0);
+        pq.insert((f64_to_ord(0.0), from), ());
+
+        while let Some((&(d_ord, current), _)) = pq.iter().next() {
+            pq.remove(&(d_ord, current));
+            let current_dist = ord_to_f64(d_ord);
 
             if current == to {
                 let mut path = vec![to];
@@ -838,7 +1586,7 @@ impl CsrGraph {
                 if new_dist < *dist.get(&edge.target).unwrap_or(&f64::MAX) {
                     dist.insert(edge.target, new_dist);
                     parent.insert(edge.target, current);
-                    pq.insert((new_dist.to_bits(), edge.target), ());
+                    pq.insert((f64_to_ord(new_dist), edge.target), ());
                 }
             }
         }
@@ -1008,14 +1756,13 @@ impl CompositePropertyIndex {
     }
 
     pub fn remove_node(&mut self, node: &Node) {
-        if let Some(key) = self.make_key(node) {
-            if let Some(set) = self.tree.get_mut(&key) {
+        if let Some(key) = self.make_key(node)
+            && let Some(set) = self.tree.get_mut(&key) {
                 set.remove(&node.id);
                 if set.is_empty() {
                     self.tree.remove(&key);
                 }
             }
-        }
     }
 
     pub fn lookup(&self, values: &[PropValue]) -> Vec<NodeId> {
@@ -1963,5 +2710,681 @@ mod tests {
 
         mgr.commit(txn, &mut g);
         assert_eq!(mgr.active_locks(), 0); // locks released on commit
+    }
+
+    // ================================================================
+    // WAL integration tests
+    // ================================================================
+
+    #[test]
+    fn wal_nodes_edges_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut g = GraphStore::open(dir.path()).unwrap();
+            let a = g.create_node(
+                vec!["Person".into()],
+                props(vec![("name", PropValue::Text("Alice".into()))]),
+            );
+            let b = g.create_node(
+                vec!["Person".into()],
+                props(vec![("name", PropValue::Text("Bob".into()))]),
+            );
+            g.create_edge(a, b, "KNOWS".into(), props(vec![("since", PropValue::Int(2024))]));
+        }
+        // Reopen.
+        let g2 = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(g2.node_count(), 2);
+        assert_eq!(g2.edge_count(), 1);
+        let alice = g2.get_node(1).unwrap();
+        assert_eq!(alice.properties.get("name"), Some(&PropValue::Text("Alice".into())));
+        let edge = g2.get_edge(1).unwrap();
+        assert_eq!(edge.edge_type, "KNOWS");
+        assert_eq!(edge.properties.get("since"), Some(&PropValue::Int(2024)));
+    }
+
+    #[test]
+    fn wal_delete_node_cascade_edges_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut g = GraphStore::open(dir.path()).unwrap();
+            let a = g.create_node(vec!["A".into()], Properties::new());
+            let b = g.create_node(vec!["B".into()], Properties::new());
+            let c = g.create_node(vec!["C".into()], Properties::new());
+            g.create_edge(a, b, "X".into(), Properties::new());
+            g.create_edge(b, c, "Y".into(), Properties::new());
+            g.create_edge(a, c, "Z".into(), Properties::new());
+            // Delete node B — should cascade edges X (a->b) and Y (b->c).
+            g.delete_node(b);
+        }
+        let g2 = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(g2.node_count(), 2);
+        assert_eq!(g2.edge_count(), 1); // only edge Z (a->c) remains
+        assert!(g2.get_node(2).is_none()); // B deleted
+        assert!(g2.get_edge(3).is_some()); // Z still exists
+    }
+
+    #[test]
+    fn wal_properties_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut g = GraphStore::open(dir.path()).unwrap();
+            g.create_node(vec![], props(vec![
+                ("s", PropValue::Text("hello".into())),
+                ("i", PropValue::Int(42)),
+                ("f", PropValue::Float(3.14)),
+                ("b", PropValue::Bool(true)),
+                ("n", PropValue::Null),
+            ]));
+        }
+        let g2 = GraphStore::open(dir.path()).unwrap();
+        let n = g2.get_node(1).unwrap();
+        assert_eq!(n.properties.get("s"), Some(&PropValue::Text("hello".into())));
+        assert_eq!(n.properties.get("i"), Some(&PropValue::Int(42)));
+        assert_eq!(n.properties.get("f"), Some(&PropValue::Float(3.14)));
+        assert_eq!(n.properties.get("b"), Some(&PropValue::Bool(true)));
+        assert_eq!(n.properties.get("n"), Some(&PropValue::Null));
+    }
+
+    #[test]
+    fn wal_label_index_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut g = GraphStore::open(dir.path()).unwrap();
+            g.create_node(vec!["Person".into(), "Employee".into()], Properties::new());
+            g.create_node(vec!["Person".into()], Properties::new());
+            g.create_node(vec!["Company".into()], Properties::new());
+        }
+        let g2 = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(g2.nodes_by_label("Person").len(), 2);
+        assert_eq!(g2.nodes_by_label("Employee").len(), 1);
+        assert_eq!(g2.nodes_by_label("Company").len(), 1);
+    }
+
+    #[test]
+    fn wal_adjacency_correct_after_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut g = GraphStore::open(dir.path()).unwrap();
+            let a = g.create_node(vec![], Properties::new());
+            let b = g.create_node(vec![], Properties::new());
+            let c = g.create_node(vec![], Properties::new());
+            g.create_edge(a, b, "E1".into(), Properties::new());
+            g.create_edge(a, c, "E2".into(), Properties::new());
+            g.create_edge(b, c, "E3".into(), Properties::new());
+        }
+        let g2 = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(g2.outgoing_edges(1).len(), 2); // a -> b, a -> c
+        assert_eq!(g2.outgoing_edges(2).len(), 1); // b -> c
+        assert_eq!(g2.incoming_edges(3).len(), 2); // a -> c, b -> c
+        assert_eq!(g2.degree(1, Direction::Outgoing), 2);
+        assert_eq!(g2.degree(3, Direction::Incoming), 2);
+    }
+
+    #[test]
+    fn wal_bfs_shortest_path_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut g = GraphStore::open(dir.path()).unwrap();
+            let a = g.create_node(vec![], Properties::new());
+            let b = g.create_node(vec![], Properties::new());
+            let c = g.create_node(vec![], Properties::new());
+            let d = g.create_node(vec![], Properties::new());
+            g.create_edge(a, b, "NEXT".into(), Properties::new());
+            g.create_edge(b, c, "NEXT".into(), Properties::new());
+            g.create_edge(c, d, "NEXT".into(), Properties::new());
+        }
+        let g2 = GraphStore::open(dir.path()).unwrap();
+        let bfs = g2.bfs(1, Direction::Outgoing, Some("NEXT"));
+        assert_eq!(bfs, vec![1, 2, 3, 4]);
+        let sp = g2.shortest_path(1, 4, Direction::Outgoing, Some("NEXT"));
+        assert_eq!(sp, Some(vec![1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn wal_corrupt_graceful_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut g = GraphStore::open(dir.path()).unwrap();
+            g.create_node(vec!["X".into()], Properties::new());
+            g.create_node(vec!["Y".into()], Properties::new());
+        }
+        // Append garbage to the WAL file.
+        {
+            use std::io::Write;
+            let wal_path = dir.path().join("graph.wal");
+            let mut f = std::fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
+            f.write_all(&[0xFF, 0xFE, 0xFD]).unwrap();
+        }
+        // Should recover the two valid nodes.
+        let g2 = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(g2.node_count(), 2);
+    }
+
+    #[test]
+    fn wal_empty_graph_clean_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(g.node_count(), 0);
+        assert_eq!(g.edge_count(), 0);
+        drop(g);
+        // Reopen empty.
+        let g2 = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(g2.node_count(), 0);
+    }
+
+    #[test]
+    fn wal_large_graph_checkpoint_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut g = GraphStore::open(dir.path()).unwrap();
+            for _ in 0..120 {
+                g.create_node(vec!["N".into()], Properties::new());
+            }
+            for i in 1u64..120 {
+                g.create_edge(i, i + 1, "NEXT".into(), Properties::new());
+            }
+            // Checkpoint.
+            g.checkpoint_wal().unwrap();
+            // Add a few more after checkpoint.
+            g.create_node(vec!["N".into()], Properties::new()); // id 121
+            g.create_edge(120, 121, "NEXT".into(), Properties::new());
+        }
+        let g2 = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(g2.node_count(), 121);
+        assert_eq!(g2.edge_count(), 120);
+        // BFS should reach all from node 1.
+        let bfs = g2.bfs(1, Direction::Outgoing, Some("NEXT"));
+        assert_eq!(bfs.len(), 121);
+    }
+
+    #[test]
+    fn wal_property_updates_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut g = GraphStore::open(dir.path()).unwrap();
+            g.create_node(vec![], props(vec![("x", PropValue::Int(1))]));
+            let a = 1;
+            let b = g.create_node(vec![], Properties::new());
+            let eid = g.create_edge(a, b, "E".into(), Properties::new()).unwrap();
+            // Update properties.
+            g.set_node_property(a, "x".into(), PropValue::Int(99));
+            g.set_node_property(a, "y".into(), PropValue::Text("new".into()));
+            g.set_edge_property(eid, "weight".into(), PropValue::Float(5.5));
+        }
+        let g2 = GraphStore::open(dir.path()).unwrap();
+        let n = g2.get_node(1).unwrap();
+        assert_eq!(n.properties.get("x"), Some(&PropValue::Int(99)));
+        assert_eq!(n.properties.get("y"), Some(&PropValue::Text("new".into())));
+        let e = g2.get_edge(1).unwrap();
+        assert_eq!(e.properties.get("weight"), Some(&PropValue::Float(5.5)));
+    }
+
+    // ================================================================
+    // Edge type index tests
+    // ================================================================
+
+    #[test]
+    fn type_index_edges_by_type_basic() {
+        let g = social_graph();
+
+        // Should find all FRIENDS edges via type index.
+        let friends = g.edges_by_type("FRIENDS");
+        assert_eq!(friends.len(), 6);
+        for e in &friends {
+            assert_eq!(e.edge_type, "FRIENDS");
+        }
+
+        // Should find all WORKS_AT edges.
+        let works = g.edges_by_type("WORKS_AT");
+        assert_eq!(works.len(), 2);
+        for e in &works {
+            assert_eq!(e.edge_type, "WORKS_AT");
+        }
+
+        // Non-existent type returns empty.
+        let none = g.edges_by_type("NONEXISTENT");
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn type_index_maintained_on_delete_edge() {
+        let mut g = GraphStore::new();
+        let a = g.create_node(vec![], Properties::new());
+        let b = g.create_node(vec![], Properties::new());
+        let e1 = g.create_edge(a, b, "ALPHA".into(), Properties::new()).unwrap();
+        let e2 = g.create_edge(a, b, "ALPHA".into(), Properties::new()).unwrap();
+        let _e3 = g.create_edge(a, b, "BETA".into(), Properties::new()).unwrap();
+
+        assert_eq!(g.edges_by_type("ALPHA").len(), 2);
+        assert_eq!(g.edges_by_type("BETA").len(), 1);
+
+        // Delete one ALPHA edge.
+        g.delete_edge(e1);
+        assert_eq!(g.edges_by_type("ALPHA").len(), 1);
+        assert_eq!(g.edges_by_type("ALPHA")[0].id, e2);
+
+        // Delete the last ALPHA edge — type entry should be cleaned up.
+        g.delete_edge(e2);
+        assert!(g.edges_by_type("ALPHA").is_empty());
+        // BETA should be unaffected.
+        assert_eq!(g.edges_by_type("BETA").len(), 1);
+    }
+
+    #[test]
+    fn type_index_maintained_on_delete_node() {
+        let mut g = GraphStore::new();
+        let a = g.create_node(vec![], Properties::new());
+        let b = g.create_node(vec![], Properties::new());
+        let c = g.create_node(vec![], Properties::new());
+        g.create_edge(a, b, "X".into(), Properties::new());
+        g.create_edge(b, c, "X".into(), Properties::new());
+        g.create_edge(a, c, "Y".into(), Properties::new());
+
+        assert_eq!(g.edges_by_type("X").len(), 2);
+        assert_eq!(g.edges_by_type("Y").len(), 1);
+
+        // Delete node b — should cascade edges a->b (X) and b->c (X).
+        g.delete_node(b);
+        assert!(g.edges_by_type("X").is_empty());
+        // Y edge (a->c) should be unaffected.
+        assert_eq!(g.edges_by_type("Y").len(), 1);
+    }
+
+    #[test]
+    fn type_index_neighbors_optimization() {
+        let mut g = GraphStore::new();
+        let a = g.create_node(vec![], Properties::new());
+        let b = g.create_node(vec![], Properties::new());
+        let c = g.create_node(vec![], Properties::new());
+        g.create_edge(a, b, "FRIENDS".into(), Properties::new());
+        g.create_edge(a, c, "WORKS_AT".into(), Properties::new());
+        g.create_edge(b, a, "FRIENDS".into(), Properties::new());
+
+        // Outgoing from a, filtered by FRIENDS — should only return b.
+        let friends = g.neighbors(a, Direction::Outgoing, Some("FRIENDS"));
+        assert_eq!(friends.len(), 1);
+        assert_eq!(friends[0].0, b);
+
+        // Outgoing from a, filtered by WORKS_AT — should only return c.
+        let works = g.neighbors(a, Direction::Outgoing, Some("WORKS_AT"));
+        assert_eq!(works.len(), 1);
+        assert_eq!(works[0].0, c);
+
+        // Incoming to a, filtered by FRIENDS — should return b.
+        let incoming_friends = g.neighbors(a, Direction::Incoming, Some("FRIENDS"));
+        assert_eq!(incoming_friends.len(), 1);
+        assert_eq!(incoming_friends[0].0, b);
+
+        // Both directions, filtered by FRIENDS — should return b twice (out + in).
+        let both_friends = g.neighbors(a, Direction::Both, Some("FRIENDS"));
+        assert_eq!(both_friends.len(), 2);
+
+        // Non-existent type returns empty.
+        let none = g.neighbors(a, Direction::Outgoing, Some("NONEXISTENT"));
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn type_index_txn_snapshot_restore() {
+        let mut g = GraphStore::new();
+        let a = g.create_node(vec![], Properties::new());
+        let b = g.create_node(vec![], Properties::new());
+        g.create_edge(a, b, "LINK".into(), Properties::new());
+
+        assert_eq!(g.edges_by_type("LINK").len(), 1);
+
+        // Take snapshot.
+        let snap = g.txn_snapshot();
+
+        // Mutate: add more edges, delete the existing one.
+        g.create_edge(a, b, "OTHER".into(), Properties::new());
+        g.delete_edge(1);
+        assert!(g.edges_by_type("LINK").is_empty());
+        assert_eq!(g.edges_by_type("OTHER").len(), 1);
+
+        // Restore from snapshot — type index should revert.
+        g.txn_restore(snap);
+        assert_eq!(g.edges_by_type("LINK").len(), 1);
+        assert!(g.edges_by_type("OTHER").is_empty());
+    }
+
+    #[test]
+    fn type_index_wal_rebuilt_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut g = GraphStore::open(dir.path()).unwrap();
+            let a = g.create_node(vec![], Properties::new());
+            let b = g.create_node(vec![], Properties::new());
+            let c = g.create_node(vec![], Properties::new());
+            g.create_edge(a, b, "FRIENDS".into(), Properties::new());
+            g.create_edge(b, c, "FRIENDS".into(), Properties::new());
+            g.create_edge(a, c, "WORKS_AT".into(), Properties::new());
+        }
+        // Reopen — type index should be rebuilt from WAL.
+        let g2 = GraphStore::open(dir.path()).unwrap();
+        assert_eq!(g2.edges_by_type("FRIENDS").len(), 2);
+        assert_eq!(g2.edges_by_type("WORKS_AT").len(), 1);
+        assert!(g2.edges_by_type("NONEXISTENT").is_empty());
+
+        // Verify neighbors still works with type filter after restart.
+        let friends = g2.neighbors(1, Direction::Outgoing, Some("FRIENDS"));
+        assert_eq!(friends.len(), 1);
+        assert_eq!(friends[0].0, 2);
+    }
+
+    #[test]
+    fn type_index_empty_after_all_edges_removed() {
+        let mut g = GraphStore::new();
+        let a = g.create_node(vec![], Properties::new());
+        let b = g.create_node(vec![], Properties::new());
+        let e1 = g.create_edge(a, b, "T".into(), Properties::new()).unwrap();
+
+        assert_eq!(g.edges_by_type("T").len(), 1);
+
+        g.delete_edge(e1);
+        assert!(g.edges_by_type("T").is_empty());
+        // The HashMap entry for type "T" should be fully cleaned up.
+        assert!(!g.type_index.contains_key("T"));
+    }
+
+    // ================================================================
+    // Parallel graph operations tests
+    // ================================================================
+
+    #[test]
+    fn par_multi_bfs_matches_sequential() {
+        let g = social_graph();
+        let sources = vec![1, 2, 3, 4]; // Alice, Bob, Charlie, Dave
+
+        let par_results = g.par_multi_bfs(&sources, Direction::Outgoing, Some("FRIENDS"));
+        assert_eq!(par_results.len(), 4);
+
+        for (src, par_reached) in &par_results {
+            let seq_reached = g.bfs(*src, Direction::Outgoing, Some("FRIENDS"));
+            let par_set: HashSet<NodeId> = par_reached.iter().copied().collect();
+            let seq_set: HashSet<NodeId> = seq_reached.iter().copied().collect();
+            assert_eq!(par_set, seq_set, "BFS from {} should match sequential", src);
+        }
+    }
+
+    #[test]
+    fn par_batch_shortest_path() {
+        let g = social_graph();
+        // Alice(1)->Bob(2)->Charlie(3)->Dave(4)
+        let queries = vec![(1, 4), (1, 3), (2, 4), (1, 2)];
+        let results = g.par_batch_shortest_path(
+            &queries,
+            Direction::Outgoing,
+            Some("FRIENDS"),
+        );
+
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0], Some(vec![1, 2, 3, 4])); // Alice -> Bob -> Charlie -> Dave
+        assert_eq!(results[1], Some(vec![1, 2, 3]));     // Alice -> Bob -> Charlie
+        assert_eq!(results[2], Some(vec![2, 3, 4]));     // Bob -> Charlie -> Dave
+        assert_eq!(results[3], Some(vec![1, 2]));         // Alice -> Bob
+    }
+
+    #[test]
+    fn par_neighbors_filtered_large() {
+        // Build a hub-spoke graph with 200+ edges from a single node.
+        let mut g = GraphStore::new();
+        let hub = g.create_node(vec!["Hub".into()], Properties::new());
+        for i in 0..250 {
+            let spoke = g.create_node(
+                vec!["Spoke".into()],
+                props(vec![("weight", PropValue::Int(i as i64))]),
+            );
+            g.create_edge(
+                hub,
+                spoke,
+                "LINK".into(),
+                props(vec![("weight", PropValue::Float(i as f64))]),
+            );
+        }
+
+        // Filter for edges with weight > 200.0
+        let filtered = g.par_neighbors_filtered(hub, |e| {
+            matches!(e.properties.get("weight"), Some(PropValue::Float(w)) if *w > 200.0)
+        });
+
+        // Weights 201..249 = 49 edges.
+        assert_eq!(filtered.len(), 49);
+        for e in &filtered {
+            if let Some(PropValue::Float(w)) = e.properties.get("weight") {
+                assert!(*w > 200.0);
+            } else {
+                panic!("expected weight property on edge");
+            }
+        }
+    }
+
+    #[test]
+    fn par_edge_type_counts() {
+        let g = social_graph();
+        let counts = g.par_edge_type_counts();
+
+        assert_eq!(counts.get("FRIENDS"), Some(&6));
+        assert_eq!(counts.get("WORKS_AT"), Some(&2));
+        assert_eq!(counts.len(), 2);
+    }
+
+    #[test]
+    fn par_multi_bfs_disconnected() {
+        let mut g = GraphStore::new();
+        // Two disconnected components: {1,2} and {3,4}.
+        let a = g.create_node(vec![], Properties::new());
+        let b = g.create_node(vec![], Properties::new());
+        let c = g.create_node(vec![], Properties::new());
+        let d = g.create_node(vec![], Properties::new());
+        g.create_edge(a, b, "LINK".into(), Properties::new());
+        g.create_edge(c, d, "LINK".into(), Properties::new());
+
+        let results = g.par_multi_bfs(&[a, c], Direction::Outgoing, None);
+        assert_eq!(results.len(), 2);
+
+        let (src1, reached1) = &results[0];
+        assert_eq!(*src1, a);
+        let set1: HashSet<NodeId> = reached1.iter().copied().collect();
+        assert!(set1.contains(&a));
+        assert!(set1.contains(&b));
+        assert!(!set1.contains(&c));
+        assert!(!set1.contains(&d));
+
+        let (src2, reached2) = &results[1];
+        assert_eq!(*src2, c);
+        let set2: HashSet<NodeId> = reached2.iter().copied().collect();
+        assert!(set2.contains(&c));
+        assert!(set2.contains(&d));
+        assert!(!set2.contains(&a));
+        assert!(!set2.contains(&b));
+    }
+
+    #[test]
+    fn par_batch_shortest_path_consistency() {
+        // Run the same batch twice and verify deterministic results.
+        let g = social_graph();
+        let queries = vec![(1, 4), (2, 4), (1, 3)];
+
+        let r1 = g.par_batch_shortest_path(&queries, Direction::Outgoing, Some("FRIENDS"));
+        let r2 = g.par_batch_shortest_path(&queries, Direction::Outgoing, Some("FRIENDS"));
+
+        assert_eq!(r1, r2, "parallel shortest path should be deterministic");
+    }
+
+    #[test]
+    fn par_neighbors_filtered_small_sequential() {
+        // Small neighbor set should still work (takes sequential path).
+        let g = social_graph();
+        let filtered = g.par_neighbors_filtered(1, |e| e.edge_type == "FRIENDS");
+        assert_eq!(filtered.len(), 1); // Alice->Bob FRIENDS
+        assert_eq!(filtered[0].to, 2);
+    }
+
+    #[test]
+    fn par_edge_type_counts_many_types() {
+        // Build a graph with 10 distinct edge types to exercise parallel path.
+        let mut g = GraphStore::new();
+        let a = g.create_node(vec![], Properties::new());
+        let b = g.create_node(vec![], Properties::new());
+        for i in 0..10 {
+            let etype = format!("TYPE_{}", i);
+            for _ in 0..5 {
+                g.create_edge(a, b, etype.clone(), Properties::new());
+            }
+        }
+
+        let counts = g.par_edge_type_counts();
+        assert_eq!(counts.len(), 10);
+        for i in 0..10 {
+            let key = format!("TYPE_{}", i);
+            assert_eq!(counts.get(&key), Some(&5), "type {} should have 5 edges", key);
+        }
+    }
+
+    // ================================================================
+    // Cold tier (tiered storage) tests
+    // ================================================================
+
+    #[test]
+    fn test_graph_cold_tier_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut g = GraphStore::open(dir.path()).unwrap();
+        assert!(g.has_cold_tier(), "disk mode should have cold tier");
+        assert!(dir.path().join("graph_cold").exists());
+        let id = g.create_node(
+            vec!["Person".into()],
+            props(vec![("name", PropValue::Text("Alice".into()))]),
+        );
+        let node = g.get_node_full(id).unwrap();
+        assert_eq!(node.properties.get("name"), Some(&PropValue::Text("Alice".into())));
+    }
+
+    #[test]
+    fn test_graph_cold_property_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut g = GraphStore::open(dir.path()).unwrap();
+        g.max_hot_nodes = 5;
+        let mut ids = Vec::new();
+        for i in 0..20 {
+            let id = g.create_node(
+                vec!["N".into()],
+                props(vec![("val", PropValue::Int(i))]),
+            );
+            ids.push(id);
+        }
+        // Hot tier should have at most max_hot_nodes
+        assert!(
+            g.node_count_hot() <= 5,
+            "hot should have <= 5, got {}",
+            g.node_count_hot()
+        );
+        // All 20 should be accessible with correct properties via get_node_full
+        for (i, &id) in ids.iter().enumerate() {
+            let node = g.get_node_full(id).unwrap();
+            assert_eq!(
+                node.properties.get("val"),
+                Some(&PropValue::Int(i as i64)),
+                "node {} should have val={}", id, i
+            );
+        }
+    }
+
+    #[test]
+    fn test_graph_memory_mode_no_cold() {
+        let g = GraphStore::new();
+        assert!(!g.has_cold_tier(), "memory mode should have no cold tier");
+    }
+
+    // ====================================================================
+    // Community Detection tests
+    // ====================================================================
+
+    #[test]
+    fn test_label_propagation_two_cliques() {
+        let mut g = GraphStore::new();
+        // Create two disconnected cliques: {A,B,C} and {D,E,F}
+        let a = g.create_node(vec!["Person".into()], Properties::new());
+        let b = g.create_node(vec!["Person".into()], Properties::new());
+        let c = g.create_node(vec!["Person".into()], Properties::new());
+        let d = g.create_node(vec!["Person".into()], Properties::new());
+        let e = g.create_node(vec!["Person".into()], Properties::new());
+        let f = g.create_node(vec!["Person".into()], Properties::new());
+
+        g.create_edge(a, b, "KNOWS".into(), Properties::new());
+        g.create_edge(b, c, "KNOWS".into(), Properties::new());
+        g.create_edge(c, a, "KNOWS".into(), Properties::new());
+
+        g.create_edge(d, e, "KNOWS".into(), Properties::new());
+        g.create_edge(e, f, "KNOWS".into(), Properties::new());
+        g.create_edge(f, d, "KNOWS".into(), Properties::new());
+
+        let labels = g.label_propagation(20);
+        assert_eq!(labels.len(), 6);
+
+        // Nodes in same clique should have same label
+        assert_eq!(labels[&a], labels[&b]);
+        assert_eq!(labels[&b], labels[&c]);
+        assert_eq!(labels[&d], labels[&e]);
+        assert_eq!(labels[&e], labels[&f]);
+
+        // Different cliques should have different labels
+        assert_ne!(labels[&a], labels[&d]);
+    }
+
+    #[test]
+    fn test_label_propagation_empty() {
+        let g = GraphStore::new();
+        let labels = g.label_propagation(10);
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn test_louvain_two_cliques() {
+        let mut g = GraphStore::new();
+        let a = g.create_node(vec!["Person".into()], Properties::new());
+        let b = g.create_node(vec!["Person".into()], Properties::new());
+        let c = g.create_node(vec!["Person".into()], Properties::new());
+        let d = g.create_node(vec!["Person".into()], Properties::new());
+        let e = g.create_node(vec!["Person".into()], Properties::new());
+        let f = g.create_node(vec!["Person".into()], Properties::new());
+
+        // Dense clique 1
+        g.create_edge(a, b, "KNOWS".into(), Properties::new());
+        g.create_edge(b, c, "KNOWS".into(), Properties::new());
+        g.create_edge(c, a, "KNOWS".into(), Properties::new());
+
+        // Dense clique 2
+        g.create_edge(d, e, "KNOWS".into(), Properties::new());
+        g.create_edge(e, f, "KNOWS".into(), Properties::new());
+        g.create_edge(f, d, "KNOWS".into(), Properties::new());
+
+        let communities = g.louvain_communities();
+        assert_eq!(communities.len(), 6);
+
+        // Same clique → same community
+        assert_eq!(communities[&a], communities[&b]);
+        assert_eq!(communities[&b], communities[&c]);
+        assert_eq!(communities[&d], communities[&e]);
+        assert_eq!(communities[&e], communities[&f]);
+
+        // Different cliques → different communities
+        assert_ne!(communities[&a], communities[&d]);
+    }
+
+    #[test]
+    fn test_louvain_empty() {
+        let g = GraphStore::new();
+        let communities = g.louvain_communities();
+        assert!(communities.is_empty());
+    }
+
+    #[test]
+    fn test_louvain_single_node() {
+        let mut g = GraphStore::new();
+        let a = g.create_node(vec!["Person".into()], Properties::new());
+        let communities = g.louvain_communities();
+        assert_eq!(communities.len(), 1);
+        assert!(communities.contains_key(&a));
     }
 }

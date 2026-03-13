@@ -121,32 +121,31 @@ impl DiskManager {
         let mut raw = vec![0u8; disk_size];
         file.read_exact(&mut raw)?;
 
-        // Step 1: Decrypt if encrypted (uses generic bytes decrypt)
-        let decrypted = if let Some(ref enc) = self.encryptor {
+        // Decrypt → decompress pipeline, minimizing intermediate copies.
+        if let Some(ref enc) = self.encryptor {
             if self.compression_enabled {
-                // Variable-size plaintext (compressed slot)
-                enc.decrypt_bytes(&raw).map_err(|e| {
+                let decrypted = enc.decrypt_bytes(&raw).map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                })?
+                })?;
+                let page = PageCompressor::decompress_page(&decrypted).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?;
+                buf.copy_from_slice(&page);
             } else {
-                // Fixed PAGE_SIZE plaintext
+                // Encrypted, uncompressed: decrypt directly into output —
+                // eliminates the intermediate .to_vec() allocation.
                 let d = enc.decrypt_page(&raw).map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
                 })?;
-                d.to_vec()
+                buf.copy_from_slice(&d);
             }
-        } else {
-            raw
-        };
-
-        // Step 2: Decompress if compressed
-        if self.compression_enabled {
-            let page = PageCompressor::decompress_page(&decrypted).map_err(|e| {
+        } else if self.compression_enabled {
+            let page = PageCompressor::decompress_page(&raw).map_err(|e| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
             })?;
             buf.copy_from_slice(&page);
         } else {
-            buf.copy_from_slice(&decrypted[..PAGE_SIZE]);
+            buf.copy_from_slice(&raw[..PAGE_SIZE]);
         }
 
         Ok(())

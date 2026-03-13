@@ -1,3 +1,9 @@
+// Use jemalloc on supported platforms for reduced fragmentation and better
+// multi-threaded allocation throughput.  Feature-gated: `--features jemalloc`.
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -35,6 +41,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Start the Nucleus database server.
     ///
@@ -115,6 +122,17 @@ enum Commands {
         /// Enable page-level LZ4 compression for on-disk pages.
         #[arg(long)]
         compress: bool,
+
+        /// Port for the RESP2 (Redis protocol) server (default: 6379).
+        /// Set to 0 to disable the RESP server.
+        #[arg(long, default_value_t = 6379)]
+        resp_port: u16,
+
+        /// OpenTelemetry OTLP endpoint for distributed tracing.
+        /// Example: http://localhost:4317 (gRPC) or http://localhost:4318 (HTTP).
+        /// Requires the 'otel' feature to be enabled at compile time.
+        #[arg(long)]
+        otlp_endpoint: Option<String>,
     },
 
     /// Initialize a new Nucleus data directory.
@@ -162,6 +180,32 @@ impl CliAuthMethod {
 }
 
 // ============================================================================
+// StartConfig — groups all `cmd_start` parameters
+// ============================================================================
+
+struct StartConfig {
+    port: u16,
+    host: String,
+    data: PathBuf,
+    memory: bool,
+    join: Option<String>,
+    region: Option<String>,
+    replicate_from: Option<String>,
+    replication_port: u16,
+    password: Option<String>,
+    auth_method: Option<CliAuthMethod>,
+    no_tls: bool,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    tls_client_ca: Option<PathBuf>,
+    cluster_port: u16,
+    encrypt: bool,
+    compress: bool,
+    resp_port: u16,
+    otlp_endpoint: Option<String>,
+}
+
+// ============================================================================
 // Entry point
 // ============================================================================
 
@@ -188,8 +232,10 @@ async fn main() {
             cluster_port,
             encrypt,
             compress,
+            resp_port,
+            otlp_endpoint,
         }) => {
-            cmd_start(
+            cmd_start(StartConfig {
                 port,
                 host,
                 data,
@@ -207,7 +253,9 @@ async fn main() {
                 cluster_port,
                 encrypt,
                 compress,
-            )
+                resp_port,
+                otlp_endpoint,
+            })
             .await;
         }
         Some(Commands::Init { data }) => {
@@ -224,25 +272,27 @@ async fn main() {
         }
         None => {
             // Default: start in server mode (same as `nucleus start`)
-            cmd_start(
-                5432,
-                "127.0.0.1".into(),
-                PathBuf::from("nucleus_data"),
-                false,
-                None,
-                None,
-                None,
-                5434,
-                None,
-                None,
-                false,
-                None,
-                None,
-                None,
-                5433,
-                false,
-                false,
-            )
+            cmd_start(StartConfig {
+                port: 5432,
+                host: "127.0.0.1".into(),
+                data: PathBuf::from("nucleus_data"),
+                memory: false,
+                join: None,
+                region: None,
+                replicate_from: None,
+                replication_port: 5434,
+                password: None,
+                auth_method: None,
+                no_tls: false,
+                tls_cert: None,
+                tls_key: None,
+                tls_client_ca: None,
+                cluster_port: 5433,
+                encrypt: false,
+                compress: false,
+                resp_port: 6379,
+                otlp_endpoint: None,
+            })
             .await;
         }
     }
@@ -252,25 +302,28 @@ async fn main() {
 // Commands
 // ============================================================================
 
-async fn cmd_start(
-    port: u16,
-    host: String,
-    data: PathBuf,
-    memory: bool,
-    join: Option<String>,
-    region: Option<String>,
-    replicate_from: Option<String>,
-    replication_port: u16,
-    password: Option<String>,
-    auth_method: Option<CliAuthMethod>,
-    no_tls: bool,
-    tls_cert: Option<PathBuf>,
-    tls_key: Option<PathBuf>,
-    tls_client_ca: Option<PathBuf>,
-    cluster_port: u16,
-    encrypt: bool,
-    compress: bool,
-) {
+async fn cmd_start(cfg: StartConfig) {
+    let StartConfig {
+        port,
+        host,
+        data,
+        memory,
+        join,
+        region,
+        replicate_from,
+        replication_port,
+        password,
+        auth_method,
+        no_tls,
+        tls_cert,
+        tls_key,
+        tls_client_ca,
+        cluster_port,
+        encrypt,
+        compress,
+        resp_port,
+        otlp_endpoint,
+    } = cfg;
     // Load config early so we can use logging.level for tracing
     let config_path = data.join("nucleus.toml");
     let mut config = match NucleusConfig::load(&config_path) {
@@ -312,15 +365,69 @@ async fn cmd_start(
 
     // Configure tracing with config-driven log level
     let log_directive = format!("nucleus={}", config.logging.level);
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env().add_directive(
-                log_directive
-                    .parse()
-                    .unwrap_or_else(|_| "nucleus=info".parse().unwrap()),
-            ),
-        )
-        .init();
+
+    #[cfg(feature = "otel")]
+    {
+        if let Some(ref endpoint) = otlp_endpoint {
+            // Initialize OpenTelemetry OTLP exporter
+            use opentelemetry::trace::TracerProvider;
+            use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+            use opentelemetry_sdk::trace::SdkTracerProvider;
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::util::SubscriberInitExt;
+
+            let exporter = SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint)
+                .build()
+                .expect("failed to create OTLP exporter");
+
+            let provider = SdkTracerProvider::builder()
+                .with_batch_exporter(exporter)
+                .build();
+
+            let tracer = provider.tracer("nucleus");
+            let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+            tracing_subscriber::registry()
+                .with(
+                    EnvFilter::from_default_env().add_directive(
+                        log_directive
+                            .parse()
+                            .unwrap_or_else(|_| "nucleus=info".parse().unwrap()),
+                    ),
+                )
+                .with(tracing_subscriber::fmt::layer())
+                .with(otel_layer)
+                .init();
+
+            eprintln!("OpenTelemetry tracing enabled → {endpoint}");
+        } else {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::from_default_env().add_directive(
+                        log_directive
+                            .parse()
+                            .unwrap_or_else(|_| "nucleus=info".parse().unwrap()),
+                    ),
+                )
+                .init();
+        }
+    }
+
+    #[cfg(not(feature = "otel"))]
+    {
+        let _ = &otlp_endpoint; // suppress unused warning
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::from_default_env().add_directive(
+                    log_directive
+                        .parse()
+                        .unwrap_or_else(|_| "nucleus=info".parse().unwrap()),
+                ),
+            )
+            .init();
+    }
 
     // Effective runtime values are sourced from merged config.
     let host = config.server.host.clone();
@@ -481,7 +588,7 @@ async fn cmd_start(
                     salt
                 } else {
                     let salt = PageEncryptor::generate_salt();
-                    if let Err(e) = std::fs::write(&salt_path, &salt) {
+                    if let Err(e) = std::fs::write(&salt_path, salt) {
                         tracing::error!("failed to write salt file {}: {e}", salt_path.display());
                         std::process::exit(1);
                     }
@@ -601,8 +708,9 @@ async fn cmd_start(
         Some(data.join("catalog.json"))
     };
     let cache_bytes = config.cache.max_memory_mb * 1024 * 1024;
+    let store_dir = if memory { None } else { Some(data.as_path()) };
     let executor = Arc::new(
-        Executor::new_with_persistence(catalog, storage, catalog_path)
+        Executor::new_with_persistence(catalog, storage, catalog_path, store_dir)
             .with_cache_size(cache_bytes)
             .with_metrics(metrics.clone())
             .with_replication(replication.clone())
@@ -610,6 +718,15 @@ async fn cmd_start(
             .with_cluster(cluster.clone()),
     );
     tracing::info!("Cache: {} MB", config.cache.max_memory_mb);
+
+    // Load persisted ANALYZE statistics so the optimizer is warm on restart.
+    executor.load_stats().await;
+
+    // Load persisted executor metadata (views, sequences, triggers, roles, functions).
+    executor.load_meta().await;
+
+    // Rebuild specialty indexes (IvfFlat, encrypted) from table data after restart.
+    executor.rebuild_specialty_indexes().await;
 
     // Resolve password: CLI arg takes priority, then NUCLEUS_PASSWORD env var.
     let resolved_password = password.or_else(|| std::env::var("NUCLEUS_PASSWORD").ok());
@@ -651,6 +768,7 @@ async fn cmd_start(
             }
         }
     }
+    let resolved_password_for_resp = resolved_password.clone();
     let handler = Arc::new(NucleusHandler::with_password_and_method(
         executor.clone(),
         resolved_password,
@@ -780,10 +898,55 @@ async fn cmd_start(
         }
     }
 
-    // Spawn cluster message receive loop (handles JoinCluster from new nodes, heartbeats, etc.)
+    // Build RaftReplicator from peers discovered during join (or empty for standalone).
+    let initial_peers: Vec<(u64, String)> = {
+        let coord = cluster.read();
+        coord
+            .peer_node_ids()
+            .into_iter()
+            .filter_map(|id| {
+                coord
+                    .cluster_nodes()
+                    .get(&id)
+                    .cloned()
+                    .map(|addr| (id, addr))
+            })
+            .collect()
+    };
+    let (raft_replicator, apply_rx) =
+        nucleus::distributed::RaftReplicator::new(node_id, initial_peers, transport.clone());
+    let raft_replicator = Arc::new(raft_replicator);
+
+    // Register initial peers with the transport.
+    let peers: Vec<_> = {
+        let coord = cluster.read();
+        coord.peer_node_ids().iter().filter_map(|peer_id| {
+            coord.cluster_nodes().get(peer_id).map(|addr| (*peer_id, addr.clone()))
+        }).collect()
+    };
+    for (peer_id, addr) in peers {
+        transport.register_peer(peer_id, &addr).await;
+    }
+
+    // Attach the replicator to the executor (set_raft_replicator works post-construction).
+    executor.set_raft_replicator(raft_replicator.clone());
+
+    // Spawn apply task: execute committed SQL from followers on this node.
+    let executor_for_apply = executor.clone();
+    tokio::spawn(async move {
+        let mut rx = apply_rx;
+        while let Some(sql) = rx.recv().await {
+            if let Err(e) = executor_for_apply.execute(&sql).await {
+                tracing::warn!("Failed to apply Raft-committed SQL: {e}: sql={sql}");
+            }
+        }
+    });
+
+    // Spawn cluster message receive loop (handles JoinCluster, heartbeats, Raft RPCs, etc.)
     let transport_for_recv = transport.clone();
     let cluster_for_recv = cluster.clone();
     let executor_for_recv = executor.clone();
+    let replicator_for_recv = raft_replicator.clone();
     tokio::spawn(async move {
         loop {
             match transport_for_recv.recv().await {
@@ -794,6 +957,7 @@ async fn cmd_start(
                         env,
                         &cluster_listen,
                         &executor_for_recv,
+                        Some(&replicator_for_recv),
                     )
                     .await;
                 }
@@ -805,12 +969,29 @@ async fn cmd_start(
         }
     });
 
-    // Spawn cluster heartbeat loop (every 2s, send heartbeats to all known peers)
+    // Spawn Raft tick loop: heartbeats every 100 ms, election timeout every 50 ms.
+    let replicator_for_tick = raft_replicator.clone();
+    tokio::spawn(async move {
+        let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        let mut election_interval = tokio::time::interval(std::time::Duration::from_millis(50));
+        loop {
+            tokio::select! {
+                _ = heartbeat_interval.tick() => {
+                    replicator_for_tick.tick_heartbeat().await;
+                }
+                _ = election_interval.tick() => {
+                    replicator_for_tick.tick_election().await;
+                }
+            }
+        }
+    });
+
+    // Legacy cluster heartbeat loop for non-Raft connectivity checks (every 5s).
     let transport_for_hb = transport.clone();
     let cluster_for_hb = cluster.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let (peer_ids, term) = {
                 let coord = cluster_for_hb.read();
                 (coord.peer_node_ids(), coord.epoch())
@@ -818,7 +999,6 @@ async fn cmd_start(
             if peer_ids.is_empty() {
                 continue; // No peers to heartbeat
             }
-            // Heartbeat is best-effort; errors are ignored
             for peer in peer_ids {
                 let _ = transport_for_hb
                     .send_message(
@@ -886,11 +1066,10 @@ async fn cmd_start(
                 match &task.task {
                     nucleus::background::BackgroundTask::BufferFlush
                     | nucleus::background::BackgroundTask::WalCheckpoint => {
-                        if let Some(ref engine) = disk_for_workers {
-                            if let Err(e) = engine.flush() {
+                        if let Some(ref engine) = disk_for_workers
+                            && let Err(e) = engine.flush() {
                                 tracing::warn!("Background flush failed: {e}");
                             }
-                        }
                     }
                     nucleus::background::BackgroundTask::ReplicationSync => {
                         if let Some(ref wal_path) = wal_path_for_workers {
@@ -1033,6 +1212,23 @@ async fn cmd_start(
         shutdown_for_handler.notify_one();
     });
 
+    // Spawn RESP2 (Redis protocol) server
+    if resp_port > 0 {
+        let resp_addr = format!("{host}:{resp_port}");
+        let kv = std::sync::Arc::clone(executor.kv_store());
+        let resp_pw = resolved_password_for_resp.clone();
+        let resp_shutdown = shutdown_notify.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                nucleus::resp::server::start_resp_server(resp_addr, kv, resp_pw, resp_shutdown)
+                    .await
+            {
+                tracing::error!("RESP server error: {e}");
+            }
+        });
+        tracing::info!("RESP server on port {resp_port} (redis-cli compatible)");
+    }
+
     // Spawn metrics HTTP endpoint
     let metrics_port = config.metrics.port;
     let metrics_enabled = config.metrics.enabled;
@@ -1129,6 +1325,9 @@ async fn cmd_start(
     } else {
         println!("  Metrics:      disabled");
     }
+    if resp_port > 0 {
+        println!("  RESP port:    {resp_port}");
+    }
     println!("  Connect:      psql -h {host} -p {port}");
     println!();
 
@@ -1220,17 +1419,32 @@ async fn cmd_start(
     }
 }
 
-/// Process an incoming cluster message (JoinCluster, Heartbeat, ForwardQuery, etc.).
+/// Process an incoming cluster message (JoinCluster, Heartbeat, Raft RPCs, ForwardDml, etc.).
 async fn handle_cluster_message(
     cluster: &Arc<parking_lot::RwLock<nucleus::distributed::ClusterCoordinator>>,
     transport: &Arc<TcpTransport>,
     env: nucleus::transport::Envelope,
     local_address: &str,
     executor: &Arc<Executor>,
+    replicator: Option<&Arc<nucleus::distributed::RaftReplicator>>,
 ) {
     use nucleus::transport::Message;
 
     match env.message {
+        // ── Raft consensus RPCs — dispatch to the replicator ─────────────────
+        Message::RequestVote { .. }
+        | Message::RequestVoteResponse { .. }
+        | Message::AppendEntries { .. }
+        | Message::AppendEntriesResponse { .. } => {
+            if let Some(rep) = replicator {
+                if let Some((to, reply)) = rep.handle_raft_message(&env.message, env.from).await {
+                    let _ = transport.send_message(to, reply).await;
+                }
+            } else {
+                tracing::debug!("Raft message from {} ignored (no replicator)", env.from);
+            }
+        }
+
         Message::JoinCluster { node_id, address } => {
             tracing::info!("Node {node_id:#x} requesting to join from {address}");
 
@@ -1244,6 +1458,11 @@ async fn handle_cluster_message(
 
             // Async work — register peer and send response
             transport.register_peer(node_id, &address).await;
+
+            // Inform the Raft replicator about the new peer.
+            if let Some(rep) = replicator {
+                rep.add_peer(node_id, address.clone()).await;
+            }
 
             let response = Message::JoinClusterResponse {
                 success: true,
@@ -1326,7 +1545,9 @@ async fn handle_cluster_message(
         }
         Message::ForwardDml { sql, shard_id: _ } => {
             tracing::debug!("ForwardDml from {}: sql={sql}", env.from);
-            match executor.execute(&sql).await {
+            let request_id = env.id; // Preserve for send_request() correlation.
+            let from = env.from;
+            let (response_msg, self_id) = match executor.execute(&sql).await {
                 Ok(results) => {
                     let rows_affected: usize = results
                         .iter()
@@ -1338,36 +1559,41 @@ async fn handle_cluster_message(
                             }
                         })
                         .sum();
-                    let _ = transport
-                        .send_message(
-                            env.from,
-                            Message::ForwardDmlResponse {
-                                success: true,
-                                rows_affected,
-                                error: None,
-                            },
-                        )
-                        .await;
+                    (
+                        Message::ForwardDmlResponse {
+                            success: true,
+                            rows_affected,
+                            error: None,
+                        },
+                        transport.local_node_id(),
+                    )
                 }
-                Err(e) => {
-                    let _ = transport
-                        .send_message(
-                            env.from,
-                            Message::ForwardDmlResponse {
-                                success: false,
-                                rows_affected: 0,
-                                error: Some(e.to_string()),
-                            },
-                        )
-                        .await;
-                }
-            }
+                Err(e) => (
+                    Message::ForwardDmlResponse {
+                        success: false,
+                        rows_affected: 0,
+                        error: Some(e.to_string()),
+                    },
+                    transport.local_node_id(),
+                ),
+            };
+            // Reply with the same envelope ID so send_request() can correlate it.
+            let reply_envelope = nucleus::transport::Envelope {
+                id: request_id,
+                from: self_id,
+                to: from,
+                message: response_msg,
+            };
+            let _ = transport.send(from, &reply_envelope).await;
         }
         other => {
             tracing::debug!("Unhandled cluster message from {}: {:?}", env.from, other);
         }
     }
 }
+
+// Helper: empty replicator for the existing call site that predates the replicator.
+// (Removed — the call site now always passes `Some(&replicator_for_recv)`.)
 
 fn cmd_init(data: PathBuf) {
     if data.exists() {

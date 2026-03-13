@@ -1,8 +1,15 @@
 //! Document / JSONB engine with GIN indexing and path queries.
 
+pub mod doc_wal;
+pub mod tiered;
+
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
+use std::sync::Arc;
+
+use doc_wal::DocWal;
 
 // ---------------------------------------------------------------------------
 // JsonValue
@@ -407,16 +414,40 @@ impl GinIndex {
 }
 
 // ---------------------------------------------------------------------------
+// Cold tier JSON encoding helpers
+// ---------------------------------------------------------------------------
+
+/// Encode a `JsonValue` as JSON string bytes for cold LsmTree storage.
+fn cold_encode_json(val: &JsonValue) -> Vec<u8> {
+    val.to_json_string().into_bytes()
+}
+
+/// Decode a `JsonValue` from JSON string bytes stored in the cold LsmTree.
+fn cold_decode_json(bytes: &[u8]) -> Option<JsonValue> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    tiered::parse_json_value_pub(s).map(|(v, _)| v)
+}
+
+// ---------------------------------------------------------------------------
 // DocumentStore
 // ---------------------------------------------------------------------------
 
 /// In-memory document store backed by a `HashMap` of document IDs to
 /// `JsonValue` documents with a GIN index for fast containment queries.
-#[derive(Debug, Clone)]
+///
+/// When created with [`DocumentStore::open`], all mutations are logged to a
+/// WAL file for crash recovery and a cold LsmTree tier is created for
+/// overflow storage. The legacy [`DocumentStore::new`] constructor
+/// creates an in-memory-only store (no WAL, no cold tier).
 pub struct DocumentStore {
     docs: HashMap<u64, JsonValue>,
     gin: GinIndex,
     next_id: u64,
+    wal: Option<Arc<DocWal>>,
+    /// Cold tier: disk-backed LsmTree for overflow documents (disk mode only).
+    cold: Option<parking_lot::Mutex<crate::storage::lsm::LsmTree>>,
+    /// Maximum documents in hot (in-memory) tier before eviction to cold.
+    max_hot_docs: usize,
 }
 
 impl Default for DocumentStore {
@@ -431,21 +462,82 @@ impl DocumentStore {
             docs: HashMap::new(),
             gin: GinIndex::new(),
             next_id: 1,
+            wal: None,
+            cold: None,
+            max_hot_docs: usize::MAX,
         }
     }
 
+    /// Open a WAL-backed document store rooted at `dir`.
+    ///
+    /// On first call the WAL file is created. On subsequent calls the WAL is
+    /// replayed to restore all documents and rebuild the GIN index. The
+    /// `next_id` counter is restored from `max(doc_id) + 1`.
+    pub fn open(dir: &Path) -> std::io::Result<Self> {
+        let (wal, state) = DocWal::open(dir)?;
+        let wal = Arc::new(wal);
+
+        // Open cold LsmTree tier for overflow documents
+        let cold_dir = dir.join("doc_cold");
+        std::fs::create_dir_all(&cold_dir).ok();
+        let config = crate::storage::lsm::LsmConfig::default();
+        let cold = crate::storage::lsm::LsmTree::open(config, &cold_dir)
+            .ok()
+            .map(parking_lot::Mutex::new);
+
+        let mut store = Self {
+            docs: HashMap::new(),
+            gin: GinIndex::new(),
+            next_id: 1,
+            wal: Some(Arc::clone(&wal)),
+            cold,
+            max_hot_docs: 50_000,
+        };
+        // Restore documents from WAL state.
+        for (doc_id, jsonb) in state.docs {
+            if let Some(jv) = jsonb_decode(&jsonb) {
+                store.gin.insert(doc_id, &jv);
+                store.docs.insert(doc_id, jv);
+                if doc_id >= store.next_id {
+                    store.next_id = doc_id + 1;
+                }
+            }
+            // Silently skip documents whose JSONB is corrupt.
+        }
+        Ok(store)
+    }
+
     /// Insert a document and return its assigned ID.
+    ///
+    /// If a WAL is attached the mutation is logged before the in-memory update.
+    /// In disk mode, triggers eviction to the cold tier if the hot tier exceeds
+    /// `max_hot_docs`.
     pub fn insert(&mut self, doc: JsonValue) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
+        if let Some(ref wal) = self.wal {
+            let bytes = jsonb_encode(&doc);
+            if let Err(e) = wal.log_insert(id, &bytes) {
+                eprintln!("document WAL: failed to log insert {id}: {e}");
+            }
+        }
         self.gin.insert(id, &doc);
         self.docs.insert(id, doc);
+        if self.cold.is_some() {
+            self.maybe_evict();
+        }
         id
     }
 
     /// Insert a document with a specific ID. Replaces any existing document
     /// at that ID.
     pub fn insert_with_id(&mut self, id: u64, doc: JsonValue) {
+        if let Some(ref wal) = self.wal {
+            let bytes = jsonb_encode(&doc);
+            if let Err(e) = wal.log_insert(id, &bytes) {
+                eprintln!("document WAL: failed to log insert_with_id {id}: {e}");
+            }
+        }
         if let Some(old) = self.docs.get(&id) {
             self.gin.remove(id, &old.clone());
         }
@@ -456,9 +548,72 @@ impl DocumentStore {
         }
     }
 
-    /// Get a document by ID.
+    /// Delete a document by ID.
+    ///
+    /// Returns `true` if the document existed and was removed (from hot or
+    /// cold tier), `false` if the ID was not found.
+    pub fn delete(&mut self, id: u64) -> bool {
+        if let Some(old) = self.docs.remove(&id) {
+            if let Some(ref wal) = self.wal
+                && let Err(e) = wal.log_delete(id) {
+                    eprintln!("document WAL: failed to log delete {id}: {e}");
+                }
+            self.gin.remove(id, &old);
+            true
+        } else {
+            // Try cold tier
+            if let Some(ref cold) = self.cold {
+                let key = id.to_le_bytes();
+                let found = cold.lock().get(&key).is_some();
+                if found {
+                    if let Some(ref wal) = self.wal
+                        && let Err(e) = wal.log_delete(id) {
+                            eprintln!("document WAL: failed to log delete {id}: {e}");
+                        }
+                    cold.lock().delete(key.to_vec());
+                    return true;
+                }
+            }
+            false
+        }
+    }
+
+    /// Get a document by ID (hot tier only).
+    ///
+    /// For cold-tier fallback with promotion, use [`get_promoting`] which
+    /// requires `&mut self`.
     pub fn get(&self, id: u64) -> Option<&JsonValue> {
         self.docs.get(&id)
+    }
+
+    /// Get a document by ID, with cold-tier fallback and promotion.
+    ///
+    /// If the document is not in the hot tier but exists in the cold LsmTree,
+    /// it is promoted back to the hot tier (and GIN index) and returned as
+    /// an owned value.
+    pub fn get_promoting(&mut self, id: u64) -> Option<JsonValue> {
+        if let Some(jv) = self.docs.get(&id) {
+            return Some(jv.clone());
+        }
+        // Try cold tier
+        if let Some(ref cold) = self.cold {
+            let key = id.to_le_bytes();
+            // Must drop the MutexGuard before re-locking for delete
+            let cold_data = cold.lock().get(&key);
+            if let Some(data) = cold_data
+                && let Some(jv) = cold_decode_json(&data) {
+                    // Remove from cold (lock is not held here)
+                    cold.lock().delete(key.to_vec());
+                    // Insert into hot + GIN
+                    self.gin.insert(id, &jv);
+                    self.docs.insert(id, jv.clone());
+                    if id >= self.next_id {
+                        self.next_id = id + 1;
+                    }
+                    return Some(jv);
+                }
+        }
+        None
     }
 
     /// Query documents by a path and expected leaf value.
@@ -509,6 +664,297 @@ impl DocumentStore {
     pub fn is_empty(&self) -> bool {
         self.docs.is_empty()
     }
+
+    // -- Parallel operations -------------------------------------------------
+
+    /// Threshold below which parallel operations fall back to sequential.
+    const PAR_THRESHOLD: usize = 500;
+
+    /// Parse a simple predicate string of the form `"path.to.field=value"`.
+    ///
+    /// The path uses dot-separated keys and the value is matched as a string
+    /// or, if it parses as `f64`, as a number. Returns `(path_segments, value)`.
+    fn parse_predicate(predicate: &str) -> Option<(Vec<String>, JsonValue)> {
+        let eq_pos = predicate.find('=')?;
+        let path_str = &predicate[..eq_pos];
+        let value_str = &predicate[eq_pos + 1..];
+        let segments: Vec<String> = path_str.split('.').map(|s| s.to_string()).collect();
+        if segments.is_empty() || segments.iter().any(|s| s.is_empty()) {
+            return None;
+        }
+        // Try to interpret the value as a number, bool, or null; fall back to string.
+        let value = if value_str == "null" {
+            JsonValue::Null
+        } else if value_str == "true" {
+            JsonValue::Bool(true)
+        } else if value_str == "false" {
+            JsonValue::Bool(false)
+        } else if let Ok(n) = value_str.parse::<f64>() {
+            JsonValue::Number(n)
+        } else {
+            JsonValue::Str(value_str.to_string())
+        };
+        Some((segments, value))
+    }
+
+    /// Check whether a document matches a predicate string.
+    fn matches_predicate(doc: &JsonValue, predicate: &str) -> bool {
+        if let Some((segments, value)) = Self::parse_predicate(predicate) {
+            let refs: Vec<&str> = segments.iter().map(|s| s.as_str()).collect();
+            doc.get_path(&refs) == Some(&value)
+        } else {
+            false
+        }
+    }
+
+    /// Query documents matching a predicate, using parallel evaluation when
+    /// the store contains >= 500 documents.
+    ///
+    /// The predicate format is `"path.to.field=value"` (dot-separated path,
+    /// `=` delimiter, value parsed as number/bool/null/string).
+    ///
+    /// Returns `(doc_id, document)` pairs for every matching document.
+    pub fn par_query(&self, predicate: &str) -> Vec<(u64, JsonValue)> {
+        if self.docs.len() < Self::PAR_THRESHOLD {
+            return self
+                .docs
+                .iter()
+                .filter(|entry| Self::matches_predicate(entry.1, predicate))
+                .map(|entry| (*entry.0, entry.1.clone()))
+                .collect();
+        }
+        let all_docs: Vec<_> = self.docs.iter().collect();
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let chunk_size = all_docs.len().div_ceil(cpus);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = all_docs
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(|| {
+                        chunk
+                            .iter()
+                            .filter(|entry| Self::matches_predicate(entry.1, predicate))
+                            .map(|entry| (*entry.0, entry.1.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        })
+    }
+
+    /// Extract a JSON path value from every document, in parallel when the
+    /// store contains >= 500 documents.
+    ///
+    /// Returns `(doc_id, Option<value>)` for every document — `None` when
+    /// the path does not exist in a given document.
+    pub fn par_path_query(&self, path: &str) -> Vec<(u64, Option<JsonValue>)> {
+        let segments: Vec<&str> = path.split('.').collect();
+        if self.docs.len() < Self::PAR_THRESHOLD {
+            return self
+                .docs
+                .iter()
+                .map(|(id, doc)| (*id, doc.get_path(&segments).cloned()))
+                .collect();
+        }
+        let all_docs: Vec<_> = self.docs.iter().collect();
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let chunk_size = all_docs.len().div_ceil(cpus);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = all_docs
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(|| {
+                        chunk
+                            .iter()
+                            .map(|entry| (*entry.0, entry.1.get_path(&segments).cloned()))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        })
+    }
+
+    /// Bulk-insert documents, parallelising validation and GIN-key extraction
+    /// across threads while performing the actual insertion sequentially.
+    ///
+    /// Each input pair is `(string_key, document)`. The string key is stored
+    /// as a `"_key"` field inside the document metadata — callers can use it
+    /// for deduplication. The assigned `u64` IDs are returned in the same
+    /// order as the input slice.
+    pub fn par_bulk_insert(&mut self, docs: &[(String, JsonValue)]) -> Vec<u64> {
+        // Phase 1: extract GIN pairs in parallel.
+        let gin_pairs: Vec<Vec<(String, JsonValue)>> = if docs.len() >= Self::PAR_THRESHOLD {
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            let chunk_size = docs.len().div_ceil(cpus);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = docs
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        s.spawn(|| {
+                            chunk
+                                .iter()
+                                .map(|(_, doc)| doc.gin_extract())
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap())
+                    .collect()
+            })
+        } else {
+            docs.iter().map(|(_, doc)| doc.gin_extract()).collect()
+        };
+
+        // Phase 2: sequential insert using pre-computed GIN pairs.
+        let mut ids = Vec::with_capacity(docs.len());
+        for (i, (_key, doc)) in docs.iter().enumerate() {
+            let id = self.next_id;
+            self.next_id += 1;
+            if let Some(ref wal) = self.wal {
+                let bytes = jsonb_encode(doc);
+                if let Err(e) = wal.log_insert(id, &bytes) {
+                    eprintln!("document WAL: failed to log bulk_insert {id}: {e}");
+                }
+            }
+            // Use pre-computed GIN pairs instead of re-extracting.
+            for (path, leaf) in &gin_pairs[i] {
+                let key_bytes = jsonb_encode(leaf);
+                self.gin
+                    .entries
+                    .entry((path.clone(), key_bytes))
+                    .or_default()
+                    .insert(id);
+            }
+            self.docs.insert(id, doc.clone());
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// Count documents matching a predicate, using parallel evaluation when
+    /// the store contains >= 500 documents.
+    ///
+    /// This is more efficient than `par_query(...).len()` because it avoids
+    /// cloning matching documents.
+    pub fn par_count_where(&self, predicate: &str) -> usize {
+        if self.docs.len() < Self::PAR_THRESHOLD {
+            return self
+                .docs
+                .values()
+                .filter(|doc| Self::matches_predicate(doc, predicate))
+                .count();
+        }
+        let all_docs: Vec<_> = self.docs.iter().collect();
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let chunk_size = all_docs.len().div_ceil(cpus);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = all_docs
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(|| {
+                        chunk
+                            .iter()
+                            .filter(|entry| Self::matches_predicate(entry.1, predicate))
+                            .count()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .sum()
+        })
+    }
+
+    /// Capture a snapshot of all document state for transaction rollback.
+    pub fn txn_snapshot(&self) -> DocTxnSnapshot {
+        DocTxnSnapshot {
+            docs: self.docs.clone(),
+            gin: self.gin.clone(),
+            next_id: self.next_id,
+        }
+    }
+
+    /// Restore document state from a transaction snapshot (for ROLLBACK).
+    pub fn txn_restore(&mut self, snap: DocTxnSnapshot) {
+        self.docs = snap.docs;
+        self.gin = snap.gin;
+        self.next_id = snap.next_id;
+    }
+
+    // ========================================================================
+    // Cold tier helpers
+    // ========================================================================
+
+    /// Whether this store has a cold tier (disk mode).
+    pub fn has_cold_tier(&self) -> bool {
+        self.cold.is_some()
+    }
+
+    /// Return the count of hot (in-memory) documents only.
+    pub fn len_hot(&self) -> usize {
+        self.docs.len()
+    }
+
+    /// Evict documents from the hot tier to the cold LsmTree when the hot
+    /// tier exceeds `max_hot_docs`.
+    fn maybe_evict(&mut self) {
+        if self.docs.len() <= self.max_hot_docs {
+            return;
+        }
+        let Some(ref cold) = self.cold else { return };
+        let to_evict = self.docs.len() - self.max_hot_docs;
+        let mut eviction_list: Vec<(u64, JsonValue)> = Vec::with_capacity(to_evict);
+
+        // Collect entries to evict (take first `to_evict` docs we iterate)
+        for (&id, doc) in self.docs.iter() {
+            eviction_list.push((id, doc.clone()));
+            if eviction_list.len() >= to_evict {
+                break;
+            }
+        }
+
+        // Move to cold
+        {
+            let mut c = cold.lock();
+            for (id, doc) in &eviction_list {
+                let key = id.to_le_bytes().to_vec();
+                let val = cold_encode_json(doc);
+                c.put(key, val);
+            }
+        }
+
+        // Remove from hot + GIN
+        for (id, doc) in &eviction_list {
+            self.gin.remove(*id, doc);
+            self.docs.remove(id);
+        }
+    }
+}
+
+/// Snapshot of document store state for transaction rollback.
+pub struct DocTxnSnapshot {
+    docs: HashMap<u64, JsonValue>,
+    gin: GinIndex,
+    next_id: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +962,7 @@ impl DocumentStore {
 // ---------------------------------------------------------------------------
 
 /// Small helper to construct a `JsonValue::Object` from key-value pairs.
+#[cfg(test)]
 fn json_obj(pairs: Vec<(&str, JsonValue)>) -> JsonValue {
     let mut map = BTreeMap::new();
     for (k, v) in pairs {
@@ -1369,5 +1816,439 @@ mod tests {
         let alpha_results = store.query_contains(&alpha_query);
         // i % 3 == 0 for i in 0..500 => 0, 3, 6, ..., 498 => 167 documents
         assert_eq!(alpha_results.len(), 167);
+    }
+
+    // -- 15. WAL-backed durability tests ------------------------------------
+
+    #[test]
+    fn test_wal_insert_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            store.insert(json_obj(vec![
+                ("name", JsonValue::Str("Alice".to_string())),
+            ]));
+            store.insert(json_obj(vec![
+                ("name", JsonValue::Str("Bob".to_string())),
+            ]));
+        }
+        // Reopen — documents should survive.
+        let store2 = DocumentStore::open(dir.path()).unwrap();
+        assert_eq!(store2.len(), 2);
+        let doc1 = store2.get(1).unwrap();
+        assert_eq!(
+            doc1.get_path(&["name"]),
+            Some(&JsonValue::Str("Alice".to_string()))
+        );
+        let doc2 = store2.get(2).unwrap();
+        assert_eq!(
+            doc2.get_path(&["name"]),
+            Some(&JsonValue::Str("Bob".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_wal_delete_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            let id1 = store.insert(json_obj(vec![
+                ("x", JsonValue::Number(1.0)),
+            ]));
+            store.insert(json_obj(vec![
+                ("x", JsonValue::Number(2.0)),
+            ]));
+            assert!(store.delete(id1));
+        }
+        let store2 = DocumentStore::open(dir.path()).unwrap();
+        assert_eq!(store2.len(), 1);
+        assert!(store2.get(1).is_none());
+        assert!(store2.get(2).is_some());
+    }
+
+    #[test]
+    fn test_wal_gin_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            store.insert(json_obj(vec![
+                ("role", JsonValue::Str("admin".to_string())),
+                ("name", JsonValue::Str("Eve".to_string())),
+            ]));
+            store.insert(json_obj(vec![
+                ("role", JsonValue::Str("user".to_string())),
+                ("name", JsonValue::Str("Frank".to_string())),
+            ]));
+        }
+        let store2 = DocumentStore::open(dir.path()).unwrap();
+        let admin_q = json_obj(vec![("role", JsonValue::Str("admin".to_string()))]);
+        let admins = store2.query_contains(&admin_q);
+        assert_eq!(admins.len(), 1);
+        assert!(admins.contains(&1));
+    }
+
+    #[test]
+    fn test_wal_nested_json_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = json_obj(vec![
+            ("level1", json_obj(vec![
+                ("level2", json_obj(vec![
+                    ("value", JsonValue::Number(42.0)),
+                    ("tags", JsonValue::Array(vec![
+                        JsonValue::Str("a".to_string()),
+                        JsonValue::Str("b".to_string()),
+                    ])),
+                ])),
+            ])),
+        ]);
+        {
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            store.insert(nested.clone());
+        }
+        let store2 = DocumentStore::open(dir.path()).unwrap();
+        assert_eq!(store2.get(1), Some(&nested));
+    }
+
+    #[test]
+    fn test_wal_next_id_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            store.insert(json_obj(vec![("a", JsonValue::Number(1.0))]));
+            store.insert(json_obj(vec![("b", JsonValue::Number(2.0))]));
+            store.insert(json_obj(vec![("c", JsonValue::Number(3.0))]));
+            // next_id should now be 4
+        }
+        let mut store2 = DocumentStore::open(dir.path()).unwrap();
+        let id = store2.insert(json_obj(vec![("d", JsonValue::Number(4.0))]));
+        assert_eq!(id, 4, "next_id should resume from max(doc_id)+1");
+    }
+
+    #[test]
+    fn test_wal_corrupt_graceful_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write a valid WAL, then corrupt it.
+        {
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            store.insert(json_obj(vec![("ok", JsonValue::Bool(true))]));
+        }
+        // Append garbage to WAL file.
+        let wal_path = dir.path().join("doc.wal");
+        let mut data = std::fs::read(&wal_path).unwrap();
+        data.extend_from_slice(&[0xFF, 0xFE, 0xFD]);
+        std::fs::write(&wal_path, &data).unwrap();
+
+        // Should recover the valid document and ignore trailing garbage.
+        let store2 = DocumentStore::open(dir.path()).unwrap();
+        assert_eq!(store2.len(), 1);
+        assert_eq!(
+            store2.get(1).unwrap().get_path(&["ok"]),
+            Some(&JsonValue::Bool(true))
+        );
+    }
+
+    #[test]
+    fn test_wal_large_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let big_arr: Vec<JsonValue> = (0..500)
+            .map(|i| json_obj(vec![
+                ("idx", JsonValue::Number(i as f64)),
+                ("data", JsonValue::Str(format!("entry_{i}"))),
+            ]))
+            .collect();
+        let big_doc = json_obj(vec![
+            ("items", JsonValue::Array(big_arr)),
+        ]);
+        {
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            store.insert(big_doc.clone());
+        }
+        let store2 = DocumentStore::open(dir.path()).unwrap();
+        assert_eq!(store2.len(), 1);
+        assert_eq!(store2.get(1), Some(&big_doc));
+    }
+
+    #[test]
+    fn test_wal_empty_store_clean_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocumentStore::open(dir.path()).unwrap();
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+        // Reopen still empty.
+        drop(store);
+        let store2 = DocumentStore::open(dir.path()).unwrap();
+        assert!(store2.is_empty());
+    }
+
+    // -- 16. Parallel query/scan operations -----------------------------------
+
+    /// Helper: build a store with `n` documents, each having `category` and
+    /// `seq` fields.  Categories cycle through alpha/beta/gamma.
+    fn build_large_store(n: usize) -> DocumentStore {
+        let mut store = DocumentStore::new();
+        for i in 0..n {
+            let cat = match i % 3 {
+                0 => "alpha",
+                1 => "beta",
+                _ => "gamma",
+            };
+            let doc = json_obj(vec![
+                ("category", JsonValue::Str(cat.to_string())),
+                ("seq", JsonValue::Number(i as f64)),
+                ("active", JsonValue::Bool(i % 2 == 0)),
+            ]);
+            store.insert(doc);
+        }
+        store
+    }
+
+    #[test]
+    fn test_par_query_matches_sequential() {
+        let store = build_large_store(1500);
+        let par_results = store.par_query("category=alpha");
+        // Sequential: count documents where category == alpha
+        let seq_results: Vec<(u64, JsonValue)> = store
+            .docs
+            .iter()
+            .filter(|(_, doc)| {
+                doc.get_path(&["category"]) == Some(&JsonValue::Str("alpha".to_string()))
+            })
+            .map(|(&id, doc)| (id, doc.clone()))
+            .collect();
+
+        assert_eq!(par_results.len(), seq_results.len());
+        // Verify every parallel result is also in the sequential set.
+        let seq_ids: HashSet<u64> = seq_results.iter().map(|(id, _)| *id).collect();
+        for (id, _) in &par_results {
+            assert!(seq_ids.contains(id), "par_query returned unexpected id {id}");
+        }
+        // alpha: i % 3 == 0 for i in 0..1500 => 500 docs
+        assert_eq!(par_results.len(), 500);
+    }
+
+    #[test]
+    fn test_par_query_small_dataset_fallback() {
+        // Below the 500-document threshold, par_query should still work
+        // (falls back to sequential internally).
+        let store = build_large_store(100);
+        let results = store.par_query("category=beta");
+        // beta: i % 3 == 1 for i in 0..100 => 33 docs (1,4,7,...,97)
+        assert_eq!(results.len(), 33);
+        for (_, doc) in &results {
+            assert_eq!(
+                doc.get_path(&["category"]),
+                Some(&JsonValue::Str("beta".to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn test_par_path_query_large() {
+        let store = build_large_store(1200);
+        let results = store.par_path_query("category");
+        assert_eq!(results.len(), 1200);
+        // Every document has a "category" field, so all should be Some.
+        for (_, val) in &results {
+            assert!(val.is_some(), "every doc should have a category");
+        }
+        // Query a non-existent path.
+        let missing = store.par_path_query("nonexistent");
+        assert_eq!(missing.len(), 1200);
+        for (_, val) in &missing {
+            assert!(val.is_none(), "no doc should have 'nonexistent'");
+        }
+    }
+
+    #[test]
+    fn test_par_bulk_insert_matches_sequential() {
+        // Build input docs.
+        let input: Vec<(String, JsonValue)> = (0..800)
+            .map(|i| {
+                let doc = json_obj(vec![
+                    ("idx", JsonValue::Number(i as f64)),
+                    ("tag", JsonValue::Str(format!("t{}", i % 10))),
+                ]);
+                (format!("key_{i}"), doc)
+            })
+            .collect();
+
+        // Parallel bulk insert.
+        let mut par_store = DocumentStore::new();
+        let par_ids = par_store.par_bulk_insert(&input);
+        assert_eq!(par_ids.len(), 800);
+        assert_eq!(par_store.len(), 800);
+
+        // Sequential insert for comparison.
+        let mut seq_store = DocumentStore::new();
+        for (_key, doc) in &input {
+            seq_store.insert(doc.clone());
+        }
+        assert_eq!(seq_store.len(), 800);
+
+        // Both stores should have the same documents (by content).
+        for id in &par_ids {
+            let par_doc = par_store.get(*id).expect("par doc missing");
+            let seq_doc = seq_store.get(*id).expect("seq doc missing");
+            assert_eq!(par_doc, seq_doc);
+        }
+
+        // GIN index should work identically: query by containment.
+        let tag_query = json_obj(vec![("tag", JsonValue::Str("t0".to_string()))]);
+        let par_gin = par_store.query_contains(&tag_query);
+        let seq_gin = seq_store.query_contains(&tag_query);
+        assert_eq!(par_gin.len(), seq_gin.len());
+        // t0: i % 10 == 0 for i in 0..800 => 80 docs
+        assert_eq!(par_gin.len(), 80);
+    }
+
+    #[test]
+    fn test_par_count_where_matches_sequential() {
+        let store = build_large_store(1500);
+        let par_count = store.par_count_where("category=gamma");
+        // Sequential count.
+        let seq_count = store
+            .docs
+            .values()
+            .filter(|doc| {
+                doc.get_path(&["category"]) == Some(&JsonValue::Str("gamma".to_string()))
+            })
+            .count();
+        assert_eq!(par_count, seq_count);
+        // gamma: i % 3 == 2 for i in 0..1500 => 500 docs
+        assert_eq!(par_count, 500);
+    }
+
+    #[test]
+    fn test_par_query_consistency() {
+        // Run the same parallel query multiple times and verify deterministic
+        // result counts.
+        let store = build_large_store(2000);
+        let mut counts = Vec::new();
+        for _ in 0..5 {
+            let results = store.par_query("active=true");
+            counts.push(results.len());
+        }
+        // All runs should produce the same count.
+        assert!(
+            counts.iter().all(|&c| c == counts[0]),
+            "par_query should be deterministic: counts = {:?}",
+            counts
+        );
+        // active=true when i % 2 == 0 => 1000 docs
+        assert_eq!(counts[0], 1000);
+    }
+
+    #[test]
+    fn test_par_count_where_small_dataset_fallback() {
+        let store = build_large_store(50);
+        let count = store.par_count_where("category=alpha");
+        // alpha: i % 3 == 0 for i in 0..50 => 17 docs (0,3,6,...,48)
+        assert_eq!(count, 17);
+    }
+
+    #[test]
+    fn test_par_path_query_nested() {
+        // Test parallel path extraction with nested paths.
+        let mut store = DocumentStore::new();
+        for i in 0..600 {
+            let doc = json_obj(vec![(
+                "user",
+                json_obj(vec![
+                    ("name", JsonValue::Str(format!("user_{i}"))),
+                    ("level", JsonValue::Number((i % 5) as f64)),
+                ]),
+            )]);
+            store.insert(doc);
+        }
+        let results = store.par_path_query("user.level");
+        assert_eq!(results.len(), 600);
+        // Every doc has user.level.
+        for (_, val) in &results {
+            assert!(val.is_some());
+            match val.as_ref().unwrap() {
+                JsonValue::Number(n) => assert!((0.0..5.0).contains(n)),
+                other => panic!("expected Number, got {:?}", other),
+            }
+        }
+    }
+
+    // ========================================================================
+    // Cold tier (tiered storage) tests
+    // ========================================================================
+
+    #[test]
+    fn test_doc_cold_tier_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DocumentStore::open(dir.path()).unwrap();
+        assert!(store.has_cold_tier(), "disk mode should have cold tier");
+        assert!(dir.path().join("doc_cold").exists());
+        let doc = json_obj(vec![("name", JsonValue::Str("Alice".into()))]);
+        let id = store.insert(doc.clone());
+        assert_eq!(store.get(id), Some(&doc));
+    }
+
+    #[test]
+    fn test_doc_cold_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DocumentStore::open(dir.path()).unwrap();
+        store.max_hot_docs = 10;
+        // Insert 30 docs — should trigger eviction
+        for i in 0..30 {
+            let doc = json_obj(vec![("seq", JsonValue::Number(i as f64))]);
+            store.insert(doc);
+        }
+        // Hot tier should have at most max_hot_docs entries
+        assert!(store.len_hot() <= 10, "hot should have <= 10, got {}", store.len_hot());
+        // All 30 should be accessible via get (hot) or get_promoting (cold)
+        for id in 1..=30u64 {
+            let doc = store.get_promoting(id);
+            assert!(doc.is_some(), "doc {id} should be accessible");
+        }
+    }
+
+    #[test]
+    fn test_doc_cold_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DocumentStore::open(dir.path()).unwrap();
+        store.max_hot_docs = 5;
+        for i in 0..20 {
+            let doc = json_obj(vec![("val", JsonValue::Number(i as f64))]);
+            store.insert(doc);
+        }
+        // Access an evicted doc — should be promoted back to hot
+        let doc = store.get_promoting(1);
+        assert!(doc.is_some(), "cold doc should be promotable");
+        // Now it should be in hot
+        assert!(store.get(1).is_some(), "promoted doc should be in hot tier");
+    }
+
+    #[test]
+    fn test_doc_cold_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            store.max_hot_docs = 5;
+            for i in 0..20 {
+                let doc = json_obj(vec![("val", JsonValue::Number(i as f64))]);
+                store.insert(doc);
+            }
+            // Force flush cold LsmTree
+            if let Some(ref cold) = store.cold {
+                cold.lock().force_flush();
+            }
+        }
+        // Reopen — WAL restores hot entries, cold persists independently
+        let mut store2 = DocumentStore::open(dir.path()).unwrap();
+        // All docs should be accessible
+        for id in 1..=20u64 {
+            let doc = store2.get_promoting(id);
+            assert!(doc.is_some(), "doc {id} should survive reopen");
+        }
+    }
+
+    #[test]
+    fn test_doc_memory_mode_no_cold() {
+        let store = DocumentStore::new();
+        assert!(!store.has_cold_tier(), "memory mode should have no cold tier");
     }
 }

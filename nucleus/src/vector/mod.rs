@@ -9,6 +9,11 @@
 //!
 //! Replaces pgvector, Pinecone, Weaviate, Milvus.
 
+pub mod tiered;
+pub mod wal;
+
+pub use wal::VectorWal;
+
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::cmp::Ordering;
 
@@ -67,34 +72,235 @@ pub enum DistanceMetric {
 pub fn distance(a: &Vector, b: &Vector, metric: DistanceMetric) -> f32 {
     debug_assert_eq!(a.dim(), b.dim(), "vector dimensions must match");
     match metric {
-        DistanceMetric::L2 => l2_distance(a, b),
-        DistanceMetric::Cosine => cosine_distance(a, b),
-        DistanceMetric::InnerProduct => neg_inner_product(a, b),
+        DistanceMetric::L2 => simd_l2_distance(&a.data, &b.data),
+        DistanceMetric::Cosine => simd_cosine_distance(&a.data, &b.data),
+        DistanceMetric::InnerProduct => {
+            -simd_dot_product(&a.data, &b.data) // Negate so lower = more similar
+        }
     }
 }
 
-fn l2_distance(a: &Vector, b: &Vector) -> f32 {
-    a.data
-        .iter()
-        .zip(b.data.iter())
-        .map(|(x, y)| (x - y) * (x - y))
-        .sum::<f32>()
-        .sqrt()
+// ============================================================================
+// SIMD-accelerated distance calculations (unrolled 8-wide f32 lanes)
+// ============================================================================
+
+/// Dot product of two f32 slices, unrolled in chunks of 8 for ILP.
+///
+/// Processes 8 elements per loop iteration to exploit instruction-level
+/// parallelism — the compiler maps these to SIMD (SSE/AVX) on x86 and
+/// NEON on ARM when optimisation is enabled.
+#[inline]
+pub fn simd_dot_product(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "slice lengths must match");
+    let n = a.len();
+    // Use 4 accumulators to break dependency chains and maximise ILP.
+    let mut sum0: f32 = 0.0;
+    let mut sum1: f32 = 0.0;
+    let mut sum2: f32 = 0.0;
+    let mut sum3: f32 = 0.0;
+
+    let chunks = n / 8;
+    let remainder = n % 8;
+
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+
+    for i in 0..chunks {
+        let base = i * 8;
+        // SAFETY: base+7 < chunks*8 <= n, and both slices have length n.
+        unsafe {
+            let a0 = *pa.add(base);
+            let a1 = *pa.add(base + 1);
+            let a2 = *pa.add(base + 2);
+            let a3 = *pa.add(base + 3);
+            let a4 = *pa.add(base + 4);
+            let a5 = *pa.add(base + 5);
+            let a6 = *pa.add(base + 6);
+            let a7 = *pa.add(base + 7);
+
+            let b0 = *pb.add(base);
+            let b1 = *pb.add(base + 1);
+            let b2 = *pb.add(base + 2);
+            let b3 = *pb.add(base + 3);
+            let b4 = *pb.add(base + 4);
+            let b5 = *pb.add(base + 5);
+            let b6 = *pb.add(base + 6);
+            let b7 = *pb.add(base + 7);
+
+            sum0 += a0 * b0 + a4 * b4;
+            sum1 += a1 * b1 + a5 * b5;
+            sum2 += a2 * b2 + a6 * b6;
+            sum3 += a3 * b3 + a7 * b7;
+        }
+    }
+
+    // Handle remaining elements
+    let tail_start = chunks * 8;
+    for i in 0..remainder {
+        unsafe {
+            sum0 += *pa.add(tail_start + i) * *pb.add(tail_start + i);
+        }
+    }
+
+    sum0 + sum1 + sum2 + sum3
 }
 
-fn cosine_distance(a: &Vector, b: &Vector) -> f32 {
-    let dot: f32 = a.data.iter().zip(b.data.iter()).map(|(x, y)| x * y).sum();
-    let na = a.norm();
-    let nb = b.norm();
-    if na == 0.0 || nb == 0.0 {
+/// L2 (Euclidean) distance between two f32 slices, unrolled in chunks of 8.
+///
+/// Computes `sqrt(sum((a[i] - b[i])^2))` using the same 4-accumulator
+/// technique as [`simd_dot_product`].
+#[inline]
+pub fn simd_l2_distance(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "slice lengths must match");
+    let n = a.len();
+    let mut sum0: f32 = 0.0;
+    let mut sum1: f32 = 0.0;
+    let mut sum2: f32 = 0.0;
+    let mut sum3: f32 = 0.0;
+
+    let chunks = n / 8;
+    let remainder = n % 8;
+
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+
+    for i in 0..chunks {
+        let base = i * 8;
+        unsafe {
+            let d0 = *pa.add(base) - *pb.add(base);
+            let d1 = *pa.add(base + 1) - *pb.add(base + 1);
+            let d2 = *pa.add(base + 2) - *pb.add(base + 2);
+            let d3 = *pa.add(base + 3) - *pb.add(base + 3);
+            let d4 = *pa.add(base + 4) - *pb.add(base + 4);
+            let d5 = *pa.add(base + 5) - *pb.add(base + 5);
+            let d6 = *pa.add(base + 6) - *pb.add(base + 6);
+            let d7 = *pa.add(base + 7) - *pb.add(base + 7);
+
+            sum0 += d0 * d0 + d4 * d4;
+            sum1 += d1 * d1 + d5 * d5;
+            sum2 += d2 * d2 + d6 * d6;
+            sum3 += d3 * d3 + d7 * d7;
+        }
+    }
+
+    let tail_start = chunks * 8;
+    for i in 0..remainder {
+        unsafe {
+            let d = *pa.add(tail_start + i) - *pb.add(tail_start + i);
+            sum0 += d * d;
+        }
+    }
+
+    (sum0 + sum1 + sum2 + sum3).sqrt()
+}
+
+/// Cosine distance between two f32 slices: `1 - (a·b)/(|a||b|)`.
+///
+/// Computes dot product, norm-a-squared, and norm-b-squared in a single
+/// fused pass over the data (one pass instead of three), unrolled 8-wide.
+#[inline]
+pub fn simd_cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "slice lengths must match");
+    let n = a.len();
+    // Three quantities computed in parallel: dot, norm_a^2, norm_b^2.
+    // Each uses 2 accumulators (8 lanes / 4 groups, doubled up).
+    let mut dot0: f32 = 0.0;
+    let mut dot1: f32 = 0.0;
+    let mut na0: f32 = 0.0;
+    let mut na1: f32 = 0.0;
+    let mut nb0: f32 = 0.0;
+    let mut nb1: f32 = 0.0;
+
+    let chunks = n / 8;
+    let remainder = n % 8;
+
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+
+    for i in 0..chunks {
+        let base = i * 8;
+        unsafe {
+            let a0 = *pa.add(base);
+            let a1 = *pa.add(base + 1);
+            let a2 = *pa.add(base + 2);
+            let a3 = *pa.add(base + 3);
+            let a4 = *pa.add(base + 4);
+            let a5 = *pa.add(base + 5);
+            let a6 = *pa.add(base + 6);
+            let a7 = *pa.add(base + 7);
+
+            let b0 = *pb.add(base);
+            let b1 = *pb.add(base + 1);
+            let b2 = *pb.add(base + 2);
+            let b3 = *pb.add(base + 3);
+            let b4 = *pb.add(base + 4);
+            let b5 = *pb.add(base + 5);
+            let b6 = *pb.add(base + 6);
+            let b7 = *pb.add(base + 7);
+
+            dot0 += a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3;
+            dot1 += a4 * b4 + a5 * b5 + a6 * b6 + a7 * b7;
+
+            na0 += a0 * a0 + a1 * a1 + a2 * a2 + a3 * a3;
+            na1 += a4 * a4 + a5 * a5 + a6 * a6 + a7 * a7;
+
+            nb0 += b0 * b0 + b1 * b1 + b2 * b2 + b3 * b3;
+            nb1 += b4 * b4 + b5 * b5 + b6 * b6 + b7 * b7;
+        }
+    }
+
+    let tail_start = chunks * 8;
+    for i in 0..remainder {
+        unsafe {
+            let ai = *pa.add(tail_start + i);
+            let bi = *pb.add(tail_start + i);
+            dot0 += ai * bi;
+            na0 += ai * ai;
+            nb0 += bi * bi;
+        }
+    }
+
+    let dot = dot0 + dot1;
+    let norm_a = (na0 + na1).sqrt();
+    let norm_b = (nb0 + nb1).sqrt();
+
+    if norm_a == 0.0 || norm_b == 0.0 {
         return 1.0;
     }
-    1.0 - dot / (na * nb)
+    1.0 - dot / (norm_a * norm_b)
 }
 
-fn neg_inner_product(a: &Vector, b: &Vector) -> f32 {
-    let dot: f32 = a.data.iter().zip(b.data.iter()).map(|(x, y)| x * y).sum();
-    -dot // Negate so lower = more similar
+/// Compute distance between two raw f32 slices using the given metric.
+///
+/// This avoids constructing [`Vector`] wrappers and is used on the
+/// hot path inside [`IvfFlatIndex`].
+#[inline]
+pub fn distance_raw(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
+    match metric {
+        DistanceMetric::L2 => simd_l2_distance(a, b),
+        DistanceMetric::Cosine => simd_cosine_distance(a, b),
+        DistanceMetric::InnerProduct => -simd_dot_product(a, b),
+    }
+}
+
+/// Issue a software prefetch hint for read access to a memory address.
+///
+/// This is a no-op on architectures that don't support prefetch, and a
+/// hint only — the CPU is free to ignore it.
+#[inline(always)]
+fn prefetch_read_data<T>(ptr: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "x86")]
+    unsafe {
+        std::arch::x86::_mm_prefetch(ptr as *const i8, std::arch::x86::_MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+    {
+        let _ = ptr; // suppress unused warning on other architectures
+    }
 }
 
 // ============================================================================
@@ -129,7 +335,7 @@ impl Default for HnswConfig {
 }
 
 /// A node in the HNSW graph.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct HnswNode {
     _id: u64,
     vector: Vector,
@@ -198,6 +404,7 @@ impl Ord for MaxCandidate {
 }
 
 /// HNSW (Hierarchical Navigable Small World) index.
+#[derive(Clone)]
 pub struct HnswIndex {
     config: HnswConfig,
     nodes: HashMap<u64, HnswNode>,
@@ -320,9 +527,16 @@ impl HnswIndex {
 
         loop {
             let mut improved = false;
-            if let Some(node) = self.nodes.get(&current) {
-                if layer < node.neighbors.len() {
-                    for &neighbor_id in &node.neighbors[layer] {
+            if let Some(node) = self.nodes.get(&current)
+                && layer < node.neighbors.len() {
+                    let neighbors = &node.neighbors[layer];
+                    for (idx, &neighbor_id) in neighbors.iter().enumerate() {
+                        // Prefetch the next neighbor's vector data
+                        if idx + 1 < neighbors.len()
+                            && let Some(next_node) = self.nodes.get(&neighbors[idx + 1])
+                                && !next_node.vector.data.is_empty() {
+                                    prefetch_read_data(next_node.vector.data.as_ptr());
+                                }
                         let d = self.dist(neighbor_id, query);
                         if d < current_dist {
                             current = neighbor_id;
@@ -331,7 +545,6 @@ impl HnswIndex {
                         }
                     }
                 }
-            }
             if !improved {
                 break;
             }
@@ -369,10 +582,21 @@ impl HnswIndex {
                 break;
             }
 
-            if let Some(node) = self.nodes.get(&closest.id) {
-                if layer < node.neighbors.len() {
-                    for &neighbor_id in &node.neighbors[layer] {
+            if let Some(node) = self.nodes.get(&closest.id)
+                && layer < node.neighbors.len() {
+                    let neighbors = &node.neighbors[layer];
+                    for (idx, &neighbor_id) in neighbors.iter().enumerate() {
                         if visited.insert(neighbor_id) {
+                            // Prefetch the *next* unvisited neighbor's vector
+                            // data into L1 cache so it's warm when we reach it.
+                            if idx + 1 < neighbors.len() {
+                                let next_id = neighbors[idx + 1];
+                                if let Some(next_node) = self.nodes.get(&next_id)
+                                    && !next_node.vector.data.is_empty() {
+                                        prefetch_read_data(next_node.vector.data.as_ptr());
+                                    }
+                            }
+
                             let d = self.dist(neighbor_id, query);
                             let worst = results.peek().map(|r| r.dist).unwrap_or(f32::MAX);
 
@@ -392,7 +616,6 @@ impl HnswIndex {
                         }
                     }
                 }
-            }
         }
 
         let mut result: Vec<Candidate> = results
@@ -471,6 +694,66 @@ impl HnswIndex {
         candidates
             .into_iter()
             .filter(|c| !self.deleted.contains(&c.id))
+            .take(k)
+            .map(|c| (c.id, c.dist))
+            .collect()
+    }
+
+    /// Search for the k nearest neighbors that pass a filter predicate.
+    ///
+    /// Uses an oversampling strategy: search with a larger ef to find more
+    /// candidates, then apply the filter and return the top-k passing results.
+    /// If the first pass doesn't yield k results, the search retries with
+    /// progressively larger ef values (up to 4x) to maintain recall.
+    ///
+    /// The `filter` closure receives a vector ID and returns `true` if the
+    /// vector should be included in results. This allows the caller to check
+    /// arbitrary predicates (MVCC visibility, WHERE clauses, etc.) without
+    /// coupling the index to the storage engine.
+    pub fn search_filtered<F>(&self, query: &Vector, k: usize, filter: F) -> Vec<(u64, f32)>
+    where
+        F: Fn(u64) -> bool,
+    {
+        if self.nodes.is_empty() || self.entry_point.is_none() || k == 0 {
+            return vec![];
+        }
+
+        let entry = match self.entry_point {
+            Some(id) => id,
+            None => return vec![],
+        };
+
+        // Phase 1: Greedy search from top to layer 1
+        let mut current = entry;
+        for layer in (1..=self.max_layer).rev() {
+            current = self.greedy_search(current, query, layer);
+        }
+
+        // Phase 2: Oversampling search at layer 0.
+        // Start with 4x oversampling and increase if needed.
+        let base_ef = self.config.ef_search.max(k);
+        for oversample in [4, 8, 16] {
+            let ef = base_ef * oversample;
+            let candidates = self.search_layer(current, query, ef, 0);
+
+            let results: Vec<(u64, f32)> = candidates
+                .into_iter()
+                .filter(|c| !self.deleted.contains(&c.id) && filter(c.id))
+                .take(k)
+                .map(|c| (c.id, c.dist))
+                .collect();
+
+            if results.len() >= k || ef >= self.nodes.len() {
+                return results;
+            }
+        }
+
+        // Final fallback: search with ef = total nodes (brute-force through graph)
+        let ef = self.nodes.len();
+        let candidates = self.search_layer(current, query, ef, 0);
+        candidates
+            .into_iter()
+            .filter(|c| !self.deleted.contains(&c.id) && filter(c.id))
             .take(k)
             .map(|c| (c.id, c.dist))
             .collect()
@@ -661,6 +944,7 @@ impl HnswIndex {
 /// 1. **Training**: k-means clustering on training vectors to find `nlist` centroids.
 /// 2. **Querying**: Find the `nprobe` nearest centroids, then brute-force search
 ///    within those clusters.
+#[derive(Clone)]
 pub struct IvfFlatIndex {
     /// Centroid vectors, one per cluster (length = nlist after training).
     centroids: Vec<Vec<f32>>,
@@ -821,6 +1105,45 @@ impl IvfFlatIndex {
         candidates
     }
 
+    /// Search for the `k` nearest neighbors that pass a filter predicate.
+    ///
+    /// The `filter` closure receives a vector ID and returns `true` if the
+    /// vector should be included in results.
+    pub fn search_filtered<F>(&self, query: &[f32], k: usize, filter: F) -> Vec<(usize, f32)>
+    where
+        F: Fn(usize) -> bool,
+    {
+        assert_eq!(query.len(), self.dimension, "query dimension mismatch");
+        if self.centroids.is_empty() {
+            return Vec::new();
+        }
+
+        let mut centroid_dists: Vec<(usize, f32)> = self
+            .centroids
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, self.compute_distance(query, c)))
+            .collect();
+        centroid_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+
+        let nprobe = self.nprobe.min(centroid_dists.len());
+
+        let mut candidates: Vec<(usize, f32)> = Vec::new();
+        for &(cluster_idx, _) in centroid_dists.iter().take(nprobe) {
+            for (id, vec) in &self.inverted_lists[cluster_idx] {
+                if self.deleted.contains(id) || !filter(*id) {
+                    continue;
+                }
+                let d = self.compute_distance(query, vec);
+                candidates.push((*id, d));
+            }
+        }
+
+        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        candidates.truncate(k);
+        candidates
+    }
+
     /// Find the index of the nearest centroid to a given vector.
     fn nearest_centroid(&self, vector: &[f32], centroids: &[Vec<f32>]) -> usize {
         let mut best_idx = 0;
@@ -836,10 +1159,11 @@ impl IvfFlatIndex {
     }
 
     /// Compute distance between two raw f32 slices using the index's metric.
+    ///
+    /// Uses the SIMD-accelerated [`distance_raw`] path — no Vector allocation.
+    #[inline]
     fn compute_distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        let va = Vector::new(a.to_vec());
-        let vb = Vector::new(b.to_vec());
-        distance(&va, &vb, self.metric)
+        distance_raw(a, b, self.metric)
     }
 
     /// Number of vectors stored in the index.
@@ -892,6 +1216,191 @@ pub fn exact_search(
     scored
 }
 
+/// Parallel brute-force nearest neighbor search.
+///
+/// Partitions the vector store across available CPU cores using
+/// `std::thread::scope`. Each thread computes distances for its chunk and
+/// returns local top-k results; the caller merges and takes the global top-k.
+///
+/// Falls back to sequential [`exact_search`] when the dataset contains fewer
+/// than 1000 vectors.
+pub fn par_search_brute_force(
+    vectors: &[(u64, Vector)],
+    query: &Vector,
+    k: usize,
+    metric: DistanceMetric,
+) -> Vec<(u64, f32)> {
+    const PAR_THRESHOLD: usize = 1000;
+
+    if vectors.len() < PAR_THRESHOLD {
+        return exact_search(vectors, query, k, metric);
+    }
+
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let chunk_size = vectors.len().div_ceil(cpus);
+
+    let mut merged: Vec<(u64, f32)> = std::thread::scope(|s| {
+        let handles: Vec<_> = vectors
+            .chunks(chunk_size)
+            .map(|chunk| {
+                s.spawn(move || {
+                    // Compute distances for this chunk
+                    let mut local: Vec<(u64, f32)> = chunk
+                        .iter()
+                        .map(|(id, v)| (*id, distance(v, query, metric)))
+                        .collect();
+                    // Keep only local top-k to reduce merge work
+                    local.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+                    local.truncate(k);
+                    local
+                })
+            })
+            .collect();
+
+        let mut all = Vec::with_capacity(cpus * k);
+        for h in handles {
+            all.extend(h.join().unwrap());
+        }
+        all
+    });
+
+    merged.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    merged.truncate(k);
+    merged
+}
+
+/// Search for multiple query vectors in parallel.
+///
+/// Each query is independent, so they are distributed across threads using
+/// `std::thread::scope`. Uses [`exact_search`] per query internally.
+pub fn par_batch_search(
+    vectors: &[(u64, Vector)],
+    queries: &[Vector],
+    k: usize,
+    metric: DistanceMetric,
+) -> Vec<Vec<(u64, f32)>> {
+    std::thread::scope(|s| {
+        let handles: Vec<_> = queries
+            .iter()
+            .map(|query| {
+                s.spawn(move || exact_search(vectors, query, k, metric))
+            })
+            .collect();
+
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    })
+}
+
+// ============================================================================
+// WAL-aware helpers
+// ============================================================================
+
+/// Encode a [`DistanceMetric`] as a single byte for WAL/persistence.
+pub fn metric_to_u8(m: DistanceMetric) -> u8 {
+    match m {
+        DistanceMetric::L2 => 0,
+        DistanceMetric::Cosine => 1,
+        DistanceMetric::InnerProduct => 2,
+    }
+}
+
+/// Decode a byte back to a [`DistanceMetric`] (defaults to L2 for unknown values).
+pub fn metric_from_u8(b: u8) -> DistanceMetric {
+    match b {
+        0 => DistanceMetric::L2,
+        1 => DistanceMetric::Cosine,
+        2 => DistanceMetric::InnerProduct,
+        _ => DistanceMetric::L2,
+    }
+}
+
+impl HnswIndex {
+    /// Return the distance metric configured for this index.
+    pub fn metric(&self) -> DistanceMetric {
+        self.config.metric
+    }
+
+    /// Return the M parameter configured for this index.
+    pub fn m(&self) -> usize {
+        self.config.m
+    }
+
+    /// Return the ef_search parameter configured for this index.
+    pub fn ef_search(&self) -> usize {
+        self.config.ef_search
+    }
+
+    /// Evaluate a batch of candidate node IDs in parallel, computing distances
+    /// to the query vector. Falls back to sequential evaluation when fewer than
+    /// 100 candidates are provided.
+    ///
+    /// Returns `(node_id, distance)` pairs sorted by ascending distance.
+    pub fn par_evaluate_candidates(
+        &self,
+        query: &Vector,
+        candidates: &[u64],
+        metric: DistanceMetric,
+    ) -> Vec<(u64, f32)> {
+        const PAR_THRESHOLD: usize = 100;
+
+        if candidates.len() < PAR_THRESHOLD {
+            let mut results: Vec<(u64, f32)> = candidates
+                .iter()
+                .map(|&id| {
+                    let d = if let Some(node) = self.nodes.get(&id) {
+                        distance(&node.vector, query, metric)
+                    } else {
+                        f32::MAX
+                    };
+                    (id, d)
+                })
+                .collect();
+            results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+            return results;
+        }
+
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let chunk_size = candidates.len().div_ceil(cpus);
+
+        let mut results: Vec<(u64, f32)> = std::thread::scope(|s| {
+            let handles: Vec<_> = candidates
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|&id| {
+                                let d = if let Some(node) = self.nodes.get(&id) {
+                                    distance(&node.vector, query, metric)
+                                } else {
+                                    f32::MAX
+                                };
+                                (id, d)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+
+            let mut merged = Vec::with_capacity(candidates.len());
+            for h in handles {
+                merged.extend(h.join().unwrap());
+            }
+            merged
+        });
+
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        results
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,28 +1415,34 @@ mod tests {
     fn l2_distance_test() {
         let a = Vector::new(vec![1.0, 0.0, 0.0]);
         let b = Vector::new(vec![0.0, 1.0, 0.0]);
-        let d = l2_distance(&a, &b);
+        let d = simd_l2_distance(&a.data, &b.data);
         assert!((d - std::f32::consts::SQRT_2).abs() < 1e-5);
     }
 
     #[test]
     fn cosine_distance_test() {
-        let a = Vector::new(vec![1.0, 0.0]);
-        let b = Vector::new(vec![0.0, 1.0]);
-        let d = cosine_distance(&a, &b);
+        let a = vec![1.0f32, 0.0];
+        let b = vec![0.0f32, 1.0];
+        let d = simd_cosine_distance(&a, &b);
         assert!((d - 1.0).abs() < 1e-5); // Orthogonal → distance = 1
 
-        let c = Vector::new(vec![1.0, 0.0]);
-        let d2 = cosine_distance(&a, &c);
+        let c = vec![1.0f32, 0.0];
+        let d2 = simd_cosine_distance(&a, &c);
         assert!(d2.abs() < 1e-5); // Same direction → distance = 0
     }
 
     #[test]
     fn inner_product_test() {
-        let a = Vector::new(vec![1.0, 2.0, 3.0]);
-        let b = Vector::new(vec![4.0, 5.0, 6.0]);
-        let d = neg_inner_product(&a, &b);
-        assert!((d - (-32.0)).abs() < 1e-5); // 1*4 + 2*5 + 3*6 = 32, negated
+        let a = vec![1.0f32, 2.0, 3.0];
+        let b = vec![4.0f32, 5.0, 6.0];
+        let dot = simd_dot_product(&a, &b);
+        assert!((dot - 32.0).abs() < 1e-5); // 1*4 + 2*5 + 3*6 = 32
+
+        // distance() with InnerProduct negates it
+        let va = Vector::new(a);
+        let vb = Vector::new(b);
+        let d = distance(&va, &vb, DistanceMetric::InnerProduct);
+        assert!((d - (-32.0)).abs() < 1e-5);
     }
 
     #[test]
@@ -968,6 +1483,104 @@ mod tests {
         let results = index.search(&query, 2);
         assert!(!results.is_empty());
         assert_eq!(results[0].0, 1); // Exact match should be first
+    }
+
+    #[test]
+    fn hnsw_filtered_search_basic() {
+        let config = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 100,
+            ef_search: 50,
+            metric: DistanceMetric::L2,
+        };
+        let mut index = HnswIndex::new(config);
+
+        // Insert vectors with IDs 1-4
+        index.insert(1, Vector::new(vec![1.0, 0.0, 0.0]));
+        index.insert(2, Vector::new(vec![0.0, 1.0, 0.0]));
+        index.insert(3, Vector::new(vec![0.9, 0.1, 0.0]));
+        index.insert(4, Vector::new(vec![0.0, 0.0, 1.0]));
+
+        let query = Vector::new(vec![1.0, 0.0, 0.0]);
+
+        // Filter: only allow even IDs
+        let results = index.search_filtered(&query, 2, |id| id % 2 == 0);
+        assert!(!results.is_empty());
+        // Should not contain ID 1 or 3 (odd), even though they are closest
+        for (id, _) in &results {
+            assert_eq!(*id % 2, 0, "filtered search returned odd ID {id}");
+        }
+    }
+
+    #[test]
+    fn hnsw_filtered_search_no_matches() {
+        let config = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 100,
+            ef_search: 50,
+            metric: DistanceMetric::L2,
+        };
+        let mut index = HnswIndex::new(config);
+
+        index.insert(1, Vector::new(vec![1.0, 0.0]));
+        index.insert(2, Vector::new(vec![0.0, 1.0]));
+
+        let query = Vector::new(vec![1.0, 0.0]);
+
+        // Filter rejects everything
+        let results = index.search_filtered(&query, 2, |_| false);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn hnsw_filtered_search_all_pass() {
+        let config = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 100,
+            ef_search: 50,
+            metric: DistanceMetric::L2,
+        };
+        let mut index = HnswIndex::new(config);
+
+        index.insert(1, Vector::new(vec![1.0, 0.0, 0.0]));
+        index.insert(2, Vector::new(vec![0.0, 1.0, 0.0]));
+        index.insert(3, Vector::new(vec![0.9, 0.1, 0.0]));
+
+        let query = Vector::new(vec![1.0, 0.0, 0.0]);
+
+        // Filter accepts everything — same as unfiltered
+        let filtered = index.search_filtered(&query, 2, |_| true);
+        let unfiltered = index.search(&query, 2);
+        assert_eq!(filtered.len(), unfiltered.len());
+        assert_eq!(filtered[0].0, unfiltered[0].0);
+    }
+
+    #[test]
+    fn ivfflat_filtered_search() {
+        let mut index = IvfFlatIndex::new(2, 2, 2, DistanceMetric::L2);
+        let training_data: Vec<Vec<f32>> = vec![
+            vec![0.0, 0.0],
+            vec![10.0, 10.0],
+            vec![0.1, 0.1],
+            vec![9.9, 9.9],
+        ];
+        index.train(&training_data);
+
+        index.add(0, vec![0.0, 0.0]);
+        index.add(1, vec![0.1, 0.1]);
+        index.add(2, vec![10.0, 10.0]);
+        index.add(3, vec![9.9, 9.9]);
+
+        let query = vec![0.0, 0.0];
+
+        // Filter: only allow IDs >= 2
+        let results = index.search_filtered(&query, 2, |id| id >= 2);
+        for (id, _) in &results {
+            assert!(*id >= 2, "filtered IVFFlat returned id {id} < 2");
+        }
     }
 
     #[test]
@@ -1208,5 +1821,338 @@ mod tests {
             "expected near-zero cosine distance for self-match, got {}",
             results[0].1
         );
+    }
+
+    // ========================================================================
+    // SIMD distance function tests
+    // ========================================================================
+
+    #[test]
+    fn simd_dot_product_correctness() {
+        // Hand-computed dot product
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let b = vec![8.0f32, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+        // 1*8 + 2*7 + 3*6 + 4*5 + 5*4 + 6*3 + 7*2 + 8*1 = 120
+        let dot = simd_dot_product(&a, &b);
+        assert!((dot - 120.0).abs() < 1e-4, "expected 120.0, got {dot}");
+    }
+
+    #[test]
+    fn simd_dot_product_non_multiple_of_8() {
+        // 11 elements — exercises the remainder path (8 + 3 tail)
+        let a: Vec<f32> = (1..=11).map(|x| x as f32).collect();
+        let b: Vec<f32> = (11..=21).map(|x| x as f32).collect();
+        let expected: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let got = simd_dot_product(&a, &b);
+        assert!(
+            (got - expected).abs() < 1e-2,
+            "dot product mismatch: expected {expected}, got {got}"
+        );
+    }
+
+    #[test]
+    fn simd_l2_distance_correctness() {
+        // Known L2: (1,0,0) to (0,1,0) = sqrt(2)
+        let a = vec![1.0f32, 0.0, 0.0];
+        let b = vec![0.0f32, 1.0, 0.0];
+        let d = simd_l2_distance(&a, &b);
+        assert!(
+            (d - std::f32::consts::SQRT_2).abs() < 1e-5,
+            "L2 mismatch: expected sqrt(2), got {d}"
+        );
+
+        // 16-dimensional (exact 8*2 chunks, no remainder)
+        let a16: Vec<f32> = vec![1.0; 16];
+        let b16: Vec<f32> = vec![0.0; 16];
+        // sum of squares = 16 * 1.0 = 16, sqrt(16) = 4
+        let d16 = simd_l2_distance(&a16, &b16);
+        assert!(
+            (d16 - 4.0).abs() < 1e-5,
+            "L2(16d) mismatch: expected 4.0, got {d16}"
+        );
+    }
+
+    #[test]
+    fn simd_l2_distance_zero_vectors() {
+        let a = vec![0.0f32; 32];
+        let b = vec![0.0f32; 32];
+        let d = simd_l2_distance(&a, &b);
+        assert!(d.abs() < 1e-10, "L2 of identical zero vectors should be 0, got {d}");
+    }
+
+    #[test]
+    fn simd_cosine_distance_orthogonal() {
+        // Orthogonal vectors → cosine distance = 1.0
+        let a = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let b = vec![0.0f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let d = simd_cosine_distance(&a, &b);
+        assert!(
+            (d - 1.0).abs() < 1e-5,
+            "cosine distance of orthogonal vectors should be 1.0, got {d}"
+        );
+    }
+
+    #[test]
+    fn simd_cosine_distance_identical() {
+        // Identical vectors → cosine distance = 0.0
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let d = simd_cosine_distance(&a, &a);
+        assert!(
+            d.abs() < 1e-5,
+            "cosine distance of identical vectors should be 0.0, got {d}"
+        );
+    }
+
+    #[test]
+    fn simd_cosine_distance_zero_vector() {
+        // Zero vector → cosine distance = 1.0 (defined by convention)
+        let a = vec![0.0f32; 8];
+        let b = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let d = simd_cosine_distance(&a, &b);
+        assert!(
+            (d - 1.0).abs() < 1e-5,
+            "cosine distance with zero vector should be 1.0, got {d}"
+        );
+    }
+
+    #[test]
+    fn simd_matches_scalar_on_random_data() {
+        // Verify SIMD results match a simple scalar implementation on
+        // random data of various sizes (including non-multiples of 8).
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        for dim in [1, 3, 7, 8, 9, 15, 16, 31, 32, 33, 64, 100, 128, 255, 256] {
+            let a: Vec<f32> = (0..dim).map(|_| rng.r#gen::<f32>() * 10.0 - 5.0).collect();
+            let b: Vec<f32> = (0..dim).map(|_| rng.r#gen::<f32>() * 10.0 - 5.0).collect();
+
+            // Scalar reference
+            let scalar_dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+            let scalar_l2: f32 = a
+                .iter()
+                .zip(b.iter())
+                .map(|(x, y)| (x - y) * (x - y))
+                .sum::<f32>()
+                .sqrt();
+
+            let simd_dot_val = simd_dot_product(&a, &b);
+            let simd_l2_val = simd_l2_distance(&a, &b);
+
+            // Allow slightly larger tolerance for large vectors (accumulated FP error)
+            let tol = (dim as f32) * 1e-4;
+            assert!(
+                (simd_dot_val - scalar_dot).abs() < tol,
+                "dot mismatch at dim={dim}: simd={simd_dot_val}, scalar={scalar_dot}"
+            );
+            assert!(
+                (simd_l2_val - scalar_l2).abs() < tol,
+                "l2 mismatch at dim={dim}: simd={simd_l2_val}, scalar={scalar_l2}"
+            );
+        }
+    }
+
+    #[test]
+    fn distance_raw_matches_distance() {
+        // Ensure the raw-slice convenience function matches the Vector-based one
+        let a_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let b_data = vec![10.0f32, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+        let va = Vector::new(a_data.clone());
+        let vb = Vector::new(b_data.clone());
+
+        for metric in [DistanceMetric::L2, DistanceMetric::Cosine, DistanceMetric::InnerProduct] {
+            let d1 = distance(&va, &vb, metric);
+            let d2 = distance_raw(&a_data, &b_data, metric);
+            assert!(
+                (d1 - d2).abs() < 1e-5,
+                "distance vs distance_raw mismatch for {metric:?}: {d1} vs {d2}"
+            );
+        }
+    }
+
+    // ========================================================================
+    // Parallel search tests
+    // ========================================================================
+
+    #[test]
+    fn par_brute_force_matches_sequential() {
+        // Parallel brute-force search must return the same top-k results
+        // as sequential exact_search on a dataset above the threshold.
+        let dim = 32;
+        let n = 2000; // above PAR_THRESHOLD (1000)
+        let k = 10;
+
+        let vectors: Vec<(u64, Vector)> = (0..n)
+            .map(|i| (i as u64, rand_vec(dim)))
+            .collect();
+        let query = rand_vec(dim);
+
+        let seq = exact_search(&vectors, &query, k, DistanceMetric::L2);
+        let par = par_search_brute_force(&vectors, &query, k, DistanceMetric::L2);
+
+        assert_eq!(seq.len(), par.len(), "result count mismatch");
+        for (s, p) in seq.iter().zip(par.iter()) {
+            assert_eq!(s.0, p.0, "id mismatch: seq={}, par={}", s.0, p.0);
+            assert!(
+                (s.1 - p.1).abs() < 1e-6,
+                "distance mismatch for id {}: seq={}, par={}",
+                s.0,
+                s.1,
+                p.1
+            );
+        }
+    }
+
+    #[test]
+    fn par_brute_force_small_dataset_fallback() {
+        // Below the 1000-vector threshold, par_search_brute_force should
+        // produce identical results to exact_search (it falls back internally).
+        let dim = 16;
+        let n = 50; // well below threshold
+        let k = 5;
+
+        let vectors: Vec<(u64, Vector)> = (0..n)
+            .map(|i| (i as u64, rand_vec(dim)))
+            .collect();
+        let query = rand_vec(dim);
+
+        let seq = exact_search(&vectors, &query, k, DistanceMetric::Cosine);
+        let par = par_search_brute_force(&vectors, &query, k, DistanceMetric::Cosine);
+
+        assert_eq!(seq.len(), par.len());
+        for (s, p) in seq.iter().zip(par.iter()) {
+            assert_eq!(s.0, p.0);
+            assert!((s.1 - p.1).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn par_batch_search_independent() {
+        // Multiple independent queries should each return correct results.
+        let dim = 16;
+        let n = 200;
+        let k = 5;
+
+        let vectors: Vec<(u64, Vector)> = (0..n)
+            .map(|i| (i as u64, rand_vec(dim)))
+            .collect();
+        let queries: Vec<Vector> = (0..10).map(|_| rand_vec(dim)).collect();
+
+        let batch_results = par_batch_search(&vectors, &queries, k, DistanceMetric::L2);
+
+        assert_eq!(batch_results.len(), queries.len());
+        for (i, query) in queries.iter().enumerate() {
+            let sequential = exact_search(&vectors, query, k, DistanceMetric::L2);
+            assert_eq!(
+                batch_results[i].len(),
+                sequential.len(),
+                "query {i}: result count mismatch"
+            );
+            for (b, s) in batch_results[i].iter().zip(sequential.iter()) {
+                assert_eq!(b.0, s.0, "query {i}: id mismatch");
+                assert!(
+                    (b.1 - s.1).abs() < 1e-6,
+                    "query {i}: distance mismatch"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn par_candidate_evaluation() {
+        // Parallel candidate evaluation on an HNSW index must match sequential.
+        let dim = 16;
+        let config = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 100,
+            ef_search: 50,
+            metric: DistanceMetric::L2,
+        };
+        let mut index = HnswIndex::new(config);
+
+        // Insert enough nodes to exceed the 100-candidate threshold
+        for i in 0..200u64 {
+            index.insert(i, rand_vec(dim));
+        }
+
+        let candidates: Vec<u64> = (0..200).collect();
+        let query = rand_vec(dim);
+
+        let par_results =
+            index.par_evaluate_candidates(&query, &candidates, DistanceMetric::L2);
+
+        // Compute sequential reference
+        let mut seq_results: Vec<(u64, f32)> = candidates
+            .iter()
+            .map(|&id| {
+                let node = index.nodes.get(&id).unwrap();
+                (id, distance(&node.vector, &query, DistanceMetric::L2))
+            })
+            .collect();
+        seq_results
+            .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+
+        assert_eq!(par_results.len(), seq_results.len());
+        for (p, s) in par_results.iter().zip(seq_results.iter()) {
+            assert_eq!(p.0, s.0, "id mismatch: par={}, seq={}", p.0, s.0);
+            assert!(
+                (p.1 - s.1).abs() < 1e-6,
+                "distance mismatch for id {}: par={}, seq={}",
+                p.0,
+                p.1,
+                s.1
+            );
+        }
+    }
+
+    #[test]
+    fn par_brute_force_large_dataset() {
+        // 5000+ vectors with parallel search — verifies correctness at scale.
+        let dim = 64;
+        let n = 5000;
+        let k = 20;
+
+        let vectors: Vec<(u64, Vector)> = (0..n)
+            .map(|i| (i as u64, rand_vec(dim)))
+            .collect();
+        let query = rand_vec(dim);
+
+        let par = par_search_brute_force(&vectors, &query, k, DistanceMetric::L2);
+        let seq = exact_search(&vectors, &query, k, DistanceMetric::L2);
+
+        assert_eq!(par.len(), k);
+        assert_eq!(seq.len(), k);
+        for (p, s) in par.iter().zip(seq.iter()) {
+            assert_eq!(p.0, s.0, "id mismatch at 5000 vectors");
+            assert!((p.1 - s.1).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn par_batch_search_consistency() {
+        // Running par_batch_search twice on the same input must produce
+        // identical (deterministic) results.
+        let dim = 16;
+        let n = 300;
+        let k = 5;
+
+        let vectors: Vec<(u64, Vector)> = (0..n)
+            .map(|i| (i as u64, rand_vec(dim)))
+            .collect();
+        let queries: Vec<Vector> = (0..5).map(|_| rand_vec(dim)).collect();
+
+        let run1 = par_batch_search(&vectors, &queries, k, DistanceMetric::InnerProduct);
+        let run2 = par_batch_search(&vectors, &queries, k, DistanceMetric::InnerProduct);
+
+        assert_eq!(run1.len(), run2.len());
+        for (r1, r2) in run1.iter().zip(run2.iter()) {
+            assert_eq!(r1.len(), r2.len());
+            for (a, b) in r1.iter().zip(r2.iter()) {
+                assert_eq!(a.0, b.0, "determinism failure: different ids across runs");
+                assert!(
+                    (a.1 - b.1).abs() < 1e-6,
+                    "determinism failure: different distances across runs"
+                );
+            }
+        }
     }
 }

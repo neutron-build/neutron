@@ -13,7 +13,16 @@ pub use crate::router::Router;
 pub use crate::extract::{FromRequest, FromRequestParts};
 
 // Core extractors (no feature required)
-pub use crate::extract::{ConnectInfo, Extension, Path, State};
+pub use crate::extract::{ConnectInfo, Extension, Optional, Path, State};
+
+// Typed header extractor and trait
+pub use crate::extract::{TypedHeader, TypedHeaderValue};
+
+// Built-in typed header types
+// Note: extract::ContentType (String newtype) is intentionally NOT re-exported here
+// because negotiate::ContentType (enum) is already exported when that feature is active.
+// Import extract::ContentType directly if you need the typed header version.
+pub use crate::extract::{Accept, Authorization, BearerToken, Host, Origin, UserAgent};
 
 // Re-exports from http crate
 pub use http::{HeaderMap, Method, StatusCode};
@@ -161,3 +170,9 @@ pub use crate::tls::{TlsConfig, TlsError};
 // ---------------------------------------------------------------------------
 #[cfg(feature = "openapi")]
 pub use crate::openapi::{ApiRoute, OpenApi, Parameter, Schema};
+
+// ---------------------------------------------------------------------------
+// Tower compatibility
+// ---------------------------------------------------------------------------
+#[cfg(feature = "tower-compat")]
+pub use crate::tower_compat::TowerLayerAdapter;

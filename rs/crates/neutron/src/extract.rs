@@ -426,3 +426,214 @@ impl<T: DeserializeOwned + Send + 'static> FromRequest for Form<T> {
             })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Optional extractor — wraps any FromRequestParts to make it non-failing
+// ---------------------------------------------------------------------------
+
+/// Wraps any [`FromRequestParts`] extractor to make extraction optional.
+///
+/// If the inner extractor succeeds, `Optional(Some(value))` is returned.
+/// If it fails (missing header, bad parse, etc.), `Optional(None)` is returned
+/// instead of propagating the error — the handler still runs.
+///
+/// ```rust,ignore
+/// async fn handler(
+///     Optional(auth): Optional<TypedHeader<Authorization>>,
+/// ) -> impl IntoResponse {
+///     match auth {
+///         Some(TypedHeader(Authorization(token))) => format!("Authenticated: {token}"),
+///         None => "Anonymous".to_string(),
+///     }
+/// }
+/// ```
+pub struct Optional<T>(pub Option<T>);
+
+impl<T: FromRequestParts> FromRequestParts for Optional<T> {
+    fn from_parts(req: &Request) -> Result<Self, Response> {
+        match T::from_parts(req) {
+            Ok(value) => Ok(Optional(Some(value))),
+            Err(_) => Ok(Optional(None)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TypedHeader extractor — type-safe single-header extraction
+// ---------------------------------------------------------------------------
+
+/// Trait for header types that know their HTTP header name and how to decode
+/// from a raw [`http::HeaderValue`].
+///
+/// Implement this for custom header types:
+///
+/// ```rust,ignore
+/// pub struct XRequestId(pub String);
+///
+/// impl TypedHeaderValue for XRequestId {
+///     const HEADER_NAME: &'static str = "x-request-id";
+///
+///     fn decode(value: &http::HeaderValue) -> Result<Self, String> {
+///         value.to_str()
+///             .map(|s| XRequestId(s.to_owned()))
+///             .map_err(|e| format!("invalid x-request-id: {e}"))
+///     }
+/// }
+/// ```
+pub trait TypedHeaderValue: Sized + Send + Sync {
+    /// The HTTP header name this type maps to (lowercase, e.g. `"content-type"`).
+    const HEADER_NAME: &'static str;
+
+    /// Decode a concrete value from the raw header bytes.
+    fn decode(value: &http::HeaderValue) -> Result<Self, String>;
+}
+
+/// Extract a single, strongly-typed HTTP header from the request.
+///
+/// Returns a 400 Bad Request if the header is missing or cannot be decoded.
+/// Wrap in [`Optional`] to make it non-failing:
+///
+/// ```rust,ignore
+/// async fn handler(
+///     TypedHeader(ct): TypedHeader<ContentType>,
+///     Optional(auth): Optional<TypedHeader<BearerToken>>,
+/// ) -> String {
+///     format!("Content-Type: {}, auth: {:?}", ct.0, auth.map(|h| h.0))
+/// }
+/// ```
+pub struct TypedHeader<T: TypedHeaderValue>(pub T);
+
+impl<T: TypedHeaderValue + 'static> FromRequestParts for TypedHeader<T> {
+    fn from_parts(req: &Request) -> Result<Self, Response> {
+        let value = req
+            .headers()
+            .get(T::HEADER_NAME)
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Missing required header: {}", T::HEADER_NAME),
+                )
+                    .into_response()
+            })?;
+
+        T::decode(value)
+            .map(TypedHeader)
+            .map_err(|msg| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid header {}: {}", T::HEADER_NAME, msg),
+                )
+                    .into_response()
+            })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in TypedHeaderValue implementations
+// ---------------------------------------------------------------------------
+
+/// The `Content-Type` header value as a string.
+pub struct ContentType(pub String);
+
+impl TypedHeaderValue for ContentType {
+    const HEADER_NAME: &'static str = "content-type";
+
+    fn decode(value: &http::HeaderValue) -> Result<Self, String> {
+        value
+            .to_str()
+            .map(|s| ContentType(s.to_owned()))
+            .map_err(|e| format!("non-ASCII header value: {e}"))
+    }
+}
+
+/// The `Authorization` header value as a raw string (includes scheme prefix).
+pub struct Authorization(pub String);
+
+impl TypedHeaderValue for Authorization {
+    const HEADER_NAME: &'static str = "authorization";
+
+    fn decode(value: &http::HeaderValue) -> Result<Self, String> {
+        value
+            .to_str()
+            .map(|s| Authorization(s.to_owned()))
+            .map_err(|e| format!("non-ASCII header value: {e}"))
+    }
+}
+
+/// The `Accept` header value as a raw string.
+pub struct Accept(pub String);
+
+impl TypedHeaderValue for Accept {
+    const HEADER_NAME: &'static str = "accept";
+
+    fn decode(value: &http::HeaderValue) -> Result<Self, String> {
+        value
+            .to_str()
+            .map(|s| Accept(s.to_owned()))
+            .map_err(|e| format!("non-ASCII header value: {e}"))
+    }
+}
+
+/// The `User-Agent` header value.
+pub struct UserAgent(pub String);
+
+impl TypedHeaderValue for UserAgent {
+    const HEADER_NAME: &'static str = "user-agent";
+
+    fn decode(value: &http::HeaderValue) -> Result<Self, String> {
+        value
+            .to_str()
+            .map(|s| UserAgent(s.to_owned()))
+            .map_err(|e| format!("non-ASCII header value: {e}"))
+    }
+}
+
+/// The `Host` header value.
+pub struct Host(pub String);
+
+impl TypedHeaderValue for Host {
+    const HEADER_NAME: &'static str = "host";
+
+    fn decode(value: &http::HeaderValue) -> Result<Self, String> {
+        value
+            .to_str()
+            .map(|s| Host(s.to_owned()))
+            .map_err(|e| format!("non-ASCII header value: {e}"))
+    }
+}
+
+/// The `Origin` header value.
+pub struct Origin(pub String);
+
+impl TypedHeaderValue for Origin {
+    const HEADER_NAME: &'static str = "origin";
+
+    fn decode(value: &http::HeaderValue) -> Result<Self, String> {
+        value
+            .to_str()
+            .map(|s| Origin(s.to_owned()))
+            .map_err(|e| format!("non-ASCII header value: {e}"))
+    }
+}
+
+/// A bearer token extracted from the `Authorization` header.
+///
+/// Strips the `"Bearer "` prefix and returns only the token string.
+/// Returns an error if the header does not start with `"Bearer "`.
+pub struct BearerToken(pub String);
+
+impl TypedHeaderValue for BearerToken {
+    const HEADER_NAME: &'static str = "authorization";
+
+    fn decode(value: &http::HeaderValue) -> Result<Self, String> {
+        let s = value
+            .to_str()
+            .map_err(|e| format!("non-ASCII header value: {e}"))?;
+
+        s.strip_prefix("Bearer ")
+            .map(|token| BearerToken(token.to_owned()))
+            .ok_or_else(|| {
+                "Authorization header does not start with \"Bearer \"".to_string()
+            })
+    }
+}

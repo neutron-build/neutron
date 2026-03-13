@@ -4,6 +4,7 @@
 //! query protocol (prepared statements with bind parameters).
 
 pub mod compression;
+pub mod kv_fast_path;
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -91,6 +92,15 @@ fn sqlstate_for_error(err: &ExecError) -> &'static str {
                 "XX000" // internal_error
             }
         }
+        ExecError::Runtime(msg) => {
+            if msg.contains("division by zero") {
+                "22012" // division_by_zero
+            } else if msg.contains("out of range") {
+                "22003" // numeric_value_out_of_range
+            } else {
+                "22000" // data_exception
+            }
+        }
     }
 }
 
@@ -153,18 +163,15 @@ impl AuthSource for UserAuthenticator {
 
 /// Password authentication method for the wire protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum AuthMethod {
     /// PostgreSQL cleartext password exchange (only safe with TLS).
     Cleartext,
     /// SCRAM-SHA-256 challenge/response (recommended).
+    #[default]
     ScramSha256,
 }
 
-impl Default for AuthMethod {
-    fn default() -> Self {
-        Self::ScramSha256
-    }
-}
 
 // ============================================================================
 // Query Parser (Extended Query Protocol)
@@ -172,14 +179,22 @@ impl Default for AuthMethod {
 
 /// Parses SQL strings for the extended query protocol.
 ///
-/// Nucleus uses the raw SQL string as its statement type. The actual parsing
-/// and execution happens in `do_query` when the portal is executed.
+/// Parsed statement: caches both the raw SQL and the parsed AST from the Parse
+/// message. On Execute, the cached AST is cloned and parameter-substituted,
+/// skipping the SQL parser entirely.
+#[derive(Debug, Clone)]
+pub struct ParsedStatement {
+    pub sql: String,
+    /// Cached AST from `sql::parse()`. `None` if parsing failed (fallback to string path).
+    pub ast: Option<Vec<sqlparser::ast::Statement>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NucleusQueryParser;
 
 #[async_trait]
 impl QueryParser for NucleusQueryParser {
-    type Statement = String;
+    type Statement = ParsedStatement;
 
     async fn parse_sql<C>(
         &self,
@@ -190,7 +205,12 @@ impl QueryParser for NucleusQueryParser {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        Ok(sql.to_owned())
+        // Parse the SQL once here and cache the AST for reuse on Execute.
+        let ast = crate::sql::parse(sql).ok();
+        Ok(ParsedStatement {
+            sql: sql.to_owned(),
+            ast,
+        })
     }
 }
 
@@ -519,7 +539,7 @@ impl NucleusHandler {
     /// doubled, NUL bytes stripped). Substitution is done in a single pass over
     /// the original SQL text so repeated placeholders are handled correctly and
     /// replacement values cannot trigger recursive substitution.
-    fn substitute_parameters(sql: &str, portal: &Portal<String>) -> PgWireResult<String> {
+    fn substitute_parameters(sql: &str, portal: &Portal<ParsedStatement>) -> PgWireResult<String> {
         let param_count = portal.parameter_len();
         let mut replacements = Vec::with_capacity(param_count);
 
@@ -537,7 +557,7 @@ impl NucleusHandler {
                 Err(_) => {
                     // Fall back: try to read raw bytes as UTF-8.
                     match &portal.parameters[i] {
-                        Some(bytes) => String::from_utf8_lossy(bytes).to_string(),
+                        Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
                         None => "NULL".to_owned(),
                     }
                 }
@@ -574,6 +594,66 @@ impl NucleusHandler {
             })
             .collect();
         substitute_positional_placeholders(sql, &replacements)
+    }
+
+    /// Try to execute using the cached AST with parameter substitution.
+    /// Returns `Err(())` on any issue (type conversion, etc.) — caller falls back to string path.
+    #[allow(clippy::type_complexity)]
+    fn try_ast_execute<'a>(
+        executor: &'a Executor,
+        session_id: u64,
+        cached_ast: &[sqlparser::ast::Statement],
+        portal: &Portal<ParsedStatement>,
+    ) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>>, ()> {
+        let param_count = portal.parameter_len();
+        let mut param_values = Vec::with_capacity(param_count);
+
+        for i in 0..param_count {
+            let type_hint = portal
+                .statement
+                .parameter_types
+                .get(i)
+                .and_then(|t| t.clone())
+                .unwrap_or(Type::TEXT);
+
+            let value = match portal.parameter::<String>(i, &type_hint) {
+                Ok(None) => Value::Null,
+                Ok(Some(s)) => Self::pg_string_to_value(&s, &type_hint),
+                Err(_) => {
+                    match &portal.parameters[i] {
+                        Some(bytes) => {
+                            let s = String::from_utf8_lossy(bytes).into_owned();
+                            Self::pg_string_to_value(&s, &type_hint)
+                        }
+                        None => Value::Null,
+                    }
+                }
+            };
+            param_values.push(value);
+        }
+
+        // Clone the AST and substitute parameters
+        let mut statements = cached_ast.to_vec();
+        for stmt in &mut statements {
+            crate::executor::param_subst::substitute_params_in_stmt(stmt, &param_values);
+        }
+
+        Ok(executor.execute_statements_with_session(session_id, statements))
+    }
+
+    /// Convert a postgres text parameter to a Nucleus Value based on the type hint.
+    fn pg_string_to_value(s: &str, type_hint: &Type) -> Value {
+        match *type_hint {
+            Type::INT2 | Type::INT4 => s.parse::<i32>().map(Value::Int32).unwrap_or(Value::Text(s.to_owned())),
+            Type::INT8 => s.parse::<i64>().map(Value::Int64).unwrap_or(Value::Text(s.to_owned())),
+            Type::FLOAT4 | Type::FLOAT8 => s.parse::<f64>().map(Value::Float64).unwrap_or(Value::Text(s.to_owned())),
+            Type::BOOL => match s {
+                "t" | "true" | "TRUE" | "1" => Value::Bool(true),
+                "f" | "false" | "FALSE" | "0" => Value::Bool(false),
+                _ => Value::Text(s.to_owned()),
+            },
+            _ => Value::Text(s.to_owned()),
+        }
     }
 }
 
@@ -805,6 +885,12 @@ impl SimpleQueryHandler for NucleusHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // ── KV fast path: intercept common KV queries before SQL parsing ──
+        if let Some(kv_cmd) = kv_fast_path::try_parse_kv(query) {
+            let result = kv_fast_path::execute_kv_command(&kv_cmd, self.executor.kv_store());
+            return Ok(vec![Self::build_response(result)?]);
+        }
+
         let session_id = self.session_id_from_client(client);
 
         // Detect COPY ... FROM STDIN and enter copy-in mode.
@@ -831,11 +917,17 @@ impl SimpleQueryHandler for NucleusHandler {
                 use pgwire::api::copy::send_copy_out_response;
                 send_copy_out_response(client, CopyResponse::new(0, 0, vec![])).await?;
                 if !data.is_empty() {
-                    client
-                        .send(PgWireBackendMessage::CopyData(CopyData::new(
-                            bytes::Bytes::from(data.into_bytes()),
-                        )))
-                        .await?;
+                    // Send data in 64KB chunks to avoid a single massive allocation
+                    // for large COPY TO results. Each chunk is a separate CopyData message.
+                    const CHUNK_SIZE: usize = 65_536;
+                    let bytes = data.into_bytes();
+                    for chunk in bytes.chunks(CHUNK_SIZE) {
+                        client
+                            .send(PgWireBackendMessage::CopyData(CopyData::new(
+                                bytes::Bytes::copy_from_slice(chunk),
+                            )))
+                            .await?;
+                    }
                 }
                 client.send(PgWireBackendMessage::CopyDone(CopyDone::new())).await?;
                 client
@@ -859,7 +951,7 @@ impl SimpleQueryHandler for NucleusHandler {
 
 #[async_trait]
 impl ExtendedQueryHandler for NucleusHandler {
-    type Statement = String;
+    type Statement = ParsedStatement;
     type QueryParser = NucleusQueryParser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
@@ -877,7 +969,7 @@ impl ExtendedQueryHandler for NucleusHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let sql = &stmt.statement;
+        let sql = &stmt.statement.sql;
         let param_types = Self::infer_parameter_types(sql, &stmt.parameter_types);
 
         // Try to determine result columns by examining the query.
@@ -909,7 +1001,7 @@ impl ExtendedQueryHandler for NucleusHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let sql = &portal.statement.statement;
+        let sql = &portal.statement.statement.sql;
 
         let fields = if is_select_query(sql) {
             // With bound parameters available, we can try to determine columns
@@ -941,14 +1033,25 @@ impl ExtendedQueryHandler for NucleusHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let sql = &portal.statement.statement;
-
-        // Substitute $N placeholders with bound parameter values.
-        let resolved_sql = Self::substitute_parameters(sql, portal)?;
-
-        // Execute through the Nucleus engine using the connection's session.
+        let parsed_stmt = &portal.statement.statement;
         let session_id = self.session_id_from_client(client);
-        let results = self.execute_sql_session(session_id, &resolved_sql).await?;
+
+        // AST fast path: if we have a cached AST, substitute parameters directly
+        // in the AST and execute without re-parsing.
+        let results = if let Some(ref cached_ast) = parsed_stmt.ast {
+            match Self::try_ast_execute(&self.executor, session_id, cached_ast, portal) {
+                Ok(fut) => fut.await.map_err(exec_error_to_pgwire),
+                Err(_) => {
+                    // Fall back to string-based substitution + re-parse
+                    let resolved_sql = Self::substitute_parameters(&parsed_stmt.sql, portal)?;
+                    self.execute_sql_session(session_id, &resolved_sql).await
+                }
+            }
+        } else {
+            // No cached AST — use string path
+            let resolved_sql = Self::substitute_parameters(&parsed_stmt.sql, portal)?;
+            self.execute_sql_session(session_id, &resolved_sql).await
+        }?;
 
         // The extended protocol returns a single Response per Execute.
         // If there are multiple statements, take the last result.
@@ -956,11 +1059,10 @@ impl ExtendedQueryHandler for NucleusHandler {
             // Respect max_rows from the Execute message. When max_rows > 0,
             // the client only wants that many rows. (Full cursor/PortalSuspended
             // support would require pgwire to expose that response variant.)
-            if max_rows > 0 {
-                if let ExecResult::Select { ref mut rows, .. } = result {
+            if max_rows > 0
+                && let ExecResult::Select { ref mut rows, .. } = result {
                     rows.truncate(max_rows);
                 }
-            }
             Self::build_response(result)
         } else {
             Ok(Response::EmptyQuery)
@@ -1023,7 +1125,7 @@ impl CopyHandler for NucleusHandler {
                         None => sql.push_str("NULL"),
                         Some(s) => {
                             sql.push('\'');
-                            sql.push_str(&s.replace('\'', "''"));
+                            sql.push_str(&sanitize_sql_text_literal(s));
                             sql.push('\'');
                         }
                     }

@@ -2,10 +2,10 @@
 //!
 //! Takes parsed Cypher AST and executes it against GraphStore.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::cypher::*;
-use super::{EdgeId, GraphStore, Node, NodeId, Properties, PropValue};
+use super::{Direction, EdgeId, GraphStore, Node, NodeId, Properties, PropValue};
 
 #[derive(Debug, Clone)]
 enum Binding {
@@ -30,7 +30,18 @@ pub fn execute_cypher(
             pattern,
             where_clause,
             return_clause,
-        } => execute_match(store, pattern, where_clause.as_ref(), return_clause),
+            optional,
+            with_clause,
+            with_where,
+        } => execute_match(
+            store,
+            pattern,
+            where_clause.as_ref(),
+            return_clause,
+            *optional,
+            with_clause.as_ref(),
+            with_where.as_ref(),
+        ),
         CypherStatement::Create { items } => execute_create(store, items),
         CypherStatement::Delete { variables } => execute_delete(store, variables),
     }
@@ -41,9 +52,12 @@ fn execute_match(
     pattern: &Pattern,
     where_clause: Option<&WhereClause>,
     return_clause: &ReturnClause,
+    optional: bool,
+    with_clause: Option<&WithClause>,
+    with_where: Option<&WhereClause>,
 ) -> Result<CypherResult, CypherError> {
     let binding_sets = find_bindings(store, pattern)?;
-    let filtered = if let Some(wc) = where_clause {
+    let filtered: Vec<HashMap<String, Binding>> = if let Some(wc) = where_clause {
         binding_sets
             .into_iter()
             .filter(|bindings| evaluate_where(store, bindings, wc))
@@ -51,7 +65,95 @@ fn execute_match(
     } else {
         binding_sets
     };
-    project_return(store, &filtered, return_clause)
+
+    // OPTIONAL MATCH: if no bindings found, return a single row of NULLs
+    if optional && filtered.is_empty() {
+        let columns: Vec<String> = return_clause
+            .items
+            .iter()
+            .map(|item| match item {
+                ReturnItem::Variable(v) => v.clone(),
+                ReturnItem::Property(v, p) => format!("{v}.{p}"),
+                ReturnItem::Count => "COUNT(*)".to_string(),
+                ReturnItem::All => "*".to_string(),
+            })
+            .collect();
+        let null_row: Vec<PropValue> = columns.iter().map(|_| PropValue::Null).collect();
+        return Ok(CypherResult {
+            columns,
+            rows: vec![null_row],
+        });
+    }
+
+    // Apply WITH clause: project intermediate bindings, then optionally filter
+    let final_bindings = if let Some(wc) = with_clause {
+        let projected = apply_with_clause(store, &filtered, wc);
+        if let Some(ww) = with_where {
+            projected
+                .into_iter()
+                .filter(|bindings| evaluate_where(store, bindings, ww))
+                .collect()
+        } else {
+            projected
+        }
+    } else {
+        filtered
+    };
+
+    project_return(store, &final_bindings, return_clause)
+}
+
+/// Apply a WITH clause: project each binding set through the WITH items.
+///
+/// WITH items can rename variables (via AS alias) or project properties.
+/// The result is a new set of bindings with only the projected variables.
+fn apply_with_clause(
+    _store: &GraphStore,
+    binding_sets: &[HashMap<String, Binding>],
+    with_clause: &WithClause,
+) -> Vec<HashMap<String, Binding>> {
+    let mut result = Vec::new();
+    for bindings in binding_sets {
+        let mut new_bindings = HashMap::new();
+        for item in &with_clause.items {
+            let name = item
+                .alias
+                .clone()
+                .or_else(|| match &item.expr {
+                    ReturnItem::Variable(v) => Some(v.clone()),
+                    ReturnItem::Property(v, p) => Some(format!("{v}.{p}")),
+                    ReturnItem::Count => Some("COUNT(*)".to_string()),
+                    ReturnItem::All => None,
+                })
+                .unwrap_or_default();
+
+            match &item.expr {
+                ReturnItem::Variable(v) => {
+                    if let Some(b) = bindings.get(v) {
+                        new_bindings.insert(name, b.clone());
+                    }
+                }
+                ReturnItem::Property(v, _p) => {
+                    // For property projections, keep the underlying node/edge binding
+                    // under the alias so that the RETURN clause can access properties.
+                    if let Some(b) = bindings.get(v) {
+                        new_bindings.insert(name.clone(), b.clone());
+                        // Also keep the original variable for property resolution
+                        new_bindings.insert(v.clone(), b.clone());
+                    }
+                }
+                ReturnItem::All => {
+                    // Pass through all bindings
+                    new_bindings.extend(bindings.clone());
+                }
+                ReturnItem::Count => {
+                    // COUNT(*) in WITH doesn't map to a binding; skip
+                }
+            }
+        }
+        result.push(new_bindings);
+    }
+    result
 }
 
 fn find_bindings(
@@ -81,39 +183,108 @@ fn find_bindings(
     for edge_pat in &pattern.edges {
         let target_node_pat = &pattern.nodes[edge_pat.to_idx];
         let mut new_binding_sets = Vec::new();
+
+        let is_variable_length = edge_pat.min_hops.is_some() || edge_pat.max_hops.is_some();
+
         for bindings in &binding_sets {
             let source_node_pat = &pattern.nodes[edge_pat.from_idx];
             let source_id = match resolve_node_id(bindings, source_node_pat) {
                 Some(id) => id,
                 None => continue,
             };
-            let neighbors = store.neighbors(
-                source_id, edge_pat.direction, edge_pat.edge_type.as_deref(),
-            );
-            for (neighbor_id, edge) in &neighbors {
-                let target_node = match store.get_node(*neighbor_id) {
-                    Some(n) => n,
-                    None => continue,
-                };
-                if !node_matches_labels(target_node, &target_node_pat.labels) {
-                    continue;
+
+            if is_variable_length {
+                // Variable-length path expansion: DFS from source within hop bounds
+                let min_hops = edge_pat.min_hops.unwrap_or(1);
+                let max_hops = edge_pat.max_hops.unwrap_or(10);
+                let terminal_nodes = variable_length_expand(
+                    store, source_id, edge_pat.direction,
+                    edge_pat.edge_type.as_deref(), min_hops, max_hops,
+                );
+                for terminal_id in terminal_nodes {
+                    let target_node = match store.get_node(terminal_id) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    if !node_matches_labels(target_node, &target_node_pat.labels) {
+                        continue;
+                    }
+                    if !node_matches_properties(target_node, &target_node_pat.properties) {
+                        continue;
+                    }
+                    let mut nb = bindings.clone();
+                    if let Some(ref var) = target_node_pat.variable {
+                        nb.insert(var.clone(), Binding::Node(target_node.id));
+                    }
+                    new_binding_sets.push(nb);
                 }
-                if !node_matches_properties(target_node, &target_node_pat.properties) {
-                    continue;
+            } else {
+                // Single-hop traversal (original logic)
+                let neighbors = store.neighbors(
+                    source_id, edge_pat.direction, edge_pat.edge_type.as_deref(),
+                );
+                for (neighbor_id, edge) in &neighbors {
+                    let target_node = match store.get_node(*neighbor_id) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    if !node_matches_labels(target_node, &target_node_pat.labels) {
+                        continue;
+                    }
+                    if !node_matches_properties(target_node, &target_node_pat.properties) {
+                        continue;
+                    }
+                    let mut nb = bindings.clone();
+                    if let Some(ref var) = edge_pat.variable {
+                        nb.insert(var.clone(), Binding::Edge(edge.id));
+                    }
+                    if let Some(ref var) = target_node_pat.variable {
+                        nb.insert(var.clone(), Binding::Node(target_node.id));
+                    }
+                    new_binding_sets.push(nb);
                 }
-                let mut nb = bindings.clone();
-                if let Some(ref var) = edge_pat.variable {
-                    nb.insert(var.clone(), Binding::Edge(edge.id));
-                }
-                if let Some(ref var) = target_node_pat.variable {
-                    nb.insert(var.clone(), Binding::Node(target_node.id));
-                }
-                new_binding_sets.push(nb);
             }
         }
         binding_sets = new_binding_sets;
     }
     Ok(binding_sets)
+}
+
+/// Expand variable-length paths from a source node via DFS.
+/// Returns deduplicated terminal node IDs reachable within `min_hops..=max_hops`.
+fn variable_length_expand(
+    store: &GraphStore,
+    source_id: NodeId,
+    direction: Direction,
+    edge_type: Option<&str>,
+    min_hops: usize,
+    max_hops: usize,
+) -> Vec<NodeId> {
+    let mut results = Vec::new();
+    let mut seen_terminals = HashSet::new();
+    // Stack: (current_node, depth, visited_set)
+    let mut stack: Vec<(NodeId, usize, HashSet<NodeId>)> = Vec::new();
+    let mut initial_visited = HashSet::new();
+    initial_visited.insert(source_id);
+    stack.push((source_id, 0, initial_visited));
+
+    while let Some((current, depth, visited)) = stack.pop() {
+        if depth >= min_hops && depth <= max_hops && current != source_id
+            && seen_terminals.insert(current) {
+                results.push(current);
+            }
+        if depth >= max_hops {
+            continue;
+        }
+        for (neighbor, _) in store.neighbors(current, direction, edge_type) {
+            if !visited.contains(&neighbor) {
+                let mut new_visited = visited.clone();
+                new_visited.insert(neighbor);
+                stack.push((neighbor, depth + 1, new_visited));
+            }
+        }
+    }
+    results
 }
 
 fn candidate_node_ids(store: &GraphStore, np: &NodePattern) -> Vec<NodeId> {
@@ -139,11 +310,10 @@ fn node_matches_properties(node: &Node, required: &BTreeMap<String, PropValue>) 
 }
 
 fn resolve_node_id(bindings: &HashMap<String, Binding>, np: &NodePattern) -> Option<NodeId> {
-    if let Some(ref var) = np.variable {
-        if let Some(Binding::Node(id)) = bindings.get(var) {
+    if let Some(ref var) = np.variable
+        && let Some(Binding::Node(id)) = bindings.get(var) {
             return Some(*id);
         }
-    }
     None
 }
 
@@ -269,11 +439,10 @@ fn execute_create(
             CreateItem::Node { variable, labels, properties } => {
                 // If this variable already exists and has no new labels/properties,
                 // treat it as a reference to an existing node (not a new creation).
-                if let Some(var) = variable {
-                    if var_map.contains_key(var) && labels.is_empty() && properties.is_empty() {
+                if let Some(var) = variable
+                    && var_map.contains_key(var) && labels.is_empty() && properties.is_empty() {
                         continue;
                     }
-                }
                 let props: Properties = properties.clone();
                 let node_id = store.create_node(labels.clone(), props);
                 created_node_ids.push(node_id);
@@ -323,9 +492,16 @@ fn execute_delete(
 ) -> Result<CypherResult, CypherError> {
     let mut deleted = 0i64;
     for var in variables {
-        if let Ok(id) = var.parse::<u64>() {
-            if store.delete_node(id) {
-                deleted += 1;
+        match var.parse::<u64>() {
+            Ok(id) => {
+                if store.delete_node(id) {
+                    deleted += 1;
+                }
+            }
+            Err(_) => {
+                return Err(CypherError::InvalidSyntax(
+                    format!("DELETE requires node IDs, got variable '{var}'")
+                ));
             }
         }
     }
@@ -478,4 +654,74 @@ mod tests {
         assert_eq!(r.rows.len(), 0);
     }
 
+    // ====================================================================
+    // OPTIONAL MATCH tests
+    // ====================================================================
+
+    #[test]
+    fn optional_match_no_results_returns_nulls() {
+        let mut s = social_graph();
+        let cypher = r#"OPTIONAL MATCH (n:NonExistent) RETURN n.name"#;
+        let r = execute_cypher(&mut s, &parse_cypher(cypher).unwrap()).unwrap();
+        // OPTIONAL MATCH returns a single row of NULLs when no matches
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], PropValue::Null);
+    }
+
+    #[test]
+    fn optional_match_with_results() {
+        let mut s = social_graph();
+        // This should behave like normal MATCH when results exist
+        let cypher = r#"OPTIONAL MATCH (n:Person) RETURN n.name"#;
+        let r = execute_cypher(&mut s, &parse_cypher(cypher).unwrap()).unwrap();
+        // Should return actual results (same as MATCH)
+        assert!(!r.rows.is_empty());
+        assert!(r.rows.iter().any(|row| row[0] != PropValue::Null));
+    }
+
+    #[test]
+    fn optional_match_where_no_match() {
+        let mut s = social_graph();
+        let cypher = r#"OPTIONAL MATCH (n:Person) WHERE n.name = "Nobody" RETURN n.name"#;
+        let r = execute_cypher(&mut s, &parse_cypher(cypher).unwrap()).unwrap();
+        // WHERE filters all — OPTIONAL gives us NULL row
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], PropValue::Null);
+    }
+
+    // ---- WITH clause tests ----
+
+    #[test]
+    fn with_passthrough() {
+        // WITH n simply passes bindings through to RETURN
+        let mut s = social_graph();
+        let cypher = r#"MATCH (n:Person) WITH n RETURN n.name"#;
+        let r = execute_cypher(&mut s, &parse_cypher(cypher).unwrap()).unwrap();
+        assert!(!r.rows.is_empty());
+        // Should return the same names as without WITH
+        let names: Vec<&PropValue> = r.rows.iter().map(|row| &row[0]).collect();
+        assert!(names.contains(&&PropValue::Text("Alice".to_string())));
+    }
+
+    #[test]
+    fn with_alias() {
+        // WITH n.name AS name renames the binding
+        let mut s = social_graph();
+        let cypher = r#"MATCH (n:Person) WITH n AS person RETURN person.name"#;
+        let r = execute_cypher(&mut s, &parse_cypher(cypher).unwrap()).unwrap();
+        assert!(!r.rows.is_empty());
+        let names: Vec<&PropValue> = r.rows.iter().map(|row| &row[0]).collect();
+        assert!(names.contains(&&PropValue::Text("Alice".to_string())));
+    }
+
+    #[test]
+    fn with_where_filter() {
+        // WITH + WHERE filters intermediate results
+        let mut s = social_graph();
+        let cypher =
+            r#"MATCH (n:Person) WITH n WHERE n.name = "Alice" RETURN n.name"#;
+        let r = execute_cypher(&mut s, &parse_cypher(cypher).unwrap()).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], PropValue::Text("Alice".to_string()));
+    }
 }

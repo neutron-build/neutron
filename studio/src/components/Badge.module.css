@@ -1,0 +1,25 @@
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.badge[data-kind="sql"]      { background: color-mix(in srgb, var(--model-sql) 15%, transparent);      color: var(--model-sql); }
+.badge[data-kind="kv"]       { background: color-mix(in srgb, var(--model-kv) 15%, transparent);       color: var(--model-kv); }
+.badge[data-kind="vector"]   { background: color-mix(in srgb, var(--model-vector) 15%, transparent);   color: var(--model-vector); }
+.badge[data-kind="ts"]       { background: color-mix(in srgb, var(--model-ts) 15%, transparent);       color: var(--model-ts); }
+.badge[data-kind="doc"]      { background: color-mix(in srgb, var(--model-doc) 15%, transparent);      color: var(--model-doc); }
+.badge[data-kind="graph"]    { background: color-mix(in srgb, var(--model-graph) 15%, transparent);    color: var(--model-graph); }
+.badge[data-kind="fts"]      { background: color-mix(in srgb, var(--model-fts) 15%, transparent);      color: var(--model-fts); }
+.badge[data-kind="geo"]      { background: color-mix(in srgb, var(--model-geo) 15%, transparent);      color: var(--model-geo); }
+.badge[data-kind="blob"]     { background: color-mix(in srgb, var(--model-blob) 15%, transparent);     color: var(--model-blob); }
+.badge[data-kind="pubsub"]   { background: color-mix(in srgb, var(--model-pubsub) 15%, transparent);   color: var(--model-pubsub); }
+.badge[data-kind="streams"]  { background: color-mix(in srgb, var(--model-streams) 15%, transparent);  color: var(--model-streams); }
+.badge[data-kind="columnar"] { background: color-mix(in srgb, var(--model-columnar) 15%, transparent); color: var(--model-columnar); }
+.badge[data-kind="datalog"]  { background: color-mix(in srgb, var(--model-datalog) 15%, transparent);  color: var(--model-datalog); }
+.badge[data-kind="cdc"]      { background: color-mix(in srgb, var(--model-cdc) 15%, transparent);      color: var(--model-cdc); }

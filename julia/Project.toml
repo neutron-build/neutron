@@ -1,0 +1,36 @@
+name = "NeutronJulia"
+uuid = "3a5f8b2c-9e1d-4c7a-b6f0-2d4e8a1c3b5f"
+version = "0.1.0"
+authors = ["Neutron Contributors"]
+
+[deps]
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+LibPQ = "194296ae-ab2e-5f79-8cd4-7183a0a5a0d1"
+StructTypes = "856f2bd8-1eba-4b0a-8007-ebc267875bd4"
+Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
+
+[weakdeps]
+DataFrames = "a93c6f00-e57d-5684-b466-afe8fa294f15"
+DifferentialEquations = "0c46a032-eb83-5123-abaf-570d42b7fbaa"
+Graphs = "86223c79-3864-5bf0-83f7-82e725a168b6"
+Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
+ModelingToolkit = "961ee093-0014-501f-94e3-6117800e7a78"
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
+
+[extensions]
+NeutronJuliaDataFramesExt = ["DataFrames"]
+NeutronJuliaDiffEqExt = ["DifferentialEquations"]
+NeutronJuliaMTKExt = ["ModelingToolkit", "DifferentialEquations"]
+NeutronJuliaGraphsExt = ["Graphs"]
+NeutronJuliaFluxExt = ["Flux"]
+NeutronJuliaCUDAExt = ["CUDA"]
+NeutronJuliaMakieExt = ["Makie"]
+
+[compat]
+julia = "1.9"
+JSON3 = "1"
+LibPQ = "1"
+StructTypes = "1"
+Tables = "1"
+

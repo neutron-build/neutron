@@ -1,0 +1,19 @@
+[package]
+name = "neutron-desktop-starter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "neutron-desktop-starter"
+path = "src/main.rs"
+
+[dependencies]
+neutron-desktop = { path = "../../../crates/neutron-desktop" }
+tauri.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true

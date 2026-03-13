@@ -73,7 +73,7 @@ impl FreeSpaceMap {
     pub fn find_page(&self, needed_bytes: usize) -> Option<u32> {
         let needed_cat = Self::bytes_to_category(needed_bytes);
         // Need at least this category to have enough space
-        let min_cat = if needed_bytes > 0 && needed_bytes % BYTES_PER_CATEGORY != 0 {
+        let min_cat = if needed_bytes > 0 && !needed_bytes.is_multiple_of(BYTES_PER_CATEGORY) {
             needed_cat + 1
         } else {
             needed_cat

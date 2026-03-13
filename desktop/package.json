@@ -1,0 +1,14 @@
+{
+  "name": "@neutron/desktop-tools",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Build tools for Neutron Desktop (icon generation, signing helpers)",
+  "type": "module",
+  "scripts": {
+    "generate-icons": "node scripts/generate-icons.mjs",
+    "sign:macos": "bash scripts/sign-macos.sh"
+  },
+  "devDependencies": {
+    "sharp": "^0.33.0"
+  }
+}

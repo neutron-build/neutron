@@ -246,8 +246,8 @@ impl ConnectionPool {
 
         // --- try to reuse an idle connection (LIFO) ---
         while let Some(id) = self.idle_stack.pop_back() {
-            if let Some(conn) = self.connections.get_mut(&id) {
-                if conn.state == ConnectionState::Idle {
+            if let Some(conn) = self.connections.get_mut(&id)
+                && conn.state == ConnectionState::Idle {
                     conn.state = ConnectionState::InUse;
                     conn.last_used_at = now;
                     conn.use_count += 1;
@@ -258,7 +258,6 @@ impl ConnectionPool {
                 }
                 // Connection was closed/validating between idle_stack push and
                 // now — skip it and keep looking.
-            }
         }
 
         // --- create a new connection if under the limit ---

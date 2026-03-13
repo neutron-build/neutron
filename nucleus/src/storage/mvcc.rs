@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use parking_lot::RwLock;
 
@@ -26,27 +27,39 @@ use crate::types::{Row, Value};
 // ---------------------------------------------------------------------------
 
 /// A versioned row: one logical row may have multiple physical versions.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MvccRow {
     /// Version metadata.
     pub version: RowVersion,
-    /// The actual row data.
-    pub data: Row,
+    /// The actual row data (Arc-wrapped for zero-copy scans).
+    pub data: Arc<Row>,
+}
+
+impl Clone for MvccRow {
+    fn clone(&self) -> Self {
+        Self {
+            version: self.version.clone(),
+            data: self.data.clone(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // MvccTable — a table with versioned rows
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct MvccTable {
     /// All row versions (including deleted ones, until GC).
-    rows: Vec<MvccRow>,
+    /// Protected by a per-table RwLock for fine-grained concurrency.
+    rows: RwLock<Vec<MvccRow>>,
 }
 
 impl MvccTable {
     fn new() -> Self {
-        Self { rows: Vec::new() }
+        Self {
+            rows: RwLock::new(Vec::new()),
+        }
     }
 
     /// Scan only visible rows for the given snapshot.
@@ -54,53 +67,135 @@ impl MvccTable {
         &self,
         snapshot: &Snapshot,
         txn_mgr: &TransactionManager,
-    ) -> Vec<(usize, Row)> {
-        self.rows
-            .iter()
+    ) -> Vec<(usize, Arc<Row>)> {
+        let rows = self.rows.read();
+        rows.iter()
             .enumerate()
             .filter(|(_, r)| r.version.is_visible(snapshot, txn_mgr))
-            .map(|(i, r)| (i, r.data.clone()))
+            .map(|(i, r)| (i, Arc::clone(&r.data)))
             .collect()
     }
 
     /// Insert a new row version.
-    fn insert(&mut self, txn_id: u64, row: Row) {
-        self.rows.push(MvccRow {
+    fn insert(&self, txn_id: u64, row: Row) {
+        let mut rows = self.rows.write();
+        rows.push(MvccRow {
             version: RowVersion::new(txn_id),
-            data: row,
+            data: Arc::new(row),
         });
     }
 
     /// Mark a row version as deleted by the given transaction.
     /// Returns Err if the row is already being modified by another active txn.
+    ///
+    /// Uses CAS (compare-and-swap) on the atomic `deleted_by` field under a
+    /// **read lock**, avoiding the need for a write lock on the row vector.
     fn delete_version(
-        &mut self,
+        &self,
         version_idx: usize,
         txn_id: u64,
         txn_mgr: &TransactionManager,
     ) -> Result<(), MvccError> {
-        let row = &mut self.rows[version_idx];
-        if row.version.deleted_by != TXN_INVALID {
-            // Already deleted — check if the deleting txn is still active (conflict)
-            let status = txn_mgr.get_status(row.version.deleted_by);
-            if status == TxnStatus::Active && row.version.deleted_by != txn_id {
+        let rows = self.rows.read(); // READ lock, not write!
+        let row = &rows[version_idx];
+        let current = row.version.deleted_by.load(Ordering::Acquire);
+        if current != TXN_INVALID {
+            // Already has a deleted_by set
+            if current == txn_id {
+                return Ok(()); // We already deleted it
+            }
+            let status = txn_mgr.get_status(current);
+            if status == TxnStatus::Active {
                 return Err(MvccError::WriteConflict {
                     table: String::new(),
                     row_idx: version_idx,
                 });
             }
+            // If committed/aborted, we can try to overwrite
         }
-        row.version.deleted_by = txn_id;
+        // CAS: try to set deleted_by from TXN_INVALID to txn_id
+        match row.version.deleted_by.compare_exchange(
+            TXN_INVALID,
+            txn_id,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(existing) => {
+                if existing == txn_id {
+                    Ok(())
+                } else {
+                    Err(MvccError::WriteConflict {
+                        table: String::new(),
+                        row_idx: version_idx,
+                    })
+                }
+            }
+        }
+    }
+
+    /// Update a row: CAS-delete old version under read lock, then push new
+    /// version under write lock.
+    ///
+    /// Split into two phases:
+    ///   1. Phase 1 (read lock): CAS delete on old version
+    ///   2. Phase 2 (write lock): push new version (O(1))
+    fn update_version(
+        &self,
+        version_idx: usize,
+        txn_id: u64,
+        new_row: Row,
+        txn_mgr: &TransactionManager,
+    ) -> Result<(), MvccError> {
+        // Phase 1: CAS delete under read lock
+        {
+            let rows = self.rows.read();
+            let row = &rows[version_idx];
+            let current = row.version.deleted_by.load(Ordering::Acquire);
+            if current != TXN_INVALID && current != txn_id {
+                let status = txn_mgr.get_status(current);
+                if status == TxnStatus::Active {
+                    return Err(MvccError::WriteConflict {
+                        table: String::new(),
+                        row_idx: version_idx,
+                    });
+                }
+            }
+            match row.version.deleted_by.compare_exchange(
+                TXN_INVALID,
+                txn_id,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {}
+                Err(existing) if existing == txn_id => {}
+                Err(_) => {
+                    return Err(MvccError::WriteConflict {
+                        table: String::new(),
+                        row_idx: version_idx,
+                    })
+                }
+            }
+        }
+        // Phase 2: Push new version under write lock (O(1))
+        let mut rows = self.rows.write();
+        rows.push(MvccRow {
+            version: RowVersion::new(txn_id),
+            data: Arc::new(new_row),
+        });
         Ok(())
     }
 
     /// Garbage collect: remove versions that are invisible to ALL possible
     /// future transactions (deleted by a committed txn, and no active txn
     /// could still see the old version).
-    fn gc(&mut self, oldest_active_xmin: u64) {
-        self.rows.retain(|r| {
+    fn gc(&self, oldest_active_xmin: u64) -> usize {
+        let mut rows = self.rows.write();
+        let before = rows.len();
+        rows.retain(|r| {
             // Keep if not deleted
-            if r.version.deleted_by == TXN_INVALID {
+            let deleted = r.version.deleted_by.load(Ordering::Acquire);
+            if deleted == TXN_INVALID {
                 return true;
             }
             // Keep if the deleting txn hasn't committed
@@ -108,9 +203,15 @@ impl MvccTable {
             // For simplicity, we remove versions where both created_by and deleted_by
             // are less than oldest_active_xmin (meaning no active txn could see them)
             !(r.version.created_by < oldest_active_xmin
-                && r.version.deleted_by < oldest_active_xmin
-                && r.version.deleted_by != TXN_INVALID)
+                && deleted < oldest_active_xmin
+                && deleted != TXN_INVALID)
         });
+        before - rows.len()
+    }
+
+    /// Get the number of row versions in this table.
+    fn version_count(&self) -> usize {
+        self.rows.read().len()
     }
 }
 
@@ -130,7 +231,11 @@ impl std::fmt::Display for MvccError {
         match self {
             Self::TableNotFound(t) => write!(f, "table '{t}' not found"),
             Self::WriteConflict { table, row_idx } => {
-                write!(f, "write-write conflict on {table} row {row_idx}")
+                if table.is_empty() {
+                    write!(f, "could not serialize access due to concurrent update")
+                } else {
+                    write!(f, "could not serialize access due to concurrent update on {table} row {row_idx}")
+                }
             }
             Self::NoActiveTransaction => write!(f, "no active transaction"),
         }
@@ -148,7 +253,7 @@ impl std::error::Error for MvccError {}
 /// explicit-transaction commit.
 struct MvccIdx {
     col_idx: usize,
-    map: HashMap<Value, Vec<Row>>,
+    map: std::collections::BTreeMap<Value, Vec<Row>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -159,8 +264,14 @@ struct MvccIdx {
 ///
 /// Unlike [`MemoryEngine`](super::MemoryEngine), this engine stores multiple
 /// versions of each row and uses snapshot isolation for reads.
+///
+/// Uses a two-level locking scheme for concurrency:
+/// - Outer `tables` lock: held briefly to look up or insert/remove table entries
+/// - Inner per-table `rows` lock: held for the duration of row-level operations
+///
+/// This allows operations on different tables to proceed in parallel.
 pub struct MvccMemoryEngine {
-    tables: RwLock<HashMap<String, MvccTable>>,
+    tables: RwLock<HashMap<String, Arc<MvccTable>>>,
     txn_mgr: Arc<TransactionManager>,
 }
 
@@ -172,10 +283,27 @@ impl MvccMemoryEngine {
         }
     }
 
+    /// Get an Arc reference to a table (brief outer read lock).
+    fn get_table(&self, table: &str) -> Result<Arc<MvccTable>, MvccError> {
+        let tables = self.tables.read();
+        tables
+            .get(table)
+            .cloned()
+            .ok_or_else(|| MvccError::TableNotFound(table.to_string()))
+    }
+
+    /// Get Arc references to all tables (brief outer read lock).
+    fn get_all_tables(&self) -> Vec<Arc<MvccTable>> {
+        let tables = self.tables.read();
+        tables.values().cloned().collect()
+    }
+
     /// Create a table.
     pub fn create_table(&self, table: &str) {
         let mut tables = self.tables.write();
-        tables.entry(table.to_string()).or_insert_with(MvccTable::new);
+        tables
+            .entry(table.to_string())
+            .or_insert_with(|| Arc::new(MvccTable::new()));
     }
 
     /// Drop a table.
@@ -189,10 +317,7 @@ impl MvccMemoryEngine {
 
     /// Insert a row under the given transaction.
     pub fn insert(&self, table: &str, txn_id: u64, row: Row) -> Result<(), MvccError> {
-        let mut tables = self.tables.write();
-        let tbl = tables
-            .get_mut(table)
-            .ok_or_else(|| MvccError::TableNotFound(table.to_string()))?;
+        let tbl = self.get_table(table)?;
         tbl.insert(txn_id, row);
         Ok(())
     }
@@ -203,11 +328,8 @@ impl MvccMemoryEngine {
         &self,
         table: &str,
         snapshot: &Snapshot,
-    ) -> Result<Vec<(usize, Row)>, MvccError> {
-        let tables = self.tables.read();
-        let tbl = tables
-            .get(table)
-            .ok_or_else(|| MvccError::TableNotFound(table.to_string()))?;
+    ) -> Result<Vec<(usize, Arc<Row>)>, MvccError> {
+        let tbl = self.get_table(table)?;
         Ok(tbl.scan_visible(snapshot, &self.txn_mgr))
     }
 
@@ -217,7 +339,11 @@ impl MvccMemoryEngine {
         table: &str,
         snapshot: &Snapshot,
     ) -> Result<Vec<Row>, MvccError> {
-        Ok(self.scan(table, snapshot)?.into_iter().map(|(_, r)| r).collect())
+        Ok(self
+            .scan(table, snapshot)?
+            .into_iter()
+            .map(|(_, r)| (*r).clone())
+            .collect())
     }
 
     /// Delete a row by its version index. Marks the version as deleted by txn_id.
@@ -227,14 +353,12 @@ impl MvccMemoryEngine {
         version_idx: usize,
         txn_id: u64,
     ) -> Result<(), MvccError> {
-        let mut tables = self.tables.write();
-        let tbl = tables
-            .get_mut(table)
-            .ok_or_else(|| MvccError::TableNotFound(table.to_string()))?;
+        let tbl = self.get_table(table)?;
+        let table_name = table.to_string();
         tbl.delete_version(version_idx, txn_id, &self.txn_mgr)
             .map_err(|mut e| {
-                if let MvccError::WriteConflict { ref mut table, .. } = e {
-                    *table = table.clone();
+                if let MvccError::WriteConflict { table: ref mut tbl_field, .. } = e {
+                    *tbl_field = table_name.clone();
                 }
                 e
             })
@@ -248,31 +372,24 @@ impl MvccMemoryEngine {
         txn_id: u64,
         new_row: Row,
     ) -> Result<(), MvccError> {
-        let mut tables = self.tables.write();
-        let tbl = tables
-            .get_mut(table)
-            .ok_or_else(|| MvccError::TableNotFound(table.to_string()))?;
-        tbl.delete_version(version_idx, txn_id, &self.txn_mgr)?;
-        tbl.insert(txn_id, new_row);
-        Ok(())
+        let tbl = self.get_table(table)?;
+        tbl.update_version(version_idx, txn_id, new_row, &self.txn_mgr)
     }
 
     /// Run garbage collection on all tables.
     pub fn gc(&self, oldest_active_xmin: u64) -> usize {
-        let mut tables = self.tables.write();
+        let all_tables = self.get_all_tables();
         let mut total = 0;
-        for tbl in tables.values_mut() {
-            let before = tbl.rows.len();
-            tbl.gc(oldest_active_xmin);
-            total += before - tbl.rows.len();
+        for tbl in &all_tables {
+            total += tbl.gc(oldest_active_xmin);
         }
         total
     }
 
     /// Get the total number of row versions (including deleted) across all tables.
     pub fn total_versions(&self) -> usize {
-        let tables = self.tables.read();
-        tables.values().map(|t| t.rows.len()).sum()
+        let all_tables = self.get_all_tables();
+        all_tables.iter().map(|t| t.version_count()).sum()
     }
 
     /// Get the transaction manager.
@@ -294,6 +411,7 @@ impl std::fmt::Debug for MvccMemoryEngine {
 // ---------------------------------------------------------------------------
 
 use super::{StorageEngine, StorageError};
+use super::mvcc_wal::{MvccWal, MvccWalRecord};
 use super::txn::Transaction;
 
 /// Wraps [`MvccMemoryEngine`] behind the [`StorageEngine`] trait, providing
@@ -304,7 +422,7 @@ use super::txn::Transaction;
 /// `BEGIN`, all operations use the session's transaction and its snapshot
 /// for visibility filtering.
 /// Savepoint state captured at SAVEPOINT time: per-table visible rows + dirty set.
-struct SavepointState {
+pub(super) struct SavepointState {
     name: String,
     /// Snapshot of visible rows per table at savepoint time.
     table_snapshots: HashMap<String, Vec<Row>>,
@@ -322,21 +440,51 @@ impl SavepointState {
     }
 }
 
+/// Per-session MVCC state. Each wire-protocol connection gets its own instance
+/// so that explicit transactions, dirty-table tracking, and savepoints are
+/// isolated between concurrent connections.
+pub struct MvccSessionState {
+    /// Current session's explicit transaction (None = auto-commit).
+    pub(super) session_txn: parking_lot::RwLock<Option<Transaction>>,
+    /// Tables mutated in the current explicit transaction; indexes are rebuilt
+    /// on commit.
+    pub(super) dirty_tables: parking_lot::RwLock<std::collections::HashSet<String>>,
+    /// Savepoint stack for nested savepoints within an explicit transaction.
+    pub(super) savepoints: parking_lot::RwLock<Vec<SavepointState>>,
+    /// Isolation level for the next BEGIN (set via SET TRANSACTION ISOLATION LEVEL).
+    pub(super) next_isolation: parking_lot::RwLock<IsolationLevel>,
+}
+
+impl Default for MvccSessionState {
+    fn default() -> Self { Self::new() }
+}
+
+impl MvccSessionState {
+    pub fn new() -> Self {
+        Self {
+            session_txn: parking_lot::RwLock::new(None),
+            dirty_tables: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            savepoints: parking_lot::RwLock::new(Vec::new()),
+            next_isolation: parking_lot::RwLock::new(IsolationLevel::Snapshot),
+        }
+    }
+}
+
 pub struct MvccStorageAdapter {
     engine: MvccMemoryEngine,
-    /// Current session's explicit transaction (None = auto-commit).
-    session_txn: parking_lot::RwLock<Option<Transaction>>,
+    /// Per-session MVCC state, keyed by session ID.
+    /// Wire-protocol connections each get an isolated entry.
+    mvcc_sessions: parking_lot::RwLock<HashMap<u64, Arc<MvccSessionState>>>,
+    /// Default session for embedded/test mode (no explicit session management).
+    default_mvcc_session: Arc<MvccSessionState>,
     /// Secondary indexes: index_name → MvccIdx.  Only stores committed data.
     indexes: parking_lot::RwLock<HashMap<String, MvccIdx>>,
     /// table → [index_name] for fast lookup during insert/delete/update.
     table_idx_names: parking_lot::RwLock<HashMap<String, Vec<String>>>,
-    /// Tables mutated in the current explicit transaction; indexes are rebuilt
-    /// on commit.
-    dirty_tables: parking_lot::RwLock<std::collections::HashSet<String>>,
     /// Committed row counts per table — enables O(1) COUNT(*) fast path.
     committed_counts: parking_lot::RwLock<HashMap<String, i64>>,
-    /// Savepoint stack for nested savepoints within an explicit transaction.
-    savepoints: parking_lot::RwLock<Vec<SavepointState>>,
+    /// Optional WAL for crash-safe durability.
+    wal: Option<Arc<MvccWal>>,
 }
 
 impl Default for MvccStorageAdapter {
@@ -350,13 +498,51 @@ impl MvccStorageAdapter {
         let txn_mgr = Arc::new(TransactionManager::new());
         Self {
             engine: MvccMemoryEngine::new(txn_mgr),
-            session_txn: parking_lot::RwLock::new(None),
+            mvcc_sessions: parking_lot::RwLock::new(HashMap::new()),
+            default_mvcc_session: Arc::new(MvccSessionState::new()),
             indexes: parking_lot::RwLock::new(HashMap::new()),
             table_idx_names: parking_lot::RwLock::new(HashMap::new()),
-            dirty_tables: parking_lot::RwLock::new(std::collections::HashSet::new()),
             committed_counts: parking_lot::RwLock::new(HashMap::new()),
-            savepoints: parking_lot::RwLock::new(Vec::new()),
+            wal: None,
         }
+    }
+
+    /// Open a durable MVCC engine backed by a WAL in the given directory.
+    /// On open, replays the WAL to recover all committed state.
+    /// Returns (adapter, recovered_schemas) — caller must register schemas in the catalog.
+    #[allow(clippy::type_complexity)]
+    pub fn with_wal(dir: &std::path::Path) -> Result<(Self, Vec<(String, Vec<(String, crate::types::DataType)>)>), StorageError> {
+        let (wal, state) = MvccWal::open(dir)
+            .map_err(|e| StorageError::Io(format!("WAL open: {e}")))?;
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = MvccMemoryEngine::new(txn_mgr);
+        let mut committed_counts = HashMap::new();
+        let mut recovered_schemas = Vec::new();
+
+        // Replay recovered tables into the MVCC engine
+        for (name, table) in &state.tables {
+            engine.create_table(name);
+            recovered_schemas.push((name.clone(), table.columns.clone()));
+            // Use auto-commit for recovery inserts
+            let txn = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+            let txn_id = txn.id;
+            for row in &table.rows {
+                let _ = engine.insert(name, txn_id, row.clone());
+            }
+            let mut txn = txn;
+            engine.txn_mgr().commit(&mut txn);
+            committed_counts.insert(name.clone(), table.rows.len() as i64);
+        }
+
+        Ok((Self {
+            engine,
+            mvcc_sessions: parking_lot::RwLock::new(HashMap::new()),
+            default_mvcc_session: Arc::new(MvccSessionState::new()),
+            indexes: parking_lot::RwLock::new(HashMap::new()),
+            table_idx_names: parking_lot::RwLock::new(HashMap::new()),
+            committed_counts: parking_lot::RwLock::new(committed_counts),
+            wal: Some(Arc::new(wal)),
+        }, recovered_schemas))
     }
 
     /// Incrementally update indexes when new rows are appended (auto-commit).
@@ -396,10 +582,37 @@ impl MvccStorageAdapter {
         }
     }
 
+    /// Get the isolation level of the current session transaction (if any).
+    fn current_isolation(&self) -> Option<IsolationLevel> {
+        self.mvcc_session().session_txn.read().as_ref().map(|t| t.isolation)
+    }
+
+    /// If the current transaction is SERIALIZABLE, record SIREAD locks.
+    fn maybe_record_siread(&self, txn_id: u64, table: &str, row_indices: &[usize]) {
+        if let Some(IsolationLevel::Serializable) = self.current_isolation() {
+            self.engine.txn_mgr().record_siread(txn_id, table, row_indices);
+        }
+    }
+
+    /// If the current transaction is SERIALIZABLE, record writes.
+    fn maybe_record_write(&self, txn_id: u64, table: &str, row_indices: &[usize]) {
+        if let Some(IsolationLevel::Serializable) = self.current_isolation() {
+            self.engine.txn_mgr().record_write(txn_id, table, row_indices);
+        }
+    }
+
+    /// If the current transaction is SERIALIZABLE, record a table-level write.
+    fn maybe_record_table_write(&self, txn_id: u64, table: &str) {
+        if let Some(IsolationLevel::Serializable) = self.current_isolation() {
+            self.engine.txn_mgr().record_table_write(txn_id, table);
+        }
+    }
+
     /// Get the current transaction's (txn_id, snapshot), or create an
     /// implicit auto-commit transaction. Returns (txn_id, snapshot, is_auto).
     fn current_or_auto(&self) -> (u64, super::txn::Snapshot, bool) {
-        let lock = self.session_txn.read();
+        let sess = self.mvcc_session();
+        let lock = sess.session_txn.read();
         if let Some(ref txn) = *lock {
             return (txn.id, txn.snapshot.clone(), false);
         }
@@ -431,6 +644,38 @@ impl MvccStorageAdapter {
         self.engine.txn_mgr().commit(&mut txn);
     }
 
+    /// Log a WAL record (no-op if WAL is disabled).
+    fn wal_log(&self, record: &MvccWalRecord) -> Result<(), StorageError> {
+        if let Some(ref wal) = self.wal {
+            wal.log(record).map_err(|e| StorageError::Io(format!("WAL write: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Log a COMMIT and fsync (no-op if WAL is disabled).
+    fn wal_log_commit(&self, txn_id: u64) -> Result<(), StorageError> {
+        if let Some(ref wal) = self.wal {
+            wal.log_commit(txn_id).map_err(|e| StorageError::Io(format!("WAL commit: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Fsync the WAL to stable storage, ensuring all previously written
+    /// auto-commit records are durable. No-op if WAL is not configured.
+    ///
+    /// By default, auto-commit operations only `flush()` to the OS page cache
+    /// (safe against process crashes but not power loss). Call `wal_sync()` to
+    /// guarantee durability against OS/power crashes — similar to SQLite's
+    /// `PRAGMA synchronous = FULL`.
+    ///
+    /// Explicit transactions (BEGIN/COMMIT) always fsync automatically.
+    pub fn wal_sync(&self) -> Result<(), StorageError> {
+        if let Some(ref wal) = self.wal {
+            wal.sync().map_err(|e| StorageError::Io(format!("WAL sync: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Get the inner MVCC engine (for GC, stats, etc.).
     pub fn inner(&self) -> &MvccMemoryEngine {
         &self.engine
@@ -440,20 +685,87 @@ impl MvccStorageAdapter {
     pub fn txn_mgr(&self) -> &TransactionManager {
         self.engine.txn_mgr()
     }
+
+    /// Get the per-session MVCC state for the current execution context.
+    /// Uses the `STORAGE_SESSION_ID` task-local to find the right session.
+    /// Falls back to the default session for embedded/test callers.
+    fn mvcc_session(&self) -> Arc<MvccSessionState> {
+        let id = super::STORAGE_SESSION_ID.try_with(|&id| id).unwrap_or(0);
+        if id != 0 && let Some(sess) = self.mvcc_sessions.read().get(&id) {
+            return sess.clone();
+        }
+        self.default_mvcc_session.clone()
+    }
+}
+
+/// Type-coerced equality: Int32(n) == Int64(n), Int32/64(n) == Float64(n.0), etc.
+/// Mirrors the executor's type promotion without importing AST evaluation.
+fn value_eq_coerced(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        _ if a == b => true,
+        (Value::Int32(x), Value::Int64(y)) => *x as i64 == *y,
+        (Value::Int64(x), Value::Int32(y)) => *x == *y as i64,
+        (Value::Float64(x), Value::Int32(y)) => *x == *y as f64,
+        (Value::Int32(x), Value::Float64(y)) => *x as f64 == *y,
+        (Value::Float64(x), Value::Int64(y)) => *x == *y as f64,
+        (Value::Int64(x), Value::Float64(y)) => *x as f64 == *y,
+        _ => false,
+    }
+}
+
+/// Type-coerced ordering: promotes Int32/Int64/Float64 to f64 for comparison.
+fn value_cmp_coerced(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    fn to_f64(v: &Value) -> Option<f64> {
+        match v {
+            Value::Int32(n) => Some(*n as f64),
+            Value::Int64(n) => Some(*n as f64),
+            Value::Float64(f) => Some(*f),
+            _ => None,
+        }
+    }
+    match (a, b) {
+        _ if a == b => Some(std::cmp::Ordering::Equal),
+        _ => {
+            let af = to_f64(a)?;
+            let bf = to_f64(b)?;
+            af.partial_cmp(&bf)
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl StorageEngine for MvccStorageAdapter {
+    fn sync(&self) -> Result<(), StorageError> {
+        self.wal_sync()
+    }
+
     async fn create_table(&self, table: &str) -> Result<(), StorageError> {
+        // WAL schema logging is deferred to store_table_schema() which is called
+        // by the executor after create_table with full column definitions.
+        self.wal_log(&MvccWalRecord::CreateTable {
+            name: table.to_string(),
+            columns: Vec::new(),
+        })?;
         self.engine.create_table(table);
         self.committed_counts.write().insert(table.to_string(), 0);
         Ok(())
+    }
+
+    fn store_table_schema(&self, table: &str, columns: &[(String, crate::types::DataType)]) {
+        // Re-log CreateTable with full schema so recovery can restore the catalog.
+        if let Err(e) = self.wal_log(&MvccWalRecord::CreateTable {
+            name: table.to_string(),
+            columns: columns.to_vec(),
+        }) {
+            tracing::error!("MVCC WAL failed to log schema for table {table}: {e}");
+        }
     }
 
     async fn drop_table(&self, table: &str) -> Result<(), StorageError> {
         self.engine
             .drop_table(table)
             .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+        self.wal_log(&MvccWalRecord::DropTable { name: table.to_string() })?;
         // Remove all indexes for this table.
         let names: Vec<String> = {
             let mut tnames = self.table_idx_names.write();
@@ -461,7 +773,7 @@ impl StorageEngine for MvccStorageAdapter {
         };
         let mut indexes = self.indexes.write();
         for name in &names { indexes.remove(name); }
-        self.dirty_tables.write().remove(table);
+        self.mvcc_session().dirty_tables.write().remove(table);
         self.committed_counts.write().remove(table);
         Ok(())
     }
@@ -477,12 +789,21 @@ impl StorageEngine for MvccStorageAdapter {
                 }
                 MvccError::NoActiveTransaction => StorageError::NoActiveTransaction,
             })?;
+        // SSI: record table-level write (INSERTs create phantoms for scanners)
+        if !auto {
+            self.maybe_record_table_write(txn_id, table);
+        }
+        self.wal_log(&MvccWalRecord::Insert {
+            table: table.to_string(),
+            txn_id: if auto { 0 } else { txn_id },
+            row: row.clone(),
+        })?;
         if auto {
             self.auto_commit(txn_id);
             self.update_indexes_for_new_rows(table, std::slice::from_ref(&row));
             *self.committed_counts.write().entry(table.to_string()).or_insert(0) += 1;
         } else {
-            self.dirty_tables.write().insert(table.to_string());
+            self.mvcc_session().dirty_tables.write().insert(table.to_string());
         }
         Ok(())
     }
@@ -492,6 +813,7 @@ impl StorageEngine for MvccStorageAdapter {
         // One implicit transaction for the whole batch — avoids N auto-commit transactions.
         let n = rows.len() as i64;
         let (txn_id, _snap, auto) = self.current_or_auto();
+        let wal_txn_id = if auto { 0 } else { txn_id };
         for row in &rows {
             self.engine.insert(table, txn_id, row.clone()).map_err(|e| match e {
                 MvccError::TableNotFound(t) => StorageError::TableNotFound(t),
@@ -500,29 +822,197 @@ impl StorageEngine for MvccStorageAdapter {
                 }
                 MvccError::NoActiveTransaction => StorageError::NoActiveTransaction,
             })?;
+            self.wal_log(&MvccWalRecord::Insert {
+                table: table.to_string(),
+                txn_id: wal_txn_id,
+                row: row.clone(),
+            })?;
         }
         if auto {
             self.auto_commit(txn_id);
             self.update_indexes_for_new_rows(table, &rows);
             *self.committed_counts.write().entry(table.to_string()).or_insert(0) += n;
         } else {
-            self.dirty_tables.write().insert(table.to_string());
+            self.mvcc_session().dirty_tables.write().insert(table.to_string());
         }
         Ok(())
     }
 
     async fn scan(&self, table: &str) -> Result<Vec<Row>, StorageError> {
         let (_txn_id, snap, auto) = self.current_or_auto();
-        let rows = self
+        // Use scan() (not scan_rows) to get version indices for SSI tracking
+        let results = self
             .engine
-            .scan_rows(table, &snap)
+            .scan(table, &snap)
             .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+        // Record SIREAD locks for SERIALIZABLE transactions
+        if !auto {
+            let indices: Vec<usize> = results.iter().map(|(idx, _)| *idx).collect();
+            self.maybe_record_siread(_txn_id, table, &indices);
+        }
+        let rows: Vec<Row> = results.into_iter().map(|(_, r)| (*r).clone()).collect();
         if auto {
-            // Read-only auto-commit: the implicit txn can be left as-is
-            // (it made no writes, so no need to formally commit)
             self.auto_commit(_txn_id);
         }
         Ok(rows)
+    }
+
+    /// Fast GROUP BY: iterate visible rows, group by key column, compute count and optional avg.
+    fn fast_group_by(
+        &self,
+        table: &str,
+        key_col: usize,
+        val_col: Option<usize>,
+    ) -> Option<Vec<(Value, i64, Option<f64>)>> {
+        let (_txn_id, snap, auto) = self.current_or_auto();
+        let tbl = {
+            let tables = self.engine.tables.read();
+            tables.get(table)?.clone()
+        };
+        let rows = tbl.rows.read();
+        // Use Vec to preserve insertion order
+        let mut key_order: Vec<Value> = Vec::new();
+        let mut groups: HashMap<Value, (i64, f64, usize)> = HashMap::new();
+        for r in rows.iter() {
+            if !r.version.is_visible(&snap, &self.engine.txn_mgr) { continue; }
+            let key = r.data.get(key_col).cloned().unwrap_or(Value::Null);
+            let entry = groups.entry(key.clone()).or_insert_with(|| {
+                key_order.push(key.clone());
+                (0, 0.0, 0)
+            });
+            entry.0 += 1; // count
+            if let Some(vc) = val_col
+                && let Some(val) = r.data.get(vc) {
+                    match val {
+                        Value::Int32(n) => { entry.1 += *n as f64; entry.2 += 1; }
+                        Value::Int64(n) => { entry.1 += *n as f64; entry.2 += 1; }
+                        Value::Float64(f) => { entry.1 += f; entry.2 += 1; }
+                        _ => {}
+                    }
+                }
+        }
+        if auto { self.auto_commit(_txn_id); }
+        let result: Vec<(Value, i64, Option<f64>)> = key_order.into_iter().map(|key| {
+            let (count, sum, non_null) = groups[&key];
+            let avg = if non_null > 0 { Some(sum / non_null as f64) } else { None };
+            (key, count, avg)
+        }).collect();
+        Some(result)
+    }
+
+    /// Fast SUM filtered by a single equality predicate.
+    fn fast_sum_f64_filtered(
+        &self,
+        table: &str,
+        val_col: usize,
+        filter_col: usize,
+        filter_val: &Value,
+    ) -> Option<(f64, usize)> {
+        let (_txn_id, snap, auto) = self.current_or_auto();
+        let tbl = {
+            let tables = self.engine.tables.read();
+            tables.get(table)?.clone()
+        };
+        let rows = tbl.rows.read();
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for r in rows.iter() {
+            if !r.version.is_visible(&snap, &self.engine.txn_mgr) { continue; }
+            if r.data.get(filter_col).is_some_and(|v| value_eq_coerced(v, filter_val))
+                && let Some(val) = r.data.get(val_col) {
+                    match val {
+                        Value::Int32(n) => { sum += *n as f64; count += 1; }
+                        Value::Int64(n) => { sum += *n as f64; count += 1; }
+                        Value::Float64(f) => { sum += f; count += 1; }
+                        _ => {}
+                    }
+                }
+        }
+        if auto { self.auto_commit(_txn_id); }
+        Some((sum, count))
+    }
+
+    /// Fast COUNT with a filter predicate.
+    fn fast_count_filtered(
+        &self,
+        table: &str,
+        filter_col: usize,
+        filter_val: &Value,
+    ) -> Option<usize> {
+        let (_txn_id, snap, auto) = self.current_or_auto();
+        let tbl = {
+            let tables = self.engine.tables.read();
+            tables.get(table)?.clone()
+        };
+        let rows = tbl.rows.read();
+        let count = rows.iter()
+            .filter(|r| {
+                r.version.is_visible(&snap, &self.engine.txn_mgr)
+                    && r.data.get(filter_col).is_some_and(|v| value_eq_coerced(v, filter_val))
+            })
+            .count();
+        if auto { self.auto_commit(_txn_id); }
+        Some(count)
+    }
+
+    /// Fast filtered scan: only clone rows where column `filter_col` equals `filter_val`.
+    /// Avoids materialising non-matching rows, saving ~(1 - selectivity) × clone cost.
+    fn fast_scan_where_eq(
+        &self,
+        table: &str,
+        filter_col: usize,
+        filter_val: &Value,
+    ) -> Option<Vec<Row>> {
+        let (_txn_id, snap, auto) = self.current_or_auto();
+        let tbl = {
+            let tables = self.engine.tables.read();
+            tables.get(table)?.clone()
+        };
+        let rows = tbl.rows.read();
+        let mut result = Vec::new();
+        for r in rows.iter() {
+            if !r.version.is_visible(&snap, &self.engine.txn_mgr) {
+                continue;
+            }
+            if let Some(val) = r.data.get(filter_col)
+                && value_eq_coerced(val, filter_val) {
+                    result.push((*r.data).clone());
+                }
+        }
+        if auto {
+            self.auto_commit(_txn_id);
+        }
+        Some(result)
+    }
+
+    fn fast_scan_where_range(
+        &self,
+        table: &str,
+        filter_col: usize,
+        low: &Value,
+        high: &Value,
+    ) -> Option<Vec<Row>> {
+        let (_txn_id, snap, auto) = self.current_or_auto();
+        let tbl = {
+            let tables = self.engine.tables.read();
+            tables.get(table)?.clone()
+        };
+        let rows = tbl.rows.read();
+        let mut result = Vec::new();
+        for r in rows.iter() {
+            if !r.version.is_visible(&snap, &self.engine.txn_mgr) {
+                continue;
+            }
+            if let Some(val) = r.data.get(filter_col)
+                && let (Some(lo_cmp), Some(hi_cmp)) = (value_cmp_coerced(val, low), value_cmp_coerced(val, high))
+                    && lo_cmp != std::cmp::Ordering::Less && hi_cmp != std::cmp::Ordering::Greater {
+                        result.push((*r.data).clone());
+                    }
+        }
+        if auto {
+            self.auto_commit(_txn_id);
+        }
+        Some(result)
     }
 
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
@@ -539,6 +1029,8 @@ impl StorageEngine for MvccStorageAdapter {
         sorted.dedup();
 
         let mut count = 0;
+        let wal_txn_id = if auto { 0 } else { txn_id };
+        let mut written_indices = Vec::new();
         for &pos in &sorted {
             if pos < visible.len() {
                 let (version_idx, _) = &visible[pos];
@@ -550,8 +1042,19 @@ impl StorageEngine for MvccStorageAdapter {
                         }
                         e => StorageError::Io(e.to_string()),
                     })?;
+                written_indices.push(*version_idx);
+                self.wal_log(&MvccWalRecord::Delete {
+                    table: table.to_string(),
+                    txn_id: wal_txn_id,
+                    row_idx: pos as u32,
+                })?;
                 count += 1;
             }
+        }
+
+        // SSI: record row-level writes for DELETE
+        if !auto && !written_indices.is_empty() {
+            self.maybe_record_write(txn_id, table, &written_indices);
         }
 
         if auto {
@@ -561,14 +1064,14 @@ impl StorageEngine for MvccStorageAdapter {
             let remaining: Vec<Row> = visible.iter()
                 .enumerate()
                 .filter(|(i, _)| !deleted.contains(i))
-                .map(|(_, (_, row))| row.clone())
+                .map(|(_, (_, row))| (**row).clone())
                 .collect();
             self.rebuild_indexes_for_table(table, &remaining);
             if count > 0 {
                 *self.committed_counts.write().entry(table.to_string()).or_insert(0) -= count as i64;
             }
         } else {
-            self.dirty_tables.write().insert(table.to_string());
+            self.mvcc_session().dirty_tables.write().insert(table.to_string());
         }
         Ok(count)
     }
@@ -587,6 +1090,8 @@ impl StorageEngine for MvccStorageAdapter {
             .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
 
         let mut count = 0;
+        let wal_txn_id = if auto { 0 } else { txn_id };
+        let mut written_indices = Vec::new();
         for (pos, new_row) in updates {
             if *pos < visible.len() {
                 let (version_idx, _) = &visible[*pos];
@@ -598,8 +1103,20 @@ impl StorageEngine for MvccStorageAdapter {
                         }
                         e => StorageError::Io(e.to_string()),
                     })?;
+                written_indices.push(*version_idx);
+                self.wal_log(&MvccWalRecord::Update {
+                    table: table.to_string(),
+                    txn_id: wal_txn_id,
+                    row_idx: *pos as u32,
+                    new_row: new_row.clone(),
+                })?;
                 count += 1;
             }
+        }
+
+        // SSI: record row-level writes for UPDATE
+        if !auto && !written_indices.is_empty() {
+            self.maybe_record_write(txn_id, table, &written_indices);
         }
 
         if auto {
@@ -613,42 +1130,83 @@ impl StorageEngine for MvccStorageAdapter {
                     if let Some(&new_row) = update_map.get(&i) {
                         new_row.clone()
                     } else {
-                        old_row.clone()
+                        (**old_row).clone()
                     }
                 })
                 .collect();
             self.rebuild_indexes_for_table(table, &updated);
         } else {
-            self.dirty_tables.write().insert(table.to_string());
+            self.mvcc_session().dirty_tables.write().insert(table.to_string());
         }
         Ok(count)
     }
 
     // -- Transaction lifecycle --
 
+    fn set_next_isolation_level(&self, level: &str) {
+        let iso = match level.to_lowercase().as_str() {
+            "read committed" => IsolationLevel::ReadCommitted,
+            "repeatable read" | "snapshot" => IsolationLevel::Snapshot,
+            "serializable" => IsolationLevel::Serializable,
+            _ => IsolationLevel::Snapshot,
+        };
+        *self.mvcc_session().next_isolation.write() = iso;
+    }
+
     async fn begin_txn(&self) -> Result<(), StorageError> {
-        let mut lock = self.session_txn.write();
+        let sess = self.mvcc_session();
+        let mut lock = sess.session_txn.write();
         if lock.is_some() {
             // Already in a transaction — no-op (matches Postgres behavior)
             return Ok(());
         }
-        let txn = self.engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        let iso = {
+            let mut next = sess.next_isolation.write();
+            let iso = *next;
+            *next = IsolationLevel::Snapshot; // reset for next BEGIN
+            iso
+        };
+        let txn = self.engine.txn_mgr().begin(iso);
+        self.wal_log(&MvccWalRecord::Begin { txn_id: txn.id })?;
         *lock = Some(txn);
         Ok(())
     }
 
     async fn commit_txn(&self) -> Result<(), StorageError> {
+        let sess = self.mvcc_session();
+        let commit_txn_id;
+        let is_serializable;
         {
-            let mut lock = self.session_txn.write();
+            let mut lock = sess.session_txn.write();
             if let Some(ref mut txn) = *lock {
-                self.engine.txn_mgr().commit(txn);
+                commit_txn_id = txn.id;
+                is_serializable = txn.isolation == IsolationLevel::Serializable;
+                if is_serializable {
+                    // SSI check: detect rw-antidependency cycles before committing
+                    self.engine.txn_mgr().commit_serializable(txn).map_err(|e| {
+                        // Abort the transaction on serialization failure
+                        self.engine.txn_mgr().abort(txn);
+                        StorageError::SerializationFailure(e)
+                    })?;
+                } else {
+                    self.engine.txn_mgr().commit(txn);
+                }
+            } else {
+                commit_txn_id = 0;
+                is_serializable = false;
             }
             *lock = None;
         }
-        self.savepoints.write().clear();
+        if is_serializable {
+            self.engine.txn_mgr().cleanup_ssi(commit_txn_id);
+        }
+        if commit_txn_id != 0 {
+            self.wal_log_commit(commit_txn_id)?;
+        }
+        sess.savepoints.write().clear();
         // Rebuild indexes for all tables that were mutated in this transaction.
         // Also refresh committed_counts from the post-commit view.
-        let dirty: Vec<String> = self.dirty_tables.write().drain().collect();
+        let dirty: Vec<String> = sess.dirty_tables.write().drain().collect();
         for table in dirty {
             let mut read_txn = self.engine.txn_mgr().begin(IsolationLevel::Snapshot);
             let snap = read_txn.snapshot.clone();
@@ -663,39 +1221,49 @@ impl StorageEngine for MvccStorageAdapter {
     }
 
     async fn abort_txn(&self) -> Result<(), StorageError> {
-        let mut lock = self.session_txn.write();
+        let sess = self.mvcc_session();
+        let mut lock = sess.session_txn.write();
         if let Some(ref mut txn) = *lock {
+            self.wal_log(&MvccWalRecord::Abort { txn_id: txn.id })?;
             self.engine.txn_mgr().abort(txn);
         }
         *lock = None;
-        self.dirty_tables.write().clear();
-        self.savepoints.write().clear();
+        sess.dirty_tables.write().clear();
+        sess.savepoints.write().clear();
         Ok(())
     }
 
     async fn savepoint(&self, name: &str) -> Result<(), StorageError> {
+        let sess = self.mvcc_session();
         // Capture visible rows for all tables under the current transaction's snapshot.
-        let lock = self.session_txn.read();
+        let lock = sess.session_txn.read();
         let snap = match lock.as_ref() {
             Some(txn) => txn.snapshot.clone(),
             None => return Err(StorageError::NoActiveTransaction),
         };
         drop(lock);
 
-        let tables = self.engine.tables.read();
+        // Brief outer lock: clone all table names and Arc refs, then drop.
+        let table_entries: Vec<(String, Arc<MvccTable>)> = {
+            let tables = self.engine.tables.read();
+            tables
+                .iter()
+                .map(|(name, tbl)| (name.clone(), Arc::clone(tbl)))
+                .collect()
+        };
+
         let mut table_snapshots = HashMap::new();
-        for (tbl_name, tbl) in tables.iter() {
+        for (tbl_name, tbl) in &table_entries {
             let rows: Vec<Row> = tbl
                 .scan_visible(&snap, self.engine.txn_mgr())
                 .into_iter()
-                .map(|(_, r)| r)
+                .map(|(_, r)| (*r).clone())
                 .collect();
             table_snapshots.insert(tbl_name.clone(), rows);
         }
-        drop(tables);
 
-        let dirty_snapshot = self.dirty_tables.read().clone();
-        self.savepoints.write().push(SavepointState {
+        let dirty_snapshot = sess.dirty_tables.read().clone();
+        sess.savepoints.write().push(SavepointState {
             name: name.to_string(),
             table_snapshots,
             dirty_tables: dirty_snapshot,
@@ -704,7 +1272,8 @@ impl StorageEngine for MvccStorageAdapter {
     }
 
     async fn rollback_to_savepoint(&self, name: &str) -> Result<(), StorageError> {
-        let mut sps = self.savepoints.write();
+        let sess = self.mvcc_session();
+        let mut sps = sess.savepoints.write();
         let pos = sps.iter().rposition(|sp| sp.name == name);
         let pos = match pos {
             Some(p) => p,
@@ -718,7 +1287,7 @@ impl StorageEngine for MvccStorageAdapter {
 
         // Restore: get the current txn_id, then for each table in the snapshot,
         // delete all currently-visible rows and re-insert the snapshot rows.
-        let lock = self.session_txn.read();
+        let lock = sess.session_txn.read();
         let txn_id = match lock.as_ref() {
             Some(txn) => txn.id,
             None => return Err(StorageError::NoActiveTransaction),
@@ -727,48 +1296,53 @@ impl StorageEngine for MvccStorageAdapter {
         drop(lock);
 
         for (tbl_name, saved_rows) in &sp.table_snapshots {
-            // Undo all changes by this txn since the savepoint
-            let _visible = self.engine.scan(tbl_name, &snap)
-                .unwrap_or_default();
-            {
-                let mut tables = self.engine.tables.write();
-                if let Some(tbl) = tables.get_mut(tbl_name) {
-                    // Remove all row versions created by this txn (undo inserts)
-                    // and un-delete any rows deleted by this txn (undo deletes)
-                    for mvcc_row in &mut tbl.rows {
-                        if mvcc_row.version.created_by == txn_id {
-                            // Mark for removal: set deleted_by to this txn
-                            mvcc_row.version.deleted_by = txn_id;
-                        }
-                        if mvcc_row.version.deleted_by == txn_id
-                            && mvcc_row.version.created_by != txn_id
-                        {
-                            // Un-delete: this row was deleted by our txn, restore it
-                            mvcc_row.version.deleted_by = super::txn::TXN_INVALID;
-                        }
-                    }
-                    // Now re-insert the saved rows
-                    for row in saved_rows {
-                        // Check if this row is already visible (was restored by un-delete)
-                        let already_visible = tbl.scan_visible(&snap, self.engine.txn_mgr())
-                            .iter()
-                            .any(|(_, r)| r == row);
-                        if !already_visible {
-                            tbl.insert(txn_id, row.clone());
-                        }
-                    }
+            // Get Arc to the table (brief outer read lock, then drop).
+            let tbl = match self.engine.get_table(tbl_name) {
+                Ok(t) => t,
+                Err(_) => continue, // table was dropped since savepoint
+            };
+
+            // Acquire per-table rows write lock for mutation.
+            let mut rows = tbl.rows.write();
+
+            // Undo all changes by this txn since the savepoint:
+            // - Mark rows created by this txn as deleted (undo inserts)
+            // - Un-delete rows deleted by this txn (undo deletes)
+            for mvcc_row in rows.iter() {
+                if mvcc_row.version.created_by == txn_id {
+                    mvcc_row.version.deleted_by.store(txn_id, Ordering::Release);
+                }
+                if mvcc_row.version.deleted_by.load(Ordering::Acquire) == txn_id
+                    && mvcc_row.version.created_by != txn_id
+                {
+                    mvcc_row.version.deleted_by.store(super::txn::TXN_INVALID, Ordering::Release);
+                }
+            }
+
+            // Now re-insert saved rows that are not already visible.
+            let txn_mgr = self.engine.txn_mgr();
+            for row in saved_rows {
+                let already_visible = rows
+                    .iter()
+                    .any(|r| r.version.is_visible(&snap, txn_mgr) && *r.data == *row);
+                if !already_visible {
+                    rows.push(MvccRow {
+                        version: RowVersion::new(txn_id),
+                        data: Arc::new(row.clone()),
+                    });
                 }
             }
         }
 
         // Restore dirty_tables to the savepoint state.
-        *self.dirty_tables.write() = sp.dirty_tables;
+        *sess.dirty_tables.write() = sp.dirty_tables;
 
         Ok(())
     }
 
     async fn release_savepoint(&self, name: &str) -> Result<(), StorageError> {
-        let mut sps = self.savepoints.write();
+        let sess = self.mvcc_session();
+        let mut sps = sess.savepoints.write();
         if let Some(pos) = sps.iter().rposition(|sp| sp.name == name) {
             sps.remove(pos);
         }
@@ -784,7 +1358,7 @@ impl StorageEngine for MvccStorageAdapter {
             .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
         if auto { self.auto_commit(txn_id); }
 
-        let mut map: HashMap<Value, Vec<Row>> = HashMap::new();
+        let mut map: std::collections::BTreeMap<Value, Vec<Row>> = std::collections::BTreeMap::new();
         for row in &rows {
             let val = row.get(col_idx).cloned().unwrap_or(Value::Null);
             map.entry(val).or_default().push(row.clone());
@@ -809,7 +1383,14 @@ impl StorageEngine for MvccStorageAdapter {
         Ok(())
     }
 
-    fn index_lookup_sync(&self, _table: &str, index_name: &str, value: &Value) -> Result<Option<Vec<Row>>, StorageError> {
+    fn index_lookup_sync(&self, table: &str, index_name: &str, value: &Value) -> Result<Option<Vec<Row>>, StorageError> {
+        // If inside an explicit transaction that has modified this table,
+        // the index may be stale (indexes are rebuilt at COMMIT). Fall back
+        // to SeqScan which has proper MVCC snapshot visibility filtering.
+        let sess = self.mvcc_session();
+        if sess.session_txn.read().is_some() && sess.dirty_tables.read().contains(table) {
+            return Ok(None);
+        }
         let indexes = self.indexes.read();
         match indexes.get(index_name) {
             Some(idx) => Ok(Some(idx.map.get(value).cloned().unwrap_or_default())),
@@ -819,25 +1400,25 @@ impl StorageEngine for MvccStorageAdapter {
 
     fn index_lookup_range_sync(
         &self,
-        _table: &str,
+        table: &str,
         index_name: &str,
         low: &Value,
         high: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
+        // Same stale-index guard as index_lookup_sync.
+        let sess = self.mvcc_session();
+        if sess.session_txn.read().is_some() && sess.dirty_tables.read().contains(table) {
+            return Ok(None);
+        }
         let indexes = self.indexes.read();
         match indexes.get(index_name) {
             Some(idx) => {
-                let mut rows = Vec::new();
-                for (v, r) in &idx.map {
-                    if v >= low && v <= high {
-                        rows.extend_from_slice(r);
-                    }
-                }
-                rows.sort_by(|a, b| {
-                    let av = a.get(idx.col_idx).unwrap_or(&Value::Null);
-                    let bv = b.get(idx.col_idx).unwrap_or(&Value::Null);
-                    av.partial_cmp(bv).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                // Use BTreeMap::range for O(log N + k) instead of O(N) linear scan.
+                // BTreeMap iterates in key order, so no sort needed.
+                let rows: Vec<Row> = idx.map
+                    .range(low..=high)
+                    .flat_map(|(_, r)| r.iter().cloned())
+                    .collect();
                 Ok(Some(rows))
             }
             None => Ok(None),
@@ -848,11 +1429,32 @@ impl StorageEngine for MvccStorageAdapter {
         true
     }
 
+    fn create_storage_session(&self, id: u64) {
+        self.mvcc_sessions.write().insert(id, Arc::new(MvccSessionState::new()));
+    }
+
+    fn drop_storage_session(&self, id: u64) {
+        self.mvcc_sessions.write().remove(&id);
+    }
+
     /// O(1) COUNT(*) — returns the committed row count maintained by the engine.
     /// During an active explicit transaction the count reflects the last commit,
     /// not mid-txn inserts/deletes (those are accounted for at COMMIT).
     fn fast_count_all(&self, table: &str) -> Option<usize> {
         self.committed_counts.read().get(table).map(|&n| n.max(0) as usize)
+    }
+
+    async fn vacuum(&self, _table: &str) -> Result<(usize, usize, usize, usize), StorageError> {
+        let watermark = self.engine.txn_mgr().gc_watermark();
+        let removed = self.engine.gc(watermark);
+        let (_, gc_committed, gc_aborted) = self.engine.txn_mgr().run_gc();
+        // (pages_scanned, dead_tuples_reclaimed, pages_freed, bytes_reclaimed)
+        // For in-memory MVCC, "pages" are not meaningful; report version counts.
+        Ok((0, removed, 0, (gc_committed + gc_aborted)))
+    }
+
+    async fn vacuum_all(&self) -> Result<(usize, usize, usize, usize), StorageError> {
+        self.vacuum("").await
     }
 }
 
@@ -1047,7 +1649,7 @@ mod tests {
         assert_eq!(
             result,
             Err(MvccError::WriteConflict {
-                table: String::new(),
+                table: "t1".to_string(),
                 row_idx: idx,
             })
         );
@@ -1401,5 +2003,1258 @@ mod tests {
         let rows = adapter.scan("t").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], adapter_row(&[1]));
+    }
+
+    // ========================================================================
+    // Concurrency tests — per-table + row-level locking
+    // ========================================================================
+
+    #[test]
+    fn concurrent_insert_different_tables() {
+        // 4 threads each insert 100 rows to different tables — no contention.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+        for i in 0..4 {
+            engine.create_table(&format!("t{i}"));
+        }
+
+        let mut handles = Vec::new();
+        for thread_id in 0..4u32 {
+            let eng = Arc::clone(&engine);
+            let mgr = Arc::clone(&txn_mgr);
+            handles.push(std::thread::spawn(move || {
+                let table = format!("t{thread_id}");
+                for i in 0..100 {
+                    let mut txn = mgr.begin(IsolationLevel::Snapshot);
+                    eng.insert(&table, txn.id, row(&[i])).unwrap();
+                    mgr.commit(&mut txn);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Each table should have exactly 100 rows.
+        for i in 0..4 {
+            let txn = txn_mgr.begin(IsolationLevel::Snapshot);
+            let rows = engine
+                .scan_rows(&format!("t{i}"), &txn.snapshot)
+                .unwrap();
+            assert_eq!(rows.len(), 100, "table t{i} should have 100 rows");
+        }
+    }
+
+    #[test]
+    fn concurrent_insert_same_table() {
+        // 4 threads each insert 100 rows to the SAME table — correctness test.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+        engine.create_table("shared");
+
+        let mut handles = Vec::new();
+        for _ in 0..4u32 {
+            let eng = Arc::clone(&engine);
+            let mgr = Arc::clone(&txn_mgr);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..100 {
+                    let mut txn = mgr.begin(IsolationLevel::Snapshot);
+                    eng.insert("shared", txn.id, row(&[i])).unwrap();
+                    mgr.commit(&mut txn);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let txn = txn_mgr.begin(IsolationLevel::Snapshot);
+        let rows = engine.scan_rows("shared", &txn.snapshot).unwrap();
+        assert_eq!(rows.len(), 400, "4 threads x 100 rows = 400");
+    }
+
+    #[test]
+    fn scan_during_concurrent_insert() {
+        // One thread scans while another inserts — snapshot consistency.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+        engine.create_table("t");
+
+        // Pre-populate with 50 committed rows.
+        for i in 0..50 {
+            let mut txn = txn_mgr.begin(IsolationLevel::Snapshot);
+            engine.insert("t", txn.id, row(&[i])).unwrap();
+            txn_mgr.commit(&mut txn);
+        }
+
+        // Take a snapshot before the writer starts.
+        let snap_txn = txn_mgr.begin(IsolationLevel::Snapshot);
+        let snap = snap_txn.snapshot.clone();
+
+        // Writer thread: insert 100 more rows.
+        let eng = Arc::clone(&engine);
+        let mgr = Arc::clone(&txn_mgr);
+        let writer = std::thread::spawn(move || {
+            for i in 50..150 {
+                let mut txn = mgr.begin(IsolationLevel::Snapshot);
+                eng.insert("t", txn.id, row(&[i])).unwrap();
+                mgr.commit(&mut txn);
+            }
+        });
+
+        // Reader: scan with the pre-writer snapshot — should see exactly 50.
+        let rows = engine.scan_rows("t", &snap).unwrap();
+        assert_eq!(rows.len(), 50);
+
+        writer.join().unwrap();
+
+        // New snapshot after writer is done — should see 150.
+        let new_txn = txn_mgr.begin(IsolationLevel::Snapshot);
+        let rows = engine.scan_rows("t", &new_txn.snapshot).unwrap();
+        assert_eq!(rows.len(), 150);
+    }
+
+    #[test]
+    fn concurrent_delete_different_tables() {
+        // Deletes on different tables don't block each other.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+
+        for i in 0..4 {
+            let tbl = format!("t{i}");
+            engine.create_table(&tbl);
+            for j in 0..50 {
+                let mut txn = txn_mgr.begin(IsolationLevel::Snapshot);
+                engine.insert(&tbl, txn.id, row(&[j])).unwrap();
+                txn_mgr.commit(&mut txn);
+            }
+        }
+
+        let mut handles = Vec::new();
+        for thread_id in 0..4u32 {
+            let eng = Arc::clone(&engine);
+            let mgr = Arc::clone(&txn_mgr);
+            handles.push(std::thread::spawn(move || {
+                let table = format!("t{thread_id}");
+                // Delete all 50 rows.
+                let txn = mgr.begin(IsolationLevel::Snapshot);
+                let visible = eng.scan(&table, &txn.snapshot).unwrap();
+                for (idx, _) in &visible {
+                    let mut del_txn = mgr.begin(IsolationLevel::Snapshot);
+                    eng.delete(&table, *idx, del_txn.id).unwrap();
+                    mgr.commit(&mut del_txn);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // All tables should be empty.
+        for i in 0..4 {
+            let txn = txn_mgr.begin(IsolationLevel::Snapshot);
+            let rows = engine
+                .scan_rows(&format!("t{i}"), &txn.snapshot)
+                .unwrap();
+            assert_eq!(rows.len(), 0, "table t{i} should be empty after deletes");
+        }
+    }
+
+    #[test]
+    fn concurrent_scan_and_write() {
+        // Reader threads scan while writer threads insert/delete.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+        engine.create_table("t");
+
+        // Pre-populate.
+        for i in 0..20 {
+            let mut txn = txn_mgr.begin(IsolationLevel::Snapshot);
+            engine.insert("t", txn.id, row(&[i])).unwrap();
+            txn_mgr.commit(&mut txn);
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+
+        // 2 writer threads insert.
+        for _ in 0..2 {
+            let eng = Arc::clone(&engine);
+            let mgr = Arc::clone(&txn_mgr);
+            let bar = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                bar.wait();
+                for i in 100..150 {
+                    let mut txn = mgr.begin(IsolationLevel::Snapshot);
+                    eng.insert("t", txn.id, row(&[i])).unwrap();
+                    mgr.commit(&mut txn);
+                }
+            }));
+        }
+
+        // 2 reader threads scan repeatedly.
+        for _ in 0..2 {
+            let eng = Arc::clone(&engine);
+            let mgr = Arc::clone(&txn_mgr);
+            let bar = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                bar.wait();
+                for _ in 0..50 {
+                    let txn = mgr.begin(IsolationLevel::Snapshot);
+                    let rows = eng.scan_rows("t", &txn.snapshot).unwrap();
+                    // Should always see at least 20 (pre-populated).
+                    assert!(rows.len() >= 20, "scan should see at least 20 rows");
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn write_conflict_concurrent() {
+        // Two threads try to delete the same row — one must get WriteConflict.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+        engine.create_table("t");
+
+        // Insert one row.
+        let mut txn = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.insert("t", txn.id, row(&[1])).unwrap();
+        txn_mgr.commit(&mut txn);
+
+        // Both threads see the same row.
+        let t1 = txn_mgr.begin(IsolationLevel::Snapshot);
+        let t2 = txn_mgr.begin(IsolationLevel::Snapshot);
+        let visible = engine.scan("t", &t1.snapshot).unwrap();
+        let (idx, _) = visible[0].clone();
+
+        let eng = Arc::clone(&engine);
+        let t1_id = t1.id;
+        let t2_id = t2.id;
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let eng2 = Arc::clone(&engine);
+        let bar1 = Arc::clone(&barrier);
+        let bar2 = Arc::clone(&barrier);
+
+        let h1 = std::thread::spawn(move || {
+            bar1.wait();
+            eng.delete("t", idx, t1_id)
+        });
+        let h2 = std::thread::spawn(move || {
+            bar2.wait();
+            eng2.delete("t", idx, t2_id)
+        });
+
+        let r1 = h1.join().unwrap();
+        let r2 = h2.join().unwrap();
+
+        // Exactly one should succeed, one should fail with WriteConflict.
+        let successes = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        let conflicts = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, Err(MvccError::WriteConflict { .. })))
+            .count();
+        assert_eq!(successes, 1, "exactly one delete should succeed");
+        assert_eq!(conflicts, 1, "exactly one should get WriteConflict");
+    }
+
+    #[test]
+    fn per_table_lock_independence() {
+        // A long-running scan on table A doesn't block inserts to table B.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+        engine.create_table("slow_table");
+        engine.create_table("fast_table");
+
+        // Pre-populate slow_table with many rows.
+        for i in 0..1000 {
+            let mut txn = txn_mgr.begin(IsolationLevel::Snapshot);
+            engine
+                .insert("slow_table", txn.id, row(&[i]))
+                .unwrap();
+            txn_mgr.commit(&mut txn);
+        }
+
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Thread 1: repeatedly scan slow_table (holds per-table read lock).
+        let eng1 = Arc::clone(&engine);
+        let mgr1 = Arc::clone(&txn_mgr);
+        let done1 = Arc::clone(&done);
+        let scanner = std::thread::spawn(move || {
+            for _ in 0..10 {
+                let txn = mgr1.begin(IsolationLevel::Snapshot);
+                let rows = eng1.scan_rows("slow_table", &txn.snapshot).unwrap();
+                assert!(rows.len() >= 1000);
+            }
+            done1.store(true, Ordering::Release);
+        });
+
+        // Thread 2: insert into fast_table — should not be blocked.
+        let eng2 = Arc::clone(&engine);
+        let mgr2 = Arc::clone(&txn_mgr);
+        let inserter = std::thread::spawn(move || {
+            for i in 0..100 {
+                let mut txn = mgr2.begin(IsolationLevel::Snapshot);
+                eng2.insert("fast_table", txn.id, row(&[i])).unwrap();
+                mgr2.commit(&mut txn);
+            }
+        });
+
+        inserter.join().unwrap();
+        scanner.join().unwrap();
+
+        // fast_table should have all 100 rows.
+        let txn = txn_mgr.begin(IsolationLevel::Snapshot);
+        let rows = engine.scan_rows("fast_table", &txn.snapshot).unwrap();
+        assert_eq!(rows.len(), 100);
+    }
+
+    #[test]
+    fn concurrent_create_and_insert() {
+        // Create tables and insert concurrently — no deadlocks.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+
+        let mut handles = Vec::new();
+        for thread_id in 0..4u32 {
+            let eng = Arc::clone(&engine);
+            let mgr = Arc::clone(&txn_mgr);
+            handles.push(std::thread::spawn(move || {
+                let table = format!("ct{thread_id}");
+                eng.create_table(&table);
+                for i in 0..50 {
+                    let mut txn = mgr.begin(IsolationLevel::Snapshot);
+                    eng.insert(&table, txn.id, row(&[i as i32])).unwrap();
+                    mgr.commit(&mut txn);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        for i in 0..4 {
+            let txn = txn_mgr.begin(IsolationLevel::Snapshot);
+            let rows = engine
+                .scan_rows(&format!("ct{i}"), &txn.snapshot)
+                .unwrap();
+            assert_eq!(rows.len(), 50);
+        }
+    }
+
+    #[test]
+    fn concurrent_gc_and_insert() {
+        // GC runs while inserts are happening — no panic or deadlock.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+        engine.create_table("t");
+
+        // Pre-populate and delete to create GC-eligible versions.
+        for i in 0..50 {
+            let mut txn = txn_mgr.begin(IsolationLevel::Snapshot);
+            engine.insert("t", txn.id, row(&[i])).unwrap();
+            txn_mgr.commit(&mut txn);
+        }
+        {
+            let txn = txn_mgr.begin(IsolationLevel::Snapshot);
+            let visible = engine.scan("t", &txn.snapshot).unwrap();
+            for (idx, _) in &visible {
+                let mut del_txn = txn_mgr.begin(IsolationLevel::Snapshot);
+                engine.delete("t", *idx, del_txn.id).unwrap();
+                txn_mgr.commit(&mut del_txn);
+            }
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let eng1 = Arc::clone(&engine);
+        let bar1 = Arc::clone(&barrier);
+        let gc_thread = std::thread::spawn(move || {
+            bar1.wait();
+            for _ in 0..10 {
+                eng1.gc(u64::MAX);
+            }
+        });
+
+        let eng2 = Arc::clone(&engine);
+        let mgr2 = Arc::clone(&txn_mgr);
+        let bar2 = Arc::clone(&barrier);
+        let insert_thread = std::thread::spawn(move || {
+            bar2.wait();
+            for i in 100..200 {
+                let mut txn = mgr2.begin(IsolationLevel::Snapshot);
+                eng2.insert("t", txn.id, row(&[i])).unwrap();
+                mgr2.commit(&mut txn);
+            }
+        });
+
+        gc_thread.join().unwrap();
+        insert_thread.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_update_different_tables() {
+        // Updates on different tables don't interfere.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+
+        for i in 0..4 {
+            let tbl = format!("u{i}");
+            engine.create_table(&tbl);
+            let mut txn = txn_mgr.begin(IsolationLevel::Snapshot);
+            engine.insert(&tbl, txn.id, row(&[0])).unwrap();
+            txn_mgr.commit(&mut txn);
+        }
+
+        let mut handles = Vec::new();
+        for thread_id in 0..4u32 {
+            let eng = Arc::clone(&engine);
+            let mgr = Arc::clone(&txn_mgr);
+            handles.push(std::thread::spawn(move || {
+                let table = format!("u{thread_id}");
+                for val in 1..=50 {
+                    let txn = mgr.begin(IsolationLevel::Snapshot);
+                    let visible = eng.scan(&table, &txn.snapshot).unwrap();
+                    if let Some((idx, _)) = visible.first() {
+                        let mut upd_txn = mgr.begin(IsolationLevel::Snapshot);
+                        eng.update(&table, *idx, upd_txn.id, row(&[val]))
+                            .unwrap();
+                        mgr.commit(&mut upd_txn);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Each table should have exactly 1 visible row with value 50.
+        for i in 0..4 {
+            let txn = txn_mgr.begin(IsolationLevel::Snapshot);
+            let rows = engine
+                .scan_rows(&format!("u{i}"), &txn.snapshot)
+                .unwrap();
+            assert_eq!(rows.len(), 1, "table u{i} should have 1 row");
+            assert_eq!(rows[0], row(&[50]), "table u{i} should have value 50");
+        }
+    }
+
+    #[test]
+    fn concurrent_drop_and_scan() {
+        // Dropping a table while another thread scans a different table.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+        engine.create_table("keep");
+        engine.create_table("drop_me");
+
+        for i in 0..10 {
+            let mut txn = txn_mgr.begin(IsolationLevel::Snapshot);
+            engine.insert("keep", txn.id, row(&[i])).unwrap();
+            txn_mgr.commit(&mut txn);
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let eng1 = Arc::clone(&engine);
+        let bar1 = Arc::clone(&barrier);
+        let dropper = std::thread::spawn(move || {
+            bar1.wait();
+            let _ = eng1.drop_table("drop_me");
+        });
+
+        let eng2 = Arc::clone(&engine);
+        let mgr2 = Arc::clone(&txn_mgr);
+        let bar2 = Arc::clone(&barrier);
+        let scanner = std::thread::spawn(move || {
+            bar2.wait();
+            let txn = mgr2.begin(IsolationLevel::Snapshot);
+            let rows = eng2.scan_rows("keep", &txn.snapshot).unwrap();
+            assert_eq!(rows.len(), 10);
+        });
+
+        dropper.join().unwrap();
+        scanner.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_total_versions() {
+        // total_versions() is consistent under concurrent inserts.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+        engine.create_table("t");
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let eng = Arc::clone(&engine);
+            let mgr = Arc::clone(&txn_mgr);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..25 {
+                    let mut txn = mgr.begin(IsolationLevel::Snapshot);
+                    eng.insert("t", txn.id, row(&[i])).unwrap();
+                    mgr.commit(&mut txn);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(engine.total_versions(), 100, "4 threads x 25 = 100 versions");
+    }
+
+    #[tokio::test]
+    async fn adapter_concurrent_autocommit_insert() {
+        // MvccStorageAdapter auto-commit inserts from multiple tasks.
+        let adapter = Arc::new(MvccStorageAdapter::new());
+        adapter.create_table("t").await.unwrap();
+
+        let mut handles = Vec::new();
+        for task_id in 0..4u32 {
+            let a = Arc::clone(&adapter);
+            handles.push(tokio::spawn(async move {
+                for i in 0..50i32 {
+                    a.insert("t", adapter_row(&[(task_id as i32) * 1000 + i]))
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let rows = adapter.scan("t").await.unwrap();
+        assert_eq!(rows.len(), 200, "4 tasks x 50 = 200 rows");
+    }
+
+    #[tokio::test]
+    async fn adapter_savepoint_with_new_structure() {
+        // Verify savepoints work correctly with Arc<MvccTable> structure.
+        let adapter = MvccStorageAdapter::new();
+        adapter.create_table("a").await.unwrap();
+        adapter.create_table("b").await.unwrap();
+
+        // Auto-commit inserts to both tables.
+        adapter.insert("a", adapter_row(&[1])).await.unwrap();
+        adapter.insert("b", adapter_row(&[10])).await.unwrap();
+
+        adapter.begin_txn().await.unwrap();
+        adapter.savepoint("sp1").await.unwrap();
+
+        // Insert in both tables within the txn.
+        adapter.insert("a", adapter_row(&[2])).await.unwrap();
+        adapter.insert("b", adapter_row(&[20])).await.unwrap();
+
+        assert_eq!(adapter.scan("a").await.unwrap().len(), 2);
+        assert_eq!(adapter.scan("b").await.unwrap().len(), 2);
+
+        // Rollback to sp1: new inserts in both tables should be undone.
+        adapter.rollback_to_savepoint("sp1").await.unwrap();
+        assert_eq!(adapter.scan("a").await.unwrap().len(), 1);
+        assert_eq!(adapter.scan("b").await.unwrap().len(), 1);
+
+        adapter.commit_txn().await.unwrap();
+    }
+
+    #[test]
+    fn arc_table_shared_correctly() {
+        // Verify that get_table returns the same Arc (not a copy).
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = MvccMemoryEngine::new(txn_mgr.clone());
+        engine.create_table("t");
+
+        let arc1 = engine.get_table("t").unwrap();
+        let arc2 = engine.get_table("t").unwrap();
+        assert!(Arc::ptr_eq(&arc1, &arc2), "should be the same Arc");
+
+        // Inserting via the engine should be visible via either Arc.
+        let mut txn = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.insert("t", txn.id, row(&[42])).unwrap();
+        txn_mgr.commit(&mut txn);
+
+        let txn2 = txn_mgr.begin(IsolationLevel::Snapshot);
+        let rows_via_arc = arc1.scan_visible(&txn2.snapshot, &txn_mgr);
+        assert_eq!(rows_via_arc.len(), 1);
+        assert_eq!(*rows_via_arc[0].1, row(&[42]));
+    }
+
+    // ========================================================================
+    // Sprint F — AtomicU64 deleted_by / CAS tests
+    // ========================================================================
+
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use super::super::txn::TXN_INVALID as TXN_INV;
+
+    #[test]
+    fn test_cas_delete_under_read_lock() {
+        // Verify delete works under read lock (no write lock needed).
+        let (engine, txn_mgr) = setup();
+        engine.create_table("t");
+
+        let mut t1 = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.insert("t", t1.id, row(&[1])).unwrap();
+        txn_mgr.commit(&mut t1);
+
+        let mut t2 = txn_mgr.begin(IsolationLevel::Snapshot);
+        let visible = engine.scan("t", &t2.snapshot).unwrap();
+        let (idx, _) = visible[0].clone();
+
+        // Delete uses CAS under read lock internally
+        engine.delete("t", idx, t2.id).unwrap();
+        txn_mgr.commit(&mut t2);
+
+        // Verify row is gone
+        let t3 = txn_mgr.begin(IsolationLevel::Snapshot);
+        let rows = engine.scan_rows("t", &t3.snapshot).unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_cas_conflict_two_threads_same_row() {
+        // Two threads try to CAS-delete same row, exactly one gets WriteConflict.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+        engine.create_table("t");
+
+        let mut t0 = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.insert("t", t0.id, row(&[1])).unwrap();
+        txn_mgr.commit(&mut t0);
+
+        let t1 = txn_mgr.begin(IsolationLevel::Snapshot);
+        let t2 = txn_mgr.begin(IsolationLevel::Snapshot);
+        let visible = engine.scan("t", &t1.snapshot).unwrap();
+        let (idx, _) = visible[0].clone();
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let eng1 = Arc::clone(&engine);
+        let eng2 = Arc::clone(&engine);
+        let bar1 = Arc::clone(&barrier);
+        let bar2 = Arc::clone(&barrier);
+        let t1_id = t1.id;
+        let t2_id = t2.id;
+
+        let h1 = std::thread::spawn(move || {
+            bar1.wait();
+            eng1.delete("t", idx, t1_id)
+        });
+        let h2 = std::thread::spawn(move || {
+            bar2.wait();
+            eng2.delete("t", idx, t2_id)
+        });
+
+        let r1 = h1.join().unwrap();
+        let r2 = h2.join().unwrap();
+
+        let successes = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        let conflicts = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, Err(MvccError::WriteConflict { .. })))
+            .count();
+        assert_eq!(successes, 1, "exactly one CAS-delete should succeed");
+        assert_eq!(conflicts, 1, "exactly one should get WriteConflict");
+    }
+
+    #[test]
+    fn test_scan_concurrent_with_delete() {
+        // Reader scans table while writer deletes rows, no blocking.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+        engine.create_table("t");
+
+        // Pre-populate with 50 rows.
+        for i in 0..50 {
+            let mut txn = txn_mgr.begin(IsolationLevel::Snapshot);
+            engine.insert("t", txn.id, row(&[i])).unwrap();
+            txn_mgr.commit(&mut txn);
+        }
+
+        // Snapshot before deletes start.
+        let reader_txn = txn_mgr.begin(IsolationLevel::Snapshot);
+        let snap = reader_txn.snapshot.clone();
+
+        let eng = Arc::clone(&engine);
+        let mgr = Arc::clone(&txn_mgr);
+        let writer = std::thread::spawn(move || {
+            let txn = mgr.begin(IsolationLevel::Snapshot);
+            let visible = eng.scan("t", &txn.snapshot).unwrap();
+            for (idx, _) in &visible {
+                let mut del_txn = mgr.begin(IsolationLevel::Snapshot);
+                eng.delete("t", *idx, del_txn.id).unwrap();
+                mgr.commit(&mut del_txn);
+            }
+        });
+
+        // Reader scans with pre-delete snapshot — should see all 50.
+        let rows = engine.scan_rows("t", &snap).unwrap();
+        assert_eq!(rows.len(), 50);
+
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn test_concurrent_delete_different_rows() {
+        // Two threads delete different rows in same table concurrently.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+        engine.create_table("t");
+
+        for i in 0..10 {
+            let mut txn = txn_mgr.begin(IsolationLevel::Snapshot);
+            engine.insert("t", txn.id, row(&[i])).unwrap();
+            txn_mgr.commit(&mut txn);
+        }
+
+        let txn = txn_mgr.begin(IsolationLevel::Snapshot);
+        let visible = engine.scan("t", &txn.snapshot).unwrap();
+        let even_idxs: Vec<usize> = visible.iter().enumerate()
+            .filter(|(i, _)| i % 2 == 0).map(|(_, (idx, _))| *idx).collect();
+        let odd_idxs: Vec<usize> = visible.iter().enumerate()
+            .filter(|(i, _)| i % 2 != 0).map(|(_, (idx, _))| *idx).collect();
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let eng1 = Arc::clone(&engine);
+        let mgr1 = Arc::clone(&txn_mgr);
+        let bar1 = Arc::clone(&barrier);
+        let h1 = std::thread::spawn(move || {
+            bar1.wait();
+            for idx in even_idxs {
+                let mut txn = mgr1.begin(IsolationLevel::Snapshot);
+                eng1.delete("t", idx, txn.id).unwrap();
+                mgr1.commit(&mut txn);
+            }
+        });
+
+        let eng2 = Arc::clone(&engine);
+        let mgr2 = Arc::clone(&txn_mgr);
+        let bar2 = Arc::clone(&barrier);
+        let h2 = std::thread::spawn(move || {
+            bar2.wait();
+            for idx in odd_idxs {
+                let mut txn = mgr2.begin(IsolationLevel::Snapshot);
+                eng2.delete("t", idx, txn.id).unwrap();
+                mgr2.commit(&mut txn);
+            }
+        });
+
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        let t3 = txn_mgr.begin(IsolationLevel::Snapshot);
+        let rows = engine.scan_rows("t", &t3.snapshot).unwrap();
+        assert_eq!(rows.len(), 0, "all 10 rows should be deleted");
+    }
+
+    #[test]
+    fn test_update_cas_then_push() {
+        // Update correctly CAS-deletes old and pushes new.
+        let (engine, txn_mgr) = setup();
+        engine.create_table("t");
+
+        let mut t1 = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.insert("t", t1.id, row(&[1])).unwrap();
+        txn_mgr.commit(&mut t1);
+
+        let mut t2 = txn_mgr.begin(IsolationLevel::Snapshot);
+        let visible = engine.scan("t", &t2.snapshot).unwrap();
+        let (idx, _) = visible[0].clone();
+
+        // Update: CAS delete old (read lock) + push new (write lock)
+        engine.update("t", idx, t2.id, row(&[100])).unwrap();
+        txn_mgr.commit(&mut t2);
+
+        let t3 = txn_mgr.begin(IsolationLevel::Snapshot);
+        let rows = engine.scan_rows("t", &t3.snapshot).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], row(&[100]));
+        // Old version still in storage until GC
+        assert_eq!(engine.total_versions(), 2);
+    }
+
+    #[test]
+    fn test_atomic_delete_idempotent_same_txn() {
+        // Same txn deleting same row twice returns Ok.
+        let (engine, txn_mgr) = setup();
+        engine.create_table("t");
+
+        let mut t1 = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.insert("t", t1.id, row(&[1])).unwrap();
+        txn_mgr.commit(&mut t1);
+
+        let t2 = txn_mgr.begin(IsolationLevel::Snapshot);
+        let visible = engine.scan("t", &t2.snapshot).unwrap();
+        let (idx, _) = visible[0].clone();
+
+        // First delete succeeds
+        engine.delete("t", idx, t2.id).unwrap();
+        // Second delete of same row by same txn also succeeds (idempotent)
+        engine.delete("t", idx, t2.id).unwrap();
+    }
+
+    #[test]
+    fn test_gc_with_atomic_deleted_by() {
+        // GC correctly reads atomic fields.
+        let (engine, txn_mgr) = setup();
+        engine.create_table("t");
+
+        let mut t1 = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.insert("t", t1.id, row(&[1])).unwrap();
+        txn_mgr.commit(&mut t1);
+
+        let mut t2 = txn_mgr.begin(IsolationLevel::Snapshot);
+        let visible = engine.scan("t", &t2.snapshot).unwrap();
+        let (idx, _) = visible[0].clone();
+        engine.delete("t", idx, t2.id).unwrap();
+        txn_mgr.commit(&mut t2);
+
+        assert_eq!(engine.total_versions(), 1);
+
+        // GC should remove the deleted version
+        let removed = engine.gc(t2.id + 10);
+        assert_eq!(removed, 1);
+        assert_eq!(engine.total_versions(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_savepoint_rollback_with_atomic() {
+        // Savepoint rollback correctly stores/loads atomics.
+        let adapter = MvccStorageAdapter::new();
+        adapter.create_table("t").await.unwrap();
+        adapter.insert("t", adapter_row(&[1])).await.unwrap();
+
+        adapter.begin_txn().await.unwrap();
+        adapter.savepoint("sp1").await.unwrap();
+
+        // Delete the row
+        adapter.delete("t", &[0]).await.unwrap();
+        assert_eq!(adapter.scan("t").await.unwrap().len(), 0);
+
+        // Rollback: row should reappear (atomic deleted_by reset)
+        adapter.rollback_to_savepoint("sp1").await.unwrap();
+        let rows = adapter.scan("t").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], adapter_row(&[1]));
+
+        adapter.commit_txn().await.unwrap();
+    }
+
+    #[test]
+    fn test_concurrent_insert_during_scan() {
+        // Insert (write lock O(1)) minimally blocks scan.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+        engine.create_table("t");
+
+        for i in 0..100 {
+            let mut txn = txn_mgr.begin(IsolationLevel::Snapshot);
+            engine.insert("t", txn.id, row(&[i])).unwrap();
+            txn_mgr.commit(&mut txn);
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let eng1 = Arc::clone(&engine);
+        let mgr1 = Arc::clone(&txn_mgr);
+        let bar1 = Arc::clone(&barrier);
+        let scanner = std::thread::spawn(move || {
+            bar1.wait();
+            let mut total = 0;
+            for _ in 0..20 {
+                let txn = mgr1.begin(IsolationLevel::Snapshot);
+                let rows = eng1.scan_rows("t", &txn.snapshot).unwrap();
+                total += rows.len();
+            }
+            total
+        });
+
+        let eng2 = Arc::clone(&engine);
+        let mgr2 = Arc::clone(&txn_mgr);
+        let bar2 = Arc::clone(&barrier);
+        let inserter = std::thread::spawn(move || {
+            bar2.wait();
+            for i in 100..200 {
+                let mut txn = mgr2.begin(IsolationLevel::Snapshot);
+                eng2.insert("t", txn.id, row(&[i])).unwrap();
+                mgr2.commit(&mut txn);
+            }
+        });
+
+        let scan_total = scanner.join().unwrap();
+        inserter.join().unwrap();
+
+        // Each scan should see >= 100 rows (pre-populated).
+        assert!(scan_total >= 100 * 20, "scans should see at least 100 rows each");
+    }
+
+    #[test]
+    fn test_encode_decode_atomic_roundtrip() {
+        // RowVersion encode/decode with AtomicU64.
+        use super::super::txn::RowVersion;
+        let rv = RowVersion {
+            created_by: 42,
+            deleted_by: AtomicU64::new(99),
+        };
+        let bytes = rv.encode();
+        let decoded = RowVersion::decode(&bytes);
+        assert_eq!(decoded.created_by, 42);
+        assert_eq!(decoded.deleted_by.load(AtomicOrdering::Acquire), 99);
+    }
+
+    #[test]
+    fn test_clone_row_version_independent() {
+        // Cloned RowVersion has independent atomic.
+        use super::super::txn::RowVersion;
+        let rv = RowVersion::new(10);
+        let rv2 = rv.clone();
+
+        // Modify original — clone should be unaffected.
+        rv.deleted_by.store(77, AtomicOrdering::Release);
+        assert_eq!(rv.deleted_by.load(AtomicOrdering::Acquire), 77);
+        assert_eq!(rv2.deleted_by.load(AtomicOrdering::Acquire), TXN_INV);
+    }
+
+    #[test]
+    fn test_concurrent_mixed_operations() {
+        // Stress test: mixed insert/delete/scan from multiple threads.
+        let txn_mgr = Arc::new(TransactionManager::new());
+        let engine = Arc::new(MvccMemoryEngine::new(txn_mgr.clone()));
+        engine.create_table("t");
+
+        // Pre-populate.
+        for i in 0..20 {
+            let mut txn = txn_mgr.begin(IsolationLevel::Snapshot);
+            engine.insert("t", txn.id, row(&[i])).unwrap();
+            txn_mgr.commit(&mut txn);
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+
+        // 2 inserter threads
+        for _ in 0..2 {
+            let eng = Arc::clone(&engine);
+            let mgr = Arc::clone(&txn_mgr);
+            let bar = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                bar.wait();
+                for i in 100..150 {
+                    let mut txn = mgr.begin(IsolationLevel::Snapshot);
+                    eng.insert("t", txn.id, row(&[i])).unwrap();
+                    mgr.commit(&mut txn);
+                }
+            }));
+        }
+
+        // 1 deleter thread
+        {
+            let eng = Arc::clone(&engine);
+            let mgr = Arc::clone(&txn_mgr);
+            let bar = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                bar.wait();
+                for _ in 0..10 {
+                    let txn = mgr.begin(IsolationLevel::Snapshot);
+                    let visible = eng.scan("t", &txn.snapshot).unwrap();
+                    if let Some((idx, _)) = visible.first() {
+                        let mut del_txn = mgr.begin(IsolationLevel::Snapshot);
+                        // Ignore conflicts — other threads may also be deleting.
+                        let _ = eng.delete("t", *idx, del_txn.id);
+                        mgr.commit(&mut del_txn);
+                    }
+                }
+            }));
+        }
+
+        // 1 scanner thread
+        {
+            let eng = Arc::clone(&engine);
+            let mgr = Arc::clone(&txn_mgr);
+            let bar = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                bar.wait();
+                for _ in 0..20 {
+                    let txn = mgr.begin(IsolationLevel::Snapshot);
+                    let _rows = eng.scan_rows("t", &txn.snapshot).unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Just verify no panic/deadlock and final state is consistent.
+        let txn = txn_mgr.begin(IsolationLevel::Snapshot);
+        let rows = engine.scan_rows("t", &txn.snapshot).unwrap();
+        // At least some rows should exist (20 pre-populated + 100 inserted - up to 10 deleted).
+        assert!(rows.len() >= 10, "should have some rows remaining");
+    }
+
+    #[tokio::test]
+    async fn test_adapter_delete_uses_atomic() {
+        // StorageAdapter delete path works with atomics.
+        let adapter = MvccStorageAdapter::new();
+        adapter.create_table("t").await.unwrap();
+        adapter.insert("t", adapter_row(&[1])).await.unwrap();
+        adapter.insert("t", adapter_row(&[2])).await.unwrap();
+        adapter.insert("t", adapter_row(&[3])).await.unwrap();
+
+        // Delete middle row via adapter (auto-commit)
+        let deleted = adapter.delete("t", &[1]).await.unwrap();
+        assert_eq!(deleted, 1);
+
+        let rows = adapter.scan("t").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&adapter_row(&[1])));
+        assert!(rows.contains(&adapter_row(&[3])));
+    }
+
+    #[tokio::test]
+    async fn test_adapter_update_uses_atomic() {
+        // StorageAdapter update path works with atomics.
+        let adapter = MvccStorageAdapter::new();
+        adapter.create_table("t").await.unwrap();
+        adapter.insert("t", adapter_row(&[10])).await.unwrap();
+        adapter.insert("t", adapter_row(&[20])).await.unwrap();
+
+        let updated = adapter
+            .update("t", &[(0, adapter_row(&[99]))])
+            .await
+            .unwrap();
+        assert_eq!(updated, 1);
+
+        let rows = adapter.scan("t").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&adapter_row(&[99])));
+        assert!(rows.contains(&adapter_row(&[20])));
+    }
+
+    #[test]
+    fn test_visibility_with_atomic() {
+        // Verify is_visible() works correctly with atomic loads.
+        let (engine, txn_mgr) = setup();
+        engine.create_table("t");
+
+        let mut t1 = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.insert("t", t1.id, row(&[1])).unwrap();
+        engine.insert("t", t1.id, row(&[2])).unwrap();
+        txn_mgr.commit(&mut t1);
+
+        // Verify both visible
+        let t2 = txn_mgr.begin(IsolationLevel::Snapshot);
+        let visible = engine.scan("t", &t2.snapshot).unwrap();
+        assert_eq!(visible.len(), 2);
+
+        // Delete one via CAS
+        let (idx, _) = visible[0].clone();
+        let mut t3 = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.delete("t", idx, t3.id).unwrap();
+        txn_mgr.commit(&mut t3);
+
+        // New snapshot: only 1 visible
+        let t4 = txn_mgr.begin(IsolationLevel::Snapshot);
+        let visible2 = engine.scan("t", &t4.snapshot).unwrap();
+        assert_eq!(visible2.len(), 1);
+
+        // Old snapshot (t2) still sees both (snapshot isolation)
+        let visible_old = engine.scan("t", &t2.snapshot).unwrap();
+        assert_eq!(visible_old.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod arc_row_tests {
+    use super::*;
+    use std::sync::Arc as StdArc;
+    use crate::types::Value;
+
+    fn make_row(vals: Vec<i32>) -> Row {
+        vals.into_iter().map(|v| Value::Int32(v)).collect()
+    }
+
+    #[test]
+    fn arc_scan_shares_data() {
+        let txn_mgr = StdArc::new(TransactionManager::new());
+        let engine = MvccMemoryEngine::new(txn_mgr.clone());
+        engine.create_table("t");
+        let txn = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        engine.insert("t", txn.id, make_row(vec![1, 2, 3])).unwrap();
+        let mut txn = txn;
+        engine.txn_mgr().commit(&mut txn);
+        let snap = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        let results = engine.scan("t", &snap.snapshot).unwrap();
+        assert_eq!(results.len(), 1);
+        // Arc strong count >= 2: one in table storage, one in our results
+        assert!(StdArc::strong_count(&results[0].1) >= 2);
+    }
+
+    #[test]
+    fn arc_concurrent_scans_share_pointer() {
+        let txn_mgr = StdArc::new(TransactionManager::new());
+        let engine = MvccMemoryEngine::new(txn_mgr.clone());
+        engine.create_table("t");
+        let txn = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        engine.insert("t", txn.id, make_row(vec![42])).unwrap();
+        let mut txn = txn;
+        engine.txn_mgr().commit(&mut txn);
+        let snap1 = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        let snap2 = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        let r1 = engine.scan("t", &snap1.snapshot).unwrap();
+        let r2 = engine.scan("t", &snap2.snapshot).unwrap();
+        // Both scans return Arc pointers to the same allocation
+        assert!(StdArc::ptr_eq(&r1[0].1, &r2[0].1));
+    }
+
+    #[test]
+    fn arc_insert_scan_roundtrip() {
+        let txn_mgr = StdArc::new(TransactionManager::new());
+        let engine = MvccMemoryEngine::new(txn_mgr.clone());
+        engine.create_table("t");
+        let txn = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        for i in 0..100 {
+            engine.insert("t", txn.id, make_row(vec![i])).unwrap();
+        }
+        let mut txn = txn;
+        engine.txn_mgr().commit(&mut txn);
+        let snap = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        let rows = engine.scan_rows("t", &snap.snapshot).unwrap();
+        assert_eq!(rows.len(), 100);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row[0], Value::Int32(i as i32));
+        }
+    }
+
+    #[test]
+    fn arc_update_creates_new_arc() {
+        let txn_mgr = StdArc::new(TransactionManager::new());
+        let engine = MvccMemoryEngine::new(txn_mgr.clone());
+        engine.create_table("t");
+        let txn = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        engine.insert("t", txn.id, make_row(vec![1])).unwrap();
+        let mut txn = txn;
+        engine.txn_mgr().commit(&mut txn);
+        let snap_before = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        let before = engine.scan("t", &snap_before.snapshot).unwrap();
+        let upd_txn = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        let vis = engine.scan("t", &upd_txn.snapshot).unwrap();
+        engine.update("t", vis[0].0, upd_txn.id, make_row(vec![99])).unwrap();
+        let mut upd_txn = upd_txn;
+        engine.txn_mgr().commit(&mut upd_txn);
+        let snap_after = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        let after = engine.scan("t", &snap_after.snapshot).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!((*after[0].1)[0], Value::Int32(99));
+        assert!(!StdArc::ptr_eq(&before[0].1, &after[0].1));
+    }
+
+    #[test]
+    fn arc_delete_filters_correctly() {
+        let txn_mgr = StdArc::new(TransactionManager::new());
+        let engine = MvccMemoryEngine::new(txn_mgr.clone());
+        engine.create_table("t");
+        let txn = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        engine.insert("t", txn.id, make_row(vec![1])).unwrap();
+        engine.insert("t", txn.id, make_row(vec![2])).unwrap();
+        let mut txn = txn;
+        engine.txn_mgr().commit(&mut txn);
+        let del_txn = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        let vis = engine.scan("t", &del_txn.snapshot).unwrap();
+        engine.delete("t", vis[0].0, del_txn.id).unwrap();
+        let mut del_txn = del_txn;
+        engine.txn_mgr().commit(&mut del_txn);
+        let snap = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        let rows = engine.scan("t", &snap.snapshot).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((*rows[0].1)[0], Value::Int32(2));
+    }
+
+    #[test]
+    fn arc_gc_drops_references() {
+        let txn_mgr = StdArc::new(TransactionManager::new());
+        let engine = MvccMemoryEngine::new(txn_mgr.clone());
+        engine.create_table("t");
+        let txn = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        engine.insert("t", txn.id, make_row(vec![1])).unwrap();
+        let mut txn = txn;
+        engine.txn_mgr().commit(&mut txn);
+        let del_txn = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        let vis = engine.scan("t", &del_txn.snapshot).unwrap();
+        let held_ref = StdArc::clone(&vis[0].1);
+        engine.delete("t", vis[0].0, del_txn.id).unwrap();
+        let mut del_txn = del_txn;
+        engine.txn_mgr().commit(&mut del_txn);
+        let gc_count = engine.gc(del_txn.id + 1);
+        assert!(gc_count > 0);
+        // Our held Arc ref should still work after GC
+        assert_eq!((*held_ref)[0], Value::Int32(1));
+    }
+
+    #[test]
+    fn arc_batch_scan() {
+        let txn_mgr = StdArc::new(TransactionManager::new());
+        let engine = MvccMemoryEngine::new(txn_mgr.clone());
+        engine.create_table("t");
+        let txn = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        for i in 0..1000 {
+            engine.insert("t", txn.id, make_row(vec![i])).unwrap();
+        }
+        let mut txn = txn;
+        engine.txn_mgr().commit(&mut txn);
+        let snap = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        let results = engine.scan("t", &snap.snapshot).unwrap();
+        assert_eq!(results.len(), 1000);
+        for (_, arc_row) in &results {
+            assert!(StdArc::strong_count(arc_row) >= 2);
+        }
+    }
+
+    #[test]
+    fn arc_scan_rows_returns_owned() {
+        let txn_mgr = StdArc::new(TransactionManager::new());
+        let engine = MvccMemoryEngine::new(txn_mgr.clone());
+        engine.create_table("t");
+        let txn = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        engine.insert("t", txn.id, make_row(vec![7, 8, 9])).unwrap();
+        let mut txn = txn;
+        engine.txn_mgr().commit(&mut txn);
+        let snap = engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        let rows = engine.scan_rows("t", &snap.snapshot).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![Value::Int32(7), Value::Int32(8), Value::Int32(9)]);
+    }
+
+    #[tokio::test]
+    async fn arc_storage_adapter_crud() {
+        let adapter = MvccStorageAdapter::new();
+        adapter.create_table("t").await.unwrap();
+        adapter.insert("t", vec![Value::Int32(42)]).await.unwrap();
+        let rows = adapter.scan("t").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int32(42));
+        adapter.delete("t", &[0]).await.unwrap();
+        let rows = adapter.scan("t").await.unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn arc_storage_adapter_update() {
+        let adapter = MvccStorageAdapter::new();
+        adapter.create_table("t").await.unwrap();
+        adapter.insert("t", vec![Value::Int32(1)]).await.unwrap();
+        adapter.insert("t", vec![Value::Int32(2)]).await.unwrap();
+        adapter.update("t", &[(0, vec![Value::Int32(99)])]).await.unwrap();
+        let rows = adapter.scan("t").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // After update, old version (1) is deleted, new version (99) is appended.
+        // Scan order: unmodified row (2) first, then new version (99).
+        assert_eq!(rows[0][0], Value::Int32(2));
+        assert_eq!(rows[1][0], Value::Int32(99));
     }
 }

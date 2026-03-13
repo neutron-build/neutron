@@ -370,45 +370,39 @@ impl NucleusConfig {
         if let Ok(v) = env::var("NUCLEUS_SERVER_HOST") {
             self.server.host = v;
         }
-        if let Ok(v) = env::var("NUCLEUS_SERVER_PORT") {
-            if let Ok(p) = v.parse::<u16>() {
+        if let Ok(v) = env::var("NUCLEUS_SERVER_PORT")
+            && let Ok(p) = v.parse::<u16>() {
                 self.server.port = p;
             }
-        }
-        if let Ok(v) = env::var("NUCLEUS_SERVER_MAX_CONNECTIONS") {
-            if let Ok(n) = v.parse::<usize>() {
+        if let Ok(v) = env::var("NUCLEUS_SERVER_MAX_CONNECTIONS")
+            && let Ok(n) = v.parse::<usize>() {
                 self.server.max_connections = n;
             }
-        }
 
         // storage
         if let Ok(v) = env::var("NUCLEUS_STORAGE_DATA_DIR") {
             self.storage.data_dir = v;
         }
-        if let Ok(v) = env::var("NUCLEUS_STORAGE_MEMORY_MODE") {
-            if let Ok(b) = v.parse::<bool>() {
+        if let Ok(v) = env::var("NUCLEUS_STORAGE_MEMORY_MODE")
+            && let Ok(b) = v.parse::<bool>() {
                 self.storage.memory_mode = b;
             }
-        }
 
         // wal
-        if let Ok(v) = env::var("NUCLEUS_WAL_ENABLED") {
-            if let Ok(b) = v.parse::<bool>() {
+        if let Ok(v) = env::var("NUCLEUS_WAL_ENABLED")
+            && let Ok(b) = v.parse::<bool>() {
                 self.wal.enabled = b;
             }
-        }
 
         // metrics
-        if let Ok(v) = env::var("NUCLEUS_METRICS_ENABLED") {
-            if let Ok(b) = v.parse::<bool>() {
+        if let Ok(v) = env::var("NUCLEUS_METRICS_ENABLED")
+            && let Ok(b) = v.parse::<bool>() {
                 self.metrics.enabled = b;
             }
-        }
-        if let Ok(v) = env::var("NUCLEUS_METRICS_PORT") {
-            if let Ok(p) = v.parse::<u16>() {
+        if let Ok(v) = env::var("NUCLEUS_METRICS_PORT")
+            && let Ok(p) = v.parse::<u16>() {
                 self.metrics.port = p;
             }
-        }
 
         // logging
         if let Ok(v) = env::var("NUCLEUS_LOGGING_LEVEL") {
@@ -416,43 +410,36 @@ impl NucleusConfig {
         }
 
         // cache
-        if let Ok(v) = env::var("NUCLEUS_CACHE_ENABLED") {
-            if let Ok(b) = v.parse::<bool>() {
+        if let Ok(v) = env::var("NUCLEUS_CACHE_ENABLED")
+            && let Ok(b) = v.parse::<bool>() {
                 self.cache.enabled = b;
             }
-        }
-        if let Ok(v) = env::var("NUCLEUS_CACHE_MAX_MEMORY_MB") {
-            if let Ok(n) = v.parse::<usize>() {
+        if let Ok(v) = env::var("NUCLEUS_CACHE_MAX_MEMORY_MB")
+            && let Ok(n) = v.parse::<usize>() {
                 self.cache.max_memory_mb = n;
             }
-        }
-        if let Ok(v) = env::var("NUCLEUS_CACHE_DEFAULT_TTL_SECS") {
-            if let Ok(n) = v.parse::<u64>() {
+        if let Ok(v) = env::var("NUCLEUS_CACHE_DEFAULT_TTL_SECS")
+            && let Ok(n) = v.parse::<u64>() {
                 self.cache.default_ttl_secs = n;
             }
-        }
 
         // pool
-        if let Ok(v) = env::var("NUCLEUS_POOL_MIN_IDLE") {
-            if let Ok(n) = v.parse::<usize>() {
+        if let Ok(v) = env::var("NUCLEUS_POOL_MIN_IDLE")
+            && let Ok(n) = v.parse::<usize>() {
                 self.pool.min_idle = n;
             }
-        }
-        if let Ok(v) = env::var("NUCLEUS_POOL_MAX_IDLE_TIME_SECS") {
-            if let Ok(n) = v.parse::<u64>() {
+        if let Ok(v) = env::var("NUCLEUS_POOL_MAX_IDLE_TIME_SECS")
+            && let Ok(n) = v.parse::<u64>() {
                 self.pool.max_idle_time_secs = n;
             }
-        }
-        if let Ok(v) = env::var("NUCLEUS_POOL_MAX_LIFETIME_SECS") {
-            if let Ok(n) = v.parse::<u64>() {
+        if let Ok(v) = env::var("NUCLEUS_POOL_MAX_LIFETIME_SECS")
+            && let Ok(n) = v.parse::<u64>() {
                 self.pool.max_lifetime_secs = n;
             }
-        }
-        if let Ok(v) = env::var("NUCLEUS_POOL_ACQUIRE_TIMEOUT_SECS") {
-            if let Ok(n) = v.parse::<u64>() {
+        if let Ok(v) = env::var("NUCLEUS_POOL_ACQUIRE_TIMEOUT_SECS")
+            && let Ok(n) = v.parse::<u64>() {
                 self.pool.acquire_timeout_secs = n;
             }
-        }
 
         // replication
         if let Ok(v) = env::var("NUCLEUS_REPLICATION_MODE") {
@@ -461,58 +448,50 @@ impl NucleusConfig {
         if let Ok(v) = env::var("NUCLEUS_REPLICATION_PRIMARY_HOST") {
             self.replication.primary_host = Some(v);
         }
-        if let Ok(v) = env::var("NUCLEUS_REPLICATION_PRIMARY_PORT") {
-            if let Ok(p) = v.parse::<u16>() {
+        if let Ok(v) = env::var("NUCLEUS_REPLICATION_PRIMARY_PORT")
+            && let Ok(p) = v.parse::<u16>() {
                 self.replication.primary_port = Some(p);
             }
-        }
         if let Ok(v) = env::var("NUCLEUS_REPLICATION_SYNC_MODE") {
             self.replication.sync_mode = v;
         }
-        if let Ok(v) = env::var("NUCLEUS_REPLICATION_FAILOVER_TIMEOUT_MS") {
-            if let Ok(n) = v.parse::<u64>() {
+        if let Ok(v) = env::var("NUCLEUS_REPLICATION_FAILOVER_TIMEOUT_MS")
+            && let Ok(n) = v.parse::<u64>() {
                 self.replication.failover_timeout_ms = n;
             }
-        }
 
         // storage (additional)
-        if let Ok(v) = env::var("NUCLEUS_STORAGE_BUFFER_POOL_SIZE_MB") {
-            if let Ok(n) = v.parse::<usize>() {
+        if let Ok(v) = env::var("NUCLEUS_STORAGE_BUFFER_POOL_SIZE_MB")
+            && let Ok(n) = v.parse::<usize>() {
                 self.storage.buffer_pool_size_mb = n;
             }
-        }
-        if let Ok(v) = env::var("NUCLEUS_STORAGE_USE_DIRECT_IO") {
-            if let Ok(b) = v.parse::<bool>() {
+        if let Ok(v) = env::var("NUCLEUS_STORAGE_USE_DIRECT_IO")
+            && let Ok(b) = v.parse::<bool>() {
                 self.storage.use_direct_io = b;
             }
-        }
 
         // wal (additional)
-        if let Ok(v) = env::var("NUCLEUS_WAL_SEGMENT_SIZE_MB") {
-            if let Ok(n) = v.parse::<usize>() {
+        if let Ok(v) = env::var("NUCLEUS_WAL_SEGMENT_SIZE_MB")
+            && let Ok(n) = v.parse::<usize>() {
                 self.wal.segment_size_mb = n;
             }
-        }
-        if let Ok(v) = env::var("NUCLEUS_WAL_CHECKPOINT_INTERVAL_SECS") {
-            if let Ok(n) = v.parse::<u64>() {
+        if let Ok(v) = env::var("NUCLEUS_WAL_CHECKPOINT_INTERVAL_SECS")
+            && let Ok(n) = v.parse::<u64>() {
                 self.wal.checkpoint_interval_secs = n;
             }
-        }
-        if let Ok(v) = env::var("NUCLEUS_WAL_GROUP_COMMIT_INTERVAL_US") {
-            if let Ok(n) = v.parse::<u64>() {
+        if let Ok(v) = env::var("NUCLEUS_WAL_GROUP_COMMIT_INTERVAL_US")
+            && let Ok(n) = v.parse::<u64>() {
                 self.wal.group_commit_interval_us = n;
             }
-        }
         if let Ok(v) = env::var("NUCLEUS_WAL_SYNC_MODE") {
             self.wal.sync_mode = v;
         }
 
         // server (additional)
-        if let Ok(v) = env::var("NUCLEUS_SERVER_IDLE_TIMEOUT_SECS") {
-            if let Ok(n) = v.parse::<u64>() {
+        if let Ok(v) = env::var("NUCLEUS_SERVER_IDLE_TIMEOUT_SECS")
+            && let Ok(n) = v.parse::<u64>() {
                 self.server.idle_timeout_secs = n;
             }
-        }
 
         // logging (additional)
         if let Ok(v) = env::var("NUCLEUS_LOGGING_FORMAT") {

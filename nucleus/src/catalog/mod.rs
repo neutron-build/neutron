@@ -3,9 +3,25 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
 use crate::types::DataType;
+
+/// Referential action for FOREIGN KEY ON DELETE / ON UPDATE clauses.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FkAction {
+    /// NO ACTION (default) — same as Restrict for immediate checks.
+    NoAction,
+    /// RESTRICT — reject if children exist.
+    Restrict,
+    /// CASCADE — propagate delete/update to children.
+    Cascade,
+    /// SET NULL — set FK columns in children to NULL.
+    SetNull,
+    /// SET DEFAULT — set FK columns in children to their default value.
+    SetDefault,
+}
 
 /// Column definition in a table.
 #[derive(Debug, Clone)]
@@ -38,6 +54,8 @@ pub enum TableConstraint {
         columns: Vec<String>,
         ref_table: String,
         ref_columns: Vec<String>,
+        on_delete: FkAction,
+        on_update: FkAction,
     },
 }
 
@@ -129,12 +147,28 @@ pub struct IndexDef {
 
 /// The catalog holds all table definitions.
 /// Thread-safe via RwLock for concurrent access.
+///
+/// A sync read cache (`parking_lot::RwLock`) mirrors the authoritative async
+/// tables/indexes maps.  The cache is populated on first access and invalidated
+/// on any DDL mutation (create/drop/alter/rename).  This lets hot query paths
+/// (planner, executor fast-aggregate) read metadata without acquiring the
+/// async `tokio::sync::RwLock`, eliminating per-query async lock overhead.
 #[derive(Debug)]
 pub struct Catalog {
     tables: RwLock<HashMap<String, Arc<TableDef>>>,
     indexes: RwLock<HashMap<String, Arc<IndexDef>>>,
     /// User-defined enum types: type_name → ordered list of label strings.
     enum_types: RwLock<HashMap<String, Vec<String>>>,
+
+    // ── Sync read cache (session-level metadata cache) ──────────────────────
+    //
+    // Epoch counter incremented on every DDL mutation. Consumers snapshot the
+    // epoch and can cheaply detect staleness.
+    catalog_epoch: AtomicU64,
+    /// Sync cache: table_name → Arc<TableDef>.
+    table_cache: parking_lot::RwLock<HashMap<String, Arc<TableDef>>>,
+    /// Sync cache: table_name → Vec<Arc<IndexDef>>.
+    index_cache: parking_lot::RwLock<HashMap<String, Vec<Arc<IndexDef>>>>,
 }
 
 impl Default for Catalog {
@@ -149,6 +183,9 @@ impl Catalog {
             tables: RwLock::new(HashMap::new()),
             indexes: RwLock::new(HashMap::new()),
             enum_types: RwLock::new(HashMap::new()),
+            catalog_epoch: AtomicU64::new(0),
+            table_cache: parking_lot::RwLock::new(HashMap::new()),
+            index_cache: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -159,8 +196,34 @@ impl Catalog {
         if tables.contains_key(&def.name) {
             return Err(CatalogError::TableExists(def.name));
         }
-        tables.insert(def.name.clone(), Arc::new(def));
+        let name = def.name.clone();
+        let arc_def = Arc::new(def);
+        tables.insert(name.clone(), Arc::clone(&arc_def));
+        // Populate sync cache eagerly and bump epoch.
+        self.table_cache.write().insert(name, arc_def);
+        self.catalog_epoch.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Synchronous table registration — for WAL recovery outside of async contexts.
+    /// Uses `try_write()` which succeeds when no other task holds the lock (guaranteed
+    /// during startup recovery).
+    pub fn create_table_sync(&self, def: TableDef) -> Result<(), CatalogError> {
+        // During recovery the catalog is exclusively ours, so try_write always succeeds.
+        match self.tables.try_write() {
+            Ok(mut tables) => {
+                if tables.contains_key(&def.name) {
+                    return Err(CatalogError::TableExists(def.name));
+                }
+                let name = def.name.clone();
+                let arc_def = Arc::new(def);
+                tables.insert(name.clone(), Arc::clone(&arc_def));
+                self.table_cache.write().insert(name, arc_def);
+                self.catalog_epoch.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(_) => Err(CatalogError::TableNotFound("catalog lock contention during recovery".into())),
+        }
     }
 
     pub async fn get_table(&self, name: &str) -> Option<Arc<TableDef>> {
@@ -176,6 +239,10 @@ impl Catalog {
         // Also drop every index that belonged to this table.
         let mut indexes = self.indexes.write().await;
         indexes.retain(|_, idx| idx.table_name != name);
+        // Invalidate sync caches.
+        self.table_cache.write().remove(name);
+        self.index_cache.write().remove(name);
+        self.catalog_epoch.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -190,7 +257,12 @@ impl Catalog {
         if !tables.contains_key(&def.name) {
             return Err(CatalogError::TableNotFound(def.name));
         }
-        tables.insert(def.name.clone(), Arc::new(def));
+        let name = def.name.clone();
+        let arc_def = Arc::new(def);
+        tables.insert(name.clone(), Arc::clone(&arc_def));
+        // Update sync cache eagerly.
+        self.table_cache.write().insert(name, arc_def);
+        self.catalog_epoch.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -207,20 +279,32 @@ impl Catalog {
         }
         let mut new_def = (*def).clone();
         new_def.name = new_name.to_string();
-        tables.insert(new_name.to_string(), Arc::new(new_def));
+        let arc_new = Arc::new(new_def);
+        tables.insert(new_name.to_string(), Arc::clone(&arc_new));
 
         // Update index references
         let mut indexes = self.indexes.write().await;
         let keys: Vec<String> = indexes.keys().cloned().collect();
         for key in keys {
-            if let Some(idx) = indexes.get(&key) {
-                if idx.table_name == old_name {
+            if let Some(idx) = indexes.get(&key)
+                && idx.table_name == old_name {
                     let mut new_idx = (**idx).clone();
                     new_idx.table_name = new_name.to_string();
                     indexes.insert(key, Arc::new(new_idx));
                 }
-            }
         }
+        // Invalidate sync caches for old and new names.
+        {
+            let mut tc = self.table_cache.write();
+            tc.remove(old_name);
+            tc.insert(new_name.to_string(), arc_new);
+        }
+        {
+            let mut ic = self.index_cache.write();
+            ic.remove(old_name);
+            ic.remove(new_name);
+        }
+        self.catalog_epoch.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -228,6 +312,60 @@ impl Catalog {
     pub async fn list_tables(&self) -> Vec<Arc<TableDef>> {
         let tables = self.tables.read().await;
         tables.values().cloned().collect()
+    }
+
+    // ── Sync metadata cache (session-level fast path) ──────────────────────
+    //
+    // These methods read from the `parking_lot::RwLock`-backed sync cache,
+    // avoiding the async `tokio::sync::RwLock` overhead that dominates
+    // repeated queries against the same table.  The cache is populated
+    // lazily on first access and eagerly kept in sync by mutation methods.
+
+    /// Return the current DDL epoch. Consumers can snapshot this value and
+    /// compare later to detect whether any DDL has occurred.
+    pub fn epoch(&self) -> u64 {
+        self.catalog_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Sync table lookup — checks the sync cache first, falls back to a
+    /// non-blocking `try_read()` on the authoritative map. Returns `None`
+    /// if the table doesn't exist or the async lock is held by a writer.
+    pub fn get_table_cached(&self, name: &str) -> Option<Arc<TableDef>> {
+        // Fast path: check sync cache.
+        {
+            let cache = self.table_cache.read();
+            if let Some(def) = cache.get(name) {
+                return Some(Arc::clone(def));
+            }
+        }
+        // Slow path: try to read from the authoritative map without blocking.
+        let guard = self.tables.try_read().ok()?;
+        let def = guard.get(name)?.clone();
+        // Populate cache for next time.
+        self.table_cache.write().insert(name.to_string(), Arc::clone(&def));
+        Some(def)
+    }
+
+    /// Sync index lookup for a table — checks the sync cache first, falls
+    /// back to a non-blocking `try_read()` on the authoritative map.
+    pub fn get_indexes_cached(&self, table_name: &str) -> Option<Vec<Arc<IndexDef>>> {
+        // Fast path: check sync cache.
+        {
+            let cache = self.index_cache.read();
+            if let Some(idxs) = cache.get(table_name) {
+                return Some(idxs.clone());
+            }
+        }
+        // Slow path: try to read from the authoritative map without blocking.
+        let guard = self.indexes.try_read().ok()?;
+        let result: Vec<Arc<IndexDef>> = guard
+            .values()
+            .filter(|idx| idx.table_name == table_name)
+            .cloned()
+            .collect();
+        // Populate cache for next time.
+        self.index_cache.write().insert(table_name.to_string(), result.clone());
+        Some(result)
     }
 
     // ── Index operations ────────────────────────────────────────────
@@ -245,19 +383,29 @@ impl Catalog {
             }
         }
 
+        let table_name = def.table_name.clone();
         let mut indexes = self.indexes.write().await;
         if indexes.contains_key(&def.name) {
             return Err(CatalogError::IndexExists(def.name));
         }
         indexes.insert(def.name.clone(), Arc::new(def));
+        // Invalidate index cache for this table (will be repopulated on next read).
+        self.index_cache.write().remove(&table_name);
+        self.catalog_epoch.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     /// Remove an index by name.
     pub async fn drop_index(&self, name: &str) -> Result<(), CatalogError> {
         let mut indexes = self.indexes.write().await;
-        if indexes.remove(name).is_none() {
-            return Err(CatalogError::IndexNotFound(name.to_string()));
+        let removed = indexes.remove(name);
+        match removed {
+            None => return Err(CatalogError::IndexNotFound(name.to_string())),
+            Some(idx_def) => {
+                // Invalidate index cache for the owning table.
+                self.index_cache.write().remove(&idx_def.table_name);
+                self.catalog_epoch.fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(())
     }
