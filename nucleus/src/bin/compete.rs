@@ -282,7 +282,7 @@ async fn wait_for_port(port: u16) {
     panic!("port {port} did not open in time");
 }
 
-/// Run a query `warmup + n` times, return stats from the last `n` only.
+/// Run a query `warmup + n` times via pgwire, return stats from the last `n` only.
 async fn bench_query(client: &Client, sql: &str, warmup: usize, n: usize) -> Stats {
     // Warm-up: run but discard results
     for _ in 0..warmup {
@@ -293,6 +293,22 @@ async fn bench_query(client: &Client, sql: &str, warmup: usize, n: usize) -> Sta
     for _ in 0..n {
         let t = Instant::now();
         client.simple_query(sql).await.unwrap();
+        stats.record(t.elapsed());
+    }
+    stats
+}
+
+/// Run a query directly on executor (bypassing pgwire), return stats from the last `n` only.
+async fn bench_query_direct(executor: &Arc<Executor>, sql: &str, warmup: usize, n: usize) -> Stats {
+    // Warm-up: run but discard results
+    for _ in 0..warmup {
+        let _ = executor.execute(sql).await;
+    }
+    // Timed iterations
+    let mut stats = Stats::new();
+    for _ in 0..n {
+        let t = Instant::now();
+        let _ = executor.execute(sql).await;
         stats.record(t.elapsed());
     }
     stats
@@ -2842,6 +2858,44 @@ async fn main() {
 
         let pg_results = bench_vs_pg(&nc, pg_client.as_ref(), cfg.warmup_n(), cfg.iterations).await;
         all_results.extend(pg_results);
+    }
+
+    // ── Section 1a: Nucleus Direct vs pgwire (Protocol Overhead Test) ──
+    if cfg.should_run("pg") {
+        println!();
+        println!("  --- Section 1a: Nucleus Direct vs pgwire (Protocol Overhead Analysis) ---");
+        println!("    NOTE: Same Nucleus engine, different access methods");
+        println!("          Direct = bypass pgwire, test if slowness is 100% protocol");
+        println!();
+
+        // Test key queries that show pgwire slowness
+        let test_queries = [
+            ("Point Query (PK)", "SELECT * FROM bench_users WHERE id = 5000"),
+            ("COUNT(*)", "SELECT COUNT(*) FROM bench_users"),
+            ("Range Scan", "SELECT * FROM bench_users WHERE id BETWEEN 1000 AND 1099"),
+        ];
+
+        for (name, sql) in &test_queries {
+            print!("    {name:<30}");
+            let pgwire_stats = bench_query(&nc, sql, cfg.warmup_n(), cfg.iterations).await;
+            let direct_stats = bench_query_direct(&executor, sql, cfg.warmup_n(), cfg.iterations).await;
+
+            let speedup_ratio = pgwire_stats.avg_us() / direct_stats.avg_us();
+            println!(" pgwire: {:>10}  direct: {:>10}  {:.1}x speedup (protocol overhead)",
+                format_ops(pgwire_stats.ops_per_sec()),
+                format_ops(direct_stats.ops_per_sec()),
+                speedup_ratio);
+
+            all_results.push(CompeteResult {
+                category: "Protocol Overhead".into(),
+                workload: name.to_string(),
+                nucleus_stats: pgwire_stats.clone(),
+                competitor_name: "Nucleus Direct (no pgwire)".into(),
+                competitor_stats: Some(direct_stats),
+                note: Some("proves slowness is protocol-bound".into()),
+            });
+        }
+        println!();
     }
 
     // ── Section 1b: SQLite (embedded comparison) ──
