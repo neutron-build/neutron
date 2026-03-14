@@ -59,6 +59,11 @@ func TestFeaturesNucleus(t *testing.T) {
 		HasFTS:      true,
 		HasGeo:      true,
 		HasBlob:     true,
+		HasStreams:  true,
+		HasColumnar: true,
+		HasDatalog:  true,
+		HasCDC:      true,
+		HasPubSub:   true,
 		Version:     "Nucleus 0.1.0",
 	}
 	if !f.IsNucleus {
@@ -66,6 +71,21 @@ func TestFeaturesNucleus(t *testing.T) {
 	}
 	if !f.HasKV {
 		t.Error("expected HasKV true")
+	}
+	if !f.HasStreams {
+		t.Error("expected HasStreams true")
+	}
+	if !f.HasColumnar {
+		t.Error("expected HasColumnar true")
+	}
+	if !f.HasDatalog {
+		t.Error("expected HasDatalog true")
+	}
+	if !f.HasCDC {
+		t.Error("expected HasCDC true")
+	}
+	if !f.HasPubSub {
+		t.Error("expected HasPubSub true")
 	}
 	if f.Version != "Nucleus 0.1.0" {
 		t.Errorf("Version = %q", f.Version)

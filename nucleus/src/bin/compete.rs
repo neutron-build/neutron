@@ -31,6 +31,9 @@ use mongodb::bson::{doc, Document};
 #[cfg(feature = "mongodb")]
 use mongodb::IndexModel;
 
+#[cfg(feature = "clickhouse")]
+use clickhouse;
+
 #[cfg(feature = "bench-tools")]
 use mysql_async;
 
@@ -68,6 +71,8 @@ struct Cfg {
     tidb_password: String,
     mongodb_uri: String,
     mongodb_database: String,
+    clickhouse_host: String,
+    clickhouse_port: u16,
     iterations: usize,
     warmup_pct: usize,
     rows: usize,
@@ -97,6 +102,8 @@ impl Cfg {
             tidb_password: "".into(),
             mongodb_uri: "mongodb://127.0.0.1:27017".into(),
             mongodb_database: "nucleus_bench".into(),
+            clickhouse_host: "127.0.0.1".into(),
+            clickhouse_port: 9000,
             iterations: 1000,
             warmup_pct: 20,
             rows: 50_000,
@@ -124,6 +131,8 @@ impl Cfg {
                 "--tidb-password" => { i += 1; cfg.tidb_password = args[i].clone(); }
                 "--mongodb-uri" => { i += 1; cfg.mongodb_uri = args[i].clone(); }
                 "--mongodb-database" => { i += 1; cfg.mongodb_database = args[i].clone(); }
+                "--clickhouse-host" => { i += 1; cfg.clickhouse_host = args[i].clone(); }
+                "--clickhouse-port" => { i += 1; cfg.clickhouse_port = args[i].parse().unwrap(); }
                 "--iterations" => { i += 1; cfg.iterations = args[i].parse().unwrap(); }
                 "--warmup" => { i += 1; cfg.warmup_pct = args[i].parse().unwrap(); }
                 "--rows" => { i += 1; cfg.rows = args[i].parse().unwrap(); }
@@ -149,7 +158,9 @@ impl Cfg {
                     println!("  --tidb-password S         TiDB password (default: empty)");
                     println!("  --mongodb-uri S           MongoDB URI (default: mongodb://127.0.0.1:27017)");
                     println!("  --mongodb-database S      MongoDB database (default: nucleus_bench)");
-                    println!("  --skip LIST               Comma-separated: pg,redis,sqlite,surreal,cockroach,tidb,mongodb,mixed");
+                    println!("  --clickhouse-host S       ClickHouse host (default: 127.0.0.1)");
+                    println!("  --clickhouse-port N       ClickHouse port (default: 9000)");
+                    println!("  --skip LIST               Comma-separated: pg,redis,sqlite,surreal,cockroach,tidb,mongodb,clickhouse,mixed");
                     std::process::exit(0);
                 }
                 _ => {}
@@ -2761,6 +2772,158 @@ async fn bench_vs_tidb(
     results
 }
 
+// ─── Section: ClickHouse SQL Benchmarks (analytical column store) ──────────────
+
+#[cfg(feature = "clickhouse")]
+/// Setup schema and data for ClickHouse benchmarks
+async fn setup_clickhouse_schema(client: &clickhouse::Client) -> Result<(), Box<dyn std::error::Error>> {
+    // Drop existing tables
+    client.query("DROP TABLE IF EXISTS bench_users").execute().await?;
+    client.query("DROP TABLE IF EXISTS bench_orders").execute().await?;
+
+    // Create bench_users table (MergeTree engine for fast analytical queries)
+    client.query(
+        "CREATE TABLE bench_users (
+            id      UInt32,
+            name    String,
+            email   String,
+            age     UInt8,
+            status  String
+        ) ENGINE = MergeTree() ORDER BY id"
+    ).execute().await?;
+
+    // Create bench_orders table
+    client.query(
+        "CREATE TABLE bench_orders (
+            id          UInt32,
+            user_id     UInt32,
+            amount      Decimal64(2),
+            created_at  DateTime DEFAULT now(),
+            status      String
+        ) ENGINE = MergeTree() ORDER BY id"
+    ).execute().await?;
+
+    // Bulk insert users (50K)
+    let rows = 50_000;
+    let mut user_rows = Vec::new();
+    for i in 1..=rows {
+        let age = 20 + ((i % 50) as u8);
+        let status = if i % 3 == 0 { "active" } else { "inactive" };
+        user_rows.push((
+            i as u32,
+            format!("user_{}", i),
+            format!("user{}@test.com", i),
+            age,
+            status.to_string(),
+        ));
+    }
+
+    // Insert users in batches
+    let mut insert = client.insert("bench_users")?;
+    for (id, name, email, age, status) in user_rows {
+        insert.write(&(id, &name, &email, age, &status)).await?;
+    }
+    insert.end().await?;
+
+    // Bulk insert orders (250K)
+    let order_count = 250_000;
+    let chunk_size = 5000;
+    let mut order_rows = Vec::new();
+    for i in 1..=order_count {
+        let user_id = ((i % rows) + 1) as u32;
+        let amount = 10.0 + ((i % 500) as f64);
+        let status = if i % 3 == 0 { "completed" } else if i % 3 == 1 { "pending" } else { "cancelled" };
+        order_rows.push((i as u32, user_id, amount, status.to_string()));
+
+        if order_rows.len() >= chunk_size {
+            let mut insert = client.insert("bench_orders")?;
+            for (id, user_id, amount, status) in order_rows.drain(..) {
+                insert.write(&(id, user_id, amount, &status)).await?;
+            }
+            insert.end().await?;
+        }
+    }
+
+    // Insert any remaining orders
+    if !order_rows.is_empty() {
+        let mut insert = client.insert("bench_orders")?;
+        for (id, user_id, amount, status) in order_rows {
+            insert.write(&(id, user_id, amount, &status)).await?;
+        }
+        insert.end().await?;
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "clickhouse")]
+/// Benchmark a single ClickHouse query
+async fn bench_clickhouse_query(client: &clickhouse::Client, sql: &str, warmup: usize, n: usize) -> Result<Stats, Box<dyn std::error::Error>> {
+    // Warm-up: run but discard results
+    for _ in 0..warmup {
+        let _ = client.query(sql).fetch_all::<(String,)>().await?;
+    }
+
+    let mut stats = Stats::new();
+    for _ in 0..n {
+        let t = Instant::now();
+        let _ = client.query(sql).fetch_all::<(String,)>().await?;
+        stats.record(t.elapsed());
+    }
+
+    Ok(stats)
+}
+
+#[cfg(feature = "clickhouse")]
+/// Benchmark Nucleus vs ClickHouse
+async fn bench_vs_clickhouse(
+    nc: &Client,
+    clickhouse_client: &clickhouse::Client,
+    warmup: usize,
+    n: usize,
+) -> Vec<CompeteResult> {
+    let mut results = Vec::new();
+
+    let workloads = [
+        ("COUNT(*)", "SELECT COUNT(*) FROM bench_users"),
+        ("Point Query (PK)", "SELECT * FROM bench_users WHERE id = 5000"),
+        ("Range Scan", "SELECT * FROM bench_users WHERE id BETWEEN 1000 AND 1099"),
+        ("GROUP BY", "SELECT status, COUNT(*) FROM bench_users GROUP BY status"),
+        ("2-Table JOIN", "SELECT u.id, u.name, o.amount FROM bench_users u JOIN bench_orders o ON u.id = o.user_id LIMIT 100"),
+        ("SUM with WHERE", "SELECT SUM(amount) FROM bench_orders WHERE status = 'completed'"),
+    ];
+
+    for (name, sql) in &workloads {
+        print!("    {name:<30}");
+
+        let ns = bench_query(nc, sql, warmup, n).await;
+        let ch = match bench_clickhouse_query(clickhouse_client, sql, warmup, n).await {
+            Ok(stats) => stats,
+            Err(e) => {
+                println!(" ClickHouse error: {e}");
+                continue;
+            }
+        };
+
+        let speedup = ns.avg_us() / ch.avg_us();
+        println!(" Nucleus: {:>10}  ClickHouse: {:>10}  {:.1}x",
+            format_ops(ns.ops_per_sec()),
+            format_ops(ch.ops_per_sec()),
+            speedup);
+
+        results.push(CompeteResult {
+            category: "SQL (ClickHouse)".into(),
+            workload: name.to_string(),
+            nucleus_stats: ns,
+            competitor_name: "ClickHouse (column store)".into(),
+            competitor_stats: Some(ch),
+            note: Some("analytical queries".into()),
+        });
+    }
+
+    results
+}
+
 // ─── Main ──────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -3082,6 +3245,39 @@ async fn main() {
             }
             Err(e) => {
                 println!("    SurrealDB setup error: {e}");
+            }
+        }
+    }
+
+    // ── Section 1g: ClickHouse (column store analytical) ──
+    #[cfg(feature = "clickhouse")]
+    if cfg.should_run("clickhouse") {
+        println!();
+        println!("  --- Section 1g: SQL vs ClickHouse (column store for analytics) ---");
+        println!("    NOTE: ClickHouse is specialized for analytical OLAP queries");
+        println!("          Comparison: pgwire row-based vs ClickHouse columnar store");
+        println!();
+
+        let clickhouse_url = format!("http://{}:{}", cfg.clickhouse_host, cfg.clickhouse_port);
+        match clickhouse::Client::default().with_url(&clickhouse_url).with_database("default").create() {
+            Ok(ch_client) => {
+                let t = Instant::now();
+                match setup_clickhouse_schema(&ch_client).await {
+                    Ok(_) => {
+                        println!("    ClickHouse data load: {}ms", t.elapsed().as_millis());
+                        println!();
+
+                        let clickhouse_results = bench_vs_clickhouse(&nc, &ch_client, cfg.warmup_n(), cfg.iterations).await;
+                        all_results.extend(clickhouse_results);
+                    }
+                    Err(e) => {
+                        println!("    ClickHouse setup error: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                println!("    ClickHouse: UNAVAILABLE ({e})");
+                println!("      URL: {}", clickhouse_url);
             }
         }
     }

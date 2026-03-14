@@ -22,6 +22,11 @@ def nucleus_features():
         has_fts=True,
         has_geo=True,
         has_blob=True,
+        has_streams=True,
+        has_columnar=True,
+        has_datalog=True,
+        has_cdc=True,
+        has_pubsub=True,
     )
 
 

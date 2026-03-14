@@ -24,6 +24,11 @@ class Features:
     has_fts: bool = False
     has_geo: bool = False
     has_blob: bool = False
+    has_streams: bool = False
+    has_columnar: bool = False
+    has_datalog: bool = False
+    has_cdc: bool = False
+    has_pubsub: bool = False
 
 
 class NucleusClient:
@@ -199,4 +204,9 @@ async def _detect_features(pool: asyncpg.Pool) -> Features:
         has_fts=is_nucleus,
         has_geo=is_nucleus,
         has_blob=is_nucleus,
+        has_streams=is_nucleus,
+        has_columnar=is_nucleus,
+        has_datalog=is_nucleus,
+        has_cdc=is_nucleus,
+        has_pubsub=is_nucleus,
     )
