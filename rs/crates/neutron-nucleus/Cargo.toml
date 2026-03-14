@@ -12,6 +12,9 @@ tokio-postgres = { workspace = true }
 tokio          = { workspace = true }
 tracing        = { workspace = true }
 http           = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+regex          = "1"
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -11,9 +11,19 @@
     "./window": "./src/window.ts",
     "./platform": "./src/platform.ts"
   },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
   "license": "MIT",
   "peerDependencies": {
-    "preact": "^10.0.0",
-    "@preact/signals": "^1.0.0"
+    "@preact/signals": "^1.0.0",
+    "preact": "^10.0.0"
+  },
+  "devDependencies": {
+    "@preact/signals": "^2.8.2",
+    "jsdom": "^28.1.0",
+    "preact": "^10.29.0",
+    "vitest": "^4.1.0"
   }
 }

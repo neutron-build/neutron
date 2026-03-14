@@ -16,7 +16,9 @@ Each subdirectory is an independent project with its own language, toolchain, an
 | `python/` | Python | `pytest` |
 | `native/` | TypeScript | `pnpm test` |
 | `desktop/` | Rust + TypeScript | `cargo tauri dev` |
-| `mobile-preview/` | Go | `go test ./...` |
+| `elixir/` | Elixir | `mix test` |
+| `julia/` | Julia | `julia --project=. test/runtests.jl` |
+| `modelica/` | Python | `pytest` |
 
 ## Getting Started
 

@@ -92,8 +92,10 @@ mobile-preview/
 zig/.zig-cache/
 zig/zig-out/
 
-# Mojo validation reports
+# Mojo validation reports, research, and internal specs
 mojo/reports/
+mojo/study/
+mojo/specs/
 
 # Turbo internal
 **/.turbo-ls-normalized.json

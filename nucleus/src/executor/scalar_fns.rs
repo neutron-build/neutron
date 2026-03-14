@@ -12,6 +12,7 @@ use crate::timeseries;
 use crate::graph::PropValue as GraphPropValue;
 use crate::graph::cypher::parse_cypher;
 use crate::graph::cypher_executor::execute_cypher;
+#[cfg(feature = "server")]
 use crate::reactive::ChangeType;
 use super::types::ColMeta;
 use super::{ExecError, ExecResult, Executor};
@@ -3671,6 +3672,7 @@ impl Executor {
             }
 
             // ── Reactive / CDC functions ─────────────────────────────
+            #[cfg(feature = "server")]
             "SUBSCRIBE" => {
                 // subscribe(query_text, table1 [, table2, ...]) → subscription_id
                 let args = self.extract_fn_args(func, row, col_meta)?;
@@ -3687,6 +3689,7 @@ impl Executor {
                 let (sub_id, _rx) = self.subscription_manager.write().subscribe(&query_text, tables);
                 Ok(Value::Int64(sub_id as i64))
             }
+            #[cfg(feature = "server")]
             "UNSUBSCRIBE" => {
                 // unsubscribe(subscription_id) → true/false
                 let args = self.extract_fn_args(func, row, col_meta)?;
@@ -3696,9 +3699,11 @@ impl Executor {
                 let id = val_to_u64(&args[0], "UNSUBSCRIBE")?;
                 Ok(Value::Bool(self.subscription_manager.write().unsubscribe(id)))
             }
+            #[cfg(feature = "server")]
             "SUBSCRIPTION_COUNT" => {
                 Ok(Value::Int64(self.subscription_manager.read().active_count() as i64))
             }
+            #[cfg(feature = "server")]
             "CDC_READ" => {
                 // cdc_read(after_sequence, limit) → JSON array of log entries
                 let args = self.extract_fn_args(func, row, col_meta)?;
@@ -3725,6 +3730,7 @@ impl Executor {
                     .join(",");
                 Ok(Value::Text(format!("[{json}]")))
             }
+            #[cfg(feature = "server")]
             "CDC_TABLE_READ" => {
                 // cdc_table_read(table, after_sequence, limit) → JSON array of log entries for a table
                 let args = self.extract_fn_args(func, row, col_meta)?;
@@ -3755,6 +3761,7 @@ impl Executor {
                     .join(",");
                 Ok(Value::Text(format!("[{json}]")))
             }
+            #[cfg(feature = "server")]
             "CDC_COUNT" => {
                 Ok(Value::Int64(self.cdc_log.read().len() as i64))
             }

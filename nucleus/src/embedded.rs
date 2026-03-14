@@ -13,13 +13,16 @@
 //! }
 //! ```
 
+#[cfg(feature = "server")]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::catalog::Catalog;
 use crate::executor::{ExecError, ExecResult, Executor};
 use crate::executor::param_subst;
-use crate::storage::{DiskEngine, MemoryEngine, MvccStorageAdapter, StorageEngine};
+#[cfg(feature = "server")]
+use crate::storage::DiskEngine;
+use crate::storage::{MemoryEngine, MvccStorageAdapter, StorageEngine};
 use crate::types::{Row, Value};
 use sqlparser::ast::Statement;
 
@@ -43,8 +46,10 @@ pub enum StorageMode {
     /// MVCC in-memory storage with snapshot isolation.
     Mvcc,
     /// Durable MVCC: snapshot isolation + WAL for crash recovery.
+    #[cfg(feature = "server")]
     DurableMvcc(PathBuf),
     /// Disk-backed page storage with WAL.
+    #[cfg(feature = "server")]
     Disk(PathBuf),
 }
 
@@ -78,12 +83,14 @@ impl DatabaseBuilder {
     }
 
     /// Use durable MVCC storage (snapshot isolation + WAL) at the given path.
+    #[cfg(feature = "server")]
     pub fn durable_mvcc<P: Into<PathBuf>>(mut self, path: P) -> Self {
         self.mode = StorageMode::DurableMvcc(path.into());
         self
     }
 
     /// Use disk-backed storage at the given path.
+    #[cfg(feature = "server")]
     pub fn disk<P: Into<PathBuf>>(mut self, path: P) -> Self {
         self.mode = StorageMode::Disk(path.into());
         self
@@ -96,12 +103,14 @@ impl DatabaseBuilder {
         let storage: Arc<dyn StorageEngine> = match self.mode {
             StorageMode::Memory => Arc::new(MemoryEngine::new()),
             StorageMode::Mvcc => Arc::new(MvccStorageAdapter::new()),
+            #[cfg(feature = "server")]
             StorageMode::DurableMvcc(path) => {
                 let (adapter, schemas) = MvccStorageAdapter::with_wal(&path)
                     .map_err(|e| DatabaseError::Storage(e.to_string()))?;
                 recovered_schemas = schemas;
                 Arc::new(adapter)
             }
+            #[cfg(feature = "server")]
             StorageMode::Disk(path) => Arc::new(
                 DiskEngine::open(&path, catalog.clone())
                     .map_err(|e| DatabaseError::Storage(e.to_string()))?,
@@ -147,6 +156,7 @@ pub struct Database {
 
 impl Database {
     /// Open a database file. Creates the file if it doesn't exist.
+    #[cfg(feature = "server")]
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, DatabaseError> {
         DatabaseBuilder::new().disk(path.as_ref()).build()
     }
@@ -163,6 +173,7 @@ impl Database {
 
     /// Open a durable MVCC database at the given path (snapshot isolation + WAL).
     /// Creates the directory if it doesn't exist. Replays WAL on open.
+    #[cfg(feature = "server")]
     pub fn durable_mvcc<P: AsRef<Path>>(path: P) -> Result<Self, DatabaseError> {
         DatabaseBuilder::new().durable_mvcc(path.as_ref()).build()
     }

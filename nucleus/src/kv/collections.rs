@@ -13,6 +13,7 @@ use parking_lot::RwLock;
 use crate::types::Value;
 
 use super::{HyperLogLog, SortedSet, SortedSetEntry};
+#[cfg(feature = "server")]
 use super::collections_wal::CollectionWal;
 use super::streams::Stream;
 
@@ -98,6 +99,7 @@ impl std::fmt::Debug for CollectionShard {
 /// exists but holds a different collection type.
 pub struct ShardedCollections {
     shards: Vec<CollectionShard>,
+    #[cfg(feature = "server")]
     wal: Option<Arc<CollectionWal>>,
 }
 
@@ -105,7 +107,12 @@ impl std::fmt::Debug for ShardedCollections {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShardedCollections")
             .field("shards", &self.shards)
-            .field("wal_enabled", &self.wal.is_some())
+            .field("wal_enabled", &{
+                #[cfg(feature = "server")]
+                { self.wal.is_some() }
+                #[cfg(not(feature = "server"))]
+                { false }
+            })
             .finish()
     }
 }
@@ -123,10 +130,15 @@ impl ShardedCollections {
         for _ in 0..NUM_SHARDS {
             shards.push(CollectionShard::new());
         }
-        Self { shards, wal: None }
+        Self {
+            shards,
+            #[cfg(feature = "server")]
+            wal: None,
+        }
     }
 
     /// Attach a WAL to this collection store (called after WAL replay).
+    #[cfg(feature = "server")]
     pub fn set_wal(&mut self, wal: Arc<CollectionWal>) {
         self.wal = Some(wal);
     }
@@ -150,6 +162,7 @@ impl ShardedCollections {
     /// LPUSH -- push a value to the front of the list at `key`.
     /// Creates the list if it does not exist. Returns the new length.
     pub fn lpush(&self, key: &str, value: Value) -> Result<usize, WrongTypeError> {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_lpush(key, &value) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -174,6 +187,7 @@ impl ShardedCollections {
     /// RPUSH -- push a value to the back of the list at `key`.
     /// Creates the list if it does not exist. Returns the new length.
     pub fn rpush(&self, key: &str, value: Value) -> Result<usize, WrongTypeError> {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_rpush(key, &value) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -197,6 +211,7 @@ impl ShardedCollections {
 
     /// LPOP -- remove and return the first element of the list at `key`.
     pub fn lpop(&self, key: &str) -> Result<Option<Value>, WrongTypeError> {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_lpop(key) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -221,6 +236,7 @@ impl ShardedCollections {
 
     /// RPOP -- remove and return the last element of the list at `key`.
     pub fn rpop(&self, key: &str) -> Result<Option<Value>, WrongTypeError> {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_rpop(key) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -315,6 +331,7 @@ impl ShardedCollections {
         field: &str,
         value: Value,
     ) -> Result<bool, WrongTypeError> {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_hset(key, field, &value) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -353,6 +370,7 @@ impl ShardedCollections {
 
     /// HDEL -- delete a field from the hash at `key`. Returns true if it existed.
     pub fn hdel(&self, key: &str, field: &str) -> Result<bool, WrongTypeError> {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_hdel(key, field) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -467,6 +485,7 @@ impl ShardedCollections {
 
     /// SADD -- add a member to the set at `key`. Returns true if the member is new.
     pub fn sadd(&self, key: &str, member: &str) -> Result<bool, WrongTypeError> {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_sadd(key, member) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -487,6 +506,7 @@ impl ShardedCollections {
 
     /// SREM -- remove a member from the set at `key`. Returns true if it existed.
     pub fn srem(&self, key: &str, member: &str) -> Result<bool, WrongTypeError> {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_srem(key, member) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -687,6 +707,7 @@ impl ShardedCollections {
         member: &str,
         score: f64,
     ) -> Result<bool, WrongTypeError> {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_zadd(key, member, score) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -708,6 +729,7 @@ impl ShardedCollections {
     /// ZREM -- remove a member from the sorted set at `key`.
     /// Returns true if the member existed.
     pub fn zrem(&self, key: &str, member: &str) -> Result<bool, WrongTypeError> {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_zrem(key, member) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -814,6 +836,7 @@ impl ShardedCollections {
         member: &str,
         increment: f64,
     ) -> Result<f64, WrongTypeError> {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_zincrby(key, member, increment) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -872,6 +895,7 @@ impl ShardedCollections {
     /// PFADD -- add an element to the HyperLogLog at `key`.
     /// Returns true if the internal registers changed (cardinality may have changed).
     pub fn pfadd(&self, key: &str, element: &str) -> Result<bool, WrongTypeError> {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_pfadd(key, element) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -938,6 +962,7 @@ impl ShardedCollections {
         }
 
         // Log the merge to WAL with the register snapshots
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_pfmerge(dest_key, &source_registers) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -971,6 +996,7 @@ impl ShardedCollections {
 
     /// Remove a key regardless of its collection type. Returns true if the key existed.
     pub fn del(&self, key: &str) -> bool {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_del(key) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -1049,12 +1075,17 @@ impl ShardedCollections {
     }
 
     /// Write a WAL checkpoint. No-op if WAL is disabled.
+    #[cfg(feature = "server")]
     pub fn checkpoint(&self) -> std::io::Result<()> {
         let Some(ref wal) = self.wal else {
             return Ok(());
         };
         wal.checkpoint(self)
     }
+
+    /// No-op checkpoint when WAL is not available.
+    #[cfg(not(feature = "server"))]
+    pub fn checkpoint(&self) -> std::io::Result<()> { Ok(()) }
 
     // ====================================================================
     // Stream operations

@@ -8,6 +8,7 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 use std::sync::atomic::Ordering as AtomicOrdering;
 
+#[cfg(feature = "server")]
 use rayon::prelude::*;
 use sqlparser::ast::{self, Expr};
 
@@ -405,14 +406,19 @@ impl Executor {
         /// Minimum row count before switching to parallel evaluation.
         const PARALLEL_THRESHOLD: usize = 10_000;
 
-        if rows.len() < PARALLEL_THRESHOLD {
-            // Serial path for small result sets
-            rows.into_iter()
-                .filter(|row| self.eval_where(where_expr, row, col_meta).unwrap_or(false))
-                .collect()
+        if cfg!(feature = "server") && rows.len() >= PARALLEL_THRESHOLD {
+            // Parallel path using Rayon (server builds only)
+            #[cfg(feature = "server")]
+            {
+                rows.into_par_iter()
+                    .filter(|row| self.eval_where(where_expr, row, col_meta).unwrap_or(false))
+                    .collect()
+            }
+            #[cfg(not(feature = "server"))]
+            { unreachable!() }
         } else {
-            // Parallel path using Rayon
-            rows.into_par_iter()
+            // Serial path for small result sets or non-server (WASM) builds
+            rows.into_iter()
                 .filter(|row| self.eval_where(where_expr, row, col_meta).unwrap_or(false))
                 .collect()
         }

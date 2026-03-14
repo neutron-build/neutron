@@ -1,12 +1,17 @@
-//! compete — Head-to-head benchmark: Nucleus vs PostgreSQL, Redis, SurrealDB.
+//! compete — Fair head-to-head benchmark: Nucleus vs PostgreSQL and Redis.
 //!
-//! Connects to running external services and runs identical workloads against each,
-//! reporting speedup ratios. Services that aren't available are gracefully skipped.
+//! METHODOLOGY:
+//!   - SQL tests: identical pgwire TCP protocol, same queries, same schema, same indexes
+//!   - KV tests: Nucleus embedded API vs Redis network (labeled as architectural comparison)
+//!   - All measurements: warm-up phase (discarded), then N timed iterations
+//!   - Percentiles computed from timed iterations only
+//!   - Environment: localhost, single machine, both services running concurrently
+//!   - PG config: default installation (out-of-box comparison)
 //!
 //! Usage:
 //!   cargo run --release --features bench-tools --bin compete
 //!   cargo run --release --features bench-tools --bin compete -- --skip redis
-//!   cargo run --release --features bench-tools --bin compete -- --pg-port 5432
+//!   cargo run --release --features bench-tools --bin compete -- --iterations 2000 --rows 50000
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -32,8 +37,8 @@ struct Cfg {
     pg_password: String,
     redis_host: String,
     redis_port: u16,
-    surrealdb_url: Option<String>,
     iterations: usize,
+    warmup_pct: usize,
     rows: usize,
     skip: Vec<String>,
 }
@@ -46,12 +51,12 @@ impl Cfg {
             pg_host: "127.0.0.1".into(),
             pg_port: 5432,
             pg_user: "postgres".into(),
-            pg_password: "bench".into(),
+            pg_password: "".into(),
             redis_host: "127.0.0.1".into(),
             redis_port: 6379,
-            surrealdb_url: None,
-            iterations: 100,
-            rows: 10_000,
+            iterations: 1000,
+            warmup_pct: 20,
+            rows: 50_000,
             skip: Vec::new(),
         };
         let mut i = 1;
@@ -64,15 +69,31 @@ impl Cfg {
                 "--pg-password" => { i += 1; cfg.pg_password = args[i].clone(); }
                 "--redis-host" => { i += 1; cfg.redis_host = args[i].clone(); }
                 "--redis-port" => { i += 1; cfg.redis_port = args[i].parse().unwrap(); }
-                "--surrealdb-url" => { i += 1; cfg.surrealdb_url = Some(args[i].clone()); }
                 "--iterations" => { i += 1; cfg.iterations = args[i].parse().unwrap(); }
+                "--warmup" => { i += 1; cfg.warmup_pct = args[i].parse().unwrap(); }
                 "--rows" => { i += 1; cfg.rows = args[i].parse().unwrap(); }
                 "--skip" => { i += 1; cfg.skip = args[i].split(',').map(|s| s.trim().to_lowercase()).collect(); }
+                "--help" | "-h" => {
+                    println!("Usage: compete [OPTIONS]");
+                    println!("  --iterations N     Timed iterations per benchmark (default: 1000)");
+                    println!("  --warmup N         Warm-up iterations as %% of iterations (default: 20)");
+                    println!("  --rows N           Dataset size (default: 50000)");
+                    println!("  --pg-port N        PostgreSQL port (default: 5432)");
+                    println!("  --pg-user S        PostgreSQL user (default: postgres)");
+                    println!("  --pg-password S    PostgreSQL password (default: empty)");
+                    println!("  --redis-port N     Redis port (default: 6379)");
+                    println!("  --skip LIST        Comma-separated: pg,redis,mixed");
+                    std::process::exit(0);
+                }
                 _ => {}
             }
             i += 1;
         }
         cfg
+    }
+
+    fn warmup_n(&self) -> usize {
+        self.iterations * self.warmup_pct / 100
     }
 
     fn should_run(&self, target: &str) -> bool {
@@ -91,7 +112,6 @@ async fn start_nucleus_server(port: u16) -> Arc<Executor> {
 
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr).await.expect("bind nucleus port");
-    println!("  Nucleus wire server: {addr}");
 
     tokio::spawn(async move {
         loop {
@@ -128,17 +148,19 @@ impl Stats {
         s
     }
 
+    fn median_us(&self) -> f64 {
+        let s = self.sorted();
+        if s.is_empty() { return 0.0; }
+        s[s.len() / 2].as_nanos() as f64 / 1_000.0
+    }
+
     fn avg_us(&self) -> f64 {
         if self.samples.is_empty() { return 0.0; }
         let total: Duration = self.samples.iter().sum();
         total.as_nanos() as f64 / self.samples.len() as f64 / 1_000.0
     }
 
-    fn p50_us(&self) -> f64 {
-        let s = self.sorted();
-        if s.is_empty() { return 0.0; }
-        s[s.len() / 2].as_nanos() as f64 / 1_000.0
-    }
+    fn p50_us(&self) -> f64 { self.median_us() }
 
     fn p95_us(&self) -> f64 {
         let s = self.sorted();
@@ -167,6 +189,7 @@ struct CompeteResult {
     nucleus_stats: Stats,
     competitor_name: String,
     competitor_stats: Option<Stats>,
+    note: Option<String>,
 }
 
 impl CompeteResult {
@@ -192,7 +215,13 @@ async fn wait_for_port(port: u16) {
     panic!("port {port} did not open in time");
 }
 
-async fn bench_query(client: &Client, sql: &str, n: usize) -> Stats {
+/// Run a query `warmup + n` times, return stats from the last `n` only.
+async fn bench_query(client: &Client, sql: &str, warmup: usize, n: usize) -> Stats {
+    // Warm-up: run but discard results
+    for _ in 0..warmup {
+        client.simple_query(sql).await.unwrap();
+    }
+    // Timed iterations
     let mut stats = Stats::new();
     for _ in 0..n {
         let t = Instant::now();
@@ -222,7 +251,7 @@ fn format_us(us: f64) -> String {
     }
 }
 
-// ─── vs PostgreSQL ─────────────────────────────────────────────────────────
+// ─── Schema + Data Setup ──────────────────────────────────────────────────
 
 async fn setup_sql(client: &Client, rows: usize) {
     client.simple_query("DROP TABLE IF EXISTS bench_orders").await.unwrap();
@@ -279,44 +308,75 @@ async fn setup_sql(client: &Client, rows: usize) {
         client.simple_query(&sql).await.unwrap();
         id = end + 1;
     }
+
+    // Create indexes on commonly queried non-PK columns — SAME for both databases.
+    // This ensures PG can use index scans where applicable, matching Nucleus behavior.
+    client.simple_query("CREATE INDEX IF NOT EXISTS idx_orders_status ON bench_orders(status)").await.unwrap();
+    client.simple_query("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON bench_orders(user_id)").await.unwrap();
+    client.simple_query("CREATE INDEX IF NOT EXISTS idx_users_age ON bench_users(age)").await.unwrap();
 }
+
+// ─── Section 1: SQL via pgwire (Apples-to-Apples) ─────────────────────────
 
 async fn bench_vs_pg(
     nc: &Client,
     pg: Option<&Client>,
+    warmup: usize,
     iterations: usize,
 ) -> Vec<CompeteResult> {
     let mut results = Vec::new();
     let n = iterations;
+    let w = warmup;
 
+    // ── Read Queries ──
     let queries = [
-        ("COUNT(*)", "SELECT COUNT(*) FROM bench_orders"),
-        ("Point Query (PK)", "SELECT * FROM bench_orders WHERE id = 5000"),
-        ("Range Scan 100", "SELECT * FROM bench_orders WHERE id BETWEEN 1000 AND 1099"),
-        ("GROUP BY + AVG", "SELECT status, COUNT(*), AVG(amount) FROM bench_orders GROUP BY status"),
-        ("Filter+Sort+Limit", "SELECT * FROM bench_orders WHERE status = 'pending' ORDER BY amount DESC LIMIT 20"),
-        ("SUM Aggregate", "SELECT SUM(amount) FROM bench_orders WHERE status = 'shipped'"),
-        ("2-Table JOIN", "SELECT u.name, o.amount FROM bench_users u, bench_orders o WHERE u.id = o.user_id AND o.id < 100"),
+        ("COUNT(*)",               "SELECT COUNT(*) FROM bench_orders"),
+        ("Point Query (PK)",       "SELECT * FROM bench_orders WHERE id = 5000"),
+        ("Range Scan (BETWEEN)",   "SELECT * FROM bench_orders WHERE id BETWEEN 1000 AND 1099"),
+        ("GROUP BY + AVG",         "SELECT status, COUNT(*), AVG(amount) FROM bench_orders GROUP BY status"),
+        ("Filter + Sort + Limit",  "SELECT * FROM bench_orders WHERE status = 'pending' ORDER BY amount DESC LIMIT 20"),
+        ("SUM with WHERE",         "SELECT SUM(amount) FROM bench_orders WHERE status = 'shipped'"),
+        ("2-Table JOIN",           "SELECT u.name, o.amount FROM bench_users u, bench_orders o WHERE u.id = o.user_id AND o.id < 100"),
     ];
 
     for (name, sql) in &queries {
-        let ns = bench_query(nc, sql, n).await;
+        print!("    {name:<30}");
+        let ns = bench_query(nc, sql, w, n).await;
         let ps = if let Some(pg) = pg {
-            Some(bench_query(pg, sql, n).await)
+            Some(bench_query(pg, sql, w, n).await)
         } else {
             None
         };
+        let speedup = ps.as_ref().map(|p| p.avg_us() / ns.avg_us()).unwrap_or(0.0);
+        println!(" Nucleus: {:>10}  PG: {:>10}  {:.1}x",
+            format_ops(ns.ops_per_sec()),
+            ps.as_ref().map(|p| format_ops(p.ops_per_sec())).unwrap_or("N/A".into()),
+            speedup);
         results.push(CompeteResult {
             category: "SQL".into(),
             workload: name.to_string(),
             nucleus_stats: ns,
             competitor_name: "PostgreSQL".into(),
             competitor_stats: ps,
+            note: Some("pgwire".into()),
         });
     }
 
-    // Single-row INSERT
+    // ── Single-row INSERT ──
     {
+        print!("    Single INSERT              ");
+        // Warm-up
+        for i in 0..w {
+            let sql = format!("INSERT INTO bench_orders VALUES ({},{},99.0,'pending')", 700_000 + i, i % 1000 + 1);
+            nc.simple_query(&sql).await.unwrap();
+        }
+        if let Some(pg) = pg {
+            for i in 0..w {
+                let sql = format!("INSERT INTO bench_orders VALUES ({},{},99.0,'pending')", 600_000 + i, i % 1000 + 1);
+                pg.simple_query(&sql).await.unwrap();
+            }
+        }
+        // Timed
         let mut ns = Stats::new();
         for i in 0..n {
             let sql = format!("INSERT INTO bench_orders VALUES ({},{},99.0,'pending')", 900_000 + i, i % 1000 + 1);
@@ -336,18 +396,48 @@ async fn bench_vs_pg(
         } else {
             None
         };
+        let speedup = ps.as_ref().map(|p| p.avg_us() / ns.avg_us()).unwrap_or(0.0);
+        println!(" Nucleus: {:>10}  PG: {:>10}  {:.1}x",
+            format_ops(ns.ops_per_sec()),
+            ps.as_ref().map(|p| format_ops(p.ops_per_sec())).unwrap_or("N/A".into()),
+            speedup);
         results.push(CompeteResult {
             category: "SQL".into(),
             workload: "Single INSERT".into(),
             nucleus_stats: ns,
             competitor_name: "PostgreSQL".into(),
             competitor_stats: ps,
+            note: Some("pgwire".into()),
         });
     }
 
-    // Batch INSERT (100 rows)
+    // ── Batch INSERT (100 rows per statement) ──
     {
+        print!("    Batch INSERT (100 rows)    ");
         let batch_iters = n / 10;
+        let batch_warmup = w / 10;
+        // Warm-up
+        for b in 0..batch_warmup {
+            let mut sql = String::from("INSERT INTO bench_orders VALUES ");
+            for j in 0..100 {
+                if j > 0 { sql.push(','); }
+                let id = 1_100_000 + b * 100 + j;
+                sql.push_str(&format!("({id},{},99.0,'batch')", j % 1000 + 1));
+            }
+            nc.simple_query(&sql).await.unwrap();
+        }
+        if let Some(pg) = pg {
+            for b in 0..batch_warmup {
+                let mut sql = String::from("INSERT INTO bench_orders VALUES ");
+                for j in 0..100 {
+                    if j > 0 { sql.push(','); }
+                    let id = 1_200_000 + b * 100 + j;
+                    sql.push_str(&format!("({id},{},99.0,'batch')", j % 1000 + 1));
+                }
+                pg.simple_query(&sql).await.unwrap();
+            }
+        }
+        // Timed
         let mut ns = Stats::new();
         for b in 0..batch_iters {
             let mut sql = String::from("INSERT INTO bench_orders VALUES ");
@@ -377,55 +467,172 @@ async fn bench_vs_pg(
         } else {
             None
         };
+        let speedup = ps.as_ref().map(|p| p.avg_us() / ns.avg_us()).unwrap_or(0.0);
+        println!(" Nucleus: {:>10}  PG: {:>10}  {:.1}x",
+            format_ops(ns.ops_per_sec()),
+            ps.as_ref().map(|p| format_ops(p.ops_per_sec())).unwrap_or("N/A".into()),
+            speedup);
         results.push(CompeteResult {
             category: "SQL".into(),
             workload: "Batch INSERT (100 rows)".into(),
             nucleus_stats: ns,
             competitor_name: "PostgreSQL".into(),
             competitor_stats: ps,
+            note: Some("pgwire".into()),
+        });
+    }
+
+    // ── UPDATE by PK ──
+    {
+        print!("    UPDATE by PK               ");
+        let ns = bench_query(nc, "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000", w, n).await;
+        let ps = if let Some(pg) = pg {
+            Some(bench_query(pg, "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000", w, n).await)
+        } else {
+            None
+        };
+        let speedup = ps.as_ref().map(|p| p.avg_us() / ns.avg_us()).unwrap_or(0.0);
+        println!(" Nucleus: {:>10}  PG: {:>10}  {:.1}x",
+            format_ops(ns.ops_per_sec()),
+            ps.as_ref().map(|p| format_ops(p.ops_per_sec())).unwrap_or("N/A".into()),
+            speedup);
+        results.push(CompeteResult {
+            category: "SQL".into(),
+            workload: "UPDATE by PK".into(),
+            nucleus_stats: ns,
+            competitor_name: "PostgreSQL".into(),
+            competitor_stats: ps,
+            note: Some("pgwire".into()),
+        });
+    }
+
+    // ── DELETE + re-INSERT (to keep table size stable) ──
+    {
+        print!("    DELETE by PK               ");
+        // Use IDs that won't collide with other tests
+        for i in 0..w {
+            let id = 2_000_000 + i;
+            nc.simple_query(&format!("INSERT INTO bench_orders VALUES ({id},1,50.0,'del')")).await.ok();
+        }
+        if let Some(pg) = pg {
+            for i in 0..w {
+                let id = 2_100_000 + i;
+                pg.simple_query(&format!("INSERT INTO bench_orders VALUES ({id},1,50.0,'del')")).await.ok();
+            }
+        }
+        // Warm-up
+        for i in 0..w {
+            nc.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_000_000 + i)).await.ok();
+        }
+        if let Some(pg) = pg {
+            for i in 0..w {
+                pg.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_100_000 + i)).await.ok();
+            }
+        }
+        // Insert rows for timed deletes
+        for i in 0..n {
+            let id = 2_200_000 + i;
+            nc.simple_query(&format!("INSERT INTO bench_orders VALUES ({id},1,50.0,'del')")).await.ok();
+        }
+        if let Some(pg) = pg {
+            for i in 0..n {
+                let id = 2_300_000 + i;
+                pg.simple_query(&format!("INSERT INTO bench_orders VALUES ({id},1,50.0,'del')")).await.ok();
+            }
+        }
+        // Timed
+        let mut ns = Stats::new();
+        for i in 0..n {
+            let t = Instant::now();
+            nc.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_200_000 + i)).await.ok();
+            ns.record(t.elapsed());
+        }
+        let ps = if let Some(pg) = pg {
+            let mut s = Stats::new();
+            for i in 0..n {
+                let t = Instant::now();
+                pg.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_300_000 + i)).await.ok();
+                s.record(t.elapsed());
+            }
+            Some(s)
+        } else {
+            None
+        };
+        let speedup = ps.as_ref().map(|p| p.avg_us() / ns.avg_us()).unwrap_or(0.0);
+        println!(" Nucleus: {:>10}  PG: {:>10}  {:.1}x",
+            format_ops(ns.ops_per_sec()),
+            ps.as_ref().map(|p| format_ops(p.ops_per_sec())).unwrap_or("N/A".into()),
+            speedup);
+        results.push(CompeteResult {
+            category: "SQL".into(),
+            workload: "DELETE by PK".into(),
+            nucleus_stats: ns,
+            competitor_name: "PostgreSQL".into(),
+            competitor_stats: ps,
+            note: Some("pgwire".into()),
         });
     }
 
     results
 }
 
-// ─── vs Redis ──────────────────────────────────────────────────────────────
+// ─── Section 2: KV (Architectural Comparison) ─────────────────────────────
+//
+// NOTE: This compares Nucleus embedded KV (in-process, zero network) against
+// Redis over localhost TCP. This is NOT an apples-to-apples engine comparison.
+// It measures the real-world architectural advantage of having KV built into
+// your database process — eliminating the network hop that every Redis call
+// requires, even on localhost (~50-100us per roundtrip).
+//
+// For apps that use Redis solely as a cache alongside their SQL database,
+// Nucleus eliminates that entire network layer.
 
 async fn bench_vs_redis(
     executor: &Arc<Executor>,
     redis_host: &str,
     redis_port: u16,
+    warmup: usize,
     iterations: usize,
 ) -> Vec<CompeteResult> {
     let mut results = Vec::new();
     let n = iterations * 100; // KV ops are fast, need more iterations
+    let w = warmup * 100;
 
     // Connect to Redis
     let redis_url = format!("redis://{redis_host}:{redis_port}");
     let redis_client = match redis::Client::open(redis_url.as_str()) {
         Ok(c) => c,
         Err(e) => {
-            println!("  Redis: UNAVAILABLE ({e}) -- skipping Redis benchmarks");
+            println!("    Redis: UNAVAILABLE ({e}) -- skipping");
             return results;
         }
     };
     let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
         Ok(c) => c,
         Err(e) => {
-            println!("  Redis: UNAVAILABLE ({e}) -- skipping Redis benchmarks");
+            println!("    Redis: UNAVAILABLE ({e}) -- skipping");
             return results;
         }
     };
-    println!("  Redis: connected ({redis_host}:{redis_port})");
+    println!("    Redis: connected ({redis_host}:{redis_port})");
 
-    // Flush Redis test keys
     let _: Result<(), _> = redis::cmd("FLUSHDB").query_async(&mut redis_conn).await;
 
-    // Access Nucleus KV store directly (same store accessed by RESP protocol)
     let kv = executor.kv_store();
 
-    // SET throughput
+    // SET
     {
+        print!("    SET {n:<25}");
+        // Warm-up
+        for i in 0..w {
+            kv.set(&format!("w:{i}"), Value::Text(format!("v-{i}")), None);
+        }
+        for i in 0..w {
+            let _: Result<(), _> = redis::cmd("SET")
+                .arg(format!("w:{i}")).arg(format!("v-{i}"))
+                .query_async(&mut redis_conn).await;
+        }
+        // Timed
         let mut ns = Stats::new();
         for i in 0..n {
             let t = Instant::now();
@@ -436,23 +643,33 @@ async fn bench_vs_redis(
         for i in 0..n {
             let t = Instant::now();
             let _: Result<(), _> = redis::cmd("SET")
-                .arg(format!("bench:{i}"))
-                .arg(format!("val-{i}"))
-                .query_async(&mut redis_conn)
-                .await;
+                .arg(format!("bench:{i}")).arg(format!("val-{i}"))
+                .query_async(&mut redis_conn).await;
             rs.record(t.elapsed());
         }
+        let speedup = rs.avg_us() / ns.avg_us();
+        println!(" Nucleus: {:>10}  Redis: {:>10}  {:.0}x",
+            format_ops(ns.ops_per_sec()), format_ops(rs.ops_per_sec()), speedup);
         results.push(CompeteResult {
             category: "KV".into(),
             workload: format!("SET {n}"),
             nucleus_stats: ns,
             competitor_name: "Redis".into(),
             competitor_stats: Some(rs),
+            note: Some("embedded vs network".into()),
         });
     }
 
-    // GET throughput (all hits)
+    // GET (all hits)
     {
+        print!("    GET {n:<25}");
+        // Warm-up
+        for i in 0..w { let _ = kv.get(&format!("bench:{i}")); }
+        for i in 0..w {
+            let _: Result<Option<String>, _> = redis::cmd("GET")
+                .arg(format!("bench:{i}")).query_async(&mut redis_conn).await;
+        }
+        // Timed
         let mut ns = Stats::new();
         for i in 0..n {
             let t = Instant::now();
@@ -463,23 +680,32 @@ async fn bench_vs_redis(
         for i in 0..n {
             let t = Instant::now();
             let _: Result<Option<String>, _> = redis::cmd("GET")
-                .arg(format!("bench:{i}"))
-                .query_async(&mut redis_conn)
-                .await;
+                .arg(format!("bench:{i}")).query_async(&mut redis_conn).await;
             rs.record(t.elapsed());
         }
+        let speedup = rs.avg_us() / ns.avg_us();
+        println!(" Nucleus: {:>10}  Redis: {:>10}  {:.0}x",
+            format_ops(ns.ops_per_sec()), format_ops(rs.ops_per_sec()), speedup);
         results.push(CompeteResult {
             category: "KV".into(),
             workload: format!("GET {n}"),
             nucleus_stats: ns,
             competitor_name: "Redis".into(),
             competitor_stats: Some(rs),
+            note: Some("embedded vs network".into()),
         });
     }
 
-    // INCR throughput
+    // INCR
     {
         let incr_n = n / 10;
+        let incr_w = w / 10;
+        print!("    INCR {incr_n:<24}");
+        for _ in 0..incr_w { let _ = kv.incr("warmup:counter"); }
+        for _ in 0..incr_w {
+            let _: Result<i64, _> = redis::cmd("INCR")
+                .arg("warmup:counter").query_async(&mut redis_conn).await;
+        }
         let mut ns = Stats::new();
         for _ in 0..incr_n {
             let t = Instant::now();
@@ -490,22 +716,40 @@ async fn bench_vs_redis(
         for _ in 0..incr_n {
             let t = Instant::now();
             let _: Result<i64, _> = redis::cmd("INCR")
-                .arg("bench:counter")
-                .query_async(&mut redis_conn)
-                .await;
+                .arg("bench:counter").query_async(&mut redis_conn).await;
             rs.record(t.elapsed());
         }
+        let speedup = rs.avg_us() / ns.avg_us();
+        println!(" Nucleus: {:>10}  Redis: {:>10}  {:.0}x",
+            format_ops(ns.ops_per_sec()), format_ops(rs.ops_per_sec()), speedup);
         results.push(CompeteResult {
             category: "KV".into(),
             workload: format!("INCR {incr_n}"),
             nucleus_stats: ns,
             competitor_name: "Redis".into(),
             competitor_stats: Some(rs),
+            note: Some("embedded vs network".into()),
         });
     }
 
     // Mixed workload: 50% GET, 30% SET, 20% DEL
     {
+        print!("    Mixed 50R/30W/20D {n:<8}");
+        // Warm-up both sides
+        for i in 0..w {
+            match i % 10 {
+                0..=4 => { let _ = kv.get(&format!("bench:{}", i % n)); }
+                5..=7 => { kv.set(&format!("wmix:{i}"), Value::Text(format!("v{i}")), None); }
+                _ => { let _ = kv.del(&format!("wmix:{}", i.wrapping_sub(2))); }
+            }
+        }
+        for i in 0..w {
+            match i % 10 {
+                0..=4 => { let _: Result<Option<String>, _> = redis::cmd("GET").arg(format!("bench:{}", i % n)).query_async(&mut redis_conn).await; }
+                5..=7 => { let _: Result<(), _> = redis::cmd("SET").arg(format!("wmix:{i}")).arg(format!("v{i}")).query_async(&mut redis_conn).await; }
+                _ => { let _: Result<i32, _> = redis::cmd("DEL").arg(format!("wmix:{}", i.wrapping_sub(2))).query_async(&mut redis_conn).await; }
+            }
+        }
         let mut ns = Stats::new();
         for i in 0..n {
             let t = Instant::now();
@@ -520,176 +764,29 @@ async fn bench_vs_redis(
         for i in 0..n {
             let t = Instant::now();
             match i % 10 {
-                0..=4 => {
-                    let _: Result<Option<String>, _> = redis::cmd("GET")
-                        .arg(format!("bench:{}", i % n))
-                        .query_async(&mut redis_conn).await;
-                }
-                5..=7 => {
-                    let _: Result<(), _> = redis::cmd("SET")
-                        .arg(format!("mix:{i}"))
-                        .arg(format!("v{i}"))
-                        .query_async(&mut redis_conn).await;
-                }
-                _ => {
-                    let _: Result<i32, _> = redis::cmd("DEL")
-                        .arg(format!("mix:{}", i.wrapping_sub(2)))
-                        .query_async(&mut redis_conn).await;
-                }
+                0..=4 => { let _: Result<Option<String>, _> = redis::cmd("GET").arg(format!("bench:{}", i % n)).query_async(&mut redis_conn).await; }
+                5..=7 => { let _: Result<(), _> = redis::cmd("SET").arg(format!("mix:{i}")).arg(format!("v{i}")).query_async(&mut redis_conn).await; }
+                _ => { let _: Result<i32, _> = redis::cmd("DEL").arg(format!("mix:{}", i.wrapping_sub(2))).query_async(&mut redis_conn).await; }
             }
             rs.record(t.elapsed());
         }
+        let speedup = rs.avg_us() / ns.avg_us();
+        println!(" Nucleus: {:>10}  Redis: {:>10}  {:.0}x",
+            format_ops(ns.ops_per_sec()), format_ops(rs.ops_per_sec()), speedup);
         results.push(CompeteResult {
             category: "KV".into(),
             workload: format!("Mixed 50R/30W/20D {n}"),
             nucleus_stats: ns,
             competitor_name: "Redis".into(),
             competitor_stats: Some(rs),
-        });
-    }
-
-    // LPUSH/RPOP (list operations)
-    {
-        let list_n = n / 10;
-        let mut ns = Stats::new();
-        for i in 0..list_n {
-            let t = Instant::now();
-            let _ = kv.lpush("bench:list", Value::Text(format!("item-{i}")));
-            ns.record(t.elapsed());
-        }
-        let mut rs = Stats::new();
-        for i in 0..list_n {
-            let t = Instant::now();
-            let _: Result<i64, _> = redis::cmd("LPUSH")
-                .arg("bench:list")
-                .arg(format!("item-{i}"))
-                .query_async(&mut redis_conn).await;
-            rs.record(t.elapsed());
-        }
-        results.push(CompeteResult {
-            category: "KV".into(),
-            workload: format!("LPUSH {list_n}"),
-            nucleus_stats: ns,
-            competitor_name: "Redis".into(),
-            competitor_stats: Some(rs),
+            note: Some("embedded vs network".into()),
         });
     }
 
     results
 }
 
-// ─── vs SurrealDB ──────────────────────────────────────────────────────────
-
-async fn bench_vs_surrealdb(
-    nc: &Client,
-    surrealdb_url: &str,
-    iterations: usize,
-) -> Vec<CompeteResult> {
-    let mut results = Vec::new();
-    let n = iterations;
-
-    let http = reqwest::Client::new();
-
-    // Check SurrealDB is reachable
-    match http.get(&format!("{surrealdb_url}/health")).send().await {
-        Ok(r) if r.status().is_success() => {
-            println!("  SurrealDB: connected ({surrealdb_url})");
-        }
-        _ => {
-            println!("  SurrealDB: UNAVAILABLE -- skipping SurrealDB benchmarks");
-            return results;
-        }
-    }
-
-    let surreal_query = |sql: &str| {
-        let http = http.clone();
-        let url = format!("{surrealdb_url}/sql");
-        let body = sql.to_string();
-        async move {
-            http.post(&url)
-                .header("Accept", "application/json")
-                .header("surreal-ns", "test")
-                .header("surreal-db", "test")
-                .body(body)
-                .send()
-                .await
-        }
-    };
-
-    // Setup SurrealDB
-    let _ = surreal_query("REMOVE TABLE bench_users; REMOVE TABLE bench_orders;").await;
-    let _ = surreal_query(
-        "DEFINE TABLE bench_users; DEFINE TABLE bench_orders;"
-    ).await;
-
-    // INSERT comparison
-    {
-        // Nucleus via pgwire
-        let mut ns = Stats::new();
-        for i in 0..n {
-            let sql = format!(
-                "INSERT INTO bench_users VALUES ({},'user_{i}','user{i}@test.com',{})",
-                500_000 + i,
-                20 + i % 50
-            );
-            let t = Instant::now();
-            nc.simple_query(&sql).await.unwrap();
-            ns.record(t.elapsed());
-        }
-
-        // SurrealDB via HTTP
-        let mut ss = Stats::new();
-        for i in 0..n {
-            let sql = format!(
-                "CREATE bench_users:{i} SET name = 'user_{i}', email = 'user{i}@test.com', age = {}",
-                20 + i % 50
-            );
-            let t = Instant::now();
-            let _ = surreal_query(&sql).await;
-            ss.record(t.elapsed());
-        }
-
-        results.push(CompeteResult {
-            category: "Multi-Model".into(),
-            workload: format!("INSERT {n} records"),
-            nucleus_stats: ns,
-            competitor_name: "SurrealDB".into(),
-            competitor_stats: Some(ss),
-        });
-    }
-
-    // SELECT comparison
-    {
-        let select_n = std::cmp::min(n, 100);
-        let mut ns = Stats::new();
-        for i in 0..select_n {
-            let sql = format!("SELECT * FROM bench_users WHERE id = {}", 500_000 + i);
-            let t = Instant::now();
-            nc.simple_query(&sql).await.unwrap();
-            ns.record(t.elapsed());
-        }
-
-        let mut ss = Stats::new();
-        for i in 0..select_n {
-            let sql = format!("SELECT * FROM bench_users:{i}");
-            let t = Instant::now();
-            let _ = surreal_query(&sql).await;
-            ss.record(t.elapsed());
-        }
-
-        results.push(CompeteResult {
-            category: "Multi-Model".into(),
-            workload: format!("SELECT by ID x{select_n}"),
-            nucleus_stats: ns,
-            competitor_name: "SurrealDB".into(),
-            competitor_stats: Some(ss),
-        });
-    }
-
-    results
-}
-
-// ─── Mixed Multi-Model Benchmark (THE KILLER) ─────────────────────────────
+// ─── Section 3: Mixed Multi-Model (Architectural) ─────────────────────────
 
 async fn bench_mixed_multimodel(
     executor: &Arc<Executor>,
@@ -697,52 +794,128 @@ async fn bench_mixed_multimodel(
     pg: Option<&Client>,
     redis_host: &str,
     redis_port: u16,
+    warmup: usize,
     iterations: usize,
 ) -> Vec<CompeteResult> {
     let mut results = Vec::new();
     let n = iterations;
+    let w = warmup;
 
-    // Simulates a realistic app: for each user signup:
-    //   1. SQL: INSERT user row
-    //   2. KV: SET session cache
-    //   3. FTS: Index user profile
-    //   4. Graph: Add user node + edges
-
-    // --- Nucleus: single process, all models ---
     let kv = executor.kv_store();
     let fts = executor.fts_index();
     let graph = executor.graph_store();
 
-    // Create table for mixed benchmark
+    // ── SQL+KV fair comparison (both use same number of operations) ──
     nc.simple_query("DROP TABLE IF EXISTS mixed_users").await.unwrap();
     nc.simple_query(
-        "CREATE TABLE mixed_users (id INT PRIMARY KEY, name TEXT NOT NULL, bio TEXT)"
+        "CREATE TABLE mixed_users (id INT PRIMARY KEY, name TEXT NOT NULL)"
     ).await.unwrap();
 
+    // Warm-up Nucleus
+    for i in 0..w {
+        let id = 5_000_000 + i;
+        nc.simple_query(&format!("INSERT INTO mixed_users VALUES ({id}, 'wu_{i}')")).await.unwrap();
+        kv.set(&format!("wsess:{i}"), Value::Text(format!("tok_{i}")), Some(3600));
+    }
+
+    // Timed: Nucleus SQL (pgwire) + KV (embedded)
     let mut ns = Stats::new();
     for i in 0..n {
         let t = Instant::now();
-
-        // 1. SQL INSERT
-        nc.simple_query(&format!(
-            "INSERT INTO mixed_users VALUES ({i}, 'user_{i}', 'Software engineer from city_{}')",
-            i % 50
-        )).await.unwrap();
-
-        // 2. KV SET session
+        // 1. SQL INSERT via pgwire (same protocol as PG)
+        nc.simple_query(&format!("INSERT INTO mixed_users VALUES ({i}, 'user_{i}')"))
+            .await.unwrap();
+        // 2. KV SET (embedded — this is the architectural advantage)
         kv.set(
             &format!("session:{i}"),
-            Value::Text(format!("{{\"user_id\":{i},\"token\":\"tok_{i}\"}}")),
+            Value::Text(format!("tok_{i}")),
             Some(3600),
         );
+        ns.record(t.elapsed());
+    }
 
-        // 3. FTS index profile
-        fts.write().add_document(
-            i as u64,
-            &format!("user_{i} software engineer city_{}", i % 50),
-        );
+    let cs = if let Some(pg) = pg {
+        let redis_url = format!("redis://{redis_host}:{redis_port}");
+        if let Ok(redis_client) = redis::Client::open(redis_url.as_str()) {
+            if let Ok(mut redis_conn) = redis_client.get_multiplexed_async_connection().await {
+                pg.simple_query("DROP TABLE IF EXISTS mixed_users").await.unwrap();
+                pg.simple_query(
+                    "CREATE TABLE mixed_users (id INT PRIMARY KEY, name TEXT NOT NULL)"
+                ).await.unwrap();
+                // Warm-up PG+Redis
+                for i in 0..w {
+                    let id = 5_000_000 + i;
+                    pg.simple_query(&format!("INSERT INTO mixed_users VALUES ({id}, 'wu_{i}')")).await.unwrap();
+                    let _: Result<(), _> = redis::cmd("SET")
+                        .arg(format!("wsess:{i}")).arg(format!("tok_{i}"))
+                        .arg("EX").arg(3600)
+                        .query_async(&mut redis_conn).await;
+                }
+                // Timed: PG (pgwire) + Redis (network)
+                let mut s = Stats::new();
+                for i in 0..n {
+                    let t = Instant::now();
+                    pg.simple_query(&format!("INSERT INTO mixed_users VALUES ({i}, 'user_{i}')"))
+                        .await.unwrap();
+                    let _: Result<(), _> = redis::cmd("SET")
+                        .arg(format!("session:{i}")).arg(format!("tok_{i}"))
+                        .arg("EX").arg(3600)
+                        .query_async(&mut redis_conn).await;
+                    s.record(t.elapsed());
+                }
+                Some(s)
+            } else { None }
+        } else { None }
+    } else { None };
 
-        // 4. Graph: add node
+    let speedup = cs.as_ref().map(|c| c.avg_us() / ns.avg_us()).unwrap_or(0.0);
+    print!("    SQL+KV x{n:<20}");
+    println!(" Nucleus: {:>10}  PG+Redis: {:>10}  {:.1}x",
+        format_ops(ns.ops_per_sec()),
+        cs.as_ref().map(|c| format_ops(c.ops_per_sec())).unwrap_or("N/A".into()),
+        speedup);
+
+    results.push(CompeteResult {
+        category: "Multi-Model".into(),
+        workload: format!("SQL+KV x{n} (Nucleus: pgwire+embedded KV vs PG+Redis: pgwire+network KV)"),
+        nucleus_stats: ns,
+        competitor_name: "PG+Redis".into(),
+        competitor_stats: cs,
+        note: Some("Nucleus SQL via pgwire (same as PG), KV via embedded API (no network)".into()),
+    });
+
+    // ── Full signup flow: SQL + KV + FTS + Graph ──
+    // NOTE: PG+Redis cannot do FTS+Graph in-process, so this shows what Nucleus
+    // can do in a single process that would require 3-4 services otherwise.
+    nc.simple_query("DROP TABLE IF EXISTS signup_users").await.unwrap();
+    nc.simple_query(
+        "CREATE TABLE signup_users (id INT PRIMARY KEY, name TEXT NOT NULL, bio TEXT)"
+    ).await.unwrap();
+
+    // Warm-up
+    for i in 0..w {
+        let id = 6_000_000 + i;
+        nc.simple_query(&format!(
+            "INSERT INTO signup_users VALUES ({id}, 'wu_{i}', 'engineer from city_{}')", i % 50
+        )).await.unwrap();
+        kv.set(&format!("wsignup:{i}"), Value::Text(format!("tok_{i}")), Some(3600));
+        fts.write().add_document(1_000_000 + i as u64, &format!("wu_{i} engineer city_{}", i % 50));
+        {
+            let mut g = graph.write();
+            let mut props = BTreeMap::new();
+            props.insert("name".to_string(), nucleus::graph::PropValue::Text(format!("wu_{i}")));
+            g.create_node(vec!["User".into()], props);
+        }
+    }
+
+    let mut ns_full = Stats::new();
+    for i in 0..n {
+        let t = Instant::now();
+        nc.simple_query(&format!(
+            "INSERT INTO signup_users VALUES ({i}, 'user_{i}', 'engineer from city_{}')", i % 50
+        )).await.unwrap();
+        kv.set(&format!("signup:{i}"), Value::Text(format!("tok_{i}")), Some(3600));
+        fts.write().add_document(i as u64, &format!("user_{i} engineer city_{}", i % 50));
         {
             let mut g = graph.write();
             let mut props = BTreeMap::new();
@@ -752,113 +925,21 @@ async fn bench_mixed_multimodel(
                 g.create_edge(node_id, node_id - 1, "follows".to_string(), BTreeMap::new());
             }
         }
-
-        ns.record(t.elapsed());
+        ns_full.record(t.elapsed());
     }
+
+    print!("    Full signup x{n:<16}");
+    println!(" Nucleus: {:>10} (SQL+KV+FTS+Graph, single process)",
+        format_ops(ns_full.ops_per_sec()));
 
     results.push(CompeteResult {
-        category: "Mixed".into(),
-        workload: format!("Full signup flow x{n} (SQL+KV+FTS+Graph)"),
-        nucleus_stats: ns.clone(),
-        competitor_name: "PG+Redis".into(),
-        competitor_stats: None, // filled below if available
+        category: "Multi-Model".into(),
+        workload: format!("Full signup x{n} (SQL+KV+FTS+Graph in single process)"),
+        nucleus_stats: ns_full,
+        competitor_name: "PG+Redis+Elastic+Neo4j".into(),
+        competitor_stats: None,
+        note: Some("No direct competitor — would require 4 services".into()),
     });
-
-    // --- Competitor: PG + Redis (2 services, 2 connections) ---
-    if let Some(pg) = pg {
-        let redis_url = format!("redis://{redis_host}:{redis_port}");
-        if let Ok(redis_client) = redis::Client::open(redis_url.as_str()) {
-            if let Ok(mut redis_conn) = redis_client.get_multiplexed_async_connection().await {
-                pg.simple_query("DROP TABLE IF EXISTS mixed_users").await.unwrap();
-                pg.simple_query(
-                    "CREATE TABLE mixed_users (id INT PRIMARY KEY, name TEXT NOT NULL, bio TEXT)"
-                ).await.unwrap();
-
-                let mut cs = Stats::new();
-                for i in 0..n {
-                    let t = Instant::now();
-
-                    // 1. SQL INSERT via PG
-                    pg.simple_query(&format!(
-                        "INSERT INTO mixed_users VALUES ({i}, 'user_{i}', 'Software engineer from city_{}')",
-                        i % 50
-                    )).await.unwrap();
-
-                    // 2. KV SET via Redis
-                    let _: Result<(), _> = redis::cmd("SET")
-                        .arg(format!("session:{i}"))
-                        .arg(format!("{{\"user_id\":{i},\"token\":\"tok_{i}\"}}"))
-                        .arg("EX").arg(3600)
-                        .query_async(&mut redis_conn).await;
-
-                    // 3. No FTS equivalent in PG+Redis stack (PG tsvector is much slower to set up)
-                    // 4. No graph equivalent in PG+Redis stack
-
-                    cs.record(t.elapsed());
-                }
-
-                // Update the last result with competitor stats
-                if let Some(last) = results.last_mut() {
-                    last.competitor_stats = Some(cs);
-                    last.workload = format!("Signup flow x{n} (Nucleus: SQL+KV+FTS+Graph vs PG+Redis: SQL+KV only)");
-                }
-            }
-        }
-    }
-
-    // --- Also benchmark just SQL+KV (fair comparison) ---
-    {
-        nc.simple_query("DROP TABLE IF EXISTS mixed2_users").await.unwrap();
-        nc.simple_query(
-            "CREATE TABLE mixed2_users (id INT PRIMARY KEY, name TEXT NOT NULL)"
-        ).await.unwrap();
-
-        let mut ns_fair = Stats::new();
-        for i in 0..n {
-            let t = Instant::now();
-            nc.simple_query(&format!("INSERT INTO mixed2_users VALUES ({i}, 'user_{i}')"))
-                .await.unwrap();
-            kv.set(
-                &format!("fair_session:{i}"),
-                Value::Text(format!("tok_{i}")),
-                Some(3600),
-            );
-            ns_fair.record(t.elapsed());
-        }
-
-        let cs_fair = if let Some(pg) = pg {
-            let redis_url = format!("redis://{redis_host}:{redis_port}");
-            if let Ok(redis_client) = redis::Client::open(redis_url.as_str()) {
-                if let Ok(mut redis_conn) = redis_client.get_multiplexed_async_connection().await {
-                    pg.simple_query("DROP TABLE IF EXISTS mixed2_users").await.unwrap();
-                    pg.simple_query(
-                        "CREATE TABLE mixed2_users (id INT PRIMARY KEY, name TEXT NOT NULL)"
-                    ).await.unwrap();
-                    let mut s = Stats::new();
-                    for i in 0..n {
-                        let t = Instant::now();
-                        pg.simple_query(&format!("INSERT INTO mixed2_users VALUES ({i}, 'user_{i}')"))
-                            .await.unwrap();
-                        let _: Result<(), _> = redis::cmd("SET")
-                            .arg(format!("fair_session:{i}"))
-                            .arg(format!("tok_{i}"))
-                            .arg("EX").arg(3600)
-                            .query_async(&mut redis_conn).await;
-                        s.record(t.elapsed());
-                    }
-                    Some(s)
-                } else { None }
-            } else { None }
-        } else { None };
-
-        results.push(CompeteResult {
-            category: "Mixed".into(),
-            workload: format!("SQL+KV only x{n} (fair comparison)"),
-            nucleus_stats: ns_fair,
-            competitor_name: "PG+Redis".into(),
-            competitor_stats: cs_fair,
-        });
-    }
 
     results
 }
@@ -866,6 +947,7 @@ async fn bench_mixed_multimodel(
 // ─── Output ────────────────────────────────────────────────────────────────
 
 fn print_results(results: &[CompeteResult]) {
+    println!();
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL)
@@ -873,48 +955,51 @@ fn print_results(results: &[CompeteResult]) {
         .set_header(vec![
             Cell::new("Category").fg(Color::Cyan),
             Cell::new("Workload").fg(Color::Cyan),
-            Cell::new("Nucleus").fg(Color::Cyan),
+            Cell::new("Nucleus ops/s").fg(Color::Cyan),
+            Cell::new("Nucleus p50").fg(Color::Cyan),
             Cell::new("Competitor").fg(Color::Cyan),
-            Cell::new("Comp. Throughput").fg(Color::Cyan),
+            Cell::new("Comp. ops/s").fg(Color::Cyan),
+            Cell::new("Comp. p50").fg(Color::Cyan),
             Cell::new("Speedup").fg(Color::Cyan),
-            Cell::new("Verdict").fg(Color::Cyan),
+            Cell::new("Note").fg(Color::Cyan),
         ]);
 
     for r in results {
         let n_ops = format_ops(r.nucleus_stats.ops_per_sec());
-        let n_lat = format_us(r.nucleus_stats.avg_us());
+        let n_p50 = format_us(r.nucleus_stats.p50_us());
 
-        let (c_label, c_ops, speedup_str, verdict) = match &r.competitor_stats {
+        let (c_ops, c_p50, speedup_str, color) = match &r.competitor_stats {
             Some(cs) => {
-                let c = format_ops(cs.ops_per_sec());
                 let speedup = r.speedup().unwrap_or(0.0);
-                let v = if speedup >= 1.0 {
-                    Cell::new("FASTER").fg(Color::Green)
-                } else {
-                    Cell::new("SLOWER").fg(Color::Red)
-                };
-                (r.competitor_name.clone(), c, format!("{speedup:.1}x"), v)
+                let color = if speedup >= 1.0 { Color::Green } else { Color::Red };
+                (
+                    format_ops(cs.ops_per_sec()),
+                    format_us(cs.p50_us()),
+                    format!("{speedup:.1}x"),
+                    color,
+                )
             }
-            None => (
-                r.competitor_name.clone(),
-                "N/A".into(),
-                "N/A".into(),
-                Cell::new("SKIP").fg(Color::Yellow),
-            ),
+            None => ("N/A".into(), "N/A".into(), "N/A".into(), Color::Yellow),
         };
 
         table.add_row(vec![
             Cell::new(&r.category),
             Cell::new(&r.workload),
-            Cell::new(format!("{n_ops} ({n_lat})")),
-            Cell::new(&c_label),
+            Cell::new(&n_ops),
+            Cell::new(&n_p50),
+            Cell::new(&r.competitor_name),
             Cell::new(&c_ops),
-            Cell::new(&speedup_str),
-            verdict,
+            Cell::new(&c_p50),
+            Cell::new(&speedup_str).fg(color),
+            Cell::new(r.note.as_deref().unwrap_or("")),
         ]);
     }
 
-    println!("\n{table}\n");
+    println!("{table}");
+    println!();
+    println!("  Speedup = competitor_latency / nucleus_latency (>1x = Nucleus faster)");
+    println!("  p50 = median latency");
+    println!();
 }
 
 fn write_json_report(results: &[CompeteResult]) {
@@ -928,10 +1013,14 @@ fn write_json_report(results: &[CompeteResult]) {
             "nucleus_p95_us": r.nucleus_stats.p95_us(),
             "nucleus_p99_us": r.nucleus_stats.p99_us(),
             "competitor": r.competitor_name,
+            "note": r.note,
         });
         if let Some(cs) = &r.competitor_stats {
             entry["competitor_ops_per_sec"] = serde_json::json!(cs.ops_per_sec());
             entry["competitor_avg_us"] = serde_json::json!(cs.avg_us());
+            entry["competitor_p50_us"] = serde_json::json!(cs.p50_us());
+            entry["competitor_p95_us"] = serde_json::json!(cs.p95_us());
+            entry["competitor_p99_us"] = serde_json::json!(cs.p99_us());
             entry["speedup"] = serde_json::json!(r.speedup().unwrap_or(0.0));
         }
         entry
@@ -939,9 +1028,14 @@ fn write_json_report(results: &[CompeteResult]) {
 
     let report = serde_json::json!({
         "timestamp": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+        "methodology": {
+            "sql_protocol": "pgwire TCP (identical for both databases)",
+            "kv_comparison": "Nucleus embedded API vs Redis localhost TCP",
+            "warmup": "20% of iterations discarded before timing",
+            "indexes": "Same B-tree indexes on both databases (PK + status + user_id + age)",
+            "pg_config": "default installation, no tuning",
+        },
         "results": json_results,
     });
 
@@ -957,16 +1051,26 @@ fn write_json_report(results: &[CompeteResult]) {
 async fn main() {
     let cfg = Cfg::from_args();
 
-    println!("\n{}", "=".repeat(60));
-    println!("  Nucleus vs The World -- Head-to-Head Competition");
-    println!("{}\n", "=".repeat(60));
-    println!("  Iterations : {}", cfg.iterations);
-    println!("  Dataset    : {} rows", cfg.rows);
+    println!();
+    println!("{}", "=".repeat(70));
+    println!("  Nucleus Competitive Benchmark");
+    println!("{}", "=".repeat(70));
+    println!();
+    println!("  METHODOLOGY:");
+    println!("    SQL:     Both databases receive identical SQL over pgwire TCP");
+    println!("    KV:      Nucleus embedded API vs Redis localhost TCP");
+    println!("             (measures architectural advantage, not engine speed)");
+    println!("    Indexes: Same B-tree indexes on PK + status + user_id + age");
+    println!("    Warm-up: {}% of iterations ({}) discarded before timing",
+        cfg.warmup_pct, cfg.warmup_n());
+    println!("    Timed:   {} iterations per benchmark", cfg.iterations);
+    println!("    Dataset: {} users + {} orders", cfg.rows, cfg.rows * 5);
+    println!();
 
     // Start Nucleus server
     let executor = start_nucleus_server(cfg.nucleus_port).await;
     wait_for_port(cfg.nucleus_port).await;
-    println!("  Nucleus    : ready");
+    println!("  Nucleus    : ready (127.0.0.1:{})", cfg.nucleus_port);
 
     // Connect to Nucleus via pgwire
     let n_dsn = format!(
@@ -978,20 +1082,39 @@ async fn main() {
         .expect("connect to Nucleus wire");
     tokio::spawn(nc_conn);
 
-    // Connect to PostgreSQL (optional)
-    let pg_dsn = format!(
-        "host={} port={} user={} password={} dbname=postgres",
-        cfg.pg_host, cfg.pg_port, cfg.pg_user, cfg.pg_password
-    );
+    // Connect to PostgreSQL
+    let pg_dsn = if cfg.pg_password.is_empty() {
+        format!(
+            "host={} port={} user={} dbname=postgres",
+            cfg.pg_host, cfg.pg_port, cfg.pg_user
+        )
+    } else {
+        format!(
+            "host={} port={} user={} password={} dbname=postgres",
+            cfg.pg_host, cfg.pg_port, cfg.pg_user, cfg.pg_password
+        )
+    };
     let pg_client: Option<Client> = if cfg.should_run("pg") {
         match tokio_postgres::connect(&pg_dsn, NoTls).await {
             Ok((client, conn)) => {
                 tokio::spawn(conn);
-                println!("  PostgreSQL : connected ({}:{})", cfg.pg_host, cfg.pg_port);
+                // Get PG version for transparency
+                let ver = client.simple_query("SELECT version()").await
+                    .ok()
+                    .and_then(|r| {
+                        r.into_iter().find_map(|msg| {
+                            if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
+                                row.get(0).map(|s| s.to_string())
+                            } else { None }
+                        })
+                    })
+                    .unwrap_or_else(|| "unknown".into());
+                println!("  PostgreSQL : {} ({}:{})", ver.split(',').next().unwrap_or(&ver), cfg.pg_host, cfg.pg_port);
                 Some(client)
             }
             Err(e) => {
                 println!("  PostgreSQL : UNAVAILABLE ({e})");
+                println!("    DSN: {pg_dsn}");
                 None
             }
         }
@@ -1002,63 +1125,57 @@ async fn main() {
 
     let mut all_results = Vec::new();
 
-    // ── vs PostgreSQL ───────────────────────────────────────────────────────
+    // ── Section 1: SQL via pgwire ──
     if cfg.should_run("pg") {
-        println!("\n  --- Setting up SQL benchmark data ---");
+        println!();
+        println!("  --- Section 1: SQL via pgwire (apples-to-apples) ---");
+        println!();
         let t = Instant::now();
         setup_sql(&nc, cfg.rows).await;
-        println!("  Nucleus load: {}ms", t.elapsed().as_millis());
+        println!("    Nucleus data load: {}ms", t.elapsed().as_millis());
         if let Some(ref pg) = pg_client {
             let t = Instant::now();
             setup_sql(pg, cfg.rows).await;
-            println!("  PG load: {}ms", t.elapsed().as_millis());
+            println!("    PG data load:     {}ms", t.elapsed().as_millis());
         }
+        println!();
 
-        println!("\n  --- Running SQL benchmarks ---");
-        let pg_results = bench_vs_pg(&nc, pg_client.as_ref(), cfg.iterations).await;
+        let pg_results = bench_vs_pg(&nc, pg_client.as_ref(), cfg.warmup_n(), cfg.iterations).await;
         all_results.extend(pg_results);
     }
 
-    // ── vs Redis ────────────────────────────────────────────────────────────
+    // ── Section 2: KV (architectural comparison) ──
     if cfg.should_run("redis") {
-        println!("\n  --- Running KV benchmarks vs Redis ---");
+        println!();
+        println!("  --- Section 2: KV — embedded vs network (architectural) ---");
+        println!("    NOTE: Nucleus KV = in-process API (0 network hops)");
+        println!("          Redis     = localhost TCP (~50-100us per roundtrip)");
+        println!();
+
         let redis_results = bench_vs_redis(
-            &executor,
-            &cfg.redis_host,
-            cfg.redis_port,
-            cfg.iterations,
+            &executor, &cfg.redis_host, cfg.redis_port,
+            cfg.warmup_n(), cfg.iterations,
         ).await;
         all_results.extend(redis_results);
     }
 
-    // ── vs SurrealDB ────────────────────────────────────────────────────────
-    if cfg.should_run("surrealdb") {
-        if let Some(ref url) = cfg.surrealdb_url {
-            println!("\n  --- Running benchmarks vs SurrealDB ---");
-            let surreal_results = bench_vs_surrealdb(&nc, url, cfg.iterations).await;
-            all_results.extend(surreal_results);
-        } else {
-            println!("\n  SurrealDB: no --surrealdb-url provided, skipping");
-        }
-    }
-
-    // ── Mixed Multi-Model (THE KILLER) ──────────────────────────────────────
+    // ── Section 3: Mixed Multi-Model ──
     if cfg.should_run("mixed") {
-        println!("\n  --- Running Mixed Multi-Model benchmark ---");
+        println!();
+        println!("  --- Section 3: Multi-Model workloads (architectural) ---");
+        println!("    Nucleus: single process (SQL via pgwire + KV/FTS/Graph embedded)");
+        println!("    PG+Redis: two services, two network connections");
+        println!();
+
         let mixed_results = bench_mixed_multimodel(
-            &executor,
-            &nc,
-            pg_client.as_ref(),
-            &cfg.redis_host,
-            cfg.redis_port,
-            cfg.iterations,
+            &executor, &nc, pg_client.as_ref(),
+            &cfg.redis_host, cfg.redis_port,
+            cfg.warmup_n(), cfg.iterations,
         ).await;
         all_results.extend(mixed_results);
     }
 
-    // ── Output ──────────────────────────────────────────────────────────────
+    // ── Results ──
     print_results(&all_results);
     write_json_report(&all_results);
-
-    println!("  (speedup = competitor latency / Nucleus latency, >1x means Nucleus is faster)\n");
 }

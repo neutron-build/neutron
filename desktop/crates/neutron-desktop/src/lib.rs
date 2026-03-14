@@ -1,9 +1,11 @@
 mod bridge;
+mod dev_server;
 mod ipc;
 mod nucleus_state;
 mod window;
 
 pub use bridge::{create_protocol_handler, Request, Response};
+pub use dev_server::{dev_port, is_dev_mode};
 pub use nucleus_state::{NucleusError, NucleusState};
 #[cfg(feature = "nucleus-embedded")]
 pub use nucleus_state::NucleusQueryResult;
@@ -153,15 +155,28 @@ impl NeutronDesktopBuilder {
         }
 
         let router = bridge::Router::new(self.routes);
+        let router = Arc::new(router);
+
+        // --- Dev-mode TCP server (strictly additive, never affects prod) ---
+        let dev_mode = dev_server::is_dev_mode();
+        let dev_port_val = dev_server::dev_port();
+
+        if dev_mode {
+            dev_server::spawn_dev_server(Arc::clone(&router), dev_port_val);
+        } else {
+            println!("Desktop running in PRODUCTION MODE \u{2014} neutron:// protocol active, no TCP port");
+        }
+
         let title = self.title.clone();
         let width = self.width;
         let height = self.height;
         let nucleus_enabled = self.nucleus_enabled;
         let data_dir = self.nucleus_data_dir.clone();
 
+        let protocol_router = Arc::clone(&router);
         let mut builder = tauri::Builder::default()
             .register_asynchronous_uri_scheme_protocol("neutron", move |_ctx, request, responder| {
-                let response = router.handle(request);
+                let response = protocol_router.handle(request);
                 responder.respond(response);
             });
 
@@ -187,7 +202,7 @@ impl NeutronDesktopBuilder {
                 }
 
                 // Create main window
-                let _window = tauri::WebviewWindowBuilder::new(
+                let window = tauri::WebviewWindowBuilder::new(
                     app,
                     "main",
                     tauri::WebviewUrl::App("index.html".into()),
@@ -196,7 +211,23 @@ impl NeutronDesktopBuilder {
                 .inner_size(width, height)
                 .build()?;
 
-                tracing::info!("Neutron Desktop started");
+                // In dev mode, inject the dev-mode flag into the WebView so the
+                // TypeScript bridge routes through the TCP server instead of
+                // the neutron:// protocol.
+                if dev_mode {
+                    let js = format!(
+                        "window.__NEUTRON_DEV_MODE__ = true; window.__NEUTRON_DEV_PORT__ = {};",
+                        dev_port_val,
+                    );
+                    window.eval(&js).unwrap_or_else(|e| {
+                        tracing::warn!("Failed to inject dev-mode flag: {e}");
+                    });
+                }
+
+                tracing::info!(
+                    mode = if dev_mode { "dev" } else { "production" },
+                    "Neutron Desktop started"
+                );
                 Ok(())
             })
             .run(context)?;

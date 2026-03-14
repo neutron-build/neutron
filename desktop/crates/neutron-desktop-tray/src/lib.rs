@@ -21,6 +21,7 @@ pub fn init() -> TauriPlugin<Wry> {
             create_tray,
             set_tray_menu,
             set_tray_tooltip,
+            set_tray_icon,
             destroy_tray,
         ])
         .build()
@@ -148,6 +149,33 @@ async fn set_tray_tooltip(
     Ok(())
 }
 
+/// Set the tray icon from a file path.
+///
+/// The icon must be a raw RGBA image file. For PNG/ICO support, decode to RGBA
+/// before passing to this command, or use Tauri's built-in icon loading.
+#[tauri::command]
+async fn set_tray_icon(
+    app: AppHandle,
+    icon_path: String,
+    width: Option<u32>,
+    height: Option<u32>,
+    state: tauri::State<'_, TrayState>,
+) -> Result<(), String> {
+    let id = state.icon_id.lock().map_err(|e| e.to_string())?;
+    if let Some(id) = id.as_ref() {
+        if let Some(tray) = app.tray_by_id(id) {
+            let rgba_bytes = std::fs::read(&icon_path)
+                .map_err(|e| format!("failed to read icon file: {e}"))?;
+            let w = width.unwrap_or(32);
+            let h = height.unwrap_or(32);
+            let icon = tauri::image::Image::new_owned(rgba_bytes, w, h);
+            tray.set_icon(Some(icon)).map_err(|e| e.to_string())?;
+            tracing::info!(path = %icon_path, width = w, height = h, "Updated tray icon");
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn destroy_tray(
     app: AppHandle,
@@ -161,4 +189,70 @@ async fn destroy_tray(
         tracing::info!(id = %tray_id, "Destroyed system tray");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tray_config_serialize() {
+        let config = TrayConfig {
+            tooltip: Some("My App".to_string()),
+            menu: Some(vec![TrayMenuItem {
+                id: "quit".to_string(),
+                label: "Quit".to_string(),
+                enabled: true,
+                checked: None,
+                accelerator: Some("CmdOrCtrl+Q".to_string()),
+                submenu: None,
+            }]),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("My App"));
+        assert!(json.contains("Quit"));
+    }
+
+    #[test]
+    fn test_tray_menu_item_with_submenu() {
+        let item = TrayMenuItem {
+            id: "file".to_string(),
+            label: "File".to_string(),
+            enabled: true,
+            checked: None,
+            accelerator: None,
+            submenu: Some(vec![
+                TrayMenuItem {
+                    id: "new".to_string(),
+                    label: "New".to_string(),
+                    enabled: true,
+                    checked: None,
+                    accelerator: Some("CmdOrCtrl+N".to_string()),
+                    submenu: None,
+                },
+                TrayMenuItem {
+                    id: "open".to_string(),
+                    label: "Open".to_string(),
+                    enabled: true,
+                    checked: None,
+                    accelerator: Some("CmdOrCtrl+O".to_string()),
+                    submenu: None,
+                },
+            ]),
+        };
+        assert_eq!(item.submenu.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_tray_config_deserialize() {
+        let json = r#"{"tooltip":"Test","menu":[{"id":"a","label":"A","enabled":true}]}"#;
+        let config: TrayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.tooltip.unwrap(), "Test");
+        assert_eq!(config.menu.unwrap()[0].id, "a");
+    }
+
+    #[test]
+    fn test_init_creates_plugin() {
+        let _plugin = super::init();
+    }
 }

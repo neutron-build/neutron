@@ -637,3 +637,675 @@ impl TypedHeaderValue for BearerToken {
             })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::{Request, StateMapBuilder};
+    use bytes::Bytes;
+    use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+    use smallvec::SmallVec;
+
+    /// Helper: build a minimal GET request.
+    fn get_request(uri: &str) -> Request {
+        Request::new(
+            Method::GET,
+            uri.parse::<Uri>().unwrap(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+    }
+
+    /// Helper: build a request with params already set.
+    fn request_with_params(params: Vec<(String, String)>) -> Request {
+        let mut req = get_request("/test");
+        let sv: SmallVec<[(String, String); 4]> = params.into();
+        req.set_params(sv);
+        req
+    }
+
+    // --- PathParam scalar parsing ---
+
+    #[test]
+    fn path_param_u64_single() {
+        let params = vec![("id".into(), "42".into())];
+        let result = u64::from_params(&params);
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn path_param_string_single() {
+        let params = vec![("name".into(), "hello".into())];
+        let result = String::from_params(&params);
+        assert_eq!(result.unwrap(), "hello");
+    }
+
+    #[test]
+    fn path_param_i32_negative() {
+        let params = vec![("id".into(), "-5".into())];
+        let result = i32::from_params(&params);
+        assert_eq!(result.unwrap(), -5);
+    }
+
+    #[test]
+    fn path_param_bool() {
+        let params = vec![("flag".into(), "true".into())];
+        let result = bool::from_params(&params);
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn path_param_f64() {
+        let params = vec![("val".into(), "3.14".into())];
+        let result = f64::from_params(&params);
+        assert!((result.unwrap() - 3.14).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn path_param_missing() {
+        let params: Vec<(String, String)> = vec![];
+        let result = u64::from_params(&params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing path parameter"));
+    }
+
+    #[test]
+    fn path_param_invalid_value() {
+        let params = vec![("id".into(), "not_a_number".into())];
+        let result = u64::from_params(&params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid path parameter"));
+    }
+
+    // --- PathParam tuple parsing ---
+
+    #[test]
+    fn path_param_2_tuple() {
+        let params = vec![
+            ("org".into(), "neutron".into()),
+            ("repo".into(), "core".into()),
+        ];
+        let result = <(String, String)>::from_params(&params);
+        let (a, b) = result.unwrap();
+        assert_eq!(a, "neutron");
+        assert_eq!(b, "core");
+    }
+
+    #[test]
+    fn path_param_2_tuple_typed() {
+        let params = vec![
+            ("org".into(), "neutron".into()),
+            ("id".into(), "42".into()),
+        ];
+        let result = <(String, u64)>::from_params(&params);
+        let (name, id) = result.unwrap();
+        assert_eq!(name, "neutron");
+        assert_eq!(id, 42);
+    }
+
+    #[test]
+    fn path_param_2_tuple_too_few() {
+        let params = vec![("only_one".into(), "value".into())];
+        let result = <(String, String)>::from_params(&params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("expected 2"));
+    }
+
+    #[test]
+    fn path_param_3_tuple() {
+        let params = vec![
+            ("a".into(), "1".into()),
+            ("b".into(), "2".into()),
+            ("c".into(), "3".into()),
+        ];
+        let result = <(u32, u32, u32)>::from_params(&params);
+        let (a, b, c) = result.unwrap();
+        assert_eq!((a, b, c), (1, 2, 3));
+    }
+
+    #[test]
+    fn path_param_3_tuple_too_few() {
+        let params = vec![
+            ("a".into(), "1".into()),
+            ("b".into(), "2".into()),
+        ];
+        let result = <(u32, u32, u32)>::from_params(&params);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("expected 3"));
+    }
+
+    // --- Path extractor via FromRequestParts ---
+
+    /// Helper: unwrap a Result<T, Response> without requiring Debug on Response.
+    fn ok_or_panic<T>(result: Result<T, Response>) -> T {
+        match result {
+            Ok(v) => v,
+            Err(resp) => panic!("expected Ok, got Err with status {}", resp.status()),
+        }
+    }
+
+    /// Helper: unwrap_err a Result<T, Response> without requiring Debug on T.
+    fn err_or_panic<T>(result: Result<T, Response>) -> Response {
+        match result {
+            Err(resp) => resp,
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    #[test]
+    fn path_extractor_success() {
+        let req = request_with_params(vec![("id".into(), "99".into())]);
+        let Path(id) = ok_or_panic(Path::<u64>::from_parts(&req));
+        assert_eq!(id, 99);
+    }
+
+    #[test]
+    fn path_extractor_invalid_returns_400() {
+        let req = request_with_params(vec![("id".into(), "abc".into())]);
+        let err = err_or_panic(Path::<u64>::from_parts(&req));
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn path_extractor_missing_returns_400() {
+        let req = get_request("/test");
+        let err = err_or_panic(Path::<u64>::from_parts(&req));
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // --- Query extractor ---
+
+    #[cfg(feature = "form")]
+    #[test]
+    fn query_extractor_success() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct Params {
+            page: u32,
+            limit: u32,
+        }
+
+        let req = get_request("/items?page=2&limit=10");
+        let Query(params) = ok_or_panic(Query::<Params>::from_parts(&req));
+        assert_eq!(params.page, 2);
+        assert_eq!(params.limit, 10);
+    }
+
+    #[cfg(feature = "form")]
+    #[test]
+    fn query_extractor_empty_query_string() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct Params {
+            #[serde(default)]
+            page: Option<u32>,
+        }
+
+        let req = get_request("/items");
+        let Query(params) = ok_or_panic(Query::<Params>::from_parts(&req));
+        assert!(params.page.is_none());
+    }
+
+    #[cfg(feature = "form")]
+    #[test]
+    fn query_extractor_bad_query_returns_400() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct Params {
+            page: u32,
+        }
+
+        let req = get_request("/items?page=notanumber");
+        let err = err_or_panic(Query::<Params>::from_parts(&req));
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // --- State extractor ---
+
+    #[test]
+    fn state_extractor_success() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct AppConfig {
+            name: String,
+        }
+
+        let cfg = AppConfig { name: "test".into() };
+        let state = StateMapBuilder::new().insert(cfg.clone()).build();
+
+        let mut req = get_request("/test");
+        req.set_state(state);
+
+        let State(extracted) = ok_or_panic(State::<AppConfig>::from_parts(&req));
+        assert_eq!(extracted, cfg);
+    }
+
+    #[test]
+    fn state_extractor_missing_returns_500() {
+        let req = get_request("/test");
+        let err = err_or_panic(State::<String>::from_parts(&req));
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // --- Method extractor ---
+
+    #[test]
+    fn method_extractor() {
+        let req = Request::new(
+            Method::POST,
+            "/test".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        let method = ok_or_panic(Method::from_parts(&req));
+        assert_eq!(method, Method::POST);
+    }
+
+    // --- Uri extractor ---
+
+    #[test]
+    fn uri_extractor() {
+        let req = get_request("/api/v1/users?page=1");
+        let uri = ok_or_panic(<Uri as FromRequestParts>::from_parts(&req));
+        assert_eq!(uri.path(), "/api/v1/users");
+        assert_eq!(uri.query(), Some("page=1"));
+    }
+
+    // --- HeaderMap extractor ---
+
+    #[test]
+    fn headermap_extractor() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-custom", HeaderValue::from_static("hello"));
+        let req = Request::new(
+            Method::GET,
+            "/test".parse().unwrap(),
+            headers,
+            Bytes::new(),
+        );
+        let extracted = ok_or_panic(HeaderMap::from_parts(&req));
+        assert_eq!(extracted.get("x-custom").unwrap(), "hello");
+    }
+
+    // --- Extension extractor ---
+
+    #[test]
+    fn extension_extractor_success() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct UserId(u64);
+
+        let mut req = get_request("/test");
+        req.set_extension(UserId(42));
+
+        let Extension(user_id) = ok_or_panic(Extension::<UserId>::from_parts(&req));
+        assert_eq!(user_id, UserId(42));
+    }
+
+    #[test]
+    fn extension_extractor_missing_returns_500() {
+        #[derive(Clone)]
+        struct MissingType;
+
+        let req = get_request("/test");
+        let err = err_or_panic(Extension::<MissingType>::from_parts(&req));
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // --- ConnectInfo extractor ---
+
+    #[test]
+    fn connect_info_extractor_success() {
+        let mut req = get_request("/test");
+        let addr: SocketAddr = "192.168.1.1:12345".parse().unwrap();
+        req.set_remote_addr(addr);
+
+        let ConnectInfo(extracted) = ok_or_panic(ConnectInfo::from_parts(&req));
+        assert_eq!(extracted, addr);
+    }
+
+    #[test]
+    fn connect_info_extractor_missing_returns_500() {
+        let req = get_request("/test");
+        let err = err_or_panic(ConnectInfo::from_parts(&req));
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // --- Body extractors: Bytes, String ---
+
+    #[test]
+    fn bytes_extractor() {
+        let body_data = Bytes::from("hello world");
+        let req = Request::new(
+            Method::POST,
+            "/test".parse().unwrap(),
+            HeaderMap::new(),
+            body_data.clone(),
+        );
+        let extracted = ok_or_panic(Bytes::from_request(&req));
+        assert_eq!(extracted, body_data);
+    }
+
+    #[test]
+    fn string_extractor_valid_utf8() {
+        let req = Request::new(
+            Method::POST,
+            "/test".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::from("hello"),
+        );
+        let extracted = ok_or_panic(String::from_request(&req));
+        assert_eq!(extracted, "hello");
+    }
+
+    #[test]
+    fn string_extractor_invalid_utf8_returns_400() {
+        let req = Request::new(
+            Method::POST,
+            "/test".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::from_static(&[0xFF, 0xFE]),
+        );
+        let err = err_or_panic(String::from_request(&req));
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // --- Json extractor ---
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_extractor_success() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct User {
+            name: String,
+            age: u32,
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let body = Bytes::from(r#"{"name":"Alice","age":30}"#);
+
+        let req = Request::new(Method::POST, "/test".parse().unwrap(), headers, body);
+        let Json(user) = ok_or_panic(Json::<User>::from_request(&req));
+        assert_eq!(user, User { name: "Alice".into(), age: 30 });
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_extractor_wrong_content_type_returns_415() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct User {
+            #[allow(dead_code)]
+            name: String,
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("text/plain"));
+        let body = Bytes::from(r#"{"name":"Alice"}"#);
+
+        let req = Request::new(Method::POST, "/test".parse().unwrap(), headers, body);
+        let err = err_or_panic(Json::<User>::from_request(&req));
+        assert_eq!(err.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_extractor_invalid_json_returns_400() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct User {
+            #[allow(dead_code)]
+            name: String,
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let body = Bytes::from("not json");
+
+        let req = Request::new(Method::POST, "/test".parse().unwrap(), headers, body);
+        let err = err_or_panic(Json::<User>::from_request(&req));
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_extractor_no_content_type_returns_415() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct User {
+            #[allow(dead_code)]
+            name: String,
+        }
+
+        let body = Bytes::from(r#"{"name":"Alice"}"#);
+        let req = Request::new(Method::POST, "/test".parse().unwrap(), HeaderMap::new(), body);
+        let err = err_or_panic(Json::<User>::from_request(&req));
+        assert_eq!(err.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    // --- Form extractor ---
+
+    #[cfg(feature = "form")]
+    #[test]
+    fn form_extractor_success() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct Login {
+            username: String,
+            password: String,
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        let body = Bytes::from("username=alice&password=secret");
+
+        let req = Request::new(Method::POST, "/login".parse().unwrap(), headers, body);
+        let Form(login) = ok_or_panic(Form::<Login>::from_request(&req));
+        assert_eq!(login, Login { username: "alice".into(), password: "secret".into() });
+    }
+
+    #[cfg(feature = "form")]
+    #[test]
+    fn form_extractor_wrong_content_type_returns_415() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct Login {
+            #[allow(dead_code)]
+            username: String,
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("text/plain"));
+        let body = Bytes::from("username=alice");
+
+        let req = Request::new(Method::POST, "/login".parse().unwrap(), headers, body);
+        let err = err_or_panic(Form::<Login>::from_request(&req));
+        assert_eq!(err.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[cfg(feature = "form")]
+    #[test]
+    fn form_extractor_invalid_data_returns_400() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct Login {
+            #[allow(dead_code)]
+            username: String,
+            #[allow(dead_code)]
+            age: u32,
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        let body = Bytes::from("username=alice&age=notanumber");
+
+        let req = Request::new(Method::POST, "/login".parse().unwrap(), headers, body);
+        let err = err_or_panic(Form::<Login>::from_request(&req));
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // --- Optional extractor ---
+
+    #[test]
+    fn optional_extractor_present() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct UserId(u64);
+
+        let mut req = get_request("/test");
+        req.set_extension(UserId(42));
+
+        let result = ok_or_panic(Optional::<Extension<UserId>>::from_parts(&req));
+        assert!(result.0.is_some());
+        assert_eq!(result.0.unwrap().0, UserId(42));
+    }
+
+    #[test]
+    fn optional_extractor_absent() {
+        #[derive(Clone)]
+        struct UserId(u64);
+
+        let req = get_request("/test");
+        let result = ok_or_panic(Optional::<Extension<UserId>>::from_parts(&req));
+        assert!(result.0.is_none());
+    }
+
+    // --- TypedHeader extractor ---
+
+    #[test]
+    fn typed_header_content_type() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
+
+        let TypedHeader(ct) = ok_or_panic(TypedHeader::<ContentType>::from_parts(&req));
+        assert_eq!(ct.0, "application/json");
+    }
+
+    #[test]
+    fn typed_header_missing_returns_400() {
+        let req = get_request("/test");
+        let err = err_or_panic(TypedHeader::<ContentType>::from_parts(&req));
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn typed_header_authorization() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Basic abc123"));
+        let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
+
+        let TypedHeader(auth) = ok_or_panic(TypedHeader::<Authorization>::from_parts(&req));
+        assert_eq!(auth.0, "Basic abc123");
+    }
+
+    #[test]
+    fn typed_header_accept() {
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", HeaderValue::from_static("text/html"));
+        let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
+
+        let TypedHeader(accept) = ok_or_panic(TypedHeader::<Accept>::from_parts(&req));
+        assert_eq!(accept.0, "text/html");
+    }
+
+    #[test]
+    fn typed_header_user_agent() {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("Neutron/1.0"));
+        let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
+
+        let TypedHeader(ua) = ok_or_panic(TypedHeader::<UserAgent>::from_parts(&req));
+        assert_eq!(ua.0, "Neutron/1.0");
+    }
+
+    #[test]
+    fn typed_header_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("example.com"));
+        let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
+
+        let TypedHeader(host) = ok_or_panic(TypedHeader::<Host>::from_parts(&req));
+        assert_eq!(host.0, "example.com");
+    }
+
+    #[test]
+    fn typed_header_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", HeaderValue::from_static("https://example.com"));
+        let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
+
+        let TypedHeader(origin) = ok_or_panic(TypedHeader::<Origin>::from_parts(&req));
+        assert_eq!(origin.0, "https://example.com");
+    }
+
+    // --- BearerToken ---
+
+    #[test]
+    fn bearer_token_success() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer my-secret-token"),
+        );
+        let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
+
+        let TypedHeader(BearerToken(token)) =
+            ok_or_panic(TypedHeader::<BearerToken>::from_parts(&req));
+        assert_eq!(token, "my-secret-token");
+    }
+
+    #[test]
+    fn bearer_token_wrong_scheme_returns_400() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Basic abc123"),
+        );
+        let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
+
+        let err = err_or_panic(TypedHeader::<BearerToken>::from_parts(&req));
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn bearer_token_missing_header_returns_400() {
+        let req = get_request("/test");
+        let err = err_or_panic(TypedHeader::<BearerToken>::from_parts(&req));
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // --- Blanket FromRequest impl for FromRequestParts types ---
+
+    #[test]
+    fn from_request_parts_blanket_impl() {
+        // Method implements FromRequestParts; via blanket, it also implements FromRequest.
+        let req = Request::new(
+            Method::DELETE,
+            "/test".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        let method = ok_or_panic(<Method as FromRequest>::from_request(&req));
+        assert_eq!(method, Method::DELETE);
+    }
+}

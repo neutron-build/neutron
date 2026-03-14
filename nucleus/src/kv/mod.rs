@@ -17,10 +17,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 
+#[cfg(feature = "server")]
 use crate::storage::kv_wal::{KvWal, KvWalOp};
 use crate::types::Value;
 
 pub mod collections;
+#[cfg(feature = "server")]
 pub mod collections_wal;
 pub mod streams;
 pub mod tiered;
@@ -125,6 +127,7 @@ impl ShardedMap {
 /// has no cold tier.
 pub struct KvStore {
     data: ShardedMap,
+    #[cfg(feature = "server")]
     wal: Option<Arc<KvWal>>,
     collections: collections::ShardedCollections,
     /// Cold tier: disk-backed LsmTree for overflow entries (disk mode only).
@@ -148,6 +151,7 @@ impl KvStore {
     pub fn new() -> Self {
         Self {
             data: ShardedMap::new(),
+            #[cfg(feature = "server")]
             wal: None,
             collections: collections::ShardedCollections::new(),
             cold: None,
@@ -161,6 +165,7 @@ impl KvStore {
     ///
     /// If the WAL files don't exist a fresh store is returned. Corrupt
     /// trailing bytes are silently skipped (best-effort recovery).
+    #[cfg(feature = "server")]
     pub fn open(dir: &Path) -> std::io::Result<Self> {
         let (wal, state) = KvWal::open(dir)?;
         let sharded = ShardedMap::new();
@@ -261,6 +266,7 @@ impl KvStore {
 
     /// SET — store a value with optional TTL in seconds.
     pub fn set(&self, key: &str, value: Value, ttl_secs: Option<u64>) {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal {
             if let Err(e) = wal.log_set(key, &value) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -297,6 +303,7 @@ impl KvStore {
 
     /// DEL — remove a key. Returns true if the key existed (in hot or cold tier).
     pub fn del(&self, key: &str) -> bool {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_delete(key) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -354,6 +361,7 @@ impl KvStore {
         let new_val = current + amount;
         let ttl = entry.and_then(|e| e.expires_at);
 
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_set(key, &Value::Int64(new_val)) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -388,6 +396,7 @@ impl KvStore {
             if let Some(old_exp) = entry.expires_at {
                 shard.remove_expiry(key, old_exp);
             }
+            #[cfg(feature = "server")]
             if let Some(ref wal) = self.wal {
                 let abs_ms = epoch_ms_now() + ttl_secs * 1000;
                 if let Err(e) = wal.log_expire(key, abs_ms) {
@@ -473,6 +482,7 @@ impl KvStore {
 
     /// FLUSHDB — remove all keys from both hot and cold tiers.
     pub fn flushdb(&self) {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal {
             // Checkpoint with empty state to truncate WAL
             if let Err(e) = wal.checkpoint(&[]) {
@@ -561,6 +571,7 @@ impl KvStore {
     /// per-key WAL writes, avoiding per-entry syscall overhead.
     /// Each key is inserted into its own shard for parallel access.
     pub fn mset(&self, pairs: &[(&str, Value)]) {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal {
             let batch: Vec<(KvWalOp, &str, Option<&Value>, Option<u64>)> = pairs
                 .iter()
@@ -595,6 +606,7 @@ impl KvStore {
                 shard.remove_expiry(key, old_exp);
             }
         }
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
             && let Err(e) = wal.log_set(key, &value) {
                 tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
@@ -1058,6 +1070,7 @@ impl KvStore {
     }
 
     /// Write a WAL checkpoint (snapshot + truncate). No-op if WAL is disabled.
+    #[cfg(feature = "server")]
     pub fn checkpoint(&self) -> std::io::Result<()> {
         let Some(ref wal) = self.wal else { return Ok(()) };
         let mut items = Vec::new();
@@ -1076,6 +1089,7 @@ impl KvStore {
     }
 
     /// Access the underlying WAL (if any).
+    #[cfg(feature = "server")]
     pub fn wal(&self) -> Option<&Arc<KvWal>> {
         self.wal.as_ref()
     }
@@ -1120,6 +1134,7 @@ pub struct KvTxnSnapshot {
 /// Start the background TTL sweeper task.
 /// Uses the active (O(expired)) sweep on each tick, and runs a full O(n)
 /// safety-net sweep every 60 ticks to catch any index drift.
+#[cfg(feature = "server")]
 pub fn start_sweeper(store: Arc<KvStore>, interval_secs: u64) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));

@@ -106,11 +106,13 @@ impl Executor {
             Ok(()) => {
                 // Route to per-table engine if engine override was specified.
                 let tbl_storage: Arc<dyn StorageEngine> = match engine_name.as_deref() {
+                    #[cfg(feature = "server")]
                     Some("columnar") => {
                         let eng = Arc::new(crate::storage::ColumnarStorageEngine::new());
                         self.table_engines.write().insert(table_name.clone(), eng.clone());
                         eng
                     }
+                    #[cfg(feature = "server")]
                     Some("lsm") => {
                         let eng = Arc::new(crate::storage::LsmStorageEngine::new());
                         self.table_engines.write().insert(table_name.clone(), eng.clone());
@@ -224,6 +226,7 @@ impl Executor {
                             // Clean up sync caches
                             self.table_columns.write().remove(&table_name);
                             self.btree_indexes.write().retain(|(t, _), _| t != &table_name);
+                            #[cfg(feature = "server")]
                             self.hash_indexes.write().retain(|(t, _), _| t != &table_name);
                             // Clean up view dependency tracking
                             self.view_deps.write().remove(&table_name);
@@ -558,6 +561,7 @@ impl Executor {
                         );
                         // For hash indexes, also register in hash_indexes so the
                         // planner can use O(1) cost estimation instead of O(log n).
+                        #[cfg(feature = "server")]
                         if matches!(index_type, crate::catalog::IndexType::Hash) {
                             self.hash_indexes.write().insert(
                                 (table_name.clone(), col_name.clone()),
@@ -613,6 +617,7 @@ impl Executor {
 
             // Clear index entries for the truncated table to avoid orphaned references
             self.btree_indexes.write().retain(|(t, _), _| t != &table_name);
+            #[cfg(feature = "server")]
             self.hash_indexes.write().retain(|(t, _), _| t != &table_name);
             self.vector_indexes.write().retain(|_, entry| entry.table_name != table_name);
             self.encrypted_indexes.write().retain(|_, entry| entry.table_name != table_name);

@@ -25,7 +25,8 @@ export {
   NucleusAuthError,
 } from './errors.js';
 
-export { HttpTransport } from './transport.js';
+export { HttpTransport, MobileTransport, EmbeddedTransport, createTransport } from './transport.js';
+export type { TransportConfig, MobileTransportConfig } from './transport.js';
 export { detectFeatures } from './features.js';
 export { migrate, migrateDown, migrationStatus } from './migrate.js';
 export type { Migration, MigrationRecord } from './migrate.js';

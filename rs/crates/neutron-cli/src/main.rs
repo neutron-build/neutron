@@ -600,3 +600,370 @@ fn walk_dir(dir: &Path) -> std::io::Result<Vec<String>> {
     }
     Ok(files)
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use std::fs;
+
+    // --- CLI argument parsing ---
+
+    #[test]
+    fn parse_dev_default_port() {
+        let cli = Cli::parse_from(["neutron-rs", "dev"]);
+        match cli.command {
+            Commands::Dev { port } => assert_eq!(port, 3000),
+            _ => panic!("expected Dev"),
+        }
+    }
+
+    #[test]
+    fn parse_dev_custom_port() {
+        let cli = Cli::parse_from(["neutron-rs", "dev", "--port", "8080"]);
+        match cli.command {
+            Commands::Dev { port } => assert_eq!(port, 8080),
+            _ => panic!("expected Dev"),
+        }
+    }
+
+    #[test]
+    fn parse_dev_short_port_flag() {
+        let cli = Cli::parse_from(["neutron-rs", "dev", "-p", "4000"]);
+        match cli.command {
+            Commands::Dev { port } => assert_eq!(port, 4000),
+            _ => panic!("expected Dev"),
+        }
+    }
+
+    #[test]
+    fn parse_new_default_template() {
+        let cli = Cli::parse_from(["neutron-rs", "new", "myapp"]);
+        match cli.command {
+            Commands::New { name, template } => {
+                assert_eq!(name, "myapp");
+                assert_eq!(template, "api");
+            }
+            _ => panic!("expected New"),
+        }
+    }
+
+    #[test]
+    fn parse_new_custom_template() {
+        let cli = Cli::parse_from(["neutron-rs", "new", "myapp", "--template", "grpc"]);
+        match cli.command {
+            Commands::New { name, template } => {
+                assert_eq!(name, "myapp");
+                assert_eq!(template, "grpc");
+            }
+            _ => panic!("expected New"),
+        }
+    }
+
+    #[test]
+    fn parse_new_short_template_flag() {
+        let cli = Cli::parse_from(["neutron-rs", "new", "myapp", "-t", "graphql"]);
+        match cli.command {
+            Commands::New { name, template } => {
+                assert_eq!(name, "myapp");
+                assert_eq!(template, "graphql");
+            }
+            _ => panic!("expected New"),
+        }
+    }
+
+    #[test]
+    fn parse_build_no_args() {
+        let cli = Cli::parse_from(["neutron-rs", "build"]);
+        match cli.command {
+            Commands::Build { args } => assert!(args.is_empty()),
+            _ => panic!("expected Build"),
+        }
+    }
+
+    #[test]
+    fn parse_build_with_extra_args() {
+        let cli = Cli::parse_from([
+            "neutron-rs",
+            "build",
+            "--features",
+            "jemalloc",
+        ]);
+        match cli.command {
+            Commands::Build { args } => {
+                assert_eq!(args, vec!["--features", "jemalloc"]);
+            }
+            _ => panic!("expected Build"),
+        }
+    }
+
+    #[test]
+    fn parse_check() {
+        let cli = Cli::parse_from(["neutron-rs", "check"]);
+        assert!(matches!(cli.command, Commands::Check));
+    }
+
+    #[test]
+    fn parse_routes() {
+        let cli = Cli::parse_from(["neutron-rs", "routes"]);
+        assert!(matches!(cli.command, Commands::Routes));
+    }
+
+    // --- Project name validation ---
+
+    fn is_valid_project_name(name: &str) -> bool {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }
+
+    #[test]
+    fn valid_project_names() {
+        assert!(is_valid_project_name("myapp"));
+        assert!(is_valid_project_name("my-app"));
+        assert!(is_valid_project_name("my_app"));
+        assert!(is_valid_project_name("app123"));
+        assert!(is_valid_project_name("A"));
+        assert!(is_valid_project_name("a-b_c-123"));
+    }
+
+    #[test]
+    fn invalid_project_names() {
+        assert!(!is_valid_project_name(""));
+        assert!(!is_valid_project_name("my app"));
+        assert!(!is_valid_project_name("my.app"));
+        assert!(!is_valid_project_name("my/app"));
+        assert!(!is_valid_project_name("my@app"));
+        assert!(!is_valid_project_name("drop;table"));
+    }
+
+    // --- Template selection validation ---
+
+    fn is_valid_template(tpl: &str) -> bool {
+        matches!(tpl, "api" | "grpc" | "graphql" | "jobs" | "full")
+    }
+
+    #[test]
+    fn valid_templates() {
+        assert!(is_valid_template("api"));
+        assert!(is_valid_template("grpc"));
+        assert!(is_valid_template("graphql"));
+        assert!(is_valid_template("jobs"));
+        assert!(is_valid_template("full"));
+    }
+
+    #[test]
+    fn invalid_templates() {
+        assert!(!is_valid_template(""));
+        assert!(!is_valid_template("rest"));
+        assert!(!is_valid_template("API"));
+        assert!(!is_valid_template("unknown"));
+    }
+
+    // --- binary_path parsing ---
+
+    #[test]
+    fn binary_path_extracts_name() {
+        // Create a temp dir with a Cargo.toml
+        let dir = std::env::temp_dir().join("neutron_cli_test_binary_path");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"my-test-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        // binary_path reads from CWD, so we test the parsing logic directly
+        let toml = "[package]\nname = \"my-test-app\"\nversion = \"0.1.0\"\n";
+        let name = toml
+            .lines()
+            .find(|l| l.trim_start().starts_with("name"))
+            .and_then(|l| l.split('"').nth(1))
+            .unwrap_or("app");
+        assert_eq!(name, "my-test-app");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binary_path_parse_missing_name_defaults_to_app() {
+        let toml = "[package]\nversion = \"0.1.0\"\n";
+        let name = toml
+            .lines()
+            .find(|l| l.trim_start().starts_with("name"))
+            .and_then(|l| l.split('"').nth(1))
+            .unwrap_or("app");
+        assert_eq!(name, "app");
+    }
+
+    // --- walk_dir ---
+
+    #[test]
+    fn walk_dir_nonexistent_returns_empty() {
+        let result = walk_dir(Path::new("/nonexistent/path/that/does/not/exist"));
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn walk_dir_lists_files_recursively() {
+        let dir = std::env::temp_dir().join("neutron_cli_test_walk_dir");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("a.txt"), "a").unwrap();
+        fs::write(dir.join("sub/b.txt"), "b").unwrap();
+
+        let files = walk_dir(&dir).unwrap();
+        assert_eq!(files.len(), 2);
+
+        // Verify both files are found (order may vary)
+        let has_a = files.iter().any(|f| f.ends_with("a.txt"));
+        let has_b = files.iter().any(|f| f.ends_with("b.txt"));
+        assert!(has_a);
+        assert!(has_b);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn walk_dir_file_not_directory_returns_empty() {
+        let dir = std::env::temp_dir().join("neutron_cli_test_walk_file");
+        let _ = fs::remove_file(&dir);
+        fs::write(&dir, "content").unwrap();
+
+        let files = walk_dir(&dir).unwrap();
+        assert!(files.is_empty());
+
+        let _ = fs::remove_file(&dir);
+    }
+
+    // --- Template constants sanity ---
+
+    #[test]
+    fn template_api_main_contains_neutron() {
+        assert!(TEMPLATE_API_MAIN.contains("Neutron::new()"));
+        assert!(TEMPLATE_API_MAIN.contains("Router::new()"));
+        assert!(TEMPLATE_API_MAIN.contains("tokio::main"));
+    }
+
+    #[test]
+    fn template_grpc_main_contains_grpc() {
+        assert!(TEMPLATE_GRPC_MAIN.contains("grpc_router()"));
+    }
+
+    #[test]
+    fn template_graphql_main_contains_graphql() {
+        assert!(TEMPLATE_GRAPHQL_MAIN.contains("graphql_handler"));
+        assert!(TEMPLATE_GRAPHQL_MAIN.contains("ExecutableSchema"));
+    }
+
+    #[test]
+    fn template_jobs_main_contains_job_worker() {
+        assert!(TEMPLATE_JOBS_MAIN.contains("JobWorker"));
+        assert!(TEMPLATE_JOBS_MAIN.contains("JobQueue"));
+    }
+
+    #[test]
+    fn template_api_routes_has_crud_endpoints() {
+        assert!(TEMPLATE_API_ROUTES.contains(".get(\"/items\""));
+        assert!(TEMPLATE_API_ROUTES.contains(".post(\"/items\""));
+        assert!(TEMPLATE_API_ROUTES.contains(".get(\"/items/:id\""));
+    }
+
+    // --- Route scanning heuristic ---
+
+    #[test]
+    fn route_scan_extracts_get_routes() {
+        let src = r#"
+let router = Router::new()
+    .get("/health", health)
+    .get("/api/users", list_users)
+    .post("/api/users", create_user);
+"#;
+        let methods = ["get", "post", "put", "patch", "delete", "head", "options"];
+        let mut routes: Vec<(String, String)> = Vec::new();
+        for line in src.lines() {
+            let trimmed = line.trim();
+            for method in methods {
+                let needle = format!(".{method}(\"");
+                if let Some(rest) = trimmed.strip_prefix(&needle) {
+                    if let Some(end) = rest.find('"') {
+                        routes.push((method.to_uppercase(), rest[..end].to_string()));
+                    }
+                }
+            }
+        }
+        assert_eq!(routes.len(), 3);
+        assert_eq!(routes[0], ("GET".to_string(), "/health".to_string()));
+        assert_eq!(routes[1], ("GET".to_string(), "/api/users".to_string()));
+        assert_eq!(routes[2], ("POST".to_string(), "/api/users".to_string()));
+    }
+
+    #[test]
+    fn route_scan_no_matches_in_plain_code() {
+        let src = "fn main() { println!(\"hello\"); }";
+        let methods = ["get", "post", "put", "patch", "delete", "head", "options"];
+        let mut count = 0;
+        for line in src.lines() {
+            let trimmed = line.trim();
+            for method in methods {
+                let needle = format!(".{method}(\"");
+                if trimmed.strip_prefix(&needle).is_some() {
+                    count += 1;
+                }
+            }
+        }
+        assert_eq!(count, 0);
+    }
+
+    // --- Subdirectory logic for templates ---
+
+    #[test]
+    fn grpc_template_uses_services_dir() {
+        let tpl = "grpc";
+        let src_subdir = match tpl {
+            "grpc" | "rpc" => "src/services",
+            _ => "src/routes",
+        };
+        assert_eq!(src_subdir, "src/services");
+    }
+
+    #[test]
+    fn api_template_uses_routes_dir() {
+        let tpl = "api";
+        let src_subdir = match tpl {
+            "grpc" | "rpc" => "src/services",
+            _ => "src/routes",
+        };
+        assert_eq!(src_subdir, "src/routes");
+    }
+
+    // --- Extra deps per template ---
+
+    #[test]
+    fn grpc_template_adds_grpc_dep() {
+        let extra_deps = match "grpc" {
+            "grpc"    => "neutron-grpc = { path = \"../neutron/crates/neutron-grpc\" }\n",
+            "graphql" => "neutron-graphql = { path = \"../neutron/crates/neutron-graphql\" }\n",
+            "jobs"    => "neutron-jobs = { path = \"../neutron/crates/neutron-jobs\" }\n",
+            _ => "",
+        };
+        assert!(extra_deps.contains("neutron-grpc"));
+    }
+
+    #[test]
+    fn api_template_adds_no_extra_deps() {
+        let extra_deps = match "api" {
+            "grpc"    => "neutron-grpc",
+            "graphql" => "neutron-graphql",
+            "jobs"    => "neutron-jobs",
+            _ => "",
+        };
+        assert!(extra_deps.is_empty());
+    }
+}

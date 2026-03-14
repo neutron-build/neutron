@@ -15,28 +15,28 @@ bytes = "1"
 crc32c = "0.6"
 futures = "0.3"
 parking_lot = "0.12"
-pgwire = { version = "0.36", features = ["server-api-aws-lc-rs"] }
-rcgen = "0.13"
-rustls-pemfile = "2"
+pgwire = { version = "0.36", features = ["server-api-aws-lc-rs"], optional = true }
+rcgen = { version = "0.13", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 rand = "0.8"
-rayon = "1.10"
+rayon = { version = "1.10", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlparser = { version = "0.61", features = ["visitor"] }
 thiserror = "2"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["sync", "macros"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4.5.58", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+clap = { version = "4.5.58", features = ["derive"], optional = true }
 base64 = "0.22.1"
 blake3 = "1"
 toml = "0.8"
-core_affinity = "0.8"
-rustyline = "14"
+core_affinity = { version = "0.8", optional = true }
+rustyline = { version = "14", optional = true }
 lz4_flex = "0.11"
-zstd = "0.13"
+zstd = { version = "0.13", optional = true }
 regex = "1.12.3"
-tokio-postgres = { version = "0.7" }
+tokio-postgres = { version = "0.7", optional = true }
 comfy-table = { version = "7", optional = true }
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
@@ -47,10 +47,23 @@ tracing-opentelemetry = { version = "0.30", optional = true }
 ort = { version = "2.0.0-rc.11", features = ["ndarray"], optional = true }
 ndarray = { version = "0.17", optional = true }
 tikv-jemallocator = { version = "0.6", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+getrandom = { version = "0.2", optional = true }
 
 [features]
-bench-tools = ["comfy-table", "redis", "reqwest"]
-otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
+default = ["server"]
+server = [
+    "dep:pgwire", "dep:rayon", "dep:core_affinity", "dep:rustyline",
+    "dep:clap", "dep:rcgen", "dep:rustls-pemfile", "dep:tokio-postgres",
+    "dep:tracing-subscriber", "dep:zstd",
+    "tokio/full", "tokio/rt-multi-thread",
+]
+wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:serde-wasm-bindgen", "getrandom/js"]
+bench-tools = ["server", "comfy-table", "redis", "reqwest"]
+otel = ["server", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 onnx = ["ort", "ndarray"]
 jemalloc = ["tikv-jemallocator"]
 
@@ -60,8 +73,14 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
 
 [[bin]]
+name = "nucleus"
+path = "src/main.rs"
+required-features = ["server"]
+
+[[bin]]
 name = "pg_compare"
 path = "src/bin/pg_compare.rs"
+required-features = ["server"]
 
 [[bin]]
 name = "benchmark"
