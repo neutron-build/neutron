@@ -8,6 +8,7 @@
 
 import { signal, computed } from '@preact/signals-core'
 import type { RouterState, NavigateOptions } from './types.js'
+import { matchRegisteredRoute } from './route-registry.js'
 
 // ─── Router state ─────────────────────────────────────────────────────────────
 
@@ -121,6 +122,14 @@ function _bridgeToRN(action: 'navigate' | 'back', path: string, p?: Record<strin
   if (action === 'back') {
     _rnNavigation.goBack()
   } else {
+    // Try registered route match first
+    const registered = matchRegisteredRoute(path)
+    if (registered) {
+      _rnNavigation.navigate(registered.screenName, registered.params)
+      return
+    }
+
+    // Fallback to slug transform (backward compatible)
     const screenName = path.replace(/^\//, '').replace(/\//g, '_') || 'index'
     _rnNavigation.navigate(screenName, p)
   }
