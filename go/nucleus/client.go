@@ -37,6 +37,11 @@ type Features struct {
 	HasFTS      bool
 	HasGeo      bool
 	HasBlob     bool
+	HasStreams  bool
+	HasColumnar bool
+	HasDatalog  bool
+	HasCDC      bool
+	HasPubSub   bool
 	Version     string
 }
 
@@ -224,6 +229,11 @@ func detectFeatures(ctx context.Context, pool *pgxpool.Pool) (Features, error) {
 		f.HasFTS = true
 		f.HasGeo = true
 		f.HasBlob = true
+		f.HasStreams = true
+		f.HasColumnar = true
+		f.HasDatalog = true
+		f.HasCDC = true
+		f.HasPubSub = true
 	}
 
 	return f, nil
