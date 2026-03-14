@@ -49,3 +49,69 @@ fn state_file_path(label: &str) -> std::path::PathBuf {
         .join("window-state")
         .join(format!("{label}.json"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_window_state_serialize() {
+        let state = WindowState {
+            x: 100,
+            y: 200,
+            width: 1920,
+            height: 1080,
+            maximized: false,
+            fullscreen: false,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("1920"));
+        assert!(json.contains("1080"));
+    }
+
+    #[test]
+    fn test_window_state_deserialize() {
+        let json = r#"{"x":50,"y":50,"width":800,"height":600,"maximized":true,"fullscreen":false}"#;
+        let state: WindowState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.x, 50);
+        assert_eq!(state.y, 50);
+        assert_eq!(state.width, 800);
+        assert_eq!(state.height, 600);
+        assert!(state.maximized);
+        assert!(!state.fullscreen);
+    }
+
+    #[test]
+    fn test_window_state_roundtrip() {
+        let state = WindowState {
+            x: -10,
+            y: 0,
+            width: 3840,
+            height: 2160,
+            maximized: true,
+            fullscreen: true,
+        };
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let restored: WindowState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.x, state.x);
+        assert_eq!(restored.y, state.y);
+        assert_eq!(restored.width, state.width);
+        assert_eq!(restored.height, state.height);
+        assert_eq!(restored.maximized, state.maximized);
+        assert_eq!(restored.fullscreen, state.fullscreen);
+    }
+
+    #[test]
+    fn test_state_file_path_format() {
+        let path = state_file_path("main");
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains("com.neutron.desktop"));
+        assert!(path_str.contains("window-state"));
+        assert!(path_str.ends_with("main.json"));
+    }
+
+    #[test]
+    fn test_init_creates_plugin() {
+        let _plugin = super::init();
+    }
+}

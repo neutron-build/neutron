@@ -791,6 +791,7 @@ unsafe impl Sync for BufferPool {}
 /// The flusher wakes every `interval_ms` milliseconds and checks whether the
 /// number of tracked dirty pages exceeds `threshold_pct` of the pool size. If
 /// so, it flushes up to `batch_size` pages via [`BufferPool::flush_dirty_batch`].
+#[cfg(feature = "server")]
 pub fn spawn_background_flusher(
     pool: std::sync::Arc<BufferPool>,
     interval_ms: u64,

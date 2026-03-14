@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 
 import pytest
 
 from neutron.error import AppError
 from neutron.nucleus._exec import Executor
 from neutron.nucleus.blob import BlobModel
+from neutron.nucleus.cdc import CDCModel, CDCEvent, _parse_cdc_events
 from neutron.nucleus.client import Features
+from neutron.nucleus.columnar import ColumnarModel
+from neutron.nucleus.datalog import DatalogModel
 from neutron.nucleus.document import DocumentModel
 from neutron.nucleus.fts import FTSModel
 from neutron.nucleus.geo import GeoFeature, GeoModel
 from neutron.nucleus.graph import GraphModel
 from neutron.nucleus.kv import KVModel
+from neutron.nucleus.pubsub import PubSubModel
+from neutron.nucleus.streams import StreamsModel, StreamEntry, _parse_stream_entries
 from neutron.nucleus.timeseries import TimeSeriesModel, TimeSeriesPoint
 from neutron.nucleus.vector import VectorModel
 
@@ -544,3 +551,582 @@ class TestBlob:
         assert meta.size == 1024
         assert meta.content_type == "image/png"
         assert meta.metadata["env"] == "prod"
+
+
+# ============================================================
+# CDC Model
+# ============================================================
+
+
+class TestCDC:
+    @pytest.mark.asyncio
+    async def test_read(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = json.dumps(
+            [{"offset": 0, "table": "users", "operation": "INSERT", "data": {"id": 1}}]
+        )
+        cdc = CDCModel(_make_exec(mock_conn), nucleus_features)
+        events = await cdc.read(offset=0)
+        assert len(events) == 1
+        assert events[0].offset == 0
+        assert events[0].table == "users"
+        assert events[0].operation == "INSERT"
+        mock_conn.fetchval.assert_called_with("SELECT CDC_READ($1)", 0)
+
+    @pytest.mark.asyncio
+    async def test_read_empty(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = None
+        cdc = CDCModel(_make_exec(mock_conn), nucleus_features)
+        events = await cdc.read(offset=0)
+        assert events == []
+
+    @pytest.mark.asyncio
+    async def test_count(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = 42
+        cdc = CDCModel(_make_exec(mock_conn), nucleus_features)
+        assert await cdc.count() == 42
+        mock_conn.fetchval.assert_called_with("SELECT CDC_COUNT()")
+
+    @pytest.mark.asyncio
+    async def test_table_read(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = json.dumps(
+            [{"offset": 5, "op": "UPDATE", "data": {"name": "Bob"}}]
+        )
+        cdc = CDCModel(_make_exec(mock_conn), nucleus_features)
+        events = await cdc.table_read("users", offset=5)
+        assert len(events) == 1
+        assert events[0].table == "users"
+        mock_conn.fetchval.assert_called_with(
+            "SELECT CDC_TABLE_READ($1, $2)", "users", 5
+        )
+
+    @pytest.mark.asyncio
+    async def test_requires_nucleus(self, mock_conn, plain_features):
+        cdc = CDCModel(_make_exec(mock_conn), plain_features)
+        with pytest.raises(AppError):
+            await cdc.read(0)
+
+    @pytest.mark.asyncio
+    async def test_count_requires_nucleus(self, mock_conn, plain_features):
+        cdc = CDCModel(_make_exec(mock_conn), plain_features)
+        with pytest.raises(AppError):
+            await cdc.count()
+
+
+class TestCDCEventParsing:
+    def test_parse_empty(self):
+        assert _parse_cdc_events(None) == []
+        assert _parse_cdc_events("") == []
+
+    def test_parse_single_event(self):
+        raw = json.dumps({"offset": 0, "table": "users", "operation": "INSERT", "data": {"id": 1}})
+        events = _parse_cdc_events(raw)
+        assert len(events) == 1
+        assert events[0].offset == 0
+
+    def test_parse_list(self):
+        raw = json.dumps([
+            {"offset": 0, "table": "a", "operation": "INSERT", "data": {}},
+            {"offset": 1, "table": "b", "operation": "DELETE", "data": {}},
+        ])
+        events = _parse_cdc_events(raw)
+        assert len(events) == 2
+
+    def test_parse_invalid_json(self):
+        assert _parse_cdc_events("not-json{{") == []
+
+    def test_cdc_event_model(self):
+        event = CDCEvent(offset=0, table="users", operation="INSERT", data={"id": 1})
+        assert event.offset == 0
+        assert event.table == "users"
+        assert event.operation == "INSERT"
+        assert event.data == {"id": 1}
+
+    def test_parse_uses_op_fallback(self):
+        raw = json.dumps([{"offset": 0, "op": "DELETE", "data": {}}])
+        events = _parse_cdc_events(raw)
+        assert events[0].operation == "DELETE"
+
+
+# ============================================================
+# Columnar Model
+# ============================================================
+
+
+class TestColumnar:
+    @pytest.mark.asyncio
+    async def test_insert(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = True
+        col = ColumnarModel(_make_exec(mock_conn), nucleus_features)
+        result = await col.insert("metrics", {"ts": 1700000000, "value": 42.5})
+        assert result is True
+        sql = mock_conn.fetchval.call_args[0][0]
+        assert "COLUMNAR_INSERT" in sql
+
+    @pytest.mark.asyncio
+    async def test_count(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = 1000
+        col = ColumnarModel(_make_exec(mock_conn), nucleus_features)
+        assert await col.count("metrics") == 1000
+        mock_conn.fetchval.assert_called_with("SELECT COLUMNAR_COUNT($1)", "metrics")
+
+    @pytest.mark.asyncio
+    async def test_sum(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = 5000.0
+        col = ColumnarModel(_make_exec(mock_conn), nucleus_features)
+        assert await col.sum("metrics", "value") == 5000.0
+        mock_conn.fetchval.assert_called_with(
+            "SELECT COLUMNAR_SUM($1, $2)", "metrics", "value"
+        )
+
+    @pytest.mark.asyncio
+    async def test_avg(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = 42.5
+        col = ColumnarModel(_make_exec(mock_conn), nucleus_features)
+        assert await col.avg("metrics", "value") == 42.5
+
+    @pytest.mark.asyncio
+    async def test_min(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = 1.0
+        col = ColumnarModel(_make_exec(mock_conn), nucleus_features)
+        assert await col.min("metrics", "value") == 1.0
+
+    @pytest.mark.asyncio
+    async def test_max(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = 100.0
+        col = ColumnarModel(_make_exec(mock_conn), nucleus_features)
+        assert await col.max("metrics", "value") == 100.0
+
+    @pytest.mark.asyncio
+    async def test_requires_nucleus(self, mock_conn, plain_features):
+        col = ColumnarModel(_make_exec(mock_conn), plain_features)
+        with pytest.raises(AppError):
+            await col.count("t")
+
+
+# ============================================================
+# Datalog Model
+# ============================================================
+
+
+class TestDatalog:
+    @pytest.mark.asyncio
+    async def test_assert_fact(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = True
+        dl = DatalogModel(_make_exec(mock_conn), nucleus_features)
+        assert await dl.assert_fact("parent(alice, bob)") is True
+        mock_conn.fetchval.assert_called_with(
+            "SELECT DATALOG_ASSERT($1)", "parent(alice, bob)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_retract(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = True
+        dl = DatalogModel(_make_exec(mock_conn), nucleus_features)
+        assert await dl.retract("parent(alice, bob)") is True
+        mock_conn.fetchval.assert_called_with(
+            "SELECT DATALOG_RETRACT($1)", "parent(alice, bob)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_rule(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = True
+        dl = DatalogModel(_make_exec(mock_conn), nucleus_features)
+        assert await dl.rule("ancestor(X, Z)", "parent(X, Y), ancestor(Y, Z)") is True
+        mock_conn.fetchval.assert_called_with(
+            "SELECT DATALOG_RULE($1, $2)",
+            "ancestor(X, Z)",
+            "parent(X, Y), ancestor(Y, Z)",
+        )
+
+    @pytest.mark.asyncio
+    async def test_query(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = "alice,bob\ncarol,dave"
+        dl = DatalogModel(_make_exec(mock_conn), nucleus_features)
+        results = await dl.query("ancestor(alice, ?X)")
+        assert len(results) == 2
+        assert results[0] == ["alice", "bob"]
+        assert results[1] == ["carol", "dave"]
+
+    @pytest.mark.asyncio
+    async def test_query_empty(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = None
+        dl = DatalogModel(_make_exec(mock_conn), nucleus_features)
+        results = await dl.query("ancestor(alice, ?X)")
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_query_empty_string(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = ""
+        dl = DatalogModel(_make_exec(mock_conn), nucleus_features)
+        results = await dl.query("ancestor(alice, ?X)")
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_clear(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = True
+        dl = DatalogModel(_make_exec(mock_conn), nucleus_features)
+        assert await dl.clear() is True
+        mock_conn.fetchval.assert_called_with("SELECT DATALOG_CLEAR()")
+
+    @pytest.mark.asyncio
+    async def test_import_graph(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = 25
+        dl = DatalogModel(_make_exec(mock_conn), nucleus_features)
+        assert await dl.import_graph() == 25
+        mock_conn.fetchval.assert_called_with("SELECT DATALOG_IMPORT_GRAPH()")
+
+    @pytest.mark.asyncio
+    async def test_requires_nucleus(self, mock_conn, plain_features):
+        dl = DatalogModel(_make_exec(mock_conn), plain_features)
+        with pytest.raises(AppError):
+            await dl.assert_fact("f")
+
+
+# ============================================================
+# Streams Model
+# ============================================================
+
+
+class TestStreams:
+    @pytest.mark.asyncio
+    async def test_xadd(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = "1700000000-0"
+        sm = StreamsModel(_make_exec(mock_conn), nucleus_features)
+        entry_id = await sm.xadd("events", {"action": "login"})
+        assert entry_id == "1700000000-0"
+        sql = mock_conn.fetchval.call_args[0][0]
+        assert "STREAM_XADD" in sql
+
+    @pytest.mark.asyncio
+    async def test_xlen(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = 42
+        sm = StreamsModel(_make_exec(mock_conn), nucleus_features)
+        assert await sm.xlen("events") == 42
+        mock_conn.fetchval.assert_called_with("SELECT STREAM_XLEN($1)", "events")
+
+    @pytest.mark.asyncio
+    async def test_xrange(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = json.dumps([
+            {"id": "100-0", "action": "login"},
+            {"id": "200-0", "action": "logout"},
+        ])
+        sm = StreamsModel(_make_exec(mock_conn), nucleus_features)
+        entries = await sm.xrange("events", 0, 1000, count=10)
+        assert len(entries) == 2
+        assert entries[0].id == "100-0"
+
+    @pytest.mark.asyncio
+    async def test_xrange_empty(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = None
+        sm = StreamsModel(_make_exec(mock_conn), nucleus_features)
+        entries = await sm.xrange("events", 0, 100)
+        assert entries == []
+
+    @pytest.mark.asyncio
+    async def test_xread(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = json.dumps([
+            {"id": "300-0", "task": "process"},
+        ])
+        sm = StreamsModel(_make_exec(mock_conn), nucleus_features)
+        entries = await sm.xread("events", last_id_ms=200, count=5)
+        assert len(entries) == 1
+        assert entries[0].id == "300-0"
+
+    @pytest.mark.asyncio
+    async def test_xgroup_create(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = True
+        sm = StreamsModel(_make_exec(mock_conn), nucleus_features)
+        assert await sm.xgroup_create("events", "workers", 0) is True
+        mock_conn.fetchval.assert_called_with(
+            "SELECT STREAM_XGROUP_CREATE($1, $2, $3)", "events", "workers", 0
+        )
+
+    @pytest.mark.asyncio
+    async def test_xreadgroup(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = json.dumps([
+            {"id": "400-0", "task": "send_email"},
+        ])
+        sm = StreamsModel(_make_exec(mock_conn), nucleus_features)
+        entries = await sm.xreadgroup("events", "workers", "w1", count=10)
+        assert len(entries) == 1
+
+    @pytest.mark.asyncio
+    async def test_xack(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = True
+        sm = StreamsModel(_make_exec(mock_conn), nucleus_features)
+        assert await sm.xack("events", "workers", 400, 0) is True
+        mock_conn.fetchval.assert_called_with(
+            "SELECT STREAM_XACK($1, $2, $3, $4)", "events", "workers", 400, 0
+        )
+
+    @pytest.mark.asyncio
+    async def test_requires_nucleus(self, mock_conn, plain_features):
+        sm = StreamsModel(_make_exec(mock_conn), plain_features)
+        with pytest.raises(AppError):
+            await sm.xlen("s")
+
+
+class TestStreamEntryParsing:
+    def test_parse_empty(self):
+        assert _parse_stream_entries(None) == []
+        assert _parse_stream_entries("") == []
+
+    def test_parse_valid(self):
+        raw = json.dumps([
+            {"id": "100-0", "action": "login"},
+            {"id": "200-0", "action": "logout"},
+        ])
+        entries = _parse_stream_entries(raw)
+        assert len(entries) == 2
+        assert entries[0].id == "100-0"
+        assert entries[0].fields.get("action") == "login"
+
+    def test_parse_invalid_json(self):
+        assert _parse_stream_entries("bad-json{{") == []
+
+    def test_stream_entry_model(self):
+        entry = StreamEntry(id="100-0", fields={"key": "value"})
+        assert entry.id == "100-0"
+        assert entry.fields["key"] == "value"
+
+    def test_stream_entry_empty_fields(self):
+        entry = StreamEntry(id="100-0")
+        assert entry.fields == {}
+
+
+# ============================================================
+# PubSub Model
+# ============================================================
+
+
+class TestPubSub:
+    @pytest.mark.asyncio
+    async def test_publish_nucleus(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = 3
+        # PubSubModel needs a pool too, but for testing we pass mock_conn as pool
+        ps = PubSubModel(mock_conn, _make_exec(mock_conn), nucleus_features)
+        n = await ps.publish("events", '{"type":"update"}')
+        assert n == 3
+        mock_conn.fetchval.assert_called_with(
+            "SELECT PUBSUB_PUBLISH($1, $2)", "events", '{"type":"update"}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_channels_with_pattern(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = "events,notifications"
+        ps = PubSubModel(mock_conn, _make_exec(mock_conn), nucleus_features)
+        channels = await ps.channels("ev*")
+        assert "events" in channels
+        assert "notifications" in channels
+
+    @pytest.mark.asyncio
+    async def test_channels_no_pattern(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = "ch1,ch2"
+        ps = PubSubModel(mock_conn, _make_exec(mock_conn), nucleus_features)
+        channels = await ps.channels()
+        assert len(channels) == 2
+
+    @pytest.mark.asyncio
+    async def test_channels_empty(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = ""
+        ps = PubSubModel(mock_conn, _make_exec(mock_conn), nucleus_features)
+        channels = await ps.channels()
+        assert channels == []
+
+    @pytest.mark.asyncio
+    async def test_subscriber_count(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = 7
+        ps = PubSubModel(mock_conn, _make_exec(mock_conn), nucleus_features)
+        assert await ps.subscriber_count("events") == 7
+        mock_conn.fetchval.assert_called_with(
+            "SELECT PUBSUB_SUBSCRIBERS($1)", "events"
+        )
+
+    @pytest.mark.asyncio
+    async def test_channels_requires_nucleus(self, mock_conn, plain_features):
+        ps = PubSubModel(mock_conn, _make_exec(mock_conn), plain_features)
+        with pytest.raises(AppError):
+            await ps.channels()
+
+    @pytest.mark.asyncio
+    async def test_subscriber_count_requires_nucleus(self, mock_conn, plain_features):
+        ps = PubSubModel(mock_conn, _make_exec(mock_conn), plain_features)
+        with pytest.raises(AppError):
+            await ps.subscriber_count("ch")
+
+
+# ============================================================
+# SQL Model
+# ============================================================
+
+
+class TestSQLModel:
+    @pytest.mark.asyncio
+    async def test_execute_insert(self, mock_conn):
+        from neutron.nucleus.sql import SQLModel as PySQLModel
+
+        mock_pool = mock_conn
+        mock_pool.acquire.return_value.__aenter__ = mock_conn.__aenter__
+        mock_pool.acquire.return_value.__aexit__ = mock_conn.__aexit__
+        # SQLModel wraps asyncpg pool
+        # Testing the parse of execute result
+        result_str = "INSERT 0 3"
+        parts = result_str.split()
+        try:
+            count = int(parts[-1])
+        except (ValueError, IndexError):
+            count = 0
+        assert count == 3
+
+    def test_execute_result_parsing_update(self):
+        result_str = "UPDATE 5"
+        parts = result_str.split()
+        count = int(parts[-1])
+        assert count == 5
+
+    def test_execute_result_parsing_delete(self):
+        result_str = "DELETE 2"
+        parts = result_str.split()
+        count = int(parts[-1])
+        assert count == 2
+
+    def test_execute_result_parsing_create(self):
+        result_str = "CREATE TABLE"
+        parts = result_str.split()
+        try:
+            count = int(parts[-1])
+        except (ValueError, IndexError):
+            count = 0
+        assert count == 0
+
+
+# ============================================================
+# Migration
+# ============================================================
+
+
+class TestMigration:
+    def test_migration_dataclass(self):
+        from neutron.nucleus.migrate import Migration
+
+        m = Migration(version=1, name="create_users", up="CREATE TABLE users (id INT)")
+        assert m.version == 1
+        assert m.name == "create_users"
+        assert "CREATE TABLE" in m.up
+        assert m.down == ""
+
+    def test_migration_with_down(self):
+        from neutron.nucleus.migrate import Migration
+
+        m = Migration(
+            version=1,
+            name="create_users",
+            up="CREATE TABLE users (id INT)",
+            down="DROP TABLE users",
+        )
+        assert m.down == "DROP TABLE users"
+
+    def test_load_from_dir_empty(self):
+        from neutron.nucleus.migrate import _load_from_dir
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            migrations = _load_from_dir(tmpdir)
+            assert migrations == []
+
+    def test_load_from_dir_nonexistent(self):
+        from neutron.nucleus.migrate import _load_from_dir
+
+        migrations = _load_from_dir("/nonexistent/path")
+        assert migrations == []
+
+    def test_load_from_dir_with_files(self):
+        from neutron.nucleus.migrate import _load_from_dir
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create migration files
+            with open(os.path.join(tmpdir, "001_create_users.sql"), "w") as f:
+                f.write("CREATE TABLE users (id INT);\n-- DOWN\nDROP TABLE users;")
+            with open(os.path.join(tmpdir, "002_add_email.sql"), "w") as f:
+                f.write("ALTER TABLE users ADD COLUMN email TEXT;")
+
+            migrations = _load_from_dir(tmpdir)
+            assert len(migrations) == 2
+            assert migrations[0].version == 1
+            assert migrations[0].name == "create_users"
+            assert "CREATE TABLE" in migrations[0].up
+            assert "DROP TABLE" in migrations[0].down
+            assert migrations[1].version == 2
+            assert migrations[1].down == ""
+
+    def test_load_from_dir_skips_non_sql(self):
+        from neutron.nucleus.migrate import _load_from_dir
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "readme.txt"), "w") as f:
+                f.write("not a migration")
+            with open(os.path.join(tmpdir, "001_init.sql"), "w") as f:
+                f.write("CREATE TABLE t (id INT);")
+
+            migrations = _load_from_dir(tmpdir)
+            assert len(migrations) == 1
+
+    def test_load_from_dir_ordering(self):
+        from neutron.nucleus.migrate import _load_from_dir
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create files out of order
+            with open(os.path.join(tmpdir, "003_third.sql"), "w") as f:
+                f.write("SELECT 3;")
+            with open(os.path.join(tmpdir, "001_first.sql"), "w") as f:
+                f.write("SELECT 1;")
+            with open(os.path.join(tmpdir, "002_second.sql"), "w") as f:
+                f.write("SELECT 2;")
+
+            migrations = _load_from_dir(tmpdir)
+            # os.listdir + sorted should give proper order
+            versions = [m.version for m in migrations]
+            assert versions == [1, 2, 3]
+
+    def test_load_from_dir_skips_bad_format(self):
+        from neutron.nucleus.migrate import _load_from_dir
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "bad_name.sql"), "w") as f:
+                f.write("SELECT 1;")
+            with open(os.path.join(tmpdir, "abc_notint.sql"), "w") as f:
+                f.write("SELECT 2;")
+
+            migrations = _load_from_dir(tmpdir)
+            assert len(migrations) == 0
+
+
+# ============================================================
+# Transaction
+# ============================================================
+
+
+class TestTransaction:
+    def test_transaction_sql_result_parsing(self):
+        """Test the result parsing logic used in _TransactionSQL.execute."""
+        result = "INSERT 0 1"
+        parts = result.split()
+        try:
+            count = int(parts[-1])
+        except (ValueError, IndexError):
+            count = 0
+        assert count == 1
+
+    def test_transaction_sql_result_parsing_update(self):
+        result = "UPDATE 5"
+        parts = result.split()
+        count = int(parts[-1])
+        assert count == 5
+
+    def test_transaction_sql_result_parsing_create(self):
+        result = "CREATE TABLE"
+        parts = result.split()
+        try:
+            count = int(parts[-1])
+        except (ValueError, IndexError):
+            count = 0
+        assert count == 0

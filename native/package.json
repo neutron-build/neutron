@@ -9,7 +9,8 @@
   "scripts": {
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
-    "dev": "pnpm --filter neutron-native-cli dev"
+    "dev": "pnpm --filter neutron-native-cli dev",
+    "test": "jest --config jest.config.js"
   },
   "devDependencies": {
     "typescript": "^5.4.0"

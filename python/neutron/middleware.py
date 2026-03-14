@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware as _StarletteCORS
@@ -135,16 +136,80 @@ class CompressionMiddleware(_NeutronMiddleware):
         return Middleware(_StarletteGZip, minimum_size=self._minimum_size)
 
 
-# --- Rate Limiting (token bucket) ---
+# --- Rate Limiting (per-IP token bucket) ---
+
+
+def _default_key_func(scope: Scope) -> str:
+    """Extract client IP from proxy headers or ASGI scope.
+
+    Resolution order: X-Forwarded-For (first hop) -> X-Real-IP -> scope client.
+    """
+    # Parse headers from raw ASGI scope (list of [name, value] byte-pairs)
+    headers: dict[bytes, bytes] = {}
+    for raw_name, raw_value in scope.get("headers", []):
+        # Only store the first occurrence of each header
+        lower_name = raw_name.lower()
+        if lower_name not in headers:
+            headers[lower_name] = raw_value
+
+    # X-Forwarded-For: client, proxy1, proxy2 — take the leftmost
+    xff = headers.get(b"x-forwarded-for")
+    if xff:
+        first_ip = xff.decode("latin-1").split(",")[0].strip()
+        if first_ip:
+            return first_ip
+
+    # X-Real-IP (set by many reverse proxies)
+    xri = headers.get(b"x-real-ip")
+    if xri:
+        return xri.decode("latin-1").strip()
+
+    # Fall back to ASGI scope client address
+    client = scope.get("client")
+    if client:
+        return client[0]
+
+    return "unknown"
+
+
+@dataclass
+class _TokenBucket:
+    """Per-key token bucket state."""
+
+    tokens: float
+    last_refill: float
 
 
 class _RateLimitASGI:
-    def __init__(self, app: ASGIApp, rps: float, burst: int) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        rps: float,
+        burst: int,
+        key_func: Callable[[Scope], str],
+        cleanup_interval: float,
+        stale_after: float,
+    ) -> None:
         self.app = app
         self.rps = rps
         self.burst = burst
-        self._tokens = float(burst)
-        self._last_refill = time.monotonic()
+        self.key_func = key_func
+        self.cleanup_interval = cleanup_interval
+        self.stale_after = stale_after
+        self._buckets: dict[str, _TokenBucket] = {}
+        self._last_cleanup = time.monotonic()
+
+    def _cleanup(self, now: float) -> None:
+        """Remove buckets that have been idle longer than *stale_after*."""
+        if now - self._last_cleanup < self.cleanup_interval:
+            return
+        self._last_cleanup = now
+        cutoff = now - self.stale_after
+        stale_keys = [
+            k for k, b in self._buckets.items() if b.last_refill < cutoff
+        ]
+        for k in stale_keys:
+            del self._buckets[k]
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -152,11 +217,23 @@ class _RateLimitASGI:
             return
 
         now = time.monotonic()
-        elapsed = now - self._last_refill
-        self._tokens = min(self.burst, self._tokens + elapsed * self.rps)
-        self._last_refill = now
 
-        if self._tokens < 1.0:
+        # Periodic cleanup of stale entries
+        self._cleanup(now)
+
+        key = self.key_func(scope)
+        bucket = self._buckets.get(key)
+
+        if bucket is None:
+            bucket = _TokenBucket(tokens=float(self.burst), last_refill=now)
+            self._buckets[key] = bucket
+
+        # Refill tokens based on elapsed time
+        elapsed = now - bucket.last_refill
+        bucket.tokens = min(self.burst, bucket.tokens + elapsed * self.rps)
+        bucket.last_refill = now
+
+        if bucket.tokens < 1.0:
             from starlette.responses import JSONResponse
 
             resp = JSONResponse(
@@ -172,19 +249,52 @@ class _RateLimitASGI:
             await resp(scope, receive, send)
             return
 
-        self._tokens -= 1.0
+        bucket.tokens -= 1.0
         await self.app(scope, receive, send)
 
 
 class RateLimitMiddleware(_NeutronMiddleware):
-    """Token bucket rate limiting."""
+    """Per-IP token bucket rate limiting.
 
-    def __init__(self, rps: float = 100.0, burst: int = 200) -> None:
+    By default, each unique client IP gets its own token bucket.
+    Use ``key_func`` to customise the rate-limiting key (e.g. by user ID
+    or API key).
+
+    Args:
+        rps: Token refill rate — requests per second per key.
+        burst: Maximum burst size (bucket capacity).
+        key_func: Callable that receives the ASGI scope and returns a
+            string key.  Defaults to client IP extraction
+            (``X-Forwarded-For`` -> ``X-Real-IP`` -> ``scope["client"]``).
+        cleanup_interval: Seconds between stale-bucket cleanup sweeps.
+            Default ``60``.
+        stale_after: Seconds of inactivity before a bucket is considered
+            stale and eligible for cleanup. Default ``300`` (5 minutes).
+    """
+
+    def __init__(
+        self,
+        rps: float = 100.0,
+        burst: int = 200,
+        key_func: Callable[[Scope], str] | None = None,
+        cleanup_interval: float = 60.0,
+        stale_after: float = 300.0,
+    ) -> None:
         self._rps = rps
         self._burst = burst
+        self._key_func = key_func or _default_key_func
+        self._cleanup_interval = cleanup_interval
+        self._stale_after = stale_after
 
     def as_starlette_middleware(self) -> Middleware:
-        return Middleware(_RateLimitASGI, rps=self._rps, burst=self._burst)
+        return Middleware(
+            _RateLimitASGI,
+            rps=self._rps,
+            burst=self._burst,
+            key_func=self._key_func,
+            cleanup_interval=self._cleanup_interval,
+            stale_after=self._stale_after,
+        )
 
 
 # --- Timeout ---

@@ -125,3 +125,40 @@ async fn get_biometric_type() -> Result<BiometricType, String> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     { Ok(BiometricType::None) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_biometric_type_serialize() {
+        let json = serde_json::to_string(&BiometricType::TouchID).unwrap();
+        assert_eq!(json, "\"TouchID\"");
+
+        let json = serde_json::to_string(&BiometricType::WindowsHello).unwrap();
+        assert_eq!(json, "\"WindowsHello\"");
+
+        let json = serde_json::to_string(&BiometricType::None).unwrap();
+        assert_eq!(json, "\"None\"");
+    }
+
+    #[test]
+    fn test_biometric_type_variants() {
+        // Ensure all variants exist and are Debug-printable
+        let types = vec![
+            BiometricType::TouchID,
+            BiometricType::FaceID,
+            BiometricType::WindowsHello,
+            BiometricType::None,
+        ];
+        for t in &types {
+            let _ = format!("{:?}", t);
+        }
+        assert_eq!(types.len(), 4);
+    }
+
+    #[test]
+    fn test_init_creates_plugin() {
+        let _plugin = super::init();
+    }
+}

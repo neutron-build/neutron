@@ -20,9 +20,12 @@ use crate::graph::cypher::parse_cypher;
 use crate::graph::cypher_executor::execute_cypher;
 use crate::metrics::{MetricsRegistry, QueryType};
 use crate::planner;
+#[cfg(feature = "server")]
 use crate::reactive::{ChangeEvent, ChangeNotifier, ChangeType, SubscriptionManager};
 use crate::sql;
-use crate::storage::{StorageEngine, STORAGE_SESSION_ID};
+#[cfg(feature = "server")]
+use crate::storage::STORAGE_SESSION_ID;
+use crate::storage::StorageEngine;
 use crate::types::{DataType, Row, Value};
 use crate::vector;
 use crate::fts;
@@ -101,8 +104,10 @@ pub struct Executor {
     /// Persistent graph store for Cypher queries.
     graph_store: parking_lot::RwLock<GraphStore>,
     /// Reactive change notifier for table mutations.
+    #[cfg(feature = "server")]
     change_notifier: parking_lot::RwLock<ChangeNotifier>,
     /// Reactive subscription manager for live queries.
+    #[cfg(feature = "server")]
     subscription_manager: parking_lot::RwLock<SubscriptionManager>,
     /// Shared metrics registry for observability (Tier 1.1).
     metrics: Arc<MetricsRegistry>,
@@ -113,21 +118,27 @@ pub struct Executor {
     /// Live B-tree index mappings: (table_name, column_name) → index_name.
     btree_indexes: parking_lot::RwLock<HashMap<(String, String), String>>,
     /// In-memory hash indexes: (table_name, column_name) → HashIndex.
+    #[cfg(feature = "server")]
     hash_indexes: parking_lot::RwLock<HashMap<(String, String), crate::storage::btree::HashIndex>>,
     /// Sync cache of table column metadata: table_name → [(col_name, DataType)].
     table_columns: parking_lot::RwLock<HashMap<String, Vec<(String, DataType)>>>,
     /// Persistent statistics store populated by ANALYZE, used by EXPLAIN / query planner.
     stats_store: Arc<planner::StatsStore>,
     /// Optional replication manager for streaming replication.
+    #[cfg(feature = "server")]
     replication: Option<Arc<parking_lot::RwLock<crate::replication::ReplicationManager>>>,
     /// Optional connection pool for live pool status reporting.
+    #[cfg(feature = "server")]
     conn_pool: Option<Arc<crate::pool::async_pool::AsyncConnectionPool>>,
     /// Optional cluster coordinator for distributed mode.
+    #[cfg(feature = "server")]
     cluster: Option<Arc<parking_lot::RwLock<crate::distributed::ClusterCoordinator>>>,
     /// Optional Raft replicator: drives actual consensus and SQL replication.
     /// Wrapped in RwLock so it can be set after Arc construction (transport init order).
+    #[cfg(feature = "server")]
     raft_replicator: parking_lot::RwLock<Option<Arc<crate::distributed::RaftReplicator>>>,
     /// Optional follower read manager for consistent follower reads.
+    #[cfg(feature = "server")]
     follower_read_mgr: Option<Arc<parking_lot::RwLock<crate::distributed::FollowerReadManager>>>,
     /// Per-connection sessions keyed by session ID.
     sessions: parking_lot::RwLock<HashMap<u64, Arc<Session>>>,
@@ -153,6 +164,7 @@ pub struct Executor {
     /// Blob store for blob_* SQL functions (chunked, dedup, tagging).
     blob_store: parking_lot::RwLock<crate::blob::BlobStore>,
     /// Change data capture log for cdc_* SQL functions.
+    #[cfg(feature = "server")]
     cdc_log: parking_lot::RwLock<crate::reactive::CdcLog>,
     /// Datalog logic programming engine for datalog_* SQL functions.
     datalog_store: parking_lot::RwLock<crate::datalog::DatalogStore>,
@@ -255,19 +267,27 @@ impl Executor {
             health_registry: Arc::new(parking_lot::RwLock::new(health)),
             encrypted_indexes: parking_lot::RwLock::new(HashMap::new()),
             graph_store: parking_lot::RwLock::new(GraphStore::new()),
+            #[cfg(feature = "server")]
             change_notifier: parking_lot::RwLock::new(ChangeNotifier::new(1024)),
+            #[cfg(feature = "server")]
             subscription_manager: parking_lot::RwLock::new(SubscriptionManager::new(1024)),
             metrics: Arc::new(MetricsRegistry::new()),
             advisor: parking_lot::RwLock::new(crate::advisor::IndexAdvisor::new()),
             cache: parking_lot::RwLock::new(CacheTier::new(64 * 1024 * 1024)), // 64 MB default
             btree_indexes: parking_lot::RwLock::new(HashMap::new()),
+            #[cfg(feature = "server")]
             hash_indexes: parking_lot::RwLock::new(HashMap::new()),
             table_columns: parking_lot::RwLock::new(HashMap::new()),
             stats_store: Arc::new(planner::StatsStore::new()),
+            #[cfg(feature = "server")]
             replication: None,
+            #[cfg(feature = "server")]
             conn_pool: None,
+            #[cfg(feature = "server")]
             cluster: None,
+            #[cfg(feature = "server")]
             raft_replicator: parking_lot::RwLock::new(None),
+            #[cfg(feature = "server")]
             follower_read_mgr: None,
             sessions: parking_lot::RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
@@ -292,6 +312,7 @@ impl Executor {
                 alloc
             }),
             blob_store: parking_lot::RwLock::new(crate::blob::BlobStore::new()),
+            #[cfg(feature = "server")]
             cdc_log: parking_lot::RwLock::new(crate::reactive::CdcLog::new()),
             datalog_store: parking_lot::RwLock::new(crate::datalog::DatalogStore::new()),
             streams: parking_lot::RwLock::new(HashMap::new()),
@@ -336,10 +357,13 @@ impl Executor {
         // Open durable multi-model stores when a data directory is provided
         if let Some(dir) = data_dir {
             // KV store: WAL + cold tier
-            let kv_dir = dir.join("kv");
-            std::fs::create_dir_all(&kv_dir).ok();
-            if let Ok(kv) = crate::kv::KvStore::open(&kv_dir) {
-                exec.kv_store = Arc::new(kv);
+            #[cfg(feature = "server")]
+            {
+                let kv_dir = dir.join("kv");
+                std::fs::create_dir_all(&kv_dir).ok();
+                if let Ok(kv) = crate::kv::KvStore::open(&kv_dir) {
+                    exec.kv_store = Arc::new(kv);
+                }
             }
 
             // Document store: WAL + cold tier
@@ -948,17 +972,20 @@ impl Executor {
     }
 
     /// Set the replication manager for streaming replication.
+    #[cfg(feature = "server")]
     pub fn with_replication(mut self, repl: Arc<parking_lot::RwLock<crate::replication::ReplicationManager>>) -> Self {
         self.replication = Some(repl);
         self
     }
 
     /// Set the connection pool for live pool status reporting.
+    #[cfg(feature = "server")]
     pub fn with_conn_pool(mut self, pool: Arc<crate::pool::async_pool::AsyncConnectionPool>) -> Self {
         self.conn_pool = Some(pool);
         self
     }
 
+    #[cfg(feature = "server")]
     pub fn with_cluster(mut self, cluster: Arc<parking_lot::RwLock<crate::distributed::ClusterCoordinator>>) -> Self {
         self.cluster = Some(cluster);
         self
@@ -966,12 +993,14 @@ impl Executor {
 
     /// Attach a Raft replicator for actual consensus-based SQL replication.
     /// Builder variant (used during initial construction).
+    #[cfg(feature = "server")]
     pub fn with_raft_replicator(self, replicator: Arc<crate::distributed::RaftReplicator>) -> Self {
         *self.raft_replicator.write() = Some(replicator);
         self
     }
 
     /// Set the Raft replicator after Arc construction (used when transport is initialized later).
+    #[cfg(feature = "server")]
     pub fn set_raft_replicator(&self, replicator: Arc<crate::distributed::RaftReplicator>) {
         *self.raft_replicator.write() = Some(replicator);
     }
@@ -981,6 +1010,9 @@ impl Executor {
     ///
     /// Call this after both the executor and the replicator are fully constructed.
     /// Spawns two background tasks that drain the delivery / gossip channels.
+    ///
+    /// Only available with the `server` feature (requires `tokio::spawn`).
+    #[cfg(feature = "server")]
     pub async fn init_distributed_pubsub(self: &Arc<Self>) {
         let replicator = match self.raft_replicator.read().clone() {
             Some(r) => r,
@@ -1015,6 +1047,7 @@ impl Executor {
     }
 
     /// Set the follower read manager for consistent follower reads.
+    #[cfg(feature = "server")]
     pub fn with_follower_reads(mut self, mgr: Arc<parking_lot::RwLock<crate::distributed::FollowerReadManager>>) -> Self {
         self.follower_read_mgr = Some(mgr);
         self
@@ -1023,6 +1056,7 @@ impl Executor {
     /// Check if this follower can serve a read query locally.
     /// Returns Ok(()) if we're the leader, standalone, or follower with fresh-enough data.
     /// Returns Err with a redirect message if follower data is stale.
+    #[cfg(feature = "server")]
     pub fn check_follower_read_eligibility(&self) -> Result<(), ExecError> {
         let mgr = match &self.follower_read_mgr {
             Some(m) => m,
@@ -1061,6 +1095,7 @@ impl Executor {
     /// Check cluster routing for a query. Returns a RouteDecision if the cluster
     /// is configured and the query targets a sharded table with a WHERE key.
     /// Returns None if in standalone mode or no routing is needed.
+    #[cfg(feature = "server")]
     pub fn check_route(&self, sql: &str) -> Option<crate::distributed::RouteDecision> {
         let cluster = self.cluster.as_ref()?;
         let coord = cluster.read();
@@ -1092,6 +1127,7 @@ impl Executor {
     }
 
     /// Get the cluster coordinator (for query forwarding in the message handler).
+    #[cfg(feature = "server")]
     pub fn cluster_ref(&self) -> Option<&Arc<parking_lot::RwLock<crate::distributed::ClusterCoordinator>>> {
         self.cluster.as_ref()
     }
@@ -1121,6 +1157,7 @@ impl Executor {
     /// Aborts any active MVCC transaction, then clears all per-connection
     /// state (prepared statements, cursors, settings). Returns the list of
     /// cleanup actions performed.
+    #[cfg(feature = "server")]
     pub async fn reset_session(&self, id: u64) -> Vec<String> {
         let session = self.get_session(id);
         let mut actions = Vec::new();
@@ -1178,6 +1215,7 @@ impl Executor {
 
     /// Execute SQL within a specific session's scope. This is the primary
     /// entry point for the wire protocol handler.
+    #[cfg(feature = "server")]
     pub fn execute_with_session<'a>(
         &'a self,
         session_id: u64,
@@ -1193,6 +1231,7 @@ impl Executor {
 
     /// Execute pre-parsed statements within a specific session's scope.
     /// This is the AST-fast-path for the extended query protocol — avoids re-parsing.
+    #[cfg(feature = "server")]
     pub fn execute_statements_with_session<'a>(
         &'a self,
         session_id: u64,
@@ -1219,6 +1258,7 @@ impl Executor {
 
     /// Persist the catalog and executor metadata to disk (if a catalog path is configured).
     /// Called after DDL operations (CREATE TABLE, DROP TABLE, CREATE VIEW, etc.).
+    #[cfg(feature = "server")]
     async fn persist_catalog(&self) {
         let Some(ref path) = self.catalog_path else { return };
 
@@ -1356,11 +1396,13 @@ impl Executor {
     }
 
     /// Get a reference to the change notifier.
+    #[cfg(feature = "server")]
     pub fn change_notifier(&self) -> &parking_lot::RwLock<ChangeNotifier> {
         &self.change_notifier
     }
 
     /// Get a reference to the subscription manager.
+    #[cfg(feature = "server")]
     pub fn subscription_manager(&self) -> &parking_lot::RwLock<SubscriptionManager> {
         &self.subscription_manager
     }
@@ -1369,6 +1411,7 @@ impl Executor {
     ///
     /// Populates `ChangeEvent.new_row`/`old_row` and sends real column values
     /// to subscription diffs instead of the stub `{"_change": "..."}` placeholder.
+    #[cfg(feature = "server")]
     fn notify_change_rows(
         &self,
         table: &str,
@@ -1382,6 +1425,26 @@ impl Executor {
             return;
         }
 
+        // Always append to CDC log (lightweight, no subscriber check needed)
+        {
+            let mut row_data = HashMap::new();
+            row_data.insert("_rows".to_string(), row_count.to_string());
+            self.cdc_log.write().append(table, change_type.clone(), row_data);
+        }
+
+        // Fast path: skip expensive HashMap/String allocation if no subscribers exist
+        let has_change_subscribers = {
+            let notifier = self.change_notifier.read();
+            notifier.subscriber_count(table) > 0
+        };
+        let has_reactive_subs = {
+            let sub_mgr = self.subscription_manager.read();
+            !sub_mgr.affected_subscriptions(table).is_empty()
+        };
+        if !has_change_subscribers && !has_reactive_subs {
+            return;
+        }
+
         let to_map = |row: &Row| -> HashMap<String, String> {
             col_meta
                 .iter()
@@ -1390,41 +1453,42 @@ impl Executor {
                 .collect()
         };
 
-        let event = ChangeEvent {
-            table: table.to_string(),
-            change_type: change_type.clone(),
-            new_row: new_rows.first().map(to_map),
-            old_row: old_rows.first().map(to_map),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-        };
-        {
-            let mut notifier = self.change_notifier.write();
-            notifier.notify(event);
-        }
-
-        let sub_mgr = self.subscription_manager.read();
-        let affected = sub_mgr.affected_subscriptions(table);
-        if !affected.is_empty() {
-            let added: Vec<HashMap<String, String>> = new_rows.iter().map(to_map).collect();
-            let removed: Vec<HashMap<String, String>> = old_rows.iter().map(to_map).collect();
-            for sub_id in affected {
-                sub_mgr.push_diff(crate::reactive::QueryDiff {
-                    subscription_id: sub_id,
-                    added_rows: added.clone(),
-                    removed_rows: removed.clone(),
-                });
+        if has_change_subscribers {
+            let event = ChangeEvent {
+                table: table.to_string(),
+                change_type: change_type.clone(),
+                new_row: new_rows.first().map(&to_map),
+                old_row: old_rows.first().map(&to_map),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            };
+            {
+                let mut notifier = self.change_notifier.write();
+                notifier.notify(event);
             }
         }
 
-        let mut row_data = HashMap::new();
-        row_data.insert("_rows".to_string(), row_count.to_string());
-        self.cdc_log.write().append(table, change_type, row_data);
+        if has_reactive_subs {
+            let sub_mgr = self.subscription_manager.read();
+            let affected = sub_mgr.affected_subscriptions(table);
+            if !affected.is_empty() {
+                let added: Vec<HashMap<String, String>> = new_rows.iter().map(&to_map).collect();
+                let removed: Vec<HashMap<String, String>> = old_rows.iter().map(&to_map).collect();
+                for sub_id in affected {
+                    sub_mgr.push_diff(crate::reactive::QueryDiff {
+                        subscription_id: sub_id,
+                        added_rows: added.clone(),
+                        removed_rows: removed.clone(),
+                    });
+                }
+            }
+        }
     }
 
     /// Notify a table change to the reactive subsystem.
+    #[cfg(feature = "server")]
     #[allow(dead_code)]
     fn notify_change(&self, table: &str, change_type: ChangeType, row_count: usize) {
         if row_count == 0 {
@@ -1531,6 +1595,15 @@ impl Executor {
         self.execute_statement(stmt).await
     }
 
+    /// Case-insensitive prefix check without allocation.
+    fn starts_with_ci(s: &str, prefix: &str) -> bool {
+        s.len() >= prefix.len()
+            && s.as_bytes()[..prefix.len()]
+                .iter()
+                .zip(prefix.as_bytes())
+                .all(|(a, b)| a.to_ascii_uppercase() == *b)
+    }
+
     pub fn execute<'a>(&'a self, sql: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>> {
         // Box to allow recursion (triggers call execute)
         Box::pin(async move {
@@ -1539,13 +1612,51 @@ impl Executor {
             self.uncorrelated_subquery_cache.write().clear();
             // Handle custom Nucleus extensions before SQL parsing.
             let trimmed = sql.trim();
-            let upper = trimmed.to_uppercase();
+
+            // Fast path: standard DML/DDL (SELECT/INSERT/UPDATE/DELETE/WITH/BEGIN/COMMIT/
+            // ROLLBACK/CREATE/DROP/ALTER TABLE/GRANT/REVOKE/EXPLAIN/SET/RESET/PREPARE/
+            // EXECUTE/DEALLOCATE/COPY/TRUNCATE/VACUUM/ANALYZE/DECLARE/FETCH NEXT/CLOSE/
+            // LISTEN/NOTIFY/UNLISTEN/DISCARD/DO/LOCK/VALUES/TABLE/MERGE) can skip all
+            // extension prefix checks. Only non-standard Nucleus extensions need them.
+            let first = trimmed.as_bytes().first().copied().unwrap_or(0).to_ascii_uppercase();
+            let skip_extensions = match first {
+                // Standard SQL initials that never collide with Nucleus extensions.
+                // 'I' = INSERT, 'W' = WITH, 'B' = BEGIN, 'E' = EXPLAIN/EXECUTE,
+                // 'G' = GRANT, 'T' = TRUNCATE/TABLE, 'L' = LOCK/LISTEN,
+                // 'N' = NOTIFY, 'V' = VALUES/VACUUM, 'P' = PREPARE
+                b'I' | b'W' | b'B' | b'E' | b'G' | b'T' | b'L' | b'N' | b'V' | b'P' => true,
+                // 'U' could be UNSUBSCRIBE or UPDATE/UNLISTEN — check
+                b'U' => {
+                    let second = trimmed.as_bytes().get(1).copied().unwrap_or(0).to_ascii_uppercase();
+                    second != b'N' || Self::starts_with_ci(trimmed, "UNLISTEN") || Self::starts_with_ci(trimmed, "UPDATE")
+                }
+                // 'D' could be DELETE (standard) or DROP MODEL/PROCEDURE (extension)
+                b'D' => Self::starts_with_ci(trimmed, "DELETE"),
+                // 'S' could be SUBSCRIBE/SHOW (extension) or SELECT/SET (standard)
+                b'S' => {
+                    let second = trimmed.as_bytes().get(1).copied().unwrap_or(0).to_ascii_uppercase();
+                    second == b'E' // SELECT or SET
+                }
+                // 'R' could be REFRESH (extension) or ROLLBACK/RESET/REVOKE (standard)
+                b'R' => !Self::starts_with_ci(trimmed, "REFRESH"),
+                _ => false,
+            };
+
+            if skip_extensions {
+                let statements = self.parse_with_ast_cache(sql)?;
+                return self.execute_statements_dispatch(sql, statements).await;
+            }
+
+            let upper = trimmed.to_ascii_uppercase();
+            #[cfg(feature = "server")]
             if upper.starts_with("SUBSCRIBE ") {
                 return Ok(vec![self.execute_subscribe(trimmed).await?]);
             }
+            #[cfg(feature = "server")]
             if upper.starts_with("UNSUBSCRIBE ") {
                 return Ok(vec![self.execute_unsubscribe(trimmed)?]);
             }
+            #[cfg(feature = "server")]
             if upper.starts_with("FETCH SUBSCRIPTION ") {
                 return Ok(vec![self.execute_fetch_subscription(trimmed)?]);
             }
@@ -1679,54 +1790,62 @@ impl Executor {
                 }]);
             }
             let statements = self.parse_with_ast_cache(sql)?;
+            self.execute_statements_dispatch(sql, statements).await
+        })
+    }
 
-            // Cluster-mode DML routing: followers forward to leader; leader appends to Raft log.
-            if let Some(ref cluster_arc) = self.cluster {
-                let has_dml = statements.iter().any(|s| {
-                    matches!(s, Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_))
-                });
-                if has_dml {
-                    // Collect routing info while holding the read lock, then release it
-                    // before any await so the guard doesn't cross an await point.
-                    let (is_leader, leader_addr) = {
-                        let cluster = cluster_arc.read();
-                        (cluster.is_leader(), cluster.leader_addr())
-                    };
-                    if !is_leader {
-                        if let Some(addr) = leader_addr {
-                            return self.forward_dml(sql, &addr).await;
+    /// Execute pre-parsed statements with cluster routing and follower read checks.
+    async fn execute_statements_dispatch(&self, sql: &str, statements: Vec<Statement>) -> Result<Vec<ExecResult>, ExecError> {
+        // Cluster-mode DML routing: followers forward to leader; leader appends to Raft log.
+        #[cfg(feature = "server")]
+        if let Some(ref cluster_arc) = self.cluster {
+            let has_dml = statements.iter().any(|s| {
+                matches!(s, Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_))
+            });
+            if has_dml {
+                // Collect routing info while holding the read lock, then release it
+                // before any await so the guard doesn't cross an await point.
+                let (is_leader, leader_addr) = {
+                    let cluster = cluster_arc.read();
+                    (cluster.is_leader(), cluster.leader_addr())
+                };
+                if !is_leader {
+                    if let Some(addr) = leader_addr {
+                        return self.forward_dml(sql, &addr).await;
+                    }
+                } else {
+                    // Leader: propose to Raft log and wait for quorum before executing.
+                    let repl = self.raft_replicator.read().clone();
+                    if let Some(replicator) = repl {
+                        if let Err(e) = replicator.propose_and_await(sql).await {
+                            tracing::warn!("Raft propose failed: {e}");
+                            // Fall through to local execution on replicator error.
                         }
                     } else {
-                        // Leader: propose to Raft log and wait for quorum before executing.
-                        let repl = self.raft_replicator.read().clone();
-                        if let Some(replicator) = repl {
-                            if let Err(e) = replicator.propose_and_await(sql).await {
-                                tracing::warn!("Raft propose failed: {e}");
-                                // Fall through to local execution on replicator error.
-                            }
-                        } else {
-                            // No replicator: legacy fire-and-forget for backward compat.
-                            let _ = cluster_arc
-                                .write()
-                                .propose(0u64, crate::distributed::Operation::Sql(sql.to_string()));
-                        }
+                        // No replicator: legacy fire-and-forget for backward compat.
+                        let _ = cluster_arc
+                            .write()
+                            .propose(0u64, crate::distributed::Operation::Sql(sql.to_string()));
                     }
                 }
             }
+        }
 
-            // Follower read consistency check: for read-only queries on a follower,
-            // verify local data is fresh enough before executing.
+        // Follower read consistency check: for read-only queries on a follower,
+        // verify local data is fresh enough before executing.
+        #[cfg(feature = "server")]
+        {
             let has_reads = statements.iter().any(|s| matches!(s, Statement::Query(_)));
             if has_reads {
                 self.check_follower_read_eligibility()?;
             }
+        }
 
-            let mut results = Vec::new();
-            for stmt in statements {
-                results.push(self.execute_statement(stmt).await?);
-            }
-            Ok(results)
-        })
+        let mut results = Vec::new();
+        for stmt in statements {
+            results.push(self.execute_statement(stmt).await?);
+        }
+        Ok(results)
     }
 
     /// Forward a DML statement to the cluster leader.
@@ -1734,6 +1853,7 @@ impl Executor {
     /// Uses the RaftReplicator's `forward_to_leader()` which sends a `ForwardDml`
     /// message over the cluster transport and awaits `ForwardDmlResponse`. Falls
     /// back to local execution when no replicator is configured (single-node mode).
+    #[cfg(feature = "server")]
     async fn forward_dml(&self, sql: &str, leader_addr: &str) -> Result<Vec<ExecResult>, ExecError> {
         let repl = self.raft_replicator.read().clone();
         if let Some(replicator) = repl {
@@ -2032,6 +2152,7 @@ impl Executor {
         if is_ddl && result.is_ok() {
             self.plan_cache.write().clear();
             self.ast_cache.write().clear();
+            #[cfg(feature = "server")]
             self.persist_catalog().await;
         }
 
@@ -2522,6 +2643,7 @@ impl Executor {
 
     /// SUBSCRIBE 'SELECT ...' — register a live query subscription.
     /// Returns the subscription ID.
+    #[cfg(feature = "server")]
     async fn execute_subscribe(&self, sql: &str) -> Result<ExecResult, ExecError> {
         // Extract the query from SUBSCRIBE '...' or SUBSCRIBE SELECT ...
         let query = sql.trim();
@@ -2573,6 +2695,7 @@ impl Executor {
     }
 
     /// UNSUBSCRIBE <id> — remove a subscription.
+    #[cfg(feature = "server")]
     fn execute_unsubscribe(&self, sql: &str) -> Result<ExecResult, ExecError> {
         let trimmed = sql.trim();
         let id_str = if let Some(rest) = trimmed.strip_prefix("UNSUBSCRIBE") {
@@ -2603,6 +2726,7 @@ impl Executor {
     ///   FETCH SUBSCRIPTION 42 LIMIT 100
     ///
     /// Returns columns: subscription_id (Int64), added (Text/JSON), removed (Text/JSON)
+    #[cfg(feature = "server")]
     fn execute_fetch_subscription(&self, sql: &str) -> Result<ExecResult, ExecError> {
         // Parse: FETCH SUBSCRIPTION <id> [LIMIT <n>]
         let rest = sql.trim()

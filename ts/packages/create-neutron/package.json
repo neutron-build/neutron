@@ -29,7 +29,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "lint": "tsc --noEmit --pretty false",
-    "test": "tsc --noEmit --pretty false"
+    "test": "pnpm run build && node --test --experimental-test-isolation=none dist/index.test.js"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",

@@ -15,6 +15,7 @@ from neutron.error import (
     validation_error,
 )
 from neutron.handler import Form, Header, Query, UploadFile
+from neutron.auth.csrf import CSRFMiddleware
 from neutron.middleware import (
     CORSMiddleware,
     CompressionMiddleware,
@@ -53,6 +54,7 @@ __all__ = [
     "validation_error",
     "rate_limited",
     "internal_error",
+    "CSRFMiddleware",
     "CORSMiddleware",
     "CompressionMiddleware",
     "LoggingMiddleware",

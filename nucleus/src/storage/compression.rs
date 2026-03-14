@@ -381,6 +381,7 @@ impl PageCompressor {
 
     /// Compress a page using ZSTD (better ratio than LZ4, slower).
     /// ZSTD level 3 is a good balance between speed and ratio.
+    #[cfg(feature = "server")]
     pub fn compress_page_zstd(page: &PageBuf) -> Vec<u8> {
         match zstd::bulk::compress(page, 3) {
             Ok(compressed) if compressed.len() + COMPRESSION_HEADER_SIZE < PAGE_SIZE => {
@@ -464,18 +465,26 @@ impl PageCompressor {
                         data.len() - COMPRESSION_HEADER_SIZE
                     )));
                 }
-                let compressed_data = &data[COMPRESSION_HEADER_SIZE..end];
-                let decompressed = zstd::bulk::decompress(compressed_data, PAGE_SIZE)
-                    .map_err(|e| CompressionError::InvalidData(format!("ZSTD decompress: {e}")))?;
-                if decompressed.len() != PAGE_SIZE {
-                    return Err(CompressionError::InvalidData(format!(
-                        "ZSTD decompressed size {} != {PAGE_SIZE}",
-                        decompressed.len()
-                    )));
+                #[cfg(not(feature = "server"))]
+                {
+                    let _ = compressed_len;
+                    return Err(CompressionError::InvalidData("ZSTD not available in WASM build".into()));
                 }
-                let mut page = [0u8; PAGE_SIZE];
-                page.copy_from_slice(&decompressed);
-                Ok(page)
+                #[cfg(feature = "server")]
+                {
+                    let compressed_data = &data[COMPRESSION_HEADER_SIZE..end];
+                    let decompressed = zstd::bulk::decompress(compressed_data, PAGE_SIZE)
+                        .map_err(|e| CompressionError::InvalidData(format!("ZSTD decompress: {e}")))?;
+                    if decompressed.len() != PAGE_SIZE {
+                        return Err(CompressionError::InvalidData(format!(
+                            "ZSTD decompressed size {} != {PAGE_SIZE}",
+                            decompressed.len()
+                        )));
+                    }
+                    let mut page = [0u8; PAGE_SIZE];
+                    page.copy_from_slice(&decompressed);
+                    Ok(page)
+                }
             }
             other => Err(CompressionError::InvalidData(format!(
                 "codec {other:?} not supported for page compression"

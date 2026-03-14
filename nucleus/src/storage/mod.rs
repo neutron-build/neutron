@@ -4,27 +4,40 @@
 //! All storage access goes through the StorageEngine trait.
 //! Principle 1: subsystems interact through clean abstractions.
 
+#[cfg(feature = "server")]
 pub mod btree;
+#[cfg(feature = "server")]
 pub mod buffer;
+#[cfg(feature = "server")]
 pub mod buffered_engine;
+#[cfg(feature = "server")]
 pub mod columnar_engine;
+#[cfg(feature = "server")]
 pub mod columnar_wal;
 pub mod compression;
+#[cfg(feature = "server")]
 pub mod kv_wal;
+#[cfg(feature = "server")]
 pub mod disk;
+#[cfg(feature = "server")]
 pub mod disk_engine;
 pub mod fsm;
 pub mod encrypted_index;
 pub mod encryption;
+#[cfg(feature = "server")]
 pub mod io_uring;
 pub mod lsm;
+#[cfg(feature = "server")]
 pub mod lsm_engine;
 pub mod mvcc;
+#[cfg(feature = "server")]
 pub mod mvcc_wal;
 pub mod page;
 pub mod tuple;
 pub mod txn;
+#[cfg(feature = "server")]
 pub mod persistence;
+#[cfg(feature = "server")]
 pub mod wal;
 
 use std::collections::{BTreeMap, HashMap};
@@ -35,15 +48,29 @@ use crate::types::{Row, Value};
 // Sync RwLock for index structures (never held across .await points).
 use parking_lot::RwLock as SyncRwLock;
 
+#[cfg(feature = "server")]
 pub use columnar_engine::ColumnarStorageEngine;
+#[cfg(feature = "server")]
 pub use disk_engine::DiskEngine;
+#[cfg(feature = "server")]
 pub use lsm_engine::LsmStorageEngine;
 
+#[cfg(feature = "server")]
 tokio::task_local! {
     /// Session ID for per-connection storage isolation.
     /// Set by the executor when running within a session scope.
     /// 0 or unset = default/embedded (no explicit session).
     pub static STORAGE_SESSION_ID: u64;
+}
+
+#[cfg(not(feature = "server"))]
+std::thread_local! {
+    static STORAGE_SESSION_ID_CELL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(not(feature = "server"))]
+pub fn get_storage_session_id() -> u64 {
+    STORAGE_SESSION_ID_CELL.with(|c| c.get())
 }
 
 /// The storage engine trait. All storage backends implement this.
@@ -84,6 +111,24 @@ pub trait StorageEngine: Send + Sync {
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError>;
     /// Update rows at the given scan-order positions with new row values.
     async fn update(&self, table: &str, updates: &[(usize, Row)]) -> Result<usize, StorageError>;
+
+    /// Scan returning only rows where column `col_idx` equals `value`, with
+    /// their scan-order positions. Enables UPDATE/DELETE by PK without
+    /// materialising the entire table. Default: full scan + filter.
+    async fn scan_where_eq_positions(
+        &self,
+        table: &str,
+        col_idx: usize,
+        value: &crate::types::Value,
+    ) -> Result<Vec<(usize, Row)>, StorageError> {
+        let rows = self.scan(table).await?;
+        Ok(rows
+            .into_iter()
+            .enumerate()
+            .filter(|(_, row)| row.get(col_idx).is_some_and(|v| v == value))
+            .map(|(pos, row)| (pos, row))
+            .collect())
+    }
 
     /// Notify the storage engine of a table's column schema (for WAL persistence).
     /// Default: no-op. Durable engines override this to log schema to WAL.
@@ -249,6 +294,19 @@ pub trait StorageEngine: Send + Sync {
         _filter_col: usize,
         _low: &Value,
         _high: &Value,
+    ) -> Option<Vec<Row>> { None }
+
+    /// Scan+filter+top-K in a single pass. Returns the top `k` rows matching
+    /// `filter_col == filter_val`, ordered by `sort_col` (descending if `desc`).
+    /// Default returns None (caller falls back to scan + sort + truncate).
+    fn fast_scan_where_eq_topk(
+        &self,
+        _table: &str,
+        _filter_col: usize,
+        _filter_val: &Value,
+        _sort_col: usize,
+        _desc: bool,
+        _k: usize,
     ) -> Option<Vec<Row>> { None }
 
     // ── Per-connection session lifecycle (default: no-op) ──────

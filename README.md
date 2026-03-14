@@ -15,21 +15,21 @@ A full-stack framework ecosystem. One mental model across web, mobile, desktop, 
 | Directory | Language | Description |
 |-----------|----------|-------------|
 | [`nucleus/`](./nucleus) | Rust | Multi-model database — SQL, KV, Vector, Timeseries, Document, Graph, FTS, Geo, Pub/Sub |
-| [`studio/`](./studio) | TypeScript | Visual database management — all 9 data models in one UI |
+| [`studio/`](./studio) | TypeScript | Visual database management — all 14 data models in one UI |
 
 ### Platforms
 | Directory | Language | Description |
 |-----------|----------|-------------|
-| [`native/`](./native) | TypeScript | Mobile framework — Preact components rendering to native iOS/Android views |
+| [`native/`](./native) | TypeScript | Mobile framework — Preact components rendering to native iOS/Android views via Expo Go |
 | [`desktop/`](./desktop) | Rust + TS | Desktop apps — Tauri 2.0 + Preact, ~10MB bundles |
-| [`mobile-preview/`](./mobile-preview) | Go | On-device preview app — scan QR code, see native app instantly (Expo Go equivalent) |
 
 ### Language SDKs
 | Directory | Language | Description |
 |-----------|----------|-------------|
-| [`go/`](./go) | Go | Nucleus client + Neutron bindings for Go |
-| [`zig/`](./zig) | Zig | Nucleus embedded client — 12KB, zero allocations, comptime SQL |
-| [`python/`](./python) | Python | Python interop via Mojo + Nucleus Python client |
+| [`go/`](./go) | Go | Full backend framework + Nucleus client |
+| [`elixir/`](./elixir) | Elixir | BEAM fault-tolerant framework — OTP supervisors, distributed, hot code reload |
+| [`zig/`](./zig) | Zig | 4-layer systems library — zero allocations, comptime SQL |
+| [`python/`](./python) | Python | AI application framework — Starlette + Pydantic + Nucleus client |
 
 ## Quick Start
 
@@ -49,13 +49,15 @@ cd nucleus && cargo build && cargo test --lib
 
 ## The ORM
 
-Each language has an idiomatic Nucleus ORM covering all 9 data models — SQL, KV, Vector, Timeseries, Document, and more. Unlike Drizzle or Prisma which only cover SQL.
+Each language has an idiomatic Nucleus client covering all 14 data models — SQL, KV, Vector, TimeSeries, Document, Graph, FTS, Geo, Blob, Streams, Columnar, Datalog, CDC, PubSub. Unlike Drizzle or Prisma which only cover SQL.
 
 - **TypeScript** — Drizzle-style, schema in code, no codegen
-- **Rust** — Proc macros, compile-time checked
+- **Rust** — Typed model handles via NucleusClient
+- **Go** — Typed generics, struct tags
+- **Python** — Pydantic models, async
+- **Elixir** — Postgrex pool, OTP patterns
 - **Zig** — Comptime, zero overhead
-- **Python** — Pydantic-style class definitions
-- **Go** — Struct tags
+- **Julia** — Multiple dispatch, ecosystem bridges
 
 See [`studio/`](./studio) for the full ORM API and [`llms.txt`](./llms.txt) for a quick AI-readable reference.
 
@@ -70,5 +72,5 @@ See [`studio/`](./studio) for the full ORM API and [`llms.txt`](./llms.txt) for 
 
 ## License
 
-- **MIT** — all framework projects (`rs/`, `ts/`, `mojo/`, `studio/`, `go/`, `zig/`, `python/`, `native/`, `desktop/`, `mobile-preview/`)
+- **MIT** — all framework projects (`rs/`, `ts/`, `mojo/`, `studio/`, `go/`, `elixir/`, `zig/`, `python/`, `julia/`, `native/`, `desktop/`)
 - **BSL 1.1** — Nucleus database engine (`nucleus/`), converts to MIT on 2046-01-01

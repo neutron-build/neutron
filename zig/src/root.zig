@@ -41,6 +41,7 @@ pub const http_server = if (build_options.enable_layer2) @import("layer2/http_se
 pub const pg_client = if (build_options.enable_layer2) @import("layer2/pg_client.zig") else struct {};
 pub const ws_server = if (build_options.enable_layer2) @import("layer2/ws_server.zig") else struct {};
 pub const static = if (build_options.enable_layer2) @import("layer2/static.zig") else struct {};
+pub const sse = if (build_options.enable_layer2) @import("layer2/sse.zig") else struct {};
 
 // Re-export commonly used Layer 2 types (conditionally)
 pub const HttpServer = if (build_options.enable_layer2) http_server.HttpServer else void;
@@ -79,6 +80,9 @@ pub const lifecycle = if (build_options.enable_layer3) @import("layer3/lifecycle
 pub const respond = if (build_options.enable_layer3) @import("layer3/respond.zig") else struct {};
 pub const json = if (build_options.enable_layer3) @import("layer3/json.zig") else struct {};
 pub const handler = if (build_options.enable_layer3) @import("layer3/handler.zig") else struct {};
+pub const jwt = if (build_options.enable_layer3) @import("layer3/jwt.zig") else struct {};
+pub const compress = if (build_options.enable_layer3) @import("layer3/compress.zig") else struct {};
+pub const cache = if (build_options.enable_layer3) @import("layer3/cache.zig") else struct {};
 
 // Re-export commonly used Layer 3 types (conditionally)
 pub const App = if (build_options.enable_layer3) app.App else void;
@@ -87,6 +91,8 @@ pub const Route = if (build_options.enable_layer3) router.Route else void;
 pub const Middleware = if (build_options.enable_layer3) middleware.Middleware else void;
 pub const AppError = if (build_options.enable_layer3) app_error.AppError else void;
 pub const Config = if (build_options.enable_layer3) config.Config else void;
+pub const JwtConfig = if (build_options.enable_layer3) jwt.JwtConfig else void;
+pub const SseEvent = if (build_options.enable_layer2) sse.SseEvent else void;
 
 test {
     // Layer 0 tests — always run
@@ -114,6 +120,7 @@ test {
         _ = @import("layer2/pg_client.zig");
         _ = @import("layer2/ws_server.zig");
         _ = @import("layer2/static.zig");
+        _ = @import("layer2/sse.zig");
     }
 
     // Nucleus client + data model tests — gated on feature flag
@@ -148,5 +155,8 @@ test {
         _ = @import("layer3/respond.zig");
         _ = @import("layer3/json.zig");
         _ = @import("layer3/handler.zig");
+        _ = @import("layer3/jwt.zig");
+        _ = @import("layer3/compress.zig");
+        _ = @import("layer3/cache.zig");
     }
 }
