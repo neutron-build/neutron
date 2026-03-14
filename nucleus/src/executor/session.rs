@@ -7,14 +7,65 @@ use crate::types::Row;
 use super::types::{CteTableMap, PreparedStmt};
 use super::schema_types::CursorDef;
 
+#[cfg(feature = "server")]
 tokio::task_local! {
     /// The active per-connection session for the current task.
     pub(super) static CURRENT_SESSION: Arc<Session>;
 }
 
+/// Non-server (WASM) fallback: thread-local session holder with a
+/// `try_with`-compatible API matching `tokio::task::LocalKey`. The `.scope()`
+/// method is only needed by server-gated methods, so we only expose `try_with`.
+#[cfg(not(feature = "server"))]
+pub(super) mod __current_session {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+    use super::Session;
+
+    thread_local! {
+        static INNER: RefCell<Option<Arc<Session>>> = const { RefCell::new(None) };
+    }
+
+    /// Lightweight error returned when no session is set (mirrors `tokio::task::AccessError`).
+    #[derive(Debug)]
+    pub struct AccessError(());
+
+    pub struct SessionLocal;
+
+    impl SessionLocal {
+        /// Mirror of `tokio::task::LocalKey::try_with`.
+        pub fn try_with<F, R>(&self, f: F) -> Result<R, AccessError>
+        where
+            F: FnOnce(&Arc<Session>) -> R,
+        {
+            INNER.with(|cell| {
+                let borrow = cell.borrow();
+                match borrow.as_ref() {
+                    Some(s) => Ok(f(s)),
+                    None => Err(AccessError(())),
+                }
+            })
+        }
+
+        /// Set the session for the current thread (used by embedded mode on WASM).
+        #[allow(dead_code)]
+        pub fn set(&self, session: Arc<Session>) {
+            INNER.with(|cell| {
+                *cell.borrow_mut() = Some(session);
+            });
+        }
+    }
+}
+
+#[cfg(not(feature = "server"))]
+pub(super) static CURRENT_SESSION: __current_session::SessionLocal = __current_session::SessionLocal;
+
 /// Run an async future from a synchronous context without deadlocking tokio.
 /// Uses `block_in_place` on multi-threaded runtimes (production) and falls
 /// back to a helper thread on current_thread runtimes (tests).
+///
+/// Only available with the `server` feature (requires full tokio runtime).
+#[cfg(feature = "server")]
 pub(super) fn sync_block_on<F: std::future::Future + Send>(fut: F) -> F::Output
 where F::Output: Send {
     let handle = tokio::runtime::Handle::current();
@@ -23,6 +74,41 @@ where F::Output: Send {
     } else {
         // current_thread: spawn a helper thread to avoid blocking the single worker
         std::thread::scope(|s| s.spawn(|| handle.block_on(fut)).join().unwrap())
+    }
+}
+
+/// WASM / non-server fallback: single-threaded, no tokio runtime available.
+/// Uses a lightweight inline executor to poll the future to completion.
+#[cfg(not(feature = "server"))]
+pub(super) fn sync_block_on<F: std::future::Future>(fut: F) -> F::Output {
+    // On WASM / embedded builds without a full tokio runtime, we use a simple
+    // spin-poll executor. This is safe because there is no true parallelism.
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::pin::pin;
+
+    fn noop_raw_waker() -> RawWaker {
+        fn no_op(_: *const ()) {}
+        fn clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+
+    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = pin!(fut);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(val) => return val,
+            Poll::Pending => {
+                // In a single-threaded WASM context, Pending means the future
+                // is waiting on something that will never resolve synchronously.
+                // This should not happen for the sync sub-queries we use this for.
+                #[cfg(target_arch = "wasm32")]
+                panic!("sync_block_on: future returned Pending in WASM context");
+                #[cfg(not(target_arch = "wasm32"))]
+                std::thread::yield_now();
+            }
+        }
     }
 }
 

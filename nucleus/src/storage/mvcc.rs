@@ -69,20 +69,28 @@ impl MvccTable {
         txn_mgr: &TransactionManager,
     ) -> Vec<(usize, Arc<Row>)> {
         let rows = self.rows.read();
+        // Hoist invariants: avoids per-row get_status() mutex in common case
+        let no_aborts = txn_mgr.has_no_aborts();
+        let xmin = snapshot.xmin;
         rows.iter()
             .enumerate()
-            .filter(|(_, r)| r.version.is_visible(snapshot, txn_mgr))
+            .filter(|(_, r)| {
+                r.version.is_visible_fast(xmin, no_aborts)
+                    || r.version.is_visible(snapshot, txn_mgr)
+            })
             .map(|(i, r)| (i, Arc::clone(&r.data)))
             .collect()
     }
 
-    /// Insert a new row version.
-    fn insert(&self, txn_id: u64, row: Row) {
+    /// Insert a new row version. Returns the version index of the new row.
+    fn insert(&self, txn_id: u64, row: Row) -> usize {
         let mut rows = self.rows.write();
+        let idx = rows.len();
         rows.push(MvccRow {
             version: RowVersion::new(txn_id),
             data: Arc::new(row),
         });
+        idx
     }
 
     /// Mark a row version as deleted by the given transaction.
@@ -140,13 +148,15 @@ impl MvccTable {
     /// Split into two phases:
     ///   1. Phase 1 (read lock): CAS delete on old version
     ///   2. Phase 2 (write lock): push new version (O(1))
+    ///
+    /// Returns the version index of the new row version.
     fn update_version(
         &self,
         version_idx: usize,
         txn_id: u64,
         new_row: Row,
         txn_mgr: &TransactionManager,
-    ) -> Result<(), MvccError> {
+    ) -> Result<usize, MvccError> {
         // Phase 1: CAS delete under read lock
         {
             let rows = self.rows.read();
@@ -179,11 +189,12 @@ impl MvccTable {
         }
         // Phase 2: Push new version under write lock (O(1))
         let mut rows = self.rows.write();
+        let new_idx = rows.len();
         rows.push(MvccRow {
             version: RowVersion::new(txn_id),
             data: Arc::new(new_row),
         });
-        Ok(())
+        Ok(new_idx)
     }
 
     /// Garbage collect: remove versions that are invisible to ALL possible
@@ -251,9 +262,16 @@ impl std::error::Error for MvccError {}
 /// A simple secondary index: maps a value in one column to all committed rows
 /// that hold that value. Maintained for auto-commit operations; rebuilt on
 /// explicit-transaction commit.
+///
+/// Also maintains a `version_map` that maps indexed values to their MVCC
+/// version chain indices, enabling O(1) point lookups for PK/UNIQUE scans.
 struct MvccIdx {
     col_idx: usize,
-    map: std::collections::BTreeMap<Value, Vec<Row>>,
+    /// Maps indexed value → {version_idx → Row}. Keyed by version_idx for O(1) update/delete.
+    map: std::collections::BTreeMap<Value, HashMap<usize, Row>>,
+    /// Maps indexed value → version indices in MvccTable.rows.
+    /// For PK/UNIQUE columns this has exactly one entry per value.
+    version_map: HashMap<Value, Vec<usize>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -315,11 +333,10 @@ impl MvccMemoryEngine {
         Ok(())
     }
 
-    /// Insert a row under the given transaction.
-    pub fn insert(&self, table: &str, txn_id: u64, row: Row) -> Result<(), MvccError> {
+    /// Insert a row under the given transaction. Returns the version index.
+    pub fn insert(&self, table: &str, txn_id: u64, row: Row) -> Result<usize, MvccError> {
         let tbl = self.get_table(table)?;
-        tbl.insert(txn_id, row);
-        Ok(())
+        Ok(tbl.insert(txn_id, row))
     }
 
     /// Scan visible rows for the given snapshot.
@@ -364,14 +381,14 @@ impl MvccMemoryEngine {
             })
     }
 
-    /// Update a row: delete old version + insert new version.
+    /// Update a row: delete old version + insert new version. Returns the new version index.
     pub fn update(
         &self,
         table: &str,
         version_idx: usize,
         txn_id: u64,
         new_row: Row,
-    ) -> Result<(), MvccError> {
+    ) -> Result<usize, MvccError> {
         let tbl = self.get_table(table)?;
         tbl.update_version(version_idx, txn_id, new_row, &self.txn_mgr)
     }
@@ -411,6 +428,7 @@ impl std::fmt::Debug for MvccMemoryEngine {
 // ---------------------------------------------------------------------------
 
 use super::{StorageEngine, StorageError};
+#[cfg(feature = "server")]
 use super::mvcc_wal::{MvccWal, MvccWalRecord};
 use super::txn::Transaction;
 
@@ -484,7 +502,12 @@ pub struct MvccStorageAdapter {
     /// Committed row counts per table — enables O(1) COUNT(*) fast path.
     committed_counts: parking_lot::RwLock<HashMap<String, i64>>,
     /// Optional WAL for crash-safe durability.
+    #[cfg(feature = "server")]
     wal: Option<Arc<MvccWal>>,
+    /// Cached scan results to avoid double-scanning during update/delete.
+    /// Key: table name. Value: (version_indices, rows) from last auto-commit scan.
+    /// Invalidated after use in update/delete.
+    scan_cache: parking_lot::RwLock<HashMap<String, Vec<(usize, Arc<Row>)>>>,
 }
 
 impl Default for MvccStorageAdapter {
@@ -503,13 +526,16 @@ impl MvccStorageAdapter {
             indexes: parking_lot::RwLock::new(HashMap::new()),
             table_idx_names: parking_lot::RwLock::new(HashMap::new()),
             committed_counts: parking_lot::RwLock::new(HashMap::new()),
+            #[cfg(feature = "server")]
             wal: None,
+            scan_cache: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
     /// Open a durable MVCC engine backed by a WAL in the given directory.
     /// On open, replays the WAL to recover all committed state.
     /// Returns (adapter, recovered_schemas) — caller must register schemas in the catalog.
+    #[cfg(feature = "server")]
     #[allow(clippy::type_complexity)]
     pub fn with_wal(dir: &std::path::Path) -> Result<(Self, Vec<(String, Vec<(String, crate::types::DataType)>)>), StorageError> {
         let (wal, state) = MvccWal::open(dir)
@@ -542,11 +568,13 @@ impl MvccStorageAdapter {
             table_idx_names: parking_lot::RwLock::new(HashMap::new()),
             committed_counts: parking_lot::RwLock::new(committed_counts),
             wal: Some(Arc::new(wal)),
+            scan_cache: parking_lot::RwLock::new(HashMap::new()),
         }, recovered_schemas))
     }
 
     /// Incrementally update indexes when new rows are appended (auto-commit).
-    fn update_indexes_for_new_rows(&self, table: &str, new_rows: &[Row]) {
+    /// Each entry is (row_data, version_idx_in_mvcc_table).
+    fn update_indexes_for_new_rows(&self, table: &str, new_rows: &[(&Row, usize)]) {
         let names: Vec<String> = {
             let m = self.table_idx_names.read();
             m.get(table).cloned().unwrap_or_default()
@@ -555,16 +583,17 @@ impl MvccStorageAdapter {
         let mut indexes = self.indexes.write();
         for name in &names {
             if let Some(idx) = indexes.get_mut(name) {
-                for row in new_rows {
+                for &(row, version_idx) in new_rows {
                     let val = row.get(idx.col_idx).cloned().unwrap_or(Value::Null);
-                    idx.map.entry(val).or_default().push(row.clone());
+                    idx.map.entry(val.clone()).or_default().insert(version_idx, row.clone());
+                    idx.version_map.entry(val).or_default().push(version_idx);
                 }
             }
         }
     }
 
-    /// Fully rebuild indexes for a table from the given row set.
-    fn rebuild_indexes_for_table(&self, table: &str, rows: &[Row]) {
+    /// Fully rebuild indexes for a table from the given row set with version indices.
+    fn rebuild_indexes_for_table(&self, table: &str, rows_with_vidx: &[(usize, Arc<Row>)]) {
         let names: Vec<String> = {
             let m = self.table_idx_names.read();
             m.get(table).cloned().unwrap_or_default()
@@ -574,9 +603,111 @@ impl MvccStorageAdapter {
         for name in &names {
             if let Some(idx) = indexes.get_mut(name) {
                 idx.map.clear();
-                for row in rows {
+                idx.version_map.clear();
+                for (version_idx, row) in rows_with_vidx {
                     let val = row.get(idx.col_idx).cloned().unwrap_or(Value::Null);
-                    idx.map.entry(val).or_default().push(row.clone());
+                    idx.map.entry(val.clone()).or_default().insert(*version_idx, (**row).clone());
+                    idx.version_map.entry(val).or_default().push(*version_idx);
+                }
+            }
+        }
+    }
+
+    /// Incrementally update indexes after UPDATE: remove old values, insert new values.
+    /// O(k * m * log n) where k=updated rows, m=indexes, n=unique values — vs O(N * m) for full rebuild.
+    /// Each update is (old_version_idx, new_version_idx, old_row, new_row).
+    fn update_indexes_incremental(&self, table: &str, updates: &[(usize, usize, &Row, &Row)]) {
+        let names: Vec<String> = {
+            let m = self.table_idx_names.read();
+            m.get(table).cloned().unwrap_or_default()
+        };
+        if names.is_empty() { return; }
+        let mut indexes = self.indexes.write();
+        for name in &names {
+            if let Some(idx) = indexes.get_mut(name) {
+                for &(old_vidx, new_vidx, old_row, new_row) in updates {
+                    let old_val = old_row.get(idx.col_idx).unwrap_or(&Value::Null);
+                    let new_val = new_row.get(idx.col_idx).unwrap_or(&Value::Null);
+
+                    if old_val == new_val {
+                        // Indexed column value unchanged — O(1) update via version_idx key
+                        if let Some(vidxs) = idx.version_map.get_mut(old_val) {
+                            if let Some(i) = vidxs.iter().position(|&v| v == old_vidx) {
+                                vidxs[i] = new_vidx;
+                            } else {
+                                vidxs.push(new_vidx);
+                            }
+                        } else {
+                            idx.version_map.entry(old_val.clone()).or_default().push(new_vidx);
+                        }
+                        // O(1) HashMap update: remove old version, insert new
+                        if let Some(entries) = idx.map.get_mut(old_val) {
+                            entries.remove(&old_vidx);
+                            entries.insert(new_vidx, new_row.clone());
+                        } else {
+                            let mut h = HashMap::new();
+                            h.insert(new_vidx, new_row.clone());
+                            idx.map.insert(old_val.clone(), h);
+                        }
+                    } else {
+                        // Indexed column value changed — remove from old, insert to new
+                        let old_val = old_val.clone();
+                        let new_val = new_val.clone();
+                        // Remove old version_idx from version_map
+                        if let Some(vidxs) = idx.version_map.get_mut(&old_val) {
+                            if let Some(i) = vidxs.iter().position(|&v| v == old_vidx) {
+                                vidxs.swap_remove(i);
+                            }
+                            if vidxs.is_empty() {
+                                idx.version_map.remove(&old_val);
+                            }
+                        }
+                        // Remove from map by version_idx (O(1))
+                        if let Some(entries) = idx.map.get_mut(&old_val) {
+                            entries.remove(&old_vidx);
+                            if entries.is_empty() {
+                                idx.map.remove(&old_val);
+                            }
+                        }
+                        // Insert new entry
+                        idx.map.entry(new_val.clone()).or_default().insert(new_vidx, new_row.clone());
+                        idx.version_map.entry(new_val).or_default().push(new_vidx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Incrementally remove rows from indexes after DELETE.
+    /// O(k * m * log n) where k=deleted rows, m=indexes, n=unique values.
+    /// Each entry is (row_data, version_idx).
+    fn remove_from_indexes(&self, table: &str, deleted_rows: &[(&Row, usize)]) {
+        let names: Vec<String> = {
+            let m = self.table_idx_names.read();
+            m.get(table).cloned().unwrap_or_default()
+        };
+        if names.is_empty() { return; }
+        let mut indexes = self.indexes.write();
+        for name in &names {
+            if let Some(idx) = indexes.get_mut(name) {
+                for &(row, version_idx) in deleted_rows {
+                    let val = row.get(idx.col_idx).cloned().unwrap_or(Value::Null);
+                    // Remove from map by version_idx (O(1))
+                    if let Some(entries) = idx.map.get_mut(&val) {
+                        entries.remove(&version_idx);
+                        if entries.is_empty() {
+                            idx.map.remove(&val);
+                        }
+                    }
+                    // Remove from version_map
+                    if let Some(vidxs) = idx.version_map.get_mut(&val) {
+                        if let Some(i) = vidxs.iter().position(|&v| v == version_idx) {
+                            vidxs.swap_remove(i);
+                        }
+                        if vidxs.is_empty() {
+                            idx.version_map.remove(&val);
+                        }
+                    }
                 }
             }
         }
@@ -644,7 +775,8 @@ impl MvccStorageAdapter {
         self.engine.txn_mgr().commit(&mut txn);
     }
 
-    /// Log a WAL record (no-op if WAL is disabled).
+    /// Log a WAL record (no-op if WAL is disabled or server feature is off).
+    #[cfg(feature = "server")]
     fn wal_log(&self, record: &MvccWalRecord) -> Result<(), StorageError> {
         if let Some(ref wal) = self.wal {
             wal.log(record).map_err(|e| StorageError::Io(format!("WAL write: {e}")))?;
@@ -652,7 +784,8 @@ impl MvccStorageAdapter {
         Ok(())
     }
 
-    /// Log a COMMIT and fsync (no-op if WAL is disabled).
+    /// Log a COMMIT and fsync (no-op if WAL is disabled or server feature is off).
+    #[cfg(feature = "server")]
     fn wal_log_commit(&self, txn_id: u64) -> Result<(), StorageError> {
         if let Some(ref wal) = self.wal {
             wal.log_commit(txn_id).map_err(|e| StorageError::Io(format!("WAL commit: {e}")))?;
@@ -670,6 +803,7 @@ impl MvccStorageAdapter {
     ///
     /// Explicit transactions (BEGIN/COMMIT) always fsync automatically.
     pub fn wal_sync(&self) -> Result<(), StorageError> {
+        #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal {
             wal.sync().map_err(|e| StorageError::Io(format!("WAL sync: {e}")))?;
         }
@@ -690,11 +824,78 @@ impl MvccStorageAdapter {
     /// Uses the `STORAGE_SESSION_ID` task-local to find the right session.
     /// Falls back to the default session for embedded/test callers.
     fn mvcc_session(&self) -> Arc<MvccSessionState> {
+        #[cfg(feature = "server")]
         let id = super::STORAGE_SESSION_ID.try_with(|&id| id).unwrap_or(0);
+        #[cfg(not(feature = "server"))]
+        let id = super::get_storage_session_id();
         if id != 0 && let Some(sess) = self.mvcc_sessions.read().get(&id) {
             return sess.clone();
         }
         self.default_mvcc_session.clone()
+    }
+
+    /// O(1) index-based point lookup: check if any index on this table covers
+    /// `col_idx`, look up the value in its version_map, verify the version is
+    /// still visible, and return matches + cache entries.
+    ///
+    /// Returns None if no index covers this column or if we're inside a dirty
+    /// explicit transaction (indexes may be stale).
+    fn index_version_lookup(
+        &self,
+        table: &str,
+        col_idx: usize,
+        value: &Value,
+        snap: &super::txn::Snapshot,
+    ) -> Option<(Vec<(usize, Row)>, Vec<(usize, Arc<Row>)>)> {
+        // Don't use stale indexes during explicit transactions
+        let sess = self.mvcc_session();
+        if sess.session_txn.read().is_some() && sess.dirty_tables.read().contains(table) {
+            return None;
+        }
+
+        // Find an index on this column
+        let idx_names = self.table_idx_names.read();
+        let names = idx_names.get(table)?;
+        let indexes = self.indexes.read();
+        for name in names {
+            let idx = indexes.get(name)?;
+            if idx.col_idx != col_idx {
+                continue;
+            }
+            // Look up version indices from the version_map
+            let version_indices = idx.version_map.get(value)?;
+            if version_indices.is_empty() {
+                return Some((Vec::new(), Vec::new()));
+            }
+
+            // Verify each version is still visible in the MVCC chain
+            let tbl = {
+                let tables = self.engine.tables.read();
+                tables.get(table)?.clone()
+            };
+            let rows_guard = tbl.rows.read();
+
+            let mut matches = Vec::new();
+            let mut cache_entries: Vec<(usize, Arc<Row>)> = Vec::new();
+            // Iterate in reverse: newest versions are appended at the end, so
+            // the most recently visible row is found first. For PK/unique
+            // columns only 1 row per value can be visible at a time —
+            // break immediately to avoid O(n) visibility checks on long
+            // version chains (e.g. 1000+ UPDATEs to the same PK).
+            for &vidx in version_indices.iter().rev() {
+                if vidx < rows_guard.len() {
+                    let mvcc_row = &rows_guard[vidx];
+                    if mvcc_row.version.is_visible(snap, &self.engine.txn_mgr) {
+                        let virtual_pos = cache_entries.len();
+                        cache_entries.push((vidx, Arc::clone(&mvcc_row.data)));
+                        matches.push((virtual_pos, (*mvcc_row.data).clone()));
+                        break;
+                    }
+                }
+            }
+            return Some((matches, cache_entries));
+        }
+        None
     }
 }
 
@@ -733,6 +934,26 @@ fn value_cmp_coerced(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     }
 }
 
+/// Helper macro to gate WAL logging calls. On non-server builds, the macro
+/// expands to `Ok(())` without referencing MvccWalRecord or wal_log.
+macro_rules! wal_log {
+    ($self:expr, $record:expr) => {{
+        #[cfg(feature = "server")]
+        { $self.wal_log(&$record) }
+        #[cfg(not(feature = "server"))]
+        { Ok::<(), StorageError>(()) }
+    }};
+}
+
+macro_rules! wal_log_commit {
+    ($self:expr, $txn_id:expr) => {{
+        #[cfg(feature = "server")]
+        { $self.wal_log_commit($txn_id) }
+        #[cfg(not(feature = "server"))]
+        { Ok::<(), StorageError>(()) }
+    }};
+}
+
 #[async_trait::async_trait]
 impl StorageEngine for MvccStorageAdapter {
     fn sync(&self) -> Result<(), StorageError> {
@@ -742,7 +963,7 @@ impl StorageEngine for MvccStorageAdapter {
     async fn create_table(&self, table: &str) -> Result<(), StorageError> {
         // WAL schema logging is deferred to store_table_schema() which is called
         // by the executor after create_table with full column definitions.
-        self.wal_log(&MvccWalRecord::CreateTable {
+        wal_log!(self, MvccWalRecord::CreateTable {
             name: table.to_string(),
             columns: Vec::new(),
         })?;
@@ -753,7 +974,7 @@ impl StorageEngine for MvccStorageAdapter {
 
     fn store_table_schema(&self, table: &str, columns: &[(String, crate::types::DataType)]) {
         // Re-log CreateTable with full schema so recovery can restore the catalog.
-        if let Err(e) = self.wal_log(&MvccWalRecord::CreateTable {
+        if let Err(e) = wal_log!(self, MvccWalRecord::CreateTable {
             name: table.to_string(),
             columns: columns.to_vec(),
         }) {
@@ -765,7 +986,7 @@ impl StorageEngine for MvccStorageAdapter {
         self.engine
             .drop_table(table)
             .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
-        self.wal_log(&MvccWalRecord::DropTable { name: table.to_string() })?;
+        wal_log!(self, MvccWalRecord::DropTable { name: table.to_string() })?;
         // Remove all indexes for this table.
         let names: Vec<String> = {
             let mut tnames = self.table_idx_names.write();
@@ -780,7 +1001,7 @@ impl StorageEngine for MvccStorageAdapter {
 
     async fn insert(&self, table: &str, row: Row) -> Result<(), StorageError> {
         let (txn_id, _snap, auto) = self.current_or_auto();
-        self.engine
+        let version_idx = self.engine
             .insert(table, txn_id, row.clone())
             .map_err(|e| match e {
                 MvccError::TableNotFound(t) => StorageError::TableNotFound(t),
@@ -793,14 +1014,14 @@ impl StorageEngine for MvccStorageAdapter {
         if !auto {
             self.maybe_record_table_write(txn_id, table);
         }
-        self.wal_log(&MvccWalRecord::Insert {
+        wal_log!(self, MvccWalRecord::Insert {
             table: table.to_string(),
             txn_id: if auto { 0 } else { txn_id },
             row: row.clone(),
         })?;
         if auto {
             self.auto_commit(txn_id);
-            self.update_indexes_for_new_rows(table, std::slice::from_ref(&row));
+            self.update_indexes_for_new_rows(table, &[(&row, version_idx)]);
             *self.committed_counts.write().entry(table.to_string()).or_insert(0) += 1;
         } else {
             self.mvcc_session().dirty_tables.write().insert(table.to_string());
@@ -814,15 +1035,17 @@ impl StorageEngine for MvccStorageAdapter {
         let n = rows.len() as i64;
         let (txn_id, _snap, auto) = self.current_or_auto();
         let wal_txn_id = if auto { 0 } else { txn_id };
+        let mut version_indices: Vec<usize> = Vec::with_capacity(rows.len());
         for row in &rows {
-            self.engine.insert(table, txn_id, row.clone()).map_err(|e| match e {
+            let vidx = self.engine.insert(table, txn_id, row.clone()).map_err(|e| match e {
                 MvccError::TableNotFound(t) => StorageError::TableNotFound(t),
                 MvccError::WriteConflict { table, row_idx } => {
                     StorageError::WriteConflict(format!("{table} row {row_idx}"))
                 }
                 MvccError::NoActiveTransaction => StorageError::NoActiveTransaction,
             })?;
-            self.wal_log(&MvccWalRecord::Insert {
+            version_indices.push(vidx);
+            wal_log!(self, MvccWalRecord::Insert {
                 table: table.to_string(),
                 txn_id: wal_txn_id,
                 row: row.clone(),
@@ -830,7 +1053,8 @@ impl StorageEngine for MvccStorageAdapter {
         }
         if auto {
             self.auto_commit(txn_id);
-            self.update_indexes_for_new_rows(table, &rows);
+            let pairs: Vec<(&Row, usize)> = rows.iter().zip(version_indices).collect();
+            self.update_indexes_for_new_rows(table, &pairs);
             *self.committed_counts.write().entry(table.to_string()).or_insert(0) += n;
         } else {
             self.mvcc_session().dirty_tables.write().insert(table.to_string());
@@ -850,11 +1074,83 @@ impl StorageEngine for MvccStorageAdapter {
             let indices: Vec<usize> = results.iter().map(|(idx, _)| *idx).collect();
             self.maybe_record_siread(_txn_id, table, &indices);
         }
+        // Cache the raw scan results (with version indices) for subsequent update/delete.
+        // This avoids a redundant re-scan when update()/delete() is called immediately after.
+        if auto {
+            self.scan_cache.write().insert(table.to_string(), results.clone());
+        }
         let rows: Vec<Row> = results.into_iter().map(|(_, r)| (*r).clone()).collect();
         if auto {
             self.auto_commit(_txn_id);
         }
         Ok(rows)
+    }
+
+    /// Efficient filtered scan that returns (virtual-position, row) pairs.
+    /// Iterates the MVCC version chain directly with integrated visibility +
+    /// equality checks, avoiding the allocation of a full visible-row Vec.
+    /// Only matching rows are materialized.  A small scan cache is populated
+    /// so that the subsequent update()/delete() can map virtual positions back
+    /// to MVCC version indices without a redundant re-scan.
+    async fn scan_where_eq_positions(
+        &self,
+        table: &str,
+        col_idx: usize,
+        value: &Value,
+    ) -> Result<Vec<(usize, Row)>, StorageError> {
+        let (_txn_id, snap, auto) = self.current_or_auto();
+
+        // --- Try index-based O(1) lookup first ---
+        // If there is a BTreeMap index on this column with version tracking,
+        // we can skip the full version chain iteration entirely.
+        let idx_hit = self.index_version_lookup(table, col_idx, value, &snap);
+        if let Some((matches, cache_entries)) = idx_hit {
+            if auto {
+                if !cache_entries.is_empty() {
+                    self.scan_cache.write().insert(table.to_string(), cache_entries);
+                }
+                self.auto_commit(_txn_id);
+            }
+            return Ok(matches);
+        }
+
+        // --- Fallback: iterate version chain directly ---
+        let tbl = {
+            let tables = self.engine.tables.read();
+            tables.get(table)
+                .cloned()
+                .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?
+        };
+        let rows_guard = tbl.rows.read();
+        let no_aborts = self.engine.txn_mgr.has_no_aborts();
+        let xmin = snap.xmin;
+
+        let mut matches = Vec::new();
+        let mut cache_entries: Vec<(usize, Arc<Row>)> = Vec::new();
+
+        for (version_idx, mvcc_row) in rows_guard.iter().enumerate() {
+            if !(mvcc_row.version.is_visible_fast(xmin, no_aborts)
+                || mvcc_row.version.is_visible(&snap, &self.engine.txn_mgr))
+            {
+                continue;
+            }
+            if let Some(v) = mvcc_row.data.get(col_idx) {
+                if value_eq_coerced(v, value) {
+                    let virtual_pos = cache_entries.len();
+                    cache_entries.push((version_idx, Arc::clone(&mvcc_row.data)));
+                    matches.push((virtual_pos, (*mvcc_row.data).clone()));
+                }
+            }
+        }
+        drop(rows_guard);
+
+        if auto {
+            if !cache_entries.is_empty() {
+                self.scan_cache.write().insert(table.to_string(), cache_entries);
+            }
+            self.auto_commit(_txn_id);
+        }
+        Ok(matches)
     }
 
     /// Fast GROUP BY: iterate visible rows, group by key column, compute count and optional avg.
@@ -870,16 +1166,30 @@ impl StorageEngine for MvccStorageAdapter {
             tables.get(table)?.clone()
         };
         let rows = tbl.rows.read();
+        // Hoist invariants: avoids per-row get_status() mutex in common case
+        let no_aborts = self.engine.txn_mgr.has_no_aborts();
+        let xmin = snap.xmin;
         // Use Vec to preserve insertion order
         let mut key_order: Vec<Value> = Vec::new();
         let mut groups: HashMap<Value, (i64, f64, usize)> = HashMap::new();
+        let null_value = Value::Null;
         for r in rows.iter() {
-            if !r.version.is_visible(&snap, &self.engine.txn_mgr) { continue; }
-            let key = r.data.get(key_col).cloned().unwrap_or(Value::Null);
-            let entry = groups.entry(key.clone()).or_insert_with(|| {
-                key_order.push(key.clone());
-                (0, 0.0, 0)
-            });
+            if !(r.version.is_visible_fast(xmin, no_aborts)
+                || r.version.is_visible(&snap, &self.engine.txn_mgr))
+            {
+                continue;
+            }
+            // Borrow key — only clone on first occurrence of each distinct value
+            let key_ref = r.data.get(key_col).unwrap_or(&null_value);
+            let entry = match groups.get_mut(key_ref) {
+                Some(e) => e,
+                None => {
+                    let owned = key_ref.clone();
+                    key_order.push(owned.clone());
+                    groups.insert(owned, (0, 0.0, 0));
+                    groups.get_mut(key_ref).unwrap()
+                }
+            };
             entry.0 += 1; // count
             if let Some(vc) = val_col
                 && let Some(val) = r.data.get(vc) {
@@ -914,10 +1224,13 @@ impl StorageEngine for MvccStorageAdapter {
             tables.get(table)?.clone()
         };
         let rows = tbl.rows.read();
+        let no_aborts = self.engine.txn_mgr.has_no_aborts();
+        let xmin = snap.xmin;
         let mut sum = 0.0f64;
         let mut count = 0usize;
         for r in rows.iter() {
-            if !r.version.is_visible(&snap, &self.engine.txn_mgr) { continue; }
+            if !(r.version.is_visible_fast(xmin, no_aborts)
+                || r.version.is_visible(&snap, &self.engine.txn_mgr)) { continue; }
             if r.data.get(filter_col).is_some_and(|v| value_eq_coerced(v, filter_val))
                 && let Some(val) = r.data.get(val_col) {
                     match val {
@@ -945,9 +1258,12 @@ impl StorageEngine for MvccStorageAdapter {
             tables.get(table)?.clone()
         };
         let rows = tbl.rows.read();
+        let no_aborts = self.engine.txn_mgr.has_no_aborts();
+        let xmin = snap.xmin;
         let count = rows.iter()
             .filter(|r| {
-                r.version.is_visible(&snap, &self.engine.txn_mgr)
+                (r.version.is_visible_fast(xmin, no_aborts)
+                    || r.version.is_visible(&snap, &self.engine.txn_mgr))
                     && r.data.get(filter_col).is_some_and(|v| value_eq_coerced(v, filter_val))
             })
             .count();
@@ -969,9 +1285,13 @@ impl StorageEngine for MvccStorageAdapter {
             tables.get(table)?.clone()
         };
         let rows = tbl.rows.read();
+        let no_aborts = self.engine.txn_mgr.has_no_aborts();
+        let xmin = snap.xmin;
         let mut result = Vec::new();
         for r in rows.iter() {
-            if !r.version.is_visible(&snap, &self.engine.txn_mgr) {
+            if !(r.version.is_visible_fast(xmin, no_aborts)
+                || r.version.is_visible(&snap, &self.engine.txn_mgr))
+            {
                 continue;
             }
             if let Some(val) = r.data.get(filter_col)
@@ -982,6 +1302,114 @@ impl StorageEngine for MvccStorageAdapter {
         if auto {
             self.auto_commit(_txn_id);
         }
+        Some(result)
+    }
+
+    fn fast_scan_where_eq_topk(
+        &self,
+        table: &str,
+        filter_col: usize,
+        filter_val: &Value,
+        sort_col: usize,
+        desc: bool,
+        k: usize,
+    ) -> Option<Vec<Row>> {
+        use std::collections::BinaryHeap;
+        use std::cmp::Ordering;
+
+        if k == 0 { return Some(Vec::new()); }
+
+        let (_txn_id, snap, auto) = self.current_or_auto();
+        let tbl = {
+            let tables = self.engine.tables.read();
+            tables.get(table)?.clone()
+        };
+        let rows = tbl.rows.read();
+        let no_aborts = self.engine.txn_mgr.has_no_aborts();
+        let xmin = snap.xmin;
+
+        // Wrapper for BinaryHeap: we want a min-heap by sort_col so we can
+        // eject the smallest (for DESC) or largest (for ASC) element.
+        // BinaryHeap is a max-heap, so we reverse the comparison.
+        struct HeapEntry {
+            sort_val: Value,
+            row: Row,
+            desc: bool,
+        }
+        impl PartialEq for HeapEntry {
+            fn eq(&self, other: &Self) -> bool { self.sort_val == other.sort_val }
+        }
+        impl Eq for HeapEntry {}
+        impl PartialOrd for HeapEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+        }
+        impl Ord for HeapEntry {
+            fn cmp(&self, other: &Self) -> Ordering {
+                // BinaryHeap is a max-heap: pop() returns the greatest element.
+                // We want pop() to eject the WORST candidate.
+                let c = self.sort_val.cmp(&other.sort_val);
+                if self.desc {
+                    // For DESC: keep largest values, eject smallest.
+                    // Reverse so smallest natural value = greatest in Ord → gets popped.
+                    c.reverse()
+                } else {
+                    // For ASC: keep smallest values, eject largest.
+                    // Natural order so largest natural value = greatest in Ord → gets popped.
+                    c
+                }
+            }
+        }
+
+        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(k + 1);
+        // Keep track of the threshold to avoid cloning rows that can't make it
+        let mut threshold: Option<Value> = None;
+
+        for r in rows.iter() {
+            if !(r.version.is_visible_fast(xmin, no_aborts)
+                || r.version.is_visible(&snap, &self.engine.txn_mgr))
+            {
+                continue;
+            }
+            if let Some(val) = r.data.get(filter_col)
+                && value_eq_coerced(val, filter_val)
+            {
+                let sort_val = r.data.get(sort_col).cloned().unwrap_or(Value::Null);
+                // Skip if this value can't beat the current threshold
+                if heap.len() >= k {
+                    if let Some(ref thr) = threshold {
+                        let dominated = if desc {
+                            sort_val <= *thr
+                        } else {
+                            sort_val >= *thr
+                        };
+                        if dominated { continue; }
+                    }
+                }
+                let entry = HeapEntry {
+                    sort_val: sort_val.clone(),
+                    row: (*r.data).clone(),
+                    desc,
+                };
+                heap.push(entry);
+                if heap.len() > k {
+                    heap.pop(); // eject worst
+                    // Update threshold from new worst
+                    if let Some(worst) = heap.peek() {
+                        threshold = Some(worst.sort_val.clone());
+                    }
+                }
+            }
+        }
+        if auto {
+            self.auto_commit(_txn_id);
+        }
+
+        // Extract rows in sorted order.
+        // into_sorted_vec() returns ascending Ord order:
+        //   DESC (reversed Ord): ascending reversed = descending natural ✓
+        //   ASC (natural Ord): ascending natural ✓
+        let result: Vec<Row> = heap.into_sorted_vec().into_iter()
+            .map(|e| e.row).collect();
         Some(result)
     }
 
@@ -998,9 +1426,13 @@ impl StorageEngine for MvccStorageAdapter {
             tables.get(table)?.clone()
         };
         let rows = tbl.rows.read();
+        let no_aborts = self.engine.txn_mgr.has_no_aborts();
+        let xmin = snap.xmin;
         let mut result = Vec::new();
         for r in rows.iter() {
-            if !r.version.is_visible(&snap, &self.engine.txn_mgr) {
+            if !(r.version.is_visible_fast(xmin, no_aborts)
+                || r.version.is_visible(&snap, &self.engine.txn_mgr))
+            {
                 continue;
             }
             if let Some(val) = r.data.get(filter_col)
@@ -1018,11 +1450,11 @@ impl StorageEngine for MvccStorageAdapter {
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
         let (txn_id, snap, auto) = self.current_or_auto();
 
-        // Map scan-order positions to MVCC version indices
-        let visible = self
-            .engine
-            .scan(table, &snap)
-            .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+        // Map scan-order positions to MVCC version indices.
+        // Try the scan cache first (populated by a prior scan() call) to avoid re-scanning.
+        let visible = self.scan_cache.write().remove(table).unwrap_or_else(|| {
+            self.engine.scan(table, &snap).unwrap_or_default()
+        });
 
         let mut sorted = positions.to_vec();
         sorted.sort_unstable();
@@ -1043,7 +1475,7 @@ impl StorageEngine for MvccStorageAdapter {
                         e => StorageError::Io(e.to_string()),
                     })?;
                 written_indices.push(*version_idx);
-                self.wal_log(&MvccWalRecord::Delete {
+                wal_log!(self, MvccWalRecord::Delete {
                     table: table.to_string(),
                     txn_id: wal_txn_id,
                     row_idx: pos as u32,
@@ -1059,14 +1491,14 @@ impl StorageEngine for MvccStorageAdapter {
 
         if auto {
             self.auto_commit(txn_id);
-            // Rebuild indexes with the remaining (non-deleted) rows.
-            let deleted: std::collections::HashSet<usize> = sorted.into_iter().collect();
-            let remaining: Vec<Row> = visible.iter()
-                .enumerate()
-                .filter(|(i, _)| !deleted.contains(i))
-                .map(|(_, (_, row))| (**row).clone())
+            // Incremental index removal: only remove deleted rows from indexes.
+            let deleted_rows: Vec<(&Row, usize)> = sorted.iter()
+                .filter(|&&pos| pos < visible.len())
+                .map(|&pos| (visible[pos].1.as_ref(), visible[pos].0))
                 .collect();
-            self.rebuild_indexes_for_table(table, &remaining);
+            if !deleted_rows.is_empty() {
+                self.remove_from_indexes(table, &deleted_rows);
+            }
             if count > 0 {
                 *self.committed_counts.write().entry(table.to_string()).or_insert(0) -= count as i64;
             }
@@ -1083,19 +1515,20 @@ impl StorageEngine for MvccStorageAdapter {
     ) -> Result<usize, StorageError> {
         let (txn_id, snap, auto) = self.current_or_auto();
 
-        // Map scan-order positions to MVCC version indices
-        let visible = self
-            .engine
-            .scan(table, &snap)
-            .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+        // Map scan-order positions to MVCC version indices.
+        // Try the scan cache first (populated by a prior scan() call) to avoid re-scanning.
+        let visible = self.scan_cache.write().remove(table).unwrap_or_else(|| {
+            self.engine.scan(table, &snap).unwrap_or_default()
+        });
 
         let mut count = 0;
         let wal_txn_id = if auto { 0 } else { txn_id };
         let mut written_indices = Vec::new();
+        let mut new_version_indices: Vec<usize> = Vec::new();
         for (pos, new_row) in updates {
             if *pos < visible.len() {
                 let (version_idx, _) = &visible[*pos];
-                self.engine
+                let new_vidx = self.engine
                     .update(table, *version_idx, txn_id, new_row.clone())
                     .map_err(|e| match e {
                         MvccError::WriteConflict { table, row_idx } => {
@@ -1104,7 +1537,8 @@ impl StorageEngine for MvccStorageAdapter {
                         e => StorageError::Io(e.to_string()),
                     })?;
                 written_indices.push(*version_idx);
-                self.wal_log(&MvccWalRecord::Update {
+                new_version_indices.push(new_vidx);
+                wal_log!(self, MvccWalRecord::Update {
                     table: table.to_string(),
                     txn_id: wal_txn_id,
                     row_idx: *pos as u32,
@@ -1121,20 +1555,20 @@ impl StorageEngine for MvccStorageAdapter {
 
         if auto {
             self.auto_commit(txn_id);
-            // Rebuild indexes with post-update row set.
-            let update_map: HashMap<usize, &Row> =
-                updates.iter().map(|(pos, row)| (*pos, row)).collect();
-            let updated: Vec<Row> = visible.iter()
-                .enumerate()
-                .map(|(i, (_, old_row))| {
-                    if let Some(&new_row) = update_map.get(&i) {
-                        new_row.clone()
-                    } else {
-                        (**old_row).clone()
-                    }
+            // Incremental index update: only touch changed rows, not entire table.
+            let mut vidx_iter = new_version_indices.iter();
+            let index_updates: Vec<(usize, usize, &Row, &Row)> = updates.iter()
+                .filter(|(pos, _)| *pos < visible.len())
+                .map(|(pos, new_row)| {
+                    let old_vidx = visible[*pos].0;
+                    let old_row: &Row = visible[*pos].1.as_ref();
+                    let new_vidx = *vidx_iter.next().unwrap();
+                    (old_vidx, new_vidx, old_row, new_row)
                 })
                 .collect();
-            self.rebuild_indexes_for_table(table, &updated);
+            if !index_updates.is_empty() {
+                self.update_indexes_incremental(table, &index_updates);
+            }
         } else {
             self.mvcc_session().dirty_tables.write().insert(table.to_string());
         }
@@ -1167,7 +1601,7 @@ impl StorageEngine for MvccStorageAdapter {
             iso
         };
         let txn = self.engine.txn_mgr().begin(iso);
-        self.wal_log(&MvccWalRecord::Begin { txn_id: txn.id })?;
+        wal_log!(self, MvccWalRecord::Begin { txn_id: txn.id })?;
         *lock = Some(txn);
         Ok(())
     }
@@ -1201,7 +1635,7 @@ impl StorageEngine for MvccStorageAdapter {
             self.engine.txn_mgr().cleanup_ssi(commit_txn_id);
         }
         if commit_txn_id != 0 {
-            self.wal_log_commit(commit_txn_id)?;
+            wal_log_commit!(self, commit_txn_id)?;
         }
         sess.savepoints.write().clear();
         // Rebuild indexes for all tables that were mutated in this transaction.
@@ -1210,9 +1644,9 @@ impl StorageEngine for MvccStorageAdapter {
         for table in dirty {
             let mut read_txn = self.engine.txn_mgr().begin(IsolationLevel::Snapshot);
             let snap = read_txn.snapshot.clone();
-            if let Ok(rows) = self.engine.scan_rows(&table, &snap) {
-                let n = rows.len() as i64;
-                self.rebuild_indexes_for_table(&table, &rows);
+            if let Ok(rows_with_vidx) = self.engine.scan(&table, &snap) {
+                let n = rows_with_vidx.len() as i64;
+                self.rebuild_indexes_for_table(&table, &rows_with_vidx);
                 self.committed_counts.write().insert(table.clone(), n);
             }
             self.engine.txn_mgr().abort(&mut read_txn);
@@ -1224,7 +1658,7 @@ impl StorageEngine for MvccStorageAdapter {
         let sess = self.mvcc_session();
         let mut lock = sess.session_txn.write();
         if let Some(ref mut txn) = *lock {
-            self.wal_log(&MvccWalRecord::Abort { txn_id: txn.id })?;
+            wal_log!(self, MvccWalRecord::Abort { txn_id: txn.id })?;
             self.engine.txn_mgr().abort(txn);
         }
         *lock = None;
@@ -1352,20 +1786,22 @@ impl StorageEngine for MvccStorageAdapter {
     // -- Index operations --
 
     async fn create_index(&self, table: &str, index_name: &str, col_idx: usize) -> Result<(), StorageError> {
-        // Scan committed rows and build the index map.
+        // Scan committed rows (with version indices) and build the index.
         let (txn_id, snap, auto) = self.current_or_auto();
-        let rows = self.engine.scan_rows(table, &snap)
+        let results = self.engine.scan(table, &snap)
             .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
         if auto { self.auto_commit(txn_id); }
 
-        let mut map: std::collections::BTreeMap<Value, Vec<Row>> = std::collections::BTreeMap::new();
-        for row in &rows {
+        let mut map: std::collections::BTreeMap<Value, HashMap<usize, Row>> = std::collections::BTreeMap::new();
+        let mut version_map: HashMap<Value, Vec<usize>> = HashMap::new();
+        for (version_idx, row) in &results {
             let val = row.get(col_idx).cloned().unwrap_or(Value::Null);
-            map.entry(val).or_default().push(row.clone());
+            map.entry(val.clone()).or_default().insert(*version_idx, (**row).clone());
+            version_map.entry(val).or_default().push(*version_idx);
         }
         {
             let mut indexes = self.indexes.write();
-            indexes.insert(index_name.to_string(), MvccIdx { col_idx, map });
+            indexes.insert(index_name.to_string(), MvccIdx { col_idx, map, version_map });
         }
         {
             let mut tnames = self.table_idx_names.write();
@@ -1383,6 +1819,20 @@ impl StorageEngine for MvccStorageAdapter {
         Ok(())
     }
 
+    async fn index_lookup(&self, table: &str, index_name: &str, value: &Value) -> Result<Option<Vec<Row>>, StorageError> {
+        self.index_lookup_sync(table, index_name, value)
+    }
+
+    async fn index_lookup_range(
+        &self,
+        table: &str,
+        index_name: &str,
+        low: &Value,
+        high: &Value,
+    ) -> Result<Option<Vec<Row>>, StorageError> {
+        self.index_lookup_range_sync(table, index_name, low, high)
+    }
+
     fn index_lookup_sync(&self, table: &str, index_name: &str, value: &Value) -> Result<Option<Vec<Row>>, StorageError> {
         // If inside an explicit transaction that has modified this table,
         // the index may be stale (indexes are rebuilt at COMMIT). Fall back
@@ -1393,7 +1843,11 @@ impl StorageEngine for MvccStorageAdapter {
         }
         let indexes = self.indexes.read();
         match indexes.get(index_name) {
-            Some(idx) => Ok(Some(idx.map.get(value).cloned().unwrap_or_default())),
+            Some(idx) => Ok(Some(
+                idx.map.get(value)
+                    .map(|entries| entries.values().cloned().collect())
+                    .unwrap_or_default()
+            )),
             None => Ok(None),
         }
     }
@@ -1417,7 +1871,7 @@ impl StorageEngine for MvccStorageAdapter {
                 // BTreeMap iterates in key order, so no sort needed.
                 let rows: Vec<Row> = idx.map
                     .range(low..=high)
-                    .flat_map(|(_, r)| r.iter().cloned())
+                    .flat_map(|(_, r)| r.values().cloned())
                     .collect();
                 Ok(Some(rows))
             }

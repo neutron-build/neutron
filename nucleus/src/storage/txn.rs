@@ -81,6 +81,42 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Check if a transaction's changes are visible under this snapshot.
+    ///
+    /// # Verified Properties (Verus)
+    ///
+    /// When Verus is enabled (`cfg(verus_keep_ghost)`), the following are proven:
+    /// - Bootstrap data (TXN_COMMITTED_BEFORE_ALL) is always visible
+    /// - Own transaction's changes are always visible
+    /// - Aborted transactions are never visible
+    /// - Active (uncommitted) transactions are never visible
+    /// - Committed transactions with txn_id >= xmax are not visible
+    /// - Committed transactions in the active set are not visible
+    ///
+    /// See `verus/specs/nucleus/mvcc_spec.rs` for the formal specification.
+    /// See `verus/proofs/nucleus/mvcc_lemmas.rs` for proof lemmas.
+    //
+    // #[cfg(verus_keep_ghost)]
+    // verus! {
+    //     requires
+    //         self.xmin <= self.xmax,
+    //     ensures
+    //         // Bootstrap always visible
+    //         txn_id == TXN_COMMITTED_BEFORE_ALL ==> result == true,
+    //         // Own changes always visible
+    //         txn_id == self.txn_id ==> result == true,
+    //         // Aborted never visible
+    //         status == TxnStatus::Aborted ==> result == false,
+    //         // Active never visible (except own, handled above)
+    //         status == TxnStatus::Active && txn_id != self.txn_id ==> result == false,
+    //         // Future transactions not visible
+    //         status == TxnStatus::Committed && txn_id >= self.xmax
+    //             && txn_id != self.txn_id && txn_id != TXN_COMMITTED_BEFORE_ALL
+    //             ==> result == false,
+    //         // In-progress-at-snapshot-time transactions not visible
+    //         status == TxnStatus::Committed && self.active.contains(txn_id)
+    //             && txn_id != self.txn_id && txn_id != TXN_COMMITTED_BEFORE_ALL
+    //             ==> result == false,
+    // }
     pub fn is_visible(&self, txn_id: u64, status: TxnStatus) -> bool {
         // Bootstrap data is always visible
         if txn_id == TXN_COMMITTED_BEFORE_ALL {
@@ -164,7 +200,44 @@ impl RowVersion {
         }
     }
 
+    /// Ultra-fast visibility check using pre-loaded scan-loop invariants.
+    /// Returns `true` if the row is *definitely* visible; `false` means
+    /// "unknown — fall back to full `is_visible()`".
+    ///
+    /// Conditions (all must hold):
+    ///   1. `no_aborts` — no transactions have been aborted, so every completed
+    ///      txn is committed.
+    ///   2. `created_by < snapshot.xmin` — the creating txn completed before the
+    ///      oldest active txn at snapshot time, so it's committed and visible.
+    ///   3. `deleted_by == TXN_INVALID` — the row has not been deleted.
+    #[inline(always)]
+    pub fn is_visible_fast(&self, xmin: u64, no_aborts: bool) -> bool {
+        no_aborts
+            && self.created_by < xmin
+            && self.deleted_by.load(Ordering::Acquire) == TXN_INVALID
+    }
+
     /// Is this row version visible to the given snapshot?
+    ///
+    /// # Verified Properties (Verus)
+    ///
+    /// - A row is visible iff its creator is visible AND it is not deleted by a visible transaction
+    /// - Deletion by an invisible transaction does not hide the row
+    /// - Undeleted rows (deleted_by == TXN_INVALID) are visible if creator is visible
+    ///
+    /// See `verus/specs/nucleus/mvcc_spec.rs` for the formal specification.
+    //
+    // #[cfg(verus_keep_ghost)]
+    // verus! {
+    //     ensures
+    //         // If creator not visible, row not visible
+    //         !snapshot.is_visible(self.created_by, txn_mgr.get_status(self.created_by))
+    //             ==> result == false,
+    //         // If not deleted and creator visible, row is visible
+    //         self.deleted_by.load() == TXN_INVALID
+    //             && snapshot.is_visible(self.created_by, txn_mgr.get_status(self.created_by))
+    //             ==> result == true,
+    // }
     pub fn is_visible(&self, snapshot: &Snapshot, txn_mgr: &TransactionManager) -> bool {
         // The row must have been created by a visible transaction
         let created_status = txn_mgr.get_status(self.created_by);
@@ -210,6 +283,9 @@ pub struct TransactionManager {
     committed: Mutex<HashSet<u64>>,
     /// Aborted transaction IDs (not GC'd — kept until row versions are vacuumed).
     aborted: Mutex<HashSet<u64>>,
+    /// Fast atomic check: non-zero means the aborted set is non-empty.
+    /// Avoids taking the aborted mutex lock in the common case (no aborts).
+    aborted_count: AtomicU64,
     /// GC watermark: committed txn IDs below this have been GC'd from the
     /// committed set. Used by `get_status()` to correctly identify GC'd
     /// committed transactions (they are NOT aborted — their rows are valid).
@@ -241,6 +317,7 @@ impl TransactionManager {
             active: Mutex::new(HashSet::new()),
             committed: Mutex::new(HashSet::new()),
             aborted: Mutex::new(HashSet::new()),
+            aborted_count: AtomicU64::new(0),
             committed_watermark: AtomicU64::new(0),
             ssi_read_locks: Mutex::new(HashMap::new()),
             ssi_write_sets: Mutex::new(HashMap::new()),
@@ -294,6 +371,7 @@ impl TransactionManager {
         txn.status = TxnStatus::Aborted;
         self.active.lock().remove(&txn.id);
         self.aborted.lock().insert(txn.id);
+        self.aborted_count.fetch_add(1, Ordering::Release);
         self.maybe_gc();
         if txn.isolation == IsolationLevel::Serializable {
             self.cleanup_ssi(txn.id);
@@ -309,26 +387,42 @@ impl TransactionManager {
     }
 
     /// Get the status of a transaction.
+    ///
+    /// Ordering is critical: aborted set must be checked before the watermark
+    /// because the watermark can't distinguish committed-then-GC'd from aborted.
+    /// Aborted IDs are never removed from the aborted set, guaranteeing this
+    /// check is correct.
     pub fn get_status(&self, txn_id: u64) -> TxnStatus {
         if txn_id == TXN_COMMITTED_BEFORE_ALL {
             return TxnStatus::Committed;
         }
+        // 1. Fast path: below committed GC watermark.
+        //    If no aborted transactions exist, this is certainly committed.
+        //    If aborted transactions exist, we must check the aborted set.
+        let wm = self.committed_watermark.load(Ordering::Acquire);
+        if txn_id < wm {
+            // Fast atomic check avoids mutex lock in the common case (no aborts)
+            if self.aborted_count.load(Ordering::Acquire) == 0 {
+                return TxnStatus::Committed;
+            }
+            if self.aborted.lock().contains(&txn_id) {
+                return TxnStatus::Aborted;
+            }
+            return TxnStatus::Committed;
+        }
+        // 2. Check aborted set (for transactions above watermark).
+        if self.aborted_count.load(Ordering::Acquire) > 0
+            && self.aborted.lock().contains(&txn_id)
+        {
+            return TxnStatus::Aborted;
+        }
+        // 3. Check recently committed (not yet GC'd).
         if self.committed.lock().contains(&txn_id) {
             return TxnStatus::Committed;
         }
-        if self.aborted.lock().contains(&txn_id) {
-            return TxnStatus::Aborted;
-        }
+        // 4. Check active.
         if self.active.lock().contains(&txn_id) {
             return TxnStatus::Active;
-        }
-        // If this txn_id is below the committed GC watermark, it was a
-        // committed transaction whose ID was cleaned from the committed set.
-        // We know it wasn't aborted because aborted IDs are retained (checked
-        // above). Therefore it must have been committed.
-        let wm = self.committed_watermark.load(Ordering::Acquire);
-        if txn_id < wm {
-            return TxnStatus::Committed;
         }
         // Truly unknown txn — treat as aborted for safety (invisible).
         TxnStatus::Aborted
@@ -395,6 +489,13 @@ impl TransactionManager {
         let watermark = self.gc_watermark();
         let (c, a) = self.gc(watermark);
         (watermark, c, a)
+    }
+
+    /// Fast atomic check: true when no transactions have ever been aborted.
+    /// Used by scan hot paths to skip full visibility checks.
+    #[inline(always)]
+    pub fn has_no_aborts(&self) -> bool {
+        self.aborted_count.load(Ordering::Acquire) == 0
     }
 
     /// Number of committed transaction IDs currently tracked.

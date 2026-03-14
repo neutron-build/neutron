@@ -182,3 +182,38 @@ async fn is_autostart_enabled(state: tauri::State<'_, AutostartState>) -> Result
     #[allow(unreachable_code)]
     Ok(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_plist_path_format() {
+        let path = plist_path("testapp");
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains("Library/LaunchAgents"));
+        assert!(path_str.contains("com.neutron.testapp.plist"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_desktop_entry_path_format() {
+        let path = desktop_entry_path("testapp");
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains("autostart"));
+        assert!(path_str.contains("testapp.desktop"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_registry_key_name_format() {
+        let key = registry_key_name("testapp");
+        assert_eq!(key, "Neutron_testapp");
+    }
+
+    #[test]
+    fn test_init_creates_plugin() {
+        let _plugin = super::init();
+    }
+}

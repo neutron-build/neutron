@@ -438,3 +438,97 @@ class TestAuthExports:
         )
         assert JWTMiddleware is not None
         assert create_token is not None
+
+    def test_password_exports(self):
+        from neutron.auth import hash_password, verify_password, needs_rehash
+        assert hash_password is not None
+        assert verify_password is not None
+        assert needs_rehash is not None
+
+
+# ============================================================================
+# Password Hashing
+# ============================================================================
+
+
+class TestPasswordHashing:
+    def test_hash_password_returns_string(self):
+        from neutron.auth.password import hash_password
+
+        hashed = hash_password("secret123")
+        assert isinstance(hashed, str)
+        assert len(hashed) > 0
+
+    def test_hash_password_not_plaintext(self):
+        from neutron.auth.password import hash_password
+
+        hashed = hash_password("mypassword")
+        assert hashed != "mypassword"
+
+    def test_hash_password_different_for_same_input(self):
+        from neutron.auth.password import hash_password
+
+        h1 = hash_password("same")
+        h2 = hash_password("same")
+        # Should produce different hashes due to random salt
+        assert h1 != h2
+
+    def test_verify_password_correct(self):
+        from neutron.auth.password import hash_password, verify_password
+
+        hashed = hash_password("correct_password")
+        assert verify_password("correct_password", hashed) is True
+
+    def test_verify_password_wrong(self):
+        from neutron.auth.password import hash_password, verify_password
+
+        hashed = hash_password("correct")
+        assert verify_password("wrong", hashed) is False
+
+    def test_verify_password_empty(self):
+        from neutron.auth.password import hash_password, verify_password
+
+        hashed = hash_password("notempty")
+        assert verify_password("", hashed) is False
+
+    def test_verify_password_unknown_format(self):
+        from neutron.auth.password import verify_password
+
+        with pytest.raises(ValueError, match="Unknown hash format"):
+            verify_password("pass", "not_a_valid_hash_format")
+
+    def test_hash_starts_with_known_prefix(self):
+        from neutron.auth.password import hash_password
+
+        hashed = hash_password("test")
+        # Should start with $argon2 (preferred) or $2b$ (bcrypt fallback)
+        assert hashed.startswith("$argon2") or hashed.startswith("$2b$") or hashed.startswith("$2a$")
+
+    def test_needs_rehash_with_current_hash(self):
+        from neutron.auth.password import hash_password, needs_rehash
+
+        hashed = hash_password("test")
+        # A freshly hashed password with current params should not need rehash
+        # (unless it's bcrypt and argon2 is available)
+        result = needs_rehash(hashed)
+        assert isinstance(result, bool)
+
+    def test_needs_rehash_unknown_format(self):
+        from neutron.auth.password import needs_rehash
+
+        assert needs_rehash("not_a_hash") is False
+
+    def test_verify_unicode_password(self):
+        from neutron.auth.password import hash_password, verify_password
+
+        hashed = hash_password("p\u00e4ssw\u00f6rd")
+        assert verify_password("p\u00e4ssw\u00f6rd", hashed) is True
+        assert verify_password("password", hashed) is False
+
+    def test_verify_long_password(self):
+        from neutron.auth.password import hash_password, verify_password
+
+        long_pw = "a" * 256
+        hashed = hash_password(long_pw)
+        assert verify_password(long_pw, hashed) is True
+        assert verify_password("a" * 255, hashed) is False

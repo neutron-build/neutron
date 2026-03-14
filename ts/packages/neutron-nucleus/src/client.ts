@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 
 import type { Transport, NucleusFeatures, NucleusPlugin } from './types.js';
-import { HttpTransport } from './transport.js';
+import { createTransport } from './transport.js';
 import { detectFeatures } from './features.js';
 
 // ---------------------------------------------------------------------------
@@ -15,8 +15,25 @@ export interface NucleusClientConfig {
   url: string;
   /** Extra HTTP headers sent with every request. */
   headers?: Record<string, string>;
-  /** Override the default HttpTransport (e.g. for testing). */
+  /** Request timeout in milliseconds (default 30000). */
+  timeout?: number;
+  /** Override the default transport (e.g. for testing or explicit platform choice). */
   transport?: Transport;
+
+  // -- Mobile-specific options (used by MobileTransport when auto-detected) --
+
+  /** Maximum retry attempts for transient failures (default 3). */
+  maxRetries?: number;
+  /** Base delay in ms between retries — uses exponential backoff (default 1000). */
+  retryDelay?: number;
+  /** Time-to-live for cached SELECT results in ms (default 60000). */
+  cacheTTL?: number;
+  /** Whether to cache SELECT queries (default true on mobile). */
+  cacheEnabled?: boolean;
+  /** Whether to queue writes when offline (default true on mobile). */
+  offlineQueueEnabled?: boolean;
+  /** Maximum number of queued offline operations (default 100). */
+  maxQueueSize?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -78,7 +95,17 @@ class ClientBuilder<Acc> implements NucleusClientBuilder<Acc> {
   }
 
   async connect(): Promise<NucleusClientBase & Acc> {
-    const transport = this.config.transport ?? new HttpTransport(this.config.url, this.config.headers);
+    const transport = this.config.transport ?? createTransport({
+      url: this.config.url,
+      headers: this.config.headers,
+      timeout: this.config.timeout,
+      maxRetries: this.config.maxRetries,
+      retryDelay: this.config.retryDelay,
+      cacheTTL: this.config.cacheTTL,
+      cacheEnabled: this.config.cacheEnabled,
+      offlineQueueEnabled: this.config.offlineQueueEnabled,
+      maxQueueSize: this.config.maxQueueSize,
+    });
     const features = await detectFeatures(transport);
 
     // Base client object

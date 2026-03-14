@@ -158,12 +158,7 @@ impl Router {
         };
 
         // Find matching route
-        let response = self
-            .routes
-            .iter()
-            .find(|r| r.method == method && route_matches(&r.path, &path))
-            .map(|r| (r.handler)(request))
-            .unwrap_or_else(Response::not_found);
+        let response = self.dispatch(request);
 
         // Convert to Tauri response
         let mut builder = tauri::http::Response::builder().status(response.status);
@@ -171,6 +166,25 @@ impl Router {
             builder = builder.header(key.as_str(), value.as_str());
         }
         builder.body(response.body).expect("response build failed")
+    }
+
+    /// Handle a pre-parsed [`Request`] directly (used by the dev TCP server).
+    pub fn handle_direct(&self, request: Request) -> Response {
+        self.dispatch(request)
+    }
+
+    /// Shared dispatch logic: match a request against registered routes.
+    fn dispatch(&self, request: Request) -> Response {
+        // Find the matching route index first, then move request into the handler.
+        let matched = self
+            .routes
+            .iter()
+            .position(|r| r.method == request.method && route_matches(&r.path, &request.path));
+
+        match matched {
+            Some(idx) => (self.routes[idx].handler)(request),
+            None => Response::not_found(),
+        }
     }
 }
 

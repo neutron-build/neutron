@@ -6,10 +6,19 @@
 > Verus annotations go **inline** in the `.rs` source files behind `#[cfg(verus_keep_ghost)]`.
 > Ghost specs and proof lemmas live in this directory as standalone `.rs` files.
 
-## Status: BUILT (inline annotations DEFERRED until crate stabilization)
+## Status: Phase 1 ANNOTATED (MVCC visibility)
 
-Ghost specifications and proof lemmas are complete. Inline `requires`/`ensures`
-annotations will be added to the target crates once they are mature and stable.
+Ghost specifications and proof lemmas are complete. Phase 1 inline annotations
+have been added to `nucleus/src/storage/txn.rs` for the MVCC visibility functions.
+Annotations are behind commented `#[cfg(verus_keep_ghost)]` blocks — ready for
+Verus compilation when the tool is installed.
+
+### Annotated Functions
+
+| Source File | Function | Properties |
+|-------------|----------|------------|
+| `nucleus/src/storage/txn.rs` | `Snapshot::is_visible()` | Bootstrap always visible, own changes visible, aborted never visible, active never visible, future txns not visible, in-progress-at-snapshot not visible |
+| `nucleus/src/storage/txn.rs` | `RowVersion::is_visible()` | Creator visibility propagates, undeleted rows visible if creator visible, deletion by invisible txn doesn't hide row |
 
 ---
 

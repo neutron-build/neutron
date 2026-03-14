@@ -9,4 +9,8 @@ description = "Neutron Desktop TouchID / Windows Hello biometrics plugin"
 tauri = { workspace = true }
 tauri-plugin = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+whoami = "1"

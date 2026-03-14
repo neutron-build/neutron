@@ -115,3 +115,43 @@ async fn is_registered(
     let shortcut = parse_shortcut(&accelerator)?;
     Ok(app.global_shortcut().is_registered(shortcut))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hotkey_serialize() {
+        let hotkey = Hotkey {
+            id: "save".to_string(),
+            accelerator: "CmdOrCtrl+S".to_string(),
+        };
+        let json = serde_json::to_string(&hotkey).unwrap();
+        assert!(json.contains("save"));
+        assert!(json.contains("CmdOrCtrl+S"));
+    }
+
+    #[test]
+    fn test_hotkey_deserialize() {
+        let json = r#"{"id":"copy","accelerator":"CmdOrCtrl+C"}"#;
+        let hotkey: Hotkey = serde_json::from_str(json).unwrap();
+        assert_eq!(hotkey.id, "copy");
+        assert_eq!(hotkey.accelerator, "CmdOrCtrl+C");
+    }
+
+    #[test]
+    fn test_hotkey_event_serialize() {
+        let event = HotkeyEvent {
+            id: "paste".to_string(),
+            accelerator: "CmdOrCtrl+V".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let restored: HotkeyEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.id, "paste");
+    }
+
+    #[test]
+    fn test_init_creates_plugin() {
+        let _plugin = super::init();
+    }
+}

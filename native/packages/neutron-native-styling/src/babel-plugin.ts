@@ -15,13 +15,17 @@
  *   ios:shadow-lg       → only applied when bundling for iOS
  *   android:elevation-4 → only applied when bundling for Android
  *
+ * Arbitrary values and opacity modifiers are also resolved at build time:
+ *   w-[42px]           → { width: 42 }
+ *   bg-blue-500/50     → { backgroundColor: 'rgba(59,130,246,0.5)' }
+ *
  * If className contains dynamic values (template literals, variables),
  * the plugin falls back to a runtime resolveClassName() call.
  */
 
 import type { NodePath, PluginObj } from '@babel/core'
 import type * as BabelTypes from '@babel/types'
-import { ALL_TOKENS } from './tokens.js'
+import { ALL_TOKENS, parseArbitraryValue, parseOpacityModifier } from './tokens.js'
 import type { StyleProp } from './tokens.js'
 
 type Platform = 'ios' | 'android' | 'all'
@@ -52,6 +56,14 @@ function resolvePlatformClass(cls: string, platform: Platform): { base: string; 
   return { base: cls, applies: true }
 }
 
+/**
+ * Resolve a single class token to a style object. Checks the static
+ * token map first, then falls back to arbitrary value / opacity modifier parsing.
+ */
+function resolveToken(cls: string): StyleProp | null {
+  return ALL_TOKENS[cls] ?? parseArbitraryValue(cls) ?? parseOpacityModifier(cls) ?? null
+}
+
 export default function neutronWindPlugin({ types: t }: BabelAPI, options: PluginOptions = {}): PluginObj {
   const platform = options.platform ?? 'all'
 
@@ -75,7 +87,7 @@ export default function neutronWindPlugin({ types: t }: BabelAPI, options: Plugi
             const { base, applies } = resolvePlatformClass(cls, platform)
             if (!applies) continue  // wrong platform
 
-            const token = ALL_TOKENS[base]
+            const token = resolveToken(base)
             if (token) {
               Object.assign(merged, token)
             } else {
@@ -112,7 +124,7 @@ export default function neutronWindPlugin({ types: t }: BabelAPI, options: Plugi
             for (const cls of classes) {
               const { base, applies } = resolvePlatformClass(cls, platform)
               if (!applies) continue
-              const token = ALL_TOKENS[base]
+              const token = resolveToken(base)
               if (token) Object.assign(merged, token)
             }
             if (Object.keys(merged).length > 0) {

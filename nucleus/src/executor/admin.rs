@@ -252,12 +252,15 @@ impl Executor {
         ];
 
         // Report live connection pool stats if available
+        #[cfg(feature = "server")]
         if let Some(ref pool) = self.conn_pool {
             let available = pool.available_permits();
             rows.push(vec![Value::Text("pool_available_permits".into()), Value::Text(available.to_string())]);
         } else {
             rows.push(vec![Value::Text("pool_status".into()), Value::Text("not wired".into())]);
         }
+        #[cfg(not(feature = "server"))]
+        rows.push(vec![Value::Text("pool_status".into()), Value::Text("not wired".into())]);
 
         Ok(ExecResult::Select {
             columns: vec![
@@ -269,6 +272,7 @@ impl Executor {
     }
 
     pub(super) fn show_cluster_status(&self) -> Result<ExecResult, ExecError> {
+        #[cfg(feature = "server")]
         let rows = if let Some(ref cluster) = self.cluster {
             let status = cluster.read().status();
             let mode_str = match status.mode {
@@ -291,6 +295,11 @@ impl Executor {
                 vec![Value::Text("cluster".into()), Value::Text("not configured".into())],
             ]
         };
+        #[cfg(not(feature = "server"))]
+        let rows = vec![
+            vec![Value::Text("mode".into()), Value::Text("standalone".into())],
+            vec![Value::Text("cluster".into()), Value::Text("not configured".into())],
+        ];
 
         Ok(ExecResult::Select {
             columns: vec![
@@ -372,6 +381,7 @@ impl Executor {
         let mut result_rows: Vec<Row> = Vec::new();
 
         // If we have a live replication manager, show real status
+        #[cfg(feature = "server")]
         if let Some(ref repl) = self.replication {
             let mgr = repl.read();
             let status = mgr.status();
@@ -702,9 +712,12 @@ impl Executor {
             let mut router = self.dist_pubsub.write();
             router.publish(channel, msg.clone());
         }
-        let maybe_rep = self.raft_replicator.read().clone();
-        if let Some(replicator) = maybe_rep {
-            replicator.broadcast_pubsub(channel, &msg).await;
+        #[cfg(feature = "server")]
+        {
+            let maybe_rep = self.raft_replicator.read().clone();
+            if let Some(replicator) = maybe_rep {
+                replicator.broadcast_pubsub(channel, &msg).await;
+            }
         }
 
         Ok(ExecResult::Command {
@@ -724,10 +737,13 @@ impl Executor {
         }
 
         // Gossip to peers: tell them this node now subscribes to `channel`.
-        let snapshot = self.dist_pubsub.read().local_subscription_snapshot();
-        let maybe_rep = self.raft_replicator.read().clone();
-        if let Some(replicator) = maybe_rep {
-            replicator.broadcast_gossip(snapshot).await;
+        #[cfg(feature = "server")]
+        {
+            let snapshot = self.dist_pubsub.read().local_subscription_snapshot();
+            let maybe_rep = self.raft_replicator.read().clone();
+            if let Some(replicator) = maybe_rep {
+                replicator.broadcast_gossip(snapshot).await;
+            }
         }
 
         Ok(ExecResult::Command {

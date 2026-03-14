@@ -79,3 +79,24 @@ async fn clear(state: tauri::State<'_, ClipboardState>) -> Result<(), String> {
     let cb = guard.as_mut().ok_or("clipboard not available")?;
     cb.clear().map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_init_creates_plugin() {
+        let _plugin = super::init();
+    }
+
+    #[test]
+    fn test_arboard_image_data_construction() {
+        let rgba = vec![255u8; 4 * 2 * 2]; // 2x2 RGBA image
+        let img = arboard::ImageData {
+            width: 2,
+            height: 2,
+            bytes: rgba.into(),
+        };
+        assert_eq!(img.width, 2);
+        assert_eq!(img.height, 2);
+        assert_eq!(img.bytes.len(), 16);
+    }
+}

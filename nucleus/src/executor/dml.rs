@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use sqlparser::ast::{self, Expr, SelectItem, SetExpr, Statement, TableFactor};
 
 use crate::catalog::TableDef;
+#[cfg(feature = "server")]
 use crate::reactive::ChangeType;
 use crate::sql;
 use crate::types::{DataType, Row, Value};
@@ -304,6 +305,7 @@ impl Executor {
             // The notification only borrows the data, so this avoids cloning the
             // entire row batch.  The subscriber sees the rows slightly before they
             // are durable, but this is fire-and-forget best-effort anyway.
+            #[cfg(feature = "server")]
             self.notify_change_rows(&table_name, ChangeType::Insert, &inserted_rows, &[], &col_meta);
             self.storage_for(&table_name).insert_batch(&table_name, inserted_rows).await?;
         }
@@ -992,10 +994,16 @@ impl Executor {
         skip_row_idx: Option<usize>,
         check_fk: bool,
         check_unique: bool,
+        has_check_constraints: bool,
+        has_enum_columns: bool,
     ) -> Result<(), ExecError> {
         Self::check_not_null_constraints(table_def, new_row)?;
-        self.check_check_constraints(table_def, new_row)?;
-        self.check_enum_constraints(table_def, new_row).await?;
+        if has_check_constraints {
+            self.check_check_constraints(table_def, new_row)?;
+        }
+        if has_enum_columns {
+            self.check_enum_constraints(table_def, new_row).await?;
+        }
         if check_fk {
             self.check_fk_constraints(table_def, new_row).await?;
         }
@@ -1026,12 +1034,24 @@ impl Executor {
                 "UPDATE not allowed on append-only table {table_name}"
             )));
         }
-        let all_rows = self.storage_for(&table_name).scan(&table_name).await?;
-        self.metrics.rows_scanned.inc_by(all_rows.len() as u64);
 
         // Build column metadata for expression evaluation
         let col_meta = self.table_col_meta(&table_def);
 
+        // Fast path: PK/unique equality WHERE → filtered scan (avoids materializing all rows)
+        let (all_rows, pre_filtered) = match Self::extract_pk_eq_value(&update.selection, &table_def) {
+            Some((col_idx, eq_value)) => {
+                let matches = self.storage_for(&table_name)
+                    .scan_where_eq_positions(&table_name, col_idx, &eq_value).await?;
+                self.metrics.rows_scanned.inc_by(1);
+                (matches.into_iter().map(|(pos, row)| (pos, row)).collect::<Vec<_>>(), true)
+            }
+            None => {
+                let rows = self.storage_for(&table_name).scan(&table_name).await?;
+                self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                (rows.into_iter().enumerate().map(|(pos, row)| (pos, row)).collect::<Vec<_>>(), false)
+            }
+        };
         // Resolve assignments: (column_index, value_expr)
         let mut assign_targets = Vec::new();
         for a in &update.assignments {
@@ -1049,6 +1069,7 @@ impl Executor {
         let updated_col_indices: HashSet<usize> = assign_targets.iter().map(|(idx, _)| *idx).collect();
         let mut check_fk = false;
         let mut check_unique = false;
+        let mut has_check_constraints = false;
         for constraint in &table_def.constraints {
             match constraint {
                 crate::catalog::TableConstraint::PrimaryKey { columns }
@@ -1070,19 +1091,31 @@ impl Executor {
                         check_fk = true;
                     }
                 }
-                _ => {}
-            }
-            if check_fk && check_unique {
-                break;
+                crate::catalog::TableConstraint::Check { .. } => {
+                    has_check_constraints = true;
+                }
             }
         }
+        // Pre-compute: does table have any enum (UserDefined) columns?
+        let has_enum_columns = table_def.columns.iter().any(|c| {
+            matches!(c.data_type, crate::types::DataType::UserDefined(_))
+        });
+
+        // Pre-check: does this table have any vector or encrypted indexes?
+        let has_vector_indexes = {
+            let indexes = self.vector_indexes.read();
+            indexes.values().any(|e| e.table_name == table_name)
+        };
+        let has_encrypted_indexes = {
+            let indexes = self.encrypted_indexes.read();
+            indexes.values().any(|e| e.table_name == table_name)
+        };
 
         // Pre-check: does this table have any UPDATE triggers?
         let has_triggers = {
             let triggers = self.triggers.read().await;
             triggers.iter().any(|t| t.table_name == table_name && t.events.contains(&TriggerEvent::Update))
         };
-
         // Fire BEFORE UPDATE statement-level triggers
         if has_triggers {
             self.fire_triggers(&table_name, TriggerTiming::Before, TriggerEvent::Update, None, None, &col_meta, false).await;
@@ -1090,10 +1123,15 @@ impl Executor {
 
         let mut updates = Vec::new();
         let mut returned_rows = Vec::new();
-        for (pos, row) in all_rows.iter().enumerate() {
-            let matches = match &update.selection {
-                Some(expr) => self.eval_where(expr, row, &col_meta)?,
-                None => true,
+        for (pos, row) in &all_rows {
+            // If pre_filtered, all rows already match the WHERE clause
+            let matches = if pre_filtered {
+                true
+            } else {
+                match &update.selection {
+                    Some(expr) => self.eval_where(expr, row, &col_meta)?,
+                    None => true,
+                }
             };
             if matches {
                 let mut new_row = row.clone();
@@ -1111,9 +1149,11 @@ impl Executor {
                     &table_name,
                     &table_def,
                     &new_row,
-                    Some(pos),
+                    Some(*pos),
                     check_fk,
                     check_unique,
+                    has_check_constraints,
+                    has_enum_columns,
                 ).await?;
                 if let Some(ref returning_items) = update.returning {
                     let returned = self.eval_returning(returning_items, &new_row, &col_meta)?;
@@ -1125,26 +1165,46 @@ impl Executor {
                     self.fire_triggers(&table_name, TriggerTiming::After, TriggerEvent::Update, Some(row), Some(&new_row), &col_meta, true).await;
                 }
 
-                updates.push((pos, new_row));
+                updates.push((*pos, new_row));
             }
         }
 
+        // Build position→row lookup for FK enforcement and change notification
+        let row_by_pos: std::collections::HashMap<usize, &Row> = all_rows.iter()
+            .map(|(pos, row)| (*pos, row))
+            .collect();
+
         // Enforce FK actions on child tables when parent PK/unique columns are updated.
-        if !updates.is_empty() {
+        // Only needed when PK/unique columns are being modified (child FKs reference those).
+        if check_unique && !updates.is_empty() {
             let update_pairs: Vec<(Row, Row)> = updates
                 .iter()
-                .map(|(pos, new_row)| (all_rows[*pos].clone(), new_row.clone()))
+                .filter_map(|(pos, new_row)| {
+                    row_by_pos.get(pos).map(|old| ((*old).clone(), new_row.clone()))
+                })
                 .collect();
             self.enforce_fk_on_parent_mutation(&table_name, &[], Some(&update_pairs), 0).await?;
         }
 
         // Maintain vector and encrypted indexes: remove old values, insert new
-        for (pos, new_row) in &updates {
-            let old_row = &all_rows[*pos];
-            self.remove_from_encrypted_indexes(&table_name, old_row, *pos, &table_def);
-            self.remove_from_vector_indexes(&table_name, *pos);
-            self.update_encrypted_indexes_on_insert(&table_name, new_row, &table_def);
-            self.update_vector_indexes_on_insert(&table_name, new_row, &table_def);
+        // Skip entirely if no such indexes exist for this table
+        if has_vector_indexes || has_encrypted_indexes {
+            for (pos, new_row) in &updates {
+                if let Some(&old_row) = row_by_pos.get(pos) {
+                    if has_encrypted_indexes {
+                        self.remove_from_encrypted_indexes(&table_name, old_row, *pos, &table_def);
+                    }
+                    if has_vector_indexes {
+                        self.remove_from_vector_indexes(&table_name, *pos);
+                    }
+                }
+                if has_encrypted_indexes {
+                    self.update_encrypted_indexes_on_insert(&table_name, new_row, &table_def);
+                }
+                if has_vector_indexes {
+                    self.update_vector_indexes_on_insert(&table_name, new_row, &table_def);
+                }
+            }
         }
 
         let count = self.storage_for(&table_name).update(&table_name, &updates).await?;
@@ -1155,9 +1215,16 @@ impl Executor {
         }
 
         // Notify reactive subscribers with real before/after row data
-        let old_rows: Vec<Row> = updates.iter().map(|(pos, _)| all_rows[*pos].clone()).collect();
-        let new_rows: Vec<Row> = updates.into_iter().map(|(_, row)| row).collect();
-        self.notify_change_rows(&table_name, ChangeType::Update, &new_rows, &old_rows, &col_meta);
+        #[cfg(feature = "server")]
+        {
+            let old_rows: Vec<Row> = updates.iter()
+                .filter_map(|(pos, _)| row_by_pos.get(pos).map(|r| (*r).clone()))
+                .collect();
+            let new_rows: Vec<Row> = updates.into_iter().map(|(_, row)| row).collect();
+            self.notify_change_rows(&table_name, ChangeType::Update, &new_rows, &old_rows, &col_meta);
+        }
+        #[cfg(not(feature = "server"))]
+        drop(updates);
 
         if update.returning.is_some() && !returned_rows.is_empty() {
             let columns: Vec<(String, DataType)> = col_meta
@@ -1201,9 +1268,22 @@ impl Executor {
             )));
         }
 
-        let all_rows = self.storage_for(&table_name).scan(&table_name).await?;
-        self.metrics.rows_scanned.inc_by(all_rows.len() as u64);
         let col_meta = self.table_col_meta(&table_def);
+
+        // Fast path: PK/unique equality WHERE → filtered scan
+        let (all_rows, pre_filtered) = match Self::extract_pk_eq_value(&delete.selection, &table_def) {
+            Some((col_idx, eq_value)) => {
+                let matches = self.storage_for(&table_name)
+                    .scan_where_eq_positions(&table_name, col_idx, &eq_value).await?;
+                self.metrics.rows_scanned.inc_by(1);
+                (matches, true)
+            }
+            None => {
+                let rows = self.storage_for(&table_name).scan(&table_name).await?;
+                self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                (rows.into_iter().enumerate().map(|(pos, row)| (pos, row)).collect::<Vec<_>>(), false)
+            }
+        };
 
         // Pre-check: does this table have any DELETE triggers?
         let has_triggers = {
@@ -1218,10 +1298,14 @@ impl Executor {
 
         let mut positions = Vec::new();
         let mut returned_rows = Vec::new();
-        for (pos, row) in all_rows.iter().enumerate() {
-            let matches = match &delete.selection {
-                Some(expr) => self.eval_where(expr, row, &col_meta)?,
-                None => true,
+        for (pos, row) in &all_rows {
+            let matches = if pre_filtered {
+                true
+            } else {
+                match &delete.selection {
+                    Some(expr) => self.eval_where(expr, row, &col_meta)?,
+                    None => true,
+                }
             };
             if matches {
                 // Fire BEFORE DELETE row-level triggers (old = row being deleted)
@@ -1233,21 +1317,36 @@ impl Executor {
                     let returned = self.eval_returning(returning_items, row, &col_meta)?;
                     returned_rows.push(returned);
                 }
-                positions.push(pos);
+                positions.push(*pos);
             }
         }
 
         // Enforce FK actions on child tables referencing this parent before deletion.
-        let deleted_rows: Vec<Row> = positions.iter().map(|&pos| all_rows[pos].clone()).collect();
+        let deleted_rows: Vec<Row> = all_rows.iter()
+            .filter(|(pos, _)| positions.contains(pos))
+            .map(|(_, row)| row.clone())
+            .collect();
         if !deleted_rows.is_empty() {
             self.enforce_fk_on_parent_mutation(&table_name, &deleted_rows, None, 0).await?;
         }
 
-        // Remove deleted rows from encrypted and vector indexes
-        for &pos in &positions {
-            let old_row = &all_rows[pos];
-            self.remove_from_encrypted_indexes(&table_name, old_row, pos, &table_def);
-            self.remove_from_vector_indexes(&table_name, pos);
+        // Build position→row lookup
+        let row_by_pos: std::collections::HashMap<usize, &Row> = all_rows.iter()
+            .map(|(pos, row)| (*pos, row))
+            .collect();
+
+        // Remove deleted rows from encrypted and vector indexes (skip if none exist)
+        {
+            let has_vec = self.vector_indexes.read().values().any(|e| e.table_name == table_name);
+            let has_enc = self.encrypted_indexes.read().values().any(|e| e.table_name == table_name);
+            if has_vec || has_enc {
+                for &pos in &positions {
+                    if let Some(&old_row) = row_by_pos.get(&pos) {
+                        if has_enc { self.remove_from_encrypted_indexes(&table_name, old_row, pos, &table_def); }
+                        if has_vec { self.remove_from_vector_indexes(&table_name, pos); }
+                    }
+                }
+            }
         }
 
         let count = self.storage_for(&table_name).delete(&table_name, &positions).await?;
@@ -1255,7 +1354,9 @@ impl Executor {
         // Fire AFTER DELETE row-level triggers for each deleted row
         if has_triggers {
             for &pos in &positions {
-                self.fire_triggers(&table_name, TriggerTiming::After, TriggerEvent::Delete, Some(&all_rows[pos]), None, &col_meta, true).await;
+                if let Some(&old_row) = row_by_pos.get(&pos) {
+                    self.fire_triggers(&table_name, TriggerTiming::After, TriggerEvent::Delete, Some(old_row), None, &col_meta, true).await;
+                }
             }
 
             // Fire AFTER DELETE statement-level triggers
@@ -1263,6 +1364,7 @@ impl Executor {
         }
 
         // Notify reactive subscribers with real deleted row data
+        #[cfg(feature = "server")]
         self.notify_change_rows(&table_name, ChangeType::Delete, &[], &deleted_rows, &col_meta);
 
         if delete.returning.is_some() && !returned_rows.is_empty() {
@@ -1278,4 +1380,61 @@ impl Executor {
             })
         }
     }
+
+    /// Extract (col_idx, value) from a simple PK/unique equality WHERE clause.
+    /// E.g., `WHERE id = 5000` → Some((0, Value::Int(5000)))
+    fn extract_pk_eq_value(
+        selection: &Option<ast::Expr>,
+        table_def: &TableDef,
+    ) -> Option<(usize, Value)> {
+        let expr = selection.as_ref()?;
+        if let Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, right } = expr {
+            // Determine which side is the column and which is the literal
+            let (col_name, lit_expr) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Identifier(ident), other) => (ident.value.to_lowercase(), other),
+                (other, Expr::Identifier(ident)) => (ident.value.to_lowercase(), other),
+                (Expr::CompoundIdentifier(parts), other) | (other, Expr::CompoundIdentifier(parts)) => {
+                    (parts.last()?.value.to_lowercase(), other)
+                }
+                _ => return None,
+            };
+            // Check if this column is a single-column PK or UNIQUE
+            let is_pk_or_unique = table_def.constraints.iter().any(|c| {
+                match c {
+                    crate::catalog::TableConstraint::PrimaryKey { columns }
+                    | crate::catalog::TableConstraint::Unique { columns, .. } => {
+                        columns.len() == 1 && columns[0].eq_ignore_ascii_case(&col_name)
+                    }
+                    _ => false,
+                }
+            });
+            if !is_pk_or_unique { return None; }
+            let col_idx = table_def.column_index(&col_name)?;
+            // Extract literal value
+            let ast_val = match lit_expr {
+                Expr::Value(vws) => &vws.value,
+                _ => return None,
+            };
+            let value = match ast_val {
+                ast::Value::Number(n, _) => {
+                    if let Ok(i) = n.parse::<i64>() {
+                        if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                            Value::Int32(i as i32)
+                        } else {
+                            Value::Int64(i)
+                        }
+                    } else if let Ok(f) = n.parse::<f64>() {
+                        Value::Float64(f)
+                    } else {
+                        return None;
+                    }
+                }
+                ast::Value::SingleQuotedString(s) => Value::Text(s.clone()),
+                _ => return None,
+            };
+            return Some((col_idx, value));
+        }
+        None
+    }
+
 }

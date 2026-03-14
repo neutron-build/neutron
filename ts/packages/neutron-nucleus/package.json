@@ -93,9 +93,11 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
+    "test": "pnpm run build && node --test --experimental-test-isolation=none dist/index.test.js",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@types/node": "^22.10.7",
     "typescript": "^5.7.2"
   }
 }
