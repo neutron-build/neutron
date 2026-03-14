@@ -40,6 +40,9 @@ tokio-postgres = { version = "0.7", optional = true }
 comfy-table = { version = "7", optional = true }
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
+rusqlite = { version = "0.30", features = ["bundled"], optional = true }
+mongodb = { version = "2.8", optional = true }
+mysql_async = { version = "0.34", optional = true }
 opentelemetry = { version = "0.29", optional = true }
 opentelemetry_sdk = { version = "0.29", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = "0.29", features = ["grpc-tonic"], optional = true }
@@ -62,7 +65,9 @@ server = [
     "tokio/full", "tokio/rt-multi-thread",
 ]
 wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:serde-wasm-bindgen", "getrandom/js"]
-bench-tools = ["server", "comfy-table", "redis", "reqwest"]
+bench-tools = ["server", "comfy-table", "dep:redis", "dep:reqwest", "rusqlite", "mongodb", "dep:mysql_async"]
+rusqlite = ["dep:rusqlite"]
+mongodb = ["dep:mongodb"]
 otel = ["server", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 onnx = ["ort", "ndarray"]
 jemalloc = ["tikv-jemallocator"]
