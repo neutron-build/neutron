@@ -10,6 +10,8 @@
 //!   - Hit-rate and memory-usage statistics
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // ============================================================================
@@ -60,8 +62,8 @@ pub struct CacheTier {
     access_order: VecDeque<String>,
     max_memory_bytes: usize,
     used_bytes: usize,
-    hits: u64,
-    misses: u64,
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 impl CacheTier {
@@ -72,8 +74,8 @@ impl CacheTier {
             access_order: VecDeque::new(),
             max_memory_bytes,
             used_bytes: 0,
-            hits: 0,
-            misses: 0,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
@@ -86,19 +88,41 @@ impl CacheTier {
             Some(true) => {
                 // Lazy expiration: remove the expired entry.
                 self.remove_entry(key);
-                self.misses += 1;
+                self.misses.fetch_add(1, Ordering::Relaxed);
                 None
             }
             Some(false) => {
                 // Hit — update LRU and access count.
                 self.touch_lru(key);
-                self.hits += 1;
+                self.hits.fetch_add(1, Ordering::Relaxed);
                 let entry = self.entries.get_mut(key).unwrap();
                 entry.access_count += 1;
                 Some(&entry.value)
             }
             None => {
-                self.misses += 1;
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Read-only peek at a cached value without updating LRU order or
+    /// per-entry access counts.  Suitable for use behind a read lock to
+    /// avoid writer contention on the common cache-hit path.  Hit/miss
+    /// counters are still updated atomically so statistics remain accurate.
+    pub fn peek(&self, key: &str) -> Option<&str> {
+        match self.entries.get(key) {
+            Some(entry) => {
+                if entry.is_expired() {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    None
+                } else {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    Some(&entry.value)
+                }
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
                 None
             }
         }
@@ -201,11 +225,13 @@ impl CacheTier {
     /// Compute the hit rate as `hits / (hits + misses)`. Returns `0.0` if
     /// there have been no accesses.
     pub fn hit_rate(&self) -> f64 {
-        let total = self.hits + self.misses;
+        let hits = self.hits.load(Ordering::Relaxed);
+        let misses = self.misses.load(Ordering::Relaxed);
+        let total = hits + misses;
         if total == 0 {
             0.0
         } else {
-            self.hits as f64 / total as f64
+            hits as f64 / total as f64
         }
     }
 
@@ -214,8 +240,8 @@ impl CacheTier {
         CacheStats {
             entry_count: self.len(),
             memory_bytes: self.used_bytes,
-            hits: self.hits,
-            misses: self.misses,
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
             hit_rate: self.hit_rate(),
             max_memory_bytes: self.max_memory_bytes,
         }
@@ -624,9 +650,6 @@ impl ShardedCache {
 // Lock-Free Read Cache — epoch-style read-optimized concurrent cache
 // ============================================================================
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-
 /// A cache entry with an atomic access counter (updated without write lock).
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -981,8 +1004,8 @@ mod tests {
     fn test_get_nonexistent_increments_misses() {
         let mut cache = CacheTier::new(1024);
         assert_eq!(cache.get("nope"), None);
-        assert_eq!(cache.misses, 1);
-        assert_eq!(cache.hits, 0);
+        assert_eq!(cache.misses.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.hits.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1003,7 +1026,7 @@ mod tests {
         cache.entries.get_mut("k").unwrap().expires_at =
             Some(Instant::now() - Duration::from_secs(1));
         assert_eq!(cache.get("k"), None);
-        assert_eq!(cache.misses, 1);
+        assert_eq!(cache.misses.load(Ordering::Relaxed), 1);
     }
 
     #[test]

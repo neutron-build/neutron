@@ -5,6 +5,7 @@
 //! and queues waiters when the pool is exhausted.
 
 pub mod async_pool;
+pub mod connection_budget;
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};

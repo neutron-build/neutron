@@ -8,7 +8,9 @@ use crate::catalog::{ColumnDef, FkAction};
 use crate::types::DataType;
 
 /// Convert a sqlparser `ReferentialAction` to our internal `FkAction`.
-fn convert_referential_action(action: &Option<ast::ReferentialAction>) -> FkAction {
+///
+/// Also available as `convert_fk_action` for use by ALTER TABLE ADD CONSTRAINT.
+pub fn convert_fk_action(action: &Option<ast::ReferentialAction>) -> FkAction {
     match action {
         None => FkAction::NoAction,
         Some(ast::ReferentialAction::NoAction) => FkAction::NoAction,
@@ -210,8 +212,8 @@ pub fn extract_constraints(
                         columns: vec![col.name.value.clone()],
                         ref_table: fk.foreign_table.to_string(),
                         ref_columns: fk.referred_columns.iter().map(|c| c.value.clone()).collect(),
-                        on_delete: convert_referential_action(&fk.on_delete),
-                        on_update: convert_referential_action(&fk.on_update),
+                        on_delete: convert_fk_action(&fk.on_delete),
+                        on_update: convert_fk_action(&fk.on_update),
                     });
                 }
                 _ => {}
@@ -246,8 +248,8 @@ pub fn extract_constraints(
                     columns: fk.columns.iter().map(|c| c.value.clone()).collect(),
                     ref_table: fk.foreign_table.to_string(),
                     ref_columns: fk.referred_columns.iter().map(|c| c.value.clone()).collect(),
-                    on_delete: convert_referential_action(&fk.on_delete),
-                    on_update: convert_referential_action(&fk.on_update),
+                    on_delete: convert_fk_action(&fk.on_delete),
+                    on_update: convert_fk_action(&fk.on_update),
                 });
             }
             _ => {}

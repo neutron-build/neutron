@@ -14,6 +14,8 @@
 //!   `check_not_null_constraints`, `enforce_constraints`
 
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use sqlparser::ast::{self, Expr, SelectItem, SetExpr, Statement, TableFactor};
 
@@ -21,11 +23,22 @@ use crate::catalog::TableDef;
 #[cfg(feature = "server")]
 use crate::reactive::ChangeType;
 use crate::sql;
+use crate::storage::granule_stats::GranuleStats;
 use crate::types::{DataType, Row, Value};
 
 use super::schema_types::*;
 use super::types::ColMeta;
 use super::{ExecError, ExecResult, Executor};
+
+/// Granule size: 8192 rows per granule (matching zone map documentation).
+const GRANULE_SIZE: u32 = 8192;
+
+/// Compute a stable table_id from a table name for zone map indexing.
+fn table_name_to_id(name: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    hasher.finish()
+}
 
 impl Executor {
     // ========================================================================
@@ -307,6 +320,33 @@ impl Executor {
             // are durable, but this is fire-and-forget best-effort anyway.
             #[cfg(feature = "server")]
             self.notify_change_rows(&table_name, ChangeType::Insert, &inserted_rows, &[], &col_meta);
+
+            // ── Zone map population ─────────────────────────────────────────
+            // Update granule stats for the newly inserted rows so that future
+            // filtered scans can skip non-matching granules.
+            {
+                let zm_table_id = table_name_to_id(&table_name);
+                let column_ids: Vec<u32> = (0..table_def.columns.len() as u32).collect();
+                let existing_granules = self.zone_map_index.get_table_granules(zm_table_id);
+                // Determine the starting row offset for new rows: sum of row_count
+                // across all existing granules.
+                let base_row_offset: u32 = existing_granules
+                    .iter()
+                    .map(|g| g.row_count)
+                    .sum();
+                for (i, row) in inserted_rows.iter().enumerate() {
+                    let row_idx = base_row_offset + i as u32;
+                    let granule_id = row_idx / GRANULE_SIZE;
+                    let mut granule = self
+                        .zone_map_index
+                        .get_granule(zm_table_id, granule_id)
+                        .unwrap_or_else(|| GranuleStats::new(zm_table_id, granule_id));
+                    granule.add_row(row, &column_ids);
+                    self.zone_map_index
+                        .update_granule(zm_table_id, granule_id, granule);
+                }
+            }
+
             self.storage_for(&table_name).insert_batch(&table_name, inserted_rows).await?;
         }
 
@@ -459,9 +499,8 @@ impl Executor {
                     let col_name = table_def.columns[idx].name.clone();
                     let index_name_opt = self
                         .btree_indexes
-                        .read()
                         .get(&(table_name.to_string(), col_name.clone()))
-                        .cloned();
+                        .map(|r| r.clone());
                     if let Some(index_name) = index_name_opt {
                         match self.storage.index_lookup_sync(table_name, &index_name, new_val) {
                             Ok(Some(rows)) if !rows.is_empty() => {
@@ -1209,6 +1248,13 @@ impl Executor {
 
         let count = self.storage_for(&table_name).update(&table_name, &updates).await?;
 
+        // Invalidate zone map stats — column values may have changed,
+        // making min/max bounds stale.
+        if count > 0 {
+            let zm_table_id = table_name_to_id(&table_name);
+            self.zone_map_index.clear_table(zm_table_id);
+        }
+
         // Fire AFTER UPDATE statement-level triggers
         if has_triggers {
             self.fire_triggers(&table_name, TriggerTiming::After, TriggerEvent::Update, None, None, &col_meta, false).await;
@@ -1350,6 +1396,14 @@ impl Executor {
         }
 
         let count = self.storage_for(&table_name).delete(&table_name, &positions).await?;
+
+        // Invalidate zone map stats — row positions have shifted after delete,
+        // so granule boundaries no longer align. Clear and let the next INSERT
+        // repopulate.
+        if count > 0 {
+            let zm_table_id = table_name_to_id(&table_name);
+            self.zone_map_index.clear_table(zm_table_id);
+        }
 
         // Fire AFTER DELETE row-level triggers for each deleted row
         if has_triggers {

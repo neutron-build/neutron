@@ -3,6 +3,8 @@
 //! Provides a [`MetricsRegistry`] with thread-safe atomic instrumentation and a
 //! hand-rolled Prometheus exposition format renderer (no external dependencies).
 
+pub mod optimizations;
+
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -475,6 +477,21 @@ pub enum QueryType {
     Update,
     Delete,
     Other,
+}
+
+// ---------------------------------------------------------------------------
+// SIMD Dispatch Counter (Phase 2D)
+// ---------------------------------------------------------------------------
+
+/// Record a SIMD operation dispatch decision.
+/// This is a lightweight counter used to track which SIMD implementation
+/// was selected at runtime (AVX-512, AVX2, or scalar fallback).
+///
+/// In a real implementation, this would increment counters in a shared
+/// metrics registry. For now, it's a placeholder that allows compilation.
+pub fn simd_dispatch_counter(_operation: &str, _dispatch: &str) {
+    // TODO: integrate with global metrics registry when available
+    // For now, this is a no-op that preserves the call site semantics
 }
 
 // ===========================================================================

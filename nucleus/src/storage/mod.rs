@@ -24,6 +24,7 @@ pub mod disk_engine;
 pub mod fsm;
 pub mod encrypted_index;
 pub mod encryption;
+pub mod granule_stats;
 #[cfg(feature = "server")]
 pub mod io_uring;
 pub mod lsm;
@@ -191,6 +192,23 @@ pub trait StorageEngine: Send + Sync {
         _low: &Value,
         _high: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> { Ok(None) }
+
+    /// Index-only scan: return all distinct key values from the named index
+    /// without touching the heap/table data. Each returned row contains a
+    /// single element — the indexed column value. Returns `None` if the
+    /// engine does not support this operation.
+    ///
+    /// When `eq_value` is `Some`, returns only entries matching that key
+    /// (equivalent to a point lookup but returning only the index column).
+    /// When `range` is `Some((low, high))`, returns entries in [low, high].
+    /// When both are `None`, returns all index entries (full index scan).
+    fn index_only_scan(
+        &self,
+        _table: &str,
+        _index_name: &str,
+        _eq_value: Option<&Value>,
+        _range: Option<(&Value, &Value)>,
+    ) -> Option<Vec<Row>> { None }
 
     // -- Transaction lifecycle (default: auto-commit / no-op) --
 
@@ -525,6 +543,64 @@ impl StorageEngine for MemoryEngine {
         Ok(())
     }
 
+    /// Index-accelerated scan_where_eq_positions: if a B-tree index exists on
+    /// the filter column, use it for O(log n) lookup instead of full table scan.
+    /// Falls back to the default linear scan when no index covers the column.
+    async fn scan_where_eq_positions(
+        &self,
+        table: &str,
+        col_idx: usize,
+        value: &Value,
+    ) -> Result<Vec<(usize, Row)>, StorageError> {
+        // Check if any index covers this column for this table.
+        let index_name = {
+            let tnames = self.table_idx_names.read();
+            let indexes = self.indexes.read();
+            tnames.get(table).and_then(|names| {
+                names.iter().find(|name| {
+                    indexes.get(*name).is_some_and(|idx| idx.col_idx == col_idx)
+                }).cloned()
+            })
+        };
+
+        if let Some(idx_name) = index_name {
+            // Use the B-tree index for O(log n) lookup.
+            let matching_rows = {
+                let indexes = self.indexes.read();
+                indexes.get(&idx_name)
+                    .and_then(|idx| idx.map.get(value).cloned())
+                    .unwrap_or_default()
+            };
+            // We need scan-order positions for UPDATE/DELETE compatibility.
+            // Match the indexed rows against the table to find their positions.
+            if matching_rows.is_empty() {
+                return Ok(Vec::new());
+            }
+            let tables = self.tables.read().await;
+            let rows = tables
+                .get(table)
+                .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
+            let mut result = Vec::with_capacity(matching_rows.len());
+            for (pos, row) in rows.iter().enumerate() {
+                if row.get(col_idx).is_some_and(|v| v == value) {
+                    result.push((pos, row.clone()));
+                    if result.len() == matching_rows.len() {
+                        break; // Found all matches, stop early
+                    }
+                }
+            }
+            Ok(result)
+        } else {
+            // No index — fall back to linear scan (default trait behavior).
+            let rows = self.scan(table).await?;
+            Ok(rows
+                .into_iter()
+                .enumerate()
+                .filter(|(_, row)| row.get(col_idx).is_some_and(|v| v == value))
+                .collect())
+        }
+    }
+
     async fn index_lookup(&self, _table: &str, index_name: &str, value: &Value) -> Result<Option<Vec<Row>>, StorageError> {
         self.index_lookup_sync(_table, index_name, value)
     }
@@ -746,6 +822,40 @@ impl StorageEngine for MemoryEngine {
             })
             .cloned()
             .collect())
+    }
+
+    fn index_only_scan(
+        &self,
+        _table: &str,
+        index_name: &str,
+        eq_value: Option<&Value>,
+        range: Option<(&Value, &Value)>,
+    ) -> Option<Vec<Row>> {
+        let indexes = self.indexes.read();
+        let idx = indexes.get(index_name)?;
+        if let Some(val) = eq_value {
+            // Point lookup: return one row per matching entry with just the key
+            let entries = idx.map.get(val)?;
+            Some(entries.iter().map(|_| vec![val.clone()]).collect())
+        } else if let Some((low, high)) = range {
+            // Range scan: iterate BTreeMap range, return key values only
+            let mut rows = Vec::new();
+            for (key, entries) in idx.map.range(low..=high) {
+                for _ in entries {
+                    rows.push(vec![key.clone()]);
+                }
+            }
+            Some(rows)
+        } else {
+            // Full index scan: return all key values
+            let mut rows = Vec::new();
+            for (key, entries) in &idx.map {
+                for _ in entries {
+                    rows.push(vec![key.clone()]);
+                }
+            }
+            Some(rows)
+        }
     }
 }
 

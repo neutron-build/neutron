@@ -1039,7 +1039,7 @@ impl StorageEngine for DiskEngine {
                 self.pool.mark_dirty(frame_id);
                 self.record_dirty_page(page_id);
                 self.pool.unpin(frame_id);
-                self.index_insert(table, page_id, slot_idx, &row);
+                self.index_insert(table, page_id, slot_idx, &row)?;
                 return Ok(());
             }
             self.pool.unpin(frame_id);
@@ -1055,7 +1055,7 @@ impl StorageEngine for DiskEngine {
         self.pool.mark_dirty(frame_id);
         self.record_dirty_page(page_id);
         self.pool.unpin(frame_id);
-        self.index_insert(table, page_id, slot_idx, &row);
+        self.index_insert(table, page_id, slot_idx, &row)?;
         Ok(())
     }
 
@@ -1296,7 +1296,7 @@ impl StorageEngine for DiskEngine {
                     if page::update_tuple_in_place(pg_mut, slot_idx, &new_data) {
                         // In-place update: row stays at same (page_id, slot_idx)
                         if has_indexes {
-                            self.index_insert(table, page_id, slot_idx, new_row);
+                            self.index_insert(table, page_id, slot_idx, new_row)?;
                         }
                         dirty = true;
                         count += 1;
@@ -1307,7 +1307,7 @@ impl StorageEngine for DiskEngine {
                         // Try inserting on this page first
                         if let Some(new_slot_idx) = page::insert_tuple(pg_mut, &new_data) {
                             if has_indexes {
-                                self.index_insert(table, page_id, new_slot_idx, new_row);
+                                self.index_insert(table, page_id, new_slot_idx, new_row)?;
                             }
                             count += 1;
                         } else {
@@ -1317,7 +1317,7 @@ impl StorageEngine for DiskEngine {
                             self.pool.unpin(frame_id);
                             let (new_page_id, new_slot_idx) = self.insert_sync(table, &new_data)?;
                             if has_indexes {
-                                self.index_insert(table, new_page_id, new_slot_idx, new_row);
+                                self.index_insert(table, new_page_id, new_slot_idx, new_row)?;
                             }
                             count += 1;
                             // Re-fetch this page to continue scanning
@@ -1399,6 +1399,55 @@ impl StorageEngine for DiskEngine {
         high: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
         Ok(Some(self.index_lookup_range_inner(table, index_name, low, high)?))
+    }
+
+    fn index_only_scan(
+        &self,
+        table: &str,
+        index_name: &str,
+        eq_value: Option<&Value>,
+        range: Option<(&Value, &Value)>,
+    ) -> Option<Vec<Row>> {
+        let indexes = self.indexes.read();
+        let idx = indexes.get(index_name)?;
+        if idx.table != table {
+            return None;
+        }
+
+        if let Some(val) = eq_value {
+            // Point lookup: get keys matching the value, return as single-column rows
+            let key = serialize_index_key(val);
+            let row_ids = idx.btree.lookup(&key).ok()?;
+            // Each matching RowId means one row — return the key value without heap access
+            Some(row_ids.iter().map(|_| vec![val.clone()]).collect())
+        } else if let Some((low, high)) = range {
+            // Range scan: iterate B-tree leaf keys without touching heap pages
+            let low_norm = normalize_index_bound_value(low, &idx.col_type)?;
+            let high_norm = normalize_index_bound_value(high, &idx.col_type)?;
+            let low_key = serialize_index_key(&low_norm);
+            let high_key = serialize_index_key(&high_norm);
+            if low_key > high_key {
+                return Some(Vec::new());
+            }
+            let key_rids = idx.btree.range_scan(Some(&low_key), Some(&high_key)).ok()?;
+            let mut rows = Vec::with_capacity(key_rids.len());
+            for (key_bytes, _rid) in &key_rids {
+                if let Some(val) = deserialize_index_key(key_bytes) {
+                    rows.push(vec![val]);
+                }
+            }
+            Some(rows)
+        } else {
+            // Full index scan: iterate all B-tree leaf entries
+            let key_rids = idx.btree.range_scan(None, None).ok()?;
+            let mut rows = Vec::with_capacity(key_rids.len());
+            for (key_bytes, _rid) in &key_rids {
+                if let Some(val) = deserialize_index_key(key_bytes) {
+                    rows.push(vec![val]);
+                }
+            }
+            Some(rows)
+        }
     }
 
     async fn vacuum(&self, table: &str) -> Result<(usize, usize, usize, usize), StorageError> {
@@ -1667,17 +1716,17 @@ impl DiskEngine {
 
     /// Maintain indexes after an insert — called with the page and slot where the
     /// row was inserted, plus the row data.
-    fn index_insert(&self, table: &str, page_id: u32, slot_idx: u16, row: &Row) {
+    fn index_insert(&self, table: &str, page_id: u32, slot_idx: u16, row: &Row) -> Result<(), StorageError> {
         let mut indexes = self.indexes.write();
         for (idx_name, idx) in indexes.iter_mut() {
             if idx.table == table && idx.col_idx < row.len() {
                 let key = serialize_index_key(&row[idx.col_idx]);
                 let rid = RowId { page_id, slot_idx };
-                if let Err(e) = idx.btree.insert(&key, rid) {
-                    tracing::error!("Index insert failed for {idx_name}: {e}");
-                }
+                idx.btree.insert(&key, rid)
+                    .map_err(|e| StorageError::Io(format!("Index insert failed for {idx_name}: {e}")))?;
             }
         }
+        Ok(())
     }
 
     /// Maintain indexes after a delete.
@@ -1798,6 +1847,46 @@ fn serialize_index_key(val: &Value) -> Vec<u8> {
             buf.extend_from_slice(format!("{val}").as_bytes());
             buf
         }
+    }
+}
+
+/// Deserialize a B-tree index key back into a Value.
+/// Inverse of `serialize_index_key`.
+fn deserialize_index_key(data: &[u8]) -> Option<Value> {
+    if data.is_empty() {
+        return None;
+    }
+    match data[0] {
+        0 => Some(Value::Null),
+        1 => data.get(1).map(|&b| Value::Bool(b != 0)),
+        2 if data.len() >= 5 => {
+            let u = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+            Some(Value::Int32((u ^ 0x8000_0000) as i32))
+        }
+        3 if data.len() >= 9 => {
+            let u = u64::from_be_bytes([
+                data[1], data[2], data[3], data[4],
+                data[5], data[6], data[7], data[8],
+            ]);
+            Some(Value::Int64((u ^ 0x8000_0000_0000_0000) as i64))
+        }
+        4 if data.len() >= 9 => {
+            let u = u64::from_be_bytes([
+                data[1], data[2], data[3], data[4],
+                data[5], data[6], data[7], data[8],
+            ]);
+            let bits = if u & 0x8000_0000_0000_0000 != 0 {
+                u ^ 0x8000_0000_0000_0000
+            } else {
+                !u
+            };
+            Some(Value::Float64(f64::from_bits(bits)))
+        }
+        5 => {
+            let s = std::str::from_utf8(&data[1..]).ok()?;
+            Some(Value::Text(s.to_string()))
+        }
+        _ => None,
     }
 }
 

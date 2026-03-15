@@ -667,7 +667,7 @@ impl Executor {
                 let mut best: Option<Value> = None;
                 for arg in &args {
                     if matches!(arg, Value::Null) {
-                        continue;
+                        return Ok(Value::Null);
                     }
                     best = Some(match best {
                         None => arg.clone(),
@@ -686,7 +686,7 @@ impl Executor {
                 let mut best: Option<Value> = None;
                 for arg in &args {
                     if matches!(arg, Value::Null) {
-                        continue;
+                        return Ok(Value::Null);
                     }
                     best = Some(match best {
                         None => arg.clone(),
