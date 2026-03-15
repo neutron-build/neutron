@@ -1134,13 +1134,12 @@ impl StorageEngine for MvccStorageAdapter {
             {
                 continue;
             }
-            if let Some(v) = mvcc_row.data.get(col_idx) {
-                if value_eq_coerced(v, value) {
+            if let Some(v) = mvcc_row.data.get(col_idx)
+                && value_eq_coerced(v, value) {
                     let virtual_pos = cache_entries.len();
                     cache_entries.push((version_idx, Arc::clone(&mvcc_row.data)));
                     matches.push((virtual_pos, (*mvcc_row.data).clone()));
                 }
-            }
         }
         drop(rows_guard);
 
@@ -1375,8 +1374,8 @@ impl StorageEngine for MvccStorageAdapter {
             {
                 let sort_val = r.data.get(sort_col).cloned().unwrap_or(Value::Null);
                 // Skip if this value can't beat the current threshold
-                if heap.len() >= k {
-                    if let Some(ref thr) = threshold {
+                if heap.len() >= k
+                    && let Some(ref thr) = threshold {
                         let dominated = if desc {
                             sort_val <= *thr
                         } else {
@@ -1384,7 +1383,6 @@ impl StorageEngine for MvccStorageAdapter {
                         };
                         if dominated { continue; }
                     }
-                }
                 let entry = HeapEntry {
                     sort_val: sort_val.clone(),
                     row: (*r.data).clone(),

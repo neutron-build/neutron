@@ -665,9 +665,9 @@ impl Executor {
             }
             // CASE WHEN is now supported
             Expr::Case { operand, conditions, else_result, .. } => {
-                operand.as_ref().map_or(false, |e| Self::expr_has_unsupported(e))
+                operand.as_ref().is_some_and(|e| Self::expr_has_unsupported(e))
                     || conditions.iter().any(|cw| Self::expr_has_unsupported(&cw.condition) || Self::expr_has_unsupported(&cw.result))
-                    || else_result.as_ref().map_or(false, |e| Self::expr_has_unsupported(e))
+                    || else_result.as_ref().is_some_and(|e| Self::expr_has_unsupported(e))
             }
             // CAST is now supported
             Expr::Cast { expr, .. } => Self::expr_has_unsupported(expr),
@@ -680,7 +680,7 @@ impl Executor {
             // IN (list) is now supported
             Expr::InList { expr, list, .. } => {
                 Self::expr_has_unsupported(expr)
-                    || list.iter().any(|e| Self::expr_has_unsupported(e))
+                    || list.iter().any(Self::expr_has_unsupported)
             }
             // Array/struct constructors
             Expr::Array(_) => true,
@@ -762,22 +762,19 @@ impl Executor {
     pub(super) fn resolve_alias_to_table(from: &[ast::TableWithJoins], alias: &str) -> String {
         let lower = alias.to_lowercase();
         for twj in from {
-            if let TableFactor::Table { name, alias: Some(a), .. } = &twj.relation {
-                if a.name.value.to_lowercase() == lower {
+            if let TableFactor::Table { name, alias: Some(a), .. } = &twj.relation
+                && a.name.value.to_lowercase() == lower {
                     return name.to_string();
                 }
-            }
-            if let TableFactor::Table { name, alias: None, .. } = &twj.relation {
-                if name.to_string().to_lowercase() == lower {
+            if let TableFactor::Table { name, alias: None, .. } = &twj.relation
+                && name.to_string().to_lowercase() == lower {
                     return name.to_string();
                 }
-            }
             for join in &twj.joins {
-                if let TableFactor::Table { name, alias: Some(a), .. } = &join.relation {
-                    if a.name.value.to_lowercase() == lower {
+                if let TableFactor::Table { name, alias: Some(a), .. } = &join.relation
+                    && a.name.value.to_lowercase() == lower {
                         return name.to_string();
                     }
-                }
             }
         }
         alias.to_string()
@@ -1327,10 +1324,10 @@ impl Executor {
                     // engine's fast_scan_where_eq (fused scan+filter with
                     // MVCC visibility fast-path). This avoids materializing
                     // all rows then filtering — only matching rows are cloned.
-                    if let Some(ref expr) = resolved_expr {
-                        if let Some((col_name, _)) = planner::is_equality_predicate(expr) {
-                            if let Some(col_idx) = meta.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name)) {
-                                if let Some(val) = Self::extract_equality_value(expr) {
+                    if let Some(ref expr) = resolved_expr
+                        && let Some((col_name, _)) = planner::is_equality_predicate(expr)
+                            && let Some(col_idx) = meta.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name))
+                                && let Some(val) = Self::extract_equality_value(expr) {
                                     // Coerce to match storage format: eval_value stores
                                     // small integers as Int32, so we must do the same.
                                     let coerced = Self::coerce_to_storage_type(&val);
@@ -1339,9 +1336,6 @@ impl Executor {
                                         return Ok((meta, rows));
                                     }
                                 }
-                            }
-                        }
-                    }
 
                     let mut rows = if let Some(lim) = scan_limit {
                         storage.scan_limit(table, *lim).await?
@@ -1443,9 +1437,9 @@ impl Executor {
                             // fast_scan_where_eq which has better cache locality than
                             // cloning from the index BTreeMap. For PK/unique lookups
                             // (estimated_rows ≤ 10), use O(log N) index lookup instead.
-                            if *estimated_rows > 10 {
-                                if let Some((col_name, _)) = planner::is_equality_predicate(key_expr) {
-                                    if let Some(col_idx) = table_def.columns.iter()
+                            if *estimated_rows > 10
+                                && let Some((col_name, _)) = planner::is_equality_predicate(key_expr)
+                                    && let Some(col_idx) = table_def.columns.iter()
                                         .position(|c| c.name.eq_ignore_ascii_case(&col_name))
                                     {
                                         let coerced_scan = Self::coerce_to_storage_type(&val);
@@ -1457,8 +1451,6 @@ impl Executor {
                                             return Ok((meta, rows));
                                         }
                                     }
-                                }
-                            }
 
                             // Coerce to the indexed column's type (e.g. Int64→Int32 for INT columns)
                             let coerced = Self::coerce_index_value(
@@ -1548,14 +1540,14 @@ impl Executor {
                     // Limit → Sort → IndexScan/Filter: push sort+limit into the scan
                     // itself via fast_scan_where_eq_topk. Avoids materializing the
                     // full intermediate result (e.g. 83K rows → only 20 cloned).
-                    if let planner::PlanNode::Sort { input: sort_input, keys, .. } = input.as_ref() {
-                        if let (Some(lim), None | Some(0)) = (limit, offset.as_ref()) {
-                            if keys.len() == 1 && *lim > 0 {
+                    if let planner::PlanNode::Sort { input: sort_input, keys, .. } = input.as_ref()
+                        && let (Some(lim), None | Some(0)) = (limit, offset.as_ref())
+                            && keys.len() == 1 && *lim > 0 {
                                 // Parse single sort key
                                 let key_str = &keys[0];
-                                let (base, _nulls) = if let Some(_) = key_str.to_uppercase().strip_suffix("NULLS FIRST") {
+                                let (base, _nulls) = if key_str.to_uppercase().strip_suffix("NULLS FIRST").is_some() {
                                     (key_str[..key_str.len() - "NULLS FIRST".len()].trim(), Some(true))
-                                } else if let Some(_) = key_str.to_uppercase().strip_suffix("NULLS LAST") {
+                                } else if key_str.to_uppercase().strip_suffix("NULLS LAST").is_some() {
                                     (key_str[..key_str.len() - "NULLS LAST".len()].trim(), Some(false))
                                 } else {
                                     (key_str.as_str(), None)
@@ -1583,10 +1575,10 @@ impl Executor {
                                         Some((table.clone(), fexpr.clone()))
                                     } else { None };
 
-                                if let Some((table, key_expr)) = scan_table_and_expr {
-                                    if let Some((col_name, _)) = planner::is_equality_predicate(&key_expr) {
-                                        if let Some(filter_val) = Self::extract_equality_value(&key_expr) {
-                                            if let Ok(table_def) = self.get_table(&table).await {
+                                if let Some((table, key_expr)) = scan_table_and_expr
+                                    && let Some((col_name, _)) = planner::is_equality_predicate(&key_expr)
+                                        && let Some(filter_val) = Self::extract_equality_value(&key_expr)
+                                            && let Ok(table_def) = self.get_table(&table).await {
                                                 let meta: Vec<ColMeta> = table_def.columns.iter().map(|c| ColMeta {
                                                     table: Some(table.clone()),
                                                     name: c.name.clone(),
@@ -1607,28 +1599,23 @@ impl Executor {
                                                     }
                                                 }
                                             }
-                                        }
-                                    }
-                                }
                             }
-                        }
-                    }
 
                     // ── Top-K sort fusion ────────────────────────────────
 
                     // When Limit wraps Sort, avoid sorting all N rows.
                     // Use select_nth_unstable_by to partition in O(N), then
                     // sort only the top K elements in O(K log K).
-                    if let planner::PlanNode::Sort { input: sort_input, keys, .. } = input.as_ref() {
-                        if let (Some(lim), None | Some(0)) = (limit, offset.as_ref()) {
+                    if let planner::PlanNode::Sort { input: sort_input, keys, .. } = input.as_ref()
+                        && let (Some(lim), None | Some(0)) = (limit, offset.as_ref()) {
                             let (meta, mut rows) = self.execute_plan_node(sort_input, cte_tables).await?;
                             let k = (*lim).min(rows.len());
                             if k > 0 && k < rows.len() {
                                 // Build comparator from sort keys
                                 let sort_specs: Vec<(usize, bool, bool)> = keys.iter().filter_map(|key_str| {
-                                    let (base, nulls_first) = if let Some(_) = key_str.to_uppercase().strip_suffix("NULLS FIRST") {
+                                    let (base, nulls_first) = if key_str.to_uppercase().strip_suffix("NULLS FIRST").is_some() {
                                         (key_str[..key_str.len() - "NULLS FIRST".len()].trim(), Some(true))
-                                    } else if let Some(_) = key_str.to_uppercase().strip_suffix("NULLS LAST") {
+                                    } else if key_str.to_uppercase().strip_suffix("NULLS LAST").is_some() {
                                         (key_str[..key_str.len() - "NULLS LAST".len()].trim(), Some(false))
                                     } else {
                                         (key_str.as_str(), None)
@@ -1678,7 +1665,6 @@ impl Executor {
                             // k == rows.len(): no truncation needed, but still sort
                             // Fall through to full sort below
                         }
-                    }
 
                     let (meta, mut rows) = self.execute_plan_node(input, cte_tables).await?;
                     if let Some(off) = offset {
@@ -2570,11 +2556,9 @@ impl Executor {
             && matches!(&select.group_by, ast::GroupByExpr::Expressions(e, _) if e.is_empty())
             && query.order_by.is_none()
             && query.limit_clause.is_none()
-        {
-            if let Ok(Some(result)) = self.try_columnar_fast_aggregate(select, &cte_tables) {
+            && let Ok(Some(result)) = self.try_columnar_fast_aggregate(select, &cte_tables) {
                 return Ok(result);
             }
-        }
 
         // --- PK lookup super-fast path ---
         // For `SELECT * FROM table WHERE pk = literal` (no JOINs, ORDER BY, LIMIT,
@@ -2590,22 +2574,20 @@ impl Executor {
             && query.limit_clause.is_none()
             && select.projection.len() == 1
             && matches!(&select.projection[0], SelectItem::Wildcard(_))
-        {
-            if let Some(ref where_expr) = select.selection {
+            && let Some(ref where_expr) = select.selection {
                 let preds = planner::split_conjunction(where_expr);
-                if preds.len() == 1 {
-                    if let Some((col, _)) = planner::is_equality_predicate(preds[0]) {
+                if preds.len() == 1
+                    && let Some((col, _)) = planner::is_equality_predicate(preds[0]) {
                         let table_name = match &select.from[0].relation {
                             TableFactor::Table { name, .. } => name.to_string(),
                             _ => String::new(),
                         };
-                        if !table_name.is_empty() {
-                            if let Ok(table_def) = self.get_table(&table_name).await {
-                                if let Some(pk_cols) = table_def.primary_key_columns()
+                        if !table_name.is_empty()
+                            && let Ok(table_def) = self.get_table(&table_name).await
+                                && let Some(pk_cols) = table_def.primary_key_columns()
                                     && pk_cols.len() == 1
                                     && pk_cols[0].eq_ignore_ascii_case(&col)
-                                {
-                                    if let Some(val) = Self::extract_equality_value(preds[0]) {
+                                    && let Some(val) = Self::extract_equality_value(preds[0]) {
                                         let coerced = Self::coerce_to_storage_type(&val);
                                         // Find PK btree index
                                         let indexes = self.catalog.get_indexes_cached(&table_name)
@@ -2615,8 +2597,8 @@ impl Executor {
                                                 && idx.columns.len() == 1
                                                 && idx.columns[0].eq_ignore_ascii_case(&col)
                                         });
-                                        if let Some(idx) = pk_idx {
-                                            if let Ok(Some(rows)) = self.storage.index_lookup(
+                                        if let Some(idx) = pk_idx
+                                            && let Ok(Some(rows)) = self.storage.index_lookup(
                                                 &table_name, &idx.name, &coerced,
                                             ).await {
                                                 let columns: Vec<(String, DataType)> = table_def.columns.iter()
@@ -2624,15 +2606,9 @@ impl Executor {
                                                     .collect();
                                                 return Ok(ExecResult::Select { columns, rows });
                                             }
-                                        }
                                     }
-                                }
-                            }
-                        }
                     }
-                }
             }
-        }
 
         // --- Plan-driven execution (default ON, disable via SET plan_execution = off) ---
         // The plan-based path walks the PlanNode tree from the planner. It handles
@@ -2673,7 +2649,7 @@ impl Executor {
                         } else {
                             // Cache miss — plan from scratch, check executability
                             self.plan_query(&query).await.ok()
-                                .filter(|p| Self::plan_is_executable(p))
+                                .filter(Self::plan_is_executable)
                         };
 
                         if let Some(plan) = plan {
@@ -3793,16 +3769,14 @@ impl Executor {
         catalog: &crate::catalog::Catalog,
     ) -> (Value, Value) {
         let idx_defs = catalog.get_indexes_cached(table).unwrap_or_default();
-        if let Some(idx) = idx_defs.iter().find(|i| i.name == index_name) {
-            if let Some(col_name) = idx.columns.first() {
-                if let Some(col) = table_def.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col_name)) {
+        if let Some(idx) = idx_defs.iter().find(|i| i.name == index_name)
+            && let Some(col_name) = idx.columns.first()
+                && let Some(col) = table_def.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col_name)) {
                     return (
                         Self::coerce_to_column_type(&lo, &col.data_type),
                         Self::coerce_to_column_type(&hi, &col.data_type),
                     );
                 }
-            }
-        }
         (lo, hi)
     }
 
@@ -3814,13 +3788,11 @@ impl Executor {
         catalog: &crate::catalog::Catalog,
     ) -> Value {
         let idx_defs = catalog.get_indexes_cached(table).unwrap_or_default();
-        if let Some(idx) = idx_defs.iter().find(|i| i.name == index_name) {
-            if let Some(col_name) = idx.columns.first() {
-                if let Some(col) = table_def.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col_name)) {
+        if let Some(idx) = idx_defs.iter().find(|i| i.name == index_name)
+            && let Some(col_name) = idx.columns.first()
+                && let Some(col) = table_def.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col_name)) {
                     return Self::coerce_to_column_type(&val, &col.data_type);
                 }
-            }
-        }
         val
     }
 
@@ -3987,7 +3959,7 @@ impl Executor {
                 for (i, row) in rows.iter().enumerate() {
                     if let Some(Value::Text(s)) = row.get(col_idx) {
                         if negate { if s != needle { matching.push(i); } }
-                        else { if s == needle { matching.push(i); } }
+                        else if s == needle { matching.push(i); }
                     }
                 }
                 Some(matching)
@@ -4484,8 +4456,8 @@ impl Executor {
         // (SELECT list + WHERE) are covered by a single B-tree index, return
         // results directly from the index without any heap/table access.
         // This achieves 1.5-2x speedup for covering index queries.
-        if select.from.len() == 1 && select.from[0].joins.is_empty() {
-            if let TableFactor::Table { name, alias, args: None, .. } = &select.from[0].relation {
+        if select.from.len() == 1 && select.from[0].joins.is_empty()
+            && let TableFactor::Table { name, alias, args: None, .. } = &select.from[0].relation {
                 let table_name = name.to_string();
                 let label = alias.as_ref()
                     .map(|a| a.name.value.clone())
@@ -4494,7 +4466,6 @@ impl Executor {
                     return Ok(SelectResult::Projected(result));
                 }
             }
-        }
 
         // Index-aware optimization (fully synchronous)
         // For simple single-table queries with WHERE equality predicates,
@@ -4646,8 +4617,8 @@ impl Executor {
                 String::new()
             };
 
-            if let Some(ref lt_name) = left_table_name {
-                if let Ok(left_table_def) = self.get_table(lt_name).await {
+            if let Some(ref lt_name) = left_table_name
+                && let Ok(left_table_def) = self.get_table(lt_name).await {
                     let left_meta: Vec<ColMeta> = left_table_def.columns.iter()
                         .map(|c| ColMeta {
                             table: Some(left_label.clone()),
@@ -4664,8 +4635,8 @@ impl Executor {
                         .await?;
                     let right_rows = self.apply_pushdown_for_factor(&twj.relation, right_rows0, &right_meta, pushdown);
 
-                    if let Some(join_expr) = Self::combine_predicates(remaining_preds.clone()) {
-                        if let Some((left_keys, right_keys, residual)) =
+                    if let Some(join_expr) = Self::combine_predicates(remaining_preds.clone())
+                        && let Some((left_keys, right_keys, residual)) =
                             Self::extract_equijoin_keys(&join_expr, &left_meta, &right_meta)
                         {
                             // Check if we can do index nested-loop
@@ -4704,9 +4675,7 @@ impl Executor {
                                 }
                             }
                         }
-                    }
                 }
-            }
         }
 
         let first = &from[0];
@@ -5023,13 +4992,12 @@ impl Executor {
                 // ── Zone map pruning ────────────────────────────────────
                 // If a pushdown predicate is available, try to skip entire
                 // granules whose min/max stats prove no rows can match.
-                if let Some(where_expr) = pushdown_expr {
-                    if let Some((col_id, ref predicate)) =
+                if let Some(where_expr) = pushdown_expr
+                    && let Some((col_id, ref predicate)) =
                         Self::extract_zone_map_predicate(where_expr, &col_meta)
                     {
                         rows = self.apply_zone_map_pruning(rows, &table_name, col_id, predicate);
                     }
-                }
 
                 Ok((col_meta, rows))
             }
@@ -5604,7 +5572,7 @@ impl Executor {
         select: &ast::Select,
     ) -> Option<planner::PlanNode> {
         // Only handle single-table queries (no JOINs)
-        if select.from.len() != 1 || !select.from.first().map_or(true, |f| f.joins.is_empty()) {
+        if select.from.len() != 1 || !select.from.first().is_none_or(|f| f.joins.is_empty()) {
             return None;
         }
         let where_expr = select.selection.clone();
@@ -5680,7 +5648,8 @@ impl Executor {
                 // For IndexScan: the index column name tells us which predicate matches.
                 let scan_pred_idx = if let planner::PlanNode::IndexScan { .. } = input.as_ref() {
                     // Find the predicate that references the indexed column
-                    let idx_col = {
+                    
+                    {
                         // Index name format is typically "idx_<table>_<col>" or user-defined.
                         // We check each predicate against the index name stored in the plan.
                         // The simplest heuristic: the planner picked this index for a reason,
@@ -5693,19 +5662,16 @@ impl Executor {
                             // Use planner's extract helpers for accuracy.
                             if let Some((col, _)) = planner::is_equality_predicate(p) {
                                 // Match against the cached IndexScan's column
-                                if let planner::PlanNode::IndexScan { lookup_key_expr: Some(old_expr), .. } = input.as_ref() {
-                                    if let Some((old_col, _)) = planner::is_equality_predicate(old_expr) {
-                                        if col.eq_ignore_ascii_case(&old_col) {
+                                if let planner::PlanNode::IndexScan { lookup_key_expr: Some(old_expr), .. } = input.as_ref()
+                                    && let Some((old_col, _)) = planner::is_equality_predicate(old_expr)
+                                        && col.eq_ignore_ascii_case(&old_col) {
                                             found = Some(i);
                                             break;
                                         }
-                                    }
-                                }
                             }
                         }
                         found
-                    };
-                    idx_col
+                    }
                 } else {
                     None
                 };
@@ -6034,21 +6000,16 @@ impl Executor {
                     Self::substitute_query_literals(source, lits, count);
                 }
                 // ON CONFLICT ... DO UPDATE SET ...
-                if let Some(ref mut on_conflict) = insert.on {
-                    match on_conflict {
-                        sqlparser::ast::OnInsert::OnConflict(oc) => {
-                            if let sqlparser::ast::OnConflictAction::DoUpdate(du) = &mut oc.action {
-                                for assign in &mut du.assignments {
-                                    Self::substitute_expr_literals(&mut assign.value, lits, count);
-                                }
-                                if let Some(ref mut sel) = du.selection {
-                                    Self::substitute_expr_literals(sel, lits, count);
-                                }
+                if let Some(ref mut on_conflict) = insert.on
+                    && let sqlparser::ast::OnInsert::OnConflict(oc) = on_conflict
+                        && let sqlparser::ast::OnConflictAction::DoUpdate(du) = &mut oc.action {
+                            for assign in &mut du.assignments {
+                                Self::substitute_expr_literals(&mut assign.value, lits, count);
+                            }
+                            if let Some(ref mut sel) = du.selection {
+                                Self::substitute_expr_literals(sel, lits, count);
                             }
                         }
-                        _ => {}
-                    }
-                }
                 // RETURNING expressions
                 if let Some(ref mut returning) = insert.returning {
                     for item in returning {
@@ -6099,27 +6060,22 @@ impl Executor {
         // Body
         Self::substitute_set_expr_literals(&mut query.body, lits, count);
         // ORDER BY
-        if let Some(ref mut order_by) = query.order_by {
-            if let ast::OrderByKind::Expressions(ref mut exprs) = order_by.kind {
+        if let Some(ref mut order_by) = query.order_by
+            && let ast::OrderByKind::Expressions(ref mut exprs) = order_by.kind {
                 for item in exprs {
                     Self::substitute_expr_literals(&mut item.expr, lits, count);
                 }
             }
-        }
         // LIMIT / OFFSET
-        if let Some(ref mut limit_clause) = query.limit_clause {
-            match limit_clause {
-                sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. } => {
-                    if let Some(l) = limit {
-                        Self::substitute_expr_literals(l, lits, count);
-                    }
-                    if let Some(o) = offset {
-                        Self::substitute_expr_literals(&mut o.value, lits, count);
-                    }
+        if let Some(ref mut limit_clause) = query.limit_clause
+            && let sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. } = limit_clause {
+                if let Some(l) = limit {
+                    Self::substitute_expr_literals(l, lits, count);
                 }
-                _ => {}
+                if let Some(o) = offset {
+                    Self::substitute_expr_literals(&mut o.value, lits, count);
+                }
             }
-        }
     }
 
     fn substitute_set_expr_literals(
@@ -6160,13 +6116,10 @@ impl Executor {
                     Self::substitute_expr_literals(sel, lits, count);
                 }
                 // GROUP BY
-                match &mut select.group_by {
-                    sqlparser::ast::GroupByExpr::Expressions(exprs, _) => {
-                        for expr in exprs {
-                            Self::substitute_expr_literals(expr, lits, count);
-                        }
+                if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &mut select.group_by {
+                    for expr in exprs {
+                        Self::substitute_expr_literals(expr, lits, count);
                     }
-                    _ => {}
                 }
                 // HAVING
                 if let Some(ref mut having) = select.having {
@@ -6196,11 +6149,8 @@ impl Executor {
         lits: &mut std::slice::Iter<'_, CacheLiteral>,
         count: &mut usize,
     ) {
-        match tf {
-            sqlparser::ast::TableFactor::Derived { subquery, .. } => {
-                Self::substitute_query_literals(subquery, lits, count);
-            }
-            _ => {}
+        if let sqlparser::ast::TableFactor::Derived { subquery, .. } = tf {
+            Self::substitute_query_literals(subquery, lits, count);
         }
     }
 
@@ -6291,45 +6241,38 @@ impl Executor {
                 }
             }
             Expr::Function(func) => {
-                match &mut func.args {
-                    sqlparser::ast::FunctionArguments::List(args) => {
-                        for arg in &mut args.args {
-                            match arg {
-                                sqlparser::ast::FunctionArg::Unnamed(
-                                    sqlparser::ast::FunctionArgExpr::Expr(e),
-                                ) => {
-                                    Self::substitute_expr_literals(e, lits, count);
-                                }
-                                sqlparser::ast::FunctionArg::Named {
-                                    arg: sqlparser::ast::FunctionArgExpr::Expr(e),
-                                    ..
-                                } => {
-                                    Self::substitute_expr_literals(e, lits, count);
-                                }
-                                _ => {}
+                if let sqlparser::ast::FunctionArguments::List(args) = &mut func.args {
+                    for arg in &mut args.args {
+                        match arg {
+                            sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(e),
+                            ) => {
+                                Self::substitute_expr_literals(e, lits, count);
                             }
+                            sqlparser::ast::FunctionArg::Named {
+                                arg: sqlparser::ast::FunctionArgExpr::Expr(e),
+                                ..
+                            } => {
+                                Self::substitute_expr_literals(e, lits, count);
+                            }
+                            _ => {}
                         }
                     }
-                    _ => {}
                 }
                 // FILTER clause
                 if let Some(ref mut filter) = func.filter {
                     Self::substitute_expr_literals(filter, lits, count);
                 }
                 // OVER clause (window functions)
-                if let Some(ref mut over) = func.over {
-                    match over {
-                        sqlparser::ast::WindowType::WindowSpec(ws) => {
-                            for expr in &mut ws.partition_by {
-                                Self::substitute_expr_literals(expr, lits, count);
-                            }
-                            for ob in &mut ws.order_by {
-                                Self::substitute_expr_literals(&mut ob.expr, lits, count);
-                            }
+                if let Some(ref mut over) = func.over
+                    && let sqlparser::ast::WindowType::WindowSpec(ws) = over {
+                        for expr in &mut ws.partition_by {
+                            Self::substitute_expr_literals(expr, lits, count);
                         }
-                        _ => {}
+                        for ob in &mut ws.order_by {
+                            Self::substitute_expr_literals(&mut ob.expr, lits, count);
+                        }
                     }
-                }
             }
             Expr::Subquery(query) => {
                 Self::substitute_query_literals(query, lits, count);
@@ -6394,8 +6337,8 @@ impl Executor {
 
         // Try cache lookup
         let cache_result = self.ast_cache.write().get(&norm_key);
-        if let Some((cached_arc, expected_count)) = cache_result {
-            if expected_count == literals.len() {
+        if let Some((cached_arc, expected_count)) = cache_result
+            && expected_count == literals.len() {
                 if literals.is_empty() {
                     // No literals to substitute — return deep clone directly
                     let stmts = (*cached_arc).clone();
@@ -6417,7 +6360,6 @@ impl Executor {
                 // Substitution count mismatch — fall through to re-parse
             }
             // Literal count mismatch — fall through to re-parse
-        }
 
         // Cache miss or mismatch — parse and cache
         let ast = crate::sql::parse(sql)?;
@@ -6492,7 +6434,7 @@ impl Executor {
             Expr::InList { expr: col_expr, list, negated } if !*negated => {
                 let col_name = Self::zm_expr_to_col_name(col_expr)?;
                 let col_idx = col_meta.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
-                let values: Vec<Value> = list.iter().filter_map(|e| Self::zm_expr_to_value(e)).collect();
+                let values: Vec<Value> = list.iter().filter_map(Self::zm_expr_to_value).collect();
                 if values.is_empty() { return None; }
                 Some((col_idx as u32, FilterPredicate::In(values)))
             }
@@ -6586,8 +6528,8 @@ impl Executor {
         let mut any_skipped = false;
 
         for (chunk_idx, chunk) in rows.chunks(GRANULE_SIZE).enumerate() {
-            if let Some(granule) = granules.get(chunk_idx) {
-                if can_skip_granule(granule, col_id, predicate) {
+            if let Some(granule) = granules.get(chunk_idx)
+                && can_skip_granule(granule, col_id, predicate) {
                     // Mark all rows in this granule as skippable
                     let start = chunk_idx * GRANULE_SIZE;
                     for i in start..start + chunk.len() {
@@ -6595,7 +6537,6 @@ impl Executor {
                     }
                     any_skipped = true;
                 }
-            }
         }
 
         if !any_skipped {
@@ -6604,7 +6545,7 @@ impl Executor {
 
         // Collect only the rows from non-skipped granules
         rows.into_iter()
-            .zip(keep.into_iter())
+            .zip(keep)
             .filter_map(|(row, k)| if k { Some(row) } else { None })
             .collect()
     }

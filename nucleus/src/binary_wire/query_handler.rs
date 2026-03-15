@@ -38,7 +38,7 @@ impl PreparedQuery {
         // Count parameter placeholders ($1, $2, etc.)
         let mut param_count = 0u16;
         for cap in sql.split('$').skip(1) {
-            if cap.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+            if cap.chars().next().is_some_and(|c| c.is_ascii_digit()) {
                 param_count += 1;
             }
         }

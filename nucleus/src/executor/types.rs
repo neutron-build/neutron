@@ -150,14 +150,13 @@ impl AstCache {
 
     /// Insert a parsed AST into the cache. Evicts the least-accessed entry if full.
     pub fn insert(&mut self, key: String, ast: Vec<sqlparser::ast::Statement>, literal_count: usize) {
-        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&key) {
-            if let Some(victim_key) = self.entries.iter()
+        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&key)
+            && let Some(victim_key) = self.entries.iter()
                 .min_by_key(|(_, e)| e.access_count)
                 .map(|(k, _)| k.clone())
             {
                 self.entries.remove(&victim_key);
             }
-        }
         self.entries.insert(key, AstCacheEntry {
             ast: std::sync::Arc::new(ast),
             literal_count,
