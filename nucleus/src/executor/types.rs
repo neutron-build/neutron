@@ -87,6 +87,23 @@ pub(crate) struct PreparedStmt {
     pub sql: String,
 }
 
+/// A prepared statement handle for the embedded API.
+///
+/// Holds a pre-parsed AST and a pre-computed plan cache key so that repeated
+/// executions skip both SQL parsing and plan-cache key normalization.
+/// Created via [`Executor::prepare`], executed via [`Executor::execute_prepared`].
+#[derive(Clone)]
+pub struct PreparedStmtHandle {
+    /// The parsed AST template. Cloned and parameter-substituted on each execute.
+    pub(crate) ast: sqlparser::ast::Statement,
+    /// Pre-computed normalized SQL key for the plan cache.
+    /// Set to the plan_cache_key_hint so execute_query() can skip
+    /// `query.to_string()` + `normalize_sql_for_cache()`.
+    pub(crate) plan_cache_key: String,
+    /// Number of `$N` parameter placeholders detected in the SQL.
+    pub(crate) param_count: usize,
+}
+
 /// A literal value extracted during SQL normalization for AST cache substitution.
 #[derive(Debug, Clone)]
 pub(crate) enum CacheLiteral {

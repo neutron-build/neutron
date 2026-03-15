@@ -13,6 +13,7 @@ argon2 = "0.5"
 async-trait = "0.1"
 bytes = "1"
 crc32c = "0.6"
+dashmap = "6"
 futures = "0.3"
 parking_lot = "0.12"
 pgwire = { version = "0.36", features = ["server-api-aws-lc-rs"], optional = true }
@@ -40,6 +41,7 @@ tokio-postgres = { version = "0.7", optional = true }
 comfy-table = { version = "7", optional = true }
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
+urlencoding = { version = "2", optional = true }
 rusqlite = { version = "0.30", features = ["bundled"], optional = true }
 mongodb = { version = "2.8", optional = true }
 mysql_async = { version = "0.34", optional = true }
@@ -66,10 +68,10 @@ server = [
     "tokio/full", "tokio/rt-multi-thread",
 ]
 wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:serde-wasm-bindgen", "getrandom/js"]
-bench-tools = ["server", "comfy-table", "dep:redis", "dep:reqwest", "rusqlite", "mongodb", "dep:mysql_async", "dep:clickhouse"]
+bench-tools = ["server", "comfy-table", "dep:redis", "dep:reqwest", "rusqlite", "mongodb", "dep:mysql_async", "clickhouse"]
 rusqlite = ["dep:rusqlite"]
 mongodb = ["dep:mongodb"]
-clickhouse = ["dep:clickhouse"]
+clickhouse = ["dep:clickhouse", "dep:urlencoding", "dep:reqwest"]
 otel = ["server", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 onnx = ["ort", "ndarray"]
 jemalloc = ["tikv-jemallocator"]

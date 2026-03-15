@@ -295,6 +295,16 @@ impl StorageEngine for BufferedDiskEngine {
         self.inner.index_lookup_range_sync(table, index_name, low, high)
     }
 
+    fn index_only_scan(
+        &self,
+        table: &str,
+        index_name: &str,
+        eq_value: Option<&Value>,
+        range: Option<(&Value, &Value)>,
+    ) -> Option<Vec<Row>> {
+        self.inner.index_only_scan(table, index_name, eq_value, range)
+    }
+
     async fn flush_all_dirty(&self) -> Result<(), StorageError> {
         self.inner.flush_all_dirty().await
     }

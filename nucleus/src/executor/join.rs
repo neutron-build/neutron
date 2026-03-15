@@ -178,7 +178,7 @@ impl Executor {
                     for rr in right_rows {
                         scratch[left_len..].clone_from_slice(rr);
                         if self.eval_where(on_expr, &scratch, &combined_meta)? {
-                            result_rows.push(scratch.clone());
+                            result_rows.push(scratch.to_vec());
                         }
                     }
                 }
@@ -190,13 +190,13 @@ impl Executor {
                     for rr in right_rows {
                         scratch[left_len..].clone_from_slice(rr);
                         if self.eval_where(on_expr, &scratch, &combined_meta)? {
-                            result_rows.push(scratch.clone());
+                            result_rows.push(scratch.to_vec());
                             matched = true;
                         }
                     }
                     if !matched {
                         scratch[left_len..].clone_from_slice(&right_nulls);
-                        result_rows.push(scratch.clone());
+                        result_rows.push(scratch.to_vec());
                     }
                 }
             }
@@ -207,13 +207,13 @@ impl Executor {
                     for lr in left_rows {
                         scratch[..left_len].clone_from_slice(lr);
                         if self.eval_where(on_expr, &scratch, &combined_meta)? {
-                            result_rows.push(scratch.clone());
+                            result_rows.push(scratch.to_vec());
                             matched = true;
                         }
                     }
                     if !matched {
                         scratch[..left_len].clone_from_slice(&left_nulls);
-                        result_rows.push(scratch.clone());
+                        result_rows.push(scratch.to_vec());
                     }
                 }
             }
@@ -225,14 +225,14 @@ impl Executor {
                     for (ri, rr) in right_rows.iter().enumerate() {
                         scratch[left_len..].clone_from_slice(rr);
                         if self.eval_where(on_expr, &scratch, &combined_meta)? {
-                            result_rows.push(scratch.clone());
+                            result_rows.push(scratch.to_vec());
                             left_matched = true;
                             right_matched[ri] = true;
                         }
                     }
                     if !left_matched {
                         scratch[left_len..].clone_from_slice(&right_nulls);
-                        result_rows.push(scratch.clone());
+                        result_rows.push(scratch.to_vec());
                     }
                 }
                 // Add unmatched right rows
@@ -240,7 +240,7 @@ impl Executor {
                     if !right_matched[ri] {
                         scratch[..left_len].clone_from_slice(&left_nulls);
                         scratch[left_len..].clone_from_slice(rr);
-                        result_rows.push(scratch.clone());
+                        result_rows.push(scratch.to_vec());
                     }
                 }
             }

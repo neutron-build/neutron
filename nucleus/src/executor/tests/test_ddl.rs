@@ -70,7 +70,7 @@ async fn test_create_hash_index() {
     }
 
     // Verify hash_indexes was populated
-    assert!(ex.hash_indexes.read().contains_key(&("products".to_string(), "price".to_string())));
+    assert!(ex.hash_indexes.contains_key(&("products".to_string(), "price".to_string())));
 
     // Equality lookup on the hash-indexed column should still work
     let results = exec(&ex, "SELECT name FROM products WHERE price = 100").await;
@@ -873,6 +873,171 @@ async fn test_json_path_operators() {
     if let ExecResult::Select { rows, .. } = &r[0] {
         assert_eq!(rows[0][0], Value::Null);
     } else { panic!("expected select"); }
+}
+
+// ======================================================================
+// ALTER TABLE ADD/DROP CONSTRAINT
+// ======================================================================
+
+#[tokio::test]
+async fn test_alter_table_add_unique_constraint() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t_uq1 (id INT, email TEXT)").await;
+    exec(&ex, "INSERT INTO t_uq1 VALUES (1, 'a@b.com')").await;
+
+    // Add a named UNIQUE constraint.
+    let r = exec(&ex, "ALTER TABLE t_uq1 ADD CONSTRAINT uq_email UNIQUE (email)").await;
+    match &r[0] {
+        ExecResult::Command { tag, .. } => assert_eq!(tag, "ALTER TABLE"),
+        _ => panic!("expected Command"),
+    }
+
+    // Duplicate should now be rejected.
+    let err = ex.execute("INSERT INTO t_uq1 VALUES (2, 'a@b.com')").await;
+    assert!(err.is_err(), "expected unique constraint violation");
+    let msg = format!("{}", err.unwrap_err());
+    assert!(
+        msg.to_lowercase().contains("unique") || msg.to_lowercase().contains("duplicate") || msg.to_lowercase().contains("constraint"),
+        "error should mention constraint: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_alter_table_add_check_constraint() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t_ck1 (id INT, age INT)").await;
+    exec(&ex, "INSERT INTO t_ck1 VALUES (1, 25)").await;
+
+    // Add a CHECK constraint.
+    let r = exec(&ex, "ALTER TABLE t_ck1 ADD CONSTRAINT ck_age CHECK (age > 0)").await;
+    match &r[0] {
+        ExecResult::Command { tag, .. } => assert_eq!(tag, "ALTER TABLE"),
+        _ => panic!("expected Command"),
+    }
+
+    // Violating insert should fail.
+    let err = ex.execute("INSERT INTO t_ck1 VALUES (2, -1)").await;
+    assert!(err.is_err(), "expected check constraint violation");
+    let msg = format!("{}", err.unwrap_err());
+    assert!(msg.contains("check constraint"), "error should mention check constraint: {msg}");
+}
+
+#[tokio::test]
+async fn test_alter_table_add_check_constraint_validates_existing_rows() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t_ck2 (id INT, val INT)").await;
+    exec(&ex, "INSERT INTO t_ck2 VALUES (1, -5)").await;
+
+    // Adding a CHECK that existing data violates should fail.
+    let err = ex.execute("ALTER TABLE t_ck2 ADD CONSTRAINT ck_val CHECK (val > 0)").await;
+    assert!(err.is_err(), "existing rows violate the new CHECK");
+}
+
+#[tokio::test]
+async fn test_alter_table_add_primary_key_constraint() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t_pk1 (id INT, name TEXT)").await;
+    exec(&ex, "INSERT INTO t_pk1 VALUES (1, 'Alice')").await;
+
+    let r = exec(&ex, "ALTER TABLE t_pk1 ADD CONSTRAINT pk_t4 PRIMARY KEY (id)").await;
+    match &r[0] {
+        ExecResult::Command { tag, .. } => assert_eq!(tag, "ALTER TABLE"),
+        _ => panic!("expected Command"),
+    }
+
+    // Duplicate PK should be rejected.
+    let err = ex.execute("INSERT INTO t_pk1 VALUES (1, 'Bob')").await;
+    assert!(err.is_err(), "expected primary key violation");
+}
+
+#[tokio::test]
+async fn test_alter_table_add_primary_key_rejects_second_pk() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t_pk2 (id INT PRIMARY KEY, name TEXT)").await;
+
+    // Adding a second PK should fail.
+    let err = ex.execute("ALTER TABLE t_pk2 ADD CONSTRAINT pk2 PRIMARY KEY (name)").await;
+    assert!(err.is_err(), "should reject second PRIMARY KEY");
+    let msg = format!("{}", err.unwrap_err());
+    assert!(msg.contains("already has a PRIMARY KEY"), "error should mention existing PK: {msg}");
+}
+
+#[tokio::test]
+async fn test_alter_table_drop_constraint() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t_dc1 (id INT, email TEXT)").await;
+    exec(&ex, "ALTER TABLE t_dc1 ADD CONSTRAINT uq_email2 UNIQUE (email)").await;
+    exec(&ex, "INSERT INTO t_dc1 VALUES (1, 'a@b.com')").await;
+
+    // Drop the constraint.
+    let r = exec(&ex, "ALTER TABLE t_dc1 DROP CONSTRAINT uq_email2").await;
+    match &r[0] {
+        ExecResult::Command { tag, .. } => assert_eq!(tag, "ALTER TABLE"),
+        _ => panic!("expected Command"),
+    }
+}
+
+#[tokio::test]
+async fn test_alter_table_drop_constraint_not_found() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t_dc2 (id INT)").await;
+
+    // Drop nonexistent should fail.
+    let err = ex.execute("ALTER TABLE t_dc2 DROP CONSTRAINT no_such").await;
+    assert!(err.is_err(), "should fail for nonexistent constraint");
+}
+
+#[tokio::test]
+async fn test_alter_table_drop_constraint_if_exists() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t_dc3 (id INT)").await;
+
+    // DROP CONSTRAINT IF EXISTS should succeed silently.
+    let r = exec(&ex, "ALTER TABLE t_dc3 DROP CONSTRAINT IF EXISTS no_such").await;
+    match &r[0] {
+        ExecResult::Command { tag, .. } => assert_eq!(tag, "ALTER TABLE"),
+        _ => panic!("expected Command"),
+    }
+}
+
+#[tokio::test]
+async fn test_alter_table_drop_check_constraint() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t_dc4 (id INT, val INT)").await;
+    exec(&ex, "ALTER TABLE t_dc4 ADD CONSTRAINT ck_val CHECK (val > 0)").await;
+
+    // The check is enforced.
+    let err = ex.execute("INSERT INTO t_dc4 VALUES (1, -1)").await;
+    assert!(err.is_err());
+
+    // Drop the check constraint.
+    exec(&ex, "ALTER TABLE t_dc4 DROP CONSTRAINT ck_val").await;
+
+    // Now the insert should succeed.
+    exec(&ex, "INSERT INTO t_dc4 VALUES (1, -1)").await;
+    let r = exec(&ex, "SELECT val FROM t_dc4 WHERE id = 1").await;
+    if let ExecResult::Select { rows, .. } = &r[0] {
+        // Value may be Int32 or Int64 depending on literal parsing; check the numeric value.
+        match &rows[0][0] {
+            Value::Int32(v) => assert_eq!(*v, -1),
+            Value::Int64(v) => assert_eq!(*v, -1),
+            other => panic!("expected integer, got: {other:?}"),
+        }
+    } else {
+        panic!("expected select");
+    }
+}
+
+#[tokio::test]
+async fn test_alter_table_add_constraint_nonexistent_column() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t_ac1 (id INT)").await;
+
+    // Adding UNIQUE on nonexistent column should fail.
+    let err = ex.execute("ALTER TABLE t_ac1 ADD CONSTRAINT uq_bad UNIQUE (nope)").await;
+    assert!(err.is_err(), "should fail for nonexistent column");
+    let msg = format!("{}", err.unwrap_err());
+    assert!(msg.contains("nope"), "error should mention column name: {msg}");
 }
 
 // ======================================================================
