@@ -127,7 +127,6 @@ pub trait StorageEngine: Send + Sync {
             .into_iter()
             .enumerate()
             .filter(|(_, row)| row.get(col_idx).is_some_and(|v| v == value))
-            .map(|(pos, row)| (pos, row))
             .collect())
     }
 

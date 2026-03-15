@@ -263,7 +263,7 @@ impl Database {
     /// - Without `sync()` calls: equivalent to `NORMAL` (default)
     /// - With `sync()` after writes: equivalent to `FULL`
     pub fn sync(&self) -> Result<(), ExecError> {
-        self._storage.sync().map_err(|e| ExecError::Storage(e))
+        self._storage.sync().map_err(ExecError::Storage)
     }
 
     /// Cleanly shut down the database, releasing all resources.
