@@ -46,3 +46,5 @@ mod test_cross_model;
 mod test_meta_persistence;
 mod test_specialty_persistence;
 mod test_module_wiring;
+mod test_filter_lazy;  // Phase 2C: Lazy materialization for WHERE clause filtering
+mod test_e2e_smoke;    // End-to-end smoke tests exercising all Nucleus capabilities

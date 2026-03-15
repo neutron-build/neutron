@@ -9,6 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use dashmap::DashMap;
+
 use sqlparser::ast::{self, Expr, SetExpr, Statement, TableFactor};
 use tokio::sync::RwLock;
 
@@ -53,6 +55,8 @@ use types::*;
 use schema_types::*;
 use helpers::*;
 pub use session::Session;
+pub use expr::FilterResult;  // Phase 2C: Lazy materialization for WHERE clause filtering
+pub use types::PreparedStmtHandle;
 use session::CURRENT_SESSION;
 
 /// The result of executing a statement.
@@ -116,10 +120,10 @@ pub struct Executor {
     /// In-memory cache tier with TTL and LRU eviction (Tier 3.6).
     cache: parking_lot::RwLock<CacheTier>,
     /// Live B-tree index mappings: (table_name, column_name) → index_name.
-    btree_indexes: parking_lot::RwLock<HashMap<(String, String), String>>,
+    btree_indexes: DashMap<(String, String), String>,
     /// In-memory hash indexes: (table_name, column_name) → HashIndex.
     #[cfg(feature = "server")]
-    hash_indexes: parking_lot::RwLock<HashMap<(String, String), crate::storage::btree::HashIndex>>,
+    hash_indexes: DashMap<(String, String), crate::storage::btree::HashIndex>,
     /// Sync cache of table column metadata: table_name → [(col_name, DataType)].
     table_columns: parking_lot::RwLock<HashMap<String, Vec<(String, DataType)>>>,
     /// Persistent statistics store populated by ANALYZE, used by EXPLAIN / query planner.
@@ -223,6 +227,10 @@ pub struct Executor {
     /// can skip the expensive `query.to_string()` + `normalize_sql_for_cache()`.
     /// Race-safe: a `None` just means we fall back to `to_string()`.
     plan_cache_key_hint: parking_lot::Mutex<Option<String>>,
+    /// Zone map index for granule-level pruning (Phase 2A).
+    /// Tracks min/max per column per 8K-row granule. Expected speedup: 5-10x on selective queries.
+    #[allow(dead_code)]
+    zone_map_index: crate::storage::granule_stats::ZoneMapIndex,
 }
 
 impl Executor {
@@ -274,9 +282,9 @@ impl Executor {
             metrics: Arc::new(MetricsRegistry::new()),
             advisor: parking_lot::RwLock::new(crate::advisor::IndexAdvisor::new()),
             cache: parking_lot::RwLock::new(CacheTier::new(64 * 1024 * 1024)), // 64 MB default
-            btree_indexes: parking_lot::RwLock::new(HashMap::new()),
+            btree_indexes: DashMap::new(),
             #[cfg(feature = "server")]
-            hash_indexes: parking_lot::RwLock::new(HashMap::new()),
+            hash_indexes: DashMap::new(),
             table_columns: parking_lot::RwLock::new(HashMap::new()),
             stats_store: Arc::new(planner::StatsStore::new()),
             #[cfg(feature = "server")]
@@ -337,6 +345,7 @@ impl Executor {
             plan_cache: parking_lot::RwLock::new(PlanCache::new(1024)),
             ast_cache: parking_lot::RwLock::new(AstCache::new(4096)),
             plan_cache_key_hint: parking_lot::Mutex::new(None),
+            zone_map_index: crate::storage::granule_stats::ZoneMapIndex::new(),
         }
     }
 
@@ -1213,6 +1222,22 @@ impl Executor {
             .unwrap_or_else(|_| self.default_session.clone())
     }
 
+    /// Take (consume) the plan cache key hint stored by `parse_with_ast_cache`.
+    /// Returns `Some(key)` if a hint was stored, `None` otherwise.
+    /// Used by the wire protocol handler to carry the normalized SQL key
+    /// from the Parse phase to the Execute phase for plan cache lookups.
+    pub fn take_plan_cache_key_hint(&self) -> Option<String> {
+        self.plan_cache_key_hint.lock().take()
+    }
+
+    /// Set the plan cache key hint for the next `execute_query` call.
+    /// Used by the wire protocol handler to pre-populate the hint before
+    /// executing pre-parsed statements, enabling plan cache reuse without
+    /// the expensive `query.to_string()` + `normalize_sql_for_cache()`.
+    pub fn set_plan_cache_key_hint(&self, key: String) {
+        *self.plan_cache_key_hint.lock() = Some(key);
+    }
+
     /// Execute SQL within a specific session's scope. This is the primary
     /// entry point for the wire protocol handler.
     #[cfg(feature = "server")]
@@ -1595,6 +1620,88 @@ impl Executor {
         self.execute_statement(stmt).await
     }
 
+    // ========================================================================
+    // Prepared statement API — skip parsing AND plan-cache key computation
+    // ========================================================================
+
+    /// Parse a SQL statement once and return a reusable handle.
+    ///
+    /// The handle caches the parsed AST and a pre-computed plan cache key.
+    /// Use `$1`, `$2`, etc. as parameter placeholders. Subsequent calls to
+    /// [`execute_prepared`] skip SQL parsing entirely and seed the plan cache
+    /// key hint so that query planning is also skipped on cache hit.
+    ///
+    /// Only single-statement SQL is supported (multi-statement SQL will error).
+    pub fn prepare(&self, sql: &str) -> Result<PreparedStmtHandle, ExecError> {
+        let stmts = crate::sql::parse(sql)
+            .map_err(ExecError::Parse)?;
+        if stmts.len() != 1 {
+            return Err(ExecError::Unsupported(
+                "prepare() requires exactly one SQL statement".into(),
+            ));
+        }
+        let ast = stmts.into_iter().next().unwrap();
+
+        // Pre-compute the normalized plan cache key so execute_prepared()
+        // can set the plan_cache_key_hint without re-serializing the AST.
+        let plan_cache_key = Self::normalize_sql_for_cache(sql);
+
+        // Count $N parameter placeholders in the SQL text.
+        let param_count = Self::count_placeholders(sql);
+
+        Ok(PreparedStmtHandle {
+            ast,
+            plan_cache_key,
+            param_count,
+        })
+    }
+
+    /// Execute a prepared statement with parameter values.
+    ///
+    /// Parameters replace `$1`, `$2`, etc. in the prepared SQL. Skips SQL
+    /// parsing entirely and seeds the plan cache key hint so that the query
+    /// planner's plan cache is hit without re-normalizing the SQL string.
+    pub async fn execute_prepared(
+        &self,
+        handle: &PreparedStmtHandle,
+        params: &[Value],
+    ) -> Result<ExecResult, ExecError> {
+        let mut ast = handle.ast.clone();
+        if !params.is_empty() {
+            param_subst::substitute_params_in_stmt(&mut ast, params);
+        }
+        // Seed the plan cache key hint so execute_query() can skip
+        // query.to_string() + normalize_sql_for_cache().
+        *self.plan_cache_key_hint.lock() = Some(handle.plan_cache_key.clone());
+        self.uncorrelated_subquery_cache.write().clear();
+        self.execute_statement(ast).await
+    }
+
+    /// Count `$N` parameter placeholders in SQL text. Returns the highest N found.
+    fn count_placeholders(sql: &str) -> usize {
+        let mut max_n: usize = 0;
+        let bytes = sql.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'$' {
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i > start
+                    && let Ok(n) = std::str::from_utf8(&bytes[start..i]).unwrap_or("0").parse::<usize>()
+                    && n > max_n
+                {
+                    max_n = n;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        max_n
+    }
+
     /// Case-insensitive prefix check without allocation.
     fn starts_with_ci(s: &str, prefix: &str) -> bool {
         s.len() >= prefix.len()
@@ -1602,6 +1709,124 @@ impl Executor {
                 .iter()
                 .zip(prefix.as_bytes())
                 .all(|(a, b)| a.to_ascii_uppercase() == *b)
+    }
+
+    /// SQL OLTP fast path: execute simple point queries/mutations directly
+    /// against the catalog and storage, bypassing SQL parsing and planning.
+    ///
+    /// Returns `None` if the command can't be executed on the fast path (e.g.
+    /// table not found, column not found, constraint issues), in which case
+    /// the caller should fall through to the normal SQL execution path.
+    pub async fn execute_sql_fast_path(
+        &self,
+        cmd: &crate::wire::kv_fast_path::SqlFastPathCommand,
+    ) -> Option<Result<ExecResult, ExecError>> {
+        use crate::wire::kv_fast_path::SqlFastPathCommand;
+
+        match cmd {
+            SqlFastPathCommand::PointSelect { table, where_col, where_val } => {
+                let table_def = self.catalog.get_table_cached(table)?;
+                let col_idx = table_def.column_index(where_col)?;
+                let search_val = where_val.to_value();
+                let storage = self.storage_for(table);
+                let rows = match storage.scan_where_eq_positions(table, col_idx, &search_val).await {
+                    Ok(matches) => matches.into_iter().map(|(_, row)| row).collect::<Vec<_>>(),
+                    Err(e) => return Some(Err(ExecError::Storage(e))),
+                };
+                let columns: Vec<(String, DataType)> = table_def
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.data_type.clone()))
+                    .collect();
+                Some(Ok(ExecResult::Select { columns, rows }))
+            }
+
+            SqlFastPathCommand::SimpleInsert { table, values } => {
+                let table_def = self.catalog.get_table_cached(table)?;
+                // Column count must match exactly for a simple VALUES insert.
+                if values.len() != table_def.columns.len() {
+                    return None; // Fall through to normal path for better error reporting.
+                }
+                let row: Vec<Value> = values.iter().map(|v| v.to_value()).collect();
+                let storage = self.storage_for(table);
+                match storage.insert(table, row).await {
+                    Ok(()) => Some(Ok(ExecResult::Command {
+                        tag: "INSERT 0 1".into(),
+                        rows_affected: 1,
+                    })),
+                    Err(e) => Some(Err(ExecError::Storage(e))),
+                }
+            }
+
+            SqlFastPathCommand::PointUpdate { table, assignments, where_col, where_val } => {
+                let table_def = self.catalog.get_table_cached(table)?;
+                let pk_idx = table_def.column_index(where_col)?;
+                // Resolve all assignment column indexes upfront. If any column
+                // is not found, fall through to normal path.
+                let mut col_updates: Vec<(usize, Value)> = Vec::with_capacity(assignments.len());
+                for (col_name, lit) in assignments {
+                    let idx = table_def.column_index(col_name)?;
+                    col_updates.push((idx, lit.to_value()));
+                }
+                let search_val = where_val.to_value();
+                let storage = self.storage_for(table);
+                let matches = match storage.scan_where_eq_positions(table, pk_idx, &search_val).await {
+                    Ok(m) => m,
+                    Err(e) => return Some(Err(ExecError::Storage(e))),
+                };
+                if matches.is_empty() {
+                    return Some(Ok(ExecResult::Command {
+                        tag: "UPDATE 0".into(),
+                        rows_affected: 0,
+                    }));
+                }
+                let updates: Vec<(usize, Vec<Value>)> = matches
+                    .into_iter()
+                    .map(|(pos, mut row)| {
+                        for (col_idx, val) in &col_updates {
+                            if *col_idx < row.len() {
+                                row[*col_idx] = val.clone();
+                            }
+                        }
+                        (pos, row)
+                    })
+                    .collect();
+                let count = match storage.update(table, &updates).await {
+                    Ok(n) => n,
+                    Err(e) => return Some(Err(ExecError::Storage(e))),
+                };
+                Some(Ok(ExecResult::Command {
+                    tag: format!("UPDATE {count}"),
+                    rows_affected: count,
+                }))
+            }
+
+            SqlFastPathCommand::PointDelete { table, where_col, where_val } => {
+                let table_def = self.catalog.get_table_cached(table)?;
+                let col_idx = table_def.column_index(where_col)?;
+                let search_val = where_val.to_value();
+                let storage = self.storage_for(table);
+                let matches = match storage.scan_where_eq_positions(table, col_idx, &search_val).await {
+                    Ok(m) => m,
+                    Err(e) => return Some(Err(ExecError::Storage(e))),
+                };
+                if matches.is_empty() {
+                    return Some(Ok(ExecResult::Command {
+                        tag: "DELETE 0".into(),
+                        rows_affected: 0,
+                    }));
+                }
+                let positions: Vec<usize> = matches.into_iter().map(|(pos, _)| pos).collect();
+                let count = match storage.delete(table, &positions).await {
+                    Ok(n) => n,
+                    Err(e) => return Some(Err(ExecError::Storage(e))),
+                };
+                Some(Ok(ExecResult::Command {
+                    tag: format!("DELETE {count}"),
+                    rows_affected: count,
+                }))
+            }
+        }
     }
 
     pub fn execute<'a>(&'a self, sql: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>> {
@@ -1912,8 +2137,51 @@ impl Executor {
         };
         let start = std::time::Instant::now();
 
+        // Track whether this is a DML write operation that should invalidate query cache.
+        let is_dml_write = matches!(
+            &stmt,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) | Statement::Truncate(_)
+        );
+
+        // Track whether this is a transaction control statement that should
+        // invalidate the query cache (ROLLBACK reverts data; BEGIN/COMMIT
+        // change visibility boundaries).
+        let is_txn_control = matches!(
+            &stmt,
+            Statement::StartTransaction { .. } | Statement::Commit { .. } | Statement::Rollback { .. }
+        );
+
+        // Check if we're inside an active transaction. If so, skip query
+        // result caching entirely — transaction-local writes may not be
+        // visible to other sessions and ROLLBACK can revert them.
+        let in_txn = {
+            let sess = self.current_session();
+            sess.txn_state.try_read().map(|t| t.active).unwrap_or(false)
+        };
+
         let result = match stmt {
-            Statement::Query(query) => self.execute_query(*query).await,
+            Statement::Query(query) => {
+                // Query result cache: check for a cached result before executing.
+                // Only cache deterministic SELECT queries (no RANDOM(), NOW(), etc.)
+                // and only outside of transactions.
+                let sql_text = query.to_string();
+                let cacheable = !in_txn && Self::query_result_is_cacheable(&sql_text);
+                if cacheable {
+                    if let Some(cached) = self.query_cache_get(&sql_text) {
+                        self.metrics.cache_hits.inc();
+                        return Ok(cached);
+                    }
+                    self.metrics.cache_misses.inc();
+                }
+                let result = self.execute_query(*query).await;
+                // Store successful SELECT results in the cache
+                if cacheable {
+                    if let Ok(ExecResult::Select { ref columns, ref rows }) = result {
+                        self.query_cache_put(&sql_text, columns, rows);
+                    }
+                }
+                result
+            }
             Statement::CreateTable(create) => self.execute_create_table(create).await,
             Statement::Insert(insert) => self.execute_insert(insert).await,
             Statement::Update(update) => self.execute_update(update).await,
@@ -2146,12 +2414,28 @@ impl Executor {
             }
         }
 
+        // Invalidate query result cache after any successful write operation
+        // (INSERT/UPDATE/DELETE/TRUNCATE) to ensure cached SELECTs don't
+        // return stale data.
+        if is_dml_write && result.is_ok() {
+            self.query_cache_invalidate_all();
+        }
+
+        // Invalidate query result cache on transaction control statements.
+        // ROLLBACK reverts data changes, so cached results from within the
+        // transaction would be stale. BEGIN/COMMIT clear the cache to avoid
+        // cross-transaction staleness.
+        if is_txn_control && result.is_ok() {
+            self.query_cache_invalidate_all();
+        }
+
         // Persist catalog to disk after successful DDL operations.
-        // Also invalidate the plan cache since DDL changes may affect
-        // query plans (new/dropped tables, indexes, columns).
+        // Also invalidate the plan cache and query result cache since DDL
+        // changes may affect query plans and cached results.
         if is_ddl && result.is_ok() {
             self.plan_cache.write().clear();
             self.ast_cache.write().clear();
+            self.query_cache_invalidate_all();
             #[cfg(feature = "server")]
             self.persist_catalog().await;
         }

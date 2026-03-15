@@ -41,6 +41,8 @@ pub mod versioning;
 #[cfg(feature = "server")]
 pub mod background;
 #[cfg(feature = "server")]
+pub mod binary_wire;
+#[cfg(feature = "server")]
 pub mod cli;
 #[cfg(feature = "server")]
 pub mod distributed;

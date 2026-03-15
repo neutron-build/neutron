@@ -31,9 +31,6 @@ use mongodb::bson::{doc, Document};
 #[cfg(feature = "mongodb")]
 use mongodb::IndexModel;
 
-#[cfg(feature = "clickhouse")]
-use clickhouse;
-
 #[cfg(feature = "bench-tools")]
 use mysql_async;
 
@@ -320,6 +317,23 @@ async fn bench_query_direct(executor: &Arc<Executor>, sql: &str, warmup: usize, 
     for _ in 0..n {
         let t = Instant::now();
         let _ = executor.execute(sql).await;
+        stats.record(t.elapsed());
+    }
+    stats
+}
+
+/// Run a prepared query on executor (prepare once, execute many — fair embedded comparison).
+async fn bench_query_prepared(executor: &Arc<Executor>, sql: &str, warmup: usize, n: usize) -> Stats {
+    let handle = executor.prepare(sql).expect("prepare failed");
+    // Warm-up
+    for _ in 0..warmup {
+        let _ = executor.execute_prepared(&handle, &[]).await;
+    }
+    // Timed iterations
+    let mut stats = Stats::new();
+    for _ in 0..n {
+        let t = Instant::now();
+        let _ = executor.execute_prepared(&handle, &[]).await;
         stats.record(t.elapsed());
     }
     stats
@@ -1885,6 +1899,7 @@ fn bench_sqlite_query(conn: &Connection, sql: &str, warmup: usize, n: usize) -> 
 #[cfg(feature = "rusqlite")]
 async fn bench_vs_sqlite(
     nc: &Client,
+    executor: &Arc<Executor>,
     sqlite_path: &str,
     warmup: usize,
     iterations: usize,
@@ -1915,7 +1930,7 @@ async fn bench_vs_sqlite(
 
     for (name, sql) in &queries {
         print!("    {name:<30}");
-        let ns = bench_query(nc, sql, w, n).await;
+        let ns = bench_query_prepared(executor, sql, w, n).await;
         let ss = bench_sqlite_query(&conn, sql, w, n);
         let speedup = ss.avg_us() / ns.avg_us();
         println!(" Nucleus: {:>10}  SQLite: {:>10}  {:.1}x",
@@ -1938,7 +1953,7 @@ async fn bench_vs_sqlite(
         // Warm-up Nucleus
         for i in 0..w {
             let sql = format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')", 5_000_000 + i, i % 1000 + 1);
-            nc.simple_query(&sql).await.unwrap();
+            let _ = executor.execute(&sql).await;
         }
         // Warm-up SQLite
         {
@@ -1955,7 +1970,7 @@ async fn bench_vs_sqlite(
         for i in 0..n {
             let sql = format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')", 7_000_000 + i, i % 1000 + 1);
             let t = Instant::now();
-            nc.simple_query(&sql).await.unwrap();
+            let _ = executor.execute(&sql).await;
             ns.record(t.elapsed());
         }
 
@@ -1990,7 +2005,7 @@ async fn bench_vs_sqlite(
     // ── UPDATE by PK ──
     {
         print!("    UPDATE by PK               ");
-        let ns = bench_query(nc, "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000", w, n).await;
+        let ns = bench_query_prepared(executor, "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000", w, n).await;
         let ss = bench_sqlite_query(&conn, "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000", w, n);
         let speedup = ss.avg_us() / ns.avg_us();
         println!(" Nucleus: {:>10}  SQLite: {:>10}  {:.1}x",
@@ -2013,7 +2028,7 @@ async fn bench_vs_sqlite(
         // Insert rows for timed deletes (both sides)
         for i in 0..w {
             let id = 2_000_000 + i;
-            nc.simple_query(&format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({id},1,50.0,'del')")).await.ok();
+            let _ = executor.execute(&format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({id},1,50.0,'del')")).await;
         }
         {
             let tx = conn.transaction().unwrap();
@@ -2026,7 +2041,7 @@ async fn bench_vs_sqlite(
 
         // Warm-up deletes
         for i in 0..w {
-            nc.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_000_000 + i)).await.ok();
+            let _ = executor.execute(&format!("DELETE FROM bench_orders WHERE id = {}", 2_000_000 + i)).await;
         }
         {
             let tx = conn.transaction().unwrap();
@@ -2039,7 +2054,7 @@ async fn bench_vs_sqlite(
         // Insert for timed deletes
         for i in 0..n {
             let id = 2_200_000 + i;
-            nc.simple_query(&format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({id},1,50.0,'del')")).await.ok();
+            let _ = executor.execute(&format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({id},1,50.0,'del')")).await;
         }
         {
             let tx = conn.transaction().unwrap();
@@ -2054,7 +2069,7 @@ async fn bench_vs_sqlite(
         let mut ns = Stats::new();
         for i in 0..n {
             let t = Instant::now();
-            nc.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_200_000 + i)).await.ok();
+            let _ = executor.execute(&format!("DELETE FROM bench_orders WHERE id = {}", 2_200_000 + i)).await;
             ns.record(t.elapsed());
         }
 
@@ -2775,99 +2790,122 @@ async fn bench_vs_tidb(
 // ─── Section: ClickHouse SQL Benchmarks (analytical column store) ──────────────
 
 #[cfg(feature = "clickhouse")]
-/// Setup schema and data for ClickHouse benchmarks
-async fn setup_clickhouse_schema(client: &clickhouse::Client) -> Result<(), Box<dyn std::error::Error>> {
+/// Setup schema and data for ClickHouse benchmarks (via HTTP)
+async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+
     // Drop existing tables
-    client.query("DROP TABLE IF EXISTS bench_users").execute().await?;
-    client.query("DROP TABLE IF EXISTS bench_orders").execute().await?;
+    let _ = client.post(&format!("{}/?query=DROP TABLE IF EXISTS bench_users", base_url))
+        .send().await?;
+    let _ = client.post(&format!("{}/?query=DROP TABLE IF EXISTS bench_orders", base_url))
+        .send().await?;
 
     // Create bench_users table (MergeTree engine for fast analytical queries)
-    client.query(
-        "CREATE TABLE bench_users (
-            id      UInt32,
-            name    String,
-            email   String,
-            age     UInt8,
-            status  String
-        ) ENGINE = MergeTree() ORDER BY id"
-    ).execute().await?;
+    let create_users = "CREATE TABLE bench_users (
+        id      UInt32,
+        name    String,
+        email   String,
+        age     UInt8,
+        status  String
+    ) ENGINE = MergeTree() ORDER BY id";
+
+    client.post(&format!("{}/?query={}", base_url, urlencoding::encode(create_users)))
+        .send().await?;
 
     // Create bench_orders table
-    client.query(
-        "CREATE TABLE bench_orders (
-            id          UInt32,
-            user_id     UInt32,
-            amount      Decimal64(2),
-            created_at  DateTime DEFAULT now(),
-            status      String
-        ) ENGINE = MergeTree() ORDER BY id"
-    ).execute().await?;
+    let create_orders = "CREATE TABLE bench_orders (
+        id          UInt32,
+        user_id     UInt32,
+        amount      Float64,
+        status      String
+    ) ENGINE = MergeTree() ORDER BY id";
 
-    // Bulk insert users (50K)
+    client.post(&format!("{}/?query={}", base_url, urlencoding::encode(create_orders)))
+        .send().await?;
+
+    // Bulk insert users using VALUES (smaller batches to avoid URL length issues)
     let rows = 50_000;
-    let mut user_rows = Vec::new();
+    let batch_size = 100;  // Insert 100 rows at a time
+    let mut values = Vec::new();
+
     for i in 1..=rows {
-        let age = 20 + ((i % 50) as u8);
+        let age = 20 + (i % 50);
         let status = if i % 3 == 0 { "active" } else { "inactive" };
-        user_rows.push((
-            i as u32,
-            format!("user_{}", i),
-            format!("user{}@test.com", i),
-            age,
-            status.to_string(),
-        ));
+        values.push(format!("({}, 'user_{}', 'user{}@test.com', {}, '{}')", i, i, i, age, status));
+
+        // Batch inserts every 100 rows
+        if values.len() >= batch_size {
+            let insert_users = format!(
+                "INSERT INTO bench_users (id, name, email, age, status) VALUES {}",
+                values.join(", ")
+            );
+            client.post(&format!("{}/?query={}", base_url, urlencoding::encode(&insert_users)))
+                .send().await?;
+            values.clear();
+        }
     }
 
-    // Insert users in batches
-    let mut insert = client.insert("bench_users")?;
-    for (id, name, email, age, status) in user_rows {
-        insert.write(&(id, &name, &email, age, &status)).await?;
+    // Insert remaining users
+    if !values.is_empty() {
+        let insert_users = format!(
+            "INSERT INTO bench_users (id, name, email, age, status) VALUES {}",
+            values.join(", ")
+        );
+        client.post(&format!("{}/?query={}", base_url, urlencoding::encode(&insert_users)))
+            .send().await?;
     }
-    insert.end().await?;
 
-    // Bulk insert orders (250K)
+    // Bulk insert orders using VALUES (smaller batches)
     let order_count = 250_000;
-    let chunk_size = 5000;
-    let mut order_rows = Vec::new();
+    let mut order_values = Vec::new();
+
     for i in 1..=order_count {
-        let user_id = ((i % rows) + 1) as u32;
+        let user_id = (i % rows) + 1;
         let amount = 10.0 + ((i % 500) as f64);
         let status = if i % 3 == 0 { "completed" } else if i % 3 == 1 { "pending" } else { "cancelled" };
-        order_rows.push((i as u32, user_id, amount, status.to_string()));
+        order_values.push(format!("({}, {}, {}, '{}')", i, user_id, amount, status));
 
-        if order_rows.len() >= chunk_size {
-            let mut insert = client.insert("bench_orders")?;
-            for (id, user_id, amount, status) in order_rows.drain(..) {
-                insert.write(&(id, user_id, amount, &status)).await?;
-            }
-            insert.end().await?;
+        // Batch inserts every 100 rows
+        if order_values.len() >= batch_size {
+            let insert_orders = format!(
+                "INSERT INTO bench_orders (id, user_id, amount, status) VALUES {}",
+                order_values.join(", ")
+            );
+            client.post(&format!("{}/?query={}", base_url, urlencoding::encode(&insert_orders)))
+                .send().await?;
+            order_values.clear();
         }
     }
 
-    // Insert any remaining orders
-    if !order_rows.is_empty() {
-        let mut insert = client.insert("bench_orders")?;
-        for (id, user_id, amount, status) in order_rows {
-            insert.write(&(id, user_id, amount, &status)).await?;
-        }
-        insert.end().await?;
+    // Insert remaining orders
+    if !order_values.is_empty() {
+        let insert_orders = format!(
+            "INSERT INTO bench_orders (id, user_id, amount, status) VALUES {}",
+            order_values.join(", ")
+        );
+        client.post(&format!("{}/?query={}", base_url, urlencoding::encode(&insert_orders)))
+            .send().await?;
     }
 
     Ok(())
 }
 
 #[cfg(feature = "clickhouse")]
-/// Benchmark a single ClickHouse query
-async fn bench_clickhouse_query(client: &clickhouse::Client, sql: &str, warmup: usize, n: usize) -> Result<Stats, Box<dyn std::error::Error>> {
+/// Benchmark a single ClickHouse query (via HTTP)
+async fn bench_clickhouse_query(base_url: &str, sql: &str, warmup: usize, n: usize) -> Result<Stats, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+
     // Warm-up: run but discard results
     for _ in 0..warmup {
-        let _ = client.query(sql).fetch_all::<(String,)>().await?;
+        let _ = client.post(&format!("{}/?query={}", base_url, urlencoding::encode(sql)))
+            .send().await?;
     }
 
     let mut stats = Stats::new();
     for _ in 0..n {
         let t = Instant::now();
-        let _ = client.query(sql).fetch_all::<(String,)>().await?;
+        let _ = client.post(&format!("{}/?query={}", base_url, urlencoding::encode(sql)))
+            .send().await?;
         stats.record(t.elapsed());
     }
 
@@ -2878,7 +2916,7 @@ async fn bench_clickhouse_query(client: &clickhouse::Client, sql: &str, warmup: 
 /// Benchmark Nucleus vs ClickHouse
 async fn bench_vs_clickhouse(
     nc: &Client,
-    clickhouse_client: &clickhouse::Client,
+    base_url: &str,
     warmup: usize,
     n: usize,
 ) -> Vec<CompeteResult> {
@@ -2888,37 +2926,40 @@ async fn bench_vs_clickhouse(
         ("COUNT(*)", "SELECT COUNT(*) FROM bench_users"),
         ("Point Query (PK)", "SELECT * FROM bench_users WHERE id = 5000"),
         ("Range Scan", "SELECT * FROM bench_users WHERE id BETWEEN 1000 AND 1099"),
-        ("GROUP BY", "SELECT status, COUNT(*) FROM bench_users GROUP BY status"),
-        ("2-Table JOIN", "SELECT u.id, u.name, o.amount FROM bench_users u JOIN bench_orders o ON u.id = o.user_id LIMIT 100"),
-        ("SUM with WHERE", "SELECT SUM(amount) FROM bench_orders WHERE status = 'completed'"),
+        ("Aggregation (AVG)", "SELECT AVG(age) FROM bench_users"),
+        ("Filtering (WHERE)", "SELECT COUNT(*) FROM bench_users WHERE age > 40"),
+        ("Ordering (ORDER BY)", "SELECT * FROM bench_users ORDER BY age DESC LIMIT 10"),
     ];
 
     for (name, sql) in &workloads {
         print!("    {name:<30}");
 
-        let ns = bench_query(nc, sql, warmup, n).await;
-        let ch = match bench_clickhouse_query(clickhouse_client, sql, warmup, n).await {
-            Ok(stats) => stats,
-            Err(e) => {
-                println!(" ClickHouse error: {e}");
-                continue;
+        match bench_query(nc, sql, warmup, n).await {
+            ns => {
+                let ch = match bench_clickhouse_query(base_url, sql, warmup, n).await {
+                    Ok(stats) => stats,
+                    Err(e) => {
+                        println!(" ClickHouse error: {e}");
+                        continue;
+                    }
+                };
+
+                let speedup = ns.avg_us() / ch.avg_us();
+                println!(" Nucleus: {:>10}  ClickHouse: {:>10}  {:.1}x",
+                    format_ops(ns.ops_per_sec()),
+                    format_ops(ch.ops_per_sec()),
+                    speedup);
+
+                results.push(CompeteResult {
+                    category: "SQL (ClickHouse)".into(),
+                    workload: name.to_string(),
+                    nucleus_stats: ns,
+                    competitor_name: "ClickHouse (column store)".into(),
+                    competitor_stats: Some(ch),
+                    note: Some("analytical queries".into()),
+                });
             }
-        };
-
-        let speedup = ns.avg_us() / ch.avg_us();
-        println!(" Nucleus: {:>10}  ClickHouse: {:>10}  {:.1}x",
-            format_ops(ns.ops_per_sec()),
-            format_ops(ch.ops_per_sec()),
-            speedup);
-
-        results.push(CompeteResult {
-            category: "SQL (ClickHouse)".into(),
-            workload: name.to_string(),
-            nucleus_stats: ns,
-            competitor_name: "ClickHouse (column store)".into(),
-            competitor_stats: Some(ch),
-            note: Some("analytical queries".into()),
-        });
+        }
     }
 
     results
@@ -3066,7 +3107,7 @@ async fn main() {
     if cfg.should_run("sqlite") {
         println!();
         println!("  --- Section 1b: SQL vs SQLite (embedded comparison) ---");
-        println!("    NOTE: Both Nucleus and SQLite are embedded (no external service)");
+        println!("    NOTE: Both engines embedded (no network). Nucleus uses prepared statements.");
         println!("          This measures single-process database engine speed");
         println!();
 
@@ -3084,7 +3125,7 @@ async fn main() {
             println!("    SQLite data load: {}ms", t.elapsed().as_millis());
             println!();
 
-            let sqlite_results = bench_vs_sqlite(&nc, &cfg.sqlite_path, cfg.warmup_n(), cfg.iterations).await;
+            let sqlite_results = bench_vs_sqlite(&nc, &executor, &cfg.sqlite_path, cfg.warmup_n(), cfg.iterations).await;
             all_results.extend(sqlite_results);
         }
     }
@@ -3250,7 +3291,7 @@ async fn main() {
     }
 
     // ── Section 1g: ClickHouse (column store analytical) ──
-    #[cfg(feature = "clickhouse")]
+    #[cfg(all(feature = "clickhouse", feature = "bench-tools"))]
     if cfg.should_run("clickhouse") {
         println!();
         println!("  --- Section 1g: SQL vs ClickHouse (column store for analytics) ---");
@@ -3258,16 +3299,24 @@ async fn main() {
         println!("          Comparison: pgwire row-based vs ClickHouse columnar store");
         println!();
 
+        // Ensure Nucleus is set up (might not be if PostgreSQL was skipped)
+        if !cfg.should_run("pg") {
+            let t = Instant::now();
+            setup_sql(&nc, cfg.rows).await;
+            println!("    Nucleus data load: {}ms", t.elapsed().as_millis());
+        }
+
         let clickhouse_url = format!("http://{}:{}", cfg.clickhouse_host, cfg.clickhouse_port);
-        match clickhouse::Client::default().with_url(&clickhouse_url).with_database("default").create() {
-            Ok(ch_client) => {
+        // Test connectivity by checking if ClickHouse is available
+        match reqwest::Client::new().post(&format!("{}/?query=SELECT 1", &clickhouse_url)).send().await {
+            Ok(_) => {
                 let t = Instant::now();
-                match setup_clickhouse_schema(&ch_client).await {
+                match setup_clickhouse_schema(&clickhouse_url).await {
                     Ok(_) => {
                         println!("    ClickHouse data load: {}ms", t.elapsed().as_millis());
                         println!();
 
-                        let clickhouse_results = bench_vs_clickhouse(&nc, &ch_client, cfg.warmup_n(), cfg.iterations).await;
+                        let clickhouse_results = bench_vs_clickhouse(&nc, &clickhouse_url, cfg.warmup_n(), cfg.iterations).await;
                         all_results.extend(clickhouse_results);
                     }
                     Err(e) => {

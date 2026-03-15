@@ -280,6 +280,395 @@ fn data_type_for_value(v: &Value) -> DataType {
 }
 
 // ============================================================================
+// SQL OLTP Fast Path
+// ============================================================================
+//
+// Intercepts the 4 most common OLTP SQL patterns before they hit the SQL parser,
+// eliminating ~900ns of parsing overhead per query. Non-matching queries fall
+// through with minimal overhead (a few byte comparisons).
+//
+// Patterns matched:
+//   SELECT * FROM table WHERE pk_col = value
+//   INSERT INTO table VALUES (v1, v2, ...)
+//   UPDATE table SET col = val, ... WHERE pk_col = value
+//   DELETE FROM table WHERE pk_col = value
+
+/// A parsed SQL OLTP command ready for direct execution.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlFastPathCommand {
+    /// `SELECT * FROM table WHERE pk = value`
+    PointSelect {
+        table: String,
+        where_col: String,
+        where_val: SqlLiteral,
+    },
+    /// `INSERT INTO table VALUES (v1, v2, ...)`
+    SimpleInsert {
+        table: String,
+        values: Vec<SqlLiteral>,
+    },
+    /// `UPDATE table SET col1 = val1, ... WHERE pk = value`
+    PointUpdate {
+        table: String,
+        assignments: Vec<(String, SqlLiteral)>,
+        where_col: String,
+        where_val: SqlLiteral,
+    },
+    /// `DELETE FROM table WHERE pk = value`
+    PointDelete {
+        table: String,
+        where_col: String,
+        where_val: SqlLiteral,
+    },
+}
+
+/// A literal value parsed from a SQL fast-path query.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlLiteral {
+    Null,
+    Integer(i64),
+    Float(f64),
+    Text(String),
+    Bool(bool),
+}
+
+impl SqlLiteral {
+    /// Convert to a Nucleus `Value`.
+    pub fn to_value(&self) -> Value {
+        match self {
+            SqlLiteral::Null => Value::Null,
+            SqlLiteral::Integer(n) => {
+                if *n >= i32::MIN as i64 && *n <= i32::MAX as i64 {
+                    Value::Int32(*n as i32)
+                } else {
+                    Value::Int64(*n)
+                }
+            }
+            SqlLiteral::Float(f) => Value::Float64(*f),
+            SqlLiteral::Text(s) => Value::Text(s.clone()),
+            SqlLiteral::Bool(b) => Value::Bool(*b),
+        }
+    }
+}
+
+/// Try to parse a query as a fast-path SQL OLTP command.
+///
+/// Returns `None` if the query doesn't match any supported pattern.
+/// Fast rejection uses a single first-byte check, so non-matching
+/// queries incur near-zero overhead.
+pub fn try_parse_sql_fast_path(query: &str) -> Option<SqlFastPathCommand> {
+    let trimmed = query.trim();
+    if trimmed.len() < 10 {
+        return None;
+    }
+
+    let first = trimmed.as_bytes()[0].to_ascii_uppercase();
+    match first {
+        b'S' => try_parse_point_select(trimmed),
+        b'I' => try_parse_simple_insert(trimmed),
+        b'U' => try_parse_point_update(trimmed),
+        b'D' => try_parse_point_delete(trimmed),
+        _ => None,
+    }
+}
+
+/// Parse: `SELECT * FROM table WHERE col = value`
+fn try_parse_point_select(s: &str) -> Option<SqlFastPathCommand> {
+    // SELECT
+    let rest = strip_prefix_ci(s, "SELECT")?;
+    let rest = skip_whitespace(rest);
+
+    // Must be `*`
+    let rest = rest.strip_prefix('*')?;
+    let rest = skip_whitespace(rest);
+
+    // FROM
+    let rest = strip_prefix_ci(rest, "FROM")?;
+    let rest = skip_whitespace(rest);
+
+    // table name
+    let (table, rest) = parse_identifier(rest)?;
+    let rest = skip_whitespace(rest);
+
+    // WHERE
+    let rest = strip_prefix_ci(rest, "WHERE")?;
+    let rest = skip_whitespace(rest);
+
+    // col = value
+    let (col, rest) = parse_identifier(rest)?;
+    let rest = skip_whitespace(rest);
+    let rest = rest.strip_prefix('=')?;
+    let rest = skip_whitespace(rest);
+    let (val, rest) = parse_sql_literal(rest)?;
+
+    if !is_end_of_query(rest) {
+        return None;
+    }
+
+    Some(SqlFastPathCommand::PointSelect {
+        table,
+        where_col: col,
+        where_val: val,
+    })
+}
+
+/// Parse: `INSERT INTO table VALUES (v1, v2, ...)`
+fn try_parse_simple_insert(s: &str) -> Option<SqlFastPathCommand> {
+    // INSERT
+    let rest = strip_prefix_ci(s, "INSERT")?;
+    let rest = skip_whitespace(rest);
+
+    // INTO
+    let rest = strip_prefix_ci(rest, "INTO")?;
+    let rest = skip_whitespace(rest);
+
+    // table name
+    let (table, rest) = parse_identifier(rest)?;
+    let rest = skip_whitespace(rest);
+
+    // VALUES
+    let rest = strip_prefix_ci(rest, "VALUES")?;
+    let rest = skip_whitespace(rest);
+
+    // Opening paren
+    let rest = rest.strip_prefix('(')?;
+
+    // Parse comma-separated values
+    let (values, rest) = parse_value_list(rest)?;
+
+    // Closing paren
+    let rest = skip_whitespace(rest);
+    let rest = rest.strip_prefix(')')?;
+
+    if !is_end_of_query(rest) {
+        return None;
+    }
+
+    Some(SqlFastPathCommand::SimpleInsert { table, values })
+}
+
+/// Parse: `UPDATE table SET col1 = val1, col2 = val2 WHERE pk = value`
+fn try_parse_point_update(s: &str) -> Option<SqlFastPathCommand> {
+    // UPDATE
+    let rest = strip_prefix_ci(s, "UPDATE")?;
+    let rest = skip_whitespace(rest);
+
+    // table name
+    let (table, rest) = parse_identifier(rest)?;
+    let rest = skip_whitespace(rest);
+
+    // SET
+    let rest = strip_prefix_ci(rest, "SET")?;
+    let rest = skip_whitespace(rest);
+
+    // Parse assignments: col = val [, col = val]*
+    let (assignments, rest) = parse_assignments(rest)?;
+
+    // WHERE
+    let rest = skip_whitespace(rest);
+    let rest = strip_prefix_ci(rest, "WHERE")?;
+    let rest = skip_whitespace(rest);
+
+    // col = value
+    let (where_col, rest) = parse_identifier(rest)?;
+    let rest = skip_whitespace(rest);
+    let rest = rest.strip_prefix('=')?;
+    let rest = skip_whitespace(rest);
+    let (where_val, rest) = parse_sql_literal(rest)?;
+
+    if !is_end_of_query(rest) {
+        return None;
+    }
+
+    Some(SqlFastPathCommand::PointUpdate {
+        table,
+        assignments,
+        where_col,
+        where_val,
+    })
+}
+
+/// Parse: `DELETE FROM table WHERE col = value`
+fn try_parse_point_delete(s: &str) -> Option<SqlFastPathCommand> {
+    // DELETE
+    let rest = strip_prefix_ci(s, "DELETE")?;
+    let rest = skip_whitespace(rest);
+
+    // FROM
+    let rest = strip_prefix_ci(rest, "FROM")?;
+    let rest = skip_whitespace(rest);
+
+    // table name
+    let (table, rest) = parse_identifier(rest)?;
+    let rest = skip_whitespace(rest);
+
+    // WHERE
+    let rest = strip_prefix_ci(rest, "WHERE")?;
+    let rest = skip_whitespace(rest);
+
+    // col = value
+    let (col, rest) = parse_identifier(rest)?;
+    let rest = skip_whitespace(rest);
+    let rest = rest.strip_prefix('=')?;
+    let rest = skip_whitespace(rest);
+    let (val, rest) = parse_sql_literal(rest)?;
+
+    if !is_end_of_query(rest) {
+        return None;
+    }
+
+    Some(SqlFastPathCommand::PointDelete {
+        table,
+        where_col: col,
+        where_val: val,
+    })
+}
+
+/// Parse an unquoted or double-quoted SQL identifier, returned lowercased.
+fn parse_identifier(s: &str) -> Option<(String, &str)> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    // Double-quoted identifier
+    if bytes[0] == b'"' {
+        let mut name = String::new();
+        let mut i = 1;
+        while i < bytes.len() {
+            if bytes[i] == b'"' {
+                // Escaped double-quote ""
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    name.push('"');
+                    i += 2;
+                } else {
+                    return Some((name, &s[i + 1..]));
+                }
+            } else {
+                name.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        return None; // unterminated quote
+    }
+
+    // Unquoted identifier: [a-zA-Z_][a-zA-Z0-9_]*
+    if !bytes[0].is_ascii_alphabetic() && bytes[0] != b'_' {
+        return None;
+    }
+    let mut i = 1;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    // SQL identifiers are case-insensitive; normalize to lowercase.
+    let name = s[..i].to_ascii_lowercase();
+    Some((name, &s[i..]))
+}
+
+/// Parse a SQL literal: integer, float, string, NULL, TRUE, FALSE.
+fn parse_sql_literal(s: &str) -> Option<(SqlLiteral, &str)> {
+    let s = skip_whitespace(s);
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    // NULL
+    if let Some(rest) = strip_prefix_ci(s, "NULL") {
+        // Make sure NULL is not a prefix of an identifier
+        if rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric() {
+            return Some((SqlLiteral::Null, rest));
+        }
+    }
+
+    // TRUE / FALSE
+    if let Some(rest) = strip_prefix_ci(s, "TRUE") {
+        if rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric() {
+            return Some((SqlLiteral::Bool(true), rest));
+        }
+    }
+    if let Some(rest) = strip_prefix_ci(s, "FALSE") {
+        if rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric() {
+            return Some((SqlLiteral::Bool(false), rest));
+        }
+    }
+
+    // String literal
+    if bytes[0] == b'\'' {
+        let (text, rest) = parse_quoted_string(s)?;
+        return Some((SqlLiteral::Text(text), rest));
+    }
+
+    // Numeric: [+-]?[0-9]+ or [+-]?[0-9]+.[0-9]+
+    if bytes[0].is_ascii_digit() || ((bytes[0] == b'-' || bytes[0] == b'+') && bytes.len() > 1 && bytes[1].is_ascii_digit()) {
+        let mut i = 0;
+        if bytes[0] == b'-' || bytes[0] == b'+' {
+            i = 1;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        // Check for decimal point
+        if i < bytes.len() && bytes[i] == b'.' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let f: f64 = s[..i].parse().ok()?;
+            return Some((SqlLiteral::Float(f), &s[i..]));
+        }
+        let n: i64 = s[..i].parse().ok()?;
+        return Some((SqlLiteral::Integer(n), &s[i..]));
+    }
+
+    None
+}
+
+/// Parse a comma-separated list of SQL literals (inside parentheses).
+fn parse_value_list(s: &str) -> Option<(Vec<SqlLiteral>, &str)> {
+    let mut values = Vec::new();
+    let mut rest = skip_whitespace(s);
+
+    // First value
+    let (val, r) = parse_sql_literal(rest)?;
+    values.push(val);
+    rest = skip_whitespace(r);
+
+    // Subsequent values
+    while let Some(r) = rest.strip_prefix(',') {
+        rest = skip_whitespace(r);
+        let (val, r) = parse_sql_literal(rest)?;
+        values.push(val);
+        rest = skip_whitespace(r);
+    }
+
+    Some((values, rest))
+}
+
+/// Parse SET assignments: `col = val [, col = val]*`
+fn parse_assignments(s: &str) -> Option<(Vec<(String, SqlLiteral)>, &str)> {
+    let mut assignments = Vec::new();
+    let mut rest = s;
+
+    loop {
+        let (col, r) = parse_identifier(rest)?;
+        let r = skip_whitespace(r);
+        let r = r.strip_prefix('=')?;
+        let r = skip_whitespace(r);
+        let (val, r) = parse_sql_literal(r)?;
+        assignments.push((col, val));
+        let r = skip_whitespace(r);
+
+        // Check for comma (more assignments) vs WHERE (end of SET clause)
+        if let Some(after_comma) = r.strip_prefix(',') {
+            rest = skip_whitespace(after_comma);
+        } else {
+            return Some((assignments, r));
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -538,5 +927,180 @@ mod tests {
             }
             _ => panic!("expected Select"),
         }
+    }
+
+    // ====================================================================
+    // SQL fast-path parsing tests
+    // ====================================================================
+
+    #[test]
+    fn sql_fp_point_select() {
+        let cmd = try_parse_sql_fast_path("SELECT * FROM users WHERE id = 42").unwrap();
+        assert_eq!(
+            cmd,
+            SqlFastPathCommand::PointSelect {
+                table: "users".into(),
+                where_col: "id".into(),
+                where_val: SqlLiteral::Integer(42),
+            }
+        );
+    }
+
+    #[test]
+    fn sql_fp_point_select_string_pk() {
+        let cmd = try_parse_sql_fast_path("SELECT * FROM users WHERE email = 'alice@example.com'").unwrap();
+        assert_eq!(
+            cmd,
+            SqlFastPathCommand::PointSelect {
+                table: "users".into(),
+                where_col: "email".into(),
+                where_val: SqlLiteral::Text("alice@example.com".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn sql_fp_point_select_case_insensitive() {
+        let cmd = try_parse_sql_fast_path("select * from Users where ID = 1").unwrap();
+        assert_eq!(
+            cmd,
+            SqlFastPathCommand::PointSelect {
+                table: "users".into(),
+                where_col: "id".into(),
+                where_val: SqlLiteral::Integer(1),
+            }
+        );
+    }
+
+    #[test]
+    fn sql_fp_point_select_semicolon() {
+        assert!(try_parse_sql_fast_path("SELECT * FROM t WHERE id = 1;").is_some());
+    }
+
+    #[test]
+    fn sql_fp_simple_insert() {
+        let cmd = try_parse_sql_fast_path("INSERT INTO users VALUES (1, 'alice', TRUE)").unwrap();
+        assert_eq!(
+            cmd,
+            SqlFastPathCommand::SimpleInsert {
+                table: "users".into(),
+                values: vec![
+                    SqlLiteral::Integer(1),
+                    SqlLiteral::Text("alice".into()),
+                    SqlLiteral::Bool(true),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn sql_fp_insert_null() {
+        let cmd = try_parse_sql_fast_path("INSERT INTO t VALUES (NULL, 1)").unwrap();
+        assert_eq!(
+            cmd,
+            SqlFastPathCommand::SimpleInsert {
+                table: "t".into(),
+                values: vec![SqlLiteral::Null, SqlLiteral::Integer(1)],
+            }
+        );
+    }
+
+    #[test]
+    fn sql_fp_insert_float() {
+        let cmd = try_parse_sql_fast_path("INSERT INTO t VALUES (3.14)").unwrap();
+        assert_eq!(
+            cmd,
+            SqlFastPathCommand::SimpleInsert {
+                table: "t".into(),
+                values: vec![SqlLiteral::Float(3.14)],
+            }
+        );
+    }
+
+    #[test]
+    fn sql_fp_point_update() {
+        let cmd = try_parse_sql_fast_path("UPDATE users SET name = 'bob', age = 30 WHERE id = 1").unwrap();
+        assert_eq!(
+            cmd,
+            SqlFastPathCommand::PointUpdate {
+                table: "users".into(),
+                assignments: vec![
+                    ("name".into(), SqlLiteral::Text("bob".into())),
+                    ("age".into(), SqlLiteral::Integer(30)),
+                ],
+                where_col: "id".into(),
+                where_val: SqlLiteral::Integer(1),
+            }
+        );
+    }
+
+    #[test]
+    fn sql_fp_point_delete() {
+        let cmd = try_parse_sql_fast_path("DELETE FROM users WHERE id = 42").unwrap();
+        assert_eq!(
+            cmd,
+            SqlFastPathCommand::PointDelete {
+                table: "users".into(),
+                where_col: "id".into(),
+                where_val: SqlLiteral::Integer(42),
+            }
+        );
+    }
+
+    #[test]
+    fn sql_fp_non_matching_falls_through() {
+        // Multi-column WHERE
+        assert!(try_parse_sql_fast_path("SELECT * FROM t WHERE a = 1 AND b = 2").is_none());
+        // SELECT with specific columns
+        assert!(try_parse_sql_fast_path("SELECT id FROM t WHERE id = 1").is_none());
+        // INSERT with column list
+        assert!(try_parse_sql_fast_path("INSERT INTO t (a, b) VALUES (1, 2)").is_none());
+        // UPDATE without WHERE
+        assert!(try_parse_sql_fast_path("UPDATE t SET x = 1").is_none());
+        // DELETE without WHERE
+        assert!(try_parse_sql_fast_path("DELETE FROM t").is_none());
+        // JOIN
+        assert!(try_parse_sql_fast_path("SELECT * FROM a JOIN b ON a.id = b.id").is_none());
+        // Subquery
+        assert!(try_parse_sql_fast_path("SELECT * FROM (SELECT 1)").is_none());
+        // Empty
+        assert!(try_parse_sql_fast_path("").is_none());
+    }
+
+    #[test]
+    fn sql_fp_negative_integer() {
+        let cmd = try_parse_sql_fast_path("SELECT * FROM t WHERE id = -1").unwrap();
+        assert_eq!(
+            cmd,
+            SqlFastPathCommand::PointSelect {
+                table: "t".into(),
+                where_col: "id".into(),
+                where_val: SqlLiteral::Integer(-1),
+            }
+        );
+    }
+
+    #[test]
+    fn sql_fp_whitespace_variations() {
+        // Extra whitespace everywhere
+        let cmd = try_parse_sql_fast_path("  SELECT  *  FROM  t  WHERE  id  =  1  ;  ").unwrap();
+        assert_eq!(
+            cmd,
+            SqlFastPathCommand::PointSelect {
+                table: "t".into(),
+                where_col: "id".into(),
+                where_val: SqlLiteral::Integer(1),
+            }
+        );
+    }
+
+    #[test]
+    fn sql_fp_literal_to_value() {
+        assert_eq!(SqlLiteral::Null.to_value(), Value::Null);
+        assert_eq!(SqlLiteral::Integer(42).to_value(), Value::Int32(42));
+        assert_eq!(SqlLiteral::Integer(i64::MAX).to_value(), Value::Int64(i64::MAX));
+        assert_eq!(SqlLiteral::Float(3.14).to_value(), Value::Float64(3.14));
+        assert_eq!(SqlLiteral::Text("hi".into()).to_value(), Value::Text("hi".into()));
+        assert_eq!(SqlLiteral::Bool(true).to_value(), Value::Bool(true));
     }
 }

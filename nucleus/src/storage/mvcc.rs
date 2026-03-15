@@ -1879,6 +1879,43 @@ impl StorageEngine for MvccStorageAdapter {
         }
     }
 
+    fn index_only_scan(
+        &self,
+        table: &str,
+        index_name: &str,
+        eq_value: Option<&Value>,
+        range: Option<(&Value, &Value)>,
+    ) -> Option<Vec<Row>> {
+        // If inside an explicit transaction that has modified this table,
+        // the index may be stale — fall back to None (caller does full scan).
+        let sess = self.mvcc_session();
+        if sess.session_txn.read().is_some() && sess.dirty_tables.read().contains(table) {
+            return None;
+        }
+        let indexes = self.indexes.read();
+        let idx = indexes.get(index_name)?;
+        if let Some(val) = eq_value {
+            let entries = idx.map.get(val)?;
+            Some(entries.values().map(|_| vec![val.clone()]).collect())
+        } else if let Some((low, high)) = range {
+            let mut rows = Vec::new();
+            for (key, entries) in idx.map.range(low..=high) {
+                for _ in entries.values() {
+                    rows.push(vec![key.clone()]);
+                }
+            }
+            Some(rows)
+        } else {
+            let mut rows = Vec::new();
+            for (key, entries) in &idx.map {
+                for _ in entries.values() {
+                    rows.push(vec![key.clone()]);
+                }
+            }
+            Some(rows)
+        }
+    }
+
     fn supports_mvcc(&self) -> bool {
         true
     }

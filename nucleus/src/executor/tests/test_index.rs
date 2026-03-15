@@ -1099,3 +1099,121 @@ async fn test_simd_plan_filter_node() {
     // amount > 1000 → ids 11..=20
     assert_eq!(ids, (11..=20).collect::<Vec<_>>());
 }
+
+// ================================================================
+// Index-only scan tests
+// ================================================================
+
+/// Index-only scan: SELECT only the indexed column with equality WHERE.
+/// Should return results from the index without scanning the table.
+#[tokio::test]
+async fn test_index_only_scan_equality() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE ios_eq (id INT, name TEXT)").await;
+    for i in 1..=10i32 {
+        exec(&ex, &format!("INSERT INTO ios_eq VALUES ({i}, 'user_{i}')")).await;
+    }
+    exec(&ex, "CREATE INDEX idx_ios_eq_id ON ios_eq (id)").await;
+
+    // SELECT only the indexed column with equality predicate
+    let results = exec(&ex, "SELECT id FROM ios_eq WHERE id = 5").await;
+    let r = rows(&results[0]);
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Int32(5));
+}
+
+/// Index-only scan: SELECT only the indexed column with BETWEEN.
+#[tokio::test]
+async fn test_index_only_scan_between() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE ios_bt (id INT, val TEXT)").await;
+    for i in 1..=20i32 {
+        exec(&ex, &format!("INSERT INTO ios_bt VALUES ({i}, 'v{i}')")).await;
+    }
+    exec(&ex, "CREATE INDEX idx_ios_bt_id ON ios_bt (id)").await;
+
+    let results = exec(&ex, "SELECT id FROM ios_bt WHERE id BETWEEN 5 AND 10").await;
+    let vals: Vec<i32> = rows(&results[0]).iter().map(|r| match &r[0] {
+        Value::Int32(n) => *n,
+        other => panic!("expected i32, got {other:?}"),
+    }).collect();
+    assert_eq!(vals, vec![5, 6, 7, 8, 9, 10]);
+}
+
+/// Index-only scan: full index scan (no WHERE) returns all indexed values.
+#[tokio::test]
+async fn test_index_only_scan_full() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE ios_full (id INT, extra TEXT)").await;
+    for i in 1..=5i32 {
+        exec(&ex, &format!("INSERT INTO ios_full VALUES ({i}, 'x')")).await;
+    }
+    exec(&ex, "CREATE INDEX idx_ios_full_id ON ios_full (id)").await;
+
+    let results = exec(&ex, "SELECT id FROM ios_full").await;
+    let vals: Vec<i32> = rows(&results[0]).iter().map(|r| match &r[0] {
+        Value::Int32(n) => *n,
+        other => panic!("expected i32, got {other:?}"),
+    }).collect();
+    // Index-only full scan returns entries in B-tree key order
+    assert_eq!(vals, vec![1, 2, 3, 4, 5]);
+}
+
+/// Index-only scan should NOT apply when SELECT includes non-indexed columns.
+#[tokio::test]
+async fn test_index_only_scan_not_covering() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE ios_nc (id INT, name TEXT)").await;
+    for i in 1..=5i32 {
+        exec(&ex, &format!("INSERT INTO ios_nc VALUES ({i}, 'user_{i}')")).await;
+    }
+    exec(&ex, "CREATE INDEX idx_ios_nc_id ON ios_nc (id)").await;
+
+    // SELECT * needs all columns — index-only scan should NOT apply
+    let results = exec(&ex, "SELECT * FROM ios_nc WHERE id = 3").await;
+    let r = rows(&results[0]);
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Int32(3));
+    assert_eq!(r[0][1], Value::Text("user_3".into()));
+}
+
+/// Index-only scan on DiskEngine should also work (avoids heap page fetches).
+#[tokio::test]
+async fn test_index_only_scan_disk_engine() {
+    let (ex, _tmp) = disk_executor();
+    exec(&ex, "CREATE TABLE ios_disk (id INT, payload TEXT)").await;
+    for i in 1..=50i32 {
+        exec(&ex, &format!("INSERT INTO ios_disk VALUES ({i}, 'data_{i}')")).await;
+    }
+    exec(&ex, "CREATE INDEX idx_ios_disk_id ON ios_disk (id)").await;
+
+    // Equality — index-only
+    let results = exec(&ex, "SELECT id FROM ios_disk WHERE id = 25").await;
+    let r = rows(&results[0]);
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Int32(25));
+
+    // BETWEEN — index-only
+    let results = exec(&ex, "SELECT id FROM ios_disk WHERE id BETWEEN 10 AND 15").await;
+    let vals: Vec<i32> = rows(&results[0]).iter().map(|r| match &r[0] {
+        Value::Int32(n) => *n,
+        other => panic!("expected i32, got {other:?}"),
+    }).collect();
+    assert_eq!(vals, vec![10, 11, 12, 13, 14, 15]);
+}
+
+/// Index-only scan with text keys.
+#[tokio::test]
+async fn test_index_only_scan_text_key() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE ios_txt (name TEXT, age INT)").await;
+    exec(&ex, "INSERT INTO ios_txt VALUES ('alice', 30)").await;
+    exec(&ex, "INSERT INTO ios_txt VALUES ('bob', 25)").await;
+    exec(&ex, "INSERT INTO ios_txt VALUES ('charlie', 35)").await;
+    exec(&ex, "CREATE INDEX idx_ios_txt_name ON ios_txt (name)").await;
+
+    let results = exec(&ex, "SELECT name FROM ios_txt WHERE name = 'bob'").await;
+    let r = rows(&results[0]);
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0][0], Value::Text("bob".into()));
+}

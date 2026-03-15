@@ -2,7 +2,7 @@
 //!
 //! Contains constant-expression evaluation, row-context expression evaluation,
 //! binary/unary operators, JSONB operators, WHERE clause filtering (serial and
-//! parallel via Rayon), and type-casting logic.
+//! parallel via Rayon), lazy materialization via filter_positions, and type-casting logic.
 
 use std::cell::Cell;
 use std::cmp::Ordering;
@@ -17,6 +17,55 @@ use super::types::ColMeta;
 use super::{ExecError, ExecResult, Executor};
 use super::helpers::*;
 use super::session::sync_block_on;
+
+// ---------------------------------------------------------------------------
+// Lazy Materialization — Phase 2C
+// ---------------------------------------------------------------------------
+
+/// Result of lazy WHERE clause evaluation: positions of matching rows only.
+/// Memory usage: ~4 bytes per evaluated row (u32 index) instead of 100-1000 bytes
+/// per full row materialization.
+#[derive(Debug, Clone)]
+pub struct FilterResult {
+    /// Indices of rows that matched the filter predicate.
+    pub matching_positions: Vec<u32>,
+    /// Total number of rows evaluated (including non-matching).
+    pub total_rows: u32,
+}
+
+impl FilterResult {
+    /// Create a new empty filter result.
+    pub fn empty() -> Self {
+        Self {
+            matching_positions: Vec::new(),
+            total_rows: 0,
+        }
+    }
+
+    /// Create a result that matches all rows (full scan, all match).
+    pub fn all(total: u32) -> Self {
+        Self {
+            matching_positions: (0..total).collect(),
+            total_rows: total,
+        }
+    }
+
+    /// Memory savings estimate in bytes.
+    /// Assumes ~100 bytes per full row (conservative).
+    pub fn estimated_memory_savings(&self) -> u64 {
+        let non_matching = self.total_rows as u64 - self.matching_positions.len() as u64;
+        non_matching * 100
+    }
+
+    /// Hit rate: percentage of rows that matched filter.
+    pub fn hit_rate(&self) -> f64 {
+        if self.total_rows == 0 {
+            100.0
+        } else {
+            (self.matching_positions.len() as f64 / self.total_rows as f64) * 100.0
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Expression depth guard — prevents stack overflow on deeply nested
@@ -422,6 +471,93 @@ impl Executor {
                 .filter(|row| self.eval_where(where_expr, row, col_meta).unwrap_or(false))
                 .collect()
         }
+    }
+
+    /// Lazy WHERE filter — returns only matching row indices instead of full rows.
+    /// Phase 2C: Memory optimization using deferred materialization.
+    ///
+    /// For large result sets with selective WHERE filters, this returns 4 bytes per
+    /// row (u32 index) instead of 100-1000 bytes per full row. Row reconstruction
+    /// happens only for matching positions in downstream operators.
+    ///
+    /// # Parameters
+    /// - `rows`: Input rows to evaluate
+    /// - `where_expr`: Filter expression to apply
+    /// - `col_meta`: Column metadata for resolving column references
+    ///
+    /// # Returns
+    /// `FilterResult` containing matching row indices and statistics.
+    #[allow(dead_code)]
+    pub(super) fn filter_positions(
+        &self,
+        rows: &[Row],
+        where_expr: &Expr,
+        col_meta: &[ColMeta],
+    ) -> Result<FilterResult, ExecError> {
+        /// Minimum row count before switching to parallel evaluation.
+        const PARALLEL_THRESHOLD: usize = 10_000;
+
+        let total_rows = rows.len() as u32;
+
+        if cfg!(feature = "server") && rows.len() >= PARALLEL_THRESHOLD {
+            // Parallel path using Rayon (server builds only)
+            #[cfg(feature = "server")]
+            {
+                let positions = rows
+                    .par_iter()
+                    .enumerate()
+                    .filter(|(_, row)| self.eval_where(where_expr, row, col_meta).unwrap_or(false))
+                    .map(|(idx, _)| idx as u32)
+                    .collect();
+
+                Ok(FilterResult {
+                    matching_positions: positions,
+                    total_rows,
+                })
+            }
+            #[cfg(not(feature = "server"))]
+            {
+                // Fallback to serial for non-server builds
+                let positions = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| self.eval_where(where_expr, row, col_meta).unwrap_or(false))
+                    .map(|(idx, _)| idx as u32)
+                    .collect();
+
+                Ok(FilterResult {
+                    matching_positions: positions,
+                    total_rows,
+                })
+            }
+        } else {
+            // Serial path for small result sets or non-server (WASM) builds
+            let positions = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| self.eval_where(where_expr, row, col_meta).unwrap_or(false))
+                .map(|(idx, _)| idx as u32)
+                .collect();
+
+            Ok(FilterResult {
+                matching_positions: positions,
+                total_rows,
+            })
+        }
+    }
+
+    /// Reconstruct full rows from filtered positions.
+    /// Used by downstream operators after WHERE evaluation.
+    #[allow(dead_code)]
+    pub(super) fn reconstruct_rows_from_positions(
+        &self,
+        all_rows: &[Row],
+        positions: &[u32],
+    ) -> Vec<Row> {
+        positions
+            .iter()
+            .filter_map(|&idx| all_rows.get(idx as usize).cloned())
+            .collect()
     }
 
     /// Evaluate an expression with row context (supports column references).
@@ -1145,5 +1281,69 @@ impl Executor {
             }
             _ => Err(ExecError::Unsupported(format!("cast to {target}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Value;
+
+    #[test]
+    fn filter_result_empty() {
+        let result = FilterResult::empty();
+        assert_eq!(result.matching_positions.len(), 0);
+        assert_eq!(result.total_rows, 0);
+        assert_eq!(result.hit_rate(), 100.0);
+    }
+
+    #[test]
+    fn filter_result_all() {
+        let result = FilterResult::all(1000);
+        assert_eq!(result.matching_positions.len(), 1000);
+        assert_eq!(result.total_rows, 1000);
+        assert_eq!(result.hit_rate(), 100.0);
+    }
+
+    #[test]
+    fn filter_result_memory_savings() {
+        // 1000 total rows, 300 match => 700 don't match
+        // Assume 100 bytes per row => 70000 bytes saved
+        let result = FilterResult {
+            matching_positions: (0..300).collect(),
+            total_rows: 1000,
+        };
+        assert_eq!(result.estimated_memory_savings(), 70000);
+    }
+
+    #[test]
+    fn filter_result_hit_rate_calculations() {
+        let result = FilterResult {
+            matching_positions: (0..500).collect(),
+            total_rows: 1000,
+        };
+        assert_eq!(result.hit_rate(), 50.0);
+
+        let result2 = FilterResult {
+            matching_positions: (0..100).collect(),
+            total_rows: 1000,
+        };
+        assert_eq!(result2.hit_rate(), 10.0);
+
+        let result3 = FilterResult {
+            matching_positions: (0..1000).collect(),
+            total_rows: 1000,
+        };
+        assert_eq!(result3.hit_rate(), 100.0);
+    }
+
+    #[test]
+    fn filter_result_no_matches() {
+        let result = FilterResult {
+            matching_positions: Vec::new(),
+            total_rows: 1000,
+        };
+        assert_eq!(result.hit_rate(), 0.0);
+        assert_eq!(result.estimated_memory_savings(), 100000);
     }
 }

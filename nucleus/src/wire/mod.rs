@@ -4,6 +4,7 @@
 //! query protocol (prepared statements with bind parameters).
 
 pub mod compression;
+pub mod error_codec;
 pub mod kv_fast_path;
 
 use std::fmt::Debug;
@@ -38,79 +39,25 @@ use pgwire::messages::startup::{Authentication, PasswordMessageFamily};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
 use compression::WireCompressor;
+use error_codec::{ErrorCodec, PgWireErrorCodec};
 
 use crate::executor::{ExecError, ExecResult, Executor};
 use crate::types::{DataType, Value};
 
 // ============================================================================
-// SQLSTATE error code mapping
+// Error Codec Management
 // ============================================================================
 
-/// Map an `ExecError` to a PostgreSQL SQLSTATE error code.
-///
-/// Reference: <https://www.postgresql.org/docs/current/errcodes-appendix.html>
-fn sqlstate_for_error(err: &ExecError) -> &'static str {
-    match err {
-        ExecError::Parse(_) => "42601",           // syntax_error
-        ExecError::TableNotFound(_) => "42P01",   // undefined_table
-        ExecError::ColumnNotFound(_) => "42703",   // undefined_column
-        ExecError::ColumnCountMismatch { .. } => "42601", // syntax_error
-        ExecError::Unsupported(_) => "0A000",      // feature_not_supported
-        ExecError::PermissionDenied(_) => "42501",  // insufficient_privilege
-        ExecError::ConstraintViolation(msg) => {
-            // Distinguish unique, FK, NOT NULL, and check constraint violations
-            // by inspecting the error message text.
-            if msg.contains("unique constraint") || msg.contains("duplicate key") {
-                "23505" // unique_violation
-            } else if msg.contains("foreign key") || msg.contains("violates foreign key") {
-                "23503" // foreign_key_violation
-            } else if msg.contains("not-null") || msg.contains("NOT NULL") {
-                "23502" // not_null_violation
-            } else if msg.contains("check constraint") {
-                "23514" // check_violation
-            } else {
-                "23000" // integrity_constraint_violation (generic)
-            }
-        }
-        ExecError::Catalog(cat_err) => {
-            let msg = cat_err.to_string();
-            if msg.contains("not found") {
-                "42P01" // undefined_table
-            } else if msg.contains("already exists") {
-                "42P07" // duplicate_table
-            } else {
-                "42000" // syntax_error_or_access_rule_violation
-            }
-        }
-        ExecError::Storage(stor_err) => {
-            let msg = stor_err.to_string();
-            if msg.contains("write conflict") || msg.contains("WriteConflict") {
-                "40001" // serialization_failure
-            } else if msg.contains("not found") {
-                "42P01" // undefined_table
-            } else {
-                "XX000" // internal_error
-            }
-        }
-        ExecError::Runtime(msg) => {
-            if msg.contains("division by zero") {
-                "22012" // division_by_zero
-            } else if msg.contains("out of range") {
-                "22003" // numeric_value_out_of_range
-            } else {
-                "22000" // data_exception
-            }
-        }
-    }
-}
-
 /// Build a `PgWireError::UserError` from an `ExecError` with proper SQLSTATE.
+/// Uses the PgWireErrorCodec to map errors consistently.
 fn exec_error_to_pgwire(e: ExecError) -> PgWireError {
-    let code = sqlstate_for_error(&e).to_owned();
+    let codec = PgWireErrorCodec;
+    let details = codec.encode(&e);
+    let sqlstate = codec.code_to_string(details.code);
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".to_owned(),
-        code,
-        e.to_string(),
+        sqlstate,
+        details.message,
     )))
 }
 
@@ -187,10 +134,34 @@ pub struct ParsedStatement {
     pub sql: String,
     /// Cached AST from `sql::parse()`. `None` if parsing failed (fallback to string path).
     pub ast: Option<Vec<sqlparser::ast::Statement>>,
+    /// Normalized SQL key for plan cache lookups (computed during Parse phase).
+    /// Avoids the expensive `query.to_string()` + `normalize_sql_for_cache()` on Execute.
+    pub plan_cache_key: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct NucleusQueryParser;
+pub struct NucleusQueryParser {
+    executor: Arc<Executor>,
+}
+
+impl NucleusQueryParser {
+    fn new(executor: Arc<Executor>) -> Self {
+        Self { executor }
+    }
+}
+
+impl std::fmt::Debug for NucleusQueryParser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NucleusQueryParser").finish()
+    }
+}
+
+impl Clone for NucleusQueryParser {
+    fn clone(&self) -> Self {
+        Self {
+            executor: self.executor.clone(),
+        }
+    }
+}
 
 #[async_trait]
 impl QueryParser for NucleusQueryParser {
@@ -205,11 +176,27 @@ impl QueryParser for NucleusQueryParser {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        // Parse the SQL once here and cache the AST for reuse on Execute.
-        let ast = crate::sql::parse(sql).ok();
+        // Use the executor's AST cache for ~5-10x faster repeated parses.
+        // On cache hit, clones the cached AST and substitutes literals via
+        // DFS walk instead of re-parsing the SQL string.
+        let plan_cache_key;
+        let ast = match self.executor.parse_with_ast_cache(sql) {
+            Ok(stmts) => {
+                // Retrieve the plan cache key hint that parse_with_ast_cache
+                // stored, so we can carry it through to the Execute phase.
+                plan_cache_key = self.executor.take_plan_cache_key_hint();
+                Some(stmts)
+            }
+            Err(_) => {
+                plan_cache_key = None;
+                // Fall back to raw parse (may still fail, but we store None).
+                crate::sql::parse(sql).ok()
+            }
+        };
         Ok(ParsedStatement {
             sql: sql.to_owned(),
             ast,
+            plan_cache_key,
         })
     }
 }
@@ -272,13 +259,14 @@ impl NucleusHandler {
 
     /// Create a handler with no authentication (accepts all connections).
     pub fn new(executor: Arc<Executor>) -> Self {
+        let query_parser = Arc::new(NucleusQueryParser::new(executor.clone()));
         Self {
             executor,
             authenticator: None,
             auth_method: AuthMethod::default(),
             scram_auth: None,
             parameter_provider: DefaultServerParameterProvider::default(),
-            query_parser: Arc::new(NucleusQueryParser),
+            query_parser,
             compressor: WireCompressor::new(1024),
             session_registry: parking_lot::RwLock::new(std::collections::HashMap::new()),
             sasl_registry: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -325,13 +313,14 @@ impl NucleusHandler {
         } else {
             None
         };
+        let query_parser = Arc::new(NucleusQueryParser::new(executor.clone()));
         Self {
             executor,
             authenticator,
             auth_method,
             scram_auth,
             parameter_provider: DefaultServerParameterProvider::default(),
-            query_parser: Arc::new(NucleusQueryParser),
+            query_parser,
             compressor: WireCompressor::new(1024),
             session_registry: parking_lot::RwLock::new(std::collections::HashMap::new()),
             sasl_registry: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -397,6 +386,12 @@ impl NucleusHandler {
     }
 
     /// Build a query response from executor results for a single ExecResult.
+    ///
+    /// Performance: For small result sets (≤10 rows, typical of point queries),
+    /// pre-encodes all rows into a Vec to avoid per-row Arc::clone overhead
+    /// and lazy stream allocation. This reduces protocol overhead for the
+    /// common OLTP case. Uses binary encoding for numeric types (Int32, Int64,
+    /// Float64, Bool) to avoid text conversion overhead.
     fn build_response(result: ExecResult) -> PgWireResult<Response> {
         match result {
             ExecResult::Select { columns, rows } => {
@@ -408,22 +403,40 @@ impl NucleusHandler {
                             None,
                             None,
                             data_type_to_pg(dt),
-                            FieldFormat::Text,
+                            // Use binary format for numeric types to avoid
+                            // text conversion (e.g., 12345 → "12345"). Binary
+                            // encoding is faster and produces fewer bytes.
+                            data_type_field_format(dt),
                         )
                     })
                     .collect();
                 let schema = Arc::new(schema);
 
-                let schema_ref = schema.clone();
-                let data_row_stream = stream::iter(rows).map(move |row| {
-                    let mut encoder = DataRowEncoder::new(schema_ref.clone());
-                    for value in &row {
-                        encode_value(&mut encoder, value)?;
+                // Fast path for small result sets (≤10 rows): pre-encode all
+                // rows into a Vec, avoiding per-row Arc::clone and lazy stream
+                // overhead. This is the common case for point queries.
+                if rows.len() <= 10 {
+                    let mut encoded = Vec::with_capacity(rows.len());
+                    for row in &rows {
+                        let mut encoder = DataRowEncoder::new(Arc::clone(&schema));
+                        for value in row {
+                            encode_value(&mut encoder, value)?;
+                        }
+                        encoded.push(encoder.finish()?);
                     }
-                    encoder.finish()
-                });
-
-                Ok(Response::Query(QueryResponse::new(schema, data_row_stream)))
+                    let data_row_stream = stream::iter(encoded.into_iter().map(Ok));
+                    Ok(Response::Query(QueryResponse::new(schema, data_row_stream)))
+                } else {
+                    let schema_ref = Arc::clone(&schema);
+                    let data_row_stream = stream::iter(rows).map(move |row| {
+                        let mut encoder = DataRowEncoder::new(Arc::clone(&schema_ref));
+                        for value in &row {
+                            encode_value(&mut encoder, value)?;
+                        }
+                        encoder.finish()
+                    });
+                    Ok(Response::Query(QueryResponse::new(schema, data_row_stream)))
+                }
             }
             ExecResult::Command { tag, rows_affected } => {
                 // Postgres command tags for INSERT are "INSERT 0 <rows>".
@@ -891,6 +904,15 @@ impl SimpleQueryHandler for NucleusHandler {
             return Ok(vec![Self::build_response(result)?]);
         }
 
+        // ── SQL OLTP fast path: intercept simple point queries/mutations ──
+        if let Some(sql_cmd) = kv_fast_path::try_parse_sql_fast_path(query) {
+            if let Some(result) = self.executor.execute_sql_fast_path(&sql_cmd).await {
+                return Ok(vec![Self::build_response(result.map_err(exec_error_to_pgwire)?)?]);
+            }
+            // Fall through to normal path if fast-path couldn't handle it
+            // (e.g. table not found in cache, column mismatch, etc.)
+        }
+
         let session_id = self.session_id_from_client(client);
 
         // Detect COPY ... FROM STDIN and enter copy-in mode.
@@ -911,10 +933,12 @@ impl SimpleQueryHandler for NucleusHandler {
         let results = self.execute_sql_session(session_id, query).await?;
 
         let mut responses = Vec::new();
+        let mut bytes_estimate: u64 = 0;
         for result in results {
             // COPY TO STDOUT: stream rows directly rather than returning a Response.
             if let crate::executor::ExecResult::CopyOut { data, row_count } = result {
                 use pgwire::api::copy::send_copy_out_response;
+                bytes_estimate += data.len() as u64;
                 send_copy_out_response(client, CopyResponse::new(0, 0, vec![])).await?;
                 if !data.is_empty() {
                     // Send data in 64KB chunks to avoid a single massive allocation
@@ -936,9 +960,15 @@ impl SimpleQueryHandler for NucleusHandler {
                     )))
                     .await?;
                 // Return empty — pgwire's on_query will send ReadyForQuery.
+                self.executor.metrics().bytes_sent.inc_by(bytes_estimate);
                 return Ok(vec![]);
             }
+            // Approximate wire bytes: count rows * avg 64 bytes per row + header
+            bytes_estimate += Self::estimate_result_bytes(&result);
             responses.push(Self::build_response(result)?);
+        }
+        if bytes_estimate > 0 {
+            self.executor.metrics().bytes_sent.inc_by(bytes_estimate);
         }
 
         Ok(responses)
@@ -1039,6 +1069,12 @@ impl ExtendedQueryHandler for NucleusHandler {
         // AST fast path: if we have a cached AST, substitute parameters directly
         // in the AST and execute without re-parsing.
         let results = if let Some(ref cached_ast) = parsed_stmt.ast {
+            // Pre-populate the plan cache key hint from the Parse phase so that
+            // execute_query() can look up cached plans without the expensive
+            // query.to_string() + normalize_sql_for_cache() round-trip.
+            if let Some(ref key) = parsed_stmt.plan_cache_key {
+                self.executor.set_plan_cache_key_hint(key.clone());
+            }
             match Self::try_ast_execute(&self.executor, session_id, cached_ast, portal) {
                 Ok(fut) => fut.await.map_err(exec_error_to_pgwire),
                 Err(_) => {
@@ -1063,6 +1099,10 @@ impl ExtendedQueryHandler for NucleusHandler {
                 && let ExecResult::Select { ref mut rows, .. } = result {
                     rows.truncate(max_rows);
                 }
+            let bytes_est = Self::estimate_result_bytes(&result);
+            if bytes_est > 0 {
+                self.executor.metrics().bytes_sent.inc_by(bytes_est);
+            }
             Self::build_response(result)
         } else {
             Ok(Response::EmptyQuery)
@@ -1149,6 +1189,18 @@ impl CopyHandler for NucleusHandler {
 }
 
 impl NucleusHandler {
+    /// Cheap approximate byte count of a result for the bytes_sent metric.
+    fn estimate_result_bytes(result: &ExecResult) -> u64 {
+        match result {
+            ExecResult::Select { columns, rows } => {
+                // ~32 bytes per column header + ~64 bytes per cell on average
+                (columns.len() as u64 * 32) + (rows.len() as u64 * columns.len().max(1) as u64 * 64)
+            }
+            ExecResult::Command { tag, .. } => tag.len() as u64 + 16,
+            ExecResult::CopyOut { data, .. } => data.len() as u64,
+        }
+    }
+
     /// Get the executor reference.
     pub fn executor(&self) -> &Arc<Executor> {
         &self.executor
@@ -1398,6 +1450,20 @@ fn data_type_to_pg(dt: &DataType) -> Type {
         DataType::Vector(_) => Type::TEXT, // Vectors sent as text for now
         DataType::Interval => Type::VARCHAR, // Intervals sent as text for now
         DataType::UserDefined(_) => Type::VARCHAR, // Enum values sent as text
+    }
+}
+
+/// Choose the wire format for a given data type.
+///
+/// Numeric types (Bool, Int32, Int64, Float64) use binary encoding to avoid
+/// the overhead of text conversion (e.g., integer 12345 → "12345" → parse).
+/// All other types use text format for maximum compatibility.
+fn data_type_field_format(dt: &DataType) -> FieldFormat {
+    match dt {
+        DataType::Bool | DataType::Int32 | DataType::Int64 | DataType::Float64 => {
+            FieldFormat::Binary
+        }
+        _ => FieldFormat::Text,
     }
 }
 
@@ -1848,7 +1914,7 @@ mod tests {
 
     #[test]
     fn query_parser_is_clone_and_debug() {
-        let parser = NucleusQueryParser;
+        let parser = NucleusQueryParser::new(make_executor());
         let _cloned = parser.clone();
         let _debug = format!("{:?}", parser);
     }

@@ -24,6 +24,8 @@ mod avx512;
 
 mod scalar; // Fallback implementation
 
+pub mod aggregates; // SIMD aggregate operations (COUNT, SUM, MIN, MAX)
+
 // ============================================================================
 // Public API — dispatches to best available SIMD implementation
 // ============================================================================
@@ -234,6 +236,28 @@ pub fn extract_f64_column(rows: &[Row], col_idx: usize) -> Vec<f64> {
             })
         })
         .collect()
+}
+
+// ============================================================================
+// SIMD Aggregate Operations (Phase 2D)
+// ============================================================================
+
+/// Count non-zero i64 values using available SIMD.
+/// Returns count of values != 0.
+pub fn count_i64(data: &[i64]) -> u64 {
+    aggregates::count_i64(data)
+}
+
+/// Find minimum i64 value using available SIMD.
+/// Returns None for empty input.
+pub fn min_i64(data: &[i64]) -> Option<i64> {
+    aggregates::min_i64(data)
+}
+
+/// Find maximum i64 value using available SIMD.
+/// Returns None for empty input.
+pub fn max_i64(data: &[i64]) -> Option<i64> {
+    aggregates::max_i64(data)
 }
 
 #[cfg(test)]

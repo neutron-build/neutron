@@ -19,12 +19,10 @@ use std::sync::Arc;
 
 use crate::catalog::Catalog;
 use crate::executor::{ExecError, ExecResult, Executor};
-use crate::executor::param_subst;
 #[cfg(feature = "server")]
 use crate::storage::DiskEngine;
 use crate::storage::{MemoryEngine, MvccStorageAdapter, StorageEngine};
 use crate::types::{Row, Value};
-use sqlparser::ast::Statement;
 
 // Re-export multi-model store types for direct access
 pub use crate::blob::BlobStore;
@@ -330,33 +328,30 @@ impl Database {
     /// Parse a SQL statement once and return a reusable handle.
     /// Use `$1`, `$2`, etc. as parameter placeholders.
     ///
+    /// The returned handle caches both the parsed AST and a pre-computed
+    /// plan cache key, so repeated executions skip SQL parsing **and**
+    /// plan-cache key normalization (the two biggest overheads vs SQLite).
+    ///
     /// ```rust,ignore
     /// let stmt = db.prepare("SELECT * FROM users WHERE id = $1")?;
     /// let rows = db.execute_prepared(&stmt, &[Value::Int64(42)]).await?;
     /// ```
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, ExecError> {
-        let stmts = crate::sql::parse(sql)
-            .map_err(|e| ExecError::Parse(e))?;
-        if stmts.len() != 1 {
-            return Err(ExecError::Unsupported(
-                "prepare() requires exactly one SQL statement".into(),
-            ));
-        }
-        Ok(PreparedStatement {
-            ast: stmts.into_iter().next().unwrap(),
-        })
+        let handle = self.executor.prepare(sql)?;
+        Ok(PreparedStatement { handle })
     }
 
     /// Execute a prepared statement with parameter values.
     /// Parameters replace `$1`, `$2`, etc. in the prepared SQL.
+    ///
+    /// Skips SQL parsing entirely and seeds the plan cache key hint so
+    /// the query planner reuses cached plans without re-normalizing.
     pub async fn execute_prepared(
         &self,
         stmt: &PreparedStatement,
         params: &[Value],
     ) -> Result<ExecResult, ExecError> {
-        let mut ast = stmt.ast.clone();
-        param_subst::substitute_params_in_stmt(&mut ast, params);
-        self.executor.execute_parsed(ast).await
+        self.executor.execute_prepared(&stmt.handle, params).await
     }
 
     /// Execute a prepared statement and return just the rows.
@@ -370,13 +365,21 @@ impl Database {
             _ => Ok(vec![]),
         }
     }
+
+    /// Get the number of parameter placeholders in a prepared statement.
+    pub fn param_count(stmt: &PreparedStatement) -> usize {
+        stmt.handle.param_count
+    }
 }
 
 /// A prepared SQL statement that can be executed multiple times with different parameters.
 /// Created via `Database::prepare()`. Parameters use `$1`, `$2`, etc.
+///
+/// Wraps the Executor-level [`PreparedStmtHandle`] which caches the parsed AST
+/// and a pre-computed plan cache key for maximum performance on repeated execution.
 #[derive(Clone)]
 pub struct PreparedStatement {
-    ast: Statement,
+    handle: crate::executor::PreparedStmtHandle,
 }
 
 // ============================================================================

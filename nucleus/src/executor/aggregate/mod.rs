@@ -1,5 +1,15 @@
 //! Aggregation (GROUP BY, HAVING, aggregate functions) and window function
 //! execution methods extracted from the main executor module.
+//!
+//! This module also provides type-specialized hash tables (fastmap) for efficient
+//! GROUP BY aggregations.
+
+pub mod fastmap;
+
+// Re-exports for future type-specialized GROUP BY optimization paths.
+#[allow(unused_imports)]
+pub use fastmap::{FastHashMap, select_fast_map, AggregateState};
+
 
 use std::collections::{HashMap, HashSet};
 
@@ -96,12 +106,12 @@ impl Executor {
                         .iter()
                         .map(|expr| self.eval_row_expr(expr, &row, col_meta))
                         .collect::<Result<_, _>>()?;
-                    let len = map.len();
-                    let idx = *key_to_idx.entry(key.clone()).or_insert(len);
-                    if idx == len {
-                        map.push((key, vec![row]));
-                    } else {
+                    if let Some(&idx) = key_to_idx.get(&key) {
                         map[idx].1.push(row);
+                    } else {
+                        let idx = map.len();
+                        key_to_idx.insert(key.clone(), idx);
+                        map.push((key, vec![row]));
                     }
                 }
                 map
@@ -309,10 +319,12 @@ impl Executor {
 
         for (row_idx, row) in rows.iter().enumerate() {
             let key_val = row[group_col_idx].clone();
-            if !key_to_indices.contains_key(&key_val) {
+            if let Some(indices) = key_to_indices.get_mut(&key_val) {
+                indices.push(row_idx);
+            } else {
                 key_order.push(key_val.clone());
+                key_to_indices.insert(key_val, vec![row_idx]);
             }
-            key_to_indices.entry(key_val).or_default().push(row_idx);
         }
 
         let mut result_columns: Option<Vec<(String, DataType)>> = None;
@@ -642,6 +654,21 @@ impl Executor {
         match fname {
             "COUNT" => {
                 if let Some(expr) = arg_expr {
+                    // SIMD fast path: for a simple i64 column reference with 1000+
+                    // rows, extract values directly instead of building Vec<Value>.
+                    // Note: we use the vector length (not simd::aggregates::count_i64)
+                    // because SQL COUNT counts all non-null values including zeros,
+                    // while simd count_i64 counts only non-zero values.
+                    if !is_distinct && func.filter.is_none()
+                        && effective_indices.len() >= 1000
+                        && let Expr::Identifier(ident) = expr
+                            && let Some(col_idx) = col_meta.iter().position(|c| c.name.eq_ignore_ascii_case(&ident.value)) {
+                                let first = indices.first().and_then(|&i| all_rows[i].get(col_idx));
+                                if matches!(first, Some(Value::Int64(_) | Value::Int32(_))) {
+                                    let col = extract_i64_indexed(col_idx);
+                                    return Ok(Value::Int64(col.len() as i64));
+                                }
+                            }
                     let vals = collect_values(expr)?;
                     Ok(Value::Int64(vals.len() as i64))
                 } else {
@@ -767,6 +794,10 @@ impl Executor {
                                 }
                                 Some(Value::Int64(_)) => {
                                     let col = extract_i64_indexed(col_idx);
+                                    // Use SIMD aggregate kernel for 1000+ i64 values
+                                    if col.len() >= 1000 {
+                                        return Ok(simd::aggregates::min_i64(&col).map(Value::Int64).unwrap_or(Value::Null));
+                                    }
                                     return Ok(col.iter().copied().min().map(Value::Int64).unwrap_or(Value::Null));
                                 }
                                 _ => {}
@@ -807,6 +838,10 @@ impl Executor {
                                 }
                                 Some(Value::Int64(_)) => {
                                     let col = extract_i64_indexed(col_idx);
+                                    // Use SIMD aggregate kernel for 1000+ i64 values
+                                    if col.len() >= 1000 {
+                                        return Ok(simd::aggregates::max_i64(&col).map(Value::Int64).unwrap_or(Value::Null));
+                                    }
                                     return Ok(col.iter().copied().max().map(Value::Int64).unwrap_or(Value::Null));
                                 }
                                 _ => {}
