@@ -1750,6 +1750,15 @@ impl Executor {
                     let (left_meta, left_rows) = self.execute_plan_node(left, cte_tables).await?;
                     let (right_meta, right_rows) = self.execute_plan_node(right, cte_tables).await?;
 
+                    // Guard against cartesian explosion.
+                    let product = left_rows.len().saturating_mul(right_rows.len());
+                    if product > Self::MAX_CROSS_JOIN_ROWS {
+                        return Err(ExecError::Runtime(format!(
+                            "nested loop join would produce {} rows, exceeding limit of {}",
+                            product, Self::MAX_CROSS_JOIN_ROWS
+                        )));
+                    }
+
                     let mut combined_meta = left_meta.clone();
                     combined_meta.extend(right_meta.clone());
 
@@ -1827,6 +1836,13 @@ impl Executor {
                         }
                     }
                     // Fallback: cross join
+                    let product = left_rows.len().saturating_mul(right_rows.len());
+                    if product > Self::MAX_CROSS_JOIN_ROWS {
+                        return Err(ExecError::Runtime(format!(
+                            "cross join would produce {} rows, exceeding limit of {}",
+                            product, Self::MAX_CROSS_JOIN_ROWS
+                        )));
+                    }
                     let mut result_rows = Vec::new();
                     for lrow in &left_rows {
                         for rrow in &right_rows {
@@ -4861,7 +4877,7 @@ impl Executor {
 
             // Fallback: cross join (no equi-join keys found in WHERE)
             let (new_meta, new_rows) =
-                self.cross_join(&col_meta, &rows, &right_meta, &right_rows);
+                self.cross_join(&col_meta, &rows, &right_meta, &right_rows)?;
             col_meta = new_meta;
             rows = new_rows;
 
@@ -5021,7 +5037,9 @@ impl Executor {
                 subquery, alias, ..
             } => {
                 // Subquery in FROM: SELECT * FROM (SELECT ...) AS alias
+                self.check_subquery_depth()?;
                 let sub_result = self.execute_query(*subquery.clone()).await?;
+                self.query_depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 let alias_name = alias
                     .as_ref()
                     .map(|a| a.name.value.clone())

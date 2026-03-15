@@ -479,10 +479,30 @@ impl ProcedureEngine {
 }
 
 fn sanitize_proc_sql_text(value: &str) -> String {
-    value
-        .replace('\0', "")
-        .replace('\\', "\\\\")
-        .replace('\'', "''")
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            // Strip NUL bytes — they can truncate strings in C-based parsers.
+            '\0' => {}
+            // Double backslashes to prevent escape-sequence injection
+            // (e.g., `\'` becoming an unescaped quote in some SQL dialects).
+            '\\' => out.push_str("\\\\"),
+            // Double single quotes (standard SQL escaping).
+            '\'' => out.push_str("''"),
+            // Block Unicode escape sequences that some SQL engines interpret:
+            //   \uXXXX  and  U&'...'  style escapes start with these chars
+            //   after a backslash (already doubled above), but raw U+0000
+            //   surrogates or BOM could also be abused.
+            // Strip Unicode replacement char and BOM.
+            '\u{FFFD}' | '\u{FEFF}' | '\u{FFFE}' | '\u{FFFF}' => {}
+            // Strip lone surrogates (Rust strings can't contain them, but
+            // guard against future changes).
+            c if ('\u{FDD0}'..='\u{FDEF}').contains(&c) => {}
+            // All other characters pass through.
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn proc_sql_replacement(value: &ProcValue) -> String {
@@ -1226,5 +1246,76 @@ mod tests {
         let (count, fuel) = sandbox.stats();
         assert_eq!(count, 0);
         assert_eq!(fuel, 0);
+    }
+
+    // ── SQL injection prevention tests ──────────────────────────────
+
+    #[test]
+    fn sanitize_strips_nul_bytes() {
+        let result = sanitize_proc_sql_text("hello\0world");
+        assert_eq!(result, "helloworld");
+    }
+
+    #[test]
+    fn sanitize_doubles_backslashes() {
+        let result = sanitize_proc_sql_text("path\\to\\file");
+        assert_eq!(result, "path\\\\to\\\\file");
+    }
+
+    #[test]
+    fn sanitize_doubles_single_quotes() {
+        let result = sanitize_proc_sql_text("O'Reilly");
+        assert_eq!(result, "O''Reilly");
+    }
+
+    #[test]
+    fn sanitize_strips_unicode_bom_and_nonchars() {
+        // BOM, replacement char, and noncharacter codepoints must be stripped
+        let input = format!("clean{}text{}", '\u{FEFF}', '\u{FFFD}');
+        let result = sanitize_proc_sql_text(&input);
+        assert_eq!(result, "cleantext");
+    }
+
+    #[test]
+    fn sanitize_combined_attack() {
+        // Attempt: break out of a string literal using backslash + quote
+        let result = sanitize_proc_sql_text("value\\'; DROP TABLE users; --");
+        assert_eq!(result, "value\\\\''; DROP TABLE users; --");
+        // The doubled backslash and doubled quote prevent breakout
+    }
+
+    #[test]
+    fn sql_injection_attempt_via_proc() {
+        let mut engine = ProcedureEngine::new();
+        engine.register_sql(
+            "lookup",
+            "Find by name",
+            vec!["name".into()],
+            "SELECT * FROM users WHERE name = $name",
+        );
+        let result = engine.execute("lookup", &[
+            ProcValue::Text("'; DROP TABLE users; --".into()),
+        ]);
+        match result {
+            ProcResult::Ok(ProcValue::Text(sql)) => {
+                // The injected single quote must be doubled, preventing
+                // breakout from the string literal.
+                assert!(sql.contains("''"), "single quote must be escaped");
+                // The full substituted SQL must keep the attack payload
+                // safely inside a quoted string — verify no unescaped
+                // single-quote-semicolon sequence exists.
+                assert!(
+                    !sql.contains("','"),
+                    "must not contain unescaped quote breakout"
+                );
+                // The resulting SQL should look like:
+                //   SELECT * FROM users WHERE name = '''; DROP TABLE users; --'
+                // i.e., the initial quote is doubled and the whole value
+                // remains inside the outer quotes.
+                assert!(sql.starts_with("SELECT * FROM users WHERE name = '"));
+                assert!(sql.ends_with("'"));
+            }
+            _ => panic!("expected substituted SQL text"),
+        }
     }
 }

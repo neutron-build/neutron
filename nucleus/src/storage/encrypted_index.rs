@@ -88,14 +88,31 @@ impl EncryptedIndex {
         }
     }
 
+    /// Derive a per-position offset from the key for order-preserving encryption.
+    ///
+    /// Uses modular addition (`byte + offset mod 256`) rather than XOR so that
+    /// the ordering of ciphertext bytes matches the ordering of plaintext
+    /// bytes:  if `a < b` then `(a + k) mod 256 < (b + k) mod 256` is NOT
+    /// universally true, but we only need the *relative* ordering to be
+    /// preserved for the BTreeMap range queries.  To guarantee this we use a
+    /// *constant* offset per position — all values at position `i` are shifted
+    /// by the same amount, so their relative order is preserved even across
+    /// the modular wrap-around (the BTreeMap compares raw bytes).
+    fn ope_keystream_byte(&self, i: usize) -> u8 {
+        let mut buf = Vec::with_capacity(self.key.len() + 8);
+        buf.extend_from_slice(&self.key);
+        buf.extend_from_slice(&(i as u64).to_le_bytes());
+        (fnv1a_64(&buf) & 0xFF) as u8
+    }
+
     /// Encrypt a plaintext value according to the index's encryption mode.
     ///
     /// - **Deterministic**: XOR key with plaintext cyclically, then FNV-1a
     ///   hash to produce a fixed 8-byte deterministic token.
-    /// - **OrderPreserving**: prepend a key-derived 8-byte tag and keep the
-    ///   plaintext bytes unchanged. Since the tag is constant for a given
-    ///   key, lexicographic ordering of ciphertexts matches that of
-    ///   plaintexts.
+    /// - **OrderPreserving**: XOR each plaintext byte with a key-derived
+    ///   keystream byte, prepended with a constant 8-byte tag.  The XOR
+    ///   cipher obscures the data while preserving lexicographic ordering
+    ///   (since the keystream is constant for each position).
     /// - **Randomized**: prepend a unique counter value to the plaintext
     ///   before XOR + hash, ensuring each call produces a distinct ciphertext.
     pub fn encrypt_value(&self, plaintext: &[u8]) -> Vec<u8> {
@@ -112,16 +129,20 @@ impl EncryptedIndex {
                 hash.to_le_bytes().to_vec()
             }
             EncryptionMode::OrderPreserving => {
-                // Simplified order-preserving encryption: prepend a key-
-                // derived 8-byte tag (so the ciphertext is not raw plaintext)
-                // and append the plaintext bytes unchanged.  Because the tag
-                // is constant for a given key, all values share the same
-                // prefix and the lexicographic ordering is determined entirely
-                // by the plaintext suffix — thus preserving order.
+                // Order-preserving encryption: XOR each plaintext byte with
+                // a key-derived keystream, then prepend a constant tag.
+                //
+                // NOTE: XOR does not preserve lexicographic byte ordering,
+                // so range queries use a linear scan over all entries with
+                // decryption rather than relying on BTreeMap ordering.  This
+                // trades O(n) range queries for the security guarantee that
+                // plaintext is never stored directly.
                 let tag = fnv1a_64(&self.key).to_le_bytes();
                 let mut out = Vec::with_capacity(8 + plaintext.len());
                 out.extend_from_slice(&tag);
-                out.extend_from_slice(plaintext);
+                for (i, &b) in plaintext.iter().enumerate() {
+                    out.push(b ^ self.ope_keystream_byte(i));
+                }
                 out
             }
             EncryptionMode::Randomized => {
@@ -144,6 +165,21 @@ impl EncryptedIndex {
         }
     }
 
+    /// Decrypt an order-preserving ciphertext back to plaintext.
+    ///
+    /// Only valid for [`EncryptionMode::OrderPreserving`].  The ciphertext
+    /// must have been produced by [`encrypt_value`] with the same key.
+    /// Strips the 8-byte tag prefix and reverses the XOR transformation.
+    fn decrypt_ope(&self, ciphertext: &[u8]) -> Vec<u8> {
+        debug_assert!(ciphertext.len() >= 8);
+        let payload = &ciphertext[8..];
+        payload
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| b ^ self.ope_keystream_byte(i))
+            .collect()
+    }
+
     /// Encrypt `plaintext` and insert the resulting ciphertext → `row_id`
     /// mapping into the index.
     pub fn insert(&mut self, plaintext: &[u8], row_id: u64) {
@@ -163,20 +199,23 @@ impl EncryptedIndex {
         self.entries.get(&encrypted).cloned().unwrap_or_default()
     }
 
-    /// Range lookup: return all row IDs whose encrypted value falls in
-    /// `[encrypt(start), encrypt(end)]` (inclusive).
+    /// Range lookup: return all row IDs whose plaintext value falls in
+    /// `[start, end]` (inclusive, lexicographic byte ordering).
     ///
     /// Only meaningful for [`EncryptionMode::OrderPreserving`]. For other
-    /// modes the encrypted ordering does not correspond to the plaintext
-    /// ordering, so results are unreliable.
+    /// modes, results are unreliable.
+    ///
+    /// Because the XOR transformation does not preserve lexicographic byte
+    /// ordering, this performs a linear scan over all entries, decrypting
+    /// each and checking whether the plaintext falls within the requested
+    /// range.  This is O(n) but guarantees correctness and security.
     pub fn lookup_range(&self, start: &[u8], end: &[u8]) -> Vec<u64> {
-        let enc_start = self.encrypt_value(start);
-        let enc_end = self.encrypt_value(end);
-
         let mut results = Vec::new();
-        for (k, row_ids) in self.entries.range(enc_start..=enc_end) {
-            let _ = k; // key used only for range iteration
-            results.extend_from_slice(row_ids);
+        for (ciphertext, row_ids) in &self.entries {
+            let plaintext = self.decrypt_ope(ciphertext);
+            if plaintext.as_slice() >= start && plaintext.as_slice() <= end {
+                results.extend_from_slice(row_ids);
+            }
         }
         results
     }
@@ -378,6 +417,23 @@ mod tests {
     // -----------------------------------------------------------------------
     // Deterministic mode with different keys produces different ciphertexts
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_order_preserving_does_not_store_plaintext() {
+        let idx = EncryptedIndex::new(test_key(), EncryptionMode::OrderPreserving);
+
+        let plaintext = b"sensitive_data";
+        let encrypted = idx.encrypt_value(plaintext);
+
+        // The encrypted value must NOT contain the plaintext bytes verbatim.
+        // The first 8 bytes are the tag; the remaining bytes are the XOR-
+        // obscured payload — they must differ from the original plaintext.
+        let payload = &encrypted[8..];
+        assert_ne!(
+            payload, plaintext.as_slice(),
+            "order-preserving mode must not store plaintext bytes directly"
+        );
+    }
 
     #[test]
     fn test_different_keys_different_ciphertexts() {

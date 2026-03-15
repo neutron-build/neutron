@@ -8,6 +8,7 @@ pub mod error_codec;
 pub mod kv_fast_path;
 
 use std::fmt::Debug;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -119,6 +120,61 @@ pub enum AuthMethod {
     ScramSha256,
 }
 
+
+// ============================================================================
+// Login Rate Limiter
+// ============================================================================
+
+/// Tracks failed authentication attempts per source IP to prevent brute-force
+/// attacks.  After [`MAX_FAILED_ATTEMPTS`] failures from the same IP within
+/// [`LOCKOUT_SECS`] seconds, subsequent attempts are rejected immediately.
+struct LoginRateLimiter {
+    /// Map from source IP → (failure_count, last_failure_instant).
+    attempts: parking_lot::Mutex<std::collections::HashMap<IpAddr, (u32, std::time::Instant)>>,
+}
+
+impl LoginRateLimiter {
+    /// Maximum consecutive failures before lockout.
+    const MAX_FAILED_ATTEMPTS: u32 = 5;
+    /// Lockout duration in seconds after exceeding the failure threshold.
+    const LOCKOUT_SECS: u64 = 30;
+
+    fn new() -> Self {
+        Self {
+            attempts: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Returns `true` if the given IP is currently locked out due to too many
+    /// recent failures.
+    fn is_locked_out(&self, ip: IpAddr) -> bool {
+        let attempts = self.attempts.lock();
+        if let Some(&(count, last)) = attempts.get(&ip) {
+            if count >= Self::MAX_FAILED_ATTEMPTS {
+                return last.elapsed().as_secs() < Self::LOCKOUT_SECS;
+            }
+        }
+        false
+    }
+
+    /// Record a failed authentication attempt from `ip`.
+    fn record_failure(&self, ip: IpAddr) {
+        let mut attempts = self.attempts.lock();
+        let entry = attempts.entry(ip).or_insert((0, std::time::Instant::now()));
+        // Reset the counter if the lockout window has elapsed.
+        if entry.1.elapsed().as_secs() >= Self::LOCKOUT_SECS {
+            *entry = (1, std::time::Instant::now());
+        } else {
+            entry.0 += 1;
+            entry.1 = std::time::Instant::now();
+        }
+    }
+
+    /// Clear the failure record for `ip` (called on successful auth).
+    fn clear(&self, ip: IpAddr) {
+        self.attempts.lock().remove(&ip);
+    }
+}
 
 // ============================================================================
 // Query Parser (Extended Query Protocol)
@@ -249,6 +305,8 @@ pub struct NucleusHandler {
     statement_timeout_secs: u64,
     /// Maximum query string size in bytes. Default: 16 MB.
     max_query_size: usize,
+    /// Rate limiter for failed authentication attempts (brute-force protection).
+    login_rate_limiter: LoginRateLimiter,
 }
 
 impl NucleusHandler {
@@ -273,6 +331,7 @@ impl NucleusHandler {
             copy_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
             statement_timeout_secs: Self::DEFAULT_STATEMENT_TIMEOUT_SECS,
             max_query_size: Self::DEFAULT_MAX_QUERY_SIZE,
+            login_rate_limiter: LoginRateLimiter::new(),
         }
     }
 
@@ -327,6 +386,7 @@ impl NucleusHandler {
             copy_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
             statement_timeout_secs: Self::DEFAULT_STATEMENT_TIMEOUT_SECS,
             max_query_size: Self::DEFAULT_MAX_QUERY_SIZE,
+            login_rate_limiter: LoginRateLimiter::new(),
         }
     }
 
@@ -826,6 +886,16 @@ impl StartupHandler for NucleusHandler {
                     client.set_state(PgWireConnectionState::AuthenticationInProgress);
                     match self.auth_method {
                         AuthMethod::Cleartext => {
+                            // Reject cleartext password auth over unencrypted connections
+                            // to prevent credential sniffing.
+                            if !client.is_secure() {
+                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "FATAL".to_owned(),
+                                    "28000".to_owned(),
+                                    "cleartext password authentication requires a TLS connection"
+                                        .to_owned(),
+                                ))));
+                            }
                             client
                                 .send(PgWireBackendMessage::Authentication(
                                     Authentication::CleartextPassword,
@@ -849,6 +919,17 @@ impl StartupHandler for NucleusHandler {
             // ── Password response: verify against configured auth mode ───
             PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
                 if let Some(auth) = &self.authenticator {
+                    // ── Rate-limit check: reject if too many recent failures ──
+                    let source_ip = client.socket_addr().ip();
+                    if self.login_rate_limiter.is_locked_out(source_ip) {
+                        self.cleanup_session(&client.socket_addr().to_string());
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "FATAL".to_owned(),
+                            "28P01".to_owned(), // invalid_password
+                            "too many failed login attempts, try again later".to_owned(),
+                        ))));
+                    }
+
                     let result = match self.auth_method {
                         AuthMethod::Cleartext => {
                             let pwd = pwd.into_password()?;
@@ -868,9 +949,12 @@ impl StartupHandler for NucleusHandler {
                     };
 
                     if let Err(e) = result {
+                        self.login_rate_limiter.record_failure(source_ip);
                         self.cleanup_session(&client.socket_addr().to_string());
                         return Err(e);
                     }
+                    // Successful auth: clear any prior failure record.
+                    self.login_rate_limiter.clear(source_ip);
                 } else {
                     tracing::warn!("Received password message but authentication is disabled");
                 }
@@ -2378,5 +2462,58 @@ mod security_tests {
         assert_eq!(unescape_copy_text("line1\\nline2"), "line1\nline2");
         assert_eq!(unescape_copy_text("back\\\\slash"), "back\\slash");
         assert_eq!(unescape_copy_text("no_escape"), "no_escape");
+    }
+
+    // ── Login rate limiter tests ────────────────────────────────────
+
+    #[test]
+    fn rate_limiter_allows_initial_attempts() {
+        let limiter = LoginRateLimiter::new();
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        assert!(!limiter.is_locked_out(ip));
+    }
+
+    #[test]
+    fn rate_limiter_locks_out_after_max_failures() {
+        let limiter = LoginRateLimiter::new();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        for _ in 0..LoginRateLimiter::MAX_FAILED_ATTEMPTS {
+            limiter.record_failure(ip);
+        }
+        assert!(limiter.is_locked_out(ip), "should be locked out after max failures");
+    }
+
+    #[test]
+    fn rate_limiter_does_not_lock_below_threshold() {
+        let limiter = LoginRateLimiter::new();
+        let ip: IpAddr = "10.0.0.2".parse().unwrap();
+        for _ in 0..(LoginRateLimiter::MAX_FAILED_ATTEMPTS - 1) {
+            limiter.record_failure(ip);
+        }
+        assert!(!limiter.is_locked_out(ip), "should not lock out below threshold");
+    }
+
+    #[test]
+    fn rate_limiter_clear_resets() {
+        let limiter = LoginRateLimiter::new();
+        let ip: IpAddr = "10.0.0.3".parse().unwrap();
+        for _ in 0..LoginRateLimiter::MAX_FAILED_ATTEMPTS {
+            limiter.record_failure(ip);
+        }
+        assert!(limiter.is_locked_out(ip));
+        limiter.clear(ip);
+        assert!(!limiter.is_locked_out(ip), "should not be locked out after clear");
+    }
+
+    #[test]
+    fn rate_limiter_different_ips_independent() {
+        let limiter = LoginRateLimiter::new();
+        let ip_a: IpAddr = "10.0.0.4".parse().unwrap();
+        let ip_b: IpAddr = "10.0.0.5".parse().unwrap();
+        for _ in 0..LoginRateLimiter::MAX_FAILED_ATTEMPTS {
+            limiter.record_failure(ip_a);
+        }
+        assert!(limiter.is_locked_out(ip_a));
+        assert!(!limiter.is_locked_out(ip_b), "unrelated IP should not be locked out");
     }
 }
