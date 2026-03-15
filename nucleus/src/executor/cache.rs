@@ -376,7 +376,7 @@ impl Executor {
         // Row data: estimate each Value
         let row_size: usize = rows.iter()
             .map(|row| {
-                row.iter().map(|v| Self::estimate_value_size(v)).sum::<usize>()
+                row.iter().map(Self::estimate_value_size).sum::<usize>()
                     + 24 // Vec overhead per row
             })
             .sum();
@@ -394,7 +394,7 @@ impl Executor {
             Value::Jsonb(j) => 24 + j.to_string().len(),
             Value::Uuid(_) => 24,
             Value::Bytea(b) => 24 + b.len(),
-            Value::Array(vals) => 24 + vals.iter().map(|v| Self::estimate_value_size(v)).sum::<usize>(),
+            Value::Array(vals) => 24 + vals.iter().map(Self::estimate_value_size).sum::<usize>(),
             Value::Vector(v) => 24 + v.len() * 4,
             Value::Interval { .. } => 24,
         }

@@ -110,8 +110,7 @@ impl FastHashMap for FastHashMapI32 {
                         vec![]
                     } else {
                         vec![(Value::Null, self.null_indices.clone())]
-                    }
-                    .into_iter(),
+                    },
                 ),
         )
     }
@@ -177,8 +176,7 @@ impl FastHashMap for FastHashMapI64 {
                         vec![]
                     } else {
                         vec![(Value::Null, self.null_indices.clone())]
-                    }
-                    .into_iter(),
+                    },
                 ),
         )
     }
@@ -270,8 +268,7 @@ impl FastHashMap for FastHashMapF64 {
                         vec![]
                     } else {
                         vec![(Value::Null, self.null_indices.clone())]
-                    }
-                    .into_iter(),
+                    },
                 ),
         )
     }
@@ -329,8 +326,7 @@ impl FastHashMap for FastHashMapString {
                         vec![]
                     } else {
                         vec![(Value::Null, self.null_indices.clone())]
-                    }
-                    .into_iter(),
+                    },
                 ),
         )
     }

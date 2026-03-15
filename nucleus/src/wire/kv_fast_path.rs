@@ -582,16 +582,14 @@ fn parse_sql_literal(s: &str) -> Option<(SqlLiteral, &str)> {
     }
 
     // TRUE / FALSE
-    if let Some(rest) = strip_prefix_ci(s, "TRUE") {
-        if rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric() {
+    if let Some(rest) = strip_prefix_ci(s, "TRUE")
+        && (rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric()) {
             return Some((SqlLiteral::Bool(true), rest));
         }
-    }
-    if let Some(rest) = strip_prefix_ci(s, "FALSE") {
-        if rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric() {
+    if let Some(rest) = strip_prefix_ci(s, "FALSE")
+        && (rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric()) {
             return Some((SqlLiteral::Bool(false), rest));
         }
-    }
 
     // String literal
     if bytes[0] == b'\'' {

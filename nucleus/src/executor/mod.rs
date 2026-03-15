@@ -2175,11 +2175,10 @@ impl Executor {
                 }
                 let result = self.execute_query(*query).await;
                 // Store successful SELECT results in the cache
-                if cacheable {
-                    if let Ok(ExecResult::Select { ref columns, ref rows }) = result {
+                if cacheable
+                    && let Ok(ExecResult::Select { ref columns, ref rows }) = result {
                         self.query_cache_put(&sql_text, columns, rows);
                     }
-                }
                 result
             }
             Statement::CreateTable(create) => self.execute_create_table(create).await,

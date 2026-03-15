@@ -288,7 +288,7 @@ impl Decoder {
     /// Parse a Ready message.
     /// Payload: [status:1] (0=idle, 1=in_txn, 2=error)
     pub fn parse_ready(payload: &[u8]) -> Result<u8, DecodeError> {
-        if payload.len() < 1 {
+        if payload.is_empty() {
             return Err(DecodeError::InvalidPayload(
                 "Ready payload too short".to_string(),
             ));
@@ -354,7 +354,7 @@ impl Decoder {
     /// Parse a BeginTxn message.
     /// Payload: [isolation_level:1]
     pub fn parse_begin_txn(payload: &[u8]) -> Result<u8, DecodeError> {
-        if payload.len() < 1 {
+        if payload.is_empty() {
             return Err(DecodeError::InvalidPayload(
                 "BeginTxn payload too short".to_string(),
             ));

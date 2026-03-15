@@ -1083,12 +1083,12 @@ impl Executor {
                 let matches = self.storage_for(&table_name)
                     .scan_where_eq_positions(&table_name, col_idx, &eq_value).await?;
                 self.metrics.rows_scanned.inc_by(1);
-                (matches.into_iter().map(|(pos, row)| (pos, row)).collect::<Vec<_>>(), true)
+                (matches.into_iter().collect::<Vec<_>>(), true)
             }
             None => {
                 let rows = self.storage_for(&table_name).scan(&table_name).await?;
                 self.metrics.rows_scanned.inc_by(rows.len() as u64);
-                (rows.into_iter().enumerate().map(|(pos, row)| (pos, row)).collect::<Vec<_>>(), false)
+                (rows.into_iter().enumerate().collect::<Vec<_>>(), false)
             }
         };
         // Resolve assignments: (column_index, value_expr)
@@ -1327,7 +1327,7 @@ impl Executor {
             None => {
                 let rows = self.storage_for(&table_name).scan(&table_name).await?;
                 self.metrics.rows_scanned.inc_by(rows.len() as u64);
-                (rows.into_iter().enumerate().map(|(pos, row)| (pos, row)).collect::<Vec<_>>(), false)
+                (rows.into_iter().enumerate().collect::<Vec<_>>(), false)
             }
         };
 

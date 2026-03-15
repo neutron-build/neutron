@@ -149,11 +149,10 @@ impl LoginRateLimiter {
     /// recent failures.
     fn is_locked_out(&self, ip: IpAddr) -> bool {
         let attempts = self.attempts.lock();
-        if let Some(&(count, last)) = attempts.get(&ip) {
-            if count >= Self::MAX_FAILED_ATTEMPTS {
+        if let Some(&(count, last)) = attempts.get(&ip)
+            && count >= Self::MAX_FAILED_ATTEMPTS {
                 return last.elapsed().as_secs() < Self::LOCKOUT_SECS;
             }
-        }
         false
     }
 
@@ -989,13 +988,12 @@ impl SimpleQueryHandler for NucleusHandler {
         }
 
         // ── SQL OLTP fast path: intercept simple point queries/mutations ──
-        if let Some(sql_cmd) = kv_fast_path::try_parse_sql_fast_path(query) {
-            if let Some(result) = self.executor.execute_sql_fast_path(&sql_cmd).await {
+        if let Some(sql_cmd) = kv_fast_path::try_parse_sql_fast_path(query)
+            && let Some(result) = self.executor.execute_sql_fast_path(&sql_cmd).await {
                 return Ok(vec![Self::build_response(result.map_err(exec_error_to_pgwire)?)?]);
             }
             // Fall through to normal path if fast-path couldn't handle it
             // (e.g. table not found in cache, column mismatch, etc.)
-        }
 
         let session_id = self.session_id_from_client(client);
 

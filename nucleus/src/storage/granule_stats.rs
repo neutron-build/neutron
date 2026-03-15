@@ -121,20 +121,18 @@ impl GranuleStats {
                 .entry(*col_id)
                 .and_modify(|stats| {
                     // Update min/max with the other granule's extremes
-                    if other_stats.min_value != Value::Null {
-                        if stats.min_value == Value::Null
-                            || other_stats.min_value < stats.min_value
+                    if other_stats.min_value != Value::Null
+                        && (stats.min_value == Value::Null
+                            || other_stats.min_value < stats.min_value)
                         {
                             stats.min_value = other_stats.min_value.clone();
                         }
-                    }
-                    if other_stats.max_value != Value::Null {
-                        if stats.max_value == Value::Null
-                            || other_stats.max_value > stats.max_value
+                    if other_stats.max_value != Value::Null
+                        && (stats.max_value == Value::Null
+                            || other_stats.max_value > stats.max_value)
                         {
                             stats.max_value = other_stats.max_value.clone();
                         }
-                    }
                     stats.null_count += other_stats.null_count;
                     stats.total_count += other_stats.total_count;
                 })
@@ -167,7 +165,7 @@ impl ZoneMapIndex {
         stats: GranuleStats,
     ) {
         let mut map = self.stats_by_table.write();
-        let granules = map.entry(table_id).or_insert_with(Vec::new);
+        let granules = map.entry(table_id).or_default();
 
         // Expand vector if necessary
         let granule_idx = granule_id as usize;
@@ -191,8 +189,7 @@ impl ZoneMapIndex {
     /// Get all granules for a table.
     pub fn get_table_granules(&self, table_id: u64) -> Vec<GranuleStats> {
         let map = self.stats_by_table.read();
-        map.get(&table_id)
-            .map(|g| g.clone())
+        map.get(&table_id).cloned()
             .unwrap_or_default()
     }
 

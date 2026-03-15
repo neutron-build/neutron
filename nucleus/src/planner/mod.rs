@@ -676,16 +676,13 @@ pub fn find_range_scan_opportunity(
     for pred in predicates {
         if let sqlparser::ast::Expr::Between { expr, negated, low, high } = pred
             && !negated
-        {
-            if let Some(col) = extract_column_name(expr) {
-                if indexed_cols.iter().any(|ic| ic.eq_ignore_ascii_case(&col)) {
+            && let Some(col) = extract_column_name(expr)
+                && indexed_cols.iter().any(|ic| ic.eq_ignore_ascii_case(&col)) {
                     let lo_val = low.to_string();
                     let hi_val = high.to_string();
                     let pred_str = pred.to_string();
                     return Some((col.to_lowercase(), lo_val, hi_val, pred_str));
                 }
-            }
-        }
     }
 
     // col → (lo_val, hi_val, predicate_strings)
@@ -1111,11 +1108,10 @@ impl QueryPlanner {
                         } else {
                             None
                         };
-                        if let Some(ref pc) = pred_col {
-                            if !col.eq_ignore_ascii_case(pc) {
+                        if let Some(ref pc) = pred_col
+                            && !col.eq_ignore_ascii_case(pc) {
                                 continue;
                             }
-                        }
                         let selectivity = stats.equality_selectivity(Some(col));
                         let idx_cost = access.estimate_cost(row_count, selectivity);
                         let est = access.estimate_rows(row_count, selectivity);
