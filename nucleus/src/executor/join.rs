@@ -70,8 +70,7 @@ impl Executor {
             ast::JoinOperator::Semi(c) | ast::JoinOperator::LeftSemi(c) => (c, JoinType::Inner),
             ast::JoinOperator::Anti(c) | ast::JoinOperator::LeftAnti(c) => (c, JoinType::Left),
             ast::JoinOperator::CrossJoin(_) => {
-                let (meta, rows) = self.cross_join(left_meta, left_rows, right_meta, right_rows);
-                return Ok((meta, rows));
+                return self.cross_join(left_meta, left_rows, right_meta, right_rows);
             }
             _ => return Err(ExecError::Unsupported("unsupported JOIN type".into())),
         };
@@ -523,24 +522,35 @@ impl Executor {
         Ok(result_rows)
     }
 
+    /// Maximum number of rows a cross join may produce.
+    /// Prevents OOM from accidental or malicious cartesian products.
+    pub(super) const MAX_CROSS_JOIN_ROWS: usize = 10_000_000;
+
     pub(super) fn cross_join(
         &self,
         left_meta: &[ColMeta],
         left_rows: &[Row],
         right_meta: &[ColMeta],
         right_rows: &[Row],
-    ) -> (Vec<ColMeta>, Vec<Row>) {
+    ) -> Result<(Vec<ColMeta>, Vec<Row>), ExecError> {
+        let product = left_rows.len().saturating_mul(right_rows.len());
+        if product > Self::MAX_CROSS_JOIN_ROWS {
+            return Err(ExecError::Runtime(format!(
+                "cross join would produce {} rows, exceeding limit of {}",
+                product, Self::MAX_CROSS_JOIN_ROWS
+            )));
+        }
         let combined_meta: Vec<ColMeta> = left_meta
             .iter()
             .chain(right_meta.iter())
             .cloned()
             .collect();
-        let mut rows = Vec::with_capacity(left_rows.len() * right_rows.len());
+        let mut rows = Vec::with_capacity(product);
         for lr in left_rows {
             for rr in right_rows {
                 rows.push(lr.iter().chain(rr.iter()).cloned().collect());
             }
         }
-        (combined_meta, rows)
+        Ok((combined_meta, rows))
     }
 }

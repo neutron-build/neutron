@@ -261,6 +261,14 @@ impl Executor {
                 }
                 match (&args[0], &args[1], &args[2]) {
                     (Value::Text(s), Value::Text(pattern), Value::Text(replacement)) => {
+                        // Limit regex pattern length to prevent excessive NFA compilation time.
+                        const MAX_REGEX_PATTERN_LEN: usize = 1000;
+                        if pattern.len() > MAX_REGEX_PATTERN_LEN {
+                            return Err(ExecError::Runtime(format!(
+                                "regex pattern too long ({} chars, max {})",
+                                pattern.len(), MAX_REGEX_PATTERN_LEN
+                            )));
+                        }
                         // Optional 4th arg: flags ('g' = global replace)
                         let flags = args.get(3).and_then(|v| if let Value::Text(f) = v { Some(f.as_str()) } else { None }).unwrap_or("");
                         let re = regex::Regex::new(pattern).map_err(|e| {
@@ -283,6 +291,14 @@ impl Executor {
                 }
                 match (&args[0], &args[1]) {
                     (Value::Text(s), Value::Text(pattern)) => {
+                        // Limit regex pattern length to prevent excessive NFA compilation time.
+                        const MAX_REGEX_PATTERN_LEN: usize = 1000;
+                        if pattern.len() > MAX_REGEX_PATTERN_LEN {
+                            return Err(ExecError::Runtime(format!(
+                                "regex pattern too long ({} chars, max {})",
+                                pattern.len(), MAX_REGEX_PATTERN_LEN
+                            )));
+                        }
                         let re = regex::Regex::new(pattern).map_err(|e| {
                             ExecError::Runtime(format!("invalid regex pattern: {e}"))
                         })?;

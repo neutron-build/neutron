@@ -209,6 +209,11 @@ pub fn filter_text(col: &[Option<String>], pred: &Predicate) -> Vec<bool> {
             })
             .collect(),
         Predicate::RegexText(pattern) => {
+            // Limit regex pattern length to prevent excessive NFA compilation time.
+            const MAX_REGEX_PATTERN_LEN: usize = 1000;
+            if pattern.len() > MAX_REGEX_PATTERN_LEN {
+                return vec![false; col.len()];
+            }
             match Regex::new(pattern) {
                 Ok(re) => col.iter()
                     .map(|v| {
@@ -436,6 +441,11 @@ pub fn apply_text_predicate(col: &[Option<String>], pred: &TextPredicate) -> Vec
             })
             .collect(),
         TextPredicate::Regex(pattern) => {
+            // Limit regex pattern length to prevent excessive NFA compilation time.
+            const MAX_REGEX_PATTERN_LEN: usize = 1000;
+            if pattern.len() > MAX_REGEX_PATTERN_LEN {
+                return vec![false; col.len()];
+            }
             match Regex::new(pattern) {
                 Ok(re) => col.iter()
                     .map(|v| {
