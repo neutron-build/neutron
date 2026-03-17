@@ -74,11 +74,17 @@ impl MiddlewareTrait for RequestId {
     fn call(&self, req: Request, next: Next) -> Pin<Box<dyn Future<Output = Response> + Send>> {
         let header_name = self.header_name;
 
-        // Use existing request ID or generate a new one
+        // Use existing request ID or generate a new one.
+        // Validate incoming IDs to prevent injection of oversized or malformed values.
         let id = req
             .headers()
             .get(header_name)
             .and_then(|v| v.to_str().ok())
+            .filter(|s| {
+                s.len() <= 128
+                    && s.chars()
+                        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+            })
             .map(|s| s.to_string())
             .unwrap_or_else(generate_id);
 

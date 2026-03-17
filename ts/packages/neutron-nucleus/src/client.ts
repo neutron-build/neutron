@@ -117,9 +117,15 @@ class ClientBuilder<Acc> implements NucleusClientBuilder<Acc> {
     };
 
     // Merge plugin contributions into the base object
+    const reserved = new Set(['transport', 'features', 'close', 'ping']);
     const client = base as NucleusClientBase & Acc;
     for (const plugin of this.plugins) {
       const contribution = plugin.init(transport, features);
+      for (const key of Object.keys(contribution as object)) {
+        if (reserved.has(key)) {
+          throw new Error(`Plugin "${plugin.name}" cannot override reserved property "${key}"`);
+        }
+      }
       Object.assign(client, contribution);
     }
 

@@ -1,0 +1,73 @@
+// Prisma schema for benchmarks
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./benchmark.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id        Int     @id @default(autoincrement())
+  email     String  @unique
+  name      String
+  age       Int
+  createdAt DateTime @default(now()) @map("created_at")
+
+  posts    Post[]
+  comments Comment[]
+
+  @@map("users")
+}
+
+model Post {
+  id        Int     @id @default(autoincrement())
+  userId    Int     @map("user_id")
+  title     String
+  content   String
+  published Boolean @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  comments Comment[]
+  tags     PostTag[]
+
+  @@index([userId])
+  @@map("posts")
+}
+
+model Comment {
+  id        Int     @id @default(autoincrement())
+  postId    Int     @map("post_id")
+  userId    Int     @map("user_id")
+  body      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([postId])
+  @@index([userId])
+  @@map("comments")
+}
+
+model Tag {
+  id    Int    @id @default(autoincrement())
+  name  String @unique
+  posts PostTag[]
+
+  @@map("tags")
+}
+
+model PostTag {
+  postId Int
+  tagId  Int
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  tag  Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([postId, tagId])
+  @@map("post_tags")
+}

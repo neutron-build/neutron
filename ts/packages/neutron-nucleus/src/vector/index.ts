@@ -68,6 +68,15 @@ class VectorModelImpl implements VectorModel {
     this.require();
     assertIdentifier(name, 'collection name');
 
+    if (!Number.isInteger(dimension) || dimension <= 0 || dimension > 65535) {
+      throw new Error(`Invalid vector dimension: ${dimension}. Must be a positive integer <= 65535`);
+    }
+
+    const VALID_METRICS = ['cosine', 'l2', 'inner'] as const;
+    if (!VALID_METRICS.includes(metric)) {
+      throw new Error(`Invalid distance metric: ${metric}. Must be one of: ${VALID_METRICS.join(', ')}`);
+    }
+
     await this.transport.execute(
       `CREATE TABLE IF NOT EXISTS ${name} (id TEXT PRIMARY KEY, embedding VECTOR(${dimension}), metadata JSONB DEFAULT '{}')`,
     );

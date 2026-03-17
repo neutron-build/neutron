@@ -31,11 +31,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlencode
+
+logger = logging.getLogger("neutron.auth")
 
 import httpx
 from starlette.requests import Request
@@ -88,6 +91,12 @@ class OAuthProvider:
     scopes: list[str]
     secret: str
     provider_name: str = ""
+
+    def __post_init__(self) -> None:
+        if len(self.secret) < 32:
+            raise ValueError(
+                f"OAuth secret must be at least 32 characters. Got {len(self.secret)}."
+            )
 
     # ------------------------------------------------------------------
     # Factory methods for common providers
@@ -510,11 +519,12 @@ async def _exchange_code(
         )
 
     if resp.status_code < 200 or resp.status_code >= 300:
+        logger.error("OAuth token exchange failed: %s %s", resp.status_code, resp.text)
         raise AppError(
             status=500,
             code="internal",
             title="Internal Server Error",
-            detail=f"Token endpoint returned {resp.status_code}: {resp.text}",
+            detail="OAuth authentication failed",
         )
 
     # Some providers (GitHub) may return form-encoded instead of JSON.
@@ -547,11 +557,12 @@ async def _fetch_userinfo(
         )
 
     if resp.status_code < 200 or resp.status_code >= 300:
+        logger.error("OAuth userinfo fetch failed: %s %s", resp.status_code, resp.text)
         raise AppError(
             status=500,
             code="internal",
             title="Internal Server Error",
-            detail=f"Userinfo endpoint returned {resp.status_code}: {resp.text}",
+            detail="OAuth authentication failed",
         )
 
     return resp.json()

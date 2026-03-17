@@ -99,6 +99,12 @@ impl Cors {
     /// header is echoed back instead of `*` (per the CORS spec).
     pub fn allow_any_origin(mut self) -> Self {
         self.origins = AllowOrigin::Any;
+        if self.credentials {
+            tracing::warn!(
+                "CORS: allow_any_origin() with allow_credentials() reflects all origins \
+                 — this is dangerous in production"
+            );
+        }
         self
     }
 
@@ -179,8 +185,18 @@ impl Cors {
     }
 
     /// Set `Access-Control-Allow-Credentials: true`.
+    ///
+    /// **Warning:** Combining `allow_any_origin()` with `allow_credentials()`
+    /// causes the server to reflect all origins, which is dangerous in
+    /// production. Prefer an explicit origin allowlist with credentials.
     pub fn allow_credentials(mut self) -> Self {
         self.credentials = true;
+        if matches!(self.origins, AllowOrigin::Any) {
+            tracing::warn!(
+                "CORS: allow_any_origin() with allow_credentials() reflects all origins \
+                 — this is dangerous in production"
+            );
+        }
         self
     }
 

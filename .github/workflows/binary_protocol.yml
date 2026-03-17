@@ -1,0 +1,71 @@
+name: Binary Protocol Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "nucleus/src/wire/**"
+      - "nucleus/src/bin/compete.rs"
+      - "nucleus/benches/phase4_bench.rs"
+      - ".github/workflows/binary_protocol.yml"
+  pull_request:
+    paths:
+      - "nucleus/src/wire/**"
+      - "nucleus/src/bin/compete.rs"
+      - "nucleus/benches/phase4_bench.rs"
+      - ".github/workflows/binary_protocol.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Binary Protocol Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+
+      - name: Build nucleus
+        run: cargo build --features bench-tools
+        working-directory: nucleus
+
+      - name: Run binary protocol tests
+        run: cargo test --lib wire --lib transport -q
+        working-directory: nucleus
+
+      - name: Run integration tests (binary protocol focus)
+        run: cargo test --test '*' -q -- --test-threads=1
+        working-directory: nucleus
+
+      - name: Run phase4 benchmarks
+        run: cargo bench --bench phase4_bench -- --verbose
+        working-directory: nucleus
+
+      - name: Block merge if tests failed
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: core.setFailed('Binary protocol tests failed')
+
+  clippy:
+    name: Clippy (Wire)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+      - run: cargo clippy --lib wire --lib transport -- -D warnings
+        working-directory: nucleus

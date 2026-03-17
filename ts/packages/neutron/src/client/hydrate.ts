@@ -305,16 +305,25 @@ function applyHeadHtml(headHtml: string): void {
     document.head.appendChild(el);
   }
 
-  // Update canonical link
+  // Update canonical link (validate same-origin to prevent open redirects)
   const canonicalMatch = headHtml.match(/<link\s+rel="canonical"\s+href="([^"]*)"[^>]*>/);
   let canonical = document.head.querySelector('link[rel="canonical"]');
   if (canonicalMatch) {
-    if (!canonical) {
-      canonical = document.createElement("link");
-      canonical.setAttribute("rel", "canonical");
-      document.head.appendChild(canonical);
+    let isSameOrigin = false;
+    try {
+      const canonUrl = new URL(canonicalMatch[1], window.location.origin);
+      isSameOrigin = canonUrl.origin === window.location.origin;
+    } catch {
+      // ignore invalid URLs
     }
-    canonical.setAttribute("href", canonicalMatch[1]);
+    if (isSameOrigin) {
+      if (!canonical) {
+        canonical = document.createElement("link");
+        canonical.setAttribute("rel", "canonical");
+        document.head.appendChild(canonical);
+      }
+      canonical.setAttribute("href", canonicalMatch[1]);
+    }
   } else if (canonical) {
     canonical.remove();
   }

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sync"
 )
 
@@ -31,8 +32,20 @@ type Upgrader func(w http.ResponseWriter, r *http.Request) (WebSocketConn, error
 // WebSocketHandler returns an http.Handler that upgrades HTTP connections to
 // WebSocket using the provided Upgrader, and registers them with the Hub.
 // Messages received from the client are broadcast to all hub connections.
+//
+// The handler validates the Origin header against the request Host to prevent
+// cross-origin WebSocket hijacking.
 func WebSocketHandler(hub *Hub, upgrader Upgrader) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Validate Origin header to prevent cross-origin WebSocket hijacking
+		if origin := r.Header.Get("Origin"); origin != "" {
+			originURL, err := url.Parse(origin)
+			if err != nil || originURL.Host != r.Host {
+				http.Error(w, "Origin not allowed", http.StatusForbidden)
+				return
+			}
+		}
+
 		ws, err := upgrader(w, r)
 		if err != nil {
 			http.Error(w, "WebSocket upgrade failed", http.StatusBadRequest)
@@ -75,8 +88,20 @@ func WebSocketHandler(hub *Hub, upgrader Upgrader) http.Handler {
 // WebSocketHandlerWithRoom returns an http.Handler that upgrades HTTP connections
 // to WebSocket and auto-subscribes them to the given room. Messages received
 // from the client are broadcast to that room.
+//
+// The handler validates the Origin header against the request Host to prevent
+// cross-origin WebSocket hijacking.
 func WebSocketHandlerWithRoom(hub *Hub, room string, upgrader Upgrader) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Validate Origin header to prevent cross-origin WebSocket hijacking
+		if origin := r.Header.Get("Origin"); origin != "" {
+			originURL, err := url.Parse(origin)
+			if err != nil || originURL.Host != r.Host {
+				http.Error(w, "Origin not allowed", http.StatusForbidden)
+				return
+			}
+		}
+
 		ws, err := upgrader(w, r)
 		if err != nil {
 			http.Error(w, "WebSocket upgrade failed", http.StatusBadRequest)

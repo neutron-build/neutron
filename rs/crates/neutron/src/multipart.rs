@@ -75,7 +75,11 @@ impl FromRequest for Multipart {
 
         let body = req.body().clone();
         let stream = tokio_stream::once(Ok::<Bytes, std::convert::Infallible>(body));
-        let multipart = multer::Multipart::new(stream, boundary);
+        let size_limit = multer::SizeLimit::new()
+            .whole_stream(2 * 1024 * 1024) // 2 MB total
+            .per_field(2 * 1024 * 1024); // 2 MB per field
+        let constraints = multer::Constraints::new().size_limit(size_limit);
+        let multipart = multer::Multipart::with_constraints(stream, boundary, constraints);
 
         Ok(Multipart { inner: multipart })
     }

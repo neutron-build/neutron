@@ -145,25 +145,23 @@ impl GeoModel {
         Ok(row.get::<_, String>(0))
     }
 
-    /// Extract the X coordinate (longitude) from a point expression.
-    pub async fn point_x(&self, point_expr: &str) -> Result<f64, NucleusError> {
+    /// Extract the X coordinate (longitude) from a point created by `make_point`.
+    pub async fn point_x(&self, lon: f64, lat: f64) -> Result<f64, NucleusError> {
         let conn = self.pool.get().await?;
-        let sql = format!("SELECT ST_X({})", point_expr);
         let row = conn
             .client()
-            .query_one(&sql, &[])
+            .query_one("SELECT ST_X(ST_MAKEPOINT($1, $2))", &[&lon, &lat])
             .await
             .map_err(NucleusError::Query)?;
         Ok(row.get::<_, f64>(0))
     }
 
-    /// Extract the Y coordinate (latitude) from a point expression.
-    pub async fn point_y(&self, point_expr: &str) -> Result<f64, NucleusError> {
+    /// Extract the Y coordinate (latitude) from a point created by `make_point`.
+    pub async fn point_y(&self, lon: f64, lat: f64) -> Result<f64, NucleusError> {
         let conn = self.pool.get().await?;
-        let sql = format!("SELECT ST_Y({})", point_expr);
         let row = conn
             .client()
-            .query_one(&sql, &[])
+            .query_one("SELECT ST_Y(ST_MAKEPOINT($1, $2))", &[&lon, &lat])
             .await
             .map_err(NucleusError::Query)?;
         Ok(row.get::<_, f64>(0))

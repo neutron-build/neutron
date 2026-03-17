@@ -191,6 +191,11 @@ class TimeSeriesModelImpl implements TimeSeriesModel {
   ): Promise<TimeSeriesPoint[]> {
     this.require();
 
+    const VALID_AGG_FUNCS = ['sum', 'avg', 'min', 'max', 'count', 'first', 'last'] as const;
+    if (!VALID_AGG_FUNCS.includes(fn)) {
+      throw new Error(`Invalid aggregation function: ${fn}. Must be one of: ${VALID_AGG_FUNCS.join(', ')}`);
+    }
+
     const sql =
       `SELECT COALESCE((SELECT json_agg(row_to_json(t)) FROM (` +
       `SELECT TIME_BUCKET($1, timestamp_ms) AS bucket_ms, ${fn}(value) AS value ` +
