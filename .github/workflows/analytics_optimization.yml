@@ -1,0 +1,90 @@
+name: Analytics Optimizations
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "nucleus/src/executor/aggregate.rs"
+      - "nucleus/src/executor/mod.rs"
+      - "nucleus/src/storage/buffer.rs"
+      - "nucleus/src/storage/compression.rs"
+      - "nucleus/src/simd/**"
+      - "nucleus/benches/phase4_bench.rs"
+      - ".github/workflows/analytics_optimization.yml"
+  pull_request:
+    paths:
+      - "nucleus/src/executor/aggregate.rs"
+      - "nucleus/src/executor/mod.rs"
+      - "nucleus/src/storage/buffer.rs"
+      - "nucleus/src/storage/compression.rs"
+      - "nucleus/src/simd/**"
+      - "nucleus/benches/phase4_bench.rs"
+      - ".github/workflows/analytics_optimization.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  analytics_tests:
+    name: Analytics Optimization Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+
+      - name: Test zone maps and granule statistics
+        run: cargo test --lib storage::buffer --lib storage::mvcc -q
+        working-directory: nucleus
+
+      - name: Test GROUP BY and aggregations
+        run: cargo test --lib executor::aggregate -q
+        working-directory: nucleus
+
+      - name: Test lazy materialization
+        run: cargo test --lib executor::project -q
+        working-directory: nucleus
+
+      - name: Test SIMD infrastructure
+        run: cargo test --lib simd -q
+        working-directory: nucleus
+
+      - name: Benchmark analytics optimizations
+        run: cargo bench --bench phase4_bench -- --verbose
+        working-directory: nucleus
+
+      - name: Alert if performance regresses
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: core.setFailed('Analytics optimization tests failed')
+
+  clippy:
+    name: Clippy (Analytics)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+      - run: cargo clippy --lib executor --lib storage --lib simd -- -D warnings
+        working-directory: nucleus
+
+  documentation:
+    name: Analytics Metrics Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate analytics metrics match source code
+        run: sh scripts/metrics.sh --check
+        working-directory: nucleus

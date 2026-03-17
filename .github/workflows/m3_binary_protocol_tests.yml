@@ -1,0 +1,148 @@
+name: M3 Binary Protocol Tests
+
+on: [push, pull_request]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  binary_protocol_tests:
+    name: Binary Protocol Test Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+
+      # Run test harness infrastructure tests
+      - name: Build binary protocol module
+        working-directory: nucleus
+        run: |
+          cargo build --lib --features "server" --all
+
+      # Run binary protocol tests (currently ignored, will activate in Phase 1)
+      - name: Run binary protocol tests
+        working-directory: nucleus
+        run: |
+          cargo test --lib binary_wire --features "server" --all -- --nocapture
+        continue-on-error: true  # Tests are ignored until Phase 1, so this won't fail
+
+      # Run cross-protocol validation tests
+      - name: Run cross-protocol tests
+        working-directory: nucleus
+        run: |
+          cargo test --lib binary_wire::tests::cross_protocol --features "server" --all -- --nocapture
+        continue-on-error: true
+
+      # Run existing executor tests (ensure no regressions)
+      - name: Run existing executor test suite (regression check)
+        working-directory: nucleus
+        run: |
+          cargo test --lib executor::tests --features "server" --all
+
+      # Ensure no warnings in binary protocol code
+      - name: Check for warnings
+        working-directory: nucleus
+        run: |
+          cargo clippy --lib --features "server" --all -- -D warnings
+
+  benchmark_baseline:
+    name: Benchmark Baseline Measurement
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+
+      # Build compete.rs benchmark tool
+      - name: Build compete.rs
+        working-directory: nucleus
+        run: |
+          cargo build --release --features "bench-tools" --bin compete
+
+      # Run baseline measurements (small dataset for CI)
+      - name: Measure baseline performance
+        working-directory: nucleus
+        run: |
+          ./target/release/compete --iterations 100 --rows 10000 --skip mongodb,tidb,cockroach,clickhouse 2>&1 | tee baseline_metrics.txt
+        continue-on-error: true
+
+      # Upload baseline metrics as artifact
+      - name: Upload baseline metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-metrics
+          path: nucleus/baseline_metrics.txt
+          retention-days: 30
+
+  test_coverage:
+    name: Test Coverage Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+
+      # Count test cases
+      - name: Count binary protocol test cases
+        working-directory: nucleus
+        run: |
+          echo "=== Binary Protocol Test Suite Coverage ===" > test_coverage.txt
+          echo "" >> test_coverage.txt
+          echo "Test files:" >> test_coverage.txt
+          find src/binary_wire/tests -name "*.rs" | while read f; do
+            echo "- $f" >> test_coverage.txt
+            grep -c "#\[tokio::test\]" "$f" || echo "  0 tests" >> test_coverage.txt
+          done
+          echo "" >> test_coverage.txt
+          echo "Total test functions (placeholders):" >> test_coverage.txt
+          find src/binary_wire/tests -name "*.rs" -exec grep -h "#\[tokio::test\]" {} \; | wc -l >> test_coverage.txt
+          cat test_coverage.txt
+
+      - name: Upload test coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-coverage-report
+          path: nucleus/test_coverage.txt
+          retention-days: 30
+
+  documentation:
+    name: M3 Documentation
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Check that M3 documentation exists
+      - name: Verify M3 documentation
+        run: |
+          if [ ! -f nucleus/M3_TEST_PLAN.md ]; then
+            echo "M3_TEST_PLAN.md not found"
+            exit 1
+          fi
+          echo "✓ M3 test plan documentation exists"
+
+      # Verify test module structure
+      - name: Verify test module structure
+        run: |
+          echo "Binary wire test modules:"
+          find nucleus/src/binary_wire/tests -name "*.rs" -type f | sort

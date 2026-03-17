@@ -90,6 +90,20 @@ impl Handler<()> for StaticFiles {
                 resolved
             };
 
+            // Canonicalize and verify the target is within the root directory
+            // to prevent symlink escape attacks.
+            let canonical = match tokio::fs::canonicalize(&target).await {
+                Ok(p) => p,
+                Err(_) => return not_found(),
+            };
+            let root_canonical = match tokio::fs::canonicalize(&root).await {
+                Ok(p) => p,
+                Err(_) => return not_found(),
+            };
+            if !canonical.starts_with(&root_canonical) {
+                return not_found();
+            }
+
             // Read file metadata for ETag
             let file_meta = match tokio::fs::metadata(&target).await {
                 Ok(m) => m,

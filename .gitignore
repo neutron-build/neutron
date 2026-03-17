@@ -126,3 +126,5 @@ venv/
 Cargo.lock
 !rs/Cargo.lock
 !nucleus/Cargo.lock
+# Database files
+*.db

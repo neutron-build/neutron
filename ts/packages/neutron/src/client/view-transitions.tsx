@@ -78,9 +78,9 @@ const BOOTSTRAP = `
     return true;
   }
 
-  // Re-execute inline scripts after DOM swap (filters, modals, email protection, etc.)
+  // Re-execute only inline scripts explicitly marked as safe for view transitions
   function rerunInlineScripts(container) {
-    var scripts = container.querySelectorAll('script:not([type="module"]):not([src])');
+    var scripts = container.querySelectorAll('script[data-neutron-inline]');
     scripts.forEach(function(oldScript) {
       var newScript = document.createElement('script');
       newScript.textContent = oldScript.textContent;

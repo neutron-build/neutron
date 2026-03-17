@@ -113,9 +113,9 @@ class CORSMiddleware(_NeutronMiddleware):
         allow_credentials: bool = False,
     ) -> None:
         self._kwargs: dict[str, Any] = {
-            "allow_origins": allow_origins or ["*"],
-            "allow_methods": allow_methods or ["*"],
-            "allow_headers": allow_headers or ["*"],
+            "allow_origins": allow_origins or [],
+            "allow_methods": allow_methods or ["GET", "POST", "PUT", "DELETE", "PATCH"],
+            "allow_headers": allow_headers or [],
             "allow_credentials": allow_credentials,
         }
 
@@ -139,32 +139,34 @@ class CompressionMiddleware(_NeutronMiddleware):
 # --- Rate Limiting (per-IP token bucket) ---
 
 
-def _default_key_func(scope: Scope) -> str:
-    """Extract client IP from proxy headers or ASGI scope.
+def _get_client_ip(scope: Scope, trust_proxy: bool = False) -> str:
+    """Extract client IP from ASGI scope.
 
-    Resolution order: X-Forwarded-For (first hop) -> X-Real-IP -> scope client.
+    Only reads proxy headers (X-Forwarded-For, X-Real-IP) when *trust_proxy*
+    is explicitly enabled.  Without trust_proxy, uses only the real connection
+    address — preventing attackers from spoofing their IP via headers.
     """
-    # Parse headers from raw ASGI scope (list of [name, value] byte-pairs)
-    headers: dict[bytes, bytes] = {}
-    for raw_name, raw_value in scope.get("headers", []):
-        # Only store the first occurrence of each header
-        lower_name = raw_name.lower()
-        if lower_name not in headers:
-            headers[lower_name] = raw_value
+    if trust_proxy:
+        # Parse headers from raw ASGI scope (list of [name, value] byte-pairs)
+        headers: dict[bytes, bytes] = {}
+        for raw_name, raw_value in scope.get("headers", []):
+            lower_name = raw_name.lower()
+            if lower_name not in headers:
+                headers[lower_name] = raw_value
 
-    # X-Forwarded-For: client, proxy1, proxy2 — take the leftmost
-    xff = headers.get(b"x-forwarded-for")
-    if xff:
-        first_ip = xff.decode("latin-1").split(",")[0].strip()
-        if first_ip:
-            return first_ip
+        # X-Forwarded-For: client, proxy1, proxy2 — take the leftmost
+        xff = headers.get(b"x-forwarded-for")
+        if xff:
+            ips = xff.decode("latin-1").split(",")
+            if ips:
+                return ips[0].strip()
 
-    # X-Real-IP (set by many reverse proxies)
-    xri = headers.get(b"x-real-ip")
-    if xri:
-        return xri.decode("latin-1").strip()
+        # X-Real-IP (set by many reverse proxies)
+        xri = headers.get(b"x-real-ip")
+        if xri:
+            return xri.decode("latin-1").strip()
 
-    # Fall back to ASGI scope client address
+    # Default: use actual connection IP
     client = scope.get("client")
     if client:
         return client[0]
@@ -263,9 +265,12 @@ class RateLimitMiddleware(_NeutronMiddleware):
     Args:
         rps: Token refill rate — requests per second per key.
         burst: Maximum burst size (bucket capacity).
+        trust_proxy: When True, reads ``X-Forwarded-For`` / ``X-Real-IP``
+            headers to determine the client IP.  Default ``False`` — only
+            uses the real connection address.  Enable only when running
+            behind a trusted reverse proxy.
         key_func: Callable that receives the ASGI scope and returns a
-            string key.  Defaults to client IP extraction
-            (``X-Forwarded-For`` -> ``X-Real-IP`` -> ``scope["client"]``).
+            string key.  Overrides the default IP-based extraction.
         cleanup_interval: Seconds between stale-bucket cleanup sweeps.
             Default ``60``.
         stale_after: Seconds of inactivity before a bucket is considered
@@ -276,13 +281,14 @@ class RateLimitMiddleware(_NeutronMiddleware):
         self,
         rps: float = 100.0,
         burst: int = 200,
+        trust_proxy: bool = False,
         key_func: Callable[[Scope], str] | None = None,
         cleanup_interval: float = 60.0,
         stale_after: float = 300.0,
     ) -> None:
         self._rps = rps
         self._burst = burst
-        self._key_func = key_func or _default_key_func
+        self._key_func = key_func or (lambda scope: _get_client_ip(scope, trust_proxy=trust_proxy))
         self._cleanup_interval = cleanup_interval
         self._stale_after = stale_after
 

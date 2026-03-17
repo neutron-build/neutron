@@ -1142,7 +1142,7 @@ async function resolveRouteHeadHtml(
     }
 
     if (typeof resolved === "string") {
-      headFragments.push(resolved);
+      headFragments.push(sanitizeHeadHtml(resolved));
       continue;
     }
 
@@ -1767,6 +1767,8 @@ function findNearestErrorBoundary(
 }
 
 function renderDefaultError(error: Error): string {
+  const isProd = typeof process !== 'undefined' && process.env.NODE_ENV === 'production';
+  const displayMessage = isProd ? 'An unexpected error occurred' : escapeHtml(error.message);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1800,7 +1802,7 @@ function renderDefaultError(error: Error): string {
 <body>
   <div class="error-container">
     <h1>Application Error</h1>
-    <p class="message">${escapeHtml(error.message)}</p>
+    <p class="message">${displayMessage}</p>
     <p style="margin-top: 2rem; color: #666;">
       Add an <code>ErrorBoundary</code> export to customize this page.
     </p>
@@ -1906,6 +1908,17 @@ function getClientEntryScriptSrc(distDir: string): string | null {
   );
 
   return match?.[1] || null;
+}
+
+/** Strip <script> tags, event handler attributes, and javascript: URLs from head HTML fragments. */
+function sanitizeHeadHtml(html: string): string {
+  // Strip script tags and their contents
+  html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+  // Strip event handler attributes
+  html = html.replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/gi, '');
+  // Strip javascript: URLs
+  html = html.replace(/(?:href|src|action)\s*=\s*(?:"javascript:[^"]*"|'javascript:[^']*')/gi, '');
+  return html;
 }
 
 function escapeHtml(str: string): string {

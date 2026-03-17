@@ -47,6 +47,12 @@ func (s *Session) Destroy(ctx context.Context) error {
 	return s.store.Delete(ctx, s.ID)
 }
 
+// Regenerate creates a new session ID, preserving data. Call after
+// authentication to prevent session fixation attacks.
+func (s *Session) Regenerate() {
+	s.ID = generateSessionID()
+}
+
 // SessionFromContext extracts the session from the request context.
 func SessionFromContext(ctx context.Context) *Session {
 	s, _ := ctx.Value(ctxKeySession).(*Session)
@@ -60,7 +66,7 @@ func SessionMiddleware(store SessionStore, opts ...SessionOption) neutron.Middle
 		ttl:        24 * time.Hour,
 		path:       "/",
 		httpOnly:   true,
-		secure:     false,
+		secure:     true,
 		sameSite:   http.SameSiteLaxMode,
 	}
 	for _, fn := range opts {

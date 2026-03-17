@@ -264,9 +264,16 @@ func (v *VectorModel) CreateCollection(ctx context.Context, name string, dimensi
 		return fmt.Errorf("nucleus: create collection: %w", err)
 	}
 
+	// Validate metric string against known values to prevent SQL injection
+	metricStr := metric.String()
+	validMetrics := map[string]bool{"cosine": true, "l2": true, "inner": true}
+	if !validMetrics[metricStr] {
+		return fmt.Errorf("nucleus: vector create collection: invalid metric %q", metricStr)
+	}
+
 	indexSQL := fmt.Sprintf(
 		"CREATE INDEX IF NOT EXISTS idx_%s_embedding ON %s USING VECTOR (embedding) WITH (metric = '%s')",
-		name, name, metric.String(),
+		name, name, metricStr,
 	)
 	_, err := v.pool.Exec(ctx, indexSQL)
 	return wrapErr("vector create index", err)

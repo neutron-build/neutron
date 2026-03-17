@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -10,6 +11,17 @@ import asyncpg
 
 from neutron.nucleus._exec import Executor, require_nucleus
 from neutron.nucleus.client import Features
+
+_CHANNEL_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def _validate_channel(channel: str) -> None:
+    """Validate a channel name to prevent SQL injection in NOTIFY statements."""
+    if not _CHANNEL_RE.match(channel):
+        raise ValueError(
+            f"Invalid channel name: {channel!r}. "
+            f"Channel names must match [a-zA-Z_][a-zA-Z0-9_]*."
+        )
 
 
 class PubSubModel:
@@ -34,6 +46,7 @@ class PubSubModel:
 
     async def publish(self, channel: str, message: str) -> int:
         """Publish a message. Returns subscriber count (Nucleus only)."""
+        _validate_channel(channel)
         if self._features.is_nucleus:
             result = await self._exec.fetchval(
                 "SELECT PUBSUB_PUBLISH($1, $2)", channel, message
@@ -60,6 +73,7 @@ class PubSubModel:
 
     async def subscriber_count(self, channel: str) -> int:
         """Count subscribers on a channel (Nucleus only)."""
+        _validate_channel(channel)
         require_nucleus(self._features, "PubSub.subscriber_count")
         return await self._exec.fetchval(
             "SELECT PUBSUB_SUBSCRIBERS($1)", channel
@@ -70,6 +84,7 @@ class PubSubModel:
 
         Works with both plain PostgreSQL (LISTEN/NOTIFY) and Nucleus.
         """
+        _validate_channel(channel)
         conn = await self._pool.acquire()
         queue: asyncio.Queue[str] = asyncio.Queue()
 

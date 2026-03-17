@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/big"
 	"net/http"
 	"time"
@@ -417,7 +418,8 @@ func (s *WebAuthnService) BeginRegistrationHandler(getUserInfo func(r *http.Requ
 
 		opts, err := s.BeginRegistration(userID, userName, displayName)
 		if err != nil {
-			neutron.WriteError(w, r, neutron.ErrInternal(err.Error()))
+			log.Printf("[neutronauth] begin registration failed: %v", err)
+			neutron.WriteError(w, r, neutron.ErrInternal("Registration setup failed"))
 			return
 		}
 
@@ -437,7 +439,8 @@ func (s *WebAuthnService) BeginAuthenticationHandler(getUserID func(r *http.Requ
 
 		opts, err := s.BeginAuthentication(userID)
 		if err != nil {
-			neutron.WriteError(w, r, neutron.ErrInternal(err.Error()))
+			log.Printf("[neutronauth] begin authentication failed: %v", err)
+			neutron.WriteError(w, r, neutron.ErrInternal("Authentication setup failed"))
 			return
 		}
 

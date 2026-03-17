@@ -109,7 +109,7 @@ impl CsrfLayer {
             header_name: "x-csrf-token".to_string(),
             form_field: "_csrf".to_string(),
             cookie_path: "/".to_string(),
-            secure: false,
+            secure: true,
         }
     }
 
@@ -137,7 +137,7 @@ impl CsrfLayer {
         self
     }
 
-    /// Require HTTPS for the CSRF cookie (default: `false`).
+    /// Require HTTPS for the CSRF cookie (default: `true`).
     pub fn secure(mut self, secure: bool) -> Self {
         self.secure = secure;
         self
@@ -148,6 +148,18 @@ fn generate_token() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Constant-time string comparison to prevent timing attacks on CSRF tokens.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.as_bytes()
+        .iter()
+        .zip(b.as_bytes().iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 fn is_safe_method(method: &Method) -> bool {
@@ -212,7 +224,7 @@ impl MiddlewareTrait for CsrfLayer {
                     .or_else(|| extract_form_field(req.body(), &form_field));
 
                 match submitted {
-                    Some(ref submitted_token) if submitted_token == &token => {
+                    Some(ref submitted_token) if constant_time_eq(submitted_token, &token) => {
                         // Token matches — proceed
                     }
                     _ => {
@@ -236,7 +248,9 @@ impl MiddlewareTrait for CsrfLayer {
                 format!("{cookie_name}={signed_token}"),
                 format!("Path={cookie_path}"),
                 "SameSite=Strict".to_string(),
+                "HttpOnly".to_string(),
             ];
+            // Default to Secure; only omit if explicitly set to false
             if secure {
                 cookie_parts.push("Secure".to_string());
             }
