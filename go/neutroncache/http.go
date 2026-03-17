@@ -20,6 +20,12 @@ func HTTPCache(c *TieredCache, ttl time.Duration) neutron.Middleware {
 				return
 			}
 
+			// Never cache authenticated requests — responses may be user-specific
+			if r.Header.Get("Authorization") != "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			cacheKey := "httpcache:" + hashKey(r.URL.String())
 
 			// Check cache

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { resolveDatabaseProfile, type DatabaseProfile } from "./index.js";
+import type { DataConfigInput } from "../config.js";
 
 test("resolveDatabaseProfile returns sqlite profile from input", () => {
   const profile = resolveDatabaseProfile({
@@ -85,7 +86,7 @@ test("resolveDatabaseProfile returns correct connection string for postgres", ()
 });
 
 test("resolveDatabaseProfile handles multiple calls with same config", () => {
-  const config = {
+  const config: DataConfigInput = {
     database: "sqlite",
     sqlitePath: "/data/app.db",
   };

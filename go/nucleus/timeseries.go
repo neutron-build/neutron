@@ -4,8 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
+
+// validAggFuncs is the allowlist of aggregation functions safe to interpolate into SQL.
+var validAggFuncs = map[string]bool{
+	"sum": true, "avg": true, "min": true, "max": true,
+	"count": true, "first": true, "last": true,
+}
 
 // TimeSeriesModel provides time-series operations over Nucleus SQL functions.
 type TimeSeriesModel struct {
@@ -264,6 +271,11 @@ func (ts *TimeSeriesModel) Aggregate(ctx context.Context, measurement string, fr
 
 	interval := windowToInterval(window)
 	aggFn := fn.String()
+
+	// Validate aggregation function against allowlist to prevent SQL injection
+	if !validAggFuncs[strings.ToLower(aggFn)] {
+		return nil, fmt.Errorf("nucleus: invalid aggregation function: %s", aggFn)
+	}
 
 	// Build aggregation query using TIME_BUCKET
 	q := fmt.Sprintf(

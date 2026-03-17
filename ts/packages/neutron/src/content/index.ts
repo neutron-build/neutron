@@ -519,6 +519,16 @@ async function collectCollectionFiles(collectionDir: string): Promise<string[]> 
   return files;
 }
 
+function sanitizeHtml(html: string): string {
+  // Strip script tags and their contents
+  html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+  // Strip event handler attributes
+  html = html.replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/gi, '');
+  // Strip javascript: URLs
+  html = html.replace(/(?:href|src|action)\s*=\s*(?:"javascript:[^"]*"|'javascript:[^']*')/gi, '');
+  return html;
+}
+
 function createEntry(input: {
   id: string;
   slug: string;
@@ -533,7 +543,7 @@ function createEntry(input: {
   const fallbackRender = async () => {
     const html = input.html;
     return {
-      Content: () => h("div", { dangerouslySetInnerHTML: { __html: html } }),
+      Content: () => h("div", { dangerouslySetInnerHTML: { __html: sanitizeHtml(html) } }),
     };
   };
 

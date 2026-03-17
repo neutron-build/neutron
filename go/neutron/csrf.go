@@ -18,7 +18,11 @@ type CSRFOptions struct {
 	// FormField is the form field checked for the token. Default: "_csrf".
 	FormField string
 	// Secure sets the Secure flag on the cookie. Default: true.
+	// To explicitly disable, set AllowInsecure to true and Secure to false.
 	Secure bool
+	// AllowInsecure must be set to true to disable the Secure cookie flag.
+	// This prevents accidental insecure defaults from Go's zero value.
+	AllowInsecure bool
 	// Path sets the cookie path. Default: "/".
 	Path string
 	// SkipPaths is a list of path prefixes that bypass CSRF validation.
@@ -69,6 +73,12 @@ func CSRF(opts CSRFOptions) Middleware {
 		opts.Path = "/"
 	}
 
+	// Default Secure to true unless explicitly disabled via AllowInsecure
+	cookieSecure := true
+	if !opts.Secure && opts.AllowInsecure {
+		cookieSecure = false
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Check if this path should skip CSRF validation.
@@ -96,7 +106,7 @@ func CSRF(opts CSRFOptions) Middleware {
 				Value:    cookieToken,
 				Path:     opts.Path,
 				HttpOnly: false,
-				Secure:   opts.Secure,
+				Secure:   cookieSecure,
 				SameSite: http.SameSiteStrictMode,
 			})
 
@@ -113,7 +123,17 @@ func CSRF(opts CSRFOptions) Middleware {
 						// Fall back to Referer header.
 						origin = r.Header.Get("Referer")
 					}
-					if origin != "" && !originInList(origin, opts.TrustedOrigins) {
+					if origin == "" {
+						// No origin info — reject for safety
+						WriteError(w, r, newAppError(
+							http.StatusForbidden,
+							"csrf-origin",
+							"CSRF Validation Failed",
+							"Missing Origin and Referer headers",
+						))
+						return
+					}
+					if !originInList(origin, opts.TrustedOrigins) {
 						WriteError(w, r, newAppError(
 							http.StatusForbidden,
 							"csrf-origin",

@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from pydantic import BaseModel
 
 from neutron.nucleus._exec import Executor, require_nucleus
 from neutron.nucleus.client import Features
+
+VALID_METRICS = ("cosine", "l2", "inner")
+
+_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
 class VectorResult(BaseModel):
@@ -42,16 +47,22 @@ class VectorModel:
     ) -> None:
         """Create a vector collection (table + index)."""
         self._require()
+        if metric not in VALID_METRICS:
+            raise ValueError(
+                f"Invalid distance metric: {metric}. "
+                f"Must be one of: {', '.join(VALID_METRICS)}"
+            )
+        safe_name = _safe(name)
         await self._exec.execute(
-            f"CREATE TABLE IF NOT EXISTS {_safe(name)} ("
+            f"CREATE TABLE IF NOT EXISTS {safe_name} ("
             f"  id TEXT PRIMARY KEY,"
             f"  embedding VECTOR,"
             f"  metadata JSONB DEFAULT '{{}}'"
             f")"
         )
         await self._exec.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{_safe(name)}_vec "
-            f"ON {_safe(name)} USING VECTOR (embedding) "
+            f"CREATE INDEX IF NOT EXISTS idx_{safe_name}_vec "
+            f"ON {safe_name} USING VECTOR (embedding) "
             f"WITH (metric = '{metric}')"
         )
 
@@ -86,6 +97,11 @@ class VectorModel:
     ) -> list[VectorResult]:
         """Search for nearest neighbors."""
         self._require()
+        if metric not in VALID_METRICS:
+            raise ValueError(
+                f"Invalid distance metric: {metric}. "
+                f"Must be one of: {', '.join(VALID_METRICS)}"
+            )
         vec_json = json.dumps(query)
 
         # Build parameterized filter clauses to prevent SQL injection
@@ -94,9 +110,13 @@ class VectorModel:
         if filter:
             clauses = []
             for fk, fv in filter.items():
-                safe_key = _safe(fk)
+                if not _IDENTIFIER_RE.match(fk):
+                    raise ValueError(
+                        f"Invalid metadata filter key: {fk!r}. "
+                        f"Keys must be valid identifiers (letters, digits, underscores)."
+                    )
                 args.append(str(fv))
-                clauses.append(f"metadata->>'{safe_key}' = ${len(args)}")
+                clauses.append(f"metadata->>'{fk}' = ${len(args)}")
             where = "WHERE " + " AND ".join(clauses)
 
         args.append(k)

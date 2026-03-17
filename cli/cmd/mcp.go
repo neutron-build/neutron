@@ -19,6 +19,7 @@ func init() {
 	mcpCmd.Flags().String("transport", "stdio", "Transport: stdio or http")
 	mcpCmd.Flags().Int("port", 7700, "HTTP port (only used with --transport http)")
 	mcpCmd.Flags().String("dump-schema", "", "Print tool schema and exit: openai, mcp, or markdown")
+	mcpCmd.Flags().Bool("allow-writes", false, "Allow query_sql tool to execute INSERT/UPDATE/DELETE/DDL (default: read-only)")
 	rootCmd.AddCommand(mcpCmd)
 }
 
@@ -103,6 +104,9 @@ func runMCP(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("mcp server: %w", err)
 	}
 	defer srv.Close()
+
+	allowWrites, _ := cmd.Flags().GetBool("allow-writes")
+	mcp.AllowWrites = allowWrites
 
 	transport, _ := cmd.Flags().GetString("transport")
 	switch transport {

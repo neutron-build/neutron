@@ -76,17 +76,31 @@ struct StoredSession {
 /// Suitable for development and single-process deployments. For multi-process
 /// or distributed deployments, implement [`SessionStore`] with a shared
 /// backend like Redis.
+/// Default maximum number of sessions to prevent unbounded memory growth.
+const DEFAULT_MAX_SESSIONS: usize = 100_000;
+
 pub struct MemoryStore {
     sessions: Mutex<HashMap<String, StoredSession>>,
     last_cleanup: Mutex<Instant>,
+    max_sessions: usize,
 }
 
 impl MemoryStore {
-    /// Create a new empty in-memory session store.
+    /// Create a new empty in-memory session store with the default max of 100,000 sessions.
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             last_cleanup: Mutex::new(Instant::now()),
+            max_sessions: DEFAULT_MAX_SESSIONS,
+        }
+    }
+
+    /// Create a new in-memory session store with a custom maximum session count.
+    pub fn with_max_sessions(max_sessions: usize) -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            last_cleanup: Mutex::new(Instant::now()),
+            max_sessions,
         }
     }
 }
@@ -116,6 +130,16 @@ impl SessionStore for MemoryStore {
         if now.duration_since(*last_cleanup) > Duration::from_secs(60) {
             sessions.retain(|_, s| now < s.expires_at);
             *last_cleanup = now;
+        }
+
+        // Reject new sessions if at capacity (existing sessions can still be updated)
+        if !sessions.contains_key(id) && sessions.len() >= self.max_sessions {
+            tracing::warn!(
+                max_sessions = self.max_sessions,
+                current = sessions.len(),
+                "session store at capacity, rejecting new session"
+            );
+            return;
         }
 
         sessions.insert(
@@ -302,7 +326,7 @@ impl SessionLayer {
             max_age: Duration::from_secs(86400), // 24 hours
             cookie_path: "/".to_string(),
             cookie_http_only: true,
-            cookie_secure: false,
+            cookie_secure: true,
             cookie_same_site: Some(SameSite::Lax),
         }
     }
@@ -331,7 +355,7 @@ impl SessionLayer {
         self
     }
 
-    /// Set whether the cookie requires HTTPS (default: `false`).
+    /// Set whether the cookie requires HTTPS (default: `true`).
     pub fn secure(mut self, secure: bool) -> Self {
         self.cookie_secure = secure;
         self

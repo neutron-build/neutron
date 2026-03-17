@@ -1,0 +1,26 @@
+{
+  "name": "orm-benchmarks",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "bench": "node --loader tsx ./bench-runner.ts",
+    "bench:neutron": "node --loader tsx ./neutron-bench.ts",
+    "bench:drizzle": "node --loader tsx ./drizzle-bench.ts",
+    "bench:prisma": "node --loader tsx ./prisma-bench.ts"
+  },
+  "dependencies": {
+    "@neutron/nucleus": "workspace:*",
+    "drizzle-orm": "^0.40.0",
+    "drizzle-kit": "^0.24.0",
+    "prisma": "^5.28.0",
+    "@prisma/client": "^5.28.0",
+    "sqlite3": "^5.1.7",
+    "better-sqlite3": "^11.5.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "tinybench": "^2.10.1",
+    "@types/better-sqlite3": "^7.6.12",
+    "typescript": "^5.7.2"
+  }
+}

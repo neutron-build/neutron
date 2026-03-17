@@ -98,7 +98,9 @@ func runDesktopDev(cmd *cobra.Command, args []string) error {
 	viteCmd.Stdout = os.Stdout
 	viteCmd.Stderr = os.Stderr
 	if err := viteCmd.Start(); err != nil {
-		ui.Warnf("Vite not found, trying without frontend dev server")
+		ui.Warnf("Failed to start Vite dev server: %s", err)
+		ui.Warnf("Hot reload will NOT be available — Tauri will run without a frontend dev server")
+		ui.Infof("To fix: run 'npm install' in %s and ensure 'npx vite' works", root)
 	}
 
 	// Start Tauri dev

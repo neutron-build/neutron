@@ -1,7 +1,8 @@
 """CSRF protection — double-submit cookie pattern.
 
 Generates a random token on safe requests (GET/HEAD/OPTIONS) and sets it
-as an HttpOnly cookie.  On mutating requests (POST/PUT/PATCH/DELETE) the
+as a cookie (non-HttpOnly by default so JavaScript can read it for the
+double-submit pattern).  On mutating requests (POST/PUT/PATCH/DELETE) the
 middleware validates that the token sent in the ``X-CSRF-Token`` header
 (or ``_csrf`` form field) matches the cookie value using constant-time
 comparison.
@@ -186,10 +187,10 @@ class CSRFMiddleware(_NeutronMiddleware):
         form_field: Name of the form field fallback. Default ``_csrf``.
         exempt_paths: Paths exempt from CSRF checks (e.g. webhooks).
         cookie_path: Cookie ``Path`` attribute. Default ``/``.
-        cookie_secure: Set ``Secure`` flag. Default ``False``
-            (enable in production with HTTPS).
+        cookie_secure: Set ``Secure`` flag. Default ``True``.
         cookie_samesite: ``SameSite`` attribute. Default ``Strict``.
-        cookie_httponly: Set ``HttpOnly`` flag. Default ``True``.
+        cookie_httponly: Set ``HttpOnly`` flag. Default ``False`` (required
+            for the double-submit cookie pattern so JavaScript can read the token).
         cookie_max_age: Cookie max-age in seconds. Default ``7200`` (2 hours).
         key_func: Optional callable receiving the ASGI scope; return ``None``
             to exempt the request from CSRF validation.
@@ -202,9 +203,11 @@ class CSRFMiddleware(_NeutronMiddleware):
         form_field: str = "_csrf",
         exempt_paths: list[str] | None = None,
         cookie_path: str = "/",
-        cookie_secure: bool = False,
+        cookie_secure: bool = True,
         cookie_samesite: str = "Strict",
-        cookie_httponly: bool = True,
+        # HttpOnly must be False for double-submit cookie pattern — JS needs to read
+        # the token to submit it in the X-CSRF-Token header.
+        cookie_httponly: bool = False,
         cookie_max_age: int = 7200,
         key_func: Callable[[Scope], str | None] | None = None,
     ) -> None:

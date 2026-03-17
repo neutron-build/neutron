@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from pydantic import BaseModel
 
 from neutron.nucleus._exec import Executor, require_nucleus
 from neutron.nucleus.client import Features
+
+_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
 class Node(BaseModel):
@@ -127,7 +130,17 @@ class GraphModel:
     ) -> list[Node]:
         """Get neighboring nodes, optionally filtered by edge type."""
         self._require()
+        if direction not in ("in", "out", "both"):
+            raise ValueError(
+                f"Invalid direction: {direction!r}. Must be 'in', 'out', or 'both'."
+            )
         if edge_type:
+            # Validate edge_type to prevent Cypher injection
+            if not _IDENTIFIER_RE.match(edge_type):
+                raise ValueError(
+                    f"Invalid edge type: {edge_type!r}. "
+                    f"Edge types must be valid identifiers (letters, digits, underscores)."
+                )
             # Use Cypher to filter by edge type
             nid = int(node_id)
             if direction == "out":

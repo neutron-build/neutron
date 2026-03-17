@@ -43,6 +43,23 @@ export interface MobileTransportConfig extends TransportConfig {
 }
 
 // ---------------------------------------------------------------------------
+// URL sanitization
+// ---------------------------------------------------------------------------
+
+function sanitizeUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.username || parsed.password) {
+      parsed.username = '***';
+      parsed.password = '***';
+    }
+    return parsed.toString();
+  } catch {
+    return url.replace(/\/\/[^@]+@/, '//***:***@');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
@@ -75,7 +92,7 @@ async function request<T>(
   } catch (err) {
     throw new NucleusConnectionError('Failed to reach Nucleus server', {
       cause: err instanceof Error ? err : undefined,
-      meta: { url },
+      meta: { url: sanitizeUrl(url) },
     });
   } finally {
     if (timer != null) clearTimeout(timer);
@@ -90,7 +107,7 @@ async function request<T>(
 }
 
 function mapHttpError(status: number, body: string, url: string): never {
-  const meta = { status, url };
+  const meta = { status, url: sanitizeUrl(url) };
   switch (status) {
     case 401:
     case 403:
@@ -118,6 +135,11 @@ export class HttpTransport implements Transport {
     this.baseUrl = url.replace(/\/+$/, '');
     this.headers = headers;
     this.timeout = timeout;
+
+    // Warn about insecure connections
+    if (this.baseUrl.startsWith('http://') && typeof process !== 'undefined' && process.env.NODE_ENV === 'production') {
+      console.warn('[neutron-nucleus] WARNING: Using unencrypted HTTP connection. Use HTTPS in production.');
+    }
   }
 
   async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<QueryResult<T>> {

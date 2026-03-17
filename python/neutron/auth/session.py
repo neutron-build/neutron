@@ -93,7 +93,7 @@ class SessionMiddleware:
         ttl: int = 3600,
         cookie_path: str = "/",
         cookie_httponly: bool = True,
-        cookie_secure: bool = False,
+        cookie_secure: bool = True,
         cookie_samesite: str = "lax",
     ) -> None:
         self.store = store or MemorySessionStore()

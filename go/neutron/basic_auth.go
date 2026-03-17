@@ -20,8 +20,11 @@ func BasicAuth(realm string, credentials map[string]string) Middleware {
 			}
 
 			expectedPass, userExists := credentials[user]
-			if !userExists ||
-				subtle.ConstantTimeCompare([]byte(pass), []byte(expectedPass)) != 1 {
+			if !userExists {
+				// Use a dummy value so timing is consistent regardless of user existence
+				expectedPass = string(make([]byte, 32))
+			}
+			if subtle.ConstantTimeCompare([]byte(pass), []byte(expectedPass)) != 1 || !userExists {
 				requireAuth(w, r, realm)
 				return
 			}

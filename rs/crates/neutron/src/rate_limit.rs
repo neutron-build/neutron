@@ -20,8 +20,8 @@
 //!
 //! ## Custom key function
 //!
-//! By default, clients are identified by `X-Forwarded-For`, then `X-Real-Ip`
-//! header, falling back to `"anonymous"`. You can customize this:
+//! By default, clients are identified by the peer socket address. Applications
+//! behind a trusted proxy should provide a custom key function:
 //!
 //! ```rust,ignore
 //! let limiter = RateLimiter::new(100, Duration::from_secs(60))
@@ -66,14 +66,17 @@ use crate::middleware::{MiddlewareTrait, Next};
 /// smooth approximation without the burst-at-boundary problem of fixed windows.
 ///
 /// Each unique client key gets an independent counter. By default the key is
-/// extracted from `X-Forwarded-For` / `X-Real-Ip` headers; use
-/// [`key_fn`](Self::key_fn) to override.
+/// extracted from the peer socket address; use [`key_fn`](Self::key_fn) to
+/// override (e.g., to read `X-Forwarded-For` behind a trusted proxy).
 pub struct RateLimiter {
     max_requests: u64,
     window: Duration,
     key_fn: Arc<dyn Fn(&Request) -> String + Send + Sync>,
     store: Arc<Mutex<Store>>,
 }
+
+/// Maximum number of tracked client entries to prevent unbounded memory growth.
+const MAX_ENTRIES: usize = 100_000;
 
 struct Store {
     entries: HashMap<String, WindowEntry>,
@@ -126,7 +129,7 @@ impl RateLimiter {
     /// Set a custom function to extract the rate-limit key from each request.
     ///
     /// Different keys are tracked independently. By default, the key is
-    /// extracted from `X-Forwarded-For` or `X-Real-Ip` headers.
+    /// extracted from the peer socket address.
     pub fn key_fn<F>(mut self, f: F) -> Self
     where
         F: Fn(&Request) -> String + Send + Sync + 'static,
@@ -144,6 +147,20 @@ impl RateLimiter {
                 .entries
                 .retain(|_, e| now.duration_since(e.window_start) < self.window * 2);
             store.last_cleanup = now;
+        }
+
+        // Evict oldest entries if over the max to prevent unbounded memory growth
+        if store.entries.len() > MAX_ENTRIES {
+            let mut entries: Vec<_> = store
+                .entries
+                .iter()
+                .map(|(k, v)| (k.clone(), v.window_start))
+                .collect();
+            entries.sort_by_key(|(_, t)| *t);
+            let to_remove = entries.len() - MAX_ENTRIES;
+            for (key, _) in entries.into_iter().take(to_remove) {
+                store.entries.remove(&key);
+            }
         }
 
         let entry = store
@@ -203,20 +220,16 @@ impl RateLimiter {
     }
 }
 
+/// Default key function: uses the actual peer/connection address, not
+/// spoofable headers like X-Forwarded-For or X-Real-IP.
+///
+/// Applications behind a trusted reverse proxy should provide a custom
+/// `key_fn` that reads the appropriate header (e.g., X-Forwarded-For)
+/// after validating the request comes from a trusted proxy.
 fn default_key_fn(req: &Request) -> String {
-    // Try X-Forwarded-For first (first IP = closest to client)
-    if let Some(val) = req.headers().get("x-forwarded-for") {
-        if let Ok(s) = val.to_str() {
-            return s.split(',').next().unwrap_or("").trim().to_string();
-        }
-    }
-    // Then X-Real-Ip
-    if let Some(val) = req.headers().get("x-real-ip") {
-        if let Ok(s) = val.to_str() {
-            return s.trim().to_string();
-        }
-    }
-    "anonymous".to_string()
+    req.remote_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn header_val(n: u64) -> HeaderValue {
@@ -334,10 +347,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn different_ips_tracked_separately() {
+    async fn different_keys_tracked_separately() {
         let client = TestClient::new(
             Router::new()
-                .middleware(RateLimiter::new(2, Duration::from_secs(60)))
+                .middleware(
+                    RateLimiter::new(2, Duration::from_secs(60)).key_fn(|req| {
+                        req.headers()
+                            .get("x-client-id")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("unknown")
+                            .to_string()
+                    }),
+                )
                 .get("/", || async { "ok" }),
         );
 
@@ -345,7 +366,7 @@ mod tests {
         for _ in 0..2 {
             let resp = client
                 .get("/")
-                .header("x-forwarded-for", "1.2.3.4")
+                .header("x-client-id", "client-a")
                 .send()
                 .await;
             assert_eq!(resp.status(), StatusCode::OK);
@@ -354,7 +375,7 @@ mod tests {
         // Client A is now limited
         let resp = client
             .get("/")
-            .header("x-forwarded-for", "1.2.3.4")
+            .header("x-client-id", "client-a")
             .send()
             .await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -362,7 +383,7 @@ mod tests {
         // Client B is unaffected
         let resp = client
             .get("/")
-            .header("x-forwarded-for", "5.6.7.8")
+            .header("x-client-id", "client-b")
             .send()
             .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -456,7 +477,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn x_real_ip_fallback() {
+    async fn default_key_uses_peer_address() {
+        // Without remote_addr set, all requests key as "unknown"
+        // and share the same rate limit bucket
         let client = TestClient::new(
             Router::new()
                 .middleware(RateLimiter::new(2, Duration::from_secs(60)))
@@ -464,29 +487,13 @@ mod tests {
         );
 
         for _ in 0..2 {
-            let resp = client
-                .get("/")
-                .header("x-real-ip", "10.0.0.1")
-                .send()
-                .await;
+            let resp = client.get("/").send().await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
 
-        // Limited for this IP
-        let resp = client
-            .get("/")
-            .header("x-real-ip", "10.0.0.1")
-            .send()
-            .await;
+        // All requests share the "unknown" key, so the 3rd is limited
+        let resp = client.get("/").send().await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-
-        // Different IP still allowed
-        let resp = client
-            .get("/")
-            .header("x-real-ip", "10.0.0.2")
-            .send()
-            .await;
-        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -505,10 +512,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwarded_for_takes_first_ip() {
+    async fn custom_key_fn_with_forwarded_for() {
+        // Demonstrates how to use X-Forwarded-For behind a trusted proxy
         let client = TestClient::new(
             Router::new()
-                .middleware(RateLimiter::new(2, Duration::from_secs(60)))
+                .middleware(
+                    RateLimiter::new(2, Duration::from_secs(60)).key_fn(|req| {
+                        req.headers()
+                            .get("x-forwarded-for")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.split(',').next())
+                            .unwrap_or("unknown")
+                            .trim()
+                            .to_string()
+                    }),
+                )
                 .get("/", || async { "ok" }),
         );
 

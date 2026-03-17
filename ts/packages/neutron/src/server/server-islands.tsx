@@ -74,7 +74,10 @@ export function ServerIsland({ children, fallback, id }: ServerIslandProps) {
     const res = await fetch(${islandEndpointJson}, { cache: 'no-store' });
     if (!res.ok) throw new Error('Failed to load island');
 
-    const html = await res.text();
+    let html = await res.text();
+    // SECURITY: Defense-in-depth — sanitize server-rendered HTML before injection
+    html = html.replace(/<script\\b[^<]*(?:(?!<\\/script>)<[^<]*)*<\\/script>/gi, '');
+    html = html.replace(/\\s+on\\w+\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s>]*)/gi, '');
     el.innerHTML = html;
 
     // Dispatch event for hydration

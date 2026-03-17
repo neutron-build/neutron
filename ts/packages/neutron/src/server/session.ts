@@ -378,8 +378,7 @@ function getClientIp(request: Request): string | null {
 /**
  * Checks if an IP address is in the trusted proxies list
  *
- * SECURITY: Simple prefix matching for CIDR ranges and exact matching for IPs.
- * This is a basic implementation - production systems may want more robust CIDR parsing.
+ * SECURITY: Uses proper bit-level CIDR matching for IPv4 addresses.
  */
 function isTrustedProxy(ip: string, trustedProxies: string[]): boolean {
   for (const trusted of trustedProxies) {
@@ -388,31 +387,39 @@ function isTrustedProxy(ip: string, trustedProxies: string[]): boolean {
       return true;
     }
 
-    // Simple CIDR prefix matching (e.g., "10.0.0.0/8" matches "10.x.x.x")
+    // CIDR matching with proper bit-level masking
     if (trusted.includes("/")) {
-      const [prefix, bits] = trusted.split("/");
-      if (prefix && bits) {
-        const prefixParts = prefix.split(".");
-        const ipParts = ip.split(".");
-        const maskBits = parseInt(bits, 10);
-
-        // Simple IPv4 CIDR check
-        if (prefixParts.length === 4 && ipParts.length === 4 && !isNaN(maskBits)) {
-          const octetsToMatch = Math.floor(maskBits / 8);
-          let matches = true;
-          for (let i = 0; i < octetsToMatch; i++) {
-            if (prefixParts[i] !== ipParts[i]) {
-              matches = false;
-              break;
-            }
-          }
-          if (matches) {
-            return true;
-          }
-        }
+      if (ipMatchesCidr(ip, trusted)) {
+        return true;
       }
     }
   }
 
   return false;
+}
+
+function ipMatchesCidr(ip: string, cidr: string): boolean {
+  const [prefix, maskStr] = cidr.split('/');
+  const maskBits = parseInt(maskStr, 10);
+  if (isNaN(maskBits) || maskBits < 0 || maskBits > 32) return false;
+
+  const ipNum = ipToNumber(ip);
+  const prefixNum = ipToNumber(prefix);
+  if (ipNum === null || prefixNum === null) return false;
+
+  // Create a bitmask with `maskBits` leading 1s
+  const mask = maskBits === 0 ? 0 : (~0 << (32 - maskBits)) >>> 0;
+  return (ipNum & mask) === (prefixNum & mask);
+}
+
+function ipToNumber(ip: string): number | null {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  let num = 0;
+  for (const part of parts) {
+    const n = parseInt(part, 10);
+    if (isNaN(n) || n < 0 || n > 255) return null;
+    num = (num << 8) | n;
+  }
+  return num >>> 0; // Convert to unsigned 32-bit
 }

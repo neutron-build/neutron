@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -452,14 +453,16 @@ func OAuthCallbackHandler(provider *OAuthProvider, onSuccess func(w http.Respons
 		// 4. Exchange the authorization code for tokens.
 		tokens, err := provider.exchangeCode(code, verifier)
 		if err != nil {
-			neutron.WriteError(w, r, neutron.ErrInternal(fmt.Sprintf("token exchange failed: %v", err)))
+			log.Printf("[neutronauth] token exchange failed: %v", err)
+			neutron.WriteError(w, r, neutron.ErrInternal("Authentication failed"))
 			return
 		}
 
 		// 5. Fetch user information from the provider.
 		user, err := provider.fetchUserInfo(tokens.AccessToken)
 		if err != nil {
-			neutron.WriteError(w, r, neutron.ErrInternal(fmt.Sprintf("userinfo fetch failed: %v", err)))
+			log.Printf("[neutronauth] userinfo fetch failed: %v", err)
+			neutron.WriteError(w, r, neutron.ErrInternal("Authentication failed"))
 			return
 		}
 

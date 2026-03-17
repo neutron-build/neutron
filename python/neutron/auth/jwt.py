@@ -196,6 +196,10 @@ class JWTMiddleware:
         exclude_paths: list[str] | None = None,
         algorithms: list[str] | None = None,
     ) -> None:
+        if len(secret) < 32:
+            raise ValueError(
+                f"JWT secret must be at least 32 characters for HS256 security. Got {len(secret)}."
+            )
         self.secret = secret
         self.exclude_paths = set(exclude_paths or ["/health", "/docs", "/openapi.json"])
         self.algorithms = algorithms

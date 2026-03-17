@@ -1,0 +1,98 @@
+name: Full Regression Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "nucleus/**"
+      - ".github/workflows/full_regression.yml"
+  pull_request:
+    paths:
+      - "nucleus/**"
+      - ".github/workflows/full_regression.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  full_regression:
+    name: Nucleus Full Regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+
+      - name: Build nucleus
+        run: cargo build --features bench-tools
+        working-directory: nucleus
+
+      - name: Run all executor tests (3184 tests)
+        run: cargo test --lib executor -q
+        working-directory: nucleus
+
+      - name: Run all wire/transport tests (133 tests)
+        run: cargo test --lib wire --lib transport -q
+        working-directory: nucleus
+
+      - name: Run all storage tests
+        run: cargo test --lib storage -q
+        working-directory: nucleus
+
+      - name: Run all data model tests
+        run: cargo test --lib kv --lib vector --lib document --lib graph --lib fts --lib geo --lib blob --lib streams --lib columnar --lib datalog --lib pubsub --lib timeseries -q
+        working-directory: nucleus
+
+      - name: Run all integration tests
+        run: cargo test --test '*' -q -- --test-threads=1
+        working-directory: nucleus
+
+      - name: Compete benchmark (100 iterations, 10k rows)
+        run: cargo run --release --features bench-tools --bin compete -- --iterations 100 --rows 10000
+        working-directory: nucleus
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compete-results
+          path: nucleus/compete_results_*.json
+
+      - name: Block merge if tests failed
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: core.setFailed('Full regression tests failed')
+
+  clippy_full:
+    name: Clippy (Full)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+      - run: cargo clippy --all-targets --features bench-tools -- -D warnings
+        working-directory: nucleus
+
+  fmt_check:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+        working-directory: nucleus

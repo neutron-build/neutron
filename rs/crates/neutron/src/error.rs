@@ -256,7 +256,10 @@ impl IntoResponse for AppError {
 
 impl From<std::io::Error> for AppError {
     fn from(e: std::io::Error) -> Self {
-        AppError::internal(e.to_string())
+        // Log the full error (including file paths) server-side, but do not
+        // expose internal details to the client.
+        tracing::error!(error = %e, "internal io error");
+        AppError::internal("An internal error occurred")
     }
 }
 

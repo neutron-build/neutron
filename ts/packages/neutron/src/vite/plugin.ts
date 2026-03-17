@@ -57,6 +57,13 @@ interface DevTimingContext {
   renderMs: number | undefined;
 }
 
+function sanitizeHost(host: string | undefined): string {
+  if (!host) return 'localhost';
+  const hostname = host.split(':')[0];
+  if (!/^[a-zA-Z0-9._-]+$/.test(hostname)) return 'localhost';
+  return host;
+}
+
 export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
   const routesDir = path.resolve(options.routesDir || ROUTES_DIR_DEFAULT);
   const rootDir = path.resolve(options.rootDir || process.cwd());
@@ -117,7 +124,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
       server.middlewares.use(async (req, res, next) => {
         const requestStartMs = performance.now();
         try {
-          const url = new URL(req.url || "/", `http://${req.headers.host}`);
+          const url = new URL(req.url || "/", `http://${sanitizeHost(req.headers.host)}`);
           const originalPathname = url.pathname;
 
           if (
@@ -253,7 +260,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
                   }
                 }
                 const cssLinks = dedupedUrls
-                  .map(url => `  <link rel="stylesheet" href="${url}">`)
+                  .map(url => `  <link rel="stylesheet" href="${url.replace(/"/g, '&quot;')}">`)
                   .join("\n");
                 rawHtml = rawHtml.replace("</head>", `${cssLinks}\n</head>`);
               }
@@ -529,7 +536,7 @@ async function resolveDevHeadHtml(
     const resolved = await mod.head({ ...args, data: args.loaderData[route.id] });
     if (!resolved) continue;
     if (typeof resolved === "string") {
-      headFragments.push(resolved);
+      headFragments.push(sanitizeHeadHtml(resolved));
       continue;
     }
     mergedSeo = mergeSeoMetaInput(mergedSeo, resolved);
@@ -819,9 +826,15 @@ function renderDefaultError(error: Error): string {
 }
 
 async function createRequest(req: import("http").IncomingMessage, url: URL): Promise<Request> {
+  const MAX_DEV_BODY = 10 * 1024 * 1024; // 10MB
   const chunks: Uint8Array[] = [];
+  let totalSize = 0;
 
   for await (const chunk of req) {
+    totalSize += chunk.length;
+    if (totalSize > MAX_DEV_BODY) {
+      throw new Error('Request body too large');
+    }
     chunks.push(chunk);
   }
 
@@ -895,11 +908,11 @@ function escapeHtml(str: string): string {
 function generateRoutesModule(routes: Route[]): string {
   const routeMap: string[] = routes.map((route) => {
     const relativePath = route.file.replace(/\\/g, "/");
-    return `  "${route.id}": {
-    id: "${route.id}",
-    path: "${route.path}",
-    parentId: ${route.parentId ? `"${route.parentId}"` : "null"},
-    load: () => import("/${relativePath}?${CLIENT_ROUTE_QUERY}")
+    return `  ${JSON.stringify(route.id)}: {
+    id: ${JSON.stringify(route.id)},
+    path: ${JSON.stringify(route.path)},
+    parentId: ${route.parentId ? JSON.stringify(route.parentId) : "null"},
+    load: () => import(${JSON.stringify("/" + relativePath + "?" + CLIENT_ROUTE_QUERY)})
   }`;
   });
 
@@ -946,6 +959,17 @@ function resolveRouteSourcePath(id: string): string {
 
 function requireSource(filePath: string): string {
   return fs.readFileSync(filePath, "utf-8");
+}
+
+/** Strip <script> tags, event handler attributes, and javascript: URLs from head HTML fragments. */
+function sanitizeHeadHtml(html: string): string {
+  // Strip script tags and their contents
+  html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+  // Strip event handler attributes
+  html = html.replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/gi, '');
+  // Strip javascript: URLs
+  html = html.replace(/(?:href|src|action)\s*=\s*(?:"javascript:[^"]*"|'javascript:[^']*')/gi, '');
+  return html;
 }
 
 function isScriptModuleId(id: string): boolean {

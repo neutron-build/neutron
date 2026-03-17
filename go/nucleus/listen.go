@@ -3,6 +3,7 @@ package nucleus
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -90,6 +91,7 @@ func (c *Client) ListenPool() *pgxpool.Pool {
 }
 
 func quoteIdent(s string) string {
-	// Simple identifier quoting — no special chars expected for channel names
-	return `"` + s + `"`
+	// Escape embedded double quotes by doubling them (SQL standard)
+	escaped := strings.ReplaceAll(s, `"`, `""`)
+	return `"` + escaped + `"`
 }

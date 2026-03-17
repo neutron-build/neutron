@@ -7,8 +7,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -46,12 +48,14 @@ func Logger(logger *slog.Logger) Middleware {
 }
 
 // Recover returns middleware that catches panics and returns a 500 error.
+// The panic details are logged server-side but NOT exposed to the client.
 func Recover() Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if rec := recover(); rec != nil {
-					err := ErrInternal(fmt.Sprintf("panic: %v", rec))
+					log.Printf("[neutron] panic recovered: %v\n%s", rec, debug.Stack())
+					err := ErrInternal("An unexpected error occurred")
 					WriteError(w, r, err)
 				}
 			}()
@@ -94,6 +98,14 @@ func CORS(opts CORSOptions) Middleware {
 	if len(opts.AllowHeaders) == 0 {
 		opts.AllowHeaders = []string{"Content-Type", "Authorization", "X-Request-Id"}
 	}
+	if opts.AllowCredentials {
+		for _, o := range opts.AllowOrigins {
+			if o == "*" {
+				log.Println("[neutron] WARNING: CORS wildcard '*' with credentials is dangerous. Restricting to request origin matching.")
+				break
+			}
+		}
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			origin := r.Header.Get("Origin")
@@ -122,7 +134,7 @@ func CORS(opts CORSOptions) Middleware {
 
 func originAllowed(origin string, allowed []string) bool {
 	if len(allowed) == 0 {
-		return true
+		return false // fail-closed: no origins configured means no origins allowed
 	}
 	for _, a := range allowed {
 		if a == "*" || a == origin {
@@ -132,28 +144,52 @@ func originAllowed(origin string, allowed []string) bool {
 	return false
 }
 
-// RateLimit returns middleware implementing a token-bucket rate limiter.
+// tokenBucket holds per-IP token bucket state.
+type tokenBucket struct {
+	tokens   float64
+	lastTime time.Time
+}
+
+// RateLimit returns middleware implementing a per-IP token-bucket rate limiter.
 func RateLimit(rps float64, burst int) Middleware {
 	var mu sync.Mutex
-	tokens := float64(burst)
-	lastTime := time.Now()
+	buckets := make(map[string]*tokenBucket)
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			mu.Lock()
-			now := time.Now()
-			elapsed := now.Sub(lastTime).Seconds()
-			lastTime = now
-			tokens += elapsed * rps
-			if tokens > float64(burst) {
-				tokens = float64(burst)
+			ip := r.RemoteAddr
+			if idx := strings.LastIndex(ip, ":"); idx != -1 {
+				ip = ip[:idx]
 			}
-			if tokens < 1 {
+
+			mu.Lock()
+			b, ok := buckets[ip]
+			if !ok {
+				b = &tokenBucket{tokens: float64(burst), lastTime: time.Now()}
+				buckets[ip] = b
+				// Evict stale entries to prevent unbounded growth
+				if len(buckets) > 100000 {
+					for k, v := range buckets {
+						if time.Since(v.lastTime) > 2*time.Minute {
+							delete(buckets, k)
+						}
+					}
+				}
+			}
+
+			now := time.Now()
+			elapsed := now.Sub(b.lastTime).Seconds()
+			b.lastTime = now
+			b.tokens += elapsed * rps
+			if b.tokens > float64(burst) {
+				b.tokens = float64(burst)
+			}
+			if b.tokens < 1 {
 				mu.Unlock()
 				WriteError(w, r, ErrRateLimited("Too many requests"))
 				return
 			}
-			tokens--
+			b.tokens--
 			mu.Unlock()
 			next.ServeHTTP(w, r)
 		})
