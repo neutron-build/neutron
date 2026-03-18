@@ -1,0 +1,17 @@
+module App
+
+using Neutron
+
+app = Neutron.App(title="{{.Name}}", version="0.1.0")
+
+Neutron.get!(app, "/") do
+    Dict("message" => "Hello from {{.Name}}!")
+end
+
+Neutron.get!(app, "/health") do
+    Dict("status" => "ok")
+end
+
+Neutron.serve(app, port={{.Port}})
+
+end # module

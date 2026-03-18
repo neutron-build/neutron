@@ -1,0 +1,42 @@
+package main
+
+import (
+	"context"
+	"log/slog"
+	"os"
+
+	"{{.Module}}/internal/handler"
+	"github.com/neutron-dev/neutron-go/neutron"
+	"github.com/neutron-dev/neutron-go/nucleus"
+)
+
+func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgres://localhost:5432/{{.Name}}"
+	}
+
+	db, err := nucleus.Connect(context.Background(), dbURL)
+	if err != nil {
+		logger.Error("failed to connect to database", "error", err)
+		os.Exit(1)
+	}
+
+	app := neutron.New(
+		neutron.WithLogger(logger),
+		neutron.WithLifecycle(db.LifecycleHook()),
+	)
+
+	app.Use(neutron.Logger(logger), neutron.Recover(), neutron.RequestID())
+
+	handler.Register(app)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "{{.Port}}"
+	}
+	logger.Info("starting server", "port", port)
+	app.Listen(":" + port)
+}

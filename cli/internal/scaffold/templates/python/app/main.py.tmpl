@@ -1,0 +1,14 @@
+"""{{.Name}} — built with Neutron."""
+
+from neutron import App, Router
+
+app = App(title="{{.Name}}", version="0.1.0")
+router = Router()
+
+
+@router.get("/")
+async def index() -> dict:
+    return {"message": "Hello from {{.Name}}!"}
+
+
+app.include_router(router)

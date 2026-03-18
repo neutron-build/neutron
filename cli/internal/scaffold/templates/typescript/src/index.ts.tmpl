@@ -1,0 +1,13 @@
+import { createApp } from "neutron";
+import { healthRoute } from "./routes/health";
+
+const app = createApp({
+  title: "{{.Name}}",
+  version: "0.1.0",
+});
+
+app.get("/", () => ({ message: "Hello from {{.Name}}!" }));
+
+healthRoute(app);
+
+export default app;
