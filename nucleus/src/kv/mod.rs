@@ -996,6 +996,27 @@ impl KvStore {
     }
 
     // ========================================================================
+    // Geo operations (delegated to ShardedCollections)
+    // ========================================================================
+
+    pub fn geoadd(&self, key: &str, lon: f64, lat: f64, member: &str) -> Result<bool, collections::WrongTypeError> {
+        self.bump_version();
+        self.collections.geoadd(key, lon, lat, member)
+    }
+    pub fn geopos(&self, key: &str, member: &str) -> Result<Option<(f64, f64)>, collections::WrongTypeError> {
+        self.collections.geopos(key, member)
+    }
+    pub fn geodist(&self, key: &str, member1: &str, member2: &str, unit: &str) -> Result<Option<f64>, collections::WrongTypeError> {
+        self.collections.geodist(key, member1, member2, unit)
+    }
+    pub fn georadius(&self, key: &str, lon: f64, lat: f64, radius: f64, unit: &str) -> Result<Vec<(String, f64)>, collections::WrongTypeError> {
+        self.collections.georadius(key, lon, lat, radius, unit)
+    }
+    pub fn geolen(&self, key: &str) -> Result<usize, collections::WrongTypeError> {
+        self.collections.geolen(key)
+    }
+
+    // ========================================================================
     // Cold tier helpers (internal)
     // ========================================================================
 

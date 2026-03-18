@@ -117,6 +117,13 @@ export function go(delta: number): void {
   window.history.go(delta);
 }
 
+// Debounce view transitions to prevent the flash artifact caused by
+// the browser cancelling a transition mid-flight when a new one starts.
+// If navigations happen faster than this threshold, skip the transition
+// API and do an instant DOM swap instead.
+const VT_DEBOUNCE_MS = 200;
+let lastTransitionTime = 0;
+
 function handlePopState(
   withTransition: boolean = true,
   event: NavigationListenerEvent = {}
@@ -129,6 +136,17 @@ function handlePopState(
   };
 
   if (withTransition && shouldUseViewTransitions()) {
+    const now = performance.now();
+    const elapsed = now - lastTransitionTime;
+    lastTransitionTime = now;
+
+    // Skip View Transitions if navigating too rapidly — prevents the
+    // browser's snapshot cancellation flash artifact.
+    if (elapsed < VT_DEBOUNCE_MS) {
+      apply();
+      return;
+    }
+
     const doc = document as DocumentWithViewTransition;
     doc.startViewTransition?.(() => apply());
     return;

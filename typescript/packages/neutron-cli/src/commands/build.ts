@@ -91,6 +91,7 @@ export async function build(): Promise<void> {
 
   await viteBuild(
     mergeConfig(userConfig, {
+      configFile: false,
       root: cwd,
       plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
       ...(runtimeAliases ? { resolve: { alias: runtimeAliases } } : {}),
@@ -122,6 +123,7 @@ export async function build(): Promise<void> {
   // Create a Vite SSR server for rendering
   const server = await createServer(
     mergeConfig(userConfig, {
+      configFile: false,
       root: cwd,
       plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
       ...(runtimeAliases ? { resolve: { alias: runtimeAliases } } : {}),
@@ -734,6 +736,7 @@ async function buildRuntimeBundle(
   const bundleOutDir = path.join(options.outputDir, "server", target);
   await viteBuild(
     mergeConfig(options.userConfig, {
+      configFile: false,
       root: options.cwd,
       plugins: [
         neutronPlugin({

@@ -101,6 +101,11 @@ name = "compete"
 path = "src/bin/compete.rs"
 required-features = ["bench-tools"]
 
+[[bin]]
+name = "stress"
+path = "src/bin/stress.rs"
+required-features = ["server"]
+
 [[bench]]
 name = "query_bench"
 harness = false

@@ -1405,14 +1405,55 @@ impl Executor {
         &self.blob_store
     }
 
+    /// Convenience: put data into the blob store.
+    pub fn blob_store_put(&self, key: &str, data: &[u8], content_type: Option<&str>) {
+        self.blob_store.write().put(key, data, content_type);
+    }
+
+    /// Convenience: check if a blob exists.
+    pub fn blob_store_exists(&self, key: &str) -> bool {
+        self.blob_store.read().metadata(key).is_some()
+    }
+
+    /// Convenience: get a full blob.
+    pub fn blob_store_get(&self, key: &str) -> Option<Vec<u8>> {
+        self.blob_store.read().get(key)
+    }
+
+    /// Convenience: get a byte range from a blob.
+    pub fn blob_store_get_range(&self, key: &str, offset: u64, length: u64) -> Option<Vec<u8>> {
+        self.blob_store.read().get_range(key, offset, length)
+    }
+
+    /// Convenience: delete a blob.
+    pub fn blob_store_delete(&self, key: &str) -> bool {
+        self.blob_store.write().delete(key)
+    }
+
     /// Get a reference to the datalog store.
     pub fn datalog_store(&self) -> &parking_lot::RwLock<crate::datalog::DatalogStore> {
         &self.datalog_store
     }
 
-    /// Get a reference to the pub/sub hub.
+    /// Get a reference to the pub/sub hub (async).
     pub fn pubsub(&self) -> &RwLock<crate::pubsub::PubSubHub> {
         &self.pubsub
+    }
+
+    /// Get a reference to the sync pub/sub hub (parking_lot).
+    pub fn pubsub_sync(&self) -> &parking_lot::RwLock<crate::pubsub::PubSubHub> {
+        &self.pubsub_sync
+    }
+
+    /// Get a reference to the streams map.
+    pub fn streams(&self) -> &parking_lot::RwLock<HashMap<String, crate::pubsub::Stream>> {
+        &self.streams
+    }
+
+    /// Get a reference to the CDC log.
+    #[cfg(feature = "server")]
+    pub fn cdc_log(&self) -> &parking_lot::RwLock<crate::reactive::CdcLog> {
+        &self.cdc_log
     }
 
     /// Get a reference to the distributed pub/sub router.

@@ -16,6 +16,8 @@
 //! - `handshake`: Connection startup, auth, TLS negotiation
 //! - `query_handler`: SQL parsing, parameter binding, preparation
 //! - `result_serializer`: Result row encoding, metadata, status
+//! - `connection_handler`: Per-connection message dispatch loop
+//! - `server`: TCP listener and connection spawner
 //! - `tests`: M3 test suite (M3 parallel test infrastructure)
 
 pub mod encoder;
@@ -23,6 +25,8 @@ pub mod decoder;
 pub mod handshake;
 pub mod query_handler;
 pub mod result_serializer;
+pub mod connection_handler;
+pub mod server;
 
 #[cfg(test)]
 pub mod tests;

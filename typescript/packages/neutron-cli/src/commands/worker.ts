@@ -66,6 +66,7 @@ export async function worker(): Promise<void> {
 
   const viteServer = await createServer(
     mergeConfig(userConfig, {
+      configFile: false,
       root: cwd,
       ...(runtimeAliases ? { resolve: { alias: runtimeAliases } } : {}),
       ...(runtimeNoExternal.length > 0 ? { ssr: { noExternal: runtimeNoExternal } } : {}),

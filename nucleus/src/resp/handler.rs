@@ -1,12 +1,14 @@
 //! RESP command handler.
 //!
 //! Maps Redis commands received over the RESP2 protocol to the Nucleus KV store
-//! API. Supports string, list, hash, set, sorted set, and HyperLogLog commands.
+//! API. Supports string, list, hash, set, sorted set, HyperLogLog, stream,
+//! geo, and pub/sub commands.
 
 use std::sync::Arc;
 
 use crate::kv::KvStore;
 use crate::resp::encoder;
+use crate::resp::pubsub_registry::{PubSubRegistry, Subscription};
 use crate::types::Value;
 
 /// Constant-time byte comparison to prevent timing attacks on password checks.
@@ -30,6 +32,12 @@ pub struct RespHandler {
     transaction_queue: Option<Vec<Vec<Vec<u8>>>>,
     /// WATCH'd keys and their version at WATCH time.
     watched_keys: Vec<(String, u64)>,
+    /// Shared pub/sub registry.
+    pubsub: Arc<PubSubRegistry>,
+    /// This connection's subscriber ID (allocated lazily on first SUBSCRIBE).
+    pubsub_id: Option<u64>,
+    /// Subscription receiver (allocated lazily).
+    pubsub_sub: Option<Subscription>,
 }
 
 impl RespHandler {
@@ -38,7 +46,7 @@ impl RespHandler {
     /// If `password` is `None`, the handler starts in the authenticated state
     /// (no auth required). Otherwise, clients must issue AUTH before any other
     /// command.
-    pub fn new(kv: Arc<KvStore>, password: Option<String>) -> Self {
+    pub fn new(kv: Arc<KvStore>, password: Option<String>, pubsub: Arc<PubSubRegistry>) -> Self {
         let authenticated = password.is_none();
         Self {
             kv,
@@ -46,6 +54,243 @@ impl RespHandler {
             authenticated,
             transaction_queue: None,
             watched_keys: Vec::new(),
+            pubsub,
+            pubsub_id: None,
+            pubsub_sub: None,
+        }
+    }
+
+    /// Returns true if this connection is in pub/sub subscriber mode.
+    pub fn is_in_pubsub_mode(&self) -> bool {
+        if let Some(id) = self.pubsub_id {
+            self.pubsub.subscription_count(id) > 0
+        } else {
+            false
+        }
+    }
+
+    /// Ensure a pub/sub subscriber ID is allocated for this connection.
+    fn ensure_pubsub_id(&mut self) {
+        if self.pubsub_id.is_none() {
+            let (id, sub) = self.pubsub.new_subscriber();
+            self.pubsub_id = Some(id);
+            self.pubsub_sub = Some(sub);
+        }
+    }
+
+    /// Clean up pub/sub state on connection close.
+    pub fn cleanup_pubsub(&mut self) {
+        if let Some(id) = self.pubsub_id.take() {
+            self.pubsub.remove_subscriber(id);
+        }
+        self.pubsub_sub = None;
+    }
+
+    /// Receive a pub/sub message (for the server loop to select! on).
+    /// Returns the RESP-encoded push message, or None if the channel is closed.
+    pub async fn recv_pubsub_message(&mut self) -> Option<Vec<u8>> {
+        let sub = self.pubsub_sub.as_mut()?;
+        let msg = sub.rx.recv().await?;
+        if msg.is_pattern {
+            // Pattern message: *4\r\n $8\r\npmessage\r\n $pattern\r\n $channel\r\n $payload\r\n
+            let mut resp = encoder::encode_array_header(4);
+            resp.extend(encoder::encode_bulk_string(b"pmessage"));
+            resp.extend(encoder::encode_bulk_string(msg.channel.as_bytes()));
+            resp.extend(encoder::encode_bulk_string(msg.actual_channel.as_bytes()));
+            resp.extend(encoder::encode_bulk_string(msg.payload.as_bytes()));
+            Some(resp)
+        } else {
+            // Direct message: *3\r\n $7\r\nmessage\r\n $channel\r\n $payload\r\n
+            let mut resp = encoder::encode_array_header(3);
+            resp.extend(encoder::encode_bulk_string(b"message"));
+            resp.extend(encoder::encode_bulk_string(msg.channel.as_bytes()));
+            resp.extend(encoder::encode_bulk_string(msg.payload.as_bytes()));
+            Some(resp)
+        }
+    }
+
+    /// Handle a command while in pub/sub mode. Only SUBSCRIBE, UNSUBSCRIBE,
+    /// PSUBSCRIBE, PUNSUBSCRIBE, PING, and QUIT are valid. Returns a list of
+    /// response frames (one per channel for SUBSCRIBE/UNSUBSCRIBE).
+    pub fn handle_pubsub_command(&mut self, args: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        if args.is_empty() {
+            return vec![encoder::encode_error("ERR empty command")];
+        }
+
+        let cmd = String::from_utf8_lossy(&args[0]).to_uppercase();
+
+        match cmd.as_str() {
+            "SUBSCRIBE" => {
+                if args.len() < 2 {
+                    return vec![encoder::encode_error(
+                        "ERR wrong number of arguments for 'subscribe' command",
+                    )];
+                }
+                self.ensure_pubsub_id();
+                let id = self.pubsub_id.unwrap();
+                let mut responses = Vec::new();
+                for ch_arg in &args[1..] {
+                    let channel = String::from_utf8_lossy(ch_arg).to_string();
+                    let count = self.pubsub.subscribe(id, &channel);
+                    let mut resp = encoder::encode_array_header(3);
+                    resp.extend(encoder::encode_bulk_string(b"subscribe"));
+                    resp.extend(encoder::encode_bulk_string(channel.as_bytes()));
+                    resp.extend(encoder::encode_integer(count as i64));
+                    responses.push(resp);
+                }
+                responses
+            }
+            "UNSUBSCRIBE" => {
+                let id = match self.pubsub_id {
+                    Some(id) => id,
+                    None => {
+                        // Not subscribed to anything — return confirmation with count 0
+                        if args.len() < 2 {
+                            let mut resp = encoder::encode_array_header(3);
+                            resp.extend(encoder::encode_bulk_string(b"unsubscribe"));
+                            resp.extend(encoder::encode_null_bulk());
+                            resp.extend(encoder::encode_integer(0));
+                            return vec![resp];
+                        }
+                        let mut responses = Vec::new();
+                        for ch_arg in &args[1..] {
+                            let channel = String::from_utf8_lossy(ch_arg).to_string();
+                            let mut resp = encoder::encode_array_header(3);
+                            resp.extend(encoder::encode_bulk_string(b"unsubscribe"));
+                            resp.extend(encoder::encode_bulk_string(channel.as_bytes()));
+                            resp.extend(encoder::encode_integer(0));
+                            responses.push(resp);
+                        }
+                        return responses;
+                    }
+                };
+                if args.len() < 2 {
+                    // Unsubscribe from all channels
+                    let channels = self.pubsub.unsubscribe_all(id);
+                    if channels.is_empty() {
+                        let mut resp = encoder::encode_array_header(3);
+                        resp.extend(encoder::encode_bulk_string(b"unsubscribe"));
+                        resp.extend(encoder::encode_null_bulk());
+                        resp.extend(encoder::encode_integer(0));
+                        return vec![resp];
+                    }
+                    let mut responses = Vec::new();
+                    for (i, ch) in channels.iter().enumerate() {
+                        let remaining = channels.len() - i - 1;
+                        let pat_count = self.pubsub.subscription_count(id).saturating_sub(remaining);
+                        let _ = pat_count; // count from registry
+                        let count = self.pubsub.subscription_count(id);
+                        let mut resp = encoder::encode_array_header(3);
+                        resp.extend(encoder::encode_bulk_string(b"unsubscribe"));
+                        resp.extend(encoder::encode_bulk_string(ch.as_bytes()));
+                        resp.extend(encoder::encode_integer(count as i64));
+                        responses.push(resp);
+                    }
+                    responses
+                } else {
+                    let mut responses = Vec::new();
+                    for ch_arg in &args[1..] {
+                        let channel = String::from_utf8_lossy(ch_arg).to_string();
+                        let count = self.pubsub.unsubscribe(id, &channel);
+                        let mut resp = encoder::encode_array_header(3);
+                        resp.extend(encoder::encode_bulk_string(b"unsubscribe"));
+                        resp.extend(encoder::encode_bulk_string(channel.as_bytes()));
+                        resp.extend(encoder::encode_integer(count as i64));
+                        responses.push(resp);
+                    }
+                    responses
+                }
+            }
+            "PSUBSCRIBE" => {
+                if args.len() < 2 {
+                    return vec![encoder::encode_error(
+                        "ERR wrong number of arguments for 'psubscribe' command",
+                    )];
+                }
+                self.ensure_pubsub_id();
+                let id = self.pubsub_id.unwrap();
+                let mut responses = Vec::new();
+                for pat_arg in &args[1..] {
+                    let pattern = String::from_utf8_lossy(pat_arg).to_string();
+                    let count = self.pubsub.psubscribe(id, &pattern);
+                    let mut resp = encoder::encode_array_header(3);
+                    resp.extend(encoder::encode_bulk_string(b"psubscribe"));
+                    resp.extend(encoder::encode_bulk_string(pattern.as_bytes()));
+                    resp.extend(encoder::encode_integer(count as i64));
+                    responses.push(resp);
+                }
+                responses
+            }
+            "PUNSUBSCRIBE" => {
+                let id = match self.pubsub_id {
+                    Some(id) => id,
+                    None => {
+                        if args.len() < 2 {
+                            let mut resp = encoder::encode_array_header(3);
+                            resp.extend(encoder::encode_bulk_string(b"punsubscribe"));
+                            resp.extend(encoder::encode_null_bulk());
+                            resp.extend(encoder::encode_integer(0));
+                            return vec![resp];
+                        }
+                        let mut responses = Vec::new();
+                        for pat_arg in &args[1..] {
+                            let pattern = String::from_utf8_lossy(pat_arg).to_string();
+                            let mut resp = encoder::encode_array_header(3);
+                            resp.extend(encoder::encode_bulk_string(b"punsubscribe"));
+                            resp.extend(encoder::encode_bulk_string(pattern.as_bytes()));
+                            resp.extend(encoder::encode_integer(0));
+                            responses.push(resp);
+                        }
+                        return responses;
+                    }
+                };
+                if args.len() < 2 {
+                    let patterns = self.pubsub.punsubscribe_all(id);
+                    if patterns.is_empty() {
+                        let mut resp = encoder::encode_array_header(3);
+                        resp.extend(encoder::encode_bulk_string(b"punsubscribe"));
+                        resp.extend(encoder::encode_null_bulk());
+                        resp.extend(encoder::encode_integer(
+                            self.pubsub.subscription_count(id) as i64,
+                        ));
+                        return vec![resp];
+                    }
+                    let mut responses = Vec::new();
+                    for pat in &patterns {
+                        let count = self.pubsub.subscription_count(id);
+                        let mut resp = encoder::encode_array_header(3);
+                        resp.extend(encoder::encode_bulk_string(b"punsubscribe"));
+                        resp.extend(encoder::encode_bulk_string(pat.as_bytes()));
+                        resp.extend(encoder::encode_integer(count as i64));
+                        responses.push(resp);
+                    }
+                    responses
+                } else {
+                    let mut responses = Vec::new();
+                    for pat_arg in &args[1..] {
+                        let pattern = String::from_utf8_lossy(pat_arg).to_string();
+                        let count = self.pubsub.punsubscribe(id, &pattern);
+                        let mut resp = encoder::encode_array_header(3);
+                        resp.extend(encoder::encode_bulk_string(b"punsubscribe"));
+                        resp.extend(encoder::encode_bulk_string(pattern.as_bytes()));
+                        resp.extend(encoder::encode_integer(count as i64));
+                        responses.push(resp);
+                    }
+                    responses
+                }
+            }
+            "PING" => {
+                if args.len() > 1 {
+                    vec![encoder::encode_bulk_string(&args[1])]
+                } else {
+                    vec![encoder::encode_simple_string("PONG")]
+                }
+            }
+            _ => {
+                vec![encoder::encode_error(&format!(
+                    "ERR Can't execute '{cmd}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context"
+                ))]
+            }
         }
     }
 
@@ -1160,6 +1405,224 @@ impl RespHandler {
             }
 
             // ================================================================
+            // Pub/Sub commands (non-subscriber side)
+            // ================================================================
+            "PUBLISH" => {
+                let channel = require_arg!(args, 1);
+                let message = require_arg!(args, 2);
+                let count = self.pubsub.publish(channel, message);
+                encoder::encode_integer(count as i64)
+            }
+            // SUBSCRIBE/PSUBSCRIBE in non-pubsub mode are handled by the
+            // server loop which calls handle_pubsub_command() directly.
+            // If they somehow reach here, redirect.
+            "SUBSCRIBE" | "PSUBSCRIBE" | "UNSUBSCRIBE" | "PUNSUBSCRIBE" => {
+                encoder::encode_error(
+                    "ERR pub/sub commands must be handled by the server connection loop"
+                )
+            }
+
+            // ================================================================
+            // Geo commands
+            // ================================================================
+            "GEOADD" => {
+                // GEOADD key [NX|XX] [CH] longitude latitude member [longitude latitude member ...]
+                let key = require_arg!(args, 1);
+                if args.len() < 5 || (args.len() - 2) % 3 != 0 {
+                    return encoder::encode_error(
+                        "ERR wrong number of arguments for 'geoadd' command",
+                    );
+                }
+                let mut count = 0i64;
+                let mut i = 2;
+                while i + 2 < args.len() {
+                    let lon: f64 = match String::from_utf8_lossy(&args[i]).parse() {
+                        Ok(v) => v,
+                        Err(_) => return encoder::encode_error("ERR value is not a valid float"),
+                    };
+                    let lat: f64 = match String::from_utf8_lossy(&args[i + 1]).parse() {
+                        Ok(v) => v,
+                        Err(_) => return encoder::encode_error("ERR value is not a valid float"),
+                    };
+                    let member = std::str::from_utf8(&args[i + 2]).unwrap_or("");
+                    match self.kv.geoadd(key, lon, lat, member) {
+                        Ok(is_new) => {
+                            if is_new {
+                                count += 1;
+                            }
+                        }
+                        Err(e) => return encode_wrongtype(&e),
+                    }
+                    i += 3;
+                }
+                encoder::encode_integer(count)
+            }
+            "GEODIST" => {
+                // GEODIST key member1 member2 [m|km|ft|mi]
+                let key = require_arg!(args, 1);
+                let member1 = require_arg!(args, 2);
+                let member2 = require_arg!(args, 3);
+                let unit = if args.len() > 4 {
+                    std::str::from_utf8(&args[4]).unwrap_or("m")
+                } else {
+                    "m"
+                };
+                match self.kv.geodist(key, member1, member2, unit) {
+                    Ok(Some(dist)) => encoder::encode_bulk_string(
+                        format!("{:.4}", dist).as_bytes(),
+                    ),
+                    Ok(None) => encoder::encode_null_bulk(),
+                    Err(e) => encode_wrongtype(&e),
+                }
+            }
+            "GEOPOS" => {
+                // GEOPOS key member [member ...]
+                let key = require_arg!(args, 1);
+                if args.len() < 3 {
+                    return encoder::encode_error(
+                        "ERR wrong number of arguments for 'geopos' command",
+                    );
+                }
+                let mut out = encoder::encode_array_header(args.len() - 2);
+                for arg in &args[2..] {
+                    let member = std::str::from_utf8(arg).unwrap_or("");
+                    match self.kv.geopos(key, member) {
+                        Ok(Some((lon, lat))) => {
+                            out.extend(encoder::encode_array_header(2));
+                            out.extend(encoder::encode_bulk_string(
+                                format!("{:.6}", lon).as_bytes(),
+                            ));
+                            out.extend(encoder::encode_bulk_string(
+                                format!("{:.6}", lat).as_bytes(),
+                            ));
+                        }
+                        Ok(None) => {
+                            out.extend(encoder::encode_null_bulk());
+                        }
+                        Err(e) => return encode_wrongtype(&e),
+                    }
+                }
+                out
+            }
+            "GEORADIUS" => {
+                // GEORADIUS key longitude latitude radius m|km|ft|mi [WITHCOORD] [WITHDIST] [COUNT count] [ASC|DESC]
+                let key = require_arg!(args, 1);
+                let lon: f64 = match String::from_utf8_lossy(require_arg_bytes!(args, 2)).parse() {
+                    Ok(v) => v,
+                    Err(_) => return encoder::encode_error("ERR value is not a valid float"),
+                };
+                let lat: f64 = match String::from_utf8_lossy(require_arg_bytes!(args, 3)).parse() {
+                    Ok(v) => v,
+                    Err(_) => return encoder::encode_error("ERR value is not a valid float"),
+                };
+                let radius: f64 = match String::from_utf8_lossy(require_arg_bytes!(args, 4)).parse() {
+                    Ok(v) => v,
+                    Err(_) => return encoder::encode_error("ERR value is not a valid float"),
+                };
+                let unit = require_arg!(args, 5);
+
+                // Parse optional flags
+                let mut with_dist = false;
+                let mut with_coord = false;
+                let mut count_limit: Option<usize> = None;
+                let mut ascending = true;
+                let mut i = 6;
+                while i < args.len() {
+                    let flag = String::from_utf8_lossy(&args[i]).to_uppercase();
+                    match flag.as_str() {
+                        "WITHDIST" => with_dist = true,
+                        "WITHCOORD" => with_coord = true,
+                        "ASC" => ascending = true,
+                        "DESC" => ascending = false,
+                        "COUNT" => {
+                            i += 1;
+                            if i < args.len() {
+                                count_limit = String::from_utf8_lossy(&args[i]).parse().ok();
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+
+                match self.kv.georadius(key, lon, lat, radius, unit) {
+                    Ok(mut results) => {
+                        if !ascending {
+                            results.reverse();
+                        }
+                        if let Some(limit) = count_limit {
+                            results.truncate(limit);
+                        }
+
+                        if with_dist || with_coord {
+                            let mut out = encoder::encode_array_header(results.len());
+                            for (member, dist) in &results {
+                                let mut sub_count = 1; // member name
+                                if with_dist { sub_count += 1; }
+                                if with_coord { sub_count += 1; }
+                                out.extend(encoder::encode_array_header(sub_count));
+                                out.extend(encoder::encode_bulk_string(member.as_bytes()));
+                                if with_dist {
+                                    out.extend(encoder::encode_bulk_string(
+                                        format!("{:.4}", dist).as_bytes(),
+                                    ));
+                                }
+                                if with_coord {
+                                    if let Ok(Some((mlon, mlat))) = self.kv.geopos(key, member) {
+                                        out.extend(encoder::encode_array_header(2));
+                                        out.extend(encoder::encode_bulk_string(
+                                            format!("{:.6}", mlon).as_bytes(),
+                                        ));
+                                        out.extend(encoder::encode_bulk_string(
+                                            format!("{:.6}", mlat).as_bytes(),
+                                        ));
+                                    } else {
+                                        out.extend(encoder::encode_null_bulk());
+                                    }
+                                }
+                            }
+                            out
+                        } else {
+                            let mut out = encoder::encode_array_header(results.len());
+                            for (member, _) in &results {
+                                out.extend(encoder::encode_bulk_string(member.as_bytes()));
+                            }
+                            out
+                        }
+                    }
+                    Err(e) => encode_wrongtype(&e),
+                }
+            }
+            "GEORADIUSBYMEMBER" => {
+                // GEORADIUSBYMEMBER key member radius m|km|ft|mi
+                let key = require_arg!(args, 1);
+                let member = require_arg!(args, 2);
+                let radius: f64 = match String::from_utf8_lossy(require_arg_bytes!(args, 3)).parse() {
+                    Ok(v) => v,
+                    Err(_) => return encoder::encode_error("ERR value is not a valid float"),
+                };
+                let unit = require_arg!(args, 4);
+
+                // Look up the member's position
+                match self.kv.geopos(key, member) {
+                    Ok(Some((lon, lat))) => {
+                        match self.kv.georadius(key, lon, lat, radius, unit) {
+                            Ok(results) => {
+                                let mut out = encoder::encode_array_header(results.len());
+                                for (m, _) in &results {
+                                    out.extend(encoder::encode_bulk_string(m.as_bytes()));
+                                }
+                                out
+                            }
+                            Err(e) => encode_wrongtype(&e),
+                        }
+                    }
+                    Ok(None) => encoder::encode_error("ERR could not decode requested zset member"),
+                    Err(e) => encode_wrongtype(&e),
+                }
+            }
+
+            // ================================================================
             // Unknown
             // ================================================================
             _ => encoder::encode_error(&format!("ERR unknown command '{cmd}'")),
@@ -1348,12 +1811,14 @@ mod tests {
 
     fn new_handler() -> RespHandler {
         let kv = Arc::new(KvStore::new());
-        RespHandler::new(kv, None)
+        let pubsub = Arc::new(PubSubRegistry::new());
+        RespHandler::new(kv, None, pubsub)
     }
 
     fn new_handler_with_password(pw: &str) -> RespHandler {
         let kv = Arc::new(KvStore::new());
-        RespHandler::new(kv, Some(pw.to_string()))
+        let pubsub = Arc::new(PubSubRegistry::new());
+        RespHandler::new(kv, Some(pw.to_string()), pubsub)
     }
 
     #[test]
@@ -1874,5 +2339,216 @@ mod tests {
         // Destroy group
         let resp = h.handle_command(args(&["XGROUP", "DESTROY", "s", "g1"]));
         assert_eq!(decode_int(&resp), 1);
+    }
+
+    // ====================================================================
+    // Geo command tests
+    // ====================================================================
+
+    #[test]
+    fn test_geoadd_geopos() {
+        let mut h = new_handler();
+        // Add two locations
+        let resp = h.handle_command(args(&[
+            "GEOADD", "places", "13.361389", "38.115556", "Palermo",
+        ]));
+        assert_eq!(decode_int(&resp), 1);
+
+        let resp = h.handle_command(args(&[
+            "GEOADD", "places", "15.087269", "37.502669", "Catania",
+        ]));
+        assert_eq!(decode_int(&resp), 1);
+
+        // GEOPOS should return coordinates
+        let resp = h.handle_command(args(&["GEOPOS", "places", "Palermo"]));
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.contains("13.361389"), "should contain lon: {s}");
+        assert!(s.contains("38.115556"), "should contain lat: {s}");
+
+        // GEOPOS for missing member returns null
+        let resp = h.handle_command(args(&["GEOPOS", "places", "NonExistent"]));
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.contains("$-1"), "should contain null bulk: {s}");
+    }
+
+    #[test]
+    fn test_geodist() {
+        let mut h = new_handler();
+        h.handle_command(args(&[
+            "GEOADD", "geo", "13.361389", "38.115556", "Palermo",
+        ]));
+        h.handle_command(args(&[
+            "GEOADD", "geo", "15.087269", "37.502669", "Catania",
+        ]));
+
+        // Distance in km
+        let resp = h.handle_command(args(&["GEODIST", "geo", "Palermo", "Catania", "km"]));
+        let dist_str = decode_bulk(&resp).unwrap();
+        let dist: f64 = dist_str.parse().unwrap();
+        // Palermo to Catania is approximately 166 km
+        assert!(dist > 150.0 && dist < 200.0, "expected ~166km, got {dist}");
+
+        // Non-existent member returns null
+        let resp = h.handle_command(args(&["GEODIST", "geo", "Palermo", "Missing", "km"]));
+        assert_eq!(decode_bulk(&resp), None);
+    }
+
+    #[test]
+    fn test_georadius() {
+        let mut h = new_handler();
+        h.handle_command(args(&[
+            "GEOADD", "geo", "13.361389", "38.115556", "Palermo",
+        ]));
+        h.handle_command(args(&[
+            "GEOADD", "geo", "15.087269", "37.502669", "Catania",
+        ]));
+        h.handle_command(args(&[
+            "GEOADD", "geo", "2.349014", "48.864716", "Paris",
+        ]));
+
+        // Radius search from Palermo area — 200km should include Catania but not Paris
+        let resp = h.handle_command(args(&[
+            "GEORADIUS", "geo", "15.0", "37.5", "200", "km",
+        ]));
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.contains("Catania"), "should contain Catania: {s}");
+        assert!(!s.contains("Paris"), "should not contain Paris: {s}");
+    }
+
+    #[test]
+    fn test_georadius_with_options() {
+        let mut h = new_handler();
+        h.handle_command(args(&[
+            "GEOADD", "geo", "13.361389", "38.115556", "Palermo",
+        ]));
+        h.handle_command(args(&[
+            "GEOADD", "geo", "15.087269", "37.502669", "Catania",
+        ]));
+
+        // GEORADIUS WITHDIST
+        let resp = h.handle_command(args(&[
+            "GEORADIUS", "geo", "15.0", "37.5", "200", "km", "WITHDIST",
+        ]));
+        let s = String::from_utf8_lossy(&resp);
+        // Should be an array of arrays (each [member, dist])
+        assert!(s.contains("Catania") || s.contains("Palermo"), "should contain results: {s}");
+
+        // GEORADIUS with COUNT
+        let resp = h.handle_command(args(&[
+            "GEORADIUS", "geo", "15.0", "37.5", "500", "km", "COUNT", "1",
+        ]));
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.starts_with("*1\r\n"), "expected 1 result with COUNT 1: {s}");
+    }
+
+    #[test]
+    fn test_geoadd_multiple() {
+        let mut h = new_handler();
+        // Add multiple members at once
+        let resp = h.handle_command(args(&[
+            "GEOADD", "geo",
+            "13.361389", "38.115556", "Palermo",
+            "15.087269", "37.502669", "Catania",
+        ]));
+        assert_eq!(decode_int(&resp), 2);
+
+        // Update existing member — should return 0 (not new)
+        let resp = h.handle_command(args(&[
+            "GEOADD", "geo", "13.361389", "38.115556", "Palermo",
+        ]));
+        assert_eq!(decode_int(&resp), 0);
+    }
+
+    // ====================================================================
+    // Pub/Sub command tests
+    // ====================================================================
+
+    #[test]
+    fn test_publish_no_subscribers() {
+        let mut h = new_handler();
+        let resp = h.handle_command(args(&["PUBLISH", "channel", "hello"]));
+        assert_eq!(decode_int(&resp), 0);
+    }
+
+    #[test]
+    fn test_publish_with_subscriber() {
+        let pubsub = Arc::new(PubSubRegistry::new());
+        let kv = Arc::new(KvStore::new());
+        let mut publisher = RespHandler::new(Arc::clone(&kv), None, Arc::clone(&pubsub));
+        let mut subscriber = RespHandler::new(Arc::clone(&kv), None, Arc::clone(&pubsub));
+
+        // Subscribe
+        let responses = subscriber.handle_pubsub_command(args(&["SUBSCRIBE", "news"]));
+        assert_eq!(responses.len(), 1);
+        let s = String::from_utf8_lossy(&responses[0]);
+        assert!(s.contains("subscribe"), "expected subscribe confirmation: {s}");
+
+        // Publish
+        let resp = publisher.handle_command(args(&["PUBLISH", "news", "breaking"]));
+        assert_eq!(decode_int(&resp), 1);
+    }
+
+    #[test]
+    fn test_subscribe_multiple_channels() {
+        let pubsub = Arc::new(PubSubRegistry::new());
+        let kv = Arc::new(KvStore::new());
+        let mut h = RespHandler::new(kv, None, pubsub);
+
+        let responses = h.handle_pubsub_command(args(&["SUBSCRIBE", "ch1", "ch2", "ch3"]));
+        assert_eq!(responses.len(), 3);
+
+        // Each response should show increasing subscription count
+        // Response 1: subscribe ch1 1
+        let s = String::from_utf8_lossy(&responses[0]);
+        assert!(s.contains("subscribe") && s.contains("ch1"), "resp[0]: {s}");
+
+        // Response 3: subscribe ch3 3
+        let s = String::from_utf8_lossy(&responses[2]);
+        assert!(s.contains("subscribe") && s.contains("ch3"), "resp[2]: {s}");
+    }
+
+    #[test]
+    fn test_unsubscribe() {
+        let pubsub = Arc::new(PubSubRegistry::new());
+        let kv = Arc::new(KvStore::new());
+        let mut h = RespHandler::new(kv, None, pubsub);
+
+        h.handle_pubsub_command(args(&["SUBSCRIBE", "ch1", "ch2"]));
+        let responses = h.handle_pubsub_command(args(&["UNSUBSCRIBE", "ch1"]));
+        assert_eq!(responses.len(), 1);
+        let s = String::from_utf8_lossy(&responses[0]);
+        assert!(s.contains("unsubscribe"), "expected unsubscribe: {s}");
+    }
+
+    #[test]
+    fn test_psubscribe_punsubscribe() {
+        let pubsub = Arc::new(PubSubRegistry::new());
+        let kv = Arc::new(KvStore::new());
+        let mut h = RespHandler::new(kv, None, pubsub);
+
+        let responses = h.handle_pubsub_command(args(&["PSUBSCRIBE", "news.*"]));
+        assert_eq!(responses.len(), 1);
+        let s = String::from_utf8_lossy(&responses[0]);
+        assert!(s.contains("psubscribe"), "expected psubscribe: {s}");
+
+        let responses = h.handle_pubsub_command(args(&["PUNSUBSCRIBE", "news.*"]));
+        assert_eq!(responses.len(), 1);
+        let s = String::from_utf8_lossy(&responses[0]);
+        assert!(s.contains("punsubscribe"), "expected punsubscribe: {s}");
+    }
+
+    #[test]
+    fn test_pubsub_mode_rejects_normal_commands() {
+        let pubsub = Arc::new(PubSubRegistry::new());
+        let kv = Arc::new(KvStore::new());
+        let mut h = RespHandler::new(kv, None, pubsub);
+
+        h.handle_pubsub_command(args(&["SUBSCRIBE", "ch"]));
+        assert!(h.is_in_pubsub_mode());
+
+        // Trying to run GET in pub/sub mode
+        let responses = h.handle_pubsub_command(args(&["GET", "key"]));
+        assert_eq!(responses.len(), 1);
+        assert!(is_error(&responses[0]));
     }
 }

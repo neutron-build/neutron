@@ -75,6 +75,12 @@ export async function dev(): Promise<void> {
 
   const server = await createServer(
     mergeConfig({ ...userConfig, plugins: filteredPlugins }, {
+      // Prevent Vite's resolveConfig from loading vite.config.ts a second time.
+      // We already loaded it above via loadConfigFromFile and merged the result.
+      // Without this, plugins (including @prefresh/vite) are instantiated twice,
+      // causing double HMR preamble injection ("Identifier 'flushUpdates' has
+      // already been declared").
+      configFile: false,
       root: cwd,
       plugins: [
         neutronPlugin({
