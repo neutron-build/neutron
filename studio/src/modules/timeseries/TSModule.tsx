@@ -1,5 +1,5 @@
 import { useSignal } from '@preact/signals'
-import { useEffect } from 'preact/hooks'
+import { useEffect, useRef } from 'preact/hooks'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { DataGrid } from '../../components/DataGrid'
@@ -10,7 +10,19 @@ interface TSModuleProps {
   name: string
 }
 
-// Tiny SVG sparkline for a series of values
+type ViewMode = 'chart' | 'grid'
+
+// --- Observable Plot lazy loading (same pattern as CodeMirror in SQLEditor) ---
+let plotLoaded = false
+let Plot: typeof import('@observablehq/plot')
+
+async function loadPlot() {
+  if (plotLoaded) return
+  Plot = await import('@observablehq/plot')
+  plotLoaded = true
+}
+
+// --- Tiny SVG sparkline for the header stats area ---
 function Sparkline({ values }: { values: number[] }) {
   if (values.length < 2) return null
   const min = Math.min(...values)
@@ -36,6 +48,118 @@ function Sparkline({ values }: { values: number[] }) {
   )
 }
 
+// --- Observable Plot chart component ---
+interface TimeChartProps {
+  buckets: string[]
+  values: number[]
+  aggFn: string
+}
+
+function TimeChart({ buckets, values, aggFn }: TimeChartProps) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const chartReady = useSignal(false)
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function render() {
+      await loadPlot()
+      if (cancelled || !containerRef.current) return
+
+      // Build data array with parsed dates
+      const data = buckets.map((b, i) => ({
+        time: new Date(b),
+        value: values[i],
+      })).filter(d => !isNaN(d.time.getTime()) && !isNaN(d.value))
+
+      if (data.length === 0) return
+
+      // Measure container
+      const rect = containerRef.current.getBoundingClientRect()
+      const width = Math.max(rect.width - 16, 300)
+      const height = Math.max(rect.height - 16, 200)
+
+      const chart = Plot.plot({
+        width,
+        height,
+        marginLeft: 60,
+        marginRight: 20,
+        marginTop: 20,
+        marginBottom: 40,
+        style: {
+          background: 'transparent',
+          color: 'var(--text-secondary)',
+          fontSize: '11px',
+          fontFamily: 'var(--font-mono)',
+        },
+        x: {
+          type: 'utc',
+          label: 'Time',
+          tickFormat: autoTickFormat(data[0].time, data[data.length - 1].time),
+        },
+        y: {
+          label: `${aggFn}(value)`,
+          grid: true,
+        },
+        marks: [
+          // Area fill
+          Plot.areaY(data, {
+            x: 'time',
+            y: 'value',
+            fill: 'var(--model-ts)',
+            fillOpacity: 0.15,
+            curve: 'monotone-x',
+          }),
+          // Line
+          Plot.lineY(data, {
+            x: 'time',
+            y: 'value',
+            stroke: 'var(--model-ts)',
+            strokeWidth: 2,
+            curve: 'monotone-x',
+          }),
+          // Dots on each bucket
+          Plot.dot(data, {
+            x: 'time',
+            y: 'value',
+            fill: 'var(--model-ts)',
+            r: data.length > 100 ? 1.5 : 3,
+            tip: true,
+          }),
+          // Rule at y=0 if values go negative
+          ...(Math.min(...values) < 0
+            ? [Plot.ruleY([0], { stroke: 'var(--text-tertiary)', strokeDasharray: '4,3' })]
+            : []),
+        ],
+      })
+
+      // Clear previous
+      containerRef.current.innerHTML = ''
+      containerRef.current.appendChild(chart)
+      chartReady.value = true
+    }
+
+    render()
+    return () => { cancelled = true }
+  }, [buckets, values, aggFn])
+
+  return (
+    <div ref={containerRef} class={s.chartContainer}>
+      {!chartReady.value && <div class={s.chartLoading}>Rendering chart...</div>}
+    </div>
+  )
+}
+
+// Pick a sensible tick format based on the time range
+function autoTickFormat(start: Date, end: Date): string {
+  const diffMs = end.getTime() - start.getTime()
+  const diffH = diffMs / (1000 * 60 * 60)
+  if (diffH < 2) return '%H:%M:%S'
+  if (diffH < 48) return '%H:%M'
+  if (diffH < 24 * 60) return '%b %d'
+  return '%Y-%m-%d'
+}
+
 export function TSModule({ name }: TSModuleProps) {
   const from = useSignal('')
   const to = useSignal('')
@@ -44,7 +168,9 @@ export function TSModule({ name }: TSModuleProps) {
   const result = useSignal<QueryResult | null>(null)
   const running = useSignal(false)
   const sparkValues = useSignal<number[]>([])
+  const bucketLabels = useSignal<string[]>([])
   const stats = useSignal<{ count: number; min: number; max: number; avg: number } | null>(null)
+  const viewMode = useSignal<ViewMode>('chart')
 
   const conn = activeConnection.value!
 
@@ -70,6 +196,7 @@ export function TSModule({ name }: TSModuleProps) {
     running.value = true
     result.value = null
     sparkValues.value = []
+    bucketLabels.value = []
     try {
       const fromClause = from.value ? `'${from.value}'` : "'-inf'"
       const toClause = to.value ? `'${to.value}'` : "'+inf'"
@@ -82,6 +209,7 @@ export function TSModule({ name }: TSModuleProps) {
       )
       result.value = r
       if (!r.error && r.rows.length > 0) {
+        bucketLabels.value = r.rows.map(row => String(row[0]))
         sparkValues.value = r.rows.map(row => Number(row[1])).filter(v => !isNaN(v))
       }
     } catch (err: unknown) {
@@ -90,6 +218,8 @@ export function TSModule({ name }: TSModuleProps) {
       running.value = false
     }
   }
+
+  const hasData = sparkValues.value.length > 0
 
   return (
     <div class={s.layout}>
@@ -123,9 +253,12 @@ export function TSModule({ name }: TSModuleProps) {
               onChange={e => { bucket.value = (e.target as HTMLSelectElement).value }}>
               <option value="1m">1 min</option>
               <option value="5m">5 min</option>
+              <option value="15m">15 min</option>
               <option value="1h">1 hr</option>
+              <option value="6h">6 hr</option>
               <option value="1d">1 day</option>
               <option value="7d">7 days</option>
+              <option value="30d">30 days</option>
             </select>
           </div>
           <div class={s.fieldGroup}>
@@ -140,22 +273,58 @@ export function TSModule({ name }: TSModuleProps) {
             </select>
           </div>
           <button class={s.runBtn} onClick={runQuery} disabled={running.value}>
-            {running.value ? 'Loading…' : '▶ Query'}
+            {running.value ? 'Loading...' : 'Query'}
           </button>
         </div>
       </div>
 
-      {sparkValues.value.length > 0 && (
-        <div class={s.chartArea}>
-          <Sparkline values={sparkValues.value} />
-          <span class={s.chartLabel}>{result.value?.rowCount} buckets</span>
+      {/* Mini sparkline preview + view toggle */}
+      {hasData && (
+        <div class={s.chartToolbar}>
+          <div class={s.sparkArea}>
+            <Sparkline values={sparkValues.value} />
+            <span class={s.chartLabel}>
+              {result.value?.rowCount} buckets &middot;
+              range [{fmt(Math.min(...sparkValues.value))}, {fmt(Math.max(...sparkValues.value))}]
+            </span>
+          </div>
+          <div class={s.viewToggle}>
+            <button
+              class={`${s.toggleBtn} ${viewMode.value === 'chart' ? s.toggleActive : ''}`}
+              onClick={() => { viewMode.value = 'chart' }}
+            >
+              Chart
+            </button>
+            <button
+              class={`${s.toggleBtn} ${viewMode.value === 'grid' ? s.toggleActive : ''}`}
+              onClick={() => { viewMode.value = 'grid' }}
+            >
+              Table
+            </button>
+          </div>
         </div>
       )}
 
-      <div class={s.grid}>
-        {result.value && <DataGrid result={result.value} />}
-        {!result.value && !running.value && (
-          <div class={s.hint}>Set a time range and click Query to explore the metric</div>
+      {/* Main content area */}
+      <div class={s.mainArea}>
+        {hasData && viewMode.value === 'chart' ? (
+          <TimeChart
+            buckets={bucketLabels.value}
+            values={sparkValues.value}
+            aggFn={aggFn.value}
+          />
+        ) : hasData && viewMode.value === 'grid' ? (
+          <div class={s.grid}>
+            <DataGrid result={result.value!} />
+          </div>
+        ) : result.value && result.value.error ? (
+          <div class={s.error}>{result.value.error}</div>
+        ) : (
+          <div class={s.hint}>
+            {running.value
+              ? 'Loading...'
+              : 'Set a time range and click Query to explore the metric'}
+          </div>
         )}
       </div>
     </div>

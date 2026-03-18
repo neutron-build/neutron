@@ -1,0 +1,6 @@
+-- Initial schema for {{.Name}}
+CREATE TABLE IF NOT EXISTS _neutron_migrations (
+    version TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    applied_at TIMESTAMPTZ DEFAULT now()
+);

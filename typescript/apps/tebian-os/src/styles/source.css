@@ -1,0 +1,50 @@
+main { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 2rem; }
+.editor { background: #11111b; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5); max-width: 800px; width: 100%; max-height: 70vh; display: flex; flex-direction: column; }
+.tabs { display: flex; background: #181825; border-bottom: 1px solid #313244; padding: 0 0.5rem; overflow-x: auto; gap: 0; flex-shrink: 0; }
+.tab { padding: 0.75rem 1rem; font-size: 0.85rem; color: #6c7086; background: none; border: none; border-bottom: 2px solid transparent; cursor: pointer; white-space: nowrap; transition: all 0.2s; font-family: inherit; border-radius: 0; }
+.tab:hover { color: #9399b2; background: rgba(255, 255, 255, 0.02); }
+.tab.active { color: #cdd6f4; border-bottom-color: #89b4fa; background: rgba(137, 180, 250, 0.05); }
+.code-container { display: flex; overflow: auto; flex: 1; }
+.line-numbers { display: flex; flex-direction: column; padding: 1.25rem 0; background: #181825; color: #45475a; font-size: 0.85rem; text-align: right; min-width: 3rem; user-select: none; }
+.line-numbers span { padding: 0 0.75rem; line-height: 1.5; }
+.code { margin: 0; padding: 1.25rem; font-size: 0.85rem; line-height: 1.5; flex: 1; white-space: pre; color: #cdd6f4; }
+.source-footer { display: flex; flex-direction: column; align-items: center; gap: 0.75rem; margin-top: 2rem; }
+.source-footer-nav { display: flex; align-items: center; gap: 1rem; font-size: 0.85rem; }
+.source-footer-nav a { color: #45475a; text-decoration: none; transition: color 0.2s; }
+.source-footer-nav a:hover { color: #89b4fa; }
+.source-footer-ext { display: flex; align-items: center; gap: 0.5rem; font-size: 0.75rem; }
+.source-footer-ext a { color: #313244; text-decoration: none; transition: color 0.2s; }
+.source-footer-ext a:hover { color: #45475a; }
+.sf-sep { color: #313244; }
+.github-link { color: #6c7086; transition: color 0.2s; }
+.github-link:hover { color: #cdd6f4; }
+
+html[data-theme="light"] .editor { background: #e6e9ef; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1); }
+html[data-theme="light"] .tabs { background: #dce0e8; border-bottom-color: #ccd0da; }
+html[data-theme="light"] .tab { color: #9ca0b0; }
+html[data-theme="light"] .tab:hover { color: #6c6f85; background: rgba(0, 0, 0, 0.03); }
+html[data-theme="light"] .tab.active { color: #4c4f69; border-bottom-color: #1e66f5; background: rgba(30, 102, 245, 0.05); }
+html[data-theme="light"] .line-numbers { background: #dce0e8; color: #9ca0b0; }
+html[data-theme="light"] .code { color: #4c4f69; }
+html[data-theme="light"] .source-footer-nav a { color: #9ca0b0; }
+html[data-theme="light"] .source-footer-nav a:hover { color: #1e66f5; }
+html[data-theme="light"] .source-footer-ext a { color: #8c8fa1; }
+html[data-theme="light"] .source-footer-ext a:hover { color: #1e66f5; }
+html[data-theme="light"] .sf-sep { color: #bcc0cc; }
+html[data-theme="light"] .github-link { color: #9ca0b0; }
+html[data-theme="light"] .github-link:hover { color: #4c4f69; }
+
+html[data-theme="frappe"] .editor { background: #232634; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4); }
+html[data-theme="frappe"] .tabs { background: #292c3c; border-bottom-color: #414559; }
+html[data-theme="frappe"] .tab { color: #838ba7; }
+html[data-theme="frappe"] .tab:hover { color: #a5adce; background: rgba(255, 255, 255, 0.02); }
+html[data-theme="frappe"] .tab.active { color: #c6d0f5; border-bottom-color: #8caaee; background: rgba(140, 170, 238, 0.05); }
+html[data-theme="frappe"] .line-numbers { background: #292c3c; color: #51576d; }
+html[data-theme="frappe"] .code { color: #c6d0f5; }
+html[data-theme="frappe"] .source-footer-nav a { color: #626880; }
+html[data-theme="frappe"] .source-footer-nav a:hover { color: #8caaee; }
+html[data-theme="frappe"] .source-footer-ext a { color: #626880; }
+html[data-theme="frappe"] .source-footer-ext a:hover { color: #8caaee; }
+html[data-theme="frappe"] .sf-sep { color: #51576d; }
+html[data-theme="frappe"] .github-link { color: #838ba7; }
+html[data-theme="frappe"] .github-link:hover { color: #c6d0f5; }

@@ -7,6 +7,7 @@
 
 use nucleus::embedded::Database;
 use nucleus::types::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 // ============================================================================
@@ -539,4 +540,390 @@ async fn stress_no_phantom_reads() {
     for h in handles {
         h.await.unwrap();
     }
+}
+
+// ============================================================================
+// Helper: extract i64 from Value
+// ============================================================================
+
+fn extract_i64(val: &Value) -> i64 {
+    match val {
+        Value::Int64(n) => *n,
+        Value::Int32(n) => *n as i64,
+        Value::Float64(f) => *f as i64,
+        Value::Null => 0,
+        other => panic!("expected numeric value, got {other:?}"),
+    }
+}
+
+// ============================================================================
+// Test 9: Deadlock detection/prevention — concurrent cross-row updates
+// ============================================================================
+
+#[tokio::test]
+#[ignore = "stress test; run explicitly"]
+async fn stress_deadlock_detection() {
+    let db = setup();
+
+    // Create two tables; tasks will update rows in opposite orders to provoke
+    // potential deadlocks. The engine should either serialize or abort one txn
+    // (never hang forever).
+    db.execute("CREATE TABLE dl_a (id INT NOT NULL, val INT NOT NULL)")
+        .await
+        .unwrap();
+    db.execute("CREATE TABLE dl_b (id INT NOT NULL, val INT NOT NULL)")
+        .await
+        .unwrap();
+
+    for i in 0..10 {
+        db.execute(&format!("INSERT INTO dl_a VALUES ({i}, 0)"))
+            .await
+            .unwrap();
+        db.execute(&format!("INSERT INTO dl_b VALUES ({i}, 0)"))
+            .await
+            .unwrap();
+    }
+
+    let committed = Arc::new(AtomicU64::new(0));
+    let failed = Arc::new(AtomicU64::new(0));
+    let task_count = 50u64;
+    let mut handles = Vec::new();
+
+    for t in 0..task_count {
+        let db = db.clone();
+        let committed = committed.clone();
+        let failed = failed.clone();
+        handles.push(tokio::spawn(async move {
+            // Even tasks: update dl_a then dl_b (ascending order)
+            // Odd tasks: update dl_b then dl_a (reverse order — deadlock potential)
+            let id_1 = (t % 10) as i64;
+            let id_2 = ((t + 3) % 10) as i64;
+
+            let (first_table, second_table) = if t % 2 == 0 {
+                ("dl_a", "dl_b")
+            } else {
+                ("dl_b", "dl_a")
+            };
+
+            let r1 = db
+                .execute(&format!(
+                    "UPDATE {first_table} SET val = val + 1 WHERE id = {id_1}"
+                ))
+                .await;
+            let r2 = db
+                .execute(&format!(
+                    "UPDATE {second_table} SET val = val + 1 WHERE id = {id_2}"
+                ))
+                .await;
+
+            if r1.is_ok() && r2.is_ok() {
+                committed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    // All tasks must complete (no infinite deadlock hang)
+    let timeout = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        for h in handles {
+            h.await.unwrap();
+        }
+    })
+    .await;
+    assert!(
+        timeout.is_ok(),
+        "all tasks should complete within 30s (no deadlock hang)"
+    );
+
+    let c = committed.load(Ordering::Relaxed);
+    let f = failed.load(Ordering::Relaxed);
+    assert_eq!(
+        c + f,
+        task_count,
+        "all tasks should complete: committed={c}, failed={f}"
+    );
+    assert!(c > 0, "at least some updates should commit");
+
+    // Tables should remain queryable and consistent
+    let rows_a = db.query("SELECT COUNT(*) FROM dl_a").await.unwrap();
+    assert_eq!(extract_i64(&rows_a[0][0]), 10);
+    let rows_b = db.query("SELECT COUNT(*) FROM dl_b").await.unwrap();
+    assert_eq!(extract_i64(&rows_b[0][0]), 10);
+}
+
+// ============================================================================
+// Test 10: MVCC isolation under heavy contention — serialized increment
+// ============================================================================
+
+#[tokio::test]
+#[ignore = "stress test; run explicitly"]
+async fn stress_mvcc_heavy_contention() {
+    let db = setup();
+
+    db.execute("CREATE TABLE contention (id INT NOT NULL, counter INT NOT NULL)")
+        .await
+        .unwrap();
+
+    // 10 hot rows that all 64 tasks will fight over
+    for i in 0..10 {
+        db.execute(&format!("INSERT INTO contention VALUES ({i}, 0)"))
+            .await
+            .unwrap();
+    }
+
+    let task_count = 64;
+    let ops_per_task = 50;
+    let committed = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::new();
+
+    for t in 0..task_count {
+        let db = db.clone();
+        let committed = committed.clone();
+        handles.push(tokio::spawn(async move {
+            for i in 0..ops_per_task {
+                let target = (t * ops_per_task + i) % 10;
+                let result = db
+                    .execute(&format!(
+                        "UPDATE contention SET counter = counter + 1 WHERE id = {target}"
+                    ))
+                    .await;
+                if result.is_ok() {
+                    committed.fetch_add(1, Ordering::Relaxed);
+                }
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let c = committed.load(Ordering::Relaxed);
+    assert!(
+        c > 0,
+        "at least some updates should succeed under contention"
+    );
+
+    // Sum of all counters should equal the number of committed updates
+    let rows = db
+        .query("SELECT SUM(counter) FROM contention")
+        .await
+        .unwrap();
+    let total = extract_i64(&rows[0][0]);
+    assert_eq!(
+        total, c as i64,
+        "sum of counters should match committed count"
+    );
+
+    // Row count must remain at 10
+    let rows = db
+        .query("SELECT COUNT(*) FROM contention")
+        .await
+        .unwrap();
+    assert_eq!(extract_i64(&rows[0][0]), 10);
+}
+
+// ============================================================================
+// Test 11: Sustained load — multiple iterations of mixed operations
+// ============================================================================
+
+#[tokio::test]
+#[ignore = "stress test; run explicitly"]
+async fn stress_sustained_load_iterations() {
+    let db = setup();
+
+    db.execute("CREATE TABLE sustained (id INT NOT NULL, iteration INT NOT NULL, val TEXT)")
+        .await
+        .unwrap();
+
+    let iterations = 10;
+    let tasks_per_iteration = 16;
+    let ops_per_task = 30;
+
+    for iter in 0..iterations {
+        let mut handles = Vec::new();
+
+        // Writers: insert new rows
+        for t in 0..(tasks_per_iteration / 2) {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                for i in 0..ops_per_task {
+                    let id = iter * 10000 + t as i32 * 1000 + i;
+                    let _ = db
+                        .execute(&format!(
+                            "INSERT INTO sustained VALUES ({id}, {iter}, 'iter_{iter}_task_{t}')"
+                        ))
+                        .await;
+                }
+            }));
+        }
+
+        // Readers: count and scan
+        for _ in 0..(tasks_per_iteration / 4) {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..ops_per_task {
+                    let _ = db.query("SELECT COUNT(*) FROM sustained").await;
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        // Updaters: modify existing rows
+        for _ in 0..(tasks_per_iteration / 4) {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                for i in 0..ops_per_task {
+                    let target = iter * 10000 + i;
+                    let _ = db
+                        .execute(&format!(
+                            "UPDATE sustained SET val = 'updated' WHERE id = {target}"
+                        ))
+                        .await;
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Verify consistency after each iteration
+        let rows = db
+            .query("SELECT COUNT(*) FROM sustained")
+            .await
+            .unwrap();
+        let count = extract_i64(&rows[0][0]);
+        assert!(
+            count > 0,
+            "iteration {iter}: table should have rows, got {count}"
+        );
+    }
+
+    // Final consistency check
+    let rows = db
+        .query("SELECT COUNT(*) FROM sustained")
+        .await
+        .unwrap();
+    let final_count = extract_i64(&rows[0][0]);
+    let expected_min = (iterations * tasks_per_iteration / 2 * ops_per_task) as i64;
+    assert!(
+        final_count >= expected_min / 2,
+        "should have substantial rows after sustained load: got {final_count}, expected at least {}/2",
+        expected_min
+    );
+}
+
+// ============================================================================
+// Test 12: 50+ concurrent clients — mixed read/write workload
+// ============================================================================
+
+#[tokio::test]
+#[ignore = "stress test; run explicitly"]
+async fn stress_fifty_plus_clients_mixed() {
+    let db = setup();
+
+    db.execute("CREATE TABLE fifty_clients (id INT NOT NULL, client INT NOT NULL, op TEXT)")
+        .await
+        .unwrap();
+
+    // Seed initial data for readers/updaters
+    for i in 0..100 {
+        db.execute(&format!(
+            "INSERT INTO fifty_clients VALUES ({i}, -1, 'seed')"
+        ))
+        .await
+        .unwrap();
+    }
+
+    let client_count = 60;
+    let ops_per_client = 20;
+    let mut handles = Vec::new();
+
+    for c in 0..client_count {
+        let db = db.clone();
+        handles.push(tokio::spawn(async move {
+            match c % 4 {
+                // 15 inserters
+                0 => {
+                    for i in 0..ops_per_client {
+                        let id = 1000 + c * ops_per_client + i;
+                        let _ = db
+                            .execute(&format!(
+                                "INSERT INTO fifty_clients VALUES ({id}, {c}, 'insert')"
+                            ))
+                            .await;
+                    }
+                }
+                // 15 readers
+                1 => {
+                    for _ in 0..ops_per_client {
+                        let _ = db
+                            .query("SELECT COUNT(*) FROM fifty_clients")
+                            .await;
+                        let _ = db
+                            .query(&format!(
+                                "SELECT * FROM fifty_clients WHERE client = {c} LIMIT 10"
+                            ))
+                            .await;
+                        tokio::task::yield_now().await;
+                    }
+                }
+                // 15 updaters
+                2 => {
+                    for i in 0..ops_per_client {
+                        let target = i % 100;
+                        let _ = db
+                            .execute(&format!(
+                                "UPDATE fifty_clients SET op = 'updated_by_{c}' WHERE id = {target}"
+                            ))
+                            .await;
+                        tokio::task::yield_now().await;
+                    }
+                }
+                // 15 mixed (delete + re-insert)
+                _ => {
+                    for i in 0..ops_per_client {
+                        let id = 2000 + c * ops_per_client + i;
+                        let _ = db
+                            .execute(&format!(
+                                "INSERT INTO fifty_clients VALUES ({id}, {c}, 'temp')"
+                            ))
+                            .await;
+                        let _ = db
+                            .execute(&format!(
+                                "DELETE FROM fifty_clients WHERE id = {id}"
+                            ))
+                            .await;
+                    }
+                }
+            }
+        }));
+    }
+
+    // All 60 clients must complete
+    let timeout = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        for h in handles {
+            h.await.unwrap();
+        }
+    })
+    .await;
+    assert!(
+        timeout.is_ok(),
+        "all 60 clients should complete within 60s"
+    );
+
+    // Table should remain queryable
+    let rows = db
+        .query("SELECT COUNT(*) FROM fifty_clients")
+        .await
+        .unwrap();
+    let count = extract_i64(&rows[0][0]);
+    assert!(
+        count >= 100,
+        "at least seed rows should remain: got {count}"
+    );
 }

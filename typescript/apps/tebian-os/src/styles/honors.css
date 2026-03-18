@@ -1,0 +1,102 @@
+main { min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 4rem 2rem; }
+.shrine { text-align: center; margin-bottom: 4rem; max-width: 900px; width: 100%; }
+.shrine-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem; }
+.shrine-card { padding: 1.25rem 1.25rem; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 12px; display: flex; flex-direction: column; align-items: center; gap: 0.5rem; }
+.shrine-gnu { font-size: 1.8rem; color: #94e2d5; margin: 0; }
+.shrine-linux { font-size: 1.8rem; color: #f9e2af; margin: 0; }
+.shrine-debian { font-size: 1.8rem; color: #d70a53; margin: 0; }
+.shrine-card p { color: #9399b2; font-size: 0.85rem; margin: 0; line-height: 1.5; flex: 1; }
+.shrine-title { font-size: 2rem; color: #cdd6f4; margin: 0 0 0.5rem 0; }
+.shrine-sub { color: #9399b2; font-size: 1.1rem; margin: 0 0 1.5rem 0; }
+.shrine-btn { display: inline-block; padding: 0.6rem 1.5rem; color: #fff; border-radius: 8px; text-decoration: none; font-weight: 700; font-size: 0.9rem; transition: all 0.2s; }
+.shrine-btn:hover { transform: translateY(-2px); }
+.shrine-btn-gnu { background: #94e2d5; color: #1e1e2e; }
+.shrine-btn-gnu:hover { box-shadow: 0 6px 20px rgba(148, 226, 213, 0.3); }
+.shrine-btn-linux { background: #f9e2af; color: #1e1e2e; }
+.shrine-btn-linux:hover { box-shadow: 0 6px 20px rgba(249, 226, 175, 0.3); }
+.shrine-btn-debian { background: #d70a53; }
+.shrine-btn-debian:hover { box-shadow: 0 6px 20px rgba(215, 10, 83, 0.3); }
+@media (max-width: 700px) { .shrine-grid { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 480px) { .shrine-grid { grid-template-columns: 1fr; } }
+.killed { border-top: 1px solid rgba(255, 255, 255, 0.1); padding-top: 3rem; margin-bottom: 3rem; max-width: 800px; width: 100%; text-align: center; }
+.killed h2 { font-size: 1.5rem; color: #6c7086; margin: 0 0 0.5rem 0; }
+.killed > p { color: #585b70; font-size: 1rem; margin: 0 0 2rem 0; }
+.killed-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem; }
+.killed-card { display: flex; flex-direction: column; padding: 1rem; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 8px; text-align: left; opacity: 1; }
+.killed-name { font-size: 1rem; font-weight: 600; color: #9399b2; margin-bottom: 0.35rem; text-decoration: line-through; }
+.killed-reason { font-size: 0.8rem; color: #6c7086; line-height: 1.4; }
+.survivors { width: 100%; max-width: 900px; text-align: center; margin-bottom: 2rem; }
+.embedded { width: 100%; max-width: 900px; text-align: center; margin-bottom: 2rem; }
+.embedded h2 { font-size: 1.5rem; color: #cba6f7; margin: 0 0 0.5rem 0; }
+.embedded > p { color: #9399b2; font-size: 0.95rem; margin: 0 0 1.5rem 0; }
+.infra { width: 100%; max-width: 900px; text-align: center; margin-bottom: 2rem; }
+.infra h2 { font-size: 1.5rem; color: #f9e2af; margin: 0 0 0.5rem 0; }
+.infra > p { color: #9399b2; font-size: 0.95rem; margin: 0 0 1.5rem 0; }
+.survivors h2 { font-size: 1.5rem; color: #a6e3a1; margin: 0 0 0.5rem 0; }
+.survivors > p { color: #9399b2; font-size: 1.1rem; margin: 0 0 0.5rem 0; }
+.survivor-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+.survivor-card { display: flex; flex-direction: column; padding: 1.25rem; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 10px; text-decoration: none; transition: all 0.2s; text-align: left; }
+.survivor-card:hover { background: rgba(255, 255, 255, 0.05); border-color: var(--accent-color); transform: translateY(-2px); }
+.survivor-name { font-size: 1.1rem; font-weight: 700; color: #a6e3a1; margin-bottom: 0.5rem; }
+.survivor-desc { font-size: 0.9rem; color: #6c7086; }
+.survivor-special { border-color: rgba(137, 180, 250, 0.2); background: rgba(137, 180, 250, 0.03); }
+.survivor-divider { grid-column: 1 / -1; font-size: 0.8rem; color: #6c7086; padding-top: 0.75rem; border-top: 1px solid rgba(255, 255, 255, 0.06); text-align: center; }
+.survivor-divider:first-child { border-top: none; padding-top: 0; }
+.survivor-vm-row { grid-column: 1 / -1; display: flex; gap: 1rem; justify-content: center; }
+.survivor-vm-row .survivor-card { width: 220px; }
+
+/* Light theme */
+html[data-theme="light"] .shrine-title { color: #4c4f69; }
+html[data-theme="light"] .shrine-sub { color: #5c5f77; }
+html[data-theme="light"] .shrine-card { background: rgba(0, 0, 0, 0.03); border-color: rgba(0, 0, 0, 0.08); }
+html[data-theme="light"] .shrine-card p { color: #5c5f77; }
+html[data-theme="light"] .shrine-gnu { color: #179299; }
+html[data-theme="light"] .shrine-btn-gnu { background: #179299; color: #eff1f5; }
+html[data-theme="light"] .shrine-linux { color: #df8e1d; }
+html[data-theme="light"] .shrine-btn-linux { background: #df8e1d; color: #eff1f5; }
+html[data-theme="light"] .survivors h2 { color: #40a02b; }
+html[data-theme="light"] .survivors > p { color: #5c5f77; }
+html[data-theme="light"] .survivor-card { background: rgba(0, 0, 0, 0.03); border-color: rgba(0, 0, 0, 0.08); }
+html[data-theme="light"] .survivor-card:hover { background: rgba(0, 0, 0, 0.05); }
+html[data-theme="light"] .survivor-name { color: #40a02b; }
+html[data-theme="light"] .survivor-desc { color: #6c6f85; }
+html[data-theme="light"] .survivor-special { border-color: rgba(30, 102, 245, 0.2); background: rgba(30, 102, 245, 0.03); }
+html[data-theme="light"] .survivor-divider { color: #8c8fa1; border-top-color: rgba(0, 0, 0, 0.08); }
+html[data-theme="light"] .embedded h2 { color: #8839ef; }
+html[data-theme="light"] .embedded > p { color: #5c5f77; }
+html[data-theme="light"] .infra h2 { color: #df8e1d; }
+html[data-theme="light"] .infra > p { color: #5c5f77; }
+html[data-theme="light"] .killed { border-top-color: rgba(0, 0, 0, 0.08); }
+html[data-theme="light"] .killed h2 { color: #8c8fa1; }
+html[data-theme="light"] .killed > p { color: #7c7f93; }
+html[data-theme="light"] .killed-card { background: rgba(0, 0, 0, 0.03); border-color: rgba(0, 0, 0, 0.08); }
+html[data-theme="light"] .killed-name { color: #5c5f77; }
+html[data-theme="light"] .killed-reason { color: #6c6f85; }
+
+/* Frappe theme */
+html[data-theme="frappe"] .shrine-title { color: #c6d0f5; }
+html[data-theme="frappe"] .shrine-sub { color: #a5adce; }
+html[data-theme="frappe"] .shrine-card { background: rgba(255, 255, 255, 0.03); border-color: rgba(255, 255, 255, 0.06); }
+html[data-theme="frappe"] .shrine-card p { color: #a5adce; }
+html[data-theme="frappe"] .shrine-gnu { color: #81c8be; }
+html[data-theme="frappe"] .shrine-btn-gnu { background: #81c8be; color: #232634; }
+html[data-theme="frappe"] .shrine-linux { color: #e5c890; }
+html[data-theme="frappe"] .shrine-btn-linux { background: #e5c890; color: #232634; }
+html[data-theme="frappe"] .survivors h2 { color: #a6d189; }
+html[data-theme="frappe"] .survivors > p { color: #a5adce; }
+html[data-theme="frappe"] .survivor-card { background: rgba(255, 255, 255, 0.03); border-color: rgba(255, 255, 255, 0.06); }
+html[data-theme="frappe"] .survivor-card:hover { background: rgba(255, 255, 255, 0.05); }
+html[data-theme="frappe"] .survivor-name { color: #a6d189; }
+html[data-theme="frappe"] .survivor-desc { color: #838ba7; }
+html[data-theme="frappe"] .survivor-special { border-color: rgba(140, 170, 238, 0.2); background: rgba(140, 170, 238, 0.03); }
+html[data-theme="frappe"] .survivor-divider { color: #737994; border-top-color: rgba(255, 255, 255, 0.07); }
+html[data-theme="frappe"] .embedded h2 { color: #ca9ee6; }
+html[data-theme="frappe"] .embedded > p { color: #a5adce; }
+html[data-theme="frappe"] .infra h2 { color: #e5c890; }
+html[data-theme="frappe"] .infra > p { color: #a5adce; }
+html[data-theme="frappe"] .killed { border-top-color: rgba(255, 255, 255, 0.08); }
+html[data-theme="frappe"] .killed h2 { color: #838ba7; }
+html[data-theme="frappe"] .killed > p { color: #737994; }
+html[data-theme="frappe"] .killed-card { background: rgba(255, 255, 255, 0.03); border-color: rgba(255, 255, 255, 0.06); }
+html[data-theme="frappe"] .killed-name { color: #a5adce; }
+html[data-theme="frappe"] .killed-reason { color: #838ba7; }

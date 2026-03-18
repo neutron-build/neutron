@@ -35,8 +35,8 @@ server_err.log
 # Compiled Mojo outputs
 /tmp/test_*
 
-# Internal planning docs & research
-internal/
+# Archive — planning docs & research
+archive/
 **/ARCHITECTURE.md
 **/PLAN.md
 **/STATUS.md

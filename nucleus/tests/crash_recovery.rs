@@ -8,6 +8,7 @@
 
 use nucleus::embedded::Database;
 use nucleus::types::Value;
+use std::sync::Arc;
 
 // ============================================================================
 // Test: committed data survives crash (close + reopen)
@@ -400,5 +401,219 @@ async fn crash_five_cycle_growing() {
         assert_eq!(count, expected, "cycle {cycle}: expected {expected} rows, got {count}");
 
         db.close();
+    }
+}
+
+// ============================================================================
+// Helper: extract i64 from Value
+// ============================================================================
+
+fn extract_count(val: &Value) -> i64 {
+    match val {
+        Value::Int64(n) => *n,
+        Value::Int32(n) => *n as i64,
+        Value::Float64(f) => *f as i64,
+        other => panic!("expected numeric value, got {other:?}"),
+    }
+}
+
+// ============================================================================
+// Test: recovery with concurrent writers
+// ============================================================================
+
+#[tokio::test]
+async fn crash_recovery_concurrent_writers() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Phase 1: Multiple concurrent writers into durable MVCC, then crash
+    {
+        let db = Arc::new(Database::durable_mvcc(dir.path()).unwrap());
+        db.execute("CREATE TABLE concurrent_wal (id INT NOT NULL, writer INT NOT NULL, val TEXT)")
+            .await
+            .unwrap();
+
+        let writer_count = 8u32;
+        let rows_per_writer = 50u32;
+        let mut handles = Vec::new();
+
+        for w in 0..writer_count {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                for i in 0..rows_per_writer {
+                    let id = w * rows_per_writer + i;
+                    let _ = db
+                        .execute(&format!(
+                            "INSERT INTO concurrent_wal VALUES ({id}, {w}, 'data_{id}')"
+                        ))
+                        .await;
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Verify all rows landed before close
+        let rows = db.query("SELECT COUNT(*) FROM concurrent_wal").await.unwrap();
+        let count = extract_count(&rows[0][0]);
+        assert_eq!(
+            count,
+            (writer_count * rows_per_writer) as i64,
+            "all rows should be present before close"
+        );
+
+        // Graceful close (flush WAL)
+        // We hold the only remaining Arc, so unwrap the inner Database
+        Arc::try_unwrap(db).ok().unwrap().close();
+    }
+
+    // Phase 2: Reopen and verify all concurrent writes survived
+    {
+        let db = Database::durable_mvcc(dir.path()).unwrap();
+        let rows = db.query("SELECT COUNT(*) FROM concurrent_wal").await.unwrap();
+        let count = extract_count(&rows[0][0]);
+        assert_eq!(
+            count, 400,
+            "all 400 concurrent-writer rows should survive recovery"
+        );
+
+        // Verify each writer's rows are present
+        for w in 0..8u32 {
+            let rows = db
+                .query(&format!(
+                    "SELECT COUNT(*) FROM concurrent_wal WHERE writer = {w}"
+                ))
+                .await
+                .unwrap();
+            let count = extract_count(&rows[0][0]);
+            assert_eq!(
+                count, 50,
+                "writer {w} should have 50 rows after recovery"
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Test: concurrent writers with uncommitted transactions — only committed survives
+// ============================================================================
+
+#[tokio::test]
+async fn crash_recovery_concurrent_writers_mixed_commit() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let db = Arc::new(Database::durable_mvcc(dir.path()).unwrap());
+        db.execute("CREATE TABLE cw_mixed (id INT NOT NULL, source TEXT)")
+            .await
+            .unwrap();
+
+        // Writer 1: committed auto-commit inserts
+        let db1 = db.clone();
+        let h1 = tokio::spawn(async move {
+            for i in 0..20 {
+                db1.execute(&format!("INSERT INTO cw_mixed VALUES ({i}, 'committed')"))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        // Writer 2: committed auto-commit inserts (higher IDs)
+        let db2 = db.clone();
+        let h2 = tokio::spawn(async move {
+            for i in 100..120 {
+                db2.execute(&format!("INSERT INTO cw_mixed VALUES ({i}, 'committed')"))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        h1.await.unwrap();
+        h2.await.unwrap();
+
+        // Writer 3: start a transaction but never commit (simulates in-flight at crash)
+        db.execute("BEGIN").await.unwrap();
+        db.execute("INSERT INTO cw_mixed VALUES (999, 'uncommitted')")
+            .await
+            .unwrap();
+        // No COMMIT — simulates crash
+        Arc::try_unwrap(db).ok().unwrap().close();
+    }
+
+    // Reopen: committed rows survive, uncommitted does not
+    {
+        let db = Database::durable_mvcc(dir.path()).unwrap();
+        let rows = db
+            .query("SELECT COUNT(*) FROM cw_mixed WHERE source = 'committed'")
+            .await
+            .unwrap();
+        let committed = extract_count(&rows[0][0]);
+        assert_eq!(committed, 40, "all 40 committed rows should survive");
+
+        let rows = db
+            .query("SELECT COUNT(*) FROM cw_mixed WHERE source = 'uncommitted'")
+            .await
+            .unwrap();
+        let uncommitted = extract_count(&rows[0][0]);
+        assert_eq!(
+            uncommitted, 0,
+            "uncommitted rows should NOT survive recovery"
+        );
+    }
+}
+
+// ============================================================================
+// Test: WAL recovery with interleaved DDL and DML from concurrent writers
+// ============================================================================
+
+#[tokio::test]
+async fn crash_recovery_concurrent_ddl_dml() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let db = Arc::new(Database::durable_mvcc(dir.path()).unwrap());
+
+        // Create multiple tables concurrently, insert into each
+        let mut handles = Vec::new();
+        for t in 0..4u32 {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                let table = format!("conc_table_{t}");
+                db.execute(&format!(
+                    "CREATE TABLE {table} (id INT NOT NULL, val INT NOT NULL)"
+                ))
+                .await
+                .unwrap();
+                for i in 0..25u32 {
+                    db.execute(&format!("INSERT INTO {table} VALUES ({i}, {i})"))
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        Arc::try_unwrap(db).ok().unwrap().close();
+    }
+
+    // Reopen: all 4 tables with 25 rows each should survive
+    {
+        let db = Database::durable_mvcc(dir.path()).unwrap();
+        for t in 0..4u32 {
+            let table = format!("conc_table_{t}");
+            let rows = db
+                .query(&format!("SELECT COUNT(*) FROM {table}"))
+                .await
+                .unwrap();
+            let count = extract_count(&rows[0][0]);
+            assert_eq!(
+                count, 25,
+                "table {table} should have 25 rows after recovery"
+            );
+        }
     }
 }

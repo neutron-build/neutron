@@ -1,0 +1,19 @@
+main { min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 4rem 2rem; }
+.reasoning { max-width: 650px; width: 100%; }
+.reasoning h1 { font-size: 2.5rem; color: var(--accent-color); margin: 0 0 1rem 0; text-align: center; }
+.lead { text-align: center; font-size: 1.25rem; color: #9399b2; margin: 0 0 2rem 0; font-style: italic; }
+.epigraph { text-align: center; margin: 0 0 3rem 0; padding: 1.5rem 2rem; border-left: 3px solid var(--accent-color); background: rgba(255, 255, 255, 0.02); border-radius: 0 8px 8px 0; }
+.epigraph p { font-size: 1.15rem; color: #cdd6f4; font-style: italic; margin: 0 0 0.75rem 0; }
+.epigraph cite { font-size: 0.9rem; color: #6c7086; font-style: normal; }
+.epigraph cite em { font-style: italic; }
+section { margin-bottom: 2rem; padding-bottom: 2rem; border-bottom: 1px solid rgba(255, 255, 255, 0.05); }
+section:last-of-type { border-bottom: none; }
+h2 { font-size: 1.3rem; color: #cdd6f4; margin: 0 0 1rem 0; }
+p { color: #9399b2; font-size: 1.05rem; line-height: 1.7; margin: 0.5rem 0; }
+code { background: rgba(255, 255, 255, 0.05); padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.9rem; color: #a6e3a1; }
+ul { color: #9399b2; font-size: 1.05rem; line-height: 1.8; margin: 0.75rem 0; padding-left: 1.5rem; }
+li { margin-bottom: 0.5rem; }
+li strong { color: #bac2de; }
+
+html[data-theme="light"] .epigraph { background: rgba(0, 0, 0, 0.03); }
+html[data-theme="frappe"] .epigraph { background: rgba(255, 255, 255, 0.03); }
