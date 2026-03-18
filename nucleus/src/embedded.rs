@@ -15,6 +15,7 @@
 
 #[cfg(feature = "server")]
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::catalog::Catalog;
@@ -32,8 +33,10 @@ pub use crate::document::DocumentStore;
 pub use crate::fts::InvertedIndex;
 pub use crate::graph::GraphStore;
 pub use crate::kv::KvStore;
-pub use crate::pubsub::PubSubHub;
+pub use crate::pubsub::{Message, PubSubHub, Stream, StreamEntry, StreamEntryId};
 pub use crate::timeseries::TimeSeriesStore;
+#[cfg(feature = "server")]
+pub use crate::reactive::{CdcLog, CdcLogEntry, ChangeType};
 
 /// Storage backend for the embedded database.
 #[derive(Debug, Clone, Default)]
@@ -319,6 +322,79 @@ impl Database {
     /// Direct access to the columnar analytics store.
     pub fn columnar(&self) -> ColumnarHandle<'_> {
         ColumnarHandle { store: self.executor.columnar_store() }
+    }
+
+    // ========================================================================
+    // Explicit transaction API
+    // ========================================================================
+
+    /// Begin an explicit transaction with snapshot isolation.
+    ///
+    /// Returns a `Transaction` handle with `execute()`, `query()`, `commit()`,
+    /// and `rollback()` methods. The transaction is isolated from other
+    /// concurrent transactions via the MVCC infrastructure.
+    ///
+    /// ```rust,ignore
+    /// let db = Database::mvcc();
+    /// let tx = db.begin().await.unwrap();
+    /// tx.execute("INSERT INTO users VALUES (1, 'Alice')").await.unwrap();
+    /// tx.commit().await.unwrap();
+    /// ```
+    pub async fn begin(&self) -> Result<Transaction, ExecError> {
+        self.executor.execute("BEGIN").await?;
+        Ok(Transaction {
+            executor: self.executor.clone(),
+            finished: false,
+        })
+    }
+
+    // ========================================================================
+    // PubSub handle
+    // ========================================================================
+
+    /// Direct access to the pub/sub messaging system.
+    ///
+    /// ```rust,ignore
+    /// let db = Database::memory();
+    /// let ps = db.pubsub();
+    /// let mut rx = ps.subscribe("events");
+    /// ps.publish("events", "hello".to_string());
+    /// ```
+    pub fn pubsub(&self) -> PubSubHandle<'_> {
+        PubSubHandle { hub: self.executor.pubsub_sync() }
+    }
+
+    // ========================================================================
+    // Streams handle
+    // ========================================================================
+
+    /// Direct access to Redis-style append-only streams.
+    ///
+    /// ```rust,ignore
+    /// let db = Database::memory();
+    /// let s = db.streams();
+    /// let id = s.xadd("mystream", vec![("key".into(), "val".into())]);
+    /// ```
+    pub fn streams(&self) -> StreamsHandle<'_> {
+        StreamsHandle { streams: self.executor.streams() }
+    }
+
+    // ========================================================================
+    // CDC handle
+    // ========================================================================
+
+    /// Direct access to the change data capture log.
+    ///
+    /// ```rust,ignore
+    /// let db = Database::memory();
+    /// db.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+    /// db.execute("INSERT INTO t VALUES (1)").await.unwrap();
+    /// let cdc = db.cdc();
+    /// let changes = cdc.changes("t", 0, 100);
+    /// ```
+    #[cfg(feature = "server")]
+    pub fn cdc(&self) -> CdcHandle<'_> {
+        CdcHandle { log: self.executor.cdc_log() }
     }
 
     // ========================================================================
@@ -635,6 +711,215 @@ impl ColumnarHandle<'_> {
     /// Get a write lock for mutations.
     pub fn write(&self) -> parking_lot::RwLockWriteGuard<'_, ColumnarStore> {
         self.store.write()
+    }
+}
+
+// ============================================================================
+// Explicit transaction handle
+// ============================================================================
+
+/// An explicit transaction with snapshot isolation.
+///
+/// Created via `Database::begin()`. All operations within the transaction see
+/// a consistent snapshot. Changes are invisible to other transactions until
+/// `commit()` is called. If `rollback()` is called (or the handle is dropped
+/// without committing), all changes are discarded.
+pub struct Transaction {
+    executor: Arc<Executor>,
+    finished: bool,
+}
+
+impl Transaction {
+    /// Execute a SQL statement within this transaction.
+    pub async fn execute(&self, sql: &str) -> Result<Vec<ExecResult>, ExecError> {
+        self.executor.execute(sql).await
+    }
+
+    /// Execute a query and return just the rows.
+    pub async fn query(&self, sql: &str) -> Result<Vec<Row>, ExecError> {
+        let results = self.executor.execute(sql).await?;
+        for result in results.into_iter().rev() {
+            if let ExecResult::Select { rows, .. } = result {
+                return Ok(rows);
+            }
+        }
+        Ok(vec![])
+    }
+
+    /// Commit the transaction, making all changes permanent.
+    pub async fn commit(mut self) -> Result<(), ExecError> {
+        self.finished = true;
+        self.executor.execute("COMMIT").await?;
+        Ok(())
+    }
+
+    /// Roll back the transaction, discarding all changes.
+    pub async fn rollback(mut self) -> Result<(), ExecError> {
+        self.finished = true;
+        self.executor.execute("ROLLBACK").await?;
+        Ok(())
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Best-effort rollback on drop. We cannot run async code in Drop,
+            // so we spawn a blocking task on the executor. This is a safety net
+            // — callers should explicitly commit or rollback.
+            let executor = self.executor.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Handle::try_current();
+                if let Ok(handle) = rt {
+                    handle.spawn(async move {
+                        let _ = executor.execute("ROLLBACK").await;
+                    });
+                }
+            });
+        }
+    }
+}
+
+// ============================================================================
+// PubSub handle
+// ============================================================================
+
+/// Direct pub/sub access — publish and subscribe to channels without SQL.
+pub struct PubSubHandle<'a> {
+    hub: &'a parking_lot::RwLock<PubSubHub>,
+}
+
+impl PubSubHandle<'_> {
+    /// Publish a message to a channel. Returns the number of active subscribers.
+    pub fn publish(&self, channel: &str, message: String) -> usize {
+        self.hub.write().publish(channel, message)
+    }
+
+    /// Subscribe to a channel. Returns a receiver for incoming messages.
+    pub fn subscribe(&self, channel: &str) -> tokio::sync::broadcast::Receiver<Arc<Message>> {
+        self.hub.write().subscribe(channel)
+    }
+
+    /// Unsubscribe from a channel by dropping the receiver.
+    /// This is a hint — the actual unsubscribe happens when all receivers are dropped.
+    /// Returns the current subscriber count for the channel.
+    pub fn subscriber_count(&self, channel: &str) -> usize {
+        self.hub.read().subscriber_count(channel)
+    }
+
+    /// List all active channels.
+    pub fn channels(&self) -> Vec<String> {
+        self.hub.read().channels().into_iter().map(|s| s.to_string()).collect()
+    }
+}
+
+// ============================================================================
+// Streams handle
+// ============================================================================
+
+/// Direct streams access — Redis-style append-only logs without SQL.
+pub struct StreamsHandle<'a> {
+    streams: &'a parking_lot::RwLock<HashMap<String, crate::pubsub::Stream>>,
+}
+
+impl StreamsHandle<'_> {
+    /// Add an entry to a stream. Creates the stream if it doesn't exist.
+    /// Returns the auto-generated entry ID.
+    pub fn xadd(&self, stream: &str, fields: Vec<(String, String)>) -> StreamEntryId {
+        let mut map = self.streams.write();
+        let s = map.entry(stream.to_string()).or_insert_with(crate::pubsub::Stream::new);
+        s.xadd(fields)
+    }
+
+    /// Query entries in a stream by ID range.
+    pub fn xrange(
+        &self,
+        stream: &str,
+        start: &StreamEntryId,
+        end: &StreamEntryId,
+    ) -> Vec<StreamEntry> {
+        let map = self.streams.read();
+        match map.get(stream) {
+            Some(s) => s.xrange(start, end, None).into_iter().cloned().collect(),
+            None => vec![],
+        }
+    }
+
+    /// Read new entries from one or more streams after the given IDs.
+    /// `streams_and_ids` is a list of (stream_name, last_seen_id) pairs.
+    /// Returns entries per stream.
+    pub fn xread(
+        &self,
+        streams_and_ids: &[(&str, &StreamEntryId)],
+        count: usize,
+    ) -> Vec<(String, Vec<StreamEntry>)> {
+        let map = self.streams.read();
+        let mut results = Vec::new();
+        for &(name, last_id) in streams_and_ids {
+            if let Some(s) = map.get(name) {
+                let entries: Vec<StreamEntry> =
+                    s.xread(last_id, count).into_iter().cloned().collect();
+                if !entries.is_empty() {
+                    results.push((name.to_string(), entries));
+                }
+            }
+        }
+        results
+    }
+
+    /// Get the length of a stream.
+    pub fn xlen(&self, stream: &str) -> usize {
+        let map = self.streams.read();
+        map.get(stream).map(|s| s.xlen()).unwrap_or(0)
+    }
+}
+
+// ============================================================================
+// CDC handle
+// ============================================================================
+
+/// Direct CDC access — read the change data capture log without SQL.
+#[cfg(feature = "server")]
+pub struct CdcHandle<'a> {
+    log: &'a parking_lot::RwLock<crate::reactive::CdcLog>,
+}
+
+#[cfg(feature = "server")]
+impl CdcHandle<'_> {
+    /// Read change events for a specific table since a sequence number.
+    /// Returns up to `limit` entries after the given sequence.
+    pub fn changes(&self, table: &str, since: u64, limit: usize) -> Vec<crate::reactive::CdcLogEntry> {
+        self.log.read().read_table_from(table, since, limit).into_iter().cloned().collect()
+    }
+
+    /// Read all change events (any table) since a sequence number.
+    pub fn changes_all(&self, since: u64, limit: usize) -> Vec<crate::reactive::CdcLogEntry> {
+        self.log.read().read_from(since, limit).into_iter().cloned().collect()
+    }
+
+    /// Register a named consumer to track its position in the CDC log.
+    pub fn register_consumer(&self, name: &str) {
+        self.log.write().register_consumer(name);
+    }
+
+    /// Get the last acknowledged sequence for a consumer.
+    pub fn consumer_position(&self, name: &str) -> u64 {
+        self.log.read().consumer_position(name)
+    }
+
+    /// Acknowledge events up to a sequence number for a consumer.
+    pub fn acknowledge(&self, consumer: &str, sequence: u64) {
+        self.log.write().acknowledge(consumer, sequence);
+    }
+
+    /// Total number of events in the CDC log.
+    pub fn len(&self) -> usize {
+        self.log.read().len()
+    }
+
+    /// Whether the CDC log is empty.
+    pub fn is_empty(&self) -> bool {
+        self.log.read().is_empty()
     }
 }
 

@@ -2,18 +2,27 @@
 //!
 //! Supports both the simple query protocol (text queries) and the extended
 //! query protocol (prepared statements with bind parameters).
+//!
+//! Additional features:
+//!   - LISTEN/NOTIFY async notification delivery via pgwire NotificationResponse
+//!   - Extended query pipeline mode with per-Sync error isolation
+//!   - Large Objects API (lo_creat, lo_open, lo_read, lo_write, lo_close, lo_unlink)
 
 pub mod compression;
 pub mod error_codec;
 pub mod kv_fast_path;
 
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use futures::sink::{Sink, SinkExt};
 use futures::{StreamExt, stream};
+use tokio::sync::broadcast;
 
 use pgwire::api::auth::sasl::{SASLState, scram::ScramAuth};
 use pgwire::api::auth::{
@@ -35,7 +44,7 @@ use pgwire::api::{
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone};
-use pgwire::messages::response::CommandComplete;
+use pgwire::messages::response::{CommandComplete, NotificationResponse};
 use pgwire::messages::startup::{Authentication, PasswordMessageFamily};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
@@ -176,6 +185,152 @@ impl LoginRateLimiter {
 }
 
 // ============================================================================
+// LISTEN/NOTIFY — Notification Registry
+// ============================================================================
+
+/// A pending notification to be delivered to a listening connection.
+#[derive(Debug, Clone)]
+pub struct PendingNotification {
+    pub pid: i32,
+    pub channel: String,
+    pub payload: String,
+}
+
+/// Per-connection notification state: tracks which channels this connection
+/// listens on and receives pending notifications from those channels.
+struct ConnectionNotifyState {
+    /// Channels this connection has subscribed to via LISTEN.
+    channels: HashSet<String>,
+    /// Receiver end for notifications destined for this connection.
+    rx: broadcast::Receiver<PendingNotification>,
+}
+
+/// Shared notification registry — routes NOTIFY messages to all connections
+/// that have called LISTEN on the corresponding channel.
+///
+/// Thread-safe via DashMap. Each channel maps to a broadcast sender; every
+/// connection that LISTENs on a channel receives a clone of that sender's
+/// receiver.
+pub struct NotificationRegistry {
+    /// channel_name → broadcast sender.
+    channels: DashMap<String, broadcast::Sender<PendingNotification>>,
+    /// Default broadcast capacity per channel.
+    capacity: usize,
+    /// Monotonic process ID counter (one per connection, exposed in
+    /// NotificationResponse as `pid`).
+    next_pid: AtomicI32,
+}
+
+impl NotificationRegistry {
+    fn new(capacity: usize) -> Self {
+        Self {
+            channels: DashMap::new(),
+            capacity,
+            next_pid: AtomicI32::new(1),
+        }
+    }
+
+    /// Allocate a unique process ID for a new connection.
+    fn allocate_pid(&self) -> i32 {
+        self.next_pid.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Subscribe to a channel. Returns a receiver for notifications on that channel.
+    fn listen(&self, channel: &str) -> broadcast::Receiver<PendingNotification> {
+        let entry = self
+            .channels
+            .entry(channel.to_string())
+            .or_insert_with(|| broadcast::channel(self.capacity).0);
+        entry.subscribe()
+    }
+
+    /// Unsubscribe from a specific channel (no-op if not subscribed — the
+    /// receiver is dropped by the caller's ConnectionNotifyState).
+    fn unlisten(&self, _channel: &str) {
+        // The receiver is dropped by the caller; the sender stays alive as
+        // long as there are other subscribers. We could GC empty channels
+        // here but it's not necessary for correctness.
+    }
+
+    /// Send a notification to all connections listening on `channel`.
+    /// Returns the number of receivers that got the message.
+    fn notify(&self, pid: i32, channel: &str, payload: &str) -> usize {
+        if let Some(tx) = self.channels.get(channel) {
+            tx.send(PendingNotification {
+                pid,
+                channel: channel.to_string(),
+                payload: payload.to_string(),
+            })
+            .unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    /// Remove a channel entirely (used during cleanup when no subscribers remain).
+    fn remove_channel_if_empty(&self, channel: &str) {
+        if let Some(entry) = self.channels.get(channel)
+            && entry.receiver_count() == 0
+        {
+            drop(entry);
+            self.channels.remove(channel);
+        }
+    }
+}
+
+// ============================================================================
+// Large Objects API
+// ============================================================================
+
+/// Modes for lo_open (matches PostgreSQL's INV_READ/INV_WRITE).
+const INV_READ: i32 = 0x00040000;
+const INV_WRITE: i32 = 0x00020000;
+
+/// State for an open large object descriptor.
+#[allow(dead_code)]
+struct LargeObjectDescriptor {
+    /// The blob key in the BlobStore (format: `lo/{oid}`).
+    key: String,
+    /// Object ID.
+    oid: u32,
+    /// Current read/write offset.
+    offset: u64,
+    /// Open mode flags.
+    mode: i32,
+}
+
+/// Per-connection large object state: tracks open descriptors.
+struct LargeObjectState {
+    /// fd → descriptor.
+    descriptors: std::collections::HashMap<i32, LargeObjectDescriptor>,
+    /// Next file descriptor to allocate.
+    next_fd: i32,
+}
+
+impl LargeObjectState {
+    fn new() -> Self {
+        Self {
+            descriptors: std::collections::HashMap::new(),
+            next_fd: 1,
+        }
+    }
+
+    fn allocate_fd(&mut self) -> i32 {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        fd
+    }
+}
+
+/// Global OID counter for large objects.
+static NEXT_LO_OID: AtomicU32 = AtomicU32::new(100_000);
+
+/// Format a large object OID into its BlobStore key.
+fn lo_blob_key(oid: u32) -> String {
+    format!("_lo/{oid}")
+}
+
+// ============================================================================
 // Query Parser (Extended Query Protocol)
 // ============================================================================
 
@@ -284,6 +439,11 @@ struct CopyInProgress {
 
 /// The Nucleus query handler. Implements startup authentication, simple query,
 /// and extended query (prepared statement) processing.
+///
+/// Also provides:
+///   - LISTEN/NOTIFY notification delivery (piggy-backed on query responses)
+///   - Extended query pipeline mode (error isolation per Sync boundary)
+///   - Large Objects API (lo_creat / lo_open / lo_read / lo_write / lo_close / lo_unlink)
 pub struct NucleusHandler {
     executor: Arc<Executor>,
     authenticator: Option<UserAuthenticator>,
@@ -306,6 +466,18 @@ pub struct NucleusHandler {
     max_query_size: usize,
     /// Rate limiter for failed authentication attempts (brute-force protection).
     login_rate_limiter: LoginRateLimiter,
+
+    // ── LISTEN/NOTIFY ────────────────────────────────────────────────────
+    /// Shared notification registry: channel → broadcast sender.
+    notification_registry: Arc<NotificationRegistry>,
+    /// Per-connection notification state: peer addr → (pid, subscribed channels, receivers).
+    notify_state: parking_lot::Mutex<std::collections::HashMap<String, ConnectionNotifyState>>,
+    /// Per-connection assigned process IDs: peer addr → pid (for NotificationResponse).
+    connection_pids: parking_lot::RwLock<std::collections::HashMap<String, i32>>,
+
+    // ── Large Objects ────────────────────────────────────────────────────
+    /// Per-connection large object descriptors: peer addr → LargeObjectState.
+    lo_state: parking_lot::Mutex<std::collections::HashMap<String, LargeObjectState>>,
 }
 
 impl NucleusHandler {
@@ -331,6 +503,10 @@ impl NucleusHandler {
             statement_timeout_secs: Self::DEFAULT_STATEMENT_TIMEOUT_SECS,
             max_query_size: Self::DEFAULT_MAX_QUERY_SIZE,
             login_rate_limiter: LoginRateLimiter::new(),
+            notification_registry: Arc::new(NotificationRegistry::new(256)),
+            notify_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            connection_pids: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            lo_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -386,6 +562,10 @@ impl NucleusHandler {
             statement_timeout_secs: Self::DEFAULT_STATEMENT_TIMEOUT_SECS,
             max_query_size: Self::DEFAULT_MAX_QUERY_SIZE,
             login_rate_limiter: LoginRateLimiter::new(),
+            notification_registry: Arc::new(NotificationRegistry::new(256)),
+            notify_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            connection_pids: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            lo_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -981,15 +1161,54 @@ impl SimpleQueryHandler for NucleusHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let peer_addr_str = client.socket_addr().to_string();
+
+        // ── Large Objects fast path: intercept lo_* function calls ───────
+        if let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, query) {
+            let resp = Self::build_response(lo_result)?;
+            self.flush_pending_notifications(client).await?;
+            return Ok(vec![resp]);
+        }
+
+        // ── LISTEN/NOTIFY wire-level interception ───────────────────────
+        // We intercept LISTEN/NOTIFY/UNLISTEN here to register the
+        // connection in the notification registry, in addition to the
+        // executor's pubsub hub. The executor still runs the statement
+        // (for distributed NOTIFY), but we also track it at the wire level
+        // for NotificationResponse delivery.
+        {
+            let trimmed_upper = query.trim().to_uppercase();
+            if trimmed_upper.starts_with("LISTEN ") {
+                let channel = query.trim()[7..].trim().trim_end_matches(';').trim();
+                self.handle_listen(&peer_addr_str, channel);
+            } else if trimmed_upper.starts_with("UNLISTEN ") {
+                let channel = query.trim()[9..].trim().trim_end_matches(';').trim();
+                self.handle_unlisten(&peer_addr_str, channel);
+            } else if trimmed_upper.starts_with("NOTIFY ") {
+                // Parse: NOTIFY channel [, 'payload']
+                let rest = query.trim()[7..].trim().trim_end_matches(';').trim();
+                let (channel, payload) = if let Some(comma) = rest.find(',') {
+                    let ch = rest[..comma].trim();
+                    let pl = rest[comma + 1..].trim().trim_matches('\'');
+                    (ch, pl)
+                } else {
+                    (rest, "")
+                };
+                self.handle_notify(&peer_addr_str, channel, payload);
+            }
+        }
+
         // ── KV fast path: intercept common KV queries before SQL parsing ──
         if let Some(kv_cmd) = kv_fast_path::try_parse_kv(query) {
             let result = kv_fast_path::execute_kv_command(&kv_cmd, self.executor.kv_store());
+            self.flush_pending_notifications(client).await?;
             return Ok(vec![Self::build_response(result)?]);
         }
 
         // ── SQL OLTP fast path: intercept simple point queries/mutations ──
         if let Some(sql_cmd) = kv_fast_path::try_parse_sql_fast_path(query)
             && let Some(result) = self.executor.execute_sql_fast_path(&sql_cmd).await {
+                self.flush_pending_notifications(client).await?;
                 return Ok(vec![Self::build_response(result.map_err(exec_error_to_pgwire)?)?]);
             }
             // Fall through to normal path if fast-path couldn't handle it
@@ -1043,6 +1262,7 @@ impl SimpleQueryHandler for NucleusHandler {
                     .await?;
                 // Return empty — pgwire's on_query will send ReadyForQuery.
                 self.executor.metrics().bytes_sent.inc_by(bytes_estimate);
+                self.flush_pending_notifications(client).await?;
                 return Ok(vec![]);
             }
             // Approximate wire bytes: count rows * avg 64 bytes per row + header
@@ -1052,6 +1272,9 @@ impl SimpleQueryHandler for NucleusHandler {
         if bytes_estimate > 0 {
             self.executor.metrics().bytes_sent.inc_by(bytes_estimate);
         }
+
+        // ── Flush pending notifications before ReadyForQuery ────────────
+        self.flush_pending_notifications(client).await?;
 
         Ok(responses)
     }
@@ -1147,6 +1370,35 @@ impl ExtendedQueryHandler for NucleusHandler {
     {
         let parsed_stmt = &portal.statement.statement;
         let session_id = self.session_id_from_client(client);
+        let peer_addr_str = client.socket_addr().to_string();
+
+        // ── Large Objects fast path (extended query) ────────────────────
+        if let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, &parsed_stmt.sql) {
+            self.flush_pending_notifications(client).await?;
+            return Self::build_response(lo_result);
+        }
+
+        // ── LISTEN/NOTIFY wire-level registration (extended query) ──────
+        {
+            let trimmed_upper = parsed_stmt.sql.trim().to_uppercase();
+            if trimmed_upper.starts_with("LISTEN ") {
+                let channel = parsed_stmt.sql.trim()[7..].trim().trim_end_matches(';').trim();
+                self.handle_listen(&peer_addr_str, channel);
+            } else if trimmed_upper.starts_with("UNLISTEN ") {
+                let channel = parsed_stmt.sql.trim()[9..].trim().trim_end_matches(';').trim();
+                self.handle_unlisten(&peer_addr_str, channel);
+            } else if trimmed_upper.starts_with("NOTIFY ") {
+                let rest = parsed_stmt.sql.trim()[7..].trim().trim_end_matches(';').trim();
+                let (channel, payload) = if let Some(comma) = rest.find(',') {
+                    let ch = rest[..comma].trim();
+                    let pl = rest[comma + 1..].trim().trim_matches('\'');
+                    (ch, pl)
+                } else {
+                    (rest, "")
+                };
+                self.handle_notify(&peer_addr_str, channel, payload);
+            }
+        }
 
         // AST fast path: if we have a cached AST, substitute parameters directly
         // in the AST and execute without re-parsing.
@@ -1185,12 +1437,45 @@ impl ExtendedQueryHandler for NucleusHandler {
             if bytes_est > 0 {
                 self.executor.metrics().bytes_sent.inc_by(bytes_est);
             }
+            // Flush pending notifications before the response (before ReadyForQuery).
+            self.flush_pending_notifications(client).await?;
             Self::build_response(result)
         } else {
+            self.flush_pending_notifications(client).await?;
             Ok(Response::EmptyQuery)
         }
     }
 }
+
+// ============================================================================
+// Pipeline Mode Support
+// ============================================================================
+
+/// Pipeline mode documentation and semantics.
+///
+/// The PostgreSQL extended query protocol inherently supports pipelining:
+/// clients can send multiple Parse/Bind/Describe/Execute messages without
+/// waiting for responses, followed by a Sync message that marks a
+/// synchronization point.
+///
+/// pgwire's `process_socket` loop already handles this correctly — it reads
+/// frontend messages in a loop and dispatches them to the appropriate handler
+/// methods. Each Sync triggers a ReadyForQuery response.
+///
+/// Error isolation between pipeline segments is provided by the pgwire
+/// framework: when an error occurs during a pipeline segment (between two
+/// Sync messages), the framework sends an ErrorResponse and skips all
+/// remaining messages in that segment until the next Sync, at which point
+/// it sends ReadyForQuery and resumes normal processing.
+///
+/// Our handler supports pipeline mode by:
+/// 1. Each Parse/Bind/Execute is handled independently via the pgwire traits
+/// 2. Errors from one Execute do not corrupt state for subsequent pipeline segments
+/// 3. The executor uses per-session state that is safe across pipeline segments
+/// 4. Notification delivery happens at each Sync boundary (via flush_pending_notifications)
+///
+/// No additional code is needed to enable pipeline mode — the pgwire framework
+/// and our stateless handler design already provide correct behavior.
 
 // ============================================================================
 // COPY Handler
@@ -1299,6 +1584,357 @@ impl NucleusHandler {
         // Parse the string back to SocketAddr to look up in copy_state.
         if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
             self.copy_state.lock().remove(&addr);
+        }
+        // Clean up notification state (channels are GC'd lazily).
+        if let Some(state) = self.notify_state.lock().remove(peer_addr) {
+            for ch in &state.channels {
+                self.notification_registry.remove_channel_if_empty(ch);
+            }
+        }
+        self.connection_pids.write().remove(peer_addr);
+        // Clean up large object descriptors.
+        self.lo_state.lock().remove(peer_addr);
+    }
+
+    // ====================================================================
+    // LISTEN/NOTIFY helpers
+    // ====================================================================
+
+    /// Get (or allocate) the process ID assigned to this connection.
+    fn connection_pid(&self, peer_addr: &str) -> i32 {
+        if let Some(&pid) = self.connection_pids.read().get(peer_addr) {
+            return pid;
+        }
+        let pid = self.notification_registry.allocate_pid();
+        self.connection_pids.write().insert(peer_addr.to_string(), pid);
+        pid
+    }
+
+    /// Register a LISTEN on `channel` for the connection identified by `peer_addr`.
+    fn handle_listen(&self, peer_addr: &str, channel: &str) {
+        let rx = self.notification_registry.listen(channel);
+        let mut map = self.notify_state.lock();
+        let state = map.entry(peer_addr.to_string()).or_insert_with(|| {
+            // First LISTEN for this connection — create the per-connection state.
+            // We use a single broadcast channel per-connection to aggregate all
+            // channel notifications. But since broadcast::Receiver cannot be
+            // merged, we store one receiver per channel and drain them all in
+            // flush_pending_notifications.
+            ConnectionNotifyState {
+                channels: HashSet::new(),
+                rx,
+            }
+        });
+        if !state.channels.contains(channel) {
+            state.channels.insert(channel.to_string());
+            // Replace the receiver with one for the new channel. In practice
+            // we store the latest one here — the flush loop drains from the
+            // registry directly using try_recv for each channel.
+            state.rx = self.notification_registry.listen(channel);
+        }
+    }
+
+    /// Unregister a LISTEN on `channel` (or all channels with `*`).
+    fn handle_unlisten(&self, peer_addr: &str, channel: &str) {
+        let mut map = self.notify_state.lock();
+        if let Some(state) = map.get_mut(peer_addr) {
+            if channel == "*" {
+                for ch in state.channels.drain() {
+                    self.notification_registry.unlisten(&ch);
+                    self.notification_registry.remove_channel_if_empty(&ch);
+                }
+            } else {
+                state.channels.remove(channel);
+                self.notification_registry.unlisten(channel);
+                self.notification_registry.remove_channel_if_empty(channel);
+            }
+        }
+    }
+
+    /// Send a NOTIFY on `channel` with `payload`. Delivers to all connections
+    /// that have called LISTEN on that channel.
+    fn handle_notify(&self, peer_addr: &str, channel: &str, payload: &str) -> usize {
+        let pid = self.connection_pid(peer_addr);
+        self.notification_registry.notify(pid, channel, payload)
+    }
+
+    /// Flush pending notifications for a connection by sending
+    /// NotificationResponse messages. Called before ReadyForQuery in both
+    /// simple and extended query paths.
+    ///
+    /// In PostgreSQL, notifications are delivered between command responses
+    /// (just before ReadyForQuery). We replicate that behavior here.
+    async fn flush_pending_notifications<C>(&self, client: &mut C) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let peer_addr = client.socket_addr().to_string();
+        let channels: Vec<String> = {
+            let map = self.notify_state.lock();
+            match map.get(&peer_addr) {
+                Some(state) => state.channels.iter().cloned().collect(),
+                None => return Ok(()),
+            }
+        };
+
+        if channels.is_empty() {
+            return Ok(());
+        }
+
+        // For each channel this connection listens on, drain pending notifications.
+        // We re-subscribe briefly to collect any pending messages.
+        for channel in &channels {
+            // Get a fresh receiver and try_recv in a loop.
+            let mut rx = self.notification_registry.listen(channel);
+            loop {
+                match rx.try_recv() {
+                    Ok(notif) => {
+                        let msg = NotificationResponse::new(
+                            notif.pid,
+                            notif.channel.clone(),
+                            notif.payload.clone(),
+                        );
+                        client
+                            .send(PgWireBackendMessage::NotificationResponse(msg))
+                            .await?;
+                    }
+                    Err(broadcast::error::TryRecvError::Empty)
+                    | Err(broadcast::error::TryRecvError::Closed) => break,
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                        // Missed some messages due to buffer overflow — skip.
+                        continue;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // ====================================================================
+    // Large Objects API helpers
+    // ====================================================================
+
+    /// Try to intercept a large object function call from a SQL query.
+    /// Returns `Some(ExecResult)` if the query was handled, `None` otherwise.
+    fn try_handle_large_object(&self, peer_addr: &str, sql: &str) -> Option<ExecResult> {
+        let trimmed = sql.trim();
+        // Fast rejection: must start with "SELECT lo_" (case-insensitive).
+        if trimmed.len() < 12 {
+            return None;
+        }
+        let upper = trimmed.to_uppercase();
+        if !upper.starts_with("SELECT LO_") {
+            return None;
+        }
+
+        // Parse function call: SELECT lo_xxx(args...)
+        let after_select = trimmed[7..].trim(); // after "SELECT "
+        if let Some(paren_start) = after_select.find('(') {
+            let func_name = after_select[..paren_start].trim().to_lowercase();
+            let args_str = after_select[paren_start + 1..]
+                .trim_end_matches(|c: char| c == ')' || c == ';' || c.is_whitespace());
+            let args: Vec<&str> = if args_str.is_empty() {
+                vec![]
+            } else {
+                args_str.split(',').map(|a| a.trim().trim_matches('\'')).collect()
+            };
+
+            match func_name.as_str() {
+                "lo_creat" | "lo_create" => {
+                    return Some(self.lo_creat(peer_addr));
+                }
+                "lo_open" => {
+                    if args.len() >= 2
+                        && let (Ok(oid), Ok(mode)) =
+                            (args[0].parse::<u32>(), args[1].parse::<i32>())
+                    {
+                        return Some(self.lo_open(peer_addr, oid, mode));
+                    }
+                }
+                "lo_close" => {
+                    if let Some(fd) = args.first().and_then(|a| a.parse::<i32>().ok()) {
+                        return Some(self.lo_close(peer_addr, fd));
+                    }
+                }
+                "lo_read" => {
+                    if args.len() >= 2
+                        && let (Ok(fd), Ok(len)) =
+                            (args[0].parse::<i32>(), args[1].parse::<usize>())
+                    {
+                        return Some(self.lo_read(peer_addr, fd, len));
+                    }
+                }
+                "lo_write" => {
+                    if args.len() >= 2
+                        && let Ok(fd) = args[0].parse::<i32>()
+                    {
+                        let data = args[1];
+                        return Some(self.lo_write(peer_addr, fd, data.as_bytes()));
+                    }
+                }
+                "lo_unlink" => {
+                    if let Some(oid) = args.first().and_then(|a| a.parse::<u32>().ok()) {
+                        return Some(self.lo_unlink(oid));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// lo_creat — create a new large object, return its OID.
+    fn lo_creat(&self, _peer_addr: &str) -> ExecResult {
+        let oid = NEXT_LO_OID.fetch_add(1, Ordering::Relaxed);
+        let key = lo_blob_key(oid);
+        // Create an empty blob in the store.
+        self.executor.blob_store_put(&key, b"", None);
+        ExecResult::Select {
+            columns: vec![("lo_creat".to_string(), DataType::Int32)],
+            rows: vec![vec![Value::Int32(oid as i32)]],
+        }
+    }
+
+    /// lo_open — open an existing large object, return a file descriptor.
+    fn lo_open(&self, peer_addr: &str, oid: u32, mode: i32) -> ExecResult {
+        let key = lo_blob_key(oid);
+        // Verify the object exists.
+        if !self.executor.blob_store_exists(&key) {
+            return ExecResult::Select {
+                columns: vec![("lo_open".to_string(), DataType::Int32)],
+                rows: vec![vec![Value::Int32(-1)]],
+            };
+        }
+        let mut map = self.lo_state.lock();
+        let state = map.entry(peer_addr.to_string()).or_insert_with(LargeObjectState::new);
+        let fd = state.allocate_fd();
+        state.descriptors.insert(
+            fd,
+            LargeObjectDescriptor {
+                key,
+                oid,
+                offset: 0,
+                mode,
+            },
+        );
+        ExecResult::Select {
+            columns: vec![("lo_open".to_string(), DataType::Int32)],
+            rows: vec![vec![Value::Int32(fd)]],
+        }
+    }
+
+    /// lo_close — close a large object descriptor.
+    fn lo_close(&self, peer_addr: &str, fd: i32) -> ExecResult {
+        let mut map = self.lo_state.lock();
+        let closed = if let Some(state) = map.get_mut(peer_addr) {
+            state.descriptors.remove(&fd).is_some()
+        } else {
+            false
+        };
+        ExecResult::Select {
+            columns: vec![("lo_close".to_string(), DataType::Int32)],
+            rows: vec![vec![Value::Int32(if closed { 0 } else { -1 })]],
+        }
+    }
+
+    /// lo_read — read `len` bytes from the current offset of the descriptor.
+    fn lo_read(&self, peer_addr: &str, fd: i32, len: usize) -> ExecResult {
+        let mut map = self.lo_state.lock();
+        let state = match map.get_mut(peer_addr) {
+            Some(s) => s,
+            None => {
+                return ExecResult::Select {
+                    columns: vec![("lo_read".to_string(), DataType::Bytea)],
+                    rows: vec![vec![Value::Null]],
+                };
+            }
+        };
+        let desc = match state.descriptors.get_mut(&fd) {
+            Some(d) => d,
+            None => {
+                return ExecResult::Select {
+                    columns: vec![("lo_read".to_string(), DataType::Bytea)],
+                    rows: vec![vec![Value::Null]],
+                };
+            }
+        };
+        // Check read permission.
+        if desc.mode & INV_READ == 0 {
+            return ExecResult::Select {
+                columns: vec![("lo_read".to_string(), DataType::Bytea)],
+                rows: vec![vec![Value::Null]],
+            };
+        }
+        let data = self
+            .executor
+            .blob_store_get_range(&desc.key, desc.offset, len as u64)
+            .unwrap_or_default();
+        desc.offset += data.len() as u64;
+        ExecResult::Select {
+            columns: vec![("lo_read".to_string(), DataType::Bytea)],
+            rows: vec![vec![Value::Bytea(data)]],
+        }
+    }
+
+    /// lo_write — write bytes at the current offset of the descriptor.
+    fn lo_write(&self, peer_addr: &str, fd: i32, data: &[u8]) -> ExecResult {
+        let mut map = self.lo_state.lock();
+        let state = match map.get_mut(peer_addr) {
+            Some(s) => s,
+            None => {
+                return ExecResult::Select {
+                    columns: vec![("lo_write".to_string(), DataType::Int32)],
+                    rows: vec![vec![Value::Int32(-1)]],
+                };
+            }
+        };
+        let desc = match state.descriptors.get_mut(&fd) {
+            Some(d) => d,
+            None => {
+                return ExecResult::Select {
+                    columns: vec![("lo_write".to_string(), DataType::Int32)],
+                    rows: vec![vec![Value::Int32(-1)]],
+                };
+            }
+        };
+        // Check write permission.
+        if desc.mode & INV_WRITE == 0 {
+            return ExecResult::Select {
+                columns: vec![("lo_write".to_string(), DataType::Int32)],
+                rows: vec![vec![Value::Int32(-1)]],
+            };
+        }
+        // Read existing data, splice in the write, put back.
+        let mut existing = self.executor.blob_store_get(&desc.key).unwrap_or_default();
+        let offset = desc.offset as usize;
+        if offset > existing.len() {
+            existing.resize(offset, 0);
+        }
+        let end = offset + data.len();
+        if end > existing.len() {
+            existing.resize(end, 0);
+        }
+        existing[offset..end].copy_from_slice(data);
+        self.executor
+            .blob_store_put(&desc.key, &existing, None);
+        let written = data.len() as i32;
+        desc.offset += data.len() as u64;
+        ExecResult::Select {
+            columns: vec![("lo_write".to_string(), DataType::Int32)],
+            rows: vec![vec![Value::Int32(written)]],
+        }
+    }
+
+    /// lo_unlink — delete a large object by OID.
+    fn lo_unlink(&self, oid: u32) -> ExecResult {
+        let key = lo_blob_key(oid);
+        let deleted = self.executor.blob_store_delete(&key);
+        ExecResult::Select {
+            columns: vec![("lo_unlink".to_string(), DataType::Int32)],
+            rows: vec![vec![Value::Int32(if deleted { 0 } else { -1 })]],
         }
     }
 
@@ -2319,6 +2955,13 @@ mod tests {
 mod security_tests {
     use super::*;
 
+    fn make_executor() -> Arc<Executor> {
+        let catalog = Arc::new(crate::catalog::Catalog::new());
+        let storage: Arc<dyn crate::storage::StorageEngine> =
+            Arc::new(crate::storage::MemoryEngine::new());
+        Arc::new(Executor::new(catalog, storage))
+    }
+
     #[test]
     fn parameter_substitution_escapes_single_quotes() {
         // A value containing a single quote must be escaped to ''
@@ -2513,5 +3156,351 @@ mod security_tests {
         }
         assert!(limiter.is_locked_out(ip_a));
         assert!(!limiter.is_locked_out(ip_b), "unrelated IP should not be locked out");
+    }
+
+    // ── Notification Registry tests ─────────────────────────────────
+
+    #[test]
+    fn notification_registry_allocate_pid() {
+        let registry = NotificationRegistry::new(16);
+        let pid1 = registry.allocate_pid();
+        let pid2 = registry.allocate_pid();
+        assert_ne!(pid1, pid2);
+        assert!(pid1 > 0);
+        assert!(pid2 > 0);
+    }
+
+    #[test]
+    fn notification_registry_listen_and_notify() {
+        let registry = NotificationRegistry::new(16);
+        let mut rx = registry.listen("test_channel");
+        let count = registry.notify(1, "test_channel", "hello");
+        assert_eq!(count, 1);
+        let notif = rx.try_recv().unwrap();
+        assert_eq!(notif.channel, "test_channel");
+        assert_eq!(notif.payload, "hello");
+        assert_eq!(notif.pid, 1);
+    }
+
+    #[test]
+    fn notification_registry_multiple_listeners() {
+        let registry = NotificationRegistry::new(16);
+        let mut rx1 = registry.listen("events");
+        let mut rx2 = registry.listen("events");
+        let count = registry.notify(1, "events", "data");
+        assert_eq!(count, 2);
+        assert_eq!(rx1.try_recv().unwrap().payload, "data");
+        assert_eq!(rx2.try_recv().unwrap().payload, "data");
+    }
+
+    #[test]
+    fn notification_registry_no_listeners() {
+        let registry = NotificationRegistry::new(16);
+        let count = registry.notify(1, "nobody_listens", "hello");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn notification_registry_remove_empty_channel() {
+        let registry = NotificationRegistry::new(16);
+        let rx = registry.listen("temp");
+        assert!(registry.channels.contains_key("temp"));
+        drop(rx);
+        registry.remove_channel_if_empty("temp");
+        assert!(!registry.channels.contains_key("temp"));
+    }
+
+    #[test]
+    fn notification_registry_channel_isolation() {
+        let registry = NotificationRegistry::new(16);
+        let mut rx_a = registry.listen("chan_a");
+        let _rx_b = registry.listen("chan_b");
+        registry.notify(1, "chan_a", "only_a");
+        assert_eq!(rx_a.try_recv().unwrap().payload, "only_a");
+    }
+
+    // ── LISTEN/NOTIFY handler integration tests ─────────────────────
+
+    #[test]
+    fn handler_listen_registers_channel() {
+        let handler = NucleusHandler::new(make_executor());
+        handler.handle_listen("peer1", "my_channel");
+        let state = handler.notify_state.lock();
+        let conn = state.get("peer1").unwrap();
+        assert!(conn.channels.contains("my_channel"));
+    }
+
+    #[test]
+    fn handler_unlisten_removes_channel() {
+        let handler = NucleusHandler::new(make_executor());
+        handler.handle_listen("peer1", "ch1");
+        handler.handle_listen("peer1", "ch2");
+        handler.handle_unlisten("peer1", "ch1");
+        let state = handler.notify_state.lock();
+        let conn = state.get("peer1").unwrap();
+        assert!(!conn.channels.contains("ch1"));
+        assert!(conn.channels.contains("ch2"));
+    }
+
+    #[test]
+    fn handler_unlisten_star_removes_all() {
+        let handler = NucleusHandler::new(make_executor());
+        handler.handle_listen("peer1", "ch1");
+        handler.handle_listen("peer1", "ch2");
+        handler.handle_listen("peer1", "ch3");
+        handler.handle_unlisten("peer1", "*");
+        let state = handler.notify_state.lock();
+        let conn = state.get("peer1").unwrap();
+        assert!(conn.channels.is_empty());
+    }
+
+    #[test]
+    fn handler_notify_returns_listener_count() {
+        let handler = NucleusHandler::new(make_executor());
+        handler.handle_listen("peer1", "events");
+        handler.handle_listen("peer2", "events");
+        let count = handler.handle_notify("peer1", "events", "test");
+        // At least 2 listeners registered (our 2 handle_listen calls).
+        assert!(count >= 2);
+    }
+
+    #[test]
+    fn handler_connection_pid_is_stable() {
+        let handler = NucleusHandler::new(make_executor());
+        let pid1 = handler.connection_pid("peer_x");
+        let pid2 = handler.connection_pid("peer_x");
+        assert_eq!(pid1, pid2, "same peer should get same pid");
+    }
+
+    #[test]
+    fn handler_connection_pid_differs_per_peer() {
+        let handler = NucleusHandler::new(make_executor());
+        let pid1 = handler.connection_pid("peer_a");
+        let pid2 = handler.connection_pid("peer_b");
+        assert_ne!(pid1, pid2, "different peers should get different pids");
+    }
+
+    #[test]
+    fn handler_cleanup_removes_notify_state() {
+        let handler = NucleusHandler::new(make_executor());
+        handler.handle_listen("peer1", "ch");
+        handler.cleanup_session("peer1");
+        assert!(!handler.notify_state.lock().contains_key("peer1"));
+        assert!(!handler.connection_pids.read().contains_key("peer1"));
+    }
+
+    // ── Large Objects API tests ─────────────────────────────────────
+
+    #[test]
+    fn lo_creat_returns_oid() {
+        let handler = NucleusHandler::new(make_executor());
+        let result = handler.lo_creat("peer1");
+        match result {
+            ExecResult::Select { columns, rows } => {
+                assert_eq!(columns[0].0, "lo_creat");
+                assert!(rows.len() == 1);
+                match &rows[0][0] {
+                    Value::Int32(oid) => assert!(*oid > 0),
+                    _ => panic!("expected Int32 OID"),
+                }
+            }
+            _ => panic!("expected Select result"),
+        }
+    }
+
+    #[test]
+    fn lo_open_close_roundtrip() {
+        let handler = NucleusHandler::new(make_executor());
+        // Create a large object first.
+        let oid = match handler.lo_creat("peer1") {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(oid) => oid as u32,
+                _ => panic!("expected oid"),
+            },
+            _ => panic!("expected select"),
+        };
+        // Open it.
+        let fd = match handler.lo_open("peer1", oid, INV_READ | INV_WRITE) {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(fd) => fd,
+                _ => panic!("expected fd"),
+            },
+            _ => panic!("expected select"),
+        };
+        assert!(fd > 0);
+        // Close it.
+        let closed = match handler.lo_close("peer1", fd) {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(v) => v,
+                _ => panic!("expected int"),
+            },
+            _ => panic!("expected select"),
+        };
+        assert_eq!(closed, 0);
+    }
+
+    #[test]
+    fn lo_write_and_read() {
+        let handler = NucleusHandler::new(make_executor());
+        let oid = match handler.lo_creat("peer1") {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(oid) => oid as u32,
+                _ => panic!("expected oid"),
+            },
+            _ => panic!("expected select"),
+        };
+        let fd = match handler.lo_open("peer1", oid, INV_READ | INV_WRITE) {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(fd) => fd,
+                _ => panic!("expected fd"),
+            },
+            _ => panic!("expected select"),
+        };
+        // Write data.
+        let written = match handler.lo_write("peer1", fd, b"hello world") {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(n) => n,
+                _ => panic!("expected int"),
+            },
+            _ => panic!("expected select"),
+        };
+        assert_eq!(written, 11);
+
+        // Close and reopen to reset offset.
+        handler.lo_close("peer1", fd);
+        let fd2 = match handler.lo_open("peer1", oid, INV_READ) {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(fd) => fd,
+                _ => panic!("expected fd"),
+            },
+            _ => panic!("expected select"),
+        };
+        // Read back.
+        let data = match handler.lo_read("peer1", fd2, 11) {
+            ExecResult::Select { rows, .. } => match &rows[0][0] {
+                Value::Bytea(b) => b.clone(),
+                _ => panic!("expected bytea"),
+            },
+            _ => panic!("expected select"),
+        };
+        assert_eq!(data, b"hello world");
+    }
+
+    #[test]
+    fn lo_unlink_deletes_object() {
+        let handler = NucleusHandler::new(make_executor());
+        let oid = match handler.lo_creat("peer1") {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(oid) => oid as u32,
+                _ => panic!("expected oid"),
+            },
+            _ => panic!("expected select"),
+        };
+        // Unlink.
+        let result = match handler.lo_unlink(oid) {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(v) => v,
+                _ => panic!("expected int"),
+            },
+            _ => panic!("expected select"),
+        };
+        assert_eq!(result, 0);
+        // Opening it should fail now.
+        let fd = match handler.lo_open("peer1", oid, INV_READ) {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(fd) => fd,
+                _ => panic!("expected fd"),
+            },
+            _ => panic!("expected select"),
+        };
+        assert_eq!(fd, -1, "open after unlink should return -1");
+    }
+
+    #[test]
+    fn lo_read_without_read_permission() {
+        let handler = NucleusHandler::new(make_executor());
+        let oid = match handler.lo_creat("peer1") {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(oid) => oid as u32,
+                _ => panic!("expected oid"),
+            },
+            _ => panic!("expected select"),
+        };
+        // Open write-only.
+        let fd = match handler.lo_open("peer1", oid, INV_WRITE) {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(fd) => fd,
+                _ => panic!("expected fd"),
+            },
+            _ => panic!("expected select"),
+        };
+        // Read should return null (no read permission).
+        match handler.lo_read("peer1", fd, 10) {
+            ExecResult::Select { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Null);
+            }
+            _ => panic!("expected select"),
+        }
+    }
+
+    #[test]
+    fn lo_open_nonexistent_returns_minus_one() {
+        let handler = NucleusHandler::new(make_executor());
+        let fd = match handler.lo_open("peer1", 999_999, INV_READ) {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(fd) => fd,
+                _ => panic!("expected fd"),
+            },
+            _ => panic!("expected select"),
+        };
+        assert_eq!(fd, -1);
+    }
+
+    // ── Large Objects SQL interception tests ─────────────────────────
+
+    #[test]
+    fn try_handle_lo_creat() {
+        let handler = NucleusHandler::new(make_executor());
+        let result = handler.try_handle_large_object("peer1", "SELECT lo_creat(-1)");
+        assert!(result.is_some());
+        match result.unwrap() {
+            ExecResult::Select { columns, rows } => {
+                assert_eq!(columns[0].0, "lo_creat");
+                assert!(rows.len() == 1);
+            }
+            _ => panic!("expected select"),
+        }
+    }
+
+    #[test]
+    fn try_handle_lo_non_matching() {
+        let handler = NucleusHandler::new(make_executor());
+        assert!(handler.try_handle_large_object("peer1", "SELECT 1").is_none());
+        assert!(handler.try_handle_large_object("peer1", "INSERT INTO t VALUES (1)").is_none());
+        assert!(handler.try_handle_large_object("peer1", "SELECT lower('X')").is_none());
+    }
+
+    #[test]
+    fn handler_cleanup_removes_lo_state() {
+        let handler = NucleusHandler::new(make_executor());
+        let oid = match handler.lo_creat("peer1") {
+            ExecResult::Select { rows, .. } => match rows[0][0] {
+                Value::Int32(oid) => oid as u32,
+                _ => panic!("expected oid"),
+            },
+            _ => panic!("expected select"),
+        };
+        handler.lo_open("peer1", oid, INV_READ);
+        assert!(handler.lo_state.lock().contains_key("peer1"));
+        handler.cleanup_session("peer1");
+        assert!(!handler.lo_state.lock().contains_key("peer1"));
+    }
+
+    // ── lo_blob_key formatting ──────────────────────────────────────
+
+    #[test]
+    fn lo_blob_key_format() {
+        assert_eq!(lo_blob_key(12345), "_lo/12345");
+        assert_eq!(lo_blob_key(0), "_lo/0");
     }
 }

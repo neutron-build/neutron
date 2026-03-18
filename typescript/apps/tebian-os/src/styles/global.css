@@ -24,15 +24,15 @@ main { margin-left: auto; margin-right: auto; }
 
 /* Dark theme (Mocha) */
 html[data-theme="dark"] body,
-html[data-theme="dark"] { background: #1e1e2e; color: #cdd6f4; --accent: #89b4fa; --accent-color: #89b4fa; }
+html[data-theme="dark"] { background: #1e1e2e; color: #cdd6f4; --accent: #89b4fa; --accent-color: #89b4fa; --neutron-vt-bg: #1e1e2e; }
 
 /* Light theme (Latte) */
 html[data-theme="light"] body,
-html[data-theme="light"] { background: #eff1f5; color: #4c4f69; --accent: #1e66f5; --accent-color: #1e66f5; }
+html[data-theme="light"] { background: #eff1f5; color: #4c4f69; --accent: #1e66f5; --accent-color: #1e66f5; --neutron-vt-bg: #eff1f5; }
 
 /* Frappe theme */
 html[data-theme="frappe"] body,
-html[data-theme="frappe"] { background: #303446; color: #c6d0f5; --accent: #8caaee; --accent-color: #8caaee; }
+html[data-theme="frappe"] { background: #303446; color: #c6d0f5; --accent: #8caaee; --accent-color: #8caaee; --neutron-vt-bg: #303446; }
 
 /* ── Global nav ── */
 .global-nav {

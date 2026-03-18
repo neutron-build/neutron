@@ -4,15 +4,16 @@
 //! [`RespHandler`]. Each connection gets its own handler instance so
 //! authentication state is per-connection.
 //!
-//! Supports optional TLS, connection limits, and idle timeouts.
+//! Supports optional TLS, connection limits, idle timeouts, and Pub/Sub.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use crate::kv::KvStore;
+use super::pubsub_registry::PubSubRegistry;
 
 /// Configuration for the RESP server.
 pub struct RespServerConfig {
@@ -56,6 +57,7 @@ pub async fn start_resp_server_with_config(
     let active_connections = Arc::new(AtomicUsize::new(0));
     let max_connections = config.max_connections;
     let idle_timeout = std::time::Duration::from_secs(config.idle_timeout_secs);
+    let pubsub = Arc::new(PubSubRegistry::new());
 
     let tls_acceptor = config.tls_config.map(|cfg| {
         pgwire::tokio::tokio_rustls::TlsAcceptor::from(cfg)
@@ -86,12 +88,13 @@ pub async fn start_resp_server_with_config(
                 let pw = password.clone();
                 let tls = tls_acceptor.clone();
                 let timeout = idle_timeout;
+                let pubsub = Arc::clone(&pubsub);
 
                 tokio::spawn(async move {
                     let result = if let Some(acceptor) = tls {
                         match acceptor.accept(stream).await {
                             Ok(tls_stream) => {
-                                handle_connection_with_timeout(tls_stream, kv, pw, timeout).await
+                                handle_connection_with_timeout(tls_stream, kv, pw, timeout, pubsub).await
                             }
                             Err(e) => {
                                 tracing::debug!("RESP TLS handshake failed from {addr}: {e}");
@@ -99,7 +102,7 @@ pub async fn start_resp_server_with_config(
                             }
                         }
                     } else {
-                        handle_connection_with_timeout(stream, kv, pw, timeout).await
+                        handle_connection_with_timeout(stream, kv, pw, timeout, pubsub).await
                     };
 
                     if let Err(e) = result {
@@ -123,49 +126,114 @@ async fn handle_connection_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
     kv: Arc<KvStore>,
     password: Option<String>,
     idle_timeout: std::time::Duration,
+    pubsub: Arc<PubSubRegistry>,
 ) -> std::io::Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut buf_reader = BufReader::new(reader);
-    let mut handler = super::handler::RespHandler::new(kv, password);
+    let mut handler = super::handler::RespHandler::new(kv, password, Arc::clone(&pubsub));
 
     loop {
-        // Apply idle timeout to each read
-        let value = match tokio::time::timeout(idle_timeout, super::parser::read_value(&mut buf_reader)).await {
-            Ok(result) => result?,
-            Err(_) => {
-                // Idle timeout — close connection
-                tracing::debug!("RESP connection idle timeout, closing");
-                return Ok(());
-            }
-        };
+        // If we are in pub/sub mode, select between incoming commands and
+        // subscription messages.
+        if handler.is_in_pubsub_mode() {
+            tokio::select! {
+                // Incoming command from client
+                read_result = tokio::time::timeout(idle_timeout, super::parser::read_value(&mut buf_reader)) => {
+                    let value = match read_result {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            tracing::debug!("RESP connection idle timeout, closing");
+                            handler.cleanup_pubsub();
+                            return Ok(());
+                        }
+                    };
 
-        let args = match super::parser::parse_command(value) {
-            Some(args) => args,
-            None => {
-                use tokio::io::AsyncWriteExt;
-                writer
-                    .write_all(&super::encoder::encode_error("ERR invalid command format"))
-                    .await?;
-                continue;
-            }
-        };
+                    let args = match super::parser::parse_command(value) {
+                        Some(args) => args,
+                        None => {
+                            writer.write_all(&super::encoder::encode_error("ERR invalid command format")).await?;
+                            continue;
+                        }
+                    };
 
-        // Check for QUIT command.
-        if !args.is_empty() {
-            let cmd = String::from_utf8_lossy(&args[0]).to_uppercase();
-            if cmd == "QUIT" {
-                use tokio::io::AsyncWriteExt;
-                writer
-                    .write_all(&super::encoder::encode_simple_string("OK"))
-                    .await?;
-                break;
+                    if !args.is_empty() {
+                        let cmd = String::from_utf8_lossy(&args[0]).to_uppercase();
+                        if cmd == "QUIT" {
+                            writer.write_all(&super::encoder::encode_simple_string("OK")).await?;
+                            handler.cleanup_pubsub();
+                            break;
+                        }
+                    }
+
+                    // In pub/sub mode, only SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE,
+                    // PUNSUBSCRIBE, PING, and QUIT are allowed.
+                    let responses = handler.handle_pubsub_command(args);
+                    for resp in responses {
+                        writer.write_all(&resp).await?;
+                    }
+                    writer.flush().await?;
+                }
+                // Subscription message to push to client
+                msg = handler.recv_pubsub_message() => {
+                    if let Some(data) = msg {
+                        writer.write_all(&data).await?;
+                        writer.flush().await?;
+                    }
+                }
             }
+        } else {
+            // Normal (non-pub/sub) mode
+            let value = match tokio::time::timeout(idle_timeout, super::parser::read_value(&mut buf_reader)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    tracing::debug!("RESP connection idle timeout, closing");
+                    return Ok(());
+                }
+            };
+
+            let args = match super::parser::parse_command(value) {
+                Some(args) => args,
+                None => {
+                    writer.write_all(&super::encoder::encode_error("ERR invalid command format")).await?;
+                    continue;
+                }
+            };
+
+            // Check for QUIT command.
+            if !args.is_empty() {
+                let cmd = String::from_utf8_lossy(&args[0]).to_uppercase();
+                if cmd == "QUIT" {
+                    writer.write_all(&super::encoder::encode_simple_string("OK")).await?;
+                    break;
+                }
+            }
+
+            // Check if this is a pub/sub command that should enter pub/sub mode
+            if !args.is_empty() {
+                let cmd = String::from_utf8_lossy(&args[0]).to_uppercase();
+                match cmd.as_str() {
+                    "SUBSCRIBE" | "PSUBSCRIBE" => {
+                        let responses = handler.handle_pubsub_command(args);
+                        for resp in responses {
+                            writer.write_all(&resp).await?;
+                        }
+                        writer.flush().await?;
+                        continue;
+                    }
+                    "PUBLISH" => {
+                        let response = handler.handle_command(args);
+                        writer.write_all(&response).await?;
+                        writer.flush().await?;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
+            let response = handler.handle_command(args);
+            writer.write_all(&response).await?;
+            writer.flush().await?;
         }
-
-        let response = handler.handle_command(args);
-        use tokio::io::AsyncWriteExt;
-        writer.write_all(&response).await?;
-        writer.flush().await?;
     }
     Ok(())
 }

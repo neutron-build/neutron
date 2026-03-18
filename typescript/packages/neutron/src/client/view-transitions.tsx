@@ -1,50 +1,42 @@
 import { h } from "preact";
 
 const TRANSITION_CSS = `
-/* Prevent white flash — force black behind the transition overlay */
+/* Prevent flash — solid background at every layer during transition */
 html { background-color: var(--neutron-vt-bg, #000); }
-::view-transition { background-color: transparent; }
+::view-transition { background-color: var(--neutron-vt-bg, #000); }
 
 /* Tag the top-level <main> via CSS so it survives Preact re-renders */
 main:not(main main) { view-transition-name: neutron-main; }
 
-/* Root: instant swap (no animation) so nav/footer stay rock-stable */
+/* Root: instant swap with no gaps — snapshot covers the full viewport */
 ::view-transition-old(root),
 ::view-transition-new(root) {
   animation: none;
   mix-blend-mode: normal;
+  height: 100%;
 }
-::view-transition-group(root) { animation: none; }
+::view-transition-group(root) {
+  animation: none;
+  isolation: auto;
+}
+::view-transition-image-pair(root) {
+  isolation: auto;
+}
 
-/* Main content: slide animation */
+/* Main content: fast crossfade — handles rapid navigation gracefully */
 ::view-transition-old(neutron-main) {
-  animation: neutronSlideOut 350ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation: neutronFadeOut 150ms ease both;
 }
 ::view-transition-new(neutron-main) {
-  animation: neutronSlideIn 350ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation: neutronFadeIn 150ms ease both;
 }
-/* Back navigation: reverse direction (no space before pseudo — must attach to html) */
-.neutron-nav-back::view-transition-old(neutron-main) {
-  animation-name: neutronSlideOutReverse;
+@keyframes neutronFadeOut {
+  from { opacity: 1; }
+  to   { opacity: 0; }
 }
-.neutron-nav-back::view-transition-new(neutron-main) {
-  animation-name: neutronSlideInReverse;
-}
-@keyframes neutronSlideOut {
-  from { opacity: 1; transform: translateX(0); }
-  to   { opacity: 0; transform: translateX(-80px); }
-}
-@keyframes neutronSlideIn {
-  from { opacity: 0; transform: translateX(80px); }
-  to   { opacity: 1; transform: translateX(0); }
-}
-@keyframes neutronSlideOutReverse {
-  from { opacity: 1; transform: translateX(0); }
-  to   { opacity: 0; transform: translateX(80px); }
-}
-@keyframes neutronSlideInReverse {
-  from { opacity: 0; transform: translateX(-80px); }
-  to   { opacity: 1; transform: translateX(0); }
+@keyframes neutronFadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 `;
 
