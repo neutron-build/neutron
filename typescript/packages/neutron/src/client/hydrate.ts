@@ -50,6 +50,63 @@ let hydrated = false;
 let activeNavigationController: AbortController | null = null;
 let latestNavigationRequestId = 0;
 
+// ── CSS loading for SPA navigation ──
+const loadedStylesheets = new Set<string>();
+const CSS_LOAD_TIMEOUT_MS = 5000;
+
+function initLoadedStylesheets(): void {
+  document.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]').forEach((link) => {
+    if (link.href) {
+      try {
+        // Normalize to pathname for stable comparison across dev query params
+        loadedStylesheets.add(new URL(link.href).pathname);
+      } catch {
+        loadedStylesheets.add(link.href);
+      }
+    }
+  });
+}
+
+function normalizeStylesheetUrl(url: string): string {
+  try {
+    return new URL(url, window.location.origin).pathname;
+  } catch {
+    return url;
+  }
+}
+
+async function loadMissingStylesheets(urls: string[]): Promise<void> {
+  const missing = urls.filter((url) => !loadedStylesheets.has(normalizeStylesheetUrl(url)));
+  if (missing.length === 0) return;
+
+  await Promise.race([
+    Promise.all(
+      missing.map(
+        (url) =>
+          new Promise<void>((resolve) => {
+            const link = document.createElement("link");
+            link.rel = "stylesheet";
+            link.href = url;
+            link.setAttribute("data-neutron-nav", "true");
+            link.onload = () => {
+              loadedStylesheets.add(normalizeStylesheetUrl(url));
+              resolve();
+            };
+            link.onerror = () => {
+              // Don't block navigation on CSS error
+              resolve();
+            };
+            document.head.appendChild(link);
+          })
+      )
+    ),
+    // Safety valve: full-page reload if CSS takes too long
+    new Promise<void>((_, reject) =>
+      setTimeout(() => reject(new Error("css-timeout")), CSS_LOAD_TIMEOUT_MS)
+    ),
+  ]);
+}
+
 export async function init() {
   if (initialized) return;
   initialized = true;
@@ -59,6 +116,7 @@ export async function init() {
   }
 
   window.__NEUTRON_ROUTER_ACTIVE__ = true;
+  initLoadedStylesheets();
 
   const data = readInitialLoaderData();
   const pathname = getCurrentPath();
@@ -400,6 +458,18 @@ async function handleNavigation(forceRevalidate: boolean = false) {
 
   const prefetched = window.__NEUTRON_PREFETCH_CACHE__?.[nextUrl];
   if (prefetched && !forceRevalidate) {
+    // CSS should already be loaded during prefetch, but ensure it
+    const prefetchCss = (prefetched as Record<string, unknown>).__css__;
+    if (Array.isArray(prefetchCss)) {
+      try {
+        await loadMissingStylesheets(prefetchCss as string[]);
+      } catch {
+        // CSS timeout — fall back to full page load
+        window.location.href = nextUrl;
+        return;
+      }
+      delete (prefetched as Record<string, unknown>).__css__;
+    }
     const merged = mergeLoaderData(window.__NEUTRON_DATA__ || {}, prefetched);
     applyData(merged);
     return;
@@ -439,6 +509,25 @@ async function handleNavigation(forceRevalidate: boolean = false) {
     if (response.ok) {
       const payload = await response.json();
       const data = decodeLoaderDataPayload(payload);
+
+      // Load CSS for the new route before DOM swap
+      const cssUrls = (data as Record<string, unknown>).__css__;
+      if (Array.isArray(cssUrls)) {
+        try {
+          await loadMissingStylesheets(cssUrls as string[]);
+        } catch {
+          // CSS timeout — fall back to full page load (guaranteed no FOUC)
+          window.location.href = nextUrl;
+          return;
+        }
+        delete (data as Record<string, unknown>).__css__;
+
+        // Re-check: another navigation may have started while CSS was loading
+        if (requestId !== latestNavigationRequestId) {
+          return;
+        }
+      }
+
       const merged = mergeLoaderData(window.__NEUTRON_DATA__ || {}, data);
       applyData(merged);
       if (previousPathname !== pathname) {

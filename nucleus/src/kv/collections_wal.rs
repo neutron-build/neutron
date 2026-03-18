@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 use crate::kv::{HyperLogLog, SortedSet};
 use crate::types::Value;
 
-use super::collections::{KvCollection, ShardedCollections};
+use super::collections::{GeoSet, KvCollection, ShardedCollections};
 use super::streams::{Stream, StreamId};
 
 // ─── Operation tags ──────────────────────────────────────────────────────────
@@ -168,6 +168,7 @@ const COLL_SET: u8 = 3;
 const COLL_ZSET: u8 = 4;
 const COLL_HLL: u8 = 5;
 const COLL_STREAM: u8 = 6;
+const COLL_GEO: u8 = 7;
 
 // ─── CollectionWal ──────────────────────────────────────────────────────────
 
@@ -441,6 +442,16 @@ fn serialize_snapshot(collections: &ShardedCollections) -> Vec<u8> {
                     }
                 }
             }
+            KvCollection::Geo(geo) => {
+                buf.push(COLL_GEO);
+                let members = geo.members();
+                buf.extend_from_slice(&(members.len() as u32).to_le_bytes());
+                for (member, (lon, lat)) in members {
+                    write_string(member, &mut buf);
+                    buf.extend_from_slice(&lon.to_le_bytes());
+                    buf.extend_from_slice(&lat.to_le_bytes());
+                }
+            }
         }
     }
     buf
@@ -522,6 +533,17 @@ fn deserialize_snapshot(data: &[u8], pos: &mut usize) -> Option<Vec<(String, KvC
                     }
                 }
                 KvCollection::Stream(stream)
+            }
+            COLL_GEO => {
+                let len = read_u32(data, pos)? as usize;
+                let mut geo = GeoSet::new();
+                for _ in 0..len {
+                    let member = read_string(data, pos)?;
+                    let lon = read_f64(data, pos)?;
+                    let lat = read_f64(data, pos)?;
+                    geo.add(lon, lat, &member);
+                }
+                KvCollection::Geo(geo)
             }
             _ => return None,
         };

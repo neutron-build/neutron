@@ -671,13 +671,14 @@ async function handleRequest(
     pathname,
   });
 
-  // For JSON requests (client-side navigation), return data + head
+  // For JSON requests (client-side navigation), return data + head + CSS
   if (wantsJson) {
     const allData: Record<string, unknown> = { ...loaderData };
     if (actionData !== undefined) {
       allData.__action__ = actionData;
     }
     allData.__head__ = headHtml;
+    allData.__css__ = collectCssFromModuleGraph(server, allRoutes.map((r) => r.file));
     return new Response(encodeSerializedPayloadAsJson(allData), {
       headers: { "Content-Type": "application/json" },
     });

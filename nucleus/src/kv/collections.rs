@@ -17,6 +17,151 @@ use super::{HyperLogLog, SortedSet, SortedSetEntry};
 use super::collections_wal::CollectionWal;
 use super::streams::Stream;
 
+// ============================================================================
+// GeoSet — stores members with (longitude, latitude) backed by the geo R-tree
+// ============================================================================
+
+/// A geospatial set: member name → (longitude, latitude), backed by an R-tree
+/// for radius queries.
+#[derive(Debug)]
+pub struct GeoSet {
+    /// member → (lon, lat)
+    members: HashMap<String, (f64, f64)>,
+    /// R-tree index. doc_id == hash of member name.
+    tree: crate::geo::RTree,
+    /// Forward map: member → doc_id used in the R-tree.
+    member_ids: HashMap<String, u64>,
+    next_id: u64,
+}
+
+impl Clone for GeoSet {
+    fn clone(&self) -> Self {
+        let mut new = GeoSet::new();
+        for (member, &(lon, lat)) in &self.members {
+            new.add(lon, lat, member);
+        }
+        new
+    }
+}
+
+impl GeoSet {
+    pub fn new() -> Self {
+        Self {
+            members: HashMap::new(),
+            tree: crate::geo::RTree::new(),
+            member_ids: HashMap::new(),
+            next_id: 1,
+        }
+    }
+
+    /// Add a member with (longitude, latitude). Returns true if the member is
+    /// new, false if it was updated.
+    pub fn add(&mut self, lon: f64, lat: f64, member: &str) -> bool {
+        let is_new = !self.members.contains_key(member);
+        self.members.insert(member.to_string(), (lon, lat));
+        // For simplicity, always insert into the R-tree (duplicates are fine
+        // for search — we deduplicate on read via the members map).
+        let id = if let Some(&existing_id) = self.member_ids.get(member) {
+            existing_id
+        } else {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.member_ids.insert(member.to_string(), id);
+            id
+        };
+        let point = crate::geo::Point::new(lon, lat);
+        self.tree.insert(&point, id);
+        is_new
+    }
+
+    /// Get the position of a member. Returns (lon, lat) or None.
+    pub fn pos(&self, member: &str) -> Option<(f64, f64)> {
+        self.members.get(member).copied()
+    }
+
+    /// Compute the distance between two members in the specified unit.
+    /// Returns None if either member does not exist.
+    pub fn dist(&self, member1: &str, member2: &str, unit: &str) -> Option<f64> {
+        let &(lon1, lat1) = self.members.get(member1)?;
+        let &(lon2, lat2) = self.members.get(member2)?;
+        let a = crate::geo::Point::new(lon1, lat1);
+        let b = crate::geo::Point::new(lon2, lat2);
+        let meters = crate::geo::haversine_distance(&a, &b);
+        Some(convert_meters(meters, unit))
+    }
+
+    /// Find all members within `radius` of (lon, lat) in the given unit.
+    /// Returns (member, distance) pairs sorted by distance.
+    pub fn radius(
+        &self,
+        lon: f64,
+        lat: f64,
+        radius: f64,
+        unit: &str,
+    ) -> Vec<(String, f64)> {
+        let radius_m = convert_to_meters(radius, unit);
+        let center = crate::geo::Point::new(lon, lat);
+        let doc_ids = self.tree.search_radius(&center, radius_m);
+
+        // Reverse map: doc_id → member name
+        let id_to_member: HashMap<u64, &str> = self
+            .member_ids
+            .iter()
+            .map(|(m, &id)| (id, m.as_str()))
+            .collect();
+
+        let mut results: Vec<(String, f64)> = doc_ids
+            .into_iter()
+            .filter_map(|id| {
+                let member = id_to_member.get(&id)?;
+                let &(mlon, mlat) = self.members.get(*member)?;
+                let point = crate::geo::Point::new(mlon, mlat);
+                let dist_m = crate::geo::haversine_distance(&center, &point);
+                if dist_m <= radius_m {
+                    Some((member.to_string(), convert_meters(dist_m, unit)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Deduplicate (R-tree may have stale entries after updates)
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.dedup_by(|a, b| a.0 == b.0);
+        results
+    }
+
+    /// Number of members.
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Return a reference to the underlying members map.
+    pub fn members(&self) -> &HashMap<String, (f64, f64)> {
+        &self.members
+    }
+}
+
+/// Convert meters to the given unit.
+fn convert_meters(meters: f64, unit: &str) -> f64 {
+    match unit {
+        "km" => meters / 1000.0,
+        "mi" => meters / 1609.344,
+        "ft" => meters * 3.28084,
+        _ => meters, // "m" or default
+    }
+}
+
+/// Convert a value in the given unit to meters.
+fn convert_to_meters(value: f64, unit: &str) -> f64 {
+    match unit {
+        "km" => value * 1000.0,
+        "mi" => value * 1609.344,
+        "ft" => value / 3.28084,
+        _ => value, // "m" or default
+    }
+}
+
 const NUM_SHARDS: usize = 64;
 
 // ============================================================================
@@ -32,6 +177,7 @@ pub enum KvCollection {
     SortedSet(SortedSet),
     HyperLogLog(HyperLogLog),
     Stream(Stream),
+    Geo(GeoSet),
 }
 
 /// Error returned when a key exists but holds the wrong collection type.
@@ -63,6 +209,7 @@ impl KvCollection {
             KvCollection::SortedSet(_) => "zset",
             KvCollection::HyperLogLog(_) => "hyperloglog",
             KvCollection::Stream(_) => "stream",
+            KvCollection::Geo(_) => "geo",
         }
     }
 }
@@ -1299,6 +1446,102 @@ impl ShardedCollections {
             None => Ok(0),
         }
     }
+
+    // ====================================================================
+    // Geo operations
+    // ====================================================================
+
+    /// GEOADD: add a member with (longitude, latitude) to a geo set.
+    /// Returns true if the member is new.
+    pub fn geoadd(
+        &self,
+        key: &str,
+        lon: f64,
+        lat: f64,
+        member: &str,
+    ) -> Result<bool, WrongTypeError> {
+        let shard = self.shard(key);
+        let mut data = shard.data.write();
+        let entry = data
+            .entry(key.to_string())
+            .or_insert_with(|| KvCollection::Geo(GeoSet::new()));
+        match entry {
+            KvCollection::Geo(g) => Ok(g.add(lon, lat, member)),
+            other => Err(WrongTypeError {
+                expected: "geo",
+                actual: other.type_name(),
+            }),
+        }
+    }
+
+    /// GEOPOS: get the position of a member. Returns (lon, lat) or None.
+    pub fn geopos(&self, key: &str, member: &str) -> Result<Option<(f64, f64)>, WrongTypeError> {
+        let shard = self.shard(key);
+        let data = shard.data.read();
+        match data.get(key) {
+            Some(KvCollection::Geo(g)) => Ok(g.pos(member)),
+            Some(other) => Err(WrongTypeError {
+                expected: "geo",
+                actual: other.type_name(),
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// GEODIST: compute distance between two members.
+    pub fn geodist(
+        &self,
+        key: &str,
+        member1: &str,
+        member2: &str,
+        unit: &str,
+    ) -> Result<Option<f64>, WrongTypeError> {
+        let shard = self.shard(key);
+        let data = shard.data.read();
+        match data.get(key) {
+            Some(KvCollection::Geo(g)) => Ok(g.dist(member1, member2, unit)),
+            Some(other) => Err(WrongTypeError {
+                expected: "geo",
+                actual: other.type_name(),
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// GEORADIUS: find members within a radius.
+    pub fn georadius(
+        &self,
+        key: &str,
+        lon: f64,
+        lat: f64,
+        radius: f64,
+        unit: &str,
+    ) -> Result<Vec<(String, f64)>, WrongTypeError> {
+        let shard = self.shard(key);
+        let data = shard.data.read();
+        match data.get(key) {
+            Some(KvCollection::Geo(g)) => Ok(g.radius(lon, lat, radius, unit)),
+            Some(other) => Err(WrongTypeError {
+                expected: "geo",
+                actual: other.type_name(),
+            }),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// GEOLEN: number of members in a geo set.
+    pub fn geolen(&self, key: &str) -> Result<usize, WrongTypeError> {
+        let shard = self.shard(key);
+        let data = shard.data.read();
+        match data.get(key) {
+            Some(KvCollection::Geo(g)) => Ok(g.len()),
+            Some(other) => Err(WrongTypeError {
+                expected: "geo",
+                actual: other.type_name(),
+            }),
+            None => Ok(0),
+        }
+    }
 }
 
 // ============================================================================
@@ -1326,6 +1569,7 @@ fn clone_collection(coll: &KvCollection) -> KvCollection {
             KvCollection::HyperLogLog(new_hll)
         }
         KvCollection::Stream(s) => KvCollection::Stream(s.clone()),
+        KvCollection::Geo(g) => KvCollection::Geo(g.clone()),
     }
 }
 
