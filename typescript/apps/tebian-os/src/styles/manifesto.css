@@ -1,0 +1,14 @@
+main { min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 4rem 2rem; }
+.manifesto { max-width: 600px; width: 100%; }
+.manifesto h1 { font-size: 2.5rem; color: var(--accent-color); margin: 0 0 1rem 0; text-align: center; }
+.lead { text-align: center; font-size: 1.25rem; color: #9399b2; margin: 0 0 3rem 0; font-style: italic; }
+section { margin-bottom: 2rem; padding-bottom: 2rem; border-bottom: 1px solid rgba(255, 255, 255, 0.05); }
+section:last-of-type { border-bottom: none; }
+h2 { font-size: 1.25rem; color: #cdd6f4; margin: 0 0 1rem 0; }
+p { color: #9399b2; font-size: 1.1rem; line-height: 1.7; margin: 0.5rem 0; }
+.closing { text-align: center; margin-top: 3rem; padding-top: 2rem; border-top: 1px solid rgba(255, 255, 255, 0.1); }
+.closing p { margin: 0.25rem 0; }
+.closing p:last-child { color: var(--accent-color); font-size: 1.5rem; margin-top: 1rem; }
+
+html[data-theme="light"] .closing { border-top-color: rgba(0, 0, 0, 0.08); }
+html[data-theme="frappe"] .closing { border-top-color: rgba(255, 255, 255, 0.08); }

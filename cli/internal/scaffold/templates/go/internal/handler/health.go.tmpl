@@ -1,0 +1,19 @@
+package handler
+
+import (
+	"context"
+
+	"github.com/neutron-dev/neutron-go/neutron"
+)
+
+type HealthResponse struct {
+	Status string `json:"status"`
+}
+
+func Register(app *neutron.App) {
+	neutron.Get(app.Router(), "/health", healthCheck)
+}
+
+func healthCheck(ctx context.Context, _ neutron.Empty) (HealthResponse, error) {
+	return HealthResponse{Status: "ok"}, nil
+}

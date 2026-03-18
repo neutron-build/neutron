@@ -1,0 +1,15 @@
+.post { max-width: 850px; width: 100%; padding: 4rem 1rem; }
+.post header { margin-bottom: 3rem; text-align: center; }
+.post .category { color: var(--accent); text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700; font-size: 0.8rem; }
+.post h1 { font-size: 3.5rem; color: #fff; margin: 0.5rem 0; line-height: 1.1; font-weight: 800; }
+.post .meta { color: #585b70; font-size: 0.9rem; }
+.post .lead { font-size: 1.25rem; color: #cdd6f4; line-height: 1.6; margin-bottom: 2rem; border-left: 3px solid var(--accent); padding-left: 1.5rem; }
+.post h2 { color: var(--accent); font-size: 2rem; margin: 3rem 0 1.5rem 0; border-bottom: 1px solid rgba(137, 180, 250, 0.2); padding-bottom: 0.5rem; }
+.post p { color: #9399b2; line-height: 1.8; margin-bottom: 1.5rem; font-size: 1.1rem; }
+
+html[data-theme="light"] .post h1 { color: #4c4f69; }
+html[data-theme="light"] .post .lead { color: #5c5f77; }
+html[data-theme="light"] .post .meta { color: #8c8fa1; }
+
+html[data-theme="frappe"] .post h1 { color: #c6d0f5; }
+html[data-theme="frappe"] .post .lead { color: #b5bfe2; }

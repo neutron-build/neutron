@@ -1,0 +1,5 @@
+import type { NeutronApp } from "neutron";
+
+export function healthRoute(app: NeutronApp) {
+  app.get("/health", () => ({ status: "ok" }));
+}
