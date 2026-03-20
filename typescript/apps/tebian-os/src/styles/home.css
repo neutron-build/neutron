@@ -1,3 +1,7 @@
+/* Hide layout nav/footer on home page — it has its own custom footer */
+.layout:has(.page-home) > .global-nav,
+.layout:has(.page-home) > .global-footer { display: none; }
+
 main { min-height: 100vh; display: flex; flex-direction: column; align-items: center; text-align: center; position: relative; overflow: hidden; width: 100%; }
 .banner { position: absolute; top: 0; left: 0; right: 0; background: rgba(137, 180, 250, 0.1); border-bottom: 1px solid rgba(137, 180, 250, 0.2); padding: 0.6rem 1rem; text-align: center; font-size: 0.85rem; color: #89b4fa; backdrop-filter: blur(8px); z-index: 100; display: flex; justify-content: center; align-items: center; }
 .content-wrapper { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 2rem; padding-top: 3.5rem; width: 100%; gap: 2rem; }

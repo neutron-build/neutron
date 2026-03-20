@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function Compatibility() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Documentation</span>
@@ -45,6 +44,6 @@ export default function Compatibility() {
           </section>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

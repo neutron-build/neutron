@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function CLevel() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Philosophy</span>
@@ -68,6 +67,6 @@ export default function CLevel() {
           <p>We've done the work to strip everything else away. All that's left is you and your machine. C-level, zero-fork, pure Debian.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

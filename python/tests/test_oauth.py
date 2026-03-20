@@ -326,7 +326,7 @@ class TestNormalizeUser:
 
 class TestProviderFactories:
     def test_github_provider(self):
-        p = OAuthProvider.github("cid", "csec", "http://redir", "secret")
+        p = OAuthProvider.github("cid", "csec", "http://redir", "secret-that-is-at-least-32-chars!")
         assert p.provider_name == "github"
         assert p.client_id == "cid"
         assert p.client_secret == "csec"
@@ -338,7 +338,7 @@ class TestProviderFactories:
         assert "user:email" in p.scopes
 
     def test_google_provider(self):
-        p = OAuthProvider.google("cid", "csec", "http://redir", "secret")
+        p = OAuthProvider.google("cid", "csec", "http://redir", "secret-that-is-at-least-32-chars!")
         assert p.provider_name == "google"
         assert "accounts.google.com" in p.auth_url
         assert "oauth2.googleapis.com" in p.token_url
@@ -348,7 +348,7 @@ class TestProviderFactories:
         assert "email" in p.scopes
 
     def test_discord_provider(self):
-        p = OAuthProvider.discord("cid", "csec", "http://redir", "secret")
+        p = OAuthProvider.discord("cid", "csec", "http://redir", "secret-that-is-at-least-32-chars!")
         assert p.provider_name == "discord"
         assert "discord.com/api/oauth2/authorize" in p.auth_url
         assert "discord.com/api/oauth2/token" in p.token_url

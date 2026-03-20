@@ -9,7 +9,12 @@
 //! Replaces ClickHouse for OLAP workloads within Nucleus.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 use regex::Regex;
+
+use crate::storage::columnar_wal::ColumnarWal;
+use crate::types::{Row, Value};
 
 // ============================================================================
 // Column types
@@ -335,14 +340,25 @@ pub fn group_by_text_agg_f64(
 // Columnar table store
 // ============================================================================
 
-/// In-memory columnar table store.
-#[derive(Debug)]
+/// In-memory columnar table store with optional WAL-backed persistence.
 pub struct ColumnarStore {
     /// Table name → list of column batches.
     tables: HashMap<String, Vec<ColumnBatch>>,
     /// Table name → (column name → dictionary-encoded column).
     /// Populated by `append_with_dict` for eligible text columns.
     dict_columns: HashMap<String, HashMap<String, DictColumn>>,
+    /// WAL for crash-recovery. None = purely in-memory.
+    wal: Option<Arc<ColumnarWal>>,
+}
+
+impl std::fmt::Debug for ColumnarStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColumnarStore")
+            .field("tables", &self.tables)
+            .field("dict_columns", &self.dict_columns)
+            .field("wal", &self.wal.as_ref().map(|_| "ColumnarWal(...)"))
+            .finish()
+    }
 }
 
 impl Default for ColumnarStore {
@@ -356,11 +372,44 @@ impl ColumnarStore {
         Self {
             tables: HashMap::new(),
             dict_columns: HashMap::new(),
+            wal: None,
         }
     }
 
+    /// Open (or create) a WAL-backed columnar store in `dir`.
+    ///
+    /// Replays the WAL to recover table state, then attaches the WAL for
+    /// subsequent mutation logging. Subsequent calls to `create_table`,
+    /// `drop_table`, `append`, and `clear` are durably logged.
+    pub fn open(dir: &Path) -> std::io::Result<Self> {
+        let (wal, state) = ColumnarWal::open(dir)?;
+        let wal = Arc::new(wal);
+        let mut store = Self {
+            tables: HashMap::new(),
+            dict_columns: HashMap::new(),
+            wal: Some(Arc::clone(&wal)),
+        };
+        // Replay recovered state: CREATE_TABLE entries first, then INSERT_ROWS.
+        for (table_name, rows) in state.tables {
+            store.tables.entry(table_name.clone()).or_default();
+            if !rows.is_empty() {
+                let batch = rows_to_batch(rows);
+                store.tables.get_mut(&table_name).unwrap().push(batch);
+            }
+        }
+        Ok(store)
+    }
+
     /// Append a batch to a table.
+    ///
+    /// If a WAL is attached the rows are logged before the in-memory update.
     pub fn append(&mut self, table: &str, batch: ColumnBatch) {
+        if let Some(ref wal) = self.wal {
+            let rows = batch_to_rows(&batch);
+            if let Err(e) = wal.log_insert_rows(table, &rows) {
+                eprintln!("columnar WAL: failed to log insert_rows for {table}: {e}");
+            }
+        }
         self.tables
             .entry(table.to_string())
             .or_default()
@@ -379,18 +428,41 @@ impl ColumnarStore {
 
     /// Ensure a table entry exists (creates an empty table if absent).
     pub fn create_table(&mut self, table: &str) {
+        if let Some(ref wal) = self.wal {
+            if let Err(e) = wal.log_create_table(table) {
+                eprintln!("columnar WAL: failed to log create_table {table}: {e}");
+            }
+        }
         self.tables.entry(table.to_string()).or_default();
     }
 
     /// Remove a table and all its batches. Returns true if the table existed.
     pub fn drop_table(&mut self, table: &str) -> bool {
-        self.tables.remove(table).is_some()
+        let existed = self.tables.remove(table).is_some();
+        if existed {
+            if let Some(ref wal) = self.wal {
+                if let Err(e) = wal.log_drop_table(table) {
+                    eprintln!("columnar WAL: failed to log drop_table {table}: {e}");
+                }
+            }
+        }
+        existed
     }
 
     /// Remove all batches from a table without dropping the table entry.
+    ///
+    /// Logged as DROP + CREATE so replay produces the same empty-table state.
     pub fn clear(&mut self, table: &str) {
         if let Some(v) = self.tables.get_mut(table) {
             v.clear();
+            if let Some(ref wal) = self.wal {
+                if let Err(e) = wal.log_drop_table(table) {
+                    eprintln!("columnar WAL: failed to log clear(drop) {table}: {e}");
+                }
+                if let Err(e) = wal.log_create_table(table) {
+                    eprintln!("columnar WAL: failed to log clear(create) {table}: {e}");
+                }
+            }
         }
     }
 
@@ -405,6 +477,105 @@ impl ColumnarStore {
     }
 }
 
+// ============================================================================
+// Row ↔ ColumnBatch conversion helpers (WAL persistence)
+// ============================================================================
+
+/// Convert a Vec<Row> into a single ColumnBatch.
+///
+/// Column names are the zero-based string index ("0", "1", ...) matching the
+/// convention used by ColumnarStorageEngine.
+fn rows_to_batch(rows: Vec<Row>) -> ColumnBatch {
+    if rows.is_empty() {
+        return ColumnBatch::new(Vec::new());
+    }
+    let n_cols = rows[0].len();
+    let columns = (0..n_cols)
+        .map(|col_i| {
+            let vals: Vec<Value> = rows.iter().map(|row| {
+                row.get(col_i).cloned().unwrap_or(Value::Null)
+            }).collect();
+            (col_i.to_string(), vals_to_coldata(vals))
+        })
+        .collect();
+    ColumnBatch::new(columns)
+}
+
+/// Extract a single row-column Value from a ColumnData at `idx`.
+fn coldata_get(col: &ColumnData, idx: usize) -> Value {
+    match col {
+        ColumnData::Bool(v) => v.get(idx).copied().flatten().map(Value::Bool).unwrap_or(Value::Null),
+        ColumnData::Int32(v) => v.get(idx).copied().flatten().map(Value::Int32).unwrap_or(Value::Null),
+        ColumnData::Int64(v) => v.get(idx).copied().flatten().map(Value::Int64).unwrap_or(Value::Null),
+        ColumnData::Float64(v) => v.get(idx).copied().flatten().map(Value::Float64).unwrap_or(Value::Null),
+        ColumnData::Text(v) => v
+            .get(idx)
+            .and_then(|o| o.as_ref())
+            .map(|s| Value::Text(s.clone()))
+            .unwrap_or(Value::Null),
+    }
+}
+
+/// Reconstruct Vec<Row> from a single ColumnBatch (for WAL logging).
+fn batch_to_rows(batch: &ColumnBatch) -> Vec<Row> {
+    let mut rows = Vec::with_capacity(batch.row_count);
+    for row_i in 0..batch.row_count {
+        let row: Row = (0..batch.columns.len())
+            .map(|col_i| {
+                let (_, col) = &batch.columns[col_i];
+                coldata_get(col, row_i)
+            })
+            .collect();
+        rows.push(row);
+    }
+    rows
+}
+
+/// Convert a Vec<Value> into the best-fit ColumnData, determined by the first
+/// non-null value.
+fn vals_to_coldata(vals: Vec<Value>) -> ColumnData {
+    let first_non_null = vals.iter().find(|v| !matches!(v, Value::Null));
+    match first_non_null {
+        Some(Value::Bool(_)) => ColumnData::Bool(
+            vals.into_iter()
+                .map(|v| match v { Value::Bool(b) => Some(b), _ => None })
+                .collect(),
+        ),
+        Some(Value::Int32(_)) => ColumnData::Int32(
+            vals.into_iter()
+                .map(|v| match v { Value::Int32(n) => Some(n), _ => None })
+                .collect(),
+        ),
+        Some(Value::Int64(_)) => ColumnData::Int64(
+            vals.into_iter()
+                .map(|v| match v {
+                    Value::Int64(n) => Some(n),
+                    Value::Int32(n) => Some(n as i64),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        Some(Value::Float64(_)) => ColumnData::Float64(
+            vals.into_iter()
+                .map(|v| match v {
+                    Value::Float64(f) => Some(f),
+                    Value::Int64(n) => Some(n as f64),
+                    Value::Int32(n) => Some(n as f64),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        _ => ColumnData::Text(
+            vals.into_iter()
+                .map(|v| match v {
+                    Value::Text(s) => Some(s),
+                    Value::Null => None,
+                    other => Some(other.to_string()),
+                })
+                .collect(),
+        ),
+    }
+}
 
 // ============================================================================
 // Text predicates (standalone enum for typed text filtering)
@@ -1592,6 +1763,12 @@ impl ColumnarStore {
     ///
     /// Dictionary-encoded columns are stored alongside the batch in `dict_columns`.
     pub fn append_with_dict(&mut self, table: &str, batch: ColumnBatch) {
+        if let Some(ref wal) = self.wal {
+            let rows = batch_to_rows(&batch);
+            if let Err(e) = wal.log_insert_rows(table, &rows) {
+                eprintln!("columnar WAL: failed to log insert_rows (dict) for {table}: {e}");
+            }
+        }
         let row_count = batch.row_count;
         if row_count >= DICT_AUTO_MIN_ROWS {
             // Check each text column for low cardinality

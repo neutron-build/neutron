@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function Mothership() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Infrastructure</span>
@@ -45,6 +44,6 @@ export default function Mothership() {
           <p>Tebian isn't just an OS for your laptop; it's a foundation for your digital life. The Mothership is the "Brain" of your Fleet. It is the place where your data is safe, stable, and truly yours. It's time to stop renting your digital existence and start owning it.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

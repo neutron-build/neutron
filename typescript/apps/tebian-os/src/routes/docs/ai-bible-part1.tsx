@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function AiBiblePart1() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Definitive Manual</span>
@@ -74,6 +73,6 @@ export default function AiBiblePart1() {
           </section>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

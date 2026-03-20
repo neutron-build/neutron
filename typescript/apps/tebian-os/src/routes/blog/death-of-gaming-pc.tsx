@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function DeathOfGamingPc() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Gaming Philosophy</span>
@@ -35,6 +34,6 @@ export default function DeathOfGamingPc() {
           <p>The "Death of the Gaming PC" is really the <strong>Birth of the Gaming Rig.</strong> By stripping away the bloat of a general-purpose corporate OS, we turn your hardware into a dedicated machine for play. It is faster, more stable, and entirely yours. One ISO. One menu. Native speed. This is the end of the Windows monopoly.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

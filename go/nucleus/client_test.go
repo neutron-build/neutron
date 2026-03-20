@@ -1,7 +1,10 @@
 package nucleus
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/neutron-dev/neutron-go/neutron"
 )
 
 func TestIsValidIdentifierExtended(t *testing.T) {
@@ -231,5 +234,149 @@ func TestClientLifecycleHook(t *testing.T) {
 	}
 	if hook.OnStop == nil {
 		t.Error("hook.OnStop should not be nil")
+	}
+}
+
+func TestClientPoolReturnsNilWhenUnset(t *testing.T) {
+	c := &Client{}
+	if c.Pool() != nil {
+		t.Error("expected nil pool for zero-value Client")
+	}
+}
+
+func TestClientCloseNilPool(t *testing.T) {
+	// Close with a nil pool should not panic — but pool is typed *pgxpool.Pool
+	// so we skip this as it would nil-deref. Instead test the accessor pattern.
+	c := &Client{features: Features{IsNucleus: true}}
+	if c.Pool() != nil {
+		t.Error("expected nil pool")
+	}
+}
+
+func TestFeaturesAllFieldsDefault(t *testing.T) {
+	f := Features{}
+	if f.HasTS {
+		t.Error("default HasTS should be false")
+	}
+	if f.HasDocument {
+		t.Error("default HasDocument should be false")
+	}
+	if f.HasGraph {
+		t.Error("default HasGraph should be false")
+	}
+	if f.HasFTS {
+		t.Error("default HasFTS should be false")
+	}
+	if f.HasGeo {
+		t.Error("default HasGeo should be false")
+	}
+	if f.HasBlob {
+		t.Error("default HasBlob should be false")
+	}
+	if f.HasStreams {
+		t.Error("default HasStreams should be false")
+	}
+	if f.HasColumnar {
+		t.Error("default HasColumnar should be false")
+	}
+	if f.HasDatalog {
+		t.Error("default HasDatalog should be false")
+	}
+	if f.HasCDC {
+		t.Error("default HasCDC should be false")
+	}
+	if f.HasPubSub {
+		t.Error("default HasPubSub should be false")
+	}
+}
+
+func TestRequireNucleusErrorIsAppError(t *testing.T) {
+	c := &Client{features: Features{IsNucleus: false}}
+	err := c.requireNucleus("KV.Get")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	appErr, ok := err.(*neutron.AppError)
+	if !ok {
+		t.Fatalf("expected *neutron.AppError, got %T", err)
+	}
+	if appErr.Status != 501 {
+		t.Errorf("Status = %d, want 501", appErr.Status)
+	}
+	if !strings.Contains(appErr.Detail, "KV.Get") {
+		t.Errorf("Detail should contain feature name, got %q", appErr.Detail)
+	}
+	if appErr.Title != "Nucleus Required" {
+		t.Errorf("Title = %q, want 'Nucleus Required'", appErr.Title)
+	}
+}
+
+func TestIsValidIdentifierUnicode(t *testing.T) {
+	// Unicode chars should be rejected
+	if isValidIdentifier("table\u00e9") {
+		t.Error("unicode chars should not be valid identifiers")
+	}
+}
+
+func TestIsValidIdentifierLong(t *testing.T) {
+	// A very long valid identifier
+	long := "a" + strings.Repeat("b", 200)
+	if !isValidIdentifier(long) {
+		t.Error("long alphanumeric identifier should be valid")
+	}
+}
+
+func TestIsValidIdentifierSpecialChars(t *testing.T) {
+	invalid := []string{"a.b", "a b", "a\tb", "a\nb", "a$b", "a@b", "a!b", "a#b"}
+	for _, id := range invalid {
+		if isValidIdentifier(id) {
+			t.Errorf("isValidIdentifier(%q) should be false", id)
+		}
+	}
+}
+
+func TestIdentifierReIsCompiled(t *testing.T) {
+	if identifierRe == nil {
+		t.Fatal("identifierRe should be compiled at init")
+	}
+}
+
+func TestClientModelAccessorsNonNilPattern(t *testing.T) {
+	c := &Client{features: Features{IsNucleus: true}}
+	// All model accessors return non-nil objects even when pool is nil
+	sql := c.SQL()
+	if sql == nil {
+		t.Fatal("SQL() returned nil")
+	}
+	kv := c.KV()
+	if kv == nil {
+		t.Fatal("KV() returned nil")
+	}
+	// KV model should have client reference
+	if kv.client != c {
+		t.Error("KV client should reference the original client")
+	}
+}
+
+func TestClientFeaturesIsStruct(t *testing.T) {
+	c := &Client{features: Features{
+		IsNucleus: true,
+		HasKV:     true,
+		Version:   "Nucleus 1.0",
+	}}
+	f := c.Features()
+	if !f.IsNucleus {
+		t.Error("expected IsNucleus")
+	}
+	if !f.HasKV {
+		t.Error("expected HasKV")
+	}
+	if f.Version != "Nucleus 1.0" {
+		t.Errorf("Version = %q", f.Version)
+	}
+	// Features() returns a copy, not a reference
+	f.IsNucleus = false
+	if !c.Features().IsNucleus {
+		t.Error("modifying returned Features should not affect client")
 	}
 }

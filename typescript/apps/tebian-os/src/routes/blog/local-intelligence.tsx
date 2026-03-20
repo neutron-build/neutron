@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function LocalIntelligence() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">AI</span>
@@ -42,6 +41,6 @@ export default function LocalIntelligence() {
           <p>The "Cloud AI" era is the end of privacy. The "Local AI" era is the rebirth of productivity. Tebian provides the foundation to run the world's most advanced intelligence on your own terms. Your brain. Your silicon. Your Tebian.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

@@ -1,4 +1,3 @@
-import { PageShell } from "../components/PageShell";
 import "../styles/docs-hub.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function Docs() {
   return (
-    <PageShell>
+    <>
       <main>
         <h1 class="page-title">Guides</h1>
         <p class="subtitle">Authoritative technical specifications. Pure instruction.</p>
@@ -92,6 +91,6 @@ export default function Docs() {
           </section>
         </div>
       </main>
-    </PageShell>
+    </>
   );
 }

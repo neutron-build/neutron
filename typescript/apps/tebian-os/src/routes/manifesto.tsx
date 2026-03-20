@@ -1,4 +1,3 @@
-import { PageShell } from "../components/PageShell";
 import "../styles/manifesto.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function Manifesto() {
   return (
-    <PageShell>
+    <>
       <main>
         <article class="manifesto">
           <h1>The Tebian Manifesto</h1>
@@ -65,6 +64,6 @@ export default function Manifesto() {
           </section>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

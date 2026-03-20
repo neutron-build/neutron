@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://tebian.org/sitemap.xml

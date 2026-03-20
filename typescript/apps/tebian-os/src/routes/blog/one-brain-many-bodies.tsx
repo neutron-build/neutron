@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function OneBrainManyBodies() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Philosophy</span>
@@ -39,6 +38,6 @@ export default function OneBrainManyBodies() {
           <p>The era of "The PC" is over. The era of "The Fleet" is here. By choosing Tebian, you aren't just picking an operating system for one computer; you are choosing a unified digital identity that respects your focus and follows you anywhere. One ISO. One menu. One Fleet. Infinite bodies.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

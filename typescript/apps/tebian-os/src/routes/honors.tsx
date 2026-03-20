@@ -1,4 +1,3 @@
-import { PageShell } from "../components/PageShell";
 import "../styles/honors.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function Honors() {
   return (
-    <PageShell>
+    <>
       <main>
         <section class="shrine">
           <h2 class="shrine-title">The Foundation</h2>
@@ -142,6 +141,6 @@ export default function Honors() {
           </div>
         </section>
       </main>
-    </PageShell>
+    </>
   );
 }

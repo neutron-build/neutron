@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function DeIsDead() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Minimalism</span>
@@ -42,6 +41,6 @@ export default function DeIsDead() {
           <p>The "Death of the DE" is really the "Birth of the Invisible OS." When you remove the DE, you remove the branding, the bloat, and the barriers. All that remains is a compositor that handles the hardware and lets you do your work. That is the Tebian promise.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

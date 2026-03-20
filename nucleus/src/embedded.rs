@@ -101,21 +101,26 @@ impl DatabaseBuilder {
     pub fn build(self) -> Result<Database, DatabaseError> {
         let catalog = Arc::new(Catalog::new());
         let mut recovered_schemas: Vec<(String, Vec<(String, crate::types::DataType)>)> = Vec::new();
+        let mut data_dir: Option<std::path::PathBuf> = None;
         let storage: Arc<dyn StorageEngine> = match self.mode {
             StorageMode::Memory => Arc::new(MemoryEngine::new()),
             StorageMode::Mvcc => Arc::new(MvccStorageAdapter::new()),
             #[cfg(feature = "server")]
-            StorageMode::DurableMvcc(path) => {
-                let (adapter, schemas) = MvccStorageAdapter::with_wal(&path)
+            StorageMode::DurableMvcc(ref path) => {
+                let (adapter, schemas) = MvccStorageAdapter::with_wal(path)
                     .map_err(|e| DatabaseError::Storage(e.to_string()))?;
                 recovered_schemas = schemas;
+                data_dir = Some(path.clone());
                 Arc::new(adapter)
             }
             #[cfg(feature = "server")]
-            StorageMode::Disk(path) => Arc::new(
-                DiskEngine::open(&path, catalog.clone())
-                    .map_err(|e| DatabaseError::Storage(e.to_string()))?,
-            ),
+            StorageMode::Disk(ref path) => {
+                data_dir = Some(path.clone());
+                Arc::new(
+                    DiskEngine::open(path, catalog.clone())
+                        .map_err(|e| DatabaseError::Storage(e.to_string()))?,
+                )
+            }
         };
 
         // Register WAL-recovered table schemas in the catalog (synchronous — safe during startup).
@@ -138,7 +143,16 @@ impl DatabaseBuilder {
             let _ = catalog.create_table_sync(td);
         }
 
-        let executor = Arc::new(Executor::new(catalog.clone(), storage.clone()));
+        let executor = if let Some(ref dir) = data_dir {
+            Arc::new(Executor::new_with_persistence(
+                catalog.clone(),
+                storage.clone(),
+                None,
+                Some(dir.as_path()),
+            ))
+        } else {
+            Arc::new(Executor::new(catalog.clone(), storage.clone()))
+        };
         Ok(Database {
             executor,
             _catalog: catalog,

@@ -56,7 +56,16 @@ func (c *Client) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row 
 
 // IsNucleus checks if the connected database is Nucleus.
 // Returns isNucleus, version string, error.
+// Detection uses SELECT NUCLEUS_VERSION() — if it succeeds, the server is Nucleus.
+// Falls back to parsing SELECT VERSION() for older Nucleus builds.
 func (c *Client) IsNucleus(ctx context.Context) (bool, string, error) {
+	// Primary detection: NUCLEUS_VERSION() is only available on Nucleus
+	var nucleusVer string
+	if err := c.pool.QueryRow(ctx, "SELECT NUCLEUS_VERSION()").Scan(&nucleusVer); err == nil {
+		return true, nucleusVer, nil
+	}
+
+	// Fallback: parse the standard VERSION() string
 	var version string
 	err := c.pool.QueryRow(ctx, "SELECT VERSION()").Scan(&version)
 	if err != nil {
@@ -64,11 +73,30 @@ func (c *Client) IsNucleus(ctx context.Context) (bool, string, error) {
 	}
 
 	if strings.Contains(version, "Nucleus") {
-		nucleusVer := parseNucleusVersion(version)
-		return true, nucleusVer, nil
+		return true, parseNucleusVersion(version), nil
 	}
 
 	return false, version, nil
+}
+
+// NucleusFeatures returns per-model feature flags from the connected Nucleus.
+// Returns nil if not connected to Nucleus or the function is unavailable.
+func (c *Client) NucleusFeatures(ctx context.Context) (map[string]bool, error) {
+	rows, err := c.pool.Query(ctx, "SELECT NUCLEUS_FEATURES()")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	features := make(map[string]bool)
+	for rows.Next() {
+		var feature string
+		if err := rows.Scan(&feature); err != nil {
+			continue
+		}
+		features[feature] = true
+	}
+	return features, nil
 }
 
 // Status returns database status information.

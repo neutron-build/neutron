@@ -7,6 +7,8 @@
 //!
 //! Replaces Redis Pub/Sub, BullMQ, Redis Streams.
 
+pub mod streams_wal;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::broadcast;

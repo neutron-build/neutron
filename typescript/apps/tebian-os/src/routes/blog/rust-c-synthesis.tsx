@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function RustCSynthesis() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Development</span>
@@ -38,6 +37,6 @@ export default function RustCSynthesis() {
           <p>We believe that for an OS to be "Great," it must be built on <strong>Systems Languages.</strong> By sticking to C and Rust, we ensure that every byte of your RAM is serving a purpose. We don't use "Middleware." We use the Metal.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

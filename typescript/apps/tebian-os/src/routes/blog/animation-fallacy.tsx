@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function AnimationFallacy() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Philosophy</span>
@@ -32,6 +31,6 @@ export default function AnimationFallacy() {
           <p>The "Smooth Animation" is a trick designed to hide system lag. If your OS is fast enough, you don't need animations to bridge the gap. Tebian is built for the user who values <strong>Response</strong> over <strong>Aesthetics.</strong> We don't want your computer to look like a movie; we want it to work like an extension of your mind. One ISO. One menu. Zero animations.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

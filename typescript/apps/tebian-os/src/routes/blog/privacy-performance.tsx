@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function PrivacyPerformance() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Philosophy</span>
@@ -28,6 +27,6 @@ export default function PrivacyPerformance() {
           <p>When your machine stops "talking" to the cloud, it starts "listening" to you. Privacy isn't a setting; it's a speed boost. One ISO. One menu. Total silence.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

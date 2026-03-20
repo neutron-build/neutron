@@ -1,6 +1,8 @@
 package nucleus
 
 import (
+	"context"
+	"strings"
 	"testing"
 )
 
@@ -90,5 +92,108 @@ func TestWithFilter(t *testing.T) {
 	}
 	if o.filter["category"] != "tech" {
 		t.Errorf("filter = %v", o.filter)
+	}
+}
+
+func TestDistanceMetricStringDefault(t *testing.T) {
+	// An out-of-range DistanceMetric should default to "l2"
+	var m DistanceMetric = 99
+	if m.String() != "l2" {
+		t.Errorf("unknown metric.String() = %q, want l2", m.String())
+	}
+}
+
+func TestVectorRequiresNucleus(t *testing.T) {
+	q := &mockCDCQuerier{}
+	client := plainPGClient()
+	v := &VectorModel{pool: q, client: client}
+
+	tests := []struct {
+		name string
+		fn   func() error
+	}{
+		{"Search", func() error {
+			_, err := v.Search(context.Background(), "col", []float32{1.0})
+			return err
+		}},
+		{"Insert", func() error {
+			return v.Insert(context.Background(), "col", "id1", []float32{1.0}, nil)
+		}},
+		{"Delete", func() error {
+			return v.Delete(context.Background(), "col", "id1")
+		}},
+		{"CreateCollection", func() error {
+			return v.CreateCollection(context.Background(), "col", 128, Cosine)
+		}},
+		{"Dims", func() error {
+			_, err := v.Dims(context.Background(), []float32{1.0})
+			return err
+		}},
+		{"Distance", func() error {
+			_, err := v.Distance(context.Background(), []float32{1.0}, []float32{2.0}, Cosine)
+			return err
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.fn()
+			if err == nil {
+				t.Fatal("expected error for non-Nucleus database")
+			}
+		})
+	}
+}
+
+func TestVectorInvalidIdentifier(t *testing.T) {
+	q := &mockCDCQuerier{}
+	v := &VectorModel{pool: q, client: nucleusClient()}
+
+	_, err := v.Search(context.Background(), "bad-name", []float32{1.0})
+	if err == nil {
+		t.Fatal("expected error for invalid identifier")
+	}
+	if !strings.Contains(err.Error(), "invalid collection name") {
+		t.Errorf("error = %q", err.Error())
+	}
+
+	err = v.Insert(context.Background(), "bad name", "id1", []float32{1.0}, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid identifier")
+	}
+
+	err = v.Delete(context.Background(), "123bad", "id1")
+	if err == nil {
+		t.Fatal("expected error for invalid identifier")
+	}
+
+	err = v.CreateCollection(context.Background(), "drop;table", 128, Cosine)
+	if err == nil {
+		t.Fatal("expected error for invalid identifier")
+	}
+}
+
+func TestVectorSearchResultFields(t *testing.T) {
+	r := VectorSearchResult[string]{
+		Item:     "test",
+		Score:    1.5,
+		Distance: 0.3,
+	}
+	if r.Item != "test" {
+		t.Errorf("Item = %q", r.Item)
+	}
+	if r.Score != 1.5 {
+		t.Errorf("Score = %f", r.Score)
+	}
+	if r.Distance != 0.3 {
+		t.Errorf("Distance = %f", r.Distance)
+	}
+}
+
+func TestFloat32SliceToSQLSingle(t *testing.T) {
+	got := float32SliceToSQL([]float32{42.0})
+	want := "[42]"
+	if got != want {
+		t.Errorf("float32SliceToSQL = %q, want %q", got, want)
 	}
 }

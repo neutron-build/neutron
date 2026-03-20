@@ -1,4 +1,3 @@
-import { PageShell } from "../components/PageShell";
 import { Island } from "neutron/client";
 import { DownloadCounter } from "../components/DownloadCounter";
 import { CopyCommand } from "../components/CopyCommand";
@@ -12,7 +11,7 @@ export function head() {
 
 export default function Home() {
   return (
-    <PageShell hideNav>
+    <div class="page-home">
       <main>
         <div class="banner">
           <span>v0.1 — Early Release</span>
@@ -68,6 +67,6 @@ export default function Home() {
           <a href="https://neutron.build" target="_blank" class="built-on-link">neutron.</a>
         </div>
       </main>
-    </PageShell>
+    </div>
   );
 }

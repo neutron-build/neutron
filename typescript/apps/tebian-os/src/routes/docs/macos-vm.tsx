@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function MacosVm() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Resources</span>
@@ -76,6 +75,6 @@ export default function MacosVm() {
           </section>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

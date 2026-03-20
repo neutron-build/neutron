@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function DebianVsArchUbuntu() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Philosophy</span>
@@ -45,6 +44,6 @@ export default function DebianVsArchUbuntu() {
           <p>Arch is a hobby. Ubuntu is a product. Debian is infrastructure. And Tebian is that infrastructure, weaponized for your desktop.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

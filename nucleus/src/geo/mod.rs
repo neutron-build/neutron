@@ -7,6 +7,8 @@
 //!   - ST_Area(polygon) → area
 //!   - ST_MakePoint(x, y) → Point
 
+pub mod wal;
+
 use std::collections::HashMap;
 use std::fmt;
 

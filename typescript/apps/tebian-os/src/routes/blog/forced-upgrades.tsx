@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function ForcedUpgrades() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Maintenance Philosophy</span>
@@ -39,6 +38,6 @@ export default function ForcedUpgrades() {
           <p>The tech industry wants you to believe that "Newer is Better." In the world of operating systems, "Stable is Better." By choosing Tebian over Fedora, you are reclaiming the hundreds of hours you would have spent debugging "Upgrade Issues" over the next decade. One ISO. One menu. One install for the next 5 years. Total peace of mind.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

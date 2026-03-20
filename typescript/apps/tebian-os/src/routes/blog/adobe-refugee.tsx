@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function AdobeRefugee() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Creative Philosophy</span>
@@ -40,6 +39,6 @@ export default function AdobeRefugee() {
           <p>The Adobe Refugee is someone who chooses <strong>Craft over Convenience.</strong> By learning the sovereign creative stack on Tebian, you are investing in skills that belong to you, not to a subscription service. One ISO. One menu. Total creative independence. Welcome home.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }
