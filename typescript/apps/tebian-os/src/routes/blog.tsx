@@ -1,4 +1,3 @@
-import { PageShell } from "../components/PageShell";
 import "../styles/blog-hub.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function Blog() {
   return (
-    <PageShell>
+    <>
       <main>
         <h1 class="page-title">Philosophy</h1>
         <p class="subtitle">Essays on digital ethics, technical debt, and the C-level soul of the OS.</p>
@@ -98,6 +97,6 @@ export default function Blog() {
           </section>
         </div>
       </main>
-    </PageShell>
+    </>
   );
 }

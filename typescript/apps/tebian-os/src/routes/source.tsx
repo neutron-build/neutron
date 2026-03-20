@@ -1,4 +1,3 @@
-import { PageShell } from "../components/PageShell";
 import { Island } from "neutron/client";
 import { SourceViewer } from "../components/SourceViewer";
 import "../styles/source.css";
@@ -11,7 +10,7 @@ export function head() {
 
 export default function Source() {
   return (
-    <PageShell hideFooter>
+    <div class="page-source">
       <main>
         <Island component={SourceViewer} client="load" id="source-viewer" />
 
@@ -33,6 +32,6 @@ export default function Source() {
           </div>
         </div>
       </main>
-    </PageShell>
+    </div>
   );
 }

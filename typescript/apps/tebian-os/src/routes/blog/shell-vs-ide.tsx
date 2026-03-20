@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function ShellVsIde() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Development Philosophy</span>
@@ -31,6 +30,6 @@ export default function ShellVsIde() {
           <p>Engineering is about efficiency. By choosing the shell over the IDE, you are reclaiming your CPU cycles and your cognitive bandwidth. One ISO. One menu. One shell. Total mastery.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

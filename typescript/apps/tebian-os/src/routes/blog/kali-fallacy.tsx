@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function KaliFallacy() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Security Philosophy</span>
@@ -35,6 +34,6 @@ export default function KaliFallacy() {
           <p>The Kali Fallacy is a distraction. A professional doesn't need a logo to be effective; they need a machine that is fast, silent, and reliable. By using Tebian as your foundation and adding your security tools modularly, you are practicing <strong>Real Sovereignty.</strong> You are the master of the tools, not a user of a brand. One ISO. One menu. All the power.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

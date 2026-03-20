@@ -135,7 +135,7 @@ class TestPerIPRateLimit:
     @pytest.mark.asyncio
     async def test_different_ips_have_separate_buckets(self):
         """Two different IPs should each get their own burst budget."""
-        app = _make_app(RateLimitMiddleware(rps=1.0, burst=1))
+        app = _make_app(RateLimitMiddleware(rps=1.0, burst=1, trust_proxy=True))
         async with TestClient(app) as client:
             # IP 1 sends one request — should succeed
             r1 = await client.get(
@@ -158,7 +158,7 @@ class TestPerIPRateLimit:
     @pytest.mark.asyncio
     async def test_x_real_ip_extraction(self):
         """X-Real-IP header is respected when X-Forwarded-For is absent."""
-        app = _make_app(RateLimitMiddleware(rps=1.0, burst=1))
+        app = _make_app(RateLimitMiddleware(rps=1.0, burst=1, trust_proxy=True))
         async with TestClient(app) as client:
             r1 = await client.get(
                 "/ping", headers={"x-real-ip": "192.168.1.1"}
@@ -317,7 +317,8 @@ class TestCSRFMiddleware:
             assert len(csrf_cookies) == 1
             cookie_value = csrf_cookies[0]
             assert "SameSite=Strict" in cookie_value
-            assert "HttpOnly" in cookie_value
+            # CSRF cookie must NOT be HttpOnly so JS can read and attach it
+            assert "HttpOnly" not in cookie_value
 
     @pytest.mark.asyncio
     async def test_get_does_not_reset_existing_cookie(self):

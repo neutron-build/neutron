@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function MintToDebianMigration() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Migration Manual</span>
@@ -53,6 +52,6 @@ export default function MintToDebianMigration() {
           </section>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

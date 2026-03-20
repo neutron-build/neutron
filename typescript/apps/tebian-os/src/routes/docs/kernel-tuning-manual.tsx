@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function KernelTuningManual() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Resources</span>
@@ -71,6 +70,6 @@ export default function KernelTuningManual() {
           </section>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

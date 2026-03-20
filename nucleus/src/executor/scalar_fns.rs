@@ -2782,8 +2782,12 @@ impl Executor {
                     i += 2;
                 }
                 let mut streams = self.streams.write();
-                let stream = streams.entry(stream_name).or_default();
-                let id = stream.xadd(fields);
+                let stream = streams.entry(stream_name.clone()).or_default();
+                let id = stream.xadd(fields.clone());
+                // Log to WAL after successful append
+                if let Some(ref wal) = self.streams_wal {
+                    let _ = wal.log_xadd(&stream_name, &id, &fields);
+                }
                 Ok(Value::Text(id.to_string()))
             }
             "STREAM_XLEN" => {

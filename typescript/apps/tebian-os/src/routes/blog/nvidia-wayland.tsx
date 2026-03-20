@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function NvidiaWayland() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Hardware</span>
@@ -38,6 +37,6 @@ export default function NvidiaWayland() {
           <p>We've tamed the beast. One ISO. One menu. All the GPU power you paid for.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

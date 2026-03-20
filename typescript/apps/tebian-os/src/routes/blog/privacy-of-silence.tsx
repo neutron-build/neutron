@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function PrivacyOfSilence() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Privacy</span>
@@ -36,6 +35,6 @@ export default function PrivacyOfSilence() {
           <p>Your computer should be a quiet space for your thoughts. It should not be a corporate observation post. By choosing a silent operating system, you are reclaiming your focus, your performance, and your privacy. One ISO. One menu. Zero Telemetry. The silence is the feature.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

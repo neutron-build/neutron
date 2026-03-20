@@ -101,6 +101,13 @@ pub struct Executor {
     vector_indexes: parking_lot::RwLock<HashMap<String, VectorIndexEntry>>,
     /// Optional vector WAL for durable vector index persistence.
     vector_wal: Option<vector::VectorWal>,
+    /// Optional streams WAL for durable stream persistence.
+    streams_wal: Option<crate::pubsub::streams_wal::StreamsWal>,
+    /// Optional CDC WAL for durable CDC log persistence.
+    #[cfg(feature = "server")]
+    cdc_wal: Option<crate::reactive::cdc_wal::CdcWal>,
+    /// Optional geo WAL for durable R-tree persistence.
+    geo_wal: Option<crate::geo::wal::GeoWal>,
     /// Fault isolation health registry (Principle 6).
     health_registry: Arc<parking_lot::RwLock<HealthRegistry>>,
     /// Live encrypted indexes keyed by index name.
@@ -172,6 +179,8 @@ pub struct Executor {
     cdc_log: parking_lot::RwLock<crate::reactive::CdcLog>,
     /// Datalog logic programming engine for datalog_* SQL functions.
     datalog_store: parking_lot::RwLock<crate::datalog::DatalogStore>,
+    /// Optional Datalog WAL for durable persistence of facts and rules.
+    datalog_wal: Option<crate::datalog::DatalogWal>,
     /// Named streams for stream_* SQL functions (Redis-style append-only logs).
     streams: parking_lot::RwLock<HashMap<String, crate::pubsub::Stream>>,
     /// Sync-safe pub/sub hub for pubsub_* SQL functions.
@@ -272,6 +281,10 @@ impl Executor {
             catalog_path: None,
             vector_indexes: parking_lot::RwLock::new(HashMap::new()),
             vector_wal: None,
+            streams_wal: None,
+            #[cfg(feature = "server")]
+            cdc_wal: None,
+            geo_wal: None,
             health_registry: Arc::new(parking_lot::RwLock::new(health)),
             encrypted_indexes: parking_lot::RwLock::new(HashMap::new()),
             graph_store: parking_lot::RwLock::new(GraphStore::new()),
@@ -323,6 +336,7 @@ impl Executor {
             #[cfg(feature = "server")]
             cdc_log: parking_lot::RwLock::new(crate::reactive::CdcLog::new()),
             datalog_store: parking_lot::RwLock::new(crate::datalog::DatalogStore::new()),
+            datalog_wal: None,
             streams: parking_lot::RwLock::new(HashMap::new()),
             pubsub_sync: parking_lot::RwLock::new(crate::pubsub::PubSubHub::new(1024)),
             dist_pubsub: parking_lot::RwLock::new(crate::pubsub::DistributedPubSubRouter::new(0, 1024)),
@@ -419,6 +433,65 @@ impl Executor {
                     });
                 }
                 exec.vector_wal = Some(wal);
+            }
+
+            // TimeSeries store: WAL-backed crash-recovery
+            let ts_dir = dir.join("timeseries");
+            std::fs::create_dir_all(&ts_dir).ok();
+            if let Ok(ts) = crate::timeseries::TimeSeriesStore::open(&ts_dir, crate::timeseries::BucketSize::Hour) {
+                *exec.ts_store.write() = ts;
+            }
+
+            // Blob store: WAL-backed crash-recovery
+            let blob_dir = dir.join("blob");
+            std::fs::create_dir_all(&blob_dir).ok();
+            if let Ok(blob) = crate::blob::BlobStore::open(&blob_dir) {
+                *exec.blob_store.write() = blob;
+            }
+
+            // Datalog store: WAL-backed crash-recovery
+            let datalog_dir = dir.join("datalog");
+            std::fs::create_dir_all(&datalog_dir).ok();
+            if let Ok((wal, state)) = crate::datalog::DatalogWal::open(&datalog_dir) {
+                *exec.datalog_store.write() = crate::datalog::restore_from_wal(state);
+                exec.datalog_wal = Some(wal);
+            }
+
+            // Columnar store: WAL-backed crash-recovery
+            let col_dir = dir.join("columnar");
+            std::fs::create_dir_all(&col_dir).ok();
+            if let Ok(col) = crate::columnar::ColumnarStore::open(&col_dir) {
+                *exec.columnar_store.write() = col;
+            }
+
+            // Streams: WAL-backed crash-recovery
+            let streams_dir = dir.join("streams");
+            std::fs::create_dir_all(&streams_dir).ok();
+            if let Ok((wal, state)) = crate::pubsub::streams_wal::StreamsWal::open(&streams_dir) {
+                let rebuilt = crate::pubsub::streams_wal::rebuild_streams(&state);
+                *exec.streams.write() = rebuilt;
+                exec.streams_wal = Some(wal);
+            }
+
+            // CDC log: WAL-backed crash-recovery
+            #[cfg(feature = "server")]
+            {
+                let cdc_dir = dir.join("cdc");
+                std::fs::create_dir_all(&cdc_dir).ok();
+                if let Ok((wal, state)) = crate::reactive::cdc_wal::CdcWal::open(&cdc_dir) {
+                    let rebuilt = crate::reactive::cdc_wal::rebuild_cdc_log(&state);
+                    *exec.cdc_log.write() = rebuilt;
+                    exec.cdc_wal = Some(wal);
+                }
+            }
+
+            // Geo R-tree: WAL-backed crash-recovery
+            let geo_dir = dir.join("geo");
+            std::fs::create_dir_all(&geo_dir).ok();
+            if let Ok((wal, _state)) = crate::geo::wal::GeoWal::open(&geo_dir) {
+                // R-tree rebuild is available via crate::geo::wal::rebuild_rtree(&state)
+                // when a GeoIndex is added to the executor. For now, store the WAL handle.
+                exec.geo_wal = Some(wal);
             }
         }
 
@@ -1495,7 +1568,21 @@ impl Executor {
         {
             let mut row_data = HashMap::new();
             row_data.insert("_rows".to_string(), row_count.to_string());
-            self.cdc_log.write().append(table, change_type.clone(), row_data);
+            let seq = self.cdc_log.write().append(table, change_type.clone(), row_data.clone());
+            // Log to CDC WAL after successful append
+            if let Some(ref wal) = self.cdc_wal {
+                let entry = crate::reactive::CdcLogEntry {
+                    sequence: seq,
+                    table: table.to_string(),
+                    change_type: change_type.clone(),
+                    row_data,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                };
+                let _ = wal.log_append(&entry);
+            }
         }
 
         // Fast path: skip expensive HashMap/String allocation if no subscribers exist
@@ -1611,7 +1698,21 @@ impl Executor {
         // Append to CDC log
         let mut row_data = std::collections::HashMap::new();
         row_data.insert("_rows".to_string(), row_count.to_string());
-        self.cdc_log.write().append(table, change_type, row_data);
+        let seq = self.cdc_log.write().append(table, change_type.clone(), row_data.clone());
+        // Log to CDC WAL after successful append
+        if let Some(ref wal) = self.cdc_wal {
+            let entry = crate::reactive::CdcLogEntry {
+                sequence: seq,
+                table: table.to_string(),
+                change_type,
+                row_data,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            };
+            let _ = wal.log_append(&entry);
+        }
     }
 
     /// Execute a Cypher query directly against the persistent graph store.

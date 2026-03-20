@@ -1,4 +1,3 @@
-import { PageShell } from "../components/PageShell";
 import "../styles/reasoning.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function Reasoning() {
   return (
-    <PageShell>
+    <>
       <main>
         <article class="reasoning">
           <h1>Reasoning</h1>
@@ -181,6 +180,6 @@ export default function Reasoning() {
           </section>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

@@ -75,7 +75,7 @@ class TestJWT:
 
 class TestJWTMiddleware:
     async def test_jwt_middleware_sets_user(self):
-        secret = "test-secret"
+        secret = "test-secret-that-is-at-least-32ch"
         token = create_token({"user_id": 42}, secret)
 
         async def endpoint(request: Request) -> JSONResponse:
@@ -102,7 +102,7 @@ class TestJWTMiddleware:
         app = Starlette(
             routes=[Route("/me", endpoint)],
             middleware=[
-                JWTMiddleware(secret="s").as_starlette_middleware()
+                JWTMiddleware(secret="s" * 32).as_starlette_middleware()
             ],
         )
 
@@ -119,7 +119,7 @@ class TestJWTMiddleware:
         app = Starlette(
             routes=[Route("/health", health)],
             middleware=[
-                JWTMiddleware(secret="s").as_starlette_middleware()
+                JWTMiddleware(secret="s" * 32).as_starlette_middleware()
             ],
         )
 

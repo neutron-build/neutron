@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function ChromeosPrison() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">System Philosophy</span>
@@ -39,6 +38,6 @@ export default function ChromeosPrison() {
           <p>Your Chromebook is a computer, not a terminal for Google's servers. By installing Tebian, you are restoring its ability to think, create, and protect your privacy. You are moving from a "Tenant" of Google to the "Root" of your own machine. One ISO. One menu. Total reclamation.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

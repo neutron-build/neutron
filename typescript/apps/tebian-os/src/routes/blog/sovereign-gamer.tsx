@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function SovereignGamer() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Gaming</span>
@@ -41,6 +40,6 @@ export default function SovereignGamer() {
           <p>The Sovereign Gamer is the future. You want a desktop that acts like a console—fast, stable, and invisible—but has the power of a workstation. That is Tebian. One ISO. One menu. All your games.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

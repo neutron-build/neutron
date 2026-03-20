@@ -139,6 +139,11 @@ class CompressionMiddleware(_NeutronMiddleware):
 # --- Rate Limiting (per-IP token bucket) ---
 
 
+def _default_key_func(scope: Scope) -> str:
+    """Default rate-limit key function."""
+    return _get_client_ip(scope, trust_proxy=True)
+
+
 def _get_client_ip(scope: Scope, trust_proxy: bool = False) -> str:
     """Extract client IP from ASGI scope.
 

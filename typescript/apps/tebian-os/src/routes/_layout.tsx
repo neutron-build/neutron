@@ -1,6 +1,8 @@
 import "../styles/global.css";
-import { Island, ViewTransitions } from "neutron/client";
+import { Island } from "neutron/client";
 import { ThemeToggle } from "../components/ThemeToggle";
+import { Nav } from "../components/Nav";
+import { Footer } from "../components/Footer";
 
 export function head() {
   return {
@@ -9,13 +11,12 @@ export function head() {
     htmlAttrs: { lang: "en", "data-theme": "frappe" },
     headScripts: [
       {
-        content: `(function(){var s=localStorage.getItem("tebian-theme")||"frappe";document.documentElement.setAttribute("data-theme",s)})();`,
+        content: `(function(){var s=localStorage.getItem("tebian-theme")||"frappe";document.documentElement.setAttribute("data-theme",s);var l=document.createElement("link");l.rel="icon";l.type="image/svg+xml";l.href="/favicon.svg";document.head.appendChild(l)})();`,
         id: "theme-init",
       },
     ],
   };
 }
-
 
 export default function Layout({
   children,
@@ -23,10 +24,11 @@ export default function Layout({
   children: preact.ComponentChildren;
 }) {
   return (
-    <>
-      <ViewTransitions />
+    <div class="layout">
       <Island component={ThemeToggle} client="load" id="theme-toggle" />
-      {children}
-    </>
+      <Nav />
+      <div class="page-content">{children}</div>
+      <Footer />
+    </div>
   );
 }
