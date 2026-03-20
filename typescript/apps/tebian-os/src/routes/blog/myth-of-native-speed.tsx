@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function MythOfNativeSpeed() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Hardware Philosophy</span>
@@ -43,6 +42,6 @@ export default function MythOfNativeSpeed() {
           <p>The "Native Speed" of your Mac is currently being hidden from you by layers of Apple's corporate bloat. By installing Tebian, you are performing a "Software Engine Swap." You are giving that beautiful aluminum chassis the C-level performance it deserves. Don't let a "Software Update" tell you your hardware is dead. Reclaim it with Tebian. One ISO. One menu. True native speed.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

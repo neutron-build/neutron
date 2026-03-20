@@ -24,15 +24,15 @@ main { margin-left: auto; margin-right: auto; }
 
 /* Dark theme (Mocha) */
 html[data-theme="dark"] body,
-html[data-theme="dark"] { background: #1e1e2e; color: #cdd6f4; --accent: #89b4fa; --accent-color: #89b4fa; --neutron-vt-bg: #1e1e2e; }
+html[data-theme="dark"] { --bg: #1e1e2e; background: #1e1e2e; color: #cdd6f4; --accent: #89b4fa; --accent-color: #89b4fa; --neutron-vt-bg: #1e1e2e; }
 
 /* Light theme (Latte) */
 html[data-theme="light"] body,
-html[data-theme="light"] { background: #eff1f5; color: #4c4f69; --accent: #1e66f5; --accent-color: #1e66f5; --neutron-vt-bg: #eff1f5; }
+html[data-theme="light"] { --bg: #eff1f5; background: #eff1f5; color: #4c4f69; --accent: #1e66f5; --accent-color: #1e66f5; --neutron-vt-bg: #eff1f5; }
 
 /* Frappe theme */
 html[data-theme="frappe"] body,
-html[data-theme="frappe"] { background: #303446; color: #c6d0f5; --accent: #8caaee; --accent-color: #8caaee; --neutron-vt-bg: #303446; }
+html[data-theme="frappe"] { --bg: #303446; background: #303446; color: #c6d0f5; --accent: #8caaee; --accent-color: #8caaee; --neutron-vt-bg: #303446; }
 
 /* ── Global nav ── */
 .global-nav {
@@ -43,6 +43,20 @@ html[data-theme="frappe"] { background: #303446; color: #c6d0f5; --accent: #8caa
 	padding: 0.75rem 1.5rem;
 	border-bottom: 1px solid rgba(255, 255, 255, 0.05);
 	font-size: 0.85rem;
+	background: var(--bg);
+}
+
+/* Stable layout structure — nav/footer stay in their own compositing layers */
+.layout {
+	min-height: 100vh;
+	display: flex;
+	flex-direction: column;
+	background: var(--bg);
+}
+
+.page-content {
+	flex: 1;
+	width: 100%;
 }
 .global-nav a { color: #6c7086; text-decoration: none; transition: color 0.2s; }
 .global-nav a:hover { color: var(--accent); }

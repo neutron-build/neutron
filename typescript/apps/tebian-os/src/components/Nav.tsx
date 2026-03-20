@@ -1,12 +1,14 @@
+import { Link } from "neutron/client";
+
 export function Nav() {
   return (
     <nav class="global-nav">
-      <a href="/">&larr; Home</a>
+      <Link to="/">&larr; Home</Link>
       <span class="nav-div">|</span>
-      <a href="/manifesto">Manifesto</a>
-      <a href="/reasoning">Reasoning</a>
-      <a href="/honors">Honors</a>
-      <a href="/source">Source</a>
+      <Link to="/manifesto">Manifesto</Link>
+      <Link to="/reasoning">Reasoning</Link>
+      <Link to="/honors">Honors</Link>
+      <Link to="/source">Source</Link>
     </nav>
   );
 }

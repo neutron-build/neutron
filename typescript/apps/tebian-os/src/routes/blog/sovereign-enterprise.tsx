@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function SovereignEnterprise() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Infrastructure</span>
@@ -56,6 +55,6 @@ export default function SovereignEnterprise() {
           <p>The "Sovereign Enterprise" is one where the tools serve the developer, not the other way around. By choosing Tebian, you are choosing an infrastructure that prioritizes performance, security, and focus. You aren't just "working on Linux"; you are wielding a weaponized workstation. One ISO. One menu. Total sovereignty.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

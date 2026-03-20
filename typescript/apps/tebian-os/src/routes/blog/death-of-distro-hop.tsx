@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function DeathOfDistroHop() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">User Psychology</span>
@@ -32,6 +31,6 @@ export default function DeathOfDistroHop() {
           <p>Distro hopping is an exhausting search for stability. By choosing Tebian, you are choosing to stop searching. You are building your life on the Rock of Debian. One ISO. One menu. The search is over. Welcome to the end of the hop.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function MythOfSecurity() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Security</span>
@@ -39,6 +38,6 @@ export default function MythOfSecurity() {
           <p>True security isn't loud. It doesn't give you pop-ups telling you it's "Protecting your PC." True security is a silent, minimal system that does exactly what you ask and nothing more. Tebian is that fortress. One ISO. One menu. Zero compromises.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

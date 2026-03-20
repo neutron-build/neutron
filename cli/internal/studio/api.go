@@ -200,10 +200,25 @@ func (s *Server) connectDB(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	s.store.SetNucleus(id, isNucleus)
 
+	models := nucleusModels(isNucleus)
+	var featureMap map[string]bool
+	if isNucleus {
+		if fm, fErr := client.NucleusFeatures(ctx); fErr == nil && len(fm) > 0 {
+			featureMap = fm
+			models = []string{"sql"}
+			for _, m := range allNucleusModels {
+				if fm[m] {
+					models = append(models, m)
+				}
+			}
+		}
+	}
+
 	features := map[string]any{
-		"isNucleus": isNucleus,
-		"version":   version,
-		"models":    nucleusModels(isNucleus),
+		"isNucleus":  isNucleus,
+		"version":    version,
+		"models":     models,
+		"featureMap": featureMap,
 	}
 
 	sc, err := FetchSchema(ctx, client, isNucleus)
@@ -219,11 +234,15 @@ func (s *Server) connectDB(w http.ResponseWriter, r *http.Request, id string) {
 	})
 }
 
+// allNucleusModels is the canonical list of the 14 data models (excluding "sql" which is always present).
+var allNucleusModels = []string{"kv", "vector", "timeseries", "document", "graph", "fts", "geo", "blob", "pubsub", "streams", "columnar", "datalog", "cdc"}
+
 func nucleusModels(isNucleus bool) []string {
 	if !isNucleus {
 		return []string{"sql"}
 	}
-	return []string{"sql", "kv", "vector", "timeseries", "document", "graph", "fts", "geo", "blob", "pubsub", "streams", "columnar", "datalog", "cdc"}
+	models := []string{"sql"}
+	return append(models, allNucleusModels...)
 }
 
 // --- /api/query ---
@@ -324,10 +343,28 @@ func (s *Server) handleFeatures(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	isNucleus, version, _ := client.IsNucleus(r.Context())
+
+	// Attempt per-model feature detection from NUCLEUS_FEATURES()
+	models := nucleusModels(isNucleus)
+	var featureMap map[string]bool
+	if isNucleus {
+		if fm, err := client.NucleusFeatures(r.Context()); err == nil && len(fm) > 0 {
+			featureMap = fm
+			// Rebuild models list from the live feature query
+			models = []string{"sql"} // SQL always present
+			for _, m := range allNucleusModels {
+				if fm[m] {
+					models = append(models, m)
+				}
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"isNucleus": isNucleus,
-		"version":   version,
-		"models":    nucleusModels(isNucleus),
+		"isNucleus":  isNucleus,
+		"version":    version,
+		"models":     models,
+		"featureMap": featureMap,
 	})
 }
 

@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function FragilityOfTheRoll() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Maintenance Philosophy</span>
@@ -39,6 +38,6 @@ export default function FragilityOfTheRoll() {
           <p>Arch Linux is a project. It's a hobby. It's a great way to learn how Linux works. But Tebian is a <strong>Tool.</strong> It is designed for the person who has already learned how Linux works and now needs to use it to build things. We take the speed of Arch (via our C-based core) and combine it with the reliability of Debian. One ISO. One menu. No part-time maintenance required.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

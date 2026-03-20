@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	githubAPIURL = "https://api.github.com/repos/neutron-build/neutron/releases/latest"
-	cacheTTL     = 24 * time.Hour
+	githubReleasesURL = "https://api.github.com/repos/neutron-build/neutron/releases"
+	nucleusTagPrefix  = "nucleus/v"
+	cacheTTL          = 24 * time.Hour
 )
 
 // ResolveVersion resolves "latest" to an actual version string, using a local cache.
@@ -44,7 +45,7 @@ func ResolveVersion(version string) (string, error) {
 
 func fetchLatestVersion() (string, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(githubAPIURL)
+	resp, err := client.Get(githubReleasesURL)
 	if err != nil {
 		return "", err
 	}
@@ -54,14 +55,20 @@ func fetchLatestVersion() (string, error) {
 		return "", fmt.Errorf("github API returned %d", resp.StatusCode)
 	}
 
-	var release struct {
+	var releases []struct {
 		TagName string `json:"tag_name"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
 		return "", err
 	}
 
-	return strings.TrimPrefix(release.TagName, "v"), nil
+	for _, r := range releases {
+		if strings.HasPrefix(r.TagName, nucleusTagPrefix) {
+			return strings.TrimPrefix(r.TagName, nucleusTagPrefix), nil
+		}
+	}
+
+	return "", fmt.Errorf("no nucleus release found (no tag matching %s*)", nucleusTagPrefix)
 }
 
 func cacheFilePath() (string, error) {

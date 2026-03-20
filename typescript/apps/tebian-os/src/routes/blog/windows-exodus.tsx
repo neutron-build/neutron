@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function WindowsExodus() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Migration</span>
@@ -48,6 +47,6 @@ export default function WindowsExodus() {
           <p>Leaving Windows isn't just about "using Linux." It is about reclaiming your role as the <strong>Root</strong> of your own machine. It is about choosing a tool that respects your focus, your privacy, and your hardware. The Windows Exodus isn't a trend; it's a return to sanity. One ISO. One menu. Total freedom.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -58,8 +59,61 @@ func BinaryPath(version string) (string, error) {
 	return filepath.Join(binDir, name), nil
 }
 
+// FindLocal searches for an existing Nucleus binary without downloading.
+// Search order:
+//  1. $NEUTRON_NUCLEUS_BIN env var (explicit override)
+//  2. exec.LookPath("nucleus") (binary on PATH)
+//  3. Walk up from cwd looking for nucleus/target/release/nucleus or nucleus/target/debug/nucleus (monorepo dev)
+//  4. ~/.neutron/bin/nucleus (unversioned fallback)
+func FindLocal() (string, error) {
+	// 1. Explicit env var override
+	if p := os.Getenv("NEUTRON_NUCLEUS_BIN"); p != "" {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+		return "", fmt.Errorf("NEUTRON_NUCLEUS_BIN=%q does not exist", p)
+	}
+
+	// 2. Binary on PATH
+	if p, err := exec.LookPath("nucleus"); err == nil {
+		return p, nil
+	}
+
+	// 3. Walk up from cwd looking for monorepo build artifacts
+	if dir, err := os.Getwd(); err == nil {
+		for {
+			for _, profile := range []string{"release", "debug"} {
+				candidate := filepath.Join(dir, "nucleus", "target", profile, "nucleus")
+				if _, err := os.Stat(candidate); err == nil {
+					return candidate, nil
+				}
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+
+	// 4. Unversioned fallback in ~/.neutron/bin/
+	if home, err := os.UserHomeDir(); err == nil {
+		candidate := filepath.Join(home, ".neutron", "bin", "nucleus")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+
+	return "", fmt.Errorf("no local nucleus binary found")
+}
+
 // FindOrDownload returns the path to the Nucleus binary, downloading if needed.
+// It first attempts to find a local binary via FindLocal before downloading.
 func FindOrDownload(version string) (string, error) {
+	if path, err := FindLocal(); err == nil {
+		return path, nil
+	}
+
 	path, err := BinaryPath(version)
 	if err != nil {
 		return "", err
@@ -77,11 +131,11 @@ func FindOrDownload(version string) (string, error) {
 }
 
 func download(version, destPath string) error {
-	archiveURL := fmt.Sprintf("%s/v%s/%s-%s-%s-%s.tar.gz",
+	archiveURL := fmt.Sprintf("%s/nucleus/v%s/%s-v%s-%s-%s.tar.gz",
 		releaseURLBase, version, binaryName, version, platformOS(), platformArch())
-	checksumURL := fmt.Sprintf("%s/v%s/checksums.txt",
+	checksumURL := fmt.Sprintf("%s/nucleus/v%s/checksums.txt",
 		releaseURLBase, version)
-	archiveBaseName := fmt.Sprintf("%s-%s-%s-%s.tar.gz",
+	archiveBaseName := fmt.Sprintf("%s-v%s-%s-%s.tar.gz",
 		binaryName, version, platformOS(), platformArch())
 
 	client := &http.Client{Timeout: downloadTimeout()}

@@ -1,18 +1,20 @@
+import { Link } from "neutron/client";
+
 export function Footer() {
   return (
     <footer class="global-footer">
       <div class="footer-nav">
-        <a href="/">&larr; Home</a>
+        <Link to="/">&larr; Home</Link>
         <span class="nav-div">|</span>
-        <a href="/manifesto">Manifesto</a>
-        <a href="/reasoning">Reasoning</a>
-        <a href="/honors">Honors</a>
-        <a href="/source">Source</a>
+        <Link to="/manifesto">Manifesto</Link>
+        <Link to="/reasoning">Reasoning</Link>
+        <Link to="/honors">Honors</Link>
+        <Link to="/source">Source</Link>
       </div>
       <div class="footer-extended">
-        <a href="/blog">Philosophy</a>
+        <Link to="/blog">Philosophy</Link>
         <span class="ext-sep">&middot;</span>
-        <a href="/docs">Guides</a>
+        <Link to="/docs">Guides</Link>
       </div>
     </footer>
   );

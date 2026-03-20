@@ -7,6 +7,8 @@
 //!
 //! Replaces Supabase Realtime, Debezium+Kafka, pg_cron.
 
+pub mod cdc_wal;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -478,6 +480,30 @@ impl CdcLog {
 
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
+    }
+
+    /// Append a recovered entry from WAL replay with explicit sequence and timestamp.
+    ///
+    /// This preserves the original sequence numbers and timestamps during
+    /// crash recovery, unlike `append()` which auto-generates them.
+    pub fn append_recovered(
+        &mut self,
+        sequence: u64,
+        table: &str,
+        change_type: ChangeType,
+        row_data: HashMap<String, String>,
+        timestamp: u64,
+    ) {
+        self.events.push(CdcLogEntry {
+            sequence,
+            table: table.to_string(),
+            change_type,
+            row_data,
+            timestamp,
+        });
+        if sequence >= self.next_sequence {
+            self.next_sequence = sequence + 1;
+        }
     }
 }
 

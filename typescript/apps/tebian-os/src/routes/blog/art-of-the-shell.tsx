@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function ArtOfTheShell() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Philosophy</span>
@@ -47,6 +46,6 @@ export default function ArtOfTheShell() {
           <p>The Art of the Shell is about taking back command of your computer. It is about choosing <strong>Capability over Comfort.</strong> In Tebian, we don't hide the shell; we celebrate it. We provide the tools (Fuzzel, t-ask, t-fetch) that make the shell accessible, but we leave the power in your hands. One ISO. One menu. One shell. Total control.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

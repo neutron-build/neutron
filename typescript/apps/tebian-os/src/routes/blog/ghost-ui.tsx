@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function GhostUi() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Philosophy</span>
@@ -43,6 +42,6 @@ export default function GhostUi() {
           <p>Your attention is the most valuable resource you have. Don't let your operating system steal it with candy. Choose a Ghost UI that respects your focus and disappears into the background. The only thing you should see on your screen is your work.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

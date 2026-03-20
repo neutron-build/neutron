@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function BloatAnatomy() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Technical</span>
@@ -48,6 +47,6 @@ export default function BloatAnatomy() {
           <p>The Anatomy of Bloat reveals a simple truth: Modern operating systems treat your hardware as a resource to be harvested. Tebian treats your hardware as a tool to be wielded. By removing the layers of abstraction, telemetry, and visual noise, we give you back the machine you paid for.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

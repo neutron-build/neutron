@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function SnapTrap() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Distribution Philosophy</span>
@@ -43,6 +42,6 @@ export default function SnapTrap() {
           <p>The "Snap Trap" is a symptom of a larger problem: Corporate Linux is trying to become macOS. It wants to manage you, instead of being managed <em>by</em> you. Tebian is the return to the source. We take the power of Debian and remove the corporate gatekeepers. No snaps. No forced updates. No traps. One ISO. One menu. Pure Debian.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

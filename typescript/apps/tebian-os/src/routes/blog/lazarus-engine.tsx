@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function LazarusEngine() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Minimalism</span>
@@ -56,6 +55,6 @@ export default function LazarusEngine() {
           <p>The Lazarus Engine isn't just about "saving money." It's about <strong>Efficiency as Art.</strong> By stripping away the layers of abstraction, telemetry, and visual noise, we've created a system that respects the hardware it runs on. Whether it's a $5,000 server or a $5 yard-sale laptop, Tebian provides the same "C-Level" speed. One ISO. One menu. Total resurrection.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

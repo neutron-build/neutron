@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function Upgrade() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Universal</span>
@@ -48,6 +47,6 @@ export default function Upgrade() {
           <p>In ten minutes, that 5-year-old laptop will feel faster than a brand-new machine from the store. That is the power of the Universal Foundation.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

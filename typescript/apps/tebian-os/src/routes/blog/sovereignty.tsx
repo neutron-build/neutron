@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function Sovereignty() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Philosophy</span>
@@ -48,6 +47,6 @@ export default function Sovereignty() {
           <p>Tebian isn't just an OS; it's a fortress for your digital life. We provide the tools to own your infrastructure from the kernel to the cloud.</p>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

@@ -7,7 +7,8 @@ import {
   LoaderData,
   setNavigationState,
 } from "./hooks.js";
-import { getCurrentPath, getCurrentSearch, subscribe } from "./navigate.js";
+import { getCurrentPath, getCurrentSearch, subscribe, navigate } from "./navigate.js";
+import type { RouteHref } from "../core/typed-routes.js";
 import { initIslands } from "./island-runtime.js";
 import { decodeLoaderDataPayload, readInitialLoaderData } from "./serialization.js";
 import { ClientErrorBoundary } from "./error-boundary.js";
@@ -144,6 +145,26 @@ export async function init() {
   
   subscribe((event) => {
     return handleNavigation(event.forceRevalidate === true);
+  });
+
+  // Global click interceptor — makes all same-origin <a> tags do SPA navigation.
+  // Without this, only <Link> components would trigger SPA nav; raw <a> tags
+  // would cause full page reloads (white flash, lost JS state).
+  document.addEventListener("click", (event: MouseEvent) => {
+    if (event.defaultPrevented) return;
+    if (event.button !== 0) return;
+    if (event.metaKey || event.altKey || event.ctrlKey || event.shiftKey) return;
+
+    const target = event.target;
+    const anchor = target instanceof Element ? target.closest("a") : null;
+    if (!anchor) return;
+    if (anchor.target && anchor.target !== "_self") return;
+    if (anchor.hasAttribute("download")) return;
+    if (anchor.origin !== window.location.origin) return;
+
+    const href = anchor.pathname + anchor.search;
+    event.preventDefault();
+    navigate(href as RouteHref);
   });
 }
 

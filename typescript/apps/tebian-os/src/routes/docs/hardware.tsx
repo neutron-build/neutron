@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function Hardware() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Documentation</span>
@@ -52,6 +51,6 @@ export default function Hardware() {
           </section>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }

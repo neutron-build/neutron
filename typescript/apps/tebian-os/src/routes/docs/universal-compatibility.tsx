@@ -1,4 +1,3 @@
-import { PageShell } from "../../components/PageShell";
 import "../../styles/post.css";
 
 export const config = { mode: "static" };
@@ -9,7 +8,7 @@ export function head() {
 
 export default function UniversalCompatibility() {
   return (
-    <PageShell>
+    <>
       <main class="post">
         <header>
           <span class="category">Hardware Manual</span>
@@ -77,6 +76,6 @@ export default function UniversalCompatibility() {
           </section>
         </article>
       </main>
-    </PageShell>
+    </>
   );
 }
