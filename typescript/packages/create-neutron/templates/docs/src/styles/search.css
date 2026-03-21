@@ -1,0 +1,225 @@
+/* Search dialog overlay */
+
+.search-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: min(20vh, 8rem);
+  background: hsla(0, 0%, 0%, 0.6);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.15s ease, visibility 0.15s ease;
+}
+
+.search-overlay.is-open {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* Search modal */
+.search-modal {
+  width: 100%;
+  max-width: 640px;
+  margin: 0 1rem;
+  background: var(--nd-bg);
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius);
+  box-shadow: 0 16px 48px hsla(0, 0%, 0%, 0.25);
+  overflow: hidden;
+  transform: translateY(-0.5rem) scale(0.98);
+  transition: transform 0.15s ease;
+}
+
+.search-overlay.is-open .search-modal {
+  transform: translateY(0) scale(1);
+}
+
+/* Search input area */
+.search-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.875rem 1.25rem;
+  border-bottom: 1px solid var(--nd-border);
+}
+
+.search-input-icon {
+  flex-shrink: 0;
+  width: 1.125rem;
+  height: 1.125rem;
+  color: var(--nd-muted);
+}
+
+.search-input {
+  flex: 1;
+  background: none;
+  border: none;
+  outline: none;
+  font-family: inherit;
+  font-size: 1rem;
+  color: var(--nd-fg);
+}
+
+.search-input::placeholder {
+  color: var(--nd-muted);
+}
+
+.search-input-kbd {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 0.75rem;
+  color: var(--nd-muted);
+  padding: 0.15rem 0.4rem;
+  border: 1px solid var(--nd-border);
+  border-radius: 0.25rem;
+  background: var(--nd-card-bg);
+}
+
+/* Results list */
+.search-results {
+  max-height: 24rem;
+  overflow-y: auto;
+  padding: 0.5rem;
+  scrollbar-width: thin;
+  scrollbar-color: var(--nd-border) transparent;
+}
+
+.search-results::-webkit-scrollbar {
+  width: 4px;
+}
+
+.search-results::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.search-results::-webkit-scrollbar-thumb {
+  background: var(--nd-border);
+  border-radius: 2px;
+}
+
+.search-results:empty::after {
+  content: '';
+  display: none;
+}
+
+.search-no-results {
+  padding: 2rem 1rem;
+  text-align: center;
+  font-size: 0.875rem;
+  color: var(--nd-muted);
+}
+
+.search-result {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  padding: 0.625rem 0.75rem;
+  border-radius: calc(var(--nd-radius) - 2px);
+  cursor: pointer;
+  transition: background 0.1s ease;
+}
+
+.search-result:hover,
+.search-result[aria-selected="true"] {
+  background: var(--nd-card-hover);
+}
+
+.search-result-title {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--nd-fg);
+}
+
+.search-result-path {
+  font-size: 0.75rem;
+  color: var(--nd-muted);
+}
+
+.search-result mark {
+  background: hsla(250, 80%, 67%, 0.25);
+  color: var(--nd-accent);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+/* Search footer */
+.search-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 1.25rem;
+  border-top: 1px solid var(--nd-border);
+  font-size: 0.75rem;
+  color: var(--nd-muted);
+}
+
+.search-footer-keys {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.search-footer-key {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.search-footer-key kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.25rem;
+  height: 1.25rem;
+  padding: 0 0.25rem;
+  font-family: inherit;
+  font-size: 0.625rem;
+  border: 1px solid var(--nd-border);
+  border-radius: 0.2rem;
+  background: var(--nd-card-bg);
+}
+
+/* Trigger button (in header) */
+.search-trigger {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.75rem;
+  border: 1px solid var(--nd-border);
+  border-radius: var(--nd-radius);
+  background: var(--nd-card-bg);
+  color: var(--nd-muted);
+  font-family: inherit;
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
+  min-width: 12rem;
+}
+
+.search-trigger:hover {
+  border-color: var(--nd-muted);
+  color: var(--nd-fg);
+}
+
+.search-trigger-icon {
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
+.search-trigger-text {
+  flex: 1;
+  text-align: left;
+}
+
+.search-trigger-kbd {
+  font-size: 0.75rem;
+  opacity: 0.6;
+}
