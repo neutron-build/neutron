@@ -6,9 +6,9 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 type RuntimeMode = "preact" | "react-compat";
-type TemplateName = "basic" | "marketing" | "app" | "full";
+type TemplateName = "basic" | "marketing" | "app" | "full" | "docs";
 
-const TEMPLATE_NAMES: TemplateName[] = ["basic", "marketing", "app", "full"];
+const TEMPLATE_NAMES: TemplateName[] = ["basic", "marketing", "app", "full", "docs"];
 
 interface CliOptions {
   targetDir: string;
