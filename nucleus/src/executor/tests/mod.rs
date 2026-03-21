@@ -48,3 +48,5 @@ mod test_specialty_persistence;
 mod test_module_wiring;
 mod test_filter_lazy;  // Phase 2C: Lazy materialization for WHERE clause filtering
 mod test_e2e_smoke;    // End-to-end smoke tests exercising all Nucleus capabilities
+mod test_mv_writetime; // Phase 3: Write-time materialized view refresh
+mod test_jsonb;        // Phase 4: JSONB @> containment, GIN indexes, subscript syntax

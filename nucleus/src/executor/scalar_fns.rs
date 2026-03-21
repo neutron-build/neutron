@@ -2999,7 +2999,7 @@ impl Executor {
                     i += 2;
                 }
                 let batch = crate::columnar::ColumnBatch::new(columns);
-                self.columnar_store.write().append(&table, batch);
+                self.columnar_store.write().append_with_dict(&table, batch);
                 Ok(Value::Text("OK".into()))
             }
             "COLUMNAR_COUNT" => {
@@ -3025,8 +3025,8 @@ impl Executor {
                 };
                 let store = self.columnar_store.read();
                 let mut total = 0.0f64;
-                for batch in store.batches(&table) {
-                    total += crate::columnar::aggregate_sum(batch, &col_name);
+                for batch in store.batches_all(&table) {
+                    total += crate::columnar::aggregate_sum(&batch, &col_name);
                 }
                 Ok(Value::Float64(total))
             }
@@ -3044,10 +3044,10 @@ impl Executor {
                 let store = self.columnar_store.read();
                 let mut total_sum = 0.0f64;
                 let mut total_count = 0usize;
-                for batch in store.batches(&table) {
+                for batch in store.batches_all(&table) {
                     if let Some(col) = batch.column(&col_name) {
                         let cnt = crate::columnar::count_non_null(col);
-                        total_sum += crate::columnar::aggregate_sum(batch, &col_name);
+                        total_sum += crate::columnar::aggregate_sum(&batch, &col_name);
                         total_count += cnt;
                     }
                 }
@@ -3070,8 +3070,8 @@ impl Executor {
                 };
                 let store = self.columnar_store.read();
                 let mut result: Option<f64> = None;
-                for batch in store.batches(&table) {
-                    let v = match crate::columnar::aggregate_min(batch, &col_name) {
+                for batch in store.batches_all(&table) {
+                    let v = match crate::columnar::aggregate_min(&batch, &col_name) {
                         crate::columnar::AggValue::Float64(v) => Some(v),
                         crate::columnar::AggValue::Int64(v) => Some(v as f64),
                         crate::columnar::AggValue::Int32(v) => Some(v as f64),
@@ -3099,8 +3099,8 @@ impl Executor {
                 };
                 let store = self.columnar_store.read();
                 let mut result: Option<f64> = None;
-                for batch in store.batches(&table) {
-                    let v = match crate::columnar::aggregate_max(batch, &col_name) {
+                for batch in store.batches_all(&table) {
+                    let v = match crate::columnar::aggregate_max(&batch, &col_name) {
                         crate::columnar::AggValue::Float64(v) => Some(v),
                         crate::columnar::AggValue::Int64(v) => Some(v as f64),
                         crate::columnar::AggValue::Int32(v) => Some(v as f64),

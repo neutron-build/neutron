@@ -71,6 +71,15 @@ pub(crate) struct EncryptedIndexEntry {
     pub index: crate::storage::encrypted_index::EncryptedIndex,
 }
 
+/// A live GIN (Generalized Inverted Index) for a JSONB column.
+/// Maps (path, encoded_leaf) pairs to row IDs for fast containment (`@>`) queries.
+pub(crate) struct GinIndexEntry {
+    pub table_name: String,
+    pub column_name: String,
+    pub col_idx: usize,
+    pub index: crate::document::GinIndex,
+}
+
 /// Cached query result entry.
 pub(crate) struct QueryCacheEntry {
     pub columns: Vec<(String, DataType)>,

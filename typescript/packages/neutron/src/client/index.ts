@@ -21,6 +21,8 @@ export type { Fetcher, FetcherState, FetcherSubmitOptions } from "./fetcher.js";
 export { Island } from "./island.js";
 export { Image, defaultImageLoader } from "./image.js";
 export type { ImageProps, ImageLoader, ImageLoaderArgs } from "./image.js";
+export { Picture } from "./picture.js";
+export type { PictureProps } from "./picture.js";
 export { ViewTransitions } from "./view-transitions.js";
 export { ScrollReveal } from "./scroll-reveal.js";
 export type { ScrollRevealProps } from "./scroll-reveal.js";
