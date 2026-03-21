@@ -541,7 +541,9 @@ impl StorageEngine for ColumnarStorageEngine {
                 return Err(StorageError::TableNotFound(table.to_string()));
             }
             // Single contiguous batch for all rows — the key perf win.
-            store.append(table, rows_to_batch(rows.clone()));
+            // Use append_with_dict so low-cardinality text columns (browser, OS,
+            // country, etc.) get automatic dictionary compression.
+            store.append_with_dict(table, rows_to_batch(rows.clone()));
         }
         if let Some(wal) = &self.wal {
             wal.log_insert_rows(table, &rows)

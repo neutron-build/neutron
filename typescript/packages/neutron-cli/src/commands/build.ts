@@ -94,7 +94,13 @@ export async function build(): Promise<void> {
       configFile: false,
       root: cwd,
       plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
-      ...(runtimeAliases ? { resolve: { alias: runtimeAliases } } : {}),
+      resolve: {
+        ...(runtimeAliases ? { alias: runtimeAliases } : {}),
+        // Deduplicate Preact to prevent multiple instances in the client bundle.
+        // Without this, island hydration fails because hooks from one Preact copy
+        // reference state from another (`Cannot read properties of undefined (reading '__H')`).
+        dedupe: ["preact", "preact/hooks", "preact/compat", "preact/jsx-runtime"],
+      },
       build: {
         outDir: outputDir,
         emptyOutDir: true,

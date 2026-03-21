@@ -7,14 +7,14 @@ A full-stack framework ecosystem. One mental model across web, mobile, desktop, 
 ### Frameworks
 | Directory | Language | Description |
 |-----------|----------|-------------|
-| [`rs/`](./rs) | Rust | Web framework — HTTP/1.1, HTTP/2, HTTP/3, middleware, WebSockets |
-| [`ts/`](./ts) | TypeScript | UI framework — SSR, file-based routing, Preact, signals |
+| [`rust/`](./rust) | Rust | Web framework — HTTP/1.1, HTTP/2, HTTP/3, middleware, WebSockets |
+| [`typescript/`](./typescript) | TypeScript | UI framework — SSR, file-based routing, Preact, signals |
 | [`mojo/`](./mojo) | Mojo | ML library — tensors, quantization, inference pipeline |
 
 ### Database
 | Directory | Language | Description |
 |-----------|----------|-------------|
-| [`nucleus/`](./nucleus) | Rust | Multi-model database — SQL, KV, Vector, Timeseries, Document, Graph, FTS, Geo, Pub/Sub |
+| [`nucleus/`](./nucleus) | Rust | Multi-model database — SQL, KV, Vector, Timeseries, Document, Graph, FTS, Geo, Blob, Streams, Columnar, Datalog, CDC, Pub/Sub |
 | [`studio/`](./studio) | TypeScript | Visual database management — all 14 data models in one UI |
 
 ### Platforms
@@ -30,21 +30,31 @@ A full-stack framework ecosystem. One mental model across web, mobile, desktop, 
 | [`elixir/`](./elixir) | Elixir | BEAM fault-tolerant framework — OTP supervisors, distributed, hot code reload |
 | [`zig/`](./zig) | Zig | 4-layer systems library — zero allocations, comptime SQL |
 | [`python/`](./python) | Python | AI application framework — Starlette + Pydantic + Nucleus client |
+| [`julia/`](./julia) | Julia | Scientific computing — DifferentialEquations, ModelingToolkit, CUDA |
+
+### Verification
+| Directory | Language | Description |
+|-----------|----------|-------------|
+| [`lean4/`](./lean4) | Lean 4 | Machine-checked correctness proofs (MVCC, B-tree, WAL, Raft) |
+| [`quint/`](./quint) | Quint | Protocol verification (Multi-Raft, resharding, distributed tx) |
 
 ## Quick Start
 
 ```bash
 # Rust web framework
-cd rs && cargo build && cargo test
+cd rust && cargo build && cargo test
 
 # TypeScript framework
-cd ts && pnpm install && pnpm dev
+cd typescript && pnpm install && pnpm dev
 
 # Mojo ML library
 cd mojo/neutron-mojo && pixi run mojo build -I src test/test_tensor.mojo -o /tmp/test_tensor
 
 # Nucleus database
 cd nucleus && cargo build && cargo test --lib
+
+# CLI
+cd cli && go build -o bin/neutron . && ./bin/neutron --help
 ```
 
 ## The ORM
@@ -65,12 +75,14 @@ See [`studio/`](./studio) for the full ORM API and [`llms.txt`](./llms.txt) for 
 
 | Workflow | Trigger |
 |----------|---------|
-| `rs.yml` | Changes to `rs/` |
-| `ts.yml` | Changes to `ts/` |
+| `rust.yml` | Changes to `rust/` |
+| `typescript.yml` | Changes to `typescript/` |
 | `nucleus.yml` | Changes to `nucleus/` |
 | `mojo-validation.yml` | Changes to `mojo/` |
+| `cli.yml` | Changes to `cli/` |
+| `desktop.yml` | Changes to `desktop/` |
 
 ## License
 
-- **MIT** — all framework projects (`rs/`, `ts/`, `mojo/`, `studio/`, `go/`, `elixir/`, `zig/`, `python/`, `julia/`, `native/`, `desktop/`)
+- **MIT** — all framework projects (`rust/`, `typescript/`, `mojo/`, `studio/`, `go/`, `elixir/`, `zig/`, `python/`, `julia/`, `native/`, `desktop/`)
 - **BSL 1.1** — Nucleus database engine (`nucleus/`), converts to MIT on 2046-01-01

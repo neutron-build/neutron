@@ -4,12 +4,12 @@ on:
   push:
     branches: [main]
     paths:
-      - "ts/**"
-      - ".github/workflows/ts.yml"
+      - "typescript/**"
+      - ".github/workflows/typescript.yml"
   pull_request:
     paths:
-      - "ts/**"
-      - ".github/workflows/ts.yml"
+      - "typescript/**"
+      - ".github/workflows/typescript.yml"
 
 jobs:
   test:
@@ -28,19 +28,19 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-          cache-dependency-path: ts/pnpm-lock.yaml
+          cache-dependency-path: typescript/pnpm-lock.yaml
 
       - name: Install dependencies
         run: pnpm install
-        working-directory: ts
+        working-directory: typescript
 
       - name: Build
         run: pnpm build
-        working-directory: ts
+        working-directory: typescript
 
       - name: Test
         run: pnpm test
-        working-directory: ts
+        working-directory: typescript
 
   typecheck:
     name: Type Check
@@ -54,8 +54,8 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-          cache-dependency-path: ts/pnpm-lock.yaml
+          cache-dependency-path: typescript/pnpm-lock.yaml
       - run: pnpm install
-        working-directory: ts
+        working-directory: typescript
       - run: pnpm typecheck
-        working-directory: ts
+        working-directory: typescript

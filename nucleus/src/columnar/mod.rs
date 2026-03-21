@@ -356,6 +356,17 @@ pub struct ColumnarStore {
     wal: Option<Arc<ColumnarWal>>,
     /// Table name → MergeTree instance for tables created with ENGINE = MergeTree.
     merge_trees: HashMap<String, MergeTree>,
+    /// Base directory for persistent storage. When set, new MergeTree tables
+    /// use disk-backed cold storage under `data_dir/mergetree/<table>/`.
+    data_dir: Option<PathBuf>,
+    /// Background merge task sender. Cloned to each new MergeTree so inserts
+    /// can queue merge work off the hot path.
+    merge_task_tx: Option<MergeTaskSender>,
+    /// Background merge result receiver. Polled during appends to apply
+    /// completed merges back to their MergeTree owners.
+    merge_result_rx: Option<Arc<parking_lot::Mutex<MergeResultReceiver>>>,
+    /// Flag to signal the background merge worker to stop.
+    merge_running: Option<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for ColumnarStore {
@@ -365,6 +376,8 @@ impl std::fmt::Debug for ColumnarStore {
             .field("dict_columns", &self.dict_columns)
             .field("wal", &self.wal.as_ref().map(|_| "ColumnarWal(...)"))
             .field("merge_trees", &self.merge_trees)
+            .field("data_dir", &self.data_dir)
+            .field("merge_running", &self.merge_running.as_ref().map(|r| r.load(AtomicOrdering::SeqCst)))
             .finish()
     }
 }
@@ -375,6 +388,16 @@ impl Default for ColumnarStore {
     }
 }
 
+impl Drop for ColumnarStore {
+    fn drop(&mut self) {
+        if let Some(ref running) = self.merge_running {
+            running.store(false, AtomicOrdering::SeqCst);
+        }
+        // Drop the sender so the worker's recv channel disconnects
+        self.merge_task_tx.take();
+    }
+}
+
 impl ColumnarStore {
     pub fn new() -> Self {
         Self {
@@ -382,6 +405,10 @@ impl ColumnarStore {
             dict_columns: HashMap::new(),
             wal: None,
             merge_trees: HashMap::new(),
+            data_dir: None,
+            merge_task_tx: None,
+            merge_result_rx: None,
+            merge_running: None,
         }
     }
 
@@ -393,11 +420,23 @@ impl ColumnarStore {
     pub fn open(dir: &Path) -> std::io::Result<Self> {
         let (wal, state) = ColumnarWal::open(dir)?;
         let wal = Arc::new(wal);
+
+        // Spawn background merge worker
+        let (task_tx, task_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let next_part_id = Arc::new(AtomicU64::new(1_000_000)); // high base to avoid collisions
+        let _worker = spawn_merge_worker(task_rx, result_tx, Arc::clone(&running), next_part_id);
+
         let mut store = Self {
             tables: HashMap::new(),
             dict_columns: HashMap::new(),
             wal: Some(Arc::clone(&wal)),
             merge_trees: HashMap::new(),
+            data_dir: Some(dir.to_path_buf()),
+            merge_task_tx: Some(task_tx),
+            merge_result_rx: Some(Arc::new(parking_lot::Mutex::new(result_rx))),
+            merge_running: Some(running),
         };
         // Replay recovered state: CREATE_TABLE entries first, then INSERT_ROWS.
         for (table_name, rows) in state.tables {
@@ -416,6 +455,7 @@ impl ColumnarStore {
     /// (sorted by PK, zone-mapped). Otherwise falls back to raw batch storage.
     /// If a WAL is attached the rows are logged before the in-memory update.
     pub fn append(&mut self, table: &str, batch: ColumnBatch) {
+        self.poll_all_merge_results();
         if let Some(ref wal) = self.wal {
             let rows = batch_to_rows(&batch);
             if let Err(e) = wal.log_insert_rows(table, &rows) {
@@ -481,6 +521,10 @@ impl ColumnarStore {
     }
 
     /// Create a MergeTree-backed table with a specific merge strategy.
+    ///
+    /// When `data_dir` is set (persistent mode), the MergeTree is opened with
+    /// disk-backed cold storage so segments survive restarts. The background
+    /// merge sender is also wired so inserts trigger async merges.
     pub fn create_merge_tree_table_with_strategy(
         &mut self,
         table: &str,
@@ -493,7 +537,25 @@ impl ColumnarStore {
             }
         }
         self.tables.entry(table.to_string()).or_default();
-        self.merge_trees.insert(table.to_string(), MergeTree::new_with_strategy(order_by, strategy));
+
+        let mut mt = if let Some(ref base) = self.data_dir {
+            let mt_dir = base.join("mergetree").join(table);
+            match MergeTree::open(order_by.clone(), &mt_dir) {
+                Ok(tree) => tree,
+                Err(e) => {
+                    eprintln!("columnar: failed to open MergeTree dir for {table}: {e}, falling back to in-memory");
+                    MergeTree::new(order_by)
+                }
+            }
+        } else {
+            MergeTree::new(order_by)
+        };
+        mt.merge_strategy = strategy;
+        mt.set_table_name(table);
+        if let Some(ref tx) = self.merge_task_tx {
+            mt.set_background_merger(tx.clone());
+        }
+        self.merge_trees.insert(table.to_string(), mt);
     }
 
     /// Returns true if the table is backed by a MergeTree.
@@ -546,10 +608,16 @@ impl ColumnarStore {
     /// Logged as DROP + CREATE so replay produces the same empty-table state.
     pub fn clear(&mut self, table: &str) {
         if let Some(mt) = self.merge_trees.get_mut(table) {
-            // Re-create the MergeTree with the same PK columns and strategy
+            // Re-create the MergeTree preserving PK, strategy, data_dir, and merge sender
             let pk = mt.primary_key.clone();
             let strategy = mt.merge_strategy.clone();
+            let data_dir = mt.data_dir.take();
+            let sender = mt.merge_sender.take();
+            let table_name = mt.table_name.clone();
             *mt = MergeTree::new_with_strategy(pk, strategy);
+            mt.data_dir = data_dir;
+            mt.merge_sender = sender;
+            mt.table_name = table_name;
         }
         if let Some(v) = self.tables.get_mut(table) {
             v.clear();
@@ -560,6 +628,21 @@ impl ColumnarStore {
                 if let Err(e) = wal.log_create_table(table) {
                     eprintln!("columnar WAL: failed to log clear(create) {table}: {e}");
                 }
+            }
+        }
+    }
+
+    /// Poll the background merge result channel and apply completed merges
+    /// back to their respective MergeTree owners.
+    fn poll_all_merge_results(&mut self) {
+        let rx = match &self.merge_result_rx {
+            Some(rx) => Arc::clone(rx),
+            None => return,
+        };
+        let rx_guard = rx.lock();
+        while let Ok(result) = rx_guard.try_recv() {
+            if let Some(mt) = self.merge_trees.get_mut(&result.table) {
+                mt.apply_merge_result(result);
             }
         }
     }
@@ -1868,6 +1951,7 @@ impl ColumnarStore {
     ///
     /// Dictionary-encoded columns are stored alongside the batch in `dict_columns`.
     pub fn append_with_dict(&mut self, table: &str, batch: ColumnBatch) {
+        self.poll_all_merge_results();
         if let Some(ref wal) = self.wal {
             let rows = batch_to_rows(&batch);
             if let Err(e) = wal.log_insert_rows(table, &rows) {

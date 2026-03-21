@@ -88,6 +88,12 @@ LAUNCH_PROMPTS.md
 # Deprecated
 mobile-preview/
 
+# Third-party benchmark apps (reference only)
+typescript/benchmarks/remix3-fw/
+
+# Observe (separate project)
+typescript/apps/observe/
+
 # Zig build artifacts
 zig/.zig-cache/
 zig/zig-out/

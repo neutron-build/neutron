@@ -12,6 +12,23 @@ import (
 	"time"
 )
 
+// sqlParam converts a value to a string for use as a pgwire query parameter.
+// Nucleus pgwire reports TEXT (OID 25) for all parameter slots, so pgx
+// must send values as strings. This helper ensures int/int64 values are
+// properly converted.
+func sqlParam(v any) string {
+	switch val := v.(type) {
+	case int:
+		return strconv.Itoa(val)
+	case int64:
+		return strconv.FormatInt(val, 10)
+	case string:
+		return val
+	default:
+		return fmt.Sprintf("%v", val)
+	}
+}
+
 // Migration represents a database migration with up and down SQL.
 type Migration struct {
 	Version int
@@ -68,7 +85,7 @@ func (c *Client) Migrate(ctx context.Context, migrations []Migration) error {
 			return fmt.Errorf("nucleus: migration %d (%s) up: %w", m.Version, m.Name, err)
 		}
 
-		if _, err := tx.Exec(ctx, "INSERT INTO _neutron_migrations (version, name) VALUES ($1, $2)", m.Version, m.Name); err != nil {
+		if _, err := tx.Exec(ctx, "INSERT INTO _neutron_migrations (version, name) VALUES ($1, $2)", sqlParam(m.Version), m.Name); err != nil {
 			_ = tx.Rollback(ctx)
 			return fmt.Errorf("nucleus: record migration %d: %w", m.Version, err)
 		}
@@ -114,7 +131,7 @@ func (c *Client) MigrateDown(ctx context.Context, migrations []Migration, steps 
 			return fmt.Errorf("nucleus: migration %d (%s) down: %w", m.Version, m.Name, err)
 		}
 
-		if _, err := tx.Exec(ctx, "DELETE FROM _neutron_migrations WHERE version = $1", m.Version); err != nil {
+		if _, err := tx.Exec(ctx, "DELETE FROM _neutron_migrations WHERE version = $1", sqlParam(m.Version)); err != nil {
 			_ = tx.Rollback(ctx)
 			return fmt.Errorf("nucleus: remove migration record %d: %w", m.Version, err)
 		}
