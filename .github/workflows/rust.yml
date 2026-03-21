@@ -4,12 +4,12 @@ on:
   push:
     branches: [main]
     paths:
-      - "rs/**"
-      - ".github/workflows/rs.yml"
+      - "rust/**"
+      - ".github/workflows/rust.yml"
   pull_request:
     paths:
-      - "rs/**"
-      - ".github/workflows/rs.yml"
+      - "rust/**"
+      - ".github/workflows/rust.yml"
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,15 +28,15 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rs
+          workspaces: rust
 
       - name: Build
         run: cargo build --workspace
-        working-directory: rs
+        working-directory: rust
 
       - name: Test
         run: cargo test --workspace
-        working-directory: rs
+        working-directory: rust
 
   clippy:
     name: Clippy
@@ -48,6 +48,6 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rs
+          workspaces: rust
       - run: cargo clippy --workspace -- -D warnings
-        working-directory: rs
+        working-directory: rust
