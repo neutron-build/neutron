@@ -85,6 +85,9 @@ struct MatViewSer {
     sql: String,
     /// Column (name, type_str) pairs — rows are NOT persisted, user must REFRESH.
     columns: Vec<(String, String)>,
+    /// Base tables this MV depends on (for write-time refresh).
+    #[serde(default)]
+    source_tables: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +221,7 @@ impl MetaPersistence {
                 columns: mv.columns.iter()
                     .map(|(n, dt)| (n.clone(), dtype_to_str(dt)))
                     .collect(),
+                source_tables: mv.source_tables.clone(),
             }).collect(),
 
             sequences: sequences.iter().map(|(name, mu)| {
@@ -328,6 +332,7 @@ impl MetaPersistence {
                 sql: mv.sql,
                 columns,
                 rows: vec![],   // rows are not persisted; user must REFRESH
+                source_tables: mv.source_tables,
             });
         }
 

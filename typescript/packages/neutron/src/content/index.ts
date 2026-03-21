@@ -4,7 +4,9 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { evaluate } from "@mdx-js/mdx";
 import matter from "gray-matter";
-import { marked } from "marked";
+import { Marked } from "marked";
+import type { NeutronMarkdownConfig } from "../config.js";
+import { markedShikiExtension } from "./syntax-highlight.js";
 import YAML from "yaml";
 import { h } from "preact";
 import type * as preact from "preact";
@@ -219,7 +221,7 @@ export async function prepareContentCollections(
 
 async function loadCollectionStore(
   rootDir: string,
-  options: { force?: boolean } = {}
+  options: { force?: boolean; markdownConfig?: NeutronMarkdownConfig } = {}
 ): Promise<CollectionStore> {
   const fingerprint = await computeContentFingerprint(rootDir);
   const cached = cacheByRoot.get(rootDir);
@@ -253,7 +255,8 @@ async function loadCollectionStore(
     collections[collectionName] = await readCollectionEntries(
       rootDir,
       collectionName,
-      definition
+      definition,
+      options.markdownConfig
     );
   }
 
@@ -418,7 +421,8 @@ async function loadManifestStore(rootDir: string): Promise<CollectionStore | nul
 async function readCollectionEntries(
   rootDir: string,
   collectionName: string,
-  definition: CollectionDefinition<unknown>
+  definition: CollectionDefinition<unknown>,
+  markdownConfig?: NeutronMarkdownConfig
 ): Promise<Array<CollectionEntry<unknown>>> {
   const collectionDir = path.join(rootDir, "src", "content", collectionName);
   if (!fs.existsSync(collectionDir)) {
@@ -493,7 +497,7 @@ async function readCollectionEntries(
       const parsed = matter(raw);
       const data = definition.schema.parse(parsed.data);
       const sourceType = ext === ".mdx" ? "mdx" : "markdown";
-      const rendered = await renderMarkup(parsed.content, sourceType, relativeFilePath);
+      const rendered = await renderMarkup(parsed.content, sourceType, relativeFilePath, markdownConfig);
 
       entries.push(createEntry({
         id,
@@ -613,37 +617,52 @@ function parseDataFile(raw: string, ext: string): unknown {
 async function renderMarkup(
   source: string,
   sourceType: "markdown" | "mdx",
-  filePathForErrors?: string
+  filePathForErrors?: string,
+  markdownConfig?: NeutronMarkdownConfig
 ): Promise<{
   html: string;
   renderFactory?: () => Promise<{ Content: preact.FunctionComponent<any> }>;
 }> {
   if (sourceType === "mdx") {
-    const compiled = await compileMdx(source, filePathForErrors);
+    const compiled = await compileMdx(source, filePathForErrors, markdownConfig);
     return {
       html: compiled.html,
       renderFactory: compiled.renderFactory,
     };
   }
 
-  const html = await marked.parse(source);
+  const markedInstance = new Marked();
+  if (markdownConfig?.syntaxHighlight !== false) {
+    const theme = (markdownConfig?.syntaxHighlight && markdownConfig.syntaxHighlight.theme) || "github-dark";
+    markedInstance.use(markedShikiExtension(theme));
+  }
+
+  const html = await markedInstance.parse(source);
   return { html: typeof html === "string" ? html : String(html) };
 }
 
 async function compileMdx(
   source: string,
-  filePathForErrors?: string
+  filePathForErrors?: string,
+  markdownConfig?: NeutronMarkdownConfig
 ): Promise<{
   html: string;
   renderFactory: () => Promise<{ Content: preact.FunctionComponent<any> }>;
 }> {
   let evaluated: { default?: preact.FunctionComponent<any> };
   try {
-    evaluated = (await evaluate(source, {
+    const mdxOptions: Record<string, unknown> = {
       ...preactJsxRuntime,
       format: "mdx",
       development: false,
-    })) as { default?: preact.FunctionComponent<any> };
+    };
+    if (markdownConfig?.remarkPlugins?.length) {
+      mdxOptions.remarkPlugins = markdownConfig.remarkPlugins;
+    }
+    if (markdownConfig?.rehypePlugins?.length) {
+      mdxOptions.rehypePlugins = markdownConfig.rehypePlugins;
+    }
+    evaluated = (await evaluate(source, mdxOptions as any)) as { default?: preact.FunctionComponent<any> };
   } catch (error) {
     const location =
       typeof filePathForErrors === "string" && filePathForErrors.length > 0

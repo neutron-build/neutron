@@ -22,6 +22,8 @@ export {
   type ContentCollectionMap,
   type PrepareContentCollectionsOptions,
 } from "./content/index.js";
+export { calculateReadingTime, type ReadingTimeResult } from "./content/reading-time.js";
+export { extractToc, type TocEntry } from "./content/toc.js";
 export {
   serializeTransportData,
   deserializeTransportData,
@@ -61,6 +63,7 @@ export {
   resolveRuntimeAliases,
   resolveRuntimeNoExternal,
   type NeutronConfig,
+  type NeutronImageConfig,
   type NeutronRedirectRule,
   type NeutronRewriteRule,
   type NeutronHeaderRule,
@@ -193,6 +196,8 @@ export type { FormProps, LinkProps, NavLinkProps } from "./client/components.js"
 export { Island } from "./client/island.js";
 export { Image, defaultImageLoader } from "./client/image.js";
 export type { ImageProps, ImageLoader, ImageLoaderArgs } from "./client/image.js";
+export { Picture } from "./client/picture.js";
+export type { PictureProps } from "./client/picture.js";
 export type { ErrorBoundaryFallbackProps } from "./client/error-boundary.js";
 export { ViewTransitions } from "./client/view-transitions.js";
 export { ScrollReveal } from "./client/scroll-reveal.js";
@@ -261,3 +266,4 @@ export {
   type I18nOptions,
   type ResolvedLocalePath,
 } from "./core/i18n.js";
+export { buildRssFeed, type RssItem, type RssOptions } from "./core/rss.js";

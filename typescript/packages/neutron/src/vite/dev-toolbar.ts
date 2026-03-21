@@ -1,4 +1,5 @@
 import type { Route } from "../core/types.js";
+import { generateErrorOverlayScript } from "./error-overlay.js";
 
 export function generateDevToolbarModule(routes: Route[]): string {
   const routesJson = JSON.stringify(
@@ -295,6 +296,22 @@ class NeutronDevToolbar extends HTMLElement {
         if (this._errors.length > 50) this._errors.length = 50;
         this._refreshBarStats();
         if (this._activePanel === 'errors') this._refreshPanel('errors');
+        // Show the error overlay
+        if (window.__NEUTRON_ERROR_OVERLAY__) {
+          window.__NEUTRON_ERROR_OVERLAY__.show(data);
+        }
+      });
+
+      import.meta.hot.on('neutron:error-resolved', () => {
+        if (window.__NEUTRON_ERROR_OVERLAY__) {
+          window.__NEUTRON_ERROR_OVERLAY__.dismiss();
+        }
+      });
+
+      import.meta.hot.on('vite:beforeUpdate', () => {
+        if (window.__NEUTRON_ERROR_OVERLAY__) {
+          window.__NEUTRON_ERROR_OVERLAY__.dismiss();
+        }
       });
     }
   }
@@ -801,5 +818,8 @@ if (!document.querySelector('neutron-dev-toolbar')) {
 if (import.meta.hot) {
   import.meta.hot.accept();
 }
+
+// ── Error Overlay ──
+${generateErrorOverlayScript()}
 `;
 }

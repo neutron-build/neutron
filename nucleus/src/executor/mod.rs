@@ -131,6 +131,8 @@ pub struct Executor {
     /// In-memory hash indexes: (table_name, column_name) → HashIndex.
     #[cfg(feature = "server")]
     hash_indexes: DashMap<(String, String), crate::storage::btree::HashIndex>,
+    /// Live GIN indexes for JSONB columns: index_name → GinIndexEntry.
+    gin_indexes: parking_lot::RwLock<HashMap<String, GinIndexEntry>>,
     /// Sync cache of table column metadata: table_name → [(col_name, DataType)].
     table_columns: parking_lot::RwLock<HashMap<String, Vec<(String, DataType)>>>,
     /// Persistent statistics store populated by ANALYZE, used by EXPLAIN / query planner.
@@ -205,6 +207,10 @@ pub struct Executor {
     /// View dependency tracking: table_name → set of view names that reference it.
     /// Used to prevent DROP TABLE when views depend on it.
     view_deps: parking_lot::RwLock<HashMap<String, HashSet<String>>>,
+    /// Materialized view dependency tracking: base_table → [mv_name, ...].
+    /// Used for write-time MV refresh: when a row is inserted into a base table,
+    /// all dependent MVs are automatically updated.
+    mv_deps: RwLock<HashMap<String, Vec<String>>>,
     /// Path for persisting ANALYZE statistics (None = in-memory only).
     stats_path: Option<std::path::PathBuf>,
     /// Memory budget for query execution — prevents OOM from giant JOINs / sorts.
@@ -298,6 +304,7 @@ impl Executor {
             btree_indexes: DashMap::new(),
             #[cfg(feature = "server")]
             hash_indexes: DashMap::new(),
+            gin_indexes: parking_lot::RwLock::new(HashMap::new()),
             table_columns: parking_lot::RwLock::new(HashMap::new()),
             stats_store: Arc::new(planner::StatsStore::new()),
             #[cfg(feature = "server")]
@@ -348,6 +355,7 @@ impl Executor {
             retention_engine: parking_lot::RwLock::new(crate::compliance::RetentionEngine::new()),
             query_cache: parking_lot::RwLock::new(HashMap::new()),
             view_deps: parking_lot::RwLock::new(HashMap::new()),
+            mv_deps: RwLock::new(HashMap::new()),
             stats_path: None,
             query_memory: Arc::new(crate::allocator::MemoryBudget::new(
                 "query_executor",
@@ -580,6 +588,15 @@ impl Executor {
             *self.views.write().await = loaded.views;
         }
         if !loaded.materialized_views.is_empty() {
+            // Rebuild mv_deps from loaded MV definitions.
+            {
+                let mut deps = self.mv_deps.write().await;
+                for mv in loaded.materialized_views.values() {
+                    for src in &mv.source_tables {
+                        deps.entry(src.clone()).or_default().push(mv.name.clone());
+                    }
+                }
+            }
             *self.materialized_views.write().await = loaded.materialized_views;
         }
         if !loaded.triggers.is_empty() {
@@ -2056,6 +2073,16 @@ impl Executor {
                 let view_name = trimmed[26..].trim().trim_end_matches(';').to_string();
                 return Ok(vec![self.execute_refresh_matview(&view_name).await?]);
             }
+            // DROP MATERIALIZED VIEW [IF EXISTS] <name>
+            if upper.starts_with("DROP MATERIALIZED VIEW ") {
+                let rest = trimmed[23..].trim().trim_end_matches(';');
+                let (if_exists, view_name) = if rest.to_uppercase().starts_with("IF EXISTS ") {
+                    (true, rest[10..].trim().to_lowercase())
+                } else {
+                    (false, rest.to_lowercase())
+                };
+                return Ok(vec![self.execute_drop_matview(&view_name, if_exists).await?]);
+            }
             // SHOW TABLE STATS <tablename> — display per-column statistics from ANALYZE.
             if upper.starts_with("SHOW TABLE STATS ") {
                 let table_name = trimmed[17..].trim().trim_end_matches(';').to_lowercase();
@@ -2374,6 +2401,8 @@ impl Executor {
             Statement::CreateView(create_view) if create_view.materialized => {
                 let view_name = create_view.name.to_string();
                 let sql = create_view.query.to_string();
+                // Extract source table references for write-time MV refresh.
+                let source_tables = Self::extract_table_refs(&create_view.query);
                 let query_result = self.execute_query(*create_view.query).await?;
                 if let ExecResult::Select { columns, rows } = query_result {
                     let mv = MaterializedViewDef {
@@ -2381,8 +2410,16 @@ impl Executor {
                         sql,
                         columns: columns.clone(),
                         rows,
+                        source_tables: source_tables.clone(),
                     };
-                    self.materialized_views.write().await.insert(view_name, mv);
+                    self.materialized_views.write().await.insert(view_name.clone(), mv);
+                    // Register write-time MV dependencies.
+                    {
+                        let mut deps = self.mv_deps.write().await;
+                        for src in &source_tables {
+                            deps.entry(src.clone()).or_default().push(view_name.clone());
+                        }
+                    }
                     Ok(ExecResult::Command {
                         tag: "CREATE MATERIALIZED VIEW".into(),
                         rows_affected: 0,

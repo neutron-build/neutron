@@ -8,13 +8,18 @@
 //!
 //! Replaces ClickHouse for OLAP workloads within Nucleus.
 
+pub mod segment;
+
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use regex::Regex;
 
 use crate::storage::columnar_wal::ColumnarWal;
 use crate::types::{Row, Value};
+
+use segment::{ColdPartInfo, SegmentReader, SegmentWriter, estimate_batch_size, DEFAULT_COLD_THRESHOLD_BYTES};
 
 // ============================================================================
 // Column types
@@ -349,6 +354,8 @@ pub struct ColumnarStore {
     dict_columns: HashMap<String, HashMap<String, DictColumn>>,
     /// WAL for crash-recovery. None = purely in-memory.
     wal: Option<Arc<ColumnarWal>>,
+    /// Table name → MergeTree instance for tables created with ENGINE = MergeTree.
+    merge_trees: HashMap<String, MergeTree>,
 }
 
 impl std::fmt::Debug for ColumnarStore {
@@ -357,6 +364,7 @@ impl std::fmt::Debug for ColumnarStore {
             .field("tables", &self.tables)
             .field("dict_columns", &self.dict_columns)
             .field("wal", &self.wal.as_ref().map(|_| "ColumnarWal(...)"))
+            .field("merge_trees", &self.merge_trees)
             .finish()
     }
 }
@@ -373,6 +381,7 @@ impl ColumnarStore {
             tables: HashMap::new(),
             dict_columns: HashMap::new(),
             wal: None,
+            merge_trees: HashMap::new(),
         }
     }
 
@@ -388,6 +397,7 @@ impl ColumnarStore {
             tables: HashMap::new(),
             dict_columns: HashMap::new(),
             wal: Some(Arc::clone(&wal)),
+            merge_trees: HashMap::new(),
         };
         // Replay recovered state: CREATE_TABLE entries first, then INSERT_ROWS.
         for (table_name, rows) in state.tables {
@@ -402,6 +412,8 @@ impl ColumnarStore {
 
     /// Append a batch to a table.
     ///
+    /// If the table has a MergeTree backing store, the batch is inserted there
+    /// (sorted by PK, zone-mapped). Otherwise falls back to raw batch storage.
     /// If a WAL is attached the rows are logged before the in-memory update.
     pub fn append(&mut self, table: &str, batch: ColumnBatch) {
         if let Some(ref wal) = self.wal {
@@ -410,20 +422,44 @@ impl ColumnarStore {
                 eprintln!("columnar WAL: failed to log insert_rows for {table}: {e}");
             }
         }
-        self.tables
-            .entry(table.to_string())
-            .or_default()
-            .push(batch);
+        if let Some(mt) = self.merge_trees.get_mut(table) {
+            mt.insert(batch);
+        } else {
+            self.tables
+                .entry(table.to_string())
+                .or_default()
+                .push(batch);
+        }
     }
 
-    /// Get all batches for a table.
+    /// Get all batches for a table as a slice reference.
+    ///
+    /// For raw (non-MergeTree) tables this returns the stored Vec<ColumnBatch>.
+    /// For MergeTree-backed tables, use `batches_all()` instead (this returns
+    /// an empty slice because MergeTree data lives in parts, not in `tables`).
     pub fn batches(&self, table: &str) -> &[ColumnBatch] {
         self.tables.get(table).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
+    /// Get all batches for a table, including MergeTree-backed tables.
+    ///
+    /// Returns owned Vec. For MergeTree-backed tables, cold parts are loaded
+    /// from disk as needed.
+    pub fn batches_all(&self, table: &str) -> Vec<ColumnBatch> {
+        if let Some(mt) = self.merge_trees.get(table) {
+            mt.scan_all()
+        } else {
+            self.tables.get(table).cloned().unwrap_or_default()
+        }
+    }
+
     /// Total row count across all batches for a table.
     pub fn row_count(&self, table: &str) -> usize {
-        self.batches(table).iter().map(|b| b.row_count).sum()
+        if let Some(mt) = self.merge_trees.get(table) {
+            mt.total_rows()
+        } else {
+            self.batches(table).iter().map(|b| b.row_count).sum()
+        }
     }
 
     /// Ensure a table entry exists (creates an empty table if absent).
@@ -436,8 +472,64 @@ impl ColumnarStore {
         self.tables.entry(table.to_string()).or_default();
     }
 
+    /// Create a MergeTree-backed table with the given primary key columns.
+    ///
+    /// The table entry is also created in `tables` for compatibility, but
+    /// all insert/scan operations will be routed through the MergeTree.
+    pub fn create_merge_tree_table(&mut self, table: &str, order_by: Vec<String>) {
+        self.create_merge_tree_table_with_strategy(table, order_by, MergeStrategy::Default);
+    }
+
+    /// Create a MergeTree-backed table with a specific merge strategy.
+    pub fn create_merge_tree_table_with_strategy(
+        &mut self,
+        table: &str,
+        order_by: Vec<String>,
+        strategy: MergeStrategy,
+    ) {
+        if let Some(ref wal) = self.wal {
+            if let Err(e) = wal.log_create_table(table) {
+                eprintln!("columnar WAL: failed to log create_table {table}: {e}");
+            }
+        }
+        self.tables.entry(table.to_string()).or_default();
+        self.merge_trees.insert(table.to_string(), MergeTree::new_with_strategy(order_by, strategy));
+    }
+
+    /// Returns true if the table is backed by a MergeTree.
+    pub fn is_merge_tree(&self, table: &str) -> bool {
+        self.merge_trees.contains_key(table)
+    }
+
+    /// Get the MergeTree for a table (if it exists).
+    pub fn get_merge_tree(&self, table: &str) -> Option<&MergeTree> {
+        self.merge_trees.get(table)
+    }
+
+    /// Get a mutable reference to the MergeTree for a table (if it exists).
+    pub fn get_merge_tree_mut(&mut self, table: &str) -> Option<&mut MergeTree> {
+        self.merge_trees.get_mut(table)
+    }
+
+    /// Scan a MergeTree-backed table with zone map pruning.
+    pub fn scan_merge_tree(
+        &self,
+        table: &str,
+        predicate_col: &str,
+        op: CmpOp,
+        value: &ScalarValue,
+    ) -> Vec<ColumnBatch> {
+        if let Some(mt) = self.merge_trees.get(table) {
+            mt.scan(predicate_col, op, value)
+        } else {
+            // Fallback: return all batches (no pruning for raw tables)
+            self.tables.get(table).cloned().unwrap_or_default()
+        }
+    }
+
     /// Remove a table and all its batches. Returns true if the table existed.
     pub fn drop_table(&mut self, table: &str) -> bool {
+        self.merge_trees.remove(table);
         let existed = self.tables.remove(table).is_some();
         if existed {
             if let Some(ref wal) = self.wal {
@@ -453,6 +545,12 @@ impl ColumnarStore {
     ///
     /// Logged as DROP + CREATE so replay produces the same empty-table state.
     pub fn clear(&mut self, table: &str) {
+        if let Some(mt) = self.merge_trees.get_mut(table) {
+            // Re-create the MergeTree with the same PK columns and strategy
+            let pk = mt.primary_key.clone();
+            let strategy = mt.merge_strategy.clone();
+            *mt = MergeTree::new_with_strategy(pk, strategy);
+        }
         if let Some(v) = self.tables.get_mut(table) {
             v.clear();
             if let Some(ref wal) = self.wal {
@@ -468,12 +566,18 @@ impl ColumnarStore {
 
     /// Returns true if the table exists in this store.
     pub fn table_exists(&self, table: &str) -> bool {
-        self.tables.contains_key(table)
+        self.tables.contains_key(table) || self.merge_trees.contains_key(table)
     }
 
     /// Return all table names (order unspecified).
     pub fn table_names(&self) -> Vec<String> {
-        self.tables.keys().cloned().collect()
+        let mut names: Vec<String> = self.tables.keys().cloned().collect();
+        for k in self.merge_trees.keys() {
+            if !names.contains(k) {
+                names.push(k.clone());
+            }
+        }
+        names
     }
 }
 
@@ -710,13 +814,14 @@ impl ColumnarStore {
     /// Scan a table, applying a text predicate on the given column.
     ///
     /// Returns filtered batches where only matching rows are retained.
+    /// Works with both raw and MergeTree-backed tables.
     pub fn scan_with_predicate(
         &self,
         table: &str,
         column: &str,
         predicate: &TextPredicate,
     ) -> Vec<ColumnBatch> {
-        self.batches(table)
+        self.batches_all(table)
             .iter()
             .map(|batch| {
                 let mask = match batch.column(column) {
@@ -1793,7 +1898,11 @@ impl ColumnarStore {
                 }
             }
         }
-        self.tables.entry(table.to_string()).or_default().push(batch);
+        if let Some(mt) = self.merge_trees.get_mut(table) {
+            mt.insert(batch);
+        } else {
+            self.tables.entry(table.to_string()).or_default().push(batch);
+        }
     }
 
     /// Retrieve dictionary-encoded columns for a table, if any.
@@ -1833,8 +1942,25 @@ impl ColumnarStore {
 // Gap 10: MergeTree Storage Engine
 // ============================================================================
 
+/// Merge strategy controlling how duplicate PK rows are handled during compaction.
+#[derive(Debug, Clone)]
+pub enum MergeStrategy {
+    /// Standard MergeTree — keeps all rows, just sorts and compacts.
+    Default,
+    /// ReplacingMergeTree — dedup by PK, keeps latest version.
+    /// The version_column is used to determine which row wins when PKs match.
+    Replacing { version_column: Option<String> },
+    /// AggregatingMergeTree — partial aggregate during merge.
+    /// Columns not in PK are aggregated (SUM for numerics, MAX for strings).
+    Aggregating {
+        group_columns: Vec<String>,
+        sum_columns: Vec<String>,
+        count_columns: Vec<String>,
+    },
+}
+
 /// A "part" in the MergeTree — a sorted chunk of data.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MergeTreePart {
     /// Unique part ID.
     pub id: u64,
@@ -1848,23 +1974,163 @@ pub struct MergeTreePart {
     pub compressed: Option<Vec<(String, CompressedColumn)>>,
 }
 
+// ============================================================================
+// Background Merge Infrastructure
+// ============================================================================
+
+/// A task describing a set of parts that should be merged in the background.
+#[derive(Debug)]
+pub struct MergeTask {
+    /// The table name this merge belongs to.
+    pub table: String,
+    /// Parts to merge (cloned from the MergeTree).
+    pub parts: Vec<MergeTreePart>,
+    /// The IDs of the source parts that were selected for merging.
+    pub source_part_ids: Vec<u64>,
+    /// Primary key columns for sort-merge.
+    pub primary_key: Vec<String>,
+    /// Merge strategy to apply during this merge.
+    pub merge_strategy: MergeStrategy,
+}
+
+/// Result of a completed background merge, ready to be applied back.
+#[derive(Debug)]
+pub struct MergeResult {
+    /// The table name this merge belongs to.
+    pub table: String,
+    /// IDs of the source parts that were merged (to remove).
+    pub source_part_ids: Vec<u64>,
+    /// The newly merged part.
+    pub merged_part: MergeTreePart,
+}
+
+/// Sender half for queuing merge tasks to a background worker.
+pub type MergeTaskSender = std::sync::mpsc::Sender<MergeTask>;
+/// Receiver half for consuming merge tasks in a background worker.
+pub type MergeTaskReceiver = std::sync::mpsc::Receiver<MergeTask>;
+
+/// Sender half for returning merge results from the background worker.
+pub type MergeResultSender = std::sync::mpsc::Sender<MergeResult>;
+/// Receiver half for consuming merge results in the MergeTree owner.
+pub type MergeResultReceiver = std::sync::mpsc::Receiver<MergeResult>;
+
+/// Execute a merge task and produce a MergeResult.
+///
+/// This is the pure computation that runs off the hot path. It sorts,
+/// combines, and compresses the source parts into a single merged part.
+pub fn execute_merge_task(task: MergeTask, new_part_id: u64) -> MergeResult {
+    // Merge all source parts by iteratively merge-sorting pairs
+    let mut batches: Vec<ColumnBatch> = task.parts.into_iter().map(|p| p.data).collect();
+
+    let sorted_batch = if batches.is_empty() {
+        ColumnBatch::new(vec![])
+    } else {
+        let mut acc = batches.remove(0);
+        for b in batches {
+            acc = merge_sorted_batches(&acc, &b, &task.primary_key);
+        }
+        acc
+    };
+
+    // Apply merge strategy to the sorted result
+    let merged_batch = match &task.merge_strategy {
+        MergeStrategy::Default => sorted_batch,
+        MergeStrategy::Replacing { version_column } => {
+            merge_replacing(&sorted_batch, &task.primary_key, version_column.as_deref())
+        }
+        MergeStrategy::Aggregating { group_columns: _, sum_columns, count_columns } => {
+            merge_aggregating(&sorted_batch, &task.primary_key, sum_columns, count_columns)
+        }
+    };
+
+    let row_count = merged_batch.columns.first().map(|(_, c)| c.len()).unwrap_or(0);
+    let zone_map = ZoneMap::from_batch(&merged_batch);
+
+    // Compress merged data using adaptive codec selection
+    let compressed = merged_batch.columns.iter()
+        .map(|(name, col)| (name.clone(), compress_adaptive(col)))
+        .collect::<Vec<_>>();
+
+    let merged_part = MergeTreePart {
+        id: new_part_id,
+        data: merged_batch,
+        row_count,
+        zone_map,
+        compressed: Some(compressed),
+    };
+
+    MergeResult {
+        table: task.table,
+        source_part_ids: task.source_part_ids,
+        merged_part,
+    }
+}
+
+/// Spawn a background merge worker thread that processes merge tasks.
+///
+/// The worker reads `MergeTask` from `task_rx`, executes the merge, and
+/// sends the `MergeResult` back via `result_tx`. The worker stops when
+/// the task channel is closed or `running` is set to false.
+///
+/// Returns a `JoinHandle` for the worker thread.
+pub fn spawn_merge_worker(
+    task_rx: MergeTaskReceiver,
+    result_tx: MergeResultSender,
+    running: Arc<AtomicBool>,
+    next_part_id: Arc<AtomicU64>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("nucleus-merge-worker".into())
+        .spawn(move || {
+            while running.load(AtomicOrdering::SeqCst) {
+                match task_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(task) => {
+                        let part_id = next_part_id.fetch_add(1, AtomicOrdering::SeqCst);
+                        let result = execute_merge_task(task, part_id);
+                        if result_tx.send(result).is_err() {
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })
+        .expect("failed to spawn merge worker thread")
+}
+
 /// MergeTree storage engine — LSM-tree inspired columnar storage with:
 /// - Sorted data parts
-/// - Background part merges
+/// - Background part merges via execute_merge_task()
 /// - Partition pruning via zone maps
 /// - Primary key ordering
+/// - Hot/cold tiering: small parts stay in memory, large parts flush to disk
 #[derive(Debug)]
 pub struct MergeTree {
     /// Primary key columns (data is sorted by these columns).
     pub primary_key: Vec<String>,
-    /// Immutable parts, sorted by part ID.
+    /// Hot parts — in-memory, below the cold threshold.
     parts: Vec<MergeTreePart>,
+    /// Cold parts — flushed to disk segment files. Only zone maps are in memory.
+    cold_parts: Vec<ColdPartInfo>,
     /// Next part ID.
     next_part_id: u64,
     /// Maximum rows per part before splitting on insert.
     pub max_part_rows: usize,
     /// Maximum number of parts before triggering a merge.
     pub max_parts: usize,
+    /// Data directory for segment files. `None` = in-memory only.
+    pub data_dir: Option<PathBuf>,
+    /// Size threshold in bytes above which a part is flushed to disk.
+    pub cold_threshold_bytes: usize,
+    /// Optional sender for queuing merge tasks to a background worker.
+    merge_sender: Option<MergeTaskSender>,
+    /// Table name for background merge task identification.
+    table_name: String,
+    /// IDs of parts currently being merged in the background.
+    merging_part_ids: Vec<u64>,
+    /// Merge strategy (Default, Replacing, or Aggregating).
+    pub merge_strategy: MergeStrategy,
 }
 
 impl MergeTree {
@@ -1872,10 +2138,74 @@ impl MergeTree {
         MergeTree {
             primary_key,
             parts: Vec::new(),
+            cold_parts: Vec::new(),
             next_part_id: 1,
             max_part_rows: 8192,
             max_parts: 10,
+            data_dir: None,
+            cold_threshold_bytes: DEFAULT_COLD_THRESHOLD_BYTES,
+            merge_sender: None,
+            table_name: String::new(),
+            merging_part_ids: Vec::new(),
+            merge_strategy: MergeStrategy::Default,
         }
+    }
+
+    pub fn new_with_strategy(primary_key: Vec<String>, strategy: MergeStrategy) -> Self {
+        let mut tree = Self::new(primary_key);
+        tree.merge_strategy = strategy;
+        tree
+    }
+
+    pub fn set_table_name(&mut self, name: &str) { self.table_name = name.to_string(); }
+    pub fn set_background_merger(&mut self, sender: MergeTaskSender) { self.merge_sender = Some(sender); }
+    pub fn clear_background_merger(&mut self) { self.merge_sender = None; }
+    pub fn has_background_merger(&self) -> bool { self.merge_sender.is_some() }
+
+    pub fn poll_merge_results(&mut self, result_rx: &MergeResultReceiver) {
+        while let Ok(result) = result_rx.try_recv() {
+            self.apply_merge_result(result);
+        }
+    }
+
+    fn queue_background_merge(&mut self) {
+        let sender = match &self.merge_sender { Some(s) => s, None => return };
+        let mut candidates: Vec<(usize, usize)> = self.parts.iter().enumerate()
+            .filter(|(_, p)| !self.merging_part_ids.contains(&p.id))
+            .map(|(i, p)| (i, p.row_count)).collect();
+        candidates.sort_by_key(|&(_, s)| s);
+        if candidates.len() < 2 { return; }
+        let (idx_a, idx_b) = (candidates[0].0, candidates[1].0);
+        let source_ids = vec![self.parts[idx_a].id, self.parts[idx_b].id];
+        let task = MergeTask {
+            table: self.table_name.clone(),
+            parts: vec![self.parts[idx_a].clone(), self.parts[idx_b].clone()],
+            source_part_ids: source_ids.clone(),
+            primary_key: self.primary_key.clone(),
+            merge_strategy: self.merge_strategy.clone(),
+        };
+        if sender.send(task).is_ok() { self.merging_part_ids.extend(source_ids); }
+    }
+
+    /// Apply a completed merge result from the background worker.
+    pub fn apply_merge_result(&mut self, result: MergeResult) -> bool {
+        self.merging_part_ids.retain(|id| !result.source_part_ids.contains(id));
+        let all_present = result.source_part_ids.iter().all(|id| {
+            self.parts.iter().any(|p| p.id == *id)
+        });
+        if !all_present { return false; }
+        self.parts.retain(|p| !result.source_part_ids.contains(&p.id));
+        self.parts.push(result.merged_part);
+        true
+    }
+
+    /// Create a disk-backed MergeTree that flushes cold parts to `dir`.
+    pub fn open(primary_key: Vec<String>, dir: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let mut tree = Self::new(primary_key);
+        tree.data_dir = Some(dir.to_path_buf());
+        tree.load_segments_from_dir(dir)?;
+        Ok(tree)
     }
 
     /// Insert a batch of data. The batch will be sorted by the primary key
@@ -1885,23 +2215,36 @@ impl MergeTree {
         let row_count = sorted.columns.first().map(|(_, c)| c.len()).unwrap_or(0);
         let zone_map = ZoneMap::from_batch(&sorted);
 
+        let part_id = self.next_part_id;
+        self.next_part_id += 1;
+
         let part = MergeTreePart {
-            id: self.next_part_id,
+            id: part_id,
             data: sorted,
             row_count,
             zone_map,
             compressed: None,
         };
-        self.next_part_id += 1;
         self.parts.push(part);
 
         // Auto-merge if too many parts
-        while self.parts.len() > self.max_parts {
-            self.merge_smallest_parts();
+        if self.parts.len() > self.max_parts {
+            if self.merge_sender.is_some() {
+                self.queue_background_merge();
+            } else {
+                while self.parts.len() > self.max_parts {
+                    self.merge_smallest_parts();
+                }
+            }
         }
+
+        // Flush cold parts to disk after merge
+        self.flush_cold_parts();
     }
 
-    /// Sort a batch by the primary key columns.
+    /// Sort a batch by the primary key columns (multi-column composite sort).
+    ///
+    /// Sorts by the first PK column as primary, second as secondary, etc.
     fn sort_by_pk(&self, batch: &ColumnBatch) -> ColumnBatch {
         if self.primary_key.is_empty() || batch.columns.is_empty() {
             return batch.clone();
@@ -1912,24 +2255,17 @@ impl MergeTree {
             return batch.clone();
         }
 
-        // Build sort indices based on primary key columns
         let mut indices: Vec<usize> = (0..row_count).collect();
 
-        // Get primary key column data for sorting
-        let pk_col = batch.column(&self.primary_key[0]);
-        if let Some(ColumnData::Int64(vals)) = pk_col {
-            indices.sort_by(|&a, &b| {
-                let va = vals[a].unwrap_or(i64::MAX);
-                let vb = vals[b].unwrap_or(i64::MAX);
-                va.cmp(&vb)
-            });
-        } else if let Some(ColumnData::Text(vals)) = pk_col {
-            indices.sort_by(|&a, &b| {
-                let va = vals[a].as_deref().unwrap_or("");
-                let vb = vals[b].as_deref().unwrap_or("");
-                va.cmp(vb)
-            });
-        }
+        indices.sort_by(|&a, &b| {
+            for pk_col_name in &self.primary_key {
+                let ord = compare_column_values(batch.column(pk_col_name), a, b);
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
 
         // Reorder all columns by the sort indices
         let mut new_columns = Vec::with_capacity(batch.columns.len());
@@ -1969,7 +2305,16 @@ impl MergeTree {
             (b, a)
         };
 
-        let merged_batch = merge_sorted_batches(&first.data, &second.data, &self.primary_key);
+        let sorted_batch = merge_sorted_batches(&first.data, &second.data, &self.primary_key);
+        let merged_batch = match &self.merge_strategy {
+            MergeStrategy::Default => sorted_batch,
+            MergeStrategy::Replacing { version_column } => {
+                merge_replacing(&sorted_batch, &self.primary_key, version_column.as_deref())
+            }
+            MergeStrategy::Aggregating { group_columns: _, sum_columns, count_columns } => {
+                merge_aggregating(&sorted_batch, &self.primary_key, sum_columns, count_columns)
+            }
+        };
         let row_count = merged_batch.columns.first().map(|(_, c)| c.len()).unwrap_or(0);
         let zone_map = ZoneMap::from_batch(&merged_batch);
 
@@ -1977,49 +2322,105 @@ impl MergeTree {
         let compressed = merged_batch.columns.iter()
             .map(|(name, col)| (name.clone(), compress_adaptive(col)))
             .collect::<Vec<_>>();
+
+        let part_id = self.next_part_id;
+        self.next_part_id += 1;
+
         let merged = MergeTreePart {
-            id: self.next_part_id,
+            id: part_id,
             data: merged_batch,
             row_count,
             zone_map,
             compressed: Some(compressed),
         };
-        self.next_part_id += 1;
         self.parts.push(merged);
     }
 
     /// Scan all parts, pruning those whose zone maps exclude the predicate.
-    pub fn scan(&self, predicate_col: &str, op: CmpOp, value: &ScalarValue) -> Vec<&ColumnBatch> {
-        self.parts
-            .iter()
-            .filter(|part| !part.zone_map.can_skip(predicate_col, op, value))
-            .map(|part| &part.data)
-            .collect()
+    ///
+    /// Hot parts are returned directly. Cold parts whose zone maps indicate
+    /// a possible match are loaded from disk on demand.
+    pub fn scan(&self, predicate_col: &str, op: CmpOp, value: &ScalarValue) -> Vec<ColumnBatch> {
+        let mut result = Vec::new();
+
+        // Hot parts
+        for part in &self.parts {
+            if !part.zone_map.can_skip(predicate_col, op, value) {
+                result.push(part.data.clone());
+            }
+        }
+
+        // Cold parts — check zone map, load from disk if needed
+        for cold in &self.cold_parts {
+            if !cold.zone_map.can_skip(predicate_col, op, value) {
+                match SegmentReader::open(&cold.path) {
+                    Ok(reader) => {
+                        if let Ok(batch) = reader.read_batch() {
+                            result.push(batch);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("MergeTree: failed to read cold segment {:?}: {e}", cold.path);
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     /// Scan all parts (no predicate, full scan).
-    pub fn scan_all(&self) -> Vec<&ColumnBatch> {
-        self.parts.iter().map(|p| &p.data).collect()
+    ///
+    /// Loads cold parts from disk as needed.
+    pub fn scan_all(&self) -> Vec<ColumnBatch> {
+        let mut result: Vec<ColumnBatch> = self.parts.iter().map(|p| p.data.clone()).collect();
+
+        for cold in &self.cold_parts {
+            match SegmentReader::open(&cold.path) {
+                Ok(reader) => {
+                    if let Ok(batch) = reader.read_batch() {
+                        result.push(batch);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("MergeTree: failed to read cold segment {:?}: {e}", cold.path);
+                }
+            }
+        }
+
+        result
     }
 
-    /// Number of parts.
+    /// Number of hot (in-memory) parts.
     pub fn part_count(&self) -> usize {
         self.parts.len()
     }
 
-    /// Total row count across all parts.
-    pub fn total_rows(&self) -> usize {
-        self.parts.iter().map(|p| p.row_count).sum()
+    /// Number of cold (on-disk) parts.
+    pub fn cold_part_count(&self) -> usize {
+        self.cold_parts.len()
     }
 
-    /// Force merge all parts into one.
+    /// Total number of parts (hot + cold).
+    pub fn total_part_count(&self) -> usize {
+        self.parts.len() + self.cold_parts.len()
+    }
+
+    /// Total row count across all parts (hot + cold).
+    pub fn total_rows(&self) -> usize {
+        let hot: usize = self.parts.iter().map(|p| p.row_count).sum();
+        let cold: usize = self.cold_parts.iter().map(|p| p.row_count).sum();
+        hot + cold
+    }
+
+    /// Force merge all hot parts into one.
     pub fn optimize(&mut self) {
         while self.parts.len() > 1 {
             self.merge_smallest_parts();
         }
     }
 
-    /// Compress all parts using adaptive compression.
+    /// Compress all hot parts using adaptive compression.
     pub fn compact(&mut self) {
         for part in &mut self.parts {
             if part.compressed.is_some() {
@@ -2031,6 +2432,110 @@ impl MergeTree {
             }
             part.compressed = Some(compressed_cols);
         }
+    }
+
+    // ─── Hot/Cold Tiering ─────────────────────────────────────────────────────
+
+    /// Flush parts exceeding the cold threshold to disk segment files.
+    ///
+    /// Only operates when `data_dir` is set. Parts that are flushed are removed
+    /// from the hot `parts` vec and replaced with `ColdPartInfo` entries that
+    /// retain the zone map for pruning.
+    pub fn flush_cold_parts(&mut self) {
+        let data_dir = match &self.data_dir {
+            Some(d) => d.clone(),
+            None => return,
+        };
+
+        let mut to_flush = Vec::new();
+        let mut i = 0;
+        while i < self.parts.len() {
+            let size = estimate_batch_size(&self.parts[i].data);
+            if size > self.cold_threshold_bytes {
+                to_flush.push(i);
+            }
+            i += 1;
+        }
+
+        // Flush in reverse index order so removal doesn't shift indices
+        for &idx in to_flush.iter().rev() {
+            let part = self.parts.remove(idx);
+            let seg_path = data_dir.join(format!("part_{:016x}.seg", part.id));
+
+            match SegmentWriter::write(&seg_path, &part.data, CompressionCodec::None, part.id) {
+                Ok(()) => {
+                    self.cold_parts.push(ColdPartInfo {
+                        part_id: part.id,
+                        path: seg_path,
+                        zone_map: part.zone_map,
+                        row_count: part.row_count,
+                    });
+                }
+                Err(e) => {
+                    eprintln!("MergeTree: failed to flush part {} to disk: {e}", part.id);
+                    // Put it back as a hot part
+                    self.parts.push(part);
+                }
+            }
+        }
+    }
+
+    /// Load segment files from a directory into the cold parts list.
+    fn load_segments_from_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+        let mut seg_files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("seg"))
+            .collect();
+        seg_files.sort();
+
+        for path in seg_files {
+            match SegmentReader::open(&path) {
+                Ok(reader) => {
+                    let part_id = reader.part_id();
+                    let zone_map = reader.read_zone_map();
+                    let row_count = reader.row_count();
+
+                    if part_id >= self.next_part_id {
+                        self.next_part_id = part_id + 1;
+                    }
+
+                    self.cold_parts.push(ColdPartInfo {
+                        part_id,
+                        path,
+                        zone_map,
+                        row_count,
+                    });
+                }
+                Err(e) => {
+                    eprintln!("MergeTree: skipping corrupt segment {:?}: {e}", path);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Recover state: load cold segments from disk, then apply WAL-recovered
+    /// hot parts on top. This is the full crash-recovery path.
+    pub fn recover(primary_key: Vec<String>, dir: &Path, wal_batches: Vec<ColumnBatch>) -> std::io::Result<Self> {
+        let mut tree = Self::open(primary_key, dir)?;
+        // WAL-recovered batches are unflushed data — insert as hot parts
+        for batch in wal_batches {
+            let sorted = tree.sort_by_pk(&batch);
+            let row_count = sorted.columns.first().map(|(_, c)| c.len()).unwrap_or(0);
+            let zone_map = ZoneMap::from_batch(&sorted);
+            let part_id = tree.next_part_id;
+            tree.next_part_id += 1;
+            tree.parts.push(MergeTreePart {
+                id: part_id,
+                data: sorted,
+                row_count,
+                zone_map,
+                compressed: None,
+            });
+        }
+        Ok(tree)
     }
 }
 
@@ -2054,6 +2559,39 @@ fn reorder_column(col: &ColumnData, indices: &[usize]) -> ColumnData {
     }
 }
 
+/// Compare values in a column at two row indices. Returns Ordering for sort.
+/// NULLs sort last (treated as maximum).
+fn compare_column_values(col: Option<&ColumnData>, a: usize, b: usize) -> std::cmp::Ordering {
+    match col {
+        Some(ColumnData::Int64(vals)) => {
+            let va = vals[a].unwrap_or(i64::MAX);
+            let vb = vals[b].unwrap_or(i64::MAX);
+            va.cmp(&vb)
+        }
+        Some(ColumnData::Int32(vals)) => {
+            let va = vals[a].unwrap_or(i32::MAX);
+            let vb = vals[b].unwrap_or(i32::MAX);
+            va.cmp(&vb)
+        }
+        Some(ColumnData::Float64(vals)) => {
+            let va = vals[a].unwrap_or(f64::MAX);
+            let vb = vals[b].unwrap_or(f64::MAX);
+            va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        Some(ColumnData::Text(vals)) => {
+            let va = vals[a].as_deref().unwrap_or("");
+            let vb = vals[b].as_deref().unwrap_or("");
+            va.cmp(vb)
+        }
+        Some(ColumnData::Bool(vals)) => {
+            let va = vals[a].unwrap_or(false) as u8;
+            let vb = vals[b].unwrap_or(false) as u8;
+            va.cmp(&vb)
+        }
+        None => std::cmp::Ordering::Equal,
+    }
+}
+
 fn merge_sorted_batches(a: &ColumnBatch, b: &ColumnBatch, primary_key: &[String]) -> ColumnBatch {
     // Simple concatenation + sort approach
     let mut columns = Vec::new();
@@ -2066,7 +2604,7 @@ fn merge_sorted_batches(a: &ColumnBatch, b: &ColumnBatch, primary_key: &[String]
 
     let batch = ColumnBatch::new(columns);
 
-    // Sort by PK if available
+    // Sort by PK if available (multi-column composite sort)
     if primary_key.is_empty() {
         return batch;
     }
@@ -2074,13 +2612,15 @@ fn merge_sorted_batches(a: &ColumnBatch, b: &ColumnBatch, primary_key: &[String]
     let row_count = batch.columns.first().map(|(_, c)| c.len()).unwrap_or(0);
     let mut indices: Vec<usize> = (0..row_count).collect();
 
-    if let Some(ColumnData::Int64(vals)) = batch.column(&primary_key[0]) {
-        indices.sort_by(|&a, &b| {
-            let va = vals[a].unwrap_or(i64::MAX);
-            let vb = vals[b].unwrap_or(i64::MAX);
-            va.cmp(&vb)
-        });
-    }
+    indices.sort_by(|&a, &b| {
+        for pk_col_name in primary_key {
+            let ord = compare_column_values(batch.column(pk_col_name), a, b);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
 
     let mut new_columns = Vec::with_capacity(batch.columns.len());
     for (name, col) in &batch.columns {
@@ -2118,6 +2658,262 @@ fn concat_columns(a: &ColumnData, b: &ColumnData) -> ColumnData {
         }
         _ => a.clone(),
     }
+}
+
+// ============================================================================
+// ReplacingMergeTree: dedup by PK, keep latest version
+// ============================================================================
+
+/// Compare two rows in a batch by primary key columns. Returns true if they are equal.
+fn pk_rows_equal(batch: &ColumnBatch, a: usize, b: usize, primary_key: &[String]) -> bool {
+    for pk_col in primary_key {
+        if compare_column_values(batch.column(pk_col), a, b) != std::cmp::Ordering::Equal {
+            return false;
+        }
+    }
+    true
+}
+
+/// Get a numeric "version" value from a column at a given row index.
+/// Used for ReplacingMergeTree to decide which row wins.
+fn version_value_at(col: Option<&ColumnData>, idx: usize) -> i64 {
+    match col {
+        Some(ColumnData::Int32(v)) => v[idx].unwrap_or(0) as i64,
+        Some(ColumnData::Int64(v)) => v[idx].unwrap_or(0),
+        Some(ColumnData::Float64(v)) => v[idx].unwrap_or(0.0) as i64,
+        _ => 0,
+    }
+}
+
+/// Append row `idx` from `src` to the column builders in `builders`.
+fn append_row_to_builders(builders: &mut Vec<(String, ColumnBuilder)>, src: &ColumnBatch, idx: usize) {
+    for (name, builder) in builders.iter_mut() {
+        if let Some(col) = src.column(name) {
+            builder.push_from(col, idx);
+        }
+    }
+}
+
+/// Column builder — accumulates values row by row to build a ColumnData.
+#[derive(Debug)]
+enum ColumnBuilder {
+    Bool(Vec<Option<bool>>),
+    Int32(Vec<Option<i32>>),
+    Int64(Vec<Option<i64>>),
+    Float64(Vec<Option<f64>>),
+    Text(Vec<Option<String>>),
+}
+
+impl ColumnBuilder {
+    fn from_type(col: &ColumnData) -> Self {
+        match col {
+            ColumnData::Bool(_) => ColumnBuilder::Bool(Vec::new()),
+            ColumnData::Int32(_) => ColumnBuilder::Int32(Vec::new()),
+            ColumnData::Int64(_) => ColumnBuilder::Int64(Vec::new()),
+            ColumnData::Float64(_) => ColumnBuilder::Float64(Vec::new()),
+            ColumnData::Text(_) => ColumnBuilder::Text(Vec::new()),
+        }
+    }
+
+    fn push_from(&mut self, col: &ColumnData, idx: usize) {
+        match (self, col) {
+            (ColumnBuilder::Bool(v), ColumnData::Bool(src)) => v.push(src[idx]),
+            (ColumnBuilder::Int32(v), ColumnData::Int32(src)) => v.push(src[idx]),
+            (ColumnBuilder::Int64(v), ColumnData::Int64(src)) => v.push(src[idx]),
+            (ColumnBuilder::Float64(v), ColumnData::Float64(src)) => v.push(src[idx]),
+            (ColumnBuilder::Text(v), ColumnData::Text(src)) => v.push(src[idx].clone()),
+            _ => {}
+        }
+    }
+
+    fn build(self) -> ColumnData {
+        match self {
+            ColumnBuilder::Bool(v) => ColumnData::Bool(v),
+            ColumnBuilder::Int32(v) => ColumnData::Int32(v),
+            ColumnBuilder::Int64(v) => ColumnData::Int64(v),
+            ColumnBuilder::Float64(v) => ColumnData::Float64(v),
+            ColumnBuilder::Text(v) => ColumnData::Text(v),
+        }
+    }
+}
+
+/// ReplacingMergeTree merge: dedup by PK, keep latest version.
+///
+/// The input batch must already be sorted by PK. Consecutive rows with
+/// identical PK values are collapsed. If `version_column` is set, the row
+/// with the highest version wins. Otherwise the last row (highest insertion
+/// order) wins.
+fn merge_replacing(batch: &ColumnBatch, primary_key: &[String], version_column: Option<&str>) -> ColumnBatch {
+    let row_count = batch.columns.first().map(|(_, c)| c.len()).unwrap_or(0);
+    if row_count <= 1 || primary_key.is_empty() {
+        return batch.clone();
+    }
+
+    // Build output column builders
+    let mut builders: Vec<(String, ColumnBuilder)> = batch.columns.iter()
+        .map(|(name, col)| (name.clone(), ColumnBuilder::from_type(col)))
+        .collect();
+
+    let mut i = 0;
+    while i < row_count {
+        // Find the range of rows with the same PK
+        let mut j = i + 1;
+        while j < row_count && pk_rows_equal(batch, i, j, primary_key) {
+            j += 1;
+        }
+
+        // Among rows [i..j), pick the winner
+        let winner = if j == i + 1 {
+            i
+        } else if let Some(vcol) = version_column {
+            // Pick row with highest version
+            let vc = batch.column(vcol);
+            let mut best = i;
+            let mut best_v = version_value_at(vc, i);
+            for k in (i + 1)..j {
+                let v = version_value_at(vc, k);
+                if v >= best_v {
+                    best_v = v;
+                    best = k;
+                }
+            }
+            best
+        } else {
+            // No version column: keep last row (latest insert)
+            j - 1
+        };
+
+        append_row_to_builders(&mut builders, batch, winner);
+        i = j;
+    }
+
+    let columns: Vec<(String, ColumnData)> = builders.into_iter()
+        .map(|(name, b)| (name, b.build()))
+        .collect();
+    ColumnBatch::new(columns)
+}
+
+// ============================================================================
+// AggregatingMergeTree: group by PK, aggregate specified columns
+// ============================================================================
+
+/// Sum two optional numeric values.
+fn sum_opt_i32(a: Option<i32>, b: Option<i32>) -> Option<i32> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x + y),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+fn sum_opt_i64(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x + y),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+fn sum_opt_f64(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x + y),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+/// AggregatingMergeTree merge: group by PK, aggregate specified columns.
+///
+/// The input batch must already be sorted by PK. Consecutive rows with
+/// identical PK values are collapsed:
+/// - `sum_columns` and `count_columns`: values are summed
+/// - Other numeric columns not in PK: keep last value
+/// - Text columns not in PK: keep last value
+fn merge_aggregating(
+    batch: &ColumnBatch,
+    primary_key: &[String],
+    sum_columns: &[String],
+    count_columns: &[String],
+) -> ColumnBatch {
+    let row_count = batch.columns.first().map(|(_, c)| c.len()).unwrap_or(0);
+    if row_count <= 1 || primary_key.is_empty() {
+        return batch.clone();
+    }
+
+    // Build output column builders
+    let mut builders: Vec<(String, ColumnBuilder)> = batch.columns.iter()
+        .map(|(name, col)| (name.clone(), ColumnBuilder::from_type(col)))
+        .collect();
+
+    let is_aggregate_col = |name: &str| -> bool {
+        sum_columns.iter().any(|s| s == name) || count_columns.iter().any(|s| s == name)
+    };
+
+    let mut i = 0;
+    while i < row_count {
+        // Find the range of rows with the same PK
+        let mut j = i + 1;
+        while j < row_count && pk_rows_equal(batch, i, j, primary_key) {
+            j += 1;
+        }
+
+        if j == i + 1 {
+            // Single row group — just copy it
+            append_row_to_builders(&mut builders, batch, i);
+        } else {
+            // Multiple rows with same PK — aggregate
+            for (name, builder) in builders.iter_mut() {
+                let col = match batch.column(name) {
+                    Some(c) => c,
+                    None => continue,
+                };
+
+                let is_pk = primary_key.iter().any(|pk| pk == name);
+                if is_pk {
+                    // PK columns: take from first row (all equal)
+                    builder.push_from(col, i);
+                } else if is_aggregate_col(name) {
+                    // Sum all values in the group
+                    match (builder, col) {
+                        (ColumnBuilder::Int32(out), ColumnData::Int32(src)) => {
+                            let mut acc = None;
+                            for k in i..j {
+                                acc = sum_opt_i32(acc, src[k]);
+                            }
+                            out.push(acc);
+                        }
+                        (ColumnBuilder::Int64(out), ColumnData::Int64(src)) => {
+                            let mut acc = None;
+                            for k in i..j {
+                                acc = sum_opt_i64(acc, src[k]);
+                            }
+                            out.push(acc);
+                        }
+                        (ColumnBuilder::Float64(out), ColumnData::Float64(src)) => {
+                            let mut acc = None;
+                            for k in i..j {
+                                acc = sum_opt_f64(acc, src[k]);
+                            }
+                            out.push(acc);
+                        }
+                        (b, _) => {
+                            // Non-numeric aggregate column: keep last
+                            b.push_from(col, j - 1);
+                        }
+                    }
+                } else {
+                    // Non-aggregate, non-PK column: keep last value
+                    builder.push_from(col, j - 1);
+                }
+            }
+        }
+        i = j;
+    }
+
+    let columns: Vec<(String, ColumnData)> = builders.into_iter()
+        .map(|(name, b)| (name, b.build()))
+        .collect();
+    ColumnBatch::new(columns)
 }
 
 // ============================================================================
@@ -3890,5 +4686,1222 @@ mod tests {
         // Force single-threaded with threshold=100
         let sum_st = par_sum_batches(batches, "val", 100);
         assert!((sum_st - seq_sum).abs() < 1e-6);
+    }
+
+    // ================================================================
+    // MergeTree-backed ColumnarStore integration tests
+    // ================================================================
+
+    #[test]
+    fn mergetree_store_create_and_insert() {
+        let mut store = ColumnarStore::new();
+        store.create_merge_tree_table("events", vec!["timestamp".into(), "metric".into()]);
+
+        assert!(store.table_exists("events"));
+        assert!(store.is_merge_tree("events"));
+
+        let batch = ColumnBatch::new(vec![
+            ("timestamp".into(), ColumnData::Int64(vec![Some(300), Some(100), Some(200)])),
+            ("metric".into(), ColumnData::Text(vec![
+                Some("cpu".into()), Some("mem".into()), Some("cpu".into()),
+            ])),
+            ("value".into(), ColumnData::Float64(vec![Some(0.9), Some(0.5), Some(0.7)])),
+        ]);
+        store.append("events", batch);
+
+        assert_eq!(store.row_count("events"), 3);
+
+        // Data should be sorted by (timestamp, metric) via MergeTree
+        let batches = store.batches_all("events");
+        assert_eq!(batches.len(), 1);
+        if let Some(ColumnData::Int64(ts)) = batches[0].column("timestamp") {
+            assert_eq!(ts, &[Some(100), Some(200), Some(300)]);
+        } else {
+            panic!("expected Int64 timestamp column");
+        }
+    }
+
+    #[test]
+    fn mergetree_store_scan_with_pruning() {
+        let mut store = ColumnarStore::new();
+        store.create_merge_tree_table("events", vec!["id".into()]);
+
+        // Insert two separate batches (two parts)
+        let batch1 = ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64((1..=10).map(Some).collect())),
+            ("val".into(), ColumnData::Float64((1..=10).map(|i| Some(i as f64)).collect())),
+        ]);
+        store.append("events", batch1);
+
+        let batch2 = ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64((100..=110).map(Some).collect())),
+            ("val".into(), ColumnData::Float64((100..=110).map(|i| Some(i as f64)).collect())),
+        ]);
+        store.append("events", batch2);
+
+        // Scan with predicate that should prune part 1
+        let pruned = store.scan_merge_tree("events", "id", CmpOp::Gt, &ScalarValue::Int64(50));
+        assert_eq!(pruned.len(), 1); // Only part 2 should survive
+
+        // Full scan should return both parts
+        let all = store.batches_all("events");
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn mergetree_store_multicolumn_sort() {
+        let mut store = ColumnarStore::new();
+        store.create_merge_tree_table("logs", vec!["level".into(), "timestamp".into()]);
+
+        let batch = ColumnBatch::new(vec![
+            ("level".into(), ColumnData::Text(vec![
+                Some("error".into()), Some("warn".into()), Some("error".into()),
+                Some("info".into()), Some("warn".into()),
+            ])),
+            ("timestamp".into(), ColumnData::Int64(vec![
+                Some(300), Some(200), Some(100), Some(400), Some(100),
+            ])),
+            ("msg".into(), ColumnData::Text(vec![
+                Some("e1".into()), Some("w1".into()), Some("e2".into()),
+                Some("i1".into()), Some("w2".into()),
+            ])),
+        ]);
+        store.append("logs", batch);
+
+        let batches = store.batches_all("logs");
+        assert_eq!(batches.len(), 1);
+
+        // Should be sorted first by level (text), then by timestamp (int64)
+        if let Some(ColumnData::Text(levels)) = batches[0].column("level") {
+            assert_eq!(levels[0].as_deref(), Some("error"));
+            assert_eq!(levels[1].as_deref(), Some("error"));
+            assert_eq!(levels[2].as_deref(), Some("info"));
+            assert_eq!(levels[3].as_deref(), Some("warn"));
+            assert_eq!(levels[4].as_deref(), Some("warn"));
+        }
+        if let Some(ColumnData::Int64(ts)) = batches[0].column("timestamp") {
+            // Within "error" group: 100 < 300
+            assert_eq!(ts[0], Some(100));
+            assert_eq!(ts[1], Some(300));
+            // Within "warn" group: 100 < 200
+            assert_eq!(ts[3], Some(100));
+            assert_eq!(ts[4], Some(200));
+        }
+    }
+
+    #[test]
+    fn non_mergetree_table_still_works() {
+        let mut store = ColumnarStore::new();
+        store.create_table("raw");
+
+        assert!(store.table_exists("raw"));
+        assert!(!store.is_merge_tree("raw"));
+
+        let batch = ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(3), Some(1), Some(2)])),
+        ]);
+        store.append("raw", batch);
+
+        // Raw tables don't sort
+        let batches = store.batches("raw");
+        assert_eq!(batches.len(), 1);
+        if let Some(ColumnData::Int64(ids)) = batches[0].column("id") {
+            assert_eq!(ids, &[Some(3), Some(1), Some(2)]); // insertion order
+        }
+        assert_eq!(store.row_count("raw"), 3);
+    }
+
+    #[test]
+    fn mergetree_store_drop_and_clear() {
+        let mut store = ColumnarStore::new();
+        store.create_merge_tree_table("t", vec!["id".into()]);
+
+        let batch = ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
+        ]);
+        store.append("t", batch);
+        assert_eq!(store.row_count("t"), 2);
+
+        // Clear should reset the MergeTree
+        store.clear("t");
+        assert_eq!(store.row_count("t"), 0);
+        assert!(store.is_merge_tree("t")); // still a MergeTree
+
+        // Re-insert after clear
+        let batch2 = ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(10)])),
+        ]);
+        store.append("t", batch2);
+        assert_eq!(store.row_count("t"), 1);
+
+        // Drop should remove MergeTree
+        store.drop_table("t");
+        assert!(!store.table_exists("t"));
+        assert!(!store.is_merge_tree("t"));
+    }
+
+    #[test]
+    fn mergetree_store_wal_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Create and populate
+        {
+            let mut store = ColumnarStore::open(dir_path).unwrap();
+            store.create_merge_tree_table("events", vec!["ts".into()]);
+
+            let batch = ColumnBatch::new(vec![
+                ("ts".into(), ColumnData::Int64(vec![Some(300), Some(100), Some(200)])),
+                ("val".into(), ColumnData::Float64(vec![Some(3.0), Some(1.0), Some(2.0)])),
+            ]);
+            store.append("events", batch);
+            assert_eq!(store.row_count("events"), 3);
+        }
+
+        // Re-open and verify WAL replayed the data
+        {
+            let store = ColumnarStore::open(dir_path).unwrap();
+            // The WAL replays into raw tables (MergeTree metadata is not persisted
+            // in the WAL yet), but the data should be recoverable.
+            assert!(store.table_exists("events"));
+            assert_eq!(store.row_count("events"), 3);
+        }
+    }
+
+    #[test]
+    fn mergetree_store_batches_all_for_aggregation() {
+        let mut store = ColumnarStore::new();
+        store.create_merge_tree_table("metrics", vec!["ts".into()]);
+
+        let batch = ColumnBatch::new(vec![
+            ("ts".into(), ColumnData::Int64(vec![Some(1), Some(2), Some(3)])),
+            ("value".into(), ColumnData::Float64(vec![Some(10.0), Some(20.0), Some(30.0)])),
+        ]);
+        store.append("metrics", batch);
+
+        // batches_all should work for MergeTree tables
+        let all = store.batches_all("metrics");
+        let mut total = 0.0f64;
+        for b in &all {
+            total += aggregate_sum(b, "value");
+        }
+        assert!((total - 60.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn mergetree_multicolumn_sort_with_int_columns() {
+        let mut mt = MergeTree::new(vec!["a".into(), "b".into()]);
+        let batch = ColumnBatch::new(vec![
+            ("a".into(), ColumnData::Int64(vec![Some(2), Some(1), Some(1), Some(2)])),
+            ("b".into(), ColumnData::Int64(vec![Some(20), Some(10), Some(20), Some(10)])),
+            ("c".into(), ColumnData::Text(vec![
+                Some("d".into()), Some("a".into()), Some("b".into()), Some("c".into()),
+            ])),
+        ]);
+        mt.insert(batch);
+
+        let parts = mt.scan_all();
+        assert_eq!(parts.len(), 1);
+        if let Some(ColumnData::Int64(a_vals)) = parts[0].column("a") {
+            assert_eq!(a_vals, &[Some(1), Some(1), Some(2), Some(2)]);
+        }
+        if let Some(ColumnData::Int64(b_vals)) = parts[0].column("b") {
+            assert_eq!(b_vals, &[Some(10), Some(20), Some(10), Some(20)]);
+        }
+        if let Some(ColumnData::Text(c_vals)) = parts[0].column("c") {
+            assert_eq!(c_vals, &[Some("a".into()), Some("b".into()), Some("c".into()), Some("d".into())]);
+        }
+    }
+
+    // ================================================================
+    // Background Merge tests
+    // ================================================================
+
+    #[test]
+    fn mergetree_sync_merge_inline() {
+        let mut mt = MergeTree::new(vec!["id".into()]);
+        mt.max_parts = 3;
+
+        for i in 0..5 {
+            let batch = ColumnBatch::new(vec![
+                ("id".into(), ColumnData::Int64(vec![Some(i)])),
+            ]);
+            mt.insert(batch);
+        }
+
+        assert!(mt.part_count() <= 3);
+        assert_eq!(mt.total_rows(), 5);
+    }
+
+    #[test]
+    fn mergetree_execute_merge_task_produces_correct_result() {
+        let task = MergeTask {
+            table: "test".into(),
+            parts: vec![
+                MergeTreePart {
+                    id: 1,
+                    data: ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
+                    ]),
+                    row_count: 2,
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
+                    ])),
+                    compressed: None,
+                },
+                MergeTreePart {
+                    id: 2,
+                    data: ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
+                    ]),
+                    row_count: 2,
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
+                    ])),
+                    compressed: None,
+                },
+            ],
+            source_part_ids: vec![1, 2],
+            primary_key: vec!["id".into()],
+            merge_strategy: MergeStrategy::Default,
+        };
+
+        let result = execute_merge_task(task, 100);
+
+        assert_eq!(result.table, "test");
+        assert_eq!(result.source_part_ids, vec![1, 2]);
+        assert_eq!(result.merged_part.id, 100);
+        assert_eq!(result.merged_part.row_count, 4);
+
+        if let Some(ColumnData::Int64(ids)) = result.merged_part.data.column("id") {
+            assert_eq!(ids, &[Some(1), Some(2), Some(3), Some(4)]);
+        } else {
+            panic!("expected Int64 id column in merged result");
+        }
+
+        assert!(result.merged_part.compressed.is_some());
+    }
+
+    #[test]
+    fn mergetree_apply_merge_result() {
+        let mut mt = MergeTree::new(vec!["id".into()]);
+        mt.max_parts = 100;
+
+        mt.insert(ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
+        ]));
+        mt.insert(ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
+        ]));
+        assert_eq!(mt.part_count(), 2);
+
+        let part_id_a = mt.parts[0].id;
+        let part_id_b = mt.parts[1].id;
+
+        let merged_batch = ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1), Some(2), Some(3), Some(4)])),
+        ]);
+        let result = MergeResult {
+            table: "test".into(),
+            source_part_ids: vec![part_id_a, part_id_b],
+            merged_part: MergeTreePart {
+                id: 999,
+                data: merged_batch.clone(),
+                row_count: 4,
+                zone_map: ZoneMap::from_batch(&merged_batch),
+                compressed: None,
+            },
+        };
+
+        let applied = mt.apply_merge_result(result);
+        assert!(applied);
+        assert_eq!(mt.part_count(), 1);
+        assert_eq!(mt.total_rows(), 4);
+
+        let batches = mt.scan_all();
+        if let Some(ColumnData::Int64(ids)) = batches[0].column("id") {
+            assert_eq!(ids, &[Some(1), Some(2), Some(3), Some(4)]);
+        }
+    }
+
+    #[test]
+    fn mergetree_apply_stale_merge_result() {
+        let mut mt = MergeTree::new(vec!["id".into()]);
+        mt.max_parts = 100;
+
+        mt.insert(ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1)])),
+        ]));
+        assert_eq!(mt.part_count(), 1);
+
+        let merged_batch = ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
+        ]);
+        let result = MergeResult {
+            table: "test".into(),
+            source_part_ids: vec![999, 1000],
+            merged_part: MergeTreePart {
+                id: 50,
+                data: merged_batch.clone(),
+                row_count: 2,
+                zone_map: ZoneMap::from_batch(&merged_batch),
+                compressed: None,
+            },
+        };
+
+        let applied = mt.apply_merge_result(result);
+        assert!(!applied, "stale merge result should not be applied");
+        assert_eq!(mt.part_count(), 1);
+    }
+
+    #[test]
+    fn mergetree_background_merge_end_to_end() {
+        let (task_tx, task_rx) = std::sync::mpsc::channel::<MergeTask>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<MergeResult>();
+        let running = Arc::new(AtomicBool::new(true));
+        let next_id = Arc::new(AtomicU64::new(1000));
+
+        let worker = spawn_merge_worker(task_rx, result_tx, Arc::clone(&running), next_id);
+
+        // Build a merge task manually
+        let task = MergeTask {
+            table: "bg_test".into(),
+            parts: vec![
+                MergeTreePart {
+                    id: 1,
+                    data: ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
+                    ]),
+                    row_count: 2,
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
+                    ])),
+                    compressed: None,
+                },
+                MergeTreePart {
+                    id: 2,
+                    data: ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
+                    ]),
+                    row_count: 2,
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
+                    ])),
+                    compressed: None,
+                },
+            ],
+            source_part_ids: vec![1, 2],
+            primary_key: vec!["id".into()],
+            merge_strategy: MergeStrategy::Default,
+        };
+        task_tx.send(task).unwrap();
+
+        // Wait for worker to process
+        let result = result_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(result.merged_part.row_count, 4);
+
+        // Apply to a MergeTree
+        let mut mt = MergeTree::new(vec!["id".into()]);
+        mt.max_parts = 100;
+        mt.insert(ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
+        ]));
+        mt.insert(ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
+        ]));
+        let applied = mt.apply_merge_result(result);
+        assert!(applied);
+        assert_eq!(mt.part_count(), 1);
+        assert_eq!(mt.total_rows(), 4);
+
+        running.store(false, AtomicOrdering::SeqCst);
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn mergetree_snapshot_reads_during_merge() {
+        let mut mt = MergeTree::new(vec!["id".into()]);
+        mt.max_parts = 100;
+
+        mt.insert(ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
+        ]));
+        mt.insert(ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(3), Some(4)])),
+        ]));
+
+        let snapshot_before = mt.scan_all();
+        let mut ids_before: Vec<i64> = Vec::new();
+        for batch in &snapshot_before {
+            if let Some(ColumnData::Int64(ids)) = batch.column("id") {
+                for v in ids {
+                    if let Some(val) = v {
+                        ids_before.push(*val);
+                    }
+                }
+            }
+        }
+        ids_before.sort();
+        assert_eq!(ids_before, vec![1, 2, 3, 4]);
+
+        mt.optimize();
+
+        let snapshot_after = mt.scan_all();
+        let mut ids_after: Vec<i64> = Vec::new();
+        for batch in &snapshot_after {
+            if let Some(ColumnData::Int64(ids)) = batch.column("id") {
+                for v in ids {
+                    if let Some(val) = v {
+                        ids_after.push(*val);
+                    }
+                }
+            }
+        }
+        ids_after.sort();
+
+        assert_eq!(ids_before, ids_after);
+        assert_eq!(mt.part_count(), 1);
+    }
+
+    #[test]
+    fn mergetree_sync_merge_preserves_data() {
+        let mut mt = MergeTree::new(vec!["id".into()]);
+        mt.max_parts = 3;
+
+        for i in 0..5 {
+            let batch = ColumnBatch::new(vec![
+                ("id".into(), ColumnData::Int64(vec![Some(i)])),
+            ]);
+            mt.insert(batch);
+        }
+
+        assert!(mt.part_count() <= 3);
+        assert_eq!(mt.total_rows(), 5);
+
+        let batches = mt.scan_all();
+        let mut all_ids: Vec<i64> = Vec::new();
+        for batch in &batches {
+            if let Some(ColumnData::Int64(ids)) = batch.column("id") {
+                for v in ids.iter().flatten() {
+                    all_ids.push(*v);
+                }
+            }
+        }
+        all_ids.sort();
+        assert_eq!(all_ids, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn mergetree_merge_result_preserves_sort_order() {
+        let task = MergeTask {
+            table: "sort_test".into(),
+            parts: vec![
+                MergeTreePart {
+                    id: 1,
+                    data: ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(5), Some(10)])),
+                        ("name".into(), ColumnData::Text(vec![
+                            Some("e".into()), Some("j".into()),
+                        ])),
+                    ]),
+                    row_count: 2,
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(5), Some(10)])),
+                    ])),
+                    compressed: None,
+                },
+                MergeTreePart {
+                    id: 2,
+                    data: ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(7)])),
+                        ("name".into(), ColumnData::Text(vec![
+                            Some("a".into()), Some("g".into()),
+                        ])),
+                    ]),
+                    row_count: 2,
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(7)])),
+                    ])),
+                    compressed: None,
+                },
+            ],
+            source_part_ids: vec![1, 2],
+            primary_key: vec!["id".into()],
+            merge_strategy: MergeStrategy::Default,
+        };
+
+        let result = execute_merge_task(task, 42);
+
+        if let Some(ColumnData::Int64(ids)) = result.merged_part.data.column("id") {
+            assert_eq!(ids, &[Some(1), Some(5), Some(7), Some(10)]);
+        } else {
+            panic!("expected Int64 id column");
+        }
+
+        if let Some(ColumnData::Text(names)) = result.merged_part.data.column("name") {
+            assert_eq!(names, &[
+                Some("a".into()), Some("e".into()),
+                Some("g".into()), Some("j".into()),
+            ]);
+        } else {
+            panic!("expected Text name column");
+        }
+    }
+
+    #[test]
+    fn mergetree_apply_result_via_worker() {
+        let (task_tx, task_rx) = std::sync::mpsc::channel::<MergeTask>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<MergeResult>();
+        let running = Arc::new(AtomicBool::new(true));
+        let next_id = Arc::new(AtomicU64::new(1000));
+        let worker = spawn_merge_worker(task_rx, result_tx, Arc::clone(&running), next_id);
+
+        // Send a merge task directly to the worker
+        let task = MergeTask {
+            table: "test".into(),
+            parts: vec![
+                MergeTreePart {
+                    id: 1,
+                    data: ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
+                    ]),
+                    row_count: 2,
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
+                    ])),
+                    compressed: None,
+                },
+                MergeTreePart {
+                    id: 2,
+                    data: ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
+                    ]),
+                    row_count: 2,
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
+                    ])),
+                    compressed: None,
+                },
+            ],
+            source_part_ids: vec![1, 2],
+            primary_key: vec!["id".into()],
+            merge_strategy: MergeStrategy::Default,
+        };
+        task_tx.send(task).unwrap();
+
+        let result = result_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+
+        let mut mt = MergeTree::new(vec!["id".into()]);
+        mt.max_parts = 100;
+        mt.insert(ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
+        ]));
+        mt.insert(ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
+        ]));
+        let applied = mt.apply_merge_result(result);
+        assert!(applied);
+        assert_eq!(mt.total_rows(), 4);
+
+        running.store(false, AtomicOrdering::SeqCst);
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn mergetree_bg_merger_queues_and_polls() {
+        let (task_tx, task_rx) = std::sync::mpsc::channel::<MergeTask>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<MergeResult>();
+        let running = Arc::new(AtomicBool::new(true));
+        let next_id = Arc::new(AtomicU64::new(1000));
+        let worker = spawn_merge_worker(task_rx, result_tx, Arc::clone(&running), next_id);
+
+        let mut mt = MergeTree::new(vec!["id".into()]);
+        mt.max_parts = 3;
+        mt.set_table_name("qp_test");
+        mt.set_background_merger(task_tx);
+        assert!(mt.has_background_merger());
+
+        for i in 0..6i64 {
+            mt.insert(ColumnBatch::new(vec![
+                ("id".into(), ColumnData::Int64(vec![Some(i)])),
+            ]));
+        }
+        assert!(mt.part_count() > 3);
+        assert_eq!(mt.total_rows(), 6);
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        mt.poll_merge_results(&result_rx);
+        assert!(mt.part_count() < 6);
+        assert_eq!(mt.total_rows(), 6);
+
+        let batches = mt.scan_all();
+        let mut all: Vec<i64> = batches.iter().flat_map(|b| {
+            match b.column("id") {
+                Some(ColumnData::Int64(v)) => v.iter().flatten().copied().collect::<Vec<_>>(),
+                _ => vec![],
+            }
+        }).collect();
+        all.sort();
+        assert_eq!(all, vec![0, 1, 2, 3, 4, 5]);
+
+        running.store(false, AtomicOrdering::SeqCst);
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn mergetree_clear_bg_merger_reverts_to_sync() {
+        let (task_tx, _rx) = std::sync::mpsc::channel::<MergeTask>();
+        let mut mt = MergeTree::new(vec!["id".into()]);
+        mt.max_parts = 3;
+        mt.set_background_merger(task_tx);
+        assert!(mt.has_background_merger());
+        mt.clear_background_merger();
+        assert!(!mt.has_background_merger());
+
+        for i in 0..5i64 {
+            mt.insert(ColumnBatch::new(vec![
+                ("id".into(), ColumnData::Int64(vec![Some(i)])),
+            ]));
+        }
+        assert!(mt.part_count() <= 3);
+        assert_eq!(mt.total_rows(), 5);
+    }
+
+    // ================================================================
+    // ReplacingMergeTree tests
+    // ================================================================
+
+    #[test]
+    fn replacing_mergetree_dedup_with_version_column() {
+        let strategy = MergeStrategy::Replacing { version_column: Some("version".into()) };
+        let mut mt = MergeTree::new_with_strategy(vec!["id".into()], strategy);
+        mt.max_parts = 2; // trigger merge quickly
+
+        // Insert duplicate PKs with different versions
+        let batch1 = ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
+            ("version".into(), ColumnData::Int64(vec![Some(1), Some(1)])),
+            ("data".into(), ColumnData::Text(vec![Some("old_1".into()), Some("old_2".into())])),
+        ]);
+        mt.insert(batch1);
+
+        let batch2 = ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
+            ("version".into(), ColumnData::Int64(vec![Some(3), Some(2)])),
+            ("data".into(), ColumnData::Text(vec![Some("new_1".into()), Some("new_2".into())])),
+        ]);
+        mt.insert(batch2);
+
+        // Before merge: should have 4 rows across 2 parts (but merge auto-triggers)
+        // After merge: only 2 rows, one per PK, with highest version
+        mt.optimize();
+
+        let batches = mt.scan_all();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+
+        if let Some(ColumnData::Int64(ids)) = batch.column("id") {
+            assert_eq!(ids, &[Some(1), Some(2)]);
+        } else {
+            panic!("expected Int64 id column");
+        }
+        if let Some(ColumnData::Int64(versions)) = batch.column("version") {
+            assert_eq!(versions, &[Some(3), Some(2)]);
+        } else {
+            panic!("expected Int64 version column");
+        }
+        if let Some(ColumnData::Text(data)) = batch.column("data") {
+            assert_eq!(data, &[Some("new_1".into()), Some("new_2".into())]);
+        } else {
+            panic!("expected Text data column");
+        }
+    }
+
+    #[test]
+    fn replacing_mergetree_dedup_without_version_column() {
+        let strategy = MergeStrategy::Replacing { version_column: None };
+        let mut mt = MergeTree::new_with_strategy(vec!["id".into()], strategy);
+        mt.max_parts = 100; // prevent auto-merge
+
+        // Insert duplicate PKs without version — last row wins
+        let batch1 = ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
+            ("data".into(), ColumnData::Text(vec![Some("first_1".into()), Some("first_2".into())])),
+        ]);
+        mt.insert(batch1);
+
+        let batch2 = ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
+            ("data".into(), ColumnData::Text(vec![Some("second_1".into()), Some("second_3".into())])),
+        ]);
+        mt.insert(batch2);
+
+        // Before merge: 4 rows
+        assert_eq!(mt.total_rows(), 4);
+
+        // Merge
+        mt.optimize();
+
+        // After merge: 3 rows (id=1 deduped, id=2 unique, id=3 unique)
+        let batches = mt.scan_all();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.row_count, 3);
+
+        if let Some(ColumnData::Int64(ids)) = batch.column("id") {
+            assert_eq!(ids, &[Some(1), Some(2), Some(3)]);
+        }
+        // For id=1, last row wins (from batch2)
+        if let Some(ColumnData::Text(data)) = batch.column("data") {
+            assert_eq!(data[0], Some("second_1".into()));
+        }
+    }
+
+    #[test]
+    fn replacing_mergetree_scan_before_and_after_merge() {
+        let strategy = MergeStrategy::Replacing { version_column: Some("ver".into()) };
+        let mut mt = MergeTree::new_with_strategy(vec!["id".into()], strategy);
+        mt.max_parts = 100; // prevent auto-merge
+
+        let batch1 = ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(10)])),
+            ("ver".into(), ColumnData::Int64(vec![Some(1)])),
+            ("val".into(), ColumnData::Float64(vec![Some(100.0)])),
+        ]);
+        mt.insert(batch1);
+
+        let batch2 = ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(10)])),
+            ("ver".into(), ColumnData::Int64(vec![Some(5)])),
+            ("val".into(), ColumnData::Float64(vec![Some(999.0)])),
+        ]);
+        mt.insert(batch2);
+
+        // Before merge: 2 rows across 2 parts
+        assert_eq!(mt.total_rows(), 2);
+        let pre_merge = mt.scan_all();
+        assert_eq!(pre_merge.len(), 2);
+
+        // After merge: 1 row
+        mt.optimize();
+        let post_merge = mt.scan_all();
+        assert_eq!(post_merge.len(), 1);
+        assert_eq!(post_merge[0].row_count, 1);
+
+        if let Some(ColumnData::Float64(vals)) = post_merge[0].column("val") {
+            assert_eq!(vals, &[Some(999.0)]); // version 5 wins
+        }
+    }
+
+    // ================================================================
+    // AggregatingMergeTree tests
+    // ================================================================
+
+    #[test]
+    fn aggregating_mergetree_sum_columns() {
+        let strategy = MergeStrategy::Aggregating {
+            group_columns: vec!["session_id".into()],
+            sum_columns: vec!["page_views".into(), "duration".into()],
+            count_columns: vec![],
+        };
+        let mut mt = MergeTree::new_with_strategy(vec!["session_id".into()], strategy);
+        mt.max_parts = 100;
+
+        // Insert partial aggregates
+        let batch1 = ColumnBatch::new(vec![
+            ("session_id".into(), ColumnData::Text(vec![Some("s1".into()), Some("s2".into())])),
+            ("page_views".into(), ColumnData::Int64(vec![Some(3), Some(5)])),
+            ("duration".into(), ColumnData::Int64(vec![Some(100), Some(200)])),
+        ]);
+        mt.insert(batch1);
+
+        let batch2 = ColumnBatch::new(vec![
+            ("session_id".into(), ColumnData::Text(vec![Some("s1".into()), Some("s2".into())])),
+            ("page_views".into(), ColumnData::Int64(vec![Some(7), Some(2)])),
+            ("duration".into(), ColumnData::Int64(vec![Some(50), Some(300)])),
+        ]);
+        mt.insert(batch2);
+
+        // Merge
+        mt.optimize();
+
+        let batches = mt.scan_all();
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.row_count, 2);
+
+        if let Some(ColumnData::Text(ids)) = batch.column("session_id") {
+            assert_eq!(ids, &[Some("s1".into()), Some("s2".into())]);
+        }
+        if let Some(ColumnData::Int64(pv)) = batch.column("page_views") {
+            assert_eq!(pv, &[Some(10), Some(7)]); // 3+7=10, 5+2=7
+        }
+        if let Some(ColumnData::Int64(dur)) = batch.column("duration") {
+            assert_eq!(dur, &[Some(150), Some(500)]); // 100+50=150, 200+300=500
+        }
+    }
+
+    #[test]
+    fn aggregating_mergetree_count_columns() {
+        let strategy = MergeStrategy::Aggregating {
+            group_columns: vec!["url".into()],
+            sum_columns: vec![],
+            count_columns: vec!["hits".into()],
+        };
+        let mut mt = MergeTree::new_with_strategy(vec!["url".into()], strategy);
+        mt.max_parts = 100;
+
+        let batch1 = ColumnBatch::new(vec![
+            ("url".into(), ColumnData::Text(vec![Some("/home".into())])),
+            ("hits".into(), ColumnData::Int64(vec![Some(10)])),
+        ]);
+        mt.insert(batch1);
+
+        let batch2 = ColumnBatch::new(vec![
+            ("url".into(), ColumnData::Text(vec![Some("/home".into())])),
+            ("hits".into(), ColumnData::Int64(vec![Some(25)])),
+        ]);
+        mt.insert(batch2);
+
+        let batch3 = ColumnBatch::new(vec![
+            ("url".into(), ColumnData::Text(vec![Some("/home".into())])),
+            ("hits".into(), ColumnData::Int64(vec![Some(5)])),
+        ]);
+        mt.insert(batch3);
+
+        mt.optimize();
+
+        let batches = mt.scan_all();
+        assert_eq!(batches.len(), 1);
+        if let Some(ColumnData::Int64(hits)) = batches[0].column("hits") {
+            assert_eq!(hits, &[Some(40)]); // 10+25+5
+        }
+    }
+
+    #[test]
+    fn aggregating_mergetree_multiple_merges_cumulative() {
+        let strategy = MergeStrategy::Aggregating {
+            group_columns: vec!["key".into()],
+            sum_columns: vec!["total".into()],
+            count_columns: vec![],
+        };
+        let mut mt = MergeTree::new_with_strategy(vec!["key".into()], strategy);
+        mt.max_parts = 100;
+
+        // First round of inserts
+        mt.insert(ColumnBatch::new(vec![
+            ("key".into(), ColumnData::Int64(vec![Some(1)])),
+            ("total".into(), ColumnData::Int64(vec![Some(10)])),
+        ]));
+        mt.insert(ColumnBatch::new(vec![
+            ("key".into(), ColumnData::Int64(vec![Some(1)])),
+            ("total".into(), ColumnData::Int64(vec![Some(20)])),
+        ]));
+        mt.optimize(); // First merge: total = 30
+
+        // Second round
+        mt.insert(ColumnBatch::new(vec![
+            ("key".into(), ColumnData::Int64(vec![Some(1)])),
+            ("total".into(), ColumnData::Int64(vec![Some(50)])),
+        ]));
+        mt.optimize(); // Second merge: total = 30 + 50 = 80
+
+        let batches = mt.scan_all();
+        assert_eq!(batches.len(), 1);
+        if let Some(ColumnData::Int64(totals)) = batches[0].column("total") {
+            assert_eq!(totals, &[Some(80)]);
+        }
+    }
+
+    #[test]
+    fn aggregating_mergetree_non_aggregate_columns_keep_last() {
+        let strategy = MergeStrategy::Aggregating {
+            group_columns: vec!["id".into()],
+            sum_columns: vec!["amount".into()],
+            count_columns: vec![],
+        };
+        let mut mt = MergeTree::new_with_strategy(vec!["id".into()], strategy);
+        mt.max_parts = 100;
+
+        mt.insert(ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1)])),
+            ("amount".into(), ColumnData::Int64(vec![Some(100)])),
+            ("label".into(), ColumnData::Text(vec![Some("first".into())])),
+        ]));
+        mt.insert(ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1)])),
+            ("amount".into(), ColumnData::Int64(vec![Some(200)])),
+            ("label".into(), ColumnData::Text(vec![Some("latest".into())])),
+        ]));
+        mt.optimize();
+
+        let batches = mt.scan_all();
+        assert_eq!(batches.len(), 1);
+        if let Some(ColumnData::Int64(amounts)) = batches[0].column("amount") {
+            assert_eq!(amounts, &[Some(300)]); // 100 + 200
+        }
+        if let Some(ColumnData::Text(labels)) = batches[0].column("label") {
+            assert_eq!(labels, &[Some("latest".into())]); // last value
+        }
+    }
+
+    #[test]
+    fn aggregating_mergetree_float64_sum() {
+        let strategy = MergeStrategy::Aggregating {
+            group_columns: vec!["sensor".into()],
+            sum_columns: vec!["reading".into()],
+            count_columns: vec![],
+        };
+        let mut mt = MergeTree::new_with_strategy(vec!["sensor".into()], strategy);
+        mt.max_parts = 100;
+
+        mt.insert(ColumnBatch::new(vec![
+            ("sensor".into(), ColumnData::Text(vec![Some("temp".into())])),
+            ("reading".into(), ColumnData::Float64(vec![Some(23.5)])),
+        ]));
+        mt.insert(ColumnBatch::new(vec![
+            ("sensor".into(), ColumnData::Text(vec![Some("temp".into())])),
+            ("reading".into(), ColumnData::Float64(vec![Some(24.5)])),
+        ]));
+        mt.optimize();
+
+        let batches = mt.scan_all();
+        if let Some(ColumnData::Float64(readings)) = batches[0].column("reading") {
+            assert!((readings[0].unwrap() - 48.0).abs() < 1e-9);
+        }
+    }
+
+    // ================================================================
+    // ColumnarStore integration tests for new strategies
+    // ================================================================
+
+    #[test]
+    fn store_create_replacing_mergetree() {
+        let mut store = ColumnarStore::new();
+        store.create_merge_tree_table_with_strategy(
+            "events",
+            vec!["id".into()],
+            MergeStrategy::Replacing { version_column: Some("ver".into()) },
+        );
+
+        assert!(store.table_exists("events"));
+        assert!(store.is_merge_tree("events"));
+
+        store.append("events", ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1)])),
+            ("ver".into(), ColumnData::Int64(vec![Some(1)])),
+            ("data".into(), ColumnData::Text(vec![Some("old".into())])),
+        ]));
+        store.append("events", ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1)])),
+            ("ver".into(), ColumnData::Int64(vec![Some(2)])),
+            ("data".into(), ColumnData::Text(vec![Some("new".into())])),
+        ]));
+
+        // Optimize via MergeTree
+        store.get_merge_tree_mut("events").unwrap().optimize();
+
+        let batches = store.batches_all("events");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].row_count, 1);
+        if let Some(ColumnData::Text(d)) = batches[0].column("data") {
+            assert_eq!(d, &[Some("new".into())]);
+        }
+    }
+
+    #[test]
+    fn store_create_aggregating_mergetree() {
+        let mut store = ColumnarStore::new();
+        store.create_merge_tree_table_with_strategy(
+            "stats",
+            vec!["page".into()],
+            MergeStrategy::Aggregating {
+                group_columns: vec!["page".into()],
+                sum_columns: vec!["views".into()],
+                count_columns: vec!["visits".into()],
+            },
+        );
+
+        store.append("stats", ColumnBatch::new(vec![
+            ("page".into(), ColumnData::Text(vec![Some("/home".into())])),
+            ("views".into(), ColumnData::Int64(vec![Some(100)])),
+            ("visits".into(), ColumnData::Int64(vec![Some(50)])),
+        ]));
+        store.append("stats", ColumnBatch::new(vec![
+            ("page".into(), ColumnData::Text(vec![Some("/home".into())])),
+            ("views".into(), ColumnData::Int64(vec![Some(200)])),
+            ("visits".into(), ColumnData::Int64(vec![Some(75)])),
+        ]));
+
+        store.get_merge_tree_mut("stats").unwrap().optimize();
+
+        let batches = store.batches_all("stats");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].row_count, 1);
+        if let Some(ColumnData::Int64(views)) = batches[0].column("views") {
+            assert_eq!(views, &[Some(300)]);
+        }
+        if let Some(ColumnData::Int64(visits)) = batches[0].column("visits") {
+            assert_eq!(visits, &[Some(125)]);
+        }
+    }
+
+    #[test]
+    fn store_clear_preserves_strategy() {
+        let mut store = ColumnarStore::new();
+        store.create_merge_tree_table_with_strategy(
+            "t",
+            vec!["id".into()],
+            MergeStrategy::Replacing { version_column: Some("ver".into()) },
+        );
+        store.append("t", ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1)])),
+            ("ver".into(), ColumnData::Int64(vec![Some(1)])),
+        ]));
+        assert_eq!(store.row_count("t"), 1);
+
+        store.clear("t");
+        assert_eq!(store.row_count("t"), 0);
+
+        // Re-insert and verify strategy still works
+        store.append("t", ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1)])),
+            ("ver".into(), ColumnData::Int64(vec![Some(1)])),
+        ]));
+        store.append("t", ColumnBatch::new(vec![
+            ("id".into(), ColumnData::Int64(vec![Some(1)])),
+            ("ver".into(), ColumnData::Int64(vec![Some(2)])),
+        ]));
+        store.get_merge_tree_mut("t").unwrap().optimize();
+        assert_eq!(store.row_count("t"), 1); // deduped
+    }
+
+    #[test]
+    fn replacing_mergetree_execute_merge_task() {
+        let task = MergeTask {
+            table: "rmt_test".into(),
+            parts: vec![
+                MergeTreePart {
+                    id: 1,
+                    data: ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
+                        ("ver".into(), ColumnData::Int64(vec![Some(1), Some(1)])),
+                    ]),
+                    row_count: 2,
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
+                    ])),
+                    compressed: None,
+                },
+                MergeTreePart {
+                    id: 2,
+                    data: ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
+                        ("ver".into(), ColumnData::Int64(vec![Some(5), Some(1)])),
+                    ]),
+                    row_count: 2,
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
+                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
+                    ])),
+                    compressed: None,
+                },
+            ],
+            source_part_ids: vec![1, 2],
+            primary_key: vec!["id".into()],
+            merge_strategy: MergeStrategy::Replacing { version_column: Some("ver".into()) },
+        };
+
+        let result = execute_merge_task(task, 99);
+        assert_eq!(result.merged_part.row_count, 3); // id=1 (deduped), id=2, id=3
+
+        if let Some(ColumnData::Int64(ids)) = result.merged_part.data.column("id") {
+            assert_eq!(ids, &[Some(1), Some(2), Some(3)]);
+        }
+        if let Some(ColumnData::Int64(vers)) = result.merged_part.data.column("ver") {
+            assert_eq!(vers[0], Some(5)); // highest version for id=1
+        }
+    }
+
+    #[test]
+    fn aggregating_mergetree_execute_merge_task() {
+        let task = MergeTask {
+            table: "amt_test".into(),
+            parts: vec![
+                MergeTreePart {
+                    id: 1,
+                    data: ColumnBatch::new(vec![
+                        ("key".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
+                        ("total".into(), ColumnData::Int64(vec![Some(10), Some(20)])),
+                    ]),
+                    row_count: 2,
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
+                        ("key".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
+                    ])),
+                    compressed: None,
+                },
+                MergeTreePart {
+                    id: 2,
+                    data: ColumnBatch::new(vec![
+                        ("key".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
+                        ("total".into(), ColumnData::Int64(vec![Some(30), Some(40)])),
+                    ]),
+                    row_count: 2,
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
+                        ("key".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
+                    ])),
+                    compressed: None,
+                },
+            ],
+            source_part_ids: vec![1, 2],
+            primary_key: vec!["key".into()],
+            merge_strategy: MergeStrategy::Aggregating {
+                group_columns: vec!["key".into()],
+                sum_columns: vec!["total".into()],
+                count_columns: vec![],
+            },
+        };
+
+        let result = execute_merge_task(task, 99);
+        assert_eq!(result.merged_part.row_count, 2);
+
+        if let Some(ColumnData::Int64(totals)) = result.merged_part.data.column("total") {
+            assert_eq!(totals, &[Some(40), Some(60)]); // 10+30, 20+40
+        }
+    }
+
+    #[test]
+    fn replacing_mergetree_multicolumn_pk() {
+        let strategy = MergeStrategy::Replacing { version_column: Some("ver".into()) };
+        let mut mt = MergeTree::new_with_strategy(
+            vec!["tenant".into(), "id".into()],
+            strategy,
+        );
+        mt.max_parts = 100;
+
+        mt.insert(ColumnBatch::new(vec![
+            ("tenant".into(), ColumnData::Text(vec![Some("a".into()), Some("a".into())])),
+            ("id".into(), ColumnData::Int64(vec![Some(1), Some(1)])),
+            ("ver".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
+            ("data".into(), ColumnData::Text(vec![Some("v1".into()), Some("v2".into())])),
+        ]));
+        mt.insert(ColumnBatch::new(vec![
+            ("tenant".into(), ColumnData::Text(vec![Some("b".into())])),
+            ("id".into(), ColumnData::Int64(vec![Some(1)])),
+            ("ver".into(), ColumnData::Int64(vec![Some(1)])),
+            ("data".into(), ColumnData::Text(vec![Some("b_v1".into())])),
+        ]));
+        mt.optimize();
+
+        let batches = mt.scan_all();
+        assert_eq!(batches.len(), 1);
+        // (a,1) deduped to ver=2, (b,1) stays
+        assert_eq!(batches[0].row_count, 2);
+
+        if let Some(ColumnData::Text(tenants)) = batches[0].column("tenant") {
+            assert_eq!(tenants, &[Some("a".into()), Some("b".into())]);
+        }
+        if let Some(ColumnData::Int64(vers)) = batches[0].column("ver") {
+            assert_eq!(vers, &[Some(2), Some(1)]);
+        }
     }
 }

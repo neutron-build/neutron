@@ -1256,3 +1256,35 @@ pub(super) fn strip_json_nulls(val: &serde_json::Value) -> serde_json::Value {
         other => other.clone(),
     }
 }
+
+/// Recursive JSON containment check (`@>`).
+///
+/// Returns true when `left` contains all key-value pairs present in `right`.
+/// - Object A contains Object B when every key in B exists in A and
+///   A[key] contains B[key].
+/// - Array A contains Array B when every element in B has a matching
+///   element in A (order-independent).
+/// - Scalars are compared for equality.
+/// Convert a `Value` (Jsonb or Text containing JSON) to a `document::JsonValue`.
+/// Returns `None` if the value is not valid JSON.
+pub(super) fn value_to_doc_json(val: &Value) -> Option<crate::document::JsonValue> {
+    match val {
+        Value::Jsonb(v) => Some(serde_to_doc(v.clone())),
+        Value::Text(s) => parse_json_to_doc(s).ok(),
+        _ => None,
+    }
+}
+
+pub(super) fn json_contains(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    match (left, right) {
+        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
+            b.iter().all(|(k, bv)| {
+                a.get(k).is_some_and(|av| json_contains(av, bv))
+            })
+        }
+        (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
+            b.iter().all(|bv| a.iter().any(|av| json_contains(av, bv)))
+        }
+        (a, b) => a == b,
+    }
+}

@@ -26,8 +26,8 @@ use super::schema_types::{
     FunctionDef, FunctionKind, FunctionLanguage, SequenceDef, TriggerDef, TriggerEvent,
     TriggerTiming, ViewDef,
 };
-use super::types::{ColMeta, EncryptedIndexEntry, VectorIndexEntry, VectorIndexKind};
-use super::helpers::{sql_replacement_for_value, strip_dollar_quotes, substitute_sql_placeholders};
+use super::types::{ColMeta, EncryptedIndexEntry, GinIndexEntry, VectorIndexEntry, VectorIndexKind};
+use super::helpers::{sql_replacement_for_value, strip_dollar_quotes, substitute_sql_placeholders, value_to_doc_json};
 use super::{ExecError, ExecResult, Executor};
 
 impl Executor {
@@ -75,6 +75,10 @@ impl Executor {
         let append_only = Self::extract_append_only_option(&create.table_options);
         let engine_name = Self::extract_engine_option(&create.table_options);
 
+        // Extract ORDER BY columns for MergeTree tables.
+        // Supports `CREATE TABLE ... WITH (engine = 'mergetree') ORDER BY (col1, col2)`.
+        let order_by_cols: Vec<String> = Self::extract_order_by_columns(&create.order_by);
+
         // Detect serial / GENERATED AS IDENTITY columns and auto-create backing sequences.
         // Serial columns become NOT NULL with a nextval() default.
         let serial_cols = sql::extract_serial_columns(&create.columns);
@@ -107,9 +111,20 @@ impl Executor {
         match self.catalog.create_table(table_def.clone()).await {
             Ok(()) => {
                 // Route to per-table engine if engine override was specified.
+                let is_mergetree = matches!(
+                    engine_name.as_deref(),
+                    Some("mergetree") | Some("replacing_mergetree") | Some("aggregating_mergetree")
+                );
                 let tbl_storage: Arc<dyn StorageEngine> = match engine_name.as_deref() {
                     #[cfg(feature = "server")]
                     Some("columnar") => {
+                        let eng = Arc::new(crate::storage::ColumnarStorageEngine::new());
+                        self.table_engines.write().insert(table_name.clone(), eng.clone());
+                        eng
+                    }
+                    #[cfg(feature = "server")]
+                    Some("mergetree") | Some("replacing_mergetree") | Some("aggregating_mergetree") => {
+                        // MergeTree variants use the columnar storage engine backed by MergeTree.
                         let eng = Arc::new(crate::storage::ColumnarStorageEngine::new());
                         self.table_engines.write().insert(table_name.clone(), eng.clone());
                         eng
@@ -123,6 +138,39 @@ impl Executor {
                     _ => self.storage.clone(),
                 };
                 tbl_storage.create_table(&table_name).await?;
+
+                // If this is a MergeTree table, also create it in the columnar store
+                // with the ORDER BY columns as the primary key.
+                if is_mergetree {
+                    use crate::columnar::MergeStrategy;
+                    let strategy = match engine_name.as_deref() {
+                        Some("replacing_mergetree") => {
+                            let version_col = Self::extract_string_option(
+                                &create.table_options, "version_column",
+                            );
+                            MergeStrategy::Replacing { version_column: version_col }
+                        }
+                        Some("aggregating_mergetree") => {
+                            let sum_cols = Self::extract_csv_option(
+                                &create.table_options, "sum_columns",
+                            );
+                            let count_cols = Self::extract_csv_option(
+                                &create.table_options, "count_columns",
+                            );
+                            MergeStrategy::Aggregating {
+                                group_columns: order_by_cols.clone(),
+                                sum_columns: sum_cols,
+                                count_columns: count_cols,
+                            }
+                        }
+                        _ => MergeStrategy::Default,
+                    };
+                    self.columnar_store.write().create_merge_tree_table_with_strategy(
+                        &table_name,
+                        order_by_cols.clone(),
+                        strategy,
+                    );
+                }
                 // Cache column metadata for sync index scan path
                 let col_info: Vec<(String, DataType)> = table_def.columns.iter()
                     .map(|c| (c.name.clone(), c.data_type.clone()))
@@ -187,6 +235,46 @@ impl Executor {
                 }
         }
         None
+    }
+
+    /// Extract `WITH (version_column = 'col')` from CREATE TABLE options.
+    fn extract_string_option(opts: &ast::CreateTableOptions, key_name: &str) -> Option<String> {
+        let sql_opts = match opts {
+            ast::CreateTableOptions::With(v) | ast::CreateTableOptions::Options(v)
+            | ast::CreateTableOptions::Plain(v) | ast::CreateTableOptions::TableProperties(v) => v,
+            ast::CreateTableOptions::None => return None,
+        };
+        for opt in sql_opts {
+            if let ast::SqlOption::KeyValue { key, value } = opt
+                && key.value.eq_ignore_ascii_case(key_name) {
+                    let raw = value.to_string();
+                    let cleaned = raw.trim_matches('\'').trim_matches('"').to_string();
+                    return Some(cleaned);
+                }
+        }
+        None
+    }
+
+    /// Extract a comma-separated list option, e.g. `WITH (sum_columns = 'a,b,c')`.
+    fn extract_csv_option(opts: &ast::CreateTableOptions, key_name: &str) -> Vec<String> {
+        match Self::extract_string_option(opts, key_name) {
+            Some(s) if !s.is_empty() => s.split(',').map(|v| v.trim().to_string()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Extract ORDER BY columns from the optional `order_by` clause of a
+    /// CREATE TABLE statement (used for MergeTree primary key ordering).
+    fn extract_order_by_columns(order_by: &Option<ast::OneOrManyWithParens<Expr>>) -> Vec<String> {
+        match order_by {
+            Some(ast::OneOrManyWithParens::One(expr)) => {
+                vec![expr.to_string()]
+            }
+            Some(ast::OneOrManyWithParens::Many(exprs)) => {
+                exprs.iter().map(|e| e.to_string()).collect()
+            }
+            None => Vec::new(),
+        }
     }
 
     /// Return the storage engine for a specific table. Falls back to the global
@@ -584,6 +672,31 @@ impl Executor {
                         }
                     }
                 }
+        }
+
+        // For GIN indexes on JSONB columns, build an in-memory inverted index.
+        if matches!(index_type, crate::catalog::IndexType::Gin) {
+            let table_def = self.get_table(&table_name).await?;
+            if let Some(col_name) = columns.first()
+                && let Some(col_idx) = table_def.column_index(col_name)
+            {
+                let mut gin = crate::document::GinIndex::new();
+                let engine = self.storage_for(&table_name);
+                let existing_rows = engine.scan(&table_name).await.unwrap_or_default();
+                for (row_id, row) in existing_rows.iter().enumerate() {
+                    if col_idx < row.len()
+                        && let Some(doc) = value_to_doc_json(&row[col_idx])
+                    {
+                        gin.insert(row_id as u64, &doc);
+                    }
+                }
+                self.gin_indexes.write().insert(index_name.clone(), GinIndexEntry {
+                    table_name: table_name.clone(),
+                    column_name: col_name.clone(),
+                    col_idx,
+                    index: gin,
+                });
+            }
         }
 
         match self.catalog.create_index(index_def).await {
@@ -1000,7 +1113,7 @@ impl Executor {
     }
 
     /// Walk a query AST to extract table names referenced in FROM clauses.
-    fn extract_table_refs(query: &ast::Query) -> Vec<String> {
+    pub(super) fn extract_table_refs(query: &ast::Query) -> Vec<String> {
         let mut tables = Vec::new();
         if let ast::SetExpr::Select(ref sel) = *query.body {
             for item in &sel.from {
@@ -1500,6 +1613,27 @@ impl Executor {
         } else {
             Err(ExecError::Unsupported("materialized view query must return rows".into()))
         }
+    }
+
+    pub(super) async fn execute_drop_matview(&self, view_name: &str, if_exists: bool) -> Result<ExecResult, ExecError> {
+        let view_name = view_name.to_lowercase();
+        let removed = self.materialized_views.write().await.remove(&view_name);
+        if removed.is_none() && !if_exists {
+            return Err(ExecError::TableNotFound(format!("materialized view '{view_name}' not found")));
+        }
+        // Clean up mv_deps: remove this MV from all base table dependency lists.
+        {
+            let mut deps = self.mv_deps.write().await;
+            for mv_list in deps.values_mut() {
+                mv_list.retain(|n| n != &view_name);
+            }
+            // Remove entries with empty lists.
+            deps.retain(|_, v| !v.is_empty());
+        }
+        Ok(ExecResult::Command {
+            tag: "DROP MATERIALIZED VIEW".into(),
+            rows_affected: 0,
+        })
     }
 
     pub(super) async fn execute_vacuum(&self, vacuum_stmt: &ast::VacuumStatement) -> Result<ExecResult, ExecError> {

@@ -355,6 +355,35 @@ impl Executor {
             self.fire_triggers(&table_name, TriggerTiming::After, TriggerEvent::Insert, None, None, &col_meta, false).await;
         }
 
+        // ── Write-time materialized view refresh ────────────────────────────
+        // After the main insert commits, check if any MVs depend on this table
+        // and refresh them. For v0.1 we re-run the full MV query to ensure
+        // correctness with aggregations, WHERE filters, and multi-table joins.
+        if count > 0 {
+            let dependent_mvs: Vec<(String, String)> = {
+                let deps = self.mv_deps.read().await;
+                if let Some(mv_names) = deps.get(&table_name) {
+                    let views = self.materialized_views.read().await;
+                    mv_names.iter()
+                        .filter_map(|name| views.get(name).map(|mv| (name.clone(), mv.sql.clone())))
+                        .collect()
+                } else {
+                    vec![]
+                }
+            };
+            for (mv_name, mv_sql) in dependent_mvs {
+                if let Ok(results) = self.execute(&mv_sql).await {
+                    if let Some(ExecResult::Select { columns, rows }) = results.into_iter().next() {
+                        let mut views = self.materialized_views.write().await;
+                        if let Some(mv) = views.get_mut(&mv_name) {
+                            mv.columns = columns;
+                            mv.rows = rows;
+                        }
+                    }
+                }
+            }
+        }
+
         if returning.is_some() && !returned_rows.is_empty() {
             let columns: Vec<(String, DataType)> = col_meta
                 .iter()

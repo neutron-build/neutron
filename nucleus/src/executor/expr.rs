@@ -153,7 +153,8 @@ impl Executor {
             | Expr::IsNotDistinctFrom(_, _)
             | Expr::Array(_)
             | Expr::AnyOp { .. }
-            | Expr::AllOp { .. } => {
+            | Expr::AllOp { .. }
+            | Expr::CompoundFieldAccess { .. } => {
                 let empty_row: Row = Vec::new();
                 let empty_meta: Vec<ColMeta> = Vec::new();
                 self.eval_row_expr(expr, &empty_row, &empty_meta)
@@ -289,6 +290,34 @@ impl Executor {
         }
     }
 
+    /// Evaluate JSONB containment operator: `left @> right`.
+    ///
+    /// Returns true when `left` contains all key-value pairs in `right`.
+    /// Both sides are parsed as JSON; containment is checked recursively:
+    /// - Object A contains Object B when every key in B exists in A and
+    ///   A[key] contains B[key].
+    /// - Array A contains Array B when every element in B has a matching
+    ///   element in A (order-independent).
+    /// - Scalars are compared for equality.
+    pub(super) fn eval_json_contains(&self, left: &Value, right: &Value) -> Result<Value, ExecError> {
+        let left_json = match left {
+            Value::Jsonb(v) => v.clone(),
+            Value::Text(s) => serde_json::from_str(s).unwrap_or(serde_json::Value::Null),
+            Value::Null => return Ok(Value::Null),
+            _ => return Ok(Value::Bool(false)),
+        };
+        let right_json = match right {
+            Value::Jsonb(v) => v.clone(),
+            Value::Text(s) => match serde_json::from_str(s) {
+                Ok(v) => v,
+                Err(_) => return Ok(Value::Bool(false)),
+            },
+            Value::Null => return Ok(Value::Null),
+            _ => return Ok(Value::Bool(false)),
+        };
+        Ok(Value::Bool(json_contains(&left_json, &right_json)))
+    }
+
     pub(super) fn eval_binary_op(
         &self,
         left: &Value,
@@ -353,6 +382,14 @@ impl Executor {
             }
             ast::BinaryOperator::HashLongArrow => {
                 return self.eval_json_path_long_arrow(left, right);
+            }
+            // JSONB containment operator: left @> right
+            ast::BinaryOperator::AtArrow => {
+                return self.eval_json_contains(left, right);
+            }
+            // JSONB contained-by operator: left <@ right (reverse of @>)
+            ast::BinaryOperator::ArrowAt => {
+                return self.eval_json_contains(right, left);
             }
             // SQL 3-valued AND: FALSE AND anything = FALSE; TRUE AND NULL = NULL
             ast::BinaryOperator::And => {
@@ -1093,6 +1130,28 @@ impl Executor {
                         }
                     }
                     _ => Ok(Value::Null),
+                }
+            }
+            // -- CompoundFieldAccess: column['key'] as sugar for column -> 'key' --
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                let base = self.eval_row_expr(root, row, col_meta)?;
+                if let Some(first) = access_chain.first() {
+                    use sqlparser::ast::AccessExpr;
+                    match first {
+                        AccessExpr::Subscript(sub) => {
+                            let key_expr = match sub {
+                                sqlparser::ast::Subscript::Index { index } => index,
+                                sqlparser::ast::Subscript::Slice { .. } => {
+                                    return Err(ExecError::Unsupported("array slice subscript".into()));
+                                }
+                            };
+                            let key = self.eval_row_expr(key_expr, row, col_meta)?;
+                            self.eval_json_arrow(&base, &key)
+                        }
+                        _ => Err(ExecError::Unsupported(format!("expression: {expr}"))),
+                    }
+                } else {
+                    Ok(base)
                 }
             }
             _ => Err(ExecError::Unsupported(format!("expression: {expr}"))),

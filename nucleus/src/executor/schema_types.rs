@@ -21,6 +21,8 @@ pub(crate) struct MaterializedViewDef {
     pub sql: String,
     pub columns: Vec<(String, DataType)>,
     pub rows: Vec<Row>,
+    /// Base tables this MV depends on (populated from the MV's SELECT query).
+    pub source_tables: Vec<String>,
 }
 
 #[allow(dead_code)]
