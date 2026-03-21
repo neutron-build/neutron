@@ -63,17 +63,37 @@ export interface NeutronInputLimits {
   maxUrlLength?: number;
 }
 
+export interface NeutronImageConfig {
+  /** Default quality for optimized images (1-100) @default 75 */
+  quality?: number;
+  /** Preferred output formats in priority order @default ["avif", "webp"] */
+  formats?: string[];
+  /** Responsive image widths to generate @default [320, 640, 960, 1200, 1600] */
+  widths?: number[];
+  /** Allowed remote image hostnames */
+  remotePatterns?: Array<{ hostname: string; protocol?: string }>;
+}
+
+export interface NeutronMarkdownConfig {
+  remarkPlugins?: unknown[];
+  rehypePlugins?: unknown[];
+  syntaxHighlight?: { theme?: string } | false;
+}
+
 export interface NeutronConfig {
   adapter?: NeutronAdapter;
   server?: Omit<NeutronServerOptions, "rootDir">;
   routes?: NeutronRoutesConfig;
   runtime?: NeutronRuntime;
   worker?: NeutronWorkerConfig;
+  /** Image optimization configuration */
+  image?: NeutronImageConfig;
   /**
    * Input validation limits
    * @default { maxRequestBodySize: 10485760, maxHeaderSize: 16384, maxHeaderCount: 100, maxUrlLength: 2048 }
    */
   inputLimits?: NeutronInputLimits;
+  markdown?: NeutronMarkdownConfig;
 }
 
 export function defineConfig(config: NeutronConfig): NeutronConfig {

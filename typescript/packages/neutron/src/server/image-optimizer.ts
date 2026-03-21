@@ -27,6 +27,29 @@ const MAX_QUALITY = 100;
 const DEFAULT_QUALITY = 75;
 const DEFAULT_FORMAT = "webp";
 
+/**
+ * Negotiate the best image format based on the request Accept header.
+ * If an explicit format is provided (via `fmt` query param), it takes priority.
+ * Otherwise: prefer AVIF > WebP > JPEG based on what the client accepts.
+ */
+export function negotiateFormat(request: Request, requestedFormat?: string): { format: string; negotiated: boolean } {
+  if (requestedFormat && VALID_FORMATS.has(requestedFormat)) {
+    return { format: requestedFormat, negotiated: false };
+  }
+
+  const accept = request.headers.get("accept") || "";
+
+  if (accept.includes("image/avif")) {
+    return { format: "avif", negotiated: true };
+  }
+
+  if (accept.includes("image/webp")) {
+    return { format: "webp", negotiated: true };
+  }
+
+  return { format: "jpeg", negotiated: true };
+}
+
 let sharpModule: any = undefined;
 let sharpLoadAttempted = false;
 let sharpWarningLogged = false;
@@ -278,17 +301,26 @@ export async function handleImageRequest(
     return new Response(validated.error, { status: validated.status });
   }
 
+  // Content negotiation: if no explicit fmt was requested, pick from Accept header
+  const explicitFmt = url.searchParams.get("fmt");
+  const { format, negotiated } = negotiateFormat(request, explicitFmt || undefined);
+  validated.format = format as ImageParams["format"];
+
   const result = await optimizeImage(validated, opts);
 
   if ("error" in result) {
     return new Response(result.error, { status: result.status });
   }
 
-  return new Response(result.buffer as unknown as BodyInit, {
-    headers: {
-      "Content-Type": result.contentType,
-      "Cache-Control": "public, max-age=31536000, immutable",
-      "Content-Length": String(result.buffer.length),
-    },
-  });
+  const headers: Record<string, string> = {
+    "Content-Type": result.contentType,
+    "Cache-Control": "public, max-age=31536000, immutable",
+    "Content-Length": String(result.buffer.length),
+  };
+
+  if (negotiated) {
+    headers["Vary"] = "Accept";
+  }
+
+  return new Response(result.buffer as unknown as BodyInit, { headers });
 }

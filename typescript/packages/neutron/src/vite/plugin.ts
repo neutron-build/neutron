@@ -26,6 +26,8 @@ import type { SeoMetaInput } from "../core/seo.js";
 import type { NeutronRoutesConfig } from "../config.js";
 import type { Route, RouteModule, AppContext, LoaderArgs, ActionArgs, HeadArgs, MiddlewareFn, ErrorBoundaryProps } from "../core/types.js";
 import { handleImageRequest } from "../server/image-optimizer.js";
+import { checkAccessibility } from "./a11y-checker.js";
+import { parseError } from "./error-parser.js";
 
 export interface NeutronPluginOptions {
   routesDir?: string;
@@ -114,6 +116,11 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
                 event: "neutron:routes-updated",
                 data: state.routes,
               });
+              server.ws.send({
+                type: "custom",
+                event: "neutron:error-resolved",
+                data: {},
+              });
             })
             .catch((error) => {
               console.error("Failed to refresh Neutron routes:", error);
@@ -123,6 +130,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
 
       server.middlewares.use(async (req, res, next) => {
         const requestStartMs = performance.now();
+        let matchedRouteId: string | undefined;
         try {
           const url = new URL(req.url || "/", `http://${sanitizeHost(req.headers.host)}`);
           const originalPathname = url.pathname;
@@ -192,6 +200,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
           }
 
           const { route, params } = match;
+          matchedRouteId = route.id;
           const layoutChain = getLayoutChain(route, state.routes);
           const allRoutes = [...layoutChain, route];
 
@@ -219,7 +228,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
             middlewares,
             request,
             context,
-            () => handleRequest(server, route, params, layoutChain, allRoutes, request, context, devTiming)
+            () => handleRequest(server, route, params, layoutChain, allRoutes, request, context, rootDir, devTiming)
           );
           applyRouteRuleHeadersToResponse(
             response,
@@ -320,17 +329,19 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
         } catch (err) {
           console.error("SSR Error:", err);
 
-          // Send error to dev toolbar
+          // Send enriched error to dev toolbar + overlay
           const error = err as Error;
+          const errorPayload = parseError(
+            error,
+            'unknown',
+            rootDir,
+            matchedRouteId,
+            req.url
+          );
           server.ws.send({
             type: "custom",
             event: "neutron:dev-toolbar:error",
-            data: {
-              message: error.message || String(err),
-              stack: error.stack,
-              source: req.url || "(unknown)",
-              timestamp: Date.now(),
-            },
+            data: errorPayload,
           });
 
           next(err as Error);
@@ -563,6 +574,7 @@ async function handleRequest(
   allRoutes: Route[],
   request: Request,
   context: AppContext,
+  rootDir: string,
   devTiming?: DevTimingContext
 ): Promise<Response> {
   const { renderToString } = await import("preact-render-to-string");
@@ -600,7 +612,9 @@ async function handleRequest(
         if (error instanceof Response) {
           return error;
         }
-        // Action error - render with ErrorBoundary
+        // Action error - send enriched error to overlay
+        const actionErrorPayload = parseError(error as Error, 'action', rootDir, route.id, request.url);
+        server.ws.send({ type: "custom", event: "neutron:dev-toolbar:error", data: actionErrorPayload });
         return renderError(server, route, layoutChain, error as Error, request, moduleCache);
       }
     }
@@ -645,6 +659,8 @@ async function handleRequest(
   const loaderError = loaderResults.find((r) => r.error);
   if (loaderError?.error) {
     if (loaderError.error instanceof Response) return loaderError.error;
+    const loaderErrorPayload = parseError(loaderError.error, 'loader', rootDir, loaderError.routeId, request.url);
+    server.ws.send({ type: "custom", event: "neutron:dev-toolbar:error", data: loaderErrorPayload });
     return renderError(server, route, layoutChain, loaderError.error, request, moduleCache);
   }
 
@@ -709,6 +725,9 @@ async function handleRequest(
       devTiming.renderMs = performance.now() - renderStart;
     }
 
+    // Dev-mode accessibility checks
+    checkAccessibility(html, route.id);
+
     // Warn if a component rendered a <head> tag inside the component tree
     if (/<head[\s>]/i.test(html)) {
       console.warn(
@@ -724,7 +743,9 @@ async function handleRequest(
       headers: { "Content-Type": "text/html; charset=utf-8" },
     });
   } catch (error) {
-    // Render error - use ErrorBoundary
+    // Render error - send enriched error to overlay
+    const renderErrorPayload = parseError(error as Error, 'render', rootDir, route.id, request.url);
+    server.ws.send({ type: "custom", event: "neutron:dev-toolbar:error", data: renderErrorPayload });
     return renderError(server, route, layoutChain, error as Error, request, moduleCache);
   }
 }
