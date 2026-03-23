@@ -2266,7 +2266,32 @@ impl Executor {
 
         let mut results = Vec::new();
         for stmt in statements {
+            #[cfg(target_os = "linux")]
+            let rss_before = {
+                std::fs::read_to_string("/proc/self/statm")
+                    .ok()
+                    .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+                    .unwrap_or(0) * 4096
+            };
+
+            let stmt_desc = format!("{:?}", &stmt).chars().take(60).collect::<String>();
             results.push(self.execute_statement(stmt).await?);
+
+            #[cfg(target_os = "linux")]
+            {
+                let rss_after = std::fs::read_to_string("/proc/self/statm")
+                    .ok()
+                    .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+                    .unwrap_or(0) * 4096;
+                let delta = rss_after as i64 - rss_before as i64;
+                if delta > 1_000_000 { // Log if >1MB growth
+                    tracing::warn!(
+                        "Memory: +{} MB after stmt: {}",
+                        delta / (1024 * 1024),
+                        stmt_desc,
+                    );
+                }
+            }
         }
         Ok(results)
     }
