@@ -554,19 +554,15 @@ impl NucleusConfig {
         if max == 0 {
             return;
         }
-        // Budget allocation:
-        //   Buffer pool: 25% of max_memory (was 128MB default)
-        //   Cache:       12% of max_memory (was 64MB default)
-        //   KV + FTS + Columnar + overhead: remaining 63%
-        let bp = max / 4;
-        let cache = max / 8;
-        // Only scale down, never scale up beyond what the user explicitly set
-        if self.storage.buffer_pool_size_mb > bp {
-            self.storage.buffer_pool_size_mb = bp.max(8); // minimum 8 MB
-        }
-        if self.cache.max_memory_mb > cache {
-            self.cache.max_memory_mb = cache.max(4); // minimum 4 MB
-        }
+        // Budget: tight proportional allocation to leave room for runtime data.
+        //   Buffer pool: 10% of max_memory (was 25%)
+        //   Cache:        5% of max_memory (was 12%)
+        //   Remaining 85%: FTS, KV, columnar, query execution, OS overhead
+        let bp = (max / 10).max(4).min(256); // 4 MB minimum, 256 MB maximum
+        let cache = (max / 20).max(2).min(128); // 2 MB minimum, 128 MB maximum
+        // Always enforce proportional sizing relative to max_memory
+        self.storage.buffer_pool_size_mb = self.storage.buffer_pool_size_mb.min(bp);
+        self.cache.max_memory_mb = self.cache.max_memory_mb.min(cache);
     }
 }
 

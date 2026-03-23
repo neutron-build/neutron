@@ -2065,7 +2065,9 @@ pub struct MergeTreePart {
     /// Unique part ID.
     pub id: u64,
     /// The data in this part, sorted by the primary key columns.
-    pub data: ColumnBatch,
+    /// Wrapped in Arc so merge task cloning is O(1) instead of deep-copying
+    /// all column data.
+    pub data: std::sync::Arc<ColumnBatch>,
     /// Number of rows.
     pub row_count: usize,
     /// Zone map for partition pruning.
@@ -2120,7 +2122,9 @@ pub type MergeResultReceiver = std::sync::mpsc::Receiver<MergeResult>;
 /// combines, and compresses the source parts into a single merged part.
 pub fn execute_merge_task(task: MergeTask, new_part_id: u64) -> MergeResult {
     // Merge all source parts by iteratively merge-sorting pairs
-    let mut batches: Vec<ColumnBatch> = task.parts.into_iter().map(|p| p.data).collect();
+    let mut batches: Vec<ColumnBatch> = task.parts.into_iter()
+        .map(|p| std::sync::Arc::try_unwrap(p.data).unwrap_or_else(|arc| (*arc).clone()))
+        .collect();
 
     let sorted_batch = if batches.is_empty() {
         ColumnBatch::new(vec![])
@@ -2153,7 +2157,7 @@ pub fn execute_merge_task(task: MergeTask, new_part_id: u64) -> MergeResult {
 
     let merged_part = MergeTreePart {
         id: new_part_id,
-        data: merged_batch,
+        data: std::sync::Arc::new(merged_batch),
         row_count,
         zone_map,
         compressed: Some(compressed),
@@ -2320,7 +2324,7 @@ impl MergeTree {
 
         let part = MergeTreePart {
             id: part_id,
-            data: sorted,
+            data: std::sync::Arc::new(sorted),
             row_count,
             zone_map,
             compressed: None,
@@ -2428,7 +2432,7 @@ impl MergeTree {
 
         let merged = MergeTreePart {
             id: part_id,
-            data: merged_batch,
+            data: std::sync::Arc::new(merged_batch),
             row_count,
             zone_map,
             compressed: Some(compressed),
@@ -2446,7 +2450,7 @@ impl MergeTree {
         // Hot parts
         for part in &self.parts {
             if !part.zone_map.can_skip(predicate_col, op, value) {
-                result.push(part.data.clone());
+                result.push((*part.data).clone());
             }
         }
 
@@ -2473,7 +2477,7 @@ impl MergeTree {
     ///
     /// Loads cold parts from disk as needed.
     pub fn scan_all(&self) -> Vec<ColumnBatch> {
-        let mut result: Vec<ColumnBatch> = self.parts.iter().map(|p| p.data.clone()).collect();
+        let mut result: Vec<ColumnBatch> = self.parts.iter().map(|p| (*p.data).clone()).collect();
 
         for cold in &self.cold_parts {
             match SegmentReader::open(&cold.path) {
@@ -2629,7 +2633,7 @@ impl MergeTree {
             tree.next_part_id += 1;
             tree.parts.push(MergeTreePart {
                 id: part_id,
-                data: sorted,
+                data: std::sync::Arc::new(sorted),
                 row_count,
                 zone_map,
                 compressed: None,
@@ -5040,9 +5044,9 @@ mod tests {
             parts: vec![
                 MergeTreePart {
                     id: 1,
-                    data: ColumnBatch::new(vec![
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
-                    ]),
+                    ])),
                     row_count: 2,
                     zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
@@ -5051,9 +5055,9 @@ mod tests {
                 },
                 MergeTreePart {
                     id: 2,
-                    data: ColumnBatch::new(vec![
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
-                    ]),
+                    ])),
                     row_count: 2,
                     zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
@@ -5106,7 +5110,7 @@ mod tests {
             source_part_ids: vec![part_id_a, part_id_b],
             merged_part: MergeTreePart {
                 id: 999,
-                data: merged_batch.clone(),
+                data: std::sync::Arc::new(merged_batch.clone()),
                 row_count: 4,
                 zone_map: ZoneMap::from_batch(&merged_batch),
                 compressed: None,
@@ -5142,7 +5146,7 @@ mod tests {
             source_part_ids: vec![999, 1000],
             merged_part: MergeTreePart {
                 id: 50,
-                data: merged_batch.clone(),
+                data: std::sync::Arc::new(merged_batch.clone()),
                 row_count: 2,
                 zone_map: ZoneMap::from_batch(&merged_batch),
                 compressed: None,
@@ -5169,9 +5173,9 @@ mod tests {
             parts: vec![
                 MergeTreePart {
                     id: 1,
-                    data: ColumnBatch::new(vec![
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
-                    ]),
+                    ])),
                     row_count: 2,
                     zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
@@ -5180,9 +5184,9 @@ mod tests {
                 },
                 MergeTreePart {
                     id: 2,
-                    data: ColumnBatch::new(vec![
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
-                    ]),
+                    ])),
                     row_count: 2,
                     zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
@@ -5298,12 +5302,12 @@ mod tests {
             parts: vec![
                 MergeTreePart {
                     id: 1,
-                    data: ColumnBatch::new(vec![
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(5), Some(10)])),
                         ("name".into(), ColumnData::Text(vec![
                             Some("e".into()), Some("j".into()),
                         ])),
-                    ]),
+                    ])),
                     row_count: 2,
                     zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(5), Some(10)])),
@@ -5312,12 +5316,12 @@ mod tests {
                 },
                 MergeTreePart {
                     id: 2,
-                    data: ColumnBatch::new(vec![
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(1), Some(7)])),
                         ("name".into(), ColumnData::Text(vec![
                             Some("a".into()), Some("g".into()),
                         ])),
-                    ]),
+                    ])),
                     row_count: 2,
                     zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(1), Some(7)])),
@@ -5362,9 +5366,9 @@ mod tests {
             parts: vec![
                 MergeTreePart {
                     id: 1,
-                    data: ColumnBatch::new(vec![
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
-                    ]),
+                    ])),
                     row_count: 2,
                     zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
@@ -5373,9 +5377,9 @@ mod tests {
                 },
                 MergeTreePart {
                     id: 2,
-                    data: ColumnBatch::new(vec![
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
-                    ]),
+                    ])),
                     row_count: 2,
                     zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
@@ -5883,10 +5887,10 @@ mod tests {
             parts: vec![
                 MergeTreePart {
                     id: 1,
-                    data: ColumnBatch::new(vec![
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
                         ("ver".into(), ColumnData::Int64(vec![Some(1), Some(1)])),
-                    ]),
+                    ])),
                     row_count: 2,
                     zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
@@ -5895,10 +5899,10 @@ mod tests {
                 },
                 MergeTreePart {
                     id: 2,
-                    data: ColumnBatch::new(vec![
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
                         ("ver".into(), ColumnData::Int64(vec![Some(5), Some(1)])),
-                    ]),
+                    ])),
                     row_count: 2,
                     zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
@@ -5929,10 +5933,10 @@ mod tests {
             parts: vec![
                 MergeTreePart {
                     id: 1,
-                    data: ColumnBatch::new(vec![
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![
                         ("key".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
                         ("total".into(), ColumnData::Int64(vec![Some(10), Some(20)])),
-                    ]),
+                    ])),
                     row_count: 2,
                     zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
                         ("key".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
@@ -5941,10 +5945,10 @@ mod tests {
                 },
                 MergeTreePart {
                     id: 2,
-                    data: ColumnBatch::new(vec![
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![
                         ("key".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
                         ("total".into(), ColumnData::Int64(vec![Some(30), Some(40)])),
-                    ]),
+                    ])),
                     row_count: 2,
                     zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
                         ("key".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
