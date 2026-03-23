@@ -12,8 +12,8 @@ use parking_lot::{Mutex, RwLock};
 use super::disk::DiskManager;
 use super::page::{self, PageBuf, INVALID_PAGE_ID, PAGE_SIZE};
 
-/// Default buffer pool: 8192 frames × 16 KB = 128 MB.
-pub const DEFAULT_POOL_SIZE: usize = 8192;
+/// Default buffer pool: 2048 frames x 16 KB = 32 MB.
+pub const DEFAULT_POOL_SIZE: usize = 2048;
 
 // ============================================================================
 // Buffer pool statistics
