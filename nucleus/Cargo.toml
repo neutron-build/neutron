@@ -64,7 +64,7 @@ default = ["server"]
 server = [
     "dep:pgwire", "dep:rayon", "dep:core_affinity", "dep:rustyline",
     "dep:clap", "dep:rcgen", "dep:rustls-pemfile", "dep:tokio-postgres",
-    "dep:tracing-subscriber", "dep:zstd",
+    "dep:tracing-subscriber", "dep:zstd", "jemalloc",
     "tokio/full", "tokio/rt-multi-thread",
 ]
 wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:serde-wasm-bindgen", "getrandom/js"]
