@@ -52,7 +52,7 @@ impl Executor {
             graph: Some(self.graph_store.read().txn_snapshot()),
             doc: Some(self.doc_store.read().txn_snapshot()),
             datalog: Some(self.datalog_store.read().txn_snapshot()),
-            fts: Some(self.fts_index.read().txn_snapshot()),
+            fts: Some(self.fts_index.read().begin_undo_log()),
             ts: Some(self.ts_store.read().txn_snapshot()),
             blob: Some(self.blob_store.read().txn_snapshot()),
             vector: Some(self.vector_indexes.read().clone()),
@@ -127,8 +127,8 @@ impl Executor {
             if let Some(datalog_snap) = cm.datalog {
                 self.datalog_store.write().txn_restore(datalog_snap);
             }
-            if let Some(fts_snap) = cm.fts {
-                self.fts_index.write().txn_restore(fts_snap);
+            if let Some(fts_log) = cm.fts {
+                self.fts_index.write().undo(fts_log);
             }
             if let Some(ts_snap) = cm.ts {
                 self.ts_store.write().txn_restore(ts_snap);

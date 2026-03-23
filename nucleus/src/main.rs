@@ -742,6 +742,7 @@ async fn cmd_start(cfg: StartConfig) {
     let executor = Arc::new(
         Executor::new_with_persistence(catalog, storage, catalog_path, store_dir)
             .with_cache_size(cache_bytes)
+            .with_allocator_budget(config.server.max_memory_mb * 1024 * 1024)
             .with_metrics(metrics.clone())
             .with_replication(replication.clone())
             .with_conn_pool(conn_pool.clone())

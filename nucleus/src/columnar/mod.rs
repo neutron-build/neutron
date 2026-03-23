@@ -412,6 +412,22 @@ impl ColumnarStore {
         }
     }
 
+    /// Estimate total in-memory bytes across all tables and MergeTree hot parts.
+    pub fn estimated_memory_bytes(&self) -> usize {
+        let mut total = 0usize;
+        for batches in self.tables.values() {
+            for batch in batches {
+                total += segment::estimate_batch_size(batch);
+            }
+        }
+        for mt in self.merge_trees.values() {
+            for part in &mt.parts {
+                total += segment::estimate_batch_size(&part.data);
+            }
+        }
+        total
+    }
+
     /// Open (or create) a WAL-backed columnar store in `dir`.
     ///
     /// Replays the WAL to recover table state, then attaches the WAL for

@@ -75,6 +75,11 @@ impl MemoryAllocator {
         }
     }
 
+    /// Update the total memory budget, preserving all registrations.
+    pub fn set_total_budget(&mut self, budget: usize) {
+        self.total_budget = budget;
+    }
+
     /// Register a subsystem.
     pub fn register(&mut self, name: &str, priority: Priority) {
         self.allocations.insert(

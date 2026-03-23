@@ -118,7 +118,7 @@ pub(super) struct CrossModelSnapshots {
     pub graph: Option<crate::graph::GraphTxnSnapshot>,
     pub doc: Option<crate::document::DocTxnSnapshot>,
     pub datalog: Option<crate::datalog::DatalogTxnSnapshot>,
-    pub fts: Option<crate::fts::FtsTxnSnapshot>,
+    pub fts: Option<crate::fts::FtsUndoLog>,
     pub ts: Option<crate::timeseries::TsTxnSnapshot>,
     pub blob: Option<crate::blob::BlobTxnSnapshot>,
     /// Clone of the full vector index map (keyed by index name).
