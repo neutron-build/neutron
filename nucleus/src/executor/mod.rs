@@ -1514,6 +1514,11 @@ impl Executor {
         &self.fts_index
     }
 
+    /// Get a reference to the memory allocator.
+    pub fn memory_allocator(&self) -> &parking_lot::Mutex<crate::memory::MemoryAllocator> {
+        &self.memory_allocator
+    }
+
     /// Get a reference to the blob store.
     pub fn blob_store(&self) -> &parking_lot::RwLock<crate::blob::BlobStore> {
         &self.blob_store

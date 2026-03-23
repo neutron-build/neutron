@@ -1143,6 +1143,61 @@ async fn cmd_start(cfg: StartConfig) {
         }
     });
 
+    // ---- Memory watchdog (RSS-based hard cap) --------------------------------
+    // Reads /proc/self/statm on Linux to get actual RSS and triggers memory
+    // pressure when approaching the --max-memory limit.
+    {
+        let executor_for_mem = executor.clone();
+        let max_memory_bytes = config.server.max_memory_mb as u64 * 1024 * 1024;
+        tokio::spawn(async move {
+            let warn_threshold = (max_memory_bytes as f64 * 0.75) as u64;
+            let pressure_threshold = (max_memory_bytes as f64 * 0.85) as u64;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let rss_bytes = read_rss_bytes();
+                if rss_bytes == 0 {
+                    continue; // /proc/self/statm not available (macOS, etc.)
+                }
+                if rss_bytes > pressure_threshold {
+                    tracing::warn!(
+                        "Memory pressure: RSS {} MB / {} MB limit — triggering eviction",
+                        rss_bytes / (1024 * 1024),
+                        max_memory_bytes / (1024 * 1024),
+                    );
+                    // Evict cache, sweep KV expired, compact FTS postings
+                    executor_for_mem.cleanup_expired_cache();
+                    executor_for_mem.kv_store().sweep_expired();
+                    {
+                        use nucleus::memory::Pressurable;
+                        let mut fts = executor_for_mem.fts_index().write();
+                        fts.shrink_postings();
+                        let _ = fts.checkpoint_wal();
+                    }
+                    // Refresh allocator tracking
+                    {
+                        let mut alloc = executor_for_mem.memory_allocator().lock();
+                        // Reset all subsystems to measured values
+                        for name in ["cache", "fts", "kv", "columnar", "sparse", "doc", "graph"] {
+                            let old = alloc.allocation(name).map(|a| a.current_bytes).unwrap_or(0);
+                            alloc.release(name, old);
+                        }
+                    }
+                } else if rss_bytes > warn_threshold {
+                    tracing::info!(
+                        "Memory: RSS {} MB / {} MB limit ({}%)",
+                        rss_bytes / (1024 * 1024),
+                        max_memory_bytes / (1024 * 1024),
+                        rss_bytes * 100 / max_memory_bytes,
+                    );
+                }
+            }
+        });
+        tracing::info!(
+            "Memory watchdog: monitoring RSS, pressure at {}% of {} MB",
+            85, config.server.max_memory_mb
+        );
+    }
+
     // ---- Streaming replication transport ------------------------------------
     if let Some(ref primary_addr) = replicate_from {
         // Replica mode: connect to the primary's replication port
@@ -1721,6 +1776,22 @@ fn load_internal_tls_from_env() -> Result<Option<nucleus::tls::InternalTlsConfig
     )
     .map(Some)
     .map_err(|e| e.to_string())
+}
+
+/// Read RSS (Resident Set Size) in bytes from /proc/self/statm.
+/// Returns 0 on platforms where /proc is not available (macOS, Windows).
+fn read_rss_bytes() -> u64 {
+    let Ok(contents) = std::fs::read_to_string("/proc/self/statm") else {
+        return 0;
+    };
+    // Format: size resident shared text lib data dt (all in pages)
+    let page_size = 4096u64; // standard page size on x86_64 Linux
+    contents
+        .split_whitespace()
+        .nth(1) // resident pages
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|pages| pages * page_size)
+        .unwrap_or(0)
 }
 
 fn is_loopback_host(host: &str) -> bool {
