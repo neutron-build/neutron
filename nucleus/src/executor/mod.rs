@@ -335,8 +335,9 @@ impl Executor {
                 alloc.register("fts",    Priority::Normal);
                 alloc.register("sparse", Priority::Normal);
                 alloc.register("kv",     Priority::Normal);
-                alloc.register("doc",    Priority::Normal);
-                alloc.register("graph",  Priority::High);
+                alloc.register("doc",      Priority::Normal);
+                alloc.register("graph",    Priority::High);
+                alloc.register("columnar", Priority::Normal);
                 alloc
             }),
             blob_store: parking_lot::RwLock::new(crate::blob::BlobStore::new()),
@@ -520,6 +521,22 @@ impl Executor {
     }
 
     /// Save the FTS index to disk (called after each mutation).
+    /// Rough byte-size estimate for a Value (used by memory accounting).
+    fn estimate_value_bytes(v: &crate::types::Value) -> usize {
+        use crate::types::Value;
+        match v {
+            Value::Null | Value::Bool(_) => 8,
+            Value::Int32(_) => 4,
+            Value::Int64(_) | Value::Float64(_) => 8,
+            Value::Text(s) | Value::Numeric(s) => s.len() + 24,
+            Value::Bytea(b) => b.len() + 24,
+            Value::Jsonb(j) => j.to_string().len() + 24,
+            Value::Array(a) => a.iter().map(Self::estimate_value_bytes).sum::<usize>() + 24,
+            Value::Vector(v) => v.len() * 4 + 24,
+            _ => 32,
+        }
+    }
+
     pub fn save_fts_index(&self) {
         let Some(path) = self.fts_persist_path() else { return; };
         if let Ok(json) = self.fts_index.read().to_json()
@@ -1067,6 +1084,13 @@ impl Executor {
     /// Set the cache tier maximum memory in bytes.
     pub fn with_cache_size(self, max_bytes: usize) -> Self {
         *self.cache.write() = CacheTier::new(max_bytes);
+        self
+    }
+
+    /// Set the global memory allocator budget in bytes.
+    /// All subsystems (cache, FTS, KV, columnar, etc.) share this budget.
+    pub fn with_allocator_budget(self, budget_bytes: usize) -> Self {
+        self.memory_allocator.lock().set_total_budget(budget_bytes);
         self
     }
 
@@ -3272,31 +3296,45 @@ impl Executor {
     /// MEMORY PRESSURE — trigger memory pressure: evict expired cache entries,
     /// checkpoint FTS WAL, and update the allocator with current measured usage.
     async fn execute_memory_pressure(&self) -> ExecResult {
+        use crate::memory::Pressurable;
+
         // 1. Evict expired cache entries and measure actual usage.
         let cache_used = {
-            use crate::memory::Pressurable;
             let mut cache = self.cache.write();
             cache.evict_expired();
             cache.current_usage()
         };
 
-        // 2. Checkpoint FTS WAL to reduce WAL file footprint.
+        // 2. Compact FTS posting lists and checkpoint WAL.
         let fts_used = {
-            use crate::memory::Pressurable;
-            let fts = self.fts_index.write();
+            let mut fts = self.fts_index.write();
+            fts.shrink_postings();
             let _ = fts.checkpoint_wal();
             fts.current_usage()
         };
 
-        // 3. Refresh allocator tracking with measured values.
+        // 3. Sweep expired KV entries and measure usage.
+        let kv_used = {
+            self.kv_store.sweep_expired();
+            self.kv_store.dbsize() * 128
+        };
+
+        // 4. Measure columnar hot-part memory.
+        let columnar_used = self.columnar_store.read().estimated_memory_bytes();
+
+        // 5. Refresh allocator tracking with measured values.
         {
             let mut alloc = self.memory_allocator.lock();
-            let old_cache = alloc.allocation("cache").map(|a| a.current_bytes).unwrap_or(0);
-            let old_fts = alloc.allocation("fts").map(|a| a.current_bytes).unwrap_or(0);
-            alloc.release("cache", old_cache);
-            alloc.release("fts", old_fts);
-            alloc.request("cache", cache_used);
-            alloc.request("fts", fts_used);
+            for (name, measured) in [
+                ("cache", cache_used),
+                ("fts", fts_used),
+                ("kv", kv_used),
+                ("columnar", columnar_used),
+            ] {
+                let old = alloc.allocation(name).map(|a| a.current_bytes).unwrap_or(0);
+                alloc.release(name, old);
+                let _ = alloc.request(name, measured);
+            }
         }
 
         ExecResult::Command { tag: "MEMORY PRESSURE".into(), rows_affected: 0 }

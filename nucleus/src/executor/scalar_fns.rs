@@ -2235,6 +2235,13 @@ impl Executor {
                 } else {
                     None
                 };
+                let estimated = key.len() + Self::estimate_value_bytes(&value) + 64;
+                if !self.memory_allocator.lock().request("kv", estimated) {
+                    return Err(ExecError::Unsupported(format!(
+                        "KV_SET: memory budget exceeded (need {} bytes for key '{}')",
+                        estimated, key
+                    )));
+                }
                 self.kv_store.set(&key, value, ttl);
                 Ok(Value::Text("OK".into()))
             }
@@ -2246,7 +2253,11 @@ impl Executor {
                     Value::Null => return Ok(Value::Bool(false)),
                     other => other.to_string(),
                 };
-                Ok(Value::Bool(self.kv_store.del(&key)))
+                let deleted = self.kv_store.del(&key);
+                if deleted {
+                    self.memory_allocator.lock().release("kv", key.len() + 96);
+                }
+                Ok(Value::Bool(deleted))
             }
             "KV_EXISTS" => {
                 // kv_exists(key) → true/false
@@ -2307,7 +2318,18 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
-                Ok(Value::Bool(self.kv_store.setnx(&key, args[1].clone())))
+                let estimated = key.len() + Self::estimate_value_bytes(&args[1]) + 64;
+                if !self.memory_allocator.lock().request("kv", estimated) {
+                    return Err(ExecError::Unsupported(format!(
+                        "KV_SETNX: memory budget exceeded (need {} bytes)", estimated
+                    )));
+                }
+                let was_set = self.kv_store.setnx(&key, args[1].clone());
+                if !was_set {
+                    // Key already existed, release the reservation
+                    self.memory_allocator.lock().release("kv", estimated);
+                }
+                Ok(Value::Bool(was_set))
             }
             "KV_DBSIZE" => {
                 // kv_dbsize() → count of non-expired keys
@@ -2734,6 +2756,12 @@ impl Executor {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
                 };
+                // HLL is fixed 16 bytes per key; account for key creation overhead
+                if !self.memory_allocator.lock().request("kv", 64) {
+                    return Err(ExecError::Unsupported(
+                        "KV_PFADD: memory budget exceeded".into()
+                    ));
+                }
                 match self.kv_store.col_pfadd(&key, &element) {
                     Ok(changed) => Ok(Value::Bool(changed)),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
@@ -2999,6 +3027,13 @@ impl Executor {
                     i += 2;
                 }
                 let batch = crate::columnar::ColumnBatch::new(columns);
+                let estimated = crate::columnar::segment::estimate_batch_size(&batch);
+                if !self.memory_allocator.lock().request("columnar", estimated) {
+                    return Err(ExecError::Unsupported(format!(
+                        "COLUMNAR_INSERT: memory budget exceeded (need {} bytes for table '{}')",
+                        estimated, table
+                    )));
+                }
                 self.columnar_store.write().append_with_dict(&table, batch);
                 Ok(Value::Text("OK".into()))
             }
@@ -3287,10 +3322,25 @@ impl Executor {
                     _ => return Err(ExecError::Unsupported("FTS_INDEX: text must be a string".into())),
                 };
                 let text_len = text.len();
+                let estimated = text_len + 64;
+                if !self.memory_allocator.lock().request("fts", estimated) {
+                    return Err(ExecError::Unsupported(format!(
+                        "FTS_INDEX: memory budget exceeded (need {} bytes for doc {})",
+                        estimated, doc_id
+                    )));
+                }
                 self.fts_index.write().add_document(doc_id, &text);
                 self.save_fts_index();
-                // Track FTS memory usage (text bytes + estimated posting overhead).
-                self.memory_allocator.lock().request("fts", text_len + 64);
+                // Record mutation for potential rollback
+                if let Ok(mut txn) = self.current_session().txn_state.try_write() {
+                    if txn.active {
+                        if let Some(ref mut cm) = txn.cross_model {
+                            if let Some(ref mut fts_log) = cm.fts {
+                                fts_log.ops.push(crate::fts::FtsUndoOp::AddedDoc { doc_id });
+                            }
+                        }
+                    }
+                }
                 Ok(Value::Bool(true))
             }
             "FTS_REMOVE" => {
@@ -3300,6 +3350,16 @@ impl Executor {
                     return Err(ExecError::Unsupported("FTS_REMOVE requires (doc_id)".into()));
                 }
                 let doc_id = val_to_u64(&args[0], "FTS_REMOVE doc_id")?;
+                // Capture state before removal for potential rollback
+                if let Ok(mut txn) = self.current_session().txn_state.try_write() {
+                    if txn.active {
+                        if let Some(ref mut cm) = txn.cross_model {
+                            if let Some(ref mut fts_log) = cm.fts {
+                                self.fts_index.read().record_remove(fts_log, doc_id);
+                            }
+                        }
+                    }
+                }
                 self.fts_index.write().remove_document(doc_id);
                 self.save_fts_index();
                 self.memory_allocator.lock().release("fts", 64);

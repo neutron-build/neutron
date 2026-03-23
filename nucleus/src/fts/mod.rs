@@ -264,6 +264,27 @@ struct DocInfo {
     length: usize,
 }
 
+/// A single undo operation for FTS transaction rollback.
+#[derive(Debug, Clone)]
+pub enum FtsUndoOp {
+    /// A document was added during the transaction. Undo = remove it.
+    AddedDoc { doc_id: u64 },
+    /// A document was removed during the transaction. Undo = re-insert it.
+    RemovedDoc {
+        doc_id: u64,
+        info: DocInfo,
+        postings: Vec<(String, Posting)>,
+        facets: Option<HashMap<String, Vec<String>>>,
+    },
+}
+
+/// Undo log for FTS operations within a transaction.
+/// O(1) to create, O(mutations) memory — replaces the old O(index_size) deep-clone.
+#[derive(Debug, Clone, Default)]
+pub struct FtsUndoLog {
+    pub ops: Vec<FtsUndoOp>,
+}
+
 /// Result of a faceted search — ranked results plus facet aggregations.
 #[derive(Debug, Clone)]
 pub struct FacetedSearchResult {
@@ -564,12 +585,70 @@ impl InvertedIndex {
     }
 
     /// Restore mutable FTS state from a transaction snapshot (for ROLLBACK).
+    #[deprecated(note = "Use begin_undo_log/undo instead for O(mutations) memory")]
     pub fn txn_restore(&mut self, snap: FtsTxnSnapshot) {
         self.postings = snap.postings;
         self.docs = snap.docs;
         self.doc_facets = snap.doc_facets;
         self.doc_count = snap.doc_count;
         self.total_length = snap.total_length;
+    }
+
+    // ====================================================================
+    // Undo Log (transaction rollback without deep cloning)
+    // ====================================================================
+
+    /// Create an empty undo log — O(1) memory. Replaces txn_snapshot().
+    pub fn begin_undo_log(&self) -> FtsUndoLog {
+        FtsUndoLog::default()
+    }
+
+    /// Capture a document's state before removal for potential rollback.
+    pub fn record_remove(&self, log: &mut FtsUndoLog, doc_id: u64) {
+        if let Some(info) = self.docs.get(&doc_id) {
+            let mut postings = Vec::new();
+            for (term, posting_list) in &self.postings {
+                for p in posting_list {
+                    if p.doc_id == doc_id {
+                        postings.push((term.clone(), p.clone()));
+                    }
+                }
+            }
+            let facets = self.doc_facets.get(&doc_id).cloned();
+            log.ops.push(FtsUndoOp::RemovedDoc {
+                doc_id,
+                info: info.clone(),
+                postings,
+                facets,
+            });
+        }
+    }
+
+    /// Replay the undo log in reverse to roll back all FTS mutations.
+    pub fn undo(&mut self, log: FtsUndoLog) {
+        for op in log.ops.into_iter().rev() {
+            match op {
+                FtsUndoOp::AddedDoc { doc_id } => {
+                    self.remove_document_internal(doc_id);
+                }
+                FtsUndoOp::RemovedDoc {
+                    doc_id,
+                    info,
+                    postings,
+                    facets,
+                } => {
+                    self.doc_count += 1;
+                    self.total_length += info.length;
+                    self.docs.insert(doc_id, info);
+                    for (term, posting) in postings {
+                        self.postings.entry(term).or_default().push(posting);
+                    }
+                    if let Some(f) = facets {
+                        self.doc_facets.insert(doc_id, f);
+                    }
+                }
+            }
+        }
     }
 
     // ====================================================================
@@ -896,6 +975,16 @@ impl InvertedIndex {
     /// Estimated posting list memory: ~24 bytes per posting (doc_id + positions vec + tf).
     pub fn estimated_posting_bytes(&self) -> usize {
         self.postings.values().map(|v| v.len() * 24).sum()
+    }
+
+    /// Shrink all posting Vecs and the postings HashMap to release excess capacity.
+    pub fn shrink_postings(&mut self) {
+        for v in self.postings.values_mut() {
+            v.shrink_to_fit();
+        }
+        self.postings.shrink_to_fit();
+        self.docs.shrink_to_fit();
+        self.doc_facets.shrink_to_fit();
     }
 
     // ========================================================================

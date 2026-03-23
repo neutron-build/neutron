@@ -948,10 +948,13 @@ impl crate::memory::Pressurable for crate::fts::InvertedIndex {
     }
 
     fn shrink_to(&mut self, _target: usize) -> usize {
-        // FTS data is authoritative — can't evict without data loss.
-        // Checkpoint the WAL to compact it (reduces disk footprint).
+        let before = self.estimated_posting_bytes();
+        // Compact posting lists and HashMaps to release excess capacity.
+        self.shrink_postings();
+        // Checkpoint the WAL to compact it on disk.
         let _ = self.checkpoint_wal();
-        0
+        let after = self.estimated_posting_bytes();
+        before.saturating_sub(after)
     }
 
     fn priority(&self) -> crate::memory::Priority {
@@ -981,6 +984,48 @@ impl crate::memory::Pressurable for crate::sparse::SparseIndex {
 
     fn name(&self) -> &str {
         "sparse"
+    }
+}
+
+/// Pressurable adapter for `KvStore` — sweeps expired entries on pressure.
+impl crate::memory::Pressurable for crate::kv::KvStore {
+    fn current_usage(&self) -> usize {
+        self.dbsize() * 128
+    }
+
+    fn shrink_to(&mut self, _target: usize) -> usize {
+        let before = self.dbsize();
+        self.sweep_expired_full();
+        let after = self.dbsize();
+        before.saturating_sub(after) * 128
+    }
+
+    fn priority(&self) -> crate::memory::Priority {
+        crate::memory::Priority::Normal
+    }
+
+    fn name(&self) -> &str {
+        "kv"
+    }
+}
+
+/// Pressurable adapter for `ColumnarStore` — reports estimated hot-part memory.
+impl crate::memory::Pressurable for crate::columnar::ColumnarStore {
+    fn current_usage(&self) -> usize {
+        self.estimated_memory_bytes()
+    }
+
+    fn shrink_to(&mut self, _target: usize) -> usize {
+        // Cold flush requires data_dir; for now just report.
+        0
+    }
+
+    fn priority(&self) -> crate::memory::Priority {
+        crate::memory::Priority::Normal
+    }
+
+    fn name(&self) -> &str {
+        "columnar"
     }
 }
 
