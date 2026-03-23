@@ -942,10 +942,9 @@ impl crate::memory::Pressurable for CacheTier {
 /// and checkpoints the WAL on pressure (reduces WAL file size, keeps all data).
 impl crate::memory::Pressurable for crate::fts::InvertedIndex {
     fn current_usage(&self) -> usize {
-        // Estimate: stored text bytes + posting list overhead (24 bytes per posting).
-        let text_bytes: usize = self.original_texts().values().map(|s| s.len()).sum();
-        let posting_bytes = self.estimated_posting_bytes();
-        text_bytes + posting_bytes
+        // Estimate: posting list overhead (24 bytes per posting).
+        // Original texts are no longer kept in memory.
+        self.estimated_posting_bytes()
     }
 
     fn shrink_to(&mut self, _target: usize) -> usize {

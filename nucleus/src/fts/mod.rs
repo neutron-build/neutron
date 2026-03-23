@@ -290,9 +290,6 @@ pub struct InvertedIndex {
     doc_count: u64,
     /// Sum of all document lengths (for avgdl)
     total_length: usize,
-    /// Original document texts, keyed by doc_id (needed for WAL snapshots).
-    #[serde(skip)]
-    original_texts: HashMap<u64, String>,
     /// Optional WAL for binary persistence.
     #[serde(skip)]
     wal: Option<Arc<fts_wal::FtsWal>>,
@@ -312,7 +309,6 @@ impl InvertedIndex {
             doc_facets: HashMap::new(),
             doc_count: 0,
             total_length: 0,
-            original_texts: HashMap::new(),
             wal: None,
         }
     }
@@ -329,13 +325,11 @@ impl InvertedIndex {
             doc_facets: HashMap::new(),
             doc_count: 0,
             total_length: 0,
-            original_texts: HashMap::new(),
             wal: Some(Arc::new(wal)),
         };
         // Re-index every recovered document (re-tokenize from original text).
         for (doc_id, text) in state.docs {
             idx.index_document_internal(doc_id, &text);
-            idx.original_texts.insert(doc_id, text);
         }
         Ok(idx)
     }
@@ -359,7 +353,6 @@ impl InvertedIndex {
             && let Err(e) = wal.log_index_doc(doc_id, text) {
                 eprintln!("FTS WAL: failed to log index_doc {doc_id}: {e}");
             }
-        self.original_texts.insert(doc_id, text.to_string());
         self.index_document_internal(doc_id, text);
     }
 
@@ -409,7 +402,6 @@ impl InvertedIndex {
             && let Err(e) = wal.log_remove_doc(doc_id) {
                 eprintln!("FTS WAL: failed to log remove_doc {doc_id}: {e}");
             }
-        self.original_texts.remove(&doc_id);
         self.remove_document_internal(doc_id);
     }
 
@@ -432,9 +424,11 @@ impl InvertedIndex {
         }
     }
 
-    /// Get the original text of a document (if stored).
-    pub fn get_original_text(&self, doc_id: u64) -> Option<&str> {
-        self.original_texts.get(&doc_id).map(|s| s.as_str())
+    /// Get the original text of a document.
+    /// Original texts are no longer kept in memory to save RAM. Returns None.
+    /// Use the WAL to retrieve original text if needed.
+    pub fn get_original_text(&self, _doc_id: u64) -> Option<&str> {
+        None
     }
 
     /// Generate highlighted snippets from a document with matched terms wrapped in tags.
@@ -541,12 +535,16 @@ impl InvertedIndex {
     /// This compacts the WAL file. Only meaningful if a WAL is attached.
     pub fn checkpoint_wal(&self) -> std::io::Result<()> {
         if let Some(wal) = &self.wal {
-            let docs: Vec<(u64, String)> = self
-                .original_texts
-                .iter()
-                .map(|(&id, text)| (id, text.clone()))
+            // Read current doc texts from the WAL file itself instead of
+            // keeping them in memory. This avoids O(corpus) memory for
+            // original text storage.
+            let docs = wal.read_current_docs()?;
+            // Filter to only docs that are still live in the index
+            let live: Vec<(u64, String)> = docs
+                .into_iter()
+                .filter(|(id, _)| self.docs.contains_key(id))
                 .collect();
-            wal.checkpoint(&docs)?;
+            wal.checkpoint(&live)?;
         }
         Ok(())
     }
@@ -562,7 +560,6 @@ impl InvertedIndex {
             doc_facets: self.doc_facets.clone(),
             doc_count: self.doc_count,
             total_length: self.total_length,
-            original_texts: self.original_texts.clone(),
         }
     }
 
@@ -573,7 +570,6 @@ impl InvertedIndex {
         self.doc_facets = snap.doc_facets;
         self.doc_count = snap.doc_count;
         self.total_length = snap.total_length;
-        self.original_texts = snap.original_texts;
     }
 
     // ====================================================================
@@ -892,9 +888,9 @@ impl InvertedIndex {
         self.postings.len()
     }
 
-    /// Expose original_texts map for memory estimation (used by Pressurable impl).
-    pub fn original_texts(&self) -> &HashMap<u64, String> {
-        &self.original_texts
+    /// Estimated original text bytes. Always 0 now that texts are not kept in memory.
+    pub fn original_texts_bytes(&self) -> usize {
+        0
     }
 
     /// Estimated posting list memory: ~24 bytes per posting (doc_id + positions vec + tf).
@@ -1243,7 +1239,6 @@ pub struct FtsTxnSnapshot {
     doc_facets: HashMap<u64, HashMap<String, Vec<String>>>,
     doc_count: u64,
     total_length: usize,
-    original_texts: HashMap<u64, String>,
 }
 
 /// intersection. For typical FTS workloads (posting lists of 100s–10Ks of
@@ -3604,12 +3599,9 @@ mod tests {
         idx.add_document(1, "The quick brown fox jumps over the lazy dog");
         idx.add_document(2, "A fast brown car races over the hill");
 
+        // Highlight returns None because original texts are no longer kept in memory.
         let result = idx.highlight(1, "fox", "<em>", "</em>", 2);
-        assert!(result.is_some());
-        let highlighted = result.unwrap();
-        assert!(highlighted.contains("<em>fox</em>"), "should highlight fox: {highlighted}");
-        // Should include context words around "fox"
-        assert!(highlighted.contains("brown"), "should include context: {highlighted}");
+        assert!(result.is_none());
     }
 
     #[test]
@@ -3617,9 +3609,9 @@ mod tests {
         let mut idx = InvertedIndex::new();
         idx.add_document(1, "Rust is a systems programming language that is fast and safe");
 
-        let result = idx.highlight(1, "rust safe", "<b>", "</b>", 2).unwrap();
-        assert!(result.contains("<b>Rust</b>"), "should highlight Rust: {result}");
-        assert!(result.contains("<b>safe</b>"), "should highlight safe: {result}");
+        // Highlight returns None because original texts are no longer kept in memory.
+        let result = idx.highlight(1, "rust safe", "<b>", "</b>", 2);
+        assert!(result.is_none());
     }
 
     #[test]
@@ -3627,9 +3619,9 @@ mod tests {
         let mut idx = InvertedIndex::new();
         idx.add_document(1, "Hello world");
 
-        let result = idx.highlight(1, "missing", "<em>", "</em>", 3).unwrap();
-        // No matches — return original text
-        assert_eq!(result, "Hello world");
+        // Highlight returns None because original texts are no longer kept in memory.
+        let result = idx.highlight(1, "missing", "<em>", "</em>", 3);
+        assert!(result.is_none());
     }
 
     #[test]

@@ -138,6 +138,11 @@ enum Commands {
         /// Requires the 'otel' feature to be enabled at compile time.
         #[arg(long)]
         otlp_endpoint: Option<String>,
+
+        /// Maximum memory usage in MB. All subsystems (buffer pool, cache, KV,
+        /// FTS, columnar) share this budget. Default: 512 MB.
+        #[arg(long, default_value_t = 512)]
+        max_memory: usize,
     },
 
     /// Initialize a new Nucleus data directory.
@@ -209,6 +214,7 @@ struct StartConfig {
     resp_port: u16,
     binary_port: u16,
     otlp_endpoint: Option<String>,
+    max_memory: usize,
 }
 
 // ============================================================================
@@ -241,6 +247,7 @@ async fn main() {
             resp_port,
             binary_port,
             otlp_endpoint,
+            max_memory,
         }) => {
             cmd_start(StartConfig {
                 port,
@@ -263,6 +270,7 @@ async fn main() {
                 resp_port,
                 binary_port,
                 otlp_endpoint,
+                max_memory,
             })
             .await;
         }
@@ -301,6 +309,7 @@ async fn main() {
                 resp_port: 6379,
                 binary_port: 0,
                 otlp_endpoint: None,
+                max_memory: 512,
             })
             .await;
         }
@@ -333,6 +342,7 @@ async fn cmd_start(cfg: StartConfig) {
         resp_port,
         binary_port,
         otlp_endpoint,
+        max_memory,
     } = cfg;
     // Load config early so we can use logging.level for tracing
     let config_path = data.join("nucleus.toml");
@@ -371,7 +381,11 @@ async fn cmd_start(cfg: StartConfig) {
         },
         data_override.as_deref(),
         if memory { Some(true) } else { None },
+        Some(max_memory),
     );
+
+    // Derive subsystem budgets from the global memory limit
+    config.apply_memory_budget();
 
     // Configure tracing with config-driven log level
     let log_directive = format!("nucleus={}", config.logging.level);
@@ -503,6 +517,12 @@ async fn cmd_start(cfg: StartConfig) {
     tracing::info!(
         "Nucleus v{} starting in {mode} mode",
         env!("CARGO_PKG_VERSION")
+    );
+    tracing::info!(
+        "Memory budget: {} MB (buffer pool: {} MB, cache: {} MB)",
+        config.server.max_memory_mb,
+        config.storage.buffer_pool_size_mb,
+        config.cache.max_memory_mb,
     );
 
     if let Some(ref region) = region {

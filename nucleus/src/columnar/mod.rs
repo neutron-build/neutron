@@ -422,8 +422,8 @@ impl ColumnarStore {
         let wal = Arc::new(wal);
 
         // Spawn background merge worker
-        let (task_tx, task_rx) = std::sync::mpsc::channel();
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let (task_tx, task_rx) = std::sync::mpsc::sync_channel(4);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(4);
         let running = Arc::new(AtomicBool::new(true));
         let next_part_id = Arc::new(AtomicU64::new(1_000_000)); // high base to avoid collisions
         let _worker = spawn_merge_worker(task_rx, result_tx, Arc::clone(&running), next_part_id);
@@ -2089,12 +2089,12 @@ pub struct MergeResult {
 }
 
 /// Sender half for queuing merge tasks to a background worker.
-pub type MergeTaskSender = std::sync::mpsc::Sender<MergeTask>;
+pub type MergeTaskSender = std::sync::mpsc::SyncSender<MergeTask>;
 /// Receiver half for consuming merge tasks in a background worker.
 pub type MergeTaskReceiver = std::sync::mpsc::Receiver<MergeTask>;
 
 /// Sender half for returning merge results from the background worker.
-pub type MergeResultSender = std::sync::mpsc::Sender<MergeResult>;
+pub type MergeResultSender = std::sync::mpsc::SyncSender<MergeResult>;
 /// Receiver half for consuming merge results in the MergeTree owner.
 pub type MergeResultReceiver = std::sync::mpsc::Receiver<MergeResult>;
 
@@ -2268,7 +2268,7 @@ impl MergeTree {
             primary_key: self.primary_key.clone(),
             merge_strategy: self.merge_strategy.clone(),
         };
-        if sender.send(task).is_ok() { self.merging_part_ids.extend(source_ids); }
+        if sender.try_send(task).is_ok() { self.merging_part_ids.extend(source_ids); }
     }
 
     /// Apply a completed merge result from the background worker.
@@ -5140,8 +5140,8 @@ mod tests {
 
     #[test]
     fn mergetree_background_merge_end_to_end() {
-        let (task_tx, task_rx) = std::sync::mpsc::channel::<MergeTask>();
-        let (result_tx, result_rx) = std::sync::mpsc::channel::<MergeResult>();
+        let (task_tx, task_rx) = std::sync::mpsc::sync_channel::<MergeTask>(4);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<MergeResult>(4);
         let running = Arc::new(AtomicBool::new(true));
         let next_id = Arc::new(AtomicU64::new(1000));
 
@@ -5334,8 +5334,8 @@ mod tests {
 
     #[test]
     fn mergetree_apply_result_via_worker() {
-        let (task_tx, task_rx) = std::sync::mpsc::channel::<MergeTask>();
-        let (result_tx, result_rx) = std::sync::mpsc::channel::<MergeResult>();
+        let (task_tx, task_rx) = std::sync::mpsc::sync_channel::<MergeTask>(4);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<MergeResult>(4);
         let running = Arc::new(AtomicBool::new(true));
         let next_id = Arc::new(AtomicU64::new(1000));
         let worker = spawn_merge_worker(task_rx, result_tx, Arc::clone(&running), next_id);
@@ -5393,8 +5393,8 @@ mod tests {
 
     #[test]
     fn mergetree_bg_merger_queues_and_polls() {
-        let (task_tx, task_rx) = std::sync::mpsc::channel::<MergeTask>();
-        let (result_tx, result_rx) = std::sync::mpsc::channel::<MergeResult>();
+        let (task_tx, task_rx) = std::sync::mpsc::sync_channel::<MergeTask>(4);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<MergeResult>(4);
         let running = Arc::new(AtomicBool::new(true));
         let next_id = Arc::new(AtomicU64::new(1000));
         let worker = spawn_merge_worker(task_rx, result_tx, Arc::clone(&running), next_id);
@@ -5434,7 +5434,7 @@ mod tests {
 
     #[test]
     fn mergetree_clear_bg_merger_reverts_to_sync() {
-        let (task_tx, _rx) = std::sync::mpsc::channel::<MergeTask>();
+        let (task_tx, _rx) = std::sync::mpsc::sync_channel::<MergeTask>(4);
         let mut mt = MergeTree::new(vec!["id".into()]);
         mt.max_parts = 3;
         mt.set_background_merger(task_tx);

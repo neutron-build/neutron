@@ -101,6 +101,16 @@ impl FtsWal {
         w.flush()
     }
 
+    /// Re-read the WAL file to get the current (doc_id, text) pairs.
+    /// Used by `InvertedIndex::checkpoint_wal` so it does not need to keep
+    /// original texts in memory.
+    pub fn read_current_docs(&self) -> io::Result<Vec<(u64, String)>> {
+        self.writer.lock().flush()?;
+        let data = std::fs::read(&self.path)?;
+        let state = replay(&data);
+        Ok(state.docs)
+    }
+
     /// Write the complete current state of all documents as a single SNAPSHOT
     /// entry and truncate the log to just that entry.
     ///

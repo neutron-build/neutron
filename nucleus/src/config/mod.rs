@@ -30,6 +30,10 @@ pub struct ServerConfig {
     pub max_connections: usize,
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+    /// Global memory limit in MB. All subsystems (buffer pool, cache, KV, FTS,
+    /// columnar) share this budget. 0 means no limit.
+    #[serde(default = "default_max_memory_mb")]
+    pub max_memory_mb: usize,
 }
 
 fn default_host() -> String {
@@ -44,6 +48,9 @@ fn default_max_connections() -> usize {
 fn default_idle_timeout_secs() -> u64 {
     300
 }
+fn default_max_memory_mb() -> usize {
+    512
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -52,6 +59,7 @@ impl Default for ServerConfig {
             port: default_port(),
             max_connections: default_max_connections(),
             idle_timeout_secs: default_idle_timeout_secs(),
+            max_memory_mb: default_max_memory_mb(),
         }
     }
 }
@@ -76,7 +84,7 @@ fn default_data_dir() -> String {
     "nucleus_data".to_string()
 }
 fn default_buffer_pool_size_mb() -> usize {
-    128
+    32
 }
 fn default_page_size() -> usize {
     16384
@@ -197,7 +205,7 @@ pub struct CacheConfig {
 }
 
 fn default_cache_max_memory_mb() -> usize {
-    64
+    16
 }
 fn default_cache_ttl_secs() -> u64 {
     300
@@ -492,6 +500,10 @@ impl NucleusConfig {
             && let Ok(n) = v.parse::<u64>() {
                 self.server.idle_timeout_secs = n;
             }
+        if let Ok(v) = env::var("NUCLEUS_MAX_MEMORY_MB")
+            && let Ok(n) = v.parse::<usize>() {
+                self.server.max_memory_mb = n;
+            }
 
         // logging (additional)
         if let Ok(v) = env::var("NUCLEUS_LOGGING_FORMAT") {
@@ -516,6 +528,7 @@ impl NucleusConfig {
         port: Option<u16>,
         data_dir: Option<&str>,
         memory_mode: Option<bool>,
+        max_memory_mb: Option<usize>,
     ) {
         if let Some(h) = host {
             self.server.host = h.to_string();
@@ -528,6 +541,31 @@ impl NucleusConfig {
         }
         if let Some(m) = memory_mode {
             self.storage.memory_mode = m;
+        }
+        if let Some(m) = max_memory_mb {
+            self.server.max_memory_mb = m;
+        }
+    }
+
+    /// Derive subsystem memory budgets from the global max_memory_mb setting.
+    /// Adjusts buffer_pool_size_mb and cache.max_memory_mb to fit within budget.
+    pub fn apply_memory_budget(&mut self) {
+        let max = self.server.max_memory_mb;
+        if max == 0 {
+            return;
+        }
+        // Budget allocation:
+        //   Buffer pool: 25% of max_memory (was 128MB default)
+        //   Cache:       12% of max_memory (was 64MB default)
+        //   KV + FTS + Columnar + overhead: remaining 63%
+        let bp = max / 4;
+        let cache = max / 8;
+        // Only scale down, never scale up beyond what the user explicitly set
+        if self.storage.buffer_pool_size_mb > bp {
+            self.storage.buffer_pool_size_mb = bp.max(8); // minimum 8 MB
+        }
+        if self.cache.max_memory_mb > cache {
+            self.cache.max_memory_mb = cache.max(4); // minimum 4 MB
         }
     }
 }
@@ -550,7 +588,7 @@ mod tests {
         assert_eq!(cfg.server.max_connections, 100);
         assert_eq!(cfg.server.idle_timeout_secs, 300);
         assert_eq!(cfg.storage.data_dir, "nucleus_data");
-        assert_eq!(cfg.storage.buffer_pool_size_mb, 128);
+        assert_eq!(cfg.storage.buffer_pool_size_mb, 32);
         assert_eq!(cfg.storage.page_size, 16384);
         assert!(!cfg.storage.use_direct_io);
         assert!(!cfg.storage.memory_mode);
@@ -560,7 +598,7 @@ mod tests {
         assert_eq!(cfg.pool.min_idle, 5);
         assert_eq!(cfg.pool.max_lifetime_secs, 3600);
         assert!(!cfg.cache.enabled);
-        assert_eq!(cfg.cache.max_memory_mb, 64);
+        assert_eq!(cfg.cache.max_memory_mb, 16);
         assert_eq!(cfg.cache.eviction_policy, "lru");
         assert_eq!(cfg.replication.mode, "standalone");
         assert!(cfg.replication.primary_host.is_none());
@@ -587,7 +625,7 @@ mod tests {
     fn test_storage_config_default() {
         let sc = StorageConfig::default();
         assert_eq!(sc.data_dir, "nucleus_data");
-        assert_eq!(sc.buffer_pool_size_mb, 128);
+        assert_eq!(sc.buffer_pool_size_mb, 32);
         assert_eq!(sc.page_size, 16384);
         assert!(!sc.use_direct_io);
         assert!(!sc.memory_mode);
@@ -617,7 +655,7 @@ mod tests {
     fn test_cache_config_default() {
         let cc = CacheConfig::default();
         assert!(!cc.enabled);
-        assert_eq!(cc.max_memory_mb, 64);
+        assert_eq!(cc.max_memory_mb, 16);
         assert_eq!(cc.default_ttl_secs, 300);
         assert_eq!(cc.eviction_policy, "lru");
     }
@@ -860,6 +898,7 @@ port = 5555
                 port: 7777,
                 max_connections: 42,
                 idle_timeout_secs: 99,
+                max_memory_mb: 512,
             },
             storage: StorageConfig {
                 data_dir: "/tmp/nucleus".to_string(),
@@ -1006,25 +1045,26 @@ port = 5555
     #[test]
     fn test_merge_cli_args_overrides() {
         let mut cfg = NucleusConfig::default();
-        cfg.merge_cli_args(Some("192.168.1.1"), Some(6543), Some("/data/db"), Some(true));
+        cfg.merge_cli_args(Some("192.168.1.1"), Some(6543), Some("/data/db"), Some(true), Some(256));
         assert_eq!(cfg.server.host, "192.168.1.1");
         assert_eq!(cfg.server.port, 6543);
         assert_eq!(cfg.storage.data_dir, "/data/db");
         assert!(cfg.storage.memory_mode);
+        assert_eq!(cfg.server.max_memory_mb, 256);
     }
 
     #[test]
     fn test_merge_cli_args_none_preserves_defaults() {
         let mut cfg = NucleusConfig::default();
         let original = cfg.clone();
-        cfg.merge_cli_args(None, None, None, None);
+        cfg.merge_cli_args(None, None, None, None, None);
         assert_eq!(cfg, original);
     }
 
     #[test]
     fn test_merge_cli_args_partial() {
         let mut cfg = NucleusConfig::default();
-        cfg.merge_cli_args(None, Some(9999), None, None);
+        cfg.merge_cli_args(None, Some(9999), None, None, None);
         assert_eq!(cfg.server.host, "127.0.0.1"); // unchanged
         assert_eq!(cfg.server.port, 9999); // changed
     }

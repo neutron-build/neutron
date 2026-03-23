@@ -155,7 +155,7 @@ impl KvStore {
             wal: None,
             collections: collections::ShardedCollections::new(),
             cold: None,
-            max_hot_entries: usize::MAX,
+            max_hot_entries: 100_000,
             global_version: std::sync::atomic::AtomicU64::new(0),
         }
     }
