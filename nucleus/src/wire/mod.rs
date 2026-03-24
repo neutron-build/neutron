@@ -626,12 +626,11 @@ impl NucleusHandler {
 
     /// Build a query response from executor results for a single ExecResult.
     ///
-    /// Performance: For small result sets (≤10 rows, typical of point queries),
-    /// pre-encodes all rows into a Vec to avoid per-row Arc::clone overhead
-    /// and lazy stream allocation. This reduces protocol overhead for the
-    /// common OLTP case. Uses binary encoding for numeric types (Int32, Int64,
-    /// Float64, Bool) to avoid text conversion overhead.
-    fn build_response(result: ExecResult) -> PgWireResult<Response> {
+    /// When `text_only` is true (SimpleQuery protocol), all columns use text
+    /// format as required by the PostgreSQL wire protocol spec.  When false
+    /// (ExtendedQuery protocol), numeric types use binary encoding for
+    /// performance.
+    fn build_response(result: ExecResult, text_only: bool) -> PgWireResult<Response> {
         match result {
             ExecResult::Select { columns, rows } => {
                 let schema: Vec<FieldInfo> = columns
@@ -642,10 +641,11 @@ impl NucleusHandler {
                             None,
                             None,
                             data_type_to_pg(dt),
-                            // Use binary format for numeric types to avoid
-                            // text conversion (e.g., 12345 → "12345"). Binary
-                            // encoding is faster and produces fewer bytes.
-                            data_type_field_format(dt),
+                            if text_only {
+                                FieldFormat::Text
+                            } else {
+                                data_type_field_format(dt)
+                            },
                         )
                     })
                     .collect();
@@ -1165,7 +1165,7 @@ impl SimpleQueryHandler for NucleusHandler {
 
         // ── Large Objects fast path: intercept lo_* function calls ───────
         if let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, query) {
-            let resp = Self::build_response(lo_result)?;
+            let resp = Self::build_response(lo_result, true)?;
             self.flush_pending_notifications(client).await?;
             return Ok(vec![resp]);
         }
@@ -1202,14 +1202,14 @@ impl SimpleQueryHandler for NucleusHandler {
         if let Some(kv_cmd) = kv_fast_path::try_parse_kv(query) {
             let result = kv_fast_path::execute_kv_command(&kv_cmd, self.executor.kv_store());
             self.flush_pending_notifications(client).await?;
-            return Ok(vec![Self::build_response(result)?]);
+            return Ok(vec![Self::build_response(result, true)?]);
         }
 
         // ── SQL OLTP fast path: intercept simple point queries/mutations ──
         if let Some(sql_cmd) = kv_fast_path::try_parse_sql_fast_path(query)
             && let Some(result) = self.executor.execute_sql_fast_path(&sql_cmd).await {
                 self.flush_pending_notifications(client).await?;
-                return Ok(vec![Self::build_response(result.map_err(exec_error_to_pgwire)?)?]);
+                return Ok(vec![Self::build_response(result.map_err(exec_error_to_pgwire)?, true)?]);
             }
             // Fall through to normal path if fast-path couldn't handle it
             // (e.g. table not found in cache, column mismatch, etc.)
@@ -1267,7 +1267,7 @@ impl SimpleQueryHandler for NucleusHandler {
             }
             // Approximate wire bytes: count rows * avg 64 bytes per row + header
             bytes_estimate += Self::estimate_result_bytes(&result);
-            responses.push(Self::build_response(result)?);
+            responses.push(Self::build_response(result, true)?);
         }
         if bytes_estimate > 0 {
             self.executor.metrics().bytes_sent.inc_by(bytes_estimate);
@@ -1375,7 +1375,7 @@ impl ExtendedQueryHandler for NucleusHandler {
         // ── Large Objects fast path (extended query) ────────────────────
         if let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, &parsed_stmt.sql) {
             self.flush_pending_notifications(client).await?;
-            return Self::build_response(lo_result);
+            return Self::build_response(lo_result, false);
         }
 
         // ── LISTEN/NOTIFY wire-level registration (extended query) ──────
@@ -1439,7 +1439,7 @@ impl ExtendedQueryHandler for NucleusHandler {
             }
             // Flush pending notifications before the response (before ReadyForQuery).
             self.flush_pending_notifications(client).await?;
-            Self::build_response(result)
+            Self::build_response(result, false)
         } else {
             self.flush_pending_notifications(client).await?;
             Ok(Response::EmptyQuery)
@@ -2173,14 +2173,12 @@ fn data_type_to_pg(dt: &DataType) -> Type {
 
 /// Choose the wire format for a given data type.
 ///
-/// Numeric types (Bool, Int32, Int64, Float64) use binary encoding to avoid
-/// the overhead of text conversion (e.g., integer 12345 → "12345" → parse).
-/// All other types use text format for maximum compatibility.
+/// Int32, Int64, Float64 use binary encoding to avoid text conversion overhead.
+/// Bool uses text format ("t"/"f") because some drivers (e.g. Go pgx) fail to
+/// decode binary bool (0x00/0x01) from function results.
 fn data_type_field_format(dt: &DataType) -> FieldFormat {
     match dt {
-        DataType::Bool | DataType::Int32 | DataType::Int64 | DataType::Float64 => {
-            FieldFormat::Binary
-        }
+        DataType::Int32 | DataType::Int64 | DataType::Float64 => FieldFormat::Binary,
         _ => FieldFormat::Text,
     }
 }
@@ -2801,7 +2799,7 @@ mod tests {
                 vec![Value::Int32(2), Value::Text("bob".into())],
             ],
         };
-        let response = NucleusHandler::build_response(result);
+        let response = NucleusHandler::build_response(result, true);
         assert!(response.is_ok());
         match response.unwrap() {
             Response::Query(_) => {} // Expected
@@ -2815,7 +2813,7 @@ mod tests {
             tag: "INSERT".to_string(),
             rows_affected: 3,
         };
-        let response = NucleusHandler::build_response(result);
+        let response = NucleusHandler::build_response(result, true);
         assert!(response.is_ok());
         match response.unwrap() {
             Response::Execution(tag) => {
@@ -2874,7 +2872,7 @@ mod tests {
             ],
             rows: vec![],
         };
-        let response = NucleusHandler::build_response(result);
+        let response = NucleusHandler::build_response(result, true);
         assert!(response.is_ok());
     }
 
@@ -2884,7 +2882,7 @@ mod tests {
             tag: "DELETE".to_string(),
             rows_affected: 0,
         };
-        let response = NucleusHandler::build_response(result);
+        let response = NucleusHandler::build_response(result, true);
         assert!(response.is_ok());
         match response.unwrap() {
             Response::Execution(tag) => {
@@ -2906,7 +2904,7 @@ mod tests {
                 vec![Value::Int32(2), Value::Text("hello".into())],
             ],
         };
-        let response = NucleusHandler::build_response(result);
+        let response = NucleusHandler::build_response(result, true);
         assert!(response.is_ok());
     }
 
@@ -2926,7 +2924,7 @@ mod tests {
                 Value::Bool(true),
             ]],
         };
-        let response = NucleusHandler::build_response(result);
+        let response = NucleusHandler::build_response(result, true);
         assert!(response.is_ok());
     }
 
