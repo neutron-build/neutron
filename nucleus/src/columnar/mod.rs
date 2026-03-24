@@ -2354,6 +2354,16 @@ impl MergeTree {
 
         // Flush cold parts to disk after merge
         self.flush_cold_parts();
+
+        // Memory pressure: if hot parts exceed 4MB, force-flush ALL to disk.
+        // This caps per-table in-memory data regardless of the background timer.
+        const MAX_HOT_BYTES: usize = 4 * 1024 * 1024;
+        let hot_bytes: usize = self.parts.iter()
+            .map(|p| estimate_batch_size(&p.data))
+            .sum();
+        if hot_bytes > MAX_HOT_BYTES {
+            self.flush_all_hot_to_disk();
+        }
     }
 
     /// Sort a batch by the primary key columns (multi-column composite sort).
