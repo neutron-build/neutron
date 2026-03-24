@@ -112,6 +112,8 @@ fn deserialize_data_type(data: &[u8], offset: &mut usize) -> Option<DataType> {
 struct TableMeta {
     /// First data page for this table.
     first_page: u32,
+    /// Last data page — used by INSERT to append without scanning the chain.
+    last_page: u32,
     /// Column types needed for tuple serialization.
     col_types: Vec<DataType>,
 }
@@ -702,7 +704,18 @@ impl DiskEngine {
                 }
             }
 
-            restored.insert(name, TableMeta { first_page, col_types });
+            // Walk chain to find last page for fast appends
+            let mut last = first_page;
+            if last != INVALID_PAGE_ID {
+                loop {
+                    let fid = self.pool.fetch_page(last).unwrap();
+                    let next = get_next_page(self.pool.frame_data(fid));
+                    self.pool.unpin(fid);
+                    if next == INVALID_PAGE_ID { break; }
+                    last = next;
+                }
+            }
+            restored.insert(name, TableMeta { first_page, last_page: last, col_types });
         }
 
         let restored_count = restored.len();
@@ -835,26 +848,19 @@ impl DiskEngine {
         if meta.first_page == INVALID_PAGE_ID {
             meta.first_page = page_id;
         } else {
-            // Walk to the last page
-            let mut cur = meta.first_page;
-            loop {
-                let fid = self.pool.fetch_page(cur)
+            // Link from the cached last page (O(1) instead of chain walk)
+            let last = meta.last_page;
+            if last != INVALID_PAGE_ID {
+                let fid = self.pool.fetch_page(last)
                     .map_err(|e| StorageError::Io(e.to_string()))?;
-                let pg = self.pool.frame_data(fid);
-                let next = get_next_page(pg);
-                if next == INVALID_PAGE_ID {
-                    // Link new page here
-                    let pg_mut = self.pool.frame_data_mut(fid);
-                    set_next_page(pg_mut, page_id);
-                    self.pool.mark_dirty(fid);
-                    self.record_dirty_page(cur); // existing page — NEXT_PAGE pointer changed
-                    self.pool.unpin(fid);
-                    break;
-                }
+                let pg_mut = self.pool.frame_data_mut(fid);
+                set_next_page(pg_mut, page_id);
+                self.pool.mark_dirty(fid);
+                self.record_dirty_page(last);
                 self.pool.unpin(fid);
-                cur = next;
             }
         }
+        meta.last_page = page_id;
 
         Ok(page_id)
     }
@@ -994,6 +1000,7 @@ impl StorageEngine for DiskEngine {
             table.to_string(),
             TableMeta {
                 first_page: INVALID_PAGE_ID,
+                last_page: INVALID_PAGE_ID,
                 col_types,
             },
         );
@@ -1029,23 +1036,28 @@ impl StorageEngine for DiskEngine {
             return Err(StorageError::Io("row too large for inline storage".into()));
         }
 
-        // Try to insert into an existing page with space
-        let pages = self.table_pages(table)?;
-        for &page_id in &pages {
-            let frame_id = self.pool.fetch_page(page_id)
+        // Fast path: try the last page first (O(1) instead of scanning all pages)
+        let last_page_id = {
+            let tables = self.tables.read();
+            tables.get(table)
+                .map(|m| m.last_page)
+                .unwrap_or(INVALID_PAGE_ID)
+        };
+        if last_page_id != INVALID_PAGE_ID {
+            let frame_id = self.pool.fetch_page(last_page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data_mut(frame_id);
             if let Some(slot_idx) = page::insert_tuple(pg, &data) {
                 self.pool.mark_dirty(frame_id);
-                self.record_dirty_page(page_id);
+                self.record_dirty_page(last_page_id);
                 self.pool.unpin(frame_id);
-                self.index_insert(table, page_id, slot_idx, &row)?;
+                self.index_insert(table, last_page_id, slot_idx, &row)?;
                 return Ok(());
             }
             self.pool.unpin(frame_id);
         }
 
-        // No page had space — allocate a new one
+        // Last page full or no pages yet — allocate a new one
         let page_id = self.alloc_data_page(table)?;
         let frame_id = self.pool.fetch_page(page_id)
             .map_err(|e| StorageError::Io(e.to_string()))?;
@@ -1055,6 +1067,10 @@ impl StorageEngine for DiskEngine {
         self.pool.mark_dirty(frame_id);
         self.record_dirty_page(page_id);
         self.pool.unpin(frame_id);
+        // Update last_page for future appends
+        if let Some(meta) = self.tables.write().get_mut(table) {
+            meta.last_page = page_id;
+        }
         self.index_insert(table, page_id, slot_idx, &row)?;
         Ok(())
     }

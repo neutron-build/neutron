@@ -2220,35 +2220,34 @@ impl Executor {
     /// Execute pre-parsed statements with cluster routing and follower read checks.
     async fn execute_statements_dispatch(&self, sql: &str, statements: Vec<Statement>) -> Result<Vec<ExecResult>, ExecError> {
         // Cluster-mode DML routing: followers forward to leader; leader appends to Raft log.
+        // Skip entirely in standalone mode to avoid lock contention on the Raft mutex.
         #[cfg(feature = "server")]
         if let Some(ref cluster_arc) = self.cluster {
-            let has_dml = statements.iter().any(|s| {
-                matches!(s, Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_))
-            });
-            if has_dml {
-                // Collect routing info while holding the read lock, then release it
-                // before any await so the guard doesn't cross an await point.
-                let (is_leader, leader_addr) = {
-                    let cluster = cluster_arc.read();
-                    (cluster.is_leader(), cluster.leader_addr())
-                };
-                if !is_leader {
-                    if let Some(addr) = leader_addr {
-                        return self.forward_dml(sql, &addr).await;
-                    }
-                } else {
-                    // Leader: propose to Raft log and wait for quorum before executing.
-                    let repl = self.raft_replicator.read().clone();
-                    if let Some(replicator) = repl {
-                        if let Err(e) = replicator.propose_and_await(sql).await {
-                            tracing::warn!("Raft propose failed: {e}");
-                            // Fall through to local execution on replicator error.
+            let mode = { cluster_arc.read().mode() };
+            if mode != crate::distributed::ClusterMode::Standalone {
+                let has_dml = statements.iter().any(|s| {
+                    matches!(s, Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_))
+                });
+                if has_dml {
+                    let (is_leader, leader_addr) = {
+                        let cluster = cluster_arc.read();
+                        (cluster.is_leader(), cluster.leader_addr())
+                    };
+                    if !is_leader {
+                        if let Some(addr) = leader_addr {
+                            return self.forward_dml(sql, &addr).await;
                         }
                     } else {
-                        // No replicator: legacy fire-and-forget for backward compat.
-                        let _ = cluster_arc
-                            .write()
-                            .propose(0u64, crate::distributed::Operation::Sql(sql.to_string()));
+                        let repl = self.raft_replicator.read().clone();
+                        if let Some(replicator) = repl {
+                            if let Err(e) = replicator.propose_and_await(sql).await {
+                                tracing::warn!("Raft propose failed: {e}");
+                            }
+                        } else {
+                            let _ = cluster_arc
+                                .write()
+                                .propose(0u64, crate::distributed::Operation::Sql(sql.to_string()));
+                        }
                     }
                 }
             }
@@ -2266,32 +2265,7 @@ impl Executor {
 
         let mut results = Vec::new();
         for stmt in statements {
-            #[cfg(target_os = "linux")]
-            let rss_before = {
-                std::fs::read_to_string("/proc/self/statm")
-                    .ok()
-                    .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-                    .unwrap_or(0) * 4096
-            };
-
-            let stmt_desc = format!("{:?}", &stmt).chars().take(60).collect::<String>();
             results.push(self.execute_statement(stmt).await?);
-
-            #[cfg(target_os = "linux")]
-            {
-                let rss_after = std::fs::read_to_string("/proc/self/statm")
-                    .ok()
-                    .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-                    .unwrap_or(0) * 4096;
-                let delta = rss_after as i64 - rss_before as i64;
-                if delta > 1_000_000 { // Log if >1MB growth
-                    tracing::warn!(
-                        "Memory: +{} MB after stmt: {}",
-                        delta / (1024 * 1024),
-                        stmt_desc,
-                    );
-                }
-            }
         }
         Ok(results)
     }
