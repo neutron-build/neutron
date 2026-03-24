@@ -1164,7 +1164,7 @@ async fn cmd_start(cfg: StartConfig) {
                         rss_bytes / (1024 * 1024),
                         max_memory_bytes / (1024 * 1024),
                     );
-                    // Evict cache, sweep KV expired, compact FTS postings
+                    // Evict cache, sweep KV expired, compact FTS, flush columnar to disk
                     executor_for_mem.cleanup_expired_cache();
                     executor_for_mem.kv_store().sweep_expired();
                     {
@@ -1172,6 +1172,15 @@ async fn cmd_start(cfg: StartConfig) {
                         let mut fts = executor_for_mem.fts_index().write();
                         fts.shrink_postings();
                         let _ = fts.checkpoint_wal();
+                    }
+                    // Flush ALL MergeTree hot segments to cold (disk) storage
+                    let col_freed = executor_for_mem.columnar_store().write()
+                        .flush_all_hot_to_disk();
+                    if col_freed > 0 {
+                        tracing::info!(
+                            "Columnar flush: freed {} MB of hot segments to disk",
+                            col_freed / (1024 * 1024),
+                        );
                     }
                     // Refresh allocator tracking
                     {

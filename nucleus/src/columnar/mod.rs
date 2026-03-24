@@ -412,6 +412,16 @@ impl ColumnarStore {
         }
     }
 
+    /// Force-flush all MergeTree hot segments to disk under memory pressure.
+    /// Returns total bytes freed.
+    pub fn flush_all_hot_to_disk(&mut self) -> usize {
+        let mut freed = 0;
+        for mt in self.merge_trees.values_mut() {
+            freed += mt.flush_all_hot_to_disk();
+        }
+        freed
+    }
+
     /// Estimate total in-memory bytes across all tables and MergeTree hot parts.
     pub fn estimated_memory_bytes(&self) -> usize {
         let mut total = 0usize;
@@ -2582,6 +2592,39 @@ impl MergeTree {
                 }
             }
         }
+    }
+
+    /// Force-flush ALL hot parts to disk regardless of size.
+    /// Called under memory pressure to free RSS immediately.
+    /// Returns the number of bytes freed.
+    pub fn flush_all_hot_to_disk(&mut self) -> usize {
+        let data_dir = match &self.data_dir {
+            Some(d) => d.clone(),
+            None => return 0,
+        };
+
+        let mut freed = 0usize;
+        let parts = std::mem::take(&mut self.parts);
+        for part in parts {
+            let size = estimate_batch_size(&part.data);
+            let seg_path = data_dir.join(format!("part_{:016x}.seg", part.id));
+            match SegmentWriter::write(&seg_path, &part.data, CompressionCodec::None, part.id) {
+                Ok(()) => {
+                    self.cold_parts.push(ColdPartInfo {
+                        part_id: part.id,
+                        path: seg_path,
+                        zone_map: part.zone_map,
+                        row_count: part.row_count,
+                    });
+                    freed += size;
+                }
+                Err(e) => {
+                    eprintln!("MergeTree: pressure flush failed for part {}: {e}", part.id);
+                    self.parts.push(part);
+                }
+            }
+        }
+        freed
     }
 
     /// Load segment files from a directory into the cold parts list.
