@@ -1963,32 +1963,41 @@ impl NucleusHandler {
     /// information without actually fetching data. Falls back to an empty
     /// column list on any error.
     async fn describe_select_columns(&self, sql: &str) -> Result<Vec<FieldInfo>, PgWireError> {
-        // Strip trailing semicolons and whitespace, wrap in LIMIT 0 subquery.
+        // Try executing the query directly with LIMIT 0 appended, or if that
+        // fails, run the original query. This avoids the subquery wrapping
+        // that can trigger nesting depth errors for function calls like VERSION().
         let trimmed = sql.trim().trim_end_matches(';').trim();
-        let probe_sql = format!("SELECT * FROM ({trimmed}) AS __describe_probe LIMIT 0");
 
-        match self.execute_sql(&probe_sql).await {
-            Ok(results) => {
-                for result in results {
-                    if let ExecResult::Select { columns, .. } = result {
-                        return Ok(columns
-                            .iter()
-                            .map(|(name, dt)| {
-                                FieldInfo::new(
-                                    name.clone(),
-                                    None,
-                                    None,
-                                    data_type_to_pg(dt),
-                                    FieldFormat::Text,
-                                )
-                            })
-                            .collect());
-                    }
+        // First try: add LIMIT 0 to avoid returning data
+        let probe_sql = format!("{trimmed} LIMIT 0");
+        let result = match self.execute_sql(&probe_sql).await {
+            Ok(r) => r,
+            Err(_) => {
+                // LIMIT 0 might not work for all queries — try the original
+                match self.execute_sql(trimmed).await {
+                    Ok(r) => r,
+                    Err(_) => return Ok(Vec::new()),
                 }
-                Ok(Vec::new())
             }
-            Err(_) => Ok(Vec::new()),
+        };
+
+        for r in result {
+            if let ExecResult::Select { columns, .. } = r {
+                return Ok(columns
+                    .iter()
+                    .map(|(name, dt)| {
+                        FieldInfo::new(
+                            name.clone(),
+                            None,
+                            None,
+                            data_type_to_pg(dt),
+                            FieldFormat::Text,
+                        )
+                    })
+                    .collect());
+            }
         }
+        Ok(Vec::new())
     }
 }
 
