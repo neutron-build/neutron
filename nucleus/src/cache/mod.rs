@@ -1016,8 +1016,7 @@ impl crate::memory::Pressurable for crate::columnar::ColumnarStore {
     }
 
     fn shrink_to(&mut self, _target: usize) -> usize {
-        // Cold flush requires data_dir; for now just report.
-        0
+        self.flush_all_hot_to_disk()
     }
 
     fn priority(&self) -> crate::memory::Priority {
