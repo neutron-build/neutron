@@ -2360,7 +2360,7 @@ impl MergeTree {
         // even on slow storage (USB) where disk flushes can't keep up.
         // The merged part will eventually exceed cold_threshold_bytes and get
         // flushed to disk by flush_cold_parts() on the next insert.
-        const MAX_HOT_BYTES: usize = 4 * 1024 * 1024;
+        const MAX_HOT_BYTES: usize = 256 * 1024; // 256KB per table
         let hot_bytes: usize = self.parts.iter()
             .map(|p| estimate_batch_size(&p.data))
             .sum();

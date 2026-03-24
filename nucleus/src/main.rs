@@ -1203,11 +1203,21 @@ async fn cmd_start(cfg: StartConfig) {
                         );
                     }
                 } else if rss_bytes > warn_threshold {
+                    // Diagnostic: report per-subsystem estimates
+                    let col_bytes = executor_for_mem.columnar_store().read()
+                        .estimated_memory_bytes();
+                    let fts_bytes = {
+                        use nucleus::memory::Pressurable;
+                        executor_for_mem.fts_index().read().current_usage()
+                    };
+                    let kv_entries = executor_for_mem.kv_store().dbsize();
                     tracing::info!(
-                        "Memory: RSS {} MB / {} MB limit ({}%)",
+                        "Memory: RSS {} MB / {} MB (columnar {} MB, FTS {} MB, KV {} entries)",
                         rss_bytes / (1024 * 1024),
                         max_memory_bytes / (1024 * 1024),
-                        rss_bytes * 100 / max_memory_bytes,
+                        col_bytes / (1024 * 1024),
+                        fts_bytes / (1024 * 1024),
+                        kv_entries,
                     );
                 }
             }
@@ -1798,20 +1808,22 @@ fn load_internal_tls_from_env() -> Result<Option<nucleus::tls::InternalTlsConfig
     .map_err(|e| e.to_string())
 }
 
-/// Read RSS (Resident Set Size) in bytes from /proc/self/statm.
-/// Returns 0 on platforms where /proc is not available (macOS, Windows).
+/// Read anonymous RSS (heap + stack) from /proc/self/status.
+/// Excludes file-backed pages (WAL, segment files, shared libs) which the
+/// kernel reclaims automatically. Returns 0 on non-Linux platforms.
 fn read_rss_bytes() -> u64 {
-    let Ok(contents) = std::fs::read_to_string("/proc/self/statm") else {
+    let Ok(contents) = std::fs::read_to_string("/proc/self/status") else {
         return 0;
     };
-    // Format: size resident shared text lib data dt (all in pages)
-    let page_size = 4096u64; // standard page size on x86_64 Linux
-    contents
-        .split_whitespace()
-        .nth(1) // resident pages
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(|pages| pages * page_size)
-        .unwrap_or(0)
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("RssAnon:") {
+            let trimmed = rest.trim().trim_end_matches(" kB").trim();
+            if let Ok(kb) = trimmed.parse::<u64>() {
+                return kb * 1024;
+            }
+        }
+    }
+    0
 }
 
 fn is_loopback_host(host: &str) -> bool {
