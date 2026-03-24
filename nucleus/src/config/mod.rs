@@ -558,8 +558,8 @@ impl NucleusConfig {
         //   Buffer pool: 10% of max_memory (was 25%)
         //   Cache:        5% of max_memory (was 12%)
         //   Remaining 85%: FTS, KV, columnar, query execution, OS overhead
-        let bp = (max / 10).max(4).min(256); // 4 MB minimum, 256 MB maximum
-        let cache = (max / 20).max(2).min(128); // 2 MB minimum, 128 MB maximum
+        let bp = (max / 32).max(4).min(256); // ~3% of budget, 4 MB min, 256 MB max
+        let cache = (max / 64).max(2).min(128); // ~1.5% of budget, 2 MB min, 128 MB max
         // Always enforce proportional sizing relative to max_memory
         self.storage.buffer_pool_size_mb = self.storage.buffer_pool_size_mb.min(bp);
         self.cache.max_memory_mb = self.cache.max_memory_mb.min(cache);

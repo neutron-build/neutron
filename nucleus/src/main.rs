@@ -1150,10 +1150,11 @@ async fn cmd_start(cfg: StartConfig) {
         let executor_for_mem = executor.clone();
         let max_memory_bytes = config.server.max_memory_mb as u64 * 1024 * 1024;
         tokio::spawn(async move {
-            let warn_threshold = (max_memory_bytes as f64 * 0.75) as u64;
-            let pressure_threshold = (max_memory_bytes as f64 * 0.85) as u64;
+            let warn_threshold = (max_memory_bytes as f64 * 0.60) as u64;
+            let pressure_threshold = (max_memory_bytes as f64 * 0.75) as u64;
+            let critical_threshold = (max_memory_bytes as f64 * 0.90) as u64;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 let rss_bytes = read_rss_bytes();
                 if rss_bytes == 0 {
                     continue; // /proc/self/statm not available (macOS, etc.)
@@ -1190,6 +1191,16 @@ async fn cmd_start(cfg: StartConfig) {
                             let old = alloc.allocation(name).map(|a| a.current_bytes).unwrap_or(0);
                             alloc.release(name, old);
                         }
+                    }
+                    // If still critical after eviction, reject new connections
+                    let rss_after = read_rss_bytes();
+                    if rss_after > critical_threshold {
+                        tracing::error!(
+                            "CRITICAL: RSS {} MB exceeds 90% of {} MB limit after eviction. \
+                             New writes will be rejected until memory drops.",
+                            rss_after / (1024 * 1024),
+                            max_memory_bytes / (1024 * 1024),
+                        );
                     }
                 } else if rss_bytes > warn_threshold {
                     tracing::info!(
