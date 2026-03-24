@@ -2341,7 +2341,7 @@ impl MergeTree {
         };
         self.parts.push(part);
 
-        // Auto-merge if too many parts
+        // Auto-merge if too many parts — consolidates small parts in memory
         if self.parts.len() > self.max_parts {
             if self.merge_sender.is_some() {
                 self.queue_background_merge();
@@ -2352,17 +2352,26 @@ impl MergeTree {
             }
         }
 
-        // Flush cold parts to disk after merge
+        // Flush oversized parts to disk
         self.flush_cold_parts();
 
-        // Memory pressure: if hot parts exceed 4MB, force-flush ALL to disk.
-        // This caps per-table in-memory data regardless of the background timer.
+        // Memory cap: if hot data exceeds 4MB, merge all parts into one
+        // consolidated part (in-memory, no disk I/O). This keeps memory bounded
+        // even on slow storage (USB) where disk flushes can't keep up.
+        // The merged part will eventually exceed cold_threshold_bytes and get
+        // flushed to disk by flush_cold_parts() on the next insert.
         const MAX_HOT_BYTES: usize = 4 * 1024 * 1024;
         let hot_bytes: usize = self.parts.iter()
             .map(|p| estimate_batch_size(&p.data))
             .sum();
         if hot_bytes > MAX_HOT_BYTES {
-            self.flush_all_hot_to_disk();
+            // Merge all hot parts into one — O(N) in memory, no disk I/O
+            while self.parts.len() > 1 {
+                self.merge_smallest_parts();
+            }
+            // The single merged part is now large enough for flush_cold_parts()
+            // to pick up on the next cycle (> cold_threshold_bytes = 64KB)
+            self.flush_cold_parts();
         }
     }
 
