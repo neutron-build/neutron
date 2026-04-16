@@ -6,11 +6,14 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/neutron-dev/neutron-go/neutron"
 )
+
+var timeType = reflect.TypeOf(time.Time{})
 
 // querier is the interface satisfied by both *pgxpool.Pool and txQuerier.
 type querier interface {
@@ -112,7 +115,7 @@ func scanRow(rows pgx.Rows, dest any) error {
 	fieldDescs := rows.FieldDescriptions()
 	colNames := make([]string, len(fieldDescs))
 	for i, fd := range fieldDescs {
-		colNames[i] = string(fd.Name)
+		colNames[i] = fd.Name
 	}
 
 	// Map db tags to field indices
@@ -162,10 +165,21 @@ func scanRow(rows pgx.Rows, dest any) error {
 		}
 		raw := *rawPtrs[i]
 
+		// Handle time.Time before the Kind switch — it's a struct, not a
+		// primitive, so Kind() returns reflect.Struct.
+		if field.Type() == timeType {
+			t, err := parseTimeValue(raw)
+			if err != nil {
+				return fmt.Errorf("column %q: parse time %q: %w", col, raw, err)
+			}
+			field.Set(reflect.ValueOf(t))
+			continue
+		}
+
 		switch field.Kind() {
 		case reflect.String:
 			field.SetString(raw)
-		case reflect.Int, reflect.Int64:
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			if raw == "" {
 				field.SetInt(0)
 			} else {
@@ -175,7 +189,17 @@ func scanRow(rows pgx.Rows, dest any) error {
 				}
 				field.SetInt(n)
 			}
-		case reflect.Float64:
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			if raw == "" {
+				field.SetUint(0)
+			} else {
+				n, err := strconv.ParseUint(raw, 10, 64)
+				if err != nil {
+					return fmt.Errorf("column %q: parse uint %q: %w", col, raw, err)
+				}
+				field.SetUint(n)
+			}
+		case reflect.Float32, reflect.Float64:
 			if raw == "" {
 				field.SetFloat(0)
 			} else {
@@ -186,11 +210,35 @@ func scanRow(rows pgx.Rows, dest any) error {
 				field.SetFloat(f)
 			}
 		case reflect.Bool:
-			field.SetBool(raw == "true" || raw == "t" || raw == "1")
+			field.SetBool(raw == "true" || raw == "t" || raw == "1" || raw == "TRUE")
 		default:
 			field.SetString(raw)
 		}
 	}
 
 	return nil
+}
+
+// parseTimeValue parses a time value from a string. Supports:
+//   - Unix milliseconds: "1712000000000"
+//   - RFC3339: "2024-04-01T12:00:00Z"
+//   - RFC3339Nano: "2024-04-01T12:00:00.000000Z"
+//   - Empty or "0": zero time
+func parseTimeValue(s string) (time.Time, error) {
+	if s == "" || s == "0" {
+		return time.Time{}, nil
+	}
+	// Try epoch milliseconds first (most common in MergeTree/Nucleus)
+	if ms, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return time.UnixMilli(ms).UTC(), nil
+	}
+	// Try RFC3339
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.UTC(), nil
+	}
+	// Try RFC3339Nano
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t.UTC(), nil
+	}
+	return time.Time{}, fmt.Errorf("unrecognized time format: %s", s)
 }
