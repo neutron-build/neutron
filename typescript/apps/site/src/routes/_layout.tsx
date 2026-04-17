@@ -7,6 +7,7 @@ import "../styles/nucleus.css";
 import "../styles/orm.css";
 import "../styles/blog.css";
 import "../styles/docs.css";
+import { ViewTransitions } from "@neutron-build/core/client";
 import Nav from "../components/Nav";
 import Footer from "../components/Footer";
 
@@ -45,6 +46,7 @@ export function head() {
 export default function RootLayout({ children }: RootLayoutProps) {
   return (
     <>
+      <ViewTransitions />
       <a href="#main-content" class="skip-link">Skip to content</a>
       <Nav />
       {children}

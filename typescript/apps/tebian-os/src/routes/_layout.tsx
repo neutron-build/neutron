@@ -1,5 +1,5 @@
 import "../styles/global.css";
-import { Island } from "neutron/client";
+import { Island, ViewTransitions } from "@neutron-build/core/client";
 import { ThemeToggle } from "../components/ThemeToggle";
 import { Nav } from "../components/Nav";
 import { Footer } from "../components/Footer";
@@ -25,6 +25,7 @@ export default function Layout({
 }) {
   return (
     <div class="layout">
+      <ViewTransitions />
       <Island component={ThemeToggle} client="load" id="theme-toggle" />
       <Nav />
       <div class="page-content">{children}</div>

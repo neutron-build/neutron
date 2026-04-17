@@ -10,7 +10,7 @@ typescript/ (TypeScript) nucleus/ (Rust) go/    (Go)       native/  (Mobile) lea
 rust/       (Rust)       studio/  (UI)   python/ (Python)  desktop/ (Tauri)  quint/ (TLA+)
 mojo/       (Mojo/GPU)                   zig/    (12KB)    mobile-preview/   verus/ (SMT)
                                          julia/  (Science) cli/     (Go)
-                                         elixir/ (OTP)     site/    (Astro)
+                                         elixir/ (OTP)     typescript/apps/site/ (Neutron)
 ```
 
 ## Key Architecture
@@ -40,7 +40,7 @@ mojo/       (Mojo/GPU)                   zig/    (12KB)    mobile-preview/   ver
 | `desktop/` | Rust+TypeScript | Desktop apps via Tauri 2.0, ~10MB bundles, embedded Nucleus |
 | `mobile-preview/` | Go | Live preview app for mobile dev (like Expo Go but not SDK-versioned) |
 | `cli/` | Go | Universal CLI — `neutron new`, `neutron db`, `neutron migrate`, `neutron studio` |
-| `site/` | TypeScript | Marketing/docs site (Astro) |
+| `typescript/apps/site/` | TypeScript | Marketing/docs site — dogfoods Neutron TS (live at neutron.build) |
 | `archive/` | Docs | Cross-language architecture docs and planning |
 | `lean4/` | Lean 4 | Machine-checked correctness proofs (MVCC, B-tree, WAL, Raft) |
 | `quint/` | Quint | Protocol verification (Multi-Raft, resharding, distributed tx) |
@@ -62,9 +62,9 @@ cargo build
 cargo test
 cargo clippy
 
-# TypeScript (typescript, native, studio, site)
-pnpm install        # typescript/ uses pnpm
-npm install         # site/, studio/ use npm
+# TypeScript (typescript, native, studio)
+pnpm install        # typescript/ (includes apps/site) and native/ use pnpm
+npm install         # studio/ uses npm
 pnpm dev / npm run dev
 
 # Go (cli, go, mobile-preview)
