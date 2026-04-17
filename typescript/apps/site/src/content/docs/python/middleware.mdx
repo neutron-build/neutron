@@ -88,7 +88,7 @@ Returns `429 Too Many Requests` with RFC 7807 body:
 
 ```json
 {
-    "type": "https://neutron.dev/errors/rate-limited",
+    "type": "https://neutron.build/errors/rate-limited",
     "title": "Rate Limited",
     "status": 429,
     "detail": "Too many requests"
@@ -160,7 +160,7 @@ All middleware error responses follow RFC 7807 Problem Details:
 
 ```json
 {
-    "type": "https://neutron.dev/errors/<error-type>",
+    "type": "https://neutron.build/errors/<error-type>",
     "title": "Human-Readable Title",
     "status": 429,
     "detail": "Detailed explanation"

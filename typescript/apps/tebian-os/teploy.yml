@@ -1,0 +1,4 @@
+app: tebian
+domain: "tebian.org, www.tebian.org"
+server: deploy-ovh
+port: 80
