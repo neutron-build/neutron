@@ -1,0 +1,39 @@
+---
+title: Docker
+description: Containerizing your Neutron app.
+---
+
+You can containerize your Neutron application using the Node.js adapter and a standard Dockerfile.
+
+## Dockerfile
+
+Create a `Dockerfile` in your project root:
+
+```dockerfile
+# 1. Build Stage
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package.json pnpm-lock.yaml ./
+RUN npm install -g pnpm && pnpm install --frozen-lockfile
+COPY . .
+RUN pnpm run build
+
+# 2. Production Stage
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/node_modules ./node_modules
+
+EXPOSE 3000
+CMD ["node", "dist/server/index.js"]
+```
+
+## Build and Run
+
+```bash
+docker build -t my-neutron-app .
+docker run -p 3000:3000 my-neutron-app
+```

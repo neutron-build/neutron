@@ -1,0 +1,41 @@
+---
+title: Content Collections
+description: Managing typed content with schemas.
+---
+
+Content Collections allow you to manage Markdown or MDX content with strict type safety.
+
+## Directory Structure
+
+Collections live in `src/content`. Each subdirectory is a collection.
+
+```
+src/content/
+  blog/                # "blog" collection
+    post-1.md
+    post-2.mdx
+  docs/                # "docs" collection
+    guide.md
+  config.ts            # Configuration file
+```
+
+## Defining Collections
+
+You define your collections in `src/content/config.ts`.
+
+```ts
+import { defineCollection, z } from "neutron/content";
+
+const blog = defineCollection({
+  schema: z.object({
+    title: z.string(),
+    date: z.date(),
+    tags: z.array(z.string()),
+    draft: z.boolean().default(false),
+  }),
+});
+
+export const collections = {
+  blog,
+};
+```

@@ -1,0 +1,82 @@
+---
+title: App Routes
+description: Server-Side Rendered (SSR) interactive routes.
+---
+
+App routes are fully dynamic, server-side rendered (SSR) routes that hydrate on the client. They function like a Single Page Application (SPA) after the initial load.
+
+## Characteristics
+
+-   **SSR**: HTML is generated on the server for every request.
+-   **Hydration**: Preact hydrates the page on the client, making it fully interactive.
+-   **Client-side Navigation**: Clicking links uses client-side routing, avoiding full page reloads.
+-   **Shared State**: Layouts persist state during navigation.
+
+## Configuration
+
+To make a route an app route, set the mode to `app`:
+
+```tsx
+export const config = { mode: "app" };
+```
+
+## Runtime Choice
+
+Neutron allows you to choose the underlying runtime for your app routes.
+
+-   **Preact (Default)**: Optimized for performance and size (~3KB runtime). Highly compatible with the React ecosystem.
+-   **React**: For apps that require specific React internals or libraries that are not fully compatible with Preact.
+
+You can configure this in `neutron.config.ts`:
+
+```ts
+export default defineConfig({
+  runtime: "preact", // or "react"
+});
+```
+
+Regardless of the runtime, your code uses standard React-style hooks and JSX.
+
+## Data Loading
+
+App routes use `loader` functions to fetch data on the server.
+
+```tsx
+import { useLoaderData } from "neutron";
+
+export const config = { mode: "app" };
+
+export async function loader({ request }: LoaderArgs) {
+  const user = await getUser(request);
+  return { user };
+}
+
+export default function Profile() {
+  const { user } = useLoaderData<typeof loader>();
+  return <h1>Hello, {user.name}</h1>;
+}
+```
+
+## Mutations
+
+App routes use `action` functions to handle form submissions and data mutations.
+
+```tsx
+import { Form } from "neutron";
+
+export async function action({ request }: ActionArgs) {
+  const formData = await request.formData();
+  // ... handle update
+  return { success: true };
+}
+
+export default function Settings() {
+  return (
+    <Form method="post">
+      <button>Update</button>
+    </Form>
+  );
+}
+```
+
+See the [Data Loading](/docs/data/loaders) and [Actions](/docs/data/actions) guides for more details.

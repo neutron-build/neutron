@@ -1,0 +1,356 @@
+---
+title: "Building High-Performance Rust Web Services with Neutron"
+description: "Neutron's Rust framework gives you a complete, batteries-included backend in Rust. Trie router, composable middleware, JWT auth, WebSockets, SSE, and Nucleus database access — all with Rust's performance guarantees."
+pubDate: 2026-03-04
+author: "Neutron Team"
+tags: ["rust", "backend", "performance", "websockets", "api"]
+---
+
+In 2026, Rust is a legitimate choice for web backends. Memory safety without GC pauses. Predictable tail latency. Small binaries. A growing ecosystem of async HTTP libraries.
+
+The problem has always been the starting cost: Rust web services require assembling middleware, routing, error handling, authentication, and database access from scratch. The TypeScript ecosystem has Next.js. The Go ecosystem has frameworks with conventions. Rust has had axum and actix-web, which are excellent HTTP primitives, but not opinionated frameworks.
+
+Neutron's Rust framework changes that. A trie-based router, composable 10-layer middleware stack, and native Nucleus database integration. Built idiomatically for Rust — with Rust's performance characteristics and type system — not a port of the TypeScript framework.
+
+## The Crate Workspace
+
+Neutron Rust is organized as a composable workspace. Take what you need:
+
+```toml
+# Cargo.toml
+[dependencies]
+neutron = { version = "0.1", features = ["full"] }
+neutron-jobs = "0.1"       # Background job queue + cron
+neutron-oauth = "0.1"      # OAuth2/OIDC with PKCE
+neutron-otel = "0.1"       # OTLP distributed tracing
+neutron-redis = "0.1"      # Redis session store
+neutron-smtp = "0.1"       # Email via lettre
+neutron-storage = "0.1"    # S3/R2/GCS with SigV4
+neutron-stripe = "0.1"     # Stripe payments + webhooks
+neutron-webauthn = "0.1"   # Passkey/WebAuthn with ECDSA
+```
+
+Or just the core:
+
+```toml
+[dependencies]
+neutron = "0.1"  # HTTP 1/2/3, router, middleware stack
+```
+
+## A Minimal Server
+
+```rust
+use neutron::{App, Router, Json, extract::Path};
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    version: &'static str,
+    nucleus: bool,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let router = Router::new()
+        .get("/health", health)
+        .get("/api/users", list_users)
+        .get("/api/users/:id", get_user)
+        .post("/api/users", create_user)
+        .delete("/api/users/:id", delete_user);
+
+    App::new(router)
+        .bind("0.0.0.0:3000")
+        .serve()
+        .await?;
+
+    Ok(())
+}
+
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        nucleus: true,
+    })
+}
+```
+
+## The Middleware Stack
+
+Neutron applies a 10-layer middleware stack to every request:
+
+```rust
+use neutron::middleware::*;
+use std::time::Duration;
+
+let app = App::new(router)
+    .layer(RequestId::new())
+    .layer(Logger::new())
+    .layer(Recovery::new())
+    .layer(Cors::new().allow_origin("https://myapp.com"))
+    .layer(Compression::new())
+    .layer(RateLimit::new(100, Duration::from_secs(60)))
+    .layer(Auth::jwt(std::env::var("JWT_SECRET").unwrap()))
+    .layer(Timeout::new(Duration::from_secs(30)))
+    .layer(OpenTelemetry::new());
+```
+
+Each layer is independent and composable. Use all of them, some of them, or none.
+
+## Database Access (Nucleus)
+
+The `Db` extractor injects a pooled Nucleus connection:
+
+```rust
+use neutron::{Json, extract::Db};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, sqlx::FromRow)]
+struct User {
+    id: i32,
+    name: String,
+    email: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Deserialize)]
+struct CreateUser {
+    name: String,
+    email: String,
+}
+
+async fn list_users(Db(db): Db) -> Result<Json<Vec<User>>, neutron::Error> {
+    let users = sqlx::query_as::<_, User>(
+        "SELECT id, name, email, created_at FROM users ORDER BY created_at DESC"
+    )
+    .fetch_all(&db)
+    .await?;
+
+    Ok(Json(users))
+}
+
+async fn create_user(
+    Db(db): Db,
+    Json(body): Json<CreateUser>,
+) -> Result<Json<User>, neutron::Error> {
+    let user = sqlx::query_as::<_, User>(
+        "INSERT INTO users (name, email) VALUES ($1, $2) RETURNING *"
+    )
+    .bind(&body.name)
+    .bind(&body.email)
+    .fetch_one(&db)
+    .await?;
+
+    Ok(Json(user))
+}
+```
+
+Nucleus speaks the PostgreSQL wire protocol, so `sqlx` with the PostgreSQL feature works out of the box. Any PostgreSQL-compatible Rust library works.
+
+## JWT Authentication
+
+```rust
+use neutron_oauth::jwt::{Claims, JwtLayer};
+
+// Apply JWT auth globally
+let app = App::new(router)
+    .layer(JwtLayer::new(secret));
+
+// Access claims in handlers
+async fn protected(claims: Claims) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "user_id": claims.sub,
+        "email": claims.email,
+        "message": "Authenticated request"
+    }))
+}
+
+// Issue a token
+async fn login(
+    Db(db): Db,
+    Json(body): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, neutron::Error> {
+    let user = verify_credentials(&db, &body.email, &body.password).await?;
+
+    let token = Claims::new(user.id.to_string())
+        .with_email(&user.email)
+        .with_expiry(Duration::from_hours(24))
+        .sign(&JWT_SECRET)?;
+
+    Ok(Json(LoginResponse { token }))
+}
+```
+
+## WebSockets
+
+```rust
+use neutron::ws::{WebSocket, WebSocketUpgrade, Message};
+
+async fn ws_handler(ws: WebSocketUpgrade) -> impl neutron::IntoResponse {
+    ws.on_upgrade(handle_socket)
+}
+
+async fn handle_socket(mut socket: WebSocket) {
+    while let Some(Ok(msg)) = socket.recv().await {
+        match msg {
+            Message::Text(text) => {
+                // Echo back with a prefix
+                if socket.send(Message::Text(format!("echo: {text}"))).await.is_err() {
+                    break;
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+}
+```
+
+For a broadcast scenario (e.g., live updates to multiple connected clients):
+
+```rust
+use std::sync::Arc;
+use tokio::sync::broadcast;
+
+type BroadcastSender = broadcast::Sender<String>;
+
+async fn ws_broadcast(
+    ws: WebSocketUpgrade,
+    State(tx): State<Arc<BroadcastSender>>,
+) -> impl neutron::IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        let mut rx = tx.subscribe();
+        let (mut sender, mut receiver) = socket.split();
+
+        tokio::select! {
+            // Forward broadcast messages to this client
+            msg = rx.recv() => {
+                if let Ok(msg) = msg {
+                    let _ = sender.send(Message::Text(msg)).await;
+                }
+            }
+            // Read from client (handle disconnects)
+            msg = receiver.next() => {
+                if msg.is_none() { return; }
+            }
+        }
+    })
+}
+```
+
+## Background Jobs
+
+```rust
+use neutron_jobs::{Queue, Job, JobHandler};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct SendWelcomeEmail {
+    user_id: i32,
+    email: String,
+    name: String,
+}
+
+#[async_trait::async_trait]
+impl JobHandler for SendWelcomeEmail {
+    async fn run(&self, ctx: &JobContext) -> Result<(), neutron_jobs::Error> {
+        let smtp = ctx.get::<SmtpClient>();
+        smtp.send_template("welcome", &self.email, &self.name).await?;
+        Ok(())
+    }
+}
+
+// Register and enqueue
+let queue = Queue::new(QueueConfig::in_memory());
+queue.register::<SendWelcomeEmail>();
+
+// In a route handler:
+async fn register_user(
+    Db(db): Db,
+    State(queue): State<Queue>,
+    Json(body): Json<RegisterRequest>,
+) -> Result<Json<User>, neutron::Error> {
+    let user = create_user_in_db(&db, &body).await?;
+
+    queue.enqueue(SendWelcomeEmail {
+        user_id: user.id,
+        email: user.email.clone(),
+        name: user.name.clone(),
+    }).await?;
+
+    Ok(Json(user))
+}
+```
+
+Jobs run in the background. The queue can be backed by in-memory (default), Redis, or Nucleus KV.
+
+## Server-Sent Events (SSE)
+
+For real-time updates without WebSocket complexity:
+
+```rust
+use neutron::sse::{Event, Sse};
+use tokio_stream::wrappers::BroadcastStream;
+
+async fn live_metrics(
+    State(metrics_tx): State<Arc<broadcast::Sender<MetricUpdate>>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = metrics_tx.subscribe();
+    let stream = BroadcastStream::new(rx).map(|msg| {
+        let data = serde_json::to_string(&msg.unwrap()).unwrap();
+        Ok(Event::default().data(data))
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+```
+
+## Performance Profile
+
+On an Apple M2 Pro (single process, no connection pool tuning):
+
+| Scenario | Req/s | P99 Latency |
+|----------|-------|------------|
+| JSON API (in-memory data) | ~185,000 | 1.1ms |
+| JSON API (Nucleus query) | ~38,000 | 4.8ms |
+| WebSocket echo | ~95,000 msg/s | 0.8ms |
+| SSE broadcast (1,000 subscribers) | ~12,000 events/s | 2.1ms |
+
+Binary size after `cargo build --release`: ~14MB. RSS memory at idle: ~11MB.
+
+These numbers reflect Rust's performance characteristics — no garbage collector, no JIT warm-up, predictable memory layout. The latency doesn't degrade over time.
+
+## When to Use Rust vs TypeScript
+
+They share the same Nucleus database, so you can mix them freely in one project:
+
+**Use TypeScript for:**
+- Web UI and SSR pages
+- Marketing and content routes
+- Form handling
+- Anything where development speed matters more than throughput
+
+**Use Rust for:**
+- High-throughput JSON APIs
+- WebSocket servers that handle many concurrent connections
+- Background workers (image processing, data pipelines)
+- Anything CPU-bound
+
+A common pattern: TypeScript handles the frontend routes and serves the UI. Rust handles the API routes that need throughput or CPU work. Both connect to the same Nucleus instance.
+
+## Getting Started
+
+```bash
+npm create neutron@latest my-service -- --lang=rust
+cd my-service
+cargo run
+```
+
+Or add to an existing Rust project:
+
+```bash
+cargo add neutron
+```
+
+The full Rust documentation is at `/docs/rust`. The source is in `rs/` in the Neutron GitHub repo, organized as a Cargo workspace with 12 crates.

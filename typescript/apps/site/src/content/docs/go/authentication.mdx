@@ -1,0 +1,166 @@
+---
+title: Authentication
+description: JWT, sessions, API keys, and role-based access control.
+---
+
+The `neutronauth` package provides authentication and authorization middleware for Neutron Go applications.
+
+## JWT
+
+### Generate Tokens
+
+```go
+import "github.com/neutron-dev/neutron-go/neutronauth"
+
+token, err := neutronauth.GenerateToken(
+    map[string]any{
+        "sub":   "user_42",
+        "role":  "admin",
+        "email": "alice@example.com",
+    },
+    []byte("your-secret-key"),
+    time.Hour * 24, // expires in 24h
+)
+```
+
+Tokens are signed with HMAC-SHA256 (HS256).
+
+### Verify Tokens
+
+```go
+claims, err := neutronauth.ParseToken(tokenString, []byte("your-secret-key"))
+if err != nil {
+    // Invalid signature or expired
+}
+fmt.Println(claims["sub"]) // "user_42"
+```
+
+### JWT Middleware
+
+```go
+app := neutron.New()
+
+// Protect all routes under /api
+api := app.Group("/api")
+api.Use(neutronauth.JWTMiddleware([]byte("your-secret-key")))
+
+api.Get("/profile", func(w http.ResponseWriter, r *http.Request) {
+    claims := neutronauth.ClaimsFromContext(r.Context())
+    neutron.WriteJSON(w, claims)
+})
+```
+
+### Options
+
+```go
+neutronauth.JWTMiddleware(secret,
+    neutronauth.WithHeaderName("X-Auth-Token"),  // Custom header (default: Authorization)
+    neutronauth.WithScheme("Token"),              // Custom scheme (default: Bearer)
+    neutronauth.WithSkipPaths("/health", "/docs"), // Skip auth on these paths
+)
+```
+
+## Sessions
+
+Interface-based session storage with cookie management.
+
+### Memory Store (Development)
+
+```go
+store := neutronauth.NewMemorySessionStore()
+app.Use(neutronauth.SessionMiddleware(store))
+```
+
+### Nucleus Store (Production)
+
+Stores session data in Nucleus KV with prefix `session:`:
+
+```go
+store := neutronauth.NewNucleusSessionStore(nucleusClient)
+app.Use(neutronauth.SessionMiddleware(store))
+```
+
+### Usage
+
+```go
+app.Post("/login", func(w http.ResponseWriter, r *http.Request) {
+    session := neutronauth.SessionFromContext(r.Context())
+    session.Data["user_id"] = "42"
+    session.Data["role"] = "admin"
+    session.Save() // Writes to store + sets cookie
+})
+
+app.Get("/dashboard", func(w http.ResponseWriter, r *http.Request) {
+    session := neutronauth.SessionFromContext(r.Context())
+    userID := session.Data["user_id"]
+    // ...
+})
+
+app.Post("/logout", func(w http.ResponseWriter, r *http.Request) {
+    session := neutronauth.SessionFromContext(r.Context())
+    session.Destroy() // Removes from store + clears cookie
+})
+```
+
+## API Keys
+
+Validate API keys from headers or query parameters:
+
+```go
+app.Use(neutronauth.APIKeyMiddleware(func(key string) (bool, error) {
+    // Look up key in database
+    valid, err := db.ValidateAPIKey(key)
+    return valid, err
+}))
+```
+
+Reads from `X-API-Key` header or `Authorization: ApiKey <key>`.
+
+## Role-Based Access Control
+
+### Require Roles
+
+```go
+// Only admins can access
+admin := app.Group("/admin")
+admin.Use(neutronauth.JWTMiddleware(secret))
+admin.Use(neutronauth.RequireRole("admin"))
+
+// Multiple roles (any match)
+admin.Use(neutronauth.RequireRole("admin", "superadmin"))
+```
+
+Checks `claims["role"]` (string) or `claims["roles"]` (array).
+
+### Require Permissions
+
+```go
+// Fine-grained permission checks
+api.Use(neutronauth.RequirePermission("users:read", "users:write"))
+```
+
+Checks `claims["permissions"]` — all listed permissions must be present.
+
+### Response
+
+Unauthorized (missing/invalid token) returns `401`:
+
+```json
+{
+    "type": "https://neutron.dev/errors/unauthorized",
+    "title": "Unauthorized",
+    "status": 401,
+    "detail": "Missing or invalid authentication token"
+}
+```
+
+Forbidden (valid token, insufficient role) returns `403`:
+
+```json
+{
+    "type": "https://neutron.dev/errors/forbidden",
+    "title": "Forbidden",
+    "status": 403,
+    "detail": "Insufficient permissions"
+}
+```

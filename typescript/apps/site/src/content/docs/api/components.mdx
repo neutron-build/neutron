@@ -1,0 +1,76 @@
+---
+title: Components
+description: API reference for Neutron components.
+---
+
+Components available from `neutron`.
+
+## `<Link>`
+
+Navigate between pages without a full reload (in app mode).
+
+```tsx
+<Link to="/about">About</Link>
+```
+
+| Prop | Type | Description |
+| :--- | :--- | :--- |
+| `to` | `string` | The URL path. |
+| `prefetch` | `"intent" \| "render" \| "none"` | When to prefetch data. |
+
+## `<NavLink>`
+
+A special version of `<Link>` that knows when it is active.
+
+```tsx
+<NavLink 
+  to="/dashboard"
+  className={({ isActive }) => isActive ? "active" : ""}
+>
+  Dashboard
+</NavLink>
+```
+
+## `<Form>`
+
+Progressive enhancement wrapper for HTML forms.
+
+```tsx
+<Form method="post" action="/update">
+  {/* inputs */}
+</Form>
+```
+
+## `<Outlet>`
+
+Renders the child route within a parent layout.
+
+```tsx
+// _layout.tsx
+export default function Layout() {
+  return (
+    <div>
+      <Sidebar />
+      <Outlet />
+    </div>
+  );
+}
+```
+
+## `<Island>`
+
+Renders an interactive component inside a static route.
+
+```tsx
+<Island component={MyComponent} client="load" />
+```
+
+## `<ViewTransitions>`
+
+Enables View Transitions API support. Place in the `<head>` of your root layout.
+
+```tsx
+<head>
+  <ViewTransitions />
+</head>
+```

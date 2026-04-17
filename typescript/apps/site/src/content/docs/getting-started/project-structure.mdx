@@ -1,0 +1,69 @@
+---
+title: Project Structure
+description: Understanding the anatomy of a Neutron project.
+---
+
+A standard Neutron project follows a convention-over-configuration structure.
+
+## Directory Tree
+
+Here's an overview of a typical Neutron project:
+
+```
+my-app/
+├── src/
+│   ├── routes/              # File-based routing (pages & API)
+│   │   ├── _layout.tsx      # Root layout
+│   │   ├── index.tsx        # Homepage (/)
+│   │   └── app/             # Nested routes (/app)
+│   │       ├── _layout.tsx
+│   │       └── dashboard.tsx
+│   ├── components/          # Shared UI components
+│   ├── styles/              # Global styles
+│   └── middleware.ts        # Global middleware
+├── public/                  # Static assets (favicon, robots.txt)
+├── neutron.config.ts        # Framework configuration
+├── tsconfig.json            # TypeScript configuration
+├── package.json             # Dependencies and scripts
+└── .env                     # Environment variables
+```
+
+## Key Files & Directories
+
+### `src/routes/`
+
+This is the most important directory. The structure of files here determines your application's URLs.
+
+-   **`index.tsx`**: Maps to the root path of the directory (e.g., `src/routes/index.tsx` → `/`).
+-   **`[param].tsx`**: Dynamic route segments (e.g., `src/routes/users/[id].tsx` → `/users/123`).
+-   **`_layout.tsx`**: Wraps all sibling and child routes. Used for persistent UI like headers and sidebars.
+-   **`_error.tsx`**: Error boundary for the directory. Handles errors thrown in sibling routes.
+
+### `neutron.config.ts`
+
+The configuration file for your Neutron app. This is where you configure adapters (deployment targets), Vite plugins, and framework features.
+
+```ts
+import { defineConfig } from "neutron";
+import node from "@neutron/adapter-node";
+
+export default defineConfig({
+  adapter: node(),
+  routesDir: "src/routes",
+});
+```
+
+### `src/middleware.ts`
+
+Global middleware that runs on every request. Use this for authentication, logging, or modifying headers globally.
+
+```ts
+import type { MiddlewareFn } from "neutron";
+
+export const middleware: MiddlewareFn[] = [
+  async (request, context, next) => {
+    console.log(`${request.method} ${request.url}`);
+    return next();
+  },
+];
+```

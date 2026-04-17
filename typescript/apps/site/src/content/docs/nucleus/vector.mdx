@@ -1,0 +1,136 @@
+---
+title: Vector Search
+description: Similarity search for AI, RAG, and embeddings.
+---
+
+Nucleus includes built-in vector search with HNSW and IVFFlat indexes. Store embeddings alongside your relational data — no separate vector database needed.
+
+## The Vector Type
+
+Declare a fixed-dimension vector column:
+
+```sql
+CREATE TABLE documents (
+  id SERIAL PRIMARY KEY,
+  title TEXT,
+  content TEXT,
+  embedding Vector(384)
+);
+```
+
+## Inserting Vectors
+
+Use the `VECTOR()` function to create vector values:
+
+```sql
+INSERT INTO documents (title, content, embedding)
+VALUES (
+  'Getting Started',
+  'Learn how to use Neutron...',
+  VECTOR('[0.1, 0.5, 0.3, ...]')
+);
+```
+
+**Important:** Always use `VECTOR('...')` — a bare string `'[1,0,0]'` stores as text, not as a vector.
+
+## Similarity Search
+
+Use `VECTOR_DISTANCE` to find similar vectors:
+
+```sql
+SELECT title, VECTOR_DISTANCE(embedding, VECTOR('[0.1, 0.4, 0.2, ...]'), 'l2') AS distance
+FROM documents
+ORDER BY distance
+LIMIT 10;
+```
+
+## Distance Metrics
+
+| Metric | Function | Best For |
+|--------|----------|----------|
+| `l2` | Euclidean distance | General purpose |
+| `cosine` | Cosine similarity | Text embeddings |
+| `dot` | Inner product | Normalized vectors |
+
+```sql
+-- Cosine similarity
+SELECT * FROM documents
+ORDER BY VECTOR_DISTANCE(embedding, VECTOR('[...]'), 'cosine')
+LIMIT 5;
+
+-- Inner product
+SELECT * FROM documents
+ORDER BY VECTOR_DISTANCE(embedding, VECTOR('[...]'), 'dot')
+LIMIT 5;
+```
+
+## Indexes
+
+### HNSW (Hierarchical Navigable Small World)
+
+Best for high recall with moderate memory usage. Recommended for most use cases.
+
+```sql
+CREATE INDEX idx_docs_hnsw ON documents USING hnsw (embedding);
+```
+
+### IVFFlat (Inverted File with Flat)
+
+Best for large datasets where you can trade some recall for speed.
+
+```sql
+CREATE INDEX idx_docs_ivf ON documents USING ivfflat (embedding);
+```
+
+## Filtering with Vectors
+
+Combine vector search with SQL filters:
+
+```sql
+-- Find similar documents in a specific category
+SELECT title, VECTOR_DISTANCE(embedding, VECTOR('[...]'), 'cosine') AS score
+FROM documents
+WHERE category = 'tutorials'
+ORDER BY score
+LIMIT 10;
+
+-- Join with other tables
+SELECT d.title, u.name AS author, VECTOR_DISTANCE(d.embedding, VECTOR('[...]'), 'l2') AS dist
+FROM documents d
+JOIN users u ON d.author_id = u.id
+ORDER BY dist
+LIMIT 5;
+```
+
+## RAG Pattern
+
+A common pattern for Retrieval-Augmented Generation:
+
+```sql
+-- 1. Store document chunks with embeddings
+CREATE TABLE chunks (
+  id SERIAL PRIMARY KEY,
+  doc_id INTEGER REFERENCES documents(id),
+  text TEXT,
+  embedding Vector(1536)
+);
+
+-- 2. Create HNSW index
+CREATE INDEX idx_chunks_hnsw ON chunks USING hnsw (embedding);
+
+-- 3. Retrieve relevant chunks for a query
+SELECT text
+FROM chunks
+ORDER BY VECTOR_DISTANCE(embedding, VECTOR('[query_embedding...]'), 'cosine')
+LIMIT 5;
+
+-- 4. Pass retrieved chunks to your LLM as context
+```
+
+## Performance
+
+- **HNSW**: ~1ms queries on 1M vectors (384 dimensions)
+- **IVFFlat**: ~0.5ms queries with nprobe=10, lower recall
+- **Brute force**: Exact results, O(n) — use for small datasets (under 10K vectors)
+
+SIMD-accelerated distance calculations are used automatically on supported hardware.

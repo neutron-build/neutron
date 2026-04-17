@@ -1,0 +1,288 @@
+---
+title: Zig
+description: 4-layer systems library — wire codecs to application framework.
+---
+
+Neutron Zig is a composable systems library with 4 opt-in layers. Each layer builds on the previous, but you can use any layer independently via compile-time build flags.
+
+## Architecture
+
+```
+Layer 3: Application    ← Router, middleware, OpenAPI, config
+Layer 2: Protocol       ← HTTP server, PG client, WebSocket server
+Layer 1: HAL            ← TCP, I/O multiplexing, connection pool, timers
+Layer 0: Wire           ← pgwire, HTTP, WebSocket, binary codecs
+```
+
+### Build Flags
+
+```bash
+# Full stack (default)
+zig build
+
+# Wire codecs only (zero-alloc, freestanding — no std required)
+zig build -Dlayer1=false -Dlayer2=false -Dlayer3=false -Dnucleus=false
+
+# Wire + networking (no HTTP server, no framework)
+zig build -Dlayer2=false -Dlayer3=false
+
+# Everything except Nucleus client
+zig build -Dnucleus=false
+```
+
+Minimum Zig version: **0.14.0**
+
+## Layer 0 — Wire Codecs
+
+Zero-allocation, freestanding codecs. No `std` required — works on bare metal.
+
+### PostgreSQL Wire Protocol
+
+```zig
+const pgwire = @import("wire/pgwire/codec.zig");
+
+// Encode a query message (client → server)
+var buf: [4096]u8 = undefined;
+const len = try pgwire.encodeQuery(&buf, "SELECT * FROM users WHERE id = $1");
+
+// Decode a server response (server → client)
+const msg = try pgwire.decodeBackendMessage(response_buf);
+switch (msg) {
+    .DataRow => |row| { /* process columns */ },
+    .CommandComplete => |tag| { /* "SELECT 1" */ },
+    .ErrorResponse => |err| { /* handle error */ },
+}
+```
+
+### HTTP Parser
+
+```zig
+const http = @import("wire/http.zig");
+
+const request = try http.parseRequest(raw_bytes);
+// request.method, request.path, request.headers, request.body
+```
+
+### WebSocket Frames
+
+```zig
+const ws = @import("wire/websocket.zig");
+
+const frame = try ws.decodeFrame(raw_bytes);
+// frame.opcode (.text, .binary, .ping, .pong, .close)
+// frame.payload
+```
+
+### Binary Utilities
+
+Varint encoding, big/little endian conversions.
+
+## Layer 1 — HAL Networking
+
+Platform-abstracted networking: epoll on Linux, kqueue on macOS.
+
+```zig
+const tcp = @import("hal/tcp.zig");
+const pool = @import("hal/pool.zig");
+
+// TCP listener
+var listener = try tcp.TcpListener.bind(allocator, "127.0.0.1", 8080);
+defer listener.deinit();
+
+var stream = try listener.accept();
+defer stream.close();
+
+const bytes_read = try stream.read(&buf);
+try stream.write(response_bytes);
+
+// Connection pool (pre-allocated)
+var conn_pool = try pool.ConnectionPool.init(allocator, .{
+    .max_connections = 100,
+    .idle_timeout_ms = 30_000,
+});
+```
+
+### Timer
+
+```zig
+const timer = @import("hal/timer.zig");
+
+var deadline = timer.Timer.init(5_000); // 5 second timeout
+if (deadline.expired()) { /* handle timeout */ }
+```
+
+## Layer 2 — Protocol Servers
+
+### HTTP Server
+
+```zig
+const HttpServer = @import("protocol/http_server.zig").HttpServer;
+
+fn handler(ctx: *RequestContext) !void {
+    const name = ctx.queryParam("name") orelse "World";
+    try ctx.respondJson(.{ .message = "Hello, " ++ name });
+}
+
+var server = try HttpServer.init(allocator, .{
+    .host = "127.0.0.1",
+    .port = 8080,
+});
+try server.serve(handler);
+```
+
+`RequestContext` provides:
+- `respondJson(value)` — Serialize and send JSON
+- `respondText(text)` — Send plain text
+- `respondError(status, detail)` — RFC 7807 Problem Details
+
+### PostgreSQL Client
+
+```zig
+const PgClient = @import("protocol/pg_client.zig").PgClient;
+
+var client = try PgClient.connect(allocator, "127.0.0.1", 5432, "mydb", "user", "pass");
+defer client.deinit();
+
+const result = try client.query("SELECT id, name FROM users");
+```
+
+### WebSocket Server
+
+```zig
+const WsServer = @import("protocol/ws_server.zig").WsServer;
+
+// Upgrade from HTTP, then handle frames
+```
+
+### Static Files
+
+```zig
+const static_handler = @import("protocol/static.zig");
+// Serves files with MIME type detection
+```
+
+## Layer 3 — Application Framework
+
+Full web framework with router, middleware, and OpenAPI generation.
+
+### App Lifecycle
+
+```zig
+const App = @import("app/app.zig").App;
+
+const routes = [_]Route{
+    .{ .method = .GET,  .path = "/api/users",      .handler = &listUsers },
+    .{ .method = .GET,  .path = "/api/users/{id}",  .handler = &getUser },
+    .{ .method = .POST, .path = "/api/users",       .handler = &createUser },
+};
+
+var app = App(routes, null).init(allocator, config);
+try app.run(); // Handles SIGTERM/SIGINT gracefully
+```
+
+### Router
+
+Compile-time route dispatch — pattern matching compiled to inline comparisons:
+
+```zig
+const router = @import("app/router.zig");
+
+// Extract path parameters
+const id = router.extractParam("/api/users/{id}", request.path, "id");
+```
+
+### Middleware
+
+10-layer middleware stack matching the Neutron convention:
+
+```zig
+const middleware = @import("app/middleware.zig");
+// CORS, compression, rate limiting, auth, OTel, etc.
+```
+
+### Configuration
+
+Standard environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HOST` | `127.0.0.1` | Bind address |
+| `PORT` | `8080` | Listen port |
+| `DATABASE_URL` | — | Connection string |
+| `LOG_LEVEL` | `info` | Log level |
+
+### OpenAPI
+
+Auto-generated OpenAPI 3.1 spec from routes:
+
+```zig
+const openapi = @import("app/openapi.zig");
+// GET /openapi.json
+```
+
+## Nucleus Client
+
+Full multi-model client for all 14 Nucleus data models:
+
+```zig
+const NucleusClient = @import("nucleus/client.zig").NucleusClient;
+
+var client = try NucleusClient.fromUrl(allocator, "postgres://localhost:5432/mydb");
+try client.connect();
+defer client.deinit();
+
+// Feature detection (Nucleus vs PostgreSQL)
+if (client.features.is_nucleus) {
+    // Use KV, Vector, Graph, etc.
+}
+
+// SQL
+const rows = try client.query("SELECT * FROM users WHERE active = true");
+
+// Key-Value
+try client.kv.set("session:abc", "user_42");
+const val = try client.kv.get("session:abc");
+
+// Vector search
+const results = try client.vector.search("embeddings", query_vec, .{ .k = 10, .metric = .cosine });
+
+// TimeSeries, Document, Graph, FTS, Geo, Blob, Streams, Columnar, Datalog, CDC, PubSub...
+```
+
+Each data model has its own typed accessor file in `nucleus/`.
+
+## Project Structure
+
+```
+zig/
+├── build.zig           # Build system with layer flags
+├── build.zig.zon       # Package manifest
+└── src/
+    ├── wire/           # Layer 0: Codecs
+    │   ├── pgwire/     # PostgreSQL protocol
+    │   ├── http.zig    # HTTP/1.1
+    │   ├── websocket.zig
+    │   └── binary.zig
+    ├── hal/            # Layer 1: Networking
+    │   ├── tcp.zig
+    │   ├── io.zig      # epoll/kqueue
+    │   ├── pool.zig
+    │   └── timer.zig
+    ├── protocol/       # Layer 2: Servers
+    │   ├── http_server.zig
+    │   ├── pg_client.zig
+    │   ├── ws_server.zig
+    │   └── static.zig
+    ├── app/            # Layer 3: Framework
+    │   ├── app.zig
+    │   ├── router.zig
+    │   ├── middleware.zig
+    │   ├── config.zig
+    │   └── openapi.zig
+    └── nucleus/        # Multi-model client
+        ├── client.zig
+        ├── sql.zig
+        ├── kv.zig
+        ├── vector.zig
+        └── ...         # 15 model files
+```

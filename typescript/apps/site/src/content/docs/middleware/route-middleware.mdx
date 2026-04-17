@@ -1,0 +1,33 @@
+---
+title: Route Middleware
+description: Scoped middleware for specific routes.
+---
+
+In addition to global middleware, you can define middleware that only applies to a specific subdirectory of your application.
+
+## Usage
+
+Place a `middleware.ts` file inside a route directory.
+
+```
+src/routes/
+  app/
+    middleware.ts    <-- Runs for all /app/* routes
+    dashboard.tsx
+    settings.tsx
+```
+
+## Execution Order
+
+Middleware runs in a top-down order:
+
+1.  Global `src/middleware.ts`
+2.  Route `src/routes/app/middleware.ts`
+3.  Nested `src/routes/app/admin/middleware.ts`
+4.  Route Loader/Action
+
+## Common Use Cases
+
+-   **Authentication**: Checking if a user is logged in before accessing `/app`.
+-   **Logging**: Tracking requests to specific API endpoints.
+-   **Headers**: Adding CORS headers to API routes.

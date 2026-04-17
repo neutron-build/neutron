@@ -1,0 +1,33 @@
+---
+title: Environment Variables
+description: Managing secrets and config.
+---
+
+Neutron uses Vite's environment variable handling.
+
+## `.env` Files
+
+Place `.env` files in your project root.
+
+```
+# .env
+DATABASE_URL="postgresql://user:pass@localhost:5432/db"
+PUBLIC_API_KEY="12345"
+```
+
+## Server vs Client
+
+-   **Server**: Variables are available via `process.env` (Node) or specific context providers (Cloudflare).
+    ```ts
+    export async function loader() {
+      // Safe to use secrets here
+      const db = connect(process.env.DATABASE_URL);
+    }
+    ```
+
+-   **Client**: Only variables prefixed with `PUBLIC_` (or `VITE_`) are exposed to the client.
+    ```ts
+    console.log(import.meta.env.PUBLIC_API_KEY);
+    ```
+
+**Warning**: Never access private secrets (like DB passwords) in code that runs on the client (components), even if you think you are "hiding" it. Only access them in `loader` or `action` functions.

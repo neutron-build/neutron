@@ -1,0 +1,43 @@
+---
+title: Revalidation
+description: Automatic data freshness.
+---
+
+One of Neutron's most powerful features is **automatic revalidation**.
+
+## How It Works
+
+1.  A user submits a `<Form>`.
+2.  The `action` runs on the server and completes successfully.
+3.  Neutron assumes that *something* might have changed on the server.
+4.  Neutron automatically re-runs **all active loaders** on the page.
+5.  The UI updates with the fresh data.
+
+## Why This Matters
+
+You don't need to manually manage local state or caches. You don't need to append the new item to a list in your React state.
+
+Just write your loader to fetch the source of truth from the database. When you mutate the database in an action, the loader re-runs, fetches the new list, and your component updates.
+
+**The Loop:**
+`Database` → `Loader` → `Component` → `Action` → `Database` → `(Auto Revalidate)`
+
+## Manual Revalidation
+
+If you need to trigger a revalidation without a form submission (e.g., after a WebSocket event), you can use `useRevalidator`.
+
+```tsx
+import { useRevalidator } from "neutron";
+
+export function RealtimeComponent() {
+  const revalidator = useRevalidator();
+
+  useEffect(() => {
+    socket.on("update", () => {
+      revalidator.revalidate();
+    });
+  }, []);
+  
+  // ...
+}
+```

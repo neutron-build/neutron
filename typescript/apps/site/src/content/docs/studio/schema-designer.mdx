@@ -1,0 +1,64 @@
+---
+title: Schema Designer
+description: Visual table editor with code generation and migration export.
+---
+
+The Schema Designer lets you create and modify database tables visually, generate model code, and export migration files.
+
+## Browsing Tables
+
+The left sidebar shows all tables in the database. Click a table to view its columns and indexes.
+
+## Creating Tables
+
+1. Click **New Table**
+2. Add columns with:
+   - **Name** — Column identifier
+   - **Type** — Pick from common types (INTEGER, TEXT, BOOLEAN, FLOAT, TIMESTAMP, JSONB, etc.) or enter a custom type
+   - **Nullable** — Allow NULL values
+   - **Primary Key** — Mark as primary key
+   - **Default** — Default value expression
+3. Click **Save** to execute the CREATE TABLE statement
+
+## Editing Tables
+
+Select an existing table to:
+- **Add columns** — New column with type, nullable, default
+- **Modify columns** — Change type or constraints
+- **Remove columns** — Drop with confirmation
+- Changes are tracked as "dirty" until saved
+
+## Index Management
+
+For each table:
+- **View indexes** — List all secondary indexes with their columns
+- **Create index** — Regular or unique, on one or more columns
+- **Drop index** — Remove with confirmation
+
+## Code Generation
+
+Generate model boilerplate from your schema in four languages:
+
+| Language | Output |
+|----------|--------|
+| **Go** | Struct with `db` and `json` tags |
+| **TypeScript** | Interface or type definition |
+| **Rust** | Struct with `serde` derives |
+| **Python** | Pydantic `BaseModel` class |
+
+Switch between language tabs instantly. Copy to clipboard with one click.
+
+## Migration Export
+
+Export pending schema changes as a SQL migration file:
+
+1. Make changes in the designer
+2. Click **Export Migration**
+3. Downloads a timestamped `.sql` file (e.g., `20260308T143000_users.sql`)
+4. File contains the appropriate ALTER TABLE or CREATE TABLE statements
+
+Use with `neutron migrate` to apply migrations consistently across environments.
+
+## Dropping Tables
+
+Select a table and click **Drop Table**. A confirmation dialog prevents accidental deletion.

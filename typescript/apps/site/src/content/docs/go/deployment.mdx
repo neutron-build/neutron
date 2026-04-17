@@ -1,0 +1,193 @@
+---
+title: Deployment
+description: Production deployment with lifecycle hooks, health checks, and Docker.
+---
+
+## Production Server
+
+```go
+import "github.com/neutron-dev/neutron-go/neutron"
+
+func main() {
+    app := neutron.New(
+        neutron.WithConfig(neutron.LoadConfig[ServerConfig]("APP")),
+    )
+
+    app.Use(neutron.Chain(
+        neutron.RequestID(),
+        neutron.Logger(slog.Default()),
+        neutron.Recover(),
+        neutron.CORS(neutron.CORSOptions{AllowOrigins: []string{"*"}}),
+        neutron.Compress(5),
+        neutron.Timeout(30 * time.Second),
+    ))
+
+    setupRoutes(app)
+    app.Run(":8080")
+}
+```
+
+## Configuration
+
+Struct-based config with environment variable loading:
+
+```go
+type ServerConfig struct {
+    Server struct {
+        Addr            string        `env:"ADDR" default:":8080"`
+        ReadTimeout     time.Duration `env:"READ_TIMEOUT" default:"5s"`
+        WriteTimeout    time.Duration `env:"WRITE_TIMEOUT" default:"10s"`
+        ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" default:"30s"`
+    }
+    Database struct {
+        URL      string `env:"URL" required:"true"`
+        MaxConns int    `env:"MAX_CONNS" default:"25"`
+        MinConns int    `env:"MIN_CONNS" default:"5"`
+    }
+    Log struct {
+        Level  string `env:"LEVEL" default:"info"`
+        Format string `env:"FORMAT" default:"json"`
+    }
+}
+
+cfg, err := neutron.LoadConfig[ServerConfig]("APP")
+// Reads: APP_SERVER_ADDR, APP_DATABASE_URL, APP_LOG_LEVEL, etc.
+```
+
+## Graceful Shutdown
+
+`app.Run()` handles `SIGINT`/`SIGTERM` automatically with a 30-second drain timeout.
+
+### Lifecycle Hooks
+
+```go
+app := neutron.New(
+    neutron.WithLifecycle(
+        neutron.LifecycleHook{
+            Name: "database",
+            OnStart: func(ctx context.Context) error {
+                return db.Connect(ctx)
+            },
+            OnStop: func(ctx context.Context) error {
+                return db.Close()
+            },
+        },
+        neutron.LifecycleHook{
+            Name: "cache",
+            OnStart: func(ctx context.Context) error {
+                return cache.Warmup(ctx)
+            },
+            OnStop: func(ctx context.Context) error {
+                return cache.Flush()
+            },
+        },
+    ),
+)
+```
+
+- `OnStart` hooks run in registration order during startup
+- `OnStop` hooks run in **reverse** order during shutdown
+
+## Health Check
+
+Built-in `GET /health` endpoint registered automatically:
+
+```json
+{
+    "status": "ok",
+    "nucleus": true,
+    "version": "0.1.0"
+}
+```
+
+Nucleus detection uses the `NucleusChecker` interface (optional).
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `APP_SERVER_ADDR` | `:8080` | Listen address |
+| `APP_SERVER_READ_TIMEOUT` | `5s` | HTTP read timeout |
+| `APP_SERVER_WRITE_TIMEOUT` | `10s` | HTTP write timeout |
+| `APP_SERVER_SHUTDOWN_TIMEOUT` | `30s` | Graceful shutdown timeout |
+| `APP_DATABASE_URL` | — | Connection string (required) |
+| `APP_LOG_LEVEL` | `info` | Log level |
+| `APP_LOG_FORMAT` | `json` | Log format |
+
+## Docker
+
+```dockerfile
+# Build stage
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /app/server ./cmd/server
+
+# Runtime stage
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /app/server /usr/local/bin/
+EXPOSE 8080
+CMD ["server"]
+```
+
+### Docker Compose
+
+```yaml
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      APP_DATABASE_URL: postgres://nucleus:5432/mydb
+      APP_LOG_LEVEL: info
+    depends_on:
+      nucleus:
+        condition: service_healthy
+
+  nucleus:
+    image: ghcr.io/neutron-build/nucleus:latest
+    ports:
+      - "5432:5432"
+    volumes:
+      - nucleus_data:/var/lib/nucleus
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "localhost"]
+      interval: 5s
+
+volumes:
+  nucleus_data:
+```
+
+## systemd
+
+```ini
+[Unit]
+Description=My Neutron Go App
+After=network.target
+
+[Service]
+Type=simple
+User=myapp
+ExecStart=/usr/local/bin/server
+Environment=APP_DATABASE_URL=postgres://localhost:5432/mydb
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## Auto-Generated Endpoints
+
+Every Neutron Go app exposes:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Health + Nucleus detection |
+| `GET /openapi.json` | OpenAPI 3.1 specification |
+| `GET /docs` | Swagger UI |

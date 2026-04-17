@@ -1,0 +1,287 @@
+/* ---- HERO ---- */
+.nucleus-hero {
+  position: relative;
+  padding: var(--space-10) 0 var(--space-9);
+  overflow: hidden;
+}
+
+.nucleus-hero__glow {
+  display: none;
+}
+
+.nucleus-hero__grid-bg {
+  display: none;
+}
+
+.nucleus-hero__inner {
+  position: relative;
+  z-index: 1;
+  text-align: center;
+}
+
+.nucleus-hero__badge {
+  display: inline-block;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-tertiary);
+  margin-bottom: var(--space-4);
+}
+
+.nucleus-hero__title {
+  font-family: var(--font-serif);
+  font-size: clamp(2.75rem, 7vw, 4.5rem);
+  font-weight: 400;
+  letter-spacing: -0.03em;
+  line-height: 1.1;
+  margin-bottom: var(--space-5);
+  color: var(--text-primary);
+}
+
+.nucleus-hero__desc {
+  font-size: 1.25rem;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  max-width: 700px;
+  margin: 0 auto var(--space-7);
+}
+
+.nucleus-hero__metrics {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--space-4);
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+@media (max-width: 640px) {
+  .nucleus-hero__metrics {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+/* ---- SECTIONS ---- */
+.nucleus-section {
+  padding: var(--space-9) 0;
+}
+
+.nucleus-section--dark {
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.nucleus-section__title {
+  font-family: var(--font-serif);
+  font-size: clamp(1.75rem, 4vw, 2.5rem);
+  font-weight: 400;
+  color: var(--text-primary);
+  margin-bottom: var(--space-4);
+  letter-spacing: -0.02em;
+}
+
+.nucleus-section__desc {
+  font-size: 1.125rem;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  max-width: 700px;
+  margin-bottom: var(--space-6);
+}
+
+.nucleus-section__desc strong {
+  color: var(--text-primary);
+}
+
+.nucleus-section__note {
+  margin-top: var(--space-4);
+  font-size: 0.875rem;
+  color: var(--text-tertiary);
+}
+
+/* ---- BRANCHING VISUAL ---- */
+.branching-visual {
+  margin-top: var(--space-6);
+  padding: var(--space-7);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  max-width: var(--max-code);
+}
+
+.branch-diagram {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  margin-bottom: var(--space-6);
+}
+
+.branch-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.branch-label {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  min-width: 110px;
+  text-align: right;
+}
+
+.branch-line--main .branch-label {
+  color: #10B981;
+}
+
+.branch-line--feature .branch-label {
+  color: #A78BFA;
+}
+
+.branch-node {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.branch-node--filled {
+  background: #10B981;
+}
+
+.branch-node--merge {
+  background: #10B981;
+  width: 18px;
+  height: 18px;
+}
+
+.branch-node--fork {
+  background: #A78BFA;
+}
+
+.branch-node--merge-source {
+  background: #A78BFA;
+  border: 2px solid #10B981;
+}
+
+.branch-connector {
+  flex: 1;
+  height: 3px;
+  background: #10B981;
+  border-radius: 2px;
+  opacity: 0.5;
+}
+
+.branch-connector--dashed {
+  background: repeating-linear-gradient(90deg, #A78BFA 0, #A78BFA 8px, transparent 8px, transparent 14px);
+  opacity: 0.5;
+}
+
+.branching-uses {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--space-3);
+}
+
+@media (max-width: 640px) {
+  .branching-uses {
+    grid-template-columns: 1fr;
+  }
+}
+
+.branching-use {
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+  padding-left: var(--space-4);
+  position: relative;
+}
+
+.branching-use::before {
+  content: '\2713';
+  position: absolute;
+  left: 0;
+  color: var(--text-tertiary);
+  font-weight: 400;
+  font-size: 0.75rem;
+}
+
+/* ---- PRODUCTION ---- */
+.production-prose p {
+  margin-bottom: var(--space-4);
+  line-height: 1.7;
+  color: var(--text-secondary);
+}
+
+.production-prose strong {
+  color: var(--text-primary);
+}
+
+/* ---- CTA ---- */
+.nucleus-cta {
+  padding: var(--space-10) 0;
+  text-align: center;
+}
+
+.nucleus-cta__title {
+  font-family: var(--font-serif);
+  font-size: 2rem;
+  font-weight: 400;
+  color: var(--text-primary);
+  margin-bottom: var(--space-6);
+}
+
+.nucleus-cta__terminal {
+  background: #0C0C0C;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  text-align: left;
+  max-width: 500px;
+  margin: 0 auto;
+}
+
+@media (prefers-color-scheme: light) {
+  .nucleus-cta__terminal {
+    background: #1a1a2e;
+  }
+}
+
+.terminal-bar {
+  display: flex;
+  gap: 6px;
+  padding: 10px 14px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.terminal-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--bg-surface);
+}
+
+.terminal-dot:first-child { background: #FF5F57; }
+.terminal-dot:nth-child(2) { background: #FEBC2E; }
+.terminal-dot:nth-child(3) { background: #28C840; }
+
+.terminal-body {
+  padding: var(--space-5);
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  line-height: 1.8;
+  color: #E0E0E0;
+  background: transparent;
+  border: none;
+}
+
+.terminal-prompt {
+  color: #10B981;
+  font-weight: 400;
+}
+
+/* ---- PAGE-LEVEL ---- */
+.nucleus-page {
+  min-height: 100vh;
+}

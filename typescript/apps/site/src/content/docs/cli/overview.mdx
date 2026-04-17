@@ -1,0 +1,93 @@
+---
+title: CLI
+description: Universal command-line tool for every Neutron language.
+---
+
+The Neutron CLI is a single binary that works across all languages in the ecosystem. It handles database management, migrations, project scaffolding, and Studio — so you don't need separate tools per language.
+
+## Install
+
+```bash
+# macOS / Linux
+curl -fsSL https://get.neutron.dev | sh
+
+# Homebrew
+brew install neutron-dev/tap/neutron
+
+# npm (wrapper)
+npx @neutron-dev/cli
+```
+
+## What It Does
+
+| Area | Commands |
+|------|----------|
+| **Projects** | `new`, `init`, `dev` |
+| **Database** | `db start`, `db stop`, `db status`, `db reset` |
+| **Migrations** | `migrate`, `migrate status`, `migrate create` |
+| **Data** | `seed`, `repl` |
+| **Tools** | `studio`, `mcp`, `doctor`, `upgrade` |
+
+## Language Auto-Detection
+
+When you run `neutron dev`, the CLI detects your project language and delegates to the right dev server:
+
+| Detected By | Language | Dev Server |
+|-------------|----------|-----------|
+| `pyproject.toml` | Python | uvicorn |
+| `package.json` | TypeScript | npm run dev |
+| `go.mod` | Go | air / go run |
+| `Cargo.toml` | Rust | cargo watch |
+| `build.zig` | Zig | zig build run |
+| `Project.toml` | Julia | julia --project |
+
+Override with `--lang` or set `project.lang` in `neutron.toml`.
+
+## Configuration
+
+Configuration is read from (highest priority first):
+
+1. CLI flags (`--url`, `--port`)
+2. Environment variables (`DATABASE_URL`, `NUCLEUS_URL`)
+3. Project config (`./neutron.toml`)
+4. User config (`~/.neutron/config.toml`)
+5. Defaults
+
+### neutron.toml
+
+```toml
+[database]
+url = "postgres://localhost:5432/mydb"
+
+[studio]
+port = 4983
+
+[project]
+lang = "python"
+
+[nucleus]
+port = 5432
+data_dir = "nucleus_data"
+```
+
+## Quick Start
+
+```bash
+# Create a new project
+neutron new my-api --lang go
+
+# Start a local database
+neutron db start
+
+# Run migrations
+neutron migrate
+
+# Seed test data
+neutron seed
+
+# Start development
+neutron dev
+
+# Open Studio
+neutron studio
+```

@@ -1,0 +1,44 @@
+---
+title: Content API
+description: API reference for content collections.
+---
+
+Available from `neutron/content`.
+
+## `defineCollection`
+
+Defines a collection schema in `src/content/config.ts`.
+
+```ts
+import { defineCollection, z } from "neutron/content";
+
+const blog = defineCollection({
+  schema: z.object({ /* ... */ })
+});
+```
+
+## `getCollection`
+
+Retrieves all entries in a collection.
+
+```ts
+const posts = await getCollection("blog");
+// With filter
+const posts = await getCollection("blog", ({ data }) => !data.draft);
+```
+
+## `getEntry`
+
+Retrieves a single entry by slug.
+
+```ts
+const post = await getEntry("blog", "hello-world");
+```
+
+## `z` (Zod)
+
+Re-export of the Zod library for schema definition.
+
+```ts
+import { z } from "neutron/content";
+```

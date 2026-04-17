@@ -1,0 +1,158 @@
+---
+title: Database
+description: Async Nucleus client with all 14 data models.
+---
+
+The Python Nucleus client provides async access to all 14 data models using asyncpg.
+
+## Connection
+
+```python
+from neutron.nucleus import NucleusClient
+
+db = await NucleusClient.connect(
+    "postgres://localhost:5432/mydb",
+    min_size=5,
+    max_size=25,
+)
+
+# Auto-detect features
+print(db.features.is_nucleus)  # True
+print(db.features.version)     # "0.1.0"
+
+await db.close()
+```
+
+## SQL
+
+```python
+from pydantic import BaseModel
+
+class User(BaseModel):
+    id: int
+    name: str
+    email: str
+
+# Query multiple rows
+users = await db.sql.query(User, "SELECT * FROM users")
+
+# Query one row
+user = await db.sql.query_one(User, "SELECT * FROM users WHERE id = $1", 42)
+
+# Query one or None
+user = await db.sql.query_one_or_none(User, "SELECT * FROM users WHERE id = $1", 99)
+
+# Execute (returns affected count)
+count = await db.sql.execute(
+    "INSERT INTO users (name, email) VALUES ($1, $2)", "Alice", "alice@example.com")
+
+# Scalar value
+total = await db.sql.fetchval("SELECT COUNT(*) FROM users")
+```
+
+## Key-Value
+
+```python
+kv = db.kv
+
+await kv.set("session:1", "data", ttl=3600)
+val = await kv.get("session:1")
+await kv.delete("session:1")
+
+# Typed get/set (JSON serialization)
+await kv.set_typed("prefs:1", PrefsModel(theme="dark"), ttl=3600)
+prefs = await kv.get_typed("prefs:1", PrefsModel)
+
+# Lists
+await kv.lpush("queue", "item")
+item = await kv.rpop("queue")
+
+# Hashes
+await kv.hset("user:1", "name", "Alice")
+name = await kv.hget("user:1", "name")
+all_fields = await kv.hgetall("user:1")
+
+# Sorted sets
+await kv.zadd("leaderboard", 100, "alice")
+top = await kv.zrange("leaderboard", 0, 9)
+
+# HyperLogLog
+await kv.pfadd("visitors", "user1")
+count = await kv.pfcount("visitors")
+```
+
+## Vector Search
+
+```python
+results = await db.vector.search(
+    "documents", query_embedding,
+    k=10, metric="cosine",
+    filter={"category": "tech"},
+)
+
+for r in results:
+    print(f"ID: {r.id}, Score: {r.score:.4f}")
+```
+
+## Document
+
+```python
+doc_id = await db.document.insert("posts", {
+    "title": "Hello", "body": "World", "tags": ["python"]
+})
+
+post = await db.document.find_one("posts", {"author": "alice"})
+posts = await db.document.find("posts", {"author": "alice"}, limit=10)
+
+# Typed queries
+post = await db.document.find_one_typed("posts", {"author": "alice"}, BlogPost)
+```
+
+## Graph
+
+```python
+node_id = await db.graph.add_node(["Person"], {"name": "Alice", "age": 30})
+await db.graph.add_edge("KNOWS", node_id, other_id, {"since": "2024"})
+
+result = await db.graph.query(
+    "MATCH (p:Person)-[:KNOWS]->(q) RETURN p.name, q.name")
+```
+
+## Full-Text Search
+
+```python
+results = await db.fts.search("articles", "machine learning",
+    limit=10, fuzzy=2, highlight=True)
+```
+
+## Time Series
+
+```python
+from neutron.nucleus import TimeSeriesPoint
+from datetime import datetime
+
+points = [TimeSeriesPoint(timestamp=datetime.now(), value=72.5, tags={"host": "web-01"})]
+await db.timeseries.write("cpu_usage", points)
+
+latest = await db.timeseries.last("cpu_usage")
+points = await db.timeseries.query("cpu_usage", start, end, buckets=60)
+```
+
+## All 14 Models
+
+| Model | Accessor | Key Methods |
+|-------|----------|-------------|
+| SQL | `db.sql` | query, execute, fetchval |
+| Key-Value | `db.kv` | get, set, hset, lpush, zadd |
+| Vector | `db.vector` | search |
+| TimeSeries | `db.timeseries` | write, query, last |
+| Document | `db.document` | insert, find, get |
+| Graph | `db.graph` | add_node, add_edge, query |
+| FTS | `db.fts` | search |
+| Geo | `db.geo` | distance, within_radius |
+| Blob | `db.blob` | put, get, delete |
+| Streams | `db.streams` | xadd, xrange, xreadgroup |
+| Columnar | `db.columnar` | insert, sum, avg |
+| Datalog | `db.datalog` | assert_rule, query |
+| CDC | `db.cdc` | subscribe |
+| PubSub | `db.pubsub` | publish, subscribe |

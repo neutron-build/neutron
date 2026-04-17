@@ -1,0 +1,40 @@
+---
+title: Global Middleware
+description: Intercepting requests across the application.
+---
+
+Middleware allows you to run code before a request reaches your route handlers. It is built on web standards (Request/Response).
+
+## Creating Middleware
+
+Create a `middleware.ts` file in your `src` directory.
+
+```ts
+// src/middleware.ts
+import type { MiddlewareFn } from "neutron";
+
+export const middleware: MiddlewareFn[] = [
+  async (request, context, next) => {
+    console.log(`[${request.method}] ${request.url}`);
+    
+    const response = await next();
+    
+    response.headers.set("X-Powered-By", "Neutron");
+    return response;
+  }
+];
+```
+
+## Middleware Signature
+
+```ts
+type MiddlewareFn = (
+  request: Request,
+  context: Record<string, any>,
+  next: () => Promise<Response>
+) => Promise<Response>;
+```
+
+-   **request**: The incoming request.
+-   **context**: A shared object for passing data to other middleware or loaders.
+-   **next**: A function that calls the next middleware (or the route handler).

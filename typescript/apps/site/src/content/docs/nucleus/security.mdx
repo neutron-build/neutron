@@ -1,0 +1,182 @@
+---
+title: Security
+description: Row-level security, data masking, encryption, and audit logging.
+---
+
+Nucleus provides defense-in-depth security: row-level security (RLS), column-level data masking, tenant-aware encryption, and immutable audit logging.
+
+## Row-Level Security (RLS)
+
+Control which rows each user can see and modify.
+
+### Enable RLS
+
+```sql
+ENABLE RLS ON patients;
+```
+
+### Create Policies
+
+```sql
+-- Doctors can see all patients
+CREATE POLICY doctor_read ON patients
+    FOR SELECT
+    TO doctor
+    USING (true);
+
+-- Patients can only see their own records
+CREATE POLICY patient_read ON patients
+    FOR SELECT
+    TO patient
+    USING (patient_id = current_user_id());
+
+-- Nurses can only see patients in their department
+CREATE POLICY nurse_read ON patients
+    FOR SELECT
+    TO nurse
+    USING (department = current_tenant());
+```
+
+### Policy Types
+
+| Type | Behavior |
+|------|----------|
+| **Permissive** (default) | At least one permissive policy must pass |
+| **Restrictive** | All restrictive policies must pass |
+
+Policies combine: `(any permissive passes) AND (all restrictive pass)`.
+
+### Predicate Types
+
+| Predicate | Description |
+|-----------|-------------|
+| `column = 'value'` | Column equals constant |
+| `column = current_user()` | Column matches session user |
+| `column = current_tenant()` | Column matches session tenant |
+| `has_role('admin')` | Session must have role |
+| Combined with `AND` / `OR` | Compose predicates |
+
+### Superuser Bypass
+
+Users with the `superuser` role bypass all RLS policies.
+
+## Column-Level Data Masking
+
+Mask sensitive columns based on the querying user's role.
+
+### Masking Rules
+
+| Rule | Input | Output |
+|------|-------|--------|
+| **Redact** | `555-0123` | `[REDACTED]` |
+| **Email** | `tyler@example.com` | `t***@example.com` |
+| **Partial** (show first 2, last 2) | `555-0123` | `55****23` |
+| **Hash** | `John Smith` | `a1b2c3d4` |
+
+### Apply Masking
+
+```sql
+-- Analysts see masked SSNs
+CREATE MASKING POLICY ssn_mask ON employees(ssn)
+    FOR ROLE analyst
+    USING PARTIAL(show_first=0, show_last=4, mask_char='*');
+
+-- Support staff see masked emails
+CREATE MASKING POLICY email_mask ON customers(email)
+    FOR ROLE support
+    USING EMAIL;
+```
+
+Masking is applied transparently — queries return masked values without application code changes.
+
+## Encryption
+
+### Tenant-Aware Key Management
+
+Nucleus supports per-tenant encryption keys with rotation:
+
+```sql
+-- Register a tenant key
+SELECT register_tenant_key('tenant_42', decode('...base64key...', 'base64'));
+
+-- Rotate to a new key (old key archived for decryption)
+SELECT rotate_key('tenant_42', decode('...newkey...', 'base64'));
+```
+
+### Key Rotation
+
+Key rotation is a managed process:
+
+1. **Begin** — New key registered, old key marked for archival
+2. **Re-encrypt** — Pages re-encrypted in background (progress tracked)
+3. **Complete** — Old key archived, new key active
+
+Old keys are retained for decrypting data written before rotation.
+
+### Encrypted Indexes
+
+Nucleus supports encrypted indexes that store index entries in ciphertext. Search operations decrypt at query time — the index file on disk contains no plaintext.
+
+## Audit Logging
+
+Immutable, append-only audit log for compliance and forensics.
+
+### What's Logged
+
+Every query execution records:
+
+| Field | Description |
+|-------|-------------|
+| `timestamp` | When the query ran |
+| `user` | Who ran it |
+| `action` | Query type (SELECT, INSERT, UPDATE, DELETE, DDL) |
+| `table` | Affected table |
+| `query` | Full SQL text |
+| `rows_affected` | Number of rows modified |
+| `success` | Whether the query succeeded |
+
+### Querying the Audit Log
+
+```sql
+-- Recent activity by user
+SELECT * FROM nucleus_audit_log WHERE user = 'alice' ORDER BY timestamp DESC LIMIT 100;
+
+-- All changes to a table
+SELECT * FROM nucleus_audit_log WHERE table_name = 'patients' AND action IN ('INSERT', 'UPDATE', 'DELETE');
+```
+
+Audit entries are immutable — they cannot be updated or deleted.
+
+## Session Context
+
+Security features use session context to evaluate policies:
+
+```sql
+-- Set session properties
+SET SESSION user = 'alice';
+SET SESSION role = 'doctor';
+SET SESSION tenant_id = 'hospital_42';
+```
+
+Context properties available to RLS predicates and masking rules:
+
+| Function | Returns |
+|----------|---------|
+| `current_user()` | Session user |
+| `current_tenant()` | Session tenant ID |
+| `has_role('name')` | Whether session has role |
+
+## Cluster Security
+
+### Inter-Node TLS
+
+In clustered deployments, replication traffic is encrypted with TLS. Configure via:
+
+```toml
+[cluster.tls]
+cert = "/path/to/node.crt"
+key = "/path/to/node.key"
+ca = "/path/to/ca.crt"
+```
+
+All Raft messages, WAL streaming, and gossip use encrypted channels.

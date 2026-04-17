@@ -1,0 +1,146 @@
+---
+title: NeutronWind
+description: Tailwind-like styling compiled to native StyleSheets at build time.
+---
+
+NeutronWind transforms Tailwind-like `className` strings into React Native StyleSheet objects at build time. Zero runtime parsing.
+
+## How It Works
+
+```tsx
+// You write:
+<View className="flex-1 p-4 bg-white">
+    <Text className="text-lg font-bold text-gray-900">Hello</Text>
+</View>
+
+// Build plugin transforms to:
+<View style={{ flex: 1, padding: 16, backgroundColor: '#ffffff' }}>
+    <Text style={{ fontSize: 18, fontWeight: '700', color: '#111827' }}>Hello</Text>
+</View>
+```
+
+The transformation happens at build time via Babel or Rspack — no runtime CSS parsing on the device.
+
+## Setup
+
+### Babel (Metro / Expo)
+
+```javascript
+// babel.config.js
+module.exports = {
+    plugins: ['@neutron/native-styling/babel-plugin'],
+};
+```
+
+### Rspack (Re.Pack)
+
+```javascript
+// rspack.config.ts
+module.exports = {
+    module: {
+        rules: [{
+            test: /\.[jt]sx?$/,
+            use: ['@neutron/native-styling/rspack-loader'],
+        }],
+    },
+};
+```
+
+## Token Reference
+
+### Spacing
+
+Base unit: 4px. Scale: 0–96.
+
+| Class | Value | Class | Value |
+|-------|-------|-------|-------|
+| `p-0` | 0 | `m-0` | 0 |
+| `p-1` | 4px | `m-1` | 4px |
+| `p-2` | 8px | `m-2` | 8px |
+| `p-4` | 16px | `m-4` | 16px |
+| `p-8` | 32px | `m-8` | 32px |
+| `p-16` | 64px | `m-16` | 64px |
+
+Directional variants: `px-*`, `py-*`, `pt-*`, `pb-*`, `pl-*`, `pr-*`, `mx-*`, `my-*`, `mt-*`, `mb-*`, `ml-*`, `mr-*`.
+
+### Flexbox
+
+| Class | Style |
+|-------|-------|
+| `flex` | `{ display: 'flex' }` |
+| `flex-1` | `{ flex: 1 }` |
+| `flex-row` | `{ flexDirection: 'row' }` |
+| `flex-col` | `{ flexDirection: 'column' }` |
+| `flex-wrap` | `{ flexWrap: 'wrap' }` |
+| `items-center` | `{ alignItems: 'center' }` |
+| `items-start` | `{ alignItems: 'flex-start' }` |
+| `justify-center` | `{ justifyContent: 'center' }` |
+| `justify-between` | `{ justifyContent: 'space-between' }` |
+| `self-center` | `{ alignSelf: 'center' }` |
+
+### Typography
+
+| Class | Size |
+|-------|------|
+| `text-xs` | 12px |
+| `text-sm` | 14px |
+| `text-base` | 16px |
+| `text-lg` | 18px |
+| `text-xl` | 20px |
+| `text-2xl` | 24px |
+| `text-3xl` | 30px |
+| `text-4xl` | 36px |
+
+Weight: `font-thin`, `font-light`, `font-normal`, `font-medium`, `font-semibold`, `font-bold`, `font-black`.
+
+### Colors
+
+Full Tailwind color palette with `text-*`, `bg-*`, and `border-*` prefixes:
+
+```tsx
+<View className="bg-blue-500">
+    <Text className="text-white">Blue background, white text</Text>
+</View>
+
+<View className="bg-gray-100 border border-gray-300 rounded-lg">
+    <Text className="text-gray-700">Card</Text>
+</View>
+```
+
+### Borders & Rounding
+
+| Class | Style |
+|-------|-------|
+| `border` | 1px border |
+| `border-2` | 2px border |
+| `rounded` | borderRadius: 4 |
+| `rounded-lg` | borderRadius: 8 |
+| `rounded-xl` | borderRadius: 12 |
+| `rounded-full` | borderRadius: 9999 |
+
+Directional: `rounded-t-*`, `rounded-b-*`, `rounded-l-*`, `rounded-r-*`.
+
+### Sizing
+
+| Class | Style |
+|-------|-------|
+| `w-full` | width: '100%' |
+| `h-full` | height: '100%' |
+| `w-16` | width: 64 |
+| `h-16` | height: 64 |
+
+## Platform Variants
+
+Apply styles per platform:
+
+```tsx
+<Text className="text-lg ios:text-xl android:text-base">
+    Platform-specific sizing
+</Text>
+
+<View className="p-4 ios:p-6 android:p-3">
+    Platform-specific padding
+</View>
+```
+
+The `ios:` and `android:` prefixes are resolved at build time — only the relevant platform's styles are included in the bundle.

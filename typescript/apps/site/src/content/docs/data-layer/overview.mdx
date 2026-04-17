@@ -1,0 +1,32 @@
+---
+title: The Data Layer
+description: Overview of the unified nucleus package.
+---
+
+Neutron isn't just a rendering framework; it's a full-stack platform. The `nucleus` package provides a unified, high-performance backend layer that covers everything your app needs.
+
+## Why a Unified Data Layer?
+
+Most frameworks leave the "backend" to you, leading to fragmented setups with different libraries for databases, caching, and queues. Neutron takes a different approach by providing a single, coherent package that:
+
+1.  **Eliminates Boilerplate**: Everything is pre-configured and designed to work together.
+2.  **Optimizes Performance**: Built-in auto-caching and parallel loading.
+3.  **Simplifies Scaling**: A stateless architecture that scale horizontally with ease.
+
+## Core Stack
+
+| Component | Technology | Role |
+| :--- | :--- | :--- |
+| **Database** | PostgreSQL / SQLite | Primary persistence with Drizzle ORM. |
+| **Cache & Queue** | Dragonfly | Drop-in Redis replacement for speed and efficiency. |
+| **Auth** | Better Auth | Full-featured authentication with session management. |
+| **Storage** | S3-Compatible | Standard protocol for file storage (AWS, R2, etc). |
+
+## Environment Awareness
+
+Neutron automatically detects your environment to provide the best developer experience:
+
+-   **Development**: Uses **SQLite** (zero config) and a local Dragonfly instance.
+-   **Production**: Connects to **PostgreSQL** and your production Dragonfly/S3 services.
+
+You can customize this behavior in your `neutron.config.ts`.

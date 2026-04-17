@@ -1,0 +1,134 @@
+---
+title: "Why We Built a Custom Database Engine"
+description: "Most applications need SQL for relational data, Redis for caching and pub/sub, a vector database for AI features, and a graph database for relationships. Nucleus collapses all of that into one engine. Here's why we built it and how it works."
+pubDate: 2026-02-22
+author: "Neutron Team"
+tags: ["nucleus", "database", "architecture", "rust", "engineering"]
+---
+
+Modern applications have a database tax. Before you write a single line of business logic, you're managing six services: PostgreSQL for relational data, Redis for caching and pub/sub, Pinecone or pgvector for vector search, Neo4j for graph traversals, InfluxDB for timeseries, and Elasticsearch for full-text search. That's six connection pools, six sets of credentials, six dashboards to monitor, six billing accounts, and six APIs to learn. Cross-model queries require application-layer joins. Transactions across models are effectively impossible.
+
+We built Nucleus to eliminate that tax.
+
+## What Nucleus Is
+
+Nucleus is a multi-model database engine written in Rust that supports fourteen data models in a single connection. One process, one port, one connection string, one place to store everything your application needs.
+
+It speaks the PostgreSQL wire protocol. Any client that works with PostgreSQL — `psql`, SQLAlchemy, asyncpg, pgx, node-postgres — works with Nucleus without modification.
+
+### The Fourteen Models
+
+**Relational (SQL)** — Full SQL with PostgreSQL syntax. `CREATE TABLE`, `SELECT`, `JOIN`, transactions, indexes. If you know PostgreSQL, you already know how to use this.
+
+**Key-Value** — TTL support, lists, hashes, sets, sorted sets, and HyperLogLog. Redis-compatible semantics. Use it for sessions, feature flags, rate limiting counters, leaderboards.
+
+**Vector** — HNSW (Hierarchical Navigable Small World) and IVFFlat indexes. L2, cosine, and inner product distance metrics. For semantic search, recommendation engines, and RAG pipelines.
+
+**TimeSeries** — Gorilla-style delta-of-delta compression. Continuous aggregates for pre-computed rollups. Built for metrics, sensor data, financial timeseries.
+
+**Document** — JSONB storage with GIN index support. Flexible schemas, nested queries, array operations. For event logs, user preferences, content that evolves over time.
+
+**Graph** — Adjacency list and CSR (Compressed Sparse Row) representation. Cypher query language. For social graphs, knowledge graphs, dependency trees, recommendation networks.
+
+**Full-Text Search** — BM25 ranking, six-language stemmers (English, French, German, Spanish, Portuguese, Italian), fuzzy matching. No Elasticsearch cluster required.
+
+**Geo** — R-tree spatial index, point-in-radius queries, bounding box search, distance calculations. For store locators, delivery routing, geofencing.
+
+**Blob** — Chunked content-addressed storage with BLAKE3 hashing and automatic deduplication. For user-uploaded files, build artifacts, media assets.
+
+## Engineering Decisions
+
+### Why Rust
+
+Memory safety without garbage collection pauses. A database needs predictable latency — GC pauses at the wrong moment can turn a 2ms query into a 200ms one. Rust gives us the memory control of C with the safety guarantees of a managed language.
+
+The entire engine, including the storage layer, query executor, and wire protocol implementation, is written in Rust. Zero unsafe blocks in the hot path.
+
+### WAL Everywhere
+
+Every data model has a Write-Ahead Log. Before any write is applied to the primary data structure, it's written to the WAL. If the process crashes mid-write, the WAL lets us replay and recover to a consistent state on restart.
+
+This was a significant engineering effort — each model has different write patterns and different recovery semantics. The vector index (HNSW graph) has very different WAL needs than the timeseries store (append-only deltas). We shipped WAL for all fourteen models in Phase 1.
+
+### MVCC for Snapshot Isolation
+
+Multi-Version Concurrency Control lets readers see a consistent snapshot of the database without blocking writers. Long-running analytical queries don't hold locks that block your application's transactional writes.
+
+> **Current limitation:** Disk-based MVCC is still in progress. The in-memory engine has full snapshot isolation. Disk mode uses a simpler locking scheme for now.
+
+### Pluggable Storage Engines
+
+Nucleus has three storage backends:
+
+- **LSM Tree** — Optimized for write-heavy workloads. Good for timeseries, event logs, append-heavy KV.
+- **B-Tree** — Optimized for read-heavy workloads with point lookups. Good for relational tables, indexed documents.
+- **Columnar** — Vectorized aggregation with LZ4/Zstd compression. Good for analytical queries over large datasets.
+
+Each model picks the storage engine that fits its access patterns.
+
+### Cross-Model Transactions
+
+The most technically interesting part: you can write to SQL, vector, KV, and document atomically. If your vector index update fails, the SQL write rolls back. No application-layer compensation logic.
+
+## Datalog: Rules Engine
+
+Nucleus also ships a Datalog rules engine — a logic programming layer for complex recursive queries that are awkward to express in SQL.
+
+```datalog
+ancestor(X, Y) :- parent(X, Y).
+ancestor(X, Y) :- parent(X, Z), ancestor(Z, Y).
+```
+
+Semi-naive evaluation prevents redundant recomputation on incremental updates. Datalog rules can reference SQL tables, making it useful for complex graph reachability, business rule engines, and knowledge base queries.
+
+## Using Nucleus Today
+
+Because Nucleus speaks the PostgreSQL wire protocol, the connection is familiar:
+
+```python
+import asyncpg
+
+conn = await asyncpg.connect('postgresql://localhost:5432/mydb')
+
+# Standard SQL
+users = await conn.fetch('SELECT id, name FROM users WHERE active = true')
+
+# Vector similarity search — same connection
+similar = await conn.fetch('''
+    SELECT name, 1 - (embedding <=> $1::vector) AS score
+    FROM products
+    ORDER BY embedding <=> $1::vector
+    LIMIT 10
+''', query_embedding)
+
+# Both in one transaction
+async with conn.transaction():
+    await conn.execute('INSERT INTO events (type) VALUES ($1)', 'search')
+    await conn.execute('UPDATE search_stats SET count = count + 1')
+```
+
+One connection. All fourteen models. Standard SQL clients.
+
+## Honest Limitations
+
+Nucleus is early-stage software. We're not going to oversell it.
+
+**Distributed mode is experimental.** We have a Raft-based distributed consensus layer, but it hasn't been hardened for production. Run single-node for now.
+
+**Disk MVCC is in progress.** Full snapshot isolation works in memory mode. Disk mode uses a simpler locking scheme while we finish the disk MVCC implementation.
+
+**Metadata now persists.** Views, sequences, triggers, roles, and functions are stored in meta.json and restored on restart.
+
+**No production references.** Nucleus hasn't been battle-tested at production scale. It's a powerful tool for teams willing to accept early-adopter risk.
+
+## What's Ahead
+
+**Studio** — A visual database manager that works with all fourteen models. Browse your SQL tables, run vector similarity searches, visualize your graph, query your timeseries — all in one UI. This is the next major component we're building.
+
+**The ORM** — Type-safe query builder that spans all fourteen models. Write TypeScript or Rust code, get SQL, vector, and graph queries with full type inference.
+
+**Distributed mode** — Multi-node Nucleus with automatic sharding and replication. One of the hardest things we're building.
+
+The goal is to be the database you'd reach for first for any new project, regardless of what data models you'll need. No more guessing which specialty services to provision before you know what you're building.
+
+If you want to try it: Nucleus is open source, MIT licensed (BSL 1.1 transitioning to MIT in 2046 for the core engine). Start with `npm create neutron@latest` and pick a TypeScript or Rust project — Nucleus ships as part of the Neutron dev environment.

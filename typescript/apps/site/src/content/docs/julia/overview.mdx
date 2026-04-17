@@ -1,0 +1,256 @@
+---
+title: Julia
+description: Scientific computing SDK with Nucleus client and ecosystem extensions.
+---
+
+Neutron Julia provides a typed Nucleus client and integrations with the Julia scientific computing ecosystem — DifferentialEquations.jl, Flux.jl, CUDA.jl, and Makie.jl.
+
+## Quick Start
+
+```julia
+using NeutronJulia
+
+# Connect to Nucleus
+client = NeutronJulia.connect("postgres://localhost:5432/mydb")
+
+# SQL queries
+rows = query(sql(client), "SELECT * FROM users WHERE active = true")
+
+# Key-Value
+set!(kv(client), "session:abc", "user_42")
+val = get(kv(client), "session:abc")
+
+# Vector search
+results = search(vector(client), "embeddings", [0.1, 0.2, 0.3]; k=10, metric=Cosine)
+
+close(client)
+```
+
+Transport: LibPQ.jl (PostgreSQL wire protocol). Min Julia: **1.9**.
+
+## Connection Pool
+
+```julia
+pool = ConnectionPool("postgres://localhost:5432/mydb", size=4)
+
+with_pool(pool) do client
+    rows = query(sql(client), "SELECT * FROM users")
+    set!(kv(client), "cache:result", JSON3.write(rows))
+end
+
+# Pool stats
+idle_count(pool)  # Available connections
+
+close(pool)
+```
+
+## All 14 Data Models
+
+Access each model through a typed accessor:
+
+```julia
+client = NeutronJulia.connect(url)
+
+sql(client)        # SQL queries
+kv(client)         # Key-Value (TTL, lists, hashes, sets, sorted sets, HyperLogLog)
+vector(client)     # Vector search (HNSW, IVFFlat)
+timeseries(client) # Time series (Gorilla compression)
+document(client)   # Document store (JSONB)
+graph(client)      # Graph (Cypher, adjacency)
+fts(client)        # Full-text search (BM25)
+geo(client)        # Geospatial (R-tree)
+blob(client)       # Blob storage (BLAKE3)
+streams(client)    # Streams (consumer groups)
+columnar(client)   # Columnar analytics
+datalog(client)    # Datalog queries
+cdc(client)        # Change Data Capture
+pubsub(client)     # PubSub (LISTEN/NOTIFY)
+```
+
+### SQL
+
+```julia
+s = sql(client)
+
+rows = query(s, "SELECT id, name, email FROM users WHERE active = \$1", [true])
+row = query_one(s, "SELECT * FROM users WHERE id = \$1", [42])
+execute!(s, "INSERT INTO users (name, email) VALUES (\$1, \$2)", ["Alice", "alice@example.com"])
+```
+
+### Key-Value
+
+```julia
+k = kv(client)
+
+set!(k, "key", "value")
+get(k, "key")              # "value"
+delete!(k, "key")
+
+# Collections
+lpush!(k, "queue", "item1", "item2")
+hset!(k, "user:1", "name", "Alice")
+sadd!(k, "tags", "rust", "julia")
+zadd!(k, "leaderboard", 100.0, "player1")
+pfadd!(k, "visitors", "user1", "user2")   # HyperLogLog
+```
+
+### Vector Search
+
+```julia
+v = vector(client)
+
+create_index!(v, "embeddings", 384; metric=Cosine, index_type=HNSW)
+results = search(v, "embeddings", query_vec; k=10, metric=Cosine)
+d = dims(v, "embeddings")  # 384
+```
+
+### TimeSeries
+
+```julia
+ts = timeseries(client)
+
+insert!(ts, "cpu_usage", [now_ms, now_ms + 1000], [0.75, 0.82])
+last = last_value(ts, "cpu_usage")
+count = ts_count(ts, "cpu_usage")
+avg = range_avg(ts, "cpu_usage", start_ms, end_ms)
+```
+
+### Graph
+
+```julia
+g = graph(client)
+
+add_node!(g, "Person", Dict("name" => "Alice"))
+add_edge!(g, node_a, node_b, "KNOWS", Dict("since" => 2024))
+neighbors(g, node_a)
+path = shortest_path(g, node_a, node_b)
+```
+
+## Ecosystem Extensions
+
+Extensions load automatically when you import both NeutronJulia and the target package (Julia weak dependency pattern).
+
+### DataFrames
+
+```julia
+using NeutronJulia, DataFrames
+
+rows = query(sql(client), "SELECT * FROM sales")
+df = DataFrame(rows)  # Automatic conversion
+```
+
+### DifferentialEquations
+
+Store ODE/SDE solutions directly in Nucleus TimeSeries:
+
+```julia
+using NeutronJulia, DifferentialEquations
+
+# Solve a system
+prob = ODEProblem(lorenz!, u0, tspan, p)
+sol = solve(prob, Tsit5(), saveat=0.01)
+
+# Store solution — each variable becomes a separate series
+ts = timeseries(client)
+store!(ts, sol, "lorenz:run1"; variable_names=["x", "y", "z"])
+
+# Retrieve later
+t, u = load_solution(ts, "lorenz:run1", ["x", "y", "z"])
+# t::Vector{Float64} (seconds)
+# u::Matrix{Float64} (n_vars x n_points)
+```
+
+### ModelingToolkit
+
+Symbolic variable names flow through to TimeSeries storage:
+
+```julia
+using NeutronJulia, ModelingToolkit
+
+# Variable names from MTK system used as series names automatically
+```
+
+### Flux (ML)
+
+Generate embeddings with Flux models and store in Nucleus Vector:
+
+```julia
+using NeutronJulia, Flux
+
+model = Chain(Dense(768, 384), relu, Dense(384, 128))
+embedding = model(input_data)
+
+v = vector(client)
+# Store and search embeddings
+```
+
+### CUDA
+
+GPU-accelerated vector similarity search:
+
+```julia
+using NeutronJulia, CUDA
+
+# Vector operations accelerated on NVIDIA GPUs
+```
+
+### Makie
+
+Plot TimeSeries data directly:
+
+```julia
+using NeutronJulia, CairoMakie
+
+ts = timeseries(client)
+fig = plot_timeseries!(ts, "cpu_usage", start_ms, end_ms)
+save("cpu.png", fig)
+```
+
+## Transactions
+
+```julia
+tx = transaction(client, read_write)
+try
+    execute!(sql(client), "UPDATE accounts SET balance = balance - 100 WHERE id = 1")
+    execute!(sql(client), "UPDATE accounts SET balance = balance + 100 WHERE id = 2")
+    commit!(tx)
+catch e
+    rollback!(tx)
+    rethrow(e)
+end
+```
+
+## Project Structure
+
+```
+julia/
+├── Project.toml              # Package manifest
+├── src/
+│   ├── NeutronJulia.jl       # Main module (exports all 14 models)
+│   ├── client.jl             # Connection management
+│   ├── pool.jl               # Connection pooling
+│   └── model/                # Data model accessors
+│       ├── sql.jl
+│       ├── kv.jl
+│       ├── vector.jl
+│       ├── timeseries.jl
+│       ├── document.jl
+│       ├── graph.jl
+│       ├── fts.jl
+│       ├── geo.jl
+│       ├── blob.jl
+│       ├── streams.jl
+│       ├── columnar.jl
+│       ├── datalog.jl
+│       ├── cdc.jl
+│       └── pubsub.jl
+├── ext/                      # Ecosystem extensions
+│   ├── NeutronJuliaDataFramesExt.jl
+│   ├── NeutronJuliaDiffEqExt.jl
+│   ├── NeutronJuliaMTKExt.jl
+│   ├── NeutronJuliaGraphsExt.jl
+│   ├── NeutronJuliaFluxExt.jl
+│   ├── NeutronJuliaCUDAExt.jl
+│   └── NeutronJuliaMakieExt.jl
+└── test/
+```

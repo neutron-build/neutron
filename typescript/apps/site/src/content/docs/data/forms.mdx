@@ -1,0 +1,50 @@
+---
+title: Forms
+description: Progressive enhancement with the Form component.
+---
+
+Neutron provides a `<Form>` component that works just like a standard HTML `<form>`, but with superpowers.
+
+## The `<Form>` Component
+
+```tsx
+import { Form } from "neutron";
+
+export default function Login() {
+  return (
+    <Form method="post" action="/login">
+      <input name="email" type="email" />
+      <input name="password" type="password" />
+      <button type="submit">Log In</button>
+    </Form>
+  );
+}
+```
+
+## Progressive Enhancement
+
+The beauty of `<Form>` is that it works **without JavaScript**.
+1.  **No JS**: The browser submits a standard POST request. The server runs the `action`, handles the logic, and returns a new page (SSR).
+2.  **With JS**: Neutron intercepts the submit event. It uses `fetch` to send the data to the action. When the response comes back, it updates the page without a full reload.
+
+## Pending States
+
+To provide a great user experience, you often want to show a loading state while the form is submitting. You can use `useNavigation`.
+
+```tsx
+import { Form, useNavigation } from "neutron";
+
+export default function Login() {
+  const navigation = useNavigation();
+  const isSubmitting = navigation.state === "submitting";
+
+  return (
+    <Form method="post">
+      {/* ... inputs ... */}
+      <button disabled={isSubmitting}>
+        {isSubmitting ? "Logging in..." : "Log In"}
+      </button>
+    </Form>
+  );
+}
+```

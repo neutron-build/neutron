@@ -1,0 +1,113 @@
+---
+title: Datalog
+description: Logic programming with semi-naive evaluation.
+---
+
+Nucleus includes a built-in Datalog engine for recursive queries and logic programming. Define facts and rules, then query with automatic fixed-point evaluation — integrated directly with your relational and graph data.
+
+## Facts
+
+Assert ground truth:
+
+```sql
+SELECT DATALOG_ASSERT('parent(alice, bob).');
+SELECT DATALOG_ASSERT('parent(bob, charlie).');
+SELECT DATALOG_ASSERT('parent(charlie, diana).');
+```
+
+## Rules
+
+Define derived relations:
+
+```sql
+-- Direct parent relationship
+SELECT DATALOG_RULE('ancestor(X, Y) :- parent(X, Y).');
+
+-- Transitive closure (recursive)
+SELECT DATALOG_RULE('ancestor(X, Z) :- ancestor(X, Y), parent(Y, Z).');
+```
+
+## Queries
+
+```sql
+-- Who are Alice's descendants?
+SELECT DATALOG_QUERY('?- ancestor(alice, Who).');
+-- → [{"Who":"bob"}, {"Who":"charlie"}, {"Who":"diana"}]
+
+-- Is Alice an ancestor of Diana?
+SELECT DATALOG_QUERY('?- ancestor(alice, diana).');
+-- → [{}]  (empty binding = true)
+```
+
+## Retracting Facts
+
+```sql
+-- Remove a specific fact
+SELECT DATALOG_RETRACT('parent(bob, charlie).');
+
+-- Clear all facts for a predicate
+SELECT DATALOG_CLEAR('parent');
+```
+
+## Cross-Model Integration
+
+Import data from relational tables and the graph engine:
+
+```sql
+-- Import rows from a SQL table as facts
+-- Each row becomes: predicate(col1, col2, ...)
+SELECT DATALOG_IMPORT('employees', 'employee');
+
+-- Import graph edges as facts
+-- Each edge becomes: predicate(from_id, edge_type, to_id)
+SELECT DATALOG_IMPORT_GRAPH('edge');
+
+-- Import graph nodes
+-- Each node becomes: predicate(node_id, label)
+SELECT DATALOG_IMPORT_NODES('node');
+```
+
+Then query across models:
+
+```sql
+-- Find all employees reachable through the management graph
+SELECT DATALOG_RULE('manages(X, Y) :- edge(X, "MANAGES", Y).');
+SELECT DATALOG_RULE('manages(X, Z) :- manages(X, Y), edge(Y, "MANAGES", Z).');
+SELECT DATALOG_QUERY('?- manages(1, Who).');
+```
+
+## Negation
+
+Stratified negation using `\+`:
+
+```sql
+SELECT DATALOG_RULE('orphan(X) :- person(X), \\+ parent(_, X).');
+SELECT DATALOG_QUERY('?- orphan(Who).');
+```
+
+## Aggregates
+
+Built-in aggregate functions in rule heads:
+
+```sql
+-- Count children per parent
+SELECT DATALOG_RULE('child_count(X, count<Y>) :- parent(X, Y).');
+SELECT DATALOG_QUERY('?- child_count(Who, Count).');
+```
+
+Supported aggregates: `count`, `sum`, `min`, `max`.
+
+## How It Works
+
+- **Semi-naive evaluation** — Only new facts from the previous iteration are used to derive new facts, avoiding redundant computation
+- **Indexed EDB** — O(1) fact lookups for efficient joins
+- **Stratified negation** — Safe handling of negated predicates
+- **WAL-backed** — Crash-safe fact persistence
+
+## Use Cases
+
+- **Access control** — Recursive permission inheritance
+- **Graph analytics** — Transitive closure, reachability
+- **Data lineage** — Track data provenance and dependencies
+- **Rule engines** — Business rules and compliance checks
+- **Ontologies** — Taxonomic reasoning and classification

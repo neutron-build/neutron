@@ -1,0 +1,102 @@
+---
+title: Middleware
+description: Built-in middleware and custom middleware patterns.
+---
+
+Neutron Go middleware uses the standard `func(http.Handler) http.Handler` signature, compatible with the entire `net/http` ecosystem.
+
+## Built-In Middleware
+
+```go
+app := neutron.New(
+    neutron.WithMiddleware(
+        neutron.Logger(logger),                          // Structured logging
+        neutron.Recover(),                               // Panic recovery
+        neutron.RequestID(),                             // X-Request-ID
+        neutron.CORS(neutron.CORSOptions{                // CORS headers
+            AllowOrigins:     []string{"https://example.com"},
+            AllowMethods:     []string{"GET", "POST"},
+            AllowHeaders:     []string{"Authorization"},
+            AllowCredentials: true,
+            MaxAge:           3600,
+        }),
+        neutron.RateLimit(100, 1000),                    // 100 RPS, burst 1000
+        neutron.Timeout(30 * time.Second),               // Request timeout
+        neutron.Compress(gzip.DefaultCompression),       // Gzip compression
+        neutron.OTel(neutron.OTelOptions{                // OpenTelemetry
+            ServiceName: "my-api",
+        }),
+    ),
+)
+```
+
+| Middleware | Description |
+|-----------|-------------|
+| `Logger` | Method, path, status, duration, request_id |
+| `Recover` | Catches panics, returns 500 |
+| `RequestID` | Generates X-Request-Id header |
+| `CORS` | Cross-origin resource sharing |
+| `RateLimit` | Token bucket rate limiting |
+| `Timeout` | Per-request deadline |
+| `Compress` | Gzip response compression |
+| `OTel` | OpenTelemetry trace context |
+
+## Custom Middleware
+
+```go
+func TimingMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        next.ServeHTTP(w, r)
+        w.Header().Set("X-Response-Time",
+            fmt.Sprintf("%dms", time.Since(start).Milliseconds()))
+    })
+}
+
+app := neutron.New(
+    neutron.WithMiddleware(TimingMiddleware),
+)
+```
+
+## Scoped Middleware
+
+Apply middleware to specific route groups:
+
+```go
+// Public routes — no auth
+public := router.Group("/public")
+
+// API routes — JWT required
+api := router.Group("/api",
+    neutronauth.JWTMiddleware(secret),
+)
+
+// Admin routes — JWT + RBAC
+admin := router.Group("/admin",
+    neutronauth.JWTMiddleware(secret),
+    neutronauth.RBACMiddleware("admin"),
+)
+```
+
+## Composing Middleware
+
+```go
+authStack := neutron.Chain(
+    neutronauth.JWTMiddleware(secret),
+    neutronauth.RBACMiddleware("admin"),
+)
+
+admin := router.Group("/admin", authStack)
+```
+
+## Context Values
+
+Access middleware-injected values:
+
+```go
+func handler(ctx context.Context, _ neutron.Empty) (string, error) {
+    requestID := neutron.RequestIDFromContext(ctx)
+    traceID := neutron.TraceIDFromContext(ctx)
+    return fmt.Sprintf("request=%s trace=%s", requestID, traceID), nil
+}
+```

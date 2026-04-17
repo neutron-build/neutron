@@ -1,0 +1,74 @@
+---
+title: Nested Layouts
+description: Using layouts to share UI across routes.
+---
+
+Neutron supports nested layouts, a powerful pattern for building complex user interfaces.
+
+## Creating a Layout
+
+A layout is a special file named `_layout.tsx`. It wraps all sibling routes and their children.
+
+**File**: `src/routes/_layout.tsx` (Root layout)
+
+```tsx
+import { Outlet } from "neutron";
+
+export default function RootLayout() {
+  return (
+    <html>
+      <body>
+        <nav>My App</nav>
+        <Outlet /> {/* Child routes render here */}
+        <footer>© 2024</footer>
+      </body>
+    </html>
+  );
+}
+```
+
+## Nesting
+
+You can nest layouts as deeply as you need.
+
+**Structure**:
+```
+src/routes/
+  _layout.tsx           (Root layout: <html>, <nav>)
+  app/
+    _layout.tsx         (App layout: Sidebar)
+    dashboard.tsx       (Dashboard page)
+    settings.tsx        (Settings page)
+```
+
+When visiting `/app/dashboard`:
+1.  `RootLayout` renders.
+2.  `AppLayout` renders inside `RootLayout`'s `<Outlet />`.
+3.  `Dashboard` renders inside `AppLayout`'s `<Outlet />`.
+
+## Persistence
+
+A key feature of Neutron's layouts is **persistence**. When you navigate between routes that share a layout, the layout **does not re-render**. It stays mounted.
+
+If you navigate from `/app/dashboard` to `/app/settings`:
+-   `RootLayout`: Stays mounted.
+-   `AppLayout`: Stays mounted (Sidebar scroll position is preserved!).
+-   `Dashboard`: Unmounts.
+-   `Settings`: Mounts.
+
+## Data in Layouts
+
+Layouts can have their own `loader` functions. This is perfect for data required by the shell of your application, like user session data or navigation items.
+
+```tsx
+// src/routes/_layout.tsx
+export async function loader({ request }: LoaderArgs) {
+  const user = await getUser(request);
+  return { user };
+}
+
+export default function Layout() {
+  const { user } = useLoaderData<typeof loader>();
+  // ...
+}
+```

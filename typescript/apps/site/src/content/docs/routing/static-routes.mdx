@@ -1,0 +1,59 @@
+---
+title: Static Routes
+description: Zero-JS, build-time rendered routes.
+---
+
+By default, all routes in Neutron are **static**. This means they are rendered to HTML at build time.
+
+## Characteristics
+
+-   **Zero JavaScript**: No framework runtime is sent to the client. The page is pure HTML and CSS.
+-   **Fast**: Because there is no client-side hydration for the page shell, First Contentful Paint (FCP) and Time to Interactive (TTI) are near-instant.
+-   **SEO Friendly**: Search engines love static HTML.
+
+## Configuration
+
+You can explicitly opt into static mode (though it is the default) by exporting a `config` object:
+
+```tsx
+export const config = { mode: "static" };
+
+export default function Page() {
+  return <h1>Hello World</h1>;
+}
+```
+
+## Interactivity (Islands)
+
+Static routes doesn't mean "no interactivity". Neutron uses the **Islands Architecture** to allow you to add interactive components to static pages.
+
+See the [Islands](/docs/rendering/islands) guide for more details.
+
+## Dynamic Static Routes
+
+If you have a dynamic route (e.g., `src/routes/blog/[slug].tsx`) that uses static mode, you must export a `getStaticPaths` function so Neutron knows which paths to generate at build time.
+
+```tsx
+// src/routes/blog/[slug].tsx
+import { useLoaderData } from "neutron";
+
+export const config = { mode: "static" };
+
+// 1. Define all possible paths
+export async function getStaticPaths() {
+  const posts = await getPosts();
+  return posts.map(post => ({
+    params: { slug: post.slug }
+  }));
+}
+
+// 2. Fetch data for each path
+export async function loader({ params }: LoaderArgs) {
+  return await getPost(params.slug);
+}
+
+export default function BlogPost() {
+  const post = useLoaderData<typeof loader>();
+  return <article>{post.content}</article>;
+}
+```

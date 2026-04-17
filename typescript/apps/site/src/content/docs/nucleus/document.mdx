@@ -1,0 +1,164 @@
+---
+title: Document Store
+description: Schemaless JSON documents with GIN indexing.
+---
+
+Nucleus includes a built-in document store for schemaless JSON data. Store, query, and index documents alongside your relational tables — no separate database needed.
+
+## Document Operations
+
+### Insert & Retrieve
+
+```sql
+-- Insert a document, get back its ID
+SELECT DOC_INSERT('{"name": "Alice", "age": 30, "tags": ["admin", "dev"]}');
+-- → 1
+
+-- Get document by ID
+SELECT DOC_GET(1);
+-- → {"name":"Alice","age":30,"tags":["admin","dev"]}
+
+-- Count all documents
+SELECT DOC_COUNT();
+```
+
+### Query by Containment
+
+Find documents matching a JSON pattern using the `@>` containment operator:
+
+```sql
+-- Find all documents where age = 30
+SELECT DOC_QUERY('{"age": 30}');
+-- → "1"  (comma-separated IDs)
+
+-- Nested containment
+SELECT DOC_QUERY('{"tags": ["admin"]}');
+```
+
+### Extract Nested Values
+
+```sql
+-- Get a value at a path
+SELECT DOC_PATH(1, 'name');
+-- → "Alice"
+
+-- Nested paths
+SELECT DOC_PATH(1, 'address', 'city');
+```
+
+## JSONB Columns
+
+Store JSON directly in relational tables using the `JSONB` type:
+
+```sql
+CREATE TABLE products (
+  id SERIAL PRIMARY KEY,
+  name TEXT,
+  metadata JSONB
+);
+
+INSERT INTO products (name, metadata)
+VALUES ('Widget', '{"color": "blue", "weight": 2.5, "dimensions": {"w": 10, "h": 5}}');
+```
+
+## JSONB Operators
+
+PostgreSQL-compatible arrow operators for JSON traversal:
+
+```sql
+-- Get field as JSONB
+SELECT metadata -> 'color' FROM products;
+-- → "blue"
+
+-- Get field as text
+SELECT metadata ->> 'color' FROM products;
+-- → blue
+
+-- Nested path as JSONB
+SELECT metadata #> '{dimensions,w}' FROM products;
+-- → 10
+
+-- Nested path as text
+SELECT metadata #>> '{dimensions,w}' FROM products;
+-- → 10
+```
+
+## JSONB Functions
+
+### Construction
+
+```sql
+-- Build an object from key-value pairs
+SELECT JSON_BUILD_OBJECT('name', 'Alice', 'age', 30);
+-- → {"name":"Alice","age":30}
+
+-- Build an array
+SELECT JSON_BUILD_ARRAY(1, 'two', true, null);
+-- → [1,"two",true,null]
+
+-- Convert any value to JSON
+SELECT TO_JSONB(42);
+```
+
+### Inspection
+
+```sql
+-- Get the JSON type
+SELECT JSON_TYPEOF('{"a":1}');  -- → "object"
+SELECT JSON_TYPEOF('[1,2]');    -- → "array"
+SELECT JSON_TYPEOF('"hello"');  -- → "string"
+
+-- Array length
+SELECT JSON_ARRAY_LENGTH('[1,2,3]');  -- → 3
+
+-- Object keys
+SELECT JSON_OBJECT_KEYS('{"a":1,"b":2}');  -- → ["a","b"]
+```
+
+### Transformation
+
+```sql
+-- Set a value at a path
+SELECT JSON_SET('{"a":1}', 'b', '2');
+-- → {"a":1,"b":2}
+
+-- Pretty print
+SELECT JSON_PRETTY('{"a":1,"b":[2,3]}');
+
+-- Strip null values
+SELECT JSON_STRIP_NULLS('{"a":1,"b":null,"c":3}');
+-- → {"a":1,"c":3}
+```
+
+### Path Extraction
+
+```sql
+-- Extract nested value as JSONB
+SELECT JSON_EXTRACT_PATH('{"a":{"b":{"c":42}}}', 'a', 'b', 'c');
+-- → 42
+
+-- Extract as text
+SELECT JSON_EXTRACT_PATH_TEXT('{"a":{"b":"hello"}}', 'a', 'b');
+-- → hello
+```
+
+## GIN Index
+
+GIN (Generalized Inverted Index) accelerates containment queries on JSONB columns:
+
+```sql
+CREATE INDEX idx_products_metadata ON products USING gin (metadata);
+
+-- This query uses the GIN index
+SELECT * FROM products WHERE metadata @> '{"color": "blue"}';
+```
+
+The GIN index extracts all path/value pairs from each document, enabling fast lookups without scanning every row.
+
+## Use Cases
+
+- **User profiles** — Flexible schema for varying user attributes
+- **Product catalogs** — Different products have different fields
+- **Event logging** — Store arbitrary event payloads
+- **Configuration** — Store app settings as JSON
+- **API responses** — Cache and query external API data

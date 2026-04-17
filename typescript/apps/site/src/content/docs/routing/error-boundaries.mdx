@@ -1,0 +1,70 @@
+---
+title: Error Boundaries
+description: Handling errors gracefully per route.
+---
+
+In Neutron, errors don't have to crash your entire application. You can define Error Boundaries to catch errors within specific routes or layouts.
+
+## The `ErrorBoundary` Component
+
+Any route file can export an `ErrorBoundary` component.
+
+```tsx
+// src/routes/app/dashboard.tsx
+import { useRouteError, isRouteErrorResponse } from "neutron";
+
+export default function Dashboard() {
+  throw new Error("Something broke!");
+}
+
+export function ErrorBoundary() {
+  const error = useRouteError();
+
+  if (isRouteErrorResponse(error)) {
+    // Handle expected errors (404, 401, etc.)
+    return (
+      <div className="error">
+        <h1>{error.status}</h1>
+        <p>{error.statusText}</p>
+      </div>
+    );
+  }
+
+  // Handle unexpected errors
+  return (
+    <div className="error">
+      <h1>Oops!</h1>
+      <p>Something unexpected went wrong.</p>
+    </div>
+  );
+}
+```
+
+## Granular Error Handling
+
+Error boundaries operate hierarchically. If a route throws an error, Neutron looks for the nearest Error Boundary.
+
+1.  **Route level**: `src/routes/app/dashboard.tsx` (exports `ErrorBoundary`)
+2.  **Sibling level**: `src/routes/app/_error.tsx` (if the route file doesn't export one)
+3.  **Parent Layout**: `src/routes/app/_layout.tsx`
+4.  **Root**: `src/routes/_error.tsx`
+
+This means if a specific part of your page crashes (e.g., a widget in the dashboard), the surrounding layout (sidebar, header) remains interactive. Only the broken part is replaced by the Error Boundary.
+
+## Expected Errors (Throwing Responses)
+
+You can "throw" a Response object to trigger the Error Boundary intentionally. This is useful for 404s or permission checks.
+
+```tsx
+export async function loader({ params }: LoaderArgs) {
+  const project = await getProject(params.id);
+  
+  if (!project) {
+    throw new Response("Project Not Found", { status: 404 });
+  }
+  
+  return { project };
+}
+```
+
+In your `ErrorBoundary`, `isRouteErrorResponse(error)` will return true, and you can access `.status` and `.statusText`.

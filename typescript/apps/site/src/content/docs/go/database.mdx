@@ -1,0 +1,162 @@
+---
+title: Database
+description: Nucleus client with all 14 data models.
+---
+
+The Go Nucleus client provides type-safe access to all 14 data models over the PostgreSQL wire protocol.
+
+## Connection
+
+```go
+import "github.com/neutron-dev/neutron-go/nucleus"
+
+db, err := nucleus.Connect(ctx, "postgres://localhost:5432/mydb")
+defer db.Close()
+
+// Auto-detect Nucleus features
+fmt.Println(db.Features().IsNucleus)  // true
+```
+
+## SQL (Relational)
+
+```go
+// Type-safe queries with struct scanning
+type User struct {
+    ID    int64  `db:"id"`
+    Name  string `db:"name"`
+    Email string `db:"email"`
+}
+
+users, err := nucleus.Query[User](ctx, db.SQL(),
+    "SELECT id, name, email FROM users WHERE active = $1", true)
+
+user, err := nucleus.QueryOne[User](ctx, db.SQL(),
+    "SELECT * FROM users WHERE id = $1", 42)
+```
+
+## Transactions
+
+```go
+tx, err := db.Begin(ctx)
+
+_, err = tx.SQL().Exec(ctx,
+    "UPDATE accounts SET balance = balance - $1 WHERE id = $2", 100, 1)
+_, err = tx.SQL().Exec(ctx,
+    "UPDATE accounts SET balance = balance + $1 WHERE id = $2", 100, 2)
+
+err = tx.Commit(ctx)  // or tx.Rollback(ctx)
+```
+
+## Key-Value
+
+```go
+kv := db.KV()
+
+await kv.Set(ctx, "session:1", "data", nucleus.WithTTL(3600))
+val, err := kv.Get(ctx, "session:1")
+kv.Delete(ctx, "session:1")
+
+// Lists
+kv.LPush(ctx, "queue", "item1")
+item, _ := kv.RPop(ctx, "queue")
+
+// Hashes
+kv.HSet(ctx, "user:1", "name", "Alice")
+name, _ := kv.HGet(ctx, "user:1", "name")
+
+// Sorted sets
+kv.ZAdd(ctx, "leaderboard", 100.0, "player1")
+top, _ := kv.ZRange(ctx, "leaderboard", 0, 9)
+```
+
+## Vector Search
+
+```go
+results, err := db.Vector().Search(ctx, "documents", queryEmbedding,
+    nucleus.WithLimit(10),
+    nucleus.WithMetric(nucleus.Cosine),
+    nucleus.WithFilter(map[string]any{"category": "tech"}),
+)
+
+for _, r := range results {
+    fmt.Printf("ID: %s, Score: %.4f\n", r.ID, r.Score)
+}
+```
+
+## Full-Text Search
+
+```go
+results, err := db.FTS().Search(ctx, "articles", "machine learning",
+    nucleus.WithFTSLimit(10),
+    nucleus.WithFuzzy(2),
+    nucleus.WithHighlight(true),
+)
+```
+
+## Graph
+
+```go
+graph := db.Graph()
+
+nodeID, _ := graph.AddNode(ctx, "Person", map[string]any{"name": "Alice"})
+graph.AddEdge(ctx, "KNOWS", nodeID, otherID, map[string]any{"since": 2024})
+
+result, _ := graph.Query(ctx,
+    "MATCH (p:Person)-[:KNOWS]->(q) RETURN p.name, q.name")
+```
+
+## Document
+
+```go
+doc := db.Document()
+
+id, _ := doc.Insert(ctx, "posts", map[string]any{
+    "title": "Hello", "body": "World",
+})
+
+post, _ := doc.Get(ctx, id)
+posts, _ := doc.Find(ctx, "posts", map[string]any{"author": "alice"})
+```
+
+## Time Series
+
+```go
+ts := db.TimeSeries()
+
+ts.Insert(ctx, "cpu_usage", time.Now(), 72.5, nucleus.WithTags(map[string]string{"host": "web-01"}))
+avg, _ := ts.RangeAvg(ctx, "cpu_usage", start, end)
+last, _ := ts.Last(ctx, "cpu_usage")
+```
+
+## Streams
+
+```go
+streams := db.Streams()
+
+id, _ := streams.XAdd(ctx, "events", map[string]string{"action": "login", "user": "alice"})
+entries, _ := streams.XRange(ctx, "events", 0, -1, 100)
+
+// Consumer groups
+streams.XGroupCreate(ctx, "events", "workers", 0)
+entries, _ = streams.XReadGroup(ctx, "events", "workers", "worker-1", 10)
+streams.XAck(ctx, "events", "workers", entryID)
+```
+
+## All 14 Models
+
+| Model | Accessor | Key Methods |
+|-------|----------|-------------|
+| SQL | `db.SQL()` | Query, Exec |
+| Key-Value | `db.KV()` | Get, Set, Del, HSet, LPush, ZAdd |
+| Vector | `db.Vector()` | Search |
+| TimeSeries | `db.TimeSeries()` | Insert, RangeAvg, Last |
+| Document | `db.Document()` | Insert, Find, Get |
+| Graph | `db.Graph()` | AddNode, AddEdge, Query |
+| FTS | `db.FTS()` | Index, Search |
+| Geo | `db.Geo()` | Distance, Within |
+| Blob | `db.Blob()` | Put, Get, Delete |
+| Streams | `db.Streams()` | XAdd, XRange, XReadGroup |
+| Columnar | `db.Columnar()` | Insert, Sum, Avg |
+| Datalog | `db.Datalog()` | Assert, Query |
+| CDC | `db.CDC()` | Subscribe, GetChanges |
+| PubSub | `db.PubSub()` | Publish, Subscribe |

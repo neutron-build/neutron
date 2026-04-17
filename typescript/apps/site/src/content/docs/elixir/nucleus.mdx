@@ -1,0 +1,90 @@
+---
+title: Nucleus Client
+description: Using all 14 Nucleus data models from Elixir.
+---
+
+The Elixir Nucleus client provides access to all 14 data models over the PostgreSQL wire protocol. Connections are managed via a GenServer-backed pool with OTP supervision.
+
+## Connection
+
+```elixir
+# In your supervision tree
+{Neutron.Nucleus.Pool, name: MyApp.Pool, url: "postgres://localhost:5432/mydb", size: 10}
+
+# Feature detection
+features = Neutron.Nucleus.features(MyApp.Pool)
+features.is_nucleus  # true
+```
+
+## SQL (Relational)
+
+```elixir
+users = Neutron.Nucleus.query!(MyApp.Pool,
+  "SELECT * FROM users WHERE active = $1", [true])
+
+user = Neutron.Nucleus.query_one!(MyApp.Pool,
+  "SELECT * FROM users WHERE id = $1", [42])
+
+# Transactions
+Neutron.Nucleus.transaction(MyApp.Pool, fn conn ->
+  Neutron.Nucleus.exec!(conn, "UPDATE accounts SET balance = balance - $1 WHERE id = $2", [100, 1])
+  Neutron.Nucleus.exec!(conn, "UPDATE accounts SET balance = balance + $1 WHERE id = $2", [100, 2])
+end)
+```
+
+## Key-Value
+
+```elixir
+kv = Neutron.Nucleus.kv(MyApp.Pool)
+
+Neutron.KV.set(kv, "session:1", "data", ttl: 3600)
+val = Neutron.KV.get(kv, "session:1")
+Neutron.KV.delete(kv, "session:1")
+
+# Hashes
+Neutron.KV.hset(kv, "user:1", "name", "Alice")
+name = Neutron.KV.hget(kv, "user:1", "name")
+```
+
+## Vector Search
+
+```elixir
+results = Neutron.Nucleus.vector(MyApp.Pool)
+|> Neutron.Vector.search("documents", query_embedding,
+  limit: 10, metric: :cosine, filter: %{category: "tech"})
+
+Enum.each(results, fn r ->
+  IO.puts("ID: #{r.id}, Score: #{r.score}")
+end)
+```
+
+## Graph
+
+```elixir
+graph = Neutron.Nucleus.graph(MyApp.Pool)
+
+{:ok, node_id} = Neutron.Graph.add_node(graph, "Person", %{name: "Alice"})
+Neutron.Graph.add_edge(graph, "KNOWS", node_id, other_id, %{since: 2024})
+
+results = Neutron.Graph.query(graph,
+  "MATCH (p:Person)-[:KNOWS]->(q) RETURN p.name, q.name")
+```
+
+## All 14 Models
+
+| Model | Accessor | Key Functions |
+|-------|----------|---------------|
+| SQL | `query!/2` | query, exec, transaction |
+| Key-Value | `kv/1` | get, set, delete, hset, lpush, zadd |
+| Vector | `vector/1` | search |
+| TimeSeries | `timeseries/1` | insert, range_avg, last |
+| Document | `document/1` | insert, find, get |
+| Graph | `graph/1` | add_node, add_edge, query |
+| FTS | `fts/1` | index, search |
+| Geo | `geo/1` | distance, within |
+| Blob | `blob/1` | put, get, delete |
+| Streams | `streams/1` | xadd, xrange, xread_group |
+| Columnar | `columnar/1` | insert, sum, avg |
+| Datalog | `datalog/1` | assert, query |
+| CDC | `cdc/1` | subscribe, get_changes |
+| PubSub | `pubsub/1` | publish, subscribe |

@@ -1,0 +1,39 @@
+---
+title: TypeScript
+description: Using TypeScript in Neutron.
+---
+
+Neutron is written in TypeScript and is designed to provide excellent type safety out of the box.
+
+## `tsconfig.json`
+
+Neutron provides a base TSConfig that you should extend.
+
+```json
+{
+  "extends": "neutron/tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "~/*": ["src/*"]
+    }
+  }
+}
+```
+
+## Type Inference
+
+Neutron's "magic" comes from its ability to infer types across the network boundary.
+
+```tsx
+// The return type of this function...
+export async function loader() {
+  return { hello: "world" };
+}
+
+// ...is inferred here!
+const data = useLoaderData<typeof loader>();
+// data is { hello: string }
+```
+
+This works for `useLoaderData`, `useActionData`, and generally means you rarely need to write manual interfaces for your API responses.

@@ -1,0 +1,56 @@
+---
+title: neutron.config.ts
+description: Configuring the framework.
+---
+
+The `neutron.config.ts` file is the entry point for configuring your Neutron application.
+
+## Basic Configuration
+
+```ts
+import { defineConfig } from "neutron";
+import node from "@neutron/adapter-node";
+
+export default defineConfig({
+  // Choice of runtime (default: preact)
+  runtime: "preact" | "react",
+
+  // Deployment adapter
+  adapter: node(),
+  
+  // Data layer configuration
+  data: {
+    database: "postgres" | "sqlite",
+    databaseUrl: process.env.DATABASE_URL,
+    dragonflyUrl: process.env.DRAGONFLY_URL,
+    storage: {
+      provider: "s3",
+      bucket: "my-bucket",
+    }
+  },
+
+  // Custom Vite configuration
+  vite: {
+    plugins: [],
+    resolve: {
+      alias: {
+        "~": "/src",
+      },
+    },
+  },
+  
+  // Project paths (optional, defaults shown)
+  routesDir: "src/routes",
+  publicDir: "public",
+  outDir: "dist",
+});
+```
+
+## Options
+
+| Option | Type | Description |
+| :--- | :--- | :--- |
+| `adapter` | `NeutronAdapter` | The deployment adapter to use. |
+| `vite` | `UserConfig` | Vite configuration object. Merged with Neutron's defaults. |
+| `routesDir` | `string` | Path to the routes directory. Default: `"src/routes"`. |
+| `features` | `object` | Toggle experimental features. |

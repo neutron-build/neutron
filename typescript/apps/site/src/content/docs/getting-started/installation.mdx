@@ -1,0 +1,70 @@
+---
+title: Installation
+description: How to create a new Neutron project.
+---
+
+Get started with Neutron by running the create command.
+
+## Quick Start
+
+Run the following command in your terminal:
+
+```bash
+npm create neutron@latest
+```
+
+Follow the interactive prompts to set up your project:
+
+1.  **Project name**: Choose a name for your directory (e.g., `my-app`).
+2.  **Template**: Select a starting point (Minimal, Blog, App, or Full).
+3.  **Tailwind CSS**: Add styling support.
+4.  **Database**: Include Drizzle ORM (optional).
+5.  **Git**: Initialize a git repository.
+
+Once the setup is complete, navigate to your project and start the development server:
+
+```bash
+cd my-app
+npm run dev
+```
+
+Open your browser to `http://localhost:3000` to see your new Neutron app.
+
+## Manual Setup
+
+Neutron is designed to be easy to set up manually if you prefer.
+
+1.  Initialize a new project:
+    ```bash
+    mkdir my-neutron-app
+    cd my-neutron-app
+    npm init -y
+    ```
+
+2.  Install dependencies:
+    ```bash
+    npm install neutron react react-dom
+    npm install -D typescript vite @types/react @types/react-dom
+    ```
+    *(Note: Neutron uses Preact for app routes but React types for compatibility)*
+
+3.  Create a `neutron.config.ts`:
+    ```ts
+    import { defineConfig } from "neutron";
+    import node from "@neutron/adapter-node";
+
+    export default defineConfig({
+      adapter: node(),
+    });
+    ```
+
+4.  Add scripts to `package.json`:
+    ```json
+    {
+      "scripts": {
+        "dev": "neutron dev",
+        "build": "neutron build",
+        "preview": "neutron preview"
+      }
+    }
+    ```

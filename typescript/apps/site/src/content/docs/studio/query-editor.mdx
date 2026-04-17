@@ -1,0 +1,50 @@
+---
+title: Query Editor
+description: SQL IDE with history, saved queries, and export.
+---
+
+The Studio SQL Editor is a full-featured IDE for writing and executing SQL queries against Nucleus or PostgreSQL.
+
+## Writing Queries
+
+The editor uses CodeMirror with SQL syntax highlighting and the One Dark theme. Write single or multi-statement SQL.
+
+## Executing
+
+Press **Cmd+Enter** (macOS) or **Ctrl+Enter** (Windows/Linux) to execute the current query.
+
+Results appear in a data grid below the editor with:
+- Column headers with types
+- Sortable columns
+- Row count and execution duration
+- **CSV export** — Download results as CSV
+- **JSON export** — Download results as JSON
+
+## Query History
+
+Every executed query is saved to browser localStorage (up to 50 per connection).
+
+History entries include:
+- SQL text
+- Execution timestamp
+- Row count
+- Duration (milliseconds)
+
+Click any history entry to restore it into the editor. Duplicate queries are deduplicated to the top.
+
+## Saved Queries
+
+Save frequently-used queries by name for permanent storage:
+
+1. Write your SQL
+2. Click **Save** and enter a name
+3. Access saved queries from the side panel
+
+Saved queries are persisted server-side (not localStorage), so they're available across browser sessions.
+
+## Tips
+
+- Use `\dt` style meta-commands in the REPL (`neutron repl`) — Studio uses standard SQL
+- Multiple statements separated by `;` execute sequentially
+- Results show the output of the last SELECT statement
+- DDL statements (CREATE, ALTER, DROP) show success/failure status

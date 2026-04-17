@@ -1,0 +1,39 @@
+---
+title: Database & Drizzle
+description: Typed SQL with Drizzle ORM.
+---
+
+Neutron uses **Drizzle ORM** for database access. It's a lightweight, TypeScript-first ORM that provides the power of raw SQL with the safety of types.
+
+## Schema Definition
+
+Define your schema in `src/db/schema.ts`.
+
+```ts
+import { pgTable, serial, text, timestamp } from "drizzle-orm/pg-core";
+
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  name: text("name").notNull(),
+  email: text("email").notNull().unique(),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+```
+
+## Querying in Loaders
+
+Loaders have direct access to the database via the `context`.
+
+```ts
+export async function loader({ context }) {
+  const allUsers = await context.db.select().from(users);
+  return { allUsers };
+}
+```
+
+## Why Drizzle?
+
+1.  **Performance**: No heavy "runtime" or "generate" step. It's just a thin layer over SQL.
+2.  **Type Safety**: Your queries are fully typed based on your schema.
+3.  **Composability**: Easily build complex queries using standard SQL patterns.
+4.  **Compatibility**: Supports both PostgreSQL (Prod) and SQLite (Dev) seamlessly.

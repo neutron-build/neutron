@@ -1,0 +1,34 @@
+---
+title: Node.js
+description: Deploying to a Node.js server.
+---
+
+The Node.js adapter builds your application into a standalone Node.js server. This is suitable for deploying to VPS providers (DigitalOcean, Linode), PaaS (Heroku, Railway, Render), or custom infrastructure.
+
+## Usage
+
+1.  Install the adapter:
+    ```bash
+    npm install @neutron/adapter-node
+    ```
+
+2.  Update `neutron.config.ts`:
+    ```ts
+    import node from "@neutron/adapter-node";
+
+    export default defineConfig({
+      adapter: node({
+        mode: "standalone", // or "middleware" for Express/Fastify integration
+      }),
+    });
+    ```
+
+3.  Build:
+    ```bash
+    npm run build
+    ```
+
+4.  Run:
+    ```bash
+    node dist/server/index.js
+    ```

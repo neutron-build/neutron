@@ -1,0 +1,66 @@
+---
+title: Your First Route
+description: Create your first page in Neutron.
+---
+
+Neutron uses file-based routing. To create a new page, you simply add a file to `src/routes`.
+
+## Creating a Static Route
+
+By default, Neutron routes are **static**. They render to pure HTML at build time and ship zero JavaScript to the client.
+
+Create a file at `src/routes/about.tsx`:
+
+```tsx
+// src/routes/about.tsx
+
+// Optional: Explicitly set mode (default is "static")
+export const config = { mode: "static" };
+
+export default function About() {
+  return (
+    <main>
+      <h1>About Us</h1>
+      <p>We are building the future of web development.</p>
+    </main>
+  );
+}
+```
+
+Visit `/about` in your browser. You'll see your page rendered. If you inspect the network tab, you'll see no JavaScript bundles are loaded for this page.
+
+## Creating an App Route
+
+When you need interactivity, server-side data loading, or mutations, you can opt into **app mode**.
+
+Create a file at `src/routes/dashboard.tsx`:
+
+```tsx
+// src/routes/dashboard.tsx
+import { useLoaderData } from "neutron";
+
+// 1. Opt into app mode
+export const config = { mode: "app" };
+
+// 2. Define a loader (runs on server)
+export async function loader() {
+  return {
+    user: "Alice",
+    lastLogin: new Date().toISOString(),
+  };
+}
+
+// 3. Render component (receives loader data)
+export default function Dashboard() {
+  const data = useLoaderData<typeof loader>();
+  
+  return (
+    <main>
+      <h1>Welcome back, {data.user}!</h1>
+      <p>Last login: {data.lastLogin}</p>
+    </main>
+  );
+}
+```
+
+This route is now Server-Side Rendered (SSR) and hydrated with Preact on the client. It supports client-side navigation and interactivity.

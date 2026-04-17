@@ -1,0 +1,64 @@
+---
+title: Columnar Analytics
+description: Column-oriented storage for OLAP workloads.
+---
+
+Nucleus includes a built-in columnar engine for analytics workloads. Run aggregations over millions of rows with vectorized execution — no ClickHouse or separate OLAP database needed.
+
+## Inserting Data
+
+```sql
+-- Insert rows as key-value pairs
+SELECT COLUMNAR_INSERT('events', 'user_id', '42', 'action', 'click', 'duration', '1.5');
+SELECT COLUMNAR_INSERT('events', 'user_id', '43', 'action', 'view', 'duration', '3.2');
+SELECT COLUMNAR_INSERT('events', 'user_id', '42', 'action', 'purchase', 'duration', '12.0');
+```
+
+## Aggregations
+
+```sql
+-- Count rows
+SELECT COLUMNAR_COUNT('events');
+-- → 3
+
+-- Sum a column
+SELECT COLUMNAR_SUM('events', 'duration');
+-- → 16.7
+
+-- Average
+SELECT COLUMNAR_AVG('events', 'duration');
+-- → 5.57
+
+-- Min / Max
+SELECT COLUMNAR_MIN('events', 'duration');
+-- → 1.5
+SELECT COLUMNAR_MAX('events', 'duration');
+-- → 12.0
+```
+
+## Why Columnar?
+
+Traditional row-oriented storage reads entire rows even when you only need one column. Columnar storage reads only the columns you reference:
+
+| Query | Row Store | Column Store |
+|-------|-----------|-------------|
+| `SELECT AVG(price) FROM products` | Reads all columns | Reads only `price` |
+| `SELECT * FROM products WHERE id = 5` | Reads one row | Reads all columns |
+
+**Best for:** Aggregations, analytics, reporting, dashboards.
+**Not ideal for:** Point lookups, transactional updates.
+
+## How It Works
+
+- **Type-aligned columns** — Values stored contiguously by type (Bool, Int32, Int64, Float64, Text)
+- **Vectorized execution** — Processes data in batches for CPU cache efficiency
+- **Compression** — Similar values in sequence compress better than mixed rows
+- **Parallel aggregation** — Multi-threaded across column batches
+
+## Use Cases
+
+- **Analytics dashboards** — Fast aggregations over large datasets
+- **Event tracking** — Aggregate user actions, clicks, pageviews
+- **Log analysis** — Count and summarize structured log entries
+- **Business intelligence** — Revenue, conversion, retention metrics
+- **Time-series rollups** — Pre-aggregated summaries

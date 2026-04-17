@@ -1,0 +1,245 @@
+---
+title: "SQL, Vector Search, and Graph Queries in One Database Connection"
+description: "Most AI applications need a relational database for structured data, a vector database for semantic search, and a graph database for relationships. Nucleus lets you query all three in a single connection. Here's how to use each model and when."
+pubDate: 2026-03-03
+author: "Neutron Team"
+tags: ["database", "vector-search", "graph", "sql", "ai", "nucleus"]
+---
+
+Building an AI application in 2026 typically means provisioning a PostgreSQL instance for your user and product data, a vector database (Pinecone, Weaviate, or pgvector) for semantic search, a graph database for relationship traversals, and Redis for caching. Four different services, four different query languages, four different schemas to keep synchronized.
+
+Nucleus collapses all of this. One connection, fourteen models, full cross-model transactions.
+
+This guide walks through the most commonly combined models: relational SQL, vector search, graph queries, and full-text search — and shows how they work together in practice.
+
+## Connecting
+
+Nucleus speaks the PostgreSQL wire protocol. Any PostgreSQL client works:
+
+```python
+import asyncpg
+
+conn = await asyncpg.connect('postgresql://localhost:5432/mydb')
+```
+
+```typescript
+import postgres from 'postgres';
+
+const sql = postgres('postgresql://localhost:5432/mydb');
+```
+
+```rust
+use sqlx::PgPool;
+
+let pool = PgPool::connect("postgresql://localhost:5432/mydb").await?;
+```
+
+One connection string. All fourteen models.
+
+## Relational Queries (SQL)
+
+Standard SQL, PostgreSQL syntax. Create tables, define indexes, run joins, use transactions.
+
+```sql
+CREATE TABLE products (
+  id        SERIAL PRIMARY KEY,
+  name      TEXT NOT NULL,
+  category  TEXT NOT NULL,
+  price     DECIMAL(10,2),
+  embedding VECTOR(1536),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX ON products (category);
+CREATE INDEX ON products USING hnsw (embedding vector_cosine_ops);
+
+INSERT INTO products (name, category, price, embedding)
+VALUES ('Wireless Headphones', 'electronics', 79.99, $1);
+```
+
+```sql
+SELECT id, name, price
+FROM products
+WHERE category = 'electronics'
+  AND price < 100
+ORDER BY price ASC;
+```
+
+Standard SQL. Nothing special. Any tool that generates PostgreSQL-compatible SQL works with Nucleus — ORMs, query builders, raw SQL, migrations.
+
+## Vector Similarity Search
+
+The `VECTOR` column type stores embedding vectors. Nucleus supports three distance metrics:
+
+- `<=>` cosine distance (most common for text embeddings)
+- `<->` L2/Euclidean distance (good for image embeddings)
+- `<#>` inner product (good for dot-product similarity)
+
+```sql
+-- Find products semantically similar to a query embedding
+SELECT id, name, price,
+       1 - (embedding <=> $1::vector) AS similarity
+FROM products
+ORDER BY embedding <=> $1::vector
+LIMIT 10;
+```
+
+The `HNSW` index makes this fast even at millions of rows. `IVFFlat` is an alternative that uses less memory at the cost of slightly lower recall.
+
+## Combining SQL Filters with Vector Ranking
+
+This is where multi-model queries earn their keep. Filter by SQL predicates — category, price range, availability — then rank the filtered results by vector similarity. One query, one round-trip:
+
+```sql
+SELECT name, price, category,
+       1 - (embedding <=> $1::vector) AS similarity
+FROM products
+WHERE category = 'electronics'       -- SQL filter applied first
+  AND price BETWEEN 50 AND 200        -- reduces the search space
+  AND in_stock = true
+ORDER BY embedding <=> $1::vector    -- then rank by semantic similarity
+LIMIT 5;
+```
+
+In a multi-service architecture, this requires two round-trips: a vector search in Pinecone, then a SQL lookup in PostgreSQL to apply the price filter, or vice versa with imprecise results. In Nucleus, it's one query with exact filtering and vector ranking.
+
+## Graph Queries (Cypher)
+
+Nucleus includes a graph model using adjacency list and CSR (Compressed Sparse Row) representation. Query it with Cypher — the same query language as Neo4j.
+
+Create nodes and relationships:
+
+```cypher
+CREATE (alice:User {id: 1, name: 'Alice'})
+CREATE (bob:User {id: 2, name: 'Bob'})
+CREATE (headphones:Product {id: 101, name: 'Wireless Headphones'})
+
+CREATE (alice)-[:PURCHASED {date: '2026-01-15'}]->(headphones)
+CREATE (alice)-[:FOLLOWS]->(bob)
+```
+
+Query the graph:
+
+```cypher
+-- What did users that Alice follows purchase?
+MATCH (alice:User {name: 'Alice'})-[:FOLLOWS]->(friend:User)
+      -[:PURCHASED]->(product:Product)
+RETURN DISTINCT product.name, product.id
+```
+
+```cypher
+-- Find all users within 2 hops of a given user
+MATCH (u:User {id: $userId})-[:FOLLOWS*1..2]->(other:User)
+RETURN other.name, other.id
+```
+
+Graph and relational data live in the same database. A product node in the graph and a product row in the SQL table can share the same ID — you can look up detailed product data in SQL after finding candidates in the graph.
+
+## Full-Text Search
+
+BM25 ranking, six-language stemmers, and fuzzy matching — without running a separate Elasticsearch cluster.
+
+```sql
+-- Create a full-text search index
+CREATE INDEX ON products USING fts (name, description);
+
+-- Search with BM25 ranking
+SELECT name, price, fts_rank(name || ' ' || description, $1) AS relevance
+FROM products
+WHERE fts_match(name || ' ' || description, $1)
+ORDER BY relevance DESC
+LIMIT 10;
+```
+
+Combine FTS with vector and SQL in one query:
+
+```sql
+-- Find products matching a keyword search, ranked by semantic similarity
+SELECT name, price,
+       fts_rank(name || ' ' || description, $1) AS text_score,
+       1 - (embedding <=> $2::vector) AS semantic_score,
+       (fts_rank(name || ' ' || description, $1) * 0.3
+        + (1 - (embedding <=> $2::vector)) * 0.7) AS combined_score
+FROM products
+WHERE fts_match(name || ' ' || description, $1)
+  AND price < 200
+ORDER BY combined_score DESC
+LIMIT 10;
+```
+
+Hybrid search — combining keyword matching with semantic similarity — in a single SQL query.
+
+## Key-Value for Caching
+
+Cache expensive query results with TTL:
+
+```
+-- In a Redis-compatible client or via SQL
+SET products:cache:electronics "{...json...}" EX 300
+GET products:cache:electronics
+```
+
+Or use the SQL interface:
+
+```sql
+-- Nucleus KV via SQL extensions
+SELECT kv_set('products:cache:electronics', $1::text, 300);
+SELECT kv_get('products:cache:electronics');
+```
+
+## Cross-Model Transactions
+
+The most important property: writes across models are atomic.
+
+```python
+async with conn.transaction():
+    # SQL write
+    product_id = await conn.fetchval(
+        'INSERT INTO products (name, price, embedding) VALUES ($1, $2, $3) RETURNING id',
+        name, price, embedding
+    )
+
+    # Graph write (same transaction)
+    await conn.execute(
+        'GRAPH CREATE (:Product {id: $1, name: $2})',
+        product_id, name
+    )
+
+    # KV write (same transaction)
+    await conn.execute(
+        "SELECT kv_set($1, $2)",
+        f'product:{product_id}', json.dumps({'name': name, 'price': str(price)})
+    )
+
+# All three committed atomically, or all three rolled back
+```
+
+If the graph write fails, the SQL INSERT rolls back. No application-level compensation logic. No eventual consistency headaches between your relational database and your graph database.
+
+## When to Use Which Model
+
+| Need | Model | Why |
+|------|-------|-----|
+| User accounts, orders, structured data | SQL | Joins, transactions, ACID guarantees |
+| "Find similar items" | Vector | Semantic similarity, not keyword matching |
+| "Who knows who" / recommendations | Graph | Relationship traversals, reachability |
+| Product search, document search | FTS | Keyword matching, BM25 ranking, fuzzy |
+| Sessions, rate limits, leaderboards | Key-Value | TTL, sorted sets, O(1) access |
+| Metrics, sensor data, analytics | TimeSeries | Time-ordered, Gorilla compression |
+| User uploads, build artifacts | Blob | Content-addressed, deduplication |
+| Flexible schemas, event logs | Document | JSONB, GIN index, schemaless |
+| Store locators, delivery routing | Geo | R-tree, point-in-radius |
+
+Most applications use three or four of these. Nucleus makes it practical to use them all without managing a fleet of specialty services.
+
+## Try It
+
+Nucleus is included with Neutron. Start a project:
+
+```bash
+npm create neutron@latest my-app
+cd my-app
+npm run dev
+```
+
+The dev environment starts a local Nucleus instance automatically. Connect with any PostgreSQL client on `postgresql://localhost:5432/neutron`.

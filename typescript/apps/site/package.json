@@ -1,0 +1,22 @@
+{
+  "name": "neutron-site",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "neutron-ts dev",
+    "build": "neutron-ts build",
+    "preview": "neutron-ts preview"
+  },
+  "dependencies": {
+    "@neutron-build/core": "workspace:*",
+    "@neutron-build/cli": "workspace:*",
+    "preact": "10.25.4"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.9.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  },
+  "peerDependencies": {}
+}
