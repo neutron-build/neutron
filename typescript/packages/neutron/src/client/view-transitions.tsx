@@ -1,217 +1,58 @@
-import { h } from "preact";
+import { h, Fragment } from "preact";
 
+// Neutron uses browser-native view transitions for same-origin navigations so
+// the browser stays in charge of routing. That's what unlocks back/forward
+// bfcache (instant restore) and clean cross-document animations.
+//
+// Apps using <Link> or navigate() still get SPA-style view transitions via
+// navigate.ts, which reads window.__NEUTRON_VIEW_TRANSITIONS__ set below.
+// Apps using plain <a href> get real browser navigations — no click
+// interception here, no fetch + swap, no popstate hijacking.
+//
+// Browser support for cross-document view transitions: Chrome 126+, Safari
+// 18+. Firefox (behind dom.viewtransitions.enabled as of early 2026)
+// gracefully falls back to plain navigation with no animation but full
+// bfcache restore.
 const TRANSITION_CSS = `
-/* Prevent flash — solid background at every layer during transition */
+@view-transition { navigation: auto; }
+
 html { background-color: var(--neutron-vt-bg, #000); }
 ::view-transition { background-color: var(--neutron-vt-bg, #000); }
 
-/* Tag the top-level <main> via CSS so it survives Preact re-renders */
 main:not(main main) { view-transition-name: neutron-main; }
 
-/* Root: instant swap with no gaps — snapshot covers the full viewport */
 ::view-transition-old(root),
 ::view-transition-new(root) {
   animation: none;
   mix-blend-mode: normal;
   height: 100%;
 }
-::view-transition-group(root) {
-  animation: none;
-  isolation: auto;
-}
-::view-transition-image-pair(root) {
-  isolation: auto;
-}
+::view-transition-group(root) { animation: none; isolation: auto; }
+::view-transition-image-pair(root) { isolation: auto; }
 
-/* Main content: fast crossfade — handles rapid navigation gracefully */
-::view-transition-old(neutron-main) {
-  animation: neutronFadeOut 150ms ease both;
-}
-::view-transition-new(neutron-main) {
-  animation: neutronFadeIn 150ms ease both;
-}
-@keyframes neutronFadeOut {
-  from { opacity: 1; }
-  to   { opacity: 0; }
-}
-@keyframes neutronFadeIn {
-  from { opacity: 0; }
-  to   { opacity: 1; }
-}
+::view-transition-old(neutron-main) { animation: neutronFadeOut 150ms ease both; }
+::view-transition-new(neutron-main) { animation: neutronFadeIn  150ms ease both; }
+@keyframes neutronFadeOut { from { opacity: 1 } to { opacity: 0 } }
+@keyframes neutronFadeIn  { from { opacity: 0 } to { opacity: 1 } }
 `;
 
 const BOOTSTRAP = `
 (() => {
-  if (window.__NEUTRON_VIEW_TRANSITIONS__) {
-    return;
-  }
+  if (window.__NEUTRON_VIEW_TRANSITIONS__) return;
   window.__NEUTRON_VIEW_TRANSITIONS__ = true;
 
-  // Inject transition animation CSS
-  var style = document.createElement('style');
-  style.textContent = ${JSON.stringify(TRANSITION_CSS)};
-  document.head.appendChild(style);
-
-  // Tag <main> for scoped view-transition-name so nav/footer stay stable
-  var main = document.querySelector('main');
-  if (main) main.style.viewTransitionName = 'neutron-main';
-
-  // Track navigation direction for directional animations
-  var navigationDirection = 'forward';
-
-  function canIntercept(anchor, event) {
-    if (!anchor) return false;
-    if (anchor.target && anchor.target !== "_self") return false;
-    if (anchor.hasAttribute("download")) return false;
-    if (event.defaultPrevented) return false;
-    if (event.button !== 0) return false;
-    if (event.metaKey || event.altKey || event.ctrlKey || event.shiftKey) return false;
-    if (anchor.origin !== window.location.origin) return false;
-    return true;
-  }
-
-  // Re-execute only inline scripts explicitly marked as safe for view transitions
-  function rerunInlineScripts(container) {
-    var scripts = container.querySelectorAll('script[data-neutron-inline]');
-    scripts.forEach(function(oldScript) {
-      var newScript = document.createElement('script');
-      newScript.textContent = oldScript.textContent;
-      oldScript.parentNode.replaceChild(newScript, oldScript);
-    });
-  }
-
-  // SECURITY: Validate URL is same-origin to prevent open redirects
-  function isSafeUrl(url) {
-    try {
-      var parsed = new URL(url, window.location.origin);
-      return parsed.origin === window.location.origin;
-    } catch {
-      return false;
-    }
-  }
-
-  async function handleNavigation(url) {
-    // SECURITY: Block navigation to external URLs
-    if (!isSafeUrl(url)) {
-      console.error('[neutron] Blocked navigation to external URL:', url);
-      return;
-    }
-
-    if (!document.startViewTransition) {
-      window.location.href = url;
-      return;
-    }
-
-    try {
-      var response = await fetch(url, { headers: { Accept: "text/html" } });
-      if (!response.ok) {
-        window.location.href = url;
-        return;
-      }
-
-      var html = await response.text();
-      var nextDoc = new DOMParser().parseFromString(html, "text/html");
-
-      // Find <main> in both current and next pages for scoped swap
-      var nextMain = nextDoc.querySelector('main');
-      var currentMain = document.querySelector('main');
-      if (!nextMain || !currentMain) {
-        // Fallback: swap entire #app
-        var nextApp = nextDoc.getElementById("app");
-        var currentApp = document.getElementById("app");
-        if (!nextApp || !currentApp) {
-          window.location.href = url;
-          return;
-        }
-        nextMain = nextApp;
-        currentMain = currentApp;
-      }
-
-      // Sync stylesheets from the next page into the current document head
-      var nextStyles = nextDoc.querySelectorAll('link[rel="stylesheet"], style');
-      var currentHrefs = new Set();
-      document.querySelectorAll('link[rel="stylesheet"]').forEach(function(l) {
-        if (l.href) currentHrefs.add(l.href);
-      });
-      nextStyles.forEach(function(el) {
-        if (el.tagName === 'LINK') {
-          if (!currentHrefs.has(el.href)) {
-            document.head.appendChild(el.cloneNode(true));
-          }
-        } else if (el.tagName === 'STYLE') {
-          document.head.appendChild(el.cloneNode(true));
-        }
-      });
-
-      // Apply direction class for CSS animation targeting
-      if (navigationDirection === 'back') {
-        document.documentElement.classList.add('neutron-nav-back');
-      } else {
-        document.documentElement.classList.remove('neutron-nav-back');
-      }
-
-      // Capture references before the closure
-      var swapTarget = currentMain;
-      var swapSource = nextMain;
-
-      var transition = document.startViewTransition(function() {
-        document.title = nextDoc.title;
-        // Only swap <main> content — nav and footer stay untouched
-        // SECURITY: Use DOMParser to create inert nodes, then selectively re-execute
-        // only inline scripts (blocks external <script src="..."> from executing)
-        var parser = new DOMParser();
-        var sanitizedDoc = parser.parseFromString(swapSource.innerHTML, 'text/html');
-        swapTarget.replaceChildren(...Array.from(sanitizedDoc.body.childNodes));
-
-        // Re-execute inline scripts in the swapped content (filters out external scripts)
-        rerunInlineScripts(swapTarget);
-
-        // Notify other components (e.g. ScrollReveal) that new content is ready
-        document.dispatchEvent(new CustomEvent("neutron:page-swap"));
-      });
-
-      transition.finished.then(function() {
-        document.documentElement.classList.remove('neutron-nav-back');
-      });
-
-      navigationDirection = 'forward';
-      history.pushState(null, "", url);
-      window.scrollTo({ top: 0, left: 0, behavior: "auto" });
-    } catch(e) {
-      window.location.href = url;
-    }
-  }
-
-  // Handle back/forward navigation
-  window.addEventListener('popstate', function() {
-    if (window.__NEUTRON_ROUTER_ACTIVE__) return;
-    navigationDirection = 'back';
-    handleNavigation(window.location.href);
-  });
-
-  document.addEventListener("click", function(event) {
-    if (window.__NEUTRON_ROUTER_ACTIVE__) return;
-    var target = event.target;
-    var element = target instanceof Element ? target : null;
-    var anchor = element ? element.closest("a") : null;
-    if (!canIntercept(anchor, event)) {
-      return;
-    }
-
-    navigationDirection = 'forward';
-    event.preventDefault();
-    handleNavigation(anchor.href);
-  });
-
-  // Prefetch on hover for near-instant navigation
-  var prefetchCache = new Set();
+  // Prefetch same-origin links on pointer-enter so forward clicks feel
+  // instant. The browser still owns navigation, so bfcache and cross-doc
+  // view transitions both remain in play.
+  var seen = new Set();
   document.addEventListener('pointerenter', function(event) {
     var target = event.target;
     var element = target instanceof Element ? target : null;
     var anchor = element ? element.closest('a') : null;
-    if (!anchor || anchor.origin !== window.location.origin) return;
-    if (prefetchCache.has(anchor.href)) return;
-    prefetchCache.add(anchor.href);
+    if (!anchor || !anchor.href) return;
+    if (anchor.origin !== window.location.origin) return;
+    if (seen.has(anchor.href)) return;
+    seen.add(anchor.href);
     var link = document.createElement('link');
     link.rel = 'prefetch';
     link.href = anchor.href;
@@ -221,9 +62,10 @@ const BOOTSTRAP = `
 `;
 
 export function ViewTransitions() {
-  return h("script", {
-    dangerouslySetInnerHTML: {
-      __html: BOOTSTRAP,
-    },
-  });
+  return h(
+    Fragment,
+    null,
+    h("style", { dangerouslySetInnerHTML: { __html: TRANSITION_CSS } }),
+    h("script", { dangerouslySetInnerHTML: { __html: BOOTSTRAP } }),
+  );
 }
