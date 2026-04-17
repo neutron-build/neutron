@@ -1,0 +1,118 @@
+---
+title: Time Series
+description: Gorilla-compressed metrics with continuous aggregation.
+---
+
+Nucleus includes a built-in time-series engine with Gorilla compression, continuous aggregation, and retention policies — no InfluxDB or TimescaleDB needed.
+
+## Inserting Data
+
+```sql
+-- Insert a data point (series_name, timestamp_ms, value)
+SELECT TS_INSERT('cpu_usage', 1709856000000, 72.5);
+SELECT TS_INSERT('cpu_usage', 1709856001000, 68.3);
+SELECT TS_INSERT('cpu_usage', 1709856002000, 75.1);
+
+SELECT TS_INSERT('memory_mb', 1709856000000, 4096);
+SELECT TS_INSERT('memory_mb', 1709856001000, 4120);
+```
+
+## Querying
+
+```sql
+-- Get the latest value
+SELECT TS_LAST('cpu_usage');
+-- → 75.1
+
+-- Count total points
+SELECT TS_COUNT('cpu_usage');
+-- → 3
+
+-- Count points in a time range
+SELECT TS_RANGE_COUNT('cpu_usage', 1709856000000, 1709856002000);
+
+-- Average in a time range
+SELECT TS_RANGE_AVG('cpu_usage', 1709856000000, 1709856002000);
+```
+
+## Time Bucketing
+
+Group data points into fixed time windows:
+
+```sql
+-- Bucket by hour
+SELECT TIME_BUCKET(3600000, timestamp_col) AS hour,
+       AVG(value) AS avg_cpu
+FROM metrics
+GROUP BY hour
+ORDER BY hour;
+
+-- Using named intervals
+SELECT DATE_BIN('1 hour', timestamp_col) AS hour,
+       AVG(value)
+FROM metrics
+GROUP BY hour;
+```
+
+### Bucket Sizes
+
+| Name | Aliases | Milliseconds |
+|------|---------|-------------|
+| Second | `s`, `sec`, `seconds` | 1,000 |
+| Minute | `m`, `min`, `minutes` | 60,000 |
+| Hour | `h`, `hr`, `hours` | 3,600,000 |
+| Day | `d`, `days` | 86,400,000 |
+| Week | `w`, `weeks` | 604,800,000 |
+| Month | `mon`, `months` | ~2,592,000,000 |
+
+## Continuous Aggregation
+
+Pre-compute rollups that materialize automatically as data arrives:
+
+```sql
+-- Create a continuous aggregate (via the API)
+-- Materializes hourly averages from the cpu_usage series
+-- Supports: Avg, Sum, Min, Max, Count, First, Last
+```
+
+Continuous aggregates use watermark-based incremental materialization — only closed time buckets are computed, avoiding partial results.
+
+## Retention Policies
+
+Automatically delete old data:
+
+```sql
+-- Set retention: delete points older than 30 days
+SELECT TS_RETENTION(2592000000);
+```
+
+## Gorilla Compression
+
+Nucleus uses Facebook's Gorilla compression algorithm for time-series data:
+
+**Timestamps** — Delta-of-delta encoding:
+- First timestamp: 64 bits
+- Subsequent: variable-length (0-12 bits for typical monotonic timestamps)
+
+**Values** — XOR-based compression:
+- Similar consecutive values compress to just a few bits
+- Typical compression ratio: ~1.37 bytes/point (vs 16 bytes uncompressed)
+
+Compression is automatic and transparent — no configuration needed.
+
+## Performance
+
+- **SIMD-accelerated** aggregations (sum, min, max) on supported hardware
+- **Parallel range queries** for sum, count, avg, min, max
+- **Parallel bulk insert** for batch ingestion
+- **Partition index** (B-tree on time windows) for O(log P + K) range scans
+- **Running statistics** — count, sum, min, max maintained incrementally
+- **WAL-backed** durability with crash recovery
+
+## Use Cases
+
+- **Application metrics** — CPU, memory, request latency
+- **IoT telemetry** — Sensor readings, device status
+- **Financial data** — Stock prices, trading volumes
+- **Infrastructure monitoring** — Server health, network traffic
+- **Analytics** — User activity over time, conversion funnels

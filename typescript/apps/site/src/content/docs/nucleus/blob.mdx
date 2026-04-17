@@ -1,0 +1,87 @@
+---
+title: Blob Storage
+description: Content-addressed binary storage with deduplication.
+---
+
+Nucleus includes built-in blob storage for binary data — files, images, videos, and backups. Content-addressed with automatic deduplication, no S3 or MinIO needed.
+
+## Storing Blobs
+
+```sql
+-- Store binary data (hex-encoded) with a key
+SELECT BLOB_STORE('avatar/user-1.png', '89504e470d0a1a0a...', 'image/png');
+
+-- Store without content type
+SELECT BLOB_STORE('backup/db-2026-03-08.bak', 'cafebabe...');
+```
+
+## Retrieving Blobs
+
+```sql
+-- Get blob data (hex-encoded)
+SELECT BLOB_GET('avatar/user-1.png');
+
+-- Get metadata (size, hash, content type, tags)
+SELECT BLOB_META('avatar/user-1.png');
+-- → {"size":4096,"hash":"a1b2c3...","content_type":"image/png","tags":{}}
+```
+
+## Listing & Counting
+
+```sql
+-- List all blob keys
+SELECT BLOB_LIST();
+-- → ["avatar/user-1.png","backup/db-2026-03-08.bak"]
+
+-- List by prefix
+SELECT BLOB_LIST('avatar/');
+-- → ["avatar/user-1.png"]
+
+-- Total blob count
+SELECT BLOB_COUNT();
+-- → 2
+```
+
+## Tagging
+
+Add custom metadata tags to blobs:
+
+```sql
+SELECT BLOB_TAG('avatar/user-1.png', 'uploaded_by', 'user-1');
+SELECT BLOB_TAG('avatar/user-1.png', 'resize', '128x128');
+```
+
+## Deleting
+
+```sql
+SELECT BLOB_DELETE('avatar/user-1.png');
+-- → true
+```
+
+## Deduplication
+
+Nucleus uses BLAKE3 content hashing. Identical data is stored only once, regardless of key:
+
+```sql
+-- Check deduplication ratio
+SELECT BLOB_DEDUP_RATIO();
+-- → 2.5  (logical bytes / physical bytes)
+```
+
+A ratio of 2.5 means you're storing 2.5x more logical data than actual disk usage.
+
+## How It Works
+
+- **Content-addressed** — BLAKE3 (256-bit) cryptographic hashing
+- **Chunked storage** — Large objects split into 1MB chunks
+- **Deduplication** — Identical chunks stored once across all keys
+- **Byte-range index** — O(log N) access for partial reads
+- **WAL-backed** — Crash-safe persistence
+
+## Use Cases
+
+- **User uploads** — Avatars, attachments, documents
+- **Media storage** — Images, videos, audio files
+- **Backups** — Database snapshots with deduplication
+- **Artifacts** — Build outputs, logs, reports
+- **Content delivery** — Serve static files directly from the database

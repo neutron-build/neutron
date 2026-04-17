@@ -1,0 +1,66 @@
+---
+title: Markdown & MDX
+description: Writing and rendering content.
+---
+
+Neutron supports standard Markdown (`.md`) and MDX (`.mdx`) out of the box.
+
+## Using MDX
+
+MDX allows you to use components inside your Markdown content.
+
+```mdx
+---
+title: Hello World
+---
+
+import Counter from "../../components/Counter.tsx";
+
+# Hello World
+
+Here is an interactive counter:
+
+<Counter client:visible />
+```
+
+## Querying Content
+
+To use your content, import helper functions from `neutron/content`.
+
+```tsx
+// src/routes/blog/index.tsx
+import { getCollection } from "neutron/content";
+
+export async function loader() {
+  // Get all blog posts that aren't drafts
+  const posts = await getCollection("blog", ({ data }) => {
+    return data.draft !== true;
+  });
+  
+  return { posts };
+}
+```
+
+## Rendering Content
+
+```tsx
+// src/routes/blog/[slug].tsx
+import { getEntry } from "neutron/content";
+
+export async function loader({ params }) {
+  const entry = await getEntry("blog", params.slug);
+  return { entry };
+}
+
+export default function Post() {
+  const { entry } = useLoaderData<typeof loader>();
+  const { Content } = entry.render();
+  
+  return (
+    <article>
+      <h1>{entry.data.title}</h1>
+      <Content />
+    </article>
+  );
+}
+```

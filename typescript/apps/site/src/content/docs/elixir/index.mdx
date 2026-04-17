@@ -1,0 +1,65 @@
+---
+title: Elixir Framework
+description: OTP-based backend framework with Plug, Bandit, and 14 Nucleus data models.
+---
+
+Neutron for Elixir is a fault-tolerant backend framework built on OTP. Plug-based routing, Bandit HTTP server, and a full Nucleus client for all 14 data models.
+
+## Features
+
+- **OTP supervisors** — Fault-tolerant process trees with automatic restart
+- **Plug + Bandit** — Composable middleware on a lightweight HTTP server
+- **14 data models** — Full Nucleus client (SQL, KV, Vector, Graph, TimeSeries, and more)
+- **Real-time** — Phoenix-style channels with presence tracking
+- **OpenAPI 3.1** — Auto-generated from route metadata
+- **RFC 7807** — Standardized error responses
+
+## Hello World
+
+```elixir
+defmodule MyApp.Router do
+  use Neutron.Router
+
+  plug Neutron.Logger
+  plug Neutron.RequestID
+  plug Neutron.Recover
+
+  get "/" do
+    send_json(conn, 200, %{message: "Hello, Neutron!"})
+  end
+
+  get "/health" do
+    send_json(conn, 200, %{status: "ok"})
+  end
+end
+
+# application.ex
+defmodule MyApp.Application do
+  use Application
+
+  def start(_type, _args) do
+    children = [
+      {Neutron.Nucleus.Pool, url: "postgres://localhost:5432/mydb", size: 10},
+      {Bandit, plug: MyApp.Router, port: 4000}
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one)
+  end
+end
+```
+
+## Module Overview
+
+| Module | Purpose |
+|--------|---------|
+| `Neutron.Router` | Plug-based routing with macro DSL |
+| `Neutron.Nucleus` | Connection pool and client for all 14 models |
+| `Neutron.Channels` | WebSocket channels with topic routing |
+| `Neutron.Presence` | Distributed presence tracking via CRDT |
+| `Neutron.Auth` | JWT, sessions, API keys, RBAC |
+| `Neutron.Middleware` | Logger, CORS, rate limit, request ID, recovery |
+| `Neutron.OpenAPI` | Auto-generated OpenAPI 3.1 spec |
+
+## Why Elixir?
+
+OTP supervision trees make Neutron Elixir ideal for real-time systems — chat, IoT dashboards, live collaboration. If a Nucleus connection drops, the supervisor restarts it. If a channel process crashes, clients reconnect automatically.

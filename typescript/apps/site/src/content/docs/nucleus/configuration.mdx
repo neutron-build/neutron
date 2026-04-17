@@ -1,0 +1,129 @@
+---
+title: Configuration
+description: Server configuration and deployment options.
+---
+
+Nucleus runs as a single binary with sensible defaults. Configure via command-line flags, environment variables, or a configuration file.
+
+## Quick Start
+
+```bash
+# Default: listens on 0.0.0.0:5432 (PostgreSQL wire protocol)
+nucleus
+
+# Custom port
+nucleus --port 5433
+
+# With data directory
+nucleus --data-dir /var/lib/nucleus
+```
+
+## Connection
+
+Connect using any PostgreSQL client:
+
+```bash
+# psql
+psql -h localhost -p 5432
+
+# Connection string
+postgresql://localhost:5432/nucleus
+```
+
+All standard PostgreSQL drivers work — psycopg2, pgx, node-postgres, diesel, sqlx, etc.
+
+## Data Directory
+
+Nucleus stores all data in a single directory:
+
+```
+data/
+├── meta.json          # Table schemas, views, sequences, roles
+├── sequences.json     # Sequence current values
+├── pages/             # B-tree page files
+├── wal/               # Write-ahead log
+├── fts.wal            # Full-text search WAL
+├── doc.wal            # Document store WAL
+├── graph.wal          # Graph WAL
+├── blob/              # Blob chunk storage
+├── ts/                # Time-series data
+└── kv/                # Key-value WAL
+```
+
+## Wire Protocol
+
+Nucleus implements the PostgreSQL wire protocol (v3), supporting:
+
+- **Simple query** — Text-based queries
+- **Extended query** — Prepared statements with parameters
+- **COPY** — Bulk data import/export
+- **SSL/TLS** — Encrypted connections
+- **Authentication** — Password, MD5, SCRAM-SHA-256
+
+## Storage Engines
+
+Nucleus supports multiple storage backends:
+
+| Engine | Description | Best For |
+|--------|-------------|----------|
+| **Disk** (default) | B-tree pages on disk with buffer pool | Production |
+| **Buffered** | In-memory with periodic flush | Development |
+| **LSM** | Log-structured merge tree | Write-heavy workloads |
+| **Columnar** | Column-oriented storage | Analytics |
+
+## MVCC
+
+Multi-Version Concurrency Control provides snapshot isolation:
+
+- Readers never block writers
+- Writers never block readers
+- Each transaction sees a consistent snapshot
+- Automatic conflict detection on write-write conflicts
+
+## Backup & Recovery
+
+All data models use write-ahead logging (WAL) for crash recovery:
+
+1. Operations are written to the WAL before applying
+2. On startup, any incomplete operations are replayed
+3. Periodic checkpointing compacts the WAL
+
+## Performance Tuning
+
+### Buffer Pool
+
+The buffer pool caches frequently accessed B-tree pages in memory. Larger pools reduce disk I/O for read-heavy workloads.
+
+### SIMD Acceleration
+
+Nucleus automatically uses SIMD instructions (SSE4.2, AVX2, NEON) when available for:
+
+- Vector distance calculations
+- Time-series aggregations
+- Columnar scan operations
+
+### Specialty Index Rebuild
+
+On startup, specialty indexes (HNSW, IVFFlat, GIN, R-tree) are rebuilt from table data. This ensures consistency after any crash but adds startup time proportional to indexed data.
+
+## Monitoring
+
+```sql
+-- Check server version
+SELECT VERSION();
+
+-- Database statistics
+SELECT GRAPH_NODE_COUNT();
+SELECT GRAPH_EDGE_COUNT();
+SELECT FTS_DOC_COUNT();
+SELECT BLOB_COUNT();
+SELECT TS_COUNT('series_name');
+SELECT COLUMNAR_COUNT('table_name');
+SELECT DOC_COUNT();
+```
+
+## License
+
+Nucleus is licensed under the **Business Source License 1.1** (BSL 1.1). It converts to the MIT license on January 1, 2046. The BSL allows free use for development, testing, and non-production workloads. Production use requires a commercial license.
+
+All Neutron framework libraries (rs/, ts/, go/, python/, etc.) are MIT-licensed with no restrictions.

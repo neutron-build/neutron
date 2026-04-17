@@ -1,0 +1,151 @@
+---
+title: Components
+description: Native UI components for iOS and Android.
+---
+
+Neutron Native provides two tiers of components: universal components that work on web and native, and native-only components.
+
+## Tier 1 — Universal
+
+These components work on both web and native platforms:
+
+```tsx
+import { View, Text, Image, Pressable, TextInput, Link } from '@neutron/native';
+```
+
+### View
+
+The fundamental layout component (maps to `RCTView`):
+
+```tsx
+<View style={{ flex: 1, padding: 16, backgroundColor: '#f5f5f5' }}>
+    <Text>Content</Text>
+</View>
+```
+
+### Text
+
+Display text (maps to `RCTText`):
+
+```tsx
+<Text style={{ fontSize: 18, fontWeight: 'bold', color: '#111' }}>
+    Hello World
+</Text>
+```
+
+### Image
+
+Display images (maps to `RCTImage`):
+
+```tsx
+<Image
+    source={{ uri: 'https://example.com/photo.jpg' }}
+    style={{ width: 200, height: 200, borderRadius: 8 }}
+/>
+```
+
+### Pressable
+
+Touchable wrapper (maps to `RCTTouchableOpacity`):
+
+```tsx
+<Pressable onPress={() => alert('Pressed!')}>
+    <Text>Tap Me</Text>
+</Pressable>
+```
+
+### TextInput
+
+Text input field (maps to `RCTTextInput`):
+
+```tsx
+<TextInput
+    value={text}
+    onChangeText={setText}
+    placeholder="Enter your name"
+    style={{ borderWidth: 1, padding: 12, borderRadius: 8 }}
+/>
+```
+
+### Other Tier 1
+
+| Component | Description |
+|-----------|-------------|
+| `Link` | Navigation wrapper (uses router) |
+| `ActivityIndicator` | Loading spinner |
+| `Switch` | Toggle switch |
+| `Slider` | Range picker |
+| `KeyboardAvoidingView` | Keyboard-safe layout |
+| `RefreshControl` | Pull-to-refresh |
+
+## Tier 3 — Native Only
+
+Import from the native subpath:
+
+```tsx
+import { ScrollView, FlatList, Modal, StatusBar, SafeAreaView } from '@neutron/native/native';
+```
+
+### ScrollView
+
+Virtualized scrollable container:
+
+```tsx
+<ScrollView style={{ flex: 1 }}>
+    {items.map(item => <ItemCard key={item.id} item={item} />)}
+</ScrollView>
+```
+
+### FlatList
+
+Recycled virtualized list for large datasets:
+
+```tsx
+<FlatList
+    data={items}
+    renderItem={({ item }) => <ItemCard item={item} />}
+    keyExtractor={item => item.id}
+    ItemSeparatorComponent={() => <View style={{ height: 1, backgroundColor: '#eee' }} />}
+    ListHeaderComponent={<Text>Header</Text>}
+    ListFooterComponent={<Text>Footer</Text>}
+    refreshing={isRefreshing}
+    onRefresh={handleRefresh}
+/>
+```
+
+### Modal
+
+Overlay dialog:
+
+```tsx
+<Modal visible={showModal} onRequestClose={() => setShowModal(false)}>
+    <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+        <Text>Modal Content</Text>
+    </View>
+</Modal>
+```
+
+### StatusBar
+
+Control the system status bar:
+
+```tsx
+<StatusBar barStyle="dark-content" backgroundColor="#ffffff" />
+```
+
+### SafeAreaView
+
+Respect device notches and safe areas:
+
+```tsx
+<SafeAreaView style={{ flex: 1 }}>
+    <Text>Safe from notches</Text>
+</SafeAreaView>
+```
+
+## Props
+
+All components accept:
+- `style` — React Native StyleSheet object (numbers for dimensions, no CSS units)
+- `testID` — For end-to-end testing
+- `accessible` + `accessibilityLabel` — Accessibility support

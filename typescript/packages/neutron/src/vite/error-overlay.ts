@@ -22,9 +22,9 @@ export function generateErrorOverlayScript(): string {
       -webkit-backdrop-filter: blur(4px);
       opacity: 0;
       transition: opacity 0.2s ease;
-      pointer-events: auto;
+      pointer-events: none;
     }
-    :host(.visible) .backdrop { opacity: 1; }
+    :host(.visible) .backdrop { opacity: 1; pointer-events: auto; }
 
     .modal {
       position: absolute;
@@ -42,12 +42,13 @@ export function generateErrorOverlayScript(): string {
       flex-direction: column;
       opacity: 0;
       transition: opacity 0.2s ease, transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-      pointer-events: auto;
+      pointer-events: none;
       box-shadow: 0 25px 60px rgba(0, 0, 0, 0.5), 0 0 1px rgba(129, 140, 248, 0.2);
     }
     :host(.visible) .modal {
       opacity: 1;
       transform: translate(-50%, -50%) scale(1);
+      pointer-events: auto;
     }
 
     .header {

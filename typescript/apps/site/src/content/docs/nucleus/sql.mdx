@@ -1,0 +1,176 @@
+---
+title: SQL Reference
+description: Standard SQL with multi-model extensions.
+---
+
+Nucleus supports standard SQL (PostgreSQL dialect) with extensions for multi-model operations. Any valid PostgreSQL query works.
+
+## Data Types
+
+| Type | Description |
+|------|-------------|
+| `INTEGER` / `INT` | 64-bit integer |
+| `FLOAT` / `REAL` | 64-bit floating point |
+| `TEXT` / `VARCHAR` | UTF-8 string |
+| `BOOLEAN` / `BOOL` | true / false |
+| `TIMESTAMP` | Date and time |
+| `JSONB` | Binary JSON |
+| `BLOB` | Binary data |
+| `Vector(N)` | N-dimensional float vector |
+
+## Tables
+
+```sql
+-- Create
+CREATE TABLE products (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  price FLOAT DEFAULT 0.0,
+  metadata JSONB,
+  embedding Vector(384),
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Drop
+DROP TABLE products;
+
+-- Alter
+ALTER TABLE products ADD COLUMN category TEXT;
+ALTER TABLE products DROP COLUMN category;
+```
+
+## Queries
+
+```sql
+-- Select
+SELECT name, price FROM products WHERE price > 10.0;
+
+-- Aliases
+SELECT name AS product_name, price * 1.1 AS with_tax FROM products;
+
+-- Ordering
+SELECT * FROM products ORDER BY price DESC LIMIT 10 OFFSET 20;
+
+-- Distinct
+SELECT DISTINCT category FROM products;
+```
+
+## Joins
+
+```sql
+-- Inner join
+SELECT o.id, u.name, o.total
+FROM orders o
+JOIN users u ON o.user_id = u.id;
+
+-- Left join
+SELECT u.name, COUNT(o.id) AS order_count
+FROM users u
+LEFT JOIN orders o ON o.user_id = u.id
+GROUP BY u.name;
+```
+
+## Aggregations
+
+```sql
+SELECT
+  category,
+  COUNT(*) AS total,
+  AVG(price) AS avg_price,
+  MIN(price) AS cheapest,
+  MAX(price) AS most_expensive,
+  SUM(price) AS revenue
+FROM products
+GROUP BY category
+HAVING COUNT(*) > 5;
+```
+
+## Subqueries
+
+```sql
+-- In WHERE
+SELECT * FROM users
+WHERE id IN (SELECT user_id FROM orders WHERE total > 100);
+
+-- In FROM
+SELECT avg_total FROM (
+  SELECT user_id, AVG(total) AS avg_total
+  FROM orders
+  GROUP BY user_id
+) AS user_avgs
+WHERE avg_total > 50;
+```
+
+## Views
+
+```sql
+CREATE VIEW active_users AS
+SELECT * FROM users WHERE last_login > NOW() - INTERVAL '30 days';
+
+SELECT * FROM active_users;
+```
+
+## Indexes
+
+```sql
+-- B-tree (default)
+CREATE INDEX idx_users_email ON users (email);
+
+-- Unique
+CREATE UNIQUE INDEX idx_users_email_unique ON users (email);
+
+-- HNSW (vector)
+CREATE INDEX idx_embeddings_hnsw ON embeddings USING hnsw (vec);
+
+-- IVFFlat (vector)
+CREATE INDEX idx_embeddings_ivf ON embeddings USING ivfflat (vec);
+```
+
+## Transactions
+
+```sql
+BEGIN;
+INSERT INTO accounts (user_id, balance) VALUES (1, 1000);
+UPDATE accounts SET balance = balance - 100 WHERE user_id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE user_id = 2;
+COMMIT;
+
+-- Or rollback
+BEGIN;
+DELETE FROM users WHERE id = 1;
+ROLLBACK;
+```
+
+## Functions
+
+```sql
+-- String
+SELECT UPPER(name), LOWER(email), LENGTH(name) FROM users;
+
+-- Math
+SELECT ABS(-5), ROUND(3.14159, 2), CEIL(3.2), FLOOR(3.8);
+
+-- Date
+SELECT NOW(), EXTRACT(YEAR FROM created_at) FROM users;
+
+-- Conditional
+SELECT COALESCE(nickname, name) AS display_name FROM users;
+SELECT CASE WHEN price > 100 THEN 'expensive' ELSE 'cheap' END FROM products;
+```
+
+## Sequences
+
+```sql
+CREATE SEQUENCE order_seq START 1000;
+SELECT NEXTVAL('order_seq');
+SELECT CURRVAL('order_seq');
+```
+
+## Triggers
+
+```sql
+CREATE TRIGGER update_timestamp
+BEFORE UPDATE ON users
+FOR EACH ROW
+SET NEW.updated_at = NOW();
+```

@@ -1,0 +1,57 @@
+---
+title: Hooks
+description: API reference for Neutron hooks.
+---
+
+Hooks available from `neutron`.
+
+## `useLoaderData`
+
+Returns the data returned from the route's `loader`.
+
+```tsx
+const data = useLoaderData<typeof loader>();
+```
+
+## `useActionData`
+
+Returns the data returned from the route's `action`. Undefined if the action hasn't run yet.
+
+```tsx
+const data = useActionData<typeof action>();
+```
+
+## `useNavigation`
+
+Returns the current navigation state.
+
+```tsx
+const navigation = useNavigation();
+// navigation.state: "idle" | "loading" | "submitting"
+// navigation.formData: FormData (during submission)
+```
+
+## `useParams`
+
+Returns an object of dynamic route parameters.
+
+```tsx
+const params = useParams();
+// params.id
+```
+
+## `useRevalidator`
+
+Allows manual revalidation of loaders.
+
+```tsx
+const { revalidate, state } = useRevalidator();
+```
+
+## `useRouteError`
+
+Returns the error thrown during rendering, loading, or action execution.
+
+```tsx
+const error = useRouteError();
+```

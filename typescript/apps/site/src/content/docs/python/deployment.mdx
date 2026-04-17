@@ -1,0 +1,173 @@
+---
+title: Deployment
+description: Production deployment with uvicorn, granian, and Docker.
+---
+
+## Running the Server
+
+```python
+from neutron import App
+
+app = App(title="My API", version="1.0.0")
+
+# Development
+app.run(host="127.0.0.1", port=8000)
+
+# Production
+app.run(host="0.0.0.0", port=8000, server="uvicorn", workers=4)
+```
+
+### Server Backends
+
+| Backend | Install | Features |
+|---------|---------|----------|
+| **uvicorn** (default) | Included | Asyncio, HTTP/1.1, WebSocket |
+| **granian** | `pip install granian` | Rust/Tokio, HTTP/2, faster |
+
+```python
+# Use granian for better performance
+app.run(server="granian", workers=4)
+```
+
+## Configuration
+
+Pydantic Settings with `NEUTRON_` prefix:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NEUTRON_HOST` | `0.0.0.0` | Bind address |
+| `NEUTRON_PORT` | `8000` | Listen port |
+| `NEUTRON_WORKERS` | `1` | Worker processes |
+| `NEUTRON_DEBUG` | `false` | Debug mode |
+| `NEUTRON_DATABASE_URL` | — | Connection string (required) |
+| `NEUTRON_DB_POOL_MIN` | `5` | Min pool connections |
+| `NEUTRON_DB_POOL_MAX` | `25` | Max pool connections |
+| `NEUTRON_LOG_LEVEL` | `info` | Log level |
+| `NEUTRON_LOG_FORMAT` | `json` | Log format (`json` or `pretty`) |
+
+## Built-in Endpoints
+
+Every app exposes:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | `{"status": "ok", "nucleus": true, "version": "1.0.0"}` |
+| `GET /openapi.json` | OpenAPI 3.1 spec |
+| `GET /docs` | Swagger UI |
+
+## Lifespan Events
+
+```python
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app):
+    # Startup
+    await db.connect()
+    await cache.warmup()
+    yield
+    # Shutdown
+    await cache.flush()
+    await db.close()
+
+app = App(lifespan=lifespan)
+```
+
+## Docker
+
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY pyproject.toml .
+RUN pip install --no-cache-dir .
+
+COPY . .
+EXPOSE 8000
+
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+```
+
+### With granian (faster)
+
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+COPY pyproject.toml .
+RUN pip install --no-cache-dir ".[fast]"
+
+COPY . .
+EXPOSE 8000
+
+CMD ["granian", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--interface", "asgi"]
+```
+
+### Docker Compose
+
+```yaml
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      NEUTRON_DATABASE_URL: postgres://nucleus:5432/mydb
+      NEUTRON_LOG_LEVEL: info
+      NEUTRON_WORKERS: 4
+    depends_on:
+      nucleus:
+        condition: service_healthy
+
+  nucleus:
+    image: ghcr.io/neutron-build/nucleus:latest
+    ports:
+      - "5432:5432"
+    volumes:
+      - nucleus_data:/var/lib/nucleus
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "localhost"]
+      interval: 5s
+
+volumes:
+  nucleus_data:
+```
+
+## Dependencies
+
+```toml
+# pyproject.toml
+[project]
+dependencies = [
+    "starlette>=0.38.0",
+    "pydantic>=2.0",
+    "uvicorn[standard]>=0.30.0",
+    "asyncpg>=0.29.0",
+    "structlog>=24.0.0",
+]
+
+[project.optional-dependencies]
+fast = ["granian>=2.0.0"]
+auth = ["PyJWT[crypto]>=2.8.0"]
+```
+
+## systemd
+
+```ini
+[Unit]
+Description=My Neutron Python App
+After=network.target
+
+[Service]
+Type=simple
+User=myapp
+WorkingDirectory=/opt/myapp
+ExecStart=/opt/myapp/.venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+Environment=NEUTRON_DATABASE_URL=postgres://localhost:5432/mydb
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```

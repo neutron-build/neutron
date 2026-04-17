@@ -1,0 +1,50 @@
+---
+title: Loaders
+description: Server-side data loading.
+---
+
+Loaders are the primary way to get data into your Neutron routes. They run exclusively on the server, which means you can connect directly to your database, access secrets, or call internal APIs.
+
+## The `loader` Function
+
+Export an async function named `loader` from any route module.
+
+```tsx
+import type { LoaderArgs } from "neutron";
+
+export async function loader({ request, params, context }: LoaderArgs) {
+  // This code runs on the server!
+  const users = await db.users.findMany();
+  return { users };
+}
+```
+
+## `useLoaderData`
+
+To access the data returned by your loader in your component, use the `useLoaderData` hook.
+
+```tsx
+import { useLoaderData } from "neutron";
+
+export default function UsersPage() {
+  const { users } = useLoaderData<typeof loader>();
+  
+  return (
+    <ul>
+      {users.map(user => <li key={user.id}>{user.name}</li>)}
+    </ul>
+  );
+}
+```
+
+## Loader Arguments
+
+The loader function receives a single object with the following properties:
+
+-   `request`: The standard web [Request](https://developer.mozilla.org/en-US/docs/Web/API/Request) object.
+-   `params`: An object containing the dynamic route parameters (e.g., `{ id: "123" }`).
+-   `context`: App-specific context passed from middleware.
+
+## Parallel Loading
+
+When you have nested routes (e.g., `_layout.tsx` -> `app/_layout.tsx` -> `dashboard.tsx`), Neutron runs all matching loaders **in parallel**. It does not wait for parent loaders to finish before starting child loaders. This prevents "waterfalls" and ensures your page loads as fast as possible.

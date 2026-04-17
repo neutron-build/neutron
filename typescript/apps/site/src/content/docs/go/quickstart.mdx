@@ -1,0 +1,122 @@
+---
+title: Quickstart
+description: Build a Go API server in minutes.
+---
+
+## Create a Project
+
+```bash
+neutron new my-api --lang go
+cd my-api
+```
+
+Or add to an existing project:
+
+```bash
+go get github.com/neutron-dev/neutron-go@latest
+```
+
+## Your First App
+
+```go
+package main
+
+import (
+    "context"
+    "log/slog"
+    "time"
+
+    "github.com/neutron-dev/neutron-go/neutron"
+    "github.com/neutron-dev/neutron-go/nucleus"
+)
+
+type User struct {
+    ID    int64  `db:"id" json:"id"`
+    Name  string `db:"name" json:"name"`
+    Email string `db:"email" json:"email"`
+}
+
+type CreateUserInput struct {
+    Name  string `json:"name"`
+    Email string `json:"email"`
+}
+
+type GetUserInput struct {
+    ID int64 `path:"id"`
+}
+
+func main() {
+    ctx := context.Background()
+    logger := slog.Default()
+
+    // Connect to Nucleus
+    db, err := nucleus.Connect(ctx, "postgres://localhost:5432/mydb")
+    if err != nil {
+        panic(err)
+    }
+
+    // Create app
+    app := neutron.New(
+        neutron.WithLogger(logger),
+        neutron.WithLifecycle(db.LifecycleHook()),
+        neutron.WithOpenAPIInfo("My API", "1.0.0"),
+        neutron.WithMiddleware(
+            neutron.Logger(logger),
+            neutron.Recover(),
+            neutron.RequestID(),
+            neutron.Timeout(30 * time.Second),
+        ),
+    )
+
+    // Routes
+    router := app.Router()
+
+    neutron.Get(router, "/users", func(ctx context.Context, _ neutron.Empty) ([]User, error) {
+        return nucleus.Query[User](ctx, db.SQL(), "SELECT * FROM users")
+    })
+
+    neutron.Get(router, "/users/{id}", func(ctx context.Context, input GetUserInput) (User, error) {
+        return nucleus.QueryOne[User](ctx, db.SQL(),
+            "SELECT * FROM users WHERE id = $1", input.ID)
+    })
+
+    neutron.Post(router, "/users", func(ctx context.Context, input CreateUserInput) (User, error) {
+        return nucleus.QueryOne[User](ctx, db.SQL(),
+            "INSERT INTO users (name, email) VALUES ($1, $2) RETURNING *",
+            input.Name, input.Email)
+    })
+
+    app.Run(":8080")
+}
+```
+
+## Run
+
+```bash
+# Development
+neutron dev
+
+# Or directly
+go run .
+```
+
+## Test It
+
+```bash
+curl http://localhost:8080/health
+curl http://localhost:8080/users
+curl -X POST http://localhost:8080/users \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Alice", "email": "alice@example.com"}'
+curl http://localhost:8080/users/1
+```
+
+## Auto-Generated Endpoints
+
+Every Neutron Go app includes:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Health check |
+| `GET /openapi.json` | OpenAPI 3.1 spec |
+| `GET /docs` | Swagger UI |

@@ -1,0 +1,44 @@
+---
+title: Cloudflare
+description: Deploying to Cloudflare Workers or Pages.
+---
+
+Neutron supports deploying to Cloudflare's edge network, giving your application global low-latency performance.
+
+## Usage
+
+1.  Install the adapter:
+    ```bash
+    npm install @neutron/adapter-cloudflare
+    ```
+
+2.  Update `neutron.config.ts`:
+    ```ts
+    import cloudflare from "@neutron/adapter-cloudflare";
+
+    export default defineConfig({
+      adapter: cloudflare(),
+    });
+    ```
+
+3.  Build:
+    ```bash
+    npm run build
+    ```
+
+4.  Deploy (using Wrangler):
+    ```bash
+    npx wrangler pages deploy dist
+    ```
+
+## Platform Proxy
+
+The adapter automatically provides the Cloudflare `env` object (KV, R2, D1) in your loader/action context.
+
+```ts
+export async function loader({ context }) {
+  const kv = context.cloudflare.env.MY_KV_NAMESPACE;
+  const value = await kv.get("key");
+  // ...
+}
+```

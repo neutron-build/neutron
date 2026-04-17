@@ -1,0 +1,149 @@
+---
+title: Graph Database
+description: Property graph with Cypher queries and built-in algorithms.
+---
+
+Nucleus includes a native property graph engine with Cypher query support, graph algorithms, and CSR-optimized traversals — no separate graph database needed.
+
+## Creating Nodes & Edges
+
+```sql
+-- Add nodes with labels and properties
+SELECT GRAPH_ADD_NODE('Person', '{"name": "Alice", "age": 30}');
+-- → 1
+SELECT GRAPH_ADD_NODE('Person', '{"name": "Bob", "age": 25}');
+-- → 2
+SELECT GRAPH_ADD_NODE('Company', '{"name": "Acme", "industry": "Tech"}');
+-- → 3
+
+-- Add directed edges with types and properties
+SELECT GRAPH_ADD_EDGE(1, 2, 'KNOWS', '{"since": 2020}');
+SELECT GRAPH_ADD_EDGE(1, 3, 'WORKS_AT', '{"role": "Engineer"}');
+SELECT GRAPH_ADD_EDGE(2, 3, 'WORKS_AT', '{"role": "Designer"}');
+```
+
+## Querying the Graph
+
+### Neighbors
+
+```sql
+-- Outgoing neighbors (default)
+SELECT GRAPH_NEIGHBORS(1, 'out');
+-- → [{"neighbor_id":2,"edge_id":1,"edge_type":"KNOWS"}, ...]
+
+-- Incoming neighbors
+SELECT GRAPH_NEIGHBORS(3, 'in');
+
+-- Both directions
+SELECT GRAPH_NEIGHBORS(1, 'both');
+```
+
+### Shortest Path
+
+```sql
+-- Find shortest path between two nodes
+SELECT GRAPH_SHORTEST_PATH(1, 3);
+-- → [1, 3]  (direct edge exists)
+```
+
+### Statistics
+
+```sql
+SELECT GRAPH_NODE_COUNT();  -- → 3
+SELECT GRAPH_EDGE_COUNT();  -- → 3
+```
+
+## Cypher Queries
+
+Use `GRAPH_QUERY` for pattern matching with the Cypher query language:
+
+```sql
+-- Find all people
+SELECT GRAPH_QUERY('MATCH (p:Person) RETURN p.name, p.age');
+
+-- Traverse relationships
+SELECT GRAPH_QUERY('
+  MATCH (p:Person)-[:WORKS_AT]->(c:Company)
+  RETURN p.name, c.name
+');
+
+-- Filter with WHERE
+SELECT GRAPH_QUERY('
+  MATCH (p:Person)-[r:KNOWS]->(q:Person)
+  WHERE p.age > 25
+  RETURN p.name, q.name
+');
+
+-- Create nodes and edges
+SELECT GRAPH_QUERY('
+  CREATE (n:City {name: "Portland", state: "OR"})
+');
+
+SELECT GRAPH_QUERY('
+  CREATE (a:Person {name: "Charlie"})-[:KNOWS]->(b:Person {name: "Diana"})
+');
+```
+
+### Supported Cypher Features
+
+| Feature | Example |
+|---------|---------|
+| Pattern matching | `MATCH (a)-[r]->(b)` |
+| Labels | `(n:Person)` |
+| Properties | `{name: "Alice"}` |
+| Edge types | `-[:KNOWS]->` |
+| Directions | `->`, `<-`, `--` (undirected) |
+| Variable-length paths | `-[*1..3]->` |
+| WHERE | `WHERE n.age > 25 AND n.name = "Alice"` |
+| OPTIONAL MATCH | Returns NULL if no match |
+| WITH | Intermediate projection |
+| DELETE | `DELETE n, r` |
+| COUNT | `RETURN COUNT(*)` |
+
+## Graph Algorithms
+
+Built-in algorithms accessible through the graph engine:
+
+| Algorithm | Purpose |
+|-----------|---------|
+| **BFS** | Breadth-first traversal |
+| **DFS** | Depth-first traversal |
+| **Shortest Path** | Unweighted (BFS-based) |
+| **Dijkstra** | Weighted shortest path using edge properties |
+| **Connected Components** | Find isolated subgraphs |
+| **PageRank** | Rank nodes by importance |
+| **Label Propagation** | Community detection |
+| **Louvain** | Modularity-optimized community detection |
+
+## Deleting Graph Data
+
+```sql
+-- Delete a node (cascades connected edges)
+SELECT GRAPH_DELETE_NODE(1);
+
+-- Delete an edge
+SELECT GRAPH_DELETE_EDGE(1);
+
+-- Delete via Cypher
+SELECT GRAPH_QUERY('
+  MATCH (n:Person {name: "Bob"})
+  DELETE n
+');
+```
+
+## Performance
+
+- **CSR (Compressed Sparse Row)** format for cache-friendly analytical traversals
+- **Property indexes** (B-tree) per label/property for fast lookups
+- **Label and type indexes** for O(1) filtered traversals
+- **Parallel BFS** for multi-source traversals
+- **Tiered storage** with hot/cold separation (100K node threshold)
+- **WAL-backed** durability with crash recovery
+
+## Use Cases
+
+- **Social networks** — Friends, followers, mutual connections
+- **Knowledge graphs** — Entity relationships, ontologies
+- **Fraud detection** — Transaction paths, ring detection
+- **Recommendation engines** — User-item-category graphs
+- **Network topology** — Infrastructure dependencies

@@ -5,6 +5,7 @@ interface TrieNode {
   paramChild: TrieNode | null;
   paramName: string | null;
   wildcardChild: TrieNode | null;
+  wildcardName: string;
   route: Route | null;
 }
 
@@ -14,6 +15,7 @@ function createNode(): TrieNode {
     paramChild: null,
     paramName: null,
     wildcardChild: null,
+    wildcardName: "*",
     route: null,
   };
 }
@@ -43,6 +45,7 @@ export function createRouter() {
         if (!node.wildcardChild) {
           node.wildcardChild = createNode();
         }
+        node.wildcardName = segment.value || "*";
         node = node.wildcardChild;
       }
     }
@@ -93,10 +96,11 @@ export function createRouter() {
 
     if (node.wildcardChild) {
       const wildcardParam = segments.slice(index).join("/");
-      params["*"] = wildcardParam;
+      const name = node.wildcardName || "*";
+      params[name] = wildcardParam;
       const result = matchNode(node.wildcardChild, segments, segments.length, params);
       if (result) return result;
-      delete params["*"];
+      delete params[name];
     }
 
     return null;
@@ -119,8 +123,8 @@ function parsePath(path: string): PathSegment[] {
   const segments: PathSegment[] = [];
 
   for (const part of parts) {
-    if (part === "*") {
-      segments.push({ type: "wildcard", value: "*" });
+    if (part.startsWith("*")) {
+      segments.push({ type: "wildcard", value: part.slice(1) || "*" });
     } else if (part.startsWith(":")) {
       segments.push({ type: "param", value: part.slice(1) });
     } else {

@@ -1,0 +1,61 @@
+---
+title: Dynamic Routes
+description: Handling variable path segments.
+---
+
+Dynamic routes allow you to match variable segments of a URL.
+
+## Basic Parameters
+
+Create a file with square brackets `[]` to capture a parameter.
+
+**File**: `src/routes/users/[id].tsx`
+
+```tsx
+import { useLoaderData } from "neutron";
+
+export async function loader({ params }: LoaderArgs) {
+  // Access the parameter via params.id
+  console.log(params.id); 
+  return { userId: params.id };
+}
+
+export default function UserPage() {
+  const { userId } = useLoaderData<typeof loader>();
+  return <div>User ID: {userId}</div>;
+}
+```
+
+Visiting `/users/123` will render the page with `userId` as "123".
+
+## Catch-all Parameters
+
+To match multiple path segments (or the rest of the path), use the spread syntax `[...]`.
+
+**File**: `src/routes/docs/[...slug].tsx`
+
+Matches:
+-   `/docs/getting-started` (`params.slug` = "getting-started")
+-   `/docs/api/reference/v1` (`params.slug` = "api/reference/v1")
+
+```tsx
+export async function loader({ params }: LoaderArgs) {
+  const slug = params.slug;
+  // Fetch content based on slug...
+}
+```
+
+## Static vs App Mode
+
+-   **App Mode**: Dynamic parameters are available immediately in the `loader` via `params`.
+-   **Static Mode**: You must use `getStaticPaths` to define all possible values for the parameters at build time.
+
+```tsx
+// Static mode example
+export async function getStaticPaths() {
+  return [
+    { params: { id: "1" } },
+    { params: { id: "2" } },
+  ];
+}
+```

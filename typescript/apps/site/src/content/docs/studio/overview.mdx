@@ -1,0 +1,79 @@
+---
+title: Studio
+description: Visual database manager for all 14 Nucleus data models.
+---
+
+Neutron Studio is a web-based database manager that connects to Nucleus and PostgreSQL. Browse schemas, run queries, design tables, and explore all 14 data models — all from your browser.
+
+## Launch
+
+```bash
+neutron studio               # opens http://localhost:4983
+neutron studio --port 8080   # custom port
+```
+
+Studio is embedded in the CLI binary — no Node.js runtime needed.
+
+## Features
+
+### Connection Manager
+
+- Save multiple database connections
+- Test connections before saving
+- Auto-detect Nucleus vs PostgreSQL
+- When connected to Nucleus, all 14 model browsers are enabled
+
+### SQL Browser
+
+Browse table data with pagination, column details, and index information.
+
+### SQL Editor
+
+Full-featured SQL IDE with:
+
+- **CodeMirror** with SQL syntax highlighting
+- **Execute** with Cmd/Ctrl+Enter
+- **Query History** — Last 50 queries per connection (localStorage), with timestamp, row count, and duration
+- **Saved Queries** — Persist named queries to the database
+- **Results** — Table view with CSV and JSON export
+
+### Schema Designer
+
+Visual table editor:
+
+- **Create tables** — Add columns with type picker, nullable, primary key, defaults
+- **Edit columns** — Modify existing tables
+- **Manage indexes** — Create/drop regular and unique indexes
+- **Code generation** — Generate model boilerplate in Go, TypeScript, Rust, or Python
+- **Migration export** — Download pending changes as timestamped `.sql` files
+- **Drop table** with confirmation
+
+### Model Browsers
+
+When connected to Nucleus, Studio provides dedicated browsers for all 14 data models:
+
+| Model | Browser Features |
+|-------|-----------------|
+| SQL | Table data viewer with pagination |
+| Key-Value | Key browser with TTL, value editor |
+| Vector | Embedding viewer, similarity search |
+| TimeSeries | Time range queries, chart preview |
+| Document | JSON editor, GIN index queries |
+| Graph | Node/edge browser, Cypher queries |
+| FTS | Search playground, BM25 scoring |
+| Geo | Map preview, radius queries |
+| Blob | Content list, metadata, download |
+| PubSub | Channel monitor, test publisher |
+| Streams | Consumer group viewer, playback |
+| Columnar | Column projections, aggregation preview |
+| Datalog | Rule browser, query evaluator |
+| CDC | Change log viewer |
+
+## Architecture
+
+- **Frontend:** Preact + @preact/signals SPA
+- **Backend:** Go server embedded in CLI binary (`//go:embed`)
+- **Editor:** CodeMirror with One Dark theme
+- **Data grid:** TanStack React Table
+- **State:** Preact signals (connections, schema, tabs, toasts)
+- **Dev loop:** `cd studio && npm run dev` (Vite proxies API to Go server)

@@ -1,0 +1,191 @@
+---
+title: Replication
+description: Primary-replica streaming, multi-Raft consensus, and automatic failover.
+---
+
+Nucleus supports three cluster modes, from single-node to fully distributed.
+
+## Cluster Modes
+
+| Mode | Nodes | Consensus | Use Case |
+|------|-------|-----------|----------|
+| **Standalone** | 1 | None | Development, small workloads |
+| **PrimaryReplica** | 2 | WAL streaming | High availability |
+| **MultiRaft** | 3+ | Raft per shard | Horizontal scaling |
+
+## Primary-Replica
+
+Two-node setup where the primary streams WAL records to a replica.
+
+### Replication Modes
+
+| Mode | Behavior | Tradeoff |
+|------|----------|----------|
+| **Synchronous** | Primary waits for replica ACK before committing | Stronger durability, higher latency |
+| **Asynchronous** | Primary streams WAL in background | Lower latency, potential data loss on failover |
+
+### WAL Streaming
+
+The primary's Write-Ahead Log is streamed to the replica in batches (default 64 records per batch):
+
+```
+Primary                          Replica
+   │                                │
+   │── WAL Batch (records 1-64) ──►│
+   │                                │── Apply records
+   │◄── ACK (confirmed_lsn=64) ────│
+   │                                │
+   │── WAL Batch (records 65-128) ─►│
+   │                                │
+```
+
+### WAL Payload Types
+
+| Type | Content |
+|------|---------|
+| `PageWrite` | Page ID + data bytes |
+| `Commit` | Transaction ID |
+| `Abort` | Transaction ID |
+| `Checkpoint` | Marks a consistent point |
+
+### Monitoring
+
+```sql
+SELECT * FROM nucleus_replication_status;
+```
+
+Returns:
+
+| Field | Description |
+|-------|-------------|
+| `node_id` | This node's ID |
+| `role` | `primary` or `replica` |
+| `wal_lsn` | Latest WAL sequence number |
+| `applied_lsn` | Last applied sequence number |
+| `replication_lag` | Records behind primary |
+| `peer_connected` | Whether peer is reachable |
+
+## Automatic Failover
+
+The `FailoverManager` monitors heartbeats and promotes the replica if the primary is unreachable.
+
+### Failover Timeline
+
+1. **Primary stops responding** — Heartbeat timeout (default 5 seconds)
+2. **PrimaryDown detected** — Failover manager triggers promotion
+3. **Replica promoted** — Becomes new primary, starts accepting writes
+4. **Old primary rejoins** — Demoted to replica, resyncs from new primary
+
+### Failover Events
+
+| Event | Description |
+|-------|-------------|
+| `PrimaryDown` | Heartbeat timeout exceeded |
+| `ReplicaPromoted` | Replica took over as primary |
+| `OldPrimaryRejoined` | Previous primary reconnected |
+| `ReplicationResumed` | Streaming resumed after failover |
+
+## Multi-Raft (3+ Nodes)
+
+For horizontal scaling, Nucleus uses **one Raft consensus group per shard**. Each shard independently elects a leader and replicates its log.
+
+### Architecture
+
+```
+Node 1                Node 2                Node 3
+┌──────────┐          ┌──────────┐          ┌──────────┐
+│ Shard A  │◄────────►│ Shard A  │◄────────►│ Shard A  │
+│ (Leader) │          │(Follower)│          │(Follower)│
+├──────────┤          ├──────────┤          ├──────────┤
+│ Shard B  │          │ Shard B  │          │ Shard B  │
+│(Follower)│◄────────►│ (Leader) │◄────────►│(Follower)│
+├──────────┤          ├──────────┤          ├──────────┤
+│ Shard C  │          │ Shard C  │          │ Shard C  │
+│(Follower)│◄────────►│(Follower)│◄────────►│ (Leader) │
+└──────────┘          └──────────┘          └──────────┘
+```
+
+### Raft Consensus
+
+Each Raft group follows the standard protocol:
+
+1. **Leader election** — Candidates increment term, request votes from majority
+2. **Log replication** — Leader sends AppendEntries RPCs to followers
+3. **Commitment** — Entry committed when majority acknowledges
+4. **Snapshot transfer** — Slow followers receive full state snapshot
+
+### Raft Messages
+
+| Message | Purpose |
+|---------|---------|
+| `RequestVote` | Candidate requests vote with term + log position |
+| `VoteResponse` | Follower grants or denies vote |
+| `AppendEntries` | Leader sends log entries + commit index |
+| `Heartbeat` | Leader maintains authority (empty AppendEntries) |
+| `InstallSnapshot` | Full state transfer to lagging follower |
+
+### Operations
+
+The Raft log carries these operation types:
+
+```
+Put { key, value }         — Write a key-value pair
+Delete { key }             — Remove a key
+Sql(String)                — Execute SQL statement
+TxnPrepare { txn_id }     — Phase 1 of 2PC
+TxnCommit { txn_id }      — Phase 2 commit
+TxnAbort { txn_id }       — Phase 2 abort
+Noop                       — Leader confirmation
+```
+
+## Distributed Transactions
+
+Cross-shard transactions use two-phase commit (2PC) coordinated through Raft:
+
+### Transaction Phases
+
+```
+Coordinator              Shard A Leader          Shard B Leader
+     │                        │                        │
+     │── TxnPrepare ────────►│                        │
+     │── TxnPrepare ─────────────────────────────────►│
+     │                        │                        │
+     │◄── Prepared ──────────│                        │
+     │◄── Prepared ──────────────────────────────────│
+     │                        │                        │
+     │── TxnCommit ─────────►│                        │
+     │── TxnCommit ──────────────────────────────────►│
+     │                        │                        │
+```
+
+### Transaction Lifecycle
+
+| Phase | State | Description |
+|-------|-------|-------------|
+| 1 | `Active` | Transaction executing, writes buffered |
+| 2 | `Preparing` | Prepare sent to all participating shards |
+| 3 | `Committing` | All shards prepared, commit in progress |
+| 4 | `Committed` | All shards committed |
+| — | `Aborting` | Any shard failed to prepare |
+| — | `Aborted` | All shards rolled back |
+
+## Configuration
+
+```toml
+[cluster]
+mode = "multi_raft"           # standalone | primary_replica | multi_raft
+node_id = 1
+peers = ["node2:5433", "node3:5434"]
+
+[cluster.replication]
+mode = "synchronous"          # synchronous | asynchronous
+batch_size = 64               # WAL records per batch
+
+[cluster.failover]
+heartbeat_timeout_ms = 5000   # Promote replica after this timeout
+
+[cluster.tls]
+cert = "/path/to/node.crt"
+key = "/path/to/node.key"
+ca = "/path/to/ca.crt"
+```

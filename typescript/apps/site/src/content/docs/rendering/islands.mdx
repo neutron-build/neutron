@@ -1,0 +1,53 @@
+---
+title: Islands Architecture
+description: Partial hydration for static routes.
+---
+
+The "Islands Architecture" is a pattern that encourages small, focused chunks of interactivity within server-rendered web pages.
+
+## The Concept
+
+Imagine a static HTML page as a "sea" of static content. In this sea, there are "islands" of interactivity.
+
+-   **The Sea**: Static HTML (Header, Footer, Sidebar, Text). Zero JS.
+-   **The Islands**: Interactive components (Image Carousel, Buy Button, Search Bar). Hydrated with JS.
+
+## Usage
+
+In a static route, import your component and use it with a `client:` directive.
+
+```tsx
+import { Island } from "neutron";
+import Counter from "../components/Counter";
+
+export default function Page() {
+  return (
+    <main>
+      <h1>Static Content</h1>
+      
+      {/* This component will hydrate */}
+      <Island component={Counter} client="load" />
+      
+      <p>More static content</p>
+    </main>
+  );
+}
+```
+
+## Directives
+
+Neutron supports several directives to control *when* an island hydrates.
+
+| Directive | Description | Use Case |
+| :--- | :--- | :--- |
+| `client="load"` | Hydrates immediately on page load. | Critical UI (Nav menus). |
+| `client="visible"` | Hydrates when the element enters the viewport. | Footer forms, comments. |
+| `client="idle"` | Hydrates when the browser is idle. | Low priority UI. |
+| `client="media"` | Hydrates when a CSS media query matches. | Mobile-only toggles. |
+| `client="only"` | Skips SSR entirely and only renders on client. | Components using `window`. |
+
+## Benefits
+
+-   **Performance**: You only ship JavaScript for the interactive parts of the page.
+-   **Bandwidth**: Users download less code.
+-   **CPU**: The browser main thread has less work to do.

@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { build as viteBuild, loadConfigFromFile, mergeConfig, createServer } from "vite";
-import { neutronPlugin } from "neutron/vite";
+import { neutronPlugin } from "@neutron-build/core/vite";
 import {
   discoverRoutes,
   adapterCloudflare,
@@ -15,8 +15,7 @@ import {
   resolveRuntimeNoExternal,
   mergeSeoMetaInput,
   renderDocumentHead,
-  serializeForInlineScript,
-} from "neutron";
+} from "@neutron-build/core";
 import type {
   NeutronConfig,
   NeutronAdapter,
@@ -28,7 +27,7 @@ import type {
   HeadArgs,
   SeoMetaInput,
   GetStaticPathsResult,
-} from "neutron";
+} from "@neutron-build/core";
 import { renderToString } from "preact-render-to-string";
 import { h } from "preact";
 
@@ -86,32 +85,76 @@ export async function build(): Promise<void> {
 
   const userConfig = loadedConfig?.config || {};
 
-  // First, build the client bundle
-  console.log("Building client bundle...");
-
-  await viteBuild(
-    mergeConfig(userConfig, {
-      configFile: false,
-      root: cwd,
-      plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
-      resolve: {
-        ...(runtimeAliases ? { alias: runtimeAliases } : {}),
-        // Deduplicate Preact to prevent multiple instances in the client bundle.
-        // Without this, island hydration fails because hooks from one Preact copy
-        // reference state from another (`Cannot read properties of undefined (reading '__H')`).
-        dedupe: ["preact", "preact/hooks", "preact/compat", "preact/jsx-runtime"],
-      },
-      build: {
-        outDir: outputDir,
-        emptyOutDir: true,
-      },
-    })
-  );
+  // Build client assets. For static-only sites (no app routes), create a
+  // temporary CSS-only entry so Vite still extracts stylesheets without
+  // requiring an index.html entry point.
+  if (appRouteCount > 0) {
+    console.log("Building client bundle...");
+    await viteBuild(
+      mergeConfig(userConfig, {
+        configFile: false,
+        root: cwd,
+        plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
+        resolve: {
+          ...(runtimeAliases ? { alias: runtimeAliases } : {}),
+          dedupe: ["preact", "preact/hooks", "preact/compat", "preact/jsx-runtime"],
+        },
+        build: {
+          outDir: outputDir,
+          emptyOutDir: true,
+        },
+      })
+    );
+  } else {
+    console.log("Building CSS bundle (static site)...");
+    const cssEntryDir = path.join(cwd, ".neutron");
+    fs.mkdirSync(cssEntryDir, { recursive: true });
+    const cssEntryPath = path.join(cssEntryDir, "_css-entry.js");
+    const cssImports = new Set<string>();
+    for (const route of routes) {
+      try {
+        const src = fs.readFileSync(route.file, "utf-8");
+        for (const m of src.matchAll(/import\s+["']([^"']+\.css)["']/g)) {
+          cssImports.add(path.resolve(path.dirname(route.file), m[1]));
+        }
+      } catch {}
+    }
+    fs.writeFileSync(
+      cssEntryPath,
+      [...cssImports].map((p) => `import ${JSON.stringify(p)};`).join("\n") + "\n"
+    );
+    await viteBuild(
+      mergeConfig(userConfig, {
+        configFile: false,
+        root: cwd,
+        plugins: [],
+        build: {
+          outDir: outputDir,
+          emptyOutDir: true,
+          lib: { entry: cssEntryPath, formats: ["es"] as const },
+          rollupOptions: {
+            output: { assetFileNames: "assets/[name]-[hash][extname]" },
+          },
+          cssCodeSplit: false,
+        },
+      })
+    );
+    try { fs.unlinkSync(cssEntryPath); } catch {}
+    // Remove the JS lib output — we only need the extracted CSS.
+    for (const f of fs.readdirSync(outputDir)) {
+      if (f.endsWith(".mjs") || f.endsWith(".js")) {
+        try { fs.unlinkSync(path.join(outputDir, f)); } catch {}
+      }
+    }
+  }
 
   const clientEntryScriptSrc = extractClientEntryScriptSrc(outputDir);
   if (clientEntryScriptSrc) {
     writeClientEntryMetadata(outputDir, clientEntryScriptSrc);
   }
+
+  // Collect CSS files produced by the client build for injection into static HTML
+  const clientCssFiles = extractClientCssFiles(outputDir);
 
   const ensureRuntimeBundle = createRuntimeBundleBuilder({
     cwd,
@@ -253,7 +296,13 @@ export async function build(): Promise<void> {
         loaderData: loaderDataMap,
         pathname,
       };
-      const resolved = await currentModule.head(args);
+      // Routes use `head({ data })` — provide `data` as an alias for
+      // the current route's loader data so destructuring works.
+      const headArgsWithData = {
+        ...args,
+        data: loaderDataMap[currentRoute.id] ?? loaderData,
+      };
+      const resolved = await currentModule.head(headArgsWithData);
       if (!resolved) {
         continue;
       }
@@ -294,18 +343,28 @@ export async function build(): Promise<void> {
           continue;
         }
 
-        // Get all paths to render
-        const result: GetStaticPathsResult = await module.getStaticPaths();
-        
-        for (const { params, props } of result.paths) {
+        // Get all paths to render — supports both array and { paths: [] } forms
+        const result = await module.getStaticPaths();
+        const pathList = Array.isArray(result) ? result : (result as GetStaticPathsResult).paths;
+
+        for (const { params, props } of pathList) {
           // Build the actual path by substituting params
           const resolvedPath = resolvePath(route.path, params);
           const context: AppContext = {};
           const request = new Request("http://localhost" + resolvedPath);
-          
-          // Render this path
-          const loaderData = props || {};
-          
+
+          // Call the route's loader (same as static routes) so content,
+          // TOC, pagination, etc. are available. Fall back to props from
+          // getStaticPaths if there is no loader.
+          let loaderData: unknown = props || {};
+          if (module.loader) {
+            loaderData = await module.loader({
+              request,
+              params,
+              context,
+            } as LoaderArgs);
+          }
+
           const layoutChain = getLayoutChain(route);
 
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -316,8 +375,17 @@ export async function build(): Promise<void> {
 
           for (const layoutRoute of [...layoutChain].reverse()) {
             const layoutModule = await loadRouteModule(layoutRoute);
+            // Call layout loaders so sidebars, nav trees, etc. are populated.
+            let layoutData: unknown = {};
+            if (layoutModule?.loader) {
+              layoutData = await layoutModule.loader({
+                request,
+                params,
+                context,
+              } as LoaderArgs);
+            }
             if (layoutModule?.default) {
-              element = h(layoutModule.default as any, { data: {} }, element);
+              element = h(layoutModule.default as any, { data: layoutData }, element);
             }
           }
 
@@ -336,7 +404,8 @@ export async function build(): Promise<void> {
             resolvedPath,
             loaderData,
             clientEntryScriptSrc,
-            headHtml
+            headHtml,
+            clientCssFiles
           );
 
           const outPath = getOutputPath(outputDir, resolvedPath);
@@ -383,8 +452,16 @@ export async function build(): Promise<void> {
 
       for (const layoutRoute of [...layoutChain].reverse()) {
         const layoutModule = await loadRouteModule(layoutRoute);
+        let layoutData: unknown = {};
+        if (layoutModule?.loader) {
+          layoutData = await layoutModule.loader({
+            request,
+            params: {},
+            context,
+          } as LoaderArgs);
+        }
         if (layoutModule?.default) {
-          element = h(layoutModule.default as any, { data: {} }, element);
+          element = h(layoutModule.default as any, { data: layoutData }, element);
         }
       }
 
@@ -403,7 +480,8 @@ export async function build(): Promise<void> {
         route.path,
         loaderData,
         clientEntryScriptSrc,
-        headHtml
+        headHtml,
+        clientCssFiles
       );
 
       const outPath = getOutputPath(outputDir, route.path);
@@ -462,50 +540,59 @@ export async function build(): Promise<void> {
 }
 
 /**
- * Resolve a route pattern with params to an actual path
- * e.g. "/blog/[slug]" with { slug: "hello" } → "/blog/hello"
+ * Resolve a route pattern with params to an actual path.
+ * Handles both named params and catch-all (splat) params:
+ *   "/blog/:slug"  + { slug: "hello" }                → "/blog/hello"
+ *   "/docs/*"      + { "*": "getting-started/intro" }  → "/docs/getting-started/intro"
  */
 function resolvePath(pattern: string, params: Record<string, string>): string {
   let resolved = pattern;
-  
+
   for (const [key, value] of Object.entries(params)) {
-    resolved = resolved.replace(`[${key}]`, value);
-    resolved = resolved.replace(`:${key}`, value);
+    // Named param — :slug or [slug]
+    const bracketReplaced = resolved.replace(`[${key}]`, value);
+    const colonReplaced = resolved.replace(`:${key}`, value);
+
+    if (bracketReplaced !== resolved) {
+      resolved = bracketReplaced;
+    } else if (colonReplaced !== resolved) {
+      resolved = colonReplaced;
+    } else {
+      // Catch-all — replace *paramName (e.g., *slug) or bare *
+      const splatPattern = key === "*" ? "*" : `*${key}`;
+      resolved = resolved.replace(splatPattern, value);
+    }
   }
-  
+
   return resolved;
 }
 
 function wrapHtml(
   content: string,
   routePath: string,
-  loaderData?: unknown,
+  _loaderData?: unknown,
   clientEntryScriptSrc: string | null = null,
-  headHtml: string = renderDocumentHead(routePath, null)
+  headHtml: string = renderDocumentHead(routePath, null),
+  cssFiles: string[] = []
 ): string {
-  const allData: Record<string, unknown> = {};
-  if (loaderData !== undefined) {
-    allData.page = loaderData;
-  }
-
-  const dataScript = Object.keys(allData).length > 0
-    ? `<script>window.__NEUTRON_DATA_SERIALIZED__=${serializeForInlineScript(allData)};</script>`
-    : "";
-
-  // Detect islands in content
+  // Detect islands in content — only load client runtime if interactive islands exist
   const hasIslands = content.includes("<neutron-island");
   const clientScript = hasIslands && clientEntryScriptSrc
     ? `<script type="module" src="${escapeHtml(clientEntryScriptSrc)}"></script>`
     : "";
 
+  const cssLinks = cssFiles
+    .map((href) => `<link rel="stylesheet" href="${escapeHtml(href)}">`)
+    .join("\n");
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 ${headHtml}
+${cssLinks}
 </head>
 <body>
 <div id="app">${content}</div>
-${dataScript}
 ${clientScript}
 </body>
 </html>`;
@@ -527,6 +614,15 @@ function getOutputPath(outputDir: string, routePath: string): string {
 
   const cleanPath = routePath.replace(/\/$/, "");
   return path.join(outputDir, cleanPath, "index.html");
+}
+
+function extractClientCssFiles(outputDir: string): string[] {
+  const assetsDir = path.join(outputDir, "assets");
+  if (!fs.existsSync(assetsDir)) return [];
+  return fs
+    .readdirSync(assetsDir)
+    .filter((name) => name.endsWith(".css"))
+    .map((name) => `/assets/${name}`);
 }
 
 function extractClientEntryScriptSrc(outputDir: string): string | null {
@@ -842,7 +938,7 @@ function generateRuntimeEntrySource(
   });
 
   return `import { h } from "preact";
-import { createRouter, runMiddlewareChain, renderToString, encodeSerializedPayloadAsJson, serializeForInlineScript, mergeSeoMetaInput, renderDocumentHead, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders } from "neutron/runtime-edge";
+import { createRouter, runMiddlewareChain, renderToString, encodeSerializedPayloadAsJson, serializeForInlineScript, mergeSeoMetaInput, renderDocumentHead, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders } from "@neutron-build/core/runtime-edge";
 ${imports.join("\n")}
 
 const CLIENT_ENTRY_SCRIPT_SRC = ${JSON.stringify(clientEntryScriptSrc)};

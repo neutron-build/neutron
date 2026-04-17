@@ -1,0 +1,98 @@
+---
+title: Getting Started
+description: Create an Elixir API server with Neutron in minutes.
+---
+
+## Create a Project
+
+```bash
+neutron new my-api --lang elixir
+cd my-api
+```
+
+Or add to an existing Mix project:
+
+```elixir
+# mix.exs
+defp deps do
+  [
+    {:neutron, "~> 0.1.0"},
+    {:neutron_nucleus, "~> 0.1.0"}
+  ]
+end
+```
+
+Then fetch dependencies:
+
+```bash
+mix deps.get
+```
+
+## Your First App
+
+```elixir
+defmodule MyApp.Router do
+  use Neutron.Router
+
+  plug Neutron.Logger
+  plug Neutron.RequestID
+
+  get "/users" do
+    users = Neutron.Nucleus.query!(MyApp.Pool, "SELECT * FROM users")
+    send_json(conn, 200, users)
+  end
+
+  post "/users" do
+    {:ok, body} = read_json(conn)
+
+    user = Neutron.Nucleus.query_one!(MyApp.Pool,
+      "INSERT INTO users (name, email) VALUES ($1, $2) RETURNING *",
+      [body["name"], body["email"]]
+    )
+
+    send_json(conn, 201, user)
+  end
+end
+
+defmodule MyApp.Application do
+  use Application
+
+  def start(_type, _args) do
+    children = [
+      {Neutron.Nucleus.Pool, name: MyApp.Pool, url: System.get_env("DATABASE_URL"), size: 10},
+      {Bandit, plug: MyApp.Router, port: 4000}
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
+  end
+end
+```
+
+## Run
+
+```bash
+# Development with hot reload
+neutron dev
+
+# Or directly with Mix
+mix run --no-halt
+```
+
+## Test It
+
+```bash
+curl http://localhost:4000/health
+curl http://localhost:4000/users
+curl -X POST http://localhost:4000/users \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Alice", "email": "alice@example.com"}'
+```
+
+## Auto-Generated Endpoints
+
+Every Neutron Elixir app includes:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Health check |
+| `GET /openapi.json` | OpenAPI 3.1 spec |

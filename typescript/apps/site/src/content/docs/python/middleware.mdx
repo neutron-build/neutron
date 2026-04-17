@@ -1,0 +1,168 @@
+---
+title: Middleware
+description: Request pipeline with 7 built-in middleware components.
+---
+
+Neutron Python uses ASGI middleware built on Starlette. Each middleware wraps the next, forming a pipeline.
+
+## Adding Middleware
+
+```python
+from neutron import App
+from neutron.middleware import (
+    RequestIDMiddleware,
+    LoggingMiddleware,
+    CORSMiddleware,
+    CompressionMiddleware,
+    RateLimitMiddleware,
+    TimeoutMiddleware,
+    OTelMiddleware,
+)
+
+app = App(
+    middleware=[
+        RequestIDMiddleware(),
+        LoggingMiddleware(),
+        OTelMiddleware(service_name="my-api"),
+        CORSMiddleware(allow_origins=["https://example.com"]),
+        CompressionMiddleware(minimum_size=500),
+        TimeoutMiddleware(timeout=30.0),
+        RateLimitMiddleware(rps=100, burst=200),
+    ]
+)
+```
+
+Middleware executes in registration order for requests, reverse order for responses.
+
+## Built-in Middleware
+
+### RequestID
+
+Generates a UUID for each request, available in `request.state.request_id` and injected as the `x-request-id` response header.
+
+```python
+RequestIDMiddleware()
+```
+
+### Logging
+
+Structured access logging via `structlog`:
+
+```python
+LoggingMiddleware()
+```
+
+Logs: method, path, status code, duration (ms). Status-based levels: 5xx = ERROR, 4xx = WARN, 2xx/3xx = INFO.
+
+### CORS
+
+Cross-Origin Resource Sharing:
+
+```python
+CORSMiddleware(
+    allow_origins=["https://example.com"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
+    allow_credentials=True,
+    max_age=3600,
+)
+```
+
+### Compression
+
+Gzip response compression:
+
+```python
+CompressionMiddleware(minimum_size=500)  # Only compress responses > 500 bytes
+```
+
+### Rate Limiting
+
+Token bucket rate limiter:
+
+```python
+RateLimitMiddleware(rps=100, burst=200)
+```
+
+Returns `429 Too Many Requests` with RFC 7807 body:
+
+```json
+{
+    "type": "https://neutron.dev/errors/rate-limited",
+    "title": "Rate Limited",
+    "status": 429,
+    "detail": "Too many requests"
+}
+```
+
+### Timeout
+
+Request timeout using `asyncio.wait_for`:
+
+```python
+TimeoutMiddleware(timeout=30.0)  # seconds
+```
+
+Returns `504 Gateway Timeout` with RFC 7807 body on timeout.
+
+### OpenTelemetry
+
+Distributed tracing:
+
+```python
+OTelMiddleware(service_name="my-api")
+```
+
+- Generates trace ID and span ID per request
+- Injects `traceparent` and `x-trace-id` response headers
+- Logs trace context via structlog
+
+## Custom Middleware
+
+Inherit from `_NeutronMiddleware`:
+
+```python
+from neutron.middleware import _NeutronMiddleware
+
+class AuthMiddleware(_NeutronMiddleware):
+    def __init__(self, secret: str):
+        self.secret = secret
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers", []))
+            token = headers.get(b"authorization", b"").decode()
+
+            if not self.validate(token):
+                response = JSONResponse({"detail": "Unauthorized"}, status_code=401)
+                await response(scope, receive, send)
+                return
+
+        await self.app(scope, receive, send)
+
+    def validate(self, token: str) -> bool:
+        # Your validation logic
+        ...
+```
+
+Register like any other middleware:
+
+```python
+app = App(middleware=[
+    RequestIDMiddleware(),
+    AuthMiddleware(secret="my-secret"),
+])
+```
+
+## Error Format
+
+All middleware error responses follow RFC 7807 Problem Details:
+
+```json
+{
+    "type": "https://neutron.dev/errors/<error-type>",
+    "title": "Human-Readable Title",
+    "status": 429,
+    "detail": "Detailed explanation"
+}
+```

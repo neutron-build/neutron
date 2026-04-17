@@ -1,0 +1,102 @@
+---
+title: Native (iOS/Android)
+description: Preact components rendered as native views via React Native Fabric.
+---
+
+Neutron Native lets you build iOS and Android apps using Preact, rendered as native views through React Native's Fabric architecture and JSI.
+
+## How It Works
+
+1. You write Preact JSX components
+2. Preact renders to a virtual DOM tree
+3. The Neutron renderer maps components to UIManager JSI calls
+4. React Native Fabric renders actual native views (UIView, android.view.View)
+
+No WebView — your components become real native views.
+
+## Packages
+
+| Package | Purpose |
+|---------|---------|
+| `@neutron/native` | Core renderer, components, router, navigation |
+| `@neutron/native-styling` | NeutronWind (className → StyleSheet at build time) |
+| `@neutron/native-cli` | CLI for dev, build, run |
+
+## Quick Start
+
+```bash
+# Create a new app
+neutron-native new my-app
+cd my-app
+
+# Install dependencies
+npm install
+
+# Start development
+neutron-native dev --ios
+neutron-native dev --android
+```
+
+## App Entry Point
+
+```tsx
+// index.js
+import { NeutronApp } from '@neutron/native';
+import App from './app/_layout';
+
+NeutronApp({ component: App, appName: 'MyApp' });
+```
+
+## Basic Component
+
+```tsx
+import { View, Text, Pressable } from '@neutron/native';
+
+function HomeScreen() {
+    return (
+        <View style={{ flex: 1, padding: 16 }}>
+            <Text style={{ fontSize: 24, fontWeight: 'bold' }}>
+                Hello, Neutron!
+            </Text>
+            <Pressable
+                onPress={() => console.log('pressed')}
+                style={{ padding: 12, backgroundColor: '#3b82f6', borderRadius: 8 }}
+            >
+                <Text style={{ color: 'white' }}>Press Me</Text>
+            </Pressable>
+        </View>
+    );
+}
+```
+
+## CLI Commands
+
+```bash
+# Development server
+neutron-native dev [--ios | --android] [--port 8081]
+
+# Production build
+neutron-native build [--ios | --android] [--release]
+
+# Run on simulator/device
+neutron-native run-ios [--simulator "iPhone 16"]
+neutron-native run-android [--device <id>]
+
+# Scaffold new project
+neutron-native new <name>
+```
+
+## React Compatibility
+
+For libraries that import from `react`:
+
+```javascript
+import { preactCompatAliases } from '@neutron/native/compat';
+
+// In rspack.config.ts
+export default {
+    resolve: {
+        alias: preactCompatAliases(),
+    },
+};
+```

@@ -1,0 +1,47 @@
+---
+title: View Transitions
+description: Native browser page transitions.
+---
+
+Neutron has built-in support for the View Transitions API, allowing for native, smooth animations between pages without a heavy SPA runtime.
+
+## Enabling View Transitions
+
+To enable view transitions, you simply need to add the `<ViewTransitions />` component to your root layout's `<head>`.
+
+```tsx
+// src/routes/_layout.tsx
+import { ViewTransitions, Outlet } from "neutron";
+
+export default function RootLayout() {
+  return (
+    <html>
+      <head>
+        <ViewTransitions />
+      </head>
+      <body>
+        <Outlet />
+      </body>
+    </html>
+  );
+}
+```
+
+## How It Works
+
+1.  **Static Routes**: When a link is clicked, Neutron intercepts the navigation. It fetches the new HTML, and then uses `document.startViewTransition()` to swap the DOM.
+2.  **App Routes**: View transitions hook into the client-side router to animate the component tree update.
+
+## Customizing Animations
+
+You can name specific elements to animate them distinctly during the transition using the `view-transition-name` CSS property.
+
+```tsx
+// Page 1: List
+<img src="avatar.jpg" style={{ viewTransitionName: "avatar" }} />
+
+// Page 2: Detail
+<img src="avatar-large.jpg" style={{ viewTransitionName: "avatar" }} />
+```
+
+The browser will automatically morph the image from Page 1 to Page 2.

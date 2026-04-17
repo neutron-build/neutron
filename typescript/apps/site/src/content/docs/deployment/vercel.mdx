@@ -1,0 +1,33 @@
+---
+title: Vercel
+description: Deploying to Vercel.
+---
+
+Deploying to Vercel is straightforward with the Vercel adapter. It supports both Serverless Functions (Node.js) and Edge Functions.
+
+## Usage
+
+1.  Install the adapter:
+    ```bash
+    npm install @neutron/adapter-vercel
+    ```
+
+2.  Update `neutron.config.ts`:
+    ```ts
+    import vercel from "@neutron/adapter-vercel";
+
+    export default defineConfig({
+      adapter: vercel({
+        edge: false, // Set to true for Edge Functions
+      }),
+    });
+    ```
+
+3.  Deploy:
+    ```bash
+    npx vercel
+    ```
+
+## Edge Middleware
+
+If you enable `edge: true`, your application will run on Vercel's Edge Runtime. Ensure your dependencies are compatible with the edge (no Node.js built-ins like `fs` or `path`).

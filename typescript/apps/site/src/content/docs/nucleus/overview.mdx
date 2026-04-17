@@ -1,0 +1,84 @@
+---
+title: What is Nucleus?
+description: A multi-model database engine that speaks PostgreSQL.
+---
+
+Nucleus is a multi-model database engine written in Rust. It provides **14 data models** through a single server, accessed via the standard PostgreSQL wire protocol. Any PostgreSQL client, driver, or ORM works out of the box.
+
+## Why Nucleus?
+
+Most applications need more than one type of database. A typical stack might include PostgreSQL for relational data, Redis for caching, Elasticsearch for search, a vector database for AI, and InfluxDB for metrics. Nucleus combines all of these into one.
+
+- **One connection string** — No more managing 5 database connections
+- **One query language** — SQL extended with model-specific functions
+- **One operational surface** — One backup, one monitor, one deploy
+- **PostgreSQL compatible** — Use `psql`, `pgx`, `asyncpg`, or any PostgreSQL driver
+
+## Data Models
+
+| Model | Use Case | Access Pattern |
+|-------|----------|---------------|
+| **SQL** | Relational data, joins, transactions | Standard SQL |
+| **Key-Value** | Caching, sessions, counters | `KV_SET`, `KV_GET`, TTL |
+| **Vector** | Similarity search, RAG, embeddings | `VECTOR_DISTANCE`, HNSW/IVFFlat |
+| **Document** | Flexible schemas, nested data | JSONB, `->`, `->>`, GIN |
+| **Graph** | Relationships, networks, paths | Cypher queries |
+| **Full-Text Search** | Search, autocomplete, facets | `FTS_SEARCH`, BM25 |
+| **Time Series** | Metrics, IoT, logs | Gorilla compression, continuous aggs |
+| **Columnar** | Analytics, aggregations | Vectorized execution, LZ4/Zstd |
+| **Blob** | Files, images, media | Chunked, content-addressed, dedup |
+| **Datalog** | Logic programming, rules | Semi-naive evaluation |
+| **Streams** | Event sourcing, queues | Append-only, consumer groups |
+| **Geospatial** | Maps, location queries | R-tree, point-in-radius |
+| **CDC** | Change tracking | Change Data Capture |
+| **Pub/Sub** | Real-time notifications | LISTEN/NOTIFY |
+
+## Connecting
+
+Nucleus speaks the PostgreSQL wire protocol. Connect with any PostgreSQL client:
+
+```bash
+# psql
+psql -h localhost -p 5432 -U neutron
+
+# Connection string
+postgresql://neutron:password@localhost:5432/mydb
+```
+
+From any language framework:
+
+```typescript
+// TypeScript (neutron-data)
+import { db } from "neutron-data";
+const users = await db.query("SELECT * FROM users");
+```
+
+```rust
+// Rust (sqlx, diesel, or raw pgx)
+let rows = sqlx::query("SELECT * FROM users")
+    .fetch_all(&pool).await?;
+```
+
+```go
+// Go (pgx/v5)
+rows, err := pool.Query(ctx, "SELECT * FROM users")
+```
+
+```python
+# Python (asyncpg)
+rows = await conn.fetch("SELECT * FROM users")
+```
+
+## Architecture
+
+Nucleus is a single statically-linked binary. No JVM, no runtime dependencies.
+
+- **Storage**: Pluggable engines (in-memory, disk, buffered, columnar, LSM)
+- **MVCC**: Snapshot isolation with row-level versioning
+- **WAL**: Write-ahead log for crash recovery
+- **Indexes**: B-tree, hash, GIN, R-tree, HNSW, IVFFlat
+- **Compression**: LZ4, Zstd, Gorilla (time series)
+
+## License
+
+Nucleus uses the **Business Source License 1.1** (BSL). It converts to MIT on 2046-01-01. You can use it freely for development, testing, and single-node production. Multi-node clustering requires a commercial license before the conversion date.

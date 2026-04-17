@@ -1,0 +1,121 @@
+---
+title: Full-Text Search
+description: BM25-ranked search with stemming and fuzzy matching.
+---
+
+Nucleus includes a built-in full-text search engine with BM25 ranking, language-aware stemming, fuzzy matching, and faceted search — no Elasticsearch or Meilisearch needed.
+
+## Indexing Documents
+
+```sql
+-- Add documents to the FTS index
+SELECT FTS_INDEX(1, 'Rust is a systems programming language');
+SELECT FTS_INDEX(2, 'Python is great for machine learning');
+SELECT FTS_INDEX(3, 'Machine learning with Rust is fast');
+
+-- Remove a document from the index
+SELECT FTS_REMOVE(2);
+
+-- Index statistics
+SELECT FTS_DOC_COUNT();   -- number of indexed documents
+SELECT FTS_TERM_COUNT();  -- number of unique terms
+```
+
+## Searching
+
+### Basic Search
+
+```sql
+-- Search with BM25 ranking (returns JSON array)
+SELECT FTS_SEARCH('machine learning', 10);
+-- → [{"doc_id":3,"score":2.45}, {"doc_id":2,"score":1.87}]
+```
+
+### Fuzzy Search
+
+Find matches even with typos using Levenshtein distance:
+
+```sql
+-- Allow up to 2 edits per term
+SELECT FTS_FUZZY_SEARCH('machne learing', 2, 10);
+-- → matches "machine learning" despite typos
+```
+
+Maximum edit distance is capped at 3 to prevent combinatorial explosion.
+
+### Filter with FTS
+
+Use `FTS_MATCH` in WHERE clauses to combine full-text search with SQL filtering:
+
+```sql
+SELECT id, title, content
+FROM articles
+WHERE FTS_MATCH(id, 'rust performance')
+ORDER BY created_at DESC
+LIMIT 10;
+```
+
+## PostgreSQL-Compatible Functions
+
+```sql
+-- BM25 score for a specific document
+SELECT TS_RANK(content, 'rust systems') AS score
+FROM articles;
+
+-- Boolean match test
+SELECT * FROM articles
+WHERE TS_MATCH(content, 'machine learning');
+
+-- Highlight matching terms with <em> tags
+SELECT TS_HEADLINE(content, 'rust') FROM articles;
+-- → "...is a systems programming language"
+-- → "<em>Rust</em> is a systems programming language"
+
+-- Convert text to stemmed query
+SELECT PLAINTO_TSQUERY('machine learning');
+-- → "machine & learn"
+```
+
+## BM25 Ranking
+
+Nucleus uses the Okapi BM25 algorithm with standard parameters:
+
+- **k1 = 1.2** — Term frequency saturation
+- **b = 0.75** — Document length normalization
+
+Shorter documents with more occurrences of rare terms score higher. Posting lists are processed shortest-first for optimal performance.
+
+## Stemming
+
+Six built-in language stemmers normalize words to their root form:
+
+| Language | Examples |
+|----------|----------|
+| English (default) | running → run, learning → learn |
+| German | Übungen → Übung |
+| French | étudiantes → étudiant |
+| Spanish | corriendo → corr |
+| Italian | velocemente → veloce |
+| Portuguese | correndo → corr |
+
+## Tokenization Pipeline
+
+1. Split on non-alphanumeric characters
+2. Lowercase
+3. Filter stopwords (48 common English words)
+4. Apply language-specific stemming
+
+## Performance
+
+- **Block-Max WAND** — Early termination for top-k queries (2-5x speedup on large indexes)
+- **Parallel search** — Automatic parallelization when candidate set exceeds 500 documents
+- **Parallel bulk indexing** — Tokenization parallelized across CPU cores
+- **WAL-backed** — Crash-safe with incremental checkpointing
+
+## Use Cases
+
+- **Site search** — Full-text search across pages and posts
+- **Product search** — Find products by description with typo tolerance
+- **Log analysis** — Search through structured log messages
+- **Knowledge base** — Search documentation and articles
+- **Content discovery** — Find related content by text similarity

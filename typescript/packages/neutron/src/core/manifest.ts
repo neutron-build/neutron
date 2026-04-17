@@ -151,12 +151,28 @@ function fileToRoutePath(filename: string, parentPath: string): string {
     return parentPath || "/";
   }
 
-  const segments = name.split(".");
-  const pathSegments: string[] = [];
+  // Split on "." for Remix-style flat routes (auth.login -> auth/login),
+  // but preserve dots inside [...] dynamic segments.
+  const segments: string[] = [];
+  let buf = "";
+  let depth = 0;
+  for (const ch of name) {
+    if (ch === "[") depth++;
+    else if (ch === "]") depth--;
+    if (ch === "." && depth === 0) {
+      segments.push(buf);
+      buf = "";
+    } else {
+      buf += ch;
+    }
+  }
+  segments.push(buf);
 
+  const pathSegments: string[] = [];
   for (const segment of segments) {
     if (segment.startsWith("[...") && segment.endsWith("]")) {
-      pathSegments.push("*");
+      // Catch-all: preserve the param name so consumers can read params.<name>.
+      pathSegments.push("*" + segment.slice(4, -1));
     } else if (segment.startsWith("[") && segment.endsWith("]")) {
       pathSegments.push(":" + segment.slice(1, -1));
     } else {
@@ -179,8 +195,8 @@ function pathToRegExp(routePath: string): { pattern: RegExp; params: string[] } 
   }
 
   for (const segment of segments) {
-    if (segment === "*") {
-      params.push("*");
+    if (segment.startsWith("*")) {
+      params.push(segment.slice(1) || "*");
       regexStr += "/(.*)";
     } else if (segment.startsWith(":")) {
       params.push(segment.slice(1));

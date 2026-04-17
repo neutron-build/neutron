@@ -1,0 +1,101 @@
+---
+title: Quint Specifications
+description: TLA+-style protocol model checking.
+---
+
+The `quint/` directory contains formal specifications of distributed protocols and stateful algorithms using Quint, a modern alternative to TLA+. These specs verify safety properties through exhaustive state-space exploration.
+
+## What's Specified
+
+### Nucleus Protocols
+
+| Spec | Properties Verified |
+|------|-------------------|
+| Multi-Raft | Leader election, log consistency, safety under partitions |
+| Resharding | Data integrity during shard splits/merges |
+| Distributed Transactions | Atomicity, isolation across shards |
+| Replication | Consistency between primary and replicas |
+| Membership | Correct join/leave under concurrent changes |
+| Snapshot Transfer | Complete state transfer without data loss |
+
+### Framework Protocols
+
+| Spec | Properties Verified |
+|------|-------------------|
+| Circuit Breaker | Valid state transitions, bounded failure counts, reject guarantees |
+| Rate Limiter | Rate enforcement, fairness, no undercounting |
+| CSRF Lifecycle | No replay attacks, session isolation, expiry correctness |
+| Session Lifecycle | Terminal permanence, bounded renewals, owner immutability |
+
+### Real-Time Protocols
+
+| Spec | Properties Verified |
+|------|-------------------|
+| WebSocket Hub | No self-delivery, no duplicates, scoped broadcasting |
+| Hot Reload | Version monotonicity, delta ordering, no version gaps |
+
+## How Quint Works
+
+Quint specs define:
+1. **State variables** — The system's mutable state
+2. **Actions** — State transitions (what can happen)
+3. **Invariants** — Safety properties that must always hold
+
+The model checker explores all possible action orderings and verifies that invariants are never violated.
+
+## Example: Circuit Breaker
+
+```quint
+module circuit_breaker {
+    var state: str             // "closed" | "open" | "half_open"
+    var failure_count: int
+    var success_count: int
+
+    action trip = all {
+        state == "closed",
+        failure_count >= FAILURE_THRESHOLD,
+        state' = "open",
+        // ...
+    }
+
+    // Safety: requests are rejected when circuit is open
+    val reject_bound = (state == "open") implies (failure_count >= FAILURE_THRESHOLD)
+}
+```
+
+## Project Structure
+
+```
+quint/
+├── specs/
+│   ├── common/         # Shared types, network, crash models
+│   ├── nucleus/        # Database protocol specs
+│   ├── framework/      # Web framework protocol specs
+│   └── realtime/       # Real-time protocol specs
+├── tests/              # Test runs for each spec
+├── conformance/        # Rust conformance tests
+└── scripts/            # CI scripts
+```
+
+## Running Specs
+
+```bash
+# Check a specification
+quint typecheck specs/framework/circuit_breaker.qnt
+
+# Run tests
+quint test tests/circuit_breaker_test.qnt
+
+# Model check (exhaustive state exploration)
+quint verify specs/framework/circuit_breaker.qnt --invariant reject_bound
+```
+
+## Relationship to Code
+
+Quint specs are **not compiled** into the running system. They serve as:
+
+1. **Design validation** — Verify protocol correctness before implementation
+2. **Regression testing** — Catch protocol bugs during design changes
+3. **Documentation** — Precise, executable specification of system behavior
+
+The `conformance/` directory contains Rust tests that verify the implementation matches the spec.

@@ -1,0 +1,68 @@
+---
+title: Actions
+description: Server-side mutations and updates.
+---
+
+Actions are responsible for handling data mutations. Anytime a non-GET request (POST, PUT, PATCH, DELETE) is sent to your route, the `action` function is called.
+
+## The `action` Function
+
+Export an async function named `action` from your route module.
+
+```tsx
+import type { ActionArgs } from "neutron";
+import { redirect } from "neutron";
+
+export async function action({ request }: ActionArgs) {
+  const formData = await request.formData();
+  const name = formData.get("name");
+  
+  await db.projects.create({ name });
+  
+  return redirect("/projects");
+}
+```
+
+## `useActionData`
+
+Sometimes you want to return data from an action instead of redirecting (e.g., validation errors). You can access this data using `useActionData`.
+
+```tsx
+export async function action({ request }: ActionArgs) {
+  const formData = await request.formData();
+  if (!formData.get("email")) {
+    return { error: "Email is required" };
+  }
+  // ...
+  return { success: true };
+}
+
+export default function Signup() {
+  const actionData = useActionData<typeof action>();
+  
+  return (
+    <Form method="post">
+      {actionData?.error && <p className="error">{actionData.error}</p>}
+      <input name="email" />
+      <button>Sign Up</button>
+    </Form>
+  );
+}
+```
+
+## Action Arguments
+
+Similar to loaders, actions receive:
+-   `request`: The web Request object (contains the body/formData).
+-   `params`: Route parameters.
+-   `context`: App context.
+
+## Redirects
+
+It is common to redirect the user after a successful action. Use the `redirect` helper.
+
+```tsx
+import { redirect } from "neutron";
+// ...
+throw redirect("/dashboard"); // or return redirect("/dashboard")
+```

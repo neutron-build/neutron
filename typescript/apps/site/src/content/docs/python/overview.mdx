@@ -1,0 +1,68 @@
+---
+title: Python Framework
+description: Async web framework with Starlette, Pydantic, and Nucleus.
+---
+
+Neutron for Python is an async web framework built on Starlette and Pydantic v2. Typed handlers with automatic parameter extraction, structured middleware, and a full Nucleus client for all 14 data models.
+
+## Features
+
+- **Async-first** — Built on Starlette ASGI + asyncpg
+- **Type-safe** — Pydantic v2 validation for requests and responses
+- **Auto-extract** — Path, query, header, and body parameters from type annotations
+- **RFC 7807** — Standardized error responses
+- **OpenAPI 3.1** — Auto-generated from handler signatures
+- **14 data models** — Full Nucleus client
+
+## Hello World
+
+```python
+from neutron import App, Router
+
+app = App(title="My API", version="1.0.0")
+router = Router()
+
+@router.get("/")
+async def hello() -> dict:
+    return {"message": "Hello, Neutron!"}
+
+@router.get("/users/{user_id}")
+async def get_user(user_id: int) -> dict:
+    return {"id": user_id, "name": "Alice"}
+
+app.include_router(router)
+
+if __name__ == "__main__":
+    app.run(port=8000)
+```
+
+## Package Structure
+
+| Module | Purpose |
+|--------|---------|
+| `neutron.app` | ASGI application, middleware, lifecycle |
+| `neutron.router` | Typed route registration |
+| `neutron.handler` | Parameter extraction engine |
+| `neutron.middleware` | 7 built-in middleware |
+| `neutron.error` | RFC 7807 error responses |
+| `neutron.config` | Environment-based config |
+| `neutron.depends` | Dependency injection |
+| `neutron.nucleus` | Database client (all 14 models) |
+
+## Auto-Generated Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Health check |
+| `GET /openapi.json` | OpenAPI 3.1 spec |
+| `GET /docs` | Swagger UI |
+
+## Servers
+
+```python
+# Uvicorn (default, HTTP/1.1)
+app.run(port=8000)
+
+# Granian (Rust/Tokio, HTTP/2)
+app.run(port=8000, server="granian")
+```

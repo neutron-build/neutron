@@ -1,0 +1,95 @@
+---
+title: Kani
+description: Bounded model checking for Rust — verify your logic is correct across all possible inputs.
+---
+
+# Kani
+
+[Kani](https://github.com/model-checking/kani) is a bounded model checker for Rust, built by AWS. It automatically verifies that your Rust code is free of panics, overflows, out-of-bounds access, and assertion violations — across all possible inputs up to a configurable bound.
+
+## What Kani Does
+
+You write a **proof harness** (like a test, but exhaustive) and Kani checks every possible input:
+
+```rust
+use neutron::handler::{Request, Response};
+
+fn calculate_discount(price: u64, percent: u8) -> u64 {
+    price - (price * percent as u64 / 100)
+}
+
+#[kani::proof]
+fn verify_discount_never_overflows() {
+    let price: u64 = kani::any();
+    let percent: u8 = kani::any();
+    kani::assume(percent <= 100);
+    kani::assume(price <= 1_000_000_00); // max $1M in cents
+
+    let result = calculate_discount(price, percent);
+    assert!(result <= price); // discount can't exceed original price
+}
+```
+
+## What It Catches
+
+- **Arithmetic overflow/underflow** — integer wrapping, division by zero
+- **Out-of-bounds access** — array/slice indexing beyond length
+- **Unwrap on None/Err** — panics from `.unwrap()` on bad values
+- **Assertion violations** — any `assert!` or `debug_assert!` that can fail
+- **Undefined behavior in unsafe blocks** — null pointers, dangling references
+
+## How to Use
+
+### 1. Install Kani
+
+```bash
+cargo install --locked kani-verifier
+cargo kani setup
+```
+
+### 2. Write Proof Harnesses
+
+Add `#[kani::proof]` to functions in your test modules:
+
+```rust
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    #[kani::proof]
+    fn verify_auth_check() {
+        let role: u8 = kani::any();
+        let resource: u8 = kani::any();
+
+        // Kani tries ALL role/resource combinations
+        let allowed = check_permission(role, resource);
+
+        // Admin (role 0) should always have access
+        if role == 0 {
+            assert!(allowed);
+        }
+    }
+}
+```
+
+### 3. Run
+
+```bash
+cargo kani
+```
+
+Kani reports either **VERIFIED** (proven correct) or shows a concrete counterexample that triggers the bug.
+
+## Bounded vs Unbounded
+
+Kani is **bounded** — it checks all inputs up to a configurable limit. For most application code (handlers, business logic, data transforms), the default bounds are sufficient. For mathematical proofs over infinite domains, see [Lean 4](/lean).
+
+For full unbounded correctness proofs on Rust code, [Verus](/docs/verification/verus) will provide that capability when it becomes available as a standard cargo dependency.
+
+## When to Use Kani
+
+- Validating business logic (pricing, permissions, state machines)
+- Checking handler functions can't panic on any input
+- Verifying `unsafe` blocks in performance-critical code
+- Proving invariants in data structures (balanced trees, sorted arrays)
+- Pre-deploy confidence on critical code paths

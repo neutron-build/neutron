@@ -1,0 +1,33 @@
+---
+title: Caching Loaders
+description: Automatic performance for your data layer.
+---
+
+To maximize throughput and reduce database load, Neutron supports **Auto-Caching Loaders**.
+
+## Enabling Cache
+
+You can wrap your loader definition with a cache configuration.
+
+```ts
+// src/routes/dashboard.tsx
+export const loader = defineLoader(async ({ context }) => {
+  const stats = await context.db.query.stats.findMany();
+  return { stats };
+}, {
+  cache: {
+    ttl: 60, // Cache in Dragonfly for 60 seconds
+    key: "dashboard-stats"
+  }
+});
+```
+
+## How It Works
+
+1.  **Request**: When a request hits the route, Neutron checks Dragonfly for a valid cache entry.
+2.  **Hit**: If found, the cached JSON is returned immediately (0.1ms). No DB query is performed.
+3.  **Miss**: If not found, the loader executes, fetches data from the DB, and stores the result in Dragonfly for the next request.
+
+## Invalidation
+
+By default, the cache is invalidated when its TTL expires. However, Neutron's `action` handlers can be configured to automatically purge relevant cache keys after a mutation, ensuring users always see fresh data after an update.

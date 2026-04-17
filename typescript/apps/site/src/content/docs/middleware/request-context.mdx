@@ -1,0 +1,40 @@
+---
+title: Request Context
+description: Sharing data between middleware and loaders.
+---
+
+The `context` object is a shared mutable object that passes through the middleware chain and eventually arrives at your `loader` or `action`.
+
+## Populating Context
+
+Middleware can add data to the context.
+
+```ts
+// src/middleware.ts
+export const middleware = [
+  async (request, context, next) => {
+    const user = await getUserFromSession(request);
+    
+    // Add user to context
+    context.user = user;
+    
+    return next();
+  }
+];
+```
+
+## Consuming Context
+
+Your route handlers can then access this data.
+
+```tsx
+// src/routes/dashboard.tsx
+export async function loader({ context }: LoaderArgs) {
+  // Access data set by middleware
+  const user = context.user;
+  
+  return { user };
+}
+```
+
+This pattern is ideal for authentication (passing the user object) or dependency injection (passing a database client).

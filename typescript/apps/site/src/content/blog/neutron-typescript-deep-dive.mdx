@@ -1,0 +1,253 @@
+---
+title: "Neutron TypeScript: Zero-JS Static Routes and Full SSR App Routes"
+description: "Neutron's TypeScript framework has two distinct modes: static routes that ship zero JavaScript to the browser, and app routes with full interactivity powered by Preact signals. Learn how both work and when to use each."
+pubDate: 2026-03-01
+author: "Neutron Team"
+tags: ["typescript", "ssr", "preact", "routing", "performance", "frontend"]
+---
+
+Most frameworks make you choose: static site generator or application server. Neutron's TypeScript framework doesn't. Every route chooses its own mode. A marketing page can ship zero JavaScript. A dashboard can ship full interactivity. Same project, same conventions, same CLI.
+
+This post covers how both modes work, when to use each, and what the performance difference actually looks like.
+
+## The Two Modes
+
+**Static routes** — Files that export a `template` function. The server renders HTML. Nothing ships to the browser. No JavaScript runtime, no hydration, no bundle to parse. Sub-100ms loads from any CDN.
+
+**App routes** — Files that export a Preact component. The 3KB Preact runtime loads in the browser. Signals-based reactivity. Only interactive components hydrate — the "islands" architecture.
+
+The file extension determines the mode: `.ts` for static, `.tsx` for app routes.
+
+## Static Routes
+
+A static route is the simplest thing a Neutron file can be:
+
+```ts
+// src/routes/index.ts
+export async function loader({ db, request }) {
+  const posts = await db.query('SELECT id, title, slug FROM posts ORDER BY created_at DESC LIMIT 10');
+  return { posts };
+}
+
+export function template({ data }) {
+  return `
+    <main>
+      <h1>Latest Posts</h1>
+      <ul>
+        ${data.posts.map(p => `
+          <li><a href="/blog/${p.slug}">${p.title}</a></li>
+        `).join('')}
+      </ul>
+    </main>
+  `;
+}
+```
+
+Zero bytes of JavaScript ship to the browser. The `loader` runs on the server, the `template` function renders to HTML, and that HTML is sent directly to the client.
+
+Static routes support layouts, nested routes, error boundaries, and all the routing conventions. They just don't ship JavaScript.
+
+**When to use static routes:**
+- Marketing pages
+- Blog posts and docs
+- Landing pages
+- Any content that doesn't need client-side interactivity
+
+## App Routes
+
+App routes export a Preact component. The 3KB Preact runtime loads, and components can use signals for reactive state:
+
+```tsx
+// src/routes/dashboard.tsx
+import { signal, computed } from '@preact/signals';
+
+export async function loader({ db, request }) {
+  const user = await getUser(request);
+  const metrics = await db.query('SELECT * FROM metrics WHERE user_id = $1', [user.id]);
+  return { user, metrics };
+}
+
+export default function Dashboard({ data }) {
+  const filter = signal('all');
+  const filtered = computed(() =>
+    filter.value === 'all'
+      ? data.metrics
+      : data.metrics.filter(m => m.type === filter.value)
+  );
+
+  return (
+    <main>
+      <h1>Dashboard</h1>
+      <select onInput={e => filter.value = e.currentTarget.value}>
+        <option value="all">All metrics</option>
+        <option value="revenue">Revenue</option>
+        <option value="users">Users</option>
+      </select>
+      <MetricList metrics={filtered.value} />
+    </main>
+  );
+}
+```
+
+The `loader` still runs on the server before render. The component renders server-side first (SSR), then hydrates in the browser with the 3KB Preact runtime.
+
+**When to use app routes:**
+- Dashboards and admin panels
+- Anything with forms and real-time updates
+- Interactive data visualizations
+- User-facing app features
+
+## Loaders — Co-located Data Fetching
+
+Every route, static or app, can export a `loader`. Loaders run on the server before render. No `useEffect`, no client-side data fetching waterfalls, no loading spinners for initial data.
+
+```ts
+export async function loader({ db, request, params }) {
+  // params from the URL: /blog/[slug] → params.slug
+  const post = await db.queryOne(
+    'SELECT * FROM posts WHERE slug = $1',
+    [params.slug]
+  );
+
+  if (!post) {
+    throw new Response('Not Found', { status: 404 });
+  }
+
+  return { post };
+}
+```
+
+The loader's return value becomes the `data` prop passed to your template or component. It's fully type-safe — TypeScript infers the type from the loader's return type.
+
+## Actions — Server Mutations
+
+Actions handle form submissions and data mutations:
+
+```tsx
+// src/routes/blog/new.tsx
+export async function action({ request, db, redirect }) {
+  const form = await request.formData();
+  const title = form.get('title') as string;
+  const content = form.get('content') as string;
+
+  if (!title || title.length < 3) {
+    return { error: 'Title must be at least 3 characters' };
+  }
+
+  const slug = title.toLowerCase().replace(/\s+/g, '-');
+  await db.execute(
+    'INSERT INTO posts (title, slug, content) VALUES ($1, $2, $3)',
+    [title, slug, content]
+  );
+
+  return redirect(`/blog/${slug}`);
+}
+
+export default function NewPost({ actionData }) {
+  return (
+    <form method="POST">
+      {actionData?.error && <p class="error">{actionData.error}</p>}
+      <input name="title" placeholder="Post title" required />
+      <textarea name="content" placeholder="Write your post..." />
+      <button type="submit">Publish</button>
+    </form>
+  );
+}
+```
+
+Actions work without JavaScript (progressive enhancement), then enhance when Preact is available. The same action handler works for both `<form method="POST">` submissions and `fetch()` calls.
+
+## File-Based Routing
+
+Routes map directly to the file system:
+
+```
+src/routes/
+├── index.ts              → /
+├── about.ts              → /about
+├── blog/
+│   ├── index.ts          → /blog
+│   └── [slug].ts         → /blog/:slug
+├── api/
+│   ├── users.ts          → /api/users
+│   └── users/
+│       └── [id].ts       → /api/users/:id
+└── _layout.tsx           → Wraps all sibling routes
+```
+
+Dynamic segments use `[param]` syntax. Catch-all routes use `[...rest]`. Layouts use `_layout.ts` or `_layout.tsx` and wrap all sibling and child routes.
+
+## Islands Architecture
+
+In app routes, not every element needs to be interactive. The islands pattern lets you ship minimal JavaScript — only the components that actually need reactivity download and execute JavaScript.
+
+```tsx
+// src/routes/product/[id].tsx
+import AddToCart from '../../components/AddToCart.tsx'; // Interactive island
+import ReviewList from '../../components/ReviewList.tsx'; // Static — no hydration
+
+export default function ProductPage({ data }) {
+  return (
+    <main>
+      <h1>{data.product.name}</h1>
+      <p>{data.product.description}</p>
+
+      {/* This island hydrates and downloads JS */}
+      <AddToCart product={data.product} client:load />
+
+      {/* This renders to HTML only — no JS shipped */}
+      <ReviewList reviews={data.reviews} />
+    </main>
+  );
+}
+```
+
+The `client:load` directive marks a component as an island. Everything else renders to static HTML.
+
+## The Middleware Stack
+
+Every request passes through a 10-layer middleware stack:
+
+```
+Request ID → Logging → Recovery → CORS → Compression
+→ Rate Limit → Auth → Timeout → OpenTelemetry → Handler
+```
+
+You can add route-level middleware or global middleware:
+
+```ts
+// neutron.config.ts
+export default {
+  middleware: [
+    cors({ origins: ['https://myapp.com'] }),
+    rateLimit({ windowMs: 60_000, max: 100 }),
+    auth({ jwt: { secret: process.env.JWT_SECRET } }),
+  ],
+};
+```
+
+## Bundle Size Comparison
+
+This is the biggest practical difference between Neutron and alternatives:
+
+| Framework | Interactive Page (min JS) |
+|-----------|--------------------------|
+| Neutron (static route) | **0 KB** |
+| Neutron (app route) | **~3 KB** (Preact) |
+| Astro (with React island) | ~45 KB |
+| Remix | ~58 KB |
+| Next.js App Router | ~87 KB |
+
+Static routes are zero-cost. App routes pay the 3KB Preact tax. The dual-mode architecture means you can use the right tool for each page without switching frameworks.
+
+## Getting Started
+
+```bash
+npm create neutron@latest my-app
+cd my-app
+npm run dev
+```
+
+The scaffolder asks you a few questions (TypeScript? Static or SSR? Deployment target?) and generates a working project. Open `localhost:3000` and start editing files in `src/routes/`.
+
+The full routing, loader, action, and middleware documentation is at `/docs`.

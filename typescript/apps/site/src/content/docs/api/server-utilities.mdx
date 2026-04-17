@@ -1,0 +1,30 @@
+---
+title: Server Utilities
+description: Helpers for server-side code.
+---
+
+Utilities available from `neutron`. These should generally only be used in `loader` and `action` functions.
+
+## `redirect`
+
+Throws a redirect response.
+
+```tsx
+import { redirect } from "neutron";
+
+export async function action() {
+  throw redirect("/login");
+}
+```
+
+## Response Helpers
+
+Neutron uses standard [Response](https://developer.mozilla.org/en-US/docs/Web/API/Response) objects. You can construct them directly.
+
+```tsx
+export async function loader() {
+  if (!found) {
+    throw new Response("Not Found", { status: 404 });
+  }
+}
+```

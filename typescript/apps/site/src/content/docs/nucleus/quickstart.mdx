@@ -1,0 +1,91 @@
+---
+title: Quick Start
+description: Get Nucleus running in 60 seconds.
+---
+
+## Install
+
+Download the binary for your platform:
+
+```bash
+# macOS (Apple Silicon)
+curl -L https://github.com/neutron-build/neutron/releases/latest/download/nucleus-darwin-arm64 -o nucleus
+chmod +x nucleus
+
+# macOS (Intel)
+curl -L https://github.com/neutron-build/neutron/releases/latest/download/nucleus-darwin-amd64 -o nucleus
+chmod +x nucleus
+
+# Linux (x86_64)
+curl -L https://github.com/neutron-build/neutron/releases/latest/download/nucleus-linux-amd64 -o nucleus
+chmod +x nucleus
+```
+
+Or use the Neutron CLI:
+
+```bash
+neutron db start
+```
+
+## Start the Server
+
+```bash
+./nucleus --port 5432 --data-dir ./data
+```
+
+Nucleus is now listening on port 5432 with the PostgreSQL wire protocol.
+
+## Connect
+
+```bash
+psql -h localhost -p 5432 -U neutron
+```
+
+## Create a Table
+
+```sql
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  email TEXT UNIQUE,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+INSERT INTO users (name, email)
+VALUES ('Alice', 'alice@example.com');
+
+SELECT * FROM users;
+```
+
+## Try Multi-Model
+
+Once connected, you can use any of the 14 data models through SQL extensions:
+
+```sql
+-- Key-Value
+SELECT KV_SET('session:abc', '{"user_id": 1}', 3600);
+SELECT KV_GET('session:abc');
+
+-- Vector search
+CREATE TABLE embeddings (id SERIAL, vec Vector(3));
+INSERT INTO embeddings (vec) VALUES (VECTOR('[1.0, 0.5, 0.3]'));
+SELECT * FROM embeddings
+  ORDER BY VECTOR_DISTANCE(vec, VECTOR('[1.0, 0.4, 0.2]'), 'l2')
+  LIMIT 5;
+
+-- Full-text search
+SELECT FTS_SEARCH('users', 'alice', 10);
+
+-- Document (JSONB)
+CREATE TABLE profiles (id SERIAL, data JSONB);
+INSERT INTO profiles (data)
+VALUES ('{"name": "Alice", "tags": ["admin", "dev"]}');
+SELECT data->>'name' FROM profiles WHERE data->'tags' ? 'admin';
+```
+
+## Next Steps
+
+- [SQL Reference](/docs/nucleus/sql) — Full SQL syntax
+- [Key-Value](/docs/nucleus/key-value) — Redis-like operations
+- [Vector Search](/docs/nucleus/vector) — Similarity search for AI
+- [Configuration](/docs/nucleus/configuration) — Tuning and options

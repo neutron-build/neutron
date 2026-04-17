@@ -1,0 +1,287 @@
+---
+title: "Getting Started with Neutron in 5 Minutes"
+description: "From zero to a working Neutron app with file-based routing, a data loader, and a Nucleus database connection. This guide walks you through the TypeScript framework from installation to your first deployed route."
+pubDate: 2026-02-28
+author: "Neutron Team"
+tags: ["tutorial", "getting-started", "typescript", "beginner"]
+---
+
+This guide gets you from an empty directory to a running Neutron TypeScript app with file-based routing, a data loader, a form action, and a Nucleus database connection. No prior Neutron experience required.
+
+**Prerequisites:** Node.js 20 or later. Basic TypeScript familiarity.
+
+## Installation
+
+```bash
+npm create neutron@latest my-app
+```
+
+The scaffolder asks a few questions:
+
+```
+? Project name: my-app
+? Framework: TypeScript
+? Default route mode: Static (zero JS) / App (Preact SSR)
+? Deployment target: Node.js / Cloudflare Workers / Vercel / Static
+? Include Nucleus database: Yes
+```
+
+Then:
+
+```bash
+cd my-app
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000`. You should see the default Neutron welcome page.
+
+## Project Structure
+
+```
+my-app/
+├── src/
+│   ├── routes/           # File-based routing
+│   │   ├── index.ts      # → /
+│   │   └── _layout.tsx   # Wraps all routes
+│   ├── components/       # Shared UI components
+│   ├── middleware/       # Route or global middleware
+│   └── styles/
+│       └── global.css
+├── neutron.config.ts     # Framework configuration
+├── tsconfig.json
+└── package.json
+```
+
+Routes map directly to URLs. `src/routes/index.ts` → `/`. `src/routes/blog/index.ts` → `/blog`. `src/routes/blog/[slug].ts` → `/blog/:slug`.
+
+## Your First Static Route
+
+Open `src/routes/index.ts`. Replace its contents:
+
+```ts
+// src/routes/index.ts
+export async function loader() {
+  const posts = [
+    { id: 1, title: 'Hello World', slug: 'hello-world' },
+    { id: 2, title: 'Getting Started', slug: 'getting-started' },
+  ];
+  return { posts };
+}
+
+export function template({ data }) {
+  return `
+    <main style="font-family: sans-serif; max-width: 600px; margin: 80px auto; padding: 0 20px">
+      <h1>My Blog</h1>
+      <ul>
+        ${data.posts.map(p => `
+          <li><a href="/blog/${p.slug}">${p.title}</a></li>
+        `).join('')}
+      </ul>
+    </main>
+  `;
+}
+```
+
+Save. The page reloads automatically. This route ships **zero bytes of JavaScript** to the browser — pure server-rendered HTML.
+
+## Adding a Dynamic Route
+
+Create `src/routes/blog/[slug].ts`:
+
+```ts
+// src/routes/blog/[slug].ts
+const posts = {
+  'hello-world': { title: 'Hello World', content: 'Welcome to my blog.' },
+  'getting-started': { title: 'Getting Started', content: 'Let\'s build something.' },
+};
+
+export async function loader({ params }) {
+  const post = posts[params.slug];
+
+  if (!post) {
+    throw new Response('Not Found', { status: 404 });
+  }
+
+  return { post };
+}
+
+export function template({ data }) {
+  return `
+    <main style="font-family: sans-serif; max-width: 600px; margin: 80px auto; padding: 0 20px">
+      <a href="/">&larr; Back</a>
+      <h1>${data.post.title}</h1>
+      <p>${data.post.content}</p>
+    </main>
+  `;
+}
+```
+
+Visit `http://localhost:3000/blog/hello-world`. The `params.slug` value comes from the URL.
+
+## Connecting to Nucleus
+
+Open `neutron.config.ts`:
+
+```ts
+// neutron.config.ts
+import { defineConfig } from 'neutron';
+
+export default defineConfig({
+  database: {
+    url: process.env.DATABASE_URL ?? 'postgresql://localhost:5432/myapp',
+  },
+});
+```
+
+The `npm run dev` command starts a local Nucleus instance automatically. Connection string: `postgresql://localhost:5432/neutron`.
+
+Now use the database in a loader:
+
+```ts
+// src/routes/index.ts
+export async function loader({ db }) {
+  const posts = await db.query(
+    'SELECT id, title, slug, created_at FROM posts ORDER BY created_at DESC LIMIT 10'
+  );
+  return { posts };
+}
+
+export function template({ data }) {
+  return `
+    <main style="font-family: sans-serif; max-width: 600px; margin: 80px auto; padding: 0 20px">
+      <h1>My Blog</h1>
+      ${data.posts.length === 0
+        ? '<p>No posts yet.</p>'
+        : `<ul>${data.posts.map(p => `
+            <li><a href="/blog/${p.slug}">${p.title}</a></li>
+          `).join('')}</ul>`
+      }
+    </main>
+  `;
+}
+```
+
+The `db` object is injected by the framework. It's a connection to your local Nucleus instance. Use standard SQL — Nucleus speaks PostgreSQL wire protocol.
+
+## Adding a Form (Action)
+
+Create a route with an action to handle form submissions:
+
+```ts
+// src/routes/posts/new.ts
+export async function action({ request, db, redirect }) {
+  const form = await request.formData();
+  const title = form.get('title') as string;
+
+  if (!title || title.trim().length < 3) {
+    return { error: 'Title must be at least 3 characters' };
+  }
+
+  const slug = title.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+
+  await db.execute(
+    'INSERT INTO posts (title, slug, content) VALUES ($1, $2, $3)',
+    [title.trim(), slug, '']
+  );
+
+  return redirect('/');
+}
+
+export function template({ actionData }) {
+  return `
+    <main style="font-family: sans-serif; max-width: 600px; margin: 80px auto; padding: 0 20px">
+      <a href="/">&larr; Back</a>
+      <h1>New Post</h1>
+      ${actionData?.error ? `<p style="color: red">${actionData.error}</p>` : ''}
+      <form method="POST" style="display: flex; flex-direction: column; gap: 12px">
+        <input name="title" placeholder="Post title" required
+          style="padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 16px" />
+        <button type="submit"
+          style="padding: 8px 16px; background: #0070f3; color: white; border: none; border-radius: 4px; cursor: pointer">
+          Create Post
+        </button>
+      </form>
+    </main>
+  `;
+}
+```
+
+Visit `http://localhost:3000/posts/new`. The form works without any JavaScript — pure HTML form submission. When JavaScript is available, Neutron enhances it with a fetch-based submission.
+
+## Switching to an App Route (Preact)
+
+Rename the file to `.tsx` and export a Preact component:
+
+```tsx
+// src/routes/index.tsx
+import { signal } from '@preact/signals';
+
+export async function loader({ db }) {
+  const posts = await db.query('SELECT id, title, slug FROM posts ORDER BY created_at DESC');
+  return { posts };
+}
+
+export default function HomePage({ data }) {
+  const search = signal('');
+  const filtered = data.posts.filter(p =>
+    p.title.toLowerCase().includes(search.value.toLowerCase())
+  );
+
+  return (
+    <main style={{ fontFamily: 'sans-serif', maxWidth: 600, margin: '80px auto', padding: '0 20px' }}>
+      <h1>My Blog</h1>
+      <input
+        placeholder="Search posts..."
+        onInput={e => search.value = e.currentTarget.value}
+        style={{ padding: 8, border: '1px solid #ccc', borderRadius: 4, fontSize: 16, width: '100%' }}
+      />
+      <ul>
+        {filtered.map(p => (
+          <li key={p.id}><a href={`/blog/${p.slug}`}>{p.title}</a></li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+```
+
+This ships the ~3KB Preact runtime to the browser and enables client-side reactivity. The search input filters posts without a page reload.
+
+## Deployment
+
+**Static (CDN):**
+```bash
+npm run build -- --static
+# Deploy dist/ to any CDN (S3, Cloudflare Pages, Netlify)
+```
+
+**Cloudflare Workers:**
+```bash
+npm run build -- --target=cloudflare
+npx wrangler deploy
+```
+
+**Vercel:**
+Push to GitHub. Vercel auto-detects Neutron and deploys. Or:
+```bash
+npx vercel deploy
+```
+
+**Docker:**
+```bash
+npm run build -- --target=docker
+docker build -t my-app .
+docker run -p 3000:3000 my-app
+```
+
+The Docker image is typically 45-60MB.
+
+## What's Next
+
+- **Middleware:** Add authentication, rate limiting, or custom headers in `src/middleware/`
+- **Layouts:** Create `_layout.tsx` files to wrap groups of routes with shared UI
+- **Multiple data models:** Use vector search, full-text search, or graph queries via the same `db` connection
+- **Full documentation:** `/docs` covers everything — routing, loaders, actions, middleware, deployment, and Nucleus integration
+
+The full source for this tutorial is in the Neutron GitHub repo under `examples/blog`.

@@ -1,0 +1,121 @@
+---
+title: Shuttle
+description: Deterministic concurrency testing for Rust — find race conditions and deadlocks systematically.
+---
+
+# Shuttle
+
+[Shuttle](https://github.com/awslabs/shuttle) is a deterministic concurrency testing library for Rust, built by AWS. It finds race conditions, deadlocks, and ordering bugs by systematically exploring all possible thread interleavings — bugs that normal tests miss because they depend on timing.
+
+## What Shuttle Does
+
+Normal concurrent tests run once with whatever thread scheduling the OS picks. Shuttle runs your code **thousands of times** with different schedules, finding the one interleaving that triggers a bug:
+
+```rust
+use shuttle::sync::{Arc, Mutex};
+use shuttle::thread;
+
+#[test]
+fn test_concurrent_counter() {
+    shuttle::check_random(|| {
+        let counter = Arc::new(Mutex::new(0));
+        let mut handles = vec![];
+
+        for _ in 0..4 {
+            let c = counter.clone();
+            handles.push(thread::spawn(move || {
+                let mut val = c.lock().unwrap();
+                *val += 1;
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(*counter.lock().unwrap(), 4);
+    }, 10_000); // explore 10,000 different schedules
+}
+```
+
+## What It Catches
+
+- **Race conditions** — data corruption from unsynchronized access
+- **Deadlocks** — circular lock dependencies that freeze your app
+- **Ordering bugs** — logic that accidentally depends on thread timing
+- **Livelock** — threads that keep retrying without making progress
+- **Atomicity violations** — check-then-act patterns that break under concurrency
+
+## How to Use
+
+### 1. Add Dependency
+
+```toml
+[dev-dependencies]
+shuttle = "0.x"
+```
+
+### 2. Replace std Primitives
+
+In your test code, use Shuttle's drop-in replacements:
+
+```rust
+// Instead of:
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+// Use:
+use shuttle::sync::{Arc, Mutex};
+use shuttle::thread;
+```
+
+### 3. Wrap in `check_random` or `check_dfs`
+
+```rust
+#[test]
+fn test_my_concurrent_code() {
+    // Random exploration — fast, good for most cases
+    shuttle::check_random(|| {
+        // your concurrent code here
+    }, 10_000);
+}
+
+#[test]
+fn test_exhaustive() {
+    // Depth-first search — slower, explores ALL interleavings
+    shuttle::check_dfs(|| {
+        // your concurrent code here
+    });
+}
+```
+
+### 4. Run with Normal Cargo
+
+```bash
+cargo test
+```
+
+Shuttle runs as part of your normal test suite — no special toolchain needed.
+
+## When to Use Shuttle
+
+- Connection pool implementations
+- Cache invalidation logic
+- Background job workers with shared state
+- Any handler that touches shared mutable state
+- Database transaction managers
+- Lock-free data structures
+- Message passing between async tasks
+
+## Kani + Shuttle Together
+
+Kani and Shuttle are complementary:
+
+| | Kani | Shuttle |
+|---|---|---|
+| Checks | Logic correctness | Concurrency safety |
+| Explores | All possible values | All possible schedules |
+| Finds | Panics, overflows, assertion failures | Races, deadlocks, ordering bugs |
+| How | Model checking (SMT solver) | Schedule exploration |
+
+Use both for maximum coverage — Kani proves your logic, Shuttle proves your concurrency.

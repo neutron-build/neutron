@@ -1,0 +1,37 @@
+---
+title: Schemas
+description: Validating content with Zod.
+---
+
+Neutron uses [Zod](https://zod.dev/) to validate the frontmatter of your content files. This ensures your content matches your expected shape and provides TypeScript types for your data.
+
+## Common Validators
+
+```ts
+import { z } from "neutron/content";
+
+// Strings
+z.string()
+z.string().email()
+z.string().url()
+
+// Numbers
+z.number()
+z.number().min(1)
+
+// Dates
+z.date()
+
+// Arrays
+z.array(z.string())
+
+// Enums
+z.enum(["red", "green", "blue"])
+
+// Relation (reference to another collection entry)
+// (Future feature)
+```
+
+## Build Errors
+
+If a content file does not match the schema, `neutron build` will fail with a helpful error message pointing to the specific file and field that is invalid. This prevents broken pages from ever reaching production.

@@ -1,0 +1,74 @@
+---
+title: Verification Overview
+description: Formal verification tools for Neutron Rust — prove your code is correct, not just tested.
+---
+
+# Verification
+
+Neutron Rust includes built-in support for formal verification — tools that mathematically prove your code is correct, not just test it with sample inputs.
+
+## Why Verification?
+
+Testing checks a few inputs and hopes for the best. Verification proves correctness for **all possible inputs**.
+
+| | Testing | Verification |
+|---|---|---|
+| Coverage | Sample inputs | All possible inputs |
+| Guarantee | "No bugs found" | "No bugs can exist" |
+| Edge cases | Must think of them | Proven for all cases |
+| Confidence | Probabilistic | Mathematical certainty |
+
+## Tools
+
+Neutron ships with two verification tools as cargo dependencies — zero extra runtimes, zero extra toolchains.
+
+### [Kani](/docs/verification/kani) — Logic Verification
+
+Bounded model checker for Rust. Checks that your functions can't panic, overflow, or violate assertions — across all possible inputs up to a bound.
+
+```rust
+#[kani::proof]
+fn check_transfer() {
+    let balance: u64 = kani::any();
+    let amount: u64 = kani::any();
+    kani::assume(amount <= balance);
+    let result = balance - amount;
+    assert!(result <= balance); // Kani proves this for ALL valid inputs
+}
+```
+
+### [Shuttle](/docs/verification/shuttle) — Concurrency Verification
+
+Deterministic concurrency testing. Finds race conditions, deadlocks, and ordering bugs by systematically exploring all possible thread interleavings.
+
+```rust
+#[test]
+fn check_no_deadlock() {
+    shuttle::check_random(|| {
+        // Shuttle explores all possible orderings
+        let lock_a = Arc::new(Mutex::new(0));
+        let lock_b = Arc::new(Mutex::new(0));
+        // ... your concurrent code here
+    }, 1000);
+}
+```
+
+### [Verus](/docs/verification/verus) — Full Correctness Proofs (Coming Soon)
+
+Deductive verification for Rust. Unlike Kani's bounded checking, Verus proves correctness for **all inputs without bounds** — mathematical proof, not brute force. Currently requires a compiler fork; will be integrated when it becomes a standard cargo dependency.
+
+## Zero Runtime Cost
+
+All verification runs at build/dev time only. Nothing ships in your binary. Your production code is identical whether you verified it or not — verification produces confidence, not extra code.
+
+## Getting Started
+
+Add to your `Cargo.toml`:
+
+```toml
+[dev-dependencies]
+kani-verifier = "0.x"
+shuttle = "0.x"
+```
+
+Then write proof harnesses alongside your tests and run with `cargo kani` or `cargo test` (for Shuttle).

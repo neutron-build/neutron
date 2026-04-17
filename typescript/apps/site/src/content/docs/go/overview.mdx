@@ -1,0 +1,81 @@
+---
+title: Go Framework
+description: Net/http-based framework with typed handlers and Nucleus integration.
+---
+
+Neutron for Go is a lightweight web framework built on `net/http`. Type-safe generic handlers, composable middleware, and first-class Nucleus integration.
+
+## Features
+
+- **stdlib-based** — 100% compatible with `net/http` ecosystem
+- **Generic handlers** — `HandlerFunc[In, Out any]` with automatic extraction
+- **OpenAPI 3.1** — Auto-generated from route metadata
+- **RFC 7807** — Standardized error responses
+- **14 data models** — Full Nucleus client for all database models
+- **Real-time** — WebSocket hub + SSE broadcasting
+
+## Hello World
+
+```go
+package main
+
+import (
+    "context"
+    "github.com/neutron-dev/neutron-go/neutron"
+)
+
+func main() {
+    app := neutron.New(
+        neutron.WithMiddleware(
+            neutron.Logger(nil),
+            neutron.Recover(),
+            neutron.RequestID(),
+        ),
+    )
+
+    neutron.Get(app.Router(), "/", func(ctx context.Context, _ neutron.Empty) (string, error) {
+        return "Hello, Neutron!", nil
+    })
+
+    app.Run(":8080")
+}
+```
+
+## Package Structure
+
+| Package | Purpose |
+|---------|---------|
+| `neutron` | Core framework (router, handlers, middleware, config) |
+| `nucleus` | Database client for all 14 Nucleus data models |
+| `neutronauth` | JWT, sessions, RBAC, API keys |
+| `neutroncache` | L1 (LRU) + L2 (Nucleus KV) tiered cache |
+| `neutronjobs` | Background job queue + cron scheduling |
+| `neutronrealtime` | WebSocket hub + SSE |
+| `neutrontest` | Test helpers |
+| `neutroncli` | Dev server, code generation, scaffolding |
+
+## App Configuration
+
+```go
+app := neutron.New(
+    neutron.WithLogger(slog.Default()),
+    neutron.WithLifecycle(db.LifecycleHook()),
+    neutron.WithOpenAPIInfo("My API", "1.0.0"),
+    neutron.WithMiddleware(
+        neutron.Logger(logger),
+        neutron.Recover(),
+        neutron.RequestID(),
+        neutron.CORS(neutron.CORSOptions{AllowOrigins: []string{"*"}}),
+        neutron.RateLimit(100, 1000),
+        neutron.Timeout(30 * time.Second),
+        neutron.Compress(gzip.DefaultCompression),
+    ),
+)
+
+app.Run(":8080")  // Graceful shutdown on SIGTERM/SIGINT
+```
+
+Auto-provides:
+- `GET /health` — Health check endpoint
+- `GET /openapi.json` — OpenAPI 3.1 spec
+- `GET /docs` — Swagger UI

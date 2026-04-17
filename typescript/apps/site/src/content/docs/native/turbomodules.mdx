@@ -1,0 +1,678 @@
+---
+title: TurboModules & Device APIs
+description: JSI-based native module bindings for camera, location, biometrics, and more.
+---
+
+Neutron Native provides two layers for accessing native device capabilities: **TurboModules** (low-level JSI bindings) and **Device Modules** (high-level wrappers around community packages). Both are accessed through `@neutron/native`.
+
+## How TurboModules Work
+
+TurboModules use React Native's JSI (JavaScript Interface) to call native code directly from JavaScript — no JSON serialization, no async bridge queue. Synchronous methods run on the JS thread with zero overhead. Async methods return real promises backed by native dispatch.
+
+```
+┌─────────────┐    JSI (C++)    ┌──────────────────┐
+│  JavaScript  │ ◄────────────► │  Native (ObjC/Kt) │
+│  useCamera() │   direct call  │  AVCaptureSession  │
+└─────────────┘                 └──────────────────┘
+```
+
+Compared to the old React Native bridge (JSON encode → async queue → JSON decode), TurboModules are:
+
+- **Synchronous** — sync methods return instantly, no round-trip
+- **Type-safe** — TypeScript interfaces match native method signatures
+- **Lazy-loaded** — modules are instantiated on first access, not at startup
+
+## Two API Layers
+
+| Layer | Import | Use when... |
+|-------|--------|-------------|
+| **TurboModule hooks** | `@neutron/native/turbomodule` | You want direct JSI access with `NativeResult` wrappers |
+| **Device modules** | `@neutron/native/device` | You want high-level functions that auto-detect Expo or bare RN packages |
+
+The TurboModule hooks (`useCamera`, `useLocation`, etc.) talk directly to native code via JSI. The device modules (`camera.takePicture`, `location.getCurrentPosition`, etc.) wrap popular community packages (expo-camera, react-native-image-picker, etc.) behind a unified API.
+
+## Built-in Device Modules
+
+All 10 device modules are available from `@neutron/native/turbomodule` (hooks) and `@neutron/native/device` (functions).
+
+### Camera
+
+Photo and video capture via native camera APIs.
+
+- **iOS:** AVCaptureSession
+- **Android:** CameraX
+- **Peer deps:** `expo-camera` or `react-native-image-picker`
+
+```tsx
+import { useCamera } from '@neutron/native/turbomodule';
+
+function PhotoButton() {
+    const camera = useCamera();
+
+    async function handleCapture() {
+        const result = await camera.capture({ facing: 'back', quality: 0.9 });
+        if (result.ok) {
+            console.log(result.value.uri);   // file:///path/to/photo.jpg
+            console.log(result.value.width);  // 4032
+        }
+    }
+
+    return <Pressable onPress={handleCapture}><Text>Take Photo</Text></Pressable>;
+}
+```
+
+Or use the device module for auto-detection of installed packages:
+
+```ts
+import { camera } from '@neutron/native/device';
+
+const photo = await camera.takePicture({ quality: 0.9, facing: 'back' });
+if (photo) console.log(photo.uri);
+
+const picks = await camera.pickFromGallery({ multiple: true, selectionLimit: 5 });
+```
+
+**Key methods:**
+
+| Method | Kind | Description |
+|--------|------|-------------|
+| `capture(options?)` | async | Open native camera UI, return captured media |
+| `pickFromGallery(options?)` | async | Pick from photo library |
+| `isAvailable()` | sync | Check if camera hardware exists |
+| `checkPermission()` | async | Check permission without prompting |
+
+### Location
+
+GPS and network-based geolocation.
+
+- **iOS:** CoreLocation (CLLocationManager)
+- **Android:** FusedLocationProviderClient
+- **Peer deps:** `expo-location` or `@react-native-community/geolocation`
+
+```tsx
+import { useLocation } from '@neutron/native/turbomodule';
+
+function LocationTracker() {
+    const location = useLocation();
+
+    async function getPosition() {
+        const pos = await location.getCurrentPosition({ accuracy: 'best', timeout: 10000 });
+        if (pos.ok) {
+            console.log(pos.value.latitude, pos.value.longitude);
+        }
+    }
+
+    // Continuous tracking
+    const sub = location.watchPosition(
+        (coord) => console.log(coord.latitude, coord.longitude),
+        { distanceFilter: 10 },
+    );
+    // later: sub.remove()
+}
+```
+
+**Key methods:**
+
+| Method | Kind | Description |
+|--------|------|-------------|
+| `getCurrentPosition(options?)` | async | One-shot position fix |
+| `watchPosition(callback, options?)` | sync | Continuous position updates, returns subscription |
+| `isServicesEnabled()` | async | Check if location services are on at OS level |
+| `requestPermission(level)` | async | Request `'when-in-use'` or `'always'` permission |
+
+### Notifications
+
+Local and push notification management.
+
+- **iOS:** UNUserNotificationCenter + APNS
+- **Android:** FCM + NotificationManager
+- **Peer deps:** `expo-notifications` or `@react-native-firebase/messaging`
+
+```tsx
+import { useNotifications } from '@neutron/native/turbomodule';
+
+const notif = useNotifications();
+
+// Request permission
+await notif.requestPermission();
+
+// Get push token
+const token = await notif.getToken();
+if (token.ok) sendTokenToServer(token.value);
+
+// Schedule a local notification
+await notif.scheduleLocal({
+    title: 'Reminder',
+    body: 'Check in with your team!',
+    fireAfter: 3600,       // 1 hour from now
+    repeat: 'day',
+});
+
+// Listen for foreground notifications
+const sub = notif.onReceived((payload) => {
+    console.log('Received:', payload.title);
+});
+```
+
+**Key methods:**
+
+| Method | Kind | Description |
+|--------|------|-------------|
+| `requestPermission()` | async | Request notification permission |
+| `getToken()` | async | Get APNS/FCM push token |
+| `scheduleLocal(payload)` | async | Schedule a local notification |
+| `cancel(id)` / `cancelAll()` | async | Cancel scheduled notifications |
+| `getBadgeCount()` / `setBadgeCount(n)` | async | Badge management (iOS) |
+| `onReceived(callback)` | sync | Listen for foreground notifications |
+| `onResponse(callback)` | sync | Listen for notification taps |
+
+### Biometrics
+
+Fingerprint and face authentication.
+
+- **iOS:** LocalAuthentication (LAContext) — Face ID / Touch ID
+- **Android:** BiometricPrompt (AndroidX)
+- **Peer deps:** `expo-local-authentication` or `react-native-biometrics`
+
+```tsx
+import { useBiometrics } from '@neutron/native/turbomodule';
+
+const bio = useBiometrics();
+
+// Check hardware capability
+const { available, biometryType } = await bio.isAvailable();
+// biometryType: 'FaceID' | 'TouchID' | 'Fingerprint' | 'Iris' | 'none'
+
+if (available) {
+    const result = await bio.authenticate({
+        reason: 'Confirm payment',
+        title: 'Authentication Required',
+        allowDeviceCredential: true,
+    });
+    if (result.success) proceedWithPayment();
+}
+```
+
+**Key methods:**
+
+| Method | Kind | Description |
+|--------|------|-------------|
+| `isAvailable()` | async | Check hardware and get biometry type |
+| `authenticate(options?)` | async | Prompt user for biometric auth |
+| `isEnrolled()` | async | Check if biometric data is enrolled |
+
+### Haptics
+
+Tactile feedback using the device vibration motor.
+
+- **iOS:** UIImpactFeedbackGenerator / UINotificationFeedbackGenerator (Taptic Engine)
+- **Android:** Vibrator / VibrationEffect (API 26+)
+- **Peer deps:** `expo-haptics` (optional; falls back to `Vibration` API)
+
+```tsx
+import { useHaptics } from '@neutron/native/turbomodule';
+
+const haptics = useHaptics();
+
+// Impact feedback — use on button presses
+haptics.impact('medium');    // 'light' | 'medium' | 'heavy'
+
+// Notification feedback — use for success/failure states
+haptics.notification('success');   // 'success' | 'warning' | 'error'
+
+// Selection feedback — use on picker/toggle changes
+haptics.selection();
+
+// Raw vibration (ms)
+haptics.vibrate(100);
+```
+
+All haptics methods are **synchronous** — they fire instantly on the JS thread.
+
+**Key methods:**
+
+| Method | Kind | Description |
+|--------|------|-------------|
+| `impact(style)` | sync | Impact feedback: `'light'`, `'medium'`, `'heavy'`, `'success'`, `'warning'`, `'error'`, `'selection'` |
+| `notification(type)` | sync | Notification feedback: `'success'`, `'warning'`, `'error'` |
+| `selection()` | sync | Selection change tap |
+| `vibrate(duration?)` | sync | Raw vibration in ms |
+| `isAvailable()` | sync | Check if haptics hardware exists |
+
+### Clipboard
+
+System clipboard read/write.
+
+- **iOS:** UIPasteboard.general
+- **Android:** ClipboardManager
+- **Peer deps:** `@react-native-clipboard/clipboard` or `expo-clipboard`
+
+```tsx
+import { useClipboard } from '@neutron/native/turbomodule';
+
+const clipboard = useClipboard();
+
+// Copy text
+clipboard.setString('https://neutron.dev');
+
+// Paste text
+const text = await clipboard.getString();
+
+// Check before reading
+if (await clipboard.hasString()) {
+    const content = await clipboard.getString();
+}
+
+// Listen for changes
+const sub = clipboard.onChange(({ content }) => {
+    console.log('Clipboard changed:', content);
+});
+// later: sub.remove()
+```
+
+**Key methods:**
+
+| Method | Kind | Description |
+|--------|------|-------------|
+| `getString()` | async | Get clipboard text |
+| `setString(text)` | sync | Set clipboard text |
+| `hasString()` | async | Check if clipboard has text |
+| `getImage()` / `setImage(base64)` | async/sync | Image clipboard (base64) |
+| `onChange(callback)` | sync | Listen for clipboard changes |
+
+### AsyncStorage
+
+Persistent key-value storage that survives app restarts.
+
+- **iOS:** UserDefaults (small values) / filesystem (large values)
+- **Android:** SharedPreferences (small values) / filesystem (large values)
+- **Peer deps:** `@react-native-async-storage/async-storage` or `expo-secure-store`
+
+```tsx
+import { useAsyncStorage } from '@neutron/native/turbomodule';
+
+const storage = useAsyncStorage();
+
+// Basic CRUD
+await storage.setItem('user.token', 'abc123');
+const token = await storage.getItem('user.token');  // 'abc123'
+await storage.removeItem('user.token');
+
+// Batch operations
+await storage.multiSet([
+    ['theme', 'dark'],
+    ['locale', 'en-US'],
+    ['onboarded', 'true'],
+]);
+const values = await storage.multiGet(['theme', 'locale']);
+// [['theme', 'dark'], ['locale', 'en-US']]
+
+// List all keys
+const keys = await storage.getAllKeys();
+
+// Nuclear option
+await storage.clear();
+```
+
+When no native module is linked (e.g., in tests or web), AsyncStorage falls back to an in-memory `Map`.
+
+**Key methods:**
+
+| Method | Kind | Description |
+|--------|------|-------------|
+| `getItem(key)` | async | Get value (returns `null` if missing) |
+| `setItem(key, value)` | async | Set a key-value pair |
+| `removeItem(key)` | async | Delete a key |
+| `multiGet(keys)` | async | Batch get |
+| `multiSet(pairs)` | async | Batch set |
+| `getAllKeys()` | async | List all keys |
+| `clear()` | async | Delete everything |
+
+### NetInfo
+
+Network connectivity monitoring.
+
+- **iOS:** NWPathMonitor (Network framework)
+- **Android:** ConnectivityManager
+- **Peer deps:** `@react-native-community/netinfo`
+
+```tsx
+import { useNetInfo } from '@neutron/native/turbomodule';
+
+const netInfo = useNetInfo();
+
+// One-shot check
+const state = await netInfo.fetch();
+console.log(state.type);                // 'wifi' | 'cellular' | 'ethernet' | ...
+console.log(state.isConnected);         // true
+console.log(state.details?.ssid);       // 'MyNetwork'
+console.log(state.details?.cellularGeneration);  // '5g'
+
+// Continuous monitoring
+const sub = netInfo.addEventListener((state) => {
+    if (!state.isConnected) showOfflineBanner();
+});
+// later: sub.remove()
+
+// Simple boolean check
+const online = await netInfo.isConnected();
+```
+
+**Key methods:**
+
+| Method | Kind | Description |
+|--------|------|-------------|
+| `fetch()` | async | Get current network state snapshot |
+| `addEventListener(callback)` | sync | Subscribe to network changes |
+| `isConnected()` | async | Simple boolean connectivity check |
+
+### DeviceInfo
+
+Device hardware and software metadata.
+
+- **iOS:** UIDevice, ProcessInfo
+- **Android:** Build, ActivityManager
+- **Peer deps:** `react-native-device-info` or `expo-device`
+
+```tsx
+import { useDeviceInfo } from '@neutron/native/turbomodule';
+
+const device = useDeviceInfo();
+
+// Full snapshot
+const info = device.getInfo();
+// { brand: 'Apple', model: 'iPhone 16 Pro', systemName: 'iOS',
+//   systemVersion: '18.0', isTablet: false, isEmulator: false, ... }
+
+// Individual queries (synchronous — cached)
+const version = device.getVersion();       // '1.0.0'
+const build = device.getBuildNumber();     // '42'
+const bundleId = device.getBundleId();     // 'com.myapp'
+const locale = device.getLocale();         // 'en-US'
+const tz = device.getTimezone();           // 'America/New_York'
+
+// Async queries
+const battery = await device.getBatteryLevel();   // 0.85
+const lowPower = await device.isLowPowerMode();   // false
+```
+
+**Key methods:**
+
+| Method | Kind | Description |
+|--------|------|-------------|
+| `getInfo()` | sync | Full device snapshot (cached) |
+| `getDeviceId()` | sync | Vendor ID (iOS) / ANDROID_ID |
+| `getVersion()` / `getBuildNumber()` | sync | App version strings |
+| `isEmulator()` / `isTablet()` | sync | Device type checks |
+| `getBatteryLevel()` | async | Battery (0-1) |
+| `getLocale()` / `getTimezone()` | sync | User locale and timezone |
+
+### Permissions
+
+Unified permission management across all device capabilities.
+
+- **iOS:** Info.plist keys + runtime requests
+- **Android:** AndroidManifest.xml + ActivityCompat
+- **Peer deps:** `react-native-permissions` or Expo modules (each handles its own)
+
+```tsx
+import { usePermissions } from '@neutron/native/turbomodule';
+
+const perms = usePermissions();
+
+// Check without prompting
+const status = await perms.check('camera');
+// 'granted' | 'denied' | 'blocked' | 'unavailable' | 'limited'
+
+// Request permission
+const result = await perms.request('camera');
+
+// If blocked, send user to Settings
+if (result === 'blocked') {
+    await perms.openSettings();
+}
+
+// Batch check
+const statuses = await perms.checkMultiple(['camera', 'microphone', 'location']);
+
+// Batch request (Android: single dialog; iOS: sequential prompts)
+const results = await perms.requestMultiple(['camera', 'microphone']);
+```
+
+**Available permission names:**
+
+`camera`, `location`, `location-always`, `microphone`, `contacts`, `calendar`, `photo-library`, `notifications`, `bluetooth`, `face-id`
+
+**Key methods:**
+
+| Method | Kind | Description |
+|--------|------|-------------|
+| `check(permission)` | async | Check status without prompting |
+| `request(permission)` | async | Request a single permission |
+| `checkMultiple(permissions)` | async | Batch check |
+| `requestMultiple(permissions)` | async | Batch request |
+| `openSettings()` | async | Open app settings page |
+
+## Creating Custom TurboModules
+
+Register your own native modules with `registerModule`. The registry resolves modules in order: cache, native JSI, then JS factory.
+
+### Step 1 — Define the Interface
+
+```ts
+import type { TurboModule, ModuleMethod } from '@neutron/native/turbomodule';
+
+export interface AnalyticsModule extends TurboModule {
+    moduleName: 'MyAnalytics';
+    track(event: string, properties?: Record<string, string>): void;
+    identify(userId: string): Promise<void>;
+    flush(): Promise<void>;
+    isEnabled(): boolean;
+}
+```
+
+### Step 2 — Register with a JS Fallback
+
+```ts
+import { registerModule, getModule } from '@neutron/native/turbomodule';
+
+const METHODS: readonly ModuleMethod[] = [
+    { name: 'track', kind: 'sync' },
+    { name: 'identify', kind: 'async' },
+    { name: 'flush', kind: 'async' },
+    { name: 'isEnabled', kind: 'sync' },
+] as const;
+
+// JS fallback — used when native module isn't linked
+registerModule<AnalyticsModule>('MyAnalytics', () => ({
+    moduleName: 'MyAnalytics',
+    methods: METHODS,
+    track(event, properties) {
+        console.log('[analytics stub]', event, properties);
+    },
+    async identify() {},
+    async flush() {},
+    isEnabled() { return false },
+}));
+```
+
+### Step 3 — Create a Hook
+
+```ts
+export function useAnalytics(): AnalyticsModule {
+    const mod = getModule<AnalyticsModule>('MyAnalytics');
+    if (!mod) throw new Error('MyAnalytics module not available');
+    return mod;
+}
+```
+
+### Step 4 — Use It
+
+```tsx
+import { useAnalytics } from './analytics';
+
+function CheckoutScreen() {
+    const analytics = useAnalytics();
+
+    function handlePurchase() {
+        analytics.track('purchase', { amount: '29.99', currency: 'USD' });
+    }
+
+    return <Pressable onPress={handlePurchase}><Text>Buy</Text></Pressable>;
+}
+```
+
+When the native module is linked and registered under the same name (`MyAnalytics`), the registry will find it via JSI and use the real native implementation. The JS factory is only used as a fallback.
+
+## Lazy Loading
+
+TurboModules are lazy by design. No module code executes until you call `getModule()` or a `use*` hook for the first time.
+
+The resolution order for `getModule('NeutronCamera')`:
+
+1. **Cache** — return immediately if already resolved
+2. **Native JSI registry** — check `__turboModuleProxy` (set by React Native's C++ runtime)
+3. **JS factory** — call the function registered via `registerModule()`
+
+```ts
+import { hasModule, listModules, requireModule } from '@neutron/native/turbomodule';
+
+// Check before using
+if (hasModule('NeutronCamera')) {
+    const camera = requireModule<CameraModule>('NeutronCamera');
+    // ...
+}
+
+// List all registered modules
+console.log(listModules());
+// ['NeutronCamera', 'NeutronLocation', 'NeutronBiometrics', ...]
+```
+
+Use `clearCache()` during hot reload or in test teardown to reset the module cache:
+
+```ts
+import { clearCache } from '@neutron/native/turbomodule';
+
+afterEach(() => {
+    clearCache();
+});
+```
+
+## Expo Go Compatibility
+
+The device modules (`@neutron/native/device`) are designed to work in both Expo Go and bare React Native. Each module lazily probes for installed packages at runtime:
+
+| Module | Expo Package | Bare RN Package |
+|--------|-------------|-----------------|
+| Camera | `expo-camera`, `expo-image-picker` | `react-native-image-picker` |
+| Location | `expo-location` | `@react-native-community/geolocation` |
+| Notifications | `expo-notifications` | `@react-native-firebase/messaging` |
+| Biometrics | `expo-local-authentication` | `react-native-biometrics` |
+| Haptics | `expo-haptics` | Built-in `Vibration` API |
+| Clipboard | `expo-clipboard` | `@react-native-clipboard/clipboard` |
+| AsyncStorage | `expo-secure-store` | `@react-native-async-storage/async-storage` |
+| NetInfo | `@react-native-community/netinfo` | `@react-native-community/netinfo` |
+| DeviceInfo | `expo-device`, `expo-application` | `react-native-device-info` |
+| Permissions | Expo modules (per-feature) | `react-native-permissions` |
+
+The detection is lazy — packages are `require()`'d on first use, not at import time. If a package is missing, you get a clear error message:
+
+```
+[neutron-native/device/camera] No camera package found.
+Install one of: expo-camera, react-native-image-picker
+```
+
+In **Expo Go**, install the Expo-flavored packages:
+
+```bash
+npx expo install expo-camera expo-location expo-haptics expo-local-authentication expo-notifications expo-clipboard expo-secure-store expo-device
+```
+
+In **bare React Native**, install community packages:
+
+```bash
+npm install react-native-image-picker @react-native-community/geolocation react-native-biometrics @react-native-clipboard/clipboard @react-native-async-storage/async-storage @react-native-community/netinfo react-native-device-info react-native-permissions
+```
+
+## Platform Capabilities Detection
+
+Check what is available on the current device at runtime:
+
+```tsx
+import { hasModule } from '@neutron/native/turbomodule';
+import { usePermissions, useCamera, useBiometrics } from '@neutron/native/turbomodule';
+
+// Check if a module is linked at all
+const hasCameraModule = hasModule('NeutronCamera');
+
+// Check hardware availability
+const camera = useCamera();
+const cameraAvailable = camera.isAvailable();
+
+const bio = useBiometrics();
+const { available, biometryType } = await bio.isAvailable();
+
+// Check permission status before requesting
+const perms = usePermissions();
+const cameraStatus = await perms.check('camera');
+const locationStatus = await perms.check('location');
+
+// Full capabilities probe
+async function getDeviceCapabilities() {
+    const perms = usePermissions();
+    const statuses = await perms.checkMultiple([
+        'camera', 'location', 'microphone', 'notifications', 'bluetooth',
+    ]);
+
+    return {
+        camera: statuses.camera !== 'unavailable',
+        location: statuses.location !== 'unavailable',
+        microphone: statuses.microphone !== 'unavailable',
+        notifications: statuses.notifications !== 'unavailable',
+        bluetooth: statuses.bluetooth !== 'unavailable',
+    };
+}
+```
+
+### NativeResult Pattern
+
+All async TurboModule methods return a `NativeResult<T>` wrapper:
+
+```ts
+interface NativeResult<T> {
+    ok: boolean;
+    value?: T;
+    error?: { code: string; message: string };
+}
+```
+
+Always check `result.ok` before accessing `result.value`:
+
+```tsx
+const result = await camera.capture();
+if (result.ok) {
+    uploadPhoto(result.value.uri);
+} else {
+    console.error(result.error.code, result.error.message);
+}
+```
+
+### Event Subscriptions
+
+Modules that emit events return a `NativeSubscription` handle. Always clean up in your component teardown:
+
+```tsx
+import { useEffect } from 'preact/hooks';
+import { useNetInfo } from '@neutron/native/turbomodule';
+
+function NetworkBanner() {
+    const netInfo = useNetInfo();
+
+    useEffect(() => {
+        const sub = netInfo.addEventListener((state) => {
+            if (!state.isConnected) showBanner('You are offline');
+        });
+        return () => sub.remove();
+    }, []);
+}
+```

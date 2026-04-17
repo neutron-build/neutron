@@ -1,0 +1,36 @@
+---
+title: Server-Side Rendering
+description: On-demand rendering for dynamic apps.
+---
+
+For applications that need personalized data, authentication, or real-time updates, Neutron provides Server-Side Rendering (SSR).
+
+## The Request Lifecycle
+
+When a request hits an App Route:
+
+1.  **Request**: The server receives the HTTP request.
+2.  **Middleware**: Global and route-specific middleware run.
+3.  **Routing**: The router matches the URL to a set of components (Layouts + Page).
+4.  **Loaders**: All matching loaders run in **parallel** to fetch data.
+5.  **Render**: The component tree is rendered to HTML strings, injected with the loader data.
+6.  **Response**: The HTML is streamed to the browser.
+7.  **Hydration**: The browser loads the client-side JavaScript, and Preact "hydrates" the HTML to make it interactive.
+
+## Why SSR?
+
+-   **SEO**: Search engines see the fully rendered content.
+-   **Performance**: Users see content sooner than with Client-Side Rendering (CSR), as they don't have to wait for the JS bundle to download and execute before seeing the page.
+-   **Robustness**: Works gracefully on slow networks/devices.
+
+## Caching
+
+Unlike static routes, SSR routes are rendered on every request. To improve performance, you can use standard HTTP `Cache-Control` headers.
+
+```tsx
+export function headers() {
+  return {
+    "Cache-Control": "public, max-age=60, s-maxage=3600",
+  };
+}
+```

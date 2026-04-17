@@ -1,0 +1,193 @@
+---
+title: Verus Proofs
+description: SMT-based verification of Rust implementation correctness.
+---
+
+Verus is a tool for verifying Rust code using SMT solving (Z3). Unlike Lean 4 or Quint, Verus annotations go **inline** in Rust source files — the verification is on the actual implementation, not a model.
+
+> **Status:** Specs and proof structures are written. Inline annotations are deferred until Nucleus APIs stabilize.
+
+## How Verus Works
+
+Verus is a modified Rust compiler. You annotate functions with `requires` (preconditions) and `ensures` (postconditions), then Z3 automatically proves correctness.
+
+```rust
+verus! {
+    fn is_visible(snap: &Snapshot, row: &RowVersion) -> (visible: bool)
+        requires
+            snap.start_ts > 0,
+        ensures
+            visible ==> row.commit_ts > 0,             // only committed rows visible
+            visible ==> row.commit_ts <= snap.start_ts, // committed before snapshot
+            row.commit_ts == 0 ==> !visible,            // uncommitted → invisible
+    {
+        if row.commit_ts == 0 { return false; }
+        if row.commit_ts > snap.start_ts { return false; }
+        true
+    }
+}
+```
+
+### Key Concepts
+
+| Annotation | Purpose |
+|------------|---------|
+| `requires` | What must be true when the function is called |
+| `ensures` | What must be true after the function returns |
+| `spec fn` | Ghost specification function (erased at compile time) |
+| `proof fn` | Proof lemma (erased at compile time) |
+| `tracked` | Ghost state for tracking logical properties |
+
+### Zero Runtime Overhead
+
+All Verus annotations are erased by `cargo build`. The verified code compiles to identical machine code as unverified code. Only `cargo verus` processes the annotations.
+
+## What's Verified
+
+### Nucleus (Database Engine)
+
+| Target | Properties | Why It Matters |
+|--------|-----------|----------------|
+| `Snapshot::is_visible()` | No dirty reads, snapshot isolation | Data corruption if wrong |
+| `RowVersion::is_visible()` | Visibility correctness for version chains | Wrong query results |
+| `BufferPool::pin/unpin()` | Capacity bounds, pinned pages never evicted | Memory corruption |
+| `PageAllocator::allocate/free()` | No double-free, conservation (allocated + free = total) | Page corruption |
+
+### Framework (Web Libraries)
+
+| Target | Properties | Why It Matters |
+|--------|-----------|----------------|
+| `constant_time_eq()` | Timing-attack resistance (examines all bytes) | Auth bypass |
+| Session ID generation | Uniqueness, no collisions | Session hijacking |
+| Rate limit window | No undercounting requests | DoS vulnerability |
+| WebAuthn signature verify | No false negatives | Auth failure |
+
+## Ghost Specifications
+
+Specs define **what** the code should do, separate from **how**:
+
+### MVCC Visibility Spec
+
+```rust
+verus! {
+    /// Specification: when is a row version visible to a snapshot?
+    spec fn visible_spec(start_ts: u64, commit_ts: u64, delete_ts: u64) -> bool {
+        commit_ts > 0                           // must be committed
+        && commit_ts <= start_ts                // committed before snapshot
+        && (delete_ts == 0 || delete_ts > start_ts) // not yet deleted
+    }
+
+    /// Ghost set tracking committed transaction IDs
+    pub tracked struct CommittedSet {
+        pub ghost txns: Set<u64>,
+    }
+
+    /// Ghost map tracking version chains per row
+    pub tracked struct VersionChains {
+        pub ghost chains: Map<u64, Seq<(u64, u64)>>,  // row_id → [(commit_ts, delete_ts)]
+    }
+}
+```
+
+## Proof Lemmas
+
+Multi-step proofs that establish deeper properties:
+
+### Visibility Anti-Monotonicity
+
+```rust
+verus! {
+    /// If a row is visible at snapshot T1 and deleted at D where T1 < D <= T2,
+    /// then the row is invisible at snapshot T2.
+    proof fn visibility_anti_monotonic_delete(
+        start_ts1: u64, start_ts2: u64,
+        commit_ts: u64, delete_ts: u64,
+    )
+        requires
+            start_ts1 < start_ts2,
+            commit_ts > 0,
+            commit_ts <= start_ts1,
+            delete_ts > 0,
+            delete_ts > start_ts1,
+            delete_ts <= start_ts2,
+        ensures
+            visible_spec(start_ts1, commit_ts, delete_ts),   // visible at T1
+            !visible_spec(start_ts2, commit_ts, delete_ts),  // invisible at T2
+    { }  // Z3 proves automatically
+}
+```
+
+### No Write Skew (SSI)
+
+```rust
+verus! {
+    /// Under serializable snapshot isolation, if two transactions
+    /// both read and write the same row, at least one must abort.
+    proof fn no_write_skew(
+        t1_start: u64, t2_start: u64,
+        t1_commit: u64, t2_commit: u64,
+        row_commit_ts: u64,
+    )
+        requires
+            t1_start < t1_commit,
+            t2_start < t2_commit,
+            row_commit_ts <= t1_start,
+            row_commit_ts <= t2_start,
+            visible_spec(t1_start, row_commit_ts, 0),
+            visible_spec(t2_start, row_commit_ts, 0),
+        ensures
+            true, // SSI validation layer catches conflicting commits
+    { }
+}
+```
+
+## Verus vs Lean 4 vs Quint
+
+| Aspect | Verus | Lean 4 | Quint |
+|--------|-------|--------|-------|
+| **Verifies** | Rust source code | Algorithm models | Protocol specs |
+| **Method** | SMT solver (Z3) | Interactive proofs | Model checking |
+| **Effort** | Low (annotations) | High (manual proofs) | Medium (specs) |
+| **Language** | Rust only | Agnostic | Agnostic |
+| **Best for** | Implementation bugs | Algorithm design | Protocol design |
+
+Use all three together:
+1. **Quint** — Verify the protocol design is correct (e.g., Raft consensus)
+2. **Lean 4** — Prove algorithm properties mathematically (e.g., MVCC isolation)
+3. **Verus** — Verify the Rust implementation matches the spec
+
+## Project Structure
+
+```
+verus/
+├── PLAN.md                  # Verification roadmap
+├── VERIFIED.md              # Registry of verified functions
+├── specs/
+│   ├── nucleus/             # Ghost types for database verification
+│   │   ├── mvcc_spec.rs     # Snapshot visibility specification
+│   │   ├── page_spec.rs     # Page allocator specification
+│   │   └── buffer_spec.rs   # Buffer pool specification
+│   └── framework/           # Ghost types for framework verification
+├── proofs/
+│   ├── nucleus/             # Database proof lemmas
+│   │   ├── mvcc_lemmas.rs
+│   │   ├── page_lemmas.rs
+│   │   └── buffer_lemmas.rs
+│   └── framework/           # Framework proof lemmas
+└── scripts/
+    ├── verify.sh            # Run cargo verus
+    └── ci.sh                # CI verification
+```
+
+## Running Verification
+
+```bash
+# Type-check specifications
+cargo verus --check specs/nucleus/mvcc_spec.rs
+
+# Verify a proof
+cargo verus proofs/nucleus/mvcc_lemmas.rs
+
+# Full verification suite
+./scripts/verify.sh
+```

@@ -1,0 +1,99 @@
+---
+title: Real-Time
+description: WebSocket hub and Server-Sent Events.
+---
+
+The `neutronrealtime` package provides room-based WebSocket broadcasting and SSE streaming.
+
+## WebSocket Hub
+
+Room-based message broadcasting:
+
+```go
+import "github.com/neutron-dev/neutron-go/neutronrealtime"
+
+hub := neutronrealtime.NewHub()
+
+// Mount WebSocket handler
+router.Handle("GET /ws/{room}",
+    neutronrealtime.WebSocketHandlerWithRoom(hub, "default", upgrader))
+```
+
+### Hub API
+
+```go
+// Connection management
+hub.Register(conn)
+hub.Unregister(conn)
+
+// Room operations
+hub.Subscribe("chatroom", conn)
+hub.Unsubscribe("chatroom", conn)
+
+// Broadcasting
+hub.Broadcast("chatroom", []byte("hello"))   // To room
+hub.BroadcastAll([]byte("announcement"))     // To all
+```
+
+### Connection
+
+Each connection has a buffered send channel:
+
+```go
+type Conn struct {
+    ID   string          // Unique connection ID
+    Send chan []byte      // Buffered (256)
+}
+```
+
+## Server-Sent Events
+
+```go
+router.Handle("GET /events", neutronrealtime.SSEHandler(
+    func(ctx interface{ Done() <-chan struct{} }, send func(string, []byte) error) error {
+        ticker := time.NewTicker(time.Second)
+        defer ticker.Stop()
+
+        for {
+            select {
+            case <-ctx.Done():
+                return nil
+            case t := <-ticker.C:
+                send("tick", []byte(t.Format(time.RFC3339)))
+            }
+        }
+    },
+))
+```
+
+## Chat Example
+
+```go
+// POST /messages — send and broadcast
+neutron.Post(api, "/messages", func(ctx context.Context, input SendInput) (Message, error) {
+    msg, err := nucleus.QueryOne[Message](ctx, db.SQL(),
+        "INSERT INTO messages (room, user_id, body) VALUES ($1, $2, $3) RETURNING *",
+        input.Room, userID, input.Body)
+
+    // Broadcast to WebSocket clients
+    data, _ := json.Marshal(msg)
+    hub.Broadcast(input.Room, data)
+
+    return msg, nil
+})
+```
+
+## Multi-Instance Sync
+
+Use Nucleus LISTEN/NOTIFY to sync across multiple server instances:
+
+```go
+// Instance A: broadcast via NOTIFY
+db.Notify(ctx, "chat:general", messageJSON)
+
+// Instance B: listen and forward to local hub
+db.Listen(ctx, "chat:*", func(channel, payload string) {
+    room := strings.TrimPrefix(channel, "chat:")
+    hub.Broadcast(room, []byte(payload))
+})
+```

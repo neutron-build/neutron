@@ -1,0 +1,86 @@
+---
+title: Lean 4 Proofs
+description: Machine-checked algorithm proofs for Nucleus.
+---
+
+The `lean4/` directory contains machine-checked proofs of critical Nucleus algorithms using the Lean 4 proof assistant. These proofs provide mathematical guarantees that core database algorithms are correct.
+
+## What's Verified
+
+### MVCC (Multi-Version Concurrency Control)
+
+- **Snapshot isolation** — Transactions see a consistent snapshot
+- **No dirty reads** — Uncommitted writes are invisible
+- **Visibility correctness** — Version chains resolve correctly
+
+### Page Allocator
+
+- **No double-free** — A freed page cannot be freed again
+- **Conservation** — allocated + free = total (no page leaks)
+- **Allocation validity** — Only free pages can be allocated
+
+### Buffer Pool
+
+- **Capacity bounds** — Pool never exceeds max size
+- **Pin safety** — Pinned pages are never evicted
+- **Eviction correctness** — Only unpinned pages are evictable
+
+### Cryptographic Primitives
+
+- **HMAC-SHA256** — Output length, determinism, PRF security
+- **Constant-time comparison** — Timing-attack resistance (examines all bytes)
+- **PKCE (RFC 7636)** — Roundtrip correctness, determinism, collision resistance
+
+### Data Structures
+
+- **LRU Cache** — Capacity bounds, set/get consistency, no duplicates
+- **Bloom Filter** — No false negatives, insert monotonicity, bit array invariants
+- **Sliding Window** — Non-negative estimates, accurate counting, rollover correctness
+
+## Project Structure
+
+```
+lean4/Nucleus/
+├── lakefile.lean           # Build configuration
+├── lean-toolchain          # Lean version pin
+└── Nucleus/
+    ├── Aeneas/             # Rust → Lean translations
+    │   ├── Primitives.lean
+    │   ├── StorageModel.lean
+    │   ├── MvccModel.lean
+    │   └── PageModel.lean
+    ├── Spec/               # Formal specifications
+    │   ├── MvccSpec.lean
+    │   ├── PageSpec.lean
+    │   ├── BufferSpec.lean
+    │   └── TupleSpec.lean
+    ├── Proofs/             # Machine-checked proofs
+    │   ├── MvccProofs.lean
+    │   ├── PageProofs.lean
+    │   ├── BufferProofs.lean
+    │   └── TupleProofs.lean
+    ├── Helpers/            # Shared tactics & lemmas
+    ├── Crypto/             # HMAC, PKCE, constant-time proofs
+    └── Structures/         # LRU, Bloom, sliding window proofs
+```
+
+## How It Works
+
+1. **Aeneas models** translate Rust types and functions into Lean 4 equivalents
+2. **Specs** state the properties to prove as Lean theorems
+3. **Proofs** provide machine-checked evidence that the properties hold
+4. Lean's type checker verifies every proof step — no human trust required
+
+## Example: No False Negatives
+
+```lean
+theorem no_false_negatives (bf : BloomFilter) (item : List UInt8) :
+    bf.insert(item).mayContain(item) = true := by
+  sorry  -- proof in progress
+```
+
+This theorem states: after inserting an item into a Bloom filter, `mayContain` always returns `true` for that item.
+
+## Status
+
+Proofs are in active development. Some use `sorry` (proof obligation marker) for theorems that are stated but not yet fully proven. The Lean type checker ensures that completed proofs are correct.

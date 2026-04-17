@@ -271,9 +271,16 @@ export function renderDocumentHead(
   // Render trusted inline head scripts
   const headScriptsHtml = renderHeadScripts(seo?.headScripts);
 
+  // Inline anti-flash style — paints a dark background before app CSS parses,
+  // so full-load navigations never flash white between pages. Apps can override
+  // via --neutron-bg on :root.
+  const antiFlashStyle =
+    '<style>html{background:var(--neutron-bg,#0A0A0A);color-scheme:dark light}</style>';
+
   return [
     '<meta charset="UTF-8">',
     '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
+    antiFlashStyle,
     titleTag,
     seoHtml,
     extraHead,

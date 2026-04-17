@@ -115,8 +115,9 @@ mojo/specs/
 # Old location remnants (build artifacts only, source is in rs/ and nucleus/)
 rust/
 
-# Site (not ready for public release yet)
-site/
+# Site build output (source is tracked, dist is not)
+typescript/apps/site/dist/
+typescript/apps/site/.neutron/
 
 # Claude internal
 .claude/

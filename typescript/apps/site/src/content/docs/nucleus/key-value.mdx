@@ -1,0 +1,140 @@
+---
+title: Key-Value
+description: Redis-like key-value operations with TTL support.
+---
+
+Nucleus provides a built-in key-value store accessible through SQL functions. It supports strings, lists, hashes, sets, sorted sets, and HyperLogLog — similar to Redis, but without a separate server.
+
+## Basic Operations
+
+```sql
+-- Set a key with optional TTL (seconds)
+SELECT KV_SET('user:1:session', 'abc123', 3600);
+
+-- Get a value
+SELECT KV_GET('user:1:session');
+
+-- Delete a key
+SELECT KV_DELETE('user:1:session');
+
+-- Check if a key exists
+SELECT KV_EXISTS('user:1:session');
+```
+
+## TTL Management
+
+```sql
+-- Set with TTL (seconds)
+SELECT KV_SET('cache:homepage', '<html>...</html>', 300);
+
+-- Get remaining TTL
+SELECT KV_TTL('cache:homepage');
+
+-- Remove TTL (persist forever)
+SELECT KV_PERSIST('cache:homepage');
+
+-- Set TTL on existing key
+SELECT KV_EXPIRE('cache:homepage', 600);
+```
+
+## Lists
+
+```sql
+-- Push to list (left/right)
+SELECT KV_LPUSH('queue:emails', 'msg1');
+SELECT KV_RPUSH('queue:emails', 'msg2');
+
+-- Pop from list
+SELECT KV_LPOP('queue:emails');
+SELECT KV_RPOP('queue:emails');
+
+-- Get list length
+SELECT KV_LLEN('queue:emails');
+
+-- Get range
+SELECT KV_LRANGE('queue:emails', 0, -1);
+```
+
+## Hashes
+
+```sql
+-- Set hash field
+SELECT KV_HSET('user:1', 'name', 'Alice');
+SELECT KV_HSET('user:1', 'email', 'alice@example.com');
+
+-- Get hash field
+SELECT KV_HGET('user:1', 'name');
+
+-- Get all fields
+SELECT KV_HGETALL('user:1');
+
+-- Delete hash field
+SELECT KV_HDEL('user:1', 'email');
+```
+
+## Sets
+
+```sql
+-- Add members
+SELECT KV_SADD('tags:post:1', 'rust');
+SELECT KV_SADD('tags:post:1', 'database');
+SELECT KV_SADD('tags:post:1', 'performance');
+
+-- Check membership
+SELECT KV_SISMEMBER('tags:post:1', 'rust');
+
+-- Get all members
+SELECT KV_SMEMBERS('tags:post:1');
+
+-- Set operations
+SELECT KV_SINTER('tags:post:1', 'tags:post:2');
+SELECT KV_SUNION('tags:post:1', 'tags:post:2');
+SELECT KV_SDIFF('tags:post:1', 'tags:post:2');
+```
+
+## Sorted Sets
+
+```sql
+-- Add with score
+SELECT KV_ZADD('leaderboard', 100.0, 'player1');
+SELECT KV_ZADD('leaderboard', 250.0, 'player2');
+SELECT KV_ZADD('leaderboard', 175.0, 'player3');
+
+-- Get by rank (top N)
+SELECT KV_ZRANGE('leaderboard', 0, 9);
+
+-- Get by score range
+SELECT KV_ZRANGEBYSCORE('leaderboard', 100.0, 200.0);
+
+-- Get rank
+SELECT KV_ZRANK('leaderboard', 'player2');
+
+-- Get score
+SELECT KV_ZSCORE('leaderboard', 'player2');
+```
+
+## HyperLogLog
+
+Probabilistic cardinality estimation — count unique items using minimal memory.
+
+```sql
+-- Add elements
+SELECT KV_PFADD('visitors:2026-03-08', 'user1');
+SELECT KV_PFADD('visitors:2026-03-08', 'user2');
+SELECT KV_PFADD('visitors:2026-03-08', 'user1'); -- duplicate, not counted
+
+-- Estimate count
+SELECT KV_PFCOUNT('visitors:2026-03-08'); -- ~2
+
+-- Merge multiple HLLs
+SELECT KV_PFMERGE('visitors:march', 'visitors:2026-03-01', 'visitors:2026-03-02');
+```
+
+## Use Cases
+
+- **Session storage** — `KV_SET` with TTL for user sessions
+- **Rate limiting** — Increment counters with expiry
+- **Caching** — Cache expensive query results
+- **Queues** — LPUSH/RPOP for simple job queues
+- **Leaderboards** — Sorted sets for ranked data
+- **Analytics** — HyperLogLog for unique counts

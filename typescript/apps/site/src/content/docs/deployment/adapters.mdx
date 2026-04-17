@@ -1,0 +1,30 @@
+---
+title: Adapters
+description: Deploying Neutron to any platform.
+---
+
+Neutron uses an **Adapter** system to build your application for different deployment targets. By changing a few lines of configuration, you can switch from a Node.js server to a Cloudflare Worker or a Docker container.
+
+## How Adapters Work
+
+When you run `neutron build`, the framework compiles your code. The final step is the "Adapt" phase, where the chosen adapter takes that compiled code and wraps it in the necessary entry points and configuration for your specific host.
+
+## Configuring an Adapter
+
+Adapters are configured in `neutron.config.ts`.
+
+```ts
+import { defineConfig } from "neutron";
+import node from "@neutron/adapter-node";
+
+export default defineConfig({
+  adapter: node(),
+});
+```
+
+## Available Adapters
+
+-   `@neutron/adapter-node`: For long-running Node.js servers.
+-   `@neutron/adapter-cloudflare`: For Cloudflare Workers and Pages.
+-   `@neutron/adapter-vercel`: For Vercel Serverless and Edge Functions.
+-   `@neutron/adapter-static`: For purely static site generation (SSG).

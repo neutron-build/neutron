@@ -1,0 +1,168 @@
+---
+title: "Introducing Neutron: Build Anything, No Ceiling"
+description: "Neutron is a full-stack development system spanning TypeScript, Rust, Go, Python, Mojo, and Zig — each used at its peak, backed by a single database with 14 data models. Build for web, mobile, and desktop without hitting walls."
+pubDate: 2026-02-15
+author: "Neutron Team"
+tags: ["announcement", "framework", "full-stack", "typescript", "rust"]
+---
+
+Every ambitious project eventually hits a wall. You're building a web app and need vector search — now you're managing a second database. You need a high-throughput API — now you're rewriting in a different language with a different framework. You need mobile — now you're maintaining a separate codebase. Each time you scale your ambitions, you scale your complexity.
+
+We built Neutron to eliminate those walls.
+
+## What Neutron Is
+
+Neutron is a development system where every piece is purpose-built for its domain, and they all compose together. TypeScript for the web. Rust for performance-critical backends. Go for concurrent services. Python for data and AI. Mojo for ML inference. Zig for embedded systems. All backed by one database that handles 14 data models natively.
+
+The core principle: **each language does what it does best.** Neutron doesn't try to make Rust feel like TypeScript or Go feel like Python. It gives each language a framework designed for that language's strengths — then connects them through a shared database and clean integration points.
+
+## The Six Languages
+
+### TypeScript — The Web, Perfected
+
+The TypeScript framework is the most fully-realized part of Neutron. It has two modes: static routes that ship zero JavaScript to the browser, and app routes with full interactivity powered by a 3KB Preact runtime.
+
+A static route:
+
+```ts
+// src/routes/index.ts
+export async function loader({ db }) {
+  return { posts: await db.query('SELECT * FROM posts') };
+}
+
+export function template({ data }) {
+  return `<h1>Latest Posts</h1><ul>
+    ${data.posts.map(p => `<li>${p.title}</li>`).join('')}
+  </ul>`;
+}
+```
+
+The same route as an app route with interactivity:
+
+```tsx
+// src/routes/index.tsx
+import { signal } from '@preact/signals';
+
+export async function loader({ db }) {
+  return { posts: await db.query('SELECT * FROM posts') };
+}
+
+export default function HomePage({ data }) {
+  const count = signal(data.posts.length);
+  return (
+    <main>
+      <h1>Latest Posts ({count})</h1>
+      {data.posts.map(p => <article key={p.id}>{p.title}</article>)}
+    </main>
+  );
+}
+```
+
+Same file conventions. Same loader pattern. One mode ships 0KB of JS, the other ships 3KB. You decide per route.
+
+### Rust — Raw Performance
+
+The Rust framework targets high-throughput APIs, WebSocket servers, and anything where latency predictability matters. Trie-based routing, 18 composable crates, JWT auth, WebSocket, SSE — all tested across 1,161 tests.
+
+```rust
+// routes/api/users.rs
+pub async fn loader(db: Db) -> Json<Vec<User>> {
+    let users = db.query::<User>("SELECT * FROM users").await.unwrap();
+    Json(users)
+}
+```
+
+Where TypeScript optimizes for developer productivity and UI, Rust optimizes for throughput and memory control. Use both in the same project — TypeScript serves the frontend, Rust handles the hot path.
+
+### Go — Concurrent Services at Scale
+
+Go's goroutine model makes it the right choice for services that handle many concurrent connections. The Go framework gives you idiomatic routing on Go 1.22+ ServeMux, typed middleware, connection pooling, and native Nucleus integration — compiled to a single binary with zero runtime dependencies.
+
+```go
+// routes/api/jobs.go
+func Loader(ctx context.Context, db *nucleus.Client) ([]Job, error) {
+    return db.Query[Job](ctx, "SELECT * FROM jobs WHERE status = 'pending'")
+}
+```
+
+### Python — Data and AI Applications
+
+Built on Starlette with Pydantic v2 and asyncpg. Designed for teams that need Python for data pipelines, ML model serving, or AI-powered features alongside their web application.
+
+```python
+# routes/api/predictions.py
+async def loader(request: Request, db: NucleusClient):
+    results = await db.fetch("""
+        SELECT name, 1 - (embedding <=> $1) AS similarity
+        FROM items ORDER BY embedding <=> $1 LIMIT 10
+    """, request.query_embedding)
+    return {"results": results}
+```
+
+### Mojo — ML at Full Speed
+
+Mojo is for compute-intensive ML workloads. Neutron's Mojo library includes a SIMD tensor library, five quantization formats (INT4, INT8, FP8, FP16, BF16), and a complete inference pipeline. 110+ test suites, 60 development sprints. Not a wrapper around Python — native ML building blocks.
+
+### Zig — When Every Byte Matters
+
+The Zig framework targets embedded and resource-constrained environments. Zero-alloc hot path, comptime SQL validation, cross-compilation to 40+ architectures. Your ESP32 has 4MB of flash — Neutron Zig fits.
+
+## One Database for Everything
+
+Every language in Neutron connects to Nucleus — a Rust database engine with 14 specialized data models in one connection:
+
+| Model | Use Case |
+|-------|----------|
+| SQL | Relational data, transactions |
+| Key-Value | Sessions, caching, rate limits |
+| Vector | Semantic search, RAG pipelines |
+| TimeSeries | Metrics, sensor data |
+| Document | Flexible schemas, JSON |
+| Graph | Social networks, knowledge graphs |
+| FTS | Full-text search, fuzzy matching |
+| Geo | Location queries, geofencing |
+| Blob | File storage, content delivery |
+
+One connection string. All fourteen models. Because Nucleus speaks the PostgreSQL wire protocol, any standard PostgreSQL client works.
+
+The real power: your TypeScript frontend, your Rust API, your Python ML pipeline, and your Go batch worker all read from and write to the same database — with full cross-model transactions. Insert a SQL row, store its vector embedding, and create graph relationships in one atomic operation.
+
+## No Walls
+
+The point of Neutron isn't consistency for its own sake. It's that **you never have to stop and start over.**
+
+Today you're building a web app with TypeScript. Next month you need a high-throughput API — add Rust, it already connects to the same database. Three months from now you need ML inference — Mojo plugs in. You need graph queries? Nucleus already has them. Native mobile? The component model supports it.
+
+Each language is used at its peak. Each tool is purpose-built for its job. And they all compose together because they share one database and a set of clean integration points.
+
+## Where We Are Today
+
+Neutron is early-stage software. Here's an honest accounting:
+
+**3,300+ passing tests across four languages.** TypeScript, Rust, Python, and Mojo all have comprehensive test suites. Go and Zig are built but have lighter test coverage.
+
+**Nucleus: 149,000+ lines of Rust, 3,724 tests.** WAL durability on all fourteen models. MVCC snapshot isolation in memory mode. Disk MVCC and distributed mode are in progress.
+
+**Available now via `npm create neutron@latest`.** The TypeScript framework is the most production-ready. Rust is close behind. The others are built but have rough edges.
+
+We're releasing early because we believe the architecture is sound and we want feedback from developers who push frameworks hard.
+
+## What's Next
+
+**Studio** — A visual database manager for all 14 Nucleus models. Query SQL, run vector searches, visualize your graph, browse your timeseries — in one UI.
+
+**The ORM** — Type-safe query builder that spans all fourteen models. Single API, full type inference, works from any of the six languages.
+
+**Desktop and Mobile** — The desktop (Rust + Tauri) and mobile (Go + QuickJS-NG + Yoga) targets are specified and partially implemented.
+
+## Try It
+
+```bash
+npm create neutron@latest my-app
+cd my-app
+npm run dev
+```
+
+Pick TypeScript or Rust for your first project. The documentation is at `/docs`. The source is on GitHub.
+
+Start with what you need today. Add what you need tomorrow. No ceiling.

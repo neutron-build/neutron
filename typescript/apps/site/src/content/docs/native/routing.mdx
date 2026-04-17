@@ -1,0 +1,161 @@
+---
+title: Routing
+description: File-based routing with Stack, Tabs, and Drawer navigation.
+---
+
+Neutron Native uses file-based routing with the `app/` directory convention, similar to Next.js and Expo Router.
+
+## File Structure
+
+```
+app/
+├── _layout.tsx      # Root layout (Stack, Tabs, or Drawer)
+├── index.tsx        # Home screen (/)
+├── about.tsx        # About screen (/about)
+├── settings/
+│   ├── _layout.tsx  # Nested layout
+│   ├── index.tsx    # /settings
+│   └── profile.tsx  # /settings/profile
+└── users/
+    └── [id].tsx     # Dynamic route (/users/42)
+```
+
+## Navigation
+
+```tsx
+import { useRouter, useParams, usePathname } from '@neutron/native/router';
+
+function HomeScreen() {
+    const router = useRouter();
+
+    return (
+        <Pressable onPress={() => router.navigate('/about')}>
+            <Text>Go to About</Text>
+        </Pressable>
+    );
+}
+
+function UserScreen() {
+    const { id } = useParams();      // URL params
+    const pathname = usePathname();   // Current path
+
+    return <Text>User {id}</Text>;
+}
+```
+
+### Router Methods
+
+| Method | Description |
+|--------|-------------|
+| `navigate(path, { params })` | Push a new screen |
+| `goBack()` | Pop the current screen |
+| `replace(path)` | Replace without adding to history |
+
+### Hooks
+
+| Hook | Returns |
+|------|---------|
+| `useRouter()` | Router state + methods |
+| `useParams()` | URL-decoded route parameters |
+| `usePathname()` | Current path as signal |
+| `useRoute()` | Current route record |
+| `useSearchParams()` | Query parameters |
+
+## Navigation Layouts
+
+### Stack
+
+Push/pop navigation with slide animations:
+
+```tsx
+// app/_layout.tsx
+import { Stack } from '@neutron/native/navigation';
+
+export default function Layout() {
+    return (
+        <Stack>
+            <Stack.Screen name="index" options={{ title: 'Home' }} />
+            <Stack.Screen name="about" options={{ title: 'About' }} />
+            <Stack.Screen name="settings" options={{ title: 'Settings' }} />
+        </Stack>
+    );
+}
+```
+
+Features:
+- Auto back button (hidden on root screen)
+- Configurable header title, tint color, style
+- `Stack.push(name, params)` / `Stack.pop()` imperative API
+
+### Tabs
+
+Bottom tab bar navigation:
+
+```tsx
+import { Tabs } from '@neutron/native/navigation';
+
+export default function Layout() {
+    return (
+        <Tabs>
+            <Tabs.Screen name="home" options={{ title: 'Home', icon: 'home' }} />
+            <Tabs.Screen name="search" options={{ title: 'Search', icon: 'search' }} />
+            <Tabs.Screen name="profile" options={{ title: 'Profile', icon: 'user', badge: 3 }} />
+        </Tabs>
+    );
+}
+```
+
+Features:
+- Icons and labels
+- Badge counts
+- Lazy-load screens on first tab press
+- Persistent state across tab switches
+
+### Drawer
+
+Slide-in sidebar navigation:
+
+```tsx
+import { Drawer } from '@neutron/native/navigation';
+
+export default function Layout() {
+    return (
+        <Drawer position="left">
+            <Drawer.Screen name="home" options={{ title: 'Home' }} />
+            <Drawer.Screen name="settings" options={{ title: 'Settings' }} />
+        </Drawer>
+    );
+}
+```
+
+Features:
+- Left or right position
+- Swipe gesture to open/close
+- Overlay with backdrop
+- Hamburger icon in header
+
+## Deep Linking
+
+Full support for iOS URL schemes and Android intent filters:
+
+```tsx
+import { initDeepLinks, handleDeepLink } from '@neutron/native/router';
+
+// Register listener on app startup
+initDeepLinks();
+
+// Or handle manually
+handleDeepLink('myapp://users/42');
+```
+
+## Link Component
+
+Navigate declaratively:
+
+```tsx
+import { Link } from '@neutron/native';
+
+<Link href="/about">
+    <Text>Go to About</Text>
+</Link>
+```

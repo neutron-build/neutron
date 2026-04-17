@@ -1,0 +1,147 @@
+---
+title: Routing & Handlers
+description: Typed generic handlers with automatic parameter extraction.
+---
+
+## Defining Routes
+
+```go
+router := app.Router()
+
+neutron.Get(router, "/users", listUsers)
+neutron.Post(router, "/users", createUser)
+neutron.Put(router, "/users/{id}", updateUser)
+neutron.Patch(router, "/users/{id}", patchUser)
+neutron.Delete(router, "/users/{id}", deleteUser)
+```
+
+## Typed Handlers
+
+Handlers are generic functions with automatic input extraction and output serialization:
+
+```go
+type HandlerFunc[In, Out any] func(ctx context.Context, input In) (Out, error)
+```
+
+### Path Parameters
+
+```go
+type GetUserInput struct {
+    ID int64 `path:"id"`
+}
+
+type User struct {
+    ID   int64  `json:"id"`
+    Name string `json:"name"`
+}
+
+func getUser(ctx context.Context, input GetUserInput) (User, error) {
+    // input.ID extracted from /users/{id}
+    return User{ID: input.ID, Name: "Alice"}, nil
+}
+
+neutron.Get(router, "/users/{id}", getUser)
+```
+
+### Request Body
+
+```go
+type CreateUserInput struct {
+    Name  string `json:"name"`
+    Email string `json:"email"`
+}
+
+func createUser(ctx context.Context, input CreateUserInput) (User, error) {
+    // input.Name and input.Email parsed from JSON body
+    return User{ID: 1, Name: input.Name}, nil
+}
+
+neutron.Post(router, "/users", createUser)
+```
+
+### No Input / No Output
+
+```go
+// No input
+func health(ctx context.Context, _ neutron.Empty) (map[string]string, error) {
+    return map[string]string{"status": "ok"}, nil
+}
+
+// No output (204 No Content)
+func deleteUser(ctx context.Context, input DeleteInput) (neutron.Empty, error) {
+    return neutron.Empty{}, nil
+}
+```
+
+## Route Groups
+
+Group routes with shared middleware:
+
+```go
+api := router.Group("/api",
+    neutronauth.JWTMiddleware(secret),
+)
+
+neutron.Get(api, "/items", listItems)
+neutron.Post(api, "/items", createItem)
+
+admin := router.Group("/admin",
+    neutronauth.RBACMiddleware("admin"),
+)
+
+neutron.Get(admin, "/users", listAllUsers)
+```
+
+## OpenAPI Metadata
+
+Annotate routes for auto-generated OpenAPI docs:
+
+```go
+neutron.Get(router, "/todos", listTodos,
+    neutron.WithSummary("List all todos"),
+    neutron.WithDescription("Returns paginated todo items"),
+    neutron.WithTags("todos"),
+    neutron.WithOperationID("listTodos"),
+)
+```
+
+## Error Handling
+
+Return RFC 7807 Problem Details errors:
+
+```go
+func getUser(ctx context.Context, input GetUserInput) (User, error) {
+    user, err := db.FindUser(input.ID)
+    if err != nil {
+        return User{}, neutron.ErrNotFound("user not found")
+    }
+    return user, nil
+}
+```
+
+Error helpers: `ErrBadRequest`, `ErrUnauthorized`, `ErrForbidden`, `ErrNotFound`, `ErrConflict`, `ErrValidation`, `ErrRateLimited`, `ErrInternal`.
+
+## Middleware
+
+Standard `net/http` middleware signature:
+
+```go
+func AuthMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        token := r.Header.Get("Authorization")
+        if token == "" {
+            neutron.WriteError(w, r, neutron.ErrUnauthorized("missing token"))
+            return
+        }
+        next.ServeHTTP(w, r)
+    })
+}
+```
+
+Built-in: `Logger`, `Recover`, `RequestID`, `CORS`, `RateLimit`, `Timeout`, `Compress`, `OTel`.
+
+## Static Files
+
+```go
+router.Mount("/static", http.FileServer(http.Dir("./public")))
+```

@@ -1,0 +1,50 @@
+---
+title: Type Safety
+description: End-to-end type safety without codegen.
+---
+
+Neutron leverages TypeScript's inference capabilities to provide complete type safety across the network boundary, without needing code generation steps or separate DTO files.
+
+## Loaders
+
+When you use `useLoaderData<typeof loader>()`, the type of the data is inferred directly from the return type of your loader function.
+
+```tsx
+// 1. Define return type automatically
+export async function loader() {
+  return {
+    user: {
+      name: "Alice",
+      age: 30,
+      roles: ["admin", "editor"] // inferred as string[]
+    }
+  };
+}
+
+export default function Page() {
+  // 2. Data is typed!
+  const data = useLoaderData<typeof loader>();
+  
+  // TypeScript knows data.user.name is a string
+  // TypeScript knows data.user.age is a number
+  // TypeScript knows data.user.roles is string[]
+  return <div>{data.user.name}</div>;
+}
+```
+
+## Date Objects
+
+Note that because data is serialized over the network (JSON), rich objects like `Date` will be converted to strings.
+
+```tsx
+export async function loader() {
+  return { createdAt: new Date() };
+}
+
+export default function Page() {
+  const { createdAt } = useLoaderData<typeof loader>();
+  // createdAt is a string (ISO format), not a Date object!
+}
+```
+
+If you need `Date` objects, standard practice is to construct them in the component: `new Date(createdAt)`.

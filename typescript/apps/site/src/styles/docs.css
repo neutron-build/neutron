@@ -1,0 +1,286 @@
+/* Docs Layout */
+.docs-container {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+}
+
+@media (min-width: 1024px) {
+  .docs-container {
+    flex-direction: row;
+    gap: var(--space-8);
+    align-items: flex-start;
+  }
+}
+
+/* Sidebar */
+.sidebar {
+  width: 100%;
+  padding: var(--space-6) 0;
+  flex-shrink: 0;
+}
+
+@media (min-width: 1024px) {
+  .sidebar {
+    width: 240px;
+    position: sticky;
+    top: 65px;
+    height: calc(100vh - 65px);
+    overflow-y: auto;
+  }
+}
+
+.sidebar-section {
+  margin-bottom: var(--space-6);
+}
+
+.sidebar-section h3 {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: var(--space-2);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.sidebar ul {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.sidebar a {
+  display: block;
+  color: var(--text-secondary);
+  font-size: 0.9375rem;
+  padding: 4px 0;
+  transition: color 0.15s;
+}
+
+.sidebar a:hover {
+  color: var(--text-primary);
+}
+
+.sidebar a.active {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+/* Content */
+.docs-content,
+.content {
+  flex: 1;
+  min-width: 0;
+  padding-top: var(--space-6);
+  padding-bottom: var(--space-9);
+}
+
+/* Markdown content styles */
+.content-wrapper h1 {
+  margin-bottom: var(--space-4);
+  font-size: 2.5rem;
+}
+
+.content-wrapper h2 {
+  margin-top: var(--space-8);
+  margin-bottom: var(--space-4);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.content-wrapper h3 {
+  margin-top: var(--space-6);
+  margin-bottom: var(--space-3);
+}
+
+.content-wrapper p {
+  margin-bottom: var(--space-4);
+  color: var(--text-secondary);
+}
+
+.content-wrapper ul {
+  list-style: disc;
+  margin-left: var(--space-5);
+  margin-bottom: var(--space-4);
+  color: var(--text-secondary);
+}
+
+.content-wrapper li {
+  margin-bottom: var(--space-1);
+}
+
+.content-wrapper code {
+  color: var(--text-primary);
+  font-size: 0.9em;
+}
+
+.content-wrapper pre {
+  margin-bottom: var(--space-5);
+}
+
+.content-wrapper a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* ============================================
+   DOCS LANDING PAGE
+   ============================================ */
+
+.docs-landing {
+  padding: var(--space-8) 0 var(--space-10);
+}
+
+.docs-landing__hero {
+  max-width: 760px;
+  margin: 0 auto var(--space-9);
+  padding: 0 var(--space-4);
+  text-align: center;
+}
+
+.docs-landing__eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-tertiary);
+  margin-bottom: var(--space-3);
+}
+
+.docs-landing__title {
+  font-size: clamp(2rem, 4vw, 3rem);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  color: var(--text-primary);
+  margin-bottom: var(--space-4);
+}
+
+.docs-landing__lead {
+  font-size: 1.0625rem;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  max-width: 600px;
+  margin: 0 auto;
+}
+
+.docs-landing__section {
+  max-width: 1100px;
+  margin: 0 auto var(--space-9);
+  padding: 0 var(--space-4);
+}
+
+.docs-landing__section-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: var(--space-2);
+  letter-spacing: -0.01em;
+}
+
+.docs-landing__section-lead {
+  font-size: 0.9375rem;
+  color: var(--text-secondary);
+  margin-bottom: var(--space-5);
+  max-width: 640px;
+}
+
+.docs-landing__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: var(--space-3);
+}
+
+.docs-landing__grid--compact {
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+}
+
+.docs-landing__card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-surface);
+  text-decoration: none;
+  color: var(--text-primary);
+  transition: border-color 0.15s ease, transform 0.15s ease, background 0.15s ease;
+}
+
+.docs-landing__card:hover {
+  border-color: var(--accent);
+  background: var(--bg-surface-hover);
+  transform: translateY(-1px);
+}
+
+.docs-landing__card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.docs-landing__card-title {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+.docs-landing__card-badge {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(168, 85, 247, 0.12);
+  color: #c084fc;
+}
+
+.docs-landing__card-desc {
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  margin: 0;
+  flex: 1;
+}
+
+.docs-landing__card-link {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--accent);
+  letter-spacing: 0.02em;
+}
+
+/* Hide parent layout nav/footer/scripts that leak into docs content-wrapper
+   due to nested layout composition order in static builds. */
+.content-wrapper > .skip-link,
+.content-wrapper > .nav,
+.content-wrapper > .footer,
+.content-wrapper > script {
+  display: none !important;
+}
+
+@media (max-width: 768px) {
+  .docs-container {
+    flex-direction: column;
+  }
+  .sidebar {
+    width: 100%;
+    max-height: 50vh;
+    overflow-y: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: var(--space-4);
+  }
+  .docs-content {
+    width: 100%;
+    padding: var(--space-4);
+  }
+  .docs-landing__grid {
+    grid-template-columns: 1fr;
+  }
+}

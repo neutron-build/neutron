@@ -1,0 +1,44 @@
+---
+title: File Conventions
+description: How files in src/routes map to URLs.
+---
+
+Neutron uses a file-system based router. The files you create in `src/routes` directly determine the routes in your application.
+
+## Basic Mapping
+
+| File Path | URL Path |
+| :--- | :--- |
+| `src/routes/index.tsx` | `/` |
+| `src/routes/about.tsx` | `/about` |
+| `src/routes/blog/index.tsx` | `/blog` |
+| `src/routes/blog/post.tsx` | `/blog/post` |
+
+## Special Files
+
+-   **`index.tsx`**: The default route for a directory.
+-   **`_layout.tsx`**: A layout component that wraps all child routes in its directory.
+-   **`_error.tsx`**: An error boundary component that catches errors from child routes.
+-   **`_*.tsx`** (any other file starting with `_`): Private files. These are ignored by the router. Use them for co-located components, utilities, or styles.
+
+## Dynamic Routes
+
+You can create dynamic route segments by wrapping the filename in brackets `[]`.
+
+| File Path | URL Path | Params |
+| :--- | :--- | :--- |
+| `src/routes/users/[id].tsx` | `/users/123` | `{ id: "123" }` |
+| `src/routes/posts/[slug].tsx` | `/posts/hello-world` | `{ slug: "hello-world" }` |
+
+## Catch-all Routes
+
+To match all remaining path segments, use the rest syntax `[...]`.
+
+| File Path | URL Path | Params |
+| :--- | :--- | :--- |
+| `src/routes/docs/[...slug].tsx` | `/docs/guides/setup` | `{ slug: "guides/setup" }` |
+| `src/routes/[...404].tsx` | `/any/unmatched/path` | `{ 404: "any/unmatched/path" }` |
+
+## Escaping
+
+If you need a route to actually include brackets in the URL, you likely need to rethink your URL structure, as this is reserved syntax.

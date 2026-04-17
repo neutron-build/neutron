@@ -1,0 +1,105 @@
+---
+title: Geospatial
+description: R-tree spatial indexing with distance and area functions.
+---
+
+Nucleus includes built-in geospatial support with R-tree indexing, Haversine distance, and polygon operations — no PostGIS extension needed.
+
+## Distance Calculations
+
+### Geographic Distance (Haversine)
+
+Calculate great-circle distance between two points on Earth:
+
+```sql
+-- Distance between San Francisco and New York (in meters)
+SELECT GEO_DISTANCE(37.7749, -122.4194, 40.7128, -74.0060);
+-- → 4,129,086.0  (~4,129 km)
+
+-- PostGIS-compatible alias
+SELECT ST_DISTANCE(37.7749, -122.4194, 40.7128, -74.0060);
+```
+
+Parameters: `(lat1, lon1, lat2, lon2)` — coordinates in degrees.
+
+### Euclidean Distance
+
+For Cartesian coordinate systems:
+
+```sql
+SELECT GEO_DISTANCE_EUCLIDEAN(0, 0, 3, 4);
+-- → 5.0
+
+-- PostGIS-compatible alias
+SELECT ST_DISTANCE_EUCLIDEAN(0, 0, 3, 4);
+```
+
+## Proximity Queries
+
+Check if two points are within a given distance:
+
+```sql
+-- Are these two points within 5,000,000 meters (5,000 km)?
+SELECT GEO_WITHIN(37.7749, -122.4194, 40.7128, -74.0060, 5000000);
+-- → true
+
+-- PostGIS-compatible alias
+SELECT ST_DWITHIN(37.7749, -122.4194, 40.7128, -74.0060, 5000000);
+```
+
+### Finding Nearby Locations
+
+Combine with SQL queries to find nearby points:
+
+```sql
+-- Find all stores within 10km of a user
+SELECT name, address,
+  GEO_DISTANCE(lat, lon, 37.7749, -122.4194) AS distance_m
+FROM stores
+WHERE GEO_WITHIN(lat, lon, 37.7749, -122.4194, 10000)
+ORDER BY distance_m
+LIMIT 10;
+```
+
+## Polygon Area
+
+Calculate the area of a polygon using the Shoelace formula:
+
+```sql
+-- Area of a triangle
+SELECT GEO_AREA(0, 0, 4, 0, 2, 3);
+-- → 6.0
+
+-- Area of a quadrilateral
+SELECT ST_AREA(0, 0, 4, 0, 4, 3, 0, 3);
+-- → 12.0
+```
+
+Pass coordinate pairs as alternating x, y values. Requires at least 3 points (6 arguments).
+
+## R-Tree Index
+
+The spatial engine uses a custom R-tree index for efficient spatial queries:
+
+- **Max 16 entries per node** — balanced tree structure
+- **Bounding box queries** — O(log N) for intersection and containment tests
+- **Point-in-polygon** — Ray casting algorithm
+
+## PostGIS Compatibility
+
+All functions have PostGIS-compatible aliases:
+
+| Nucleus | PostGIS Alias |
+|---------|--------------|
+| `GEO_DISTANCE` | `ST_DISTANCE` |
+| `GEO_DISTANCE_EUCLIDEAN` | `ST_DISTANCE_EUCLIDEAN` |
+| `GEO_WITHIN` | `ST_DWITHIN` |
+| `GEO_AREA` | `ST_AREA` |
+
+## Use Cases
+
+- **Store locators** — Find nearest locations
+- **Delivery zones** — Check if an address is within a service area
+- **Fleet tracking** — Monitor vehicle positions and distances
+- **Geofencing** — Trigger actions when entering/leaving areas
+- **Mapping** — Calculate routes and distances

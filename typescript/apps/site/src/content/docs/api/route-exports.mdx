@@ -1,0 +1,89 @@
+---
+title: Route Exports
+description: API reference for route modules.
+---
+
+Route files in `src/routes` can export the following named exports.
+
+## `default` (Component)
+
+**Required**. The React/Preact component to render for this route.
+
+```tsx
+export default function Page() {
+  return <h1>Hello</h1>;
+}
+```
+
+## `loader`
+
+**Optional**. Async function to load data on the server.
+
+```tsx
+export async function loader(args: LoaderArgs): Promise<Data>;
+```
+
+## `action`
+
+**Optional**. Async function to handle non-GET requests.
+
+```tsx
+export async function action(args: ActionArgs): Promise<Data>;
+```
+
+## `config`
+
+**Optional**. Configuration object for the route.
+
+```tsx
+export const config = {
+  mode: "static" | "app" // default: "static"
+};
+```
+
+## `ErrorBoundary`
+
+**Optional**. Component to render when an error occurs in this route or its children.
+
+```tsx
+export function ErrorBoundary() {
+  return <h1>Something went wrong</h1>;
+}
+```
+
+## `headers`
+
+**Optional**. Function to set HTTP headers for the response.
+
+```tsx
+export function headers({ loaderHeaders, parentHeaders }) {
+  return {
+    "Cache-Control": "max-age=3600",
+  };
+}
+```
+
+## `meta`
+
+**Optional**. Function to set meta tags in the `<head>`.
+
+```tsx
+export function meta({ data }) {
+  return [
+    { title: data.post.title },
+    { name: "description", content: "..." },
+  ];
+}
+```
+
+## `links`
+
+**Optional**. Function to add `<link>` tags (stylesheets, preloads).
+
+```tsx
+export function links() {
+  return [
+    { rel: "stylesheet", href: "/styles.css" },
+  ];
+}
+```

@@ -1,0 +1,212 @@
+---
+title: Command Reference
+description: Every CLI command with flags and examples.
+---
+
+## Project Management
+
+### `neutron new <name>`
+
+Create a new project from templates.
+
+```bash
+neutron new my-api --lang python
+neutron new my-app --lang typescript
+neutron new my-service --lang go
+```
+
+**Flags:** `--lang, -l` — Project language (python, typescript, go, rust, zig, julia)
+
+### `neutron init`
+
+Initialize Neutron in an existing project.
+
+```bash
+neutron init              # auto-detect language
+neutron init --lang go    # explicit
+```
+
+Creates `neutron.toml` and `migrations/` directory.
+
+### `neutron dev`
+
+Start the development server with auto-restart.
+
+```bash
+neutron dev
+```
+
+Delegates to the language-specific dev server based on auto-detection.
+
+## Database
+
+### `neutron db start`
+
+Download Nucleus (if needed) and start a local instance.
+
+```bash
+neutron db start                    # persistent, port 5432
+neutron db start --port 5433        # custom port
+neutron db start --memory           # ephemeral (no persistence)
+neutron db start --data-dir ./db    # custom data directory
+```
+
+### `neutron db stop`
+
+Stop the local Nucleus instance.
+
+```bash
+neutron db stop
+```
+
+### `neutron db status`
+
+Check database connectivity and version.
+
+```bash
+neutron db status
+```
+
+### `neutron db reset`
+
+Drop all tables and recreate the database.
+
+```bash
+neutron db reset           # interactive confirmation
+neutron db reset --force   # skip confirmation
+```
+
+## Migrations
+
+### `neutron migrate`
+
+Apply all pending migrations.
+
+```bash
+neutron migrate
+neutron migrate --dir db/migrations    # custom directory
+```
+
+Migrations are `.up.sql` files named `{NNN}_{name}.up.sql`. Each runs in a transaction.
+
+### `neutron migrate status`
+
+Show applied and pending migrations.
+
+```bash
+neutron migrate status
+```
+
+### `neutron migrate create <name>`
+
+Generate new migration files.
+
+```bash
+neutron migrate create add_role_column
+```
+
+Creates `{version}_{name}.up.sql` and `{version}_{name}.down.sql`.
+
+## Data
+
+### `neutron seed`
+
+Execute a SQL seed file.
+
+```bash
+neutron seed                          # default: seeds/seed.sql
+neutron seed --file data/demo.sql     # custom file
+```
+
+### `neutron repl`
+
+Interactive SQL shell.
+
+```bash
+neutron repl
+```
+
+Supports multi-line SQL, table-formatted output, and meta-commands (`\dt`, `\q`, `\?`).
+
+## Studio
+
+### `neutron studio`
+
+Launch the web-based database manager.
+
+```bash
+neutron studio               # opens http://localhost:4983
+neutron studio --port 8080   # custom port
+```
+
+## MCP Server
+
+### `neutron mcp`
+
+Start a Model Context Protocol server for AI assistants.
+
+```bash
+# stdio (for Claude Desktop, Cursor, etc.)
+neutron mcp --db postgres://localhost:5432/mydb
+
+# HTTP
+neutron mcp --transport http --port 7700
+
+# Dump schema
+neutron mcp --dump-schema markdown
+```
+
+**Flags:**
+- `--transport` — `stdio` (default) or `http`
+- `--port` — HTTP port (default: 7700)
+- `--db` — Database URL
+- `--dump-schema` — Print schema and exit (`openai`, `mcp`, or `markdown`)
+
+## Diagnostics
+
+### `neutron doctor`
+
+Check your development environment.
+
+```bash
+neutron doctor
+```
+
+Verifies language runtimes, database connectivity, and configuration.
+
+### `neutron version`
+
+Show CLI and database versions.
+
+```bash
+neutron version
+```
+
+### `neutron upgrade`
+
+Self-update to the latest version.
+
+```bash
+neutron upgrade
+```
+
+### `neutron completion`
+
+Generate shell completions.
+
+```bash
+neutron completion bash >> ~/.bashrc
+neutron completion zsh > "${fpath[1]}/_neutron"
+neutron completion fish > ~/.config/fish/completions/neutron.fish
+```
+
+## Global Flags
+
+All commands accept:
+
+| Flag | Description |
+|------|-------------|
+| `--config` | Path to neutron.toml |
+| `--url` | Database URL (overrides config) |
+| `--verbose` | Debug logging |
+| `--no-color` | Disable colored output |

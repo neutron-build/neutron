@@ -1,0 +1,153 @@
+---
+title: Routing
+description: Typed routes with automatic parameter extraction.
+---
+
+## Route Registration
+
+```python
+from neutron import Router
+
+router = Router()
+
+@router.get("/users")
+async def list_users() -> list[User]: ...
+
+@router.post("/users")
+async def create_user(input: CreateUser) -> User: ...
+
+@router.put("/users/{user_id}")
+async def update_user(user_id: int, input: UpdateUser) -> User: ...
+
+@router.patch("/users/{user_id}")
+async def patch_user(user_id: int, input: PatchUser) -> User: ...
+
+@router.delete("/users/{user_id}")
+async def delete_user(user_id: int) -> None: ...
+```
+
+## Parameter Extraction
+
+Parameters are automatically extracted based on type annotations:
+
+### Path Parameters
+
+```python
+@router.get("/users/{user_id}/posts/{post_id}")
+async def get_post(user_id: int, post_id: int) -> Post:
+    # Extracted from URL path
+    ...
+```
+
+### Request Body
+
+```python
+from pydantic import BaseModel
+
+class CreateUser(BaseModel):
+    name: str
+    email: str
+    age: int | None = None
+
+@router.post("/users")
+async def create_user(input: CreateUser) -> User:
+    # Parsed from JSON body, validated by Pydantic
+    ...
+```
+
+### Query Parameters
+
+```python
+from neutron import Query
+
+class Filters(BaseModel):
+    page: int = 1
+    per_page: int = 20
+    q: str | None = None
+
+@router.get("/users")
+async def list_users(query: Query[Filters]) -> list[User]:
+    # ?page=2&per_page=50&q=alice
+    ...
+```
+
+### Headers
+
+```python
+from neutron import Header
+
+class AuthHeaders(BaseModel):
+    authorization: str
+
+@router.get("/protected")
+async def protected(headers: Header[AuthHeaders]) -> dict:
+    ...
+```
+
+### Raw Request
+
+```python
+from starlette.requests import Request
+
+@router.get("/custom")
+async def custom(request: Request) -> dict:
+    body = await request.json()
+    ...
+```
+
+## Route Groups
+
+```python
+api = router.group("/api")
+
+@api.get("/items")
+async def list_items() -> list[Item]: ...
+
+@api.post("/items")
+async def create_item(input: CreateItem) -> Item: ...
+```
+
+## Dependency Injection
+
+```python
+from neutron import Depends
+
+async def get_db():
+    return request.app.state.db
+
+async def get_current_user(db = Depends(get_db)):
+    # Resolved recursively
+    ...
+
+@router.get("/me")
+async def me(user = Depends(get_current_user)) -> User:
+    return user
+```
+
+## Response Serialization
+
+Return types are automatically serialized:
+
+| Return Type | Response |
+|-------------|----------|
+| Pydantic model | JSON (200) |
+| `list[Model]` | JSON array (200) |
+| `dict` | JSON (200) |
+| `None` | 204 No Content |
+| `str` | text/plain (200) |
+| Starlette `Response` | passed through |
+
+## Error Handling
+
+```python
+from neutron.error import not_found, bad_request, validation_error
+
+@router.get("/users/{user_id}")
+async def get_user(user_id: int) -> User:
+    user = await db.find(user_id)
+    if not user:
+        raise not_found("User not found")
+    return user
+```
+
+RFC 7807 errors: `bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `validation_error`, `rate_limited`, `internal_error`.

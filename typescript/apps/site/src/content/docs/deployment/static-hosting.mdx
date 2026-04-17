@@ -1,0 +1,35 @@
+---
+title: Static Hosting
+description: Deploying as a static site.
+---
+
+If your application consists only of **static routes** (no `mode: "app"`), you can deploy it to any static hosting provider (GitHub Pages, Netlify, AWS S3, etc.).
+
+## Usage
+
+1.  Install the adapter:
+    ```bash
+    npm install @neutron/adapter-static
+    ```
+
+2.  Update `neutron.config.ts`:
+    ```ts
+    import staticAdapter from "@neutron/adapter-static";
+
+    export default defineConfig({
+      adapter: staticAdapter(),
+    });
+    ```
+
+3.  Build:
+    ```bash
+    npm run build
+    ```
+
+## Output
+
+The build command will produce a directory (usually `dist`) containing pure `.html`, `.css`, and `.js` (for islands) files. Upload this directory to your host.
+
+## Client-Side Routing?
+
+Static builds produce standard HTML files. Navigation between pages is standard browser navigation. If you need SPA-like navigation on a static host, consider using View Transitions.
