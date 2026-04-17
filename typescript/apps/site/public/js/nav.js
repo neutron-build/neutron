@@ -3,8 +3,8 @@
   var activePanel = null;
   var openTimer = null;
   var closeTimer = null;
-  var OPEN_DELAY = 80;   // ignore brief hover pass-throughs
-  var CLOSE_DELAY = 140; // grace period so you can cross to the popover
+  var OPEN_DELAY = 50;   // quick intent detection
+  var CLOSE_DELAY = 200; // generous grace period to reach the popover
 
   function getNav() { return document.getElementById('main-nav'); }
   function getProducts() { return document.getElementById('nav-products'); }
@@ -61,8 +61,9 @@
 
     var triggerRect = trigger.getBoundingClientRect();
     var navRect = nav.getBoundingClientRect();
-    // Left-align popover under the trigger (extends to the right from trigger's left edge)
-    var left = triggerRect.left - navRect.left;
+    // Center popover under the trigger, clamped to nav edges
+    var triggerCenter = triggerRect.left + triggerRect.width / 2 - navRect.left;
+    var left = triggerCenter - w / 2;
     left = Math.max(8, Math.min(left, navRect.width - w - 8));
     popover.style.left = left + 'px';
     popover.style.top = navRect.height + 'px';
