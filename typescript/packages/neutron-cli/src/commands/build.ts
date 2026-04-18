@@ -67,6 +67,36 @@ export async function build(): Promise<void> {
   const staticRouteCount = pageRoutes.filter((route) => route.config.mode === "static").length;
   const appRouteCount = pageRoutes.filter((route) => route.config.mode === "app").length;
 
+  // Static-only sites can still use <Island> for interactive hydration; if any
+  // source file references Island from the client entrypoint, we need the full
+  // client bundle (not just CSS) so the island-runtime + component code ship
+  // to the browser.
+  function fileUsesIsland(p: string): boolean {
+    try {
+      const src = fs.readFileSync(p, "utf-8");
+      return /\bIsland\b/.test(src) && /from\s+["'][^"']*@neutron-build\/core\/client["']/.test(src);
+    } catch {
+      return false;
+    }
+  }
+  function walkForIslands(dir: string): boolean {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (walkForIslands(p)) return true;
+      } else if (/\.(tsx|ts|jsx|js)$/.test(entry.name) && fileUsesIsland(p)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  const srcDir = path.join(cwd, "src");
+  const hasIslands =
+    routes.some((r) => fileUsesIsland(r.file)) ||
+    (fs.existsSync(srcDir) && walkForIslands(srcDir));
+  void staticRouteCount;
+
   console.log(`Found ${routes.length} routes:\n`);
   for (const route of routes) {
     const isStatic = route.config.mode === "static";
@@ -74,6 +104,9 @@ export async function build(): Promise<void> {
     const hasParams = route.params.length > 0;
     const paramNote = hasParams ? " (has params)" : "";
     console.log(`  ${route.path} (${type})${paramNote}`);
+  }
+  if (hasIslands && appRouteCount === 0) {
+    console.log("\n  (static routes with islands — client bundle will be emitted for hydration)");
   }
   console.log("");
 
@@ -88,7 +121,7 @@ export async function build(): Promise<void> {
   // Build client assets. For static-only sites (no app routes), create a
   // temporary CSS-only entry so Vite still extracts stylesheets without
   // requiring an index.html entry point.
-  if (appRouteCount > 0) {
+  if (appRouteCount > 0 || hasIslands) {
     console.log("Building client bundle...");
     await viteBuild(
       mergeConfig(userConfig, {
