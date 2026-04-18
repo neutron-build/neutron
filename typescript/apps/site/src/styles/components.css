@@ -140,7 +140,7 @@
 /* === NAV RESPONSIVE LAYOUT ===
    Wide (>1200): logo · [full language bar] · [dropdowns] · CLI Docs GitHub
    Medium (641–1200): logo · [Languages▾ Platforms▾ Database▾] · CLI Docs GitHub
-   Mobile (≤640): logo · CLI Docs GitHub
+   Mobile (≤640): logo · hamburger → drawer
 */
 
 /* Wide: full language bar visible, compact Languages trigger hidden */
@@ -148,6 +148,105 @@
 
 /* Push the right-side items (links) to the far right at all sizes */
 .nav__links { margin-left: auto; }
+
+/* Hamburger button — only shown at mobile breakpoint */
+.nav__hamburger {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-primary);
+  cursor: pointer;
+  padding: 0;
+  margin-left: auto;
+  transition: background 0.15s, border-color 0.15s;
+}
+.nav__hamburger:hover { background: var(--surface-hover, rgba(255,255,255,0.04)); }
+.nav__hamburger:focus-visible { outline: 2px solid var(--accent, #89b4fa); outline-offset: 2px; }
+
+/* Mobile drawer — hidden by default, full-screen overlay when open */
+.nav__drawer {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity 0.2s ease, visibility 0s linear 0.2s;
+}
+.nav__drawer.is-open {
+  visibility: visible;
+  opacity: 1;
+  transition: opacity 0.2s ease, visibility 0s linear 0s;
+}
+.nav__drawer-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+}
+.nav__drawer-panel {
+  position: absolute;
+  inset: 0;
+  background: var(--bg, #0a0a0a);
+  color: var(--text-primary);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  transform: translateY(-16px);
+  transition: transform 0.2s ease;
+}
+.nav__drawer.is-open .nav__drawer-panel { transform: translateY(0); }
+.nav__drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg, #0a0a0a);
+  z-index: 1;
+}
+.nav__drawer-close {
+  width: 40px;
+  height: 40px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.nav__drawer-body { padding: 1.25rem 1.25rem 3rem; }
+.nav__drawer-section { margin-bottom: 1.75rem; }
+.nav__drawer-title {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-muted, #9399b2);
+  margin: 0 0 0.75rem 0;
+}
+.nav__drawer-link {
+  display: block;
+  padding: 0.75rem 0;
+  font-size: 1rem;
+  color: var(--text-primary);
+  text-decoration: none;
+  border-bottom: 1px solid var(--border);
+}
+.nav__drawer-link:last-child { border-bottom: none; }
+.nav__drawer-link--primary { font-weight: 500; }
+
+/* Prevent background scroll while drawer is open */
+body.nav-drawer-open { overflow: hidden; }
 
 .nav__tile-grid--languages {
   display: grid;
@@ -168,13 +267,12 @@
   .nav__trigger--compact { display: inline-flex; }
 }
 
-/* Mobile: keep dropdowns, tighten spacing */
+/* Mobile: collapse everything behind a hamburger drawer */
 @media (max-width: 640px) {
   .nav__inner { gap: var(--space-2); }
-  .nav__dropdowns { gap: 0; }
-  .nav__links { gap: var(--space-3); }
-  .nav__trigger { font-size: 0.8125rem; padding: 4px 6px; }
-  .nav__link { font-size: 0.8125rem; }
+  .nav__dropdowns { display: none; }
+  .nav__links { display: none; }
+  .nav__hamburger { display: inline-flex; }
 }
 
 .nav__link {
