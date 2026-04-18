@@ -150,4 +150,43 @@
   document.addEventListener('keydown', function (e) {
     if (e.key === 'Escape' && activePanel) closeNow();
   });
+
+  // --- Mobile drawer ---
+  function getDrawer() { return document.getElementById('nav-drawer'); }
+  function openDrawer() {
+    var d = getDrawer();
+    if (!d) return;
+    d.classList.add('is-open');
+    d.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('nav-drawer-open');
+    var trigger = document.getElementById('nav-hamburger');
+    if (trigger) trigger.setAttribute('aria-expanded', 'true');
+  }
+  function closeDrawer() {
+    var d = getDrawer();
+    if (!d) return;
+    d.classList.remove('is-open');
+    d.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('nav-drawer-open');
+    var trigger = document.getElementById('nav-hamburger');
+    if (trigger) trigger.setAttribute('aria-expanded', 'false');
+  }
+  document.addEventListener('click', function (e) {
+    if (e.target.closest && e.target.closest('#nav-hamburger')) {
+      e.preventDefault();
+      var d = getDrawer();
+      if (d && d.classList.contains('is-open')) closeDrawer(); else openDrawer();
+      return;
+    }
+    if (e.target.closest && e.target.closest('[data-drawer-close]')) {
+      e.preventDefault();
+      closeDrawer();
+    }
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') {
+      var d = getDrawer();
+      if (d && d.classList.contains('is-open')) closeDrawer();
+    }
+  });
 })();
