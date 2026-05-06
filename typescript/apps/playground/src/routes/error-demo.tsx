@@ -1,4 +1,4 @@
-import type { ErrorBoundaryProps } from "neutron";
+import type { ErrorBoundaryProps } from "@neutron-build/core";
 
 export const config = { mode: "static" };
 

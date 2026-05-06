@@ -165,7 +165,7 @@ document.querySelectorAll("[data-stagger-children]>*").forEach(function(el){el.s
  *
  * @example
  * ```tsx
- * import { ScrollReveal } from "neutron/client";
+ * import { ScrollReveal } from "@neutron-build/core/client";
  *
  * // With default CSS (good for quick prototyping):
  * <ScrollReveal />

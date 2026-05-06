@@ -179,6 +179,57 @@ impl AstCache {
     }
 }
 
+/// Bounded global prepared statement cache with LRU eviction.
+///
+/// Shared across all sessions — when a session PREPAREs a statement,
+/// the parsed AST is cached here. Other sessions with an identical SQL
+/// string can reuse the cached AST instead of re-parsing.
+/// When the cache is full, the entry with the lowest access count
+/// is evicted to make room.
+pub(crate) struct GlobalPreparedCache {
+    entries: HashMap<String, GlobalPreparedEntry>,
+    max_entries: usize,
+}
+
+struct GlobalPreparedEntry {
+    stmt: std::sync::Arc<PreparedStmt>,
+    access_count: u64,
+}
+
+impl GlobalPreparedCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_entries,
+        }
+    }
+
+    /// Look up a cached prepared statement by SQL text. Bumps the access counter on hit.
+    pub fn get(&mut self, sql: &str) -> Option<std::sync::Arc<PreparedStmt>> {
+        if let Some(entry) = self.entries.get_mut(sql) {
+            entry.access_count = entry.access_count.saturating_add(1);
+            Some(std::sync::Arc::clone(&entry.stmt))
+        } else {
+            None
+        }
+    }
+
+    /// Insert a prepared statement. Evicts the least-accessed entry if full.
+    pub fn insert(&mut self, sql: String, stmt: std::sync::Arc<PreparedStmt>) {
+        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&sql)
+            && let Some(victim_key) = self.entries.iter()
+                .min_by_key(|(_, e)| e.access_count)
+                .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&victim_key);
+            }
+        self.entries.insert(sql, GlobalPreparedEntry {
+            stmt,
+            access_count: 1,
+        });
+    }
+}
+
 /// A cached query plan entry with LRU access tracking.
 struct PlanCacheEntry {
     plan: crate::planner::PlanNode,

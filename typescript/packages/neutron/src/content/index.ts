@@ -193,7 +193,11 @@ export async function prepareContentCollections(
   const manifestPath =
     options.manifestPath || path.join(rootDir, "dist", CONTENT_MANIFEST_DIST_NAME);
 
-  const store = await loadCollectionStore(rootDir, { force: true });
+  const store = await loadCollectionStore(rootDir, {
+    force: true,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    markdownConfig: (options as any).markdownConfig ?? activeMarkdownConfig,
+  });
 
   if (writeManifest) {
     const serializableCollections = toSerializableCollections(store.collections);
@@ -219,6 +223,22 @@ export async function prepareContentCollections(
   }
 }
 
+// Module-level fallback for the markdown config. Set by the CLI during
+// build/dev startup so callers of getCollection (which don't receive a
+// markdownConfig as an argument) still pick up user-supplied marked
+// extensions, remark/rehype plugins, etc.
+let activeMarkdownConfig: NeutronMarkdownConfig | undefined;
+
+export function setActiveMarkdownConfig(config: NeutronMarkdownConfig | undefined) {
+  activeMarkdownConfig = config;
+  // Invalidate any cached stores so the new config takes effect.
+  cacheByRoot.clear();
+}
+
+export function getActiveMarkdownConfig(): NeutronMarkdownConfig | undefined {
+  return activeMarkdownConfig;
+}
+
 async function loadCollectionStore(
   rootDir: string,
   options: { force?: boolean; markdownConfig?: NeutronMarkdownConfig } = {}
@@ -228,6 +248,7 @@ async function loadCollectionStore(
   if (!options.force && cached && cached.fingerprint === fingerprint) {
     return cached.store;
   }
+  const effectiveConfig = options.markdownConfig ?? activeMarkdownConfig;
 
   const config = await loadContentConfig(rootDir);
   if (!config) {
@@ -256,7 +277,7 @@ async function loadCollectionStore(
       rootDir,
       collectionName,
       definition,
-      options.markdownConfig
+      effectiveConfig
     );
   }
 
@@ -635,6 +656,17 @@ async function renderMarkup(
   if (markdownConfig?.syntaxHighlight !== false) {
     const theme = (markdownConfig?.syntaxHighlight && markdownConfig.syntaxHighlight.theme) || "github-dark";
     markedInstance.use(markedShikiExtension(theme));
+  }
+  // Apply user-supplied marked extensions (KaTeX, directive, custom tokens).
+  // Each entry is forwarded directly to Marked.use(). Wired here so plain
+  // `.md` content gets the same plugin opportunity that MDX has via
+  // remark/rehype.
+  const extList = markdownConfig?.markedExtensions ?? activeMarkdownConfig?.markedExtensions;
+  if (extList?.length) {
+    for (const ext of extList) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      markedInstance.use(ext as any);
+    }
   }
 
   const html = await markedInstance.parse(source);

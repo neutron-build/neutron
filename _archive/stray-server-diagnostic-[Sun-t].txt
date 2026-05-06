@@ -1,0 +1,20 @@
+=== MEMORY ===
+               total        used        free      shared  buff/cache   available
+Mem:           7.6Gi       4.0Gi       659Mi       516Mi       3.8Gi       3.6Gi
+Swap:          4.0Gi       131Mi       3.9Gi
+
+=== OOM KILLS SINCE FIX (~30min ago) ===
+0
+awk: cannot open "{print}" (No such file or directory)
+0
+(total all-time for context)
+25
+
+=== MYSQL + TYLERS WP ===
+tylers-webpage-wordpress-yueat9-wordpress-1	179.3MiB / 512MiB	35.02%
+wordpress-shared-mysql	512.3MiB / 768MiB	66.70%
+
+=== MYSQL RESPONSIVE ===
+mysqld is alive
+uptime (seconds):
+Uptime	6708

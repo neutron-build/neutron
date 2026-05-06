@@ -1,10 +1,10 @@
 {
-  "name": "@neutron/nucleus",
+  "name": "@neutron-build/nucleus",
   "version": "0.1.0",
   "description": "TypeScript client for Nucleus multi-model database engine.",
   "author": "Tyler",
   "type": "module",
-  "license": "BUSL-1.1",
+  "license": "MIT",
   "homepage": "https://neutron.build",
   "repository": {
     "type": "git",
@@ -99,5 +99,11 @@
   "devDependencies": {
     "@types/node": "^22.10.7",
     "typescript": "^5.7.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

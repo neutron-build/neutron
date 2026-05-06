@@ -1,4 +1,4 @@
-import { getCookie, serializeCookie, type MiddlewareFn } from "neutron";
+import { getCookie, serializeCookie, type MiddlewareFn } from "@neutron-build/core";
 import { getDataRuntime } from "../data/runtime.js";
 
 export const config = { mode: "app" };

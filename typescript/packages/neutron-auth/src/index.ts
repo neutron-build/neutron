@@ -1,4 +1,4 @@
-import type { AppContext, MiddlewareFn } from "neutron";
+import type { AppContext, MiddlewareFn } from "@neutron-build/core";
 
 export interface AuthUser {
   id?: string;

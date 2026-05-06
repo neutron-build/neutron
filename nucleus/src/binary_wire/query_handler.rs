@@ -52,6 +52,9 @@ impl PreparedQuery {
     }
 }
 
+/// Maximum number of prepared statements cached per connection.
+const MAX_PREPARED_PER_CONNECTION: usize = 256;
+
 /// Query handler for simple and prepared queries.
 pub struct QueryHandler {
     #[allow(dead_code)]
@@ -69,6 +72,7 @@ impl QueryHandler {
     }
 
     /// Prepare a statement for later execution.
+    /// Evicts the oldest entry (lowest stmt_id) if the cache exceeds the limit.
     pub fn prepare_statement(
         &mut self,
         stmt_id: u32,
@@ -76,6 +80,14 @@ impl QueryHandler {
     ) -> Result<PreparedQuery, ExecError> {
         let prepared = PreparedQuery::new(stmt_id, sql)?;
         self.prepared_cache.insert(stmt_id, prepared.clone());
+        // Evict oldest entries if over capacity
+        while self.prepared_cache.len() > MAX_PREPARED_PER_CONNECTION {
+            if let Some(&oldest_id) = self.prepared_cache.keys().min() {
+                self.prepared_cache.remove(&oldest_id);
+            } else {
+                break;
+            }
+        }
         Ok(prepared)
     }
 

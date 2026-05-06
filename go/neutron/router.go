@@ -13,7 +13,10 @@ type Router struct {
 	mux        *http.ServeMux
 	prefix     string
 	middleware []Middleware
-	routes     []routeRecord // tracked for OpenAPI generation
+	// routes is shared across a root router and its Group() descendants via
+	// pointer so OpenAPI sees every registered endpoint regardless of where it
+	// was registered.
+	routes *[]routeRecord
 }
 
 // routeRecord stores metadata about a registered route for OpenAPI.
@@ -58,8 +61,10 @@ func WithOperationID(id string) RouteOption {
 
 // newRouter creates a root router.
 func newRouter() *Router {
+	var routes []routeRecord
 	return &Router{
-		mux: http.NewServeMux(),
+		mux:    http.NewServeMux(),
+		routes: &routes,
 	}
 }
 
@@ -69,8 +74,8 @@ func (r *Router) Group(prefix string, mw ...Middleware) *Router {
 	return &Router{
 		mux:        r.mux,
 		prefix:     r.prefix + prefix,
-		middleware:  append(r.middleware[:len(r.middleware):len(r.middleware)], mw...),
-		routes:     r.routes, // share route list (pointer to same backing)
+		middleware: append(r.middleware[:len(r.middleware):len(r.middleware)], mw...),
+		routes:     r.routes, // pointer-shared across the whole tree
 	}
 }
 
@@ -102,13 +107,15 @@ func (r *Router) register(method, pattern string, handler http.Handler, inType, 
 	wrapped := applyMiddleware(handler, r.middleware)
 	r.mux.Handle(fullPattern, wrapped)
 
-	r.routes = append(r.routes, routeRecord{
-		Method:  method,
-		Pattern: r.prefix + pattern,
-		InType:  inType,
-		OutType: outType,
-		Options: opts,
-	})
+	if r.routes != nil {
+		*r.routes = append(*r.routes, routeRecord{
+			Method:  method,
+			Pattern: r.prefix + pattern,
+			InType:  inType,
+			OutType: outType,
+			Options: opts,
+		})
+	}
 }
 
 // ServeHTTP implements http.Handler.
@@ -150,8 +157,12 @@ type RouteInfo struct {
 
 // Routes returns a list of all registered routes for debugging/inspection.
 func (r *Router) Routes() []RouteInfo {
-	infos := make([]RouteInfo, 0, len(r.routes))
-	for _, rec := range r.routes {
+	if r.routes == nil {
+		return nil
+	}
+	records := *r.routes
+	infos := make([]RouteInfo, 0, len(records))
+	for _, rec := range records {
 		infos = append(infos, RouteInfo{
 			Method:  rec.Method,
 			Pattern: rec.Pattern,

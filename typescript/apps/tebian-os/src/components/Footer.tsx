@@ -1,4 +1,4 @@
-import { Link } from "neutron/client";
+import { Link } from "@neutron-build/core/client";
 
 export function Footer() {
   return (

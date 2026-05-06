@@ -10,8 +10,8 @@
     "preview": "neutron-ts preview"
   },
   "dependencies": {
-    "neutron": "workspace:*",
-    "neutron-cli": "workspace:*",
+    "@neutron-build/core": "workspace:*",
+    "@neutron-build/cli": "workspace:*",
     "preact": "^10.25.4",
     "react": "19.2.4",
     "react-dom": "19.2.4"
@@ -19,5 +19,6 @@
   "devDependencies": {
     "typescript": "^5.7.2",
     "vite": "^6.0.7"
-  }
+  },
+  "peerDependencies": {}
 }

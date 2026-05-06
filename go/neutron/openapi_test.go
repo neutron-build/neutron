@@ -27,7 +27,7 @@ func TestOpenAPIGeneration(t *testing.T) {
 		return nil, nil
 	}, WithSummary("List users"), WithTags("users"))
 
-	spec := generateOpenAPI(r.routes, OpenAPIInfo{Title: "Test API", Version: "1.0.0"})
+	spec := generateOpenAPI(*r.routes, OpenAPIInfo{Title: "Test API", Version: "1.0.0"})
 
 	if spec.OpenAPI != "3.1.0" {
 		t.Errorf("openapi = %q", spec.OpenAPI)
@@ -95,7 +95,7 @@ func TestOpenAPIPathParams(t *testing.T) {
 		return UserResponse{ID: input.ID}, nil
 	})
 
-	spec := generateOpenAPI(r.routes, OpenAPIInfo{Title: "Test", Version: "1.0.0"})
+	spec := generateOpenAPI(*r.routes, OpenAPIInfo{Title: "Test", Version: "1.0.0"})
 
 	pathItem, ok := spec.Paths["/users/{id}"]
 	if !ok {
@@ -135,7 +135,7 @@ func TestOpenAPIValidationConstraints(t *testing.T) {
 		return Resp{}, nil
 	})
 
-	spec := generateOpenAPI(r.routes, OpenAPIInfo{Title: "Test", Version: "1.0.0"})
+	spec := generateOpenAPI(*r.routes, OpenAPIInfo{Title: "Test", Version: "1.0.0"})
 
 	schema, ok := spec.Components.Schemas["Input"]
 	if !ok {

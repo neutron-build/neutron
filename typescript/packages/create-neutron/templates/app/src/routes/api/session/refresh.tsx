@@ -1,4 +1,4 @@
-import type { ActionArgs } from "neutron";
+import type { ActionArgs } from "@neutron-build/core";
 
 export const config = { mode: "app" };
 

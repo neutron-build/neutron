@@ -10,8 +10,8 @@
     "preview": "neutron-ts preview"
   },
   "dependencies": {
-    "neutron": "__NEUTRON_VERSION__",
-    "neutron-cli": "__NEUTRON_CLI_VERSION__",
+    "@neutron-build/core": "__NEUTRON_VERSION__",
+    "@neutron-build/cli": "__NEUTRON_CLI_VERSION__",
     "preact": "^10.25.4"
   },
   "devDependencies": {

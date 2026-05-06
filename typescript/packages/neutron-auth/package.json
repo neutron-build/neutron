@@ -1,9 +1,9 @@
 {
-  "name": "@neutron/auth",
+  "name": "@neutron-build/auth",
   "version": "0.1.0",
   "description": "Auth middleware for Neutron. Better Auth and Auth.js adapters with protected route helpers.",
   "author": "Tyler",
-  "license": "BUSL-1.1",
+  "license": "MIT",
   "homepage": "https://neutron.build",
   "repository": {
     "type": "git",
@@ -34,7 +34,7 @@
     "test": "pnpm run build && node --test --experimental-test-isolation=none dist/index.test.js"
   },
   "dependencies": {
-    "neutron": "workspace:*"
+    "@neutron-build/core": "workspace:*"
   },
   "peerDependencies": {
     "better-auth": "*",
@@ -51,5 +51,12 @@
   "devDependencies": {
     "@types/node": "^22.10.7",
     "typescript": "^5.7.2"
-  }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false
 }

@@ -1,5 +1,5 @@
-import { Form } from "neutron/client";
-import type { ActionArgs } from "neutron";
+import { Form } from "@neutron-build/core/client";
+import type { ActionArgs } from "@neutron-build/core";
 
 export const config = { mode: "app" };
 

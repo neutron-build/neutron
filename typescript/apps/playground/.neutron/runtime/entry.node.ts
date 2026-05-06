@@ -1,5 +1,5 @@
 import { h } from "preact";
-import { createRouter, runMiddlewareChain, renderToString, encodeSerializedPayloadAsJson, serializeForInlineScript, mergeSeoMetaInput, renderDocumentHead, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders } from "neutron/runtime-edge";
+import { createRouter, runMiddlewareChain, renderToString, encodeSerializedPayloadAsJson, serializeForInlineScript, mergeSeoMetaInput, renderDocumentHead, compileRouteRules, resolveRouteRuleRedirect, resolveRouteRuleRewrite, resolveRouteRuleHeaders } from "@neutron-build/core/runtime-edge";
 import * as routeModule0 from "../../src/routes/_layout.tsx";
 import * as routeModule1 from "../../src/routes/admin.tsx";
 import * as routeModule2 from "../../src/routes/big.tsx";

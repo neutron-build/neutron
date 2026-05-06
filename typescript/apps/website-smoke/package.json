@@ -12,13 +12,14 @@
     "release:check": "neutron-ts release-check --preset static"
   },
   "dependencies": {
-    "neutron": "workspace:*",
-    "neutron-cli": "workspace:*",
+    "@neutron-build/core": "workspace:*",
+    "@neutron-build/cli": "workspace:*",
     "preact": "^10.25.4"
   },
   "devDependencies": {
     "@preact/preset-vite": "^2.9.4",
     "typescript": "^5.7.2",
     "vite": "^6.0.7"
-  }
+  },
+  "peerDependencies": {}
 }

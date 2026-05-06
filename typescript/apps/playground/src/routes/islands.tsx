@@ -1,4 +1,4 @@
-import { Island } from "neutron/client";
+import { Island } from "@neutron-build/core/client";
 import Counter from "../components/Counter.js";
 import Toggle from "../components/Toggle.js";
 import Stopwatch from "../components/Stopwatch.js";

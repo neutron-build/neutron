@@ -1,0 +1,19 @@
+[
+  {
+    "mode": "traces",
+    "target": "http://192.168.1.80:3000",
+    "duration": "30s",
+    "concurrency": 5,
+    "total_requests": 15,
+    "success_requests": 0,
+    "failed_requests": 15,
+    "throughput_rps": 0,
+    "latency_p50_ms": 10001.223082999999,
+    "latency_p95_ms": 10001.351250000002,
+    "latency_p99_ms": 10001.351250000002,
+    "latency_avg_ms": 10001.197158199999,
+    "latency_min_ms": 10000.981916,
+    "latency_max_ms": 10001.351250000002,
+    "bytes_sent": 10003
+  }
+]

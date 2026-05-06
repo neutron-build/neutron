@@ -137,6 +137,15 @@ impl Decoder {
         self.buffer.clear();
     }
 
+    /// Shrink the internal buffer back to a target capacity if it has grown
+    /// beyond a threshold. Prevents per-connection memory retention from
+    /// large incoming frames.
+    pub fn shrink_if_needed(&mut self, target: usize) {
+        if self.buffer.is_empty() && self.buffer.capacity() > target * 4 {
+            self.buffer = BytesMut::with_capacity(target);
+        }
+    }
+
     /// Parse a Query message from decoded frame payload.
     /// Payload: [flags:1][query_id:4][sql:variable]
     pub fn parse_query(payload: &[u8]) -> Result<(u8, u32, &str), DecodeError> {

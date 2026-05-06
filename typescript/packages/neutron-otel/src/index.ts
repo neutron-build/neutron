@@ -7,7 +7,7 @@ import type {
   NeutronRequestEndEvent,
   NeutronRequestStartEvent,
   NeutronServerHooks,
-} from "neutron";
+} from "@neutron-build/core";
 
 interface OTelSpan {
   setAttribute(key: string, value: string | number | boolean): void;

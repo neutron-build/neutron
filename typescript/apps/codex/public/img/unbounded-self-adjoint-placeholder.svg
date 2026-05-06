@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-labelledby="title desc">
+  <title id="title">Unbounded self-adjoint operator</title>
+  <desc id="desc">A steep operator is defined on a dense domain inside a Hilbert space and has a balanced mirror symmetry.</desc>
+  <rect width="900" height="460" fill="#f8fafc"/>
+  <ellipse cx="450" cy="245" rx="300" ry="150" fill="#eef2ff" stroke="#4f46e5" stroke-width="4"/>
+  <ellipse cx="375" cy="245" rx="150" ry="82" fill="#ffffff" stroke="#2563eb" stroke-width="4" stroke-dasharray="9 8"/>
+  <text x="450" y="72" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="30" fill="#1f2933">dense domain inside a Hilbert space</text>
+  <text x="375" y="354" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="22" fill="#2563eb">domain D(A)</text>
+  <text x="656" y="344" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="22" fill="#4f46e5">Hilbert space H</text>
+  <path d="M315 265 C365 150 430 150 495 265" fill="none" stroke="#dc2626" stroke-width="6" stroke-linecap="round"/>
+  <path d="M315 265 C365 380 430 380 495 265" fill="none" stroke="#16a34a" stroke-width="6" stroke-linecap="round"/>
+  <line x1="405" y1="128" x2="405" y2="384" stroke="#64748b" stroke-width="3" stroke-dasharray="8 8"/>
+  <text x="515" y="178" font-family="Inter, Arial, sans-serif" font-size="21" fill="#dc2626">operator action</text>
+  <text x="515" y="304" font-family="Inter, Arial, sans-serif" font-size="21" fill="#16a34a">adjoint symmetry</text>
+  <text x="450" y="425" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="21" fill="#475569">Self-adjointness is symmetry plus the correct domain.</text>
+</svg>

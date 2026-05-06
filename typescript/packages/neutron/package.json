@@ -1,9 +1,9 @@
 {
-  "name": "neutron",
-  "version": "0.1.0",
+  "name": "@neutron-build/core",
+  "version": "0.0.1",
   "description": "The unified TypeScript web framework. Static sites with zero JS, app routes with Preact SSR, one router, deploy anywhere.",
   "author": "Tyler",
-  "license": "BUSL-1.1",
+  "license": "MIT",
   "homepage": "https://neutron.build",
   "repository": {
     "type": "git",
@@ -96,5 +96,12 @@
     "shiki": {
       "optional": true
     }
-  }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false
 }

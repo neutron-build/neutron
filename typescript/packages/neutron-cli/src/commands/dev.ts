@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import { createServer, loadConfigFromFile, mergeConfig } from "vite";
 import {
   neutronPlugin,
-} from "neutron/vite";
+} from "@neutron-build/core/vite";
 import {
   prepareContentCollections,
   prepareRouteTypes,
@@ -11,7 +11,7 @@ import {
   resolveRuntimeAliases,
   resolveRuntimeNoExternal,
   type NeutronConfig,
-} from "neutron";
+} from "@neutron-build/core";
 
 export async function dev(): Promise<void> {
   const cwd = process.cwd();

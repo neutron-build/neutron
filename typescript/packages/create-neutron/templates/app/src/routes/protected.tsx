@@ -1,4 +1,4 @@
-import type { LoaderArgs } from "neutron";
+import type { LoaderArgs } from "@neutron-build/core";
 
 export const config = { mode: "app", cache: { maxAge: 10 } };
 

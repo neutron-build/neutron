@@ -86,6 +86,15 @@ impl Encoder {
         self.buffer.to_vec()
     }
 
+    /// Shrink the internal buffer back to a target capacity if it has grown
+    /// beyond a threshold. Prevents per-connection memory retention from
+    /// large query responses.
+    pub fn shrink_if_needed(&mut self, target: usize) {
+        if self.buffer.capacity() > target * 4 {
+            self.buffer = BytesMut::with_capacity(target);
+        }
+    }
+
     /// Encode a complete TLV frame: [type:1][length:4][payload:N]
     pub fn encode_frame(&mut self, message_type: u8, payload: &[u8]) {
         // Type (1 byte)

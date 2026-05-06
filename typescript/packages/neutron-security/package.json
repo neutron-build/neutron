@@ -1,9 +1,9 @@
 {
-  "name": "@neutron/security",
+  "name": "@neutron-build/security",
   "version": "0.1.0",
   "description": "Security middleware for Neutron. CSP, CSRF protection, rate limiting, and secure cookie defaults.",
   "author": "Tyler",
-  "license": "BUSL-1.1",
+  "license": "MIT",
   "homepage": "https://neutron.build",
   "repository": {
     "type": "git",
@@ -35,10 +35,18 @@
     "test": "pnpm run build && node --test --experimental-test-isolation=none dist/index.test.js"
   },
   "dependencies": {
-    "neutron": "workspace:*"
+    "@neutron-build/core": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",
     "typescript": "^5.7.2"
-  }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {},
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false
 }

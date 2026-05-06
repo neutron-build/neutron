@@ -66,7 +66,7 @@ export interface CsrfOptions {
  *
  * @example
  * ```ts
- * import { csrfMiddleware } from "neutron/server";
+ * import { csrfMiddleware } from "@neutron-build/core/server";
  *
  * export const middleware = [
  *   sessionMiddleware(...),

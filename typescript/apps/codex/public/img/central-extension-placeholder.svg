@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-labelledby="title desc">
+  <title id="title">Central extension adds a central direction</title>
+  <desc id="desc">A Lie algebra is enlarged by a new central line that commutes with everything, recording a cocycle defect.</desc>
+  <rect width="900" height="460" fill="#f8fafc"/>
+  <rect x="120" y="140" width="260" height="180" rx="8" fill="#ffffff" stroke="#1f2933" stroke-width="4"/>
+  <text x="250" y="222" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="30" fill="#1f2933">g</text>
+  <path d="M405 230 L515 230" stroke="#334155" stroke-width="6" stroke-linecap="round"/>
+  <path d="M515 230 l-22 -14 l4 28 z" fill="#334155"/>
+  <rect x="545" y="115" width="250" height="230" rx="8" fill="#ffffff" stroke="#1f2933" stroke-width="4"/>
+  <rect x="590" y="255" width="160" height="58" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="4"/>
+  <text x="670" y="293" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="25" fill="#1f2933">g</text>
+  <line x1="670" y1="145" x2="670" y2="245" stroke="#dc2626" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="670" cy="145" r="15" fill="#dc2626"/>
+  <text x="705" y="174" font-family="Inter, Arial, sans-serif" font-size="22" fill="#dc2626">central line</text>
+  <text x="450" y="70" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="30" fill="#1f2933">add a commuting direction</text>
+  <text x="450" y="420" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="22" fill="#475569">The new term records a cocycle while commuting with the old algebra.</text>
+</svg>

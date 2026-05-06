@@ -1,4 +1,4 @@
-import { defineCollection, z } from "neutron/content";
+import { defineCollection, z } from "@neutron-build/core/content";
 
 export const collections = {
   docs: defineCollection({

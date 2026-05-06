@@ -1,4 +1,4 @@
-import { Island } from "neutron/client";
+import { Island } from "@neutron-build/core/client";
 import { DownloadCounter } from "../components/DownloadCounter";
 import { CopyCommand } from "../components/CopyCommand";
 import "../styles/home.css";
@@ -25,7 +25,7 @@ export default function Home() {
             <div class="dl-wrapper">
               <a href="https://github.com/tebian-os/tebian/releases/latest/download/tebian-pc.iso" class="dl-main" id="dl-btn">
                 <span class="dl-text">Download ISO</span>
-                <span class="dl-arch">x86_64 ~800MB</span>
+                <span class="dl-arch">x86_64 ~1GB</span>
               </a>
             </div>
             <Island component={DownloadCounter} client="load" id="dl-counter" />

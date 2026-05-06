@@ -1,5 +1,5 @@
 import "../styles/docs.css";
-import { Island, ViewTransitions } from "neutron/client";
+import { Island, ViewTransitions } from "@neutron-build/core/client";
 import { ThemeToggle } from "../components/ThemeToggle";
 
 export function head() {

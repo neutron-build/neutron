@@ -1,9 +1,9 @@
 {
-  "name": "@neutron/cache-redis",
+  "name": "@neutron-build/cache-redis",
   "version": "0.1.0",
   "description": "Redis and Dragonfly cache store for Neutron. Distributed app and loader caching.",
   "author": "Tyler",
-  "license": "BUSL-1.1",
+  "license": "MIT",
   "homepage": "https://neutron.build",
   "repository": {
     "type": "git",
@@ -34,7 +34,7 @@
     "test": "pnpm run build && node --test --experimental-test-isolation=none dist/index.test.js"
   },
   "dependencies": {
-    "neutron": "workspace:*"
+    "@neutron-build/core": "workspace:*"
   },
   "peerDependencies": {
     "ioredis": "^5.8.1"
@@ -47,5 +47,12 @@
   "devDependencies": {
     "@types/node": "^22.10.7",
     "typescript": "^5.7.2"
-  }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false
 }

@@ -1,4 +1,4 @@
-import { init, registerRoutes } from "neutron/client";
+import { init, registerRoutes } from "@neutron-build/core/client";
 import { routes } from "virtual:neutron/routes";
 
 // Theme init — runs before hydration to prevent flash

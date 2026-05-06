@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-labelledby="title desc">
+  <title id="title">Variational calculus as nearby paths</title>
+  <desc id="desc">Several nearby curves connect the same endpoints, and the critical curve has first-order action change equal to zero.</desc>
+  <rect width="900" height="460" fill="#f8fafc"/>
+  <circle cx="155" cy="315" r="12" fill="#1f2933"/>
+  <circle cx="745" cy="130" r="12" fill="#1f2933"/>
+  <path d="M155 315 C310 115 520 340 745 130" fill="none" stroke="#2563eb" stroke-width="7" stroke-linecap="round"/>
+  <path d="M155 315 C320 180 500 210 745 130" fill="none" stroke="#dc2626" stroke-width="4" stroke-dasharray="9 8"/>
+  <path d="M155 315 C310 385 530 85 745 130" fill="none" stroke="#16a34a" stroke-width="4" stroke-dasharray="9 8"/>
+  <text x="450" y="62" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="30" fill="#1f2933">vary the path, measure first-order change</text>
+  <text x="450" y="240" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="26" fill="#2563eb">critical path</text>
+  <text x="450" y="420" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="22" fill="#475569">Euler-Lagrange equations say the first variation vanishes.</text>
+</svg>

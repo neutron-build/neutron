@@ -1,4 +1,4 @@
-import type { ActionArgs, LoaderArgs, MiddlewareFn } from "neutron";
+import type { ActionArgs, LoaderArgs, MiddlewareFn } from "@neutron-build/core";
 import { getDataRuntime, getDataRuntimeSummary } from "../data/runtime.js";
 
 export const middleware: MiddlewareFn = async (request, context, next) => {

@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" role="img" aria-labelledby="title desc">
+  <title id="title">Conformal field theory local scale symmetry</title>
+  <desc id="desc">A grid is locally stretched while preserving small angles, with operator insertions and symmetry rings.</desc>
+  <rect width="960" height="420" fill="#fbfaf7"/>
+  <defs>
+    <radialGradient id="field" cx="50%" cy="45%" r="65%">
+      <stop offset="0" stop-color="#ecfeff"/>
+      <stop offset="0.55" stop-color="#e0f2fe"/>
+      <stop offset="1" stop-color="#fef9c3"/>
+    </radialGradient>
+  </defs>
+  <rect x="58" y="50" width="844" height="310" rx="8" fill="url(#field)" stroke="#0f172a" stroke-width="3"/>
+  <g stroke="#64748b" stroke-width="2" opacity="0.55">
+    <path d="M115 70 C145 150 145 255 115 340"/>
+    <path d="M215 65 C245 145 245 260 215 345"/>
+    <path d="M320 60 C345 145 345 270 320 350"/>
+    <path d="M480 58 C500 150 500 268 480 352"/>
+    <path d="M640 60 C615 145 615 270 640 350"/>
+    <path d="M745 65 C715 145 715 260 745 345"/>
+    <path d="M845 70 C815 150 815 255 845 340"/>
+    <path d="M82 105 C250 125 700 125 878 105"/>
+    <path d="M72 180 C260 205 700 205 888 180"/>
+    <path d="M72 255 C260 230 700 230 888 255"/>
+    <path d="M82 325 C250 305 700 305 878 325"/>
+  </g>
+  <g fill="#ffffff" stroke-width="5">
+    <circle cx="315" cy="205" r="35" stroke="#7c3aed"/>
+    <circle cx="600" cy="175" r="35" stroke="#dc2626"/>
+    <circle cx="515" cy="285" r="35" stroke="#059669"/>
+  </g>
+  <g fill="none" stroke="#0f172a" stroke-width="3">
+    <circle cx="315" cy="205" r="62"/>
+    <circle cx="600" cy="175" r="62"/>
+    <path d="M377 205 C430 185 495 180 538 175"/>
+    <path d="M548 266 C575 240 590 215 600 237"/>
+  </g>
+  <g font-family="Inter, Arial, sans-serif" fill="#0f172a">
+    <text x="87" y="92" font-size="28" font-weight="700">local scale changes</text>
+    <text x="87" y="128" font-size="18">angles survive; distances may change</text>
+    <text x="302" y="213" font-size="22" font-weight="700">O</text>
+    <text x="587" y="183" font-size="22" font-weight="700">O</text>
+    <text x="502" y="293" font-size="22" font-weight="700">T</text>
+  </g>
+</svg>

@@ -262,7 +262,7 @@ export interface PermissionCheckOptions {
  *
  * @example
  * ```ts
- * import { tenantIsolation } from "neutron/server";
+ * import { tenantIsolation } from "@neutron-build/core/server";
  *
  * export const middleware = tenantIsolation({
  *   getOrganizationId: async (request, context) => {
@@ -313,7 +313,7 @@ export function tenantIsolation(options: TenantIsolationOptions): MiddlewareFn {
  *
  * @example
  * ```ts
- * import { requireOrganization } from "neutron/server";
+ * import { requireOrganization } from "@neutron-build/core/server";
  *
  * export const middleware = requireOrganization();
  * ```
@@ -351,7 +351,7 @@ export function getOrganization(context: EnterpriseAuthContext): OrganizationCon
  *
  * @example
  * ```ts
- * import { auditLogging, createMemoryAuditLogger } from "neutron/server";
+ * import { auditLogging, createMemoryAuditLogger } from "@neutron-build/core/server";
  *
  * const auditLogger = createMemoryAuditLogger();
  *
@@ -490,7 +490,7 @@ export function createMemoryAuditLogger(): AuditLogger {
  *
  * @example
  * ```ts
- * import { requirePermissions } from "neutron/server";
+ * import { requirePermissions } from "@neutron-build/core/server";
  *
  * export const middleware = requirePermissions({
  *   permissions: ["projects:read", "projects:write"],
@@ -530,7 +530,7 @@ export function requirePermissions(
  *
  * @example
  * ```ts
- * import { hasPermission } from "neutron/server";
+ * import { hasPermission } from "@neutron-build/core/server";
  *
  * export async function loader({ context }: LoaderArgs) {
  *   if (!hasPermission(context.user?.permissions || [], "projects:delete")) {
@@ -549,7 +549,7 @@ export function hasPermission(permissions: string[], permission: string): boolea
  *
  * @example
  * ```ts
- * import { hasAnyPermission } from "neutron/server";
+ * import { hasAnyPermission } from "@neutron-build/core/server";
  *
  * export async function loader({ context }: LoaderArgs) {
  *   if (!hasAnyPermission(context.user?.permissions || [], ["projects:read", "projects:write"])) {
@@ -568,7 +568,7 @@ export function hasAnyPermission(permissions: string[], requiredPermissions: str
  *
  * @example
  * ```ts
- * import { hasAllPermissions } from "neutron/server";
+ * import { hasAllPermissions } from "@neutron-build/core/server";
  *
  * export async function loader({ context }: LoaderArgs) {
  *   if (!hasAllPermissions(context.user?.permissions || [], ["projects:read", "projects:write"])) {
@@ -587,7 +587,7 @@ export function hasAllPermissions(permissions: string[], requiredPermissions: st
  *
  * @example
  * ```ts
- * import { resolvePermissions } from "neutron/server";
+ * import { resolvePermissions } from "@neutron-build/core/server";
  *
  * const roles: Role[] = [
  *   { name: "admin", permissions: ["*"] },
@@ -625,7 +625,7 @@ export function resolvePermissions(userRoles: string[], roles: Role[]): string[]
  *
  * @example
  * ```ts
- * import { sessionEnrichment } from "neutron/server";
+ * import { sessionEnrichment } from "@neutron-build/core/server";
  *
  * export const middleware = sessionEnrichment({
  *   enrich: async (context) => {

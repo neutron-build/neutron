@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-labelledby="title desc">
+  <title id="title">Integration on an oriented manifold</title>
+  <desc id="desc">Small oriented coordinate patches cover a curved surface, each contributing signed local area to a global integral.</desc>
+  <rect width="900" height="460" fill="#f8fafc"/>
+  <path d="M110 320 C210 170 330 355 455 235 C585 110 700 210 790 145 L810 365 C660 310 560 395 420 340 C290 285 220 395 110 320 Z" fill="#dcfce7" stroke="#166534" stroke-width="4"/>
+  <g transform="translate(250 245) rotate(-14)">
+    <rect x="-58" y="-38" width="116" height="76" rx="5" fill="#ffffff" opacity="0.9" stroke="#2563eb" stroke-width="4"/>
+    <path d="M-35 0 L35 0 M18 -16 L35 0 L18 16" stroke="#2563eb" stroke-width="4" fill="none" stroke-linecap="round"/>
+  </g>
+  <g transform="translate(450 255) rotate(18)">
+    <rect x="-58" y="-38" width="116" height="76" rx="5" fill="#ffffff" opacity="0.9" stroke="#dc2626" stroke-width="4"/>
+    <path d="M-35 0 L35 0 M18 -16 L35 0 L18 16" stroke="#dc2626" stroke-width="4" fill="none" stroke-linecap="round"/>
+  </g>
+  <g transform="translate(630 225) rotate(-8)">
+    <rect x="-58" y="-38" width="116" height="76" rx="5" fill="#ffffff" opacity="0.9" stroke="#7c3aed" stroke-width="4"/>
+    <path d="M-35 0 L35 0 M18 -16 L35 0 L18 16" stroke="#7c3aed" stroke-width="4" fill="none" stroke-linecap="round"/>
+  </g>
+  <text x="450" y="64" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="30" fill="#1f2933">add signed local contributions</text>
+  <text x="450" y="420" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="22" fill="#475569">Orientation tells all patches which sign agrees globally.</text>
+</svg>

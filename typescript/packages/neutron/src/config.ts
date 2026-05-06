@@ -75,8 +75,24 @@ export interface NeutronImageConfig {
 }
 
 export interface NeutronMarkdownConfig {
+  /**
+   * remark plugins applied to MDX content. Not applied to plain `.md`
+   * content (which goes through the `marked` pipeline below).
+   */
   remarkPlugins?: unknown[];
+  /**
+   * rehype plugins applied to MDX content. Not applied to plain `.md`
+   * content (which goes through the `marked` pipeline below).
+   */
   rehypePlugins?: unknown[];
+  /**
+   * `marked` extensions applied to plain `.md` content via
+   * `Marked.use(...)`. Use this to wire `marked-katex-extension`,
+   * `marked-directive`, `marked-extended-tables`, or custom token
+   * extensions. Each entry must be a value accepted by `Marked.use`.
+   * Applied after the built-in syntax-highlight extension if any.
+   */
+  markedExtensions?: unknown[];
   syntaxHighlight?: { theme?: string } | false;
 }
 

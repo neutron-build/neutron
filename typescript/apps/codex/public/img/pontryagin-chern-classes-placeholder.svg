@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540" role="img" aria-labelledby="title desc">
+  <title id="title">Chern and Pontryagin classes visual</title>
+  <desc id="desc">A complex bundle splits into line bundles whose Chern roots combine into characteristic classes.</desc>
+  <rect width="960" height="540" fill="#f6f7fb"/>
+  <path d="M90 380 C210 300 330 455 480 365 C625 278 745 330 870 250" fill="none" stroke="#284b63" stroke-width="9" stroke-linecap="round"/>
+  <g transform="translate(205 150)">
+    <rect x="-82" y="-48" width="164" height="96" rx="10" fill="#fff" stroke="#284b63" stroke-width="5"/>
+    <path d="M-62 -16 C-26 -52 27 24 62 -16" fill="none" stroke="#f4a261" stroke-width="8" stroke-linecap="round"/>
+    <path d="M-62 18 C-24 -20 28 52 62 18" fill="none" stroke="#2a9d8f" stroke-width="8" stroke-linecap="round"/>
+    <text x="0" y="88" text-anchor="middle" font-family="Arial, sans-serif" font-size="26" fill="#284b63">bundle</text>
+  </g>
+  <g transform="translate(480 150)">
+    <circle cx="-70" cy="0" r="46" fill="#fff" stroke="#f4a261" stroke-width="6"/>
+    <circle cx="0" cy="0" r="46" fill="#fff" stroke="#2a9d8f" stroke-width="6"/>
+    <circle cx="70" cy="0" r="46" fill="#fff" stroke="#e76f51" stroke-width="6"/>
+    <text x="0" y="88" text-anchor="middle" font-family="Arial, sans-serif" font-size="26" fill="#284b63">Chern roots</text>
+  </g>
+  <g transform="translate(750 150)">
+    <rect x="-74" y="-54" width="148" height="108" rx="16" fill="#fff" stroke="#284b63" stroke-width="5"/>
+    <path d="M-42 -20 H42" stroke="#f4a261" stroke-width="7" stroke-linecap="round"/>
+    <path d="M-42 4 H42" stroke="#2a9d8f" stroke-width="7" stroke-linecap="round"/>
+    <path d="M-42 28 H42" stroke="#e76f51" stroke-width="7" stroke-linecap="round"/>
+    <text x="0" y="94" text-anchor="middle" font-family="Arial, sans-serif" font-size="26" fill="#284b63">classes</text>
+  </g>
+  <path d="M300 150 H360" stroke="#284b63" stroke-width="5" marker-end="url(#arrow)"/>
+  <path d="M585 150 H655" stroke="#284b63" stroke-width="5" marker-end="url(#arrow)"/>
+  <text x="480" y="440" text-anchor="middle" font-family="Arial, sans-serif" font-size="28" fill="#284b63">split, multiply simple factors, then recombine</text>
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0 0 L12 6 L0 12 Z" fill="#284b63"/>
+    </marker>
+  </defs>
+</svg>

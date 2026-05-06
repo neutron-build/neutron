@@ -28,6 +28,7 @@ async function hydrateIsland(island: IslandElement) {
 
   try {
     const element = h(Component, props);
+    island.innerHTML = "";
     hydrate(element, island);
     island.__neutronHydrated = true;
   } catch (error) {
@@ -106,7 +107,6 @@ export function initIslands() {
         break;
         
       case "only":
-        island.innerHTML = "";
         hydrateIsland(island);
         break;
     }

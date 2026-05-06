@@ -1,6 +1,13 @@
-// Use jemalloc on supported platforms for reduced fragmentation and better
-// multi-threaded allocation throughput.  Feature-gated: `--features jemalloc`.
-#[cfg(feature = "jemalloc")]
+// Custom global allocator selection. `mimalloc-allocator` is the default
+// (universal, builds clean on macOS / Linux / Windows) shipped in the
+// `server` feature. `jemalloc` is available as opt-in for Linux production
+// tuning. Pick exactly one — the cfg gates are mutually exclusive: if
+// `mimalloc-allocator` is on, jemalloc is suppressed even if also enabled.
+#[cfg(feature = "mimalloc-allocator")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(feature = "jemalloc", not(feature = "mimalloc-allocator")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -1148,6 +1155,7 @@ async fn cmd_start(cfg: StartConfig) {
     // pressure when approaching the --max-memory limit.
     {
         let executor_for_mem = executor.clone();
+        let memory_flag = executor.memory_critical_flag().clone();
         let max_memory_bytes = config.server.max_memory_mb as u64 * 1024 * 1024;
         tokio::spawn(async move {
             let warn_threshold = (max_memory_bytes as f64 * 0.60) as u64;
@@ -1192,33 +1200,41 @@ async fn cmd_start(cfg: StartConfig) {
                             alloc.release(name, old);
                         }
                     }
-                    // If still critical after eviction, reject new connections
+                    // If still critical after eviction, reject writes via executor flag
                     let rss_after = read_rss_bytes();
                     if rss_after > critical_threshold {
+                        memory_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                         tracing::error!(
                             "CRITICAL: RSS {} MB exceeds 90% of {} MB limit after eviction. \
                              New writes will be rejected until memory drops.",
                             rss_after / (1024 * 1024),
                             max_memory_bytes / (1024 * 1024),
                         );
+                    } else {
+                        // Eviction brought us below critical — allow writes again
+                        memory_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
-                } else if rss_bytes > warn_threshold {
-                    // Diagnostic: report per-subsystem estimates
-                    let col_bytes = executor_for_mem.columnar_store().read()
-                        .estimated_memory_bytes();
-                    let fts_bytes = {
-                        use nucleus::memory::Pressurable;
-                        executor_for_mem.fts_index().read().current_usage()
-                    };
-                    let kv_entries = executor_for_mem.kv_store().dbsize();
-                    tracing::info!(
-                        "Memory: RSS {} MB / {} MB (columnar {} MB, FTS {} MB, KV {} entries)",
-                        rss_bytes / (1024 * 1024),
-                        max_memory_bytes / (1024 * 1024),
-                        col_bytes / (1024 * 1024),
-                        fts_bytes / (1024 * 1024),
-                        kv_entries,
-                    );
+                } else {
+                    // Below pressure threshold — ensure writes are allowed
+                    memory_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    if rss_bytes > warn_threshold {
+                        // Diagnostic: report per-subsystem estimates
+                        let col_bytes = executor_for_mem.columnar_store().read()
+                            .estimated_memory_bytes();
+                        let fts_bytes = {
+                            use nucleus::memory::Pressurable;
+                            executor_for_mem.fts_index().read().current_usage()
+                        };
+                        let kv_entries = executor_for_mem.kv_store().dbsize();
+                        tracing::info!(
+                            "Memory: RSS {} MB / {} MB (columnar {} MB, FTS {} MB, KV {} entries)",
+                            rss_bytes / (1024 * 1024),
+                            max_memory_bytes / (1024 * 1024),
+                            col_bytes / (1024 * 1024),
+                            fts_bytes / (1024 * 1024),
+                            kv_entries,
+                        );
+                    }
                 }
             }
         });
