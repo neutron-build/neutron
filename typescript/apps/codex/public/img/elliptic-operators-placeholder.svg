@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-labelledby="title desc">
+  <title id="title">Elliptic operator symbol invertibility</title>
+  <desc id="desc">Every nonzero cotangent direction around a point has an invertible symbol map, shown as arrows on a circle avoiding the zero direction.</desc>
+  <rect width="900" height="460" fill="#f8fafc"/>
+  <text x="450" y="60" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="30" fill="#1f2933">ellipticity tests every nonzero direction</text>
+  <circle cx="450" cy="235" r="122" fill="#ffffff" stroke="#1f2933" stroke-width="4"/>
+  <circle cx="450" cy="235" r="10" fill="#dc2626"/>
+  <g stroke="#2563eb" stroke-width="5" stroke-linecap="round">
+    <line x1="450" y1="235" x2="450" y2="95"/>
+    <line x1="450" y1="235" x2="570" y2="165"/>
+    <line x1="450" y1="235" x2="570" y2="305"/>
+    <line x1="450" y1="235" x2="450" y2="375"/>
+    <line x1="450" y1="235" x2="330" y2="305"/>
+    <line x1="450" y1="235" x2="330" y2="165"/>
+  </g>
+  <g fill="#2563eb">
+    <path d="M450 95 l-12 22 h24 z"/>
+    <path d="M570 165 l-25 0 l13 22 z"/>
+    <path d="M570 305 l-13 -22 l-12 22 z"/>
+    <path d="M450 375 l12 -22 h-24 z"/>
+    <path d="M330 305 l25 0 l-13 -22 z"/>
+    <path d="M330 165 l13 22 l12 -22 z"/>
+  </g>
+  <rect x="80" y="160" width="210" height="150" rx="8" fill="#ffffff" stroke="#475569" stroke-width="3"/>
+  <text x="185" y="216" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="23" fill="#475569">symbol map</text>
+  <text x="185" y="256" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="23" fill="#16a34a">invertible</text>
+  <rect x="610" y="160" width="210" height="150" rx="8" fill="#ffffff" stroke="#475569" stroke-width="3"/>
+  <text x="715" y="216" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="23" fill="#475569">zero direction</text>
+  <text x="715" y="256" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="23" fill="#dc2626">excluded</text>
+  <text x="450" y="425" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="22" fill="#475569">Elliptic operators have no symbolic blind direction.</text>
+</svg>

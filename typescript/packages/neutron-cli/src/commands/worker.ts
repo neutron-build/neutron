@@ -11,7 +11,7 @@ import {
   resolveRuntimeAliases,
   resolveRuntimeNoExternal,
   type NeutronConfig,
-} from "neutron";
+} from "@neutron-build/core";
 
 interface WorkerRunContext {
   mode: string;

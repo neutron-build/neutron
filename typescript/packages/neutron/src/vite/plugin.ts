@@ -66,6 +66,46 @@ function sanitizeHost(host: string | undefined): string {
   return host;
 }
 
+// Detects URL pathnames that look like file requests so the dev middleware can
+// bypass the router for static assets without also bypassing legitimate
+// dynamic-route params that happen to contain dots (e.g. `/u/03.09.02`).
+//
+// A real file extension starts with a letter and is short (≤ 8 chars after
+// the dot, alphanumeric). This excludes purely numeric "extensions" like
+// `.02` or `.123` that arise from version-tag- or dotted-id-style param
+// values, while still matching every real extension we care about (`css`,
+// `js`, `tsx`, `svg`, `mp4`, `woff2`, `html`, `json`, …).
+const STATIC_ASSET_TRAILING_EXT = /\/[^/]+\.[a-zA-Z][a-zA-Z0-9]{0,7}$/;
+function looksLikeStaticAsset(pathname: string): boolean {
+  return STATIC_ASSET_TRAILING_EXT.test(pathname);
+}
+
+// Resolves the client hydration entry path that the dev server injects as a
+// `<script type="module">` into rendered HTML. Apps that hydrate client-side
+// place this file at `src/main.tsx` (or one of the other listed candidates).
+// SSR-only apps with no hydration step omit the file entirely; in that case
+// this returns null and the dev server skips the script injection so the
+// missing-file pre-transform error doesn't fire.
+const CLIENT_ENTRY_CANDIDATES = [
+  "src/main.tsx",
+  "src/main.ts",
+  "src/main.jsx",
+  "src/main.js",
+  "src/client.tsx",
+  "src/client.ts",
+  "src/client.jsx",
+  "src/client.js",
+];
+function resolveClientEntryPath(rootDir: string): string | null {
+  for (const candidate of CLIENT_ENTRY_CANDIDATES) {
+    const abs = path.join(rootDir, candidate);
+    if (fs.existsSync(abs)) {
+      return "/" + candidate;
+    }
+  }
+  return null;
+}
+
 export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
   const routesDir = path.resolve(options.routesDir || ROUTES_DIR_DEFAULT);
   const rootDir = path.resolve(options.rootDir || process.cwd());
@@ -76,6 +116,8 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
     router: createRouter(),
   };
   const compiledRouteRules = compileRouteRules(options.routeRules);
+  const clientEntry = resolveClientEntryPath(rootDir);
+  let isBuild = false;
 
   async function refreshRoutes() {
     state.routes = discoverRoutes({ routesDir });
@@ -96,7 +138,8 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
   return {
     name: "neutron:core",
 
-    async configResolved() {
+    async configResolved(config) {
+      isBuild = config.command === "build";
       await refreshRoutes();
     },
 
@@ -135,13 +178,23 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
           const url = new URL(req.url || "/", `http://${sanitizeHost(req.headers.host)}`);
           const originalPathname = url.pathname;
 
+          // Vite-internal and dev-machinery paths always bypass the router.
           if (
             originalPathname.startsWith("/@") ||
             originalPathname.startsWith("/node_modules") ||
-            originalPathname.includes(".") ||
             originalPathname === "/__vite_ping" ||
             originalPathname === "/favicon.ico"
           ) {
+            return next();
+          }
+
+          // Static-asset bypass: only short-circuit if the LAST path segment
+          // looks like a real file extension (a single trailing `.ext` with
+          // alphanumeric characters). This preserves bypasses for things like
+          // `/styles.css`, `/foo.js`, `/img/logo.svg` while still routing
+          // dotted dynamic params such as Codex unit IDs `/u/03.09.02`, which
+          // are param values rather than file paths.
+          if (looksLikeStaticAsset(originalPathname)) {
             return next();
           }
 
@@ -228,7 +281,7 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
             middlewares,
             request,
             context,
-            () => handleRequest(server, route, params, layoutChain, allRoutes, request, context, rootDir, devTiming)
+            () => handleRequest(server, route, params, layoutChain, allRoutes, request, context, rootDir, clientEntry, devTiming)
           );
           applyRouteRuleHeadersToResponse(
             response,
@@ -375,10 +428,13 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
         const sourcePath = resolveRouteSourcePath(id);
         const source = requireSource(sourcePath);
         let result = stripServerOnlyRouteModule(source);
-        // Strip CSS imports — already loaded via <link> tags in SSR HTML.
+        // In dev mode, strip CSS imports — already loaded via <link> tags in SSR HTML.
         // Keeping them would cause Vite to inject duplicate <style> tags,
         // triggering redundant style recalculations and microfreezes.
-        result = result.replace(/^import\s+['"][^'"]+\.css['"];?\s*$/gm, "");
+        // In production builds, keep CSS imports so Vite can extract them to files.
+        if (!isBuild) {
+          result = result.replace(/^import\s+['"][^'"]+\.css['"];?\s*$/gm, "");
+        }
         return result;
       }
 
@@ -575,6 +631,7 @@ async function handleRequest(
   request: Request,
   context: AppContext,
   rootDir: string,
+  clientEntry: string | null,
   devTiming?: DevTimingContext
 ): Promise<Response> {
   const { renderToString } = await import("preact-render-to-string");
@@ -615,7 +672,7 @@ async function handleRequest(
         // Action error - send enriched error to overlay
         const actionErrorPayload = parseError(error as Error, 'action', rootDir, route.id, request.url);
         server.ws.send({ type: "custom", event: "neutron:dev-toolbar:error", data: actionErrorPayload });
-        return renderError(server, route, layoutChain, error as Error, request, moduleCache);
+        return renderError(server, route, layoutChain, error as Error, request, moduleCache, clientEntry);
       }
     }
   }
@@ -661,7 +718,7 @@ async function handleRequest(
     if (loaderError.error instanceof Response) return loaderError.error;
     const loaderErrorPayload = parseError(loaderError.error, 'loader', rootDir, loaderError.routeId, request.url);
     server.ws.send({ type: "custom", event: "neutron:dev-toolbar:error", data: loaderErrorPayload });
-    return renderError(server, route, layoutChain, loaderError.error, request, moduleCache);
+    return renderError(server, route, layoutChain, loaderError.error, request, moduleCache, clientEntry);
   }
 
   const pageResult = loaderResults.find((r) => r.routeId === route.id);
@@ -737,7 +794,7 @@ async function handleRequest(
       );
     }
 
-    const fullHtml = wrapHtml(html, route, request, loaderData, actionData, headHtml, mergedSeo);
+    const fullHtml = wrapHtml(html, route, request, loaderData, clientEntry, actionData, headHtml, mergedSeo);
 
     return new Response(fullHtml, {
       headers: { "Content-Type": "text/html; charset=utf-8" },
@@ -746,7 +803,7 @@ async function handleRequest(
     // Render error - send enriched error to overlay
     const renderErrorPayload = parseError(error as Error, 'render', rootDir, route.id, request.url);
     server.ws.send({ type: "custom", event: "neutron:dev-toolbar:error", data: renderErrorPayload });
-    return renderError(server, route, layoutChain, error as Error, request, moduleCache);
+    return renderError(server, route, layoutChain, error as Error, request, moduleCache, clientEntry);
   }
 }
 
@@ -783,7 +840,8 @@ async function renderError(
   layoutChain: Route[],
   error: Error,
   request: Request,
-  moduleCache: Map<string, RouteModule>
+  moduleCache: Map<string, RouteModule>,
+  clientEntry: string | null
 ): Promise<Response> {
   const { renderToString } = await import("preact-render-to-string");
   const { h } = await import("preact");
@@ -815,7 +873,7 @@ async function renderError(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const element = h(ErrorBoundary as any, { error } as ErrorBoundaryProps);
   const html = renderToString(element);
-  const fullHtml = wrapHtml(html, route, request, {});
+  const fullHtml = wrapHtml(html, route, request, {}, clientEntry);
 
   return new Response(fullHtml, {
     status: 500,
@@ -911,6 +969,7 @@ function wrapHtml(
   route: Route,
   request: Request,
   loaderData: Record<string, unknown>,
+  clientEntry: string | null,
   actionData?: unknown,
   headHtml?: string,
   seo?: SeoMetaInput | null
@@ -924,6 +983,9 @@ function wrapHtml(
   }
 
   const dataScript = `<script>window.__NEUTRON_DATA_SERIALIZED__=${serializeForInlineScript(allData)};</script>`;
+  const clientScript = clientEntry
+    ? `<script type="module" src="${clientEntry}"></script>`
+    : "";
 
   const htmlTag = buildHtmlOpenTag(seo?.htmlAttrs);
   const bodyTag = buildBodyOpenTag(seo?.bodyAttrs);
@@ -936,7 +998,7 @@ ${resolvedHead}
 ${bodyTag}
 <div id="app">${content}</div>
 ${dataScript}
-<script type="module" src="/src/main.tsx"></script>
+${clientScript}
 </body>
 </html>`;
 }

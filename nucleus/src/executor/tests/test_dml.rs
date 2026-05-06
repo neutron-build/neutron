@@ -368,6 +368,32 @@ async fn test_insert_partial_default() {
 }
 
 #[tokio::test]
+async fn test_insert_partial_default_false() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE def_tbl2f (id INT PRIMARY KEY, name TEXT DEFAULT 'anon', active BOOLEAN DEFAULT false)").await;
+    // Specify only id and name, active should get its default (false)
+    exec(&ex, "INSERT INTO def_tbl2f (id, name) VALUES (1, 'alice')").await;
+    let results = exec(&ex, "SELECT id, name, active FROM def_tbl2f").await;
+    let r = rows(&results[0]);
+    assert_eq!(r[0][0], Value::Int32(1));
+    assert_eq!(r[0][1], Value::Text("alice".into()));
+    assert_eq!(r[0][2], Value::Bool(false));
+}
+
+#[cfg(feature = "server")]
+#[tokio::test]
+async fn test_mergetree_boolean_default_false() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE mt_bool_def (id INT, active BOOLEAN DEFAULT false) WITH (engine = 'mergetree') ORDER BY (id)").await;
+    exec(&ex, "INSERT INTO mt_bool_def (id) VALUES (1)").await;
+    let results = exec(&ex, "SELECT id, active FROM mt_bool_def").await;
+    let r = rows(&results[0]);
+    assert_eq!(r.len(), 1, "expected 1 row");
+    assert_eq!(r[0][0], Value::Int32(1));
+    assert_eq!(r[0][1], Value::Bool(false), "BOOLEAN DEFAULT false should store as false, not true");
+}
+
+#[tokio::test]
 async fn test_insert_mixed_default_and_literal() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE def_tbl3 (id INT, val TEXT DEFAULT 'x', num INT DEFAULT 42)").await;

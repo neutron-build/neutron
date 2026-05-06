@@ -1,6 +1,6 @@
-import { getCollection, getEntry } from "neutron/content";
-import { extractToc } from "neutron";
-import { calculateReadingTime } from "neutron";
+import { getCollection, getEntry } from "@neutron-build/core/content";
+import { extractToc } from "@neutron-build/core";
+import { calculateReadingTime } from "@neutron-build/core";
 import { Toc } from "../../components/Toc";
 import { Footer } from "../../components/Footer";
 import { Breadcrumbs } from "../../components/Breadcrumbs";

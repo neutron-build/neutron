@@ -50,7 +50,7 @@ const DEFAULT_LIMITS: Required<InputLimitsOptions> = {
  *
  * @example
  * ```ts
- * import { inputLimitsMiddleware } from "neutron/server";
+ * import { inputLimitsMiddleware } from "@neutron-build/core/server";
  *
  * export const middleware = inputLimitsMiddleware({
  *   maxRequestBodySize: 5 * 1024 * 1024, // 5MB

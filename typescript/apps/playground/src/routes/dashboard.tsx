@@ -1,4 +1,4 @@
-import type { LoaderArgs } from "neutron";
+import type { LoaderArgs } from "@neutron-build/core";
 import { getDataRuntimeSummary } from "../data/runtime.js";
 
 export const config = { mode: "app" };

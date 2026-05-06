@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use dashmap::DashMap;
 
@@ -222,7 +222,8 @@ pub struct Executor {
     /// Shared across all sessions — when a session PREPAREs a statement,
     /// the parsed AST is cached here. Other sessions with an identical SQL
     /// string can reuse the cached AST instead of re-parsing.
-    global_prepared_cache: parking_lot::RwLock<HashMap<String, Arc<PreparedStmt>>>,
+    /// Bounded to 4096 entries with LRU eviction.
+    global_prepared_cache: parking_lot::RwLock<GlobalPreparedCache>,
     /// Non-correlated subquery result cache: subquery SQL → first-column values.
     /// Populated during row-level evaluation of `IN (subquery)` for subqueries
     /// that don't reference outer table columns. Cleared at the start of each
@@ -246,6 +247,11 @@ pub struct Executor {
     /// Tracks min/max per column per 8K-row granule. Expected speedup: 5-10x on selective queries.
     #[allow(dead_code)]
     zone_map_index: crate::storage::granule_stats::ZoneMapIndex,
+    /// Memory pressure flag: set by the watchdog when RSS exceeds the critical
+    /// threshold (90% of --max-memory). Write operations (INSERT, UPDATE, DELETE,
+    /// TRUNCATE) are rejected while this flag is set. Cleared when RSS drops
+    /// below the pressure threshold.
+    memory_critical: Arc<AtomicBool>,
 }
 
 impl Executor {
@@ -363,12 +369,13 @@ impl Executor {
                 256 * 1024 * 1024, // 256 MB default
             )),
             query_depth: AtomicU32::new(0),
-            global_prepared_cache: parking_lot::RwLock::new(HashMap::new()),
+            global_prepared_cache: parking_lot::RwLock::new(GlobalPreparedCache::new(4096)),
             uncorrelated_subquery_cache: parking_lot::RwLock::new(HashMap::new()),
             plan_cache: parking_lot::RwLock::new(PlanCache::new(1024)),
             ast_cache: parking_lot::RwLock::new(AstCache::new(4096)),
             plan_cache_key_hint: parking_lot::Mutex::new(None),
             zone_map_index: crate::storage::granule_stats::ZoneMapIndex::new(),
+            memory_critical: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1484,6 +1491,13 @@ impl Executor {
         &self.health_registry
     }
 
+    /// Get a reference to the memory-critical flag.
+    /// The watchdog sets this when RSS exceeds 90% of the limit;
+    /// the executor checks it before allowing write operations.
+    pub fn memory_critical_flag(&self) -> &Arc<AtomicBool> {
+        &self.memory_critical
+    }
+
     /// Get a reference to the persistent graph store.
     pub fn graph_store(&self) -> &parking_lot::RwLock<GraphStore> {
         &self.graph_store
@@ -2339,6 +2353,14 @@ impl Executor {
             &stmt,
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) | Statement::Truncate(_)
         );
+
+        // Reject write operations when the memory watchdog has flagged critical pressure.
+        // Reads (SELECT) are always allowed so clients can still query data.
+        if is_dml_write && self.memory_critical.load(Ordering::Relaxed) {
+            return Err(ExecError::MemoryExceeded(
+                "server is under critical memory pressure; writes are temporarily rejected".into(),
+            ));
+        }
 
         // Track whether this is a transaction control statement that should
         // invalidate the query cache (ROLLBACK reverts data; BEGIN/COMMIT
@@ -3875,6 +3897,8 @@ pub enum ExecError {
     PermissionDenied(String),
     #[error("{0}")]
     Runtime(String),
+    #[error("memory limit exceeded: {0}")]
+    MemoryExceeded(String),
 }
 
 

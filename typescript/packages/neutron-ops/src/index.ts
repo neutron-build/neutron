@@ -4,7 +4,7 @@ import type {
   NeutronErrorEvent,
   NeutronRequestEndEvent,
   NeutronServerHooks,
-} from "neutron";
+} from "@neutron-build/core";
 
 export interface RequestContextMiddlewareOptions {
   requestIdHeader?: string;

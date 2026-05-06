@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 220" role="img" aria-label="Fredholm operator: T from V to W with finite-dimensional kernel and cokernel boxes, index labelled above">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="currentColor" />
+    </marker>
+  </defs>
+  <style>
+    .frame  { fill: none; stroke: currentColor; stroke-width: 2; }
+    .ker    { fill: currentColor; opacity: 0.18; stroke: currentColor; stroke-width: 1.5; }
+    .coker  { fill: currentColor; opacity: 0.10; stroke: currentColor; stroke-width: 1.5; stroke-dasharray: 4 3; }
+    .lab    { font: 600 14px "Georgia", serif; fill: currentColor; }
+    .sub    { font: 400 11px "Helvetica Neue", sans-serif; fill: currentColor; opacity: 0.72; }
+    .formula { font: 600 16px "Georgia", serif; fill: currentColor; }
+  </style>
+  <!-- Index formula above -->
+  <text class="formula" x="240" y="28" text-anchor="middle">ind(T) = dim ker T − dim coker T</text>
+
+  <!-- Domain V -->
+  <rect class="frame" x="40"  y="55" width="140" height="130" />
+  <text class="lab"   x="110" y="48"  text-anchor="middle">V</text>
+  <!-- Kernel box inside V -->
+  <rect class="ker"   x="60"  y="135" width="60" height="40" />
+  <text class="lab"   x="90"  y="160" text-anchor="middle">ker T</text>
+  <text class="sub"   x="90"  y="175" text-anchor="middle">finite-dim</text>
+
+  <!-- Arrow T -->
+  <line class="frame" x1="195" y1="120" x2="295" y2="120" marker-end="url(#arrow)" />
+  <text class="lab"   x="245" y="110" text-anchor="middle">T</text>
+
+  <!-- Codomain W -->
+  <rect class="frame" x="305" y="55"  width="140" height="130" />
+  <text class="lab"   x="375" y="48"  text-anchor="middle">W</text>
+  <!-- Cokernel box inside W -->
+  <rect class="coker" x="370" y="65"  width="60" height="40" />
+  <text class="lab"   x="400" y="90"  text-anchor="middle">coker T</text>
+  <text class="sub"   x="400" y="105" text-anchor="middle">finite-dim</text>
+
+  <!-- Hint text -->
+  <text class="sub" x="240" y="210" text-anchor="middle">A Fredholm operator: only finitely many things go wrong.</text>
+</svg>

@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { createServer, startServer } from "neutron/server";
-import { prepareContentCollections, resolveRuntime, type NeutronConfig } from "neutron";
+import { createServer, startServer } from "@neutron-build/core/server";
+import { prepareContentCollections, resolveRuntime, type NeutronConfig } from "@neutron-build/core";
 import { loadConfigFromFile, loadEnv } from "vite";
 
 export async function start() {

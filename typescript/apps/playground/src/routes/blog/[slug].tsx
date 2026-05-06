@@ -1,4 +1,4 @@
-import type { GetStaticPathsResult } from "neutron";
+import type { GetStaticPathsResult } from "@neutron-build/core";
 
 export const config = { mode: "static" };
 

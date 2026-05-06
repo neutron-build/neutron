@@ -62,7 +62,7 @@ interface RateLimitRecord {
  *
  * @example
  * ```ts
- * import { rateLimitMiddleware } from "neutron/server";
+ * import { rateLimitMiddleware } from "@neutron-build/core/server";
  *
  * // Global rate limit
  * export const middleware = [

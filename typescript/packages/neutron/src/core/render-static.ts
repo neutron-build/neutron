@@ -10,7 +10,6 @@ import type {
   HeadArgs,
 } from "./types.js";
 import { discoverRoutes } from "./manifest.js";
-import { serializeForInlineScript } from "./serialization.js";
 import {
   mergeSeoMetaInput,
   renderDocumentHead,
@@ -115,7 +114,7 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
         pageRoute.path,
         moduleCache
       );
-      const fullHtml = wrapHtml(html, pageRoute.path, loaderData, headHtml);
+      const fullHtml = wrapHtml(html, pageRoute.path, headHtml);
 
       const outPath = getOutputPath(outputDir, pageRoute.path);
       fs.mkdirSync(path.dirname(outPath), { recursive: true });
@@ -201,13 +200,8 @@ async function loadRouteModule(file: string, cache?: Map<string, RouteModule>): 
 function wrapHtml(
   content: string,
   routePath: string,
-  loaderData?: unknown,
   headHtml: string = renderDocumentHead(routePath, null)
 ): string {
-  const dataScript = loaderData !== undefined
-    ? `<script>window.__NEUTRON_DATA_SERIALIZED__=${serializeForInlineScript({ page: loaderData })};</script>`
-    : "";
-
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -215,7 +209,6 @@ ${headHtml}
 </head>
 <body>
 <div id="app">${content}</div>
-${dataScript}
 </body>
 </html>`;
 }

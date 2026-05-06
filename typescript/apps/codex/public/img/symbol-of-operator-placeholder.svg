@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-labelledby="title desc">
+  <title id="title">Symbol keeps the highest-order part</title>
+  <desc id="desc">A differential operator is filtered through a magnifying lens that keeps only its highest-order coefficient, producing a function on cotangent directions.</desc>
+  <rect width="900" height="460" fill="#f8fafc"/>
+  <rect x="70" y="95" width="280" height="250" rx="8" fill="#ffffff" stroke="#1f2933" stroke-width="3"/>
+  <text x="210" y="140" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="24" fill="#1f2933">operator P</text>
+  <text x="210" y="195" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="28" fill="#2563eb">highest order</text>
+  <text x="210" y="245" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="23" fill="#64748b">lower order terms</text>
+  <text x="210" y="292" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="23" fill="#64748b">coefficients</text>
+  <path d="M365 220 L505 220" stroke="#334155" stroke-width="6" stroke-linecap="round"/>
+  <path d="M505 220 l-22 -14 l4 28 z" fill="#334155"/>
+  <circle cx="435" cy="220" r="48" fill="none" stroke="#16a34a" stroke-width="6"/>
+  <text x="435" y="308" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="20" fill="#16a34a">principal filter</text>
+  <rect x="550" y="95" width="280" height="250" rx="8" fill="#ffffff" stroke="#1f2933" stroke-width="3"/>
+  <text x="690" y="140" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="24" fill="#1f2933">symbol</text>
+  <line x1="622" y1="252" x2="760" y2="154" stroke="#dc2626" stroke-width="6" stroke-linecap="round"/>
+  <path d="M760 154 l-25 2 l15 20 z" fill="#dc2626"/>
+  <text x="690" y="244" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="22" fill="#475569">cotangent direction</text>
+  <text x="450" y="420" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="22" fill="#475569">The principal symbol records the top-order response in each direction.</text>
+</svg>

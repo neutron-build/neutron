@@ -15,6 +15,7 @@ import {
   resolveRuntimeNoExternal,
   mergeSeoMetaInput,
   renderDocumentHead,
+  setActiveMarkdownConfig,
 } from "@neutron-build/core";
 import type {
   NeutronConfig,
@@ -42,11 +43,16 @@ export async function build(): Promise<void> {
   const buildArgs = parseBuildArgs(process.argv.slice(3));
   const selectedAdapter = resolveAdapterForBuild(neutronConfig, buildArgs);
 
+  // Wire user-supplied markdown config (marked extensions, remark/rehype
+  // plugins) so it's picked up by content rendering throughout the build.
+  setActiveMarkdownConfig(neutronConfig.markdown);
+
   await prepareContentCollections({
     rootDir: cwd,
     writeManifest: true,
     writeTypes: true,
-  });
+    markdownConfig: neutronConfig.markdown,
+  } as any);
   await prepareRouteTypes({
     rootDir: cwd,
     routesDir: "src/routes",

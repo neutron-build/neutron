@@ -1,9 +1,9 @@
 {
-  "name": "create-neutron",
+  "name": "@neutron-build/create",
   "version": "0.1.0",
   "description": "Scaffold a new Neutron project. Run with: npm create neutron@latest",
   "author": "Tyler",
-  "license": "BUSL-1.1",
+  "license": "MIT",
   "homepage": "https://neutron.build",
   "repository": {
     "type": "git",
@@ -19,7 +19,7 @@
   ],
   "type": "module",
   "bin": {
-    "create-neutron": "./dist/index.js"
+    "create-neutron-build": "./dist/index.js"
   },
   "files": [
     "dist",
@@ -34,5 +34,11 @@
   "devDependencies": {
     "@types/node": "^22.10.7",
     "typescript": "^5.7.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

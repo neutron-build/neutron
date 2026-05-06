@@ -52,6 +52,8 @@ pub enum ErrorCode {
     InternalError,
     /// Generic runtime error
     RuntimeError,
+    /// Insufficient resources (memory pressure, disk full, etc.)
+    InsufficientResources,
 }
 
 /// Protocol-independent error details.
@@ -166,6 +168,9 @@ impl ErrorCodec for PgWireErrorCodec {
                 };
                 ErrorDetails::new(code, msg.clone())
             }
+            ExecError::MemoryExceeded(msg) => {
+                ErrorDetails::new(ErrorCode::InsufficientResources, msg.clone())
+            }
         }
     }
 
@@ -191,6 +196,7 @@ impl ErrorCodec for PgWireErrorCodec {
             ErrorCode::DataException => "22000".to_string(),
             ErrorCode::InternalError => "XX000".to_string(),
             ErrorCode::RuntimeError => "22000".to_string(),
+            ErrorCode::InsufficientResources => "53200".to_string(),
         }
     }
 }
@@ -280,6 +286,9 @@ impl ErrorCodec for BinaryErrorCodec {
                 };
                 ErrorDetails::new(code, msg.clone())
             }
+            ExecError::MemoryExceeded(msg) => {
+                ErrorDetails::new(ErrorCode::InsufficientResources, msg.clone())
+            }
         }
     }
 
@@ -307,6 +316,7 @@ impl ErrorCodec for BinaryErrorCodec {
             ErrorCode::DataException => "4000".to_string(),
             ErrorCode::InternalError => "5000".to_string(),
             ErrorCode::RuntimeError => "4999".to_string(),
+            ErrorCode::InsufficientResources => "5002".to_string(),
         }
     }
 }

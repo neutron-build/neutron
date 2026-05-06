@@ -1,4 +1,4 @@
-import { getCollection, getEntry } from "neutron/content";
+import { getCollection, getEntry } from "@neutron-build/core/content";
 
 export const config = { mode: "static" };
 

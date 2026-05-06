@@ -23,7 +23,7 @@ describe("route type generation", () => {
       route("/docs/*"),
     ]);
 
-    expect(declaration).toContain('declare module "neutron"');
+    expect(declaration).toContain('declare module "@neutron-build/core"');
     expect(declaration).toContain('| "/"');
     expect(declaration).toContain('| "/pricing"');
     expect(declaration).toContain("| `/users/${string}`");

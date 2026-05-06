@@ -77,6 +77,15 @@ impl ResultEncoder {
         }
     }
 
+    /// Shrink the internal buffer back to a target capacity if it has grown
+    /// beyond a threshold. Prevents per-connection memory retention from
+    /// large result rows.
+    pub fn shrink_if_needed(&mut self, target: usize) {
+        if self.buffer.capacity() > target * 4 {
+            self.buffer = BytesMut::with_capacity(target);
+        }
+    }
+
     /// Encode a single row (Vec<Value>).
     pub fn encode_row(&mut self, row: &[Value]) -> Vec<u8> {
         self.buffer.clear();

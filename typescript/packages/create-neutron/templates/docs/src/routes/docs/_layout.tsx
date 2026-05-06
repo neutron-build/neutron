@@ -1,7 +1,7 @@
-import { getCollection } from "neutron/content";
+import { getCollection } from "@neutron-build/core/content";
 import { buildSidebarTree } from "../../lib/sidebar";
 import { Sidebar } from "../../components/Sidebar";
-import { Island } from "neutron/client";
+import { Island } from "@neutron-build/core/client";
 import { SidebarToggle } from "../../components/SidebarToggle";
 import { Search } from "../../components/Search";
 

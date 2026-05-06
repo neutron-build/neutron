@@ -9,9 +9,9 @@ import {
   resolveRouteRuleRedirect,
   resolveRouteRuleRewrite,
   resolveRuntime,
-} from "neutron";
-import { startServer } from "neutron/server";
-import type { NeutronConfig } from "neutron";
+} from "@neutron-build/core";
+import { startServer } from "@neutron-build/core/server";
+import type { NeutronConfig } from "@neutron-build/core";
 import { loadConfigFromFile, loadEnv } from "vite";
 
 export async function preview(): Promise<void> {

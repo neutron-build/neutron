@@ -1356,20 +1356,20 @@ impl Executor {
         statement: Statement,
     ) -> Result<ExecResult, ExecError> {
         let sql = statement.to_string();
-        // Check global cache first — reuse if identical SQL was already parsed
+        // Check global cache first — reuse if identical SQL was already parsed.
+        // Uses write lock because get() bumps the LRU access counter.
         let prepared = {
-            let cache = self.global_prepared_cache.read();
-            cache.get(&sql).cloned()
-        };
-        let prepared = match prepared {
-            Some(cached) => cached,
-            None => {
-                let stmt = std::sync::Arc::new(super::types::PreparedStmt {
-                    ast: statement,
-                    sql: sql.clone(),
-                });
-                self.global_prepared_cache.write().insert(sql, stmt.clone());
-                stmt
+            let mut cache = self.global_prepared_cache.write();
+            match cache.get(&sql) {
+                Some(cached) => cached,
+                None => {
+                    let stmt = std::sync::Arc::new(super::types::PreparedStmt {
+                        ast: statement,
+                        sql: sql.clone(),
+                    });
+                    cache.insert(sql, stmt.clone());
+                    stmt
+                }
             }
         };
         let sess = self.current_session();

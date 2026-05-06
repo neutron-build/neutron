@@ -422,6 +422,11 @@ impl ConnectionHandler {
                 self.send_ready().await?;
             }
         }
+        // Shrink buffers back to 4KB if they grew large from a big result set
+        // or big incoming query. Prevents per-connection memory retention.
+        self.encoder.shrink_if_needed(4096);
+        self.result_encoder.shrink_if_needed(4096);
+        self.decoder.shrink_if_needed(4096);
         Ok(())
     }
 

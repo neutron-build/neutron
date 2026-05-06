@@ -26,6 +26,9 @@ type App struct {
 	openapi        *OpenAPISpec
 	oaInfo         OpenAPIInfo
 	nucleusChecker NucleusChecker
+	// disableDefaultDocs suppresses the built-in GET /docs (Swagger UI) route.
+	// Callers can mount Swagger UI themselves at a different path.
+	disableDefaultDocs bool
 }
 
 // Option configures the App.
@@ -68,6 +71,13 @@ func WithNucleusChecker(nc NucleusChecker) Option {
 	}
 }
 
+// DisableDefaultDocs suppresses the auto-registered Swagger UI at /docs.
+// /openapi.json is still served. Useful when an SPA wants to own /docs for
+// its own in-product documentation page.
+func DisableDefaultDocs() Option {
+	return func(a *App) { a.disableDefaultDocs = true }
+}
+
 // New creates a new Neutron application.
 func New(opts ...Option) *App {
 	logger := slog.Default()
@@ -93,7 +103,11 @@ func (a *App) Router() *Router {
 // The spec is built lazily on first access from registered routes.
 func (a *App) OpenAPI() *OpenAPISpec {
 	if a.openapi == nil {
-		a.openapi = generateOpenAPI(a.router.routes, a.oaInfo)
+		var routes []routeRecord
+		if a.router.routes != nil {
+			routes = *a.router.routes
+		}
+		a.openapi = generateOpenAPI(routes, a.oaInfo)
 	}
 	return a.openapi
 }
@@ -115,8 +129,10 @@ func (a *App) Run(addr string) error {
 
 	// Register default routes
 	a.router.mux.Handle("GET /openapi.json", OpenAPIJSON(a.OpenAPI()))
-	a.router.mux.Handle("GET /docs", SwaggerUI(a.OpenAPI()))
-	a.router.mux.Handle("GET /docs/", SwaggerUI(a.OpenAPI()))
+	if !a.disableDefaultDocs {
+		a.router.mux.Handle("GET /docs", SwaggerUI(a.OpenAPI()))
+		a.router.mux.Handle("GET /docs/", SwaggerUI(a.OpenAPI()))
+	}
 	a.registerHealthCheck()
 
 	// Start lifecycle hooks

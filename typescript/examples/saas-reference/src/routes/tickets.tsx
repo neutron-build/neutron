@@ -1,4 +1,4 @@
-import { Form } from "neutron/client";
+import { Form } from "@neutron-build/core/client";
 import { addTicket, listTickets, toggleTicket } from "../lib/store.js";
 
 export const config = { mode: "app" };

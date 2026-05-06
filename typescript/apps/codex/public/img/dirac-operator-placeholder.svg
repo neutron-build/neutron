@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540" role="img" aria-labelledby="title desc">
+  <title id="title">Dirac operator visual</title>
+  <desc id="desc">A spinor field on a curved surface is differentiated and then multiplied by local Clifford arrows to produce the Dirac operator.</desc>
+  <rect width="960" height="540" fill="#f8faf7"/>
+  <path d="M85 370 C200 260 325 435 475 340 C620 248 750 305 875 218" fill="none" stroke="#23424a" stroke-width="10" stroke-linecap="round"/>
+  <path d="M85 408 C210 300 330 470 486 378 C632 293 753 347 875 262" fill="none" stroke="#8fb9a8" stroke-width="5" stroke-linecap="round"/>
+  <g transform="translate(180 155)">
+    <circle cx="0" cy="0" r="62" fill="#fff" stroke="#23424a" stroke-width="5"/>
+    <path d="M-38 -12 C-12 -48 31 -40 42 -8 C28 24 -10 42 -40 12" fill="none" stroke="#e76f51" stroke-width="8" stroke-linecap="round"/>
+    <circle cx="-8" cy="-2" r="8" fill="#2a9d8f"/>
+    <text x="0" y="100" text-anchor="middle" font-family="Arial, sans-serif" font-size="27" fill="#23424a">spinor field</text>
+  </g>
+  <g transform="translate(480 155)">
+    <rect x="-84" y="-58" width="168" height="116" rx="14" fill="#fff" stroke="#23424a" stroke-width="5"/>
+    <path d="M-46 24 L-12 -26 L24 22 L52 -18" fill="none" stroke="#2a9d8f" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M-54 -34 H54" stroke="#e9c46a" stroke-width="7" stroke-linecap="round"/>
+    <text x="0" y="100" text-anchor="middle" font-family="Arial, sans-serif" font-size="27" fill="#23424a">differentiate</text>
+  </g>
+  <g transform="translate(760 155)">
+    <circle cx="0" cy="0" r="64" fill="#fff" stroke="#23424a" stroke-width="5"/>
+    <path d="M-36 26 L32 -34" stroke="#264653" stroke-width="9" stroke-linecap="round" marker-end="url(#arrow)"/>
+    <path d="M-30 -22 L36 26" stroke="#f4a261" stroke-width="9" stroke-linecap="round" marker-end="url(#arrow2)"/>
+    <text x="0" y="100" text-anchor="middle" font-family="Arial, sans-serif" font-size="27" fill="#23424a">Clifford mix</text>
+  </g>
+  <path d="M262 155 H370" stroke="#23424a" stroke-width="5" marker-end="url(#arrow3)"/>
+  <path d="M570 155 H654" stroke="#23424a" stroke-width="5" marker-end="url(#arrow3)"/>
+  <text x="480" y="454" text-anchor="middle" font-family="Arial, sans-serif" font-size="30" fill="#23424a">Dirac operator = spinor derivative followed by Clifford multiplication</text>
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0 0 L12 6 L0 12 Z" fill="#264653"/>
+    </marker>
+    <marker id="arrow2" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0 0 L12 6 L0 12 Z" fill="#f4a261"/>
+    </marker>
+    <marker id="arrow3" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0 0 L12 6 L0 12 Z" fill="#23424a"/>
+    </marker>
+  </defs>
+</svg>

@@ -51,7 +51,7 @@ export default function Reasoning() {
 
           <section>
             <h2>Why One ISO?</h2>
-            <p>Most distros provide 20+ ISOs (Desktop, Server, Minimal, etc). We provide one. ~800MB.</p>
+            <p>Most distros provide 20+ ISOs (Desktop, Server, Minimal, etc). We provide one. ~1GB.</p>
             <p>The installer asks: Desktop or Server? Desktop installs the GUI stack. Server installs SSH and optionally hardens. Both use <code>debootstrap</code> — clean install, zero leftovers from the live session.</p>
             <p>Smaller than Arch. Smaller than Ubuntu. Smaller than Fedora. With a prettier installer than all of them.</p>
           </section>

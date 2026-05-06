@@ -1,4 +1,4 @@
-import { defineConfig } from "neutron";
+import { defineConfig } from "@neutron-build/core";
 
 const runtime = process.env.NEUTRON_RUNTIME === "react-compat" ? "react-compat" : "preact";
 

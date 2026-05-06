@@ -109,7 +109,7 @@ impl ColumnarStorageEngine {
             .table_names()
             .into_iter()
             .map(|name| {
-                let rows = batches_to_rows(store.batches(&name));
+                let rows = batches_to_rows(&store.batches_all(&name));
                 (name, rows)
             })
             .collect()
@@ -452,7 +452,7 @@ impl ColumnarStorageEngine {
             return;
         }
         // Read all rows once — we need values per column for each row.
-        let rows = batches_to_rows(self.store.read().batches(table));
+        let rows = batches_to_rows(&self.store.read().batches_all(table));
         let mut indexes = self.indexes.write();
         for name in &names {
             if let Some(idx) = indexes.get_mut(name) {
@@ -560,7 +560,8 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return Err(StorageError::TableNotFound(table.to_string()));
         }
-        Ok(batches_to_rows(store.batches(table)))
+        let batches = store.batches_all(table);
+        Ok(batches_to_rows(&batches))
     }
 
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
@@ -574,7 +575,7 @@ impl StorageEngine for ColumnarStorageEngine {
             if !store.table_exists(table) {
                 return Err(StorageError::TableNotFound(table.to_string()));
             }
-            let old_rows = batches_to_rows(store.batches(table));
+            let old_rows = batches_to_rows(&store.batches_all(table));
             let total = old_rows.len();
             let new_rows: Vec<Row> = old_rows
                 .into_iter()
@@ -614,7 +615,7 @@ impl StorageEngine for ColumnarStorageEngine {
             if !store.table_exists(table) {
                 return Err(StorageError::TableNotFound(table.to_string()));
             }
-            let old_rows = batches_to_rows(store.batches(table));
+            let old_rows = batches_to_rows(&store.batches_all(table));
             let mut changed = 0usize;
             let new_rows: Vec<Row> = old_rows
                 .into_iter()
@@ -654,7 +655,7 @@ impl StorageEngine for ColumnarStorageEngine {
         self.flush_write_buffer(table);
         let rows = {
             let store = self.store.read();
-            batches_to_rows(store.batches(table))
+            batches_to_rows(&store.batches_all(table))
         };
         // Build position-based index: key → list of row positions.
         let mut map: BTreeMap<Value, Vec<usize>> = BTreeMap::new();
@@ -701,7 +702,8 @@ impl StorageEngine for ColumnarStorageEngine {
             }
         };
         let store = self.store.read();
-        Ok(Some(fetch_rows_by_positions(store.batches(table), &positions)))
+        let batches = store.batches_all(table);
+        Ok(Some(fetch_rows_by_positions(&batches, &positions)))
     }
 
     fn index_lookup_range_sync(
@@ -727,7 +729,8 @@ impl StorageEngine for ColumnarStorageEngine {
             }
         };
         let store = self.store.read();
-        Ok(Some(fetch_rows_by_positions(store.batches(table), &positions)))
+        let batches = store.batches_all(table);
+        Ok(Some(fetch_rows_by_positions(&batches, &positions)))
     }
 
     // ─── Aggregate fast paths ─────────────────────────────────────────────────
@@ -749,9 +752,9 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
+        let batches = store.batches_all(table);
         let (total, n) =
-            store
-                .batches(table)
+            batches
                 .iter()
                 .fold((0.0f64, 0usize), |(s, c), batch| {
                     let sum = aggregate_sum(batch, &col_name);
@@ -774,7 +777,7 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let batches = store.batches(table);
+        let batches = store.batches_all(table);
 
         // Collect the key and value columns across all batches.
         let mut key_vec: Vec<Option<String>> = Vec::new();
@@ -845,7 +848,8 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let count = store.batches(table).iter().map(|batch| {
+        let batches = store.batches_all(table);
+        let count = batches.iter().map(|batch| {
             match batch.column(&filter_col_name) {
                 Some(col) => eq_mask(col, filter_val).iter().filter(|&&b| b).count(),
                 None => 0,
@@ -868,7 +872,8 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let (sum, count) = store.batches(table).iter().fold((0.0f64, 0usize), |(s, c), batch| {
+        let batches = store.batches_all(table);
+        let (sum, count) = batches.iter().fold((0.0f64, 0usize), |(s, c), batch| {
             let filter_data = match batch.column(&filter_col_name) {
                 Some(d) => d,
                 None => return (s, c),
@@ -892,7 +897,8 @@ impl StorageEngine for ColumnarStorageEngine {
             return None;
         }
         let mut min: Option<f64> = None;
-        for batch in store.batches(table) {
+        let batches = store.batches_all(table);
+        for batch in &batches {
             match batch.column(&col_name) {
                 Some(ColumnData::Float64(v)) => {
                     for f in v.iter().flatten() {
@@ -925,7 +931,8 @@ impl StorageEngine for ColumnarStorageEngine {
             return None;
         }
         let mut max: Option<f64> = None;
-        for batch in store.batches(table) {
+        let batches = store.batches_all(table);
+        for batch in &batches {
             match batch.column(&col_name) {
                 Some(ColumnData::Float64(v)) => {
                     for f in v.iter().flatten() {
@@ -961,7 +968,8 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        Some(batches_to_rows_where_eq(store.batches(table), filter_col, filter_val))
+        let batches = store.batches_all(table);
+        Some(batches_to_rows_where_eq(&batches, filter_col, filter_val))
     }
 
     async fn flush_all_dirty(&self) -> Result<(), StorageError> {

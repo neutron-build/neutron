@@ -1,4 +1,4 @@
-import type { DrizzleDatabase } from "neutron-data";
+import type { DrizzleDatabase } from "@neutron-build/data";
 
 export interface Todo {
   id: string;

@@ -1,4 +1,4 @@
-import { Island } from "neutron/client";
+import { Island } from "@neutron-build/core/client";
 import { Counter } from "../components/Counter";
 
 export const config = { mode: "static" };

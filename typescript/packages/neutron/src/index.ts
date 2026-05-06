@@ -16,6 +16,8 @@ export {
   getCollection,
   getEntry,
   prepareContentCollections,
+  setActiveMarkdownConfig,
+  getActiveMarkdownConfig,
   type CollectionDefinition,
   type DefineCollectionOptions,
   type CollectionEntry,

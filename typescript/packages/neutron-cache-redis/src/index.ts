@@ -6,7 +6,7 @@ import {
   type NeutronCacheStores,
   type NeutronLoaderCacheStore,
   type NeutronLoaderDataCacheEntry,
-} from "neutron";
+} from "@neutron-build/core";
 
 export interface RedisNeutronCacheOptions {
   url?: string;

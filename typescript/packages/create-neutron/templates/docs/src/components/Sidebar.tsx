@@ -1,4 +1,4 @@
-import { Link } from "neutron/client";
+import { Link } from "@neutron-build/core/client";
 import type { SidebarSection } from "../lib/sidebar";
 
 function SidebarLink(props: {

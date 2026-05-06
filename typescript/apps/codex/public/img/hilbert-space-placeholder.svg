@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-labelledby="title desc">
+  <title id="title">Hilbert space projection geometry</title>
+  <desc id="desc">A vector decomposes into a projection onto a closed subspace and a perpendicular error vector.</desc>
+  <rect width="900" height="460" fill="#f8fafc"/>
+  <g transform="translate(105 80)">
+    <rect x="0" y="0" width="690" height="300" rx="8" fill="#ffffff" stroke="#1f2933" stroke-width="3"/>
+    <line x1="80" y1="220" x2="610" y2="220" stroke="#64748b" stroke-width="5"/>
+    <text x="600" y="252" text-anchor="end" font-family="Inter, Arial, sans-serif" font-size="22" fill="#475569">closed subspace M</text>
+    <circle cx="220" cy="220" r="8" fill="#16a34a"/>
+    <circle cx="220" cy="78" r="8" fill="#2563eb"/>
+    <line x1="220" y1="220" x2="220" y2="78" stroke="#dc2626" stroke-width="5"/>
+    <line x1="80" y1="220" x2="220" y2="78" stroke="#2563eb" stroke-width="5"/>
+    <path d="M220 194 L246 194 L246 220" fill="none" stroke="#dc2626" stroke-width="4"/>
+    <text x="144" y="133" font-family="Inter, Arial, sans-serif" font-size="24" fill="#2563eb">v</text>
+    <text x="232" y="151" font-family="Inter, Arial, sans-serif" font-size="22" fill="#dc2626">v - p</text>
+    <text x="224" y="248" font-family="Inter, Arial, sans-serif" font-size="22" fill="#16a34a">p</text>
+    <path d="M80 220 L610 220" stroke="#94a3b8" stroke-width="1"/>
+    <text x="345" y="44" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="28" fill="#1f2933">orthogonal projection</text>
+  </g>
+  <text x="450" y="425" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="22" fill="#1f2933">Inner product geometry survives in infinite dimensions when the space is complete.</text>
+</svg>

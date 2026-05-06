@@ -248,7 +248,7 @@ async function makeTypeScriptConfigFixtureProject(): Promise<string> {
   await fs.writeFile(
     path.join(root, "src", "content", "config.ts"),
     `
-import { defineCollection, z } from "neutron/content";
+import { defineCollection, z } from "@neutron-build/core/content";
 
 export const collections = {
   blog: defineCollection({

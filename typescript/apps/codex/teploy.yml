@@ -1,0 +1,5 @@
+app: neutron-site
+domain: "neutron.build, www.neutron.build"
+server: deploy-ovh
+port: 80
+build_local: true

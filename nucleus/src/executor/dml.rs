@@ -1521,3 +1521,75 @@ impl Executor {
     }
 
 }
+
+/// Coerce row values to match DDL column types.
+///
+/// When SimpleProtocol sends INSERT values, all parameters arrive as text strings.
+/// The executor stores them as `Value::Text` even for BIGINT, INTEGER, BOOLEAN, etc.
+/// This function converts each value to the correct type based on the table definition,
+/// so MergeTree columns store typed data and arithmetic/comparison works correctly.
+fn coerce_rows_to_schema(table_def: &TableDef, rows: Vec<Row>) -> Vec<Row> {
+    rows.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .enumerate()
+                .map(|(i, val)| {
+                    if i < table_def.columns.len() {
+                        coerce_value(val, &table_def.columns[i].data_type)
+                    } else {
+                        val
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Coerce a single value to match the target data type.
+/// Only converts when the source is Text and the target expects a different type.
+fn coerce_value(val: Value, target: &DataType) -> Value {
+    match (&val, target) {
+        // Text → Int64 (BIGINT)
+        (Value::Text(s), DataType::Int64) => {
+            if let Ok(n) = s.parse::<i64>() {
+                Value::Int64(n)
+            } else {
+                val
+            }
+        }
+        // Text → Int32 (INTEGER)
+        (Value::Text(s), DataType::Int32) => {
+            if let Ok(n) = s.parse::<i32>() {
+                Value::Int32(n)
+            } else {
+                val
+            }
+        }
+        // Text → Float64 (DOUBLE PRECISION / REAL)
+        (Value::Text(s), DataType::Float64) => {
+            if let Ok(n) = s.parse::<f64>() {
+                Value::Float64(n)
+            } else {
+                val
+            }
+        }
+        // Text → Bool (BOOLEAN)
+        (Value::Text(s), DataType::Bool) => {
+            match s.as_str() {
+                "true" | "t" | "1" | "yes" => Value::Bool(true),
+                "false" | "f" | "0" | "no" => Value::Bool(false),
+                _ => val,
+            }
+        }
+        // Text → Jsonb (parse if it looks like JSON)
+        (Value::Text(s), DataType::Jsonb) => {
+            if let Ok(j) = serde_json::from_str(s) {
+                Value::Jsonb(j)
+            } else {
+                val
+            }
+        }
+        // Already correct type or no coercion needed
+        _ => val,
+    }
+}

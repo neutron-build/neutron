@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" role="img" aria-labelledby="title desc">
+  <title id="title">De Rham cohomology closed and exact forms</title>
+  <desc id="desc">A surface with loops, a closed circulating form, and an exact flow that comes from a potential.</desc>
+  <rect width="960" height="420" fill="#f8fafc"/>
+  <path d="M85 292 C220 180 350 348 495 250 C635 155 745 315 880 215 L880 350 L85 350 Z" fill="#e0f2fe" stroke="#0369a1" stroke-width="4"/>
+  <g fill="none" stroke-linecap="round" stroke-width="5">
+    <path d="M235 205 C280 150 360 165 380 230 C400 295 315 325 260 285 C220 255 205 235 235 205 Z" stroke="#7c3aed"/>
+    <path d="M560 122 C625 75 710 120 700 195 C690 270 585 285 535 225 C500 183 515 145 560 122 Z" stroke="#dc2626"/>
+  </g>
+  <g stroke="#059669" stroke-width="5" stroke-linecap="round" marker-end="url(#dr-arrow)">
+    <defs>
+      <marker id="dr-arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+        <path d="M1 1 L9 5 L1 9 Z" fill="#059669"/>
+      </marker>
+    </defs>
+    <path d="M168 298 C210 270 245 270 290 295"/>
+    <path d="M406 270 C450 235 495 230 535 250"/>
+    <path d="M705 285 C745 250 795 242 835 260"/>
+  </g>
+  <g font-family="Inter, Arial, sans-serif" fill="#0f172a">
+    <text x="82" y="54" font-size="30" font-weight="700">closed forms modulo exact forms</text>
+    <text x="95" y="383" font-size="19">de Rham cohomology keeps the circulation data that is not a global derivative</text>
+    <text x="236" y="143" font-size="20" font-weight="700" fill="#7c3aed">closed</text>
+    <text x="620" y="87" font-size="20" font-weight="700" fill="#dc2626">not filled by one global potential</text>
+    <text x="435" y="217" font-size="20" font-weight="700" fill="#059669">exact</text>
+  </g>
+</svg>

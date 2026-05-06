@@ -1,9 +1,9 @@
 {
-  "name": "neutron-cli",
-  "version": "0.1.0",
+  "name": "@neutron-build/cli",
+  "version": "0.0.1",
   "description": "CLI for the Neutron framework. Dev server, production builds, and deployment.",
   "author": "Tyler",
-  "license": "BUSL-1.1",
+  "license": "MIT",
   "homepage": "https://neutron.build",
   "repository": {
     "type": "git",
@@ -27,7 +27,9 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
@@ -35,7 +37,7 @@
     "test": "pnpm run build && node --test --experimental-test-isolation=none dist/index.test.js"
   },
   "dependencies": {
-    "neutron": "workspace:*",
+    "@neutron-build/core": "workspace:*",
     "preact": "^10.25.4",
     "preact-render-to-string": "^6.5.11",
     "vite": "^6.0.7"
@@ -43,5 +45,13 @@
   "devDependencies": {
     "@types/node": "^22.10.7",
     "typescript": "^5.7.2"
-  }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {},
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false
 }

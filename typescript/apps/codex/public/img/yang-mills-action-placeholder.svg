@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" role="img" aria-labelledby="title desc">
+  <title id="title">Yang-Mills curvature energy diagram</title>
+  <desc id="desc">A surface with a connection grid, curved field loops, and an energy meter representing the Yang-Mills action.</desc>
+  <rect width="960" height="420" fill="#f8fafc"/>
+  <defs>
+    <linearGradient id="surface" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#dbeafe"/>
+      <stop offset="0.55" stop-color="#ccfbf1"/>
+      <stop offset="1" stop-color="#fef3c7"/>
+    </linearGradient>
+  </defs>
+  <path d="M70 285 C210 170 340 360 480 245 C625 125 735 315 890 205 L890 350 L70 350 Z" fill="url(#surface)" stroke="#0f766e" stroke-width="4"/>
+  <g stroke="#334155" stroke-width="2" opacity="0.42">
+    <path d="M140 315 C250 240 345 335 455 270 C575 200 690 285 815 235"/>
+    <path d="M115 280 C240 205 355 295 485 230 C615 165 725 245 855 200"/>
+    <path d="M210 190 C235 235 250 275 270 340"/>
+    <path d="M335 205 C365 250 385 295 400 350"/>
+    <path d="M485 170 C510 220 535 280 552 350"/>
+    <path d="M640 175 C665 225 690 285 715 350"/>
+    <path d="M780 180 C805 230 830 285 850 350"/>
+  </g>
+  <g fill="none" stroke-linecap="round">
+    <path d="M230 145 C280 95 350 125 360 185 C370 245 290 270 245 230 C205 195 200 170 230 145 Z" stroke="#7c3aed" stroke-width="7"/>
+    <path d="M545 95 C610 60 680 100 680 165 C680 230 600 255 548 210 C500 168 505 120 545 95 Z" stroke="#dc2626" stroke-width="7"/>
+    <path d="M715 255 C760 215 835 240 850 300 C865 360 780 372 735 335 C705 310 695 280 715 255 Z" stroke="#2563eb" stroke-width="7"/>
+  </g>
+  <g font-family="Inter, Arial, sans-serif" fill="#0f172a">
+    <text x="78" y="65" font-size="32" font-weight="700">Curvature has energy</text>
+    <text x="79" y="101" font-size="19">Yang-Mills measures the squared size of the field strength.</text>
+    <rect x="712" y="52" width="170" height="76" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+    <text x="735" y="84" font-size="18" font-weight="700">action</text>
+    <rect x="735" y="98" width="122" height="13" rx="3" fill="#e2e8f0"/>
+    <rect x="735" y="98" width="82" height="13" rx="3" fill="#dc2626"/>
+  </g>
+</svg>

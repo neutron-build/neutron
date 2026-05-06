@@ -4,7 +4,7 @@ import {
   type AppContext,
   type CookieSerializeOptions,
   type MiddlewareFn,
-} from "neutron";
+} from "@neutron-build/core";
 
 export interface CspNonceMiddlewareOptions {
   contextKey?: string;
