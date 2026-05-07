@@ -135,3 +135,10 @@ Cargo.lock
 !nucleus/Cargo.lock
 # Database files
 *.db
+
+# Rust build artifacts (added after filter-repo cleanup of history)
+**/target/
+**/debug/
+*.rlib
+*.rmeta
+*.rcgu.o
