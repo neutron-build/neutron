@@ -41,7 +41,11 @@ func Query[T any](ctx context.Context, sql *SQLModel, query string, args ...any)
 	}
 	defer rows.Close()
 
-	var results []T
+	// Initialise as empty slice (not nil) so handlers that pass results
+	// straight back to JSON encoders emit `[]` for zero-row results
+	// rather than `null`. Saves every consumer from writing the same
+	// nil-to-empty shim.
+	results := make([]T, 0)
 	for rows.Next() {
 		var item T
 		if err := scanRow(rows, &item); err != nil {
