@@ -1289,7 +1289,18 @@ async fn cmd_start(cfg: StartConfig) {
     let router = Arc::new(ConnectionRouter::new(runtime.clone()));
     tracing::info!("Runtime: {num_cores} cores, round-robin connection routing");
 
-    // Graceful shutdown handler: flush dirty pages on Ctrl+C / SIGTERM
+    // Graceful shutdown handler: flush dirty pages on Ctrl+C / SIGTERM.
+    //
+    // Bounded shutdown contract (see #16):
+    //   1. On signal, notify the accept loop to stop taking new work.
+    //   2. Arm a hard-exit watchdog on a real OS thread — if the in-tokio
+    //      cleanup is still running after `SHUTDOWN_DEADLINE_SECS`, the
+    //      watchdog calls `std::process::exit` so we never hang past the
+    //      budget regardless of dropped runtime / stuck spawn_blocking /
+    //      lock contention in the buffer pool.
+    //   3. Run synchronous work (disk flush) on a blocking thread so it
+    //      cannot stall a tokio worker.
+    const SHUTDOWN_DEADLINE_SECS: u64 = 5;
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let shutdown_for_handler = shutdown_notify.clone();
     let disk_for_shutdown = disk_engine.clone();
@@ -1314,6 +1325,26 @@ async fn cmd_start(cfg: StartConfig) {
         }
         tracing::info!("Shutdown signal received, flushing data...");
 
+        // Arm the hard-exit watchdog FIRST. This runs on a dedicated OS
+        // thread that is invisible to the tokio runtime, so it fires even
+        // if every tokio worker is parked or the runtime drop is wedged.
+        std::thread::Builder::new()
+            .name("nucleus-shutdown-watchdog".into())
+            .spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(
+                    SHUTDOWN_DEADLINE_SECS,
+                ));
+                eprintln!(
+                    "[nucleus] graceful shutdown exceeded {SHUTDOWN_DEADLINE_SECS}s budget, forcing exit"
+                );
+                std::process::exit(0);
+            })
+            .expect("failed to spawn shutdown watchdog thread");
+
+        // Tell the accept loop and protocol servers to stop immediately so
+        // ports are released and no new work is admitted.
+        shutdown_for_handler.notify_waiters();
+
         // Log runtime stats before shutdown
         let stats = runtime_for_shutdown.stats();
         tracing::info!(
@@ -1335,14 +1366,23 @@ async fn cmd_start(cfg: StartConfig) {
 
         workers_for_shutdown.shutdown();
         transport_for_shutdown.shutdown().await;
-        if let Some(ref engine) = disk_for_shutdown {
-            match engine.flush() {
-                Ok(()) => tracing::info!("Data flushed to disk successfully"),
-                Err(e) => tracing::error!("Failed to flush data on shutdown: {e}"),
+
+        // Run the synchronous flush on a blocking thread. Disk flushes can
+        // contend with the buffer pool's writer paths and block for several
+        // hundred ms; doing it inline on a tokio worker has been observed
+        // to stall the runtime drop sequence under load.
+        if let Some(engine) = disk_for_shutdown {
+            let flush_result = tokio::task::spawn_blocking(move || engine.flush()).await;
+            match flush_result {
+                Ok(Ok(())) => tracing::info!("Data flushed to disk successfully"),
+                Ok(Err(e)) => tracing::error!("Failed to flush data on shutdown: {e}"),
+                Err(e) => tracing::error!("Flush task panicked: {e}"),
             }
         }
         tracing::info!("Nucleus stopped.");
-        shutdown_for_handler.notify_one();
+        // Hard-exit immediately; do not wait for the runtime to drop
+        // background tasks (some of which never check a shutdown flag).
+        std::process::exit(0);
     });
 
     // Spawn RESP2 (Redis protocol) server
@@ -1547,11 +1587,13 @@ async fn cmd_start(cfg: StartConfig) {
         });
     }
 
-    // Drain in-flight connections with a timeout
+    // Drain in-flight connections with a tight timeout. Must be smaller than
+    // SHUTDOWN_DEADLINE_SECS in the signal handler so the watchdog has slack
+    // to actually fire if drain stalls.
     if !connection_tasks.is_empty() {
         let active = connection_tasks.len();
-        tracing::info!("Waiting for {active} in-flight connection(s) to finish (5s timeout)...");
-        let drain_deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+        tracing::info!("Waiting for {active} in-flight connection(s) to finish (2s timeout)...");
+        let drain_deadline = tokio::time::sleep(std::time::Duration::from_secs(2));
         tokio::pin!(drain_deadline);
         loop {
             tokio::select! {
