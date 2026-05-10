@@ -1705,11 +1705,29 @@ impl Executor {
                             });
                             proj_items.push(ProjItem::ColIdx(idx));
                         } else if let Ok(expr) = Self::parse_expr_string(col_name) {
-                            // Expression column — evaluate per-row via eval_expr_plan
+                            // Expression column — evaluate per-row via eval_expr_plan.
+                            // Statically infer the result type so the pgwire layer
+                            // can advertise the right OID even if the result set is
+                            // empty (otherwise empty results default to TEXT and
+                            // break pgx-style typed scanners).  When the upstream
+                            // node already produced a column with the same string
+                            // representation (e.g. an Aggregate node emitting
+                            // `MAX(ts)` directly), prefer its dtype because the
+                            // upstream had access to the original table schema.
+                            let normalized = col_name.replace(' ', "");
+                            let upstream_dt = meta.iter().find_map(|c| {
+                                let cn = c.name.replace(' ', "");
+                                if cn.eq_ignore_ascii_case(&normalized) {
+                                    Some(c.dtype.clone())
+                                } else {
+                                    None
+                                }
+                            });
+                            let dtype = upstream_dt.unwrap_or_else(|| infer_expr_type(&expr, &meta));
                             proj_meta.push(ColMeta {
                                 table: None,
                                 name: alias.unwrap_or(col_name).to_string(),
-                                dtype: DataType::Text, // type inferred at runtime
+                                dtype,
                             });
                             proj_items.push(ProjItem::Expr(Box::new(expr)));
                         } else {
@@ -1943,10 +1961,36 @@ impl Executor {
                         let val = col_idx
                             .and_then(|ci| simd_aggregate(&func_name, ci, &meta, &rows))
                             .unwrap_or_else(|| compute_aggregate(&func_name, col_idx, &rows));
+                        // Resolve the dtype from the aggregate function + the
+                        // arg column's type so empty input (Value::Null) doesn't
+                        // collapse the column type to TEXT.  Falls back to the
+                        // value's dynamic type only when both sides are unknown.
+                        let arg_dt = col_idx.and_then(|i| meta.get(i)).map(|c| c.dtype.clone());
+                        let static_dt = match func_name.as_str() {
+                            "COUNT" => Some(DataType::Int64),
+                            "SUM" => match &arg_dt {
+                                Some(DataType::Int32) | Some(DataType::Int64) => Some(DataType::Int64),
+                                Some(dt) => Some(dt.clone()),
+                                None => None,
+                            },
+                            "MAX" | "MIN" => arg_dt.clone(),
+                            "AVG" | "STDDEV" | "VARIANCE" => Some(DataType::Float64),
+                            _ => None,
+                        };
+                        let dtype = match static_dt {
+                            Some(dt) => dt,
+                            None => match &val {
+                                Value::Int32(_) => DataType::Int32,
+                                Value::Int64(_) => DataType::Int64,
+                                Value::Float64(_) => DataType::Float64,
+                                Value::Bool(_) => DataType::Bool,
+                                _ => DataType::Text,
+                            },
+                        };
                         result_meta.push(ColMeta {
                             table: None,
                             name: agg_str.clone(),
-                            dtype: match &val { Value::Int64(_) => DataType::Int64, Value::Float64(_) => DataType::Float64, _ => DataType::Text },
+                            dtype,
                         });
                         result_values.push(val);
                     }
@@ -1987,10 +2031,21 @@ impl Executor {
                                     let key_dt = ci.get(ki).map(|(_, dt)| dt.clone()).unwrap_or(DataType::Text);
                                     result_meta.push(ColMeta { table: Some(table.clone()), name: group_keys[0].clone(), dtype: key_dt });
                                     for agg_str in aggregates {
-                                        let (func_name, _) = parse_agg_spec(agg_str);
+                                        let (func_name, col_name) = parse_agg_spec(agg_str);
+                                        // Resolve the aggregate's argument column type so MAX/MIN
+                                        // preserve their input type (BIGINT MAX(ts) → Int64) instead
+                                        // of being defaulted to Float64.
+                                        let arg_dt = if col_name == "*" {
+                                            None
+                                        } else {
+                                            ci.iter()
+                                                .find(|(c, _)| c.eq_ignore_ascii_case(&col_name))
+                                                .map(|(_, dt)| dt.clone())
+                                        };
                                         let dtype = match func_name.as_str() {
                                             "COUNT" => DataType::Int64,
                                             "SUM" if val_is_int => DataType::Int64,
+                                            "MAX" | "MIN" => arg_dt.unwrap_or(DataType::Float64),
                                             _ => DataType::Float64,
                                         };
                                         result_meta.push(ColMeta {
@@ -2044,11 +2099,29 @@ impl Executor {
                         }
                     }
                     for agg_str in aggregates {
-                        let (func_name, _) = parse_agg_spec(agg_str);
+                        let (func_name, col_name) = parse_agg_spec(agg_str);
+                        let arg_dt = if col_name == "*" {
+                            None
+                        } else {
+                            Self::resolve_plan_col_idx(&meta, &col_name)
+                                .and_then(|i| meta.get(i))
+                                .map(|c| c.dtype.clone())
+                        };
+                        let dtype = match func_name.as_str() {
+                            "COUNT" => DataType::Int64,
+                            "SUM" => match &arg_dt {
+                                Some(DataType::Int32) | Some(DataType::Int64) => DataType::Int64,
+                                Some(dt) => dt.clone(),
+                                None => DataType::Float64,
+                            },
+                            "MAX" | "MIN" => arg_dt.unwrap_or(DataType::Float64),
+                            "AVG" | "STDDEV" | "VARIANCE" => DataType::Float64,
+                            _ => DataType::Float64,
+                        };
                         result_meta.push(ColMeta {
                             table: None,
                             name: agg_str.clone(),
-                            dtype: if func_name == "COUNT" { DataType::Int64 } else { DataType::Float64 },
+                            dtype,
                         });
                     }
 

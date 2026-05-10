@@ -5,11 +5,11 @@
 
 use sqlparser::ast::{self, Expr, SelectItem};
 
-use crate::types::{DataType, Row};
+use crate::types::Row;
 
 use super::ExecError;
 use super::Executor;
-use super::helpers::value_type;
+use super::helpers::{infer_expr_type, value_type};
 use super::types::{ColMeta, ProjectedResult};
 
 impl Executor {
@@ -52,12 +52,16 @@ impl Executor {
                     expr_items.push(None);
                 }
                 SelectItem::UnnamedExpr(expr) => {
-                    // Expression projection — evaluate per row
+                    // Expression projection — evaluate per row.  When the
+                    // result set is empty (e.g. a `LIMIT 0` probe used by the
+                    // pgwire `Describe` path, or a filter with no matches),
+                    // fall back to static AST inference so we still advertise
+                    // the correct column type instead of defaulting to TEXT.
                     if let Some(first) = rows.first() {
                         let val = self.eval_row_expr(expr, first, col_meta)?;
                         columns.push((format!("{expr}"), value_type(&val)));
                     } else {
-                        columns.push((format!("{expr}"), DataType::Text));
+                        columns.push((format!("{expr}"), infer_expr_type(expr, col_meta)));
                     }
                     col_indices.push(usize::MAX); // sentinel
                     expr_items.push(Some(expr));
@@ -67,7 +71,7 @@ impl Executor {
                         let val = self.eval_row_expr(expr, first, col_meta)?;
                         columns.push((alias.value.clone(), value_type(&val)));
                     } else {
-                        columns.push((alias.value.clone(), DataType::Text));
+                        columns.push((alias.value.clone(), infer_expr_type(expr, col_meta)));
                     }
                     col_indices.push(usize::MAX);
                     expr_items.push(Some(expr));

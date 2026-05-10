@@ -110,6 +110,129 @@ pub(super) fn value_type(value: &Value) -> DataType {
     }
 }
 
+/// Statically infer the result type of an expression without evaluating it.
+///
+/// Used by the projection layer when there are zero result rows (so we cannot
+/// derive the type from a sample value) and by the pgwire `Describe` path
+/// (which probes via `LIMIT 0`). Without this, every empty-result column
+/// gets advertised as TEXT in `RowDescription`, which breaks pgx clients
+/// that expect numeric/boolean columns to round-trip through their typed
+/// scanners.
+pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
+    match expr {
+        Expr::Identifier(ident) => col_meta
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&ident.value))
+            .map(|c| c.dtype.clone())
+            .unwrap_or(DataType::Text),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let table = &parts[0].value;
+            let col = &parts[1].value;
+            col_meta
+                .iter()
+                .find(|c| {
+                    c.name.eq_ignore_ascii_case(col)
+                        && c.table.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(table))
+                })
+                .or_else(|| col_meta.iter().find(|c| c.name.eq_ignore_ascii_case(col)))
+                .map(|c| c.dtype.clone())
+                .unwrap_or(DataType::Text)
+        }
+        Expr::Value(val) => match &val.value {
+            ast::Value::Number(n, _) => {
+                if n.parse::<i32>().is_ok() {
+                    DataType::Int32
+                } else if n.parse::<i64>().is_ok() {
+                    DataType::Int64
+                } else if n.parse::<f64>().is_ok() {
+                    DataType::Float64
+                } else {
+                    DataType::Text
+                }
+            }
+            ast::Value::Boolean(_) => DataType::Bool,
+            ast::Value::Null => DataType::Text,
+            ast::Value::SingleQuotedString(_) | ast::Value::DoubleQuotedString(_) => DataType::Text,
+            _ => DataType::Text,
+        },
+        Expr::Cast { data_type, .. } => {
+            crate::sql::convert_data_type(data_type).unwrap_or(DataType::Text)
+        }
+        Expr::Function(func) => {
+            let name = func.name.to_string().to_uppercase();
+            let arg_expr = match &func.args {
+                ast::FunctionArguments::List(list) => list.args.first().and_then(|a| match a {
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => Some(e),
+                    _ => None,
+                }),
+                _ => None,
+            };
+            match name.as_str() {
+                "COUNT" => DataType::Int64,
+                "AVG" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP"
+                | "VARIANCE" | "VAR_POP" | "VAR_SAMP" => DataType::Float64,
+                "SUM" => match arg_expr.map(|e| infer_expr_type(e, col_meta)) {
+                    Some(DataType::Int32) | Some(DataType::Int64) => DataType::Int64,
+                    Some(dt) => dt,
+                    None => DataType::Int64,
+                },
+                "MAX" | "MIN" => arg_expr
+                    .map(|e| infer_expr_type(e, col_meta))
+                    .unwrap_or(DataType::Text),
+                "BOOL_AND" | "BOOL_OR" | "EVERY" => DataType::Bool,
+                "BIT_AND" | "BIT_OR" => arg_expr
+                    .map(|e| infer_expr_type(e, col_meta))
+                    .unwrap_or(DataType::Int64),
+                "STRING_AGG" => DataType::Text,
+                "ARRAY_AGG" => {
+                    let inner = arg_expr
+                        .map(|e| infer_expr_type(e, col_meta))
+                        .unwrap_or(DataType::Text);
+                    DataType::Array(Box::new(inner))
+                }
+                "JSON_AGG" => DataType::Jsonb,
+                _ => DataType::Text,
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            use ast::BinaryOperator::*;
+            match op {
+                Eq | NotEq | Lt | LtEq | Gt | GtEq | And | Or => DataType::Bool,
+                Plus | Minus | Multiply | Divide | Modulo => {
+                    let lt = infer_expr_type(left, col_meta);
+                    let rt = infer_expr_type(right, col_meta);
+                    match (&lt, &rt) {
+                        (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
+                        (DataType::Int64, _) | (_, DataType::Int64) => DataType::Int64,
+                        (DataType::Int32, DataType::Int32) => DataType::Int32,
+                        _ => lt,
+                    }
+                }
+                _ => DataType::Text,
+            }
+        }
+        Expr::UnaryOp { expr, .. } => infer_expr_type(expr, col_meta),
+        Expr::Nested(inner) => infer_expr_type(inner, col_meta),
+        Expr::Case { conditions, else_result, .. } => {
+            for cw in conditions {
+                let t = infer_expr_type(&cw.result, col_meta);
+                if !matches!(t, DataType::Text) {
+                    return t;
+                }
+            }
+            if let Some(e) = else_result {
+                return infer_expr_type(e, col_meta);
+            }
+            DataType::Text
+        }
+        Expr::IsNull(_) | Expr::IsNotNull(_) | Expr::IsTrue(_) | Expr::IsFalse(_)
+        | Expr::IsNotTrue(_) | Expr::IsNotFalse(_) | Expr::InList { .. }
+        | Expr::Between { .. } | Expr::Like { .. } | Expr::ILike { .. } => DataType::Bool,
+        _ => DataType::Text,
+    }
+}
+
+
 pub(super) fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Value::Int32(a), Value::Int32(b)) => Some(a.cmp(b)),

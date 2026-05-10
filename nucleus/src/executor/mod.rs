@@ -822,6 +822,14 @@ impl Executor {
         &self.metrics
     }
 
+    /// Get a reference to the shared catalog. Used by the pgwire layer to
+    /// resolve column types when describing prepared statements (so a
+    /// `WHERE bigint_col >= $1` placeholder can be advertised as int8 to
+    /// the client driver instead of defaulting to text).
+    pub fn catalog(&self) -> &Arc<Catalog> {
+        &self.catalog
+    }
+
     /// Set the query execution memory limit.
     pub fn with_query_memory_limit(self, limit_bytes: u64) -> Self {
         self.query_memory.set_limit(limit_bytes);

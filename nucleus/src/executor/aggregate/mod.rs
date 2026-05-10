@@ -19,8 +19,20 @@ use crate::simd;
 use crate::types::{DataType, Row, Value};
 
 use super::types::ColMeta;
-use super::helpers::{compare_values, compute_window_frame_bounds, value_to_f64, value_to_i64, value_type};
+use super::helpers::{compare_values, compute_window_frame_bounds, infer_expr_type, value_to_f64, value_to_i64, value_type};
 use super::{ExecError, ExecResult, Executor};
+
+/// Resolve the column type for an aggregate projection: prefer the runtime
+/// `value_type`, but when the aggregate evaluates to NULL (e.g. `MAX` over
+/// an empty input) fall back to static AST inference so we still advertise
+/// the right pgwire OID instead of TEXT.
+fn agg_column_type(val: &Value, expr: &Expr, col_meta: &[ColMeta]) -> DataType {
+    if matches!(val, Value::Null) {
+        infer_expr_type(expr, col_meta)
+    } else {
+        value_type(val)
+    }
+}
 
 impl Executor {
     // ========================================================================
@@ -131,12 +143,12 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, group_rows, &trivial, col_meta)?;
-                        cols.push((format!("{expr}"), value_type(&val)));
+                        cols.push((format!("{expr}"), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
                         let val = self.eval_aggregate_expr(expr, group_rows, &trivial, col_meta)?;
-                        cols.push((alias.value.clone(), value_type(&val)));
+                        cols.push((alias.value.clone(), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     SelectItem::Wildcard(_) => {
@@ -228,12 +240,12 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, &rows, indices, col_meta)?;
-                        cols.push((format!("{expr}"), value_type(&val)));
+                        cols.push((format!("{expr}"), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
                         let val = self.eval_aggregate_expr(expr, &rows, indices, col_meta)?;
-                        cols.push((alias.value.clone(), value_type(&val)));
+                        cols.push((alias.value.clone(), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     SelectItem::Wildcard(_) => {
@@ -271,12 +283,12 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, &rows, &null_indices, col_meta)?;
-                        cols.push((format!("{expr}"), value_type(&val)));
+                        cols.push((format!("{expr}"), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
                         let val = self.eval_aggregate_expr(expr, &rows, &null_indices, col_meta)?;
-                        cols.push((alias.value.clone(), value_type(&val)));
+                        cols.push((alias.value.clone(), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     _ => {}
@@ -341,12 +353,12 @@ impl Executor {
                 match item {
                     SelectItem::UnnamedExpr(expr) => {
                         let val = self.eval_aggregate_expr(expr, &rows, indices, col_meta)?;
-                        cols.push((format!("{expr}"), value_type(&val)));
+                        cols.push((format!("{expr}"), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
                         let val = self.eval_aggregate_expr(expr, &rows, indices, col_meta)?;
-                        cols.push((alias.value.clone(), value_type(&val)));
+                        cols.push((alias.value.clone(), agg_column_type(&val, expr, col_meta)));
                         row.push(val);
                     }
                     SelectItem::Wildcard(_) => {
@@ -464,12 +476,12 @@ impl Executor {
                     match item {
                         SelectItem::UnnamedExpr(expr) => {
                             let val = self.eval_aggregate_expr(expr, group_rows, &trivial, col_meta)?;
-                            cols.push((format!("{expr}"), value_type(&val)));
+                            cols.push((format!("{expr}"), agg_column_type(&val, expr, col_meta)));
                             row.push(val);
                         }
                         SelectItem::ExprWithAlias { expr, alias } => {
                             let val = self.eval_aggregate_expr(expr, group_rows, &trivial, col_meta)?;
-                            cols.push((alias.value.clone(), value_type(&val)));
+                            cols.push((alias.value.clone(), agg_column_type(&val, expr, col_meta)));
                             row.push(val);
                         }
                         _ => {
