@@ -1,7 +1,7 @@
 // Neutron Island Runtime
 // Hydrates islands based on client directive
 
-import { h, hydrate } from "preact";
+import { h, hydrate, render } from "preact";
 
 type ClientDirective = "load" | "visible" | "idle" | "media" | "only";
 
@@ -28,8 +28,17 @@ async function hydrateIsland(island: IslandElement) {
 
   try {
     const element = h(Component, props);
-    island.innerHTML = "";
-    hydrate(element, island);
+    // Preact's hydrate() walks the existing DOM and attaches event handlers
+    // in place — it crashes with "Cannot read properties of null (reading
+    // 'length')" if you call it against an empty container, because its diff
+    // walker tries to iterate children that don't exist. So:
+    //   - If the island already has SSR-rendered children, hydrate over them.
+    //   - Otherwise (e.g. client="only" with no SSR), render a fresh tree.
+    if (island.firstChild) {
+      hydrate(element, island);
+    } else {
+      render(element, island);
+    }
     island.__neutronHydrated = true;
   } catch (error) {
     console.error(`[Neutron] Failed to hydrate island ${componentId}:`, error);
