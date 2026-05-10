@@ -296,7 +296,10 @@ func TestKVIncr(t *testing.T) {
 	q := &mockCDCQuerier{
 		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
 			return &mockCDCRow{scanFn: func(dest ...any) error {
-				*(dest[0].(*int64)) = 5
+				// Incr now scans into *string and ParseInts in Go, per the
+				// pgwire BIGINT-as-binary workaround documented in
+				// nucleus_dogfood_findings #23.
+				*(dest[0].(*string)) = "5"
 				return nil
 			}}
 		},
@@ -318,7 +321,7 @@ func TestKVIncrWithAmount(t *testing.T) {
 		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
 			capturedArgs = args
 			return &mockCDCRow{scanFn: func(dest ...any) error {
-				*(dest[0].(*int64)) = 10
+				*(dest[0].(*string)) = "10"
 				return nil
 			}}
 		},
