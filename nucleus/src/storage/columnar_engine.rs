@@ -560,8 +560,35 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return Err(StorageError::TableNotFound(table.to_string()));
         }
-        let batches = store.batches_all(table);
+        // batches_all_for_select applies replacing_mergetree dedup for tables
+        // registered via crate::columnar::register_replacing_table; plain
+        // tables pass through unchanged.
+        let batches = store.batches_all_for_select(table);
         Ok(batches_to_rows(&batches))
+    }
+
+    async fn scan_where_eq_positions(
+        &self,
+        table: &str,
+        col_idx: usize,
+        value: &Value,
+    ) -> Result<Vec<(usize, Row)>, StorageError> {
+        // UPDATE/DELETE need every physical row matching the predicate, so
+        // mutations remove/overwrite all versions of a logical PK. The
+        // default impl calls scan() which deduplicates for replacing tables —
+        // that would leave older versions orphaned and they'd resurrect on
+        // the next read. Override to scan physical batches directly.
+        self.flush_write_buffer(table);
+        let store = self.store.read();
+        if !store.table_exists(table) {
+            return Err(StorageError::TableNotFound(table.to_string()));
+        }
+        let rows = batches_to_rows(&store.batches_all(table));
+        Ok(rows
+            .into_iter()
+            .enumerate()
+            .filter(|(_, row)| row.get(col_idx).is_some_and(|v| v == value))
+            .collect())
     }
 
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
@@ -702,8 +729,15 @@ impl StorageEngine for ColumnarStorageEngine {
             }
         };
         let store = self.store.read();
+        // Index points at physical positions; fetch by those, then dedup so
+        // SELECT via the index sees one row per logical PK.
         let batches = store.batches_all(table);
-        Ok(Some(fetch_rows_by_positions(&batches, &positions)))
+        let rows = fetch_rows_by_positions(&batches, &positions);
+        let out = match crate::columnar::replacing_config(table) {
+            Some(c) => crate::columnar::dedup_replacing_rows(rows, &c),
+            None => rows,
+        };
+        Ok(Some(out))
     }
 
     fn index_lookup_range_sync(
@@ -730,7 +764,12 @@ impl StorageEngine for ColumnarStorageEngine {
         };
         let store = self.store.read();
         let batches = store.batches_all(table);
-        Ok(Some(fetch_rows_by_positions(&batches, &positions)))
+        let rows = fetch_rows_by_positions(&batches, &positions);
+        let out = match crate::columnar::replacing_config(table) {
+            Some(c) => crate::columnar::dedup_replacing_rows(rows, &c),
+            None => rows,
+        };
+        Ok(Some(out))
     }
 
     // ─── Aggregate fast paths ─────────────────────────────────────────────────
@@ -738,11 +777,17 @@ impl StorageEngine for ColumnarStorageEngine {
     fn fast_count_all(&self, table: &str) -> Option<usize> {
         self.flush_write_buffer(table);
         let store = self.store.read();
-        if store.table_exists(table) {
-            Some(store.row_count(table))
-        } else {
-            None
+        if !store.table_exists(table) {
+            return None;
         }
+        // For replacing_mergetree the deduped logical row count must match
+        // SELECT *. Counting raw row_count would over-report by every
+        // superseded version. batches_all_for_select collapses those.
+        if crate::columnar::replacing_config(table).is_some() {
+            let batches = store.batches_all_for_select(table);
+            return Some(batches.iter().map(|b| b.row_count).sum());
+        }
+        Some(store.row_count(table))
     }
 
     fn fast_sum_f64(&self, table: &str, col_idx: usize) -> Option<(f64, usize)> {
@@ -843,12 +888,18 @@ impl StorageEngine for ColumnarStorageEngine {
 
     fn fast_count_filtered(&self, table: &str, filter_col: usize, filter_val: &Value) -> Option<usize> {
         self.flush_write_buffer(table);
-        let filter_col_name = filter_col.to_string();
         let store = self.store.read();
         if !store.table_exists(table) {
             return None;
         }
-        let batches = store.batches_all(table);
+        // For replacing_mergetree, count after dedup so superseded versions
+        // don't inflate the result.
+        let batches = if crate::columnar::replacing_config(table).is_some() {
+            store.batches_all_for_select(table)
+        } else {
+            store.batches_all(table)
+        };
+        let filter_col_name = filter_col.to_string();
         let count = batches.iter().map(|batch| {
             match batch.column(&filter_col_name) {
                 Some(col) => eq_mask(col, filter_val).iter().filter(|&&b| b).count(),
@@ -968,7 +1019,9 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let batches = store.batches_all(table);
+        // SELECT path — apply replacing_mergetree dedup so callers see one
+        // row per logical PK. No-op for plain tables.
+        let batches = store.batches_all_for_select(table);
         Some(batches_to_rows_where_eq(&batches, filter_col, filter_val))
     }
 
