@@ -342,6 +342,183 @@ pub fn group_by_text_agg_f64(
 }
 
 // ============================================================================
+// Replacing-mergetree dedup registry (process-global)
+// ============================================================================
+//
+// `replacing_mergetree` tables route their physical data through the same
+// `ColumnarStorageEngine` as plain tables — that engine has its own private
+// `ColumnarStore` instance, separate from the executor's. To make read-time
+// dedup work cleanly across both stores, we keep a small process-global
+// registry of `(table_name → ReplacingConfig)`. DDL populates the registry
+// on `CREATE TABLE ... WITH (engine='replacing_mergetree')` and clears it
+// on `DROP TABLE`. SELECT-side accessors in `ColumnarStore` and
+// `ColumnarStorageEngine` consult the registry to dedup output rows.
+
+/// Per-table read-time dedup configuration for `replacing_mergetree` tables.
+#[derive(Clone, Debug)]
+pub struct ReplacingConfig {
+    /// Scan-order column indices that form the primary key.
+    pub primary_key_indices: Vec<usize>,
+    /// Optional scan-order index of the version column. `None` ⇒ last-write
+    /// wins by insertion order.
+    pub version_col_idx: Option<usize>,
+}
+
+static REPLACING_REGISTRY: std::sync::OnceLock<parking_lot::RwLock<HashMap<String, ReplacingConfig>>> =
+    std::sync::OnceLock::new();
+
+fn replacing_registry() -> &'static parking_lot::RwLock<HashMap<String, ReplacingConfig>> {
+    REPLACING_REGISTRY.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
+}
+
+/// Register a table as `replacing_mergetree`. Called by DDL on CREATE TABLE.
+pub fn register_replacing_table(
+    table: &str,
+    primary_key_indices: Vec<usize>,
+    version_col_idx: Option<usize>,
+) {
+    if primary_key_indices.is_empty() {
+        replacing_registry().write().remove(table);
+        return;
+    }
+    replacing_registry().write().insert(
+        table.to_string(),
+        ReplacingConfig { primary_key_indices, version_col_idx },
+    );
+}
+
+/// Drop the dedup config for a table. Called by DDL on DROP TABLE.
+pub fn unregister_replacing_table(table: &str) {
+    replacing_registry().write().remove(table);
+}
+
+/// Look up the dedup config for a table.
+pub fn replacing_config(table: &str) -> Option<ReplacingConfig> {
+    replacing_registry().read().get(table).cloned()
+}
+
+/// Apply read-time dedup to a `Vec<ColumnBatch>` for tables registered as
+/// `replacing_mergetree`. Returns the original batches unchanged for plain
+/// tables.
+pub fn apply_replacing_dedup(table: &str, batches: Vec<ColumnBatch>) -> Vec<ColumnBatch> {
+    let cfg = match replacing_config(table) {
+        Some(c) => c,
+        None => return batches,
+    };
+    let total_rows: usize = batches.iter().map(|b| b.row_count).sum();
+    if total_rows <= 1 {
+        return batches;
+    }
+    let pk_names: Vec<String> = cfg.primary_key_indices.iter().map(|i| i.to_string()).collect();
+    let version_name: Option<String> = cfg.version_col_idx.map(|i| i.to_string());
+    let combined = match concat_dedup_batches(&batches) {
+        Some(b) => b,
+        None => return batches,
+    };
+    let sorted = sort_batch_by_keys(&combined, &pk_names);
+    let deduped = merge_replacing(&sorted, &pk_names, version_name.as_deref());
+    vec![deduped]
+}
+
+/// Row-major dedup, used by index-lookup paths where rows are already
+/// materialised and we don't want to round-trip through column form.
+pub fn dedup_replacing_rows(rows: Vec<Row>, cfg: &ReplacingConfig) -> Vec<Row> {
+    if rows.len() <= 1 || cfg.primary_key_indices.is_empty() {
+        return rows;
+    }
+    let mut groups: HashMap<Vec<Value>, (usize, Option<i64>)> = HashMap::with_capacity(rows.len());
+    let mut order: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+    for (pos, row) in rows.iter().enumerate() {
+        let key: Vec<Value> = cfg
+            .primary_key_indices
+            .iter()
+            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+            .collect();
+        let cur_ver = cfg
+            .version_col_idx
+            .and_then(|vi| row.get(vi))
+            .map(value_to_version_i64);
+        match groups.get_mut(&key) {
+            Some(existing) => match (existing.1, cur_ver) {
+                (Some(prev), Some(cur)) if cur >= prev => *existing = (pos, Some(cur)),
+                (None, Some(cur)) => *existing = (pos, Some(cur)),
+                (Some(_), None) => {}
+                (None, None) => *existing = (pos, None),
+                _ => {}
+            },
+            None => {
+                order.push(key.clone());
+                groups.insert(key, (pos, cur_ver));
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(groups.len());
+    for key in order {
+        if let Some(&(pos, _)) = groups.get(&key) {
+            out.push(rows[pos].clone());
+        }
+    }
+    out
+}
+
+fn value_to_version_i64(v: &Value) -> i64 {
+    match v {
+        Value::Int32(n) => *n as i64,
+        Value::Int64(n) => *n,
+        Value::Float64(f) => *f as i64,
+        Value::Bool(b) => *b as i64,
+        _ => 0,
+    }
+}
+
+/// Concatenate a slice of `ColumnBatch` into one. Assumes all batches share
+/// the same column schema (invariant in `ColumnarStorageEngine`).
+fn concat_dedup_batches(batches: &[ColumnBatch]) -> Option<ColumnBatch> {
+    let first = batches.first()?;
+    if batches.len() == 1 {
+        return Some(first.clone());
+    }
+    let mut cols: Vec<(String, ColumnData)> = first
+        .columns
+        .iter()
+        .map(|(n, c)| (n.clone(), c.clone()))
+        .collect();
+    for b in &batches[1..] {
+        for (i, (_, src)) in b.columns.iter().enumerate() {
+            if let Some((_, dst)) = cols.get_mut(i) {
+                *dst = concat_columns(dst, src);
+            }
+        }
+    }
+    Some(ColumnBatch::new(cols))
+}
+
+/// Sort a batch's rows by the supplied key column names.
+fn sort_batch_by_keys(batch: &ColumnBatch, keys: &[String]) -> ColumnBatch {
+    let row_count = batch.columns.first().map(|(_, c)| c.len()).unwrap_or(0);
+    if row_count <= 1 || keys.is_empty() {
+        return batch.clone();
+    }
+    let mut indices: Vec<usize> = (0..row_count).collect();
+    indices.sort_by(|&a, &b| {
+        for k in keys {
+            let col = batch.column(k);
+            match compare_column_values(col, a, b) {
+                std::cmp::Ordering::Equal => continue,
+                other => return other,
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    let new_columns: Vec<(String, ColumnData)> = batch
+        .columns
+        .iter()
+        .map(|(name, col)| (name.clone(), reorder_column(col, &indices)))
+        .collect();
+    ColumnBatch::new(new_columns)
+}
+
+// ============================================================================
 // Columnar table store
 // ============================================================================
 
@@ -511,12 +688,27 @@ impl ColumnarStore {
     ///
     /// Returns owned Vec. For MergeTree-backed tables, cold parts are loaded
     /// from disk as needed.
+    ///
+    /// IMPORTANT: returns *physical* batches even for `replacing_mergetree`
+    /// tables. UPDATE/DELETE/snapshot rely on physical row identity, so
+    /// transparently deduping here would corrupt mutations. SELECT-only
+    /// callers must use `batches_all_for_select` (or wrap with
+    /// `apply_replacing_dedup`) to collapse superseded versions.
     pub fn batches_all(&self, table: &str) -> Vec<ColumnBatch> {
         if let Some(mt) = self.merge_trees.get(table) {
             mt.scan_all()
         } else {
             self.tables.get(table).cloned().unwrap_or_default()
         }
+    }
+
+    /// SELECT-side accessor: returns batches with `replacing_mergetree`
+    /// read-time dedup applied if the table is so registered. Plain tables
+    /// pass through unchanged. This is a no-op except for tables registered
+    /// via `register_replacing_table`.
+    pub fn batches_all_for_select(&self, table: &str) -> Vec<ColumnBatch> {
+        let raw = self.batches_all(table);
+        apply_replacing_dedup(table, raw)
     }
 
     /// Total row count across all batches for a table.

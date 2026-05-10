@@ -148,6 +148,28 @@ impl Executor {
                             let version_col = Self::extract_string_option(
                                 &create.table_options, "version_column",
                             );
+                            // Register read-time dedup so SELECT collapses
+                            // superseded versions. We resolve ORDER BY column
+                            // names + version column to scan-order indices
+                            // using the freshly-built TableDef. The registry
+                            // is consulted by `ColumnarStore::batches_all_for_select`
+                            // and the SELECT-side fast paths.
+                            let pk_idx: Vec<usize> = order_by_cols
+                                .iter()
+                                .filter_map(|name| {
+                                    table_def.columns.iter().position(|c|
+                                        c.name.eq_ignore_ascii_case(name)
+                                    )
+                                })
+                                .collect();
+                            let ver_idx = version_col.as_ref().and_then(|name| {
+                                table_def.columns.iter().position(|c|
+                                    c.name.eq_ignore_ascii_case(name)
+                                )
+                            });
+                            crate::columnar::register_replacing_table(
+                                &table_name, pk_idx, ver_idx,
+                            );
                             MergeStrategy::Replacing { version_column: version_col }
                         }
                         Some("aggregating_mergetree") => {
@@ -313,6 +335,9 @@ impl Executor {
                             }
                             // Remove per-table engine entry if present.
                             self.table_engines.write().remove(&table_name);
+                            // Drop replacing-mergetree dedup config so a
+                            // subsequent CREATE doesn't inherit stale entries.
+                            crate::columnar::unregister_replacing_table(&table_name);
                             // Clean up sync caches
                             self.table_columns.write().remove(&table_name);
                             self.btree_indexes.retain(|(t, _), _| t != &table_name);
