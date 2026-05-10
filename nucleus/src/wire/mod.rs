@@ -763,20 +763,45 @@ impl NucleusHandler {
 
     /// Infer parameter types from SQL placeholders.
     ///
-    /// This does basic analysis: counts `$N` placeholders and returns TEXT
-    /// for each, since Nucleus does text-based parameter substitution.
-    /// If explicit types were provided in the Parse message, those are used
-    /// instead.
+    /// Counts `$N` placeholders, then for each one tries to resolve a Postgres
+    /// wire `Type` in this priority order:
+    ///   1. The type explicitly declared by the client in the Parse message.
+    ///   2. A type inferred from the AST context (e.g. the column on the
+    ///      other side of a comparison, or an explicit `CAST($N AS …)`).
+    ///   3. `Type::TEXT` as a safe last resort.
+    ///
+    /// Step 2 is what unblocks pgx clients: without it, every undeclared `$N`
+    /// is advertised as TEXT, so pgx refuses to bind a Go `int64` to a
+    /// `WHERE bigint_col >= $1` parameter ("cannot find encode plan").
+    #[allow(dead_code)] // kept as a thin wrapper used by unit tests
     fn infer_parameter_types(sql: &str, declared: &[Option<Type>]) -> Vec<Type> {
-        // Count the number of $N placeholders to determine parameter count.
+        Self::infer_parameter_types_with_ast(sql, declared, None, None)
+    }
+
+    /// AST-aware variant of `infer_parameter_types`.  When the parsed AST and
+    /// executor are available, walks the AST to derive each `$N` parameter\'s
+    /// type from sibling expressions (column references resolved through the
+    /// catalog, or explicit `CAST` targets).
+    fn infer_parameter_types_with_ast(
+        sql: &str,
+        declared: &[Option<Type>],
+        ast: Option<&[sqlparser::ast::Statement]>,
+        executor: Option<&Arc<Executor>>,
+    ) -> Vec<Type> {
         let param_count = count_placeholders(sql);
         let count = param_count.max(declared.len());
+
+        let inferred: Vec<Option<Type>> = match (ast, executor) {
+            (Some(stmts), Some(exec)) => infer_param_types_from_ast(stmts, exec, count),
+            _ => vec![None; count],
+        };
 
         (0..count)
             .map(|i| {
                 declared
                     .get(i)
                     .and_then(|t| t.clone())
+                    .or_else(|| inferred.get(i).cloned().flatten())
                     .unwrap_or(Type::TEXT)
             })
             .collect()
@@ -792,35 +817,40 @@ impl NucleusHandler {
     /// the original SQL text so repeated placeholders are handled correctly and
     /// replacement values cannot trigger recursive substitution.
     fn substitute_parameters(sql: &str, portal: &Portal<ParsedStatement>) -> PgWireResult<String> {
+        Self::substitute_parameters_with_executor(sql, portal, None)
+    }
+
+    /// Same as [`substitute_parameters`] but accepts an optional executor so
+    /// we can run the AST-driven parameter type inference (column lookups via
+    /// the catalog).  When the client did not declare a type for `$N`, the
+    /// inferred type is used; when even inference fails, we fall back to TEXT.
+    fn substitute_parameters_with_executor(
+        sql: &str,
+        portal: &Portal<ParsedStatement>,
+        executor: Option<&Arc<Executor>>,
+    ) -> PgWireResult<String> {
         let param_count = portal.parameter_len();
         let mut replacements = Vec::with_capacity(param_count);
 
+        let inferred = Self::infer_parameter_types_with_ast(
+            sql,
+            &portal.statement.parameter_types,
+            portal.statement.statement.ast.as_deref(),
+            executor,
+        );
+
         for i in 0..param_count {
-            let type_hint = portal
-                .statement
-                .parameter_types
+            let type_hint = inferred
                 .get(i)
-                .and_then(|t| t.clone())
+                .cloned()
                 .unwrap_or(Type::TEXT);
 
-            let value_str: String = match portal.parameter::<String>(i, &type_hint) {
-                Ok(Some(s)) => s,
-                Ok(None) => "NULL".to_owned(),
-                Err(_) => {
-                    // Fall back: try to read raw bytes as UTF-8.
-                    match &portal.parameters[i] {
-                        Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-                        None => "NULL".to_owned(),
-                    }
+            let replacement = match decode_pg_param(portal, i, &type_hint) {
+                Some(DecodedParam::Null) | None => "NULL".to_owned(),
+                Some(DecodedParam::Numeric(s)) | Some(DecodedParam::Bool(s)) => s,
+                Some(DecodedParam::Text(s)) => {
+                    format!("\'{}\'", sanitize_sql_text_literal(&s))
                 }
-            };
-
-            // Quote the value for SQL injection safety, unless it's NULL.
-            // Strip NUL bytes, escape backslashes and single quotes.
-            let replacement = if value_str == "NULL" {
-                "NULL".to_owned()
-            } else {
-                format!("'{}'", sanitize_sql_text_literal(&value_str))
             };
             replacements.push(replacement);
         }
@@ -852,7 +882,7 @@ impl NucleusHandler {
     /// Returns `Err(())` on any issue (type conversion, etc.) — caller falls back to string path.
     #[allow(clippy::type_complexity)]
     fn try_ast_execute<'a>(
-        executor: &'a Executor,
+        executor: &'a Arc<Executor>,
         session_id: u64,
         cached_ast: &[sqlparser::ast::Statement],
         portal: &Portal<ParsedStatement>,
@@ -860,26 +890,28 @@ impl NucleusHandler {
         let param_count = portal.parameter_len();
         let mut param_values = Vec::with_capacity(param_count);
 
+        // Re-derive inferred parameter types from the cached AST so binary
+        // numeric/bool params get decoded with the right type even when the
+        // client did not declare one in Parse.  We pass the executor through
+        // so column references in the AST can be resolved against the catalog.
+        let inferred = Self::infer_parameter_types_with_ast(
+            &portal.statement.statement.sql,
+            &portal.statement.parameter_types,
+            Some(cached_ast),
+            Some(executor),
+        );
+
         for i in 0..param_count {
-            let type_hint = portal
-                .statement
-                .parameter_types
+            let type_hint = inferred
                 .get(i)
-                .and_then(|t| t.clone())
+                .cloned()
                 .unwrap_or(Type::TEXT);
 
-            let value = match portal.parameter::<String>(i, &type_hint) {
-                Ok(None) => Value::Null,
-                Ok(Some(s)) => Self::pg_string_to_value(&s, &type_hint),
-                Err(_) => {
-                    match &portal.parameters[i] {
-                        Some(bytes) => {
-                            let s = String::from_utf8_lossy(bytes).into_owned();
-                            Self::pg_string_to_value(&s, &type_hint)
-                        }
-                        None => Value::Null,
-                    }
-                }
+            let value = match decode_pg_param(portal, i, &type_hint) {
+                Some(DecodedParam::Null) | None => Value::Null,
+                Some(DecodedParam::Numeric(s))
+                | Some(DecodedParam::Bool(s))
+                | Some(DecodedParam::Text(s)) => Self::pg_string_to_value(&s, &type_hint),
             };
             param_values.push(value);
         }
@@ -1305,7 +1337,12 @@ impl ExtendedQueryHandler for NucleusHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let sql = &stmt.statement.sql;
-        let param_types = Self::infer_parameter_types(sql, &stmt.parameter_types);
+        let param_types = Self::infer_parameter_types_with_ast(
+            sql,
+            &stmt.parameter_types,
+            stmt.statement.ast.as_deref(),
+            Some(&self.executor),
+        );
 
         // Try to determine result columns by examining the query.
         // For SELECT statements, we can execute with dummy values to get the
@@ -1341,7 +1378,9 @@ impl ExtendedQueryHandler for NucleusHandler {
         let fields = if is_select_query(sql) {
             // With bound parameters available, we can try to determine columns
             // more accurately by substituting and executing.
-            let substituted = Self::substitute_parameters(sql, portal)?;
+            let substituted = Self::substitute_parameters_with_executor(
+                sql, portal, Some(&self.executor),
+            )?;
             match self.describe_select_columns(&substituted).await {
                 Ok(cols) => cols,
                 Err(e) => {
@@ -1419,7 +1458,9 @@ impl ExtendedQueryHandler for NucleusHandler {
             }
         } else {
             // No cached AST — use string path
-            let resolved_sql = Self::substitute_parameters(&parsed_stmt.sql, portal)?;
+            let resolved_sql = Self::substitute_parameters_with_executor(
+                &parsed_stmt.sql, portal, Some(&self.executor),
+            )?;
             self.execute_sql_session(session_id, &resolved_sql).await
         }?;
 
@@ -2146,6 +2187,436 @@ fn count_placeholders(sql: &str) -> usize {
     }
 
     max_idx
+}
+
+/// Result of decoding a single bound parameter from a Portal.
+#[derive(Debug)]
+enum DecodedParam {
+    Null,
+    Numeric(String),
+    Bool(String),
+    Text(String),
+}
+
+/// Decode a portal parameter into a `DecodedParam` regardless of whether the
+/// client sent it in text or binary format.  Returns `None` only when the
+/// portal index is out of bounds.
+fn decode_pg_param(
+    portal: &Portal<ParsedStatement>,
+    idx: usize,
+    type_hint: &Type,
+) -> Option<DecodedParam> {
+    let raw = portal.parameters.get(idx)?;
+    let Some(bytes) = raw.as_ref() else {
+        return Some(DecodedParam::Null);
+    };
+    let is_binary = portal.parameter_format.is_binary(idx);
+
+    match type_hint.oid() {
+        23 => {
+            if is_binary && bytes.len() == 4 {
+                let n = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                Some(DecodedParam::Numeric(n.to_string()))
+            } else {
+                let s = String::from_utf8_lossy(bytes);
+                if let Ok(n) = s.parse::<i32>() {
+                    Some(DecodedParam::Numeric(n.to_string()))
+                } else {
+                    Some(DecodedParam::Text(s.into_owned()))
+                }
+            }
+        }
+        20 => {
+            if is_binary && bytes.len() == 8 {
+                let n = i64::from_be_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3],
+                    bytes[4], bytes[5], bytes[6], bytes[7],
+                ]);
+                Some(DecodedParam::Numeric(n.to_string()))
+            } else {
+                let s = String::from_utf8_lossy(bytes);
+                if let Ok(n) = s.parse::<i64>() {
+                    Some(DecodedParam::Numeric(n.to_string()))
+                } else {
+                    Some(DecodedParam::Text(s.into_owned()))
+                }
+            }
+        }
+        21 => {
+            if is_binary && bytes.len() == 2 {
+                let n = i16::from_be_bytes([bytes[0], bytes[1]]);
+                Some(DecodedParam::Numeric(n.to_string()))
+            } else {
+                let s = String::from_utf8_lossy(bytes);
+                if let Ok(n) = s.parse::<i16>() {
+                    Some(DecodedParam::Numeric(n.to_string()))
+                } else {
+                    Some(DecodedParam::Text(s.into_owned()))
+                }
+            }
+        }
+        701 => {
+            if is_binary && bytes.len() == 8 {
+                let n = f64::from_be_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3],
+                    bytes[4], bytes[5], bytes[6], bytes[7],
+                ]);
+                Some(DecodedParam::Numeric(n.to_string()))
+            } else {
+                let s = String::from_utf8_lossy(bytes);
+                if let Ok(n) = s.parse::<f64>() {
+                    Some(DecodedParam::Numeric(n.to_string()))
+                } else {
+                    Some(DecodedParam::Text(s.into_owned()))
+                }
+            }
+        }
+        700 => {
+            if is_binary && bytes.len() == 4 {
+                let n = f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                Some(DecodedParam::Numeric(n.to_string()))
+            } else {
+                let s = String::from_utf8_lossy(bytes);
+                if let Ok(n) = s.parse::<f32>() {
+                    Some(DecodedParam::Numeric(n.to_string()))
+                } else {
+                    Some(DecodedParam::Text(s.into_owned()))
+                }
+            }
+        }
+        16 => {
+            if is_binary {
+                let b = matches!(bytes.first(), Some(&n) if n != 0);
+                Some(DecodedParam::Bool(if b { "true".into() } else { "false".into() }))
+            } else {
+                let s = String::from_utf8_lossy(bytes);
+                let b = matches!(s.trim().to_ascii_lowercase().as_str(), "t" | "true" | "1" | "y" | "yes");
+                Some(DecodedParam::Bool(if b { "true".into() } else { "false".into() }))
+            }
+        }
+        _ => Some(DecodedParam::Text(String::from_utf8_lossy(bytes).into_owned())),
+    }
+}
+
+/// Walk a parsed SQL statement looking for `$N` placeholders and infer each
+/// one\'s pgwire `Type` from its surrounding context.
+///
+/// Two shapes are handled today (they cover the long tail of pgx-driven
+/// queries in Observe and other consumers):
+///
+///   1. `Expr::Cast { expr: $N, data_type: T }`         → infer from T
+///   2. `Expr::BinaryOp { left: <typed>, op: cmp/arith, right: $N }`
+///      and the symmetric form                         → infer from the other side
+///
+/// "Typed" means an `Identifier` / `CompoundIdentifier` we can resolve via
+/// the catalog (looking at every table referenced in the statement\'s `FROM`
+/// clauses), or another `Cast`.  Anything we cannot resolve stays `None`,
+/// which the caller turns into `Type::TEXT` — preserving the pre-fix
+/// behavior so we do not regress queries we could not infer before.
+fn infer_param_types_from_ast(
+    stmts: &[sqlparser::ast::Statement],
+    executor: &Arc<Executor>,
+    param_count: usize,
+) -> Vec<Option<Type>> {
+    use sqlparser::ast::{SetExpr, Statement};
+    let mut result: Vec<Option<Type>> = vec![None; param_count];
+
+    for stmt in stmts {
+        let mut tables: Vec<Arc<crate::catalog::TableDef>> = Vec::new();
+        collect_referenced_tables(stmt, executor, &mut tables);
+
+        match stmt {
+            Statement::Query(q) => {
+                if let SetExpr::Select(select) = q.body.as_ref() {
+                    for item in &select.projection {
+                        if let sqlparser::ast::SelectItem::UnnamedExpr(e)
+                        | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } = item
+                        {
+                            walk_expr_for_params(e, &tables, &mut result);
+                        }
+                    }
+                    if let Some(ref w) = select.selection {
+                        walk_expr_for_params(w, &tables, &mut result);
+                    }
+                    if let Some(ref h) = select.having {
+                        walk_expr_for_params(h, &tables, &mut result);
+                    }
+                }
+                if let Some(ref limit_clause) = q.limit_clause {
+                    use sqlparser::ast::LimitClause;
+                    if let LimitClause::LimitOffset { limit, offset, .. } = limit_clause {
+                        if let Some(e) = limit {
+                            mark_param(e, Type::INT8, &mut result);
+                        }
+                        if let Some(off) = offset {
+                            mark_param(&off.value, Type::INT8, &mut result);
+                        }
+                    }
+                }
+            }
+            Statement::Insert(insert) => {
+                if let Some(source) = &insert.source
+                    && let SetExpr::Values(values) = source.body.as_ref()
+                {
+                    for row in &values.rows {
+                        for (col_pos, expr) in row.iter().enumerate() {
+                            let target_type = insert
+                                .columns
+                                .get(col_pos)
+                                .and_then(|name| column_type_in_tables(&tables, &name.value))
+                                .or_else(|| {
+                                    tables
+                                        .first()
+                                        .and_then(|t| t.columns.get(col_pos))
+                                        .map(|c| c.data_type.clone())
+                                })
+                                .map(|dt| data_type_to_pg(&dt));
+                            if let Some(t) = target_type {
+                                mark_param(expr, t, &mut result);
+                            }
+                        }
+                    }
+                }
+            }
+            Statement::Update(update) => {
+                if let Some(w) = &update.selection {
+                    walk_expr_for_params(w, &tables, &mut result);
+                }
+                for assign in &update.assignments {
+                    use sqlparser::ast::AssignmentTarget;
+                    if let AssignmentTarget::ColumnName(name) = &assign.target
+                        && let Some(part) = name.0.last()
+                        && let Some(ident) = part.as_ident()
+                        && let Some(dt) = column_type_in_tables(&tables, &ident.value)
+                    {
+                        mark_param(&assign.value, data_type_to_pg(&dt), &mut result);
+                    }
+                    walk_expr_for_params(&assign.value, &tables, &mut result);
+                }
+            }
+            Statement::Delete(d) => {
+                if let Some(w) = &d.selection {
+                    walk_expr_for_params(w, &tables, &mut result);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    result
+}
+
+/// Collect every TableDef referenced by `stmt` into `out`.  Best-effort —
+/// missing tables are simply skipped.  Uses the synchronous catalog cache so
+/// we never block on a tokio lock.
+fn collect_referenced_tables(
+    stmt: &sqlparser::ast::Statement,
+    executor: &Arc<Executor>,
+    out: &mut Vec<Arc<crate::catalog::TableDef>>,
+) {
+    use sqlparser::ast::{SetExpr, Statement, TableFactor};
+    let catalog = executor.catalog();
+    let push = |name: &str, out: &mut Vec<Arc<crate::catalog::TableDef>>| {
+        if let Some(t) = catalog.get_table_cached(name) {
+            out.push(t);
+        }
+    };
+
+    match stmt {
+        Statement::Query(q) => {
+            if let SetExpr::Select(select) = q.body.as_ref() {
+                for tbl in &select.from {
+                    if let TableFactor::Table { name, .. } = &tbl.relation
+                        && let Some(part) = name.0.last()
+                        && let Some(ident) = part.as_ident()
+                    {
+                        push(&ident.value, out);
+                    }
+                    for join in &tbl.joins {
+                        if let TableFactor::Table { name, .. } = &join.relation
+                            && let Some(part) = name.0.last()
+                            && let Some(ident) = part.as_ident()
+                        {
+                            push(&ident.value, out);
+                        }
+                    }
+                }
+            }
+        }
+        Statement::Insert(insert) => {
+            if let sqlparser::ast::TableObject::TableName(name) = &insert.table
+                && let Some(part) = name.0.last()
+                && let Some(ident) = part.as_ident()
+            {
+                push(&ident.value, out);
+            }
+        }
+        Statement::Update(update) => {
+            if let TableFactor::Table { name, .. } = &update.table.relation
+                && let Some(part) = name.0.last()
+                && let Some(ident) = part.as_ident()
+            {
+                push(&ident.value, out);
+            }
+        }
+        Statement::Delete(d) => {
+            for tbl in &d.tables {
+                if let Some(part) = tbl.0.last()
+                    && let Some(ident) = part.as_ident()
+                {
+                    push(&ident.value, out);
+                }
+            }
+            let from = match &d.from {
+                sqlparser::ast::FromTable::WithFromKeyword(f)
+                | sqlparser::ast::FromTable::WithoutKeyword(f) => f,
+            };
+            {
+                for t in from {
+                    if let TableFactor::Table { name, .. } = &t.relation
+                        && let Some(part) = name.0.last()
+                        && let Some(ident) = part.as_ident()
+                    {
+                        push(&ident.value, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Find a column\'s nucleus DataType across a slice of TableDefs (case-insensitive).
+fn column_type_in_tables(
+    tables: &[Arc<crate::catalog::TableDef>],
+    col_name: &str,
+) -> Option<DataType> {
+    for t in tables {
+        for c in &t.columns {
+            if c.name.eq_ignore_ascii_case(col_name) {
+                return Some(c.data_type.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Recursively walk an expression looking for `$N` placeholders and infer
+/// each one\'s pgwire `Type` from the surrounding AST.
+fn walk_expr_for_params(
+    expr: &sqlparser::ast::Expr,
+    tables: &[Arc<crate::catalog::TableDef>],
+    out: &mut [Option<Type>],
+) {
+    use sqlparser::ast::{BinaryOperator, Expr};
+
+    match expr {
+        Expr::Cast { expr: inner, data_type, .. } => {
+            if let Ok(dt) = crate::sql::convert_data_type(data_type) {
+                mark_param(inner, data_type_to_pg(&dt), out);
+            }
+            walk_expr_for_params(inner, tables, out);
+        }
+        Expr::BinaryOp { left, op, right } => {
+            if matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo
+            ) {
+                if let Some(t) = expr_pg_type(left, tables) {
+                    mark_param(right, t, out);
+                }
+                if let Some(t) = expr_pg_type(right, tables) {
+                    mark_param(left, t, out);
+                }
+            }
+            walk_expr_for_params(left, tables, out);
+            walk_expr_for_params(right, tables, out);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr) => walk_expr_for_params(expr, tables, out),
+        Expr::Between { expr, low, high, .. } => {
+            if let Some(t) = expr_pg_type(expr, tables) {
+                mark_param(low, t.clone(), out);
+                mark_param(high, t, out);
+            }
+            walk_expr_for_params(expr, tables, out);
+            walk_expr_for_params(low, tables, out);
+            walk_expr_for_params(high, tables, out);
+        }
+        Expr::InList { expr, list, .. } => {
+            if let Some(t) = expr_pg_type(expr, tables) {
+                for item in list {
+                    mark_param(item, t.clone(), out);
+                }
+            }
+            walk_expr_for_params(expr, tables, out);
+            for item in list {
+                walk_expr_for_params(item, tables, out);
+            }
+        }
+        Expr::Function(func) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &func.args {
+                for arg in &list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    ) = arg
+                    {
+                        walk_expr_for_params(e, tables, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Return the pgwire `Type` of a non-placeholder expression, if known.
+fn expr_pg_type(
+    expr: &sqlparser::ast::Expr,
+    tables: &[Arc<crate::catalog::TableDef>],
+) -> Option<Type> {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Identifier(ident) => {
+            column_type_in_tables(tables, &ident.value).map(|dt| data_type_to_pg(&dt))
+        }
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            column_type_in_tables(tables, &parts[1].value).map(|dt| data_type_to_pg(&dt))
+        }
+        Expr::Cast { data_type, .. } => crate::sql::convert_data_type(data_type)
+            .ok()
+            .map(|dt| data_type_to_pg(&dt)),
+        Expr::Nested(inner) => expr_pg_type(inner, tables),
+        _ => None,
+    }
+}
+
+/// If `expr` is a `$N` placeholder, record `ty` at index N-1 (unless we have
+/// already recorded a more specific type).
+fn mark_param(expr: &sqlparser::ast::Expr, ty: Type, out: &mut [Option<Type>]) {
+    use sqlparser::ast::Expr;
+    if let Expr::Value(vws) = expr
+        && let sqlparser::ast::Value::Placeholder(p) = &vws.value
+        && let Some(idx_str) = p.strip_prefix('$')
+        && let Ok(idx) = idx_str.parse::<usize>()
+        && idx >= 1
+        && idx <= out.len()
+        && out[idx - 1].is_none()
+    {
+        out[idx - 1] = Some(ty);
+    }
 }
 
 /// Check if a SQL string is a SELECT query (or similar data-returning query).

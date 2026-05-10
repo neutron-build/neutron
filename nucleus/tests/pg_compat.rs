@@ -134,13 +134,14 @@ async fn pg_prepared_statement() {
         .await
         .expect("CREATE TABLE");
 
-    // Use the extended query protocol with parameters.
-    // Note: Nucleus reports all parameter types as TEXT by default, so we
-    // pass values as strings.  The executor coerces them to the column type.
+    // Use the extended query protocol with parameters.  Since the pgwire
+    // RowDescription fix, undeclared `$N` parameters get inferred from the
+    // column they target on the other side of `INSERT ... VALUES`, so we can
+    // bind native typed values via pgx-style scanners.
     client
         .execute(
             "INSERT INTO prep_t VALUES ($1, $2)",
-            &[&"1", &"hello"],
+            &[&1_i32, &"hello"],
         )
         .await
         .expect("INSERT with params");
@@ -148,7 +149,7 @@ async fn pg_prepared_statement() {
     client
         .execute(
             "INSERT INTO prep_t VALUES ($1, $2)",
-            &[&"2", &"world"],
+            &[&2_i32, &"world"],
         )
         .await
         .expect("INSERT 2 with params");
@@ -646,6 +647,145 @@ async fn pg_large_result_set() {
     assert_eq!(data_rows.len(), 200, "should return all 200 rows");
     assert_eq!(data_rows[0].get(0), Some("0"));
     assert_eq!(data_rows[199].get(0), Some("199"));
+
+    server.abort();
+}
+
+
+// ============================================================================
+// Test: pgwire RowDescription type advertisement (regression for finding #6)
+// ============================================================================
+//
+// Before the fix:
+//   - SELECTs reported BIGINT columns as TEXT in RowDescription, breaking pgx.
+//   - Empty result sets reported every expression column as TEXT.
+//   - Undeclared `$N` parameters defaulted to TEXT, so pgx refused to bind
+//     int64 values to `WHERE bigint_col >= $1`.
+// After the fix all three round-trip with the right pgwire OIDs.
+
+#[tokio::test]
+async fn pg_row_description_advertises_int8_for_bigint() {
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    client
+        .simple_query("CREATE TABLE rd_t (id INT, ts BIGINT, ratio DOUBLE PRECISION, ok BOOLEAN)")
+        .await
+        .expect("CREATE TABLE");
+    client
+        .simple_query("INSERT INTO rd_t VALUES (1, 1700000000000, 3.14, true)")
+        .await
+        .expect("INSERT");
+
+    // Use the extended protocol with native typed scanners. If RowDescription
+    // still reported these columns as TEXT, pgx would fail to decode.
+    let row = client
+        .query_one("SELECT id, ts, ratio, ok FROM rd_t WHERE id = $1", &[&1_i32])
+        .await
+        .expect("typed SELECT");
+
+    let id: i32 = row.get(0);
+    let ts: i64 = row.get(1);
+    let ratio: f64 = row.get(2);
+    let ok: bool = row.get(3);
+    assert_eq!(id, 1);
+    assert_eq!(ts, 1700000000000);
+    assert!((ratio - 3.14).abs() < 1e-9);
+    assert!(ok);
+
+    // Direct OID assertions on the prepared statement\'s row description.
+    let stmt = client
+        .prepare("SELECT id, ts, ratio, ok FROM rd_t")
+        .await
+        .expect("prepare");
+    let cols = stmt.columns();
+    assert_eq!(cols[0].type_(), &tokio_postgres::types::Type::INT4, "id should be int4");
+    assert_eq!(cols[1].type_(), &tokio_postgres::types::Type::INT8, "ts should be int8");
+    assert_eq!(cols[2].type_(), &tokio_postgres::types::Type::FLOAT8, "ratio should be float8");
+    assert_eq!(cols[3].type_(), &tokio_postgres::types::Type::BOOL, "ok should be bool");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn pg_row_description_typed_when_filter_returns_zero_rows() {
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    client
+        .simple_query("CREATE TABLE rdz (ts BIGINT)")
+        .await
+        .expect("CREATE TABLE");
+    // Insert a single row that we will filter out, so the executor takes the
+    // empty-rows branch in `project_columns`.
+    client
+        .simple_query("INSERT INTO rdz VALUES (100)")
+        .await
+        .expect("INSERT");
+
+    // `SELECT MAX(ts) FROM rdz` — confirm the empty-input aggregate column
+    // is advertised as int8 (covers the `LIMIT 0` Describe probe path that
+    // pgx hits before binding parameters).  Prior to the fix this would be
+    // advertised as Varchar/TEXT because `value_type(Value::Null)` defaults
+    // to TEXT and the executor returns NULL for `MAX` over empty input.
+    let stmt = client
+        .prepare("SELECT MAX(ts) AS m FROM rdz")
+        .await
+        .expect("prepare");
+    assert_eq!(
+        stmt.columns()[0].type_(),
+        &tokio_postgres::types::Type::INT8,
+        "MAX(ts) should be advertised as int8 in Describe path",
+    );
+
+    // Same for `COUNT(*)` — should always be int8 regardless of input.
+    let stmt2 = client
+        .prepare("SELECT COUNT(*) AS c FROM rdz")
+        .await
+        .expect("prepare2");
+    assert_eq!(
+        stmt2.columns()[0].type_(),
+        &tokio_postgres::types::Type::INT8,
+        "COUNT(*) should always be int8",
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn pg_param_types_inferred_from_cast_and_column() {
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    client
+        .simple_query("CREATE TABLE pi_t (id INT, ts BIGINT, name TEXT)")
+        .await
+        .expect("CREATE TABLE");
+    client
+        .simple_query("INSERT INTO pi_t VALUES (1, 1700000000000, \'a\')")
+        .await
+        .expect("INSERT");
+
+    // (a) Inferred from the column on the other side of `=`.
+    let row = client
+        .query_one("SELECT id FROM pi_t WHERE id = $1", &[&1_i32])
+        .await
+        .expect("eq with int4");
+    assert_eq!(row.get::<_, i32>(0), 1);
+
+    // (b) Inferred from `ts >= $1` — column is BIGINT, so $1 is int8.
+    let row = client
+        .query_one("SELECT ts FROM pi_t WHERE ts >= $1", &[&1_i64])
+        .await
+        .expect("gte with int8");
+    assert_eq!(row.get::<_, i64>(0), 1700000000000);
+
+    // (c) Explicit CAST drives the type even without a column on the other side.
+    let stmt = client
+        .prepare("SELECT id FROM pi_t WHERE id = CAST($1 AS INT)")
+        .await
+        .expect("prepare CAST");
+    assert_eq!(stmt.params()[0], tokio_postgres::types::Type::INT4);
 
     server.abort();
 }
