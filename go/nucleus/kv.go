@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -147,14 +148,26 @@ func (kv *KVModel) Incr(ctx context.Context, key string, amount ...int64) (int64
 	if err := kv.client.requireNucleus("KV.Incr"); err != nil {
 		return 0, err
 	}
-	var val int64
+	// nucleus_dogfood #22 sibling — KV_INCR returns BIGINT but pgwire
+	// describes the column as TEXT, so pgx tries to parse the raw 8-byte
+	// big-endian payload as a decimal string and fails. Wrap in CAST AS
+	// TEXT so the server emits the digits.
+	var raw string
 	var err error
 	if len(amount) > 0 {
-		err = kv.pool.QueryRow(ctx, "SELECT KV_INCR($1, $2)", key, amount[0]).Scan(&val)
+		err = kv.pool.QueryRow(ctx, "SELECT CAST(KV_INCR($1, CAST($2 AS BIGINT)) AS TEXT)",
+			key, fmt.Sprintf("%d", amount[0])).Scan(&raw)
 	} else {
-		err = kv.pool.QueryRow(ctx, "SELECT KV_INCR($1)", key).Scan(&val)
+		err = kv.pool.QueryRow(ctx, "SELECT CAST(KV_INCR($1) AS TEXT)", key).Scan(&raw)
 	}
-	return val, wrapErr("kv incr", err)
+	if err != nil {
+		return 0, wrapErr("kv incr", err)
+	}
+	val, perr := strconv.ParseInt(raw, 10, 64)
+	if perr != nil {
+		return 0, wrapErr("kv incr parse", perr)
+	}
+	return val, nil
 }
 
 // TTL returns the remaining TTL in seconds. -1 means no TTL, -2 means key missing.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 )
 
 // FTSModel provides full-text search over Nucleus SQL functions.
@@ -58,7 +59,9 @@ func (f *FTSModel) Index(ctx context.Context, docID int64, text string) (bool, e
 		return false, err
 	}
 	var ok bool
-	err := f.pool.QueryRow(ctx, "SELECT FTS_INDEX($1, $2)", docID, text).Scan(&ok)
+	// CAST workaround for nucleus_dogfood #22 — see Search() comment.
+	err := f.pool.QueryRow(ctx, "SELECT FTS_INDEX(CAST($1 AS BIGINT), $2)",
+		strconv.FormatInt(docID, 10), text).Scan(&ok)
 	return ok, wrapErr("fts index", err)
 }
 
@@ -77,12 +80,18 @@ func (f *FTSModel) Search(ctx context.Context, query string, opts ...FTSOption) 
 	var raw string
 	var err error
 
+	// CAST workaround for nucleus_dogfood #22: pgwire describes both
+	// params as TEXT, so binding int64 against $2 fails in pgx with
+	// "cannot find encode plan". Force the limit through as text and
+	// CAST it back to BIGINT inside the SQL.
 	if o.fuzzyDist > 0 {
-		err = f.pool.QueryRow(ctx, "SELECT FTS_FUZZY_SEARCH($1, $2, $3)",
-			query, o.fuzzyDist, o.limit).Scan(&raw)
+		err = f.pool.QueryRow(ctx,
+			"SELECT FTS_FUZZY_SEARCH($1, CAST($2 AS BIGINT), CAST($3 AS BIGINT))",
+			query, strconv.Itoa(o.fuzzyDist), strconv.FormatInt(o.limit, 10)).Scan(&raw)
 	} else {
-		err = f.pool.QueryRow(ctx, "SELECT FTS_SEARCH($1, $2)",
-			query, o.limit).Scan(&raw)
+		err = f.pool.QueryRow(ctx,
+			"SELECT FTS_SEARCH($1, CAST($2 AS BIGINT))",
+			query, strconv.FormatInt(o.limit, 10)).Scan(&raw)
 	}
 	if err != nil {
 		return nil, wrapErr("fts search", err)
