@@ -96,6 +96,7 @@ memory-debug = []
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 proptest = "1"
+libc = "0.2"
 
 [[bin]]
 name = "nucleus"

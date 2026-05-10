@@ -2442,6 +2442,7 @@ dependencies = [
  "getrandom 0.2.17",
  "io-uring",
  "js-sys",
+ "libc",
  "lz4_flex",
  "mimalloc",
  "mongodb",
