@@ -653,10 +653,14 @@ async function renderMarkup(
   }
 
   const markedInstance = new Marked();
-  if (markdownConfig?.syntaxHighlight !== false) {
-    const theme = (markdownConfig?.syntaxHighlight && markdownConfig.syntaxHighlight.theme) || "github-dark";
-    markedInstance.use(markedShikiExtension(theme));
-  }
+  // Note: markedShikiExtension was previously wired here, but Marked v15's
+  // `renderer` override API is sync-only — async renderers (which the Shiki
+  // extension uses) are NOT awaited and get stringified as "[object Promise]"
+  // into the output. Until that's reworked via walkTokens or marked-highlight,
+  // we fall back to Marked's default sync code-block renderer (plain
+  // <pre><code> output, no syntax colors). syntaxHighlight config is
+  // currently a no-op as a result.
+  void markedShikiExtension;
   // Apply user-supplied marked extensions (KaTeX, directive, custom tokens).
   // Each entry is forwarded directly to Marked.use(). Wired here so plain
   // `.md` content gets the same plugin opportunity that MDX has via
