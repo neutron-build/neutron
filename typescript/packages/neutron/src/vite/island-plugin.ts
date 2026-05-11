@@ -21,8 +21,10 @@ export function islandPlugin(): Plugin {
     
     transform(code, id) {
       if (id.includes("node_modules")) return null;
-      if (!id.includes("/src/routes/")) return null;
-      
+      // Scan all user source — Islands can be wrapped inside any component
+      // (Nav, Footer, etc.), not just route files.
+      if (!id.includes("/src/")) return null;
+
       // Find Island component usage
       const islandPattern = /<Island\s+[^>]*component=\{(\w+)\}/g;
       let match;
