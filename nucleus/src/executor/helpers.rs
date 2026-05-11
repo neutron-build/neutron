@@ -267,8 +267,97 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering>
         (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
         (Value::Null, _) => Some(std::cmp::Ordering::Less),
         (_, Value::Null) => Some(std::cmp::Ordering::Greater),
+        // Cross-type: text ↔ numeric / bool / date / timestamp coercion.
+        //
+        // Required because pgx's `QueryExecModeSimpleProtocol` interpolates
+        // bound parameters client-side as text literals before the SQL hits
+        // Nucleus, so `WHERE bigint_col >= $1` arrives as
+        // `WHERE bigint_col >= '1700000000000'`. PostgreSQL transparently
+        // coerces here; we mirror that. If the text is not parseable as the
+        // target type, the comparison returns `None` so SQL 3VL collapses
+        // the predicate to false (no rows, no error) — matching Postgres.
+        (Value::Text(_), _) | (_, Value::Text(_)) => coerce_text_and_compare(a, b),
         _ => None,
     }
+}
+
+/// Coerce a text literal to the other operand's concrete type and compare.
+/// Returns `None` (i.e. "not comparable / predicate is false") when the text
+/// can't be parsed — matching PostgreSQL's `WHERE n = 'abc'` behavior on a
+/// numeric column (zero rows, no error).
+fn coerce_text_and_compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        // text vs concrete — coerce text to the concrete type.
+        (Value::Text(s), Value::Int32(n)) => s.trim().parse::<i32>().ok().map(|v| v.cmp(n)),
+        (Value::Int32(n), Value::Text(s)) => s.trim().parse::<i32>().ok().map(|v| n.cmp(&v)),
+        (Value::Text(s), Value::Int64(n)) => s.trim().parse::<i64>().ok().map(|v| v.cmp(n)),
+        (Value::Int64(n), Value::Text(s)) => s.trim().parse::<i64>().ok().map(|v| n.cmp(&v)),
+        (Value::Text(s), Value::Float64(f)) => s.trim().parse::<f64>().ok().and_then(|v| v.partial_cmp(f)),
+        (Value::Float64(f), Value::Text(s)) => s.trim().parse::<f64>().ok().and_then(|v| f.partial_cmp(&v)),
+        (Value::Text(s), Value::Numeric(n)) => {
+            let lhs = s.trim().parse::<f64>().ok()?;
+            let rhs = n.parse::<f64>().ok()?;
+            lhs.partial_cmp(&rhs)
+        }
+        (Value::Numeric(n), Value::Text(s)) => {
+            let lhs = n.parse::<f64>().ok()?;
+            let rhs = s.trim().parse::<f64>().ok()?;
+            lhs.partial_cmp(&rhs)
+        }
+        (Value::Text(s), Value::Bool(b)) => parse_pg_bool(s).map(|v| v.cmp(b)),
+        (Value::Bool(b), Value::Text(s)) => parse_pg_bool(s).map(|v| b.cmp(&v)),
+        // text vs date/timestamp — let the existing parsers do the heavy
+        // lifting so formats like "2024-03-15" and "2024-03-15 14:30:00"
+        // both work. Date stored as i32 days, Timestamp/TimestampTz as i64 us.
+        (Value::Text(s), Value::Date(d)) => parse_date_string(s).map(|v| v.cmp(d)),
+        (Value::Date(d), Value::Text(s)) => parse_date_string(s).map(|v| d.cmp(&v)),
+        (Value::Text(s), Value::Timestamp(t)) => text_to_timestamp_us(s).map(|v| v.cmp(t)),
+        (Value::Timestamp(t), Value::Text(s)) => text_to_timestamp_us(s).map(|v| t.cmp(&v)),
+        (Value::Text(s), Value::TimestampTz(t)) => text_to_timestamp_us(s).map(|v| v.cmp(t)),
+        (Value::TimestampTz(t), Value::Text(s)) => text_to_timestamp_us(s).map(|v| t.cmp(&v)),
+        // text vs uuid — accept the canonical 8-4-4-4-12 hex form.
+        (Value::Text(s), Value::Uuid(u)) => parse_uuid_text(s).map(|v| v.cmp(u)),
+        (Value::Uuid(u), Value::Text(s)) => parse_uuid_text(s).map(|v| u.cmp(&v)),
+        // Anything else (text vs jsonb, vector, array, bytea, interval) —
+        // intentionally return None. These don't have an unambiguous text
+        // coercion at the comparator layer; the ones that need string-side
+        // semantics already have dedicated operators (`@>`, `?`, etc.).
+        _ => None,
+    }
+}
+
+/// PostgreSQL-compatible boolean text parser.
+/// Accepts: t/true/y/yes/on/1, f/false/n/no/off/0 (case-insensitive).
+fn parse_pg_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "t" | "true" | "y" | "yes" | "on" | "1" => Some(true),
+        "f" | "false" | "n" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// Parse an ISO-style timestamp string ("YYYY-MM-DD[ T]HH:MM:SS") into
+/// microseconds-since-epoch. Returns `None` if unparseable.
+fn text_to_timestamp_us(s: &str) -> Option<i64> {
+    let (y, m, d, hh, mm, ss) = parse_timestamp_parts(s)?;
+    let days = crate::types::ymd_to_days(y, m, d) as i64;
+    let secs = days * 86_400 + (hh as i64) * 3600 + (mm as i64) * 60 + (ss as i64);
+    Some(secs * 1_000_000)
+}
+
+/// Parse a canonical UUID text form ("8-4-4-4-12" lowercase or uppercase
+/// hex) into a 16-byte array. Returns `None` if malformed.
+fn parse_uuid_text(s: &str) -> Option<[u8; 16]> {
+    let trimmed = s.trim();
+    let hex: String = trimmed.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Compare two values for ORDER BY, respecting NULLS FIRST / NULLS LAST and ASC / DESC.

@@ -1937,7 +1937,16 @@ impl Executor {
             SqlFastPathCommand::PointSelect { table, where_col, where_val } => {
                 let table_def = self.catalog.get_table_cached(table)?;
                 let col_idx = table_def.column_index(where_col)?;
-                let search_val = where_val.to_value();
+                // Coerce the wire-parsed literal to the column's declared
+                // type. Without this, pgx's SimpleProtocol-style text
+                // literals (`WHERE bigint_col = '5'`) would be compared
+                // as Text vs Int64 in the storage layer and miss every row.
+                // Falls back to the original value if the cast fails — the
+                // storage scan then returns zero rows (Postgres-compatible
+                // "WHERE n = 'abc'" → no rows, no error).
+                let search_val = where_val.to_value()
+                    .cast(&table_def.columns[col_idx].data_type)
+                    .unwrap_or_else(|_| where_val.to_value());
                 let storage = self.storage_for(table);
                 let rows = match storage.scan_where_eq_positions(table, col_idx, &search_val).await {
                     Ok(matches) => matches.into_iter().map(|(_, row)| row).collect::<Vec<_>>(),
@@ -1957,7 +1966,16 @@ impl Executor {
                 if values.len() != table_def.columns.len() {
                     return None; // Fall through to normal path for better error reporting.
                 }
-                let row: Vec<Value> = values.iter().map(|v| v.to_value()).collect();
+                // Coerce each literal to its target column's declared type
+                // so pgx SimpleProtocol text-literal inserts land in the
+                // column's native representation. Fall back to the original
+                // value on cast failure — the storage layer will reject
+                // type-incompatible inserts with a clearer error than ours.
+                let row: Vec<Value> = values.iter().enumerate().map(|(i, v)| {
+                    v.to_value()
+                        .cast(&table_def.columns[i].data_type)
+                        .unwrap_or_else(|_| v.to_value())
+                }).collect();
                 let storage = self.storage_for(table);
                 match storage.insert(table, row).await {
                     Ok(()) => Some(Ok(ExecResult::Command {
@@ -1972,13 +1990,23 @@ impl Executor {
                 let table_def = self.catalog.get_table_cached(table)?;
                 let pk_idx = table_def.column_index(where_col)?;
                 // Resolve all assignment column indexes upfront. If any column
-                // is not found, fall through to normal path.
+                // is not found, fall through to normal path. Each assignment
+                // value is coerced to its target column's declared type so
+                // that text-literal SET values land in the column's native
+                // representation.
                 let mut col_updates: Vec<(usize, Value)> = Vec::with_capacity(assignments.len());
                 for (col_name, lit) in assignments {
                     let idx = table_def.column_index(col_name)?;
-                    col_updates.push((idx, lit.to_value()));
+                    let v = lit.to_value()
+                        .cast(&table_def.columns[idx].data_type)
+                        .unwrap_or_else(|_| lit.to_value());
+                    col_updates.push((idx, v));
                 }
-                let search_val = where_val.to_value();
+                // Coerce the WHERE search value too — same rationale as
+                // PointSelect (pgx SimpleProtocol text literals).
+                let search_val = where_val.to_value()
+                    .cast(&table_def.columns[pk_idx].data_type)
+                    .unwrap_or_else(|_| where_val.to_value());
                 let storage = self.storage_for(table);
                 let matches = match storage.scan_where_eq_positions(table, pk_idx, &search_val).await {
                     Ok(m) => m,
@@ -2014,7 +2042,11 @@ impl Executor {
             SqlFastPathCommand::PointDelete { table, where_col, where_val } => {
                 let table_def = self.catalog.get_table_cached(table)?;
                 let col_idx = table_def.column_index(where_col)?;
-                let search_val = where_val.to_value();
+                // Coerce text literal to the column's declared type — see
+                // PointSelect for the pgx SimpleProtocol rationale.
+                let search_val = where_val.to_value()
+                    .cast(&table_def.columns[col_idx].data_type)
+                    .unwrap_or_else(|_| where_val.to_value());
                 let storage = self.storage_for(table);
                 let matches = match storage.scan_where_eq_positions(table, col_idx, &search_val).await {
                     Ok(m) => m,
