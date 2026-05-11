@@ -789,3 +789,261 @@ async fn pg_param_types_inferred_from_cast_and_column() {
 
     server.abort();
 }
+
+// ============================================================================
+// Text-literal coercion in comparisons (regression for finding #29)
+// ============================================================================
+//
+// pgx's `QueryExecModeSimpleProtocol` interpolates parameters client-side as
+// single-quoted text literals before sending the query. So
+//   pool.Query(ctx, "SELECT ... WHERE ts >= $1", int64(1700000000000))
+// arrives at the executor as
+//   SELECT ... WHERE ts >= '1700000000000'
+// Without implicit text→numeric coercion, the comparator silently returns
+// false and the query yields zero rows. Postgres-compatible behavior is to
+// coerce text to the column type when parseable, and to return zero rows
+// (not an error) when not.
+
+/// Helper used by the coercion tests below — runs a SELECT and returns how
+/// many rows came back via the simple-query protocol (which mirrors what
+/// pgx SimpleProtocol mode produces on the wire).
+async fn count_simple(client: &tokio_postgres::Client, sql: &str) -> usize {
+    let msgs = client.simple_query(sql).await.expect("simple_query");
+    msgs.iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count()
+}
+
+#[tokio::test]
+async fn text_literal_coerces_to_int8_in_comparison() {
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    client
+        .simple_query("CREATE TABLE coerce_int8 (id TEXT, ts BIGINT)")
+        .await
+        .expect("CREATE TABLE");
+    client
+        .simple_query("INSERT INTO coerce_int8 VALUES ('a', 1700000000000), ('b', 1700000000001)")
+        .await
+        .expect("INSERT");
+
+    // Native int literal: baseline.
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM coerce_int8 WHERE ts >= 1700000000000").await,
+        2,
+        "baseline native int comparison",
+    );
+    // Text literal on the right: pgx SimpleProtocol shape.
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM coerce_int8 WHERE ts >= '1700000000000'").await,
+        2,
+        "text literal coerces to int8 for >=",
+    );
+    // Equality.
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM coerce_int8 WHERE ts = '1700000000000'").await,
+        1,
+        "text literal coerces to int8 for =",
+    );
+    // Strict <.
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM coerce_int8 WHERE ts < '1700000000001'").await,
+        1,
+        "text literal coerces to int8 for <",
+    );
+    // Reversed: literal on the left.
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM coerce_int8 WHERE '1700000000000' <= ts").await,
+        2,
+        "text literal coerces when on the left side",
+    );
+    // BETWEEN with text bounds.
+    assert_eq!(
+        count_simple(
+            &client,
+            "SELECT * FROM coerce_int8 WHERE ts BETWEEN '1700000000000' AND '1700000000001'",
+        ).await,
+        2,
+        "text bounds in BETWEEN coerce to int8",
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn unparseable_text_vs_int_returns_no_rows() {
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    client
+        .simple_query("CREATE TABLE unparseable (n BIGINT)")
+        .await
+        .expect("CREATE TABLE");
+    client
+        .simple_query("INSERT INTO unparseable VALUES (1), (2), (3)")
+        .await
+        .expect("INSERT");
+
+    // Postgres-compatible: 'abc' isn't a valid int, but the executor must
+    // not error — it returns zero rows.
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM unparseable WHERE n = 'abc'").await,
+        0,
+        "= 'abc' against bigint column returns no rows, no error",
+    );
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM unparseable WHERE n >= 'abc'").await,
+        0,
+        ">= 'abc' against bigint column returns no rows, no error",
+    );
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM unparseable WHERE n < 'abc'").await,
+        0,
+        "< 'abc' against bigint column returns no rows, no error",
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn int_literal_against_text_column_coerces_to_text() {
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    client
+        .simple_query("CREATE TABLE str_col (s TEXT)")
+        .await
+        .expect("CREATE TABLE");
+    client
+        .simple_query("INSERT INTO str_col VALUES ('a'), ('b'), ('5')")
+        .await
+        .expect("INSERT");
+
+    // PostgreSQL would error here ("operator does not exist: text = integer")
+    // but Nucleus coerces symmetrically — `Value::cast(Int → Text)` is
+    // defined and yields the same `'5'`, so the row matches. This is more
+    // permissive than Postgres but keeps the executor consistent: both
+    // directions of (Text, NonText) → numeric column coerce to the column
+    // type, and (Numeric, Text) → text column coerces to text.
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM str_col WHERE s = 5").await,
+        1,
+        "int literal coerces to text and matches the '5' row",
+    );
+    // No matching numeric row (only '5' is parseable but '7' has no match).
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM str_col WHERE s = 7").await,
+        0,
+        "int literal that doesn't match any text value returns no rows",
+    );
+    // Equality against the literal '5' (text) still matches the text row.
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM str_col WHERE s = '5'").await,
+        1,
+        "text-vs-text equality still works",
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn text_vs_float_coercion_works() {
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    client
+        .simple_query("CREATE TABLE floats (val DOUBLE PRECISION)")
+        .await
+        .expect("CREATE TABLE");
+    client
+        .simple_query("INSERT INTO floats VALUES (3.14), (2.71), (1.0)")
+        .await
+        .expect("INSERT");
+
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM floats WHERE val >= '3.0'").await,
+        1,
+        ">= '3.0' coerces to float8",
+    );
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM floats WHERE val = '3.14'").await,
+        1,
+        "= '3.14' coerces to float8",
+    );
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM floats WHERE '2.71' = val").await,
+        1,
+        "reversed text-vs-float coerces",
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn bool_text_coercion_works() {
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    client
+        .simple_query("CREATE TABLE flags (id INT, flag BOOLEAN)")
+        .await
+        .expect("CREATE TABLE");
+    client
+        .simple_query("INSERT INTO flags VALUES (1, true), (2, false), (3, true)")
+        .await
+        .expect("INSERT");
+
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM flags WHERE flag = 'true'").await,
+        2,
+        "= 'true' coerces to bool",
+    );
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM flags WHERE flag = 't'").await,
+        2,
+        "= 't' coerces to bool (Postgres short form)",
+    );
+    assert_eq!(
+        count_simple(&client, "SELECT * FROM flags WHERE flag = 'false'").await,
+        1,
+        "= 'false' coerces to bool",
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn text_literal_coercion_with_simple_protocol_via_pgx_shape() {
+    // Smoke test: simulates the exact shape of an Observe analytics query —
+    // a TEXT id column plus a BIGINT timestamp range filter, with both bound
+    // values arriving as quoted text literals (pgx SimpleProtocol semantics).
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    client
+        .simple_query(
+            "CREATE TABLE events (site_id TEXT, timestamp BIGINT, name TEXT)",
+        )
+        .await
+        .expect("CREATE TABLE");
+    client
+        .simple_query(
+            "INSERT INTO events VALUES \
+             ('s1', 1700000000000, 'click'), \
+             ('s1', 1700000000500, 'view'), \
+             ('s2', 1700000000750, 'click')",
+        )
+        .await
+        .expect("INSERT");
+
+    // Mirror an Observe-style range scan with text-bound parameters.
+    let count = count_simple(
+        &client,
+        "SELECT name FROM events WHERE site_id = 's1' AND timestamp >= '1700000000000'",
+    )
+    .await;
+    assert_eq!(count, 2, "site filter + text-bound timestamp range");
+
+    server.abort();
+}

@@ -1328,9 +1328,14 @@ impl Executor {
                         && let Some((col_name, _)) = planner::is_equality_predicate(expr)
                             && let Some(col_idx) = meta.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name))
                                 && let Some(val) = Self::extract_equality_value(expr) {
-                                    // Coerce to match storage format: eval_value stores
-                                    // small integers as Int32, so we must do the same.
-                                    let coerced = Self::coerce_to_storage_type(&val);
+                                    // Coerce to the column's declared type. Two
+                                    // distinct adjustments happen here:
+                                    //   • integer-width (Int64→Int32 for INT cols)
+                                    //   • text→native (pgx SimpleProtocol literals)
+                                    // After typed coercion, normalise small ints
+                                    // back to Int32 so storage row-format matches.
+                                    let typed = Self::coerce_to_column_type(&val, &meta[col_idx].dtype);
+                                    let coerced = Self::coerce_to_storage_type(&typed);
                                     if let Some(rows) = storage.fast_scan_where_eq(table, col_idx, &coerced) {
                                         self.metrics.rows_scanned.inc_by(rows.len() as u64);
                                         return Ok((meta, rows));
@@ -2297,13 +2302,20 @@ impl Executor {
                         _ => {}
                     }
                 }
+                // Comparisons funnel through `compare_values`, which performs
+                // implicit text→numeric coercion for pgx SimpleProtocol-style
+                // text literals. When the helper returns None (e.g. "abc" vs
+                // BIGINT) the predicate collapses to false — matching the
+                // Postgres semantics requested by callers that don't want a
+                // hard error on unparseable text.
+                let cmp = || super::helpers::compare_values(&lv, &rv);
                 match op {
-                    ast::BinaryOperator::Eq => Ok(Value::Bool(Self::plan_values_cmp(&lv, &rv) == std::cmp::Ordering::Equal)),
-                    ast::BinaryOperator::NotEq => Ok(Value::Bool(Self::plan_values_cmp(&lv, &rv) != std::cmp::Ordering::Equal)),
-                    ast::BinaryOperator::Lt => Ok(Value::Bool(Self::plan_values_cmp(&lv, &rv) == std::cmp::Ordering::Less)),
-                    ast::BinaryOperator::LtEq => Ok(Value::Bool(matches!(Self::plan_values_cmp(&lv, &rv), std::cmp::Ordering::Less | std::cmp::Ordering::Equal))),
-                    ast::BinaryOperator::Gt => Ok(Value::Bool(Self::plan_values_cmp(&lv, &rv) == std::cmp::Ordering::Greater)),
-                    ast::BinaryOperator::GtEq => Ok(Value::Bool(matches!(Self::plan_values_cmp(&lv, &rv), std::cmp::Ordering::Greater | std::cmp::Ordering::Equal))),
+                    ast::BinaryOperator::Eq => Ok(Value::Bool(cmp() == Some(std::cmp::Ordering::Equal))),
+                    ast::BinaryOperator::NotEq => Ok(Value::Bool(matches!(cmp(), Some(o) if o != std::cmp::Ordering::Equal))),
+                    ast::BinaryOperator::Lt => Ok(Value::Bool(cmp() == Some(std::cmp::Ordering::Less))),
+                    ast::BinaryOperator::LtEq => Ok(Value::Bool(matches!(cmp(), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)))),
+                    ast::BinaryOperator::Gt => Ok(Value::Bool(cmp() == Some(std::cmp::Ordering::Greater))),
+                    ast::BinaryOperator::GtEq => Ok(Value::Bool(matches!(cmp(), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)))),
                     ast::BinaryOperator::And => {
                         match (&lv, &rv) {
                             (Value::Bool(false), _) | (_, Value::Bool(false)) => Ok(Value::Bool(false)),
@@ -2338,8 +2350,8 @@ impl Executor {
                 if matches!(v, Value::Null) || matches!(lo, Value::Null) || matches!(hi, Value::Null) {
                     return Ok(Value::Null);
                 }
-                let in_range = matches!(Self::plan_values_cmp(&v, &lo), std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
-                    && matches!(Self::plan_values_cmp(&v, &hi), std::cmp::Ordering::Less | std::cmp::Ordering::Equal);
+                let in_range = matches!(super::helpers::compare_values(&v, &lo), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal))
+                    && matches!(super::helpers::compare_values(&v, &hi), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal));
                 Ok(Value::Bool(if *negated { !in_range } else { in_range }))
             }
             Expr::Function(func) => {
@@ -2479,19 +2491,17 @@ impl Executor {
     }
 
     /// Compare two Values with numeric type coercion (Int32 <-> Int64 <-> Float64).
+    /// Total-ordering comparator used by ORDER BY / DISTINCT / structural
+    /// comparisons that need a deterministic result for any (a, b). For
+    /// predicate evaluation (WHERE, HAVING, BETWEEN) prefer the partial
+    /// `helpers::compare_values`, which performs SQL-style implicit coercion
+    /// (incl. text→numeric for pgx SimpleProtocol literals) and returns
+    /// `None` when the values aren't comparable.
     pub(super) fn plan_values_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
-        match (a, b) {
-            // Int32/Int64 cross-comparison
-            (Value::Int32(x), Value::Int64(y)) => (*x as i64).cmp(y),
-            (Value::Int64(x), Value::Int32(y)) => x.cmp(&(*y as i64)),
-            // Int/Float cross-comparison
-            (Value::Int32(x), Value::Float64(y)) => (*x as f64).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
-            (Value::Float64(x), Value::Int32(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(std::cmp::Ordering::Equal),
-            (Value::Int64(x), Value::Float64(y)) => (*x as f64).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
-            (Value::Float64(x), Value::Int64(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(std::cmp::Ordering::Equal),
-            // Same-type: use Value's Ord
-            _ => a.cmp(b),
-        }
+        // Try the partial comparator first so coercion rules stay consistent
+        // across the executor; fall back to the derived `Value::Ord` only
+        // when no defined ordering exists (e.g. Array vs Array).
+        super::helpers::compare_values(a, b).unwrap_or_else(|| a.cmp(b))
     }
 
     /// SQL LIKE pattern matching. Supports `%` (any sequence) and `_` (any char).
@@ -3820,9 +3830,24 @@ impl Executor {
     }
 
     /// Coerce a Value to match a column's declared DataType for accurate comparison.
-    /// SQL parser produces Int64 for all integer literals, but INT columns store Int32.
+    ///
+    /// Two main categories:
+    /// 1. Integer-width adjustments (Int64↔Int32, Int↔Float). The SQL parser
+    ///    always produces Int64 for integer literals, but INT columns store
+    ///    Int32 — without coercion the storage comparator would miss rows.
+    /// 2. Text-literal coercion to numeric / bool / date / timestamp / uuid.
+    ///    Required because pgx's SimpleProtocol mode interpolates parameters
+    ///    client-side as text literals (e.g. `WHERE bigint_col = '5'`); the
+    ///    storage layer needs the literal in the column's native type.
+    ///
+    /// Unparseable text is left as-is — downstream code (storage fast paths,
+    /// index lookups) returns no rows and the caller falls back to scan +
+    /// WHERE filter, where `helpers::compare_values` collapses the predicate
+    /// to false. Mirrors PostgreSQL's "no rows, no error" for `WHERE n = 'abc'`.
     pub(super) fn coerce_to_column_type(val: &Value, target: &DataType) -> Value {
         match (val, target) {
+            // Integer-width / int↔float adjustments (preserve original
+            // fast-path; `Value::cast` would also work but allocates more).
             (Value::Int64(n), DataType::Int32) if *n >= i32::MIN as i64 && *n <= i32::MAX as i64 => {
                 Value::Int32(*n as i32)
             }
@@ -3830,6 +3855,15 @@ impl Executor {
             (Value::Int64(n), DataType::Float64) => Value::Float64(*n as f64),
             (Value::Float64(f), DataType::Int32) => Value::Int32(*f as i32),
             (Value::Float64(f), DataType::Int64) => Value::Int64(*f as i64),
+            // Text-literal coercion for pgx SimpleProtocol. Use Value::cast
+            // so we share behavior with explicit CAST(...) expressions. On
+            // parse failure, fall back to the original text — storage will
+            // miss the row, the post-scan WHERE filter will catch it.
+            (Value::Text(_), DataType::Int32 | DataType::Int64 | DataType::Float64
+                | DataType::Bool | DataType::Numeric | DataType::Date
+                | DataType::Timestamp | DataType::TimestampTz | DataType::Uuid) => {
+                val.cast(target).unwrap_or_else(|_| val.clone())
+            }
             _ => val.clone(),
         }
     }
@@ -4103,15 +4137,62 @@ impl Executor {
         match kind {
             FilterKind::Eq(col_name, filter_val) => {
                 let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
-                let rows = storage.fast_scan_where_eq(&table_name, col_idx, &filter_val)?;
+                // Coerce text literals to the column's declared type before
+                // pushdown — pgx SimpleProtocol delivers all parameters as
+                // text, so `WHERE bigint_col = '5'` arrives with `filter_val =
+                // Value::Text("5")` and the storage engine's typed comparator
+                // would otherwise miss every row.
+                let coerced = Self::coerce_literal_to_column_type(filter_val, &col_meta[col_idx].dtype)?;
+                let rows = storage.fast_scan_where_eq(&table_name, col_idx, &coerced)?;
                 Some((col_meta, rows))
             }
             FilterKind::Range(col_name, lo, hi) => {
                 let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
+                let lo = Self::coerce_literal_to_column_type(lo, &col_meta[col_idx].dtype)?;
+                let hi = Self::coerce_literal_to_column_type(hi, &col_meta[col_idx].dtype)?;
                 let rows = storage.fast_scan_where_range(&table_name, col_idx, &lo, &hi)?;
                 Some((col_meta, rows))
             }
         }
+    }
+
+    /// Coerce a literal Value to the column's declared `DataType` so that
+    /// type-strict storage-layer comparators (B-tree index, columnar fast
+    /// scan, etc.) match rows correctly when the SQL parser produced a
+    /// different concrete `Value` variant.
+    ///
+    /// The most common case: pgx's `QueryExecModeSimpleProtocol` interpolates
+    /// every parameter as a single-quoted text literal, so a `WHERE int_col =
+    /// $1` predicate arrives with a `Value::Text` operand. Without this
+    /// coercion the storage engine sees `Text("5")` vs `Int64(5)` and skips
+    /// the row.
+    ///
+    /// Returns `None` for unparseable text — matching the WHERE-eval path's
+    /// "predicate is false / no rows, no error" Postgres semantics. Callers
+    /// using `?` will then bail out of the fast path; the slower scan + WHERE
+    /// filter path handles the result correctly (also returning zero rows).
+    fn coerce_literal_to_column_type(val: Value, dtype: &DataType) -> Option<Value> {
+        // Fast path: same-typed literal, no work to do.
+        let already_matches = matches!(
+            (&val, dtype),
+            (Value::Int32(_), DataType::Int32)
+                | (Value::Int64(_), DataType::Int64)
+                | (Value::Float64(_), DataType::Float64)
+                | (Value::Text(_), DataType::Text)
+                | (Value::Bool(_), DataType::Bool)
+                | (Value::Date(_), DataType::Date)
+                | (Value::Timestamp(_), DataType::Timestamp)
+                | (Value::TimestampTz(_), DataType::TimestampTz)
+                | (Value::Numeric(_), DataType::Numeric)
+                | (Value::Uuid(_), DataType::Uuid)
+                | (Value::Null, _)
+        );
+        if already_matches {
+            return Some(val);
+        }
+        // Cross-type: use the canonical Value::cast (text→numeric, int→bigint,
+        // etc.). Errors are folded into None per the doc-comment contract.
+        val.cast(dtype).ok()
     }
 
     /// Try to extract a range predicate from `col >= X AND col <= Y` (same column).
@@ -4173,6 +4254,10 @@ impl Executor {
     /// Try to use storage-level fast scan for a simple predicate during table loading.
     /// Handles equality, BETWEEN, and simple range comparisons (col < val, col > val, etc.).
     /// Returns None if the predicate is too complex or the storage engine doesn't support it.
+    ///
+    /// Literals are coerced to the column's declared type before pushdown so
+    /// pgx-style text-interpolated parameters (`WHERE bigint_col = '5'`) match
+    /// rows correctly. See `coerce_to_column_type` for the cross-type rules.
     pub(super) fn try_storage_fast_scan(
         &self,
         table_name: &str,
@@ -4185,11 +4270,15 @@ impl Executor {
             Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, right } => {
                 let (col_name, filter_val) = self.try_extract_col_eq_literal(left, right)?;
                 let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
+                let filter_val = Self::coerce_to_column_type(&filter_val, &col_meta[col_idx].dtype);
                 storage.fast_scan_where_eq(table_name, col_idx, &filter_val)
             }
             Expr::Between { expr, low, high, negated } if !*negated => {
                 let (col_name, lo, hi) = self.try_extract_col_between_literals(expr, low, high)?;
                 let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
+                let dtype = &col_meta[col_idx].dtype;
+                let lo = Self::coerce_to_column_type(&lo, dtype);
+                let hi = Self::coerce_to_column_type(&hi, dtype);
                 storage.fast_scan_where_range(table_name, col_idx, &lo, &hi)
             }
             // Single range comparison: col < val, col > val, col <= val, col >= val
@@ -4199,6 +4288,7 @@ impl Executor {
             {
                 let (col_name, val, is_lower) = self.try_extract_col_bound(where_expr)?;
                 let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
+                let val = Self::coerce_to_column_type(&val, &col_meta[col_idx].dtype);
                 let (lo, hi) = if is_lower {
                     (val, Value::Int64(i64::MAX))
                 } else {
@@ -4213,6 +4303,9 @@ impl Executor {
             Expr::BinaryOp { left, op: ast::BinaryOperator::And, right } => {
                 let (col_name, lo, hi) = self.try_extract_range_from_and(left, right)?;
                 let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
+                let dtype = &col_meta[col_idx].dtype;
+                let lo = Self::coerce_to_column_type(&lo, dtype);
+                let hi = Self::coerce_to_column_type(&hi, dtype);
                 storage.fast_scan_where_range(table_name, col_idx, &lo, &hi)
             }
             _ => None,
@@ -6459,10 +6552,19 @@ impl Executor {
         expr: &Expr,
         col_meta: &[ColMeta],
     ) -> Option<(u32, FilterPredicate)> {
+        // Local helper: coerce a literal to match the column's declared type
+        // before handing it to the zone-map skip logic. Without this, a text
+        // literal (e.g. pgx SimpleProtocol's interpolated `'1700000000000'`)
+        // would compare via `Value::Ord`'s variant ranking and incorrectly
+        // skip every granule of an integer column.
+        let coerce = |v: Value, idx: usize| -> Value {
+            Self::coerce_to_column_type(&v, &col_meta[idx].dtype)
+        };
         match expr {
             Expr::BinaryOp { left, op, right } => {
                 // Try col op literal (left=col, right=literal)
                 if let Some((col_idx, val)) = Self::zm_extract_col_and_literal(left, right, col_meta) {
+                    let val = coerce(val, col_idx);
                     let pred = match op {
                         ast::BinaryOperator::Eq => FilterPredicate::Equal(val),
                         ast::BinaryOperator::Gt => FilterPredicate::GreaterThan(val),
@@ -6475,6 +6577,7 @@ impl Executor {
                 }
                 // Try literal op col (reversed): e.g., 5 < col means col > 5
                 if let Some((col_idx, val)) = Self::zm_extract_col_and_literal(right, left, col_meta) {
+                    let val = coerce(val, col_idx);
                     let pred = match op {
                         ast::BinaryOperator::Eq => FilterPredicate::Equal(val),
                         ast::BinaryOperator::Gt => FilterPredicate::LessThan(val),
@@ -6490,8 +6593,8 @@ impl Executor {
             Expr::Between { expr: col_expr, low, high, negated } if !*negated => {
                 let col_name = Self::zm_expr_to_col_name(col_expr)?;
                 let col_idx = col_meta.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
-                let lo = Self::zm_expr_to_value(low)?;
-                let hi = Self::zm_expr_to_value(high)?;
+                let lo = coerce(Self::zm_expr_to_value(low)?, col_idx);
+                let hi = coerce(Self::zm_expr_to_value(high)?, col_idx);
                 Some((col_idx as u32, FilterPredicate::Between { min: lo, max: hi }))
             }
             Expr::IsNull(col_expr) => {
@@ -6507,7 +6610,10 @@ impl Executor {
             Expr::InList { expr: col_expr, list, negated } if !*negated => {
                 let col_name = Self::zm_expr_to_col_name(col_expr)?;
                 let col_idx = col_meta.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
-                let values: Vec<Value> = list.iter().filter_map(Self::zm_expr_to_value).collect();
+                let values: Vec<Value> = list.iter()
+                    .filter_map(Self::zm_expr_to_value)
+                    .map(|v| coerce(v, col_idx))
+                    .collect();
                 if values.is_empty() { return None; }
                 Some((col_idx as u32, FilterPredicate::In(values)))
             }
