@@ -230,8 +230,14 @@ export async function prepareContentCollections(
 let activeMarkdownConfig: NeutronMarkdownConfig | undefined;
 
 export function setActiveMarkdownConfig(config: NeutronMarkdownConfig | undefined) {
+  // No-op on identical references. Layout and SSR-bootstrap files commonly
+  // call this at module-load time, so every HMR pass would otherwise wipe
+  // the content cache and force every collection file to be re-read,
+  // re-parsed, and re-rendered — turning a layout edit into a multi-GB
+  // memory churn cycle. Genuine config swaps still produce a fresh
+  // reference and correctly invalidate.
+  if (activeMarkdownConfig === config) return;
   activeMarkdownConfig = config;
-  // Invalidate any cached stores so the new config takes effect.
   cacheByRoot.clear();
 }
 

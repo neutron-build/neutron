@@ -194,7 +194,7 @@ async function loadSharp(): Promise<any> {
   sharpLoadAttempted = true;
   try {
     const sharpId = "sharp";
-    sharpModule = (await import(sharpId)).default;
+    sharpModule = (await import(/* @vite-ignore */ sharpId)).default;
   } catch {
     sharpModule = null;
     if (!sharpWarningLogged) {

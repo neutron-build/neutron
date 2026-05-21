@@ -8,6 +8,7 @@ import {
   getCollection,
   getEntry,
   prepareContentCollections,
+  setActiveMarkdownConfig,
 } from "./index.js";
 
 const tempRoots: string[] = [];
@@ -101,6 +102,31 @@ describe("content collections", () => {
     const posts = await getCollection("blog");
     expect(posts.length).toBe(1);
     expect(posts[0]?.data).toMatchObject({ title: "Typed Config" });
+  });
+
+  it("setActiveMarkdownConfig is idempotent for reference-identical config", async () => {
+    // Regression: layouts and SSR-bootstrap files call this at module-load
+    // time. Every HMR pass was wiping the content cache, forcing a full
+    // re-parse of every collection file (multi-GB churn on large projects).
+    const root = await makeFixtureProject();
+    process.chdir(root);
+    setActiveMarkdownConfig(undefined);
+
+    const config = {};
+    setActiveMarkdownConfig(config as never);
+    const first = await getCollection("blog");
+
+    setActiveMarkdownConfig(config as never);
+    const second = await getCollection("blog");
+
+    expect(second).toBe(first);
+
+    setActiveMarkdownConfig({} as never);
+    const third = await getCollection("blog");
+    expect(third).not.toBe(first);
+    expect(third.length).toBe(first.length);
+
+    setActiveMarkdownConfig(undefined);
   });
 });
 
