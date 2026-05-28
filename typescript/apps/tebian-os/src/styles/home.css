@@ -32,13 +32,16 @@
 .feature { color: #6c7086; font-size: 0.85rem; }
 .feature-sep { color: #313244; font-size: 0.7rem; }
 .page-footer { display: flex; flex-direction: column; align-items: center; gap: 1rem; padding: 2rem; width: 100%; }
+.footer-links { display: flex; gap: 1.25rem; align-items: center; flex-wrap: wrap; justify-content: center; }
 .footer-link { color: var(--accent); text-decoration: none; font-size: 0.9rem; transition: color 0.2s; opacity: 0.7; }
 .footer-link:hover { opacity: 1; }
 .quote { color: #45475a; font-size: 0.85rem; font-style: italic; margin: 0; max-width: 420px; line-height: 1.5; text-align: center; }
 .quote-cite { color: #313244; font-size: 0.75rem; margin: 0; }
 .quote-cite em { font-style: italic; }
-.built-on-link { color: #b4befe; font-size: 1.3rem; font-weight: 600; text-decoration: none; transition: color 0.2s; display: block; margin-top: 3rem; }
-.built-on-link:hover { color: #a6e3a1; }
+.built-on-row { display: flex; gap: 1.5rem; justify-content: center; margin-top: 3rem; }
+.built-on-link { color: #b4befe; font-size: 1.3rem; font-weight: 600; text-decoration: none; transition: color 0.2s; }
+.neutron-link:hover { color: #a6e3a1; }
+.teploy-link:hover { color: #ffffff; }
 @media (max-width: 640px) {
   .content-wrapper { padding-top: 4rem; padding-left: 1rem; padding-right: 1rem; gap: 1.5rem; }
   .tagline { font-size: 0.95rem; }
@@ -48,7 +51,8 @@
   .arm-cmd { font-size: 0.8rem; padding: 0.6rem 1rem; gap: 0.5rem; max-width: 100%; overflow-wrap: anywhere; word-break: break-word; white-space: normal; }
   .dl-main { font-size: 0.85rem; padding: 0.85rem 1.25rem; gap: 0.5rem; }
   .dl-arch { font-size: 0.8rem; }
-  .built-on-link { font-size: 1.1rem; margin-top: 2rem; }
+  .built-on-row { margin-top: 2rem; gap: 1rem; }
+  .built-on-link { font-size: 1.1rem; }
   .feature { font-size: 0.75rem; }
   .feature-sep { font-size: 0.6rem; }
 }
@@ -78,7 +82,8 @@ html[data-theme="light"] .screenshot { background: rgba(0, 0, 0, 0.03); border-c
 html[data-theme="light"] .quote { color: #8c8fa1; }
 html[data-theme="light"] .quote-cite { color: #9ca0b0; }
 html[data-theme="light"] .built-on-link { color: #9ca0b0; }
-html[data-theme="light"] .built-on-link:hover { color: #40a02b; }
+html[data-theme="light"] .neutron-link:hover { color: #40a02b; }
+html[data-theme="light"] .teploy-link:hover { color: #4c4f69; }
 
 /* Frappe theme */
 html[data-theme="frappe"] .logo { color: #c6d0f5; }
@@ -99,4 +104,5 @@ html[data-theme="frappe"] .screenshot { background: rgba(255, 255, 255, 0.03); b
 html[data-theme="frappe"] .quote { color: #626880; }
 html[data-theme="frappe"] .quote-cite { color: #51576d; }
 html[data-theme="frappe"] .built-on-link { color: #626880; }
-html[data-theme="frappe"] .built-on-link:hover { color: #a6d189; }
+html[data-theme="frappe"] .neutron-link:hover { color: #a6d189; }
+html[data-theme="frappe"] .teploy-link:hover { color: #c6d0f5; }

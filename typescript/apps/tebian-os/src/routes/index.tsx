@@ -23,9 +23,9 @@ export default function Home() {
 
           <div class="download-section">
             <div class="dl-wrapper">
-              <a href="https://github.com/tebian-os/tebian/releases/latest/download/tebian-pc.iso" class="dl-main" id="dl-btn">
+              <a href="https://github.com/tebian-os/tebian/releases/latest/download/tebian.iso" class="dl-main" id="dl-btn">
                 <span class="dl-text">Download ISO</span>
-                <span class="dl-arch">x86_64 ~1GB</span>
+                <span class="dl-arch">x86_64 ~988MB</span>
               </a>
             </div>
             <Island component={DownloadCounter} client="load" id="dl-counter" />
@@ -61,10 +61,17 @@ export default function Home() {
         </div>
 
         <div class="page-footer">
-          <a href="/source" class="footer-link">Source</a>
+          <div class="footer-links">
+            <a href="/handbook" class="footer-link">Handbook</a>
+            <a href="/honors" class="footer-link">Honors</a>
+            <a href="/source" class="footer-link">Source</a>
+          </div>
           <p class="quote">"Perfection is achieved not when there is nothing more to add, but when there is nothing left to take away."</p>
           <p class="quote-cite">— Saint-Exup&eacute;ry, <em>Wind, Sand and Stars</em> (1939)</p>
-          <a href="https://neutron.build" target="_blank" class="built-on-link">neutron.</a>
+          <div class="built-on-row">
+            <a href="https://neutron.build" target="_blank" class="built-on-link neutron-link">neutron.</a>
+            <a href="https://teploy.com" target="_blank" class="built-on-link teploy-link">Teploy</a>
+          </div>
         </div>
       </main>
     </div>
