@@ -28,10 +28,11 @@ The current naming can blur these boundaries:
 - Product/marketing:
   - `Neutron` (umbrella)
   - `Neutron TypeScript`, `Neutron Rust`, `Neutron Zig`, `Neutron Mojo` (implementations)
-- TypeScript packages (npm):
-  - framework core: `neutron`
-  - implementation extensions: `@neutron/*`
-  - subsystem integrations: `@nucleus/*` (when published as separate packages)
+- TypeScript packages (npm) — see Reality note in `docs/rfcs/naming.md`:
+  - framework core: `@neutron-build/core` (bare `neutron` is owned by an unrelated npm author)
+  - implementation extensions: `@neutron-build/*` (`@neutron-build/auth`, `@neutron-build/security`, etc.)
+  - subsystem integrations: `@neutron-build/nucleus` (the bare `nucleus` is similarly unavailable on npm)
+  - project generator: `create-neutron` (unscoped; required by `npm create <name>` convention)
 - Rust crates (cargo):
   - implementation crates: `neutron-*`
   - subsystem crates: `nucleus-*`
@@ -73,12 +74,13 @@ Reason:
 
 ## Recommended Package Naming
 
-TypeScript (npm):
+TypeScript (npm) — the bare `neutron` and `nucleus` names are taken on npm by unrelated authors; see the Reality note in `docs/rfcs/naming.md`. We use the `@neutron-build` org scope:
 
-- Keep app-framework package as `neutron`.
-- Keep scoped extensions as `@neutron/*` (`@neutron/auth`, `@neutron/security`, etc.).
-- Avoid introducing new unscoped packages besides `neutron`, `neutron-cli`, `create-neutron`, `neutron-data`.
-- If TypeScript uses Nucleus services, keep package names separate (`@neutron/*` and `@nucleus/*`), not merged.
+- App-framework package: `@neutron-build/core` (would be `neutron` if available).
+- Scoped extensions: `@neutron-build/*` (`@neutron-build/auth`, `@neutron-build/security`, `@neutron-build/data`, etc.).
+- CLI: `@neutron-build/cli` (would be `neutron-cli`).
+- Project generator: `create-neutron` (unscoped — required for `npm create neutron@latest` to resolve; this name is free).
+- Nucleus client: `@neutron-build/nucleus` — the org-scoped *client* artifact; the layer rule still applies, since the package name within the scope is `nucleus`, not a `neutron`-`nucleus` composite.
 
 Rust (cargo):
 
