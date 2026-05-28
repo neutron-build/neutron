@@ -36,6 +36,15 @@ export interface InputLimitsOptions {
    * @default 2048
    */
   maxUrlLength?: number;
+
+  /**
+   * Reject body-bearing requests (POST/PUT/PATCH) that do not declare a valid
+   * Content-Length (e.g. chunked transfer). Enable for deployments NOT fronted
+   * by a proxy that bounds request bodies. Off by default to avoid breaking
+   * legitimate streaming clients.
+   * @default false
+   */
+  rejectUnknownLength?: boolean;
 }
 
 const DEFAULT_LIMITS: Required<InputLimitsOptions> = {
@@ -43,6 +52,7 @@ const DEFAULT_LIMITS: Required<InputLimitsOptions> = {
   maxHeaderSize: 16 * 1024, // 16KB
   maxHeaderCount: 100,
   maxUrlLength: 2048,
+  rejectUnknownLength: false,
 };
 
 /**
@@ -64,6 +74,7 @@ export function inputLimitsMiddleware(options: InputLimitsOptions = {}): Middlew
     maxHeaderSize: options.maxHeaderSize ?? DEFAULT_LIMITS.maxHeaderSize,
     maxHeaderCount: options.maxHeaderCount ?? DEFAULT_LIMITS.maxHeaderCount,
     maxUrlLength: options.maxUrlLength ?? DEFAULT_LIMITS.maxUrlLength,
+    rejectUnknownLength: options.rejectUnknownLength ?? DEFAULT_LIMITS.rejectUnknownLength,
   };
 
   return async (request, context, next) => {
@@ -88,23 +99,47 @@ export function inputLimitsMiddleware(options: InputLimitsOptions = {}): Middlew
     const method = request.method.toUpperCase();
     if (method === "POST" || method === "PUT" || method === "PATCH") {
       const contentLength = request.headers.get("content-length");
+      const transferEncoding = request.headers.get("transfer-encoding");
+
+      // SECURITY: A request that declares both Content-Length and
+      // Transfer-Encoding is ambiguous and a classic request-smuggling vector —
+      // reject it outright.
+      if (contentLength && transferEncoding) {
+        return new Response("Ambiguous request framing", {
+          status: 400,
+          headers: { "Content-Type": "text/plain" },
+        });
+      }
+
       if (contentLength) {
-        const bodySize = parseInt(contentLength, 10);
-        if (!isNaN(bodySize) && bodySize > limits.maxRequestBodySize) {
+        const bodySize = Number(contentLength);
+        if (!Number.isInteger(bodySize) || bodySize < 0) {
+          return new Response("Invalid Content-Length", {
+            status: 400,
+            headers: { "Content-Type": "text/plain" },
+          });
+        }
+        if (bodySize > limits.maxRequestBodySize) {
           return new Response("Request body too large", {
             status: 413, // Payload Too Large
             headers: { "Content-Type": "text/plain" },
           });
         }
+      } else if (limits.rejectUnknownLength) {
+        // No declared length (e.g. chunked). When the deployment isn't behind a
+        // proxy that bounds bodies, opt into rejecting these.
+        return new Response("Length Required", {
+          status: 411,
+          headers: { "Content-Type": "text/plain" },
+        });
       }
 
-      // SECURITY: For requests without Content-Length, we'll rely on the
-      // underlying server (Node.js/Hono) to enforce limits. We can't easily
-      // validate streaming bodies without consuming them, which would break
-      // the request for downstream handlers.
-      //
-      // Most production deployments should configure body size limits at the
-      // reverse proxy level (nginx, cloudflare, etc.) as a defense-in-depth measure.
+      // SECURITY: For requests with a declared length we enforce the cap above.
+      // True byte-accurate enforcement of streamed/chunked bodies has to happen
+      // where the request stream is created (the server adapter) or at the
+      // reverse proxy (nginx/cloudflare) — this middleware cannot replace the
+      // request body that downstream handlers will read. Configure body limits
+      // there as defense-in-depth, or enable `rejectUnknownLength`.
     }
 
     return next();
@@ -125,8 +160,9 @@ function validateHeaders(
   headers.forEach((value, name) => {
     count++;
 
-    // Check individual header size
-    const headerSize = name.length + value.length;
+    // Check individual header size in bytes (multi-byte values undercount when
+    // measured by string length / UTF-16 code units).
+    const headerSize = Buffer.byteLength(name, "utf8") + Buffer.byteLength(value, "utf8");
     if (headerSize > limits.maxHeaderSize && !oversizedHeader) {
       oversizedHeader = name;
     }

@@ -3,6 +3,8 @@
  * Use in an API route to return an RSS feed response.
  */
 
+import { escapeXml } from "./escape.js";
+
 export interface RssItem {
   title: string;
   link: string;
@@ -20,13 +22,13 @@ export interface RssOptions {
   items: RssItem[];
 }
 
-function escapeXml(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
+/**
+ * Escape the CDATA terminator so HTML content (e.g. a post body) cannot break
+ * out of the <![CDATA[...]]> section. The standard technique splits the `]]>`
+ * sequence across two CDATA blocks.
+ */
+function escapeCdata(str: string): string {
+  return str.replace(/]]>/g, "]]]]><![CDATA[>");
 }
 
 function formatPubDate(date: string | Date): string {
@@ -87,7 +89,7 @@ export function buildRssFeed(options: RssOptions): string {
 
     if (item.content) {
       itemParts.push(
-        `      <content:encoded><![CDATA[${item.content}]]></content:encoded>`
+        `      <content:encoded><![CDATA[${escapeCdata(item.content)}]]></content:encoded>`
       );
     }
 

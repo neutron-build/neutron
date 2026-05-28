@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import {
   getCookie,
   serializeCookie,
@@ -27,6 +28,12 @@ export interface TrustedProxyOptions {
   trustProxy?: boolean;
   forwardedHeader?: string;
   maxForwardedIps?: number;
+  /**
+   * Number of trusted proxies between this server and the client. The client
+   * IP is read this many hops from the right of the forwarded chain, since the
+   * left-most entries are attacker-controlled. Default 1.
+   */
+  trustedHops?: number;
 }
 
 export interface RateLimitMiddlewareOptions {
@@ -87,10 +94,14 @@ export function createCsrfMiddleware(
     )
   );
   const contextKey = options.contextKey || DEFAULT_CSRF_CONTEXT_KEY;
+  // Secure-by-default double-submit: the token is exposed to the page through
+  // context (rendered into forms / a meta tag), so the cookie itself stays
+  // HttpOnly and SameSite=Strict. This blocks JS/subdomain cookie reads while
+  // the page still has the value it needs to echo back in the header/field.
   const cookieOptions = resolveSecureCookieOptions({
     path: "/",
-    sameSite: "Lax",
-    httpOnly: false,
+    sameSite: "Strict",
+    httpOnly: true,
     ...options.cookie,
   });
 
@@ -101,10 +112,19 @@ export function createCsrfMiddleware(
     context[contextKey] = csrfToken;
 
     if (!safeMethods.has(method)) {
+      if (!isSameOrigin(request)) {
+        return new Response("Invalid CSRF origin", { status: 403 });
+      }
+      // Prefer the header token; only fall back to parsing the (potentially
+      // large) form body when no header was supplied.
       const headerToken = request.headers.get(headerName) || "";
-      const formToken = await readFormToken(request, formFieldName);
-      const submittedToken = headerToken || formToken;
-      if (!existingToken || !submittedToken || submittedToken !== existingToken) {
+      const submittedToken =
+        headerToken || (await readFormToken(request, formFieldName));
+      if (
+        !existingToken ||
+        !submittedToken ||
+        !timingSafeEqualStr(submittedToken, existingToken)
+      ) {
         return new Response("Invalid CSRF token", { status: 403 });
       }
     }
@@ -159,9 +179,18 @@ export function resolveClientIp(
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean)
-    .slice(0, maxForwardedIps);
+    .slice(-maxForwardedIps);
 
-  return ips.length > 0 ? ips[0] : null;
+  if (ips.length === 0) {
+    return null;
+  }
+
+  // The left-most entries are supplied by the client and cannot be trusted.
+  // Read the entry `trustedHops` from the right — the address observed by the
+  // outermost proxy we actually trust.
+  const trustedHops = Math.max(1, options.trustedHops ?? 1);
+  const index = ips.length - trustedHops;
+  return ips[Math.max(0, index)] ?? null;
 }
 
 export function createRateLimitMiddleware(
@@ -280,6 +309,27 @@ function resolvePolicy(
     "base-uri 'self'",
     "frame-ancestors 'none'",
   ].join("; ");
+}
+
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a, "utf8");
+  const bBuf = Buffer.from(b, "utf8");
+  if (aBuf.length !== bBuf.length) {
+    return false;
+  }
+  return timingSafeEqual(aBuf, bBuf);
+}
+
+function isSameOrigin(request: Request): boolean {
+  const source = request.headers.get("Origin") || request.headers.get("Referer");
+  if (!source) {
+    return true;
+  }
+  try {
+    return new URL(source).host === new URL(request.url).host;
+  } catch {
+    return false;
+  }
 }
 
 async function readFormToken(

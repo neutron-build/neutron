@@ -14,7 +14,7 @@ export interface DrizzleDatabase {
   client: unknown;
   db: unknown;
   /**
-   * When connected to Nucleus, this holds the `@neutron/nucleus` client
+   * When connected to Nucleus, this holds the `@neutron-build/nucleus` client
    * builder return value after `.connect()`. You can use it to access
    * non-relational models (KV, Vector, Graph, etc.).
    *
@@ -76,7 +76,7 @@ async function createNucleusDrizzle(
     : drizzleModule.drizzle(sqlClient);
 
   // Optionally create the Nucleus multi-model client.
-  // This uses `@neutron/nucleus` which may not be installed in every project.
+  // This uses `@neutron-build/nucleus` which may not be installed in every project.
   let nucleus: unknown | null = null;
   try {
     const nucleusModule = await lazyImport<{
@@ -85,8 +85,8 @@ async function createNucleusDrizzle(
         connect: () => Promise<unknown>;
       };
     }>(
-      "@neutron/nucleus",
-      "@neutron/nucleus is optional for multi-model features"
+      "@neutron-build/nucleus",
+      "@neutron-build/nucleus is optional for multi-model features"
     );
 
     if (nucleusModule.createClient) {
@@ -95,7 +95,7 @@ async function createNucleusDrizzle(
       }).connect();
     }
   } catch {
-    // @neutron/nucleus not installed — Drizzle-only mode is fine.
+    // @neutron-build/nucleus not installed — Drizzle-only mode is fine.
     nucleus = null;
   }
 

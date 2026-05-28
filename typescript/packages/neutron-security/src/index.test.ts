@@ -28,11 +28,31 @@ describe("resolveClientIp", () => {
     assert.equal(resolveClientIp(request), null);
   });
 
-  it("returns first forwarded IP when trustProxy is enabled", () => {
+  it("returns the trusted right-most forwarded hop when trustProxy is enabled", () => {
     const request = new Request("https://example.com", {
       headers: { "x-forwarded-for": "203.0.113.9, 198.51.100.7" },
     });
+    // The right-most entry is the address our nearest trusted proxy observed;
+    // the left-most is client-supplied and must not be returned.
+    assert.equal(resolveClientIp(request, { trustProxy: true }), "198.51.100.7");
+  });
+
+  it("ignores a spoofed left-most forwarded entry", () => {
+    const request = new Request("https://example.com", {
+      headers: { "x-forwarded-for": "1.2.3.4, 203.0.113.9" },
+    });
     assert.equal(resolveClientIp(request, { trustProxy: true }), "203.0.113.9");
+  });
+
+  it("honors trustedHops for multi-proxy chains", () => {
+    const request = new Request("https://example.com", {
+      // client, proxyA, proxyB (we trust 2 hops in front of us)
+      headers: { "x-forwarded-for": "client, 203.0.113.9, 198.51.100.7" },
+    });
+    assert.equal(
+      resolveClientIp(request, { trustProxy: true, trustedHops: 2 }),
+      "203.0.113.9"
+    );
   });
 
   it("prefers cf-connecting-ip over other headers", () => {
@@ -56,14 +76,14 @@ describe("resolveClientIp", () => {
     assert.equal(resolveClientIp(request, { trustProxy: true }), "5.6.7.8");
   });
 
-  it("respects maxForwardedIps limit", () => {
+  it("respects maxForwardedIps limit (counted from the right)", () => {
     const request = new Request("https://example.com", {
       headers: {
         "x-forwarded-for": "1.1.1.1, 2.2.2.2, 3.3.3.3",
       },
     });
     const ip = resolveClientIp(request, { trustProxy: true, maxForwardedIps: 1 });
-    assert.equal(ip, "1.1.1.1");
+    assert.equal(ip, "3.3.3.3");
   });
 
   it("supports custom forwarded header", () => {
@@ -281,6 +301,57 @@ describe("createCsrfMiddleware", () => {
     );
 
     assert.equal(response.status, 200);
+  });
+
+  it("accepts POST with a matching same-origin Origin header", async () => {
+    const mw = createCsrfMiddleware();
+    const token = "csrf-token-123";
+    const response = await mw(
+      new Request("https://example.com/account", {
+        method: "POST",
+        headers: {
+          cookie: `__neutron_csrf=${token}`,
+          "x-csrf-token": token,
+          origin: "https://example.com",
+        },
+      }),
+      {},
+      async () => OK_RESPONSE()
+    );
+
+    assert.equal(response.status, 200);
+  });
+
+  it("rejects a cross-origin POST even with a matching token", async () => {
+    const mw = createCsrfMiddleware();
+    const token = "csrf-token-123";
+    const response = await mw(
+      new Request("https://example.com/account", {
+        method: "POST",
+        headers: {
+          cookie: `__neutron_csrf=${token}`,
+          "x-csrf-token": token,
+          origin: "https://evil.example",
+        },
+      }),
+      {},
+      async () => OK_RESPONSE()
+    );
+
+    assert.equal(response.status, 403);
+    assert.equal(await response.text(), "Invalid CSRF origin");
+  });
+
+  it("sets an HttpOnly, SameSite=Strict CSRF cookie by default", async () => {
+    const mw = createCsrfMiddleware();
+    const response = await mw(
+      new Request("https://example.com/", { method: "GET" }),
+      {},
+      async () => OK_RESPONSE()
+    );
+    const setCookie = response.headers.get("set-cookie") || "";
+    assert.ok(setCookie.includes("HttpOnly"), "cookie should be HttpOnly");
+    assert.ok(setCookie.includes("SameSite=Strict"), "cookie should be SameSite=Strict");
   });
 
   it("rejects PUT and DELETE as unsafe methods", async () => {

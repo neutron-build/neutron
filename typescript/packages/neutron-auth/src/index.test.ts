@@ -93,6 +93,74 @@ describe("createAuthContextMiddleware", () => {
     assert.equal(auth.isAuthenticated, true);
   });
 
+  it("treats an expired session as unauthenticated even when it carries a user", async () => {
+    const session: AuthSession = {
+      user: { id: "u1" },
+      expiresAt: "2000-01-01T00:00:00Z",
+    };
+    const mw = createAuthContextMiddleware({ adapter: fakeAdapter(session) });
+    const ctx: Record<string, unknown> = {};
+    await mw(new Request("https://example.com"), ctx, async () => OK_RESPONSE());
+    const auth = ctx["auth"] as NeutronAuthState;
+    assert.equal(auth.isAuthenticated, false);
+    assert.equal(auth.user, null);
+  });
+
+  it("authenticates a session whose expiry is in the future", async () => {
+    const session: AuthSession = {
+      user: { id: "u1" },
+      expiresAt: Date.now() + 60_000,
+    };
+    const mw = createAuthContextMiddleware({ adapter: fakeAdapter(session) });
+    const ctx: Record<string, unknown> = {};
+    await mw(new Request("https://example.com"), ctx, async () => OK_RESPONSE());
+    const auth = ctx["auth"] as NeutronAuthState;
+    assert.equal(auth.isAuthenticated, true);
+  });
+});
+
+describe("createProtectedRouteMiddleware redirect safety", () => {
+  it("redirects unauthenticated users to a relative path", async () => {
+    const mw = createProtectedRouteMiddleware({
+      adapter: fakeAdapter(null),
+      redirectTo: "/login",
+    });
+    const res = await mw(
+      new Request("https://example.com/private"),
+      {},
+      async () => OK_RESPONSE()
+    );
+    assert.equal(res.status, 302);
+    assert.equal(res.headers.get("Location"), "/login");
+  });
+
+  it("never redirects to a cross-origin target (open-redirect guard)", async () => {
+    const mw = createProtectedRouteMiddleware({
+      adapter: fakeAdapter(null),
+      redirectTo: "https://evil.example/phish",
+    });
+    const res = await mw(
+      new Request("https://example.com/private"),
+      {},
+      async () => OK_RESPONSE()
+    );
+    assert.equal(res.status, 302);
+    assert.equal(res.headers.get("Location"), "/");
+  });
+
+  it("rejects protocol-relative redirect targets", async () => {
+    const mw = createProtectedRouteMiddleware({
+      adapter: fakeAdapter(null),
+      redirectTo: "//evil.example/phish",
+    });
+    const res = await mw(
+      new Request("https://example.com/private"),
+      {},
+      async () => OK_RESPONSE()
+    );
+    assert.equal(res.headers.get("Location"), "/");
+  });
+
   it("calls next() and returns its response", async () => {
     const adapter = fakeAdapter(null);
     const mw = createAuthContextMiddleware({ adapter });

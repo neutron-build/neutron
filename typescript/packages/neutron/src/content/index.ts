@@ -7,6 +7,10 @@ import matter from "gray-matter";
 import { Marked } from "marked";
 import type { NeutronMarkdownConfig } from "../config.js";
 import { markedShikiExtension } from "./syntax-highlight.js";
+import { sanitizeHtml } from "./sanitize.js";
+
+export { sanitizeHtml } from "./sanitize.js";
+export type { SanitizeOptions } from "./sanitize.js";
 import YAML from "yaml";
 import { h } from "preact";
 import type * as preact from "preact";
@@ -72,6 +76,13 @@ export interface CollectionDefinition<TData = unknown> {
   live?: boolean; // NEW: Enable runtime loading
   loader?: () => Promise<TData[]>; // NEW: Runtime data loader
   cacheTtl?: number; // NEW: Cache TTL for live collections (ms)
+  /**
+   * Sanitize rendered HTML through a real parser-based sanitizer. Enable for
+   * collections whose content is NOT fully trusted (CMS, user submissions,
+   * remote sources). Local authored files are trusted by default. Requires the
+   * optional `sanitize-html` dependency.
+   */
+  sanitize?: boolean;
 }
 
 export interface DefineCollectionOptions<TData = unknown> {
@@ -80,6 +91,8 @@ export interface DefineCollectionOptions<TData = unknown> {
   live?: boolean; // NEW: Enable runtime loading
   loader?: () => Promise<TData[]>; // NEW: Runtime data loader
   cacheTtl?: number; // NEW: Cache TTL in milliseconds (default: 60000)
+  /** Sanitize rendered HTML for untrusted content. See CollectionDefinition. */
+  sanitize?: boolean;
 }
 
 export interface ContentCollectionMap {}
@@ -93,6 +106,7 @@ export interface CollectionEntry<TData = unknown> {
   data: TData;
   filePath: string;
   sourceType: "markdown" | "mdx" | "html" | "data";
+  sanitize?: boolean;
   render: () => Promise<{ Content: preact.FunctionComponent<any> }>;
 }
 
@@ -119,6 +133,7 @@ interface SerializedCollectionEntry {
   data: unknown;
   filePath: string;
   sourceType?: "markdown" | "mdx" | "html" | "data";
+  sanitize?: boolean;
 }
 
 interface CacheRecord {
@@ -143,6 +158,10 @@ export function defineCollection<TData>(
   return {
     type: options.type ?? "content",
     schema: options.schema,
+    live: options.live,
+    loader: options.loader,
+    cacheTtl: options.cacheTtl,
+    sanitize: options.sanitize,
   };
 }
 
@@ -435,6 +454,7 @@ async function loadManifestStore(rootDir: string): Promise<CollectionStore | nul
         html: entry.html,
         data: entry.data,
         sourceType: entry.sourceType ?? "data",
+        sanitize: entry.sanitize,
       })
     );
   }
@@ -508,6 +528,7 @@ async function readCollectionEntries(
           html: parsed.content,
           data,
           sourceType: "html",
+          sanitize: definition.sanitize,
         }));
       } catch (error) {
         throw withCollectionContext(
@@ -535,6 +556,7 @@ async function readCollectionEntries(
         html: rendered.html,
         data,
         sourceType,
+        sanitize: definition.sanitize,
         renderFactory: rendered.renderFactory,
       }));
     } catch (error) {
@@ -576,16 +598,6 @@ async function collectCollectionFiles(collectionDir: string): Promise<string[]> 
   return files;
 }
 
-function sanitizeHtml(html: string): string {
-  // Strip script tags and their contents
-  html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
-  // Strip event handler attributes
-  html = html.replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/gi, '');
-  // Strip javascript: URLs
-  html = html.replace(/(?:href|src|action)\s*=\s*(?:"javascript:[^"]*"|'javascript:[^']*')/gi, '');
-  return html;
-}
-
 function createEntry(input: {
   id: string;
   slug: string;
@@ -595,12 +607,17 @@ function createEntry(input: {
   html: string;
   data: unknown;
   sourceType: "markdown" | "mdx" | "html" | "data";
+  sanitize?: boolean;
   renderFactory?: () => Promise<{ Content: preact.FunctionComponent<any> }>;
 }): CollectionEntry<unknown> {
   const fallbackRender = async () => {
-    const html = input.html;
+    // Local content files are trusted authored content and rendered faithfully.
+    // When the collection is marked `sanitize: true` (untrusted source), run the
+    // real parser-based sanitizer first. There is no regex fallback — a regex
+    // cannot safely sanitize HTML.
+    const html = input.sanitize ? await sanitizeHtml(input.html) : input.html;
     return {
-      Content: () => h("div", { dangerouslySetInnerHTML: { __html: sanitizeHtml(html) } }),
+      Content: () => h("div", { dangerouslySetInnerHTML: { __html: html } }),
     };
   };
 
@@ -659,14 +676,15 @@ async function renderMarkup(
   }
 
   const markedInstance = new Marked();
-  // Note: markedShikiExtension was previously wired here, but Marked v15's
-  // `renderer` override API is sync-only — async renderers (which the Shiki
-  // extension uses) are NOT awaited and get stringified as "[object Promise]"
-  // into the output. Until that's reworked via walkTokens or marked-highlight,
-  // we fall back to Marked's default sync code-block renderer (plain
-  // <pre><code> output, no syntax colors). syntaxHighlight config is
-  // currently a no-op as a result.
-  void markedShikiExtension;
+  // Syntax highlighting via Shiki. Highlighting runs in the extension's async
+  // walkTokens hook (Marked v15 renderers are sync-only), and degrades to plain
+  // escaped <pre><code> when the optional `shiki` peer dependency is absent.
+  // Enabled by default; opt out with `syntaxHighlight: false`.
+  const syntaxHighlight =
+    markdownConfig?.syntaxHighlight ?? activeMarkdownConfig?.syntaxHighlight;
+  if (syntaxHighlight !== false) {
+    markedInstance.use(markedShikiExtension(syntaxHighlight?.theme ?? "github-dark"));
+  }
   // Apply user-supplied marked extensions (KaTeX, directive, custom tokens).
   // Each entry is forwarded directly to Marked.use(). Wired here so plain
   // `.md` content gets the same plugin opportunity that MDX has via
@@ -815,6 +833,7 @@ function toSerializableCollections(
       data: entry.data,
       filePath: entry.filePath,
       sourceType: entry.sourceType,
+      sanitize: entry.sanitize,
     }));
   }
   return result;

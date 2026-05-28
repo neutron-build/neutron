@@ -25,6 +25,40 @@ describe("route rules", () => {
     });
   });
 
+  it("neutralizes an open redirect from a protocol-relative param value", () => {
+    const compiled = compileRouteRules({
+      redirects: [
+        { source: "/go/:dest*", destination: "/:dest*", permanent: false },
+      ],
+    });
+
+    // Attacker supplies a protocol-relative target via the captured param.
+    const redirect = resolveRouteRuleRedirect(compiled, "/go//evil.example/phish", "");
+    expect(redirect?.location.startsWith("//")).toBe(false);
+    expect(redirect?.location).toBe("/evil.example/phish");
+  });
+
+  it("neutralizes a tab/newline-smuggled protocol-relative redirect", () => {
+    const compiled = compileRouteRules({
+      redirects: [
+        { source: "/go/:dest*", destination: "/:dest*", permanent: false },
+      ],
+    });
+    // "/\t/evil.example" resolves to "//evil.example" after browsers strip TAB.
+    const redirect = resolveRouteRuleRedirect(compiled, "/go/\t/evil.example", "");
+    expect(redirect?.location).toBe("/evil.example");
+  });
+
+  it("preserves an intentionally absolute destination", () => {
+    const compiled = compileRouteRules({
+      redirects: [
+        { source: "/ext", destination: "https://example.com/ok", permanent: false },
+      ],
+    });
+    const redirect = resolveRouteRuleRedirect(compiled, "/ext", "");
+    expect(redirect?.location).toBe("https://example.com/ok");
+  });
+
   it("resolves rewrites and destination params", () => {
     const compiled = compileRouteRules({
       rewrites: [
