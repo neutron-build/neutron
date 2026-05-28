@@ -1,5 +1,5 @@
 {
-  "name": "@neutron-build/create",
+  "name": "create-neutron",
   "version": "0.1.0",
   "description": "Scaffold a new Neutron project. Run with: npm create neutron@latest",
   "author": "Tyler",
@@ -19,7 +19,7 @@
   ],
   "type": "module",
   "bin": {
-    "create-neutron-build": "./dist/index.js"
+    "create-neutron": "./dist/index.js"
   },
   "files": [
     "dist",
