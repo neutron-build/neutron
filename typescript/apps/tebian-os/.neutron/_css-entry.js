@@ -1,9 +1,0 @@
-import "/Users/tyler/Documents/proj rn/tystack/typescript/apps/tebian-os/src/styles/global.css";
-import "/Users/tyler/Documents/proj rn/tystack/typescript/apps/tebian-os/src/styles/home.css";
-import "/Users/tyler/Documents/proj rn/tystack/typescript/apps/tebian-os/src/styles/blog-hub.css";
-import "/Users/tyler/Documents/proj rn/tystack/typescript/apps/tebian-os/src/styles/docs-hub.css";
-import "/Users/tyler/Documents/proj rn/tystack/typescript/apps/tebian-os/src/styles/honors.css";
-import "/Users/tyler/Documents/proj rn/tystack/typescript/apps/tebian-os/src/styles/manifesto.css";
-import "/Users/tyler/Documents/proj rn/tystack/typescript/apps/tebian-os/src/styles/reasoning.css";
-import "/Users/tyler/Documents/proj rn/tystack/typescript/apps/tebian-os/src/styles/source.css";
-import "/Users/tyler/Documents/proj rn/tystack/typescript/apps/tebian-os/src/styles/post.css";
