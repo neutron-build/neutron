@@ -5,20 +5,26 @@ description: Get Nucleus running in 60 seconds.
 
 ## Install
 
-Download the binary for your platform:
+Download and extract the binary for your platform (each release publishes
+checksums alongside; verify with `sha256sum -c checksums.txt` from the same
+release page):
 
 ```bash
 # macOS (Apple Silicon)
-curl -L https://github.com/neutron-build/neutron/releases/latest/download/nucleus-darwin-arm64 -o nucleus
-chmod +x nucleus
+curl -L https://github.com/neutron-build/neutron/releases/latest/download/nucleus-darwin-arm64.tar.gz \
+  | tar xz && chmod +x nucleus
 
 # macOS (Intel)
-curl -L https://github.com/neutron-build/neutron/releases/latest/download/nucleus-darwin-amd64 -o nucleus
-chmod +x nucleus
+curl -L https://github.com/neutron-build/neutron/releases/latest/download/nucleus-darwin-amd64.tar.gz \
+  | tar xz && chmod +x nucleus
 
 # Linux (x86_64)
-curl -L https://github.com/neutron-build/neutron/releases/latest/download/nucleus-linux-amd64 -o nucleus
-chmod +x nucleus
+curl -L https://github.com/neutron-build/neutron/releases/latest/download/nucleus-linux-amd64.tar.gz \
+  | tar xz && chmod +x nucleus
+
+# Linux (aarch64)
+curl -L https://github.com/neutron-build/neutron/releases/latest/download/nucleus-linux-arm64.tar.gz \
+  | tar xz && chmod +x nucleus
 ```
 
 Or use the Neutron CLI:

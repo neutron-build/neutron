@@ -9,22 +9,17 @@ Neutron uses an **Adapter** system to build your application for different deplo
 
 When you run `neutron build`, the framework compiles your code. The final step is the "Adapt" phase, where the chosen adapter takes that compiled code and wraps it in the necessary entry points and configuration for your specific host.
 
-## Configuring an Adapter
+## Selecting an Adapter
 
-Adapters are configured in `neutron.config.ts`.
+Adapters ship **bundled inside `@neutron-build/core`** — there's no separate package to install. Select one at build time with the CLI's `--preset` flag:
 
-```ts
-import { defineConfig } from "neutron";
-import node from "@neutron/adapter-node";
-
-export default defineConfig({
-  adapter: node(),
-});
+```bash
+npx @neutron-build/cli build --preset vercel
 ```
 
-## Available Adapters
+## Available Presets
 
--   `@neutron/adapter-node`: For long-running Node.js servers.
--   `@neutron/adapter-cloudflare`: For Cloudflare Workers and Pages.
--   `@neutron/adapter-vercel`: For Vercel Serverless and Edge Functions.
--   `@neutron/adapter-static`: For purely static site generation (SSG).
+-   `--preset docker`: long-running Node server (produces `dist/server.mjs` + Dockerfile).
+-   `--preset cloudflare`: Cloudflare Workers / Pages.
+-   `--preset vercel`: Vercel Serverless / Edge Functions.
+-   `--preset static`: pure static-site output (SSG).

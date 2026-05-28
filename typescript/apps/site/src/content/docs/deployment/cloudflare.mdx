@@ -7,26 +7,14 @@ Neutron supports deploying to Cloudflare's edge network, giving your application
 
 ## Usage
 
-1.  Install the adapter:
+The Cloudflare adapter ships inside `@neutron-build/core` and is selected at build time via the CLI's `--preset` flag — no separate install needed.
+
+1.  Build with the Cloudflare preset:
     ```bash
-    npm install @neutron/adapter-cloudflare
+    npx @neutron-build/cli build --preset cloudflare
     ```
 
-2.  Update `neutron.config.ts`:
-    ```ts
-    import cloudflare from "@neutron/adapter-cloudflare";
-
-    export default defineConfig({
-      adapter: cloudflare(),
-    });
-    ```
-
-3.  Build:
-    ```bash
-    npm run build
-    ```
-
-4.  Deploy (using Wrangler):
+2.  Deploy (using Wrangler):
     ```bash
     npx wrangler pages deploy dist
     ```

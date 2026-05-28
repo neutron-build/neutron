@@ -7,23 +7,11 @@ If your application consists only of **static routes** (no `mode: "app"`), you c
 
 ## Usage
 
-1.  Install the adapter:
+The static adapter ships inside `@neutron-build/core` and is selected at build time via the CLI's `--preset` flag — no separate install needed.
+
+1.  Build with the static preset:
     ```bash
-    npm install @neutron/adapter-static
-    ```
-
-2.  Update `neutron.config.ts`:
-    ```ts
-    import staticAdapter from "@neutron/adapter-static";
-
-    export default defineConfig({
-      adapter: staticAdapter(),
-    });
-    ```
-
-3.  Build:
-    ```bash
-    npm run build
+    npx @neutron-build/cli build --preset static
     ```
 
 ## Output

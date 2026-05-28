@@ -7,28 +7,14 @@ The Node.js adapter builds your application into a standalone Node.js server. Th
 
 ## Usage
 
-1.  Install the adapter:
+The Node adapter ships inside `@neutron-build/core` and is selected at build time via the CLI's `--preset` flag — no separate install needed. For a long-running Node server, use the `docker` preset (which produces a Node `server.mjs` you can run directly without containerizing).
+
+1.  Build with the Docker preset (produces a standalone Node server):
     ```bash
-    npm install @neutron/adapter-node
+    npx @neutron-build/cli build --preset docker
     ```
 
-2.  Update `neutron.config.ts`:
-    ```ts
-    import node from "@neutron/adapter-node";
-
-    export default defineConfig({
-      adapter: node({
-        mode: "standalone", // or "middleware" for Express/Fastify integration
-      }),
-    });
-    ```
-
-3.  Build:
+2.  Run the generated server:
     ```bash
-    npm run build
-    ```
-
-4.  Run:
-    ```bash
-    node dist/server/index.js
+    node dist/server.mjs
     ```
