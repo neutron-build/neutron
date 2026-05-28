@@ -108,7 +108,9 @@ describe("session middleware", () => {
     expect(setCookie).toContain("Secure");
   });
 
-  it("uses forwarded protocol when deciding Secure cookie default", async () => {
+  it("ignores forwarded protocol from an untrusted source", async () => {
+    // No trustedProxies configured: a spoofed X-Forwarded-Proto must NOT make
+    // the cookie Secure on a plain-HTTP request.
     const storage = createMemorySessionStorage();
     const middleware = sessionMiddleware({
       storage,
@@ -117,8 +119,31 @@ describe("session middleware", () => {
 
     const context: AppContext = {};
     const request = new Request("http://example.com/test", {
+      headers: { "x-forwarded-proto": "https" },
+    });
+    const response = await runMiddlewareChain([middleware], request, context, async () => {
+      getSessionFromContext(context)?.set("userId", "1");
+      return new Response("ok");
+    });
+
+    const setCookie = response.headers.get("Set-Cookie");
+    expect(setCookie).toBeTruthy();
+    expect(setCookie).not.toContain("Secure");
+  });
+
+  it("honors forwarded protocol only from a trusted proxy", async () => {
+    const storage = createMemorySessionStorage();
+    const middleware = sessionMiddleware({
+      storage,
+      cookie: { name: "sid" },
+      trustedProxies: ["10.0.0.0/8"],
+    });
+
+    const context: AppContext = {};
+    const request = new Request("http://example.com/test", {
       headers: {
         "x-forwarded-proto": "https",
+        "x-real-ip": "10.0.0.5",
       },
     });
     const response = await runMiddlewareChain([middleware], request, context, async () => {
@@ -129,6 +154,26 @@ describe("session middleware", () => {
     const setCookie = response.headers.get("Set-Cookie");
     expect(setCookie).toBeTruthy();
     expect(setCookie).toContain("Secure");
+  });
+
+  it("defaults Secure in production over plain HTTP without trusted proxies", async () => {
+    const prev = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      const storage = createMemorySessionStorage();
+      const middleware = sessionMiddleware({ storage, cookie: { name: "sid" } });
+      const context: AppContext = {};
+      const request = new Request("http://example.com/test");
+      const response = await runMiddlewareChain([middleware], request, context, async () => {
+        getSessionFromContext(context)?.set("userId", "1");
+        return new Response("ok");
+      });
+      const setCookie = response.headers.get("Set-Cookie");
+      expect(setCookie).toBeTruthy();
+      expect(setCookie).toContain("Secure");
+    } finally {
+      process.env.NODE_ENV = prev;
+    }
   });
 });
 

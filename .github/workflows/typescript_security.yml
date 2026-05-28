@@ -1,0 +1,67 @@
+name: TypeScript Security
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "typescript/**"
+      - ".github/workflows/typescript_security.yml"
+  pull_request:
+    paths:
+      - "typescript/**"
+      - ".github/workflows/typescript_security.yml"
+  schedule:
+    # Weekly, so newly-disclosed advisories surface even without a push.
+    - cron: "0 6 * * 1"
+
+jobs:
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: latest
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: typescript
+
+      # Reported (not yet gating) while the pre-existing advisory backlog is
+      # triaged. Flip `continue-on-error` to false to make high+ severities block.
+      - name: pnpm audit (high+)
+        run: pnpm audit --audit-level=high
+        working-directory: typescript
+        continue-on-error: true
+
+  semgrep:
+    name: Static analysis (Semgrep)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rulesets target the exact bug classes hardened in this codebase:
+      # XSS sinks (dangerouslySetInnerHTML), regex sanitizers, ReDoS, weak
+      # crypto/compares, and the OWASP Top 10.
+      - name: Semgrep scan
+        run: |
+          semgrep --error \
+            --config p/typescript \
+            --config p/react \
+            --config p/owasp-top-ten \
+            --config p/secrets \
+            --metrics off \
+            typescript/
+        continue-on-error: true

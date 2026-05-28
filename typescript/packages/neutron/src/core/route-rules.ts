@@ -69,14 +69,33 @@ export function resolveRouteRuleRedirect(
 
     const destination = substituteDestination(rule.meta.destination, params);
     const hasQuery = destination.includes("?");
-    const location = !hasQuery && search ? `${destination}${search}` : destination;
+    const rawLocation = !hasQuery && search ? `${destination}${search}` : destination;
     return {
-      location,
+      location: sanitizeRedirectLocation(rawLocation),
       status: rule.meta.status,
     };
   }
 
   return null;
+}
+
+/**
+ * Prevent open redirects from request-controlled params substituted into a
+ * destination. A relative destination must not become protocol-relative
+ * (`//host`) or backslash-tricked (`/\host`) — collapse any leading run of
+ * slashes/backslashes to a single same-origin slash. Intentional absolute
+ * destinations (`https://...`) start with a scheme and are left untouched.
+ */
+function sanitizeRedirectLocation(location: string): string {
+  // Browsers strip TAB/LF/CR anywhere in a URL, so "/\t/evil" resolves to
+  // "//evil" client-side. Remove them before checking, then collapse a leading
+  // run of slashes/backslashes so a relative destination can't become
+  // protocol-relative (//host) or backslash-tricked (/\host).
+  const cleaned = location.replace(/[\t\n\r]/g, "");
+  if (/^[/\\]{2,}/.test(cleaned)) {
+    return "/" + cleaned.replace(/^[/\\]+/, "");
+  }
+  return cleaned;
 }
 
 export function resolveRouteRuleRewrite(

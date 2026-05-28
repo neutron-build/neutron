@@ -83,7 +83,10 @@ export function createProtectedRouteMiddleware<TUser extends AuthUser = AuthUser
 
     if (!authState?.isAuthenticated) {
       if (redirectTo) {
-        return Response.redirect(redirectTo, 302);
+        return new Response(null, {
+          status: 302,
+          headers: { Location: safeRedirectLocation(redirectTo, request) },
+        });
       }
       return new Response("Unauthorized", { status: unauthorizedStatus });
     }
@@ -196,9 +199,59 @@ function resolveUserFromSession<TUser extends AuthUser = AuthUser>(
   if (!session || typeof session !== "object") {
     return null;
   }
+  // Enforce expiry: an expired session is not authenticated even if an adapter
+  // still returns a user object attached to it.
+  if (isSessionExpired(session)) {
+    return null;
+  }
   const user = session.user;
   if (!user || typeof user !== "object") {
     return null;
   }
   return user as TUser;
+}
+
+function isSessionExpired(session: AuthSession): boolean {
+  const exp = session.expiresAt;
+  if (exp === undefined || exp === null) {
+    return false;
+  }
+  let ms: number;
+  if (exp instanceof Date) {
+    ms = exp.getTime();
+  } else if (typeof exp === "number") {
+    // Accept both seconds- and milliseconds-epoch values.
+    ms = exp < 1e12 ? exp * 1000 : exp;
+  } else {
+    ms = Date.parse(String(exp));
+  }
+  if (Number.isNaN(ms)) {
+    return false;
+  }
+  return ms <= Date.now();
+}
+
+/**
+ * Resolve a post-auth redirect target to a safe, same-origin Location. Relative
+ * paths are allowed as-is; absolute URLs are permitted only when same-origin;
+ * protocol-relative (`//host`), backslash, and cross-origin targets fall back
+ * to "/" — preventing an open redirect if `redirectTo` is ever derived from
+ * request input.
+ */
+function safeRedirectLocation(target: string, request: Request): string {
+  // Browsers strip TAB/LF/CR from URLs, so "/\t/evil" would resolve to
+  // "//evil" client-side — remove them before the same-origin checks.
+  const cleaned = target.replace(/[\t\n\r]/g, "");
+  if (cleaned.startsWith("/") && !cleaned.startsWith("//") && !cleaned.startsWith("/\\")) {
+    return cleaned;
+  }
+  try {
+    const url = new URL(cleaned, request.url);
+    if (url.origin === new URL(request.url).origin) {
+      return url.pathname + url.search + url.hash;
+    }
+  } catch {
+    // fall through to safe default
+  }
+  return "/";
 }

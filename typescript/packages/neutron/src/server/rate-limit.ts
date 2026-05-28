@@ -22,19 +22,39 @@ export interface RateLimitOptions {
   maxRequests?: number;
 
   /**
-   * Function to generate a unique key for each client
-   * Defaults to using X-Forwarded-For or a global key
+   * Function to generate a unique key for each client.
+   *
+   * If omitted, the key is derived from a trusted client address (see
+   * `trustProxy`). SECURITY: the default never reads `X-Forwarded-For` unless
+   * `trustProxy` is enabled, because that header is attacker-controlled — using
+   * it as the key lets a client mint a fresh bucket per request and bypass the
+   * limit entirely.
    *
    * @example
    * ```ts
-   * // Rate limit by IP address
-   * keyGenerator: (request) => request.headers.get("x-forwarded-for") || "unknown"
-   *
-   * // Rate limit by user ID (requires auth)
+   * // Rate limit by authenticated user (most robust)
    * keyGenerator: (request) => request.context?.user?.id || "anonymous"
    * ```
    */
   keyGenerator?: (request: Request) => string;
+
+  /**
+   * Trust proxy-forwarded client-address headers (`X-Forwarded-For` /
+   * `X-Real-IP`). Only enable this when the server sits behind a proxy you
+   * control that overwrites these headers. Default: false.
+   */
+  trustProxy?: boolean;
+
+  /**
+   * Header carrying the forwarded client chain. Default: "x-forwarded-for".
+   */
+  forwardedHeader?: string;
+
+  /**
+   * Number of trusted proxies in front of this server. The client address is
+   * read this many hops from the right of the forwarded chain. Default: 1.
+   */
+  trustedHops?: number;
 
   /**
    * Custom handler for rate limit exceeded
@@ -72,27 +92,86 @@ interface RateLimitRecord {
  *   })
  * ];
  *
- * // Per-IP rate limit
+ * // Per-IP rate limit behind a trusted proxy
  * export const middleware = [
  *   rateLimitMiddleware({
  *     windowMs: 60000,
  *     maxRequests: 20,
- *     keyGenerator: (req) => req.headers.get("x-forwarded-for") || "unknown"
+ *     trustProxy: true // read client IP from X-Forwarded-For
  *   })
  * ];
  * ```
  */
+let warnedGlobalKey = false;
+
+/**
+ * Derive a rate-limit key from a trustworthy client address.
+ *
+ * Order of preference:
+ *   1. A client address the server adapter populated on the context
+ *      (`context.clientAddress`) — the real socket peer, never spoofable.
+ *   2. `X-Forwarded-For` / `X-Real-IP`, but only when `trustProxy` is enabled,
+ *      reading `trustedHops` from the right of the chain.
+ *
+ * If none is available it falls back to a shared `"global"` bucket (so the
+ * limiter still bounds total throughput) and warns once, because per-client
+ * limiting is impossible without a trusted address.
+ */
+function resolveClientKey(
+  request: Request,
+  context: unknown,
+  options: RateLimitOptions
+): string {
+  const ctxAddr = (context as { clientAddress?: unknown } | null | undefined)
+    ?.clientAddress;
+  if (typeof ctxAddr === "string" && ctxAddr.length > 0) {
+    return ctxAddr;
+  }
+
+  if (options.trustProxy) {
+    const header = (options.forwardedHeader || "x-forwarded-for").toLowerCase();
+    const realIp = request.headers.get("x-real-ip");
+    if (realIp) {
+      return realIp.trim();
+    }
+    const forwarded = request.headers.get(header);
+    if (forwarded) {
+      const parts = forwarded
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+      if (parts.length > 0) {
+        const trustedHops = Math.max(1, options.trustedHops ?? 1);
+        const index = parts.length - trustedHops;
+        return parts[Math.max(0, index)]!;
+      }
+    }
+  }
+
+  if (!warnedGlobalKey && process.env.NODE_ENV !== "production") {
+    warnedGlobalKey = true;
+    console.warn(
+      "[neutron] rateLimitMiddleware has no trusted client address; falling " +
+        "back to a shared global limit. Set trustProxy (behind a trusted " +
+        "proxy) or a keyGenerator for per-client limiting."
+    );
+  }
+  return "global";
+}
+
 export function rateLimitMiddleware(
   options: RateLimitOptions = {}
 ): MiddlewareFn {
   const windowMs = options.windowMs ?? 60000; // 1 minute default
   const maxRequests = options.maxRequests ?? 100;
-  const keyGenerator =
-    options.keyGenerator ||
-    ((request: Request) =>
-      request.headers.get("x-forwarded-for") || "global");
   const skip = options.skip || (() => false);
+  const resolveKey = options.keyGenerator
+    ? (request: Request, _context: unknown) => String(options.keyGenerator!(request))
+    : (request: Request, context: unknown) => resolveClientKey(request, context, options);
 
+  // Hard cap on distinct keys so an attacker who can still vary the key (e.g.
+  // a misconfigured trusted proxy) cannot exhaust memory.
+  const MAX_KEYS = 100_000;
   const requests = new Map<string, RateLimitRecord>();
 
   // Cleanup expired entries periodically to prevent memory leaks
@@ -117,7 +196,7 @@ export function rateLimitMiddleware(
     }
 
     // SECURITY: Validate and normalize keys to prevent memory exhaustion
-    let key = String(keyGenerator(request));
+    let key = resolveKey(request, context);
     const MAX_KEY_LENGTH = 256;
     if (key.length > MAX_KEY_LENGTH) {
       // Hash long keys to prevent memory issues
@@ -129,6 +208,14 @@ export function rateLimitMiddleware(
 
     // No record or window expired - create new window
     if (!record || now >= record.resetAt) {
+      if (!record && requests.size >= MAX_KEYS) {
+        // At capacity: drop expired entries before admitting a new key.
+        for (const [existingKey, existing] of requests) {
+          if (now >= existing.resetAt) {
+            requests.delete(existingKey);
+          }
+        }
+      }
       requests.set(key, {
         count: 1,
         resetAt: now + windowMs,
@@ -224,10 +311,11 @@ export function imageRateLimit(
     ...options,
     skip:
       options.skip ||
-      ((request) => {
-        // Don't rate limit local/dev requests
-        const url = new URL(request.url);
-        return url.hostname === "localhost" || url.hostname === "127.0.0.1";
+      (() => {
+        // Don't rate limit in development. Gating on a trusted env flag rather
+        // than the request hostname, which an attacker can set via the Host
+        // header to bypass the limit on a CPU-heavy endpoint.
+        return process.env.NODE_ENV !== "production";
       }),
   });
 }

@@ -109,7 +109,8 @@ export function createMemorySessionStorage(
       }
     }
 
-    // If still over limit, evict oldest entries (LRU approximation)
+    // If still over limit, evict least-recently-used entries (access promotes
+    // recency in getSession, so insertion order is now LRU order).
     if (map.size >= maxSessions) {
       const entries = Array.from(map.entries());
       const toDelete = entries.slice(0, Math.floor(maxSessions * 0.1));
@@ -130,6 +131,12 @@ export function createMemorySessionStorage(
         map.delete(sessionId);
         return null;
       }
+
+      // Promote to most-recently-used: Map preserves insertion order, so
+      // re-inserting moves this key to the end and eviction drops genuinely
+      // cold sessions rather than recently-active ones.
+      map.delete(sessionId);
+      map.set(sessionId, record);
 
       return {
         data: { ...record.data },
@@ -307,9 +314,16 @@ function resolveCookieOptionsForRequest(
     return baseOptions;
   }
 
+  // Default Secure when the request is verifiably HTTPS, OR in production. The
+  // production fallback matters because a TLS-terminating proxy that forwards
+  // plain HTTP — without `trustedProxies` configured — would otherwise yield a
+  // non-Secure cookie now that we no longer trust a spoofable X-Forwarded-Proto.
+  // Plain-HTTP production deployments must set `cookie.secure: false` explicitly.
   return {
     ...baseOptions,
-    secure: isSecureRequest(request, trustedProxies),
+    secure:
+      isSecureRequest(request, trustedProxies) ||
+      process.env.NODE_ENV === "production",
   };
 }
 
@@ -324,20 +338,14 @@ function resolveCookieOptionsForRequest(
  */
 function isSecureRequest(request: Request, trustedProxies?: string[]): boolean {
   const forwardedProto = request.headers.get("x-forwarded-proto");
-  if (forwardedProto) {
-    // Only trust X-Forwarded-Proto if request is from a trusted proxy
-    if (trustedProxies && trustedProxies.length > 0) {
-      const clientIp = getClientIp(request);
-      if (clientIp && isTrustedProxy(clientIp, trustedProxies)) {
-        const first = forwardedProto.split(",")[0]?.trim().toLowerCase();
-        if (first === "https") {
-          return true;
-        }
-      }
-    } else {
-      // SECURITY WARNING: If trustedProxies is not configured, we trust any
-      // X-Forwarded-Proto header. This maintains backward compatibility but
-      // is less secure. Users should configure trustedProxies in production.
+  // Only honor X-Forwarded-Proto when the request demonstrably arrived through
+  // a configured trusted proxy. Without trustedProxies the header is
+  // attacker-controlled, so we ignore it entirely and fall back to the real
+  // connection protocol — a spoofed `X-Forwarded-Proto: https` must never
+  // decide the Secure cookie flag.
+  if (forwardedProto && trustedProxies && trustedProxies.length > 0) {
+    const clientIp = getClientIp(request);
+    if (clientIp && isTrustedProxy(clientIp, trustedProxies)) {
       const first = forwardedProto.split(",")[0]?.trim().toLowerCase();
       if (first === "https") {
         return true;
@@ -357,19 +365,23 @@ function isSecureRequest(request: Request, trustedProxies?: string[]): boolean {
  * Extracts client IP from request headers
  */
 function getClientIp(request: Request): string | null {
-  // Try X-Forwarded-For first (most common)
-  const xForwardedFor = request.headers.get("x-forwarded-for");
-  if (xForwardedFor) {
-    const ips = xForwardedFor.split(",").map((ip) => ip.trim());
-    if (ips.length > 0 && ips[0]) {
-      return ips[0];
-    }
-  }
-
-  // Try X-Real-IP
+  // X-Real-IP is set by the nearest proxy to the address of its immediate peer.
   const xRealIp = request.headers.get("x-real-ip");
   if (xRealIp) {
     return xRealIp.trim();
+  }
+
+  const xForwardedFor = request.headers.get("x-forwarded-for");
+  if (xForwardedFor) {
+    const ips = xForwardedFor
+      .split(",")
+      .map((ip) => ip.trim())
+      .filter(Boolean);
+    // The right-most entry is the peer observed by our nearest hop; left-most
+    // entries are client-supplied and must not be trusted for proxy checks.
+    if (ips.length > 0) {
+      return ips[ips.length - 1]!;
+    }
   }
 
   return null;
@@ -417,8 +429,14 @@ function ipToNumber(ip: string): number | null {
   if (parts.length !== 4) return null;
   let num = 0;
   for (const part of parts) {
+    // Reject anything that isn't a canonical 1-3 digit octet. Leading zeros
+    // (e.g. "010") are ambiguous and would let "127.000.000.001" diverge from
+    // the exact-string trusted-proxy comparison.
+    if (!/^\d{1,3}$/.test(part) || (part.length > 1 && part[0] === "0")) {
+      return null;
+    }
     const n = parseInt(part, 10);
-    if (isNaN(n) || n < 0 || n > 255) return null;
+    if (n < 0 || n > 255) return null;
     num = (num << 8) | n;
   }
   return num >>> 0; // Convert to unsigned 32-bit

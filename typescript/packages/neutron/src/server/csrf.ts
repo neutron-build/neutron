@@ -5,7 +5,7 @@
  * Tokens are stored in cookies and must be provided in request headers for validation.
  */
 
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { serializeCookie, getCookie } from "../core/cookies.js";
 import type { MiddlewareFn } from "../core/types.js";
 
@@ -102,32 +102,47 @@ export function csrfMiddleware(options: CsrfOptions = {}): MiddlewareFn {
   return async (request, context, next) => {
     const method = request.method.toUpperCase();
 
-    // For safe methods: generate token and set cookie
+    // For safe methods: reuse the existing token if present, otherwise mint one.
     if (ignoredMethods.has(method)) {
-      const token = randomBytes(32).toString("hex");
+      const existing = getCookie(request, cookieName);
+      const token = existing || randomBytes(32).toString("hex");
       context.csrfToken = token;
 
       const response = await next();
 
-      // Set CSRF token in cookie using serializeCookie for proper validation
-      const cookieString = serializeCookie(cookieName, token, {
-        path: cookiePath,
-        httpOnly: true,
-        secure: cookieSecure,
-        sameSite: cookieSameSite,
-      });
-
-      response.headers.append("Set-Cookie", cookieString);
+      // Only (re)set the cookie when we minted a new token. Regenerating on
+      // every safe request churns the cookie and can race a token already
+      // embedded in an in-flight form, causing spurious 403s on submit.
+      if (!existing) {
+        const cookieString = serializeCookie(cookieName, token, {
+          path: cookiePath,
+          httpOnly: true,
+          secure: cookieSecure,
+          sameSite: cookieSameSite,
+        });
+        response.headers.append("Set-Cookie", cookieString);
+      }
 
       return response;
     }
 
-    // For unsafe methods: validate token
+    // For unsafe methods: verify same-origin first (defense in depth — a
+    // cross-site attacker's browser stamps Origin/Referer with its own site),
+    // then validate the double-submit token in constant time.
+    if (!isSameOrigin(request)) {
+      return new Response("CSRF origin validation failed", {
+        status: 403,
+        headers: {
+          "Content-Type": "text/plain",
+        },
+      });
+    }
+
     // SECURITY: Use getCookie from cookies.ts for proper parsing (handles URL encoding, quotes, etc.)
     const cookieToken = getCookie(request, cookieName);
     const headerToken = request.headers.get(headerName);
 
-    if (!cookieToken || !headerToken || cookieToken !== headerToken) {
+    if (!cookieToken || !headerToken || !timingSafeEqualStr(cookieToken, headerToken)) {
       return new Response("CSRF token validation failed", {
         status: 403,
         headers: {
@@ -140,6 +155,37 @@ export function csrfMiddleware(options: CsrfOptions = {}): MiddlewareFn {
     context.csrfToken = cookieToken;
     return next();
   };
+}
+
+/**
+ * Constant-time comparison of two strings. Returns false for unequal lengths
+ * (without an early-exit timing signal on the contents themselves).
+ */
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a, "utf8");
+  const bBuf = Buffer.from(b, "utf8");
+  if (aBuf.length !== bBuf.length) {
+    return false;
+  }
+  return timingSafeEqual(aBuf, bBuf);
+}
+
+/**
+ * Same-origin check for state-changing requests. When an Origin (or Referer)
+ * header is present it must match the request host; a forged cross-site request
+ * carries the attacker's origin and is rejected. Absent both headers we defer
+ * to token validation rather than hard-failing legitimate non-browser clients.
+ */
+function isSameOrigin(request: Request): boolean {
+  const source = request.headers.get("Origin") || request.headers.get("Referer");
+  if (!source) {
+    return true;
+  }
+  try {
+    return new URL(source).host === new URL(request.url).host;
+  } catch {
+    return false;
+  }
 }
 
 /**
