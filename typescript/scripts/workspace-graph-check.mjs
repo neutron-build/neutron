@@ -6,11 +6,14 @@ const workspaceRoot = process.cwd();
 const snapshotPath = path.join(workspaceRoot, ".turbo-ls-normalized.json");
 const writeMode = process.argv.includes("--write");
 
+// Per the amended naming RFC (see docs/rfcs/naming.md "Reality note"), the
+// canonical npm scope is `@neutron-build/*` (with `create-neutron` as the
+// single unscoped exception required by `npm create <name>`).
 const requiredPackages = new Set([
-  "neutron",
-  "neutron-cli",
+  "@neutron-build/core",
+  "@neutron-build/cli",
   "create-neutron",
-  "neutron-data",
+  "@neutron-build/data",
 ]);
 
 run();

@@ -13,5 +13,5 @@
 
 ## Enterprise Guidance
 
-- Use optional packages (`@neutron/cache-redis`, `@neutron/otel`, `@neutron/auth`, `@neutron/security`, `@neutron/ops`) for production hardening.
+- Use optional packages (`@neutron-build/cache-redis`, `@neutron-build/otel`, `@neutron-build/auth`, `@neutron-build/security`, `@neutron-build/ops`) for production hardening.
 - Keep core framework usage lean and provider-agnostic.

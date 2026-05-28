@@ -50,8 +50,8 @@ Each release entry should include date and version.
 
 1. Bump package versions.
 2. Commit version + changelog updates.
-3. Create git tag: `vX.Y.Z`.
-4. Publish packages.
+3. Create git tag: `ts/vX.Y.Z` (the `ts/` prefix scopes the tag to the TypeScript implementation; the `typescript-publish.yml` workflow fires on `ts/v*`). Other implementations use parallel prefixes: e.g. `rust/v*`, `nucleus/v*`, `cli/v*`.
+4. Push the tag to `origin` (Forgejo). The push mirrors to GitHub, which triggers the publish workflow that runs `pnpm publish -r --access public --no-git-checks`.
 
 ## Support Policy
 

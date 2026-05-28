@@ -18,7 +18,7 @@ Use this checklist before shipping any new package/crate/module or major docs up
 2. No artifact name combines `neutron` and `nucleus`.
 3. No artifact name combines multiple implementation labels in one token.
 4. Ecosystem prefix rules are followed:
-   - npm: `neutron`, `neutron-*`, `@neutron/*`, `@nucleus/*`
+   - npm: `@neutron-build/*` (plus `create-neutron`, the only unscoped exception — required by the `npm create <name>` convention). See Reality note in `docs/rfcs/naming.md` for why bare `neutron`/`nucleus` and the `@neutron`/`@nucleus` scopes are not used.
    - Cargo: `neutron`/`neutron-*` or `nucleus`/`nucleus-*`
    - Mojo project names: `neutron-mojo-*` or `nucleus-*`
 
@@ -35,7 +35,7 @@ Use this checklist before shipping any new package/crate/module or major docs up
 
 - Good:
   - `Neutron TypeScript` with note: `uses Nucleus services`
-  - package `@neutron/security`
+  - package `@neutron-build/security`
   - crate `neutron-cli`
 - Bad:
   - `neutron-typescript-mojo-nucleus`
