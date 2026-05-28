@@ -49,7 +49,11 @@ export async function build(): Promise<void> {
 
   await prepareContentCollections({
     rootDir: cwd,
-    writeManifest: true,
+    // Manifest is only a runtime fallback for sites lacking a content.config.ts.
+    // Skipping the write avoids a JSON.stringify overflow on very large content
+    // sets (Node's max string length is ~512 MiB and KaTeX-rendered HTML can
+    // push the combined manifest past that).
+    writeManifest: false,
     writeTypes: true,
     markdownConfig: neutronConfig.markdown,
   } as any);

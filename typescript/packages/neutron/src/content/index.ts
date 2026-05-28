@@ -223,14 +223,10 @@ export async function prepareContentCollections(
     await fsp.mkdir(path.dirname(manifestPath), { recursive: true });
     await fsp.writeFile(
       manifestPath,
-      JSON.stringify(
-        {
-          collections: serializableCollections,
-          generatedAt: new Date().toISOString(),
-        },
-        null,
-        2
-      ),
+      JSON.stringify({
+        collections: serializableCollections,
+        generatedAt: new Date().toISOString(),
+      }),
       "utf-8"
     );
   }
