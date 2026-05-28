@@ -2,24 +2,59 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased]
+## [0.1.0] - 2026-05-28
+
+> First coordinated multi-package publish to npm. `@neutron-build/core` and
+> `@neutron-build/cli` move from 0.0.1 to 0.1.0; the other eight packages
+> publish for the first time, all at 0.1.0. Canonical npm scope is
+> `@neutron-build/*` (plus the unscoped `create-neutron`) — see Reality note
+> in `docs/rfcs/naming.md`.
 
 ### Added
 
-- New core cache-store abstraction for server runtime (`cache.app` + `cache.loader`) with memory defaults and exported cache store types/factories.
-- New package `@neutron/cache-redis` for distributed Redis/Dragonfly-backed app + loader cache stores.
-- New package `@neutron/otel` for Neutron hook -> OpenTelemetry span/error integration.
-- New package `@neutron/auth` for auth context middleware, protected-route middleware, and Better Auth/Auth.js style adapters.
-- New package `@neutron/security` for CSP nonce middleware, CSRF middleware, trusted proxy IP resolution, rate limiting, and secure cookie defaults.
-- New package `@neutron/ops` for request-id/trace context middleware, health/readiness middleware, and structured JSON logging hooks.
-- New enterprise documentation (`docs/enterprise.md`) plus security/support policies (`SECURITY.md`, `SUPPORT.md`).
+- Core cache-store abstraction for server runtime (`cache.app` + `cache.loader`) with memory defaults and exported cache store types/factories.
+- New package `@neutron-build/cache-redis` for distributed Redis/Dragonfly-backed app + loader cache stores.
+- New package `@neutron-build/otel` for Neutron hook → OpenTelemetry span/error integration.
+- New package `@neutron-build/auth` for auth context middleware, protected-route middleware, and Better Auth/Auth.js style adapters.
+- New package `@neutron-build/security` for CSP nonce middleware, CSRF middleware, trusted-proxy IP resolution, rate limiting, and secure cookie defaults.
+- New package `@neutron-build/ops` for request-id/trace context middleware, health/readiness middleware, and structured JSON logging hooks.
+- New package `@neutron-build/data` (database, cache, sessions, queues, storage, rate limiting).
+- New package `@neutron-build/nucleus` — typed Nucleus client (14 data models).
+- New package `create-neutron` — project scaffold (`npm create neutron@latest`).
+- Enterprise documentation (`docs/enterprise.md`) plus security/support policies (`SECURITY.md`, `SUPPORT.md`).
+- Semgrep + `pnpm audit` CI workflow (`.github/workflows/typescript_security.yml`).
 
 ### Changed
 
 - `createServer` now supports pluggable cache stores through `NeutronServerOptions.cache`.
-- Release docs now include explicit support and deprecation policy commitments.
+- Release docs include explicit support and deprecation policy commitments.
+- Naming RFC amended to bless the `@neutron-build/*` org scope (bare `neutron`/`nucleus` and the `@neutron`/`@nucleus` scopes are unavailable on npm).
+- Tag format standardized as `ts/vX.Y.Z` (matches the existing `typescript-publish.yml` trigger).
 
-## [0.1.0] - 2026-02-13
+### Security (regression-tested)
+
+- Cross-user app-response cache poisoning closed via credentials gate; CORS-reflected responses no longer cached.
+- Rate-limit X-Forwarded-For spoof bypass: default no longer trusts XFF; `trustProxy` opt-in with right-most hop; per-client `context.clientAddress`; key cap.
+- CSRF: `crypto.timingSafeEqual` compare; same-origin (Origin/Referer) check; cookie defaults to `HttpOnly` + `SameSite=Strict`; token reuse to stop churn; lazy form-body read.
+- Fail-open `X-Forwarded-Proto` removed; new `trustedHosts` server option; `__Host-`/`__Secure-` cookie-prefix enforcement; production-default Secure cookie.
+- Bypassable regex HTML sanitizers replaced with trusted-by-default content + optional `sanitize-html` peer dependency; head fragment and island sinks corrected.
+- RSS `content:encoded` CDATA-terminator escape; SEO `on*` attribute names blocked; hardened `</script>` head-script guard.
+- Request-smuggling rejection (Content-Length + Transfer-Encoding); byte-accurate header limits; opt-in `rejectUnknownLength`.
+- Open-redirect closed in route rules (protocol-relative, backslash, tab/newline collapse) and in auth `redirectTo` (same-origin only).
+- Default `nosniff` / `X-Frame-Options` / `Referrer-Policy` on static, docker, and generated serverless adapters; docker static path traversal containment + null-byte reject.
+- CSP nonce stamped onto framework inline scripts (data, client module, JSON-LD, `headScripts`).
+- Dep CVEs: `devalue` ≥5.6.4, `hono` 4.12.x, `@hono/node-server` 1.19.x, `turbo` 2.9.x, `fast-xml-parser` ≥5.7.0 (override).
+
+### Fixed
+
+- Dead Nucleus client specifier in `@neutron-build/data`/drizzle.
+- Syntax highlighting restored (Marked v15 async `walkTokens` integration with Shiki).
+- `defineCollection` no longer silently drops `live`/`loader`/`cacheTtl`.
+- Audit-log IDs use `randomUUID()` (was `Math.random()`).
+- Deduplicated `escapeHtml`/`escapeXml` across the codebase into `core/escape.ts`.
+- Site install docs corrected to reflect actual published package names and CLI-preset adapter model.
+
+## [0.1.0-dev] - 2026-02-13
 
 ### Added
 

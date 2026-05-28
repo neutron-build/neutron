@@ -1,4 +1,4 @@
-# @neutron-build/create
+# create-neutron
 
 Scaffold a new Neutron project.
 
