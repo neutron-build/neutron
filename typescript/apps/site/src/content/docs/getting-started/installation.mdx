@@ -43,20 +43,17 @@ Neutron is designed to be easy to set up manually if you prefer.
 
 2.  Install dependencies:
     ```bash
-    npm install neutron react react-dom
-    npm install -D typescript vite @types/react @types/react-dom
+    npm install @neutron-build/core @neutron-build/cli preact
+    npm install -D typescript vite
     ```
-    *(Note: Neutron uses Preact for app routes but React types for compatibility)*
 
 3.  Create a `neutron.config.ts`:
     ```ts
-    import { defineConfig } from "neutron";
-    import node from "@neutron/adapter-node";
+    import { defineConfig } from "@neutron-build/core";
 
-    export default defineConfig({
-      adapter: node(),
-    });
+    export default defineConfig({});
     ```
+    Adapters are bundled in `@neutron-build/core`; select one at build time with the CLI's `--preset` flag (e.g. `--preset docker`, `--preset vercel`, `--preset cloudflare`, `--preset static`).
 
 4.  Add scripts to `package.json`:
     ```json

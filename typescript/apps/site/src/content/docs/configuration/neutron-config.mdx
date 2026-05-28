@@ -8,16 +8,15 @@ The `neutron.config.ts` file is the entry point for configuring your Neutron app
 ## Basic Configuration
 
 ```ts
-import { defineConfig } from "neutron";
-import node from "@neutron/adapter-node";
+import { defineConfig } from "@neutron-build/core";
 
 export default defineConfig({
   // Choice of runtime (default: preact)
   runtime: "preact" | "react",
 
-  // Deployment adapter
-  adapter: node(),
-  
+  // Deployment adapters are bundled in @neutron-build/core and selected at
+  // build time with the CLI's --preset flag (e.g. neutron-ts build --preset vercel).
+
   // Data layer configuration
   data: {
     database: "postgres" | "sqlite",
