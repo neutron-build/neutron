@@ -23,9 +23,12 @@ jobs:
           cache-dependency-path: typescript/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
         working-directory: typescript
-      - run: pnpm run build
+      # Build/test only the publishable packages. The apps (site, playground)
+      # are private and not released; their build invokes the neutron-ts bin,
+      # which pnpm cannot link in a clean install until the CLI is built.
+      - run: pnpm --filter "./packages/*" run build
         working-directory: typescript
-      - run: pnpm run test
+      - run: pnpm --filter "./packages/*" run test
         working-directory: typescript
 
   publish:
@@ -47,7 +50,7 @@ jobs:
           cache-dependency-path: typescript/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
         working-directory: typescript
-      - run: pnpm run build
+      - run: pnpm --filter "./packages/*" run build
         working-directory: typescript
       - run: pnpm publish -r --access public --no-git-checks
         working-directory: typescript
