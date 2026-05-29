@@ -1,0 +1,15 @@
+use neutron::prelude::*;
+
+mod routes;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let app = App::new()
+        .title("{{.Name}}")
+        .version("0.1.0");
+
+    let app = routes::register(app);
+
+    app.listen("0.0.0.0:{{.Port}}").await?;
+    Ok(())
+}
