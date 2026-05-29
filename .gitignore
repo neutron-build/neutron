@@ -145,3 +145,7 @@ Cargo.lock
 *.rlib
 *.rmeta
 *.rcgu.o
+
+# Private notes — local only, never committed
+/_internal/
+/INTERNAL.md
