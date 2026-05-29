@@ -9,7 +9,7 @@
 import type { StorageDriver, StorageObject } from "./index.js";
 
 /**
- * Blob-like interface matching the subset of @neutron/nucleus BlobModel
+ * Blob-like interface matching the subset of @neutron-build/nucleus BlobModel
  * needed by NucleusStorageDriver.
  */
 export interface NucleusBlobLike {
@@ -19,7 +19,7 @@ export interface NucleusBlobLike {
 }
 
 export interface NucleusStorageDriverOptions {
-  /** A Blob model instance (from `@neutron/nucleus`). */
+  /** A Blob model instance (from `@neutron-build/nucleus`). */
   blob: NucleusBlobLike;
   /** Bucket name for all stored objects (default `"default"`). */
   bucket?: string;

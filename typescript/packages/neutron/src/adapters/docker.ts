@@ -139,9 +139,14 @@ ${runtimeFallback}
 });
 
 function resolveStaticPath(pathname) {
+  if (pathname.includes(String.fromCharCode(0))) {
+    return null;
+  }
   const cleaned = pathname === "/" ? "/index.html" : pathname;
   const resolved = path.resolve(DIST_DIR, cleaned.replace(/^\\/+/, ""));
-  if (!resolved.startsWith(DIST_DIR)) {
+  // Containment must use a path-separator boundary; a bare startsWith() prefix
+  // check would also accept sibling dirs like "<DIST_DIR>-secret".
+  if (resolved !== DIST_DIR && !resolved.startsWith(DIST_DIR + path.sep)) {
     return null;
   }
 
@@ -150,7 +155,7 @@ function resolveStaticPath(pathname) {
   }
 
   const nestedIndex = path.join(resolved, "index.html");
-  if (nestedIndex.startsWith(DIST_DIR) && existsSync(nestedIndex) && statSync(nestedIndex).isFile()) {
+  if ((nestedIndex === DIST_DIR || nestedIndex.startsWith(DIST_DIR + path.sep)) && existsSync(nestedIndex) && statSync(nestedIndex).isFile()) {
     return nestedIndex;
   }
 
@@ -161,6 +166,9 @@ function streamFile(res, filePath) {
   const ext = path.extname(filePath).toLowerCase();
   res.statusCode = 200;
   res.setHeader("Content-Type", MIME_TYPES[ext] || "application/octet-stream");
+  // Prevent MIME sniffing of static assets (e.g. a .txt/.json that contains
+  // HTML being interpreted as HTML).
+  res.setHeader("X-Content-Type-Options", "nosniff");
   const stream = createReadStream(filePath);
   stream.pipe(res);
   stream.on("error", () => {

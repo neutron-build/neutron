@@ -95,6 +95,10 @@ function *walkForBasename(root, basename) {
 }
 
 function validateNpmPackages(files) {
+  // See `docs/rfcs/naming.md` "Reality note": bare `neutron`/`nucleus` and the
+  // `@neutron`/`@nucleus` scopes on npm are owned by unrelated third parties,
+  // so the canonical scope is `@neutron-build/*`. `create-neutron` is the
+  // single unscoped exception, required for `npm create neutron@latest`.
   const allowedExact = new Set([
     "neutron",
     "neutron-cli",
@@ -120,7 +124,8 @@ function validateNpmPackages(files) {
       allowedExact.has(name) ||
       name.startsWith("neutron-") ||
       name.startsWith("@neutron/") ||
-      name.startsWith("@nucleus/");
+      name.startsWith("@nucleus/") ||
+      name.startsWith("@neutron-build/");
 
     if (!valid) {
       errors.push(`${rel}: npm package name "${name}" does not follow Neutron/Nucleus naming prefixes.`);
@@ -175,7 +180,12 @@ function validateLayerMixing(name, rel) {
   const implementationTokens = ["typescript", "rust", "zig", "mojo"];
   const foundImplTokens = implementationTokens.filter((token) => lower.includes(token));
 
-  if (lower.includes("neutron") && lower.includes("nucleus")) {
+  // Per the amended naming RFC (Reality note): `@neutron-build` is the
+  // brand/org scope, not the platform name `Neutron`. A package whose artifact
+  // name within that scope is `nucleus` is therefore the Nucleus client
+  // artifact and does not violate the layer rule.
+  const isNeutronBuildNucleus = name === "@neutron-build/nucleus";
+  if (lower.includes("neutron") && lower.includes("nucleus") && !isNeutronBuildNucleus) {
     errors.push(`${rel}: name "${name}" mixes platform and subsystem labels.`);
   }
 

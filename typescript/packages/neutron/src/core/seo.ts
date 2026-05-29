@@ -1,3 +1,5 @@
+import { escapeHtml, escapeXml } from "./escape.js";
+
 export interface HeadScript {
   /** Inline JavaScript content. Must not contain </script>. */
   content: string;
@@ -243,7 +245,8 @@ export function inferPageTitle(pathname: string): string {
 export function renderDocumentHead(
   pathname: string,
   seo: SeoMetaInput | null | undefined,
-  headFragments: string[] = []
+  headFragments: string[] = [],
+  nonce?: string
 ): string {
   const seoTags = seo ? buildMetaTags(seo) : [];
   const seoHtml = seoTags.length > 0 ? renderMetaTags(seoTags) : "";
@@ -266,10 +269,10 @@ export function renderDocumentHead(
   }
 
   // Render JSON-LD structured data scripts
-  const jsonLdHtml = renderJsonLd(seo?.jsonLd);
+  const jsonLdHtml = renderJsonLd(seo?.jsonLd, nonce);
 
   // Render trusted inline head scripts
-  const headScriptsHtml = renderHeadScripts(seo?.headScripts);
+  const headScriptsHtml = renderHeadScripts(seo?.headScripts, nonce);
 
   // Inline anti-flash style — paints a dark background before app CSS parses,
   // so full-load navigations never flash white between pages. Apps can override
@@ -316,7 +319,15 @@ export function buildBodyOpenTag(bodyAttrs?: Record<string, string>): string {
 export function renderAttrs(attrs: Record<string, string> | undefined): string {
   if (!attrs || Object.keys(attrs).length === 0) return "";
   return Object.entries(attrs)
-    .map(([key, value]) => ` ${escapeAttrName(key)}="${escapeHtml(value)}"`)
+    .map(([key, value]) => {
+      // Drop event-handler attributes (onload, onclick, …). escapeAttrName
+      // permits them character-wise, so a name built from untrusted data could
+      // otherwise inject an inline handler on <html>/<body>.
+      if (/^on/i.test(key)) return "";
+      const name = escapeAttrName(key);
+      return name ? ` ${name}="${escapeHtml(value)}"` : "";
+    })
+    .filter(Boolean)
     .join("");
 }
 
@@ -439,19 +450,38 @@ function applyTitleTemplate(title: string, template: string | null | undefined):
   return template.replace(/%s/g, title);
 }
 
-function renderHeadScripts(headScripts: HeadScript | HeadScript[] | undefined): string {
+/**
+ * Render a CSP `nonce` attribute, only for a syntactically safe nonce
+ * (base64/base64url charset) so it can never inject extra attributes.
+ */
+function nonceAttr(nonce?: string): string {
+  if (!nonce || !/^[A-Za-z0-9+/_=-]+$/.test(nonce)) {
+    return "";
+  }
+  return ` nonce="${nonce}"`;
+}
+
+function renderHeadScripts(
+  headScripts: HeadScript | HeadScript[] | undefined,
+  nonce?: string
+): string {
   if (!headScripts) return "";
   const items = Array.isArray(headScripts) ? headScripts : [headScripts];
   if (items.length === 0) return "";
   return items
     .map((script) => {
-      if (/<\/script>/i.test(script.content)) {
-        console.warn("[neutron] headScripts content contains </script> — skipping to prevent injection.");
+      // Reject content that can close the inline <script> element. `</script>`
+      // alone is insufficient — HTML5 ends the element on `</script` followed by
+      // whitespace, `/`, or `>`. This is the real breakout vector; we don't also
+      // block `<script`/`<!--`, which would false-positive on legitimate inline
+      // JS (e.g. a string containing "<script>") in otherwise-trusted content.
+      if (/<\/script[\s/>]/i.test(script.content)) {
+        console.warn("[neutron] headScripts content contains a </script> close — skipping to prevent injection.");
         return "";
       }
       const typeAttr = script.type ? ` type="${escapeHtml(script.type)}"` : "";
       const idAttr = script.id ? ` id="${escapeHtml(script.id)}"` : "";
-      return `<script${typeAttr}${idAttr} data-neutron-head="true">${script.content}</script>`;
+      return `<script${typeAttr}${idAttr}${nonceAttr(nonce)} data-neutron-head="true">${script.content}</script>`;
     })
     .filter(Boolean)
     .join("\n");
@@ -461,7 +491,10 @@ function escapeAttrName(name: string): string {
   return name.replace(/[^a-zA-Z0-9\-_:]/g, "");
 }
 
-function renderJsonLd(jsonLd: object | object[] | undefined): string {
+function renderJsonLd(
+  jsonLd: object | object[] | undefined,
+  nonce?: string
+): string {
   if (!jsonLd) return "";
   const items = Array.isArray(jsonLd) ? jsonLd : [jsonLd];
   if (items.length === 0) return "";
@@ -471,7 +504,7 @@ function renderJsonLd(jsonLd: object | object[] | undefined): string {
         .replace(/</g, "\\u003c")
         .replace(/>/g, "\\u003e")
         .replace(/&/g, "\\u0026");
-      return `<script type="application/ld+json">${json}</script>`;
+      return `<script type="application/ld+json"${nonceAttr(nonce)}>${json}</script>`;
     })
     .join("\n");
 }
@@ -499,22 +532,6 @@ function normalizePathname(pathname: string): string {
   }
   const trimmed = value.replace(/\/+$/, "");
   return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
-}
-
-function escapeXml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }
 
 // ── JSON-LD Schema Helpers ──

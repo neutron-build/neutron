@@ -7,7 +7,7 @@ export interface DataConfigInput {
   /**
    * Environment variable holding the Nucleus server URL.
    * When `database` is `"nucleus"` (or auto-detected), this is used to
-   * configure the `@neutron/nucleus` client transport.
+   * configure the `@neutron-build/nucleus` client transport.
    * Defaults to `"NUCLEUS_URL"`, falling back to the Postgres URL env var.
    */
   nucleusUrlEnv?: string;

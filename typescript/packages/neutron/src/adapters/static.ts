@@ -21,7 +21,18 @@ export function adapterStatic(options: StaticAdapterOptions = {}): NeutronAdapte
         );
       }
 
-      const defaultHeaders = [
+      const defaultHeaders: Array<{ source: string; headers: Record<string, string> }> = [
+        {
+          // Security headers on every response. nosniff and X-Frame-Options are
+          // the load-bearing ones for static hosting; emitting them by default
+          // means deployed sites aren't left bare unless the operator opts out.
+          source: "/*",
+          headers: {
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+            "Referrer-Policy": "strict-origin-when-cross-origin",
+          },
+        },
         {
           source: "/assets/*",
           headers: {

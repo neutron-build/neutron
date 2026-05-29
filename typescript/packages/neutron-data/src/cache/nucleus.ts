@@ -9,10 +9,10 @@
 import type { CacheClient } from "./index.js";
 
 /**
- * A KV-like interface matching the subset of @neutron/nucleus KVModel
+ * A KV-like interface matching the subset of @neutron-build/nucleus KVModel
  * needed by NucleusCacheClient.
  *
- * We define this locally to avoid a hard dependency on @neutron/nucleus
+ * We define this locally to avoid a hard dependency on @neutron-build/nucleus
  * from neutron-data (it's a peer dependency).
  */
 export interface NucleusKVLike {
@@ -24,7 +24,7 @@ export interface NucleusKVLike {
 }
 
 export interface NucleusCacheClientOptions {
-  /** A KV model instance (from `@neutron/nucleus`). */
+  /** A KV model instance (from `@neutron-build/nucleus`). */
   kv: NucleusKVLike;
   /** Key prefix for all cache entries (default `"cache:"`). */
   prefix?: string;

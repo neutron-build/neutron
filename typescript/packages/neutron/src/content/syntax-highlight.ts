@@ -1,3 +1,5 @@
+import { escapeHtml } from "../core/escape.js";
+
 interface ShikiHighlighter {
   codeToHtml: (code: string, options: { lang: string; theme: string }) => string;
   getLoadedLanguages: () => string[];
@@ -16,14 +18,6 @@ async function getHighlighter(theme: string): Promise<ShikiHighlighter | null> {
       .catch(() => null);
   }
   return highlighterPromise;
-}
-
-function escapeHtml(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
 }
 
 export async function highlightCode(
@@ -48,12 +42,41 @@ export async function highlightCode(
   return highlighter.codeToHtml(code, { lang, theme });
 }
 
+interface CodeToken {
+  type: string;
+  text?: string;
+  lang?: string;
+}
+
+/**
+ * Marked extension that syntax-highlights fenced code blocks with Shiki.
+ *
+ * Marked v15's renderer methods are synchronous — an `async` renderer is not
+ * awaited and stringifies to "[object Promise]". So highlighting happens in the
+ * async `walkTokens` hook (which IS awaited under `async: true`), keyed per
+ * token in a WeakMap, and the sync `renderer.code` simply returns the
+ * pre-computed HTML (falling back to escaped <pre><code> if Shiki is absent).
+ */
 export function markedShikiExtension(theme = "github-dark"): object {
+  const highlighted = new WeakMap<object, string>();
   return {
     async: true,
+    async walkTokens(token: CodeToken) {
+      if (token.type === "code") {
+        highlighted.set(
+          token,
+          await highlightCode(token.text || "", token.lang || "text", theme),
+        );
+      }
+    },
     renderer: {
-      async code({ text, lang }: { text: string; lang?: string }) {
-        return highlightCode(text, lang || "text", theme);
+      code(token: CodeToken) {
+        const cached = highlighted.get(token);
+        if (cached !== undefined) {
+          return cached;
+        }
+        const lang = token.lang || "text";
+        return `<pre><code class="language-${lang}">${escapeHtml(token.text || "")}</code></pre>`;
       },
     },
   };

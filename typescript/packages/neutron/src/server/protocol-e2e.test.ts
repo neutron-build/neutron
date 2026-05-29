@@ -85,6 +85,37 @@ export default function NoHydratePage({ data }) {
 `,
     "utf-8"
   );
+
+  await fs.writeFile(
+    path.join(rootDir, "src", "routes", "csp-demo.ts"),
+    `
+import { h } from "preact";
+
+export const config = { mode: "app" };
+
+// Simulates createCspNonceMiddleware: sets a nonce on context before render.
+export const middleware = async (request, context, next) => {
+  context.cspNonce = "testnonce123";
+  return next();
+};
+
+export function head() {
+  return {
+    jsonLd: { "@context": "https://schema.org", "@type": "WebPage", name: "CSP" },
+    headScripts: [{ content: "console.log('csp');" }],
+  };
+}
+
+export async function loader() {
+  return { ok: true };
+}
+
+export default function CspDemo({ data }) {
+  return h("main", null, "csp " + data.ok);
+}
+`,
+    "utf-8"
+  );
 }
 
 describe("protocol e2e", () => {
@@ -192,6 +223,47 @@ describe("protocol e2e", () => {
     expect(noHydrateBody).toContain("NoHydrate: No hydrate payload");
     expect(noHydrateBody).not.toContain("__NEUTRON_DATA_SERIALIZED__");
   }, 30000);
+
+  it("never shares the app-response cache across authenticated requests", async () => {
+    // Regression: the app-response cache is keyed only on path+query, so it is
+    // shared across users. A request carrying Authorization (or Cookie) must
+    // never be read from or stored into it, or one user's page leaks to others.
+    const authed1 = await fetch(`${baseUrl}/users/3`, {
+      headers: { Accept: "application/json", Authorization: "Bearer user-a" },
+    });
+    expect(authed1.status).toBe(200);
+    expect(authed1.headers.get("x-neutron-cache")).toBeNull();
+
+    // A repeat authenticated request is still a MISS — never served from cache.
+    const authed2 = await fetch(`${baseUrl}/users/3`, {
+      headers: { Accept: "application/json", Authorization: "Bearer user-a" },
+    });
+    expect(authed2.headers.get("x-neutron-cache")).toBeNull();
+
+    // An anonymous request is a fresh MISS too — the authenticated responses
+    // did not populate the shared cache.
+    const anon = await fetch(`${baseUrl}/users/3`, {
+      headers: { Accept: "application/json" },
+    });
+    expect(anon.headers.get("x-neutron-cache")).toBeNull();
+  }, 30000);
+
+  it("stamps the CSP nonce onto framework inline scripts when set on context", async () => {
+    const res = await fetch(`${baseUrl}/csp-demo`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The serialized-data inline script and the client module script must carry
+    // the nonce so a nonce-based CSP admits them.
+    expect(html).toContain('nonce="testnonce123"');
+    expect(html).toMatch(/<script nonce="testnonce123">window\.__NEUTRON_DATA_SERIALIZED__/);
+    // Head-emitted scripts (JSON-LD + inline headScripts) carry it too.
+    expect(html).toMatch(/<script type="application\/ld\+json" nonce="testnonce123">/);
+    expect(html).toMatch(/<script nonce="testnonce123" data-neutron-head="true">/);
+
+    // A route without the middleware emits no nonce attribute.
+    const plain = await fetch(`${baseUrl}/users/1`);
+    expect(await plain.text()).not.toContain("nonce=");
+  });
 
   it("applies redirects, rewrites, and route headers from config", async () => {
     const redirectResponse = await fetch(`${baseUrl}/legacy/9`, {

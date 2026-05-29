@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Plugin, ViteDevServer } from "vite";
+import { escapeHtml } from "../core/escape.js";
 import { discoverRoutes } from "../core/manifest.js";
 import { prepareRouteTypes } from "../core/route-typegen.js";
 import { createRouter } from "../core/router.js";
@@ -1001,14 +1002,6 @@ ${dataScript}
 ${clientScript}
 </body>
 </html>`;
-}
-
-function escapeHtml(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
 }
 
 export function generateRoutesModule(routes: Route[]): string {

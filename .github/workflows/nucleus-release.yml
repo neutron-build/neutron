@@ -137,7 +137,9 @@ jobs:
       - name: Package
         id: package
         run: |
-          ARCHIVE="nucleus-${{ steps.version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
+          # Unversioned asset name so /releases/latest/download/<asset> resolves
+          # without needing to know the version in the URL.
+          ARCHIVE="nucleus-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
           tar czf "$ARCHIVE" -C "nucleus/target/${{ matrix.target }}/release" nucleus
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
@@ -190,7 +192,7 @@ jobs:
 
             ```bash
             # Download and extract
-            tar xzf nucleus-${{ steps.version.outputs.version }}-<os>-<arch>.tar.gz
+            tar xzf nucleus-<os>-<arch>.tar.gz
 
             # Start the server (PostgreSQL wire protocol on :5432)
             ./nucleus serve
@@ -209,7 +211,7 @@ jobs:
 
             | File | OS | Arch |
             |------|----|------|
-            | `nucleus-${{ steps.version.outputs.version }}-linux-amd64.tar.gz` | Linux | x86_64 |
-            | `nucleus-${{ steps.version.outputs.version }}-linux-arm64.tar.gz` | Linux | aarch64 |
-            | `nucleus-${{ steps.version.outputs.version }}-darwin-arm64.tar.gz` | macOS | Apple Silicon |
-            | `nucleus-${{ steps.version.outputs.version }}-darwin-amd64.tar.gz` | macOS | Intel |
+            | `nucleus-linux-amd64.tar.gz` | Linux | x86_64 |
+            | `nucleus-linux-arm64.tar.gz` | Linux | aarch64 |
+            | `nucleus-darwin-arm64.tar.gz` | macOS | Apple Silicon |
+            | `nucleus-darwin-amd64.tar.gz` | macOS | Intel |

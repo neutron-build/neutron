@@ -74,10 +74,11 @@ export function ServerIsland({ children, fallback, id }: ServerIslandProps) {
     const res = await fetch(${islandEndpointJson}, { cache: 'no-store' });
     if (!res.ok) throw new Error('Failed to load island');
 
-    let html = await res.text();
-    // SECURITY: Defense-in-depth — sanitize server-rendered HTML before injection
-    html = html.replace(/<script\\b[^<]*(?:(?!<\\/script>)<[^<]*)*<\\/script>/gi, '');
-    html = html.replace(/\\s+on\\w+\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s>]*)/gi, '');
+    // The island endpoint returns this same app's server-rendered output of a
+    // registered Preact component — trusted markup whose dynamic data was
+    // already HTML-escaped during SSR. (The previous regex "sanitizer" here was
+    // bypassable theater and is intentionally removed.)
+    const html = await res.text();
     el.innerHTML = html;
 
     // Dispatch event for hydration

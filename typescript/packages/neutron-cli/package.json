@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/cli",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "CLI for the Neutron framework. Dev server, production builds, and deployment.",
   "author": "Tyler",
   "license": "MIT",
