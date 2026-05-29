@@ -8,7 +8,7 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/neutron-build/neutron",
-    "directory": "packages/create-neutron"
+    "directory": "typescript/packages/create-neutron"
   },
   "keywords": [
     "neutron",
@@ -23,6 +23,7 @@
   },
   "files": [
     "dist",
+    "!dist/**/*.test.*",
     "templates"
   ],
   "scripts": {
