@@ -5,23 +5,54 @@ on:
     branches: [main]
     paths:
       - "cli/**"
+      - "studio/**"
       - ".github/workflows/cli.yml"
     tags:
       - "cli/v*"
   pull_request:
     paths:
       - "cli/**"
+      - "studio/**"
       - ".github/workflows/cli.yml"
 
 permissions:
   contents: write
 
 jobs:
-  test:
-    name: Test
+  # The CLI embeds the compiled Studio frontend (//go:embed all:dist in
+  # cli/internal/studio/embed.go). studio/dist is a build artifact, not
+  # committed, so build it once here and share it with every go-build job.
+  studio:
+    name: Build Studio
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+        working-directory: studio
+      - run: npm run build
+        working-directory: studio
+      - uses: actions/upload-artifact@v4
+        with:
+          name: studio-dist
+          path: studio/dist
+          retention-days: 1
+          if-no-files-found: error
+
+  test:
+    name: Test
+    needs: studio
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Studio dist
+        uses: actions/download-artifact@v4
+        with:
+          name: studio-dist
+          path: cli/internal/studio/dist
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -43,6 +74,7 @@ jobs:
 
   cross-compile:
     name: Cross-compile
+    needs: studio
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -59,6 +91,12 @@ jobs:
             goarch: amd64
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fetch Studio dist
+        uses: actions/download-artifact@v4
+        with:
+          name: studio-dist
+          path: cli/internal/studio/dist
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -89,6 +127,12 @@ jobs:
             arch: arm64
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fetch Studio dist
+        uses: actions/download-artifact@v4
+        with:
+          name: studio-dist
+          path: cli/internal/studio/dist
 
       - name: Install Go
         uses: actions/setup-go@v5
@@ -137,6 +181,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: neutron-*
           merge-multiple: true
 
       - name: Generate checksums
