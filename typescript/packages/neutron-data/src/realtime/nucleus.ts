@@ -14,14 +14,14 @@
 import type { RealtimeBus } from "./index.js";
 
 /**
- * PubSub-like interface matching the subset of @neutron/nucleus PubSubModel.
+ * PubSub-like interface matching the subset of @neutron-build/nucleus PubSubModel.
  */
 export interface NucleusPubSubLike {
   publish(channel: string, message: string): Promise<number>;
 }
 
 export interface NucleusRealtimeBusOptions {
-  /** A PubSub model instance (from `@neutron/nucleus`). */
+  /** A PubSub model instance (from `@neutron-build/nucleus`). */
   pubsub: NucleusPubSubLike;
 }
 

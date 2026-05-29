@@ -12,8 +12,13 @@ const validatorPath = resolve(codexRoot, "scripts/validate_all.py");
 const venvPython = resolve(codexRoot, ".venv/bin/python");
 
 if (!existsSync(validatorPath)) {
-  console.error(`✗ validate-all: cannot find validator at ${validatorPath}`);
-  process.exit(1);
+  console.warn(
+    `[codex] validator not found at ${validatorPath} — skipping.\n` +
+      `        Expected when the sister 'codex' repo isn't checked out\n` +
+      `        alongside Neutron; the validator runs at content-edit time\n` +
+      `        in that environment.`,
+  );
+  process.exit(0);
 }
 
 // Prefer the codex venv (has pyyaml), fall back to system python3.

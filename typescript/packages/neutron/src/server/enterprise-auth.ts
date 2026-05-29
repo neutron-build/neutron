@@ -9,6 +9,7 @@
  * @module enterprise-auth
  */
 
+import { randomUUID } from "node:crypto";
 import type { MiddlewareFn, AppContext } from "../core/types.js";
 
 // ============================================================================
@@ -429,7 +430,7 @@ export function createMemoryAuditLogger(): AuditLogger {
     async log(entry) {
       logs.push({
         ...entry,
-        id: `audit_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+        id: `audit_${Date.now()}_${randomUUID()}`,
         timestamp: Date.now(),
       });
 

@@ -88,6 +88,23 @@ export function serializeCookie(
     throw new Error(`Invalid cookie path: "${path}"`);
   }
 
+  // Enforce the browser-mandated __Secure-/__Host- name-prefix contract so we
+  // never emit a cookie the browser will silently drop (which would also mask
+  // a security misconfiguration).
+  if (name.startsWith("__Secure-") || name.startsWith("__Host-")) {
+    if (!options.secure) {
+      throw new Error(`Cookie "${name}" uses a secure prefix and requires Secure`);
+    }
+  }
+  if (name.startsWith("__Host-")) {
+    if (options.domain) {
+      throw new Error(`Cookie "${name}" uses the __Host- prefix and must not set Domain`);
+    }
+    if (path !== "/") {
+      throw new Error(`Cookie "${name}" uses the __Host- prefix and requires Path=/`);
+    }
+  }
+
   const segments = [`${name}=${encodeURIComponent(value)}`];
 
   if (Number.isFinite(options.maxAge)) {

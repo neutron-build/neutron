@@ -202,6 +202,10 @@ describe("platform adapters", () => {
     expect(headersText).toContain("/assets/*");
     expect(headersText).toContain("/blog");
     expect(headersText).toContain("must-revalidate");
+    // Default security headers are emitted for every route.
+    expect(headersText).toContain("/*");
+    expect(headersText).toContain("X-Content-Type-Options: nosniff");
+    expect(headersText).toContain("X-Frame-Options: DENY");
 
     expect(fs.existsSync(path.join(outDir, "assets/app.js.gz"))).toBe(true);
     expect(fs.existsSync(path.join(outDir, "assets/app.js.br"))).toBe(true);

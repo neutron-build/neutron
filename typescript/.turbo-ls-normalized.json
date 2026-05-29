@@ -1,0 +1,88 @@
+{
+  "packageManager": "pnpm9",
+  "packages": {
+    "count": 20,
+    "items": [
+      {
+        "name": "@neutron-build/auth",
+        "path": "packages/neutron-auth"
+      },
+      {
+        "name": "@neutron-build/cache-redis",
+        "path": "packages/neutron-cache-redis"
+      },
+      {
+        "name": "@neutron-build/cli",
+        "path": "packages/neutron-cli"
+      },
+      {
+        "name": "@neutron-build/core",
+        "path": "packages/neutron"
+      },
+      {
+        "name": "@neutron-build/data",
+        "path": "packages/neutron-data"
+      },
+      {
+        "name": "@neutron-build/nucleus",
+        "path": "packages/neutron-nucleus"
+      },
+      {
+        "name": "@neutron-build/ops",
+        "path": "packages/neutron-ops"
+      },
+      {
+        "name": "@neutron-build/otel",
+        "path": "packages/neutron-otel"
+      },
+      {
+        "name": "@neutron-build/security",
+        "path": "packages/neutron-security"
+      },
+      {
+        "name": "@neutron/example-marketing-reference",
+        "path": "examples/marketing-reference"
+      },
+      {
+        "name": "@neutron/example-saas-reference",
+        "path": "examples/saas-reference"
+      },
+      {
+        "name": "@neutron/playground",
+        "path": "apps/playground"
+      },
+      {
+        "name": "@neutron/playground-react-compat",
+        "path": "apps/playground-react-compat"
+      },
+      {
+        "name": "@neutron/tebian-os",
+        "path": "apps/tebian-os"
+      },
+      {
+        "name": "codex",
+        "path": "apps/codex"
+      },
+      {
+        "name": "create-neutron",
+        "path": "packages/create-neutron"
+      },
+      {
+        "name": "neutron-site",
+        "path": "apps/site"
+      },
+      {
+        "name": "observe-dashboard",
+        "path": "apps/observe"
+      },
+      {
+        "name": "website-smoke",
+        "path": "apps/website-smoke"
+      },
+      {
+        "name": "website-smoke-2",
+        "path": "apps/website-smoke-2"
+      }
+    ]
+  }
+}

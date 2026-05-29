@@ -55,4 +55,21 @@ describe("cookies", () => {
     expect(parsed.token).toBe("abc123");
     expect(parsed.theme).toBe("dark");
   });
+
+  it("enforces the __Secure-/__Host- cookie name prefix contract", () => {
+    // __Secure- requires Secure
+    expect(() => serializeCookie("__Secure-sid", "v")).toThrow("requires Secure");
+    expect(() =>
+      serializeCookie("__Secure-sid", "v", { secure: true })
+    ).not.toThrow();
+
+    // __Host- requires Secure, Path=/, and no Domain
+    expect(() => serializeCookie("__Host-sid", "v", { secure: true })).not.toThrow();
+    expect(() =>
+      serializeCookie("__Host-sid", "v", { secure: true, domain: "example.com" })
+    ).toThrow("must not set Domain");
+    expect(() =>
+      serializeCookie("__Host-sid", "v", { secure: true, path: "/app" })
+    ).toThrow("requires Path=/");
+  });
 });

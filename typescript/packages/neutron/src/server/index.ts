@@ -32,6 +32,7 @@ import {
   type NeutronCacheStores,
 } from "./cache-store.js";
 import { createEntityTag, requestHasMatchingEtag } from "./cache-utils.js";
+import { escapeHtml } from "../core/escape.js";
 import { neutronPlugin } from "../vite/plugin.js";
 import {
   resolveRuntimeAliases,
@@ -120,6 +121,12 @@ export interface NeutronServerOptions {
   runtime?: NeutronRuntime;
   cors?: false | CorsOptions;
   securityHeaders?: false | { headers?: Record<string, string> };
+  /**
+   * Allow-list of Host header values this server will serve. When set, requests
+   * with any other Host get a 400 — preventing Host-header injection into
+   * absolute URLs, links, and cache keys. Unset = accept any Host (unchanged).
+   */
+  trustedHosts?: string[];
   cache?: NeutronCacheStores;
   routes?: NeutronRoutesConfig;
   hooks?: NeutronServerHooks;
@@ -249,6 +256,7 @@ export async function createServer(options: NeutronServerOptions = {}) {
     runtime = "preact",
     cors,
     securityHeaders,
+    trustedHosts,
     cache,
     routes: routeRules,
     hooks,
@@ -290,6 +298,19 @@ export async function createServer(options: NeutronServerOptions = {}) {
   }
 
   const app = new Hono();
+
+  // Reject untrusted Host headers first, before any other processing, so a
+  // spoofed Host can't reach URL/link construction or cache keying.
+  if (trustedHosts && trustedHosts.length > 0) {
+    const allowedHosts = new Set(trustedHosts.map((value) => value.toLowerCase()));
+    app.use("*", async (c, next) => {
+      const host = (c.req.raw.headers.get("host") || "").toLowerCase();
+      if (!allowedHosts.has(host)) {
+        return new Response("Invalid Host", { status: 400 });
+      }
+      return next();
+    });
+  }
 
   if (enableCompress) {
     app.use("*", compress());
@@ -505,8 +526,16 @@ export async function createServer(options: NeutronServerOptions = {}) {
       }
 
       const appCacheMaxAge = match.route.config.cache?.maxAge ?? 0;
+      // SECURITY: the app-response cache is keyed only on path+query, so it is
+      // shared across users. Never read, single-flight-share, or store a
+      // response for a request that carries credentials (Cookie/Authorization),
+      // since it may be authenticated/personalized and would otherwise leak one
+      // user's rendered page to others. Conditional/no-cache requests without
+      // credentials still revalidate normally.
       const appCacheKey =
-        appCacheMaxAge > 0 ? buildAppCacheKey(c.req.raw, effectivePathname) : null;
+        appCacheMaxAge > 0 && !requestCarriesCredentials(c.req.raw)
+          ? buildAppCacheKey(c.req.raw, effectivePathname)
+          : null;
 
       if (appCacheKey && (method === "GET" || method === "HEAD")) {
         const hit = await readCachedAppResponse(
@@ -973,6 +1002,12 @@ async function handleAppRouteRequest(
         clientEntryScriptSrc,
         includeClientRuntime,
         headers: routeHeaders,
+        // Set by createCspNonceMiddleware (if used) before next(); carried onto
+        // the framework's inline scripts so a nonce-based CSP admits them.
+        nonce:
+          typeof (context as { cspNonce?: unknown }).cspNonce === "string"
+            ? ((context as { cspNonce?: unknown }).cspNonce as string)
+            : undefined,
       });
     } catch (error) {
       emitHook(hooks?.onError, {
@@ -1018,6 +1053,7 @@ interface RenderAppRouteHtmlResponseArgs {
   clientEntryScriptSrc: string | null;
   includeClientRuntime: boolean;
   headers: Headers;
+  nonce?: string;
 }
 
 async function renderAppRouteHtmlResponse(
@@ -1038,7 +1074,8 @@ async function renderAppRouteHtmlResponse(
       args.loaderData,
       args.actionData,
       args.clientEntryScriptSrc,
-      args.includeClientRuntime
+      args.includeClientRuntime,
+      args.nonce
     );
     return new Response(fullHtml, { headers });
   }
@@ -1048,7 +1085,8 @@ async function renderAppRouteHtmlResponse(
     args.loaderData,
     args.actionData,
     args.clientEntryScriptSrc,
-    args.includeClientRuntime
+    args.includeClientRuntime,
+    args.nonce
   );
 
   try {
@@ -1063,7 +1101,8 @@ async function renderAppRouteHtmlResponse(
       args.loaderData,
       args.actionData,
       args.clientEntryScriptSrc,
-      args.includeClientRuntime
+      args.includeClientRuntime,
+      args.nonce
     );
     return new Response(fullHtml, { headers });
   }
@@ -1142,14 +1181,24 @@ async function resolveRouteHeadHtml(
     }
 
     if (typeof resolved === "string") {
-      headFragments.push(sanitizeHeadHtml(resolved));
+      // A raw string returned from head() is developer-authored markup (the
+      // explicit escape hatch), so it is emitted faithfully — matching the
+      // production build output. Data-driven head content should use the
+      // structured SeoMetaInput return value, which is HTML-escaped.
+      headFragments.push(resolved);
       continue;
     }
 
     mergedSeo = mergeSeoMetaInput(mergedSeo, resolved);
   }
 
-  return renderDocumentHead(args.pathname, mergedSeo, headFragments);
+  // Carry the CSP nonce (set by createCspNonceMiddleware) onto head-emitted
+  // scripts (JSON-LD, inline headScripts) so a nonce-based CSP admits them.
+  const nonce =
+    typeof (args.context as { cspNonce?: unknown }).cspNonce === "string"
+      ? ((args.context as { cspNonce?: unknown }).cspNonce as string)
+      : undefined;
+  return renderDocumentHead(args.pathname, mergedSeo, headFragments, nonce);
 }
 
 function toHeaders(
@@ -1378,6 +1427,15 @@ function buildAppCacheKey(request: Request, pathname: string): string {
   return `${variant}:${pathname}${url.search}`;
 }
 
+/**
+ * A request carries credentials when it has a Cookie or Authorization header.
+ * Such requests may be authenticated/personalized and must never participate in
+ * the shared, path-keyed app-response cache (read, store, or single-flight).
+ */
+function requestCarriesCredentials(request: Request): boolean {
+  return request.headers.has("Authorization") || request.headers.has("Cookie");
+}
+
 function isLoaderDataCacheableRequest(request: Request): boolean {
   const cacheControl = request.headers.get("Cache-Control") || "";
   if (cacheControl.includes("no-cache") || cacheControl.includes("no-store")) {
@@ -1565,6 +1623,14 @@ async function maybeStoreAppResponse(
 
   const cacheControl = response.headers.get("Cache-Control") || "";
   if (cacheControl.includes("no-store") || cacheControl.includes("private")) {
+    return;
+  }
+
+  // A response that reflects a per-request Origin (CORS) must not be shared —
+  // storing it would replay one origin's Access-Control-Allow-Origin to
+  // another. (The Accept-based JSON/HTML split is already part of the cache
+  // key, and Cookie/Authorization requests are excluded before we get here.)
+  if (response.headers.has("Access-Control-Allow-Origin")) {
     return;
   }
 
@@ -1818,14 +1884,27 @@ function wrapHtml(
   loaderData: Record<string, unknown>,
   actionData?: unknown,
   clientEntryScriptSrc: string | null = null,
-  includeClientRuntime: boolean = true
+  includeClientRuntime: boolean = true,
+  nonce?: string
 ): string {
   return `${buildHtmlPrefix(pathname, headHtml)}${content}${buildHtmlSuffix(
     loaderData,
     actionData,
     clientEntryScriptSrc,
-    includeClientRuntime
+    includeClientRuntime,
+    nonce
   )}`;
+}
+
+/**
+ * Render a CSP `nonce` attribute. Only emitted for a syntactically safe nonce
+ * (base64/base64url charset), so it can never inject extra attributes.
+ */
+function nonceAttr(nonce?: string): string {
+  if (!nonce || !/^[A-Za-z0-9+/_=-]+$/.test(nonce)) {
+    return "";
+  }
+  return ` nonce="${nonce}"`;
 }
 
 function buildHtmlPrefix(pathname: string, headHtml: string = ""): string {
@@ -1842,7 +1921,8 @@ function buildHtmlSuffix(
   loaderData: Record<string, unknown>,
   actionData?: unknown,
   clientEntryScriptSrc: string | null = null,
-  includeClientRuntime: boolean = true
+  includeClientRuntime: boolean = true,
+  nonce?: string
 ): string {
   if (!includeClientRuntime) {
     return `</div>
@@ -1855,12 +1935,16 @@ function buildHtmlSuffix(
     allData.__action__ = actionData;
   }
 
+  // Carry the CSP nonce onto the framework's own inline/module scripts so a
+  // nonce-based Content-Security-Policy admits them (without it, the data
+  // script is blocked and hydration breaks).
+  const na = nonceAttr(nonce);
   const dataScript =
     Object.keys(allData).length > 0
-      ? `<script>window.__NEUTRON_DATA_SERIALIZED__=${serializeForInlineScript(allData)};</script>`
+      ? `<script${na}>window.__NEUTRON_DATA_SERIALIZED__=${serializeForInlineScript(allData)};</script>`
       : "";
   const clientScript = clientEntryScriptSrc
-    ? `<script type="module" src="${escapeHtml(clientEntryScriptSrc)}"></script>`
+    ? `<script type="module"${na} src="${escapeHtml(clientEntryScriptSrc)}"></script>`
     : "";
 
   return `</div>
@@ -1910,25 +1994,6 @@ function getClientEntryScriptSrc(distDir: string): string | null {
   return match?.[1] || null;
 }
 
-/** Strip <script> tags, event handler attributes, and javascript: URLs from head HTML fragments. */
-function sanitizeHeadHtml(html: string): string {
-  // Strip script tags and their contents
-  html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
-  // Strip event handler attributes
-  html = html.replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/gi, '');
-  // Strip javascript: URLs
-  html = html.replace(/(?:href|src|action)\s*=\s*(?:"javascript:[^"]*"|'javascript:[^']*')/gi, '');
-  return html;
-}
-
-function escapeHtml(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;"); // SECURITY: Escape single quotes for use in single-quoted HTML attributes
-}
 
 let requestCounter = 0;
 
