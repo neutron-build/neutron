@@ -114,6 +114,9 @@ mojo/specs/
 
 # Old location remnants (build artifacts only, source is in rs/ and nucleus/)
 rust/
+# ...but the CLI's Rust scaffold template is real source, not a remnant.
+!cli/internal/scaffold/templates/rust/
+!cli/internal/scaffold/templates/rust/**
 
 # Site build output (source is tracked, dist is not)
 typescript/apps/site/dist/

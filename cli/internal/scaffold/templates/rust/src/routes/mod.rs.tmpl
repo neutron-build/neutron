@@ -1,0 +1,7 @@
+pub mod health;
+
+use neutron::prelude::*;
+
+pub fn register(app: App) -> App {
+    app.get("/health", health::check)
+}
