@@ -51,7 +51,27 @@ Each release entry should include date and version.
 1. Bump package versions.
 2. Commit version + changelog updates.
 3. Create git tag: `ts/vX.Y.Z` (the `ts/` prefix scopes the tag to the TypeScript implementation; the `typescript-publish.yml` workflow fires on `ts/v*`). Other implementations use parallel prefixes: e.g. `rust/v*`, `nucleus/v*`, `cli/v*`.
-4. Push the tag to `origin` (Forgejo). The push mirrors to GitHub, which triggers the publish workflow that runs `pnpm publish -r --access public --no-git-checks`.
+4. Push the tag to `origin` (Forgejo). The push mirrors to GitHub, which triggers `typescript-publish.yml`. That workflow runs the **build + test gate** (scoped to `./packages/*`, on Node 24) — but see the publishing note below: the `publish` step cannot complete in CI.
+
+## Publishing (must be done locally)
+
+The npm account enforces interactive two-factor auth for publishing, which a CI
+token cannot satisfy — the workflow's `publish` step fails with `EOTP`. So the
+build/test job is the gate, and the actual publish is run locally:
+
+```bash
+npm login --auth-type=web        # approve in browser with your security key
+cd typescript
+pnpm publish -r --access public --no-git-checks
+```
+
+- `pnpm publish -r` skips any version already on the registry, so it is safe to
+  re-run if it stops partway (e.g. an OTP prompt lapses mid-run).
+- After publishing, the npm registry can lag for several minutes — `npm view`
+  may report a just-published package as missing. Confirm against the registry's
+  `versions` map (`https://registry.npmjs.org/<pkg>`), not just `npm view`.
+- `workspace:*` cross-package deps are rewritten to the concrete version on
+  publish (verified: `@neutron-build/data` ships `@neutron-build/nucleus: "0.1.0"`).
 
 ## Support Policy
 
