@@ -1,7 +1,8 @@
 import * as path from "node:path";
 import * as fs from "node:fs";
+import { createHash } from "node:crypto";
 import { build as viteBuild, loadConfigFromFile, mergeConfig, createServer } from "vite";
-import { neutronPlugin } from "@neutron-build/core/vite";
+import { neutronPlugin, CLIENT_ROUTE_QUERY } from "@neutron-build/core/vite";
 import {
   discoverRoutes,
   adapterCloudflare,
@@ -128,6 +129,25 @@ export async function build(): Promise<void> {
 
   const userConfig = loadedConfig?.config || {};
 
+  // CSS Modules: pin scoped class names to a deterministic function of (local
+  // name, file path). The static/app pages are pre-rendered by a Vite *dev* SSR
+  // instance (createServer below) while their CSS is emitted by a separate Vite
+  // *build* instance; Vite's default scoped-name hashing differs between the two,
+  // so module classes in the HTML would not match any rule in the emitted CSS.
+  // Forcing one deterministic name in every Vite instance keeps them in sync.
+  const cwdFwd = cwd.replace(/\\/g, "/");
+  const cssConfig = {
+    modules: {
+      generateScopedName(name: string, filename: string): string {
+        const clean = filename.replace(/\?.*$/, "").replace(/\\/g, "/");
+        const rel = clean.startsWith(cwdFwd + "/") ? clean.slice(cwdFwd.length + 1) : clean;
+        const hash = createHash("sha256").update(`${rel}#${name}`).digest("hex").slice(0, 8);
+        const safe = name.replace(/[^a-zA-Z0-9_-]/g, "_");
+        return `_${safe}_${hash}`;
+      },
+    },
+  };
+
   // Build client assets. For static-only sites (no app routes), create a
   // temporary CSS-only entry so Vite still extracts stylesheets without
   // requiring an index.html entry point.
@@ -138,6 +158,7 @@ export async function build(): Promise<void> {
         configFile: false,
         root: cwd,
         plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
+        css: cssConfig,
         resolve: {
           ...(runtimeAliases ? { alias: runtimeAliases } : {}),
           dedupe: ["preact", "preact/hooks", "preact/compat", "preact/jsx-runtime"],
@@ -153,24 +174,39 @@ export async function build(): Promise<void> {
     const cssEntryDir = path.join(cwd, ".neutron");
     fs.mkdirSync(cssEntryDir, { recursive: true });
     const cssEntryPath = path.join(cssEntryDir, "_css-entry.js");
-    const cssImports = new Set<string>();
-    for (const route of routes) {
-      try {
-        const src = fs.readFileSync(route.file, "utf-8");
-        for (const m of src.matchAll(/import\s+["']([^"']+\.css)["']/g)) {
-          cssImports.add(path.resolve(path.dirname(route.file), m[1]));
-        }
-      } catch {}
-    }
+    // Import every route + layout MODULE through the client-route pipeline so Vite
+    // walks the real import graph and extracts ALL reachable CSS — side-effect
+    // imports, component-level CSS, AND CSS Modules — not just side-effect `*.css`
+    // imports textually present in the route file. The ?CLIENT_ROUTE_QUERY suffix
+    // makes neutronPlugin strip server-only code (loader/action) while keeping CSS
+    // imports in build mode, exactly as the client bundle does. Root-relative paths
+    // (`/src/...`) are used so Vite resolves them from the project root.
+    // Namespace-import + export each module so its component graph is NOT
+    // tree-shaken. Side-effect-only imports would keep `import "x.css"` lines but
+    // drop value-imported CSS Modules (`import s from "x.module.css"`) once the
+    // unused component that references them is shaken away.
+    const importLines: string[] = [];
+    const keepRefs: string[] = [];
+    routes.forEach((route, i) => {
+      const abs = route.file.replace(/\\/g, "/");
+      const rel = abs.startsWith(cwdFwd + "/") ? abs.slice(cwdFwd.length) : "/@fs" + abs;
+      importLines.push(`import * as __r${i} from ${JSON.stringify(rel + "?" + CLIENT_ROUTE_QUERY)};`);
+      keepRefs.push(`__r${i}`);
+    });
     fs.writeFileSync(
       cssEntryPath,
-      [...cssImports].map((p) => `import ${JSON.stringify(p)};`).join("\n") + "\n"
+      importLines.join("\n") + `\nexport const __keep = [${keepRefs.join(", ")}];\n`
     );
     await viteBuild(
       mergeConfig(userConfig, {
         configFile: false,
         root: cwd,
-        plugins: [],
+        plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
+        css: cssConfig,
+        resolve: {
+          ...(runtimeAliases ? { alias: runtimeAliases } : {}),
+          dedupe: ["preact", "preact/hooks", "preact/compat", "preact/jsx-runtime"],
+        },
         build: {
           outDir: outputDir,
           emptyOutDir: true,
@@ -218,6 +254,7 @@ export async function build(): Promise<void> {
       configFile: false,
       root: cwd,
       plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
+      css: cssConfig,
       ...(runtimeAliases ? { resolve: { alias: runtimeAliases } } : {}),
       ...(runtimeNoExternal.length > 0 ? { ssr: { noExternal: runtimeNoExternal } } : {}),
       server: {

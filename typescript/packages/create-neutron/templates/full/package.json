@@ -4,12 +4,12 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
-    "dev": "neutron dev",
-    "build": "neutron build",
-    "build:vercel": "neutron build --preset vercel",
-    "start": "neutron start",
-    "preview": "neutron preview",
-    "release:check": "neutron release-check --preset vercel"
+    "dev": "neutron-ts dev",
+    "build": "neutron-ts build",
+    "build:vercel": "neutron-ts build --preset vercel",
+    "start": "neutron-ts start",
+    "preview": "neutron-ts preview",
+    "release:check": "neutron-ts release-check --preset vercel"
   },
   "dependencies": {
     "@neutron-build/core": "__NEUTRON_VERSION__",
