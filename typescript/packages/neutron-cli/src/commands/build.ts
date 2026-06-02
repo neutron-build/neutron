@@ -255,12 +255,23 @@ export async function build(): Promise<void> {
       root: cwd,
       plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
       css: cssConfig,
-      ...(runtimeAliases ? { resolve: { alias: runtimeAliases } } : {}),
-      ...(runtimeNoExternal.length > 0 ? { ssr: { noExternal: runtimeNoExternal } } : {}),
+      resolve: {
+        ...(runtimeAliases ? { alias: runtimeAliases } : {}),
+        // Force one preact copy so route components and the renderer share the
+        // same hooks dispatcher (otherwise hooks crash during pre-render).
+        dedupe: ["preact", "preact/hooks", "preact/jsx-runtime", "preact/compat"],
+      },
+      ssr: {
+        // Process these through Vite's SSR graph (deduped) instead of native
+        // node resolution, so preact-render-to-string binds to the app's preact.
+        noExternal: ["preact", "preact/hooks", "preact-render-to-string", ...runtimeNoExternal],
+      },
       server: {
         middlewareMode: true,
         hmr: false,
         ws: false,
+        // Allow loading the CLI-provided renderer from outside the app root.
+        fs: { strict: false },
       },
       optimizeDeps: {
         noDiscovery: true,
@@ -268,6 +279,34 @@ export async function build(): Promise<void> {
       appType: "custom",
     })
   );
+
+  // Resolve the renderer through the SAME Vite SSR server that loads the route
+  // modules, so preact-render-to-string and the components share ONE preact
+  // instance. The CLI's own preact-render-to-string can otherwise bind to a
+  // different preact copy (e.g. under pnpm, or a linked/monorepo install),
+  // leaving the hooks dispatcher unset and crashing any component that uses
+  // useState/useEffect during pre-render with "Cannot read properties of
+  // undefined (reading '__H')".
+  let appH = h;
+  let appRender = renderToString;
+  try {
+    // Load the renderer + preact through the SAME Vite SSR graph as the route
+    // components so they share ONE preact instance (otherwise hooks crash during
+    // pre-render). This resolves them from the app, where preact and (ideally)
+    // preact-render-to-string are installed at a single matched version. If the
+    // app doesn't ship preact-render-to-string, we fall back to the CLI copy,
+    // which is correct whenever the app and CLI resolve the same preact.
+    const appPreact = (await server.ssrLoadModule("preact")) as { h?: typeof h };
+    const appRts = (await server.ssrLoadModule("preact-render-to-string")) as {
+      renderToString?: typeof renderToString;
+      default?: { renderToString?: typeof renderToString };
+    };
+    if (appPreact?.h) appH = appPreact.h;
+    const rts = appRts?.renderToString ?? appRts?.default?.renderToString;
+    if (rts) appRender = rts;
+  } catch {
+    // Fall back to the CLI-bundled renderer (single-preact installs are fine).
+  }
 
   // Get layouts map
   const layouts = new Map<string, Route>();
@@ -448,7 +487,7 @@ export async function build(): Promise<void> {
           const layoutChain = getLayoutChain(route);
 
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          let element: any = h(module.default as any, {
+          let element: any = appH(module.default as any, {
             data: loaderData,
             params,
           });
@@ -465,11 +504,11 @@ export async function build(): Promise<void> {
               } as LoaderArgs);
             }
             if (layoutModule?.default) {
-              element = h(layoutModule.default as any, { data: layoutData }, element);
+              element = appH(layoutModule.default as any, { data: layoutData }, element);
             }
           }
 
-          const html = renderToString(element);
+          const html = appRender(element);
           const headHtml = await resolveRouteHeadHtml(
             route,
             layoutChain,
@@ -525,7 +564,7 @@ export async function build(): Promise<void> {
       const layoutChain = getLayoutChain(route);
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let element: any = h(module.default as any, {
+      let element: any = appH(module.default as any, {
         data: loaderData,
         params: {},
       });
@@ -545,7 +584,7 @@ export async function build(): Promise<void> {
         }
       }
 
-      const html = renderToString(element);
+      const html = appRender(element);
       const headHtml = await resolveRouteHeadHtml(
         route,
         layoutChain,

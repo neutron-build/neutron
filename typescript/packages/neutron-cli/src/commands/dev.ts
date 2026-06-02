@@ -90,8 +90,15 @@ export async function dev(): Promise<void> {
           routeRules: neutronConfig.routes,
         }),
       ],
-      ...(runtimeAliases ? { resolve: { alias: runtimeAliases } } : {}),
-      ...(runtimeNoExternal.length > 0 ? { ssr: { noExternal: runtimeNoExternal } } : {}),
+      resolve: {
+        ...(runtimeAliases ? { alias: runtimeAliases } : {}),
+        // One preact copy so dev SSR components and the renderer share a hooks
+        // dispatcher (matches the build path).
+        dedupe: ["preact", "preact/hooks", "preact/jsx-runtime", "preact/compat"],
+      },
+      ssr: {
+        noExternal: ["preact", "preact/hooks", "preact-render-to-string", ...runtimeNoExternal],
+      },
       server: {
         port,
         ...(host ? { host } : {}),

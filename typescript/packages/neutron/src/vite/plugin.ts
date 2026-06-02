@@ -635,8 +635,28 @@ async function handleRequest(
   clientEntry: string | null,
   devTiming?: DevTimingContext
 ): Promise<Response> {
-  const { renderToString } = await import("preact-render-to-string");
-  const { h } = await import("preact");
+  // Load the renderer + preact through the dev server's module graph so they
+  // share ONE preact instance with the route components (resolved via
+  // ssrLoadModule). Importing them here would bind to this package's own preact
+  // copy, leaving the hooks dispatcher unset and crashing any component that
+  // uses hooks during dev SSR. Falls back to a direct import when the app does
+  // not provide preact-render-to-string (single-preact installs are fine).
+  let renderToString: typeof import("preact-render-to-string").renderToString;
+  let h: typeof import("preact").h;
+  try {
+    const rts = (await server.ssrLoadModule("preact-render-to-string")) as {
+      renderToString?: typeof renderToString;
+      default?: { renderToString?: typeof renderToString };
+    };
+    const resolved = rts.renderToString ?? rts.default?.renderToString;
+    const appH = ((await server.ssrLoadModule("preact")) as { h?: typeof h }).h;
+    if (!resolved || !appH) throw new Error("renderer not resolvable from app");
+    renderToString = resolved;
+    h = appH;
+  } catch {
+    renderToString = (await import("preact-render-to-string")).renderToString;
+    h = (await import("preact")).h;
+  }
 
   const isMutation = ["POST", "PUT", "PATCH", "DELETE"].includes(request.method);
   const wantsJson =
@@ -844,8 +864,28 @@ async function renderError(
   moduleCache: Map<string, RouteModule>,
   clientEntry: string | null
 ): Promise<Response> {
-  const { renderToString } = await import("preact-render-to-string");
-  const { h } = await import("preact");
+  // Load the renderer + preact through the dev server's module graph so they
+  // share ONE preact instance with the route components (resolved via
+  // ssrLoadModule). Importing them here would bind to this package's own preact
+  // copy, leaving the hooks dispatcher unset and crashing any component that
+  // uses hooks during dev SSR. Falls back to a direct import when the app does
+  // not provide preact-render-to-string (single-preact installs are fine).
+  let renderToString: typeof import("preact-render-to-string").renderToString;
+  let h: typeof import("preact").h;
+  try {
+    const rts = (await server.ssrLoadModule("preact-render-to-string")) as {
+      renderToString?: typeof renderToString;
+      default?: { renderToString?: typeof renderToString };
+    };
+    const resolved = rts.renderToString ?? rts.default?.renderToString;
+    const appH = ((await server.ssrLoadModule("preact")) as { h?: typeof h }).h;
+    if (!resolved || !appH) throw new Error("renderer not resolvable from app");
+    renderToString = resolved;
+    h = appH;
+  } catch {
+    renderToString = (await import("preact-render-to-string")).renderToString;
+    h = (await import("preact")).h;
+  }
 
   // Find nearest ErrorBoundary (route first, then layouts)
   const module = moduleCache.get(route.id);
