@@ -38,7 +38,7 @@ export interface NeutronPluginOptions {
 }
 
 const ROUTES_DIR_DEFAULT = "src/routes";
-const CLIENT_ROUTE_QUERY = "neutron-client-route";
+export const CLIENT_ROUTE_QUERY = "neutron-client-route";
 const EMPTY_SERVER_MODULE_ID = "\0neutron:empty-server-module";
 const DEV_TOOLBAR_MODULE_ID = "virtual:neutron/dev-toolbar";
 const DEV_TOOLBAR_RESOLVED_ID = "\0virtual:neutron/dev-toolbar";
