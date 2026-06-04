@@ -687,3 +687,38 @@ describe("template DX files", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// detectPackageManager — "Next steps" commands should match the PM the user ran.
+// ---------------------------------------------------------------------------
+
+describe("detectPackageManager", () => {
+  function detectPackageManager(): string {
+    const ua = process.env.npm_config_user_agent || "";
+    if (ua.startsWith("pnpm")) return "pnpm";
+    if (ua.startsWith("yarn")) return "yarn";
+    if (ua.startsWith("bun")) return "bun";
+    return "npm";
+  }
+
+  const cases: Array<[string, string]> = [
+    ["npm/10.2.3 node/v22.0.0", "npm"],
+    ["pnpm/8.15.0 node/v22.0.0", "pnpm"],
+    ["yarn/1.22.19 node/v22.0.0", "yarn"],
+    ["bun/1.1.0", "bun"],
+    ["", "npm"],
+  ];
+
+  for (const [ua, expected] of cases) {
+    it(`maps "${ua.slice(0, 8)}" -> ${expected}`, () => {
+      const prev = process.env.npm_config_user_agent;
+      process.env.npm_config_user_agent = ua;
+      try {
+        assert.equal(detectPackageManager(), expected);
+      } finally {
+        if (prev === undefined) delete process.env.npm_config_user_agent;
+        else process.env.npm_config_user_agent = prev;
+      }
+    });
+  }
+});

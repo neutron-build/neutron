@@ -118,12 +118,23 @@ Options:
   -h, --help            Show this help message`);
 }
 
+function detectPackageManager(): string {
+  const ua = process.env.npm_config_user_agent || "";
+  if (ua.startsWith("pnpm")) return "pnpm";
+  if (ua.startsWith("yarn")) return "yarn";
+  if (ua.startsWith("bun")) return "bun";
+  return "npm";
+}
+
 function printSuccess(projectName: string, template: TemplateName, runtime: RuntimeMode): void {
+  const pm = detectPackageManager();
+  const install = pm === "yarn" ? "yarn" : `${pm} install`;
+  const dev = pm === "npm" ? "npm run dev" : `${pm} dev`;
   console.log(`\nCreated ${projectName} (template: ${template}, runtime: ${runtime})\n`);
   console.log("Next steps:");
   console.log(`  cd ${projectName}`);
-  console.log("  pnpm install");
-  console.log("  pnpm dev\n");
+  console.log(`  ${install}`);
+  console.log(`  ${dev}\n`);
 }
 
 async function ensureTargetDirectory(targetDir: string): Promise<void> {
