@@ -3,7 +3,7 @@ title: TurboModules & Device APIs
 description: JSI-based native module bindings for camera, location, biometrics, and more.
 ---
 
-Neutron Native provides two layers for accessing native device capabilities: **TurboModules** (low-level JSI bindings) and **Device Modules** (high-level wrappers around community packages). Both are accessed through `@neutron/native`.
+Neutron Native provides two layers for accessing native device capabilities: **TurboModules** (low-level JSI bindings) and **Device Modules** (high-level wrappers around community packages). Both are accessed through `@neutron-build/native`.
 
 ## How TurboModules Work
 
@@ -26,14 +26,14 @@ Compared to the old React Native bridge (JSON encode → async queue → JSON de
 
 | Layer | Import | Use when... |
 |-------|--------|-------------|
-| **TurboModule hooks** | `@neutron/native/turbomodule` | You want direct JSI access with `NativeResult` wrappers |
-| **Device modules** | `@neutron/native/device` | You want high-level functions that auto-detect Expo or bare RN packages |
+| **TurboModule hooks** | `@neutron-build/native/turbomodule` | You want direct JSI access with `NativeResult` wrappers |
+| **Device modules** | `@neutron-build/native/device` | You want high-level functions that auto-detect Expo or bare RN packages |
 
 The TurboModule hooks (`useCamera`, `useLocation`, etc.) talk directly to native code via JSI. The device modules (`camera.takePicture`, `location.getCurrentPosition`, etc.) wrap popular community packages (expo-camera, react-native-image-picker, etc.) behind a unified API.
 
 ## Built-in Device Modules
 
-All 10 device modules are available from `@neutron/native/turbomodule` (hooks) and `@neutron/native/device` (functions).
+All 10 device modules are available from `@neutron-build/native/turbomodule` (hooks) and `@neutron-build/native/device` (functions).
 
 ### Camera
 
@@ -44,7 +44,7 @@ Photo and video capture via native camera APIs.
 - **Peer deps:** `expo-camera` or `react-native-image-picker`
 
 ```tsx
-import { useCamera } from '@neutron/native/turbomodule';
+import { useCamera } from '@neutron-build/native/turbomodule';
 
 function PhotoButton() {
     const camera = useCamera();
@@ -64,7 +64,7 @@ function PhotoButton() {
 Or use the device module for auto-detection of installed packages:
 
 ```ts
-import { camera } from '@neutron/native/device';
+import { camera } from '@neutron-build/native/device';
 
 const photo = await camera.takePicture({ quality: 0.9, facing: 'back' });
 if (photo) console.log(photo.uri);
@@ -90,7 +90,7 @@ GPS and network-based geolocation.
 - **Peer deps:** `expo-location` or `@react-native-community/geolocation`
 
 ```tsx
-import { useLocation } from '@neutron/native/turbomodule';
+import { useLocation } from '@neutron-build/native/turbomodule';
 
 function LocationTracker() {
     const location = useLocation();
@@ -129,7 +129,7 @@ Local and push notification management.
 - **Peer deps:** `expo-notifications` or `@react-native-firebase/messaging`
 
 ```tsx
-import { useNotifications } from '@neutron/native/turbomodule';
+import { useNotifications } from '@neutron-build/native/turbomodule';
 
 const notif = useNotifications();
 
@@ -175,7 +175,7 @@ Fingerprint and face authentication.
 - **Peer deps:** `expo-local-authentication` or `react-native-biometrics`
 
 ```tsx
-import { useBiometrics } from '@neutron/native/turbomodule';
+import { useBiometrics } from '@neutron-build/native/turbomodule';
 
 const bio = useBiometrics();
 
@@ -210,7 +210,7 @@ Tactile feedback using the device vibration motor.
 - **Peer deps:** `expo-haptics` (optional; falls back to `Vibration` API)
 
 ```tsx
-import { useHaptics } from '@neutron/native/turbomodule';
+import { useHaptics } from '@neutron-build/native/turbomodule';
 
 const haptics = useHaptics();
 
@@ -248,7 +248,7 @@ System clipboard read/write.
 - **Peer deps:** `@react-native-clipboard/clipboard` or `expo-clipboard`
 
 ```tsx
-import { useClipboard } from '@neutron/native/turbomodule';
+import { useClipboard } from '@neutron-build/native/turbomodule';
 
 const clipboard = useClipboard();
 
@@ -289,7 +289,7 @@ Persistent key-value storage that survives app restarts.
 - **Peer deps:** `@react-native-async-storage/async-storage` or `expo-secure-store`
 
 ```tsx
-import { useAsyncStorage } from '@neutron/native/turbomodule';
+import { useAsyncStorage } from '@neutron-build/native/turbomodule';
 
 const storage = useAsyncStorage();
 
@@ -337,7 +337,7 @@ Network connectivity monitoring.
 - **Peer deps:** `@react-native-community/netinfo`
 
 ```tsx
-import { useNetInfo } from '@neutron/native/turbomodule';
+import { useNetInfo } from '@neutron-build/native/turbomodule';
 
 const netInfo = useNetInfo();
 
@@ -375,7 +375,7 @@ Device hardware and software metadata.
 - **Peer deps:** `react-native-device-info` or `expo-device`
 
 ```tsx
-import { useDeviceInfo } from '@neutron/native/turbomodule';
+import { useDeviceInfo } from '@neutron-build/native/turbomodule';
 
 const device = useDeviceInfo();
 
@@ -416,7 +416,7 @@ Unified permission management across all device capabilities.
 - **Peer deps:** `react-native-permissions` or Expo modules (each handles its own)
 
 ```tsx
-import { usePermissions } from '@neutron/native/turbomodule';
+import { usePermissions } from '@neutron-build/native/turbomodule';
 
 const perms = usePermissions();
 
@@ -460,7 +460,7 @@ Register your own native modules with `registerModule`. The registry resolves mo
 ### Step 1 — Define the Interface
 
 ```ts
-import type { TurboModule, ModuleMethod } from '@neutron/native/turbomodule';
+import type { TurboModule, ModuleMethod } from '@neutron-build/native/turbomodule';
 
 export interface AnalyticsModule extends TurboModule {
     moduleName: 'MyAnalytics';
@@ -474,7 +474,7 @@ export interface AnalyticsModule extends TurboModule {
 ### Step 2 — Register with a JS Fallback
 
 ```ts
-import { registerModule, getModule } from '@neutron/native/turbomodule';
+import { registerModule, getModule } from '@neutron-build/native/turbomodule';
 
 const METHODS: readonly ModuleMethod[] = [
     { name: 'track', kind: 'sync' },
@@ -535,7 +535,7 @@ The resolution order for `getModule('NeutronCamera')`:
 3. **JS factory** — call the function registered via `registerModule()`
 
 ```ts
-import { hasModule, listModules, requireModule } from '@neutron/native/turbomodule';
+import { hasModule, listModules, requireModule } from '@neutron-build/native/turbomodule';
 
 // Check before using
 if (hasModule('NeutronCamera')) {
@@ -551,7 +551,7 @@ console.log(listModules());
 Use `clearCache()` during hot reload or in test teardown to reset the module cache:
 
 ```ts
-import { clearCache } from '@neutron/native/turbomodule';
+import { clearCache } from '@neutron-build/native/turbomodule';
 
 afterEach(() => {
     clearCache();
@@ -560,7 +560,7 @@ afterEach(() => {
 
 ## Expo Go Compatibility
 
-The device modules (`@neutron/native/device`) are designed to work in both Expo Go and bare React Native. Each module lazily probes for installed packages at runtime:
+The device modules (`@neutron-build/native/device`) are designed to work in both Expo Go and bare React Native. Each module lazily probes for installed packages at runtime:
 
 | Module | Expo Package | Bare RN Package |
 |--------|-------------|-----------------|
@@ -599,8 +599,8 @@ npm install react-native-image-picker @react-native-community/geolocation react-
 Check what is available on the current device at runtime:
 
 ```tsx
-import { hasModule } from '@neutron/native/turbomodule';
-import { usePermissions, useCamera, useBiometrics } from '@neutron/native/turbomodule';
+import { hasModule } from '@neutron-build/native/turbomodule';
+import { usePermissions, useCamera, useBiometrics } from '@neutron-build/native/turbomodule';
 
 // Check if a module is linked at all
 const hasCameraModule = hasModule('NeutronCamera');
@@ -663,7 +663,7 @@ Modules that emit events return a `NativeSubscription` handle. Always clean up i
 
 ```tsx
 import { useEffect } from 'preact/hooks';
-import { useNetInfo } from '@neutron/native/turbomodule';
+import { useNetInfo } from '@neutron-build/native/turbomodule';
 
 function NetworkBanner() {
     const netInfo = useNetInfo();
