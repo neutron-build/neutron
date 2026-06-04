@@ -8,7 +8,7 @@
  *
  * Falls back to an in-memory Map when no native module is linked (useful in tests).
  *
- * @module @neutron/native/device/async-storage
+ * @module @neutron-build/native/device/async-storage
  */
 
 // ─── Lazy module loaders ────────────────────────────────────────────────────
@@ -51,7 +51,7 @@ const _memStore = new Map<string, string>()
  *
  * @example
  * ```ts
- * import { getItem } from '@neutron/native/device/async-storage'
+ * import { getItem } from '@neutron-build/native/device/async-storage'
  * const token = await getItem('auth.token')
  * ```
  */
@@ -79,7 +79,7 @@ export async function getItem(key: string): Promise<string | null> {
  *
  * @example
  * ```ts
- * import { setItem } from '@neutron/native/device/async-storage'
+ * import { setItem } from '@neutron-build/native/device/async-storage'
  * await setItem('auth.token', 'abc123')
  * ```
  */
@@ -106,7 +106,7 @@ export async function setItem(key: string, value: string): Promise<void> {
  *
  * @example
  * ```ts
- * import { removeItem } from '@neutron/native/device/async-storage'
+ * import { removeItem } from '@neutron-build/native/device/async-storage'
  * await removeItem('auth.token')
  * ```
  */
@@ -133,7 +133,7 @@ export async function removeItem(key: string): Promise<void> {
  *
  * @example
  * ```ts
- * import { getAllKeys } from '@neutron/native/device/async-storage'
+ * import { getAllKeys } from '@neutron-build/native/device/async-storage'
  * const keys = await getAllKeys()
  * console.log('Stored keys:', keys)
  * ```
@@ -157,7 +157,7 @@ export async function getAllKeys(): Promise<string[]> {
  *
  * @example
  * ```ts
- * import { clear } from '@neutron/native/device/async-storage'
+ * import { clear } from '@neutron-build/native/device/async-storage'
  * await clear()
  * ```
  */
@@ -180,7 +180,7 @@ export async function clear(): Promise<void> {
  *
  * @example
  * ```ts
- * import { multiGet } from '@neutron/native/device/async-storage'
+ * import { multiGet } from '@neutron-build/native/device/async-storage'
  * const results = await multiGet(['user.name', 'user.email'])
  * results.forEach(([key, value]) => console.log(key, value))
  * ```
@@ -209,7 +209,7 @@ export async function multiGet(
  *
  * @example
  * ```ts
- * import { multiSet } from '@neutron/native/device/async-storage'
+ * import { multiSet } from '@neutron-build/native/device/async-storage'
  * await multiSet([
  *   ['user.name', 'Alice'],
  *   ['user.email', 'alice@example.com'],
@@ -236,7 +236,7 @@ export async function multiSet(pairs: [string, string][]): Promise<void> {
  *
  * @example
  * ```ts
- * import { multiRemove } from '@neutron/native/device/async-storage'
+ * import { multiRemove } from '@neutron-build/native/device/async-storage'
  * await multiRemove(['user.name', 'user.email'])
  * ```
  */
@@ -263,7 +263,7 @@ export async function multiRemove(keys: string[]): Promise<void> {
  *
  * @example
  * ```ts
- * import { mergeItem } from '@neutron/native/device/async-storage'
+ * import { mergeItem } from '@neutron-build/native/device/async-storage'
  * await setItem('settings', JSON.stringify({ theme: 'dark' }))
  * await mergeItem('settings', JSON.stringify({ fontSize: 16 }))
  * // Result: { theme: 'dark', fontSize: 16 }

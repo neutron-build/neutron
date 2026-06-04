@@ -15,7 +15,7 @@ Light core, real native rendering. Preact (3KB) instead of React (42KB). Re.Pack
 | Bundler | Re.Pack 5 (Rspack) | 5× faster builds than webpack, Module Federation v2 for OTA updates |
 | Navigation | File-based router → React Navigation native stack | Real `UINavigationController` / `FragmentTransaction` |
 | Styling | NeutronWind (Tailwind → `StyleSheet.create`) | `className` on web, same `className` on native, zero runtime overhead |
-| Native APIs | TurboModules (`@neutron/native-*`) | Typed, opt-in, no bundle weight if unused |
+| Native APIs | TurboModules (`@neutron-build/native-*`) | Typed, opt-in, no bundle weight if unused |
 
 ## The Bridge
 
@@ -125,8 +125,8 @@ export default defineConfig({
   icon: './assets/icon.png',
   splash: { image: './assets/splash.png', backgroundColor: '#fff' },
   plugins: [
-    '@neutron/native-camera',
-    '@neutron/native-location',
+    '@neutron-build/native-camera',
+    '@neutron-build/native-location',
   ],
   ota: {
     url: 'https://updates.example.com',
@@ -145,16 +145,16 @@ All opt-in, zero bundle weight if unused:
 
 | Package | Provides |
 |---------|---------|
-| `@neutron/native-camera` | Camera, photo library, QR scanner |
-| `@neutron/native-location` | GPS, geofencing |
-| `@neutron/native-notifications` | Push + local notifications |
-| `@neutron/native-biometrics` | Face ID, Touch ID, Fingerprint |
-| `@neutron/native-haptics` | Taptic Engine / vibration |
-| `@neutron/native-storage` | Secure keychain/keystore |
-| `@neutron/native-sensors` | Accelerometer, gyroscope, barometer |
-| `@neutron/native-clipboard` | Clipboard read/write |
-| `@neutron/native-audio` | Playback, recording |
-| `@neutron/native-share` | OS share sheet |
+| `@neutron-build/native-camera` | Camera, photo library, QR scanner |
+| `@neutron-build/native-location` | GPS, geofencing |
+| `@neutron-build/native-notifications` | Push + local notifications |
+| `@neutron-build/native-biometrics` | Face ID, Touch ID, Fingerprint |
+| `@neutron-build/native-haptics` | Taptic Engine / vibration |
+| `@neutron-build/native-storage` | Secure keychain/keystore |
+| `@neutron-build/native-sensors` | Accelerometer, gyroscope, barometer |
+| `@neutron-build/native-clipboard` | Clipboard read/write |
+| `@neutron-build/native-audio` | Playback, recording |
+| `@neutron-build/native-share` | OS share sheet |
 
 ## Development Flow
 
@@ -173,7 +173,7 @@ No Xcode or Android Studio required during development — only needed for final
 
 Neutron Native targets **React Native 0.82+**, where the New Architecture (Fabric renderer + TurboModules) is mandatory — `newArchEnabled=false` is silently ignored. As of early 2026, ~83% of EAS-built projects already run it. There is no legacy bridge fallback to maintain.
 
-All `@neutron/native-*` modules are TurboModules from day one — no legacy bridge wrappers, no JSI polyfills.
+All `@neutron-build/native-*` modules are TurboModules from day one — no legacy bridge wrappers, no JSI polyfills.
 
 ## Platform Support
 
@@ -204,7 +204,7 @@ native/
 │   │   └── package.json
 │   ├── neutron-native-styling/   # NeutronWind — className → StyleSheet
 │   └── neutron-native-cli/       # CLI: dev, build, release
-├── modules/                      # @neutron/native-* packages
+├── modules/                      # @neutron-build/native-* packages
 │   ├── camera/
 │   ├── location/
 │   └── notifications/

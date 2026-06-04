@@ -38,7 +38,7 @@ export default defineConfig({
         use: [
           // NeutronWind: className → StyleSheet (must run before SWC)
           {
-            loader: '@neutron/native-styling/rspack',
+            loader: '@neutron-build/native-styling/rspack',
           },
           {
             loader: 'builtin:swc-loader',

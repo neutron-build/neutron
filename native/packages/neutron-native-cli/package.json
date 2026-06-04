@@ -1,5 +1,5 @@
 {
-  "name": "@neutron/native-cli",
+  "name": "@neutron-build/native-cli",
   "version": "0.1.0",
   "description": "Neutron Native CLI — dev, build, and run commands for iOS/Android",
   "type": "module",

@@ -2,7 +2,7 @@
  * Animated component wrappers — apply animated styles via JSI worklets.
  *
  * Usage:
- *   import { Animated } from '@neutron/native/animated'
+ *   import { Animated } from '@neutron-build/native/animated'
  *   <Animated.View style={animatedStyle}>...</Animated.View>
  */
 
@@ -76,7 +76,7 @@ function AnimatedScrollView({ children, style, testID, ...rest }: AnimatedScroll
  * Animated namespace — mirrors react-native-reanimated API.
  *
  * @example
- * import { Animated } from '@neutron/native/animated'
+ * import { Animated } from '@neutron-build/native/animated'
  *
  * function FadeIn({ children }) {
  *   const opacity = useSharedValue(0)

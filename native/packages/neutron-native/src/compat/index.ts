@@ -6,7 +6,7 @@
  * React Native) — these aliases are NOT used.
  *
  * Usage in your web bundler config (vite, webpack, rspack):
- *   import { preactCompatAliases } from '@neutron/native/compat'
+ *   import { preactCompatAliases } from '@neutron-build/native/compat'
  *   resolve: { alias: preactCompatAliases() }
  */
 

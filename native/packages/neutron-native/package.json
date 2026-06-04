@@ -1,5 +1,5 @@
 {
-  "name": "@neutron/native",
+  "name": "@neutron-build/native",
   "version": "0.1.0",
   "description": "Neutron Native — universal components, routing, and styling for React Native",
   "main": "./dist/index.js",

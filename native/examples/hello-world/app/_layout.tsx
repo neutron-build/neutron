@@ -7,7 +7,7 @@
  * In a real app you would add providers (auth, theme, i18n) here, or swap
  * the children for a <Stack> / <Tabs> navigator.
  */
-import { View } from '@neutron/native'
+import { View } from '@neutron-build/native'
 import type { ComponentChildren } from 'preact'
 import HomeScreen from './index'
 

@@ -1,5 +1,5 @@
 /**
- * '@neutron/native/profiler' — performance profiling tools for Neutron Native.
+ * '@neutron-build/native/profiler' — performance profiling tools for Neutron Native.
  *
  * Provides FPS monitoring, render tracking, interaction timing, startup metrics,
  * and a visual performance overlay. All profiling tools are production-safe:
@@ -16,10 +16,10 @@
  *   PerformanceOverlay,
  *   useInteractionTiming,
  *   startupMetrics,
- * } from '@neutron/native/profiler'
+ * } from '@neutron-build/native/profiler'
  * ```
  *
- * @module @neutron/native/profiler
+ * @module @neutron-build/native/profiler
  */
 
 import React, {
@@ -349,7 +349,7 @@ const appStartTime = Date.now()
  * @example
  * ```tsx
  * // In your root App component
- * import { startupMetrics } from '@neutron/native/profiler'
+ * import { startupMetrics } from '@neutron-build/native/profiler'
  *
  * function App() {
  *   useEffect(() => {

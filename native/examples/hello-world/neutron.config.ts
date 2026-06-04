@@ -1,4 +1,4 @@
-import { defineConfig } from '@neutron/native/config'
+import { defineConfig } from '@neutron-build/native/config'
 
 export default defineConfig({
   name: 'Hello World',

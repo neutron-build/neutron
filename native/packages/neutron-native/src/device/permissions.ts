@@ -6,7 +6,7 @@
  *   - react-native-permissions (bare React Native — comprehensive)
  *   - expo modules (expo-camera, expo-location, etc. — each handles its own permissions)
  *
- * @module @neutron/native/device/permissions
+ * @module @neutron-build/native/device/permissions
  */
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -255,7 +255,7 @@ async function expoRequest(name: PermissionName): Promise<PermissionStatus> {
  *
  * @example
  * ```ts
- * import { check, PermissionStatus } from '@neutron/native/device/permissions'
+ * import { check, PermissionStatus } from '@neutron-build/native/device/permissions'
  * const status = await check('camera')
  * if (status === PermissionStatus.GRANTED) {
  *   // Camera is available
@@ -286,7 +286,7 @@ export async function check(permission: PermissionName): Promise<PermissionStatu
  *
  * @example
  * ```ts
- * import { request, PermissionStatus } from '@neutron/native/device/permissions'
+ * import { request, PermissionStatus } from '@neutron-build/native/device/permissions'
  * const status = await request('camera')
  * if (status === PermissionStatus.BLOCKED) {
  *   await openSettings()
@@ -313,7 +313,7 @@ export async function request(permission: PermissionName): Promise<PermissionSta
  *
  * @example
  * ```ts
- * import { checkMultiple } from '@neutron/native/device/permissions'
+ * import { checkMultiple } from '@neutron-build/native/device/permissions'
  * const statuses = await checkMultiple(['camera', 'microphone', 'location'])
  * ```
  */
@@ -361,7 +361,7 @@ export async function checkMultiple(
  *
  * @example
  * ```ts
- * import { requestMultiple } from '@neutron/native/device/permissions'
+ * import { requestMultiple } from '@neutron-build/native/device/permissions'
  * const statuses = await requestMultiple(['camera', 'microphone'])
  * ```
  */
@@ -405,7 +405,7 @@ export async function requestMultiple(
  *
  * @example
  * ```ts
- * import { openSettings } from '@neutron/native/device/permissions'
+ * import { openSettings } from '@neutron-build/native/device/permissions'
  * const status = await request('camera')
  * if (status === PermissionStatus.BLOCKED) {
  *   // Show a dialog explaining why the permission is needed,

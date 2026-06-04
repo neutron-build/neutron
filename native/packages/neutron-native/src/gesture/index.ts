@@ -1,5 +1,5 @@
 /**
- * '@neutron/native/gesture' — React Native Gesture Handler compatible API.
+ * '@neutron-build/native/gesture' — React Native Gesture Handler compatible API.
  *
  * Architecture:
  *   1. When react-native-gesture-handler is installed, GestureDetector delegates
@@ -8,7 +8,7 @@
  *      JS-thread gesture recognition for all gesture types.
  *
  * Usage:
- *   import { GestureDetector, Gesture } from '@neutron/native/gesture'
+ *   import { GestureDetector, Gesture } from '@neutron-build/native/gesture'
  *
  *   const pan = Gesture.Pan()
  *     .onUpdate((e) => { offset.value = e.translationX })

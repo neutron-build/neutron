@@ -6,7 +6,7 @@
  *   1. RNGH native gesture recognition when react-native-gesture-handler is installed
  *   2. PanResponder-based fallback when RNGH is not available
  *
- * New code should import from '@neutron/native/gesture' directly.
+ * New code should import from '@neutron-build/native/gesture' directly.
  */
 
 export { GestureDetector } from './handlers.js'

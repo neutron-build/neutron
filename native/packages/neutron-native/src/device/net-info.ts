@@ -7,7 +7,7 @@
  * Falls back to `navigator.onLine` on web and provides a stub when no
  * native module is available.
  *
- * @module @neutron/native/device/net-info
+ * @module @neutron-build/native/device/net-info
  */
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -147,7 +147,7 @@ function webFallbackState(): NetInfoState {
  *
  * @example
  * ```ts
- * import { fetch } from '@neutron/native/device/net-info'
+ * import { fetch } from '@neutron-build/native/device/net-info'
  * const state = await fetch()
  * console.log(`Connected: ${state.isConnected}, Type: ${state.type}`)
  * ```
@@ -191,7 +191,7 @@ export async function fetchInterface(
  *
  * @example
  * ```ts
- * import { addEventListener } from '@neutron/native/device/net-info'
+ * import { addEventListener } from '@neutron-build/native/device/net-info'
  * const sub = addEventListener((state) => {
  *   if (!state.isConnected) {
  *     console.log('Lost connection!')
@@ -243,7 +243,7 @@ export function addEventListener(
  *
  * @example
  * ```ts
- * import { isConnected } from '@neutron/native/device/net-info'
+ * import { isConnected } from '@neutron-build/native/device/net-info'
  * if (await isConnected()) {
  *   await syncData()
  * }

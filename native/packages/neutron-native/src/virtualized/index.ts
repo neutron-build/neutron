@@ -1,5 +1,5 @@
 /**
- * '@neutron/native/virtualized' — High-performance virtualized lists.
+ * '@neutron-build/native/virtualized' — High-performance virtualized lists.
  *
  * Uses native RecyclerView (Android) / UICollectionView (iOS) for
  * smooth scrolling with view recycling. Only renders items visible

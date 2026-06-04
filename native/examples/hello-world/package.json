@@ -13,13 +13,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@neutron/native": "workspace:*",
+    "@neutron-build/native": "workspace:*",
     "preact": "^10.25.0",
     "react-native": "0.76.0"
   },
   "devDependencies": {
     "@callstack/repack": "^5.0.0",
-    "@neutron/native-cli": "workspace:*",
+    "@neutron-build/native-cli": "workspace:*",
     "@types/react-native": "^0.73.0",
     "typescript": "^5.7.0"
   }

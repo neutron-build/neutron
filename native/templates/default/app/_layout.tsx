@@ -2,7 +2,7 @@
  * Root layout — wraps all screens.
  * Add providers (auth, theme, etc.) here.
  */
-import { View } from '@neutron/native'
+import { View } from '@neutron-build/native'
 import type { ReactNode } from 'react'
 
 interface RootLayoutProps {

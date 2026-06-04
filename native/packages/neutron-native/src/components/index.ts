@@ -7,7 +7,7 @@ export { TextInput } from './TextInput.native.js'
 export { Link } from './Link.native.js'
 
 // ─── Tier 3 — Native-only ─────────────────────────────────────────────────────
-// Use '@neutron/native/native' for these to avoid web bundle errors.
+// Use '@neutron-build/native/native' for these to avoid web bundle errors.
 export { ScrollView } from './ScrollView.native.js'
 export { FlatList } from './FlatList.native.js'
 export { Modal } from './Modal.native.js'

@@ -7,7 +7,7 @@
  *
  * All functions are async and handle missing dependencies gracefully.
  *
- * @module @neutron/native/device/camera
+ * @module @neutron-build/native/device/camera
  */
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -108,7 +108,7 @@ function assertAvailable(): void {
  *
  * @example
  * ```ts
- * import { requestCameraPermission } from '@neutron/native/device/camera'
+ * import { requestCameraPermission } from '@neutron-build/native/device/camera'
  * const status = await requestCameraPermission()
  * if (status === 'granted') { ... }
  * ```
@@ -164,7 +164,7 @@ export async function getCameraPermissionStatus(): Promise<CameraPermissionStatu
  *
  * @example
  * ```ts
- * import { takePicture } from '@neutron/native/device/camera'
+ * import { takePicture } from '@neutron-build/native/device/camera'
  * const photo = await takePicture({ quality: 0.9, facing: 'back' })
  * if (photo) console.log(photo.uri)
  * ```
@@ -246,7 +246,7 @@ export async function takePicture(options: CaptureOptions = {}): Promise<CameraR
  *
  * @example
  * ```ts
- * import { pickFromGallery } from '@neutron/native/device/camera'
+ * import { pickFromGallery } from '@neutron-build/native/device/camera'
  * const photos = await pickFromGallery({ multiple: true, selectionLimit: 5 })
  * photos.forEach(p => console.log(p.uri))
  * ```

@@ -11,7 +11,7 @@
  *   4. JS-side factory (registered via registerModule — stubs)
  *
  * Usage:
- *   import { getModule } from '@neutron/native/turbomodule'
+ *   import { getModule } from '@neutron-build/native/turbomodule'
  *   const camera = getModule<CameraModule>('NeutronCamera')
  */
 

@@ -1,5 +1,5 @@
 /**
- * '@neutron/native/animated' — Reanimated-compatible animation system.
+ * '@neutron-build/native/animated' — Reanimated-compatible animation system.
  *
  * Architecture:
  *   1. When react-native-reanimated is installed, all APIs delegate to it
@@ -12,7 +12,7 @@
  *   import {
  *     useSharedValue, useAnimatedStyle, withTiming, withSpring,
  *     interpolate, Easing, Animated,
- *   } from '@neutron/native/animated'
+ *   } from '@neutron-build/native/animated'
  *
  *   const opacity = useSharedValue(0)
  *   const style = useAnimatedStyle(() => ({ opacity: opacity.value }))

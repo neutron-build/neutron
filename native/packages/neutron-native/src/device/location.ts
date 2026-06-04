@@ -7,7 +7,7 @@
  *
  * All functions are async and handle missing dependencies gracefully.
  *
- * @module @neutron/native/device/location
+ * @module @neutron-build/native/device/location
  */
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -136,7 +136,7 @@ function normalizePosition(pos: any): LocationCoordinate { // eslint-disable-lin
  *
  * @example
  * ```ts
- * import { requestLocationPermission } from '@neutron/native/device/location'
+ * import { requestLocationPermission } from '@neutron-build/native/device/location'
  * const status = await requestLocationPermission('when-in-use')
  * ```
  */
@@ -199,7 +199,7 @@ export async function getLocationPermissionStatus(): Promise<LocationPermissionS
  *
  * @example
  * ```ts
- * import { getCurrentPosition } from '@neutron/native/device/location'
+ * import { getCurrentPosition } from '@neutron-build/native/device/location'
  * const pos = await getCurrentPosition({ accuracy: 'high' })
  * console.log(pos.latitude, pos.longitude)
  * ```
@@ -245,7 +245,7 @@ export async function getCurrentPosition(
  *
  * @example
  * ```ts
- * import { watchPosition } from '@neutron/native/device/location'
+ * import { watchPosition } from '@neutron-build/native/device/location'
  * const sub = await watchPosition((pos) => {
  *   console.log('Moved to', pos.latitude, pos.longitude)
  * }, { accuracy: 'high', distanceFilter: 10 })

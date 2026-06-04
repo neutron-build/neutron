@@ -6,7 +6,7 @@
  *   - expo-haptics (Expo managed/bare — iOS Taptic Engine + Android vibration)
  *   - react-native (Vibration API is built-in — basic fallback)
  *
- * @module @neutron/native/device/haptics
+ * @module @neutron-build/native/device/haptics
  */
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -80,7 +80,7 @@ const NOTIFICATION_PATTERNS: Record<NotificationType, number[]> = {
  *
  * @example
  * ```ts
- * import { impact } from '@neutron/native/device/haptics'
+ * import { impact } from '@neutron-build/native/device/haptics'
  * impact('light')   // Subtle tap
  * impact('heavy')   // Strong thump
  * ```
@@ -116,7 +116,7 @@ export async function impact(style: ImpactStyle = 'medium'): Promise<void> {
  *
  * @example
  * ```ts
- * import { notification } from '@neutron/native/device/haptics'
+ * import { notification } from '@neutron-build/native/device/haptics'
  * notification('success')  // Payment complete
  * notification('error')    // Validation failed
  * ```
@@ -156,7 +156,7 @@ export async function notification(type: NotificationType = 'success'): Promise<
  *
  * @example
  * ```ts
- * import { selection } from '@neutron/native/device/haptics'
+ * import { selection } from '@neutron-build/native/device/haptics'
  * selection()  // Picker wheel tick
  * ```
  */
@@ -182,7 +182,7 @@ export async function selection(): Promise<void> {
  *
  * @example
  * ```ts
- * import { vibrate } from '@neutron/native/device/haptics'
+ * import { vibrate } from '@neutron-build/native/device/haptics'
  * vibrate(200)  // 200ms buzz
  * ```
  */
@@ -202,7 +202,7 @@ export function vibrate(durationMs: number = 400): void {
  *
  * @example
  * ```ts
- * import { vibratePattern } from '@neutron/native/device/haptics'
+ * import { vibratePattern } from '@neutron-build/native/device/haptics'
  * vibratePattern([0, 100, 50, 100, 50, 200])  // SOS-style
  * ```
  */
