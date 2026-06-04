@@ -1,5 +1,5 @@
 {
-  "name": "@neutron/native-styling",
+  "name": "@neutron-build/native-styling",
   "version": "0.1.0",
   "description": "NeutronWind — build-time className-to-StyleSheet transform for Neutron Native",
   "type": "module",

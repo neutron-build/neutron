@@ -8,7 +8,7 @@
  * so the same component code works with Preact's 3KB runtime.
  *
  * @example
- * import { NeutronApp } from '@neutron/native'
+ * import { NeutronApp } from '@neutron-build/native'
  * import App from './app/_layout'
  * NeutronApp({ component: App, appName: 'MyApp' })
  */

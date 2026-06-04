@@ -1,5 +1,5 @@
 /**
- * '@neutron/native/accessibility' — VoiceOver (iOS) and TalkBack (Android) support.
+ * '@neutron-build/native/accessibility' — VoiceOver (iOS) and TalkBack (Android) support.
  *
  * Provides hooks, components, and utilities for building accessible mobile
  * applications. Wraps React Native's accessibility APIs with a higher-level
@@ -11,7 +11,7 @@
  *   announceForAccessibility,
  *   AccessibleView,
  *   LiveRegion,
- * } from '@neutron/native/accessibility'
+ * } from '@neutron-build/native/accessibility'
  *
  * function CartTotal({ total }) {
  *   const { isScreenReaderEnabled } = useAccessibility()

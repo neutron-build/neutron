@@ -1,7 +1,7 @@
 /**
  * neutron.config.ts schema — defineConfig + full type definitions.
  *
- * Import from '@neutron/native/config' in the project root neutron.config.ts.
+ * Import from '@neutron-build/native/config' in the project root neutron.config.ts.
  * This replaces metro.config.js, babel.config.js, app.json, eas.json.
  */
 
@@ -182,8 +182,8 @@ export interface NeutronConfig {
    * native iOS/Android projects. Each plugin may add native code, CocoaPods,
    * Gradle dependencies, etc.
    *
-   * String form: '@neutron/native-camera'
-   * Tuple form:  ['@neutron/native-notifications', { mode: 'production' }]
+   * String form: '@neutron-build/native-camera'
+   * Tuple form:  ['@neutron-build/native-notifications', { mode: 'production' }]
    */
   plugins?: NeutronPlugin[]
 
@@ -191,7 +191,7 @@ export interface NeutronConfig {
 
   /**
    * Over-the-air update configuration.
-   * When set, `@neutron/ota` is automatically included and the update check
+   * When set, `@neutron-build/ota` is automatically included and the update check
    * is wired into app startup.
    */
   ota?: NeutronOTAConfig
@@ -250,7 +250,7 @@ export interface NeutronConfig {
  * @example
  * ```ts
  * // neutron.config.ts
- * import { defineConfig } from '@neutron/native/config'
+ * import { defineConfig } from '@neutron-build/native/config'
  *
  * export default defineConfig({
  *   name: 'My App',

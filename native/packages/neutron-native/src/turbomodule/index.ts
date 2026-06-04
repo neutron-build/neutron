@@ -1,5 +1,5 @@
 /**
- * '@neutron/native/turbomodule' — TurboModule registry + all device modules.
+ * '@neutron-build/native/turbomodule' — TurboModule registry + all device modules.
  */
 
 // ─── Registry ────────────────────────────────────────────────────────────────

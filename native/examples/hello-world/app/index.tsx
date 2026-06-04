@@ -7,7 +7,7 @@
  *   - @preact/signals for local state
  *   - NeutronWind className (compiled to StyleSheet at build time)
  */
-import { View, Text, Pressable } from '@neutron/native'
+import { View, Text, Pressable } from '@neutron-build/native'
 import { useSignal } from '@preact/signals'
 
 export default function HomeScreen() {

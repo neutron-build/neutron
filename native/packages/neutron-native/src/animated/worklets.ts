@@ -7,7 +7,7 @@
  * `useNativeDriver: true` to still achieve hardware-accelerated animations.
  *
  * @example
- * import { useSharedValue, withTiming, useAnimatedStyle } from '@neutron/native/animated'
+ * import { useSharedValue, withTiming, useAnimatedStyle } from '@neutron-build/native/animated'
  *
  * function FadeIn({ children }) {
  *   const opacity = useSharedValue(0)

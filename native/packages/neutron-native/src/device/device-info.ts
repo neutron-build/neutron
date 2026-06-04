@@ -6,7 +6,7 @@
  *   - expo-device (Expo managed/bare)
  *   - expo-application (Expo — for app-level info)
  *
- * @module @neutron/native/device/device-info
+ * @module @neutron-build/native/device/device-info
  */
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -89,7 +89,7 @@ function getPlatform(): any {
  *
  * @example
  * ```ts
- * import { getDeviceId } from '@neutron/native/device/device-info'
+ * import { getDeviceId } from '@neutron-build/native/device/device-info'
  * const id = await getDeviceId()
  * ```
  */
@@ -115,7 +115,7 @@ export async function getDeviceId(): Promise<string> {
  *
  * @example
  * ```ts
- * import { getModel } from '@neutron/native/device/device-info'
+ * import { getModel } from '@neutron-build/native/device/device-info'
  * const model = await getModel()
  * console.log(`Running on ${model}`)
  * ```
@@ -208,7 +208,7 @@ export async function getSystemVersion(): Promise<string> {
  *
  * @example
  * ```ts
- * import { isTablet } from '@neutron/native/device/device-info'
+ * import { isTablet } from '@neutron-build/native/device/device-info'
  * if (await isTablet()) {
  *   // Use tablet-optimized layout
  * }
@@ -425,7 +425,7 @@ export function getTimezone(): string {
  *
  * @example
  * ```ts
- * import { getSnapshot } from '@neutron/native/device/device-info'
+ * import { getSnapshot } from '@neutron-build/native/device/device-info'
  * const info = await getSnapshot()
  * console.log(`${info.brand} ${info.model} running ${info.systemName} ${info.systemVersion}`)
  * ```

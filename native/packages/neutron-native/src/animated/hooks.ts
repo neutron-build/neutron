@@ -9,7 +9,7 @@
  *
  * All public exports are preserved for backward compatibility.
  * New code should import directly from './worklets.js' or from
- * the '@neutron/native/animated' barrel export.
+ * the '@neutron-build/native/animated' barrel export.
  */
 
 export {

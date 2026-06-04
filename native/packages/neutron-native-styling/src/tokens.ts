@@ -11,7 +11,7 @@
 
 import { Dimensions } from 'react-native'
 
-/** Mirrors NativeStyleProp from @neutron/native — avoid circular dep */
+/** Mirrors NativeStyleProp from @neutron-build/native — avoid circular dep */
 export type StyleProp = {
   [key: string]: string | number | null | { width?: number; height?: number } | undefined
 }

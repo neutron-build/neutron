@@ -35,7 +35,7 @@ describe('defineConfig', () => {
         camera: 'We need camera access',
         location: 'We need your location',
       },
-      plugins: ['@neutron/native-camera', ['@neutron/native-notifications', { mode: 'production' }]],
+      plugins: ['@neutron-build/native-camera', ['@neutron-build/native-notifications', { mode: 'production' }]],
       ota: {
         endpoint: 'https://ota.example.com',
         publicKey: 'abc123',

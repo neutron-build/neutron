@@ -6,7 +6,7 @@
  *   - @react-native-clipboard/clipboard (community standard)
  *   - expo-clipboard (Expo managed/bare)
  *
- * @module @neutron/native/device/clipboard
+ * @module @neutron-build/native/device/clipboard
  */
 
 // ─── Lazy module loaders ────────────────────────────────────────────────────
@@ -52,7 +52,7 @@ function assertAvailable(): void {
  *
  * @example
  * ```ts
- * import { getString } from '@neutron/native/device/clipboard'
+ * import { getString } from '@neutron-build/native/device/clipboard'
  * const text = await getString()
  * console.log('Clipboard:', text)
  * ```
@@ -80,7 +80,7 @@ export async function getString(): Promise<string> {
  *
  * @example
  * ```ts
- * import { setString } from '@neutron/native/device/clipboard'
+ * import { setString } from '@neutron-build/native/device/clipboard'
  * await setString('Hello, world!')
  * ```
  */
@@ -107,7 +107,7 @@ export async function setString(text: string): Promise<void> {
  *
  * @example
  * ```ts
- * import { hasString } from '@neutron/native/device/clipboard'
+ * import { hasString } from '@neutron-build/native/device/clipboard'
  * if (await hasString()) {
  *   const text = await getString()
  * }
@@ -136,7 +136,7 @@ export async function hasString(): Promise<boolean> {
  *
  * @example
  * ```ts
- * import { getImage } from '@neutron/native/device/clipboard'
+ * import { getImage } from '@neutron-build/native/device/clipboard'
  * const base64 = await getImage()
  * if (base64) console.log('Got image from clipboard')
  * ```
@@ -164,7 +164,7 @@ export async function getImage(): Promise<string | null> {
  *
  * @example
  * ```ts
- * import { setImage } from '@neutron/native/device/clipboard'
+ * import { setImage } from '@neutron-build/native/device/clipboard'
  * await setImage(myBase64ImageData)
  * ```
  */
@@ -215,7 +215,7 @@ export async function getUrl(): Promise<string | null> {
  *
  * @example
  * ```ts
- * import { addListener } from '@neutron/native/device/clipboard'
+ * import { addListener } from '@neutron-build/native/device/clipboard'
  * const sub = addListener((newContent) => {
  *   console.log('Clipboard changed:', newContent)
  * })

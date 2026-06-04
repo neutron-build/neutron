@@ -2,8 +2,8 @@
  * Home screen — app/index.tsx → route: /
  */
 import { useState } from 'react'
-import { View, Text, Pressable } from '@neutron/native'
-import { useRouter } from '@neutron/native/router'
+import { View, Text, Pressable } from '@neutron-build/native'
+import { useRouter } from '@neutron-build/native/router'
 
 export default function HomeScreen() {
   const { navigate } = useRouter()

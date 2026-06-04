@@ -6,7 +6,7 @@
  *   - expo-notifications (Expo managed/bare)
  *   - @react-native-firebase/messaging + @notifee/react-native (bare React Native)
  *
- * @module @neutron/native/device/notifications
+ * @module @neutron-build/native/device/notifications
  */
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -111,7 +111,7 @@ function assertAvailable(): void {
  *
  * @example
  * ```ts
- * import { requestPermission } from '@neutron/native/device/notifications'
+ * import { requestPermission } from '@neutron-build/native/device/notifications'
  * const status = await requestPermission()
  * if (status === 'granted') { ... }
  * ```
@@ -174,7 +174,7 @@ export async function getPermissionStatus(): Promise<NotificationPermissionStatu
  *
  * @example
  * ```ts
- * import { getToken } from '@neutron/native/device/notifications'
+ * import { getToken } from '@neutron-build/native/device/notifications'
  * const token = await getToken()
  * // Send token to your backend for push delivery
  * ```
@@ -230,7 +230,7 @@ export async function getDevicePushToken(): Promise<string> {
  *
  * @example
  * ```ts
- * import { onMessage } from '@neutron/native/device/notifications'
+ * import { onMessage } from '@neutron-build/native/device/notifications'
  * const sub = onMessage((notification) => {
  *   console.log('Received:', notification.content.title)
  * })
@@ -340,7 +340,7 @@ export function onNotificationResponse(
  *
  * @example
  * ```ts
- * import { scheduleLocal } from '@neutron/native/device/notifications'
+ * import { scheduleLocal } from '@neutron-build/native/device/notifications'
  * const id = await scheduleLocal(
  *   { title: 'Reminder', body: 'Time to check in!' },
  *   { seconds: 60 }

@@ -6,7 +6,7 @@
  *
  *   {
  *     test: /\.(tsx|jsx)$/,
- *     use: [{ loader: '@neutron/native-styling/rspack', options: { platform: 'ios' } }],
+ *     use: [{ loader: '@neutron-build/native-styling/rspack', options: { platform: 'ios' } }],
  *   }
  *
  * Pass `platform: 'ios' | 'android' | 'all'` via loader options to enable

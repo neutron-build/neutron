@@ -13,13 +13,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@neutron/native": "workspace:*",
+    "@neutron-build/native": "workspace:*",
     "react": "^18.3.0",
     "react-native": "0.76.0"
   },
   "devDependencies": {
-    "@neutron/native-cli": "workspace:*",
-    "@neutron/native-styling": "workspace:*",
+    "@neutron-build/native-cli": "workspace:*",
+    "@neutron-build/native-styling": "workspace:*",
     "@re-pack/dev-server": "^5.0.0",
     "@types/react": "^18.2.0",
     "typescript": "^5.7.0"

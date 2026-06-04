@@ -1,4 +1,4 @@
-import { defineConfig } from '@neutron/native/config'
+import { defineConfig } from '@neutron-build/native/config'
 
 export default defineConfig({
   // ── Identity ──────────────────────────────────────────────────────────────
@@ -27,11 +27,11 @@ export default defineConfig({
   // },
 
   // ── Plugins ───────────────────────────────────────────────────────────────
-  // Install optional @neutron/native-* packages and list them here.
+  // Install optional @neutron-build/native-* packages and list them here.
   // plugins: [
-  //   '@neutron/native-camera',
-  //   '@neutron/native-location',
-  //   ['@neutron/native-notifications', { mode: 'production' }],
+  //   '@neutron-build/native-camera',
+  //   '@neutron-build/native-location',
+  //   ['@neutron-build/native-notifications', { mode: 'production' }],
   // ],
 
   // ── OTA updates ───────────────────────────────────────────────────────────

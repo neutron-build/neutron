@@ -1,14 +1,14 @@
 /**
- * @neutron/native — public API
+ * @neutron-build/native — public API
  *
  * This is the main entry point. Import universal (Tier 1) components,
  * the app entry helper, router, platform utilities, and navigation from here.
  *
- * For native-only (Tier 3) components, import from '@neutron/native/native'.
- * For navigation layouts, import from '@neutron/native/navigation'.
- * For router only, import from '@neutron/native/router'.
- * For platform only, import from '@neutron/native/platform'.
- * For preact/compat aliases (web builds), import from '@neutron/native/compat'.
+ * For native-only (Tier 3) components, import from '@neutron-build/native/native'.
+ * For navigation layouts, import from '@neutron-build/native/navigation'.
+ * For router only, import from '@neutron-build/native/router'.
+ * For platform only, import from '@neutron-build/native/platform'.
+ * For preact/compat aliases (web builds), import from '@neutron-build/native/compat'.
  */
 
 // ─── App Entry ───────────────────────────────────────────────────────────────
@@ -22,7 +22,7 @@ export { Pressable } from './components/Pressable.native.js'
 export { TextInput } from './components/TextInput.native.js'
 export { Link } from './components/Link.native.js'
 
-// ─── Tier 3 Components (native-only, also in @neutron/native/native) ──────────
+// ─── Tier 3 Components (native-only, also in @neutron-build/native/native) ──────────
 export { ActivityIndicator } from './components/ActivityIndicator.native.js'
 export { Switch } from './components/Switch.native.js'
 export { Slider } from './components/Slider.native.js'

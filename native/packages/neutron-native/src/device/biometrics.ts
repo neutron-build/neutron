@@ -6,7 +6,7 @@
  *   - expo-local-authentication (Expo managed/bare)
  *   - react-native-biometrics (bare React Native)
  *
- * @module @neutron/native/device/biometrics
+ * @module @neutron-build/native/device/biometrics
  */
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -96,7 +96,7 @@ function assertAvailable(): void {
  *
  * @example
  * ```ts
- * import { isAvailable } from '@neutron/native/device/biometrics'
+ * import { isAvailable } from '@neutron-build/native/device/biometrics'
  * const { available, biometryType } = await isAvailable()
  * if (available) console.log(`${biometryType} is available`)
  * ```
@@ -144,7 +144,7 @@ export async function isAvailable(): Promise<BiometricAvailability> {
  *
  * @example
  * ```ts
- * import { getSupportedTypes } from '@neutron/native/device/biometrics'
+ * import { getSupportedTypes } from '@neutron-build/native/device/biometrics'
  * const types = await getSupportedTypes()
  * // e.g. ['FaceID'] or ['Fingerprint']
  * ```
@@ -180,7 +180,7 @@ export async function getSupportedTypes(): Promise<BiometryType[]> {
  *
  * @example
  * ```ts
- * import { authenticate } from '@neutron/native/device/biometrics'
+ * import { authenticate } from '@neutron-build/native/device/biometrics'
  * const result = await authenticate({
  *   promptMessage: 'Verify your identity',
  *   fallbackToDeviceCredential: true,

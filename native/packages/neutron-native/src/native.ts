@@ -1,8 +1,8 @@
 /**
- * '@neutron/native/native' — Tier 3 (native-only) exports.
+ * '@neutron-build/native/native' — Tier 3 (native-only) exports.
  *
  * These components wrap React Native primitives that have no web equivalent.
- * Import from '@neutron/native' for universal (Tier 1) components.
+ * Import from '@neutron-build/native' for universal (Tier 1) components.
  */
 
 export { ScrollView } from './components/ScrollView.native.js'

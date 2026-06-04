@@ -25,7 +25,7 @@ const _state = signal<OTAState>({
  *
  * @example
  * ```tsx
- * import { initOTA } from '@neutron/native/ota'
+ * import { initOTA } from '@neutron-build/native/ota'
  *
  * initOTA({
  *   endpoint: 'https://updates.myapp.com',

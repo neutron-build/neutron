@@ -1,5 +1,5 @@
 /**
- * '@neutron/native/device' — unified device API modules.
+ * '@neutron-build/native/device' — unified device API modules.
  *
  * Each module wraps popular React Native / Expo community packages behind
  * a consistent async API with runtime package detection, graceful fallbacks,
@@ -10,7 +10,7 @@
  *
  * @example
  * ```ts
- * import { camera, location, haptics } from '@neutron/native/device'
+ * import { camera, location, haptics } from '@neutron-build/native/device'
  *
  * const photo = await camera.takePicture({ quality: 0.9 })
  * const pos = await location.getCurrentPosition({ accuracy: 'high' })
@@ -19,11 +19,11 @@
  *
  * Or import individual modules:
  * ```ts
- * import { takePicture } from '@neutron/native/device/camera'
- * import { getCurrentPosition } from '@neutron/native/device/location'
+ * import { takePicture } from '@neutron-build/native/device/camera'
+ * import { getCurrentPosition } from '@neutron-build/native/device/location'
  * ```
  *
- * @module @neutron/native/device
+ * @module @neutron-build/native/device
  */
 
 // ─── Camera ─────────────────────────────────────────────────────────────────

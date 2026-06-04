@@ -133,8 +133,8 @@ module.exports = {
     }),
 
     // NeutronWind — className → StyleSheet.create transform.
-    // Uncomment when @neutron/native-styling is installed.
-    // new (require('@neutron/native-styling/rspack-plugin'))(),
+    // Uncomment when @neutron-build/native-styling is installed.
+    // new (require('@neutron-build/native-styling/rspack-plugin'))(),
   ],
 
   // ── Optimisation ──────────────────────────────────────────────────────────

@@ -1,8 +1,8 @@
 /**
  * About screen — app/about.tsx → route: /about
  */
-import { View, Text, Pressable } from '@neutron/native'
-import { useRouter } from '@neutron/native/router'
+import { View, Text, Pressable } from '@neutron-build/native'
+import { useRouter } from '@neutron-build/native/router'
 
 export default function AboutScreen() {
   const { goBack } = useRouter()

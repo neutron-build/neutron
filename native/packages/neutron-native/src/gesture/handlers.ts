@@ -7,8 +7,8 @@
  * equivalent (though less performant) gesture recognition on the JS thread.
  *
  * @example
- * import { GestureDetector, Gesture } from '@neutron/native/gesture'
- * import { useSharedValue, withSpring } from '@neutron/native/animated'
+ * import { GestureDetector, Gesture } from '@neutron-build/native/gesture'
+ * import { useSharedValue, withSpring } from '@neutron-build/native/animated'
  *
  * const offset = useSharedValue(0)
  * const pan = Gesture.Pan()
