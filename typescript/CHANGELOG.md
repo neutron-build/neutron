@@ -2,11 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
-## [0.1.1] - 2026-06-04
+## [0.1.1 / cli 0.1.2] - 2026-06-04
 
-> Patch release fixing first-run experience bugs found by smoke-testing the
-> shipped 0.1.0. Republishes `create-neutron` (0.1.1) and `@neutron-build/cli`
-> (0.1.1); the other eight packages at 0.1.0 are unaffected.
+> Patch wave fixing first-run-experience and SSR bugs found by smoke-testing the
+> shipped 0.1.0. Republishes `create-neutron` (0.1.1), `@neutron-build/core`
+> (0.1.1) and `@neutron-build/cli` (0.1.2). The other seven packages at 0.1.0 are
+> unaffected. NOTE: `@neutron-build/cli@0.1.1` was a broken intermediate publish
+> (pinned `core@0.1.0`, which predates an export it needs) — use 0.1.2.
 
 ### Fixed
 
@@ -20,10 +22,31 @@ All notable changes to this project are documented in this file.
   names the catch-all param `slug`, so pages rendered at garbage paths like
   `/docs/getting-started/installationslug`. Now keyed by `slug`, producing the
   correct `/docs/getting-started/installation`.
+- **`@neutron-build/cli`: inline hook components crashed SSR/pre-render.** Both
+  `neutron-ts build` and `neutron-ts dev` left `@neutron-build/core` outside the
+  Vite SSR graph while the renderer used the in-graph preact, so core's inline
+  `<Link>` (and any inline `useState`/`useEffect` component) crashed with
+  "Cannot read properties of null (reading '__H')" — two preact instances, no
+  shared hooks dispatcher. `@neutron-build/core` is now in `ssr.noExternal` on
+  both paths. (Island components were unaffected — they defer hooks to the
+  client.) Surfaced by the `docs` template, the only one using inline `<Link>`.
 - **`@neutron-build/cli`: misleading build output.** `neutron-ts build` listed
   `_layout` files as routes, printing duplicates (e.g. `/` twice). The listing
   now shows only page routes; layouts were already correctly excluded from
   rendering, so this is output-only.
+
+### Changed
+
+- **`@neutron-build/core` → 0.1.1.** Ships two fixes that landed after the 0.1.0
+  publish: CSS Modules now emit in static builds, and a single preact instance is
+  shared during SSR/pre-render (the `CLIENT_ROUTE_QUERY` export the CLI now
+  depends on lives here). `cli@0.1.2` pins `core@0.1.1`.
+
+### Known limitations
+
+- The edge/worker bundle (vercel/cloudflare app-route deploys) still externalizes
+  `@neutron-build/core`. No template exercises app-mode inline `<Link>` on edge,
+  so this is not yet fixed there; static (SSG) and dev paths are.
 
 ### Testing
 
