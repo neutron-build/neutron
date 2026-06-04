@@ -38,18 +38,30 @@ impl MemoryBudget {
 
     /// Try to allocate `bytes`. Returns Ok(()) if within budget, Err if exceeded.
     pub fn try_allocate(&self, bytes: u64) -> Result<(), MemoryError> {
-        let current = self.used_bytes.load(Ordering::Relaxed);
         let limit = self.limit_bytes.load(Ordering::Relaxed);
-        if current + bytes > limit {
-            self.denied_count.fetch_add(1, Ordering::Relaxed);
-            return Err(MemoryError::BudgetExceeded {
-                subsystem: self.name.clone(),
-                requested: bytes,
-                used: current,
-                limit,
-            });
-        }
-        let new_used = self.used_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        // CAS loop: check-and-reserve atomically. The old load-check-then-fetch_add
+        // let concurrent callers both pass the check and over-allocate past `limit`.
+        let new_used = loop {
+            let current = self.used_bytes.load(Ordering::Acquire);
+            let next = current.saturating_add(bytes);
+            if next > limit {
+                self.denied_count.fetch_add(1, Ordering::Relaxed);
+                return Err(MemoryError::BudgetExceeded {
+                    subsystem: self.name.clone(),
+                    requested: bytes,
+                    used: current,
+                    limit,
+                });
+            }
+            if self
+                .used_bytes
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                break next;
+            }
+            // Another thread changed used_bytes; retry with the new value.
+        };
         self.alloc_count.fetch_add(1, Ordering::Relaxed);
         // Update peak.
         let mut peak = self.peak_bytes.load(Ordering::Relaxed);
