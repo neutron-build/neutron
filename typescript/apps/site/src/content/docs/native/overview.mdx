@@ -5,6 +5,10 @@ description: Preact components rendered as native views via React Native Fabric.
 
 Neutron Native lets you build iOS and Android apps using Preact, rendered as native views through React Native's Fabric architecture and JSI.
 
+> **Preview.** Neutron Native is in active development and not yet published to npm.
+> The package names below (`@neutron-build/native`, etc.) are the planned published
+> names; the API may change before release.
+
 ## How It Works
 
 1. You write Preact JSX components
@@ -18,9 +22,9 @@ No WebView — your components become real native views.
 
 | Package | Purpose |
 |---------|---------|
-| `@neutron/native` | Core renderer, components, router, navigation |
-| `@neutron/native-styling` | NeutronWind (className → StyleSheet at build time) |
-| `@neutron/native-cli` | CLI for dev, build, run |
+| `@neutron-build/native` | Core renderer, components, router, navigation |
+| `@neutron-build/native-styling` | NeutronWind (className → StyleSheet at build time) |
+| `@neutron-build/native-cli` | CLI for dev, build, run |
 
 ## Quick Start
 
@@ -41,7 +45,7 @@ neutron-native dev --android
 
 ```tsx
 // index.js
-import { NeutronApp } from '@neutron/native';
+import { NeutronApp } from '@neutron-build/native';
 import App from './app/_layout';
 
 NeutronApp({ component: App, appName: 'MyApp' });
@@ -50,7 +54,7 @@ NeutronApp({ component: App, appName: 'MyApp' });
 ## Basic Component
 
 ```tsx
-import { View, Text, Pressable } from '@neutron/native';
+import { View, Text, Pressable } from '@neutron-build/native';
 
 function HomeScreen() {
     return (
@@ -91,7 +95,7 @@ neutron-native new <name>
 For libraries that import from `react`:
 
 ```javascript
-import { preactCompatAliases } from '@neutron/native/compat';
+import { preactCompatAliases } from '@neutron-build/native/compat';
 
 // In rspack.config.ts
 export default {
