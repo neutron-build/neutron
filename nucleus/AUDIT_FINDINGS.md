@@ -120,6 +120,9 @@ is ~202K LOC; this is an honest checkpoint, not a claim of completeness.
 - **F-033 page iter_tuples corrupt-slot panic** (`storage/page.rs`). Slice from a corrupt
   slot offset/len. → bounds-check + skip/log. (`insert_tuple`'s u16 cast is bounded by
   PAGE_SIZE < 65535 — non-issue.)
+- **F-034 Streams WAL snapshot wipes data before validating** (`pubsub/streams_wal.rs`). A
+  corrupt SNAPSHOT cleared all recovered state, then failed. → parse into a temp map, swap
+  in only on success.
 
 ### False positives confirmed (no change)
 

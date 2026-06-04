@@ -232,8 +232,13 @@ fn replay(data: &[u8]) -> StreamsWalState {
                     .push((StreamEntryId::new(ms, seq), fields));
             }
             ENTRY_SNAPSHOT => {
-                streams.clear();
-                if !replay_snapshot(data, &mut pos, &mut streams) {
+                // Parse into a temporary map and only swap it in once the snapshot
+                // parses completely. Clearing first meant a corrupt/truncated
+                // snapshot wiped all already-recovered state before failing.
+                let mut snapshot = StreamsMap::new();
+                if replay_snapshot(data, &mut pos, &mut snapshot) {
+                    streams = snapshot;
+                } else {
                     break;
                 }
             }
