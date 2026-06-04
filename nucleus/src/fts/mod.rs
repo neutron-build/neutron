@@ -1935,6 +1935,14 @@ impl SegmentedIndex {
         // Sort posting lists by doc_id in the merged index
         for postings in merged.postings.values_mut() {
             postings.sort_by_key(|p| p.doc_id);
+            // Segments being merged should never share a doc_id; if they do, the
+            // dedup below would silently drop one posting's positions/TF. Fail loud
+            // in debug to surface the upstream re-indexing bug; dedup stays as a
+            // release-safety net.
+            debug_assert!(
+                postings.windows(2).all(|w| w[0].doc_id != w[1].doc_id),
+                "duplicate doc_id across merged FTS segments — re-indexing bug"
+            );
             postings.dedup_by_key(|p| p.doc_id);
         }
 
