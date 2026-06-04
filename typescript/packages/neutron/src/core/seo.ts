@@ -262,9 +262,11 @@ export function renderDocumentHead(
   if (!hasTitle) {
     const inferred = inferPageTitle(pathname);
     const template = seo?.titleTemplate;
+    // No framework brand in the default — a page with no title gets just the
+    // inferred title. Users add a site-name suffix via `titleTemplate`.
     const fallbackTitle = (template !== null && template !== undefined)
       ? template.replace(/%s/g, inferred)
-      : `${inferred} - Neutron`;
+      : inferred;
     titleTag = `<title>${escapeHtml(fallbackTitle)}</title>`;
   }
 
