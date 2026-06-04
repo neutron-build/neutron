@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// @neutron/nucleus/sql — SQL model plugin
+// @neutron-build/nucleus/sql — SQL model plugin
 // ---------------------------------------------------------------------------
 
 import type { Transport, NucleusPlugin, NucleusFeatures, IsolationLevel } from '../types.js';

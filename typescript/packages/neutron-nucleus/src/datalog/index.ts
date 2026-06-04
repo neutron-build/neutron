@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// @neutron/nucleus/datalog — Datalog reasoning model plugin
+// @neutron-build/nucleus/datalog — Datalog reasoning model plugin
 // ---------------------------------------------------------------------------
 
 import type { Transport, NucleusPlugin, NucleusFeatures } from '../types.js';

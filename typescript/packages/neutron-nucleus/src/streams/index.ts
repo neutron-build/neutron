@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// @neutron/nucleus/streams — Streams model plugin (Redis Streams-compatible)
+// @neutron-build/nucleus/streams — Streams model plugin (Redis Streams-compatible)
 // ---------------------------------------------------------------------------
 
 import type { Transport, NucleusPlugin, NucleusFeatures } from '../types.js';

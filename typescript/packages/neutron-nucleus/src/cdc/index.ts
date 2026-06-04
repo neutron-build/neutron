@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// @neutron/nucleus/cdc — Change Data Capture model plugin
+// @neutron-build/nucleus/cdc — Change Data Capture model plugin
 // ---------------------------------------------------------------------------
 
 import type { Transport, NucleusPlugin, NucleusFeatures } from '../types.js';

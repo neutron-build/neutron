@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// @neutron/nucleus/kv — KV model plugin
+// @neutron-build/nucleus/kv — KV model plugin
 // ---------------------------------------------------------------------------
 
 import type { Transport, NucleusPlugin, NucleusFeatures } from '../types.js';

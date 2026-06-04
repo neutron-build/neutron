@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// @neutron/nucleus — main entry point
+// @neutron-build/nucleus — main entry point
 // ---------------------------------------------------------------------------
 
 export { createClient } from './client.js';
@@ -35,7 +35,7 @@ export type { Migration, MigrationRecord } from './migrate.js';
 // ---------------------------------------------------------------------------
 // Model plugins — re-exported for convenience.
 // Tree-shakeable: each plugin can also be imported from its own subpath
-// (e.g. `@neutron/nucleus/kv`).
+// (e.g. `@neutron-build/nucleus/kv`).
 // ---------------------------------------------------------------------------
 
 export { withSQL } from './sql/index.js';

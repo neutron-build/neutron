@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// @neutron/nucleus/geo — Geospatial model plugin
+// @neutron-build/nucleus/geo — Geospatial model plugin
 // ---------------------------------------------------------------------------
 
 import type { Transport, NucleusPlugin, NucleusFeatures } from '../types.js';
