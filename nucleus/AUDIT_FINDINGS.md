@@ -3,6 +3,21 @@
 Running log for the audit/hardening effort described in `AUDIT_PLAN.md`.
 Severity order: correctness > memory-safety > security > durability > performance > quality.
 
+## RESUME HERE (for a compacted or fresh session)
+
+- **Branch:** `audit/nucleus-correctness-phase2-3` (pushed to origin). Keep working here.
+- **Read first:** this file (fixed = F-005..F-028; "Deferred / verified-real" = the
+  remaining work with rationale) + `AUDIT_FINDINGS_RAW.json` (full detail for all 76
+  findings incl. the 24 medium + 8 low, plus the unsafe inventory).
+- **State:** build + 3603 lib tests + `clippy --all-targets -D warnings` + `cargo fmt`
+  all green. Verify each finding against real code before fixing — the audit agents had
+  false positives and one inverted finding (F-009). Add a regression test per fix. Stage
+  `nucleus/` only (the repo has unrelated `typescript/` changes; don't commit those).
+- **Suggested order:** (1) low-risk batch — the 24 medium + 8 low + `unsafe` SAFETY
+  comments; (2) the high deferred items that need signature changes (ZRANGE i64);
+  (3) **MVCC GC** — diff against `lean4/Nucleus/Nucleus/Proofs/MvccProofs.lean` BEFORE
+  touching; (4) feature-sized: RLS-to-authenticated-user wiring, WAL header-CRC format change.
+
 ## Phase 2+3 audit — summary (in progress)
 
 A multi-agent discovery pass (per-subsystem correctness review + adversarial
