@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Cell, Color, Table};
+use comfy_table::{Cell, Color, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
 use tokio::net::TcpListener;
 use tokio_postgres::{Client, NoTls};
 
@@ -26,7 +26,7 @@ use tokio_postgres::{Client, NoTls};
 use rusqlite::{Connection, params};
 
 #[cfg(feature = "mongodb")]
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{Document, doc};
 
 #[cfg(feature = "mongodb")]
 use mongodb::IndexModel;
@@ -109,42 +109,128 @@ impl Cfg {
         let mut i = 1;
         while i < args.len() {
             match args[i].as_str() {
-                "--nucleus-port" => { i += 1; cfg.nucleus_port = args[i].parse().unwrap(); }
-                "--pg-host" => { i += 1; cfg.pg_host = args[i].clone(); }
-                "--pg-port" => { i += 1; cfg.pg_port = args[i].parse().unwrap(); }
-                "--pg-user" => { i += 1; cfg.pg_user = args[i].clone(); }
-                "--pg-password" => { i += 1; cfg.pg_password = args[i].clone(); }
-                "--redis-host" => { i += 1; cfg.redis_host = args[i].clone(); }
-                "--redis-port" => { i += 1; cfg.redis_port = args[i].parse().unwrap(); }
-                "--sqlite-path" => { i += 1; cfg.sqlite_path = args[i].clone(); }
-                "--surreal-endpoint" => { i += 1; cfg.surreal_endpoint = args[i].clone(); }
-                "--surreal-user" => { i += 1; cfg.surreal_user = args[i].clone(); }
-                "--surreal-pass" => { i += 1; cfg.surreal_pass = args[i].clone(); }
-                "--cockroach-host" => { i += 1; cfg.cockroach_host = args[i].clone(); }
-                "--cockroach-port" => { i += 1; cfg.cockroach_port = args[i].parse().unwrap(); }
-                "--tidb-host" => { i += 1; cfg.tidb_host = args[i].clone(); }
-                "--tidb-port" => { i += 1; cfg.tidb_port = args[i].parse().unwrap(); }
-                "--tidb-user" => { i += 1; cfg.tidb_user = args[i].clone(); }
-                "--tidb-password" => { i += 1; cfg.tidb_password = args[i].clone(); }
-                "--mongodb-uri" => { i += 1; cfg.mongodb_uri = args[i].clone(); }
-                "--mongodb-database" => { i += 1; cfg.mongodb_database = args[i].clone(); }
-                "--clickhouse-host" => { i += 1; cfg.clickhouse_host = args[i].clone(); }
-                "--clickhouse-port" => { i += 1; cfg.clickhouse_port = args[i].parse().unwrap(); }
-                "--iterations" => { i += 1; cfg.iterations = args[i].parse().unwrap(); }
-                "--warmup" => { i += 1; cfg.warmup_pct = args[i].parse().unwrap(); }
-                "--rows" => { i += 1; cfg.rows = args[i].parse().unwrap(); }
-                "--skip" => { i += 1; cfg.skip = args[i].split(',').map(|s| s.trim().to_lowercase()).collect(); }
+                "--nucleus-port" => {
+                    i += 1;
+                    cfg.nucleus_port = args[i].parse().unwrap();
+                }
+                "--pg-host" => {
+                    i += 1;
+                    cfg.pg_host = args[i].clone();
+                }
+                "--pg-port" => {
+                    i += 1;
+                    cfg.pg_port = args[i].parse().unwrap();
+                }
+                "--pg-user" => {
+                    i += 1;
+                    cfg.pg_user = args[i].clone();
+                }
+                "--pg-password" => {
+                    i += 1;
+                    cfg.pg_password = args[i].clone();
+                }
+                "--redis-host" => {
+                    i += 1;
+                    cfg.redis_host = args[i].clone();
+                }
+                "--redis-port" => {
+                    i += 1;
+                    cfg.redis_port = args[i].parse().unwrap();
+                }
+                "--sqlite-path" => {
+                    i += 1;
+                    cfg.sqlite_path = args[i].clone();
+                }
+                "--surreal-endpoint" => {
+                    i += 1;
+                    cfg.surreal_endpoint = args[i].clone();
+                }
+                "--surreal-user" => {
+                    i += 1;
+                    cfg.surreal_user = args[i].clone();
+                }
+                "--surreal-pass" => {
+                    i += 1;
+                    cfg.surreal_pass = args[i].clone();
+                }
+                "--cockroach-host" => {
+                    i += 1;
+                    cfg.cockroach_host = args[i].clone();
+                }
+                "--cockroach-port" => {
+                    i += 1;
+                    cfg.cockroach_port = args[i].parse().unwrap();
+                }
+                "--tidb-host" => {
+                    i += 1;
+                    cfg.tidb_host = args[i].clone();
+                }
+                "--tidb-port" => {
+                    i += 1;
+                    cfg.tidb_port = args[i].parse().unwrap();
+                }
+                "--tidb-user" => {
+                    i += 1;
+                    cfg.tidb_user = args[i].clone();
+                }
+                "--tidb-password" => {
+                    i += 1;
+                    cfg.tidb_password = args[i].clone();
+                }
+                "--mongodb-uri" => {
+                    i += 1;
+                    cfg.mongodb_uri = args[i].clone();
+                }
+                "--mongodb-database" => {
+                    i += 1;
+                    cfg.mongodb_database = args[i].clone();
+                }
+                "--clickhouse-host" => {
+                    i += 1;
+                    cfg.clickhouse_host = args[i].clone();
+                }
+                "--clickhouse-port" => {
+                    i += 1;
+                    cfg.clickhouse_port = args[i].parse().unwrap();
+                }
+                "--iterations" => {
+                    i += 1;
+                    cfg.iterations = args[i].parse().unwrap();
+                }
+                "--warmup" => {
+                    i += 1;
+                    cfg.warmup_pct = args[i].parse().unwrap();
+                }
+                "--rows" => {
+                    i += 1;
+                    cfg.rows = args[i].parse().unwrap();
+                }
+                "--skip" => {
+                    i += 1;
+                    cfg.skip = args[i]
+                        .split(',')
+                        .map(|s| s.trim().to_lowercase())
+                        .collect();
+                }
                 "--help" | "-h" => {
                     println!("Usage: compete [OPTIONS]");
-                    println!("  --iterations N            Timed iterations per benchmark (default: 1000)");
-                    println!("  --warmup N                Warm-up iterations as %% of iterations (default: 20)");
+                    println!(
+                        "  --iterations N            Timed iterations per benchmark (default: 1000)"
+                    );
+                    println!(
+                        "  --warmup N                Warm-up iterations as %% of iterations (default: 20)"
+                    );
                     println!("  --rows N                  Dataset size (default: 50000)");
                     println!("  --pg-port N               PostgreSQL port (default: 5432)");
                     println!("  --pg-user S               PostgreSQL user (default: postgres)");
                     println!("  --pg-password S           PostgreSQL password (default: empty)");
                     println!("  --redis-port N            Redis port (default: 6379)");
-                    println!("  --sqlite-path S           SQLite DB path (default: /tmp/nucleus_bench.db)");
-                    println!("  --surreal-endpoint URL    SurrealDB endpoint (default: http://127.0.0.1:8000)");
+                    println!(
+                        "  --sqlite-path S           SQLite DB path (default: /tmp/nucleus_bench.db)"
+                    );
+                    println!(
+                        "  --surreal-endpoint URL    SurrealDB endpoint (default: http://127.0.0.1:8000)"
+                    );
                     println!("  --surreal-user S          SurrealDB user (default: root)");
                     println!("  --surreal-pass S          SurrealDB pass (default: root)");
                     println!("  --cockroach-host S        CockroachDB host (default: 127.0.0.1)");
@@ -153,11 +239,17 @@ impl Cfg {
                     println!("  --tidb-port N             TiDB port (default: 4000)");
                     println!("  --tidb-user S             TiDB user (default: root)");
                     println!("  --tidb-password S         TiDB password (default: empty)");
-                    println!("  --mongodb-uri S           MongoDB URI (default: mongodb://127.0.0.1:27017)");
-                    println!("  --mongodb-database S      MongoDB database (default: nucleus_bench)");
+                    println!(
+                        "  --mongodb-uri S           MongoDB URI (default: mongodb://127.0.0.1:27017)"
+                    );
+                    println!(
+                        "  --mongodb-database S      MongoDB database (default: nucleus_bench)"
+                    );
                     println!("  --clickhouse-host S       ClickHouse host (default: 127.0.0.1)");
                     println!("  --clickhouse-port N       ClickHouse port (default: 9000)");
-                    println!("  --skip LIST               Comma-separated: pg,redis,sqlite,surreal,cockroach,tidb,mongodb,clickhouse,mixed");
+                    println!(
+                        "  --skip LIST               Comma-separated: pg,redis,sqlite,surreal,cockroach,tidb,mongodb,clickhouse,mixed"
+                    );
                     std::process::exit(0);
                 }
                 _ => {}
@@ -190,14 +282,14 @@ async fn start_nucleus_server(port: u16) -> Arc<Executor> {
 
     tokio::spawn(async move {
         loop {
-            let Ok((socket, _)) = listener.accept().await else { break };
+            let Ok((socket, _)) = listener.accept().await else {
+                break;
+            };
             let srv = server.clone();
             tokio::spawn(async move {
-                let _ = pgwire::tokio::process_socket(
-                    socket,
-                    None::<pgwire::tokio::TlsAcceptor>,
-                    srv,
-                ).await;
+                let _ =
+                    pgwire::tokio::process_socket(socket, None::<pgwire::tokio::TlsAcceptor>, srv)
+                        .await;
             });
         }
     });
@@ -213,9 +305,15 @@ struct Stats {
 }
 
 impl Stats {
-    fn new() -> Self { Self { samples: Vec::new() } }
+    fn new() -> Self {
+        Self {
+            samples: Vec::new(),
+        }
+    }
 
-    fn record(&mut self, d: Duration) { self.samples.push(d); }
+    fn record(&mut self, d: Duration) {
+        self.samples.push(d);
+    }
 
     fn sorted(&self) -> Vec<Duration> {
         let mut s = self.samples.clone();
@@ -225,32 +323,44 @@ impl Stats {
 
     fn median_us(&self) -> f64 {
         let s = self.sorted();
-        if s.is_empty() { return 0.0; }
+        if s.is_empty() {
+            return 0.0;
+        }
         s[s.len() / 2].as_nanos() as f64 / 1_000.0
     }
 
     fn avg_us(&self) -> f64 {
-        if self.samples.is_empty() { return 0.0; }
+        if self.samples.is_empty() {
+            return 0.0;
+        }
         let total: Duration = self.samples.iter().sum();
         total.as_nanos() as f64 / self.samples.len() as f64 / 1_000.0
     }
 
-    fn p50_us(&self) -> f64 { self.median_us() }
+    fn p50_us(&self) -> f64 {
+        self.median_us()
+    }
 
     fn p95_us(&self) -> f64 {
         let s = self.sorted();
-        if s.is_empty() { return 0.0; }
+        if s.is_empty() {
+            return 0.0;
+        }
         s[(s.len() as f64 * 0.95) as usize].as_nanos() as f64 / 1_000.0
     }
 
     fn p99_us(&self) -> f64 {
         let s = self.sorted();
-        if s.is_empty() { return 0.0; }
+        if s.is_empty() {
+            return 0.0;
+        }
         s[std::cmp::min((s.len() as f64 * 0.99) as usize, s.len() - 1)].as_nanos() as f64 / 1_000.0
     }
 
     fn ops_per_sec(&self) -> f64 {
-        if self.samples.is_empty() { return 0.0; }
+        if self.samples.is_empty() {
+            return 0.0;
+        }
         let total: Duration = self.samples.iter().sum();
         self.samples.len() as f64 / total.as_secs_f64()
     }
@@ -272,7 +382,9 @@ impl CompeteResult {
         self.competitor_stats.as_ref().map(|c| {
             let n = self.nucleus_stats.avg_us();
             let p = c.avg_us();
-            if n == 0.0 { return 0.0; }
+            if n == 0.0 {
+                return 0.0;
+            }
             p / n
         })
     }
@@ -282,7 +394,10 @@ impl CompeteResult {
 
 async fn wait_for_port(port: u16) {
     for _ in 0..50 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -323,7 +438,12 @@ async fn bench_query_direct(executor: &Arc<Executor>, sql: &str, warmup: usize, 
 }
 
 /// Run a prepared query on executor (prepare once, execute many — fair embedded comparison).
-async fn bench_query_prepared(executor: &Arc<Executor>, sql: &str, warmup: usize, n: usize) -> Stats {
+async fn bench_query_prepared(
+    executor: &Arc<Executor>,
+    sql: &str,
+    warmup: usize,
+    n: usize,
+) -> Stats {
     let handle = executor.prepare(sql).expect("prepare failed");
     // Warm-up
     for _ in 0..warmup {
@@ -362,24 +482,36 @@ fn format_us(us: f64) -> String {
 // ─── Schema + Data Setup ──────────────────────────────────────────────────
 
 async fn setup_sql(client: &Client, rows: usize) {
-    client.simple_query("DROP TABLE IF EXISTS bench_orders").await.unwrap();
-    client.simple_query("DROP TABLE IF EXISTS bench_users").await.unwrap();
-    client.simple_query(
-        "CREATE TABLE bench_users (
+    client
+        .simple_query("DROP TABLE IF EXISTS bench_orders")
+        .await
+        .unwrap();
+    client
+        .simple_query("DROP TABLE IF EXISTS bench_users")
+        .await
+        .unwrap();
+    client
+        .simple_query(
+            "CREATE TABLE bench_users (
             id      INT PRIMARY KEY,
             name    TEXT NOT NULL,
             email   TEXT,
             age     INT NOT NULL
-        )"
-    ).await.unwrap();
-    client.simple_query(
-        "CREATE TABLE bench_orders (
+        )",
+        )
+        .await
+        .unwrap();
+    client
+        .simple_query(
+            "CREATE TABLE bench_orders (
             id      INT PRIMARY KEY,
             user_id INT NOT NULL,
             amount  FLOAT NOT NULL,
             status  TEXT NOT NULL
-        )"
-    ).await.unwrap();
+        )",
+        )
+        .await
+        .unwrap();
 
     // Bulk insert users
     let chunk = 500;
@@ -389,7 +521,9 @@ async fn setup_sql(client: &Client, rows: usize) {
         let mut sql = String::from("INSERT INTO bench_users VALUES ");
         let mut first = true;
         for i in id..=end {
-            if !first { sql.push(','); }
+            if !first {
+                sql.push(',');
+            }
             first = false;
             let age = 20 + (i % 50);
             sql.push_str(&format!("({i},'user_{i}','user{i}@test.com',{age})"));
@@ -406,11 +540,19 @@ async fn setup_sql(client: &Client, rows: usize) {
         let mut sql = String::from("INSERT INTO bench_orders VALUES ");
         let mut first = true;
         for i in id..=end {
-            if !first { sql.push(','); }
+            if !first {
+                sql.push(',');
+            }
             first = false;
             let user_id = (i % rows) + 1;
             let amount = 10.0 + (i % 500) as f64;
-            let status = if i % 3 == 0 { "shipped" } else if i % 3 == 1 { "pending" } else { "delivered" };
+            let status = if i % 3 == 0 {
+                "shipped"
+            } else if i % 3 == 1 {
+                "pending"
+            } else {
+                "delivered"
+            };
             sql.push_str(&format!("({i},{user_id},{amount},'{status}')"));
         }
         client.simple_query(&sql).await.unwrap();
@@ -419,9 +561,18 @@ async fn setup_sql(client: &Client, rows: usize) {
 
     // Create indexes on commonly queried non-PK columns — SAME for both databases.
     // This ensures PG can use index scans where applicable, matching Nucleus behavior.
-    client.simple_query("CREATE INDEX IF NOT EXISTS idx_orders_status ON bench_orders(status)").await.unwrap();
-    client.simple_query("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON bench_orders(user_id)").await.unwrap();
-    client.simple_query("CREATE INDEX IF NOT EXISTS idx_users_age ON bench_users(age)").await.unwrap();
+    client
+        .simple_query("CREATE INDEX IF NOT EXISTS idx_orders_status ON bench_orders(status)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON bench_orders(user_id)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE INDEX IF NOT EXISTS idx_users_age ON bench_users(age)")
+        .await
+        .unwrap();
 }
 
 // ─── Section 1: SQL via pgwire (Apples-to-Apples) ─────────────────────────
@@ -438,13 +589,31 @@ async fn bench_vs_pg(
 
     // ── Read Queries ──
     let queries = [
-        ("COUNT(*)",               "SELECT COUNT(*) FROM bench_orders"),
-        ("Point Query (PK)",       "SELECT * FROM bench_orders WHERE id = 5000"),
-        ("Range Scan (BETWEEN)",   "SELECT * FROM bench_orders WHERE id BETWEEN 1000 AND 1099"),
-        ("GROUP BY + AVG",         "SELECT status, COUNT(*), AVG(amount) FROM bench_orders GROUP BY status"),
-        ("Filter + Sort + Limit",  "SELECT * FROM bench_orders WHERE status = 'pending' ORDER BY amount DESC LIMIT 20"),
-        ("SUM with WHERE",         "SELECT SUM(amount) FROM bench_orders WHERE status = 'shipped'"),
-        ("2-Table JOIN",           "SELECT u.name, o.amount FROM bench_users u, bench_orders o WHERE u.id = o.user_id AND o.id < 100"),
+        ("COUNT(*)", "SELECT COUNT(*) FROM bench_orders"),
+        (
+            "Point Query (PK)",
+            "SELECT * FROM bench_orders WHERE id = 5000",
+        ),
+        (
+            "Range Scan (BETWEEN)",
+            "SELECT * FROM bench_orders WHERE id BETWEEN 1000 AND 1099",
+        ),
+        (
+            "GROUP BY + AVG",
+            "SELECT status, COUNT(*), AVG(amount) FROM bench_orders GROUP BY status",
+        ),
+        (
+            "Filter + Sort + Limit",
+            "SELECT * FROM bench_orders WHERE status = 'pending' ORDER BY amount DESC LIMIT 20",
+        ),
+        (
+            "SUM with WHERE",
+            "SELECT SUM(amount) FROM bench_orders WHERE status = 'shipped'",
+        ),
+        (
+            "2-Table JOIN",
+            "SELECT u.name, o.amount FROM bench_users u, bench_orders o WHERE u.id = o.user_id AND o.id < 100",
+        ),
     ];
 
     for (name, sql) in &queries {
@@ -456,10 +625,14 @@ async fn bench_vs_pg(
             None
         };
         let speedup = ps.as_ref().map(|p| p.avg_us() / ns.avg_us()).unwrap_or(0.0);
-        println!(" Nucleus: {:>10}  PG: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  PG: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
-            ps.as_ref().map(|p| format_ops(p.ops_per_sec())).unwrap_or("N/A".into()),
-            speedup);
+            ps.as_ref()
+                .map(|p| format_ops(p.ops_per_sec()))
+                .unwrap_or("N/A".into()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL".into(),
             workload: name.to_string(),
@@ -475,19 +648,31 @@ async fn bench_vs_pg(
         print!("    Single INSERT              ");
         // Warm-up
         for i in 0..w {
-            let sql = format!("INSERT INTO bench_orders VALUES ({},{},99.0,'pending')", 700_000 + i, i % 1000 + 1);
+            let sql = format!(
+                "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
+                700_000 + i,
+                i % 1000 + 1
+            );
             nc.simple_query(&sql).await.unwrap();
         }
         if let Some(pg) = pg {
             for i in 0..w {
-                let sql = format!("INSERT INTO bench_orders VALUES ({},{},99.0,'pending')", 600_000 + i, i % 1000 + 1);
+                let sql = format!(
+                    "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
+                    600_000 + i,
+                    i % 1000 + 1
+                );
                 pg.simple_query(&sql).await.unwrap();
             }
         }
         // Timed
         let mut ns = Stats::new();
         for i in 0..n {
-            let sql = format!("INSERT INTO bench_orders VALUES ({},{},99.0,'pending')", 900_000 + i, i % 1000 + 1);
+            let sql = format!(
+                "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
+                900_000 + i,
+                i % 1000 + 1
+            );
             let t = Instant::now();
             nc.simple_query(&sql).await.unwrap();
             ns.record(t.elapsed());
@@ -495,7 +680,11 @@ async fn bench_vs_pg(
         let ps = if let Some(pg) = pg {
             let mut s = Stats::new();
             for i in 0..n {
-                let sql = format!("INSERT INTO bench_orders VALUES ({},{},99.0,'pending')", 800_000 + i, i % 1000 + 1);
+                let sql = format!(
+                    "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
+                    800_000 + i,
+                    i % 1000 + 1
+                );
                 let t = Instant::now();
                 pg.simple_query(&sql).await.unwrap();
                 s.record(t.elapsed());
@@ -505,10 +694,14 @@ async fn bench_vs_pg(
             None
         };
         let speedup = ps.as_ref().map(|p| p.avg_us() / ns.avg_us()).unwrap_or(0.0);
-        println!(" Nucleus: {:>10}  PG: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  PG: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
-            ps.as_ref().map(|p| format_ops(p.ops_per_sec())).unwrap_or("N/A".into()),
-            speedup);
+            ps.as_ref()
+                .map(|p| format_ops(p.ops_per_sec()))
+                .unwrap_or("N/A".into()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL".into(),
             workload: "Single INSERT".into(),
@@ -528,7 +721,9 @@ async fn bench_vs_pg(
         for b in 0..batch_warmup {
             let mut sql = String::from("INSERT INTO bench_orders VALUES ");
             for j in 0..100 {
-                if j > 0 { sql.push(','); }
+                if j > 0 {
+                    sql.push(',');
+                }
                 let id = 1_100_000 + b * 100 + j;
                 sql.push_str(&format!("({id},{},99.0,'batch')", j % 1000 + 1));
             }
@@ -538,7 +733,9 @@ async fn bench_vs_pg(
             for b in 0..batch_warmup {
                 let mut sql = String::from("INSERT INTO bench_orders VALUES ");
                 for j in 0..100 {
-                    if j > 0 { sql.push(','); }
+                    if j > 0 {
+                        sql.push(',');
+                    }
                     let id = 1_200_000 + b * 100 + j;
                     sql.push_str(&format!("({id},{},99.0,'batch')", j % 1000 + 1));
                 }
@@ -550,7 +747,9 @@ async fn bench_vs_pg(
         for b in 0..batch_iters {
             let mut sql = String::from("INSERT INTO bench_orders VALUES ");
             for j in 0..100 {
-                if j > 0 { sql.push(','); }
+                if j > 0 {
+                    sql.push(',');
+                }
                 let id = 950_000 + b * 100 + j;
                 sql.push_str(&format!("({id},{},99.0,'batch')", j % 1000 + 1));
             }
@@ -563,7 +762,9 @@ async fn bench_vs_pg(
             for b in 0..batch_iters {
                 let mut sql = String::from("INSERT INTO bench_orders VALUES ");
                 for j in 0..100 {
-                    if j > 0 { sql.push(','); }
+                    if j > 0 {
+                        sql.push(',');
+                    }
                     let id = 850_000 + b * 100 + j;
                     sql.push_str(&format!("({id},{},99.0,'batch')", j % 1000 + 1));
                 }
@@ -576,10 +777,14 @@ async fn bench_vs_pg(
             None
         };
         let speedup = ps.as_ref().map(|p| p.avg_us() / ns.avg_us()).unwrap_or(0.0);
-        println!(" Nucleus: {:>10}  PG: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  PG: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
-            ps.as_ref().map(|p| format_ops(p.ops_per_sec())).unwrap_or("N/A".into()),
-            speedup);
+            ps.as_ref()
+                .map(|p| format_ops(p.ops_per_sec()))
+                .unwrap_or("N/A".into()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL".into(),
             workload: "Batch INSERT (100 rows)".into(),
@@ -593,17 +798,35 @@ async fn bench_vs_pg(
     // ── UPDATE by PK ──
     {
         print!("    UPDATE by PK               ");
-        let ns = bench_query(nc, "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000", w, n).await;
+        let ns = bench_query(
+            nc,
+            "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000",
+            w,
+            n,
+        )
+        .await;
         let ps = if let Some(pg) = pg {
-            Some(bench_query(pg, "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000", w, n).await)
+            Some(
+                bench_query(
+                    pg,
+                    "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000",
+                    w,
+                    n,
+                )
+                .await,
+            )
         } else {
             None
         };
         let speedup = ps.as_ref().map(|p| p.avg_us() / ns.avg_us()).unwrap_or(0.0);
-        println!(" Nucleus: {:>10}  PG: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  PG: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
-            ps.as_ref().map(|p| format_ops(p.ops_per_sec())).unwrap_or("N/A".into()),
-            speedup);
+            ps.as_ref()
+                .map(|p| format_ops(p.ops_per_sec()))
+                .unwrap_or("N/A".into()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL".into(),
             workload: "UPDATE by PK".into(),
@@ -620,46 +843,82 @@ async fn bench_vs_pg(
         // Use IDs that won't collide with other tests
         for i in 0..w {
             let id = 2_000_000 + i;
-            nc.simple_query(&format!("INSERT INTO bench_orders VALUES ({id},1,50.0,'del')")).await.ok();
+            nc.simple_query(&format!(
+                "INSERT INTO bench_orders VALUES ({id},1,50.0,'del')"
+            ))
+            .await
+            .ok();
         }
         if let Some(pg) = pg {
             for i in 0..w {
                 let id = 2_100_000 + i;
-                pg.simple_query(&format!("INSERT INTO bench_orders VALUES ({id},1,50.0,'del')")).await.ok();
+                pg.simple_query(&format!(
+                    "INSERT INTO bench_orders VALUES ({id},1,50.0,'del')"
+                ))
+                .await
+                .ok();
             }
         }
         // Warm-up
         for i in 0..w {
-            nc.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_000_000 + i)).await.ok();
+            nc.simple_query(&format!(
+                "DELETE FROM bench_orders WHERE id = {}",
+                2_000_000 + i
+            ))
+            .await
+            .ok();
         }
         if let Some(pg) = pg {
             for i in 0..w {
-                pg.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_100_000 + i)).await.ok();
+                pg.simple_query(&format!(
+                    "DELETE FROM bench_orders WHERE id = {}",
+                    2_100_000 + i
+                ))
+                .await
+                .ok();
             }
         }
         // Insert rows for timed deletes
         for i in 0..n {
             let id = 2_200_000 + i;
-            nc.simple_query(&format!("INSERT INTO bench_orders VALUES ({id},1,50.0,'del')")).await.ok();
+            nc.simple_query(&format!(
+                "INSERT INTO bench_orders VALUES ({id},1,50.0,'del')"
+            ))
+            .await
+            .ok();
         }
         if let Some(pg) = pg {
             for i in 0..n {
                 let id = 2_300_000 + i;
-                pg.simple_query(&format!("INSERT INTO bench_orders VALUES ({id},1,50.0,'del')")).await.ok();
+                pg.simple_query(&format!(
+                    "INSERT INTO bench_orders VALUES ({id},1,50.0,'del')"
+                ))
+                .await
+                .ok();
             }
         }
         // Timed
         let mut ns = Stats::new();
         for i in 0..n {
             let t = Instant::now();
-            nc.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_200_000 + i)).await.ok();
+            nc.simple_query(&format!(
+                "DELETE FROM bench_orders WHERE id = {}",
+                2_200_000 + i
+            ))
+            .await
+            .ok();
             ns.record(t.elapsed());
         }
         let ps = if let Some(pg) = pg {
             let mut s = Stats::new();
             for i in 0..n {
                 let t = Instant::now();
-                pg.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_300_000 + i)).await.ok();
+                pg.simple_query(&format!(
+                    "DELETE FROM bench_orders WHERE id = {}",
+                    2_300_000 + i
+                ))
+                .await
+                .ok();
                 s.record(t.elapsed());
             }
             Some(s)
@@ -667,10 +926,14 @@ async fn bench_vs_pg(
             None
         };
         let speedup = ps.as_ref().map(|p| p.avg_us() / ns.avg_us()).unwrap_or(0.0);
-        println!(" Nucleus: {:>10}  PG: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  PG: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
-            ps.as_ref().map(|p| format_ops(p.ops_per_sec())).unwrap_or("N/A".into()),
-            speedup);
+            ps.as_ref()
+                .map(|p| format_ops(p.ops_per_sec()))
+                .unwrap_or("N/A".into()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL".into(),
             workload: "DELETE by PK".into(),
@@ -737,8 +1000,10 @@ async fn bench_vs_redis(
         }
         for i in 0..w {
             let _: Result<(), _> = redis::cmd("SET")
-                .arg(format!("w:{i}")).arg(format!("v-{i}"))
-                .query_async(&mut redis_conn).await;
+                .arg(format!("w:{i}"))
+                .arg(format!("v-{i}"))
+                .query_async(&mut redis_conn)
+                .await;
         }
         // Timed
         let mut ns = Stats::new();
@@ -751,13 +1016,19 @@ async fn bench_vs_redis(
         for i in 0..n {
             let t = Instant::now();
             let _: Result<(), _> = redis::cmd("SET")
-                .arg(format!("bench:{i}")).arg(format!("val-{i}"))
-                .query_async(&mut redis_conn).await;
+                .arg(format!("bench:{i}"))
+                .arg(format!("val-{i}"))
+                .query_async(&mut redis_conn)
+                .await;
             rs.record(t.elapsed());
         }
         let speedup = rs.avg_us() / ns.avg_us();
-        println!(" Nucleus: {:>10}  Redis: {:>10}  {:.0}x",
-            format_ops(ns.ops_per_sec()), format_ops(rs.ops_per_sec()), speedup);
+        println!(
+            " Nucleus: {:>10}  Redis: {:>10}  {:.0}x",
+            format_ops(ns.ops_per_sec()),
+            format_ops(rs.ops_per_sec()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "KV".into(),
             workload: format!("SET {n}"),
@@ -772,10 +1043,14 @@ async fn bench_vs_redis(
     {
         print!("    GET {n:<25}");
         // Warm-up
-        for i in 0..w { let _ = kv.get(&format!("bench:{i}")); }
+        for i in 0..w {
+            let _ = kv.get(&format!("bench:{i}"));
+        }
         for i in 0..w {
             let _: Result<Option<String>, _> = redis::cmd("GET")
-                .arg(format!("bench:{i}")).query_async(&mut redis_conn).await;
+                .arg(format!("bench:{i}"))
+                .query_async(&mut redis_conn)
+                .await;
         }
         // Timed
         let mut ns = Stats::new();
@@ -788,12 +1063,18 @@ async fn bench_vs_redis(
         for i in 0..n {
             let t = Instant::now();
             let _: Result<Option<String>, _> = redis::cmd("GET")
-                .arg(format!("bench:{i}")).query_async(&mut redis_conn).await;
+                .arg(format!("bench:{i}"))
+                .query_async(&mut redis_conn)
+                .await;
             rs.record(t.elapsed());
         }
         let speedup = rs.avg_us() / ns.avg_us();
-        println!(" Nucleus: {:>10}  Redis: {:>10}  {:.0}x",
-            format_ops(ns.ops_per_sec()), format_ops(rs.ops_per_sec()), speedup);
+        println!(
+            " Nucleus: {:>10}  Redis: {:>10}  {:.0}x",
+            format_ops(ns.ops_per_sec()),
+            format_ops(rs.ops_per_sec()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "KV".into(),
             workload: format!("GET {n}"),
@@ -809,10 +1090,14 @@ async fn bench_vs_redis(
         let incr_n = n / 10;
         let incr_w = w / 10;
         print!("    INCR {incr_n:<24}");
-        for _ in 0..incr_w { let _ = kv.incr("warmup:counter"); }
+        for _ in 0..incr_w {
+            let _ = kv.incr("warmup:counter");
+        }
         for _ in 0..incr_w {
             let _: Result<i64, _> = redis::cmd("INCR")
-                .arg("warmup:counter").query_async(&mut redis_conn).await;
+                .arg("warmup:counter")
+                .query_async(&mut redis_conn)
+                .await;
         }
         let mut ns = Stats::new();
         for _ in 0..incr_n {
@@ -824,12 +1109,18 @@ async fn bench_vs_redis(
         for _ in 0..incr_n {
             let t = Instant::now();
             let _: Result<i64, _> = redis::cmd("INCR")
-                .arg("bench:counter").query_async(&mut redis_conn).await;
+                .arg("bench:counter")
+                .query_async(&mut redis_conn)
+                .await;
             rs.record(t.elapsed());
         }
         let speedup = rs.avg_us() / ns.avg_us();
-        println!(" Nucleus: {:>10}  Redis: {:>10}  {:.0}x",
-            format_ops(ns.ops_per_sec()), format_ops(rs.ops_per_sec()), speedup);
+        println!(
+            " Nucleus: {:>10}  Redis: {:>10}  {:.0}x",
+            format_ops(ns.ops_per_sec()),
+            format_ops(rs.ops_per_sec()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "KV".into(),
             workload: format!("INCR {incr_n}"),
@@ -846,25 +1137,53 @@ async fn bench_vs_redis(
         // Warm-up both sides
         for i in 0..w {
             match i % 10 {
-                0..=4 => { let _ = kv.get(&format!("bench:{}", i % n)); }
-                5..=7 => { kv.set(&format!("wmix:{i}"), Value::Text(format!("v{i}")), None); }
-                _ => { let _ = kv.del(&format!("wmix:{}", i.wrapping_sub(2))); }
+                0..=4 => {
+                    let _ = kv.get(&format!("bench:{}", i % n));
+                }
+                5..=7 => {
+                    kv.set(&format!("wmix:{i}"), Value::Text(format!("v{i}")), None);
+                }
+                _ => {
+                    let _ = kv.del(&format!("wmix:{}", i.wrapping_sub(2)));
+                }
             }
         }
         for i in 0..w {
             match i % 10 {
-                0..=4 => { let _: Result<Option<String>, _> = redis::cmd("GET").arg(format!("bench:{}", i % n)).query_async(&mut redis_conn).await; }
-                5..=7 => { let _: Result<(), _> = redis::cmd("SET").arg(format!("wmix:{i}")).arg(format!("v{i}")).query_async(&mut redis_conn).await; }
-                _ => { let _: Result<i32, _> = redis::cmd("DEL").arg(format!("wmix:{}", i.wrapping_sub(2))).query_async(&mut redis_conn).await; }
+                0..=4 => {
+                    let _: Result<Option<String>, _> = redis::cmd("GET")
+                        .arg(format!("bench:{}", i % n))
+                        .query_async(&mut redis_conn)
+                        .await;
+                }
+                5..=7 => {
+                    let _: Result<(), _> = redis::cmd("SET")
+                        .arg(format!("wmix:{i}"))
+                        .arg(format!("v{i}"))
+                        .query_async(&mut redis_conn)
+                        .await;
+                }
+                _ => {
+                    let _: Result<i32, _> = redis::cmd("DEL")
+                        .arg(format!("wmix:{}", i.wrapping_sub(2)))
+                        .query_async(&mut redis_conn)
+                        .await;
+                }
             }
         }
         let mut ns = Stats::new();
         for i in 0..n {
             let t = Instant::now();
             match i % 10 {
-                0..=4 => { let _ = kv.get(&format!("bench:{}", i % n)); }
-                5..=7 => { kv.set(&format!("mix:{i}"), Value::Text(format!("v{i}")), None); }
-                _ => { let _ = kv.del(&format!("mix:{}", i.wrapping_sub(2))); }
+                0..=4 => {
+                    let _ = kv.get(&format!("bench:{}", i % n));
+                }
+                5..=7 => {
+                    kv.set(&format!("mix:{i}"), Value::Text(format!("v{i}")), None);
+                }
+                _ => {
+                    let _ = kv.del(&format!("mix:{}", i.wrapping_sub(2)));
+                }
             }
             ns.record(t.elapsed());
         }
@@ -872,15 +1191,35 @@ async fn bench_vs_redis(
         for i in 0..n {
             let t = Instant::now();
             match i % 10 {
-                0..=4 => { let _: Result<Option<String>, _> = redis::cmd("GET").arg(format!("bench:{}", i % n)).query_async(&mut redis_conn).await; }
-                5..=7 => { let _: Result<(), _> = redis::cmd("SET").arg(format!("mix:{i}")).arg(format!("v{i}")).query_async(&mut redis_conn).await; }
-                _ => { let _: Result<i32, _> = redis::cmd("DEL").arg(format!("mix:{}", i.wrapping_sub(2))).query_async(&mut redis_conn).await; }
+                0..=4 => {
+                    let _: Result<Option<String>, _> = redis::cmd("GET")
+                        .arg(format!("bench:{}", i % n))
+                        .query_async(&mut redis_conn)
+                        .await;
+                }
+                5..=7 => {
+                    let _: Result<(), _> = redis::cmd("SET")
+                        .arg(format!("mix:{i}"))
+                        .arg(format!("v{i}"))
+                        .query_async(&mut redis_conn)
+                        .await;
+                }
+                _ => {
+                    let _: Result<i32, _> = redis::cmd("DEL")
+                        .arg(format!("mix:{}", i.wrapping_sub(2)))
+                        .query_async(&mut redis_conn)
+                        .await;
+                }
             }
             rs.record(t.elapsed());
         }
         let speedup = rs.avg_us() / ns.avg_us();
-        println!(" Nucleus: {:>10}  Redis: {:>10}  {:.0}x",
-            format_ops(ns.ops_per_sec()), format_ops(rs.ops_per_sec()), speedup);
+        println!(
+            " Nucleus: {:>10}  Redis: {:>10}  {:.0}x",
+            format_ops(ns.ops_per_sec()),
+            format_ops(rs.ops_per_sec()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "KV".into(),
             workload: format!("Mixed 50R/30W/20D {n}"),
@@ -914,16 +1253,24 @@ async fn bench_mixed_multimodel(
     let graph = executor.graph_store();
 
     // ── SQL+KV fair comparison (both use same number of operations) ──
-    nc.simple_query("DROP TABLE IF EXISTS mixed_users").await.unwrap();
-    nc.simple_query(
-        "CREATE TABLE mixed_users (id INT PRIMARY KEY, name TEXT NOT NULL)"
-    ).await.unwrap();
+    nc.simple_query("DROP TABLE IF EXISTS mixed_users")
+        .await
+        .unwrap();
+    nc.simple_query("CREATE TABLE mixed_users (id INT PRIMARY KEY, name TEXT NOT NULL)")
+        .await
+        .unwrap();
 
     // Warm-up Nucleus
     for i in 0..w {
         let id = 5_000_000 + i;
-        nc.simple_query(&format!("INSERT INTO mixed_users VALUES ({id}, 'wu_{i}')")).await.unwrap();
-        kv.set(&format!("wsess:{i}"), Value::Text(format!("tok_{i}")), Some(3600));
+        nc.simple_query(&format!("INSERT INTO mixed_users VALUES ({id}, 'wu_{i}')"))
+            .await
+            .unwrap();
+        kv.set(
+            &format!("wsess:{i}"),
+            Value::Text(format!("tok_{i}")),
+            Some(3600),
+        );
     }
 
     // Timed: Nucleus SQL (pgwire) + KV (embedded)
@@ -932,7 +1279,8 @@ async fn bench_mixed_multimodel(
         let t = Instant::now();
         // 1. SQL INSERT via pgwire (same protocol as PG)
         nc.simple_query(&format!("INSERT INTO mixed_users VALUES ({i}, 'user_{i}')"))
-            .await.unwrap();
+            .await
+            .unwrap();
         // 2. KV SET (embedded — this is the architectural advantage)
         kv.set(
             &format!("session:{i}"),
@@ -946,46 +1294,71 @@ async fn bench_mixed_multimodel(
         let redis_url = format!("redis://{redis_host}:{redis_port}");
         if let Ok(redis_client) = redis::Client::open(redis_url.as_str()) {
             if let Ok(mut redis_conn) = redis_client.get_multiplexed_async_connection().await {
-                pg.simple_query("DROP TABLE IF EXISTS mixed_users").await.unwrap();
+                pg.simple_query("DROP TABLE IF EXISTS mixed_users")
+                    .await
+                    .unwrap();
                 pg.simple_query(
-                    "CREATE TABLE mixed_users (id INT PRIMARY KEY, name TEXT NOT NULL)"
-                ).await.unwrap();
+                    "CREATE TABLE mixed_users (id INT PRIMARY KEY, name TEXT NOT NULL)",
+                )
+                .await
+                .unwrap();
                 // Warm-up PG+Redis
                 for i in 0..w {
                     let id = 5_000_000 + i;
-                    pg.simple_query(&format!("INSERT INTO mixed_users VALUES ({id}, 'wu_{i}')")).await.unwrap();
+                    pg.simple_query(&format!("INSERT INTO mixed_users VALUES ({id}, 'wu_{i}')"))
+                        .await
+                        .unwrap();
                     let _: Result<(), _> = redis::cmd("SET")
-                        .arg(format!("wsess:{i}")).arg(format!("tok_{i}"))
-                        .arg("EX").arg(3600)
-                        .query_async(&mut redis_conn).await;
+                        .arg(format!("wsess:{i}"))
+                        .arg(format!("tok_{i}"))
+                        .arg("EX")
+                        .arg(3600)
+                        .query_async(&mut redis_conn)
+                        .await;
                 }
                 // Timed: PG (pgwire) + Redis (network)
                 let mut s = Stats::new();
                 for i in 0..n {
                     let t = Instant::now();
                     pg.simple_query(&format!("INSERT INTO mixed_users VALUES ({i}, 'user_{i}')"))
-                        .await.unwrap();
+                        .await
+                        .unwrap();
                     let _: Result<(), _> = redis::cmd("SET")
-                        .arg(format!("session:{i}")).arg(format!("tok_{i}"))
-                        .arg("EX").arg(3600)
-                        .query_async(&mut redis_conn).await;
+                        .arg(format!("session:{i}"))
+                        .arg(format!("tok_{i}"))
+                        .arg("EX")
+                        .arg(3600)
+                        .query_async(&mut redis_conn)
+                        .await;
                     s.record(t.elapsed());
                 }
                 Some(s)
-            } else { None }
-        } else { None }
-    } else { None };
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let speedup = cs.as_ref().map(|c| c.avg_us() / ns.avg_us()).unwrap_or(0.0);
     print!("    SQL+KV x{n:<20}");
-    println!(" Nucleus: {:>10}  PG+Redis: {:>10}  {:.1}x",
+    println!(
+        " Nucleus: {:>10}  PG+Redis: {:>10}  {:.1}x",
         format_ops(ns.ops_per_sec()),
-        cs.as_ref().map(|c| format_ops(c.ops_per_sec())).unwrap_or("N/A".into()),
-        speedup);
+        cs.as_ref()
+            .map(|c| format_ops(c.ops_per_sec()))
+            .unwrap_or("N/A".into()),
+        speedup
+    );
 
     results.push(CompeteResult {
         category: "Multi-Model".into(),
-        workload: format!("SQL+KV x{n} (Nucleus: pgwire+embedded KV vs PG+Redis: pgwire+network KV)"),
+        workload: format!(
+            "SQL+KV x{n} (Nucleus: pgwire+embedded KV vs PG+Redis: pgwire+network KV)"
+        ),
         nucleus_stats: ns,
         competitor_name: "PG+Redis".into(),
         competitor_stats: cs,
@@ -995,23 +1368,38 @@ async fn bench_mixed_multimodel(
     // ── Full signup flow: SQL + KV + FTS + Graph ──
     // NOTE: PG+Redis cannot do FTS+Graph in-process, so this shows what Nucleus
     // can do in a single process that would require 3-4 services otherwise.
-    nc.simple_query("DROP TABLE IF EXISTS signup_users").await.unwrap();
-    nc.simple_query(
-        "CREATE TABLE signup_users (id INT PRIMARY KEY, name TEXT NOT NULL, bio TEXT)"
-    ).await.unwrap();
+    nc.simple_query("DROP TABLE IF EXISTS signup_users")
+        .await
+        .unwrap();
+    nc.simple_query("CREATE TABLE signup_users (id INT PRIMARY KEY, name TEXT NOT NULL, bio TEXT)")
+        .await
+        .unwrap();
 
     // Warm-up
     for i in 0..w {
         let id = 6_000_000 + i;
         nc.simple_query(&format!(
-            "INSERT INTO signup_users VALUES ({id}, 'wu_{i}', 'engineer from city_{}')", i % 50
-        )).await.unwrap();
-        kv.set(&format!("wsignup:{i}"), Value::Text(format!("tok_{i}")), Some(3600));
-        fts.write().add_document(1_000_000 + i as u64, &format!("wu_{i} engineer city_{}", i % 50));
+            "INSERT INTO signup_users VALUES ({id}, 'wu_{i}', 'engineer from city_{}')",
+            i % 50
+        ))
+        .await
+        .unwrap();
+        kv.set(
+            &format!("wsignup:{i}"),
+            Value::Text(format!("tok_{i}")),
+            Some(3600),
+        );
+        fts.write().add_document(
+            1_000_000 + i as u64,
+            &format!("wu_{i} engineer city_{}", i % 50),
+        );
         {
             let mut g = graph.write();
             let mut props = BTreeMap::new();
-            props.insert("name".to_string(), nucleus::graph::PropValue::Text(format!("wu_{i}")));
+            props.insert(
+                "name".to_string(),
+                nucleus::graph::PropValue::Text(format!("wu_{i}")),
+            );
             g.create_node(vec!["User".into()], props);
         }
     }
@@ -1020,14 +1408,25 @@ async fn bench_mixed_multimodel(
     for i in 0..n {
         let t = Instant::now();
         nc.simple_query(&format!(
-            "INSERT INTO signup_users VALUES ({i}, 'user_{i}', 'engineer from city_{}')", i % 50
-        )).await.unwrap();
-        kv.set(&format!("signup:{i}"), Value::Text(format!("tok_{i}")), Some(3600));
-        fts.write().add_document(i as u64, &format!("user_{i} engineer city_{}", i % 50));
+            "INSERT INTO signup_users VALUES ({i}, 'user_{i}', 'engineer from city_{}')",
+            i % 50
+        ))
+        .await
+        .unwrap();
+        kv.set(
+            &format!("signup:{i}"),
+            Value::Text(format!("tok_{i}")),
+            Some(3600),
+        );
+        fts.write()
+            .add_document(i as u64, &format!("user_{i} engineer city_{}", i % 50));
         {
             let mut g = graph.write();
             let mut props = BTreeMap::new();
-            props.insert("name".to_string(), nucleus::graph::PropValue::Text(format!("user_{i}")));
+            props.insert(
+                "name".to_string(),
+                nucleus::graph::PropValue::Text(format!("user_{i}")),
+            );
             let node_id = g.create_node(vec!["User".into()], props);
             if node_id > 1 {
                 g.create_edge(node_id, node_id - 1, "follows".to_string(), BTreeMap::new());
@@ -1037,8 +1436,10 @@ async fn bench_mixed_multimodel(
     }
 
     print!("    Full signup x{n:<16}");
-    println!(" Nucleus: {:>10} (SQL+KV+FTS+Graph, single process)",
-        format_ops(ns_full.ops_per_sec()));
+    println!(
+        " Nucleus: {:>10} (SQL+KV+FTS+Graph, single process)",
+        format_ops(ns_full.ops_per_sec())
+    );
 
     results.push(CompeteResult {
         category: "Multi-Model".into(),
@@ -1079,7 +1480,11 @@ fn print_results(results: &[CompeteResult]) {
         let (c_ops, c_p50, speedup_str, color) = match &r.competitor_stats {
             Some(cs) => {
                 let speedup = r.speedup().unwrap_or(0.0);
-                let color = if speedup >= 1.0 { Color::Green } else { Color::Red };
+                let color = if speedup >= 1.0 {
+                    Color::Green
+                } else {
+                    Color::Red
+                };
                 (
                     format_ops(cs.ops_per_sec()),
                     format_us(cs.p50_us()),
@@ -1111,28 +1516,31 @@ fn print_results(results: &[CompeteResult]) {
 }
 
 fn write_json_report(results: &[CompeteResult]) {
-    let json_results: Vec<serde_json::Value> = results.iter().map(|r| {
-        let mut entry = serde_json::json!({
-            "category": r.category,
-            "workload": r.workload,
-            "nucleus_ops_per_sec": r.nucleus_stats.ops_per_sec(),
-            "nucleus_avg_us": r.nucleus_stats.avg_us(),
-            "nucleus_p50_us": r.nucleus_stats.p50_us(),
-            "nucleus_p95_us": r.nucleus_stats.p95_us(),
-            "nucleus_p99_us": r.nucleus_stats.p99_us(),
-            "competitor": r.competitor_name,
-            "note": r.note,
-        });
-        if let Some(cs) = &r.competitor_stats {
-            entry["competitor_ops_per_sec"] = serde_json::json!(cs.ops_per_sec());
-            entry["competitor_avg_us"] = serde_json::json!(cs.avg_us());
-            entry["competitor_p50_us"] = serde_json::json!(cs.p50_us());
-            entry["competitor_p95_us"] = serde_json::json!(cs.p95_us());
-            entry["competitor_p99_us"] = serde_json::json!(cs.p99_us());
-            entry["speedup"] = serde_json::json!(r.speedup().unwrap_or(0.0));
-        }
-        entry
-    }).collect();
+    let json_results: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            let mut entry = serde_json::json!({
+                "category": r.category,
+                "workload": r.workload,
+                "nucleus_ops_per_sec": r.nucleus_stats.ops_per_sec(),
+                "nucleus_avg_us": r.nucleus_stats.avg_us(),
+                "nucleus_p50_us": r.nucleus_stats.p50_us(),
+                "nucleus_p95_us": r.nucleus_stats.p95_us(),
+                "nucleus_p99_us": r.nucleus_stats.p99_us(),
+                "competitor": r.competitor_name,
+                "note": r.note,
+            });
+            if let Some(cs) = &r.competitor_stats {
+                entry["competitor_ops_per_sec"] = serde_json::json!(cs.ops_per_sec());
+                entry["competitor_avg_us"] = serde_json::json!(cs.avg_us());
+                entry["competitor_p50_us"] = serde_json::json!(cs.p50_us());
+                entry["competitor_p95_us"] = serde_json::json!(cs.p95_us());
+                entry["competitor_p99_us"] = serde_json::json!(cs.p99_us());
+                entry["speedup"] = serde_json::json!(r.speedup().unwrap_or(0.0));
+            }
+            entry
+        })
+        .collect();
 
     let report = serde_json::json!({
         "timestamp": std::time::SystemTime::now()
@@ -1156,24 +1564,36 @@ fn write_json_report(results: &[CompeteResult]) {
 // ─── Section: CockroachDB Benchmarks (distributed SQL) ────────────────────
 
 async fn setup_cockroach_schema(client: &Client, rows: usize) {
-    client.simple_query("DROP TABLE IF EXISTS bench_orders").await.unwrap();
-    client.simple_query("DROP TABLE IF EXISTS bench_users").await.unwrap();
-    client.simple_query(
-        "CREATE TABLE bench_users (
+    client
+        .simple_query("DROP TABLE IF EXISTS bench_orders")
+        .await
+        .unwrap();
+    client
+        .simple_query("DROP TABLE IF EXISTS bench_users")
+        .await
+        .unwrap();
+    client
+        .simple_query(
+            "CREATE TABLE bench_users (
             id      INT PRIMARY KEY,
             name    TEXT NOT NULL,
             age     INT NOT NULL,
             city    TEXT NOT NULL
-        )"
-    ).await.unwrap();
-    client.simple_query(
-        "CREATE TABLE bench_orders (
+        )",
+        )
+        .await
+        .unwrap();
+    client
+        .simple_query(
+            "CREATE TABLE bench_orders (
             id      INT PRIMARY KEY,
             user_id INT NOT NULL,
             amount  DECIMAL(10,2) NOT NULL,
             status  TEXT NOT NULL
-        )"
-    ).await.unwrap();
+        )",
+        )
+        .await
+        .unwrap();
 
     // Insert users in chunks
     let chunk = 1000;
@@ -1183,11 +1603,15 @@ async fn setup_cockroach_schema(client: &Client, rows: usize) {
         let mut sql = String::from("INSERT INTO bench_users VALUES ");
         let mut first = true;
         for i in id..=end {
-            if !first { sql.push(','); }
+            if !first {
+                sql.push(',');
+            }
             first = false;
             let age = 20 + (i % 50) as i32;
             let city_idx = (i % 10) as i32;
-            let city = ["NYC", "LA", "CHI", "HOU", "PHX", "PHI", "SAN", "DEN", "BOS", "SEA"][city_idx as usize];
+            let city = [
+                "NYC", "LA", "CHI", "HOU", "PHX", "PHI", "SAN", "DEN", "BOS", "SEA",
+            ][city_idx as usize];
             sql.push_str(&format!("({},{},{},'{}') ", i, i, age, city));
         }
         client.simple_query(&sql).await.unwrap();
@@ -1202,7 +1626,9 @@ async fn setup_cockroach_schema(client: &Client, rows: usize) {
         let mut sql = String::from("INSERT INTO bench_orders VALUES ");
         let mut first = true;
         for i in id..=end {
-            if !first { sql.push(','); }
+            if !first {
+                sql.push(',');
+            }
             first = false;
             let user_id = ((i - 1) % rows as usize) as i32 + 1;
             let amount = 10.0 + ((i % 100) as f64);
@@ -1215,9 +1641,18 @@ async fn setup_cockroach_schema(client: &Client, rows: usize) {
     }
 
     // Create indexes on commonly queried non-PK columns — SAME for both databases.
-    client.simple_query("CREATE INDEX IF NOT EXISTS idx_orders_status ON bench_orders(status)").await.unwrap();
-    client.simple_query("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON bench_orders(user_id)").await.unwrap();
-    client.simple_query("CREATE INDEX IF NOT EXISTS idx_users_age ON bench_users(age)").await.unwrap();
+    client
+        .simple_query("CREATE INDEX IF NOT EXISTS idx_orders_status ON bench_orders(status)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON bench_orders(user_id)")
+        .await
+        .unwrap();
+    client
+        .simple_query("CREATE INDEX IF NOT EXISTS idx_users_age ON bench_users(age)")
+        .await
+        .unwrap();
 }
 
 async fn bench_vs_cockroach(
@@ -1232,13 +1667,31 @@ async fn bench_vs_cockroach(
 
     // ── Read Queries ──
     let queries = [
-        ("COUNT(*)",               "SELECT COUNT(*) FROM bench_orders"),
-        ("Point Query (PK)",       "SELECT * FROM bench_orders WHERE id = 5000"),
-        ("Range Scan (BETWEEN)",   "SELECT * FROM bench_orders WHERE id BETWEEN 1000 AND 1099"),
-        ("GROUP BY + AVG",         "SELECT status, COUNT(*), AVG(amount) FROM bench_orders GROUP BY status"),
-        ("Filter + Sort + Limit",  "SELECT * FROM bench_orders WHERE status = 'pending' ORDER BY amount DESC LIMIT 20"),
-        ("SUM with WHERE",         "SELECT SUM(amount) FROM bench_orders WHERE status = 'shipped'"),
-        ("2-Table JOIN",           "SELECT u.name, o.amount FROM bench_users u, bench_orders o WHERE u.id = o.user_id AND o.id < 100"),
+        ("COUNT(*)", "SELECT COUNT(*) FROM bench_orders"),
+        (
+            "Point Query (PK)",
+            "SELECT * FROM bench_orders WHERE id = 5000",
+        ),
+        (
+            "Range Scan (BETWEEN)",
+            "SELECT * FROM bench_orders WHERE id BETWEEN 1000 AND 1099",
+        ),
+        (
+            "GROUP BY + AVG",
+            "SELECT status, COUNT(*), AVG(amount) FROM bench_orders GROUP BY status",
+        ),
+        (
+            "Filter + Sort + Limit",
+            "SELECT * FROM bench_orders WHERE status = 'pending' ORDER BY amount DESC LIMIT 20",
+        ),
+        (
+            "SUM with WHERE",
+            "SELECT SUM(amount) FROM bench_orders WHERE status = 'shipped'",
+        ),
+        (
+            "2-Table JOIN",
+            "SELECT u.name, o.amount FROM bench_users u, bench_orders o WHERE u.id = o.user_id AND o.id < 100",
+        ),
     ];
 
     for (name, sql) in &queries {
@@ -1250,10 +1703,14 @@ async fn bench_vs_cockroach(
             None
         };
         let speedup = cs.as_ref().map(|c| c.avg_us() / ns.avg_us()).unwrap_or(0.0);
-        println!(" Nucleus: {:>10}  CRDB: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  CRDB: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
-            cs.as_ref().map(|c| format_ops(c.ops_per_sec())).unwrap_or("N/A".into()),
-            speedup);
+            cs.as_ref()
+                .map(|c| format_ops(c.ops_per_sec()))
+                .unwrap_or("N/A".into()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL (CockroachDB)".into(),
             workload: name.to_string(),
@@ -1269,19 +1726,31 @@ async fn bench_vs_cockroach(
         print!("    Single INSERT              ");
         // Warm-up
         for i in 0..w {
-            let sql = format!("INSERT INTO bench_orders VALUES ({},{},99.0,'pending')", 700_000 + i, i % 1000 + 1);
+            let sql = format!(
+                "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
+                700_000 + i,
+                i % 1000 + 1
+            );
             nc.simple_query(&sql).await.unwrap();
         }
         if let Some(cockroach) = cockroach {
             for i in 0..w {
-                let sql = format!("INSERT INTO bench_orders VALUES ({},{},99.0,'pending')", 600_000 + i, i % 1000 + 1);
+                let sql = format!(
+                    "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
+                    600_000 + i,
+                    i % 1000 + 1
+                );
                 cockroach.simple_query(&sql).await.unwrap();
             }
         }
         // Timed
         let mut ns = Stats::new();
         for i in 0..n {
-            let sql = format!("INSERT INTO bench_orders VALUES ({},{},99.0,'pending')", 900_000 + i, i % 1000 + 1);
+            let sql = format!(
+                "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
+                900_000 + i,
+                i % 1000 + 1
+            );
             let t = Instant::now();
             nc.simple_query(&sql).await.unwrap();
             ns.record(t.elapsed());
@@ -1289,7 +1758,11 @@ async fn bench_vs_cockroach(
         let cs = if let Some(cockroach) = cockroach {
             let mut s = Stats::new();
             for i in 0..n {
-                let sql = format!("INSERT INTO bench_orders VALUES ({},{},99.0,'pending')", 800_000 + i, i % 1000 + 1);
+                let sql = format!(
+                    "INSERT INTO bench_orders VALUES ({},{},99.0,'pending')",
+                    800_000 + i,
+                    i % 1000 + 1
+                );
                 let t = Instant::now();
                 cockroach.simple_query(&sql).await.unwrap();
                 s.record(t.elapsed());
@@ -1299,10 +1772,14 @@ async fn bench_vs_cockroach(
             None
         };
         let speedup = cs.as_ref().map(|c| c.avg_us() / ns.avg_us()).unwrap_or(0.0);
-        println!(" Nucleus: {:>10}  CRDB: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  CRDB: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
-            cs.as_ref().map(|c| format_ops(c.ops_per_sec())).unwrap_or("N/A".into()),
-            speedup);
+            cs.as_ref()
+                .map(|c| format_ops(c.ops_per_sec()))
+                .unwrap_or("N/A".into()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL (CockroachDB)".into(),
             workload: "Single INSERT".into(),
@@ -1316,17 +1793,35 @@ async fn bench_vs_cockroach(
     // ── UPDATE by PK ──
     {
         print!("    UPDATE by PK               ");
-        let ns = bench_query(nc, "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000", w, n).await;
+        let ns = bench_query(
+            nc,
+            "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000",
+            w,
+            n,
+        )
+        .await;
         let cs = if let Some(cockroach) = cockroach {
-            Some(bench_query(cockroach, "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000", w, n).await)
+            Some(
+                bench_query(
+                    cockroach,
+                    "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000",
+                    w,
+                    n,
+                )
+                .await,
+            )
         } else {
             None
         };
         let speedup = cs.as_ref().map(|c| c.avg_us() / ns.avg_us()).unwrap_or(0.0);
-        println!(" Nucleus: {:>10}  CRDB: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  CRDB: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
-            cs.as_ref().map(|c| format_ops(c.ops_per_sec())).unwrap_or("N/A".into()),
-            speedup);
+            cs.as_ref()
+                .map(|c| format_ops(c.ops_per_sec()))
+                .unwrap_or("N/A".into()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL (CockroachDB)".into(),
             workload: "UPDATE by PK".into(),
@@ -1343,46 +1838,86 @@ async fn bench_vs_cockroach(
         // Use IDs that won't collide with other tests
         for i in 0..w {
             let id = 2_000_000 + i;
-            nc.simple_query(&format!("INSERT INTO bench_orders VALUES ({id},1,50.0,'del')")).await.ok();
+            nc.simple_query(&format!(
+                "INSERT INTO bench_orders VALUES ({id},1,50.0,'del')"
+            ))
+            .await
+            .ok();
         }
         if let Some(cockroach) = cockroach {
             for i in 0..w {
                 let id = 2_100_000 + i;
-                cockroach.simple_query(&format!("INSERT INTO bench_orders VALUES ({id},1,50.0,'del')")).await.ok();
+                cockroach
+                    .simple_query(&format!(
+                        "INSERT INTO bench_orders VALUES ({id},1,50.0,'del')"
+                    ))
+                    .await
+                    .ok();
             }
         }
         // Warm-up
         for i in 0..w {
-            nc.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_000_000 + i)).await.ok();
+            nc.simple_query(&format!(
+                "DELETE FROM bench_orders WHERE id = {}",
+                2_000_000 + i
+            ))
+            .await
+            .ok();
         }
         if let Some(cockroach) = cockroach {
             for i in 0..w {
-                cockroach.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_100_000 + i)).await.ok();
+                cockroach
+                    .simple_query(&format!(
+                        "DELETE FROM bench_orders WHERE id = {}",
+                        2_100_000 + i
+                    ))
+                    .await
+                    .ok();
             }
         }
         // Insert rows for timed deletes
         for i in 0..n {
             let id = 2_200_000 + i;
-            nc.simple_query(&format!("INSERT INTO bench_orders VALUES ({id},1,50.0,'del')")).await.ok();
+            nc.simple_query(&format!(
+                "INSERT INTO bench_orders VALUES ({id},1,50.0,'del')"
+            ))
+            .await
+            .ok();
         }
         if let Some(cockroach) = cockroach {
             for i in 0..n {
                 let id = 2_300_000 + i;
-                cockroach.simple_query(&format!("INSERT INTO bench_orders VALUES ({id},1,50.0,'del')")).await.ok();
+                cockroach
+                    .simple_query(&format!(
+                        "INSERT INTO bench_orders VALUES ({id},1,50.0,'del')"
+                    ))
+                    .await
+                    .ok();
             }
         }
         // Timed
         let mut ns = Stats::new();
         for i in 0..n {
             let t = Instant::now();
-            nc.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_200_000 + i)).await.ok();
+            nc.simple_query(&format!(
+                "DELETE FROM bench_orders WHERE id = {}",
+                2_200_000 + i
+            ))
+            .await
+            .ok();
             ns.record(t.elapsed());
         }
         let cs = if let Some(cockroach) = cockroach {
             let mut s = Stats::new();
             for i in 0..n {
                 let t = Instant::now();
-                cockroach.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_300_000 + i)).await.ok();
+                cockroach
+                    .simple_query(&format!(
+                        "DELETE FROM bench_orders WHERE id = {}",
+                        2_300_000 + i
+                    ))
+                    .await
+                    .ok();
                 s.record(t.elapsed());
             }
             Some(s)
@@ -1390,10 +1925,14 @@ async fn bench_vs_cockroach(
             None
         };
         let speedup = cs.as_ref().map(|c| c.avg_us() / ns.avg_us()).unwrap_or(0.0);
-        println!(" Nucleus: {:>10}  CRDB: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  CRDB: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
-            cs.as_ref().map(|c| format_ops(c.ops_per_sec())).unwrap_or("N/A".into()),
-            speedup);
+            cs.as_ref()
+                .map(|c| format_ops(c.ops_per_sec()))
+                .unwrap_or("N/A".into()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL (CockroachDB)".into(),
             workload: "DELETE by PK".into(),
@@ -1410,7 +1949,11 @@ async fn bench_vs_cockroach(
 // ─── Section: MongoDB Benchmarks (document store comparison) ────────────────
 
 #[cfg(feature = "mongodb")]
-async fn setup_mongodb_schema(client: &mongodb::Client, db_name: &str, rows: usize) -> Result<(), Box<dyn std::error::Error>> {
+async fn setup_mongodb_schema(
+    client: &mongodb::Client,
+    db_name: &str,
+    rows: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let db = client.database(db_name);
 
     // Drop existing collections
@@ -1425,7 +1968,13 @@ async fn setup_mongodb_schema(client: &mongodb::Client, db_name: &str, rows: usi
         let mut users = Vec::new();
         for i in 1..=rows {
             let age = 20 + (i % 50);
-            let status = if i % 3 == 0 { "active" } else if i % 3 == 1 { "inactive" } else { "pending" };
+            let status = if i % 3 == 0 {
+                "active"
+            } else if i % 3 == 1 {
+                "inactive"
+            } else {
+                "pending"
+            };
             users.push(doc! {
                 "_id": i as i32,
                 "name": format!("user_{i}"),
@@ -1444,7 +1993,13 @@ async fn setup_mongodb_schema(client: &mongodb::Client, db_name: &str, rows: usi
         for i in 1..=order_count {
             let user_id = (i % rows) + 1;
             let amount = 10.0 + (i % 500) as f64;
-            let status = if i % 3 == 0 { "shipped" } else if i % 3 == 1 { "pending" } else { "delivered" };
+            let status = if i % 3 == 0 {
+                "shipped"
+            } else if i % 3 == 1 {
+                "pending"
+            } else {
+                "delivered"
+            };
             orders.push(doc! {
                 "_id": i as i32,
                 "user_id": user_id as i32,
@@ -1457,21 +2012,30 @@ async fn setup_mongodb_schema(client: &mongodb::Client, db_name: &str, rows: usi
     }
 
     // Create indexes
-    users_coll.create_index(IndexModel::builder()
-        .keys(doc! { "status": 1 })
-        .build(), None).await?;
+    users_coll
+        .create_index(
+            IndexModel::builder().keys(doc! { "status": 1 }).build(),
+            None,
+        )
+        .await?;
 
-    users_coll.create_index(IndexModel::builder()
-        .keys(doc! { "age": 1 })
-        .build(), None).await?;
+    users_coll
+        .create_index(IndexModel::builder().keys(doc! { "age": 1 }).build(), None)
+        .await?;
 
-    orders_coll.create_index(IndexModel::builder()
-        .keys(doc! { "status": 1 })
-        .build(), None).await?;
+    orders_coll
+        .create_index(
+            IndexModel::builder().keys(doc! { "status": 1 }).build(),
+            None,
+        )
+        .await?;
 
-    orders_coll.create_index(IndexModel::builder()
-        .keys(doc! { "user_id": 1 })
-        .build(), None).await?;
+    orders_coll
+        .create_index(
+            IndexModel::builder().keys(doc! { "user_id": 1 }).build(),
+            None,
+        )
+        .await?;
 
     Ok(())
 }
@@ -1525,24 +2089,30 @@ async fn bench_mongodb_query(
         "group_by" => {
             // Warm-up
             for _ in 0..warmup {
-                let _ = coll.aggregate(vec![
-                    doc! { "$group": {
-                        "_id": "$status",
-                        "count": { "$sum": 1 },
-                        "avg_age": { "$avg": "$age" }
-                    }}
-                ], None).await;
+                let _ = coll
+                    .aggregate(
+                        vec![doc! { "$group": {
+                            "_id": "$status",
+                            "count": { "$sum": 1 },
+                            "avg_age": { "$avg": "$age" }
+                        }}],
+                        None,
+                    )
+                    .await;
             }
             // Timed
             for _ in 0..n {
                 let t = Instant::now();
-                let _ = coll.aggregate(vec![
-                    doc! { "$group": {
-                        "_id": "$status",
-                        "count": { "$sum": 1 },
-                        "avg_age": { "$avg": "$age" }
-                    }}
-                ], None).await;
+                let _ = coll
+                    .aggregate(
+                        vec![doc! { "$group": {
+                            "_id": "$status",
+                            "count": { "$sum": 1 },
+                            "avg_age": { "$avg": "$age" }
+                        }}],
+                        None,
+                    )
+                    .await;
                 stats.record(t.elapsed());
             }
         }
@@ -1566,8 +2136,14 @@ async fn bench_vs_mongodb(
     let nucleus_queries = vec![
         ("COUNT(*)", "SELECT COUNT(*) FROM bench_users"),
         ("Point Query", "SELECT * FROM bench_users WHERE id = 5000"),
-        ("Range Scan (age > 30)", "SELECT * FROM bench_users WHERE age > 30"),
-        ("GROUP BY status", "SELECT status, COUNT(*), AVG(age) FROM bench_users GROUP BY status"),
+        (
+            "Range Scan (age > 30)",
+            "SELECT * FROM bench_users WHERE age > 30",
+        ),
+        (
+            "GROUP BY status",
+            "SELECT status, COUNT(*), AVG(age) FROM bench_users GROUP BY status",
+        ),
     ];
 
     for (name, sql) in nucleus_queries {
@@ -1597,10 +2173,12 @@ async fn bench_vs_mongodb(
         };
 
         let speedup = mongo_stats.avg_us() / ns.avg_us();
-        println!(" Nucleus: {:>10}  MongoDB: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  MongoDB: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
             format_ops(mongo_stats.ops_per_sec()),
-            speedup);
+            speedup
+        );
 
         results.push(CompeteResult {
             category: "Document (MongoDB)".into(),
@@ -1618,25 +2196,38 @@ async fn bench_vs_mongodb(
 
         // Warm-up Nucleus
         for i in 0..warmup {
-            let sql = format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')", 700_000 + i, i % 1000 + 1);
+            let sql = format!(
+                "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
+                700_000 + i,
+                i % 1000 + 1
+            );
             nc.simple_query(&sql).await.ok();
         }
 
         // Warm-up MongoDB
         let orders_coll = db.collection::<Document>("bench_orders");
         for i in 0..warmup {
-            let _ = orders_coll.insert_one(doc! {
-                "_id": 600_000 + i as i32,
-                "user_id": (i % 1000 + 1) as i32,
-                "amount": 99.0,
-                "status": "pending",
-            }, None).await;
+            let _ = orders_coll
+                .insert_one(
+                    doc! {
+                        "_id": 600_000 + i as i32,
+                        "user_id": (i % 1000 + 1) as i32,
+                        "amount": 99.0,
+                        "status": "pending",
+                    },
+                    None,
+                )
+                .await;
         }
 
         // Timed Nucleus
         let mut ns = Stats::new();
         for i in 0..n {
-            let sql = format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')", 900_000 + i, i % 1000 + 1);
+            let sql = format!(
+                "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
+                900_000 + i,
+                i % 1000 + 1
+            );
             let t = Instant::now();
             nc.simple_query(&sql).await.ok();
             ns.record(t.elapsed());
@@ -1646,20 +2237,27 @@ async fn bench_vs_mongodb(
         let mut ms = Stats::new();
         for i in 0..n {
             let t = Instant::now();
-            let _ = orders_coll.insert_one(doc! {
-                "_id": 800_000 + i as i32,
-                "user_id": (i % 1000 + 1) as i32,
-                "amount": 99.0,
-                "status": "pending",
-            }, None).await;
+            let _ = orders_coll
+                .insert_one(
+                    doc! {
+                        "_id": 800_000 + i as i32,
+                        "user_id": (i % 1000 + 1) as i32,
+                        "amount": 99.0,
+                        "status": "pending",
+                    },
+                    None,
+                )
+                .await;
             ms.record(t.elapsed());
         }
 
         let speedup = ms.avg_us() / ns.avg_us();
-        println!(" Nucleus: {:>10}  MongoDB: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  MongoDB: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
             format_ops(ms.ops_per_sec()),
-            speedup);
+            speedup
+        );
 
         results.push(CompeteResult {
             category: "Document (MongoDB)".into(),
@@ -1675,36 +2273,40 @@ async fn bench_vs_mongodb(
     {
         print!("    UPDATE by PK              ");
 
-        let ns = bench_query(nc, "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000", warmup, n).await;
+        let ns = bench_query(
+            nc,
+            "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000",
+            warmup,
+            n,
+        )
+        .await;
 
         let orders_coll = db.collection::<Document>("bench_orders");
 
         // Warm-up
         for _ in 0..warmup {
-            let _ = orders_coll.update_one(
-                doc! { "_id": 5000 },
-                doc! { "$inc": { "amount": 1 } },
-                None,
-            ).await;
+            let _ = orders_coll
+                .update_one(doc! { "_id": 5000 }, doc! { "$inc": { "amount": 1 } }, None)
+                .await;
         }
 
         // Timed
         let mut ms = Stats::new();
         for _ in 0..n {
             let t = Instant::now();
-            let _ = orders_coll.update_one(
-                doc! { "_id": 5000 },
-                doc! { "$inc": { "amount": 1 } },
-                None,
-            ).await;
+            let _ = orders_coll
+                .update_one(doc! { "_id": 5000 }, doc! { "$inc": { "amount": 1 } }, None)
+                .await;
             ms.record(t.elapsed());
         }
 
         let speedup = ms.avg_us() / ns.avg_us();
-        println!(" Nucleus: {:>10}  MongoDB: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  MongoDB: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
             format_ops(ms.ops_per_sec()),
-            speedup);
+            speedup
+        );
 
         results.push(CompeteResult {
             category: "Document (MongoDB)".into(),
@@ -1724,26 +2326,32 @@ async fn bench_vs_mongodb(
 
         // Insert rows for timed deletes
         for i in 0..n {
-            let _ = orders_coll.insert_one(doc! {
-                "_id": 2_000_000 + i as i32,
-                "user_id": 1,
-                "amount": 50.0,
-                "status": "del",
-            }, None).await;
+            let _ = orders_coll
+                .insert_one(
+                    doc! {
+                        "_id": 2_000_000 + i as i32,
+                        "user_id": 1,
+                        "amount": 50.0,
+                        "status": "del",
+                    },
+                    None,
+                )
+                .await;
         }
 
         // Warm-up Nucleus deletes
         for i in 0..warmup {
             let id = 2_300_000 + i;
-            nc.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", id)).await.ok();
+            nc.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", id))
+                .await
+                .ok();
         }
 
         // Warm-up MongoDB deletes
         for i in 0..warmup {
-            let _ = orders_coll.delete_one(
-                doc! { "_id": 2_100_000 + i as i32 },
-                None,
-            ).await;
+            let _ = orders_coll
+                .delete_one(doc! { "_id": 2_100_000 + i as i32 }, None)
+                .await;
         }
 
         // Timed Nucleus deletes
@@ -1751,7 +2359,9 @@ async fn bench_vs_mongodb(
         for i in 0..n {
             let id = 2_200_000 + i;
             let t = Instant::now();
-            nc.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", id)).await.ok();
+            nc.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", id))
+                .await
+                .ok();
             ns.record(t.elapsed());
         }
 
@@ -1759,18 +2369,19 @@ async fn bench_vs_mongodb(
         let mut ms = Stats::new();
         for i in 0..n {
             let t = Instant::now();
-            let _ = orders_coll.delete_one(
-                doc! { "_id": 2_000_000 + i as i32 },
-                None,
-            ).await;
+            let _ = orders_coll
+                .delete_one(doc! { "_id": 2_000_000 + i as i32 }, None)
+                .await;
             ms.record(t.elapsed());
         }
 
         let speedup = ms.avg_us() / ns.avg_us();
-        println!(" Nucleus: {:>10}  MongoDB: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  MongoDB: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
             format_ops(ms.ops_per_sec()),
-            speedup);
+            speedup
+        );
 
         results.push(CompeteResult {
             category: "Document (MongoDB)".into(),
@@ -1810,7 +2421,7 @@ fn setup_sqlite_schema(sqlite_path: &str, rows: usize) -> Result<(), rusqlite::E
             amount  REAL NOT NULL,
             created_at TEXT,
             status  TEXT
-        );"
+        );",
     )?;
 
     // Bulk insert users
@@ -1818,7 +2429,7 @@ fn setup_sqlite_schema(sqlite_path: &str, rows: usize) -> Result<(), rusqlite::E
     {
         let tx = conn.transaction()?;
         let mut stmt = tx.prepare(
-            "INSERT INTO bench_users (id, name, email, age, status) VALUES (?1, ?2, ?3, ?4, ?5)"
+            "INSERT INTO bench_users (id, name, email, age, status) VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
 
         let mut id = 1;
@@ -1826,8 +2437,20 @@ fn setup_sqlite_schema(sqlite_path: &str, rows: usize) -> Result<(), rusqlite::E
             let end = (id + chunk - 1).min(rows);
             for i in id..=end {
                 let age = 20 + (i % 50);
-                let status = if i % 3 == 0 { "active" } else if i % 3 == 1 { "inactive" } else { "pending" };
-                stmt.execute(params![i as i32, format!("user_{i}"), format!("user{i}@test.com"), age as i32, status])?;
+                let status = if i % 3 == 0 {
+                    "active"
+                } else if i % 3 == 1 {
+                    "inactive"
+                } else {
+                    "pending"
+                };
+                stmt.execute(params![
+                    i as i32,
+                    format!("user_{i}"),
+                    format!("user{i}@test.com"),
+                    age as i32,
+                    status
+                ])?;
             }
             id = end + 1;
         }
@@ -1849,7 +2472,13 @@ fn setup_sqlite_schema(sqlite_path: &str, rows: usize) -> Result<(), rusqlite::E
             for i in id..=end {
                 let user_id = (i % rows) + 1;
                 let amount = 10.0 + (i % 500) as f64;
-                let status = if i % 3 == 0 { "shipped" } else if i % 3 == 1 { "pending" } else { "delivered" };
+                let status = if i % 3 == 0 {
+                    "shipped"
+                } else if i % 3 == 1 {
+                    "pending"
+                } else {
+                    "delivered"
+                };
                 stmt.execute(params![
                     i as i32,
                     user_id as i32,
@@ -1868,7 +2497,7 @@ fn setup_sqlite_schema(sqlite_path: &str, rows: usize) -> Result<(), rusqlite::E
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_orders_status ON bench_orders(status);
          CREATE INDEX IF NOT EXISTS idx_orders_user_id ON bench_orders(user_id);
-         CREATE INDEX IF NOT EXISTS idx_users_age ON bench_users(age);"
+         CREATE INDEX IF NOT EXISTS idx_users_age ON bench_users(age);",
     )?;
 
     Ok(())
@@ -1919,13 +2548,31 @@ async fn bench_vs_sqlite(
 
     // ── Read Queries ──
     let queries = [
-        ("COUNT(*)",               "SELECT COUNT(*) FROM bench_orders"),
-        ("Point Query (PK)",       "SELECT * FROM bench_orders WHERE id = 5000"),
-        ("Range Scan",             "SELECT * FROM bench_orders WHERE id BETWEEN 1000 AND 1099"),
-        ("GROUP BY + AVG",         "SELECT status, COUNT(*), AVG(amount) FROM bench_orders GROUP BY status"),
-        ("Filter + Sort + Limit",  "SELECT * FROM bench_orders WHERE status = 'pending' ORDER BY amount DESC LIMIT 20"),
-        ("SUM with WHERE",         "SELECT SUM(amount) FROM bench_orders WHERE status = 'shipped'"),
-        ("2-Table JOIN",           "SELECT u.name, o.amount FROM bench_users u, bench_orders o WHERE u.id = o.user_id AND o.id < 100"),
+        ("COUNT(*)", "SELECT COUNT(*) FROM bench_orders"),
+        (
+            "Point Query (PK)",
+            "SELECT * FROM bench_orders WHERE id = 5000",
+        ),
+        (
+            "Range Scan",
+            "SELECT * FROM bench_orders WHERE id BETWEEN 1000 AND 1099",
+        ),
+        (
+            "GROUP BY + AVG",
+            "SELECT status, COUNT(*), AVG(amount) FROM bench_orders GROUP BY status",
+        ),
+        (
+            "Filter + Sort + Limit",
+            "SELECT * FROM bench_orders WHERE status = 'pending' ORDER BY amount DESC LIMIT 20",
+        ),
+        (
+            "SUM with WHERE",
+            "SELECT SUM(amount) FROM bench_orders WHERE status = 'shipped'",
+        ),
+        (
+            "2-Table JOIN",
+            "SELECT u.name, o.amount FROM bench_users u, bench_orders o WHERE u.id = o.user_id AND o.id < 100",
+        ),
     ];
 
     for (name, sql) in &queries {
@@ -1933,10 +2580,12 @@ async fn bench_vs_sqlite(
         let ns = bench_query_prepared(executor, sql, w, n).await;
         let ss = bench_sqlite_query(&conn, sql, w, n);
         let speedup = ss.avg_us() / ns.avg_us();
-        println!(" Nucleus: {:>10}  SQLite: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  SQLite: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
             format_ops(ss.ops_per_sec()),
-            speedup);
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL (SQLite)".into(),
             workload: name.to_string(),
@@ -1952,14 +2601,22 @@ async fn bench_vs_sqlite(
         print!("    Single INSERT              ");
         // Warm-up Nucleus
         for i in 0..w {
-            let sql = format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')", 5_000_000 + i, i % 1000 + 1);
+            let sql = format!(
+                "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
+                5_000_000 + i,
+                i % 1000 + 1
+            );
             let _ = executor.execute(&sql).await;
         }
         // Warm-up SQLite
         {
             let tx = conn.transaction().unwrap();
             for i in 0..w {
-                let sql = format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')", 6_000_000 + i, i % 1000 + 1);
+                let sql = format!(
+                    "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
+                    6_000_000 + i,
+                    i % 1000 + 1
+                );
                 tx.execute(&sql, params![]).unwrap();
             }
             tx.commit().unwrap();
@@ -1968,7 +2625,11 @@ async fn bench_vs_sqlite(
         // Timed Nucleus
         let mut ns = Stats::new();
         for i in 0..n {
-            let sql = format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')", 7_000_000 + i, i % 1000 + 1);
+            let sql = format!(
+                "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
+                7_000_000 + i,
+                i % 1000 + 1
+            );
             let t = Instant::now();
             let _ = executor.execute(&sql).await;
             ns.record(t.elapsed());
@@ -1979,7 +2640,11 @@ async fn bench_vs_sqlite(
         {
             let tx = conn.transaction().unwrap();
             for i in 0..n {
-                let sql = format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')", 8_000_000 + i, i % 1000 + 1);
+                let sql = format!(
+                    "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
+                    8_000_000 + i,
+                    i % 1000 + 1
+                );
                 let t = Instant::now();
                 tx.execute(&sql, params![]).unwrap();
                 ss.record(t.elapsed());
@@ -1988,10 +2653,12 @@ async fn bench_vs_sqlite(
         }
 
         let speedup = ss.avg_us() / ns.avg_us();
-        println!(" Nucleus: {:>10}  SQLite: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  SQLite: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
             format_ops(ss.ops_per_sec()),
-            speedup);
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL (SQLite)".into(),
             workload: "Single INSERT".into(),
@@ -2005,13 +2672,26 @@ async fn bench_vs_sqlite(
     // ── UPDATE by PK ──
     {
         print!("    UPDATE by PK               ");
-        let ns = bench_query_prepared(executor, "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000", w, n).await;
-        let ss = bench_sqlite_query(&conn, "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000", w, n);
+        let ns = bench_query_prepared(
+            executor,
+            "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000",
+            w,
+            n,
+        )
+        .await;
+        let ss = bench_sqlite_query(
+            &conn,
+            "UPDATE bench_orders SET amount = amount + 1 WHERE id = 5000",
+            w,
+            n,
+        );
         let speedup = ss.avg_us() / ns.avg_us();
-        println!(" Nucleus: {:>10}  SQLite: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  SQLite: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
             format_ops(ss.ops_per_sec()),
-            speedup);
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL (SQLite)".into(),
             workload: "UPDATE by PK".into(),
@@ -2041,12 +2721,21 @@ async fn bench_vs_sqlite(
 
         // Warm-up deletes
         for i in 0..w {
-            let _ = executor.execute(&format!("DELETE FROM bench_orders WHERE id = {}", 2_000_000 + i)).await;
+            let _ = executor
+                .execute(&format!(
+                    "DELETE FROM bench_orders WHERE id = {}",
+                    2_000_000 + i
+                ))
+                .await;
         }
         {
             let tx = conn.transaction().unwrap();
             for i in 0..w {
-                tx.execute(&format!("DELETE FROM bench_orders WHERE id = {}", 2_100_000 + i), params![]).ok();
+                tx.execute(
+                    &format!("DELETE FROM bench_orders WHERE id = {}", 2_100_000 + i),
+                    params![],
+                )
+                .ok();
             }
             tx.commit().ok();
         }
@@ -2069,7 +2758,12 @@ async fn bench_vs_sqlite(
         let mut ns = Stats::new();
         for i in 0..n {
             let t = Instant::now();
-            let _ = executor.execute(&format!("DELETE FROM bench_orders WHERE id = {}", 2_200_000 + i)).await;
+            let _ = executor
+                .execute(&format!(
+                    "DELETE FROM bench_orders WHERE id = {}",
+                    2_200_000 + i
+                ))
+                .await;
             ns.record(t.elapsed());
         }
 
@@ -2078,17 +2772,23 @@ async fn bench_vs_sqlite(
             let tx = conn.transaction().unwrap();
             for i in 0..n {
                 let t = Instant::now();
-                tx.execute(&format!("DELETE FROM bench_orders WHERE id = {}", 2_300_000 + i), params![]).ok();
+                tx.execute(
+                    &format!("DELETE FROM bench_orders WHERE id = {}", 2_300_000 + i),
+                    params![],
+                )
+                .ok();
                 ss.record(t.elapsed());
             }
             tx.commit().ok();
         }
 
         let speedup = ss.avg_us() / ns.avg_us();
-        println!(" Nucleus: {:>10}  SQLite: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  SQLite: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
             format_ops(ss.ops_per_sec()),
-            speedup);
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL (SQLite)".into(),
             workload: "DELETE by PK".into(),
@@ -2125,7 +2825,8 @@ impl SurrealDbClient {
 
     async fn query(&self, sql: &str) -> Result<String, Box<dyn std::error::Error>> {
         let url = format!("{}/sql", self.endpoint);
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(&url)
             .header("Content-Type", "application/sql")
             .basic_auth(&self.user, Some(&self.pass))
@@ -2144,7 +2845,10 @@ impl SurrealDbClient {
 }
 
 #[cfg(all(feature = "bench-tools", feature = "reqwest"))]
-async fn setup_surreal_schema(client: &SurrealDbClient, rows: usize) -> Result<(), Box<dyn std::error::Error>> {
+async fn setup_surreal_schema(
+    client: &SurrealDbClient,
+    rows: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Drop existing tables
     client.query("DELETE FROM bench_users").await.ok();
     client.query("DELETE FROM bench_orders").await.ok();
@@ -2162,7 +2866,10 @@ async fn setup_surreal_schema(client: &SurrealDbClient, rows: usize) -> Result<(
             }
             first = false;
             let age = 20 + (i % 50);
-            sql.push_str(&format!("({}, 'user_{}', 'user{}@test.com', {})", i, i, i, age));
+            sql.push_str(&format!(
+                "({}, 'user_{}', 'user{}@test.com', {})",
+                i, i, i, age
+            ));
         }
         client.query(&sql).await?;
         id = end + 1;
@@ -2173,7 +2880,8 @@ async fn setup_surreal_schema(client: &SurrealDbClient, rows: usize) -> Result<(
     let order_count = rows * 5;
     while id <= order_count {
         let end = (id + chunk - 1).min(order_count);
-        let mut sql = String::from("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ");
+        let mut sql =
+            String::from("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ");
         let mut first = true;
         for i in id..=end {
             if !first {
@@ -2189,10 +2897,7 @@ async fn setup_surreal_schema(client: &SurrealDbClient, rows: usize) -> Result<(
             } else {
                 "delivered"
             };
-            sql.push_str(&format!(
-                "({}, {}, {}, '{}')",
-                i, user_id, amount, status
-            ));
+            sql.push_str(&format!("({}, {}, {}, '{}')", i, user_id, amount, status));
         }
         client.query(&sql).await?;
         id = end + 1;
@@ -2236,7 +2941,10 @@ async fn bench_vs_surreal(
     // ── Read Queries ──
     let queries = [
         ("COUNT(*)", "SELECT COUNT(*) FROM bench_orders"),
-        ("Point Query (PK)", "SELECT * FROM bench_orders WHERE id = 5000"),
+        (
+            "Point Query (PK)",
+            "SELECT * FROM bench_orders WHERE id = 5000",
+        ),
         (
             "Range Scan",
             "SELECT * FROM bench_orders WHERE id > 1000 AND id < 1100",
@@ -2334,11 +3042,7 @@ async fn bench_vs_surreal(
                     s.record(t.elapsed());
                 }
             }
-            if s.samples.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
+            if s.samples.is_empty() { None } else { Some(s) }
         };
         let speedup = ss.as_ref().map(|s| s.avg_us() / ns.avg_us()).unwrap_or(0.0);
         println!(
@@ -2364,17 +3068,26 @@ async fn bench_vs_surreal(
         print!("    UPDATE by PK               ");
         // Warm-up
         for i in 0..w {
-            let sql = format!("UPDATE bench_users SET name = 'updated' WHERE id = {}", i % 1000 + 1);
+            let sql = format!(
+                "UPDATE bench_users SET name = 'updated' WHERE id = {}",
+                i % 1000 + 1
+            );
             nc.simple_query(&sql).await.unwrap();
         }
         for i in 0..w {
-            let sql = format!("UPDATE bench_users SET name = 'updated' WHERE id = {}", (i % 1000 + 1) + 1000);
+            let sql = format!(
+                "UPDATE bench_users SET name = 'updated' WHERE id = {}",
+                (i % 1000 + 1) + 1000
+            );
             surreal.query(&sql).await.ok();
         }
         // Timed
         let mut ns = Stats::new();
         for i in 0..n {
-            let sql = format!("UPDATE bench_users SET name = 'updated' WHERE id = {}", (i % 1000 + 1) + 2000);
+            let sql = format!(
+                "UPDATE bench_users SET name = 'updated' WHERE id = {}",
+                (i % 1000 + 1) + 2000
+            );
             let t = Instant::now();
             nc.simple_query(&sql).await.unwrap();
             ns.record(t.elapsed());
@@ -2382,16 +3095,15 @@ async fn bench_vs_surreal(
         let ss = {
             let mut s = Stats::new();
             for i in 0..n {
-                let sql = format!("UPDATE bench_users SET name = 'updated' WHERE id = {}", (i % 1000 + 1) + 3000);
+                let sql = format!(
+                    "UPDATE bench_users SET name = 'updated' WHERE id = {}",
+                    (i % 1000 + 1) + 3000
+                );
                 let t = Instant::now();
                 surreal.query(&sql).await.ok();
                 s.record(t.elapsed());
             }
-            if s.samples.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
+            if s.samples.is_empty() { None } else { Some(s) }
         };
         let speedup = ss.as_ref().map(|s| s.avg_us() / ns.avg_us()).unwrap_or(0.0);
         println!(
@@ -2440,11 +3152,7 @@ async fn bench_vs_surreal(
                 surreal.query(&sql).await.ok();
                 s.record(t.elapsed());
             }
-            if s.samples.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
+            if s.samples.is_empty() { None } else { Some(s) }
         };
         let speedup = ss.as_ref().map(|s| s.avg_us() / ns.avg_us()).unwrap_or(0.0);
         println!(
@@ -2476,7 +3184,9 @@ async fn setup_tidb_schema(pool: &mysql_async::Pool) -> mysql_async::Result<()> 
     let mut conn = pool.get_conn().await?;
 
     // Drop existing tables
-    let _ = conn.exec_drop("DROP TABLE IF EXISTS bench_orders", ()).await;
+    let _ = conn
+        .exec_drop("DROP TABLE IF EXISTS bench_orders", ())
+        .await;
     let _ = conn.exec_drop("DROP TABLE IF EXISTS bench_users", ()).await;
 
     // Create bench_users table
@@ -2489,7 +3199,8 @@ async fn setup_tidb_schema(pool: &mysql_async::Pool) -> mysql_async::Result<()> 
             status  VARCHAR(50)
         )",
         (),
-    ).await?;
+    )
+    .await?;
 
     // Create bench_orders table
     conn.exec_drop(
@@ -2502,7 +3213,8 @@ async fn setup_tidb_schema(pool: &mysql_async::Pool) -> mysql_async::Result<()> 
             FOREIGN KEY (user_id) REFERENCES bench_users(id)
         )",
         (),
-    ).await?;
+    )
+    .await?;
 
     // Bulk insert users (50K)
     let rows = 50_000;
@@ -2514,7 +3226,13 @@ async fn setup_tidb_schema(pool: &mysql_async::Pool) -> mysql_async::Result<()> 
         for i in id..=end {
             let age = 20 + (i % 50);
             let status = if i % 3 == 0 { "active" } else { "inactive" };
-            values.push((i, format!("user_{}", i), format!("user{}@test.com", i), age, status));
+            values.push((
+                i,
+                format!("user_{}", i),
+                format!("user{}@test.com", i),
+                age,
+                status,
+            ));
         }
 
         conn.exec_batch(
@@ -2535,7 +3253,13 @@ async fn setup_tidb_schema(pool: &mysql_async::Pool) -> mysql_async::Result<()> 
         for i in id..=end {
             let user_id = (i % rows) + 1;
             let amount = 10.0 + (i % 500) as f64;
-            let status = if i % 3 == 0 { "completed" } else if i % 3 == 1 { "pending" } else { "cancelled" };
+            let status = if i % 3 == 0 {
+                "completed"
+            } else if i % 3 == 1 {
+                "pending"
+            } else {
+                "cancelled"
+            };
             values.push((i, user_id, amount, status));
         }
 
@@ -2549,17 +3273,33 @@ async fn setup_tidb_schema(pool: &mysql_async::Pool) -> mysql_async::Result<()> 
     }
 
     // Create indexes (same as PG for fair comparison)
-    let _ = conn.exec_drop("CREATE INDEX idx_users_status ON bench_users(status)", ()).await;
-    let _ = conn.exec_drop("CREATE INDEX idx_orders_user_id ON bench_orders(user_id)", ()).await;
-    let _ = conn.exec_drop("CREATE INDEX idx_orders_status ON bench_orders(status)", ()).await;
-    let _ = conn.exec_drop("CREATE INDEX idx_users_age ON bench_users(age)", ()).await;
+    let _ = conn
+        .exec_drop("CREATE INDEX idx_users_status ON bench_users(status)", ())
+        .await;
+    let _ = conn
+        .exec_drop(
+            "CREATE INDEX idx_orders_user_id ON bench_orders(user_id)",
+            (),
+        )
+        .await;
+    let _ = conn
+        .exec_drop("CREATE INDEX idx_orders_status ON bench_orders(status)", ())
+        .await;
+    let _ = conn
+        .exec_drop("CREATE INDEX idx_users_age ON bench_users(age)", ())
+        .await;
 
     Ok(())
 }
 
 #[cfg(feature = "bench-tools")]
 /// Benchmark a single TiDB query
-async fn bench_tidb_query(pool: &mysql_async::Pool, sql: &str, warmup: usize, n: usize) -> mysql_async::Result<Stats> {
+async fn bench_tidb_query(
+    pool: &mysql_async::Pool,
+    sql: &str,
+    warmup: usize,
+    n: usize,
+) -> mysql_async::Result<Stats> {
     let mut conn = pool.get_conn().await?;
 
     // Warm-up: run but discard results
@@ -2592,13 +3332,28 @@ async fn bench_vs_tidb(
 
     // ── Read Queries ──
     let queries = [
-        ("COUNT(*)",               "SELECT COUNT(*) FROM bench_users"),
-        ("Point Query (PK)",       "SELECT * FROM bench_users WHERE id = 5000"),
-        ("Range Scan",             "SELECT * FROM bench_users WHERE age > 30"),
-        ("GROUP BY + AVG",         "SELECT status, COUNT(*), AVG(age) FROM bench_users GROUP BY status"),
-        ("Filter + Sort + Limit",  "SELECT * FROM bench_users WHERE age > 25 ORDER BY age DESC LIMIT 100"),
-        ("SUM with WHERE",         "SELECT SUM(amount) FROM bench_orders WHERE status = 'completed'"),
-        ("2-Table JOIN",           "SELECT u.name, o.amount FROM bench_users u JOIN bench_orders o ON u.id = o.user_id LIMIT 100"),
+        ("COUNT(*)", "SELECT COUNT(*) FROM bench_users"),
+        (
+            "Point Query (PK)",
+            "SELECT * FROM bench_users WHERE id = 5000",
+        ),
+        ("Range Scan", "SELECT * FROM bench_users WHERE age > 30"),
+        (
+            "GROUP BY + AVG",
+            "SELECT status, COUNT(*), AVG(age) FROM bench_users GROUP BY status",
+        ),
+        (
+            "Filter + Sort + Limit",
+            "SELECT * FROM bench_users WHERE age > 25 ORDER BY age DESC LIMIT 100",
+        ),
+        (
+            "SUM with WHERE",
+            "SELECT SUM(amount) FROM bench_orders WHERE status = 'completed'",
+        ),
+        (
+            "2-Table JOIN",
+            "SELECT u.name, o.amount FROM bench_users u JOIN bench_orders o ON u.id = o.user_id LIMIT 100",
+        ),
     ];
 
     for (name, sql) in &queries {
@@ -2611,10 +3366,14 @@ async fn bench_vs_tidb(
         };
 
         let speedup = ps.as_ref().map(|p| p.avg_us() / ns.avg_us()).unwrap_or(0.0);
-        println!(" Nucleus: {:>10}  TiDB: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  TiDB: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
-            ps.as_ref().map(|p| format_ops(p.ops_per_sec())).unwrap_or("N/A".into()),
-            speedup);
+            ps.as_ref()
+                .map(|p| format_ops(p.ops_per_sec()))
+                .unwrap_or("N/A".into()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL (TiDB)".into(),
             workload: name.to_string(),
@@ -2630,12 +3389,20 @@ async fn bench_vs_tidb(
         print!("    Single INSERT              ");
         // Warm-up
         for i in 0..w {
-            let sql = format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')", 700_000 + i, i % 1000 + 1);
+            let sql = format!(
+                "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
+                700_000 + i,
+                i % 1000 + 1
+            );
             nc.simple_query(&sql).await.ok();
         }
         if let Ok(mut conn) = tidb_pool.get_conn().await {
             for i in 0..w {
-                let sql = format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')", 600_000 + i, i % 1000 + 1);
+                let sql = format!(
+                    "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
+                    600_000 + i,
+                    i % 1000 + 1
+                );
                 let _ = conn.exec_drop(sql, ()).await;
             }
         }
@@ -2643,7 +3410,11 @@ async fn bench_vs_tidb(
         // Timed
         let mut ns = Stats::new();
         for i in 0..n {
-            let sql = format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')", 900_000 + i, i % 1000 + 1);
+            let sql = format!(
+                "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
+                900_000 + i,
+                i % 1000 + 1
+            );
             let t = Instant::now();
             nc.simple_query(&sql).await.ok();
             ns.record(t.elapsed());
@@ -2652,7 +3423,11 @@ async fn bench_vs_tidb(
         let ps = if let Ok(mut conn) = tidb_pool.get_conn().await {
             let mut s = Stats::new();
             for i in 0..n {
-                let sql = format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')", 800_000 + i, i % 1000 + 1);
+                let sql = format!(
+                    "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({},{},99.0,'pending')",
+                    800_000 + i,
+                    i % 1000 + 1
+                );
                 let t = Instant::now();
                 let _ = conn.exec_drop(sql, ()).await;
                 s.record(t.elapsed());
@@ -2663,10 +3438,14 @@ async fn bench_vs_tidb(
         };
 
         let speedup = ps.as_ref().map(|p| p.avg_us() / ns.avg_us()).unwrap_or(0.0);
-        println!(" Nucleus: {:>10}  TiDB: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  TiDB: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
-            ps.as_ref().map(|p| format_ops(p.ops_per_sec())).unwrap_or("N/A".into()),
-            speedup);
+            ps.as_ref()
+                .map(|p| format_ops(p.ops_per_sec()))
+                .unwrap_or("N/A".into()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL (TiDB)".into(),
             workload: "Single INSERT".into(),
@@ -2680,15 +3459,31 @@ async fn bench_vs_tidb(
     // ── UPDATE by PK ──
     {
         print!("    UPDATE by PK               ");
-        let ns = bench_query(nc, "UPDATE bench_users SET name = 'updated' WHERE id = 5000", w, n).await;
+        let ns = bench_query(
+            nc,
+            "UPDATE bench_users SET name = 'updated' WHERE id = 5000",
+            w,
+            n,
+        )
+        .await;
         let ps = if let Ok(mut conn) = tidb_pool.get_conn().await {
             let mut s = Stats::new();
             for _ in 0..w {
-                let _ = conn.exec_drop("UPDATE bench_users SET name = 'updated' WHERE id = 5000", ()).await;
+                let _ = conn
+                    .exec_drop(
+                        "UPDATE bench_users SET name = 'updated' WHERE id = 5000",
+                        (),
+                    )
+                    .await;
             }
             for _ in 0..n {
                 let t = Instant::now();
-                let _ = conn.exec_drop("UPDATE bench_users SET name = 'updated' WHERE id = 5000", ()).await;
+                let _ = conn
+                    .exec_drop(
+                        "UPDATE bench_users SET name = 'updated' WHERE id = 5000",
+                        (),
+                    )
+                    .await;
                 s.record(t.elapsed());
             }
             Some(s)
@@ -2697,10 +3492,14 @@ async fn bench_vs_tidb(
         };
 
         let speedup = ps.as_ref().map(|p| p.avg_us() / ns.avg_us()).unwrap_or(0.0);
-        println!(" Nucleus: {:>10}  TiDB: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  TiDB: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
-            ps.as_ref().map(|p| format_ops(p.ops_per_sec())).unwrap_or("N/A".into()),
-            speedup);
+            ps.as_ref()
+                .map(|p| format_ops(p.ops_per_sec()))
+                .unwrap_or("N/A".into()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL (TiDB)".into(),
             workload: "UPDATE by PK".into(),
@@ -2718,7 +3517,11 @@ async fn bench_vs_tidb(
         // Pre-insert rows for deletion
         for i in 0..w {
             let id = 2_000_000 + i;
-            nc.simple_query(&format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({id},1,50.0,'del')")).await.ok();
+            nc.simple_query(&format!(
+                "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({id},1,50.0,'del')"
+            ))
+            .await
+            .ok();
         }
         if let Ok(mut conn) = tidb_pool.get_conn().await {
             for i in 0..w {
@@ -2729,18 +3532,32 @@ async fn bench_vs_tidb(
 
         // Warm-up deletes
         for i in 0..w {
-            nc.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_000_000 + i)).await.ok();
+            nc.simple_query(&format!(
+                "DELETE FROM bench_orders WHERE id = {}",
+                2_000_000 + i
+            ))
+            .await
+            .ok();
         }
         if let Ok(mut conn) = tidb_pool.get_conn().await {
             for i in 0..w {
-                let _ = conn.exec_drop(format!("DELETE FROM bench_orders WHERE id = {}", 2_100_000 + i), ()).await;
+                let _ = conn
+                    .exec_drop(
+                        format!("DELETE FROM bench_orders WHERE id = {}", 2_100_000 + i),
+                        (),
+                    )
+                    .await;
             }
         }
 
         // Insert rows for timed deletes
         for i in 0..n {
             let id = 2_200_000 + i;
-            nc.simple_query(&format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({id},1,50.0,'del')")).await.ok();
+            nc.simple_query(&format!(
+                "INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({id},1,50.0,'del')"
+            ))
+            .await
+            .ok();
         }
         if let Ok(mut conn) = tidb_pool.get_conn().await {
             for i in 0..n {
@@ -2753,7 +3570,12 @@ async fn bench_vs_tidb(
         let mut ns = Stats::new();
         for i in 0..n {
             let t = Instant::now();
-            nc.simple_query(&format!("DELETE FROM bench_orders WHERE id = {}", 2_200_000 + i)).await.ok();
+            nc.simple_query(&format!(
+                "DELETE FROM bench_orders WHERE id = {}",
+                2_200_000 + i
+            ))
+            .await
+            .ok();
             ns.record(t.elapsed());
         }
 
@@ -2761,7 +3583,12 @@ async fn bench_vs_tidb(
             let mut s = Stats::new();
             for i in 0..n {
                 let t = Instant::now();
-                let _ = conn.exec_drop(format!("DELETE FROM bench_orders WHERE id = {}", 2_300_000 + i), ()).await;
+                let _ = conn
+                    .exec_drop(
+                        format!("DELETE FROM bench_orders WHERE id = {}", 2_300_000 + i),
+                        (),
+                    )
+                    .await;
                 s.record(t.elapsed());
             }
             Some(s)
@@ -2770,10 +3597,14 @@ async fn bench_vs_tidb(
         };
 
         let speedup = ps.as_ref().map(|p| p.avg_us() / ns.avg_us()).unwrap_or(0.0);
-        println!(" Nucleus: {:>10}  TiDB: {:>10}  {:.1}x",
+        println!(
+            " Nucleus: {:>10}  TiDB: {:>10}  {:.1}x",
             format_ops(ns.ops_per_sec()),
-            ps.as_ref().map(|p| format_ops(p.ops_per_sec())).unwrap_or("N/A".into()),
-            speedup);
+            ps.as_ref()
+                .map(|p| format_ops(p.ops_per_sec()))
+                .unwrap_or("N/A".into()),
+            speedup
+        );
         results.push(CompeteResult {
             category: "SQL (TiDB)".into(),
             workload: "DELETE by PK".into(),
@@ -2795,10 +3626,20 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
     let client = reqwest::Client::new();
 
     // Drop existing tables
-    let _ = client.post(&format!("{}/?query=DROP TABLE IF EXISTS bench_users", base_url))
-        .send().await?;
-    let _ = client.post(&format!("{}/?query=DROP TABLE IF EXISTS bench_orders", base_url))
-        .send().await?;
+    let _ = client
+        .post(&format!(
+            "{}/?query=DROP TABLE IF EXISTS bench_users",
+            base_url
+        ))
+        .send()
+        .await?;
+    let _ = client
+        .post(&format!(
+            "{}/?query=DROP TABLE IF EXISTS bench_orders",
+            base_url
+        ))
+        .send()
+        .await?;
 
     // Create bench_users table (MergeTree engine for fast analytical queries)
     let create_users = "CREATE TABLE bench_users (
@@ -2809,8 +3650,14 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
         status  String
     ) ENGINE = MergeTree() ORDER BY id";
 
-    client.post(&format!("{}/?query={}", base_url, urlencoding::encode(create_users)))
-        .send().await?;
+    client
+        .post(&format!(
+            "{}/?query={}",
+            base_url,
+            urlencoding::encode(create_users)
+        ))
+        .send()
+        .await?;
 
     // Create bench_orders table
     let create_orders = "CREATE TABLE bench_orders (
@@ -2820,18 +3667,27 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
         status      String
     ) ENGINE = MergeTree() ORDER BY id";
 
-    client.post(&format!("{}/?query={}", base_url, urlencoding::encode(create_orders)))
-        .send().await?;
+    client
+        .post(&format!(
+            "{}/?query={}",
+            base_url,
+            urlencoding::encode(create_orders)
+        ))
+        .send()
+        .await?;
 
     // Bulk insert users using VALUES (smaller batches to avoid URL length issues)
     let rows = 50_000;
-    let batch_size = 100;  // Insert 100 rows at a time
+    let batch_size = 100; // Insert 100 rows at a time
     let mut values = Vec::new();
 
     for i in 1..=rows {
         let age = 20 + (i % 50);
         let status = if i % 3 == 0 { "active" } else { "inactive" };
-        values.push(format!("({}, 'user_{}', 'user{}@test.com', {}, '{}')", i, i, i, age, status));
+        values.push(format!(
+            "({}, 'user_{}', 'user{}@test.com', {}, '{}')",
+            i, i, i, age, status
+        ));
 
         // Batch inserts every 100 rows
         if values.len() >= batch_size {
@@ -2839,8 +3695,14 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
                 "INSERT INTO bench_users (id, name, email, age, status) VALUES {}",
                 values.join(", ")
             );
-            client.post(&format!("{}/?query={}", base_url, urlencoding::encode(&insert_users)))
-                .send().await?;
+            client
+                .post(&format!(
+                    "{}/?query={}",
+                    base_url,
+                    urlencoding::encode(&insert_users)
+                ))
+                .send()
+                .await?;
             values.clear();
         }
     }
@@ -2851,8 +3713,14 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
             "INSERT INTO bench_users (id, name, email, age, status) VALUES {}",
             values.join(", ")
         );
-        client.post(&format!("{}/?query={}", base_url, urlencoding::encode(&insert_users)))
-            .send().await?;
+        client
+            .post(&format!(
+                "{}/?query={}",
+                base_url,
+                urlencoding::encode(&insert_users)
+            ))
+            .send()
+            .await?;
     }
 
     // Bulk insert orders using VALUES (smaller batches)
@@ -2862,7 +3730,13 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
     for i in 1..=order_count {
         let user_id = (i % rows) + 1;
         let amount = 10.0 + ((i % 500) as f64);
-        let status = if i % 3 == 0 { "completed" } else if i % 3 == 1 { "pending" } else { "cancelled" };
+        let status = if i % 3 == 0 {
+            "completed"
+        } else if i % 3 == 1 {
+            "pending"
+        } else {
+            "cancelled"
+        };
         order_values.push(format!("({}, {}, {}, '{}')", i, user_id, amount, status));
 
         // Batch inserts every 100 rows
@@ -2871,8 +3745,14 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
                 "INSERT INTO bench_orders (id, user_id, amount, status) VALUES {}",
                 order_values.join(", ")
             );
-            client.post(&format!("{}/?query={}", base_url, urlencoding::encode(&insert_orders)))
-                .send().await?;
+            client
+                .post(&format!(
+                    "{}/?query={}",
+                    base_url,
+                    urlencoding::encode(&insert_orders)
+                ))
+                .send()
+                .await?;
             order_values.clear();
         }
     }
@@ -2883,8 +3763,14 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
             "INSERT INTO bench_orders (id, user_id, amount, status) VALUES {}",
             order_values.join(", ")
         );
-        client.post(&format!("{}/?query={}", base_url, urlencoding::encode(&insert_orders)))
-            .send().await?;
+        client
+            .post(&format!(
+                "{}/?query={}",
+                base_url,
+                urlencoding::encode(&insert_orders)
+            ))
+            .send()
+            .await?;
     }
 
     Ok(())
@@ -2892,20 +3778,29 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
 
 #[cfg(feature = "clickhouse")]
 /// Benchmark a single ClickHouse query (via HTTP)
-async fn bench_clickhouse_query(base_url: &str, sql: &str, warmup: usize, n: usize) -> Result<Stats, Box<dyn std::error::Error>> {
+async fn bench_clickhouse_query(
+    base_url: &str,
+    sql: &str,
+    warmup: usize,
+    n: usize,
+) -> Result<Stats, Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
 
     // Warm-up: run but discard results
     for _ in 0..warmup {
-        let _ = client.post(&format!("{}/?query={}", base_url, urlencoding::encode(sql)))
-            .send().await?;
+        let _ = client
+            .post(&format!("{}/?query={}", base_url, urlencoding::encode(sql)))
+            .send()
+            .await?;
     }
 
     let mut stats = Stats::new();
     for _ in 0..n {
         let t = Instant::now();
-        let _ = client.post(&format!("{}/?query={}", base_url, urlencoding::encode(sql)))
-            .send().await?;
+        let _ = client
+            .post(&format!("{}/?query={}", base_url, urlencoding::encode(sql)))
+            .send()
+            .await?;
         stats.record(t.elapsed());
     }
 
@@ -2924,11 +3819,23 @@ async fn bench_vs_clickhouse(
 
     let workloads = [
         ("COUNT(*)", "SELECT COUNT(*) FROM bench_users"),
-        ("Point Query (PK)", "SELECT * FROM bench_users WHERE id = 5000"),
-        ("Range Scan", "SELECT * FROM bench_users WHERE id BETWEEN 1000 AND 1099"),
+        (
+            "Point Query (PK)",
+            "SELECT * FROM bench_users WHERE id = 5000",
+        ),
+        (
+            "Range Scan",
+            "SELECT * FROM bench_users WHERE id BETWEEN 1000 AND 1099",
+        ),
         ("Aggregation (AVG)", "SELECT AVG(age) FROM bench_users"),
-        ("Filtering (WHERE)", "SELECT COUNT(*) FROM bench_users WHERE age > 40"),
-        ("Ordering (ORDER BY)", "SELECT * FROM bench_users ORDER BY age DESC LIMIT 10"),
+        (
+            "Filtering (WHERE)",
+            "SELECT COUNT(*) FROM bench_users WHERE age > 40",
+        ),
+        (
+            "Ordering (ORDER BY)",
+            "SELECT * FROM bench_users ORDER BY age DESC LIMIT 10",
+        ),
     ];
 
     for (name, sql) in &workloads {
@@ -2945,10 +3852,12 @@ async fn bench_vs_clickhouse(
                 };
 
                 let speedup = ns.avg_us() / ch.avg_us();
-                println!(" Nucleus: {:>10}  ClickHouse: {:>10}  {:.1}x",
+                println!(
+                    " Nucleus: {:>10}  ClickHouse: {:>10}  {:.1}x",
                     format_ops(ns.ops_per_sec()),
                     format_ops(ch.ops_per_sec()),
-                    speedup);
+                    speedup
+                );
 
                 results.push(CompeteResult {
                     category: "SQL (ClickHouse)".into(),
@@ -2981,8 +3890,11 @@ async fn main() {
     println!("    KV:      Nucleus embedded API vs Redis localhost TCP");
     println!("             (measures architectural advantage, not engine speed)");
     println!("    Indexes: Same B-tree indexes on PK + status + user_id + age");
-    println!("    Warm-up: {}% of iterations ({}) discarded before timing",
-        cfg.warmup_pct, cfg.warmup_n());
+    println!(
+        "    Warm-up: {}% of iterations ({}) discarded before timing",
+        cfg.warmup_pct,
+        cfg.warmup_n()
+    );
     println!("    Timed:   {} iterations per benchmark", cfg.iterations);
     println!("    Dataset: {} users + {} orders", cfg.rows, cfg.rows * 5);
     println!();
@@ -3019,17 +3931,26 @@ async fn main() {
             Ok((client, conn)) => {
                 tokio::spawn(conn);
                 // Get PG version for transparency
-                let ver = client.simple_query("SELECT version()").await
+                let ver = client
+                    .simple_query("SELECT version()")
+                    .await
                     .ok()
                     .and_then(|r| {
                         r.into_iter().find_map(|msg| {
                             if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
                                 row.get(0).map(|s| s.to_string())
-                            } else { None }
+                            } else {
+                                None
+                            }
                         })
                     })
                     .unwrap_or_else(|| "unknown".into());
-                println!("  PostgreSQL : {} ({}:{})", ver.split(',').next().unwrap_or(&ver), cfg.pg_host, cfg.pg_port);
+                println!(
+                    "  PostgreSQL : {} ({}:{})",
+                    ver.split(',').next().unwrap_or(&ver),
+                    cfg.pg_host,
+                    cfg.pg_port
+                );
                 Some(client)
             }
             Err(e) => {
@@ -3074,21 +3995,30 @@ async fn main() {
 
         // Test key queries that show pgwire slowness
         let test_queries = [
-            ("Point Query (PK)", "SELECT * FROM bench_users WHERE id = 5000"),
+            (
+                "Point Query (PK)",
+                "SELECT * FROM bench_users WHERE id = 5000",
+            ),
             ("COUNT(*)", "SELECT COUNT(*) FROM bench_users"),
-            ("Range Scan", "SELECT * FROM bench_users WHERE id BETWEEN 1000 AND 1099"),
+            (
+                "Range Scan",
+                "SELECT * FROM bench_users WHERE id BETWEEN 1000 AND 1099",
+            ),
         ];
 
         for (name, sql) in &test_queries {
             print!("    {name:<30}");
             let pgwire_stats = bench_query(&nc, sql, cfg.warmup_n(), cfg.iterations).await;
-            let direct_stats = bench_query_direct(&executor, sql, cfg.warmup_n(), cfg.iterations).await;
+            let direct_stats =
+                bench_query_direct(&executor, sql, cfg.warmup_n(), cfg.iterations).await;
 
             let speedup_ratio = pgwire_stats.avg_us() / direct_stats.avg_us();
-            println!(" pgwire: {:>10}  direct: {:>10}  {:.1}x speedup (protocol overhead)",
+            println!(
+                " pgwire: {:>10}  direct: {:>10}  {:.1}x speedup (protocol overhead)",
                 format_ops(pgwire_stats.ops_per_sec()),
                 format_ops(direct_stats.ops_per_sec()),
-                speedup_ratio);
+                speedup_ratio
+            );
 
             all_results.push(CompeteResult {
                 category: "Protocol Overhead".into(),
@@ -3125,7 +4055,14 @@ async fn main() {
             println!("    SQLite data load: {}ms", t.elapsed().as_millis());
             println!();
 
-            let sqlite_results = bench_vs_sqlite(&nc, &executor, &cfg.sqlite_path, cfg.warmup_n(), cfg.iterations).await;
+            let sqlite_results = bench_vs_sqlite(
+                &nc,
+                &executor,
+                &cfg.sqlite_path,
+                cfg.warmup_n(),
+                cfg.iterations,
+            )
+            .await;
             all_results.extend(sqlite_results);
         }
     }
@@ -3139,9 +4076,13 @@ async fn main() {
         println!();
 
         let redis_results = bench_vs_redis(
-            &executor, &cfg.redis_host, cfg.redis_port,
-            cfg.warmup_n(), cfg.iterations,
-        ).await;
+            &executor,
+            &cfg.redis_host,
+            cfg.redis_port,
+            cfg.warmup_n(),
+            cfg.iterations,
+        )
+        .await;
         all_results.extend(redis_results);
     }
 
@@ -3154,10 +4095,15 @@ async fn main() {
         println!();
 
         let mixed_results = bench_mixed_multimodel(
-            &executor, &nc, pg_client.as_ref(),
-            &cfg.redis_host, cfg.redis_port,
-            cfg.warmup_n(), cfg.iterations,
-        ).await;
+            &executor,
+            &nc,
+            pg_client.as_ref(),
+            &cfg.redis_host,
+            cfg.redis_port,
+            cfg.warmup_n(),
+            cfg.iterations,
+        )
+        .await;
         all_results.extend(mixed_results);
     }
 
@@ -3178,7 +4124,14 @@ async fn main() {
                         println!("    MongoDB data load: {}ms", t.elapsed().as_millis());
                         println!();
 
-                        let mongodb_results = bench_vs_mongodb(&nc, &mongo_client, &cfg.mongodb_database, cfg.warmup_n(), cfg.iterations).await;
+                        let mongodb_results = bench_vs_mongodb(
+                            &nc,
+                            &mongo_client,
+                            &cfg.mongodb_database,
+                            cfg.warmup_n(),
+                            cfg.iterations,
+                        )
+                        .await;
                         all_results.extend(mongodb_results);
                     }
                     Err(e) => {
@@ -3213,7 +4166,8 @@ async fn main() {
                 println!("    CockroachDB data load: {}ms", t.elapsed().as_millis());
                 println!();
 
-                let cockroach_results = bench_vs_cockroach(&nc, Some(&client), cfg.warmup_n(), cfg.iterations).await;
+                let cockroach_results =
+                    bench_vs_cockroach(&nc, Some(&client), cfg.warmup_n(), cfg.iterations).await;
                 all_results.extend(cockroach_results);
             }
             Err(e) => {
@@ -3224,7 +4178,7 @@ async fn main() {
     }
 
     // ── Section 1e: TiDB (MySQL-compatible distributed SQL) ──
-    #[cfg(FALSE)]  // TODO: Fix mysql_async::params! macro issue
+    #[cfg(FALSE)] // TODO: Fix mysql_async::params! macro issue
     if cfg.should_run("tidb") {
         println!();
         println!("  --- Section 1e: SQL vs TiDB (MySQL-compatible distributed SQL) ---");
@@ -3246,7 +4200,9 @@ async fn main() {
                             println!("    TiDB data load: {}ms", t.elapsed().as_millis());
                             println!();
 
-                            let tidb_results = bench_vs_tidb(&nc, &tidb_pool, cfg.warmup_n(), cfg.iterations).await;
+                            let tidb_results =
+                                bench_vs_tidb(&nc, &tidb_pool, cfg.warmup_n(), cfg.iterations)
+                                    .await;
                             all_results.extend(tidb_results);
                         }
                         Err(e) => {
@@ -3274,14 +4230,16 @@ async fn main() {
         println!("          Comparison: pgwire embedded vs HTTP remote multi-model");
         println!();
 
-        let surreal = SurrealDbClient::new(&cfg.surreal_endpoint, &cfg.surreal_user, &cfg.surreal_pass).await;
+        let surreal =
+            SurrealDbClient::new(&cfg.surreal_endpoint, &cfg.surreal_user, &cfg.surreal_pass).await;
         let t = Instant::now();
         match setup_surreal_schema(&surreal, cfg.rows).await {
             Ok(_) => {
                 println!("    SurrealDB data load: {}ms", t.elapsed().as_millis());
                 println!();
 
-                let surreal_results = bench_vs_surreal(&nc, &surreal, cfg.warmup_n(), cfg.iterations).await;
+                let surreal_results =
+                    bench_vs_surreal(&nc, &surreal, cfg.warmup_n(), cfg.iterations).await;
                 all_results.extend(surreal_results);
             }
             Err(e) => {
@@ -3308,7 +4266,11 @@ async fn main() {
 
         let clickhouse_url = format!("http://{}:{}", cfg.clickhouse_host, cfg.clickhouse_port);
         // Test connectivity by checking if ClickHouse is available
-        match reqwest::Client::new().post(&format!("{}/?query=SELECT 1", &clickhouse_url)).send().await {
+        match reqwest::Client::new()
+            .post(&format!("{}/?query=SELECT 1", &clickhouse_url))
+            .send()
+            .await
+        {
             Ok(_) => {
                 let t = Instant::now();
                 match setup_clickhouse_schema(&clickhouse_url).await {
@@ -3316,7 +4278,13 @@ async fn main() {
                         println!("    ClickHouse data load: {}ms", t.elapsed().as_millis());
                         println!();
 
-                        let clickhouse_results = bench_vs_clickhouse(&nc, &clickhouse_url, cfg.warmup_n(), cfg.iterations).await;
+                        let clickhouse_results = bench_vs_clickhouse(
+                            &nc,
+                            &clickhouse_url,
+                            cfg.warmup_n(),
+                            cfg.iterations,
+                        )
+                        .await;
                         all_results.extend(clickhouse_results);
                     }
                     Err(e) => {

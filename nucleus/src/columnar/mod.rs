@@ -10,16 +10,18 @@
 
 pub mod segment;
 
+use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use regex::Regex;
 
 use crate::storage::columnar_wal::ColumnarWal;
 use crate::types::{Row, Value};
 
-use segment::{ColdPartInfo, SegmentReader, SegmentWriter, estimate_batch_size, DEFAULT_COLD_THRESHOLD_BYTES};
+use segment::{
+    ColdPartInfo, DEFAULT_COLD_THRESHOLD_BYTES, SegmentReader, SegmentWriter, estimate_batch_size,
+};
 
 // ============================================================================
 // Column types
@@ -48,6 +50,17 @@ impl ColumnData {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Name of the underlying physical type, for diagnostics.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            ColumnData::Bool(_) => "Bool",
+            ColumnData::Int32(_) => "Int32",
+            ColumnData::Int64(_) => "Int64",
+            ColumnData::Float64(_) => "Float64",
+            ColumnData::Text(_) => "Text",
+        }
     }
 }
 
@@ -225,12 +238,9 @@ pub fn filter_text(col: &[Option<String>], pred: &Predicate) -> Vec<bool> {
                 return vec![false; col.len()];
             }
             match Regex::new(pattern) {
-                Ok(re) => col.iter()
-                    .map(|v| {
-                        v.as_ref()
-                            .map(|s| re.is_match(s))
-                            .unwrap_or(false)
-                    })
+                Ok(re) => col
+                    .iter()
+                    .map(|v| v.as_ref().map(|s| re.is_match(s)).unwrap_or(false))
                     .collect(),
                 Err(_) => vec![false; col.len()], // invalid regex matches nothing
             }
@@ -309,16 +319,15 @@ pub struct GroupByRow {
 }
 
 /// Group-by on a text column with aggregation on a numeric column.
-pub fn group_by_text_agg_f64(
-    key_col: &[Option<String>],
-    val_col: &[Option<f64>],
-) -> GroupByResult {
+pub fn group_by_text_agg_f64(key_col: &[Option<String>], val_col: &[Option<f64>]) -> GroupByResult {
     let mut groups: HashMap<String, (usize, f64, f64, f64)> = HashMap::new();
     // (count, sum, min, max)
 
     for (key, val) in key_col.iter().zip(val_col.iter()) {
         if let (Some(k), Some(v)) = (key, val) {
-            let entry = groups.entry(k.clone()).or_insert((0, 0.0, f64::MAX, f64::MIN));
+            let entry = groups
+                .entry(k.clone())
+                .or_insert((0, 0.0, f64::MAX, f64::MIN));
             entry.0 += 1;
             entry.1 += v;
             entry.2 = entry.2.min(*v);
@@ -364,8 +373,9 @@ pub struct ReplacingConfig {
     pub version_col_idx: Option<usize>,
 }
 
-static REPLACING_REGISTRY: std::sync::OnceLock<parking_lot::RwLock<HashMap<String, ReplacingConfig>>> =
-    std::sync::OnceLock::new();
+static REPLACING_REGISTRY: std::sync::OnceLock<
+    parking_lot::RwLock<HashMap<String, ReplacingConfig>>,
+> = std::sync::OnceLock::new();
 
 fn replacing_registry() -> &'static parking_lot::RwLock<HashMap<String, ReplacingConfig>> {
     REPLACING_REGISTRY.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
@@ -383,7 +393,10 @@ pub fn register_replacing_table(
     }
     replacing_registry().write().insert(
         table.to_string(),
-        ReplacingConfig { primary_key_indices, version_col_idx },
+        ReplacingConfig {
+            primary_key_indices,
+            version_col_idx,
+        },
     );
 }
 
@@ -409,7 +422,11 @@ pub fn apply_replacing_dedup(table: &str, batches: Vec<ColumnBatch>) -> Vec<Colu
     if total_rows <= 1 {
         return batches;
     }
-    let pk_names: Vec<String> = cfg.primary_key_indices.iter().map(|i| i.to_string()).collect();
+    let pk_names: Vec<String> = cfg
+        .primary_key_indices
+        .iter()
+        .map(|i| i.to_string())
+        .collect();
     let version_name: Option<String> = cfg.version_col_idx.map(|i| i.to_string());
     let combined = match concat_dedup_batches(&batches) {
         Some(b) => b,
@@ -554,7 +571,13 @@ impl std::fmt::Debug for ColumnarStore {
             .field("wal", &self.wal.as_ref().map(|_| "ColumnarWal(...)"))
             .field("merge_trees", &self.merge_trees)
             .field("data_dir", &self.data_dir)
-            .field("merge_running", &self.merge_running.as_ref().map(|r| r.load(AtomicOrdering::SeqCst)))
+            .field(
+                "merge_running",
+                &self
+                    .merge_running
+                    .as_ref()
+                    .map(|r| r.load(AtomicOrdering::SeqCst)),
+            )
             .finish()
     }
 }
@@ -722,10 +745,10 @@ impl ColumnarStore {
 
     /// Ensure a table entry exists (creates an empty table if absent).
     pub fn create_table(&mut self, table: &str) {
-        if let Some(ref wal) = self.wal {
-            if let Err(e) = wal.log_create_table(table) {
-                eprintln!("columnar WAL: failed to log create_table {table}: {e}");
-            }
+        if let Some(ref wal) = self.wal
+            && let Err(e) = wal.log_create_table(table)
+        {
+            eprintln!("columnar WAL: failed to log create_table {table}: {e}");
         }
         self.tables.entry(table.to_string()).or_default();
     }
@@ -749,10 +772,10 @@ impl ColumnarStore {
         order_by: Vec<String>,
         strategy: MergeStrategy,
     ) {
-        if let Some(ref wal) = self.wal {
-            if let Err(e) = wal.log_create_table(table) {
-                eprintln!("columnar WAL: failed to log create_table {table}: {e}");
-            }
+        if let Some(ref wal) = self.wal
+            && let Err(e) = wal.log_create_table(table)
+        {
+            eprintln!("columnar WAL: failed to log create_table {table}: {e}");
         }
         self.tables.entry(table.to_string()).or_default();
 
@@ -761,7 +784,9 @@ impl ColumnarStore {
             match MergeTree::open(order_by.clone(), &mt_dir) {
                 Ok(tree) => tree,
                 Err(e) => {
-                    eprintln!("columnar: failed to open MergeTree dir for {table}: {e}, falling back to in-memory");
+                    eprintln!(
+                        "columnar: failed to open MergeTree dir for {table}: {e}, falling back to in-memory"
+                    );
                     MergeTree::new(order_by)
                 }
             }
@@ -811,12 +836,11 @@ impl ColumnarStore {
     pub fn drop_table(&mut self, table: &str) -> bool {
         self.merge_trees.remove(table);
         let existed = self.tables.remove(table).is_some();
-        if existed {
-            if let Some(ref wal) = self.wal {
-                if let Err(e) = wal.log_drop_table(table) {
-                    eprintln!("columnar WAL: failed to log drop_table {table}: {e}");
-                }
-            }
+        if existed
+            && let Some(ref wal) = self.wal
+            && let Err(e) = wal.log_drop_table(table)
+        {
+            eprintln!("columnar WAL: failed to log drop_table {table}: {e}");
         }
         existed
     }
@@ -897,9 +921,10 @@ fn rows_to_batch(rows: Vec<Row>) -> ColumnBatch {
     let n_cols = rows[0].len();
     let columns = (0..n_cols)
         .map(|col_i| {
-            let vals: Vec<Value> = rows.iter().map(|row| {
-                row.get(col_i).cloned().unwrap_or(Value::Null)
-            }).collect();
+            let vals: Vec<Value> = rows
+                .iter()
+                .map(|row| row.get(col_i).cloned().unwrap_or(Value::Null))
+                .collect();
             (col_i.to_string(), vals_to_coldata(vals))
         })
         .collect();
@@ -909,10 +934,30 @@ fn rows_to_batch(rows: Vec<Row>) -> ColumnBatch {
 /// Extract a single row-column Value from a ColumnData at `idx`.
 fn coldata_get(col: &ColumnData, idx: usize) -> Value {
     match col {
-        ColumnData::Bool(v) => v.get(idx).copied().flatten().map(Value::Bool).unwrap_or(Value::Null),
-        ColumnData::Int32(v) => v.get(idx).copied().flatten().map(Value::Int32).unwrap_or(Value::Null),
-        ColumnData::Int64(v) => v.get(idx).copied().flatten().map(Value::Int64).unwrap_or(Value::Null),
-        ColumnData::Float64(v) => v.get(idx).copied().flatten().map(Value::Float64).unwrap_or(Value::Null),
+        ColumnData::Bool(v) => v
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(Value::Bool)
+            .unwrap_or(Value::Null),
+        ColumnData::Int32(v) => v
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(Value::Int32)
+            .unwrap_or(Value::Null),
+        ColumnData::Int64(v) => v
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(Value::Int64)
+            .unwrap_or(Value::Null),
+        ColumnData::Float64(v) => v
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(Value::Float64)
+            .unwrap_or(Value::Null),
         ColumnData::Text(v) => v
             .get(idx)
             .and_then(|o| o.as_ref())
@@ -943,12 +988,18 @@ fn vals_to_coldata(vals: Vec<Value>) -> ColumnData {
     match first_non_null {
         Some(Value::Bool(_)) => ColumnData::Bool(
             vals.into_iter()
-                .map(|v| match v { Value::Bool(b) => Some(b), _ => None })
+                .map(|v| match v {
+                    Value::Bool(b) => Some(b),
+                    _ => None,
+                })
                 .collect(),
         ),
         Some(Value::Int32(_)) => ColumnData::Int32(
             vals.into_iter()
-                .map(|v| match v { Value::Int32(n) => Some(n), _ => None })
+                .map(|v| match v {
+                    Value::Int32(n) => Some(n),
+                    _ => None,
+                })
                 .collect(),
         ),
         Some(Value::Int64(_)) => ColumnData::Int64(
@@ -1023,12 +1074,9 @@ pub fn apply_text_predicate(col: &[Option<String>], pred: &TextPredicate) -> Vec
                 return vec![false; col.len()];
             }
             match Regex::new(pattern) {
-                Ok(re) => col.iter()
-                    .map(|v| {
-                        v.as_ref()
-                            .map(|s| re.is_match(s))
-                            .unwrap_or(false)
-                    })
+                Ok(re) => col
+                    .iter()
+                    .map(|v| v.as_ref().map(|s| re.is_match(s)).unwrap_or(false))
                     .collect(),
                 Err(_) => vec![false; col.len()], // invalid regex matches nothing
             }
@@ -1067,11 +1115,41 @@ pub fn aggregate_sum(batch: &ColumnBatch, column: &str) -> f64 {
 /// Find the minimum value in a named column of a batch.
 pub fn aggregate_min(batch: &ColumnBatch, column: &str) -> AggValue {
     match batch.column(column) {
-        Some(ColumnData::Int32(v)) => v.iter().filter_map(|x| x.as_ref()).copied().min().map(AggValue::Int32).unwrap_or(AggValue::Null),
-        Some(ColumnData::Int64(v)) => v.iter().filter_map(|x| x.as_ref()).copied().min().map(AggValue::Int64).unwrap_or(AggValue::Null),
-        Some(ColumnData::Float64(v)) => v.iter().filter_map(|x| x.as_ref()).copied().reduce(f64::min).map(AggValue::Float64).unwrap_or(AggValue::Null),
-        Some(ColumnData::Text(v)) => v.iter().filter_map(|x| x.as_ref()).min().cloned().map(AggValue::Text).unwrap_or(AggValue::Null),
-        Some(ColumnData::Bool(v)) => v.iter().filter_map(|x| x.as_ref()).copied().min().map(AggValue::Bool).unwrap_or(AggValue::Null),
+        Some(ColumnData::Int32(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .copied()
+            .min()
+            .map(AggValue::Int32)
+            .unwrap_or(AggValue::Null),
+        Some(ColumnData::Int64(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .copied()
+            .min()
+            .map(AggValue::Int64)
+            .unwrap_or(AggValue::Null),
+        Some(ColumnData::Float64(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .copied()
+            .reduce(f64::min)
+            .map(AggValue::Float64)
+            .unwrap_or(AggValue::Null),
+        Some(ColumnData::Text(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .min()
+            .cloned()
+            .map(AggValue::Text)
+            .unwrap_or(AggValue::Null),
+        Some(ColumnData::Bool(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .copied()
+            .min()
+            .map(AggValue::Bool)
+            .unwrap_or(AggValue::Null),
         None => AggValue::Null,
     }
 }
@@ -1079,11 +1157,41 @@ pub fn aggregate_min(batch: &ColumnBatch, column: &str) -> AggValue {
 /// Find the maximum value in a named column of a batch.
 pub fn aggregate_max(batch: &ColumnBatch, column: &str) -> AggValue {
     match batch.column(column) {
-        Some(ColumnData::Int32(v)) => v.iter().filter_map(|x| x.as_ref()).copied().max().map(AggValue::Int32).unwrap_or(AggValue::Null),
-        Some(ColumnData::Int64(v)) => v.iter().filter_map(|x| x.as_ref()).copied().max().map(AggValue::Int64).unwrap_or(AggValue::Null),
-        Some(ColumnData::Float64(v)) => v.iter().filter_map(|x| x.as_ref()).copied().reduce(f64::max).map(AggValue::Float64).unwrap_or(AggValue::Null),
-        Some(ColumnData::Text(v)) => v.iter().filter_map(|x| x.as_ref()).max().cloned().map(AggValue::Text).unwrap_or(AggValue::Null),
-        Some(ColumnData::Bool(v)) => v.iter().filter_map(|x| x.as_ref()).copied().max().map(AggValue::Bool).unwrap_or(AggValue::Null),
+        Some(ColumnData::Int32(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .copied()
+            .max()
+            .map(AggValue::Int32)
+            .unwrap_or(AggValue::Null),
+        Some(ColumnData::Int64(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .copied()
+            .max()
+            .map(AggValue::Int64)
+            .unwrap_or(AggValue::Null),
+        Some(ColumnData::Float64(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .copied()
+            .reduce(f64::max)
+            .map(AggValue::Float64)
+            .unwrap_or(AggValue::Null),
+        Some(ColumnData::Text(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .max()
+            .cloned()
+            .map(AggValue::Text)
+            .unwrap_or(AggValue::Null),
+        Some(ColumnData::Bool(v)) => v
+            .iter()
+            .filter_map(|x| x.as_ref())
+            .copied()
+            .max()
+            .map(AggValue::Bool)
+            .unwrap_or(AggValue::Null),
         None => AggValue::Null,
     }
 }
@@ -1135,7 +1243,6 @@ impl ColumnarStore {
             .collect()
     }
 }
-
 
 // ============================================================================
 // Zone Maps (min/max metadata per column per batch)
@@ -1202,21 +1309,11 @@ impl ZoneMap {
             _ => return false,
         };
         match op {
-            CmpOp::Eq => {
-                scalar_lt(value, min_val) || scalar_lt(max_val, value)
-            }
-            CmpOp::Gt => {
-                !scalar_lt(value, max_val)
-            }
-            CmpOp::Lt => {
-                !scalar_lt(min_val, value)
-            }
-            CmpOp::Gte => {
-                scalar_lt(max_val, value)
-            }
-            CmpOp::Lte => {
-                scalar_lt(value, min_val)
-            }
+            CmpOp::Eq => scalar_lt(value, min_val) || scalar_lt(max_val, value),
+            CmpOp::Gt => !scalar_lt(value, max_val),
+            CmpOp::Lt => !scalar_lt(min_val, value),
+            CmpOp::Gte => scalar_lt(max_val, value),
+            CmpOp::Lte => scalar_lt(value, min_val),
         }
     }
 }
@@ -1257,7 +1354,12 @@ impl ColumnZoneMap {
                 } else {
                     None
                 };
-                ColumnZoneMap { min, max, null_count, row_count: v.len() }
+                ColumnZoneMap {
+                    min,
+                    max,
+                    null_count,
+                    row_count: v.len(),
+                }
             }
             ColumnData::Int32(v) => {
                 let mut null_count = 0usize;
@@ -1329,11 +1431,23 @@ impl ColumnZoneMap {
                         Some(x) => {
                             mn = Some(match mn {
                                 None => x.clone(),
-                                Some(m) => if x.as_str() < m.as_str() { x.clone() } else { m },
+                                Some(m) => {
+                                    if x.as_str() < m.as_str() {
+                                        x.clone()
+                                    } else {
+                                        m
+                                    }
+                                }
                             });
                             mx = Some(match mx {
                                 None => x.clone(),
-                                Some(m) => if x.as_str() > m.as_str() { x.clone() } else { m },
+                                Some(m) => {
+                                    if x.as_str() > m.as_str() {
+                                        x.clone()
+                                    } else {
+                                        m
+                                    }
+                                }
                             });
                         }
                     }
@@ -1379,27 +1493,37 @@ impl NullBitmap {
         match col {
             ColumnData::Bool(v) => {
                 for (i, val) in v.iter().enumerate() {
-                    if val.is_none() { bm.set_null(i); }
+                    if val.is_none() {
+                        bm.set_null(i);
+                    }
                 }
             }
             ColumnData::Int32(v) => {
                 for (i, val) in v.iter().enumerate() {
-                    if val.is_none() { bm.set_null(i); }
+                    if val.is_none() {
+                        bm.set_null(i);
+                    }
                 }
             }
             ColumnData::Int64(v) => {
                 for (i, val) in v.iter().enumerate() {
-                    if val.is_none() { bm.set_null(i); }
+                    if val.is_none() {
+                        bm.set_null(i);
+                    }
                 }
             }
             ColumnData::Float64(v) => {
                 for (i, val) in v.iter().enumerate() {
-                    if val.is_none() { bm.set_null(i); }
+                    if val.is_none() {
+                        bm.set_null(i);
+                    }
                 }
             }
             ColumnData::Text(v) => {
                 for (i, val) in v.iter().enumerate() {
-                    if val.is_none() { bm.set_null(i); }
+                    if val.is_none() {
+                        bm.set_null(i);
+                    }
                 }
             }
         }
@@ -1407,7 +1531,12 @@ impl NullBitmap {
     }
     /// Mark row at idx as NULL.
     pub fn set_null(&mut self, idx: usize) {
-        assert!(idx < self.len, "index {} out of bounds (len={})", idx, self.len);
+        assert!(
+            idx < self.len,
+            "index {} out of bounds (len={})",
+            idx,
+            self.len
+        );
         let word = idx / 64;
         let bit = idx % 64;
         self.bits[word] |= 1u64 << bit;
@@ -1415,7 +1544,12 @@ impl NullBitmap {
 
     /// Clear the null flag for row at idx (mark as non-null).
     pub fn clear_null(&mut self, idx: usize) {
-        assert!(idx < self.len, "index {} out of bounds (len={})", idx, self.len);
+        assert!(
+            idx < self.len,
+            "index {} out of bounds (len={})",
+            idx,
+            self.len
+        );
         let word = idx / 64;
         let bit = idx % 64;
         self.bits[word] &= !(1u64 << bit);
@@ -1423,7 +1557,12 @@ impl NullBitmap {
 
     /// Check if row at idx is NULL.
     pub fn is_null(&self, idx: usize) -> bool {
-        assert!(idx < self.len, "index {} out of bounds (len={})", idx, self.len);
+        assert!(
+            idx < self.len,
+            "index {} out of bounds (len={})",
+            idx,
+            self.len
+        );
         let word = idx / 64;
         let bit = idx % 64;
         (self.bits[word] >> bit) & 1 == 1
@@ -1467,7 +1606,11 @@ impl NullBitmap {
 ///
 /// Instead of copying all columns, this returns just the matching row positions.
 /// Combine with gather() to only materialize the columns you actually need.
-pub fn filter_positions(batch: &ColumnBatch, predicate_col: &str, predicate: &Predicate) -> Vec<usize> {
+pub fn filter_positions(
+    batch: &ColumnBatch,
+    predicate_col: &str,
+    predicate: &Predicate,
+) -> Vec<usize> {
     let col = match batch.column(predicate_col) {
         Some(c) => c,
         None => return Vec::new(),
@@ -1475,81 +1618,84 @@ pub fn filter_positions(batch: &ColumnBatch, predicate_col: &str, predicate: &Pr
     match col {
         ColumnData::Int64(v) => {
             let mask = filter_i64(v, predicate);
-            mask.iter().enumerate()
+            mask.iter()
+                .enumerate()
                 .filter(|&(_, &m)| m)
                 .map(|(i, _)| i)
                 .collect()
         }
-        ColumnData::Int32(v) => {
-            match predicate {
-                Predicate::EqI64(target) => {
-                    let t = *target as i32;
-                    v.iter().enumerate()
-                        .filter(|(_, val)| val.as_ref() == Some(&t))
-                        .map(|(i, _)| i)
-                        .collect()
-                }
-                Predicate::GtI64(target) => {
-                    let t = *target as i32;
-                    v.iter().enumerate()
-                        .filter(|(_, val)| val.map(|x| x > t).unwrap_or(false))
-                        .map(|(i, _)| i)
-                        .collect()
-                }
-                Predicate::LtI64(target) => {
-                    let t = *target as i32;
-                    v.iter().enumerate()
-                        .filter(|(_, val)| val.map(|x| x < t).unwrap_or(false))
-                        .map(|(i, _)| i)
-                        .collect()
-                }
-                Predicate::BetweenI64(lo, hi) => {
-                    let lo32 = *lo as i32;
-                    let hi32 = *hi as i32;
-                    v.iter().enumerate()
-                        .filter(|(_, val)| val.map(|x| x >= lo32 && x <= hi32).unwrap_or(false))
-                        .map(|(i, _)| i)
-                        .collect()
-                }
-                _ => (0..v.len()).collect(),
+        ColumnData::Int32(v) => match predicate {
+            Predicate::EqI64(target) => {
+                let t = *target as i32;
+                v.iter()
+                    .enumerate()
+                    .filter(|(_, val)| val.as_ref() == Some(&t))
+                    .map(|(i, _)| i)
+                    .collect()
             }
-        }
+            Predicate::GtI64(target) => {
+                let t = *target as i32;
+                v.iter()
+                    .enumerate()
+                    .filter(|(_, val)| val.map(|x| x > t).unwrap_or(false))
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+            Predicate::LtI64(target) => {
+                let t = *target as i32;
+                v.iter()
+                    .enumerate()
+                    .filter(|(_, val)| val.map(|x| x < t).unwrap_or(false))
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+            Predicate::BetweenI64(lo, hi) => {
+                let lo32 = *lo as i32;
+                let hi32 = *hi as i32;
+                v.iter()
+                    .enumerate()
+                    .filter(|(_, val)| val.map(|x| x >= lo32 && x <= hi32).unwrap_or(false))
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+            _ => (0..v.len()).collect(),
+        },
         ColumnData::Text(v) => {
             let mask = filter_text(v, predicate);
-            mask.iter().enumerate()
+            mask.iter()
+                .enumerate()
                 .filter(|&(_, &m)| m)
                 .map(|(i, _)| i)
                 .collect()
         }
-        ColumnData::Float64(v) => {
-            match predicate {
-                Predicate::GtI64(target) => {
-                    let t = *target as f64;
-                    v.iter().enumerate()
-                        .filter(|(_, val)| val.map(|x| x > t).unwrap_or(false))
-                        .map(|(i, _)| i)
-                        .collect()
-                }
-                Predicate::LtI64(target) => {
-                    let t = *target as f64;
-                    v.iter().enumerate()
-                        .filter(|(_, val)| val.map(|x| x < t).unwrap_or(false))
-                        .map(|(i, _)| i)
-                        .collect()
-                }
-                Predicate::EqI64(target) => {
-                    let t = *target as f64;
-                    v.iter().enumerate()
-                        .filter(|(_, val)| val.map(|x| (x - t).abs() < f64::EPSILON).unwrap_or(false))
-                        .map(|(i, _)| i)
-                        .collect()
-                }
-                _ => (0..v.len()).collect(),
+        ColumnData::Float64(v) => match predicate {
+            Predicate::GtI64(target) => {
+                let t = *target as f64;
+                v.iter()
+                    .enumerate()
+                    .filter(|(_, val)| val.map(|x| x > t).unwrap_or(false))
+                    .map(|(i, _)| i)
+                    .collect()
             }
-        }
-        ColumnData::Bool(_) => {
-            (0..col.len()).collect()
-        }
+            Predicate::LtI64(target) => {
+                let t = *target as f64;
+                v.iter()
+                    .enumerate()
+                    .filter(|(_, val)| val.map(|x| x < t).unwrap_or(false))
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+            Predicate::EqI64(target) => {
+                let t = *target as f64;
+                v.iter()
+                    .enumerate()
+                    .filter(|(_, val)| val.map(|x| (x - t).abs() < f64::EPSILON).unwrap_or(false))
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+            _ => (0..v.len()).collect(),
+        },
+        ColumnData::Bool(_) => (0..col.len()).collect(),
     }
 }
 /// Materialize only specific columns at specific row positions from a batch.
@@ -1561,7 +1707,9 @@ pub fn gather(batch: &ColumnBatch, positions: &[usize], columns: &[&str]) -> Col
     let selected_cols: Vec<&(String, ColumnData)> = if columns.is_empty() {
         batch.columns.iter().collect()
     } else {
-        batch.columns.iter()
+        batch
+            .columns
+            .iter()
             .filter(|(name, _)| columns.contains(&name.as_str()))
             .collect()
     };
@@ -1569,15 +1717,9 @@ pub fn gather(batch: &ColumnBatch, positions: &[usize], columns: &[&str]) -> Col
     let mut new_columns = Vec::with_capacity(selected_cols.len());
     for (name, col) in selected_cols {
         let gathered = match col {
-            ColumnData::Bool(v) => {
-                ColumnData::Bool(positions.iter().map(|&i| v[i]).collect())
-            }
-            ColumnData::Int32(v) => {
-                ColumnData::Int32(positions.iter().map(|&i| v[i]).collect())
-            }
-            ColumnData::Int64(v) => {
-                ColumnData::Int64(positions.iter().map(|&i| v[i]).collect())
-            }
+            ColumnData::Bool(v) => ColumnData::Bool(positions.iter().map(|&i| v[i]).collect()),
+            ColumnData::Int32(v) => ColumnData::Int32(positions.iter().map(|&i| v[i]).collect()),
+            ColumnData::Int64(v) => ColumnData::Int64(positions.iter().map(|&i| v[i]).collect()),
             ColumnData::Float64(v) => {
                 ColumnData::Float64(positions.iter().map(|&i| v[i]).collect())
             }
@@ -1630,7 +1772,11 @@ pub enum CompressedData {
     RleText(Vec<(Option<String>, u32)>),
     /// Delta encoded: base value + deltas for i64 columns.
     /// Null bitmap tracks which positions in the original column were NULL.
-    DeltaI64 { base: i64, deltas: Vec<i32>, null_bitmap: Vec<bool> },
+    DeltaI64 {
+        base: i64,
+        deltas: Vec<i32>,
+        null_bitmap: Vec<bool>,
+    },
     /// Dictionary encoded: dictionary + indices for text columns.
     DictionaryText {
         dict: Vec<String>,
@@ -1639,7 +1785,11 @@ pub enum CompressedData {
     },
     /// Frame-of-reference: min value + offsets for i64 columns.
     /// Null bitmap tracks which positions in the original column were NULL.
-    ForI64 { min_val: i64, offsets: Vec<u16>, null_bitmap: Vec<bool> },
+    ForI64 {
+        min_val: i64,
+        offsets: Vec<u16>,
+        null_bitmap: Vec<bool>,
+    },
 }
 
 /// Analyze a column and select the best compression codec.
@@ -1670,7 +1820,11 @@ fn select_codec_i64(vals: &[Option<i64>]) -> CompressionCodec {
     let is_sorted = non_nulls.windows(2).all(|w| w[1] >= w[0]);
     if is_sorted && non_nulls.len() > 10 {
         // Check if deltas fit in i32
-        let max_delta = non_nulls.windows(2).map(|w| (w[1] - w[0]).unsigned_abs()).max().unwrap_or(0);
+        let max_delta = non_nulls
+            .windows(2)
+            .map(|w| (w[1] - w[0]).unsigned_abs())
+            .max()
+            .unwrap_or(0);
         if max_delta <= i32::MAX as u64 {
             return CompressionCodec::Delta;
         }
@@ -1784,8 +1938,12 @@ fn compress_rle(col: &ColumnData) -> CompressedData {
                 let mut run_len = 1u32;
                 loop {
                     let next = i + run_len as usize;
-                    if next >= vals.len() { break; }
-                    if vals[next] != val { break; }
+                    if next >= vals.len() {
+                        break;
+                    }
+                    if vals[next] != val {
+                        break;
+                    }
                     run_len += 1;
                 }
                 runs.push((val, run_len));
@@ -1801,8 +1959,12 @@ fn compress_rle(col: &ColumnData) -> CompressedData {
                 let mut run_len = 1u32;
                 loop {
                     let next = i + run_len as usize;
-                    if next >= vals.len() { break; }
-                    if vals[next] != *val { break; }
+                    if next >= vals.len() {
+                        break;
+                    }
+                    if vals[next] != *val {
+                        break;
+                    }
                     run_len += 1;
                 }
                 runs.push((val.clone(), run_len));
@@ -1824,7 +1986,11 @@ fn compress_delta(col: &ColumnData) -> CompressedData {
             }
             let base = non_nulls[0];
             let deltas: Vec<i32> = non_nulls.windows(2).map(|w| (w[1] - w[0]) as i32).collect();
-            CompressedData::DeltaI64 { base, deltas, null_bitmap }
+            CompressedData::DeltaI64 {
+                base,
+                deltas,
+                null_bitmap,
+            }
         }
         _ => CompressedData::None(col.clone()),
     }
@@ -1876,7 +2042,11 @@ fn compress_for(col: &ColumnData) -> CompressedData {
             }
             let min_val = *non_nulls.iter().min().unwrap();
             let offsets: Vec<u16> = non_nulls.iter().map(|v| (v - min_val) as u16).collect();
-            CompressedData::ForI64 { min_val, offsets, null_bitmap }
+            CompressedData::ForI64 {
+                min_val,
+                offsets,
+                null_bitmap,
+            }
         }
         _ => CompressedData::None(col.clone()),
     }
@@ -1904,7 +2074,11 @@ pub fn decompress_column(compressed: &CompressedColumn) -> ColumnData {
             }
             ColumnData::Text(vals)
         }
-        CompressedData::DeltaI64 { base, deltas, null_bitmap } => {
+        CompressedData::DeltaI64 {
+            base,
+            deltas,
+            null_bitmap,
+        } => {
             let mut non_null_vals = Vec::with_capacity(deltas.len() + 1);
             let mut current = *base;
             non_null_vals.push(current);
@@ -1945,7 +2119,11 @@ pub fn decompress_column(compressed: &CompressedColumn) -> ColumnData {
                 .collect();
             ColumnData::Text(vals)
         }
-        CompressedData::ForI64 { min_val, offsets, null_bitmap } => {
+        CompressedData::ForI64 {
+            min_val,
+            offsets,
+            null_bitmap,
+        } => {
             // Reconstruct non-null values from offsets
             let non_null_vals: Vec<i64> = offsets.iter().map(|&o| *min_val + o as i64).collect();
             // Reconstruct with nulls using the bitmap
@@ -1971,12 +2149,25 @@ pub fn compressed_size(compressed: &CompressedColumn) -> usize {
     match &compressed.data {
         CompressedData::None(col) => col.len() * 8, // approximate
         CompressedData::RleI64(runs) => runs.len() * 13, // (Option<i64> + u32) per run, +1 for null flag
-        CompressedData::RleText(runs) => runs.iter().map(|(s, _)| s.as_ref().map_or(1, |v| v.len() + 1) + 4).sum(),
-        CompressedData::DeltaI64 { deltas, null_bitmap, .. } => 8 + deltas.len() * 4 + null_bitmap.len(), // base + deltas + bitmap
-        CompressedData::DictionaryText { dict, indices, nulls } => {
-            dict.iter().map(|s| s.len()).sum::<usize>() + indices.len() * 4 + nulls.len()
-        }
-        CompressedData::ForI64 { offsets, null_bitmap, .. } => 8 + offsets.len() * 2 + null_bitmap.len(), // min + offsets + bitmap
+        CompressedData::RleText(runs) => runs
+            .iter()
+            .map(|(s, _)| s.as_ref().map_or(1, |v| v.len() + 1) + 4)
+            .sum(),
+        CompressedData::DeltaI64 {
+            deltas,
+            null_bitmap,
+            ..
+        } => 8 + deltas.len() * 4 + null_bitmap.len(), // base + deltas + bitmap
+        CompressedData::DictionaryText {
+            dict,
+            indices,
+            nulls,
+        } => dict.iter().map(|s| s.len()).sum::<usize>() + indices.len() * 4 + nulls.len(),
+        CompressedData::ForI64 {
+            offsets,
+            null_bitmap,
+            ..
+        } => 8 + offsets.len() * 2 + null_bitmap.len(), // min + offsets + bitmap
     }
 }
 
@@ -2091,9 +2282,10 @@ pub fn dict_group_by_count(col: &DictColumn) -> Vec<(String, usize)> {
     let mut counts = vec![0usize; col.dict.len()];
     for &code in &col.codes {
         if code != DICT_NULL_CODE
-            && let Some(c) = counts.get_mut(code as usize) {
-                *c += 1;
-            }
+            && let Some(c) = counts.get_mut(code as usize)
+        {
+            *c += 1;
+        }
     }
 
     // Map codes back to strings, skip zero-count entries
@@ -2133,13 +2325,14 @@ pub fn dict_group_by_sum_f64(
 
     for (i, &code) in key_col.codes.iter().enumerate() {
         if code != DICT_NULL_CODE
-            && let Some(v) = val_col[i] {
-                let idx = code as usize;
-                if idx < card {
-                    counts[idx] += 1;
-                    sums[idx] += v;
-                }
+            && let Some(v) = val_col[i]
+        {
+            let idx = code as usize;
+            if idx < card {
+                counts[idx] += 1;
+                sums[idx] += v;
             }
+        }
     }
 
     let mut result: Vec<(String, usize, f64)> = key_col
@@ -2203,7 +2396,10 @@ impl ColumnarStore {
         if let Some(mt) = self.merge_trees.get_mut(table) {
             mt.insert(batch);
         } else {
-            self.tables.entry(table.to_string()).or_default().push(batch);
+            self.tables
+                .entry(table.to_string())
+                .or_default()
+                .push(batch);
         }
     }
 
@@ -2214,16 +2410,13 @@ impl ColumnarStore {
 
     /// Perform GROUP BY COUNT using dictionary encoding if available,
     /// falling back to hash-based counting otherwise.
-    pub fn dict_group_by_count_for(
-        &self,
-        table: &str,
-        column: &str,
-    ) -> Vec<(String, usize)> {
+    pub fn dict_group_by_count_for(&self, table: &str, column: &str) -> Vec<(String, usize)> {
         // Try dictionary-encoded fast path first
         if let Some(dict_cols) = self.dict_columns.get(table)
-            && let Some(dict_col) = dict_cols.get(column) {
-                return dict_group_by_count(dict_col);
-            }
+            && let Some(dict_col) = dict_cols.get(column)
+        {
+            return dict_group_by_count(dict_col);
+        }
 
         // Fallback: scan all batches with HashMap
         let mut counts: HashMap<String, usize> = HashMap::new();
@@ -2324,7 +2517,9 @@ pub type MergeResultReceiver = std::sync::mpsc::Receiver<MergeResult>;
 /// combines, and compresses the source parts into a single merged part.
 pub fn execute_merge_task(task: MergeTask, new_part_id: u64) -> MergeResult {
     // Merge all source parts by iteratively merge-sorting pairs
-    let mut batches: Vec<ColumnBatch> = task.parts.into_iter()
+    let mut batches: Vec<ColumnBatch> = task
+        .parts
+        .into_iter()
         .map(|p| std::sync::Arc::try_unwrap(p.data).unwrap_or_else(|arc| (*arc).clone()))
         .collect();
 
@@ -2344,16 +2539,24 @@ pub fn execute_merge_task(task: MergeTask, new_part_id: u64) -> MergeResult {
         MergeStrategy::Replacing { version_column } => {
             merge_replacing(&sorted_batch, &task.primary_key, version_column.as_deref())
         }
-        MergeStrategy::Aggregating { group_columns: _, sum_columns, count_columns } => {
-            merge_aggregating(&sorted_batch, &task.primary_key, sum_columns, count_columns)
-        }
+        MergeStrategy::Aggregating {
+            group_columns: _,
+            sum_columns,
+            count_columns,
+        } => merge_aggregating(&sorted_batch, &task.primary_key, sum_columns, count_columns),
     };
 
-    let row_count = merged_batch.columns.first().map(|(_, c)| c.len()).unwrap_or(0);
+    let row_count = merged_batch
+        .columns
+        .first()
+        .map(|(_, c)| c.len())
+        .unwrap_or(0);
     let zone_map = ZoneMap::from_batch(&merged_batch);
 
     // Compress merged data using adaptive codec selection
-    let compressed = merged_batch.columns.iter()
+    let compressed = merged_batch
+        .columns
+        .iter()
         .map(|(name, col)| (name.clone(), compress_adaptive(col)))
         .collect::<Vec<_>>();
 
@@ -2463,10 +2666,18 @@ impl MergeTree {
         tree
     }
 
-    pub fn set_table_name(&mut self, name: &str) { self.table_name = name.to_string(); }
-    pub fn set_background_merger(&mut self, sender: MergeTaskSender) { self.merge_sender = Some(sender); }
-    pub fn clear_background_merger(&mut self) { self.merge_sender = None; }
-    pub fn has_background_merger(&self) -> bool { self.merge_sender.is_some() }
+    pub fn set_table_name(&mut self, name: &str) {
+        self.table_name = name.to_string();
+    }
+    pub fn set_background_merger(&mut self, sender: MergeTaskSender) {
+        self.merge_sender = Some(sender);
+    }
+    pub fn clear_background_merger(&mut self) {
+        self.merge_sender = None;
+    }
+    pub fn has_background_merger(&self) -> bool {
+        self.merge_sender.is_some()
+    }
 
     pub fn poll_merge_results(&mut self, result_rx: &MergeResultReceiver) {
         while let Ok(result) = result_rx.try_recv() {
@@ -2475,12 +2686,21 @@ impl MergeTree {
     }
 
     fn queue_background_merge(&mut self) {
-        let sender = match &self.merge_sender { Some(s) => s, None => return };
-        let mut candidates: Vec<(usize, usize)> = self.parts.iter().enumerate()
+        let sender = match &self.merge_sender {
+            Some(s) => s,
+            None => return,
+        };
+        let mut candidates: Vec<(usize, usize)> = self
+            .parts
+            .iter()
+            .enumerate()
             .filter(|(_, p)| !self.merging_part_ids.contains(&p.id))
-            .map(|(i, p)| (i, p.row_count)).collect();
+            .map(|(i, p)| (i, p.row_count))
+            .collect();
         candidates.sort_by_key(|&(_, s)| s);
-        if candidates.len() < 2 { return; }
+        if candidates.len() < 2 {
+            return;
+        }
         let (idx_a, idx_b) = (candidates[0].0, candidates[1].0);
         let source_ids = vec![self.parts[idx_a].id, self.parts[idx_b].id];
         let task = MergeTask {
@@ -2490,17 +2710,24 @@ impl MergeTree {
             primary_key: self.primary_key.clone(),
             merge_strategy: self.merge_strategy.clone(),
         };
-        if sender.try_send(task).is_ok() { self.merging_part_ids.extend(source_ids); }
+        if sender.try_send(task).is_ok() {
+            self.merging_part_ids.extend(source_ids);
+        }
     }
 
     /// Apply a completed merge result from the background worker.
     pub fn apply_merge_result(&mut self, result: MergeResult) -> bool {
-        self.merging_part_ids.retain(|id| !result.source_part_ids.contains(id));
-        let all_present = result.source_part_ids.iter().all(|id| {
-            self.parts.iter().any(|p| p.id == *id)
-        });
-        if !all_present { return false; }
-        self.parts.retain(|p| !result.source_part_ids.contains(&p.id));
+        self.merging_part_ids
+            .retain(|id| !result.source_part_ids.contains(id));
+        let all_present = result
+            .source_part_ids
+            .iter()
+            .all(|id| self.parts.iter().any(|p| p.id == *id));
+        if !all_present {
+            return false;
+        }
+        self.parts
+            .retain(|p| !result.source_part_ids.contains(&p.id));
         self.parts.push(result.merged_part);
         true
     }
@@ -2553,7 +2780,9 @@ impl MergeTree {
         // The merged part will eventually exceed cold_threshold_bytes and get
         // flushed to disk by flush_cold_parts() on the next insert.
         const MAX_HOT_BYTES: usize = 256 * 1024; // 256KB per table
-        let hot_bytes: usize = self.parts.iter()
+        let hot_bytes: usize = self
+            .parts
+            .iter()
             .map(|p| estimate_batch_size(&p.data))
             .sum();
         if hot_bytes > MAX_HOT_BYTES {
@@ -2636,15 +2865,23 @@ impl MergeTree {
             MergeStrategy::Replacing { version_column } => {
                 merge_replacing(&sorted_batch, &self.primary_key, version_column.as_deref())
             }
-            MergeStrategy::Aggregating { group_columns: _, sum_columns, count_columns } => {
-                merge_aggregating(&sorted_batch, &self.primary_key, sum_columns, count_columns)
-            }
+            MergeStrategy::Aggregating {
+                group_columns: _,
+                sum_columns,
+                count_columns,
+            } => merge_aggregating(&sorted_batch, &self.primary_key, sum_columns, count_columns),
         };
-        let row_count = merged_batch.columns.first().map(|(_, c)| c.len()).unwrap_or(0);
+        let row_count = merged_batch
+            .columns
+            .first()
+            .map(|(_, c)| c.len())
+            .unwrap_or(0);
         let zone_map = ZoneMap::from_batch(&merged_batch);
 
         // Compress merged data using adaptive codec selection
-        let compressed = merged_batch.columns.iter()
+        let compressed = merged_batch
+            .columns
+            .iter()
             .map(|(name, col)| (name.clone(), compress_adaptive(col)))
             .collect::<Vec<_>>();
 
@@ -2685,7 +2922,10 @@ impl MergeTree {
                         }
                     }
                     Err(e) => {
-                        eprintln!("MergeTree: failed to read cold segment {:?}: {e}", cold.path);
+                        eprintln!(
+                            "MergeTree: failed to read cold segment {:?}: {e}",
+                            cold.path
+                        );
                     }
                 }
             }
@@ -2708,7 +2948,10 @@ impl MergeTree {
                     }
                 }
                 Err(e) => {
-                    eprintln!("MergeTree: failed to read cold segment {:?}: {e}", cold.path);
+                    eprintln!(
+                        "MergeTree: failed to read cold segment {:?}: {e}",
+                        cold.path
+                    );
                 }
             }
         }
@@ -2876,7 +3119,11 @@ impl MergeTree {
 
     /// Recover state: load cold segments from disk, then apply WAL-recovered
     /// hot parts on top. This is the full crash-recovery path.
-    pub fn recover(primary_key: Vec<String>, dir: &Path, wal_batches: Vec<ColumnBatch>) -> std::io::Result<Self> {
+    pub fn recover(
+        primary_key: Vec<String>,
+        dir: &Path,
+        wal_batches: Vec<ColumnBatch>,
+    ) -> std::io::Result<Self> {
         let mut tree = Self::open(primary_key, dir)?;
         // WAL-recovered batches are unflushed data — insert as hot parts
         for batch in wal_batches {
@@ -2899,21 +3146,15 @@ impl MergeTree {
 
 fn reorder_column(col: &ColumnData, indices: &[usize]) -> ColumnData {
     match col {
-        ColumnData::Int32(vals) => {
-            ColumnData::Int32(indices.iter().map(|&i| vals[i]).collect())
-        }
-        ColumnData::Int64(vals) => {
-            ColumnData::Int64(indices.iter().map(|&i| vals[i]).collect())
-        }
+        ColumnData::Int32(vals) => ColumnData::Int32(indices.iter().map(|&i| vals[i]).collect()),
+        ColumnData::Int64(vals) => ColumnData::Int64(indices.iter().map(|&i| vals[i]).collect()),
         ColumnData::Float64(vals) => {
             ColumnData::Float64(indices.iter().map(|&i| vals[i]).collect())
         }
         ColumnData::Text(vals) => {
             ColumnData::Text(indices.iter().map(|&i| vals[i].clone()).collect())
         }
-        ColumnData::Bool(vals) => {
-            ColumnData::Bool(indices.iter().map(|&i| vals[i]).collect())
-        }
+        ColumnData::Bool(vals) => ColumnData::Bool(indices.iter().map(|&i| vals[i]).collect()),
     }
 }
 
@@ -3014,7 +3255,15 @@ fn concat_columns(a: &ColumnData, b: &ColumnData) -> ColumnData {
             result.extend_from_slice(vb);
             ColumnData::Bool(result)
         }
-        _ => a.clone(),
+        // All batches for a table must share column types. A mismatch here would
+        // silently drop `b`'s rows and leave this column shorter than its
+        // siblings (ragged, misaligned batch) — far worse than failing. Treat it
+        // as the schema-corruption invariant violation it is and fail loudly.
+        (a, b) => panic!(
+            "concat_columns: column type mismatch ({} vs {}) — batches for a table must share column types",
+            a.type_name(),
+            b.type_name()
+        ),
     }
 }
 
@@ -3044,7 +3293,7 @@ fn version_value_at(col: Option<&ColumnData>, idx: usize) -> i64 {
 }
 
 /// Append row `idx` from `src` to the column builders in `builders`.
-fn append_row_to_builders(builders: &mut Vec<(String, ColumnBuilder)>, src: &ColumnBatch, idx: usize) {
+fn append_row_to_builders(builders: &mut [(String, ColumnBuilder)], src: &ColumnBatch, idx: usize) {
     for (name, builder) in builders.iter_mut() {
         if let Some(col) = src.column(name) {
             builder.push_from(col, idx);
@@ -3101,14 +3350,20 @@ impl ColumnBuilder {
 /// identical PK values are collapsed. If `version_column` is set, the row
 /// with the highest version wins. Otherwise the last row (highest insertion
 /// order) wins.
-fn merge_replacing(batch: &ColumnBatch, primary_key: &[String], version_column: Option<&str>) -> ColumnBatch {
+fn merge_replacing(
+    batch: &ColumnBatch,
+    primary_key: &[String],
+    version_column: Option<&str>,
+) -> ColumnBatch {
     let row_count = batch.columns.first().map(|(_, c)| c.len()).unwrap_or(0);
     if row_count <= 1 || primary_key.is_empty() {
         return batch.clone();
     }
 
     // Build output column builders
-    let mut builders: Vec<(String, ColumnBuilder)> = batch.columns.iter()
+    let mut builders: Vec<(String, ColumnBuilder)> = batch
+        .columns
+        .iter()
         .map(|(name, col)| (name.clone(), ColumnBuilder::from_type(col)))
         .collect();
 
@@ -3145,7 +3400,8 @@ fn merge_replacing(batch: &ColumnBatch, primary_key: &[String], version_column: 
         i = j;
     }
 
-    let columns: Vec<(String, ColumnData)> = builders.into_iter()
+    let columns: Vec<(String, ColumnData)> = builders
+        .into_iter()
         .map(|(name, b)| (name, b.build()))
         .collect();
     ColumnBatch::new(columns)
@@ -3199,7 +3455,9 @@ fn merge_aggregating(
     }
 
     // Build output column builders
-    let mut builders: Vec<(String, ColumnBuilder)> = batch.columns.iter()
+    let mut builders: Vec<(String, ColumnBuilder)> = batch
+        .columns
+        .iter()
         .map(|(name, col)| (name.clone(), ColumnBuilder::from_type(col)))
         .collect();
 
@@ -3235,22 +3493,22 @@ fn merge_aggregating(
                     match (builder, col) {
                         (ColumnBuilder::Int32(out), ColumnData::Int32(src)) => {
                             let mut acc = None;
-                            for k in i..j {
-                                acc = sum_opt_i32(acc, src[k]);
+                            for &v in &src[i..j] {
+                                acc = sum_opt_i32(acc, v);
                             }
                             out.push(acc);
                         }
                         (ColumnBuilder::Int64(out), ColumnData::Int64(src)) => {
                             let mut acc = None;
-                            for k in i..j {
-                                acc = sum_opt_i64(acc, src[k]);
+                            for &v in &src[i..j] {
+                                acc = sum_opt_i64(acc, v);
                             }
                             out.push(acc);
                         }
                         (ColumnBuilder::Float64(out), ColumnData::Float64(src)) => {
                             let mut acc = None;
-                            for k in i..j {
-                                acc = sum_opt_f64(acc, src[k]);
+                            for &v in &src[i..j] {
+                                acc = sum_opt_f64(acc, v);
                             }
                             out.push(acc);
                         }
@@ -3268,7 +3526,8 @@ fn merge_aggregating(
         i = j;
     }
 
-    let columns: Vec<(String, ColumnData)> = builders.into_iter()
+    let columns: Vec<(String, ColumnData)> = builders
+        .into_iter()
         .map(|(name, b)| (name, b.build()))
         .collect();
     ColumnBatch::new(columns)
@@ -3310,14 +3569,9 @@ pub fn par_sum_batches(batches: &[ColumnBatch], column: &str, threshold: usize) 
     std::thread::scope(|s| {
         let handles: Vec<_> = batches
             .chunks(chunk_size)
-            .map(|chunk| {
-                s.spawn(|| chunk.iter().map(|b| aggregate_sum(b, column)).sum::<f64>())
-            })
+            .map(|chunk| s.spawn(|| chunk.iter().map(|b| aggregate_sum(b, column)).sum::<f64>()))
             .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .sum::<f64>()
+        handles.into_iter().map(|h| h.join().unwrap()).sum::<f64>()
     })
 }
 
@@ -3332,9 +3586,7 @@ pub fn par_count_batches(batches: &[ColumnBatch], threshold: usize) -> usize {
     std::thread::scope(|s| {
         let handles: Vec<_> = batches
             .chunks(chunk_size)
-            .map(|chunk| {
-                s.spawn(|| chunk.iter().map(|b| b.row_count).sum::<usize>())
-            })
+            .map(|chunk| s.spawn(|| chunk.iter().map(|b| b.row_count).sum::<usize>()))
             .collect();
         handles
             .into_iter()
@@ -3518,21 +3770,15 @@ fn scan_batch_eq(batch: &ColumnBatch, column: &str, value: &AggValue) -> ColumnB
         None => return ColumnBatch::new(vec![]),
     };
     let mask: Vec<bool> = match (col, value) {
-        (ColumnData::Int32(v), AggValue::Int32(n)) => {
-            v.iter().map(|o| o == &Some(*n)).collect()
-        }
-        (ColumnData::Int64(v), AggValue::Int64(n)) => {
-            v.iter().map(|o| o == &Some(*n)).collect()
-        }
+        (ColumnData::Int32(v), AggValue::Int32(n)) => v.iter().map(|o| o == &Some(*n)).collect(),
+        (ColumnData::Int64(v), AggValue::Int64(n)) => v.iter().map(|o| o == &Some(*n)).collect(),
         (ColumnData::Float64(v), AggValue::Float64(f)) => {
             v.iter().map(|o| o == &Some(*f)).collect()
         }
         (ColumnData::Text(v), AggValue::Text(s)) => {
             v.iter().map(|o| o.as_deref() == Some(s.as_str())).collect()
         }
-        (ColumnData::Bool(v), AggValue::Bool(b)) => {
-            v.iter().map(|o| o == &Some(*b)).collect()
-        }
+        (ColumnData::Bool(v), AggValue::Bool(b)) => v.iter().map(|o| o == &Some(*b)).collect(),
         _ => vec![false; batch.row_count],
     };
     apply_mask(batch, &mask)
@@ -3600,6 +3846,17 @@ impl ColumnarStore {
 mod tests {
     use super::*;
 
+    // Regression: concat_columns used to `_ => a.clone()` on a type mismatch,
+    // silently dropping b's rows and leaving this column shorter than its
+    // siblings (ragged batch). It must fail loudly instead.
+    #[test]
+    #[should_panic(expected = "column type mismatch")]
+    fn concat_columns_type_mismatch_panics() {
+        let a = ColumnData::Int32(vec![Some(1)]);
+        let b = ColumnData::Int64(vec![Some(2)]);
+        let _ = concat_columns(&a, &b);
+    }
+
     fn sample_batch() -> ColumnBatch {
         ColumnBatch::new(vec![
             (
@@ -3614,13 +3871,7 @@ mod tests {
             ),
             (
                 "age".into(),
-                ColumnData::Int64(vec![
-                    Some(30),
-                    Some(25),
-                    Some(35),
-                    Some(28),
-                    Some(32),
-                ]),
+                ColumnData::Int64(vec![Some(30), Some(25), Some(35), Some(28), Some(32)]),
             ),
             (
                 "salary".into(),
@@ -3721,22 +3972,57 @@ mod tests {
     fn mixed_column_types_in_store() {
         let mut store = ColumnarStore::new();
         let batch = ColumnBatch::new(vec![
-            ("active".into(), ColumnData::Bool(vec![Some(true), Some(false), None, Some(true)])),
-            ("score_i32".into(), ColumnData::Int32(vec![Some(100), Some(200), Some(300), None])),
-            ("score_i64".into(), ColumnData::Int64(vec![Some(1000), None, Some(3000), Some(4000)])),
-            ("rating".into(), ColumnData::Float64(vec![Some(4.5), Some(3.2), None, Some(4.8)])),
-            ("label".into(), ColumnData::Text(vec![Some("A".into()), Some("B".into()), Some("C".into()), None])),
+            (
+                "active".into(),
+                ColumnData::Bool(vec![Some(true), Some(false), None, Some(true)]),
+            ),
+            (
+                "score_i32".into(),
+                ColumnData::Int32(vec![Some(100), Some(200), Some(300), None]),
+            ),
+            (
+                "score_i64".into(),
+                ColumnData::Int64(vec![Some(1000), None, Some(3000), Some(4000)]),
+            ),
+            (
+                "rating".into(),
+                ColumnData::Float64(vec![Some(4.5), Some(3.2), None, Some(4.8)]),
+            ),
+            (
+                "label".into(),
+                ColumnData::Text(vec![
+                    Some("A".into()),
+                    Some("B".into()),
+                    Some("C".into()),
+                    None,
+                ]),
+            ),
         ]);
         assert_eq!(batch.row_count, 4);
         store.append("mixed", batch);
         let batches = store.batches("mixed");
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].row_count, 4);
-        assert!(matches!(batches[0].column("active"), Some(ColumnData::Bool(_))));
-        assert!(matches!(batches[0].column("score_i32"), Some(ColumnData::Int32(_))));
-        assert!(matches!(batches[0].column("score_i64"), Some(ColumnData::Int64(_))));
-        assert!(matches!(batches[0].column("rating"), Some(ColumnData::Float64(_))));
-        assert!(matches!(batches[0].column("label"), Some(ColumnData::Text(_))));
+        assert!(matches!(
+            batches[0].column("active"),
+            Some(ColumnData::Bool(_))
+        ));
+        assert!(matches!(
+            batches[0].column("score_i32"),
+            Some(ColumnData::Int32(_))
+        ));
+        assert!(matches!(
+            batches[0].column("score_i64"),
+            Some(ColumnData::Int64(_))
+        ));
+        assert!(matches!(
+            batches[0].column("rating"),
+            Some(ColumnData::Float64(_))
+        ));
+        assert!(matches!(
+            batches[0].column("label"),
+            Some(ColumnData::Text(_))
+        ));
         assert!(batches[0].column("nonexistent").is_none());
     }
 
@@ -3775,13 +4061,20 @@ mod tests {
     #[test]
     fn predicate_pushdown_with_mask_application() {
         let batch = ColumnBatch::new(vec![
-            ("city".into(), ColumnData::Text(vec![
-                Some("NYC".into()), Some("LA".into()), Some("NYC".into()),
-                Some("Chicago".into()), Some("LA".into()),
-            ])),
-            ("revenue".into(), ColumnData::Int64(vec![
-                Some(100), Some(200), Some(150), Some(50), Some(300),
-            ])),
+            (
+                "city".into(),
+                ColumnData::Text(vec![
+                    Some("NYC".into()),
+                    Some("LA".into()),
+                    Some("NYC".into()),
+                    Some("Chicago".into()),
+                    Some("LA".into()),
+                ]),
+            ),
+            (
+                "revenue".into(),
+                ColumnData::Int64(vec![Some(100), Some(200), Some(150), Some(50), Some(300)]),
+            ),
         ]);
         let rev_col = match batch.column("revenue").unwrap() {
             ColumnData::Int64(v) => v,
@@ -3805,7 +4098,13 @@ mod tests {
         assert_eq!(count_non_null(&bool_col), 2);
         let i32_col = ColumnData::Int32(vec![None, None, Some(42)]);
         assert_eq!(count_non_null(&i32_col), 1);
-        let text_col = ColumnData::Text(vec![Some("hello".into()), None, None, Some("world".into()), None]);
+        let text_col = ColumnData::Text(vec![
+            Some("hello".into()),
+            None,
+            None,
+            Some("world".into()),
+            None,
+        ]);
         assert_eq!(count_non_null(&text_col), 2);
         let empty_col = ColumnData::Float64(vec![]);
         assert_eq!(count_non_null(&empty_col), 0);
@@ -3817,11 +4116,10 @@ mod tests {
         let mut store = ColumnarStore::new();
         for i in 0..3 {
             let base = (i * 10) as i64;
-            let batch = ColumnBatch::new(vec![
-                ("id".into(), ColumnData::Int64(vec![
-                    Some(base + 1), Some(base + 2), Some(base + 3),
-                ])),
-            ]);
+            let batch = ColumnBatch::new(vec![(
+                "id".into(),
+                ColumnData::Int64(vec![Some(base + 1), Some(base + 2), Some(base + 3)]),
+            )]);
             store.append("events", batch);
         }
         assert_eq!(store.batches("events").len(), 3);
@@ -3846,7 +4144,8 @@ mod tests {
         let mut columns = Vec::with_capacity(num_cols);
         for c in 0..num_cols {
             let data: Vec<Option<i64>> = (0..num_rows)
-                .map(|r| Some((c * num_rows + r) as i64)).collect();
+                .map(|r| Some((c * num_rows + r) as i64))
+                .collect();
             columns.push((format!("col_{}", c), ColumnData::Int64(data)));
         }
         let batch = ColumnBatch::new(columns);
@@ -3870,12 +4169,20 @@ mod tests {
     #[test]
     fn group_by_with_nulls() {
         let key_col: Vec<Option<String>> = vec![
-            Some("X".into()), Some("Y".into()), None,
-            Some("X".into()), None, Some("Y".into()),
+            Some("X".into()),
+            Some("Y".into()),
+            None,
+            Some("X".into()),
+            None,
+            Some("Y".into()),
         ];
         let val_col: Vec<Option<f64>> = vec![
-            Some(10.0), Some(20.0), Some(99.0),
-            Some(30.0), Some(99.0), None,
+            Some(10.0),
+            Some(20.0),
+            Some(99.0),
+            Some(30.0),
+            Some(99.0),
+            None,
         ];
         let result = group_by_text_agg_f64(&key_col, &val_col);
         let x = result.groups.iter().find(|g| g.key == "X").unwrap();
@@ -3905,7 +4212,14 @@ mod tests {
             ),
             (
                 "score".into(),
-                ColumnData::Int64(vec![Some(95), Some(80), Some(70), Some(60), Some(85), Some(90)]),
+                ColumnData::Int64(vec![
+                    Some(95),
+                    Some(80),
+                    Some(70),
+                    Some(60),
+                    Some(85),
+                    Some(90),
+                ]),
             ),
         ])
     }
@@ -3914,7 +4228,8 @@ mod tests {
     fn text_predicate_starts_with() {
         let batch = text_batch();
         let col = match batch.column("email").unwrap() {
-            ColumnData::Text(v) => v, _ => panic!("expected Text"),
+            ColumnData::Text(v) => v,
+            _ => panic!("expected Text"),
         };
         let mask = filter_text(col, &Predicate::StartsWithText("alice".into()));
         assert_eq!(mask, vec![true, false, false, false, false, false]);
@@ -3926,7 +4241,8 @@ mod tests {
     fn text_predicate_contains() {
         let batch = text_batch();
         let col = match batch.column("email").unwrap() {
-            ColumnData::Text(v) => v, _ => panic!("expected Text"),
+            ColumnData::Text(v) => v,
+            _ => panic!("expected Text"),
         };
         let mask = filter_text(col, &Predicate::ContainsText("example".into()));
         assert_eq!(mask, vec![true, false, true, false, false, false]);
@@ -3993,9 +4309,10 @@ mod tests {
 
     #[test]
     fn zone_map_all_nulls_skips() {
-        let batch = ColumnBatch::new(vec![
-            ("val".into(), ColumnData::Int64(vec![None, None, None])),
-        ]);
+        let batch = ColumnBatch::new(vec![(
+            "val".into(),
+            ColumnData::Int64(vec![None, None, None]),
+        )]);
         let zm = ZoneMap::from_batch(&batch);
         assert!(zm.can_skip("val", CmpOp::Eq, &ScalarValue::Int64(0)));
         assert!(zm.can_skip("val", CmpOp::Gt, &ScalarValue::Int64(0)));
@@ -4016,7 +4333,10 @@ mod tests {
         let email_zm = zm.columns.get("email").unwrap();
         assert_eq!(email_zm.null_count, 1);
         assert_eq!(email_zm.row_count, 6);
-        assert_eq!(email_zm.min, Some(ScalarValue::Text("alice@example.com".into())));
+        assert_eq!(
+            email_zm.min,
+            Some(ScalarValue::Text("alice@example.com".into()))
+        );
     }
 
     #[test]
@@ -4032,9 +4352,10 @@ mod tests {
 
     #[test]
     fn zone_map_bool_column() {
-        let batch = ColumnBatch::new(vec![
-            ("flag".into(), ColumnData::Bool(vec![Some(true), Some(false), None])),
-        ]);
+        let batch = ColumnBatch::new(vec![(
+            "flag".into(),
+            ColumnData::Bool(vec![Some(true), Some(false), None]),
+        )]);
         let zm = ZoneMap::from_batch(&batch);
         let flag_zm = zm.columns.get("flag").unwrap();
         assert_eq!(flag_zm.min, Some(ScalarValue::Bool(false)));
@@ -4178,7 +4499,8 @@ mod tests {
     #[test]
     fn filter_positions_text_column() {
         let batch = text_batch();
-        let positions = filter_positions(&batch, "email", &Predicate::ContainsText("example".into()));
+        let positions =
+            filter_positions(&batch, "email", &Predicate::ContainsText("example".into()));
         assert_eq!(positions, vec![0, 2]);
     }
 
@@ -4237,11 +4559,17 @@ mod tests {
     #[test]
     fn late_materialization_with_zone_map_skip() {
         let young_batch = ColumnBatch::new(vec![
-            ("name".into(), ColumnData::Text(vec![Some("A".into()), Some("B".into())])),
+            (
+                "name".into(),
+                ColumnData::Text(vec![Some("A".into()), Some("B".into())]),
+            ),
             ("age".into(), ColumnData::Int64(vec![Some(20), Some(22)])),
         ]);
         let old_batch = ColumnBatch::new(vec![
-            ("name".into(), ColumnData::Text(vec![Some("C".into()), Some("D".into())])),
+            (
+                "name".into(),
+                ColumnData::Text(vec![Some("C".into()), Some("D".into())]),
+            ),
             ("age".into(), ColumnData::Int64(vec![Some(50), Some(55)])),
         ]);
 
@@ -4279,7 +4607,10 @@ mod tests {
         let decompressed = decompress_column(&compressed);
         assert_eq!(decompressed.len(), 6);
         if let ColumnData::Int64(vals) = decompressed {
-            assert_eq!(vals, vec![Some(1), Some(1), Some(1), Some(2), Some(2), Some(3)]);
+            assert_eq!(
+                vals,
+                vec![Some(1), Some(1), Some(1), Some(2), Some(2), Some(3)]
+            );
         } else {
             panic!("wrong type");
         }
@@ -4302,11 +4633,20 @@ mod tests {
     #[test]
     fn compress_dictionary_text() {
         let col = ColumnData::Text(vec![
-            Some("red".into()), Some("blue".into()), Some("red".into()),
-            None, Some("blue".into()), Some("red".into()),
+            Some("red".into()),
+            Some("blue".into()),
+            Some("red".into()),
+            None,
+            Some("blue".into()),
+            Some("red".into()),
         ]);
         let compressed = compress_column(&col, CompressionCodec::Dictionary);
-        if let CompressedData::DictionaryText { dict, indices, nulls } = &compressed.data {
+        if let CompressedData::DictionaryText {
+            dict,
+            indices,
+            nulls,
+        } = &compressed.data
+        {
             assert!(dict.len() <= 2); // only "red" and "blue"
             assert_eq!(indices.len(), 6);
             assert!(nulls[3]); // null at index 3
@@ -4322,7 +4662,10 @@ mod tests {
     fn compress_for_i64() {
         let col = ColumnData::Int64(vec![Some(1000), Some(1005), Some(1002), Some(1010)]);
         let compressed = compress_column(&col, CompressionCodec::FrameOfReference);
-        if let CompressedData::ForI64 { min_val, offsets, .. } = &compressed.data {
+        if let CompressedData::ForI64 {
+            min_val, offsets, ..
+        } = &compressed.data
+        {
             assert_eq!(*min_val, 1000);
             assert_eq!(offsets, &[0, 5, 2, 10]);
         }
@@ -4348,7 +4691,11 @@ mod tests {
 
     #[test]
     fn adaptive_selects_dictionary_for_low_cardinality() {
-        let col = ColumnData::Text((0..100).map(|i| Some(if i % 3 == 0 { "A" } else { "B" }.to_string())).collect());
+        let col = ColumnData::Text(
+            (0..100)
+                .map(|i| Some(if i % 3 == 0 { "A" } else { "B" }.to_string()))
+                .collect(),
+        );
         let codec = select_codec(&col);
         assert_eq!(codec, CompressionCodec::Dictionary);
     }
@@ -4387,10 +4734,18 @@ mod tests {
     fn mergetree_insert_and_scan() {
         let mut mt = MergeTree::new(vec!["id".into()]);
         let batch = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(3), Some(1), Some(2)])),
-            ("name".into(), ColumnData::Text(vec![
-                Some("charlie".into()), Some("alice".into()), Some("bob".into()),
-            ])),
+            (
+                "id".into(),
+                ColumnData::Int64(vec![Some(3), Some(1), Some(2)]),
+            ),
+            (
+                "name".into(),
+                ColumnData::Text(vec![
+                    Some("charlie".into()),
+                    Some("alice".into()),
+                    Some("bob".into()),
+                ]),
+            ),
         ]);
         mt.insert(batch);
 
@@ -4410,9 +4765,7 @@ mod tests {
         mt.max_parts = 3;
 
         for i in 0..5 {
-            let batch = ColumnBatch::new(vec![
-                ("id".into(), ColumnData::Int64(vec![Some(i)])),
-            ]);
+            let batch = ColumnBatch::new(vec![("id".into(), ColumnData::Int64(vec![Some(i)]))]);
             mt.insert(batch);
         }
 
@@ -4427,9 +4780,7 @@ mod tests {
         mt.max_parts = 100; // don't auto-merge
 
         for i in 0..5 {
-            let batch = ColumnBatch::new(vec![
-                ("id".into(), ColumnData::Int64(vec![Some(i)])),
-            ]);
+            let batch = ColumnBatch::new(vec![("id".into(), ColumnData::Int64(vec![Some(i)]))]);
             mt.insert(batch);
         }
 
@@ -4445,15 +4796,17 @@ mod tests {
         mt.max_parts = 100;
 
         // Part 1: ids 1-10
-        let batch = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64((1..=10).map(|i| Some(i)).collect())),
-        ]);
+        let batch = ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64((1..=10).map(Some).collect()),
+        )]);
         mt.insert(batch);
 
         // Part 2: ids 100-110
-        let batch = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64((100..=110).map(|i| Some(i)).collect())),
-        ]);
+        let batch = ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64((100..=110).map(Some).collect()),
+        )]);
         mt.insert(batch);
 
         // Scanning for id > 50 should prune part 1
@@ -4464,9 +4817,10 @@ mod tests {
     #[test]
     fn mergetree_compact_compresses() {
         let mut mt = MergeTree::new(vec!["id".into()]);
-        let batch = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64((0..100).map(|i| Some(i)).collect())),
-        ]);
+        let batch = ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64((0..100).map(Some).collect()),
+        )]);
         mt.insert(batch);
 
         assert!(mt.parts[0].compressed.is_none());
@@ -4479,12 +4833,14 @@ mod tests {
         let mut mt = MergeTree::new(vec!["id".into()]);
         mt.max_parts = 100;
 
-        mt.insert(ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(5), Some(3), Some(1)])),
-        ]));
-        mt.insert(ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(4), Some(2), Some(6)])),
-        ]));
+        mt.insert(ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(5), Some(3), Some(1)]),
+        )]));
+        mt.insert(ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(4), Some(2), Some(6)]),
+        )]));
 
         mt.optimize();
 
@@ -4593,8 +4949,7 @@ mod tests {
 
     #[test]
     fn dict_decode_single_value() {
-        let values: Vec<Option<String>> =
-            (0..100).map(|_| Some("constant".into())).collect();
+        let values: Vec<Option<String>> = (0..100).map(|_| Some("constant".into())).collect();
         let encoded = dict_encode(&values);
         assert_eq!(encoded.cardinality(), 1);
         let decoded = dict_decode(&encoded);
@@ -4657,13 +5012,7 @@ mod tests {
             Some("Y".into()),
             Some("X".into()),
         ];
-        let vals = vec![
-            Some(10.0),
-            Some(20.0),
-            Some(30.0),
-            Some(40.0),
-            Some(50.0),
-        ];
+        let vals = vec![Some(10.0), Some(20.0), Some(30.0), Some(40.0), Some(50.0)];
         let key_col = dict_encode(&keys);
         let groups = dict_group_by_sum_f64(&key_col, &vals);
         assert_eq!(groups.len(), 2);
@@ -4711,9 +5060,7 @@ mod tests {
         let values: Vec<Option<String>> = (0..500)
             .map(|i| Some(if i % 2 == 0 { "A" } else { "B" }.to_string()))
             .collect();
-        let batch = ColumnBatch::new(vec![
-            ("label".into(), ColumnData::Text(values)),
-        ]);
+        let batch = ColumnBatch::new(vec![("label".into(), ColumnData::Text(values))]);
 
         let mut store = ColumnarStore::new();
         store.append_with_dict("small", batch);
@@ -4729,9 +5076,7 @@ mod tests {
             .map(|i| Some(categories[i % categories.len()].to_string()))
             .collect();
 
-        let batch = ColumnBatch::new(vec![
-            ("category".into(), ColumnData::Text(cat_vals)),
-        ]);
+        let batch = ColumnBatch::new(vec![("category".into(), ColumnData::Text(cat_vals))]);
 
         let mut store = ColumnarStore::new();
         store.append_with_dict("products", batch);
@@ -4752,11 +5097,14 @@ mod tests {
     #[test]
     fn dict_store_group_by_fallback() {
         // When no dict encoding exists, should fall back to hash-based counting
-        let batch = ColumnBatch::new(vec![
-            ("color".into(), ColumnData::Text(vec![
-                Some("red".into()), Some("blue".into()), Some("red".into()),
-            ])),
-        ]);
+        let batch = ColumnBatch::new(vec![(
+            "color".into(),
+            ColumnData::Text(vec![
+                Some("red".into()),
+                Some("blue".into()),
+                Some("red".into()),
+            ]),
+        )]);
 
         let mut store = ColumnarStore::new();
         store.append("colors", batch); // regular append, no dict
@@ -4771,8 +5119,16 @@ mod tests {
     fn dict_benchmark_100k_group_by() {
         // Insert 100K rows with 10-value cardinality, then GROUP BY
         let values_set = [
-            "pending", "active", "inactive", "completed", "cancelled",
-            "archived", "draft", "review", "approved", "rejected",
+            "pending",
+            "active",
+            "inactive",
+            "completed",
+            "cancelled",
+            "archived",
+            "draft",
+            "review",
+            "approved",
+            "rejected",
         ];
         let text_vals: Vec<Option<String>> = (0..100_000)
             .map(|i| Some(values_set[i % values_set.len()].to_string()))
@@ -4860,9 +5216,8 @@ mod tests {
         store.create_table("t");
         for batch_i in 0..n_batches {
             let base = (batch_i * rows_per_batch) as i64;
-            let ids: Vec<Option<i64>> = (0..rows_per_batch)
-                .map(|r| Some(base + r as i64))
-                .collect();
+            let ids: Vec<Option<i64>> =
+                (0..rows_per_batch).map(|r| Some(base + r as i64)).collect();
             let vals: Vec<Option<f64>> = (0..rows_per_batch)
                 .map(|r| Some((base + r as i64) as f64 * 1.5))
                 .collect();
@@ -4898,12 +5253,7 @@ mod tests {
             .sum();
         // Parallel sum (8 batches >= threshold 4)
         let par = store.par_aggregate_sum("t", "val").unwrap();
-        assert!(
-            (par - seq_sum).abs() < 1e-6,
-            "par={} seq={}",
-            par,
-            seq_sum
-        );
+        assert!((par - seq_sum).abs() < 1e-6, "par={} seq={}", par, seq_sum);
     }
 
     #[test]
@@ -4925,12 +5275,7 @@ mod tests {
             .map(|b| aggregate_sum(b, "val"))
             .sum();
         let par = store.par_aggregate_sum("t", "val").unwrap();
-        assert!(
-            (par - seq_sum).abs() < 1e-6,
-            "par={} seq={}",
-            par,
-            seq_sum
-        );
+        assert!((par - seq_sum).abs() < 1e-6, "par={} seq={}", par, seq_sum);
         let par_count = store.par_aggregate_count("t").unwrap();
         assert_eq!(par_count, 200);
     }
@@ -5059,11 +5404,22 @@ mod tests {
         assert!(store.is_merge_tree("events"));
 
         let batch = ColumnBatch::new(vec![
-            ("timestamp".into(), ColumnData::Int64(vec![Some(300), Some(100), Some(200)])),
-            ("metric".into(), ColumnData::Text(vec![
-                Some("cpu".into()), Some("mem".into()), Some("cpu".into()),
-            ])),
-            ("value".into(), ColumnData::Float64(vec![Some(0.9), Some(0.5), Some(0.7)])),
+            (
+                "timestamp".into(),
+                ColumnData::Int64(vec![Some(300), Some(100), Some(200)]),
+            ),
+            (
+                "metric".into(),
+                ColumnData::Text(vec![
+                    Some("cpu".into()),
+                    Some("mem".into()),
+                    Some("cpu".into()),
+                ]),
+            ),
+            (
+                "value".into(),
+                ColumnData::Float64(vec![Some(0.9), Some(0.5), Some(0.7)]),
+            ),
         ]);
         store.append("events", batch);
 
@@ -5087,13 +5443,22 @@ mod tests {
         // Insert two separate batches (two parts)
         let batch1 = ColumnBatch::new(vec![
             ("id".into(), ColumnData::Int64((1..=10).map(Some).collect())),
-            ("val".into(), ColumnData::Float64((1..=10).map(|i| Some(i as f64)).collect())),
+            (
+                "val".into(),
+                ColumnData::Float64((1..=10).map(|i| Some(i as f64)).collect()),
+            ),
         ]);
         store.append("events", batch1);
 
         let batch2 = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64((100..=110).map(Some).collect())),
-            ("val".into(), ColumnData::Float64((100..=110).map(|i| Some(i as f64)).collect())),
+            (
+                "id".into(),
+                ColumnData::Int64((100..=110).map(Some).collect()),
+            ),
+            (
+                "val".into(),
+                ColumnData::Float64((100..=110).map(|i| Some(i as f64)).collect()),
+            ),
         ]);
         store.append("events", batch2);
 
@@ -5112,17 +5477,30 @@ mod tests {
         store.create_merge_tree_table("logs", vec!["level".into(), "timestamp".into()]);
 
         let batch = ColumnBatch::new(vec![
-            ("level".into(), ColumnData::Text(vec![
-                Some("error".into()), Some("warn".into()), Some("error".into()),
-                Some("info".into()), Some("warn".into()),
-            ])),
-            ("timestamp".into(), ColumnData::Int64(vec![
-                Some(300), Some(200), Some(100), Some(400), Some(100),
-            ])),
-            ("msg".into(), ColumnData::Text(vec![
-                Some("e1".into()), Some("w1".into()), Some("e2".into()),
-                Some("i1".into()), Some("w2".into()),
-            ])),
+            (
+                "level".into(),
+                ColumnData::Text(vec![
+                    Some("error".into()),
+                    Some("warn".into()),
+                    Some("error".into()),
+                    Some("info".into()),
+                    Some("warn".into()),
+                ]),
+            ),
+            (
+                "timestamp".into(),
+                ColumnData::Int64(vec![Some(300), Some(200), Some(100), Some(400), Some(100)]),
+            ),
+            (
+                "msg".into(),
+                ColumnData::Text(vec![
+                    Some("e1".into()),
+                    Some("w1".into()),
+                    Some("e2".into()),
+                    Some("i1".into()),
+                    Some("w2".into()),
+                ]),
+            ),
         ]);
         store.append("logs", batch);
 
@@ -5155,9 +5533,10 @@ mod tests {
         assert!(store.table_exists("raw"));
         assert!(!store.is_merge_tree("raw"));
 
-        let batch = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(3), Some(1), Some(2)])),
-        ]);
+        let batch = ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(3), Some(1), Some(2)]),
+        )]);
         store.append("raw", batch);
 
         // Raw tables don't sort
@@ -5174,9 +5553,10 @@ mod tests {
         let mut store = ColumnarStore::new();
         store.create_merge_tree_table("t", vec!["id".into()]);
 
-        let batch = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
-        ]);
+        let batch = ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(1), Some(2)]),
+        )]);
         store.append("t", batch);
         assert_eq!(store.row_count("t"), 2);
 
@@ -5186,9 +5566,7 @@ mod tests {
         assert!(store.is_merge_tree("t")); // still a MergeTree
 
         // Re-insert after clear
-        let batch2 = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(10)])),
-        ]);
+        let batch2 = ColumnBatch::new(vec![("id".into(), ColumnData::Int64(vec![Some(10)]))]);
         store.append("t", batch2);
         assert_eq!(store.row_count("t"), 1);
 
@@ -5209,8 +5587,14 @@ mod tests {
             store.create_merge_tree_table("events", vec!["ts".into()]);
 
             let batch = ColumnBatch::new(vec![
-                ("ts".into(), ColumnData::Int64(vec![Some(300), Some(100), Some(200)])),
-                ("val".into(), ColumnData::Float64(vec![Some(3.0), Some(1.0), Some(2.0)])),
+                (
+                    "ts".into(),
+                    ColumnData::Int64(vec![Some(300), Some(100), Some(200)]),
+                ),
+                (
+                    "val".into(),
+                    ColumnData::Float64(vec![Some(3.0), Some(1.0), Some(2.0)]),
+                ),
             ]);
             store.append("events", batch);
             assert_eq!(store.row_count("events"), 3);
@@ -5232,8 +5616,14 @@ mod tests {
         store.create_merge_tree_table("metrics", vec!["ts".into()]);
 
         let batch = ColumnBatch::new(vec![
-            ("ts".into(), ColumnData::Int64(vec![Some(1), Some(2), Some(3)])),
-            ("value".into(), ColumnData::Float64(vec![Some(10.0), Some(20.0), Some(30.0)])),
+            (
+                "ts".into(),
+                ColumnData::Int64(vec![Some(1), Some(2), Some(3)]),
+            ),
+            (
+                "value".into(),
+                ColumnData::Float64(vec![Some(10.0), Some(20.0), Some(30.0)]),
+            ),
         ]);
         store.append("metrics", batch);
 
@@ -5250,11 +5640,23 @@ mod tests {
     fn mergetree_multicolumn_sort_with_int_columns() {
         let mut mt = MergeTree::new(vec!["a".into(), "b".into()]);
         let batch = ColumnBatch::new(vec![
-            ("a".into(), ColumnData::Int64(vec![Some(2), Some(1), Some(1), Some(2)])),
-            ("b".into(), ColumnData::Int64(vec![Some(20), Some(10), Some(20), Some(10)])),
-            ("c".into(), ColumnData::Text(vec![
-                Some("d".into()), Some("a".into()), Some("b".into()), Some("c".into()),
-            ])),
+            (
+                "a".into(),
+                ColumnData::Int64(vec![Some(2), Some(1), Some(1), Some(2)]),
+            ),
+            (
+                "b".into(),
+                ColumnData::Int64(vec![Some(20), Some(10), Some(20), Some(10)]),
+            ),
+            (
+                "c".into(),
+                ColumnData::Text(vec![
+                    Some("d".into()),
+                    Some("a".into()),
+                    Some("b".into()),
+                    Some("c".into()),
+                ]),
+            ),
         ]);
         mt.insert(batch);
 
@@ -5267,7 +5669,15 @@ mod tests {
             assert_eq!(b_vals, &[Some(10), Some(20), Some(10), Some(20)]);
         }
         if let Some(ColumnData::Text(c_vals)) = parts[0].column("c") {
-            assert_eq!(c_vals, &[Some("a".into()), Some("b".into()), Some("c".into()), Some("d".into())]);
+            assert_eq!(
+                c_vals,
+                &[
+                    Some("a".into()),
+                    Some("b".into()),
+                    Some("c".into()),
+                    Some("d".into())
+                ]
+            );
         }
     }
 
@@ -5281,9 +5691,7 @@ mod tests {
         mt.max_parts = 3;
 
         for i in 0..5 {
-            let batch = ColumnBatch::new(vec![
-                ("id".into(), ColumnData::Int64(vec![Some(i)])),
-            ]);
+            let batch = ColumnBatch::new(vec![("id".into(), ColumnData::Int64(vec![Some(i)]))]);
             mt.insert(batch);
         }
 
@@ -5298,24 +5706,28 @@ mod tests {
             parts: vec![
                 MergeTreePart {
                     id: 1,
-                    data: std::sync::Arc::new(ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
-                    ])),
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(1), Some(3)]),
+                    )])),
                     row_count: 2,
-                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
-                    ])),
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(1), Some(3)]),
+                    )])),
                     compressed: None,
                 },
                 MergeTreePart {
                     id: 2,
-                    data: std::sync::Arc::new(ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
-                    ])),
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(2), Some(4)]),
+                    )])),
                     row_count: 2,
-                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
-                    ])),
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(2), Some(4)]),
+                    )])),
                     compressed: None,
                 },
             ],
@@ -5345,20 +5757,23 @@ mod tests {
         let mut mt = MergeTree::new(vec!["id".into()]);
         mt.max_parts = 100;
 
-        mt.insert(ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
-        ]));
-        mt.insert(ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
-        ]));
+        mt.insert(ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(1), Some(3)]),
+        )]));
+        mt.insert(ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(2), Some(4)]),
+        )]));
         assert_eq!(mt.part_count(), 2);
 
         let part_id_a = mt.parts[0].id;
         let part_id_b = mt.parts[1].id;
 
-        let merged_batch = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(1), Some(2), Some(3), Some(4)])),
-        ]);
+        let merged_batch = ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(1), Some(2), Some(3), Some(4)]),
+        )]);
         let result = MergeResult {
             table: "test".into(),
             source_part_ids: vec![part_id_a, part_id_b],
@@ -5387,14 +5802,16 @@ mod tests {
         let mut mt = MergeTree::new(vec!["id".into()]);
         mt.max_parts = 100;
 
-        mt.insert(ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(1)])),
-        ]));
+        mt.insert(ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(1)]),
+        )]));
         assert_eq!(mt.part_count(), 1);
 
-        let merged_batch = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
-        ]);
+        let merged_batch = ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(1), Some(2)]),
+        )]);
         let result = MergeResult {
             table: "test".into(),
             source_part_ids: vec![999, 1000],
@@ -5427,24 +5844,28 @@ mod tests {
             parts: vec![
                 MergeTreePart {
                     id: 1,
-                    data: std::sync::Arc::new(ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
-                    ])),
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(1), Some(3)]),
+                    )])),
                     row_count: 2,
-                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
-                    ])),
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(1), Some(3)]),
+                    )])),
                     compressed: None,
                 },
                 MergeTreePart {
                     id: 2,
-                    data: std::sync::Arc::new(ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
-                    ])),
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(2), Some(4)]),
+                    )])),
                     row_count: 2,
-                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
-                    ])),
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(2), Some(4)]),
+                    )])),
                     compressed: None,
                 },
             ],
@@ -5455,18 +5876,22 @@ mod tests {
         task_tx.send(task).unwrap();
 
         // Wait for worker to process
-        let result = result_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let result = result_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
         assert_eq!(result.merged_part.row_count, 4);
 
         // Apply to a MergeTree
         let mut mt = MergeTree::new(vec!["id".into()]);
         mt.max_parts = 100;
-        mt.insert(ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
-        ]));
-        mt.insert(ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
-        ]));
+        mt.insert(ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(1), Some(3)]),
+        )]));
+        mt.insert(ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(2), Some(4)]),
+        )]));
         let applied = mt.apply_merge_result(result);
         assert!(applied);
         assert_eq!(mt.part_count(), 1);
@@ -5481,21 +5906,21 @@ mod tests {
         let mut mt = MergeTree::new(vec!["id".into()]);
         mt.max_parts = 100;
 
-        mt.insert(ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
-        ]));
-        mt.insert(ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(3), Some(4)])),
-        ]));
+        mt.insert(ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(1), Some(2)]),
+        )]));
+        mt.insert(ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(3), Some(4)]),
+        )]));
 
         let snapshot_before = mt.scan_all();
         let mut ids_before: Vec<i64> = Vec::new();
         for batch in &snapshot_before {
             if let Some(ColumnData::Int64(ids)) = batch.column("id") {
-                for v in ids {
-                    if let Some(val) = v {
-                        ids_before.push(*val);
-                    }
+                for val in ids.iter().flatten() {
+                    ids_before.push(*val);
                 }
             }
         }
@@ -5508,10 +5933,8 @@ mod tests {
         let mut ids_after: Vec<i64> = Vec::new();
         for batch in &snapshot_after {
             if let Some(ColumnData::Int64(ids)) = batch.column("id") {
-                for v in ids {
-                    if let Some(val) = v {
-                        ids_after.push(*val);
-                    }
+                for val in ids.iter().flatten() {
+                    ids_after.push(*val);
                 }
             }
         }
@@ -5527,9 +5950,7 @@ mod tests {
         mt.max_parts = 3;
 
         for i in 0..5 {
-            let batch = ColumnBatch::new(vec![
-                ("id".into(), ColumnData::Int64(vec![Some(i)])),
-            ]);
+            let batch = ColumnBatch::new(vec![("id".into(), ColumnData::Int64(vec![Some(i)]))]);
             mt.insert(batch);
         }
 
@@ -5558,28 +5979,32 @@ mod tests {
                     id: 1,
                     data: std::sync::Arc::new(ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(5), Some(10)])),
-                        ("name".into(), ColumnData::Text(vec![
-                            Some("e".into()), Some("j".into()),
-                        ])),
+                        (
+                            "name".into(),
+                            ColumnData::Text(vec![Some("e".into()), Some("j".into())]),
+                        ),
                     ])),
                     row_count: 2,
-                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(5), Some(10)])),
-                    ])),
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(5), Some(10)]),
+                    )])),
                     compressed: None,
                 },
                 MergeTreePart {
                     id: 2,
                     data: std::sync::Arc::new(ColumnBatch::new(vec![
                         ("id".into(), ColumnData::Int64(vec![Some(1), Some(7)])),
-                        ("name".into(), ColumnData::Text(vec![
-                            Some("a".into()), Some("g".into()),
-                        ])),
+                        (
+                            "name".into(),
+                            ColumnData::Text(vec![Some("a".into()), Some("g".into())]),
+                        ),
                     ])),
                     row_count: 2,
-                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(7)])),
-                    ])),
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(1), Some(7)]),
+                    )])),
                     compressed: None,
                 },
             ],
@@ -5597,10 +6022,15 @@ mod tests {
         }
 
         if let Some(ColumnData::Text(names)) = result.merged_part.data.column("name") {
-            assert_eq!(names, &[
-                Some("a".into()), Some("e".into()),
-                Some("g".into()), Some("j".into()),
-            ]);
+            assert_eq!(
+                names,
+                &[
+                    Some("a".into()),
+                    Some("e".into()),
+                    Some("g".into()),
+                    Some("j".into()),
+                ]
+            );
         } else {
             panic!("expected Text name column");
         }
@@ -5620,24 +6050,28 @@ mod tests {
             parts: vec![
                 MergeTreePart {
                     id: 1,
-                    data: std::sync::Arc::new(ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
-                    ])),
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(1), Some(3)]),
+                    )])),
                     row_count: 2,
-                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
-                    ])),
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(1), Some(3)]),
+                    )])),
                     compressed: None,
                 },
                 MergeTreePart {
                     id: 2,
-                    data: std::sync::Arc::new(ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
-                    ])),
+                    data: std::sync::Arc::new(ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(2), Some(4)]),
+                    )])),
                     row_count: 2,
-                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
-                    ])),
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(2), Some(4)]),
+                    )])),
                     compressed: None,
                 },
             ],
@@ -5647,16 +6081,20 @@ mod tests {
         };
         task_tx.send(task).unwrap();
 
-        let result = result_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let result = result_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
 
         let mut mt = MergeTree::new(vec!["id".into()]);
         mt.max_parts = 100;
-        mt.insert(ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
-        ]));
-        mt.insert(ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(2), Some(4)])),
-        ]));
+        mt.insert(ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(1), Some(3)]),
+        )]));
+        mt.insert(ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(2), Some(4)]),
+        )]));
         let applied = mt.apply_merge_result(result);
         assert!(applied);
         assert_eq!(mt.total_rows(), 4);
@@ -5680,9 +6118,10 @@ mod tests {
         assert!(mt.has_background_merger());
 
         for i in 0..6i64 {
-            mt.insert(ColumnBatch::new(vec![
-                ("id".into(), ColumnData::Int64(vec![Some(i)])),
-            ]));
+            mt.insert(ColumnBatch::new(vec![(
+                "id".into(),
+                ColumnData::Int64(vec![Some(i)]),
+            )]));
         }
         assert!(mt.part_count() > 3);
         assert_eq!(mt.total_rows(), 6);
@@ -5693,12 +6132,13 @@ mod tests {
         assert_eq!(mt.total_rows(), 6);
 
         let batches = mt.scan_all();
-        let mut all: Vec<i64> = batches.iter().flat_map(|b| {
-            match b.column("id") {
+        let mut all: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| match b.column("id") {
                 Some(ColumnData::Int64(v)) => v.iter().flatten().copied().collect::<Vec<_>>(),
                 _ => vec![],
-            }
-        }).collect();
+            })
+            .collect();
         all.sort();
         assert_eq!(all, vec![0, 1, 2, 3, 4, 5]);
 
@@ -5717,9 +6157,10 @@ mod tests {
         assert!(!mt.has_background_merger());
 
         for i in 0..5i64 {
-            mt.insert(ColumnBatch::new(vec![
-                ("id".into(), ColumnData::Int64(vec![Some(i)])),
-            ]));
+            mt.insert(ColumnBatch::new(vec![(
+                "id".into(),
+                ColumnData::Int64(vec![Some(i)]),
+            )]));
         }
         assert!(mt.part_count() <= 3);
         assert_eq!(mt.total_rows(), 5);
@@ -5731,7 +6172,9 @@ mod tests {
 
     #[test]
     fn replacing_mergetree_dedup_with_version_column() {
-        let strategy = MergeStrategy::Replacing { version_column: Some("version".into()) };
+        let strategy = MergeStrategy::Replacing {
+            version_column: Some("version".into()),
+        };
         let mut mt = MergeTree::new_with_strategy(vec!["id".into()], strategy);
         mt.max_parts = 2; // trigger merge quickly
 
@@ -5739,14 +6182,20 @@ mod tests {
         let batch1 = ColumnBatch::new(vec![
             ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
             ("version".into(), ColumnData::Int64(vec![Some(1), Some(1)])),
-            ("data".into(), ColumnData::Text(vec![Some("old_1".into()), Some("old_2".into())])),
+            (
+                "data".into(),
+                ColumnData::Text(vec![Some("old_1".into()), Some("old_2".into())]),
+            ),
         ]);
         mt.insert(batch1);
 
         let batch2 = ColumnBatch::new(vec![
             ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
             ("version".into(), ColumnData::Int64(vec![Some(3), Some(2)])),
-            ("data".into(), ColumnData::Text(vec![Some("new_1".into()), Some("new_2".into())])),
+            (
+                "data".into(),
+                ColumnData::Text(vec![Some("new_1".into()), Some("new_2".into())]),
+            ),
         ]);
         mt.insert(batch2);
 
@@ -5777,20 +6226,28 @@ mod tests {
 
     #[test]
     fn replacing_mergetree_dedup_without_version_column() {
-        let strategy = MergeStrategy::Replacing { version_column: None };
+        let strategy = MergeStrategy::Replacing {
+            version_column: None,
+        };
         let mut mt = MergeTree::new_with_strategy(vec!["id".into()], strategy);
         mt.max_parts = 100; // prevent auto-merge
 
         // Insert duplicate PKs without version — last row wins
         let batch1 = ColumnBatch::new(vec![
             ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
-            ("data".into(), ColumnData::Text(vec![Some("first_1".into()), Some("first_2".into())])),
+            (
+                "data".into(),
+                ColumnData::Text(vec![Some("first_1".into()), Some("first_2".into())]),
+            ),
         ]);
         mt.insert(batch1);
 
         let batch2 = ColumnBatch::new(vec![
             ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
-            ("data".into(), ColumnData::Text(vec![Some("second_1".into()), Some("second_3".into())])),
+            (
+                "data".into(),
+                ColumnData::Text(vec![Some("second_1".into()), Some("second_3".into())]),
+            ),
         ]);
         mt.insert(batch2);
 
@@ -5817,7 +6274,9 @@ mod tests {
 
     #[test]
     fn replacing_mergetree_scan_before_and_after_merge() {
-        let strategy = MergeStrategy::Replacing { version_column: Some("ver".into()) };
+        let strategy = MergeStrategy::Replacing {
+            version_column: Some("ver".into()),
+        };
         let mut mt = MergeTree::new_with_strategy(vec!["id".into()], strategy);
         mt.max_parts = 100; // prevent auto-merge
 
@@ -5867,16 +6326,34 @@ mod tests {
 
         // Insert partial aggregates
         let batch1 = ColumnBatch::new(vec![
-            ("session_id".into(), ColumnData::Text(vec![Some("s1".into()), Some("s2".into())])),
-            ("page_views".into(), ColumnData::Int64(vec![Some(3), Some(5)])),
-            ("duration".into(), ColumnData::Int64(vec![Some(100), Some(200)])),
+            (
+                "session_id".into(),
+                ColumnData::Text(vec![Some("s1".into()), Some("s2".into())]),
+            ),
+            (
+                "page_views".into(),
+                ColumnData::Int64(vec![Some(3), Some(5)]),
+            ),
+            (
+                "duration".into(),
+                ColumnData::Int64(vec![Some(100), Some(200)]),
+            ),
         ]);
         mt.insert(batch1);
 
         let batch2 = ColumnBatch::new(vec![
-            ("session_id".into(), ColumnData::Text(vec![Some("s1".into()), Some("s2".into())])),
-            ("page_views".into(), ColumnData::Int64(vec![Some(7), Some(2)])),
-            ("duration".into(), ColumnData::Int64(vec![Some(50), Some(300)])),
+            (
+                "session_id".into(),
+                ColumnData::Text(vec![Some("s1".into()), Some("s2".into())]),
+            ),
+            (
+                "page_views".into(),
+                ColumnData::Int64(vec![Some(7), Some(2)]),
+            ),
+            (
+                "duration".into(),
+                ColumnData::Int64(vec![Some(50), Some(300)]),
+            ),
         ]);
         mt.insert(batch2);
 
@@ -5989,7 +6466,10 @@ mod tests {
         mt.insert(ColumnBatch::new(vec![
             ("id".into(), ColumnData::Int64(vec![Some(1)])),
             ("amount".into(), ColumnData::Int64(vec![Some(200)])),
-            ("label".into(), ColumnData::Text(vec![Some("latest".into())])),
+            (
+                "label".into(),
+                ColumnData::Text(vec![Some("latest".into())]),
+            ),
         ]));
         mt.optimize();
 
@@ -6039,22 +6519,30 @@ mod tests {
         store.create_merge_tree_table_with_strategy(
             "events",
             vec!["id".into()],
-            MergeStrategy::Replacing { version_column: Some("ver".into()) },
+            MergeStrategy::Replacing {
+                version_column: Some("ver".into()),
+            },
         );
 
         assert!(store.table_exists("events"));
         assert!(store.is_merge_tree("events"));
 
-        store.append("events", ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(1)])),
-            ("ver".into(), ColumnData::Int64(vec![Some(1)])),
-            ("data".into(), ColumnData::Text(vec![Some("old".into())])),
-        ]));
-        store.append("events", ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(1)])),
-            ("ver".into(), ColumnData::Int64(vec![Some(2)])),
-            ("data".into(), ColumnData::Text(vec![Some("new".into())])),
-        ]));
+        store.append(
+            "events",
+            ColumnBatch::new(vec![
+                ("id".into(), ColumnData::Int64(vec![Some(1)])),
+                ("ver".into(), ColumnData::Int64(vec![Some(1)])),
+                ("data".into(), ColumnData::Text(vec![Some("old".into())])),
+            ]),
+        );
+        store.append(
+            "events",
+            ColumnBatch::new(vec![
+                ("id".into(), ColumnData::Int64(vec![Some(1)])),
+                ("ver".into(), ColumnData::Int64(vec![Some(2)])),
+                ("data".into(), ColumnData::Text(vec![Some("new".into())])),
+            ]),
+        );
 
         // Optimize via MergeTree
         store.get_merge_tree_mut("events").unwrap().optimize();
@@ -6080,16 +6568,22 @@ mod tests {
             },
         );
 
-        store.append("stats", ColumnBatch::new(vec![
-            ("page".into(), ColumnData::Text(vec![Some("/home".into())])),
-            ("views".into(), ColumnData::Int64(vec![Some(100)])),
-            ("visits".into(), ColumnData::Int64(vec![Some(50)])),
-        ]));
-        store.append("stats", ColumnBatch::new(vec![
-            ("page".into(), ColumnData::Text(vec![Some("/home".into())])),
-            ("views".into(), ColumnData::Int64(vec![Some(200)])),
-            ("visits".into(), ColumnData::Int64(vec![Some(75)])),
-        ]));
+        store.append(
+            "stats",
+            ColumnBatch::new(vec![
+                ("page".into(), ColumnData::Text(vec![Some("/home".into())])),
+                ("views".into(), ColumnData::Int64(vec![Some(100)])),
+                ("visits".into(), ColumnData::Int64(vec![Some(50)])),
+            ]),
+        );
+        store.append(
+            "stats",
+            ColumnBatch::new(vec![
+                ("page".into(), ColumnData::Text(vec![Some("/home".into())])),
+                ("views".into(), ColumnData::Int64(vec![Some(200)])),
+                ("visits".into(), ColumnData::Int64(vec![Some(75)])),
+            ]),
+        );
 
         store.get_merge_tree_mut("stats").unwrap().optimize();
 
@@ -6110,26 +6604,37 @@ mod tests {
         store.create_merge_tree_table_with_strategy(
             "t",
             vec!["id".into()],
-            MergeStrategy::Replacing { version_column: Some("ver".into()) },
+            MergeStrategy::Replacing {
+                version_column: Some("ver".into()),
+            },
         );
-        store.append("t", ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(1)])),
-            ("ver".into(), ColumnData::Int64(vec![Some(1)])),
-        ]));
+        store.append(
+            "t",
+            ColumnBatch::new(vec![
+                ("id".into(), ColumnData::Int64(vec![Some(1)])),
+                ("ver".into(), ColumnData::Int64(vec![Some(1)])),
+            ]),
+        );
         assert_eq!(store.row_count("t"), 1);
 
         store.clear("t");
         assert_eq!(store.row_count("t"), 0);
 
         // Re-insert and verify strategy still works
-        store.append("t", ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(1)])),
-            ("ver".into(), ColumnData::Int64(vec![Some(1)])),
-        ]));
-        store.append("t", ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(1)])),
-            ("ver".into(), ColumnData::Int64(vec![Some(2)])),
-        ]));
+        store.append(
+            "t",
+            ColumnBatch::new(vec![
+                ("id".into(), ColumnData::Int64(vec![Some(1)])),
+                ("ver".into(), ColumnData::Int64(vec![Some(1)])),
+            ]),
+        );
+        store.append(
+            "t",
+            ColumnBatch::new(vec![
+                ("id".into(), ColumnData::Int64(vec![Some(1)])),
+                ("ver".into(), ColumnData::Int64(vec![Some(2)])),
+            ]),
+        );
         store.get_merge_tree_mut("t").unwrap().optimize();
         assert_eq!(store.row_count("t"), 1); // deduped
     }
@@ -6146,9 +6651,10 @@ mod tests {
                         ("ver".into(), ColumnData::Int64(vec![Some(1), Some(1)])),
                     ])),
                     row_count: 2,
-                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
-                    ])),
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(1), Some(2)]),
+                    )])),
                     compressed: None,
                 },
                 MergeTreePart {
@@ -6158,15 +6664,18 @@ mod tests {
                         ("ver".into(), ColumnData::Int64(vec![Some(5), Some(1)])),
                     ])),
                     row_count: 2,
-                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
-                        ("id".into(), ColumnData::Int64(vec![Some(1), Some(3)])),
-                    ])),
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![(
+                        "id".into(),
+                        ColumnData::Int64(vec![Some(1), Some(3)]),
+                    )])),
                     compressed: None,
                 },
             ],
             source_part_ids: vec![1, 2],
             primary_key: vec!["id".into()],
-            merge_strategy: MergeStrategy::Replacing { version_column: Some("ver".into()) },
+            merge_strategy: MergeStrategy::Replacing {
+                version_column: Some("ver".into()),
+            },
         };
 
         let result = execute_merge_task(task, 99);
@@ -6192,9 +6701,10 @@ mod tests {
                         ("total".into(), ColumnData::Int64(vec![Some(10), Some(20)])),
                     ])),
                     row_count: 2,
-                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
-                        ("key".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
-                    ])),
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![(
+                        "key".into(),
+                        ColumnData::Int64(vec![Some(1), Some(2)]),
+                    )])),
                     compressed: None,
                 },
                 MergeTreePart {
@@ -6204,9 +6714,10 @@ mod tests {
                         ("total".into(), ColumnData::Int64(vec![Some(30), Some(40)])),
                     ])),
                     row_count: 2,
-                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![
-                        ("key".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
-                    ])),
+                    zone_map: ZoneMap::from_batch(&ColumnBatch::new(vec![(
+                        "key".into(),
+                        ColumnData::Int64(vec![Some(1), Some(2)]),
+                    )])),
                     compressed: None,
                 },
             ],
@@ -6229,18 +6740,23 @@ mod tests {
 
     #[test]
     fn replacing_mergetree_multicolumn_pk() {
-        let strategy = MergeStrategy::Replacing { version_column: Some("ver".into()) };
-        let mut mt = MergeTree::new_with_strategy(
-            vec!["tenant".into(), "id".into()],
-            strategy,
-        );
+        let strategy = MergeStrategy::Replacing {
+            version_column: Some("ver".into()),
+        };
+        let mut mt = MergeTree::new_with_strategy(vec!["tenant".into(), "id".into()], strategy);
         mt.max_parts = 100;
 
         mt.insert(ColumnBatch::new(vec![
-            ("tenant".into(), ColumnData::Text(vec![Some("a".into()), Some("a".into())])),
+            (
+                "tenant".into(),
+                ColumnData::Text(vec![Some("a".into()), Some("a".into())]),
+            ),
             ("id".into(), ColumnData::Int64(vec![Some(1), Some(1)])),
             ("ver".into(), ColumnData::Int64(vec![Some(1), Some(2)])),
-            ("data".into(), ColumnData::Text(vec![Some("v1".into()), Some("v2".into())])),
+            (
+                "data".into(),
+                ColumnData::Text(vec![Some("v1".into()), Some("v2".into())]),
+            ),
         ]));
         mt.insert(ColumnBatch::new(vec![
             ("tenant".into(), ColumnData::Text(vec![Some("b".into())])),

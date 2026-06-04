@@ -48,9 +48,8 @@ jobs:
 
   clippy:
     name: Clippy
-    # Quality signal on branches/PRs only — not a release gate. Clippy lint
-    # debt should not block shipping a binary that builds and passes tests.
-    if: "!startsWith(github.ref, 'refs/tags/nucleus/v')"
+    # Release gate: the tree is clippy-clean at `--all-targets -D warnings`, so
+    # lint regressions block both branches/PRs and release tags.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -60,7 +59,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: nucleus
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
         working-directory: nucleus
 
   # ---------------------------------------------------------------------------
@@ -68,7 +67,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     name: Build ${{ matrix.os }}-${{ matrix.arch }}
-    needs: [test]
+    needs: [test, clippy]
     if: startsWith(github.ref, 'refs/tags/nucleus/v')
     runs-on: ${{ matrix.runner }}
     strategy:

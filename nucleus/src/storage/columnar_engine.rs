@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 
 use crate::columnar::{
-    aggregate_count, aggregate_sum, group_by_text_agg_f64, ColumnBatch, ColumnData, ColumnarStore,
+    ColumnBatch, ColumnData, ColumnarStore, aggregate_count, aggregate_sum, group_by_text_agg_f64,
 };
 use crate::storage::columnar_wal::ColumnarWal;
 use crate::storage::{StorageEngine, StorageError};
@@ -83,8 +83,7 @@ impl ColumnarStorageEngine {
     /// mutations are appended to the log; `flush_all_dirty` checkpoints the
     /// log to a compact single-snapshot file.
     pub fn open(dir: &std::path::Path) -> Result<Self, StorageError> {
-        let (wal, state) = ColumnarWal::open(dir)
-            .map_err(|e| StorageError::Io(e.to_string()))?;
+        let (wal, state) = ColumnarWal::open(dir).map_err(|e| StorageError::Io(e.to_string()))?;
         let mut store = ColumnarStore::new();
         // Restore tables from WAL state.
         for (table_name, rows) in &state.tables {
@@ -228,10 +227,30 @@ fn rows_to_batch(rows: Vec<Row>) -> ColumnBatch {
 /// Extract a Value from a ColumnData at `idx`.
 fn coldata_get(col: &ColumnData, idx: usize) -> Value {
     match col {
-        ColumnData::Bool(v) => v.get(idx).copied().flatten().map(Value::Bool).unwrap_or(Value::Null),
-        ColumnData::Int32(v) => v.get(idx).copied().flatten().map(Value::Int32).unwrap_or(Value::Null),
-        ColumnData::Int64(v) => v.get(idx).copied().flatten().map(Value::Int64).unwrap_or(Value::Null),
-        ColumnData::Float64(v) => v.get(idx).copied().flatten().map(Value::Float64).unwrap_or(Value::Null),
+        ColumnData::Bool(v) => v
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(Value::Bool)
+            .unwrap_or(Value::Null),
+        ColumnData::Int32(v) => v
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(Value::Int32)
+            .unwrap_or(Value::Null),
+        ColumnData::Int64(v) => v
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(Value::Int64)
+            .unwrap_or(Value::Null),
+        ColumnData::Float64(v) => v
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(Value::Float64)
+            .unwrap_or(Value::Null),
         ColumnData::Text(v) => v
             .get(idx)
             .and_then(|o| o.as_ref())
@@ -266,7 +285,9 @@ fn batches_to_rows_where_eq(
 ) -> Vec<Row> {
     let mut rows = Vec::new();
     for batch in batches {
-        let Some((_, filter_data)) = batch.columns.get(filter_col) else { continue };
+        let Some((_, filter_data)) = batch.columns.get(filter_col) else {
+            continue;
+        };
         let mask = eq_mask(filter_data, filter_val);
         let n_cols = batch.columns.len();
         for row_i in 0..batch.row_count {
@@ -330,12 +351,8 @@ fn eq_mask(col: &ColumnData, val: &Value) -> Vec<bool> {
         (ColumnData::Text(v), Value::Text(s)) => {
             v.iter().map(|o| o.as_deref() == Some(s.as_str())).collect()
         }
-        (ColumnData::Int64(v), Value::Int64(n)) => {
-            v.iter().map(|o| o == &Some(*n)).collect()
-        }
-        (ColumnData::Int32(v), Value::Int32(n)) => {
-            v.iter().map(|o| o == &Some(*n)).collect()
-        }
+        (ColumnData::Int64(v), Value::Int64(n)) => v.iter().map(|o| o == &Some(*n)).collect(),
+        (ColumnData::Int32(v), Value::Int32(n)) => v.iter().map(|o| o == &Some(*n)).collect(),
         // Cross-type: Int32 stored, Int64 predicate
         (ColumnData::Int32(v), Value::Int64(n)) => {
             if let Ok(n32) = i32::try_from(*n) {
@@ -349,12 +366,8 @@ fn eq_mask(col: &ColumnData, val: &Value) -> Vec<bool> {
             let n64 = *n as i64;
             v.iter().map(|o| o == &Some(n64)).collect()
         }
-        (ColumnData::Float64(v), Value::Float64(f)) => {
-            v.iter().map(|o| o == &Some(*f)).collect()
-        }
-        (ColumnData::Bool(v), Value::Bool(b)) => {
-            v.iter().map(|o| o == &Some(*b)).collect()
-        }
+        (ColumnData::Float64(v), Value::Float64(f)) => v.iter().map(|o| o == &Some(*f)).collect(),
+        (ColumnData::Bool(v), Value::Bool(b)) => v.iter().map(|o| o == &Some(*b)).collect(),
         _ => vec![false; col.len()],
     }
 }
@@ -366,29 +379,26 @@ fn sum_masked(col: &ColumnData, mask: &[bool]) -> (f64, usize) {
     match col {
         ColumnData::Float64(v) => {
             for (opt, &keep) in v.iter().zip(mask) {
-                if keep
-                    && let Some(f) = opt {
-                        sum += f;
-                        count += 1;
-                    }
+                if keep && let Some(f) = opt {
+                    sum += f;
+                    count += 1;
+                }
             }
         }
         ColumnData::Int64(v) => {
             for (opt, &keep) in v.iter().zip(mask) {
-                if keep
-                    && let Some(n) = opt {
-                        sum += *n as f64;
-                        count += 1;
-                    }
+                if keep && let Some(n) = opt {
+                    sum += *n as f64;
+                    count += 1;
+                }
             }
         }
         ColumnData::Int32(v) => {
             for (opt, &keep) in v.iter().zip(mask) {
-                if keep
-                    && let Some(n) = opt {
-                        sum += *n as f64;
-                        count += 1;
-                    }
+                if keep && let Some(n) = opt {
+                    sum += *n as f64;
+                    count += 1;
+                }
             }
         }
         _ => {}
@@ -473,7 +483,8 @@ impl StorageEngine for ColumnarStorageEngine {
     async fn create_table(&self, table: &str) -> Result<(), StorageError> {
         self.store.write().create_table(table);
         if let Some(wal) = &self.wal {
-            wal.log_create_table(table).map_err(|e| StorageError::Io(e.to_string()))?;
+            wal.log_create_table(table)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
         }
         Ok(())
     }
@@ -486,7 +497,8 @@ impl StorageEngine for ColumnarStorageEngine {
             return Err(StorageError::TableNotFound(table.to_string()));
         }
         if let Some(wal) = &self.wal {
-            wal.log_drop_table(table).map_err(|e| StorageError::Io(e.to_string()))?;
+            wal.log_drop_table(table)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
         }
         // Remove index entries for this table.
         let names: Vec<String> = {
@@ -621,17 +633,17 @@ impl StorageEngine for ColumnarStorageEngine {
         // DELETE can't be expressed as an INSERT — checkpoint full state.
         if let Some(wal) = &self.wal {
             let tables = self.snapshot_tables();
-            let refs: Vec<(&str, Vec<Row>)> = tables.iter().map(|(n, r)| (n.as_str(), r.clone())).collect();
-            wal.checkpoint(&refs).map_err(|e| StorageError::Io(e.to_string()))?;
+            let refs: Vec<(&str, Vec<Row>)> = tables
+                .iter()
+                .map(|(n, r)| (n.as_str(), r.clone()))
+                .collect();
+            wal.checkpoint(&refs)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
         }
         Ok(count)
     }
 
-    async fn update(
-        &self,
-        table: &str,
-        updates: &[(usize, Row)],
-    ) -> Result<usize, StorageError> {
+    async fn update(&self, table: &str, updates: &[(usize, Row)]) -> Result<usize, StorageError> {
         if updates.is_empty() {
             return Ok(0);
         }
@@ -666,8 +678,12 @@ impl StorageEngine for ColumnarStorageEngine {
         // UPDATE can't be expressed as an INSERT — checkpoint full state.
         if let Some(wal) = &self.wal {
             let tables = self.snapshot_tables();
-            let refs: Vec<(&str, Vec<Row>)> = tables.iter().map(|(n, r)| (n.as_str(), r.clone())).collect();
-            wal.checkpoint(&refs).map_err(|e| StorageError::Io(e.to_string()))?;
+            let refs: Vec<(&str, Vec<Row>)> = tables
+                .iter()
+                .map(|(n, r)| (n.as_str(), r.clone()))
+                .collect();
+            wal.checkpoint(&refs)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
         }
         Ok(count)
     }
@@ -798,14 +814,11 @@ impl StorageEngine for ColumnarStorageEngine {
             return None;
         }
         let batches = store.batches_all(table);
-        let (total, n) =
-            batches
-                .iter()
-                .fold((0.0f64, 0usize), |(s, c), batch| {
-                    let sum = aggregate_sum(batch, &col_name);
-                    let cnt = aggregate_count(batch, &col_name);
-                    (s + sum, c + cnt)
-                });
+        let (total, n) = batches.iter().fold((0.0f64, 0usize), |(s, c), batch| {
+            let sum = aggregate_sum(batch, &col_name);
+            let cnt = aggregate_count(batch, &col_name);
+            (s + sum, c + cnt)
+        });
         Some((total, n))
     }
 
@@ -833,14 +846,18 @@ impl StorageEngine for ColumnarStorageEngine {
             // Key column — always text-converted.
             match batch.column(&key_col_name) {
                 Some(ColumnData::Text(v)) => key_vec.extend(v.iter().cloned()),
-                Some(ColumnData::Int32(v)) => key_vec
-                    .extend(v.iter().map(|o| o.map(|n| n.to_string()))),
-                Some(ColumnData::Int64(v)) => key_vec
-                    .extend(v.iter().map(|o| o.map(|n| n.to_string()))),
-                Some(ColumnData::Float64(v)) => key_vec
-                    .extend(v.iter().map(|o| o.map(|n| n.to_string()))),
-                Some(ColumnData::Bool(v)) => key_vec
-                    .extend(v.iter().map(|o| o.map(|b| b.to_string()))),
+                Some(ColumnData::Int32(v)) => {
+                    key_vec.extend(v.iter().map(|o| o.map(|n| n.to_string())))
+                }
+                Some(ColumnData::Int64(v)) => {
+                    key_vec.extend(v.iter().map(|o| o.map(|n| n.to_string())))
+                }
+                Some(ColumnData::Float64(v)) => {
+                    key_vec.extend(v.iter().map(|o| o.map(|n| n.to_string())))
+                }
+                Some(ColumnData::Bool(v)) => {
+                    key_vec.extend(v.iter().map(|o| o.map(|b| b.to_string())))
+                }
                 None => key_vec.extend(std::iter::repeat_n(None, n)),
             }
             // Value column (optional) — numeric only.
@@ -886,7 +903,12 @@ impl StorageEngine for ColumnarStorageEngine {
         }
     }
 
-    fn fast_count_filtered(&self, table: &str, filter_col: usize, filter_val: &Value) -> Option<usize> {
+    fn fast_count_filtered(
+        &self,
+        table: &str,
+        filter_col: usize,
+        filter_val: &Value,
+    ) -> Option<usize> {
         self.flush_write_buffer(table);
         let store = self.store.read();
         if !store.table_exists(table) {
@@ -900,12 +922,13 @@ impl StorageEngine for ColumnarStorageEngine {
             store.batches_all(table)
         };
         let filter_col_name = filter_col.to_string();
-        let count = batches.iter().map(|batch| {
-            match batch.column(&filter_col_name) {
+        let count = batches
+            .iter()
+            .map(|batch| match batch.column(&filter_col_name) {
                 Some(col) => eq_mask(col, filter_val).iter().filter(|&&b| b).count(),
                 None => 0,
-            }
-        }).sum();
+            })
+            .sum();
         Some(count)
     }
 
@@ -1034,8 +1057,10 @@ impl StorageEngine for ColumnarStorageEngine {
         // Checkpoint WAL to a compact single-snapshot file.
         if let Some(wal) = &self.wal {
             let snap = self.snapshot_tables();
-            let refs: Vec<(&str, Vec<Row>)> = snap.iter().map(|(n, r)| (n.as_str(), r.clone())).collect();
-            wal.checkpoint(&refs).map_err(|e| StorageError::Io(e.to_string()))?;
+            let refs: Vec<(&str, Vec<Row>)> =
+                snap.iter().map(|(n, r)| (n.as_str(), r.clone())).collect();
+            wal.checkpoint(&refs)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
         }
         Ok(())
     }
@@ -1048,7 +1073,11 @@ mod tests {
     use super::*;
 
     fn row(id: i64, name: &str, amount: f64) -> Row {
-        vec![Value::Int64(id), Value::Text(name.to_string()), Value::Float64(amount)]
+        vec![
+            Value::Int64(id),
+            Value::Text(name.to_string()),
+            Value::Float64(amount),
+        ]
     }
 
     #[tokio::test]
@@ -1092,7 +1121,9 @@ mod tests {
         eng.create_table("t").await.unwrap();
         eng.insert("t", row(1, "alice", 1.0)).await.unwrap();
         eng.insert("t", row(2, "bob", 2.0)).await.unwrap();
-        eng.update("t", &[(0, row(99, "updated", 99.0))]).await.unwrap();
+        eng.update("t", &[(0, row(99, "updated", 99.0))])
+            .await
+            .unwrap();
         let rows = eng.scan("t").await.unwrap();
         assert_eq!(rows[0][0], Value::Int64(99));
     }
@@ -1134,12 +1165,24 @@ mod tests {
         let eng = ColumnarStorageEngine::new();
         eng.create_table("t").await.unwrap();
         // 2 rows with status "a", 1 with "b"
-        eng.insert("t", vec![Value::Text("a".into()), Value::Float64(10.0)]).await.unwrap();
-        eng.insert("t", vec![Value::Text("a".into()), Value::Float64(20.0)]).await.unwrap();
-        eng.insert("t", vec![Value::Text("b".into()), Value::Float64(30.0)]).await.unwrap();
+        eng.insert("t", vec![Value::Text("a".into()), Value::Float64(10.0)])
+            .await
+            .unwrap();
+        eng.insert("t", vec![Value::Text("a".into()), Value::Float64(20.0)])
+            .await
+            .unwrap();
+        eng.insert("t", vec![Value::Text("b".into()), Value::Float64(30.0)])
+            .await
+            .unwrap();
         let groups = eng.fast_group_by("t", 0, Some(1)).unwrap();
-        let a = groups.iter().find(|(k, _, _)| k == &Value::Text("a".into())).unwrap();
-        let b = groups.iter().find(|(k, _, _)| k == &Value::Text("b".into())).unwrap();
+        let a = groups
+            .iter()
+            .find(|(k, _, _)| k == &Value::Text("a".into()))
+            .unwrap();
+        let b = groups
+            .iter()
+            .find(|(k, _, _)| k == &Value::Text("b".into()))
+            .unwrap();
         assert_eq!(a.1, 2);
         assert!((a.2.unwrap() - 15.0).abs() < 1e-9);
         assert_eq!(b.1, 1);
@@ -1152,7 +1195,9 @@ mod tests {
         eng.insert("t", row(1, "alice", 10.0)).await.unwrap();
         eng.insert("t", row(2, "bob", 20.0)).await.unwrap();
         eng.create_index("t", "t_id_idx", 0).await.unwrap();
-        let result = eng.index_lookup_sync("t", "t_id_idx", &Value::Int64(2)).unwrap();
+        let result = eng
+            .index_lookup_sync("t", "t_id_idx", &Value::Int64(2))
+            .unwrap();
         assert!(result.is_some());
         let rows = result.unwrap();
         assert_eq!(rows.len(), 1);
@@ -1174,7 +1219,9 @@ mod tests {
         eng.create_table("t").await.unwrap();
         // Insert fewer than WRITE_BUF_CAPACITY rows → stays in buffer
         for i in 0..10i64 {
-            eng.insert("t", vec![Value::Int64(i), Value::Float64(i as f64)]).await.unwrap();
+            eng.insert("t", vec![Value::Int64(i), Value::Float64(i as f64)])
+                .await
+                .unwrap();
         }
         // scan() should flush the buffer and return all 10 rows
         let rows = eng.scan("t").await.unwrap();
@@ -1202,7 +1249,9 @@ mod tests {
         eng.create_table("t").await.unwrap();
         // 5 rows buffered (not yet flushed to store)
         for i in 0..5i64 {
-            eng.insert("t", vec![Value::Int64(i), Value::Float64(i as f64)]).await.unwrap();
+            eng.insert("t", vec![Value::Int64(i), Value::Float64(i as f64)])
+                .await
+                .unwrap();
         }
         // fast_count_all should flush then count
         assert_eq!(eng.fast_count_all("t"), Some(5));
@@ -1233,11 +1282,16 @@ mod tests {
         {
             let eng = ColumnarStorageEngine::open(dir.path()).unwrap();
             eng.create_table("orders").await.unwrap();
-            eng.insert_batch("orders", vec![
-                row(1, "alice", 10.0),
-                row(2, "bob",   20.0),
-                row(3, "carol", 30.0),
-            ]).await.unwrap();
+            eng.insert_batch(
+                "orders",
+                vec![
+                    row(1, "alice", 10.0),
+                    row(2, "bob", 20.0),
+                    row(3, "carol", 30.0),
+                ],
+            )
+            .await
+            .unwrap();
         }
 
         // Session 2: reopen — rows must survive.
@@ -1263,7 +1317,10 @@ mod tests {
 
         {
             let eng = ColumnarStorageEngine::open(dir.path()).unwrap();
-            assert!(eng.scan("t").await.is_err(), "table should not exist after drop+recovery");
+            assert!(
+                eng.scan("t").await.is_err(),
+                "table should not exist after drop+recovery"
+            );
         }
     }
 

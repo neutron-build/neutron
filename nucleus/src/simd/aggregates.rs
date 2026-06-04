@@ -483,7 +483,9 @@ mod tests {
     fn test_count_i64_various_sizes() {
         // Test with sizes that exercise different chunk paths
         for size in &[1, 3, 4, 5, 7, 8, 9, 15, 16, 17] {
-            let data: Vec<i64> = (0..*size).map(|i| if i % 2 == 0 { i as i64 } else { 0 }).collect();
+            let data: Vec<i64> = (0..*size)
+                .map(|i| if i % 2 == 0 { i as i64 } else { 0 })
+                .collect();
             let expected = data.iter().filter(|&&v| v != 0).count() as u64;
             assert_eq!(count_i64(&data), expected, "Failed for size {}", size);
         }
@@ -637,7 +639,11 @@ mod tests {
         for data in test_data {
             let simd_result = count_i64(&data);
             let scalar_result = count_i64_scalar(&data);
-            assert_eq!(simd_result, scalar_result, "Count mismatch for data: {:?}", data);
+            assert_eq!(
+                simd_result, scalar_result,
+                "Count mismatch for data: {:?}",
+                data
+            );
         }
     }
 
@@ -656,7 +662,11 @@ mod tests {
         for data in test_data {
             let simd_result = sum_i64(&data);
             let scalar_result = sum_i64_scalar(&data);
-            assert_eq!(simd_result, scalar_result, "Sum mismatch for data: {:?}", data);
+            assert_eq!(
+                simd_result, scalar_result,
+                "Sum mismatch for data: {:?}",
+                data
+            );
         }
     }
 
@@ -674,7 +684,11 @@ mod tests {
         for data in test_data {
             let simd_result = min_i64(&data);
             let scalar_result = min_i64_scalar(&data);
-            assert_eq!(simd_result, scalar_result, "Min mismatch for data: {:?}", data);
+            assert_eq!(
+                simd_result, scalar_result,
+                "Min mismatch for data: {:?}",
+                data
+            );
         }
     }
 
@@ -692,7 +706,11 @@ mod tests {
         for data in test_data {
             let simd_result = max_i64(&data);
             let scalar_result = max_i64_scalar(&data);
-            assert_eq!(simd_result, scalar_result, "Max mismatch for data: {:?}", data);
+            assert_eq!(
+                simd_result, scalar_result,
+                "Max mismatch for data: {:?}",
+                data
+            );
         }
     }
 

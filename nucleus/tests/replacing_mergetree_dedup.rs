@@ -31,9 +31,7 @@ async fn fresh_executor() -> Arc<Executor> {
 
 async fn exec(ex: &Executor, sql: &str) -> ExecResult {
     let mut results = ex.execute(sql).await.expect(sql);
-    results
-        .pop()
-        .expect("at least one statement result")
+    results.pop().expect("at least one statement result")
 }
 
 async fn select_rows(ex: &Executor, sql: &str) -> Vec<Vec<Value>> {
@@ -62,7 +60,11 @@ async fn replacing_mergetree_collapses_duplicate_pks_on_select() {
     )
     .await;
 
-    let rows = select_rows(&ex, "SELECT issue_id, group_hash, version FROM issues WHERE issue_id='abc'").await;
+    let rows = select_rows(
+        &ex,
+        "SELECT issue_id, group_hash, version FROM issues WHERE issue_id='abc'",
+    )
+    .await;
     assert_eq!(rows.len(), 1, "dedup should collapse all 5 versions");
     assert_eq!(rows[0][0], Value::Text("abc".into()));
     assert_eq!(rows[0][1], Value::Text("g5".into()), "highest version wins");
@@ -161,13 +163,19 @@ async fn replacing_mergetree_delete_via_pk_removes_all_physical_versions() {
     // DELETE WHERE id='rm' must wipe every physical version of 'rm'.
     let res = exec(&ex, "DELETE FROM d WHERE id='rm'").await;
     if let ExecResult::Command { rows_affected, .. } = res {
-        assert_eq!(rows_affected, 3, "DELETE must remove all 3 physical versions of 'rm'");
+        assert_eq!(
+            rows_affected, 3,
+            "DELETE must remove all 3 physical versions of 'rm'"
+        );
     } else {
         panic!("expected Command result for DELETE");
     }
 
     let after = select_rows(&ex, "SELECT id FROM d WHERE id='rm'").await;
-    assert!(after.is_empty(), "no version of 'rm' should resurrect after DELETE");
+    assert!(
+        after.is_empty(),
+        "no version of 'rm' should resurrect after DELETE"
+    );
 
     let remaining = select_rows(&ex, "SELECT id FROM d").await;
     assert_eq!(remaining.len(), 1);
@@ -191,7 +199,11 @@ async fn replacing_mergetree_no_version_column_keeps_last_insert() {
     .await;
     let rows = select_rows(&ex, "SELECT k, v FROM nv WHERE k='a'").await;
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][1], Value::Text("3".into()), "no version_column → last insert wins");
+    assert_eq!(
+        rows[0][1],
+        Value::Text("3".into()),
+        "no version_column → last insert wins"
+    );
 }
 
 #[tokio::test]
@@ -213,7 +225,10 @@ async fn replacing_mergetree_cross_connection_visibility() {
 
     exec(&ex, "DELETE FROM c WHERE id='y'").await;
     let after = select_rows(&ex, "SELECT id FROM c WHERE id='y'").await;
-    assert!(after.is_empty(), "DELETE must be immediately visible to next SELECT");
+    assert!(
+        after.is_empty(),
+        "DELETE must be immediately visible to next SELECT"
+    );
 }
 
 #[tokio::test]
@@ -221,7 +236,11 @@ async fn plain_table_count_unchanged_by_replacing_changes() {
     // Regression guard: plain (non-replacing) tables must not get dedup'd.
     let ex = fresh_executor().await;
     exec(&ex, "CREATE TABLE p (id INT, name TEXT)").await;
-    exec(&ex, "INSERT INTO p (id, name) VALUES (1, 'a'), (1, 'b'), (1, 'c')").await;
+    exec(
+        &ex,
+        "INSERT INTO p (id, name) VALUES (1, 'a'), (1, 'b'), (1, 'c')",
+    )
+    .await;
     let rows = select_rows(&ex, "SELECT id, name FROM p").await;
     assert_eq!(rows.len(), 3, "plain table must NOT be deduped");
 }

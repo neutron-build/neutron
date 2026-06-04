@@ -7,13 +7,13 @@
 
 use nucleus::embedded::Database;
 use nucleus::fts::InvertedIndex;
-use nucleus::graph::{Direction, GraphStore, Properties, PropValue};
+use nucleus::graph::{Direction, GraphStore, PropValue, Properties};
 use nucleus::kv::KvStore;
 use nucleus::types::Value;
 use nucleus::vector::{DistanceMetric, HnswConfig, HnswIndex, Vector};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
 // Section 1: Storage Limits
@@ -51,21 +51,15 @@ async fn extreme_tuple_boundary_sizes() {
     }
 
     // Small sizes must succeed
-    assert!(
-        succeeded.contains(&100),
-        "100-byte value should succeed"
-    );
-    assert!(
-        succeeded.contains(&1000),
-        "1000-byte value should succeed"
-    );
-    assert!(
-        succeeded.contains(&4000),
-        "4000-byte value should succeed"
-    );
+    assert!(succeeded.contains(&100), "100-byte value should succeed");
+    assert!(succeeded.contains(&1000), "1000-byte value should succeed");
+    assert!(succeeded.contains(&4000), "4000-byte value should succeed");
 
     // Verify successful values round-trip correctly
-    let rows = db.query("SELECT id, data FROM big ORDER BY id").await.unwrap();
+    let rows = db
+        .query("SELECT id, data FROM big ORDER BY id")
+        .await
+        .unwrap();
     assert_eq!(rows.len(), succeeded.len());
     for (row_idx, row) in rows.iter().enumerate() {
         let id = extract_i64(&row[0]) as usize;
@@ -342,9 +336,7 @@ async fn extreme_txn_id_rapid_cycling() {
     db.execute("CREATE TABLE rapid (id INT NOT NULL, val INT NOT NULL)")
         .await
         .unwrap();
-    db.execute("INSERT INTO rapid VALUES (1, 0)")
-        .await
-        .unwrap();
+    db.execute("INSERT INTO rapid VALUES (1, 0)").await.unwrap();
 
     let total = 50_000u64;
     let mut update_count = 0u64;
@@ -363,15 +355,20 @@ async fn extreme_txn_id_rapid_cycling() {
     }
 
     assert!(update_count > 0, "some updates should succeed");
-    eprintln!(
-        "Completed {total} rapid txns ({update_count} updates)"
-    );
+    eprintln!("Completed {total} rapid txns ({update_count} updates)");
 
     // Database should still be queryable after rapid cycling.
     // The GC watermark fix ensures committed row versions stay visible
     // even after their txn IDs are removed from the committed set.
-    let rows = db.query("SELECT val FROM rapid WHERE id = 1").await.unwrap();
-    assert_eq!(rows.len(), 1, "row must remain visible after rapid txn cycling");
+    let rows = db
+        .query("SELECT val FROM rapid WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "row must remain visible after rapid txn cycling"
+    );
     let val = extract_i64(&rows[0][0]);
     assert!(val > 0, "val should have been updated: {val}");
     eprintln!("Final val after rapid cycling: {val}");
@@ -472,7 +469,10 @@ async fn extreme_snapshot_isolation_under_heavy_churn() {
 
     let violations = violation_count.load(Ordering::Relaxed);
     let nulls = null_count.load(Ordering::Relaxed);
-    assert_eq!(nulls, 0, "SUM should never return NULL with GC watermark fix");
+    assert_eq!(
+        nulls, 0,
+        "SUM should never return NULL with GC watermark fix"
+    );
     eprintln!("Snapshot reads: {violations} violations, {nulls} nulls");
 }
 
@@ -554,10 +554,7 @@ async fn extreme_aggregate_overflow_i64() {
     }
 
     // SUM should be near i64::MAX (should not overflow since 10 * (MAX/10) <= MAX)
-    let rows = db
-        .query("SELECT SUM(val) FROM bignum")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT SUM(val) FROM bignum").await.unwrap();
     let sum = extract_i64(&rows[0][0]);
     let expected = near_max * 10;
     assert_eq!(sum, expected, "SUM near i64::MAX should be exact");
@@ -604,10 +601,7 @@ async fn extreme_cartesian_join_explosion() {
     }
 
     // Cartesian join: 1000 × 1000 = 1,000,000
-    let rows = db
-        .query("SELECT COUNT(*) FROM a, b")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM a, b").await.unwrap();
     let count = extract_i64(&rows[0][0]);
     assert_eq!(count, 1_000_000, "cartesian product should be 1M");
 
@@ -756,10 +750,7 @@ async fn extreme_graph_dense_cycles_and_deep_traversal() {
     // Create nodes
     let mut node_ids = Vec::with_capacity(total_nodes);
     for i in 0..total_nodes {
-        let props: Properties = BTreeMap::from([(
-            "idx".to_string(),
-            PropValue::Int(i as i64),
-        )]);
+        let props: Properties = BTreeMap::from([("idx".to_string(), PropValue::Int(i as i64))]);
         let id = graph.create_node(vec!["Node".to_string()], props);
         node_ids.push(id);
     }
@@ -952,13 +943,20 @@ async fn extreme_vector_hnsw_high_dimension() {
     let start = std::time::Instant::now();
     let results = index.search(&query, k);
     let search_time = start.elapsed();
-    eprintln!("HNSW search returned {} results in {:?}", results.len(), search_time);
+    eprintln!(
+        "HNSW search returned {} results in {:?}",
+        results.len(),
+        search_time
+    );
 
     assert_eq!(results.len(), k, "should return {k} results");
 
     // Check no NaN/infinity in distances
     for (id, dist) in &results {
-        assert!(dist.is_finite(), "distance should be finite: id={id}, dist={dist}");
+        assert!(
+            dist.is_finite(),
+            "distance should be finite: id={id}, dist={dist}"
+        );
         assert!(!dist.is_nan(), "distance should not be NaN: id={id}");
     }
 
@@ -985,8 +983,7 @@ async fn extreme_vector_hnsw_high_dimension() {
     brute_force.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
     let bf_top_k: std::collections::HashSet<u64> =
         brute_force.iter().take(k).map(|(id, _)| *id).collect();
-    let hnsw_top_k: std::collections::HashSet<u64> =
-        results.iter().map(|(id, _)| *id).collect();
+    let hnsw_top_k: std::collections::HashSet<u64> = results.iter().map(|(id, _)| *id).collect();
 
     let overlap = bf_top_k.intersection(&hnsw_top_k).count();
     let recall = overlap as f64 / k as f64;
@@ -1097,10 +1094,7 @@ async fn extreme_partial_wal_record_truncation() {
             Ok(rows) => {
                 let count = extract_i64(&rows[0][0]);
                 eprintln!("Recovered {count}/50 rows after WAL truncation");
-                assert!(
-                    count >= 40,
-                    "should recover most rows, got {count}"
-                );
+                assert!(count >= 40, "should recover most rows, got {count}");
             }
             Err(e) => {
                 // Table might not exist if truncation hit the CREATE TABLE record
@@ -1112,9 +1106,7 @@ async fn extreme_partial_wal_record_truncation() {
         let _ = db
             .execute("CREATE TABLE IF NOT EXISTS post_trunc (x INT NOT NULL)")
             .await;
-        let result = db
-            .execute("INSERT INTO post_trunc VALUES (999)")
-            .await;
+        let result = db.execute("INSERT INTO post_trunc VALUES (999)").await;
         assert!(result.is_ok(), "db should be writable after recovery");
     }
 }
@@ -1179,8 +1171,7 @@ async fn extreme_rapid_crash_recover_cycles() {
                 .unwrap();
             let count = extract_i64(&rows[0][0]);
             assert_eq!(
-                count,
-                rows_per_cycle as i64,
+                count, rows_per_cycle as i64,
                 "cycle {cycle} should have {rows_per_cycle} rows"
             );
         }

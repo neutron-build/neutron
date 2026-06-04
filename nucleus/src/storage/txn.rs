@@ -292,7 +292,6 @@ pub struct TransactionManager {
     committed_watermark: AtomicU64,
 
     // -- SSI (Serializable Snapshot Isolation) tracking --
-
     /// SIREAD locks: txn_id → { table → set of row version indices read }.
     ssi_read_locks: Mutex<HashMap<u64, HashMap<String, HashSet<usize>>>>,
     /// Write sets: txn_id → { table → set of row version indices written }.
@@ -411,9 +410,7 @@ impl TransactionManager {
             return TxnStatus::Committed;
         }
         // 2. Check aborted set (for transactions above watermark).
-        if self.aborted_count.load(Ordering::Acquire) > 0
-            && self.aborted.lock().contains(&txn_id)
-        {
+        if self.aborted_count.load(Ordering::Acquire) > 0 && self.aborted.lock().contains(&txn_id) {
             return TxnStatus::Aborted;
         }
         // 3. Check recently committed (not yet GC'd).
@@ -472,7 +469,8 @@ impl TransactionManager {
         // Record watermark BEFORE removing entries so get_status() can
         // identify GC'd committed txns. Use fetch_max to avoid TOCTOU race
         // when multiple threads GC concurrently.
-        self.committed_watermark.fetch_max(watermark, Ordering::AcqRel);
+        self.committed_watermark
+            .fetch_max(watermark, Ordering::AcqRel);
 
         let mut committed = self.committed.lock();
         let before_c = committed.len();
@@ -541,15 +539,16 @@ impl TransactionManager {
                 continue;
             }
             if let Some(other_writes) = writes.get(&other_txn)
-                && let Some(other_tbl_writes) = other_writes.get(table) {
-                    for &idx in row_indices {
-                        if other_tbl_writes.contains(&idx) {
-                            // txn_id read data that other_txn wrote
-                            conflicts.insert((txn_id, other_txn));
-                            break;
-                        }
+                && let Some(other_tbl_writes) = other_writes.get(table)
+            {
+                for &idx in row_indices {
+                    if other_tbl_writes.contains(&idx) {
+                        // txn_id read data that other_txn wrote
+                        conflicts.insert((txn_id, other_txn));
+                        break;
                     }
                 }
+            }
         }
     }
 
@@ -577,15 +576,16 @@ impl TransactionManager {
                 continue;
             }
             if let Some(other_reads) = reads.get(&other_txn)
-                && let Some(other_tbl_reads) = other_reads.get(table) {
-                    for &idx in row_indices {
-                        if other_tbl_reads.contains(&idx) {
-                            // other_txn read data that txn_id wrote
-                            conflicts.insert((other_txn, txn_id));
-                            break;
-                        }
+                && let Some(other_tbl_reads) = other_reads.get(table)
+            {
+                for &idx in row_indices {
+                    if other_tbl_reads.contains(&idx) {
+                        // other_txn read data that txn_id wrote
+                        conflicts.insert((other_txn, txn_id));
+                        break;
                     }
                 }
+            }
         }
     }
 
@@ -605,10 +605,11 @@ impl TransactionManager {
                 continue;
             }
             if let Some(other_reads) = reads.get(&other_txn)
-                && other_reads.contains_key(table) {
-                    // other_txn read from this table, txn_id inserted into it
-                    conflicts.insert((other_txn, txn_id));
-                }
+                && other_reads.contains_key(table)
+            {
+                // other_txn read from this table, txn_id inserted into it
+                conflicts.insert((other_txn, txn_id));
+            }
         }
     }
 
@@ -1244,7 +1245,10 @@ mod tests {
         // maybe_gc should have triggered, keeping metadata bounded
         // With no active txns, GC should clean everything
         let total = mgr.committed_count() + mgr.aborted_count();
-        assert!(total <= 10_000, "metadata should be bounded by GC, got {total}");
+        assert!(
+            total <= 10_000,
+            "metadata should be bounded by GC, got {total}"
+        );
     }
 
     #[test]
@@ -1260,7 +1264,10 @@ mod tests {
         // committed.len() > 10K, which won't trigger here. Aborted entries
         // are cleaned when a future vacuum pass removes their row versions.
         let aborted = mgr.aborted_count();
-        assert_eq!(aborted, 10_100, "aborted set is retained for visibility correctness");
+        assert_eq!(
+            aborted, 10_100,
+            "aborted set is retained for visibility correctness"
+        );
     }
 
     #[test]

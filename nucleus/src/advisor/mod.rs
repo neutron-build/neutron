@@ -91,22 +91,20 @@ impl IndexAdvisor {
     }
 
     /// Record a query execution.
-    pub fn record_query(
-        &mut self,
-        pattern: QueryPattern,
-        rows_scanned: u64,
-        duration_us: u64,
-    ) {
+    pub fn record_query(&mut self, pattern: QueryPattern, rows_scanned: u64, duration_us: u64) {
         let ts = now_ms();
-        let stats = self.patterns.entry(pattern.clone()).or_insert_with(|| PatternStats {
-            pattern,
-            execution_count: 0,
-            total_rows_scanned: 0,
-            total_duration_us: 0,
-            avg_rows_scanned: 0.0,
-            avg_duration_us: 0.0,
-            last_seen: 0,
-        });
+        let stats = self
+            .patterns
+            .entry(pattern.clone())
+            .or_insert_with(|| PatternStats {
+                pattern,
+                execution_count: 0,
+                total_rows_scanned: 0,
+                total_duration_us: 0,
+                avg_rows_scanned: 0.0,
+                avg_duration_us: 0.0,
+                last_seen: 0,
+            });
 
         stats.execution_count += 1;
         stats.total_rows_scanned += rows_scanned;
@@ -118,14 +116,15 @@ impl IndexAdvisor {
 
     /// Register an existing index.
     pub fn register_index(&mut self, table: &str, columns: Vec<String>) {
-        self.existing_indexes
-            .push((table.to_string(), columns));
+        self.existing_indexes.push((table.to_string(), columns));
     }
 
     /// Check if an index already exists for a table and columns.
     fn has_index(&self, table: &str, columns: &[String]) -> bool {
         self.existing_indexes.iter().any(|(t, cols)| {
-            t == table && cols.len() >= columns.len() && columns.iter().zip(cols).all(|(a, b)| a == b)
+            t == table
+                && cols.len() >= columns.len()
+                && columns.iter().zip(cols).all(|(a, b)| a == b)
         })
     }
 
@@ -250,20 +249,15 @@ impl EnergyEstimator {
     /// Default estimator with typical x86 server values.
     pub fn new() -> Self {
         Self {
-            cpu_uj_per_row: 0.5,     // ~0.5 microjoules per row
-            io_uj_per_page: 10.0,    // ~10 microjoules per 8KB page read (NVMe)
-            net_uj_per_kb: 5.0,      // ~5 microjoules per KB network
+            cpu_uj_per_row: 0.5,               // ~0.5 microjoules per row
+            io_uj_per_page: 10.0,              // ~10 microjoules per 8KB page read (NVMe)
+            net_uj_per_kb: 5.0,                // ~5 microjoules per KB network
             carbon_intensity_g_per_kwh: 400.0, // US average
         }
     }
 
     /// Estimate energy cost for a query.
-    pub fn estimate(
-        &self,
-        rows_processed: u64,
-        pages_read: u64,
-        network_kb: u64,
-    ) -> EnergyCost {
+    pub fn estimate(&self, rows_processed: u64, pages_read: u64, network_kb: u64) -> EnergyCost {
         let cpu = self.cpu_uj_per_row * rows_processed as f64;
         let io = self.io_uj_per_page * pages_read as f64;
         let net = self.net_uj_per_kb * network_kb as f64;
@@ -288,9 +282,17 @@ impl EnergyEstimator {
         if cost.total_uj < 1000.0 {
             format!("{:.1} µJ ({:.3} µg CO₂)", cost.total_uj, cost.co2_ug)
         } else if cost.total_uj < 1_000_000.0 {
-            format!("{:.1} mJ ({:.3} µg CO₂)", cost.total_uj / 1000.0, cost.co2_ug)
+            format!(
+                "{:.1} mJ ({:.3} µg CO₂)",
+                cost.total_uj / 1000.0,
+                cost.co2_ug
+            )
         } else {
-            format!("{:.3} J ({:.3} mg CO₂)", cost.total_uj / 1_000_000.0, cost.co2_ug / 1000.0)
+            format!(
+                "{:.3} J ({:.3} mg CO₂)",
+                cost.total_uj / 1_000_000.0,
+                cost.co2_ug / 1000.0
+            )
         }
     }
 }
@@ -343,9 +345,22 @@ pub struct AutoIndex {
 /// Actions taken by the auto-indexer.
 #[derive(Debug, Clone)]
 pub enum AutoIndexAction {
-    Created { table: String, columns: Vec<String>, timestamp_ms: u64 },
-    Dropped { table: String, columns: Vec<String>, reason: String, timestamp_ms: u64 },
-    Skipped { table: String, columns: Vec<String>, reason: String },
+    Created {
+        table: String,
+        columns: Vec<String>,
+        timestamp_ms: u64,
+    },
+    Dropped {
+        table: String,
+        columns: Vec<String>,
+        reason: String,
+        timestamp_ms: u64,
+    },
+    Skipped {
+        table: String,
+        columns: Vec<String>,
+        reason: String,
+    },
 }
 
 /// Manages automatic index creation and retirement.
@@ -357,7 +372,11 @@ pub struct AutoIndexer {
 
 impl AutoIndexer {
     pub fn new(config: AutoIndexConfig) -> Self {
-        Self { config, auto_indexes: Vec::new(), actions_log: Vec::new() }
+        Self {
+            config,
+            auto_indexes: Vec::new(),
+            actions_log: Vec::new(),
+        }
     }
 
     /// Evaluate recommendations and auto-create indexes that meet the threshold.
@@ -367,18 +386,27 @@ impl AutoIndexer {
         timestamp_ms: u64,
     ) -> Vec<AutoIndexAction> {
         let mut actions = Vec::new();
-        if !self.config.enabled { return actions; }
+        if !self.config.enabled {
+            return actions;
+        }
 
         for rec in recs {
-            let already_exists = self.auto_indexes.iter().any(|idx| {
-                idx.table == rec.table && idx.columns == rec.columns
-            });
-            if already_exists { continue; }
+            let already_exists = self
+                .auto_indexes
+                .iter()
+                .any(|idx| idx.table == rec.table && idx.columns == rec.columns);
+            if already_exists {
+                continue;
+            }
 
             if rec.estimated_speedup < self.config.creation_threshold {
                 let action = AutoIndexAction::Skipped {
-                    table: rec.table.clone(), columns: rec.columns.clone(),
-                    reason: format!("speedup {:.1} below threshold {:.0}", rec.estimated_speedup, self.config.creation_threshold),
+                    table: rec.table.clone(),
+                    columns: rec.columns.clone(),
+                    reason: format!(
+                        "speedup {:.1} below threshold {:.0}",
+                        rec.estimated_speedup, self.config.creation_threshold
+                    ),
                 };
                 actions.push(action.clone());
                 self.actions_log.push(action);
@@ -387,8 +415,12 @@ impl AutoIndexer {
 
             if self.auto_indexes.len() >= self.config.max_auto_indexes {
                 let action = AutoIndexAction::Skipped {
-                    table: rec.table.clone(), columns: rec.columns.clone(),
-                    reason: format!("max auto-indexes limit ({}) reached", self.config.max_auto_indexes),
+                    table: rec.table.clone(),
+                    columns: rec.columns.clone(),
+                    reason: format!(
+                        "max auto-indexes limit ({}) reached",
+                        self.config.max_auto_indexes
+                    ),
                 };
                 actions.push(action.clone());
                 self.actions_log.push(action);
@@ -396,12 +428,17 @@ impl AutoIndexer {
             }
 
             self.auto_indexes.push(AutoIndex {
-                table: rec.table.clone(), columns: rec.columns.clone(),
-                index_type: rec.index_type, created_at_ms: timestamp_ms,
-                last_used_at_ms: timestamp_ms, query_count: 0,
+                table: rec.table.clone(),
+                columns: rec.columns.clone(),
+                index_type: rec.index_type,
+                created_at_ms: timestamp_ms,
+                last_used_at_ms: timestamp_ms,
+                query_count: 0,
             });
             let action = AutoIndexAction::Created {
-                table: rec.table.clone(), columns: rec.columns.clone(), timestamp_ms,
+                table: rec.table.clone(),
+                columns: rec.columns.clone(),
+                timestamp_ms,
             };
             actions.push(action.clone());
             self.actions_log.push(action);
@@ -430,7 +467,8 @@ impl AutoIndexer {
             let age_ms = timestamp_ms.saturating_sub(idx.last_used_at_ms);
             if age_ms >= threshold_ms {
                 let action = AutoIndexAction::Dropped {
-                    table: idx.table.clone(), columns: idx.columns.clone(),
+                    table: idx.table.clone(),
+                    columns: idx.columns.clone(),
                     reason: format!("unused for {age_ms}ms (threshold: {threshold_ms}ms)"),
                     timestamp_ms,
                 };
@@ -444,11 +482,21 @@ impl AutoIndexer {
         actions
     }
 
-    pub fn auto_index_count(&self) -> usize { self.auto_indexes.len() }
-    pub fn actions_log(&self) -> &[AutoIndexAction] { &self.actions_log }
-    pub fn get_auto_indexes(&self) -> &[AutoIndex] { &self.auto_indexes }
-    pub fn is_enabled(&self) -> bool { self.config.enabled }
-    pub fn set_enabled(&mut self, enabled: bool) { self.config.enabled = enabled; }
+    pub fn auto_index_count(&self) -> usize {
+        self.auto_indexes.len()
+    }
+    pub fn actions_log(&self) -> &[AutoIndexAction] {
+        &self.actions_log
+    }
+    pub fn get_auto_indexes(&self) -> &[AutoIndex] {
+        &self.auto_indexes
+    }
+    pub fn is_enabled(&self) -> bool {
+        self.config.enabled
+    }
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.config.enabled = enabled;
+    }
 }
 
 #[cfg(test)]
@@ -591,7 +639,10 @@ mod tests {
             advisor.record_query(pattern.clone(), 5_000, 3_000);
         }
         let recs = advisor.recommend();
-        let rec = recs.iter().find(|r| r.columns == vec!["customer_id", "status", "region"]).unwrap();
+        let rec = recs
+            .iter()
+            .find(|r| r.columns == vec!["customer_id", "status", "region"])
+            .unwrap();
         assert_eq!(rec.table, "orders");
         assert!(rec.estimated_speedup > 1.0);
     }
@@ -602,17 +653,23 @@ mod tests {
         let p1 = QueryPattern {
             table: "users".into(),
             columns_in_where: vec!["email".into()],
-            columns_in_order_by: vec![], columns_in_group_by: vec![], has_join: false,
+            columns_in_order_by: vec![],
+            columns_in_group_by: vec![],
+            has_join: false,
         };
         let p2 = QueryPattern {
             table: "orders".into(),
             columns_in_where: vec!["user_id".into()],
-            columns_in_order_by: vec![], columns_in_group_by: vec![], has_join: false,
+            columns_in_order_by: vec![],
+            columns_in_group_by: vec![],
+            has_join: false,
         };
         let p3 = QueryPattern {
             table: "products".into(),
             columns_in_where: vec!["category".into()],
-            columns_in_order_by: vec![], columns_in_group_by: vec![], has_join: false,
+            columns_in_order_by: vec![],
+            columns_in_group_by: vec![],
+            has_join: false,
         };
         for _ in 0..30 {
             advisor.record_query(p1.clone(), 10_000, 5_000);
@@ -642,14 +699,16 @@ mod tests {
         let pattern = QueryPattern {
             table: "tiny".into(),
             columns_in_where: vec!["id".into()],
-            columns_in_order_by: vec![], columns_in_group_by: vec![], has_join: false,
+            columns_in_order_by: vec![],
+            columns_in_group_by: vec![],
+            has_join: false,
         };
         // Below min_executions (10)
         for _ in 0..5 {
             advisor.record_query(pattern.clone(), 50_000, 10_000);
         }
         let recs = advisor.recommend();
-        assert!(recs.iter().find(|r| r.table == "tiny").is_none());
+        assert!(!recs.iter().any(|r| r.table == "tiny"));
     }
 
     #[test]
@@ -658,14 +717,16 @@ mod tests {
         let pattern = QueryPattern {
             table: "small".into(),
             columns_in_where: vec!["id".into()],
-            columns_in_order_by: vec![], columns_in_group_by: vec![], has_join: false,
+            columns_in_order_by: vec![],
+            columns_in_group_by: vec![],
+            has_join: false,
         };
         // Below min_rows_threshold (100)
         for _ in 0..50 {
             advisor.record_query(pattern.clone(), 50, 100);
         }
         let recs = advisor.recommend();
-        assert!(recs.iter().find(|r| r.table == "small").is_none());
+        assert!(!recs.iter().any(|r| r.table == "small"));
     }
 
     #[test]
@@ -682,9 +743,14 @@ mod tests {
             advisor.record_query(pattern.clone(), 10_000, 5_000);
         }
         let recs = advisor.recommend();
-        let covering = recs.iter().find(|r| r.columns == vec!["level", "timestamp"]);
+        let covering = recs
+            .iter()
+            .find(|r| r.columns == vec!["level", "timestamp"]);
         assert!(covering.is_some());
-        assert_eq!(covering.unwrap().reason, "Covering index for ORDER BY avoids sort operation");
+        assert_eq!(
+            covering.unwrap().reason,
+            "Covering index for ORDER BY avoids sort operation"
+        );
     }
 
     #[test]
@@ -727,12 +793,16 @@ mod tests {
         let p_medium = QueryPattern {
             table: "t1".into(),
             columns_in_where: vec!["a".into()],
-            columns_in_order_by: vec![], columns_in_group_by: vec![], has_join: false,
+            columns_in_order_by: vec![],
+            columns_in_group_by: vec![],
+            has_join: false,
         };
         let p_high = QueryPattern {
             table: "t2".into(),
             columns_in_where: vec!["b".into()],
-            columns_in_order_by: vec![], columns_in_group_by: vec![], has_join: false,
+            columns_in_order_by: vec![],
+            columns_in_group_by: vec![],
+            has_join: false,
         };
         for _ in 0..20 {
             advisor.record_query(p_medium.clone(), 500, 1_000);
@@ -789,7 +859,10 @@ mod tests {
 
     #[test]
     fn auto_indexer_respects_max_limit() {
-        let config = AutoIndexConfig { max_auto_indexes: 2, ..sample_auto_config() };
+        let config = AutoIndexConfig {
+            max_auto_indexes: 2,
+            ..sample_auto_config()
+        };
         let mut indexer = AutoIndexer::new(config);
         let recs = vec![
             make_rec("t1", vec!["a"], 100.0),
@@ -797,8 +870,14 @@ mod tests {
             make_rec("t3", vec!["c"], 300.0),
         ];
         let actions = indexer.evaluate_recommendations(&recs, 1000);
-        let created = actions.iter().filter(|a| matches!(a, AutoIndexAction::Created { .. })).count();
-        let skipped = actions.iter().filter(|a| matches!(a, AutoIndexAction::Skipped { .. })).count();
+        let created = actions
+            .iter()
+            .filter(|a| matches!(a, AutoIndexAction::Created { .. }))
+            .count();
+        let skipped = actions
+            .iter()
+            .filter(|a| matches!(a, AutoIndexAction::Skipped { .. }))
+            .count();
         assert_eq!(created, 2);
         assert_eq!(skipped, 1);
     }
@@ -843,7 +922,10 @@ mod tests {
 
     #[test]
     fn auto_indexer_disabled_does_nothing() {
-        let config = AutoIndexConfig { enabled: false, ..sample_auto_config() };
+        let config = AutoIndexConfig {
+            enabled: false,
+            ..sample_auto_config()
+        };
         let mut indexer = AutoIndexer::new(config);
         let recs = vec![make_rec("users", vec!["email"], 500.0)];
         let actions = indexer.evaluate_recommendations(&recs, 1000);
@@ -897,9 +979,11 @@ mod tests {
             max_auto_indexes: 8,
         });
         let actions = indexer.evaluate_recommendations(&recs, 1000);
-        let created: Vec<_> = actions.iter().filter(|a| matches!(a, AutoIndexAction::Created { .. })).collect();
+        let created: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, AutoIndexAction::Created { .. }))
+            .collect();
         assert!(!created.is_empty());
         assert_eq!(indexer.get_auto_indexes()[0].table, "orders");
     }
-
 }

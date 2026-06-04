@@ -84,10 +84,7 @@ impl BlobWal {
                 blobs: HashMap::new(),
             }
         };
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok((
             Self {
                 path,
@@ -410,7 +407,9 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
     if *pos + len > data.len() {
         return None;
     }
-    let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+    let s = std::str::from_utf8(&data[*pos..*pos + len])
+        .ok()?
+        .to_string();
     *pos += len;
     Some(s)
 }
@@ -457,13 +456,8 @@ mod tests {
         let (wal, _) = BlobWal::open(dir.path()).unwrap();
 
         let hash = blake3::hash(b"data");
-        wal.log_store(
-            "blob1",
-            None,
-            4,
-            &[(*hash.as_bytes(), b"data".to_vec())],
-        )
-        .unwrap();
+        wal.log_store("blob1", None, 4, &[(*hash.as_bytes(), b"data".to_vec())])
+            .unwrap();
         wal.log_delete("blob1").unwrap();
         drop(wal);
 
@@ -581,13 +575,8 @@ mod tests {
         let (wal, _) = BlobWal::open(dir.path()).unwrap();
 
         let hash = blake3::hash(b"data");
-        wal.log_store(
-            "blob1",
-            None,
-            4,
-            &[(*hash.as_bytes(), b"data".to_vec())],
-        )
-        .unwrap();
+        wal.log_store("blob1", None, 4, &[(*hash.as_bytes(), b"data".to_vec())])
+            .unwrap();
         drop(wal);
 
         let (_wal2, state) = BlobWal::open(dir.path()).unwrap();
@@ -600,12 +589,22 @@ mod tests {
         let (wal, _) = BlobWal::open(dir.path()).unwrap();
 
         let h1 = blake3::hash(b"old");
-        wal.log_store("key", Some("text/plain"), 3, &[(*h1.as_bytes(), b"old".to_vec())])
-            .unwrap();
+        wal.log_store(
+            "key",
+            Some("text/plain"),
+            3,
+            &[(*h1.as_bytes(), b"old".to_vec())],
+        )
+        .unwrap();
 
         let h2 = blake3::hash(b"new");
-        wal.log_store("key", Some("text/html"), 3, &[(*h2.as_bytes(), b"new".to_vec())])
-            .unwrap();
+        wal.log_store(
+            "key",
+            Some("text/html"),
+            3,
+            &[(*h2.as_bytes(), b"new".to_vec())],
+        )
+        .unwrap();
         drop(wal);
 
         let (_wal2, state) = BlobWal::open(dir.path()).unwrap();

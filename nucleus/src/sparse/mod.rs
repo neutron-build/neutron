@@ -9,8 +9,8 @@
 //!
 //! Replaces Elasticsearch sparse vectors, Milvus, Qdrant sparse features.
 
-use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 
 // ============================================================================
 // Sparse vector types
@@ -28,10 +28,8 @@ impl SparseVector {
     pub fn new(mut entries: Vec<(u32, f32)>) -> Self {
         entries.sort_by_key(|(idx, _)| *idx);
         // Filter out zeros
-        let (indices, values): (Vec<u32>, Vec<f32>) = entries
-            .into_iter()
-            .filter(|(_, v)| *v != 0.0)
-            .unzip();
+        let (indices, values): (Vec<u32>, Vec<f32>) =
+            entries.into_iter().filter(|(_, v)| *v != 0.0).unzip();
         Self { indices, values }
     }
 
@@ -106,7 +104,8 @@ impl PostingList {
 
     fn add(&mut self, doc_id: u64, weight: f32) {
         // Insert in sorted order by doc_id
-        let pos = self.postings
+        let pos = self
+            .postings
             .binary_search_by_key(&doc_id, |p| p.doc_id)
             .unwrap_or_else(|i| i);
         self.postings.insert(pos, Posting { doc_id, weight });
@@ -119,7 +118,12 @@ impl PostingList {
         if let Ok(pos) = self.postings.binary_search_by_key(&doc_id, |p| p.doc_id) {
             self.postings.remove(pos);
             // Recompute max_weight
-            self.max_weight = self.postings.iter().map(|p| p.weight).reduce(f32::max).unwrap_or(0.0);
+            self.max_weight = self
+                .postings
+                .iter()
+                .map(|p| p.weight)
+                .reduce(f32::max)
+                .unwrap_or(0.0);
         }
     }
 
@@ -165,7 +169,10 @@ impl SparseIndex {
         }
 
         for (idx, val) in vector.indices.iter().zip(vector.values.iter()) {
-            self.index.entry(*idx).or_insert_with(PostingList::new).add(doc_id, *val);
+            self.index
+                .entry(*idx)
+                .or_insert_with(PostingList::new)
+                .add(doc_id, *val);
         }
 
         self.vectors.insert(doc_id, vector);
@@ -230,10 +237,7 @@ impl SparseIndex {
         }
 
         // Total upper bound for any single document
-        let _total_upper: f32 = query_upper_bounds
-            .iter()
-            .map(|(_, qw, pw)| qw * pw)
-            .sum();
+        let _total_upper: f32 = query_upper_bounds.iter().map(|(_, qw, pw)| qw * pw).sum();
 
         // Score accumulation using inverted index
         for (dim, qval, _) in &query_upper_bounds {
@@ -254,10 +258,11 @@ impl SparseIndex {
             if heap.len() < top_k {
                 heap.push(std::cmp::Reverse(ScoredDoc { doc_id, score }));
             } else if let Some(min) = heap.peek()
-                && score > min.0.score {
-                    heap.pop();
-                    heap.push(std::cmp::Reverse(ScoredDoc { doc_id, score }));
-                }
+                && score > min.0.score
+            {
+                heap.pop();
+                heap.push(std::cmp::Reverse(ScoredDoc { doc_id, score }));
+            }
         }
 
         let mut results: Vec<(u64, f32)> = heap
@@ -293,7 +298,10 @@ impl SparseIndex {
             .iter()
             .zip(query.values.iter())
             .filter_map(|(idx, qval)| {
-                self.index.get(idx).filter(|pl| !pl.postings.is_empty()).map(|pl| (0usize, *qval, pl))
+                self.index
+                    .get(idx)
+                    .filter(|pl| !pl.postings.is_empty())
+                    .map(|pl| (0usize, *qval, pl))
             })
             .collect();
 
@@ -304,7 +312,8 @@ impl SparseIndex {
         // Sort cursors by their current doc_id (ascending).
         cursors.sort_by_key(|(pos, _, pl)| pl.postings[*pos].doc_id);
 
-        let mut heap: BinaryHeap<std::cmp::Reverse<ScoredDoc>> = BinaryHeap::with_capacity(top_k + 1);
+        let mut heap: BinaryHeap<std::cmp::Reverse<ScoredDoc>> =
+            BinaryHeap::with_capacity(top_k + 1);
         let mut threshold: f32 = 0.0; // k-th best score seen so far
 
         loop {
@@ -342,13 +351,19 @@ impl SparseIndex {
 
                 if score > 0.0 {
                     if heap.len() < top_k {
-                        heap.push(std::cmp::Reverse(ScoredDoc { doc_id: pivot_doc, score }));
+                        heap.push(std::cmp::Reverse(ScoredDoc {
+                            doc_id: pivot_doc,
+                            score,
+                        }));
                         if heap.len() == top_k {
                             threshold = heap.peek().map(|r| r.0.score).unwrap_or(0.0);
                         }
                     } else if score > threshold {
                         heap.pop();
-                        heap.push(std::cmp::Reverse(ScoredDoc { doc_id: pivot_doc, score }));
+                        heap.push(std::cmp::Reverse(ScoredDoc {
+                            doc_id: pivot_doc,
+                            score,
+                        }));
                         threshold = heap.peek().map(|r| r.0.score).unwrap_or(0.0);
                     }
                 }
@@ -370,7 +385,11 @@ impl SparseIndex {
 
             // Re-sort cursors by their new current doc_id.
             cursors.sort_by_key(|(pos, _, pl)| {
-                if *pos < pl.postings.len() { pl.postings[*pos].doc_id } else { u64::MAX }
+                if *pos < pl.postings.len() {
+                    pl.postings[*pos].doc_id
+                } else {
+                    u64::MAX
+                }
             });
         }
 
@@ -427,8 +446,18 @@ pub fn hybrid_score(
     let mut combined: HashMap<u64, (f32, f32)> = HashMap::new(); // (dense_score, sparse_score)
 
     // Normalize scores to [0, 1]
-    let dense_max = dense_results.iter().map(|(_, s)| *s).reduce(f32::max).unwrap_or(1.0).max(1e-10);
-    let sparse_max = sparse_results.iter().map(|(_, s)| *s).reduce(f32::max).unwrap_or(1.0).max(1e-10);
+    let dense_max = dense_results
+        .iter()
+        .map(|(_, s)| *s)
+        .reduce(f32::max)
+        .unwrap_or(1.0)
+        .max(1e-10);
+    let sparse_max = sparse_results
+        .iter()
+        .map(|(_, s)| *s)
+        .reduce(f32::max)
+        .unwrap_or(1.0)
+        .max(1e-10);
 
     for &(id, score) in dense_results {
         combined.entry(id).or_insert((0.0, 0.0)).0 = score / dense_max;
@@ -552,11 +581,14 @@ mod tests {
         assert_eq!(sparse_only[0].0, 3); // Doc 3 has highest sparse score
     }
 
-
     #[test]
     fn large_sparse_vectors() {
-        let ea = (0..1000u32).map(|i| (i * 1000, (i as f32) * 0.01)).collect();
-        let eb = (0..1000u32).map(|i| (i * 1000, (i as f32) * 0.02)).collect();
+        let ea = (0..1000u32)
+            .map(|i| (i * 1000, (i as f32) * 0.01))
+            .collect();
+        let eb = (0..1000u32)
+            .map(|i| (i * 1000, (i as f32) * 0.02))
+            .collect();
         let a = SparseVector::new(ea);
         let b = SparseVector::new(eb);
         assert_eq!(a.nnz(), 999);
@@ -702,8 +734,16 @@ mod tests {
         // Sort by (score desc, doc_id asc) for deterministic comparison
         let mut exact_sorted = exact.clone();
         let mut wand_sorted = wand.clone();
-        exact_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
-        wand_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
+        exact_sorted.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        wand_sorted.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
         for ((we, ws), (ee, es)) in wand_sorted.iter().zip(exact_sorted.iter()) {
             assert_eq!(we, ee, "doc_id mismatch");
             assert!((ws - es).abs() < 1e-5, "score mismatch: {ws} vs {es}");
@@ -728,8 +768,16 @@ mod tests {
         // since tied-score documents may appear in different traversal order.
         let mut exact_sorted = exact.clone();
         let mut wand_sorted = wand.clone();
-        exact_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
-        wand_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
+        exact_sorted.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        wand_sorted.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
 
         for ((we, ws), (ee, es)) in wand_sorted.iter().zip(exact_sorted.iter()) {
             assert_eq!(we, ee, "doc_id mismatch");
@@ -741,7 +789,10 @@ mod tests {
     fn wand_pruned_top_k_respected() {
         let mut idx = SparseIndex::new();
         for i in 1u64..=50 {
-            idx.insert(i, SparseVector::new(vec![(0, i as f32), (1, (51 - i) as f32)]));
+            idx.insert(
+                i,
+                SparseVector::new(vec![(0, i as f32), (1, (51 - i) as f32)]),
+            );
         }
         let query = SparseVector::new(vec![(0, 1.0), (1, 1.0)]);
         let wand = idx.search_wand_pruned(&query, 5);
@@ -756,7 +807,10 @@ mod tests {
     fn wand_pruned_empty_query() {
         let mut idx = SparseIndex::new();
         idx.insert(1, SparseVector::new(vec![(0, 1.0)]));
-        assert!(idx.search_wand_pruned(&SparseVector::new(vec![]), 5).is_empty());
+        assert!(
+            idx.search_wand_pruned(&SparseVector::new(vec![]), 5)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -779,7 +833,12 @@ mod tests {
         let mut idx = SparseIndex::new();
         for i in 0..200u64 {
             let entries: Vec<(u32, f32)> = (0..8u32)
-                .map(|d| (d * 13 + (i as u32 % 13), 1.0 + (i as f32) * 0.01 + d as f32 * 0.1))
+                .map(|d| {
+                    (
+                        d * 13 + (i as u32 % 13),
+                        1.0 + (i as f32) * 0.01 + d as f32 * 0.1,
+                    )
+                })
                 .collect();
             idx.insert(i, SparseVector::new(entries));
         }
@@ -792,5 +851,4 @@ mod tests {
             assert_eq!(wand[0].0, exact[0].0, "top result doc_id mismatch");
         }
     }
-
 }

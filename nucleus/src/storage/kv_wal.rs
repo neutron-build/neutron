@@ -70,11 +70,14 @@ impl KvWal {
         } else {
             KvWalState { items: Vec::new() }
         };
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        Ok((Self { path, writer: Mutex::new(BufWriter::new(file)) }, state))
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok((
+            Self {
+                path,
+                writer: Mutex::new(BufWriter::new(file)),
+            },
+            state,
+        ))
     }
 
     /// Log a SET operation (key + value, no TTL change).
@@ -128,7 +131,10 @@ impl KvWal {
     ///
     /// Each entry is `(op, key, optional_value, optional_ttl_abs_ms)`.
     /// This avoids per-entry syscall overhead for burst workloads like MSET.
-    pub fn log_batch(&self, entries: &[(KvWalOp, &str, Option<&Value>, Option<u64>)]) -> io::Result<()> {
+    pub fn log_batch(
+        &self,
+        entries: &[(KvWalOp, &str, Option<&Value>, Option<u64>)],
+    ) -> io::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -196,7 +202,9 @@ impl KvWal {
         }
 
         // Flush existing writer, then truncate file and rewrite as one entry.
-        { self.writer.lock().flush()?; }
+        {
+            self.writer.lock().flush()?;
+        }
 
         let file = OpenOptions::new()
             .write(true)
@@ -277,7 +285,9 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Option<Value> {
             if *pos + len > data.len() {
                 return None;
             }
-            let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+            let s = std::str::from_utf8(&data[*pos..*pos + len])
+                .ok()?
+                .to_string();
             *pos += len;
             Some(Value::Text(s))
         }
@@ -297,57 +307,95 @@ fn replay(data: &[u8]) -> KvWalState {
     let mut pos = 0usize;
 
     while pos < data.len() {
-        let Some(&entry_type) = data.get(pos) else { break };
+        let Some(&entry_type) = data.get(pos) else {
+            break;
+        };
         pos += 1;
 
         match entry_type {
             ENTRY_SET => {
                 // key
-                let Some(key) = read_string(data, &mut pos) else { break };
+                let Some(key) = read_string(data, &mut pos) else {
+                    break;
+                };
                 // value (length-prefixed)
-                let Some(val_len) = read_u32(data, &mut pos) else { break };
+                let Some(val_len) = read_u32(data, &mut pos) else {
+                    break;
+                };
                 let val_len = val_len as usize;
-                if pos + val_len > data.len() { break; }
+                if pos + val_len > data.len() {
+                    break;
+                }
                 let mut vpos = pos;
-                let Some(val) = decode_value(data, &mut vpos) else { break; };
+                let Some(val) = decode_value(data, &mut vpos) else {
+                    break;
+                };
                 pos += val_len;
                 // Preserve existing TTL if key already exists
                 let ttl = store.get(&key).and_then(|(_, t)| *t);
                 store.insert(key, (val, ttl));
             }
             ENTRY_DEL => {
-                let Some(key) = read_string(data, &mut pos) else { break };
+                let Some(key) = read_string(data, &mut pos) else {
+                    break;
+                };
                 store.remove(&key);
             }
             ENTRY_EXPIRE => {
-                let Some(key) = read_string(data, &mut pos) else { break };
-                let Some(ttl_ms) = read_u64(data, &mut pos) else { break };
+                let Some(key) = read_string(data, &mut pos) else {
+                    break;
+                };
+                let Some(ttl_ms) = read_u64(data, &mut pos) else {
+                    break;
+                };
                 if let Some(entry) = store.get_mut(&key) {
                     entry.1 = Some(ttl_ms);
                 }
             }
             ENTRY_SNAPSHOT => {
                 store.clear();
-                let Some(n_items) = read_u32(data, &mut pos) else { break };
+                let Some(n_items) = read_u32(data, &mut pos) else {
+                    break;
+                };
                 let mut ok = true;
                 for _ in 0..n_items {
                     // key
-                    let Some(key) = read_string(data, &mut pos) else { ok = false; break };
+                    let Some(key) = read_string(data, &mut pos) else {
+                        ok = false;
+                        break;
+                    };
                     // value (length-prefixed)
-                    let Some(val_len) = read_u32(data, &mut pos) else { ok = false; break };
+                    let Some(val_len) = read_u32(data, &mut pos) else {
+                        ok = false;
+                        break;
+                    };
                     let val_len = val_len as usize;
-                    if pos + val_len > data.len() { ok = false; break; }
+                    if pos + val_len > data.len() {
+                        ok = false;
+                        break;
+                    }
                     let mut vpos = pos;
-                    let Some(val) = decode_value(data, &mut vpos) else { ok = false; break };
+                    let Some(val) = decode_value(data, &mut vpos) else {
+                        ok = false;
+                        break;
+                    };
                     pos += val_len;
                     // TTL
-                    let Some(&has_ttl) = data.get(pos) else { ok = false; break };
+                    let Some(&has_ttl) = data.get(pos) else {
+                        ok = false;
+                        break;
+                    };
                     pos += 1;
-                    let Some(ttl_ms) = read_u64(data, &mut pos) else { ok = false; break };
+                    let Some(ttl_ms) = read_u64(data, &mut pos) else {
+                        ok = false;
+                        break;
+                    };
                     let ttl = if has_ttl != 0 { Some(ttl_ms) } else { None };
                     store.insert(key, (val, ttl));
                 }
-                if !ok { break; }
+                if !ok {
+                    break;
+                }
             }
             _ => {
                 // Unknown entry type — stop replay (can't know how much to skip).
@@ -376,7 +424,9 @@ fn read_i32(data: &[u8], pos: &mut usize) -> Option<i32> {
 fn read_u64(data: &[u8], pos: &mut usize) -> Option<u64> {
     let b = data.get(*pos..*pos + 8)?;
     *pos += 8;
-    Some(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    Some(u64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
 }
 
 fn read_i64(data: &[u8], pos: &mut usize) -> Option<i64> {
@@ -392,7 +442,9 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
     if *pos + len > data.len() {
         return None;
     }
-    let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+    let s = std::str::from_utf8(&data[*pos..*pos + len])
+        .ok()?
+        .to_string();
     *pos += len;
     Some(s)
 }
@@ -401,6 +453,8 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
 
     #[test]
@@ -443,7 +497,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = KvWal::open(dir.path()).unwrap();
 
-        wal.log_set("temp", &Value::Text("ephemeral".into())).unwrap();
+        wal.log_set("temp", &Value::Text("ephemeral".into()))
+            .unwrap();
         let ttl_ms = 1_700_000_000_000u64; // some future epoch ms
         wal.log_expire("temp", ttl_ms).unwrap();
         drop(wal);
@@ -546,13 +601,22 @@ mod tests {
         wal.log_set("i32", &Value::Int32(-42)).unwrap();
         wal.log_set("i64", &Value::Int64(i64::MAX)).unwrap();
         wal.log_set("f64", &Value::Float64(3.14159)).unwrap();
-        wal.log_set("text", &Value::Text("hello world".into())).unwrap();
+        wal.log_set("text", &Value::Text("hello world".into()))
+            .unwrap();
         drop(wal);
 
         let (_wal2, state) = KvWal::open(dir.path()).unwrap();
         assert_eq!(state.items.len(), 6);
 
-        let find = |k: &str| state.items.iter().find(|(key, _, _)| key == k).unwrap().1.clone();
+        let find = |k: &str| {
+            state
+                .items
+                .iter()
+                .find(|(key, _, _)| key == k)
+                .unwrap()
+                .1
+                .clone()
+        };
         assert_eq!(find("null"), Value::Null);
         assert_eq!(find("bool"), Value::Bool(true));
         assert_eq!(find("i32"), Value::Int32(-42));
@@ -587,7 +651,11 @@ mod tests {
         // Checkpoint with initial data
         let items = vec![
             ("x".to_string(), Value::Int64(10), None),
-            ("y".to_string(), Value::Int64(20), Some(8_000_000_000_000u64)),
+            (
+                "y".to_string(),
+                Value::Int64(20),
+                Some(8_000_000_000_000u64),
+            ),
         ];
         wal.checkpoint(&items).unwrap();
 
@@ -619,7 +687,8 @@ mod tests {
             (KvWalOp::Set, "a", Some(&v1), None),
             (KvWalOp::Set, "b", Some(&v2), None),
             (KvWalOp::Set, "c", Some(&v3), None),
-        ]).unwrap();
+        ])
+        .unwrap();
         drop(wal);
 
         let (_wal2, state2) = KvWal::open(dir.path()).unwrap();
@@ -648,7 +717,8 @@ mod tests {
             (KvWalOp::Delete, "x", None, None),
             (KvWalOp::Expire, "y", None, Some(9_000_000_000_000u64)),
             (KvWalOp::Set, "w", Some(&w_val), None),
-        ]).unwrap();
+        ])
+        .unwrap();
         drop(wal);
 
         let (_wal2, state) = KvWal::open(dir.path()).unwrap();

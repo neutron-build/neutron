@@ -325,8 +325,7 @@ impl Default for LoggingConfig {
 // NucleusConfig (top-level)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NucleusConfig {
     #[serde(default)]
     pub server: ServerConfig,
@@ -346,18 +345,15 @@ pub struct NucleusConfig {
     pub logging: LoggingConfig,
 }
 
-
 impl NucleusConfig {
     /// Load config from a TOML file, then overlay environment variables.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         if !path.exists() {
-            return Err(ConfigError::FileNotFound(
-                path.display().to_string(),
-            ));
+            return Err(ConfigError::FileNotFound(path.display().to_string()));
         }
 
-        let contents = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::IoError(e.to_string()))?;
+        let contents =
+            std::fs::read_to_string(path).map_err(|e| ConfigError::IoError(e.to_string()))?;
 
         let mut config = Self::from_toml(&contents)?;
         config.apply_env_overrides();
@@ -366,8 +362,7 @@ impl NucleusConfig {
 
     /// Load from a TOML string.
     pub fn from_toml(toml_str: &str) -> Result<Self, ConfigError> {
-        toml::from_str(toml_str)
-            .map_err(|e| ConfigError::ParseError(e.to_string()))
+        toml::from_str(toml_str).map_err(|e| ConfigError::ParseError(e.to_string()))
     }
 
     /// Apply environment variable overrides.
@@ -379,38 +374,44 @@ impl NucleusConfig {
             self.server.host = v;
         }
         if let Ok(v) = env::var("NUCLEUS_SERVER_PORT")
-            && let Ok(p) = v.parse::<u16>() {
-                self.server.port = p;
-            }
+            && let Ok(p) = v.parse::<u16>()
+        {
+            self.server.port = p;
+        }
         if let Ok(v) = env::var("NUCLEUS_SERVER_MAX_CONNECTIONS")
-            && let Ok(n) = v.parse::<usize>() {
-                self.server.max_connections = n;
-            }
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.server.max_connections = n;
+        }
 
         // storage
         if let Ok(v) = env::var("NUCLEUS_STORAGE_DATA_DIR") {
             self.storage.data_dir = v;
         }
         if let Ok(v) = env::var("NUCLEUS_STORAGE_MEMORY_MODE")
-            && let Ok(b) = v.parse::<bool>() {
-                self.storage.memory_mode = b;
-            }
+            && let Ok(b) = v.parse::<bool>()
+        {
+            self.storage.memory_mode = b;
+        }
 
         // wal
         if let Ok(v) = env::var("NUCLEUS_WAL_ENABLED")
-            && let Ok(b) = v.parse::<bool>() {
-                self.wal.enabled = b;
-            }
+            && let Ok(b) = v.parse::<bool>()
+        {
+            self.wal.enabled = b;
+        }
 
         // metrics
         if let Ok(v) = env::var("NUCLEUS_METRICS_ENABLED")
-            && let Ok(b) = v.parse::<bool>() {
-                self.metrics.enabled = b;
-            }
+            && let Ok(b) = v.parse::<bool>()
+        {
+            self.metrics.enabled = b;
+        }
         if let Ok(v) = env::var("NUCLEUS_METRICS_PORT")
-            && let Ok(p) = v.parse::<u16>() {
-                self.metrics.port = p;
-            }
+            && let Ok(p) = v.parse::<u16>()
+        {
+            self.metrics.port = p;
+        }
 
         // logging
         if let Ok(v) = env::var("NUCLEUS_LOGGING_LEVEL") {
@@ -419,35 +420,42 @@ impl NucleusConfig {
 
         // cache
         if let Ok(v) = env::var("NUCLEUS_CACHE_ENABLED")
-            && let Ok(b) = v.parse::<bool>() {
-                self.cache.enabled = b;
-            }
+            && let Ok(b) = v.parse::<bool>()
+        {
+            self.cache.enabled = b;
+        }
         if let Ok(v) = env::var("NUCLEUS_CACHE_MAX_MEMORY_MB")
-            && let Ok(n) = v.parse::<usize>() {
-                self.cache.max_memory_mb = n;
-            }
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.cache.max_memory_mb = n;
+        }
         if let Ok(v) = env::var("NUCLEUS_CACHE_DEFAULT_TTL_SECS")
-            && let Ok(n) = v.parse::<u64>() {
-                self.cache.default_ttl_secs = n;
-            }
+            && let Ok(n) = v.parse::<u64>()
+        {
+            self.cache.default_ttl_secs = n;
+        }
 
         // pool
         if let Ok(v) = env::var("NUCLEUS_POOL_MIN_IDLE")
-            && let Ok(n) = v.parse::<usize>() {
-                self.pool.min_idle = n;
-            }
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.pool.min_idle = n;
+        }
         if let Ok(v) = env::var("NUCLEUS_POOL_MAX_IDLE_TIME_SECS")
-            && let Ok(n) = v.parse::<u64>() {
-                self.pool.max_idle_time_secs = n;
-            }
+            && let Ok(n) = v.parse::<u64>()
+        {
+            self.pool.max_idle_time_secs = n;
+        }
         if let Ok(v) = env::var("NUCLEUS_POOL_MAX_LIFETIME_SECS")
-            && let Ok(n) = v.parse::<u64>() {
-                self.pool.max_lifetime_secs = n;
-            }
+            && let Ok(n) = v.parse::<u64>()
+        {
+            self.pool.max_lifetime_secs = n;
+        }
         if let Ok(v) = env::var("NUCLEUS_POOL_ACQUIRE_TIMEOUT_SECS")
-            && let Ok(n) = v.parse::<u64>() {
-                self.pool.acquire_timeout_secs = n;
-            }
+            && let Ok(n) = v.parse::<u64>()
+        {
+            self.pool.acquire_timeout_secs = n;
+        }
 
         // replication
         if let Ok(v) = env::var("NUCLEUS_REPLICATION_MODE") {
@@ -457,53 +465,62 @@ impl NucleusConfig {
             self.replication.primary_host = Some(v);
         }
         if let Ok(v) = env::var("NUCLEUS_REPLICATION_PRIMARY_PORT")
-            && let Ok(p) = v.parse::<u16>() {
-                self.replication.primary_port = Some(p);
-            }
+            && let Ok(p) = v.parse::<u16>()
+        {
+            self.replication.primary_port = Some(p);
+        }
         if let Ok(v) = env::var("NUCLEUS_REPLICATION_SYNC_MODE") {
             self.replication.sync_mode = v;
         }
         if let Ok(v) = env::var("NUCLEUS_REPLICATION_FAILOVER_TIMEOUT_MS")
-            && let Ok(n) = v.parse::<u64>() {
-                self.replication.failover_timeout_ms = n;
-            }
+            && let Ok(n) = v.parse::<u64>()
+        {
+            self.replication.failover_timeout_ms = n;
+        }
 
         // storage (additional)
         if let Ok(v) = env::var("NUCLEUS_STORAGE_BUFFER_POOL_SIZE_MB")
-            && let Ok(n) = v.parse::<usize>() {
-                self.storage.buffer_pool_size_mb = n;
-            }
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.storage.buffer_pool_size_mb = n;
+        }
         if let Ok(v) = env::var("NUCLEUS_STORAGE_USE_DIRECT_IO")
-            && let Ok(b) = v.parse::<bool>() {
-                self.storage.use_direct_io = b;
-            }
+            && let Ok(b) = v.parse::<bool>()
+        {
+            self.storage.use_direct_io = b;
+        }
 
         // wal (additional)
         if let Ok(v) = env::var("NUCLEUS_WAL_SEGMENT_SIZE_MB")
-            && let Ok(n) = v.parse::<usize>() {
-                self.wal.segment_size_mb = n;
-            }
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.wal.segment_size_mb = n;
+        }
         if let Ok(v) = env::var("NUCLEUS_WAL_CHECKPOINT_INTERVAL_SECS")
-            && let Ok(n) = v.parse::<u64>() {
-                self.wal.checkpoint_interval_secs = n;
-            }
+            && let Ok(n) = v.parse::<u64>()
+        {
+            self.wal.checkpoint_interval_secs = n;
+        }
         if let Ok(v) = env::var("NUCLEUS_WAL_GROUP_COMMIT_INTERVAL_US")
-            && let Ok(n) = v.parse::<u64>() {
-                self.wal.group_commit_interval_us = n;
-            }
+            && let Ok(n) = v.parse::<u64>()
+        {
+            self.wal.group_commit_interval_us = n;
+        }
         if let Ok(v) = env::var("NUCLEUS_WAL_SYNC_MODE") {
             self.wal.sync_mode = v;
         }
 
         // server (additional)
         if let Ok(v) = env::var("NUCLEUS_SERVER_IDLE_TIMEOUT_SECS")
-            && let Ok(n) = v.parse::<u64>() {
-                self.server.idle_timeout_secs = n;
-            }
+            && let Ok(n) = v.parse::<u64>()
+        {
+            self.server.idle_timeout_secs = n;
+        }
         if let Ok(v) = env::var("NUCLEUS_MAX_MEMORY_MB")
-            && let Ok(n) = v.parse::<usize>() {
-                self.server.max_memory_mb = n;
-            }
+            && let Ok(n) = v.parse::<usize>()
+        {
+            self.server.max_memory_mb = n;
+        }
 
         // logging (additional)
         if let Ok(v) = env::var("NUCLEUS_LOGGING_FORMAT") {
@@ -558,8 +575,8 @@ impl NucleusConfig {
         //   Buffer pool: 10% of max_memory (was 25%)
         //   Cache:        5% of max_memory (was 12%)
         //   Remaining 85%: FTS, KV, columnar, query execution, OS overhead
-        let bp = (max / 32).max(4).min(256); // ~3% of budget, 4 MB min, 256 MB max
-        let cache = (max / 64).max(2).min(128); // ~1.5% of budget, 2 MB min, 128 MB max
+        let bp = (max / 32).clamp(4, 256); // ~3% of budget, 4 MB min, 256 MB max
+        let cache = (max / 64).clamp(2, 128); // ~1.5% of budget, 2 MB min, 128 MB max
         // Always enforce proportional sizing relative to max_memory
         self.storage.buffer_pool_size_mb = self.storage.buffer_pool_size_mb.min(bp);
         self.cache.max_memory_mb = self.cache.max_memory_mb.min(cache);
@@ -1041,7 +1058,13 @@ port = 5555
     #[test]
     fn test_merge_cli_args_overrides() {
         let mut cfg = NucleusConfig::default();
-        cfg.merge_cli_args(Some("192.168.1.1"), Some(6543), Some("/data/db"), Some(true), Some(256));
+        cfg.merge_cli_args(
+            Some("192.168.1.1"),
+            Some(6543),
+            Some("/data/db"),
+            Some(true),
+            Some(256),
+        );
         assert_eq!(cfg.server.host, "192.168.1.1");
         assert_eq!(cfg.server.port, 6543);
         assert_eq!(cfg.storage.data_dir, "/data/db");

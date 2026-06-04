@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::cypher::*;
-use super::{Direction, EdgeId, GraphStore, Node, NodeId, Properties, PropValue};
+use super::{Direction, EdgeId, GraphStore, Node, NodeId, PropValue, Properties};
 
 #[derive(Debug, Clone)]
 enum Binding {
@@ -198,8 +198,12 @@ fn find_bindings(
                 let min_hops = edge_pat.min_hops.unwrap_or(1);
                 let max_hops = edge_pat.max_hops.unwrap_or(10);
                 let terminal_nodes = variable_length_expand(
-                    store, source_id, edge_pat.direction,
-                    edge_pat.edge_type.as_deref(), min_hops, max_hops,
+                    store,
+                    source_id,
+                    edge_pat.direction,
+                    edge_pat.edge_type.as_deref(),
+                    min_hops,
+                    max_hops,
                 );
                 for terminal_id in terminal_nodes {
                     let target_node = match store.get_node(terminal_id) {
@@ -220,9 +224,8 @@ fn find_bindings(
                 }
             } else {
                 // Single-hop traversal (original logic)
-                let neighbors = store.neighbors(
-                    source_id, edge_pat.direction, edge_pat.edge_type.as_deref(),
-                );
+                let neighbors =
+                    store.neighbors(source_id, edge_pat.direction, edge_pat.edge_type.as_deref());
                 for (neighbor_id, edge) in &neighbors {
                     let target_node = match store.get_node(*neighbor_id) {
                         Some(n) => n,
@@ -269,10 +272,13 @@ fn variable_length_expand(
     stack.push((source_id, 0, initial_visited));
 
     while let Some((current, depth, visited)) = stack.pop() {
-        if depth >= min_hops && depth <= max_hops && current != source_id
-            && seen_terminals.insert(current) {
-                results.push(current);
-            }
+        if depth >= min_hops
+            && depth <= max_hops
+            && current != source_id
+            && seen_terminals.insert(current)
+        {
+            results.push(current);
+        }
         if depth >= max_hops {
             continue;
         }
@@ -311,9 +317,10 @@ fn node_matches_properties(node: &Node, required: &BTreeMap<String, PropValue>) 
 
 fn resolve_node_id(bindings: &HashMap<String, Binding>, np: &NodePattern) -> Option<NodeId> {
     if let Some(ref var) = np.variable
-        && let Some(Binding::Node(id)) = bindings.get(var) {
-            return Some(*id);
-        }
+        && let Some(Binding::Node(id)) = bindings.get(var)
+    {
+        return Some(*id);
+    }
     None
 }
 
@@ -322,7 +329,9 @@ fn evaluate_where(
     bindings: &HashMap<String, Binding>,
     wc: &WhereClause,
 ) -> bool {
-    wc.conditions.iter().all(|c| evaluate_condition(store, bindings, c))
+    wc.conditions
+        .iter()
+        .all(|c| evaluate_condition(store, bindings, c))
 }
 
 fn evaluate_condition(
@@ -331,22 +340,24 @@ fn evaluate_condition(
     condition: &Condition,
 ) -> bool {
     match condition {
-        Condition::PropertyEquals { variable, property, value } => {
-            match bindings.get(variable) {
-                Some(Binding::Node(id)) => store.get_node(*id)
-                    .is_some_and(|n| n.properties.get(property) == Some(value)),
-                Some(Binding::Edge(id)) => store.get_edge(*id)
-                    .is_some_and(|e| e.properties.get(property) == Some(value)),
-                None => false,
-            }
-        }
+        Condition::PropertyEquals {
+            variable,
+            property,
+            value,
+        } => match bindings.get(variable) {
+            Some(Binding::Node(id)) => store
+                .get_node(*id)
+                .is_some_and(|n| n.properties.get(property) == Some(value)),
+            Some(Binding::Edge(id)) => store
+                .get_edge(*id)
+                .is_some_and(|e| e.properties.get(property) == Some(value)),
+            None => false,
+        },
         Condition::And(left, right) => {
-            evaluate_condition(store, bindings, left)
-                && evaluate_condition(store, bindings, right)
+            evaluate_condition(store, bindings, left) && evaluate_condition(store, bindings, right)
         }
     }
 }
-
 
 fn project_return(
     store: &GraphStore,
@@ -436,13 +447,20 @@ fn execute_create(
     let mut created_edge_ids: Vec<u64> = Vec::new();
     for item in items {
         match item {
-            CreateItem::Node { variable, labels, properties } => {
+            CreateItem::Node {
+                variable,
+                labels,
+                properties,
+            } => {
                 // If this variable already exists and has no new labels/properties,
                 // treat it as a reference to an existing node (not a new creation).
                 if let Some(var) = variable
-                    && var_map.contains_key(var) && labels.is_empty() && properties.is_empty() {
-                        continue;
-                    }
+                    && var_map.contains_key(var)
+                    && labels.is_empty()
+                    && properties.is_empty()
+                {
+                    continue;
+                }
                 let props: Properties = properties.clone();
                 let node_id = store.create_node(labels.clone(), props);
                 created_node_ids.push(node_id);
@@ -450,21 +468,29 @@ fn execute_create(
                     var_map.insert(var.clone(), node_id);
                 }
             }
-            CreateItem::Edge { from_var, to_var, edge_type, properties } => {
+            CreateItem::Edge {
+                from_var,
+                to_var,
+                edge_type,
+                properties,
+            } => {
                 let from_id = var_map.get(from_var).ok_or_else(|| {
-                    CypherError::InvalidSyntax(
-                        format!("undefined variable in CREATE edge: {from_var}"))
+                    CypherError::InvalidSyntax(format!(
+                        "undefined variable in CREATE edge: {from_var}"
+                    ))
                 })?;
                 let to_id = var_map.get(to_var).ok_or_else(|| {
-                    CypherError::InvalidSyntax(
-                        format!("undefined variable in CREATE edge: {to_var}"))
+                    CypherError::InvalidSyntax(format!(
+                        "undefined variable in CREATE edge: {to_var}"
+                    ))
                 })?;
                 let props: Properties = properties.clone();
                 let edge_id = store
                     .create_edge(*from_id, *to_id, edge_type.clone(), props)
                     .ok_or_else(|| {
                         CypherError::InvalidSyntax(
-                            "failed to create edge: node not found".to_string())
+                            "failed to create edge: node not found".to_string(),
+                        )
                     })?;
                 created_edge_ids.push(edge_id);
             }
@@ -482,7 +508,11 @@ fn execute_create(
     }
     Ok(CypherResult {
         columns,
-        rows: if row.is_empty() { Vec::new() } else { vec![row] },
+        rows: if row.is_empty() {
+            Vec::new()
+        } else {
+            vec![row]
+        },
     })
 }
 
@@ -499,9 +529,9 @@ fn execute_delete(
                 }
             }
             Err(_) => {
-                return Err(CypherError::InvalidSyntax(
-                    format!("DELETE requires node IDs, got variable '{var}'")
-                ));
+                return Err(CypherError::InvalidSyntax(format!(
+                    "DELETE requires node IDs, got variable '{var}'"
+                )));
             }
         }
     }
@@ -513,73 +543,125 @@ fn execute_delete(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::props;
+    use super::*;
 
     fn social_graph() -> GraphStore {
         let mut g = GraphStore::new();
-        g.create_node(vec!["Person".into()],
-            props(vec![("name", PropValue::Text("Alice".into())), ("age", PropValue::Int(30))]));
-        g.create_node(vec!["Person".into()],
-            props(vec![("name", PropValue::Text("Bob".into())), ("age", PropValue::Int(25))]));
-        g.create_node(vec!["Person".into()],
-            props(vec![("name", PropValue::Text("Charlie".into())), ("age", PropValue::Int(35))]));
-        g.create_node(vec!["Company".into()],
-            props(vec![("name", PropValue::Text("Acme Corp".into()))]));
+        g.create_node(
+            vec!["Person".into()],
+            props(vec![
+                ("name", PropValue::Text("Alice".into())),
+                ("age", PropValue::Int(30)),
+            ]),
+        );
+        g.create_node(
+            vec!["Person".into()],
+            props(vec![
+                ("name", PropValue::Text("Bob".into())),
+                ("age", PropValue::Int(25)),
+            ]),
+        );
+        g.create_node(
+            vec!["Person".into()],
+            props(vec![
+                ("name", PropValue::Text("Charlie".into())),
+                ("age", PropValue::Int(35)),
+            ]),
+        );
+        g.create_node(
+            vec!["Company".into()],
+            props(vec![("name", PropValue::Text("Acme Corp".into()))]),
+        );
         g.create_edge(1, 2, "FRIENDS".into(), Properties::new());
         g.create_edge(2, 3, "FRIENDS".into(), Properties::new());
-        g.create_edge(1, 4, "WORKS_AT".into(), props(vec![("since", PropValue::Int(2020))]));
-        g.create_edge(2, 4, "WORKS_AT".into(), props(vec![("since", PropValue::Int(2022))]));
+        g.create_edge(
+            1,
+            4,
+            "WORKS_AT".into(),
+            props(vec![("since", PropValue::Int(2020))]),
+        );
+        g.create_edge(
+            2,
+            4,
+            "WORKS_AT".into(),
+            props(vec![("since", PropValue::Int(2022))]),
+        );
         g
     }
 
     #[test]
     fn match_by_label() {
         let mut s = social_graph();
-        let r = execute_cypher(&mut s, &parse_cypher("MATCH (n:Person) RETURN n").unwrap()).unwrap();
+        let r =
+            execute_cypher(&mut s, &parse_cypher("MATCH (n:Person) RETURN n").unwrap()).unwrap();
         assert_eq!(r.columns, vec!["n"]);
         assert_eq!(r.rows.len(), 3);
     }
     #[test]
     fn match_with_where_int() {
         let mut s = social_graph();
-        let r = execute_cypher(&mut s, &parse_cypher("MATCH (n:Person) WHERE n.age = 25 RETURN n.name").unwrap()).unwrap();
+        let r = execute_cypher(
+            &mut s,
+            &parse_cypher("MATCH (n:Person) WHERE n.age = 25 RETURN n.name").unwrap(),
+        )
+        .unwrap();
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0][0], PropValue::Text("Bob".into()));
     }
     #[test]
     fn match_count_aggregation() {
         let mut s = social_graph();
-        let r = execute_cypher(&mut s, &parse_cypher("MATCH (n:Person) RETURN COUNT(*)").unwrap()).unwrap();
+        let r = execute_cypher(
+            &mut s,
+            &parse_cypher("MATCH (n:Person) RETURN COUNT(*)").unwrap(),
+        )
+        .unwrap();
         assert_eq!(r.columns, vec!["COUNT(*)"]);
         assert_eq!(r.rows[0][0], PropValue::Int(3));
     }
     #[test]
     fn match_return_property() {
         let mut s = social_graph();
-        let r = execute_cypher(&mut s, &parse_cypher("MATCH (n:Person) RETURN n.name, n.age").unwrap()).unwrap();
+        let r = execute_cypher(
+            &mut s,
+            &parse_cypher("MATCH (n:Person) RETURN n.name, n.age").unwrap(),
+        )
+        .unwrap();
         assert_eq!(r.columns, vec!["n.name", "n.age"]);
         assert_eq!(r.rows.len(), 3);
     }
     #[test]
     fn match_company_nodes() {
         let mut s = social_graph();
-        let r = execute_cypher(&mut s, &parse_cypher("MATCH (c:Company) RETURN c.name").unwrap()).unwrap();
+        let r = execute_cypher(
+            &mut s,
+            &parse_cypher("MATCH (c:Company) RETURN c.name").unwrap(),
+        )
+        .unwrap();
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0][0], PropValue::Text("Acme Corp".into()));
     }
     #[test]
     fn match_edge_traversal() {
         let mut s = social_graph();
-        let r = execute_cypher(&mut s,
-            &parse_cypher("MATCH (a:Person)-[r:FRIENDS]->(b:Person) RETURN a.name, b.name").unwrap()).unwrap();
+        let r = execute_cypher(
+            &mut s,
+            &parse_cypher("MATCH (a:Person)-[r:FRIENDS]->(b:Person) RETURN a.name, b.name")
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(r.rows.len(), 2);
     }
     #[test]
     fn match_edge_type_filter() {
         let mut s = social_graph();
-        let r = execute_cypher(&mut s,
-            &parse_cypher("MATCH (p:Person)-[r:WORKS_AT]->(c:Company) RETURN p.name, c.name").unwrap()).unwrap();
+        let r = execute_cypher(
+            &mut s,
+            &parse_cypher("MATCH (p:Person)-[r:WORKS_AT]->(c:Company) RETURN p.name, c.name")
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(r.rows.len(), 2);
     }
     #[test]
@@ -605,13 +687,17 @@ mod tests {
         assert_eq!(r.columns, vec!["node_0"]);
         assert_eq!(s.node_count(), 1);
         let p = s.nodes_by_label("Person");
-        assert_eq!(p[0].properties.get("name"), Some(&PropValue::Text("Eve".into())));
+        assert_eq!(
+            p[0].properties.get("name"),
+            Some(&PropValue::Text("Eve".into()))
+        );
         assert_eq!(p[0].properties.get("age"), Some(&PropValue::Int(22)));
     }
     #[test]
     fn create_node_and_edge() {
         let mut s = GraphStore::new();
-        let cypher = r#"CREATE (a:Person {name: "Alice"}), (b:Person {name: "Bob"}), (a)-[:KNOWS]->(b)"#;
+        let cypher =
+            r#"CREATE (a:Person {name: "Alice"}), (b:Person {name: "Bob"}), (a)-[:KNOWS]->(b)"#;
         let r = execute_cypher(&mut s, &parse_cypher(cypher).unwrap()).unwrap();
         assert_eq!(s.node_count(), 2);
         assert_eq!(s.edge_count(), 1);
@@ -620,7 +706,8 @@ mod tests {
     #[test]
     fn roundtrip_create_match() {
         let mut s = GraphStore::new();
-        let c = r#"CREATE (a:Person {name: "Alice"}), (b:Person {name: "Bob"}), (a)-[:FRIENDS]->(b)"#;
+        let c =
+            r#"CREATE (a:Person {name: "Alice"}), (b:Person {name: "Bob"}), (a)-[:FRIENDS]->(b)"#;
         execute_cypher(&mut s, &parse_cypher(c).unwrap()).unwrap();
         let q = "MATCH (a:Person)-[r:FRIENDS]->(b:Person) RETURN a.name, b.name";
         let r = execute_cypher(&mut s, &parse_cypher(q).unwrap()).unwrap();
@@ -631,18 +718,46 @@ mod tests {
     #[test]
     fn roundtrip_create_count() {
         let mut s = GraphStore::new();
-        execute_cypher(&mut s, &parse_cypher(r#"CREATE (n:City {name: "NYC"})"#).unwrap()).unwrap();
-        execute_cypher(&mut s, &parse_cypher(r#"CREATE (n:City {name: "LA"})"#).unwrap()).unwrap();
-        execute_cypher(&mut s, &parse_cypher(r#"CREATE (n:City {name: "CHI"})"#).unwrap()).unwrap();
-        let r = execute_cypher(&mut s, &parse_cypher("MATCH (c:City) RETURN COUNT(*)").unwrap()).unwrap();
+        execute_cypher(
+            &mut s,
+            &parse_cypher(r#"CREATE (n:City {name: "NYC"})"#).unwrap(),
+        )
+        .unwrap();
+        execute_cypher(
+            &mut s,
+            &parse_cypher(r#"CREATE (n:City {name: "LA"})"#).unwrap(),
+        )
+        .unwrap();
+        execute_cypher(
+            &mut s,
+            &parse_cypher(r#"CREATE (n:City {name: "CHI"})"#).unwrap(),
+        )
+        .unwrap();
+        let r = execute_cypher(
+            &mut s,
+            &parse_cypher("MATCH (c:City) RETURN COUNT(*)").unwrap(),
+        )
+        .unwrap();
         assert_eq!(r.rows[0][0], PropValue::Int(3));
     }
     #[test]
     fn roundtrip_create_where() {
         let mut s = GraphStore::new();
-        execute_cypher(&mut s, &parse_cypher(r#"CREATE (a:Person {name: "Alice", age: 30})"#).unwrap()).unwrap();
-        execute_cypher(&mut s, &parse_cypher(r#"CREATE (b:Person {name: "Bob", age: 25})"#).unwrap()).unwrap();
-        let r = execute_cypher(&mut s, &parse_cypher("MATCH (n:Person) WHERE n.age = 30 RETURN n.name").unwrap()).unwrap();
+        execute_cypher(
+            &mut s,
+            &parse_cypher(r#"CREATE (a:Person {name: "Alice", age: 30})"#).unwrap(),
+        )
+        .unwrap();
+        execute_cypher(
+            &mut s,
+            &parse_cypher(r#"CREATE (b:Person {name: "Bob", age: 25})"#).unwrap(),
+        )
+        .unwrap();
+        let r = execute_cypher(
+            &mut s,
+            &parse_cypher("MATCH (n:Person) WHERE n.age = 30 RETURN n.name").unwrap(),
+        )
+        .unwrap();
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0][0], PropValue::Text("Alice".into()));
     }
@@ -718,8 +833,7 @@ mod tests {
     fn with_where_filter() {
         // WITH + WHERE filters intermediate results
         let mut s = social_graph();
-        let cypher =
-            r#"MATCH (n:Person) WITH n WHERE n.name = "Alice" RETURN n.name"#;
+        let cypher = r#"MATCH (n:Person) WITH n WHERE n.name = "Alice" RETURN n.name"#;
         let r = execute_cypher(&mut s, &parse_cypher(cypher).unwrap()).unwrap();
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0][0], PropValue::Text("Alice".to_string()));

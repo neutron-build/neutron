@@ -11,7 +11,10 @@ async fn test_subscribe_and_unsubscribe() {
     assert_eq!(scalar(&res[0]), &Value::Int64(0));
     // Subscribe to a query watching table t1
     let res = exec(&ex, "SELECT subscribe('SELECT * FROM t1', 't1')").await;
-    let sub_id = match scalar(&res[0]) { Value::Int64(n) => *n, ref v => panic!("{v:?}") };
+    let sub_id = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
     assert!(sub_id > 0);
     let res = exec(&ex, "SELECT subscription_count()").await;
     assert_eq!(scalar(&res[0]), &Value::Int64(1));
@@ -35,13 +38,25 @@ async fn test_cdc_log_from_dml() {
     exec(&ex, "INSERT INTO cdc_test VALUES (2, 'b')").await;
     // CDC log should have entries
     let res = exec(&ex, "SELECT cdc_count()").await;
-    let count = match scalar(&res[0]) { Value::Int64(n) => *n, ref v => panic!("{v:?}") };
+    let count = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
     assert!(count >= 2, "expected >=2 CDC entries, got {count}");
     // Read CDC log
     let res = exec(&ex, "SELECT cdc_read(0, 10)").await;
-    let json = match scalar(&res[0]) { Value::Text(s) => s.clone(), ref v => panic!("{v:?}") };
-    assert!(json.contains("INSERT"), "CDC log should show INSERT: {json}");
-    assert!(json.contains("cdc_test"), "CDC log should reference table: {json}");
+    let json = match scalar(&res[0]) {
+        Value::Text(s) => s.clone(),
+        ref v => panic!("{v:?}"),
+    };
+    assert!(
+        json.contains("INSERT"),
+        "CDC log should show INSERT: {json}"
+    );
+    assert!(
+        json.contains("cdc_test"),
+        "CDC log should reference table: {json}"
+    );
 }
 
 #[tokio::test]
@@ -53,9 +68,15 @@ async fn test_cdc_table_read() {
     exec(&ex, "INSERT INTO cdc_b VALUES (2)").await;
     // Read only cdc_a entries
     let res = exec(&ex, "SELECT cdc_table_read('cdc_a', 0, 10)").await;
-    let json = match scalar(&res[0]) { Value::Text(s) => s.clone(), ref v => panic!("{v:?}") };
+    let json = match scalar(&res[0]) {
+        Value::Text(s) => s.clone(),
+        ref v => panic!("{v:?}"),
+    };
     assert!(json.contains("cdc_a"));
-    assert!(!json.contains("cdc_b"), "should only have cdc_a entries: {json}");
+    assert!(
+        !json.contains("cdc_b"),
+        "should only have cdc_a entries: {json}"
+    );
 }
 
 #[tokio::test]
@@ -66,7 +87,10 @@ async fn test_cdc_update_and_delete() {
     exec(&ex, "UPDATE cdc_ud SET val = 'y' WHERE id = 1").await;
     exec(&ex, "DELETE FROM cdc_ud WHERE id = 1").await;
     let res = exec(&ex, "SELECT cdc_table_read('cdc_ud', 0, 100)").await;
-    let json = match scalar(&res[0]) { Value::Text(s) => s.clone(), ref v => panic!("{v:?}") };
+    let json = match scalar(&res[0]) {
+        Value::Text(s) => s.clone(),
+        ref v => panic!("{v:?}"),
+    };
     assert!(json.contains("INSERT"));
     assert!(json.contains("UPDATE"));
     assert!(json.contains("DELETE"));
@@ -81,10 +105,20 @@ async fn test_cdc_update_and_delete() {
 async fn test_graph_add_node_and_edge() {
     let ex = test_executor();
     // Add two nodes
-    let res = exec(&ex, r#"SELECT graph_add_node('Person', '{"name":"Alice"}')"#).await;
-    let alice_id = match scalar(&res[0]) { Value::Int64(n) => *n, ref v => panic!("expected int, got {v:?}") };
+    let res = exec(
+        &ex,
+        r#"SELECT graph_add_node('Person', '{"name":"Alice"}')"#,
+    )
+    .await;
+    let alice_id = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("expected int, got {v:?}"),
+    };
     let res = exec(&ex, r#"SELECT graph_add_node('Person', '{"name":"Bob"}')"#).await;
-    let bob_id = match scalar(&res[0]) { Value::Int64(n) => *n, ref v => panic!("expected int, got {v:?}") };
+    let bob_id = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("expected int, got {v:?}"),
+    };
     // Add edge
     let sql = format!("SELECT graph_add_edge({alice_id}, {bob_id}, 'KNOWS')");
     let res = exec(&ex, &sql).await;
@@ -104,20 +138,35 @@ async fn test_graph_neighbors_and_shortest_path() {
     let ex = test_executor();
     // Build chain: A → B → C
     let res = exec(&ex, "SELECT graph_add_node('N')").await;
-    let a = match scalar(&res[0]) { Value::Int64(n) => *n, ref v => panic!("{v:?}") };
+    let a = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
     let res = exec(&ex, "SELECT graph_add_node('N')").await;
-    let b = match scalar(&res[0]) { Value::Int64(n) => *n, ref v => panic!("{v:?}") };
+    let b = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
     let res = exec(&ex, "SELECT graph_add_node('N')").await;
-    let c = match scalar(&res[0]) { Value::Int64(n) => *n, ref v => panic!("{v:?}") };
+    let c = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
     exec(&ex, &format!("SELECT graph_add_edge({a}, {b}, 'NEXT')")).await;
     exec(&ex, &format!("SELECT graph_add_edge({b}, {c}, 'NEXT')")).await;
     // Neighbors of A (outgoing) → B
     let res = exec(&ex, &format!("SELECT graph_neighbors({a})")).await;
-    let json = match scalar(&res[0]) { Value::Text(s) => s.clone(), ref v => panic!("{v:?}") };
+    let json = match scalar(&res[0]) {
+        Value::Text(s) => s.clone(),
+        ref v => panic!("{v:?}"),
+    };
     assert!(json.contains(&format!("\"neighbor_id\":{b}")));
     // Shortest path A→C
     let res = exec(&ex, &format!("SELECT graph_shortest_path({a}, {c})")).await;
-    let json = match scalar(&res[0]) { Value::Text(s) => s.clone(), ref v => panic!("{v:?}") };
+    let json = match scalar(&res[0]) {
+        Value::Text(s) => s.clone(),
+        ref v => panic!("{v:?}"),
+    };
     assert!(json.contains(&a.to_string()));
     assert!(json.contains(&c.to_string()));
 }
@@ -126,7 +175,10 @@ async fn test_graph_neighbors_and_shortest_path() {
 async fn test_graph_delete() {
     let ex = test_executor();
     let res = exec(&ex, "SELECT graph_add_node('X')").await;
-    let nid = match scalar(&res[0]) { Value::Int64(n) => *n, ref v => panic!("{v:?}") };
+    let nid = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
     let res = exec(&ex, &format!("SELECT graph_delete_node({nid})")).await;
     assert_eq!(scalar(&res[0]), &Value::Bool(true));
     // Double-delete → false
@@ -143,7 +195,10 @@ async fn test_graph_cypher_query() {
     exec(&ex, r#"SELECT graph_add_node('Person', '{"name":"Eve"}')"#).await;
     // Run Cypher MATCH
     let res = exec(&ex, "SELECT graph_query('MATCH (p:Person) RETURN p.name')").await;
-    let json = match scalar(&res[0]) { Value::Text(s) => s.clone(), ref v => panic!("{v:?}") };
+    let json = match scalar(&res[0]) {
+        Value::Text(s) => s.clone(),
+        ref v => panic!("{v:?}"),
+    };
     assert!(json.contains("Eve"), "cypher should find Eve: {json}");
 }
 
@@ -156,7 +211,11 @@ async fn test_graph_cypher_query() {
 async fn test_blob_store_and_get() {
     let ex = test_executor();
     // Store a blob (hex-encoded "hello")
-    let res = exec(&ex, "SELECT blob_store('myfile', '68656c6c6f', 'text/plain')").await;
+    let res = exec(
+        &ex,
+        "SELECT blob_store('myfile', '68656c6c6f', 'text/plain')",
+    )
+    .await;
     assert_eq!(scalar(&res[0]), &Value::Bool(true));
     // Retrieve it
     let res = exec(&ex, "SELECT blob_get('myfile')").await;
@@ -171,8 +230,16 @@ async fn test_blob_delete_and_count() {
     let ex = test_executor();
     let res = exec(&ex, "SELECT blob_count()").await;
     assert_eq!(scalar(&res[0]), &Value::Int64(0));
-    exec(&ex, "SELECT blob_store('a', 'ff', 'application/octet-stream')").await;
-    exec(&ex, "SELECT blob_store('b', 'ee', 'application/octet-stream')").await;
+    exec(
+        &ex,
+        "SELECT blob_store('a', 'ff', 'application/octet-stream')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT blob_store('b', 'ee', 'application/octet-stream')",
+    )
+    .await;
     let res = exec(&ex, "SELECT blob_count()").await;
     assert_eq!(scalar(&res[0]), &Value::Int64(2));
     let res = exec(&ex, "SELECT blob_delete('a')").await;
@@ -207,9 +274,21 @@ async fn test_blob_meta_and_tag() {
 #[tokio::test]
 async fn test_blob_list_and_dedup() {
     let ex = test_executor();
-    exec(&ex, "SELECT blob_store('data/a', 'aabb', 'application/octet-stream')").await;
-    exec(&ex, "SELECT blob_store('data/b', 'ccdd', 'application/octet-stream')").await;
-    exec(&ex, "SELECT blob_store('other', 'eeff', 'application/octet-stream')").await;
+    exec(
+        &ex,
+        "SELECT blob_store('data/a', 'aabb', 'application/octet-stream')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT blob_store('data/b', 'ccdd', 'application/octet-stream')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT blob_store('other', 'eeff', 'application/octet-stream')",
+    )
+    .await;
     // List all
     let res = exec(&ex, "SELECT blob_list()").await;
     let json = match scalar(&res[0]) {
@@ -243,7 +322,11 @@ async fn test_blob_list_and_dedup() {
 #[tokio::test]
 async fn test_complex_query_with_subquery_and_join() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE orders (id INT, customer_id INT, amount INT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE orders (id INT, customer_id INT, amount INT)",
+    )
+    .await;
     exec(&ex, "CREATE TABLE customers (id INT, name TEXT)").await;
     exec(&ex, "INSERT INTO customers VALUES (1, 'alice')").await;
     exec(&ex, "INSERT INTO customers VALUES (2, 'bob')").await;
@@ -260,7 +343,7 @@ async fn test_complex_query_with_subquery_and_join() {
     // Subquery in WHERE
     let results = exec(&ex, "SELECT name FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE amount > 100)").await;
     let r = rows(&results[0]);
-    assert!(r.len() >= 1);
+    assert!(!r.is_empty());
 }
 
 #[tokio::test]
@@ -289,7 +372,11 @@ async fn test_nested_subquery_exists() {
     exec(&ex, "INSERT INTO emp VALUES (1, 1, 'alice')").await;
 
     // EXISTS subquery
-    let results = exec(&ex, "SELECT name FROM dept WHERE EXISTS (SELECT 1 FROM emp WHERE emp.dept_id = dept.id)").await;
+    let results = exec(
+        &ex,
+        "SELECT name FROM dept WHERE EXISTS (SELECT 1 FROM emp WHERE emp.dept_id = dept.id)",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Text("engineering".into()));
@@ -305,7 +392,11 @@ async fn test_regexp_replace() {
 #[tokio::test]
 async fn test_age_function() {
     let ex = test_executor();
-    let results = exec(&ex, "SELECT AGE(MAKE_DATE(2024, 1, 1), MAKE_DATE(2020, 1, 1))").await;
+    let results = exec(
+        &ex,
+        "SELECT AGE(MAKE_DATE(2024, 1, 1), MAKE_DATE(2020, 1, 1))",
+    )
+    .await;
     match scalar(&results[0]) {
         Value::Text(s) => assert!(s.contains("4 years")),
         _ => panic!("expected text"),
@@ -330,7 +421,11 @@ async fn test_ends_with() {
 #[tokio::test]
 async fn test_jsonb_strip_nulls() {
     let ex = test_executor();
-    let results = exec(&ex, "SELECT JSONB_STRIP_NULLS('{\"a\": 1, \"b\": null}'::JSONB)").await;
+    let results = exec(
+        &ex,
+        "SELECT JSONB_STRIP_NULLS('{\"a\": 1, \"b\": null}'::JSONB)",
+    )
+    .await;
     match scalar(&results[0]) {
         Value::Jsonb(v) => {
             assert!(v.get("a").is_some());
@@ -396,9 +491,7 @@ async fn test_failed_fts_subsystem_blocks_ts_rank() {
         reg.mark_failed("fts", "index corruption");
     }
 
-    let result = ex
-        .execute("SELECT TS_RANK(body, 'hello') FROM docs")
-        .await;
+    let result = ex.execute("SELECT TS_RANK(body, 'hello') FROM docs").await;
     assert!(result.is_err(), "should fail when fts subsystem is down");
     let err_msg = format!("{}", result.unwrap_err());
     assert!(
@@ -511,7 +604,8 @@ async fn test_cypher_create_edge_and_traverse() {
     let results = exec(
         &ex,
         "SELECT CYPHER('MATCH (a:Person)-[r:FRIENDS]->(b:Person) RETURN a.name, b.name')",
-    ).await;
+    )
+    .await;
     match &results[0] {
         ExecResult::Select { rows, .. } => {
             let text = match &rows[0][0] {
@@ -530,10 +624,14 @@ async fn test_execute_cypher_query_direct() {
     let ex = test_executor();
 
     // Use the direct execute_cypher_query API
-    ex.execute_cypher_query(r#"CREATE (a:City {name: "NYC"})"#).unwrap();
-    ex.execute_cypher_query(r#"CREATE (b:City {name: "LA"})"#).unwrap();
+    ex.execute_cypher_query(r#"CREATE (a:City {name: "NYC"})"#)
+        .unwrap();
+    ex.execute_cypher_query(r#"CREATE (b:City {name: "LA"})"#)
+        .unwrap();
 
-    let result = ex.execute_cypher_query("MATCH (c:City) RETURN COUNT(*)").unwrap();
+    let result = ex
+        .execute_cypher_query("MATCH (c:City) RETURN COUNT(*)")
+        .unwrap();
     match result {
         ExecResult::Select { columns, rows } => {
             assert_eq!(columns[0].0, "COUNT(*)");
@@ -547,8 +645,16 @@ async fn test_execute_cypher_query_direct() {
 async fn test_cypher_with_where_clause() {
     let ex = test_executor();
 
-    exec(&ex, r#"SELECT CYPHER('CREATE (a:Person {name: "Alice", age: 30})')"#).await;
-    exec(&ex, r#"SELECT CYPHER('CREATE (b:Person {name: "Bob", age: 25})')"#).await;
+    exec(
+        &ex,
+        r#"SELECT CYPHER('CREATE (a:Person {name: "Alice", age: 30})')"#,
+    )
+    .await;
+    exec(
+        &ex,
+        r#"SELECT CYPHER('CREATE (b:Person {name: "Bob", age: 25})')"#,
+    )
+    .await;
 
     let result = ex
         .execute_cypher_query("MATCH (n:Person) WHERE n.age = 30 RETURN n.name")
@@ -583,9 +689,12 @@ async fn test_cypher_persistent_graph_store() {
     let ex = test_executor();
 
     // Create in one call, query in another — graph store persists across calls
-    ex.execute_cypher_query(r#"CREATE (n:Animal {species: "Dog"})"#).unwrap();
-    ex.execute_cypher_query(r#"CREATE (n:Animal {species: "Cat"})"#).unwrap();
-    ex.execute_cypher_query(r#"CREATE (n:Animal {species: "Bird"})"#).unwrap();
+    ex.execute_cypher_query(r#"CREATE (n:Animal {species: "Dog"})"#)
+        .unwrap();
+    ex.execute_cypher_query(r#"CREATE (n:Animal {species: "Cat"})"#)
+        .unwrap();
+    ex.execute_cypher_query(r#"CREATE (n:Animal {species: "Bird"})"#)
+        .unwrap();
 
     // Verify persistence
     let gs = ex.graph_store().read();
@@ -600,7 +709,9 @@ async fn test_cypher_persistent_graph_store() {
 #[tokio::test]
 async fn test_reactive_insert_notifies_subscribers() {
     let ex = test_executor();
-    ex.execute("CREATE TABLE events (id INT, name TEXT)").await.unwrap();
+    ex.execute("CREATE TABLE events (id INT, name TEXT)")
+        .await
+        .unwrap();
 
     // Subscribe to 'events' table changes — keep rx alive
     let mut rx = {
@@ -608,7 +719,9 @@ async fn test_reactive_insert_notifies_subscribers() {
         notifier.subscribe("events")
     };
 
-    ex.execute("INSERT INTO events VALUES (1, 'test')").await.unwrap();
+    ex.execute("INSERT INTO events VALUES (1, 'test')")
+        .await
+        .unwrap();
 
     // Verify we received the notification
     let event = rx.try_recv().unwrap();
@@ -619,8 +732,12 @@ async fn test_reactive_insert_notifies_subscribers() {
 #[tokio::test]
 async fn test_reactive_update_notifies_subscribers() {
     let ex = test_executor();
-    ex.execute("CREATE TABLE scores (id INT, val INT)").await.unwrap();
-    ex.execute("INSERT INTO scores VALUES (1, 100)").await.unwrap();
+    ex.execute("CREATE TABLE scores (id INT, val INT)")
+        .await
+        .unwrap();
+    ex.execute("INSERT INTO scores VALUES (1, 100)")
+        .await
+        .unwrap();
 
     // Subscribe and capture change
     let mut rx = {
@@ -628,7 +745,9 @@ async fn test_reactive_update_notifies_subscribers() {
         notifier.subscribe("scores")
     };
 
-    ex.execute("UPDATE scores SET val = 200 WHERE id = 1").await.unwrap();
+    ex.execute("UPDATE scores SET val = 200 WHERE id = 1")
+        .await
+        .unwrap();
 
     let event = rx.try_recv().unwrap();
     assert_eq!(event.table, "scores");
@@ -638,8 +757,12 @@ async fn test_reactive_update_notifies_subscribers() {
 #[tokio::test]
 async fn test_reactive_delete_notifies_subscribers() {
     let ex = test_executor();
-    ex.execute("CREATE TABLE logs (id INT, msg TEXT)").await.unwrap();
-    ex.execute("INSERT INTO logs VALUES (1, 'hello')").await.unwrap();
+    ex.execute("CREATE TABLE logs (id INT, msg TEXT)")
+        .await
+        .unwrap();
+    ex.execute("INSERT INTO logs VALUES (1, 'hello')")
+        .await
+        .unwrap();
 
     let mut rx = {
         let mut notifier = ex.change_notifier().write();
@@ -664,7 +787,9 @@ async fn test_reactive_no_notification_on_zero_rows() {
     };
 
     // Delete from empty table — 0 rows affected, no notification
-    ex.execute("DELETE FROM empty_tbl WHERE id = 1").await.unwrap();
+    ex.execute("DELETE FROM empty_tbl WHERE id = 1")
+        .await
+        .unwrap();
 
     assert!(rx.try_recv().is_err());
 }
@@ -672,7 +797,9 @@ async fn test_reactive_no_notification_on_zero_rows() {
 #[tokio::test]
 async fn test_reactive_subscription_manager_wired() {
     let ex = test_executor();
-    ex.execute("CREATE TABLE orders (id INT, total INT)").await.unwrap();
+    ex.execute("CREATE TABLE orders (id INT, total INT)")
+        .await
+        .unwrap();
 
     // Subscribe via subscription manager
     {
@@ -746,7 +873,9 @@ async fn test_metrics_tracking_after_queries() {
     ex.execute("INSERT INTO m VALUES (1)").await.unwrap();
     ex.execute("INSERT INTO m VALUES (2)").await.unwrap();
     ex.execute("SELECT * FROM m").await.unwrap();
-    ex.execute("UPDATE m SET id = 3 WHERE id = 1").await.unwrap();
+    ex.execute("UPDATE m SET id = 3 WHERE id = 1")
+        .await
+        .unwrap();
     ex.execute("DELETE FROM m WHERE id = 2").await.unwrap();
 
     let m = ex.metrics();
@@ -770,11 +899,15 @@ async fn test_show_metrics_returns_real_values() {
             assert_eq!(columns.len(), 3);
             assert_eq!(columns[0].0, "metric");
             // queries_total should be > 0 now
-            let qt = rows.iter().find(|r| {
-                matches!(&r[0], Value::Text(t) if t == "nucleus_queries_total")
-            }).unwrap();
+            let qt = rows
+                .iter()
+                .find(|r| matches!(&r[0], Value::Text(t) if t == "nucleus_queries_total"))
+                .unwrap();
             // Value should not be "0" since we ran queries
-            let val = match &qt[2] { Value::Text(t) => t.clone(), _ => "0".into() };
+            let val = match &qt[2] {
+                Value::Text(t) => t.clone(),
+                _ => "0".into(),
+            };
             assert_ne!(val, "0");
         }
         _ => panic!("expected select"),
@@ -860,9 +993,14 @@ async fn test_shared_metrics_registry() {
 #[tokio::test]
 async fn test_subscribe_returns_subscription_id() {
     let ex = test_executor();
-    ex.execute("CREATE TABLE orders (id INT, status TEXT)").await.unwrap();
+    ex.execute("CREATE TABLE orders (id INT, status TEXT)")
+        .await
+        .unwrap();
 
-    let results = ex.execute("SUBSCRIBE SELECT * FROM orders WHERE status = 'pending'").await.unwrap();
+    let results = ex
+        .execute("SUBSCRIBE SELECT * FROM orders WHERE status = 'pending'")
+        .await
+        .unwrap();
     match &results[0] {
         ExecResult::Select { columns, rows } => {
             assert_eq!(columns[0].0, "subscription_id");
@@ -910,7 +1048,10 @@ async fn test_subscribe_quoted_query() {
     let ex = test_executor();
     ex.execute("CREATE TABLE events (id INT)").await.unwrap();
 
-    let results = ex.execute("SUBSCRIBE 'SELECT * FROM events'").await.unwrap();
+    let results = ex
+        .execute("SUBSCRIBE 'SELECT * FROM events'")
+        .await
+        .unwrap();
     match &results[0] {
         ExecResult::Select { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -930,7 +1071,9 @@ async fn test_subscribe_quoted_query() {
 #[tokio::test]
 async fn test_fetch_subscription_empty() {
     let ex = test_executor();
-    ex.execute("CREATE TABLE feed (id INT, val TEXT)").await.unwrap();
+    ex.execute("CREATE TABLE feed (id INT, val TEXT)")
+        .await
+        .unwrap();
 
     let sub_results = ex.execute("SUBSCRIBE SELECT * FROM feed").await.unwrap();
     let sub_id = match &sub_results[0] {
@@ -942,7 +1085,10 @@ async fn test_fetch_subscription_empty() {
     };
 
     // No DML yet — fetch returns no rows
-    let results = ex.execute(&format!("FETCH SUBSCRIPTION {sub_id}")).await.unwrap();
+    let results = ex
+        .execute(&format!("FETCH SUBSCRIPTION {sub_id}"))
+        .await
+        .unwrap();
     match &results[0] {
         ExecResult::Select { columns, rows } => {
             assert_eq!(columns[0].0, "subscription_id");
@@ -957,9 +1103,14 @@ async fn test_fetch_subscription_empty() {
 #[tokio::test]
 async fn test_fetch_subscription_after_insert() {
     let ex = test_executor();
-    ex.execute("CREATE TABLE products (id INT, name TEXT)").await.unwrap();
+    ex.execute("CREATE TABLE products (id INT, name TEXT)")
+        .await
+        .unwrap();
 
-    let sub_results = ex.execute("SUBSCRIBE SELECT * FROM products").await.unwrap();
+    let sub_results = ex
+        .execute("SUBSCRIBE SELECT * FROM products")
+        .await
+        .unwrap();
     let sub_id = match &sub_results[0] {
         ExecResult::Select { rows, .. } => match &rows[0][0] {
             Value::Int64(id) => *id,
@@ -968,10 +1119,17 @@ async fn test_fetch_subscription_after_insert() {
         _ => panic!("expected select"),
     };
 
-    ex.execute("INSERT INTO products VALUES (1, 'widget')").await.unwrap();
-    ex.execute("INSERT INTO products VALUES (2, 'gadget')").await.unwrap();
+    ex.execute("INSERT INTO products VALUES (1, 'widget')")
+        .await
+        .unwrap();
+    ex.execute("INSERT INTO products VALUES (2, 'gadget')")
+        .await
+        .unwrap();
 
-    let results = ex.execute(&format!("FETCH SUBSCRIPTION {sub_id}")).await.unwrap();
+    let results = ex
+        .execute(&format!("FETCH SUBSCRIPTION {sub_id}"))
+        .await
+        .unwrap();
     match &results[0] {
         ExecResult::Select { rows, .. } => {
             // Two inserts → two diff entries
@@ -1009,7 +1167,10 @@ async fn test_fetch_subscription_drains_buffer() {
     ex.execute("INSERT INTO logs VALUES (2)").await.unwrap();
 
     // First fetch returns 2 diffs
-    let r1 = ex.execute(&format!("FETCH SUBSCRIPTION {sub_id}")).await.unwrap();
+    let r1 = ex
+        .execute(&format!("FETCH SUBSCRIPTION {sub_id}"))
+        .await
+        .unwrap();
     let count1 = match &r1[0] {
         ExecResult::Select { rows, .. } => rows.len(),
         _ => panic!("expected select"),
@@ -1017,7 +1178,10 @@ async fn test_fetch_subscription_drains_buffer() {
     assert_eq!(count1, 2);
 
     // Second fetch returns 0 — buffer drained
-    let r2 = ex.execute(&format!("FETCH SUBSCRIPTION {sub_id}")).await.unwrap();
+    let r2 = ex
+        .execute(&format!("FETCH SUBSCRIPTION {sub_id}"))
+        .await
+        .unwrap();
     match &r2[0] {
         ExecResult::Select { rows, .. } => assert!(rows.is_empty()),
         _ => panic!("expected select"),
@@ -1039,18 +1203,26 @@ async fn test_fetch_subscription_with_limit() {
     };
 
     for i in 1..=5 {
-        ex.execute(&format!("INSERT INTO events VALUES ({i})")).await.unwrap();
+        ex.execute(&format!("INSERT INTO events VALUES ({i})"))
+            .await
+            .unwrap();
     }
 
     // Fetch only 2
-    let r = ex.execute(&format!("FETCH SUBSCRIPTION {sub_id} LIMIT 2")).await.unwrap();
+    let r = ex
+        .execute(&format!("FETCH SUBSCRIPTION {sub_id} LIMIT 2"))
+        .await
+        .unwrap();
     match &r[0] {
         ExecResult::Select { rows, .. } => assert_eq!(rows.len(), 2),
         _ => panic!("expected select"),
     }
 
     // 3 remain
-    let r2 = ex.execute(&format!("FETCH SUBSCRIPTION {sub_id}")).await.unwrap();
+    let r2 = ex
+        .execute(&format!("FETCH SUBSCRIPTION {sub_id}"))
+        .await
+        .unwrap();
     match &r2[0] {
         ExecResult::Select { rows, .. } => assert_eq!(rows.len(), 3),
         _ => panic!("expected select"),
@@ -1060,8 +1232,12 @@ async fn test_fetch_subscription_with_limit() {
 #[tokio::test]
 async fn test_fetch_subscription_delete_produces_removed_rows() {
     let ex = test_executor();
-    ex.execute("CREATE TABLE items (id INT, name TEXT)").await.unwrap();
-    ex.execute("INSERT INTO items VALUES (1, 'alpha')").await.unwrap();
+    ex.execute("CREATE TABLE items (id INT, name TEXT)")
+        .await
+        .unwrap();
+    ex.execute("INSERT INTO items VALUES (1, 'alpha')")
+        .await
+        .unwrap();
 
     let sub_results = ex.execute("SUBSCRIBE SELECT * FROM items").await.unwrap();
     let sub_id = match &sub_results[0] {
@@ -1074,7 +1250,10 @@ async fn test_fetch_subscription_delete_produces_removed_rows() {
 
     ex.execute("DELETE FROM items WHERE id = 1").await.unwrap();
 
-    let r = ex.execute(&format!("FETCH SUBSCRIPTION {sub_id}")).await.unwrap();
+    let r = ex
+        .execute(&format!("FETCH SUBSCRIPTION {sub_id}"))
+        .await
+        .unwrap();
     match &r[0] {
         ExecResult::Select { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -1128,15 +1307,15 @@ async fn test_cache_get_missing_key() {
 #[tokio::test]
 async fn test_cache_set_with_ttl() {
     let ex = test_executor();
-    ex.execute("CACHE_SET('ttlkey', 'ttlvalue', 300)").await.unwrap();
+    ex.execute("CACHE_SET('ttlkey', 'ttlvalue', 300)")
+        .await
+        .unwrap();
     let results = ex.execute("CACHE_TTL('ttlkey')").await.unwrap();
     match &results[0] {
-        ExecResult::Select { rows, .. } => {
-            match &rows[0][0] {
-                Value::Float64(secs) => assert!(*secs > 290.0 && *secs <= 300.0),
-                _ => panic!("expected Float64"),
-            }
-        }
+        ExecResult::Select { rows, .. } => match &rows[0][0] {
+            Value::Float64(secs) => assert!(*secs > 290.0 && *secs <= 300.0),
+            _ => panic!("expected Float64"),
+        },
         _ => panic!("expected Select"),
     }
 }
@@ -1258,7 +1437,11 @@ async fn test_cache_paren_syntax() {
 #[tokio::test]
 async fn test_append_only_create_and_insert() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE audit_log (id INT, event TEXT) WITH (append_only = true)").await;
+    exec(
+        &ex,
+        "CREATE TABLE audit_log (id INT, event TEXT) WITH (append_only = true)",
+    )
+    .await;
     exec(&ex, "INSERT INTO audit_log VALUES (1, 'login')").await;
     exec(&ex, "INSERT INTO audit_log VALUES (2, 'logout')").await;
     let results = ex.execute("SELECT * FROM audit_log").await.unwrap();
@@ -1271,23 +1454,39 @@ async fn test_append_only_create_and_insert() {
 #[tokio::test]
 async fn test_append_only_rejects_update() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE audit_log2 (id INT, event TEXT) WITH (append_only = true)").await;
+    exec(
+        &ex,
+        "CREATE TABLE audit_log2 (id INT, event TEXT) WITH (append_only = true)",
+    )
+    .await;
     exec(&ex, "INSERT INTO audit_log2 VALUES (1, 'login')").await;
-    let err = ex.execute("UPDATE audit_log2 SET event = 'changed' WHERE id = 1").await;
+    let err = ex
+        .execute("UPDATE audit_log2 SET event = 'changed' WHERE id = 1")
+        .await;
     assert!(err.is_err(), "UPDATE should fail on append-only table");
     let msg = format!("{:?}", err.unwrap_err());
-    assert!(msg.contains("append-only"), "error should mention append-only: {msg}");
+    assert!(
+        msg.contains("append-only"),
+        "error should mention append-only: {msg}"
+    );
 }
 
 #[tokio::test]
 async fn test_append_only_rejects_delete() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE audit_log3 (id INT, event TEXT) WITH (append_only = true)").await;
+    exec(
+        &ex,
+        "CREATE TABLE audit_log3 (id INT, event TEXT) WITH (append_only = true)",
+    )
+    .await;
     exec(&ex, "INSERT INTO audit_log3 VALUES (1, 'login')").await;
     let err = ex.execute("DELETE FROM audit_log3 WHERE id = 1").await;
     assert!(err.is_err(), "DELETE should fail on append-only table");
     let msg = format!("{:?}", err.unwrap_err());
-    assert!(msg.contains("append-only"), "error should mention append-only: {msg}");
+    assert!(
+        msg.contains("append-only"),
+        "error should mention append-only: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -1296,27 +1495,47 @@ async fn test_non_append_only_allows_update_delete() {
     exec(&ex, "CREATE TABLE normal_table (id INT, val TEXT)").await;
     exec(&ex, "INSERT INTO normal_table VALUES (1, 'a')").await;
     // UPDATE should succeed on normal table
-    ex.execute("UPDATE normal_table SET val = 'b' WHERE id = 1").await.unwrap();
+    ex.execute("UPDATE normal_table SET val = 'b' WHERE id = 1")
+        .await
+        .unwrap();
     // DELETE should succeed on normal table
-    ex.execute("DELETE FROM normal_table WHERE id = 1").await.unwrap();
+    ex.execute("DELETE FROM normal_table WHERE id = 1")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn test_append_only_with_options_false() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE not_append (id INT) WITH (append_only = false)").await;
+    exec(
+        &ex,
+        "CREATE TABLE not_append (id INT) WITH (append_only = false)",
+    )
+    .await;
     exec(&ex, "INSERT INTO not_append VALUES (1)").await;
     // Should allow UPDATE and DELETE since append_only = false
-    ex.execute("UPDATE not_append SET id = 2 WHERE id = 1").await.unwrap();
-    ex.execute("DELETE FROM not_append WHERE id = 2").await.unwrap();
+    ex.execute("UPDATE not_append SET id = 2 WHERE id = 1")
+        .await
+        .unwrap();
+    ex.execute("DELETE FROM not_append WHERE id = 2")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn test_append_only_multiple_inserts() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE events (id INT, ts TEXT) WITH (append_only = true)").await;
+    exec(
+        &ex,
+        "CREATE TABLE events (id INT, ts TEXT) WITH (append_only = true)",
+    )
+    .await;
     for i in 1..=10 {
-        exec(&ex, &format!("INSERT INTO events VALUES ({i}, 'event_{i}')")).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO events VALUES ({i}, 'event_{i}')"),
+        )
+        .await;
     }
     let results = ex.execute("SELECT * FROM events").await.unwrap();
     match &results[0] {
@@ -1333,7 +1552,11 @@ async fn test_append_only_multiple_inserts() {
 #[tokio::test]
 async fn test_columnar_table_create_insert_scan() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE analytics (id INT, amount FLOAT) WITH (engine = 'columnar')").await;
+    exec(
+        &ex,
+        "CREATE TABLE analytics (id INT, amount FLOAT) WITH (engine = 'columnar')",
+    )
+    .await;
     exec(&ex, "INSERT INTO analytics VALUES (1, 100.0)").await;
     exec(&ex, "INSERT INTO analytics VALUES (2, 200.0)").await;
     let results = exec(&ex, "SELECT * FROM analytics").await;
@@ -1344,9 +1567,17 @@ async fn test_columnar_table_create_insert_scan() {
 #[tokio::test]
 async fn test_columnar_table_count_fast_path() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE col_tbl (x INT, y FLOAT) WITH (engine = 'columnar')").await;
+    exec(
+        &ex,
+        "CREATE TABLE col_tbl (x INT, y FLOAT) WITH (engine = 'columnar')",
+    )
+    .await;
     for i in 1..=50 {
-        exec(&ex, &format!("INSERT INTO col_tbl VALUES ({i}, {}.0)", i * 2)).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO col_tbl VALUES ({i}, {}.0)", i * 2),
+        )
+        .await;
     }
     let results = exec(&ex, "SELECT COUNT(*) FROM col_tbl").await;
     let v = scalar(&results[0]);
@@ -1356,8 +1587,16 @@ async fn test_columnar_table_count_fast_path() {
 #[tokio::test]
 async fn test_columnar_table_sum_fast_path() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE col_sum (id INT, val FLOAT) WITH (engine = 'columnar')").await;
-    exec(&ex, "INSERT INTO col_sum VALUES (1, 10.0), (2, 20.0), (3, 30.0)").await;
+    exec(
+        &ex,
+        "CREATE TABLE col_sum (id INT, val FLOAT) WITH (engine = 'columnar')",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO col_sum VALUES (1, 10.0), (2, 20.0), (3, 30.0)",
+    )
+    .await;
     let results = exec(&ex, "SELECT SUM(val) FROM col_sum").await;
     let v = scalar(&results[0]);
     assert!(matches!(v, Value::Float64(f) if (*f - 60.0).abs() < 1e-9));
@@ -1367,7 +1606,11 @@ async fn test_columnar_table_sum_fast_path() {
 async fn test_columnar_and_regular_tables_coexist() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE regular (id INT, name TEXT)").await;
-    exec(&ex, "CREATE TABLE columnar (id INT, name TEXT) WITH (engine = 'columnar')").await;
+    exec(
+        &ex,
+        "CREATE TABLE columnar (id INT, name TEXT) WITH (engine = 'columnar')",
+    )
+    .await;
     exec(&ex, "INSERT INTO regular VALUES (1, 'alice')").await;
     exec(&ex, "INSERT INTO columnar VALUES (2, 'bob')").await;
     let r1 = exec(&ex, "SELECT * FROM regular").await;
@@ -1382,7 +1625,11 @@ async fn test_columnar_and_regular_tables_coexist() {
 #[tokio::test]
 async fn test_columnar_table_drop() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE to_drop (x INT) WITH (engine = 'columnar')").await;
+    exec(
+        &ex,
+        "CREATE TABLE to_drop (x INT) WITH (engine = 'columnar')",
+    )
+    .await;
     exec(&ex, "INSERT INTO to_drop VALUES (1)").await;
     exec(&ex, "DROP TABLE to_drop").await;
     // Table should be gone from catalog
@@ -1393,8 +1640,16 @@ async fn test_columnar_table_drop() {
 #[tokio::test]
 async fn test_columnar_table_delete() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE col_del (id INT, v FLOAT) WITH (engine = 'columnar')").await;
-    exec(&ex, "INSERT INTO col_del VALUES (1, 1.0), (2, 2.0), (3, 3.0)").await;
+    exec(
+        &ex,
+        "CREATE TABLE col_del (id INT, v FLOAT) WITH (engine = 'columnar')",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO col_del VALUES (1, 1.0), (2, 2.0), (3, 3.0)",
+    )
+    .await;
     exec(&ex, "DELETE FROM col_del WHERE id = 2").await;
     let results = exec(&ex, "SELECT COUNT(*) FROM col_del").await;
     let v = scalar(&results[0]);
@@ -1404,8 +1659,16 @@ async fn test_columnar_table_delete() {
 #[tokio::test]
 async fn test_columnar_group_by_fast_path() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE col_grp (status TEXT, amount FLOAT) WITH (engine = 'columnar')").await;
-    exec(&ex, "INSERT INTO col_grp VALUES ('a', 10.0), ('b', 20.0), ('a', 30.0)").await;
+    exec(
+        &ex,
+        "CREATE TABLE col_grp (status TEXT, amount FLOAT) WITH (engine = 'columnar')",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO col_grp VALUES ('a', 10.0), ('b', 20.0), ('a', 30.0)",
+    )
+    .await;
     let results = exec(&ex, "SELECT status, COUNT(*) FROM col_grp GROUP BY status").await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
@@ -1419,7 +1682,11 @@ async fn test_columnar_group_by_fast_path() {
 #[tokio::test]
 async fn test_lsm_table_create_insert_scan() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE events (id INT, msg TEXT) WITH (engine = 'lsm')").await;
+    exec(
+        &ex,
+        "CREATE TABLE events (id INT, msg TEXT) WITH (engine = 'lsm')",
+    )
+    .await;
     exec(&ex, "INSERT INTO events VALUES (1, 'hello')").await;
     exec(&ex, "INSERT INTO events VALUES (2, 'world')").await;
     let results = exec(&ex, "SELECT * FROM events").await;
@@ -1543,14 +1810,26 @@ async fn test_current_date_returns_date() {
 async fn test_uuid_column_insert_and_select() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE uuidtest (id UUID, name TEXT)").await;
-    exec(&ex, "INSERT INTO uuidtest VALUES (gen_random_uuid(), 'alice')").await;
-    exec(&ex, "INSERT INTO uuidtest VALUES (gen_random_uuid(), 'bob')").await;
+    exec(
+        &ex,
+        "INSERT INTO uuidtest VALUES (gen_random_uuid(), 'alice')",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO uuidtest VALUES (gen_random_uuid(), 'bob')",
+    )
+    .await;
     let results = exec(&ex, "SELECT id, name FROM uuidtest").await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
     // All IDs should be UUIDs
     for row in r.iter() {
-        assert!(matches!(row[0], Value::Uuid(_)), "id should be Uuid, got {:?}", row[0]);
+        assert!(
+            matches!(row[0], Value::Uuid(_)),
+            "id should be Uuid, got {:?}",
+            row[0]
+        );
     }
     // IDs should be distinct
     assert_ne!(r[0][0], r[1][0], "UUIDs should be distinct");
@@ -1559,11 +1838,17 @@ async fn test_uuid_column_insert_and_select() {
 #[tokio::test]
 async fn test_timestamp_column_with_now_default() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE tstest (id INT, created_at TIMESTAMPTZ DEFAULT NOW())").await;
+    exec(
+        &ex,
+        "CREATE TABLE tstest (id INT, created_at TIMESTAMPTZ DEFAULT NOW())",
+    )
+    .await;
     exec(&ex, "INSERT INTO tstest (id) VALUES (1)").await;
     let results = exec(&ex, "SELECT id, created_at FROM tstest").await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
-    assert!(matches!(r[0][1], Value::TimestampTz(_)), "created_at should be TimestampTz");
+    assert!(
+        matches!(r[0][1], Value::TimestampTz(_)),
+        "created_at should be TimestampTz"
+    );
 }
-

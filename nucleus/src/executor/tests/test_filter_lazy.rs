@@ -22,14 +22,22 @@ async fn test_where_filter_simple_equality() {
 #[tokio::test]
 async fn test_where_filter_multiple_conditions() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE products (id INT, category TEXT, price INT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE products (id INT, category TEXT, price INT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO products VALUES (1, 'electronics', 100)").await;
     exec(&ex, "INSERT INTO products VALUES (2, 'books', 20)").await;
     exec(&ex, "INSERT INTO products VALUES (3, 'electronics', 500)").await;
     exec(&ex, "INSERT INTO products VALUES (4, 'books', 15)").await;
 
     // WHERE category = 'electronics' AND price > 200
-    let results = exec(&ex, "SELECT * FROM products WHERE category = 'electronics' AND price > 200").await;
+    let results = exec(
+        &ex,
+        "SELECT * FROM products WHERE category = 'electronics' AND price > 200",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][2], Value::Int32(500));
@@ -44,7 +52,11 @@ async fn test_where_filter_in_clause() {
     exec(&ex, "INSERT INTO orders VALUES (3, 'delivered')").await;
     exec(&ex, "INSERT INTO orders VALUES (4, 'cancelled')").await;
 
-    let results = exec(&ex, "SELECT * FROM orders WHERE status IN ('shipped', 'delivered')").await;
+    let results = exec(
+        &ex,
+        "SELECT * FROM orders WHERE status IN ('shipped', 'delivered')",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
 }
@@ -101,7 +113,11 @@ async fn test_where_filter_complex_boolean_expr() {
     exec(&ex, "INSERT INTO data VALUES (25, 30, 'z')").await;
 
     // WHERE (a > 5 AND b < 25) OR c = 'z'
-    let results = exec(&ex, "SELECT * FROM data WHERE (a > 5 AND b < 25) OR c = 'z'").await;
+    let results = exec(
+        &ex,
+        "SELECT * FROM data WHERE (a > 5 AND b < 25) OR c = 'z'",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
 }
@@ -116,7 +132,11 @@ async fn test_where_filter_with_order_by() {
     exec(&ex, "INSERT INTO sorted VALUES (4, 60)").await;
 
     // WHERE score > 55 ORDER BY score DESC
-    let results = exec(&ex, "SELECT * FROM sorted WHERE score > 55 ORDER BY score DESC").await;
+    let results = exec(
+        &ex,
+        "SELECT * FROM sorted WHERE score > 55 ORDER BY score DESC",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 3);
     assert_eq!(r[0][1], Value::Int32(100));
@@ -182,7 +202,11 @@ async fn test_where_filter_selective_hit_rate() {
     // Insert 100 rows with mostly category = 1
     for i in 1..=100 {
         let category = if i > 95 { 2 } else { 1 };
-        exec(&ex, &format!("INSERT INTO large_table VALUES ({}, {})", i, category)).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO large_table VALUES ({}, {})", i, category),
+        )
+        .await;
     }
 
     // WHERE category = 2 should match only 5 out of 100 rows (5% hit rate)

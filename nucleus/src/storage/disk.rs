@@ -71,7 +71,10 @@ impl DiskManager {
     }
 
     /// Open a database file with both compression and encryption.
-    pub fn open_compressed_encrypted(path: &Path, encryptor: PageEncryptor) -> std::io::Result<Self> {
+    pub fn open_compressed_encrypted(
+        path: &Path,
+        encryptor: PageEncryptor,
+    ) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -140,9 +143,8 @@ impl DiskManager {
                 buf.copy_from_slice(&d);
             }
         } else if self.compression_enabled {
-            let page = PageCompressor::decompress_page(&raw).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-            })?;
+            let page = PageCompressor::decompress_page(&raw)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             buf.copy_from_slice(&page);
         } else {
             buf.copy_from_slice(&raw[..PAGE_SIZE]);

@@ -8,8 +8,8 @@
 
 use crate::executor::{ExecError, Executor};
 use crate::types::Value;
-use sqlparser::parser::Parser;
 use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 use std::sync::Arc;
 
 /// Parsed and prepared query state.
@@ -32,8 +32,9 @@ impl PreparedQuery {
 
         // Parse SQL to validate syntax and count parameters
         let dialect = PostgreSqlDialect {};
-        let _parsed = Parser::parse_sql(&dialect, &sql)
-            .map_err(|e| ExecError::Parse(crate::sql::ParseError::UnexpectedStatement(e.to_string())))?;
+        let _parsed = Parser::parse_sql(&dialect, &sql).map_err(|e| {
+            ExecError::Parse(crate::sql::ParseError::UnexpectedStatement(e.to_string()))
+        })?;
 
         // Count parameter placeholders ($1, $2, etc.)
         let mut param_count = 0u16;
@@ -96,17 +97,11 @@ impl QueryHandler {
         self.prepared_cache
             .get(&stmt_id)
             .cloned()
-            .ok_or_else(|| {
-                ExecError::Runtime(format!("Prepared statement {} not found", stmt_id))
-            })
+            .ok_or_else(|| ExecError::Runtime(format!("Prepared statement {} not found", stmt_id)))
     }
 
     /// Bind parameters to a prepared statement.
-    pub fn bind_parameters(
-        &self,
-        stmt_id: u32,
-        params: Vec<Value>,
-    ) -> Result<String, ExecError> {
+    pub fn bind_parameters(&self, stmt_id: u32, params: Vec<Value>) -> Result<String, ExecError> {
         let prepared = self.get_prepared(stmt_id)?;
 
         if params.len() != prepared.param_count as usize {
@@ -129,7 +124,12 @@ impl QueryHandler {
                 Value::Int64(n) => n.to_string(),
                 Value::Float64(f) => f.to_string(),
                 Value::Text(s) => format!("'{}'", s.replace("'", "''")),
-                _ => return Err(ExecError::Runtime(format!("Unsupported parameter type: {:?}", param))),
+                _ => {
+                    return Err(ExecError::Runtime(format!(
+                        "Unsupported parameter type: {:?}",
+                        param
+                    )));
+                }
             };
             substituted = substituted.replace("?", &param_str);
         }

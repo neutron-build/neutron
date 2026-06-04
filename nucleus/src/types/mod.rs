@@ -31,7 +31,11 @@ pub enum Value {
     /// Dense vector for similarity search.
     Vector(Vec<f32>),
     /// Interval: months, days, microseconds (PostgreSQL-compatible).
-    Interval { months: i32, days: i32, microseconds: i64 },
+    Interval {
+        months: i32,
+        days: i32,
+        microseconds: i64,
+    },
 }
 
 impl fmt::Display for Value {
@@ -58,10 +62,22 @@ impl fmt::Display for Value {
                 write!(
                     f,
                     "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                    bytes[0], bytes[1], bytes[2], bytes[3],
-                    bytes[4], bytes[5], bytes[6], bytes[7],
-                    bytes[8], bytes[9], bytes[10], bytes[11],
-                    bytes[12], bytes[13], bytes[14], bytes[15]
+                    bytes[0],
+                    bytes[1],
+                    bytes[2],
+                    bytes[3],
+                    bytes[4],
+                    bytes[5],
+                    bytes[6],
+                    bytes[7],
+                    bytes[8],
+                    bytes[9],
+                    bytes[10],
+                    bytes[11],
+                    bytes[12],
+                    bytes[13],
+                    bytes[14],
+                    bytes[15]
                 )
             }
             Value::Bytea(b) => {
@@ -91,13 +107,32 @@ impl fmt::Display for Value {
                 }
                 write!(f, "]")
             }
-            Value::Interval { months, days, microseconds } => {
+            Value::Interval {
+                months,
+                days,
+                microseconds,
+            } => {
                 let mut parts = Vec::new();
                 let years = months / 12;
                 let rem_months = months % 12;
-                if years != 0 { parts.push(format!("{years} year{}", if years.abs() != 1 { "s" } else { "" })); }
-                if rem_months != 0 { parts.push(format!("{rem_months} mon{}", if rem_months.abs() != 1 { "s" } else { "" })); }
-                if *days != 0 { parts.push(format!("{days} day{}", if days.abs() != 1 { "s" } else { "" })); }
+                if years != 0 {
+                    parts.push(format!(
+                        "{years} year{}",
+                        if years.abs() != 1 { "s" } else { "" }
+                    ));
+                }
+                if rem_months != 0 {
+                    parts.push(format!(
+                        "{rem_months} mon{}",
+                        if rem_months.abs() != 1 { "s" } else { "" }
+                    ));
+                }
+                if *days != 0 {
+                    parts.push(format!(
+                        "{days} day{}",
+                        if days.abs() != 1 { "s" } else { "" }
+                    ));
+                }
                 if *microseconds != 0 || parts.is_empty() {
                     let total_us = microseconds.unsigned_abs();
                     let h = total_us / 3_600_000_000;
@@ -215,7 +250,10 @@ fn format_timestamp(f: &mut fmt::Formatter<'_>, us: i64) -> fmt::Result {
     let minute = (time_secs % 3600) / 60;
     let second = time_secs % 60;
     if frac > 0 {
-        write!(f, "{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02}.{frac:06}")
+        write!(
+            f,
+            "{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02}.{frac:06}"
+        )
     } else {
         write!(f, "{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02}")
     }
@@ -264,30 +302,49 @@ impl Value {
             (Value::Int32(n), DataType::Numeric) => Ok(Value::Numeric(n.to_string())),
             (Value::Int32(n), DataType::Bool) => Ok(Value::Bool(*n != 0)),
             // Int64 conversions
-            (Value::Int64(n), DataType::Int32) => i32::try_from(*n).map(Value::Int32).map_err(|_| "integer out of range".to_string()),
+            (Value::Int64(n), DataType::Int32) => i32::try_from(*n)
+                .map(Value::Int32)
+                .map_err(|_| "integer out of range".to_string()),
             (Value::Int64(n), DataType::Float64) => Ok(Value::Float64(*n as f64)),
             (Value::Int64(n), DataType::Text) => Ok(Value::Text(n.to_string())),
             (Value::Int64(n), DataType::Numeric) => Ok(Value::Numeric(n.to_string())),
             (Value::Int64(n), DataType::Bool) => Ok(Value::Bool(*n != 0)),
             // Float64 conversions
             (Value::Float64(n), DataType::Int32) => {
-                if n.is_nan() || n.is_infinite() { return Err("integer out of range".to_string()); }
+                if n.is_nan() || n.is_infinite() {
+                    return Err("integer out of range".to_string());
+                }
                 let rounded = n.round();
-                if rounded < i32::MIN as f64 || rounded > i32::MAX as f64 { return Err("integer out of range".to_string()); }
+                if rounded < i32::MIN as f64 || rounded > i32::MAX as f64 {
+                    return Err("integer out of range".to_string());
+                }
                 Ok(Value::Int32(rounded as i32))
             }
             (Value::Float64(n), DataType::Int64) => {
-                if n.is_nan() || n.is_infinite() { return Err("integer out of range".to_string()); }
+                if n.is_nan() || n.is_infinite() {
+                    return Err("integer out of range".to_string());
+                }
                 let rounded = n.round();
-                if rounded < i64::MIN as f64 || rounded > i64::MAX as f64 { return Err("integer out of range".to_string()); }
+                if rounded < i64::MIN as f64 || rounded > i64::MAX as f64 {
+                    return Err("integer out of range".to_string());
+                }
                 Ok(Value::Int64(rounded as i64))
             }
             (Value::Float64(n), DataType::Text) => Ok(Value::Text(n.to_string())),
             (Value::Float64(n), DataType::Numeric) => Ok(Value::Numeric(n.to_string())),
             // Text conversions
-            (Value::Text(s), DataType::Int32) => s.parse::<i32>().map(Value::Int32).map_err(|e| e.to_string()),
-            (Value::Text(s), DataType::Int64) => s.parse::<i64>().map(Value::Int64).map_err(|e| e.to_string()),
-            (Value::Text(s), DataType::Float64) => s.parse::<f64>().map(Value::Float64).map_err(|e| e.to_string()),
+            (Value::Text(s), DataType::Int32) => s
+                .parse::<i32>()
+                .map(Value::Int32)
+                .map_err(|e| e.to_string()),
+            (Value::Text(s), DataType::Int64) => s
+                .parse::<i64>()
+                .map(Value::Int64)
+                .map_err(|e| e.to_string()),
+            (Value::Text(s), DataType::Float64) => s
+                .parse::<f64>()
+                .map(Value::Float64)
+                .map_err(|e| e.to_string()),
             (Value::Text(s), DataType::Bool) => match s.to_lowercase().as_str() {
                 "true" | "t" | "1" | "yes" | "on" => Ok(Value::Bool(true)),
                 "false" | "f" | "0" | "no" | "off" => Ok(Value::Bool(false)),
@@ -295,9 +352,18 @@ impl Value {
             },
             (Value::Text(s), DataType::Numeric) => Ok(Value::Numeric(s.clone())),
             // Numeric conversions
-            (Value::Numeric(s), DataType::Int32) => s.parse::<i32>().map(Value::Int32).map_err(|e| e.to_string()),
-            (Value::Numeric(s), DataType::Int64) => s.parse::<i64>().map(Value::Int64).map_err(|e| e.to_string()),
-            (Value::Numeric(s), DataType::Float64) => s.parse::<f64>().map(Value::Float64).map_err(|e| e.to_string()),
+            (Value::Numeric(s), DataType::Int32) => s
+                .parse::<i32>()
+                .map(Value::Int32)
+                .map_err(|e| e.to_string()),
+            (Value::Numeric(s), DataType::Int64) => s
+                .parse::<i64>()
+                .map(Value::Int64)
+                .map_err(|e| e.to_string()),
+            (Value::Numeric(s), DataType::Float64) => s
+                .parse::<f64>()
+                .map(Value::Float64)
+                .map_err(|e| e.to_string()),
             (Value::Numeric(s), DataType::Text) => Ok(Value::Text(s.clone())),
             // Fallback: use Display
             (_, DataType::Text) => Ok(Value::Text(self.to_string())),
@@ -373,7 +439,11 @@ impl Hash for Value {
                     f.to_bits().hash(state);
                 }
             }
-            Value::Interval { months, days, microseconds } => {
+            Value::Interval {
+                months,
+                days,
+                microseconds,
+            } => {
                 months.hash(state);
                 days.hash(state);
                 microseconds.hash(state);
@@ -421,11 +491,23 @@ impl Ord for Value {
             (Value::TimestampTz(a), Value::TimestampTz(b)) => a.cmp(b),
             (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
             (Value::Bytea(a), Value::Bytea(b)) => a.cmp(b),
-            (Value::Interval { months: am, days: ad, microseconds: aus },
-             Value::Interval { months: bm, days: bd, microseconds: bus }) => {
+            (
+                Value::Interval {
+                    months: am,
+                    days: ad,
+                    microseconds: aus,
+                },
+                Value::Interval {
+                    months: bm,
+                    days: bd,
+                    microseconds: bus,
+                },
+            ) => {
                 // Convert to total microseconds for comparison (approximate)
-                let a_total = *am as i64 * 30 * 86400 * 1_000_000 + *ad as i64 * 86400 * 1_000_000 + aus;
-                let b_total = *bm as i64 * 30 * 86400 * 1_000_000 + *bd as i64 * 86400 * 1_000_000 + bus;
+                let a_total =
+                    *am as i64 * 30 * 86400 * 1_000_000 + *ad as i64 * 86400 * 1_000_000 + aus;
+                let b_total =
+                    *bm as i64 * 30 * 86400 * 1_000_000 + *bd as i64 * 86400 * 1_000_000 + bus;
                 a_total.cmp(&b_total)
             }
             // Cross-type numeric comparisons: coerce to common type
@@ -618,7 +700,8 @@ mod tests {
     fn test_timestamp_display() {
         // 2024-01-01 12:30:45
         let days = ymd_to_days(2024, 1, 1) as i64;
-        let us = days * 86400 * 1_000_000 + 12 * 3600 * 1_000_000 + 30 * 60 * 1_000_000 + 45 * 1_000_000;
+        let us =
+            days * 86400 * 1_000_000 + 12 * 3600 * 1_000_000 + 30 * 60 * 1_000_000 + 45 * 1_000_000;
         let v = Value::Timestamp(us);
         assert_eq!(v.to_string(), "2024-01-01 12:30:45");
     }
@@ -626,8 +709,8 @@ mod tests {
     #[test]
     fn test_uuid_display() {
         let bytes = [
-            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
-            0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
         ];
         let v = Value::Uuid(bytes);
         assert_eq!(v.to_string(), "550e8400-e29b-41d4-a716-446655440000");
@@ -660,13 +743,21 @@ mod tests {
 
     #[test]
     fn test_interval_display() {
-        let v = Value::Interval { months: 14, days: 3, microseconds: 3_661_000_000 };
+        let v = Value::Interval {
+            months: 14,
+            days: 3,
+            microseconds: 3_661_000_000,
+        };
         assert_eq!(v.to_string(), "1 year 2 mons 3 days 01:01:01");
     }
 
     #[test]
     fn test_interval_zero() {
-        let v = Value::Interval { months: 0, days: 0, microseconds: 0 };
+        let v = Value::Interval {
+            months: 0,
+            days: 0,
+            microseconds: 0,
+        };
         assert_eq!(v.to_string(), "00:00:00");
     }
 
@@ -684,8 +775,14 @@ mod tests {
 
     #[test]
     fn test_cast_bool_to_int() {
-        assert_eq!(Value::Bool(true).cast(&DataType::Int32).unwrap(), Value::Int32(1));
-        assert_eq!(Value::Bool(false).cast(&DataType::Int32).unwrap(), Value::Int32(0));
+        assert_eq!(
+            Value::Bool(true).cast(&DataType::Int32).unwrap(),
+            Value::Int32(1)
+        );
+        assert_eq!(
+            Value::Bool(false).cast(&DataType::Int32).unwrap(),
+            Value::Int32(0)
+        );
     }
 
     #[test]
@@ -700,9 +797,22 @@ mod tests {
 
     #[test]
     fn test_value_ordering() {
-        let mut vals = vec![Value::Int32(3), Value::Int32(1), Value::Null, Value::Int32(2)];
+        let mut vals = vec![
+            Value::Int32(3),
+            Value::Int32(1),
+            Value::Null,
+            Value::Int32(2),
+        ];
         vals.sort();
-        assert_eq!(vals, vec![Value::Int32(1), Value::Int32(2), Value::Int32(3), Value::Null]);
+        assert_eq!(
+            vals,
+            vec![
+                Value::Int32(1),
+                Value::Int32(2),
+                Value::Int32(3),
+                Value::Null
+            ]
+        );
     }
 
     #[test]
@@ -731,8 +841,16 @@ mod tests {
 
     #[test]
     fn test_interval_ordering() {
-        let a = Value::Interval { months: 0, days: 0, microseconds: 1_000_000 };
-        let b = Value::Interval { months: 0, days: 0, microseconds: 2_000_000 };
+        let a = Value::Interval {
+            months: 0,
+            days: 0,
+            microseconds: 1_000_000,
+        };
+        let b = Value::Interval {
+            months: 0,
+            days: 0,
+            microseconds: 2_000_000,
+        };
         assert!(a < b);
     }
 
@@ -970,5 +1088,4 @@ mod tests {
             }
         }
     }
-
 }

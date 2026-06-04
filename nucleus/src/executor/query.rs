@@ -5,8 +5,8 @@
 //! CTE resolution (WITH clause), and all supporting helpers for index scans,
 //! columnar fast aggregates, SIMD filters, and lateral joins.
 
-use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -19,12 +19,12 @@ use crate::simd;
 use crate::storage::granule_stats::{FilterPredicate, can_skip_granule};
 use crate::types::{DataType, Row, Value};
 
+use super::helpers::*;
 use super::types::{
     BoxedExecFuture, CacheLiteral, ColMeta, CteTableMap, IndexPredicates, IndexScanResult,
     JoinType, ProjectedResult, SelectResult,
 };
 use super::{ExecError, ExecResult, Executor};
-use super::helpers::*;
 
 /// Granule size: 8192 rows per granule (matching zone map documentation).
 #[allow(dead_code)]
@@ -47,7 +47,9 @@ impl Executor {
         &self,
         stmt: Statement,
         analyze: bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExecResult, ExecError>> + Send + '_>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ExecResult, ExecError>> + Send + '_>,
+    > {
         Box::pin(async move {
             let plan = self.build_plan(&stmt).await?;
 
@@ -97,7 +99,10 @@ impl Executor {
     }
 
     /// Build a query plan for a statement (used by EXPLAIN).
-    pub(super) async fn build_plan(&self, stmt: &Statement) -> Result<planner::PlanNode, ExecError> {
+    pub(super) async fn build_plan(
+        &self,
+        stmt: &Statement,
+    ) -> Result<planner::PlanNode, ExecError> {
         match stmt {
             Statement::Query(query) => self.plan_query(query).await,
             _ => Err(ExecError::Unsupported(
@@ -107,13 +112,16 @@ impl Executor {
     }
 
     /// Build a plan tree for a SELECT query.
-    pub(super) async fn plan_query(&self, query: &ast::Query) -> Result<planner::PlanNode, ExecError> {
+    pub(super) async fn plan_query(
+        &self,
+        query: &ast::Query,
+    ) -> Result<planner::PlanNode, ExecError> {
         let select = match query.body.as_ref() {
             SetExpr::Select(s) => s,
             _ => {
                 return Err(ExecError::Unsupported(
                     "EXPLAIN only supports simple SELECT".into(),
-                ))
+                ));
             }
         };
 
@@ -124,7 +132,10 @@ impl Executor {
             .unwrap_or(false);
         let mut remaining_join_preds: Vec<Expr> = if has_joins {
             match &select.selection {
-                Some(expr) => planner::split_conjunction(expr).into_iter().cloned().collect(),
+                Some(expr) => planner::split_conjunction(expr)
+                    .into_iter()
+                    .cloned()
+                    .collect(),
                 None => Vec::new(),
             }
         } else {
@@ -160,8 +171,10 @@ impl Executor {
             for join in &from.joins {
                 let right_where = if has_joins {
                     let relation_names = Self::table_factor_names(&join.relation);
-                    let (pushable, remaining) =
-                        Self::partition_predicates_for_relation(remaining_join_preds, &relation_names);
+                    let (pushable, remaining) = Self::partition_predicates_for_relation(
+                        remaining_join_preds,
+                        &relation_names,
+                    );
                     remaining_join_preds = remaining;
                     Self::combine_predicates(pushable)
                 } else {
@@ -169,11 +182,15 @@ impl Executor {
                 };
                 let right_plan = self.plan_table_scan(&join.relation, &right_where).await?;
                 let join_type = match &join.join_operator {
-                    ast::JoinOperator::Inner(_) | ast::JoinOperator::Join(_) => planner::JoinPlanType::Inner,
-                    ast::JoinOperator::LeftOuter(_)
-                    | ast::JoinOperator::Left(_) => planner::JoinPlanType::Left,
-                    ast::JoinOperator::RightOuter(_)
-                    | ast::JoinOperator::Right(_) => planner::JoinPlanType::Right,
+                    ast::JoinOperator::Inner(_) | ast::JoinOperator::Join(_) => {
+                        planner::JoinPlanType::Inner
+                    }
+                    ast::JoinOperator::LeftOuter(_) | ast::JoinOperator::Left(_) => {
+                        planner::JoinPlanType::Left
+                    }
+                    ast::JoinOperator::RightOuter(_) | ast::JoinOperator::Right(_) => {
+                        planner::JoinPlanType::Right
+                    }
                     ast::JoinOperator::CrossJoin(_) => planner::JoinPlanType::Cross,
                     _ => planner::JoinPlanType::Inner,
                 };
@@ -186,12 +203,10 @@ impl Executor {
                     | ast::JoinOperator::LeftOuter(c)
                     | ast::JoinOperator::Right(c)
                     | ast::JoinOperator::RightOuter(c)
-                    | ast::JoinOperator::FullOuter(c) => {
-                        match c {
-                            ast::JoinConstraint::On(expr) => Some(expr.clone()),
-                            _ => None,
-                        }
-                    }
+                    | ast::JoinOperator::FullOuter(c) => match c {
+                        ast::JoinConstraint::On(expr) => Some(expr.clone()),
+                        _ => None,
+                    },
                     _ => None,
                 };
 
@@ -200,30 +215,25 @@ impl Executor {
                     Arc::clone(&self.stats_store),
                 );
 
-                plan = query_planner.plan_join(
-                    plan,
-                    right_plan,
-                    join_type,
-                    join_condition.as_ref(),
-                );
+                plan =
+                    query_planner.plan_join(plan, right_plan, join_type, join_condition.as_ref());
             }
         }
 
         // Remaining WHERE predicates for join queries (applied after join composition).
-        if has_joins
-            && let Some(where_expr) = Self::combine_predicates(remaining_join_preds) {
-                let estimated_rows = (plan.estimated_rows() / 2).max(1);
-                let filter_cost = planner::Cost(
-                    plan.total_cost().0 + plan.estimated_rows() as f64 * planner::CPU_OPERATOR_COST,
-                );
-                plan = planner::PlanNode::Filter {
-                    input: Box::new(plan),
-                    predicate: where_expr.to_string(),
-                    predicate_expr: Some(where_expr),
-                    estimated_rows,
-                    estimated_cost: filter_cost,
-                };
-            }
+        if has_joins && let Some(where_expr) = Self::combine_predicates(remaining_join_preds) {
+            let estimated_rows = (plan.estimated_rows() / 2).max(1);
+            let filter_cost = planner::Cost(
+                plan.total_cost().0 + plan.estimated_rows() as f64 * planner::CPU_OPERATOR_COST,
+            );
+            plan = planner::PlanNode::Filter {
+                input: Box::new(plan),
+                predicate: where_expr.to_string(),
+                predicate_expr: Some(where_expr),
+                estimated_rows,
+                estimated_cost: filter_cost,
+            };
+        }
 
         // Detect aggregate functions in the projection
         let agg_funcs = Self::extract_aggregate_names(&select.projection);
@@ -234,8 +244,9 @@ impl Executor {
                 let input_rows = plan.estimated_rows();
                 let group_keys: Vec<String> = exprs.iter().map(|e| e.to_string()).collect();
                 let distinct_groups = (input_rows / 10).max(1);
-                let agg_cost =
-                    planner::Cost(plan.total_cost().0 + input_rows as f64 * planner::CPU_TUPLE_COST);
+                let agg_cost = planner::Cost(
+                    plan.total_cost().0 + input_rows as f64 * planner::CPU_TUPLE_COST,
+                );
                 plan = planner::PlanNode::HashAggregate {
                     input: Box::new(plan),
                     group_keys,
@@ -253,8 +264,9 @@ impl Executor {
 
         // Simple aggregate (e.g., SELECT COUNT(*) FROM t) without GROUP BY
         if !has_group_by && !agg_funcs.is_empty() {
-            let agg_cost =
-                planner::Cost(plan.total_cost().0 + plan.estimated_rows() as f64 * planner::CPU_TUPLE_COST);
+            let agg_cost = planner::Cost(
+                plan.total_cost().0 + plan.estimated_rows() as f64 * planner::CPU_TUPLE_COST,
+            );
             plan = planner::PlanNode::Aggregate {
                 input: Box::new(plan),
                 aggregates: agg_funcs,
@@ -306,33 +318,40 @@ impl Executor {
 
         // ORDER BY
         if let Some(ref order_by) = query.order_by
-            && let ast::OrderByKind::Expressions(exprs) = &order_by.kind {
-                let sort_keys: Vec<String> = exprs
-                    .iter()
-                    .map(|o| {
-                        let dir = if o.options.asc.unwrap_or(true) { "ASC" } else { "DESC" };
-                        let nulls = match o.options.nulls_first {
-                            Some(true) => " NULLS FIRST",
-                            Some(false) => " NULLS LAST",
-                            None => "",
-                        };
-                        format!("{} {dir}{nulls}", o.expr)
-                    })
-                    .collect();
-                let input_rows = plan.estimated_rows();
-                let sort_cost = planner::estimate_sort_cost(input_rows, plan.total_cost());
-                plan = planner::PlanNode::Sort {
-                    input: Box::new(plan),
-                    keys: sort_keys,
-                    estimated_cost: sort_cost,
-                };
-            }
+            && let ast::OrderByKind::Expressions(exprs) = &order_by.kind
+        {
+            let sort_keys: Vec<String> = exprs
+                .iter()
+                .map(|o| {
+                    let dir = if o.options.asc.unwrap_or(true) {
+                        "ASC"
+                    } else {
+                        "DESC"
+                    };
+                    let nulls = match o.options.nulls_first {
+                        Some(true) => " NULLS FIRST",
+                        Some(false) => " NULLS LAST",
+                        None => "",
+                    };
+                    format!("{} {dir}{nulls}", o.expr)
+                })
+                .collect();
+            let input_rows = plan.estimated_rows();
+            let sort_cost = planner::estimate_sort_cost(input_rows, plan.total_cost());
+            plan = planner::PlanNode::Sort {
+                input: Box::new(plan),
+                keys: sort_keys,
+                estimated_cost: sort_cost,
+            };
+        }
 
         // LIMIT / OFFSET
         let (limit_val, offset_val) = match &query.limit_clause {
             Some(ast::LimitClause::LimitOffset { limit, offset, .. }) => {
                 let l = limit.as_ref().and_then(|e| self.plan_expr_to_usize(e));
-                let o = offset.as_ref().and_then(|off| self.plan_expr_to_usize(&off.value));
+                let o = offset
+                    .as_ref()
+                    .and_then(|off| self.plan_expr_to_usize(&off.value));
                 (l, o)
             }
             _ => (None, None),
@@ -340,13 +359,14 @@ impl Executor {
 
         if limit_val.is_some() || offset_val.is_some() {
             let cost = planner::Cost(
-                plan.total_cost().0
-                    + limit_val.unwrap_or(0) as f64 * planner::CPU_TUPLE_COST,
+                plan.total_cost().0 + limit_val.unwrap_or(0) as f64 * planner::CPU_TUPLE_COST,
             );
             // LIMIT pushdown: if the child is a SeqScan (no Sort/Aggregate),
             // push limit into the scan to enable early exit.
             if let Some(lim) = limit_val {
-                let effective = lim + offset_val.unwrap_or(0);
+                // saturating: a huge LIMIT+OFFSET just means "no early exit",
+                // never an overflow panic/wrap.
+                let effective = lim.saturating_add(offset_val.unwrap_or(0));
                 Self::push_limit_into_scan(&mut plan, effective);
             }
             plan = planner::PlanNode::Limit {
@@ -371,13 +391,18 @@ impl Executor {
     /// - Every projection item is a plain column name (no expressions, no aliases
     ///   with computed expressions).
     async fn try_push_projection_into_scan(&self, plan: &mut planner::PlanNode) {
-        let planner::PlanNode::Project { input, columns, .. } = plan else { return };
+        let planner::PlanNode::Project { input, columns, .. } = plan else {
+            return;
+        };
         let planner::PlanNode::SeqScan {
             table,
             filter,
             projection,
             ..
-        } = input.as_mut() else { return };
+        } = input.as_mut()
+        else {
+            return;
+        };
 
         // Only push when there is no filter — filter evaluation may reference
         // columns outside the projection, so we need the full row.
@@ -438,12 +463,15 @@ impl Executor {
     /// Only pushes when the scan has no filter (exact row count is known).
     pub(super) fn push_limit_into_scan(plan: &mut planner::PlanNode, effective_limit: usize) {
         match plan {
-            planner::PlanNode::SeqScan { filter: None, scan_limit, .. } => {
+            planner::PlanNode::SeqScan {
+                filter: None,
+                scan_limit,
+                ..
+            } => {
                 *scan_limit = Some(effective_limit);
             }
             // Walk through Project/Filter but NOT Sort/Aggregate
-            planner::PlanNode::Project { input, .. }
-            | planner::PlanNode::Filter { input, .. } => {
+            planner::PlanNode::Project { input, .. } | planner::PlanNode::Filter { input, .. } => {
                 Self::push_limit_into_scan(input, effective_limit);
             }
             _ => {} // Don't push through Sort, Aggregate, Join, etc.
@@ -458,7 +486,11 @@ impl Executor {
     ) -> Result<planner::PlanNode, ExecError> {
         let table_name = match table_factor {
             TableFactor::Table { name, .. } => name.to_string(),
-            _ => return Err(ExecError::Unsupported("subqueries in FROM not planned yet".into())),
+            _ => {
+                return Err(ExecError::Unsupported(
+                    "subqueries in FROM not planned yet".into(),
+                ));
+            }
         };
 
         let table_def = self.get_table(&table_name).await?;
@@ -477,7 +509,9 @@ impl Executor {
                 && pk_cols[0].eq_ignore_ascii_case(&col)
             {
                 // Find the B-tree index on this PK column (sync cache avoids async lock)
-                let indexes = self.catalog.get_indexes_cached(&table_name)
+                let indexes = self
+                    .catalog
+                    .get_indexes_cached(&table_name)
                     .unwrap_or_default();
                 let pk_index = indexes.iter().find(|idx| {
                     matches!(idx.index_type, crate::catalog::IndexType::BTree)
@@ -507,14 +541,14 @@ impl Executor {
 
         // Use the shared StatsStore + QueryPlanner for cost-based scan selection.
         // If ANALYZE has been run, the planner uses real stats; otherwise defaults.
-        let query_planner = planner::QueryPlanner::new(
-            Arc::clone(&self.catalog),
-            Arc::clone(&self.stats_store),
-        );
+        let query_planner =
+            planner::QueryPlanner::new(Arc::clone(&self.catalog), Arc::clone(&self.stats_store));
 
         let plan = if let Some(where_expr) = where_clause {
             let predicates = planner::split_conjunction(where_expr);
-            query_planner.plan_scan_unified(&table_name, &predicates).await
+            query_planner
+                .plan_scan_unified(&table_name, &predicates)
+                .await
         } else {
             query_planner.plan_scan_unified(&table_name, &[]).await
         };
@@ -555,10 +589,9 @@ impl Executor {
             Expr::Function(func) => {
                 let name = func.name.to_string().to_uppercase();
                 match name.as_str() {
-                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
-                    | "ARRAY_AGG" | "STRING_AGG" | "JSON_AGG" | "BOOL_AND" | "BOOL_OR"
-                    | "STDDEV" | "VARIANCE" | "STDDEV_POP" | "STDDEV_SAMP"
-                    | "VAR_POP" | "VAR_SAMP" => {
+                    "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "ARRAY_AGG" | "STRING_AGG"
+                    | "JSON_AGG" | "BOOL_AND" | "BOOL_OR" | "STDDEV" | "VARIANCE"
+                    | "STDDEV_POP" | "STDDEV_SAMP" | "VAR_POP" | "VAR_SAMP" => {
                         out.push(format!("{expr}"));
                     }
                     _ => {}
@@ -592,12 +625,16 @@ impl Executor {
     /// evaluate correctly in the plan path.
     pub(super) fn query_eligible_for_plan(select: &ast::Select, query: &ast::Query) -> bool {
         // No DISTINCT ON (plain DISTINCT is ok)
-        if let Some(ast::Distinct::On(_)) = &select.distinct { return false; }
+        if let Some(ast::Distinct::On(_)) = &select.distinct {
+            return false;
+        }
         // Projection expressions must be evaluable by the plan path.
         for item in &select.projection {
             match item {
                 SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                    if Self::expr_has_unsupported(expr) { return false; }
+                    if Self::expr_has_unsupported(expr) {
+                        return false;
+                    }
                 }
                 SelectItem::Wildcard(_) => {}
                 // Qualified wildcards like t.* need special handling
@@ -606,15 +643,23 @@ impl Executor {
         }
         // No unsupported features in WHERE
         if let Some(ref where_expr) = select.selection
-            && Self::expr_has_unsupported(where_expr) { return false; }
+            && Self::expr_has_unsupported(where_expr)
+        {
+            return false;
+        }
         // No unsupported features in HAVING
         if let Some(ref having_expr) = select.having
-            && Self::expr_has_unsupported(having_expr) { return false; }
+            && Self::expr_has_unsupported(having_expr)
+        {
+            return false;
+        }
         if let Some(from) = select.from.first() {
             for join in &from.joins {
                 match &join.join_operator {
-                    ast::JoinOperator::LeftOuter(_) | ast::JoinOperator::Left(_)
-                    | ast::JoinOperator::RightOuter(_) | ast::JoinOperator::Right(_)
+                    ast::JoinOperator::LeftOuter(_)
+                    | ast::JoinOperator::Left(_)
+                    | ast::JoinOperator::RightOuter(_)
+                    | ast::JoinOperator::Right(_)
                     | ast::JoinOperator::FullOuter(_) => return false,
                     _ => {}
                 }
@@ -629,25 +674,42 @@ impl Executor {
             // Fall back to AST execution when joins use aliases.
             if !from.joins.is_empty() {
                 let base_alias = if let TableFactor::Table { alias, name, .. } = &from.relation {
-                    alias.as_ref().map(|a| a.name.value.as_str() != name.to_string().as_str()).unwrap_or(false)
-                } else { false };
+                    alias
+                        .as_ref()
+                        .map(|a| a.name.value.as_str() != name.to_string().as_str())
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
                 let join_has_alias = from.joins.iter().any(|j| {
                     if let TableFactor::Table { alias, name, .. } = &j.relation {
-                        alias.as_ref().map(|a| a.name.value.as_str() != name.to_string().as_str()).unwrap_or(false)
-                    } else { false }
+                        alias
+                            .as_ref()
+                            .map(|a| a.name.value.as_str() != name.to_string().as_str())
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
                 });
-                if base_alias || join_has_alias { return false; }
+                if base_alias || join_has_alias {
+                    return false;
+                }
             }
         }
         // No UNION/INTERSECT/EXCEPT
-        if !matches!(*query.body, SetExpr::Select(_)) { return false; }
+        if !matches!(*query.body, SetExpr::Select(_)) {
+            return false;
+        }
         // No unsupported expressions in ORDER BY
         if let Some(ref order_by) = query.order_by
-            && let ast::OrderByKind::Expressions(exprs) = &order_by.kind {
-                for ob_expr in exprs {
-                    if Self::expr_has_unsupported(&ob_expr.expr) { return false; }
+            && let ast::OrderByKind::Expressions(exprs) = &order_by.kind
+        {
+            for ob_expr in exprs {
+                if Self::expr_has_unsupported(&ob_expr.expr) {
+                    return false;
                 }
             }
+        }
         true
     }
 
@@ -664,39 +726,62 @@ impl Executor {
                 Self::expr_has_unsupported(expr) || Self::expr_has_unsupported(pattern)
             }
             // CASE WHEN is now supported
-            Expr::Case { operand, conditions, else_result, .. } => {
-                operand.as_ref().is_some_and(|e| Self::expr_has_unsupported(e))
-                    || conditions.iter().any(|cw| Self::expr_has_unsupported(&cw.condition) || Self::expr_has_unsupported(&cw.result))
-                    || else_result.as_ref().is_some_and(|e| Self::expr_has_unsupported(e))
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                operand
+                    .as_ref()
+                    .is_some_and(|e| Self::expr_has_unsupported(e))
+                    || conditions.iter().any(|cw| {
+                        Self::expr_has_unsupported(&cw.condition)
+                            || Self::expr_has_unsupported(&cw.result)
+                    })
+                    || else_result
+                        .as_ref()
+                        .is_some_and(|e| Self::expr_has_unsupported(e))
             }
             // CAST is now supported
             Expr::Cast { expr, .. } => Self::expr_has_unsupported(expr),
             // BETWEEN is supported (including negated)
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 Self::expr_has_unsupported(expr)
                     || Self::expr_has_unsupported(low)
                     || Self::expr_has_unsupported(high)
             }
             // IN (list) is now supported
             Expr::InList { expr, list, .. } => {
-                Self::expr_has_unsupported(expr)
-                    || list.iter().any(Self::expr_has_unsupported)
+                Self::expr_has_unsupported(expr) || list.iter().any(Self::expr_has_unsupported)
             }
             // Array/struct constructors
             Expr::Array(_) => true,
             // Recurse into compound expressions
             Expr::BinaryOp { left, op, right } => {
                 // Only allow operators we handle in eval_expr_plan
-                let op_supported = matches!(op,
-                    ast::BinaryOperator::Eq | ast::BinaryOperator::NotEq
-                    | ast::BinaryOperator::Lt | ast::BinaryOperator::Gt
-                    | ast::BinaryOperator::LtEq | ast::BinaryOperator::GtEq
-                    | ast::BinaryOperator::And | ast::BinaryOperator::Or
-                    | ast::BinaryOperator::Plus | ast::BinaryOperator::Minus
-                    | ast::BinaryOperator::Multiply | ast::BinaryOperator::Divide
-                    | ast::BinaryOperator::Modulo | ast::BinaryOperator::StringConcat
+                let op_supported = matches!(
+                    op,
+                    ast::BinaryOperator::Eq
+                        | ast::BinaryOperator::NotEq
+                        | ast::BinaryOperator::Lt
+                        | ast::BinaryOperator::Gt
+                        | ast::BinaryOperator::LtEq
+                        | ast::BinaryOperator::GtEq
+                        | ast::BinaryOperator::And
+                        | ast::BinaryOperator::Or
+                        | ast::BinaryOperator::Plus
+                        | ast::BinaryOperator::Minus
+                        | ast::BinaryOperator::Multiply
+                        | ast::BinaryOperator::Divide
+                        | ast::BinaryOperator::Modulo
+                        | ast::BinaryOperator::StringConcat
                 );
-                !op_supported || Self::expr_has_unsupported(left) || Self::expr_has_unsupported(right)
+                !op_supported
+                    || Self::expr_has_unsupported(left)
+                    || Self::expr_has_unsupported(right)
             }
             Expr::UnaryOp { expr, .. } => Self::expr_has_unsupported(expr),
             Expr::Nested(inner) => Self::expr_has_unsupported(inner),
@@ -710,7 +795,9 @@ impl Executor {
 
     pub(super) fn is_supported_plan_function(func: &ast::Function) -> bool {
         // Window functions (OVER clause) are not handled by the plan execution path.
-        if func.over.is_some() { return false; }
+        if func.over.is_some() {
+            return false;
+        }
 
         let fn_name = func.name.to_string().to_uppercase();
         match fn_name.as_str() {
@@ -719,7 +806,10 @@ impl Executor {
                     ast::FunctionArguments::List(arg_list) => {
                         // DISTINCT aggregates (COUNT DISTINCT, SUM DISTINCT) are not handled
                         // by the plan execution path — fall back to AST.
-                        if matches!(arg_list.duplicate_treatment, Some(ast::DuplicateTreatment::Distinct)) {
+                        if matches!(
+                            arg_list.duplicate_treatment,
+                            Some(ast::DuplicateTreatment::Distinct)
+                        ) {
                             return false;
                         }
                         for arg in &arg_list.args {
@@ -762,19 +852,32 @@ impl Executor {
     pub(super) fn resolve_alias_to_table(from: &[ast::TableWithJoins], alias: &str) -> String {
         let lower = alias.to_lowercase();
         for twj in from {
-            if let TableFactor::Table { name, alias: Some(a), .. } = &twj.relation
-                && a.name.value.to_lowercase() == lower {
-                    return name.to_string();
-                }
-            if let TableFactor::Table { name, alias: None, .. } = &twj.relation
-                && name.to_string().to_lowercase() == lower {
-                    return name.to_string();
-                }
+            if let TableFactor::Table {
+                name,
+                alias: Some(a),
+                ..
+            } = &twj.relation
+                && a.name.value.to_lowercase() == lower
+            {
+                return name.to_string();
+            }
+            if let TableFactor::Table {
+                name, alias: None, ..
+            } = &twj.relation
+                && name.to_string().to_lowercase() == lower
+            {
+                return name.to_string();
+            }
             for join in &twj.joins {
-                if let TableFactor::Table { name, alias: Some(a), .. } = &join.relation
-                    && a.name.value.to_lowercase() == lower {
-                        return name.to_string();
-                    }
+                if let TableFactor::Table {
+                    name,
+                    alias: Some(a),
+                    ..
+                } = &join.relation
+                    && a.name.value.to_lowercase() == lower
+                {
+                    return name.to_string();
+                }
             }
         }
         alias.to_string()
@@ -793,7 +896,9 @@ impl Executor {
             | Expr::IsNull(expr)
             | Expr::IsNotNull(expr)
             | Expr::Nested(expr) => Self::collect_expr_table_refs(expr, out),
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 Self::collect_expr_table_refs(expr, out);
                 Self::collect_expr_table_refs(low, out);
                 Self::collect_expr_table_refs(high, out);
@@ -870,7 +975,10 @@ impl Executor {
         false
     }
 
-    pub(super) async fn create_implicit_unique_indexes(&self, table_def: &crate::catalog::TableDef) -> Result<(), ExecError> {
+    pub(super) async fn create_implicit_unique_indexes(
+        &self,
+        table_def: &crate::catalog::TableDef,
+    ) -> Result<(), ExecError> {
         use crate::catalog::TableConstraint;
 
         let mut seen_columns: HashSet<String> = HashSet::new();
@@ -920,9 +1028,10 @@ impl Executor {
             };
             // Best-effort registration: if it already exists, continue.
             if let Err(e) = self.catalog.create_index(index_def).await
-                && !matches!(e, crate::catalog::CatalogError::IndexExists(_)) {
-                    return Err(e.into());
-                }
+                && !matches!(e, crate::catalog::CatalogError::IndexExists(_))
+            {
+                return Err(e.into());
+            }
         }
         Ok(())
     }
@@ -941,16 +1050,20 @@ impl Executor {
             Self::collect_expr_table_refs(&pred, &mut refs);
             if refs.len() == 1
                 && let Some(name) = refs.iter().next()
-                    && relation_names.contains(name) {
-                        by_relation.entry(name.clone()).or_default().push(pred.clone());
-                        // For outer joins, keep pushed predicates as post-join filters too.
-                        // This preserves NULL-extension semantics while still enabling
-                        // relation-level pushdown.
-                        if has_outer_join {
-                            remaining.push(pred);
-                        }
-                        continue;
-                    }
+                && relation_names.contains(name)
+            {
+                by_relation
+                    .entry(name.clone())
+                    .or_default()
+                    .push(pred.clone());
+                // For outer joins, keep pushed predicates as post-join filters too.
+                // This preserves NULL-extension semantics while still enabling
+                // relation-level pushdown.
+                if has_outer_join {
+                    remaining.push(pred);
+                }
+                continue;
+            }
             remaining.push(pred);
         }
         (by_relation, Self::combine_predicates(remaining))
@@ -963,7 +1076,9 @@ impl Executor {
         col_meta: &[ColMeta],
         pushdown: Option<&HashMap<String, Vec<Expr>>>,
     ) -> Vec<Row> {
-        let Some(pushdown_map) = pushdown else { return rows; };
+        let Some(pushdown_map) = pushdown else {
+            return rows;
+        };
         let factor_names = Self::table_factor_names(factor);
         if factor_names.is_empty() {
             return rows;
@@ -974,7 +1089,9 @@ impl Executor {
                 preds.extend(items.clone());
             }
         }
-        let Some(expr) = Self::combine_predicates(preds) else { return rows; };
+        let Some(expr) = Self::combine_predicates(preds) else {
+            return rows;
+        };
         // Parallel Rayon filter for large sets, serial for small
         self.parallel_filter(rows, &expr, col_meta)
     }
@@ -999,7 +1116,12 @@ impl Executor {
         };
 
         let (table_name, label) = match &join.relation {
-            TableFactor::Table { name, alias, args: None, .. } => {
+            TableFactor::Table {
+                name,
+                alias,
+                args: None,
+                ..
+            } => {
                 let table_name = name.to_string();
                 let label = alias
                     .as_ref()
@@ -1036,13 +1158,14 @@ impl Executor {
             })
             .collect();
 
-        let (left_keys, right_keys, residual_on) = match Self::extract_equijoin_keys(&on_expr, left_meta, &right_meta) {
-            Some(keys) => keys,
-            None => {
-                self.metrics.index_join_skipped.inc();
-                return Ok(None);
-            }
-        };
+        let (left_keys, right_keys, residual_on) =
+            match Self::extract_equijoin_keys(&on_expr, left_meta, &right_meta) {
+                Some(keys) => keys,
+                None => {
+                    self.metrics.index_join_skipped.inc();
+                    return Ok(None);
+                }
+            };
 
         let probe_pair = {
             let mut chosen: Option<(usize, usize, String)> = None;
@@ -1117,18 +1240,17 @@ impl Executor {
             .find(|v| !matches!(v, Value::Null));
         if let Some(probe_val) = first_probe_val
             && matches!(
-                self.storage.index_lookup_sync(&table_name, &right_index_name, probe_val),
+                self.storage
+                    .index_lookup_sync(&table_name, &right_index_name, probe_val),
                 Ok(None)
-            ) {
-                self.metrics.index_join_skipped.inc();
-                return Ok(None);
-            }
+            )
+        {
+            self.metrics.index_join_skipped.inc();
+            return Ok(None);
+        }
 
-        let combined_meta: Vec<ColMeta> = left_meta
-            .iter()
-            .chain(right_meta.iter())
-            .cloned()
-            .collect();
+        let combined_meta: Vec<ColMeta> =
+            left_meta.iter().chain(right_meta.iter()).cloned().collect();
         let right_nulls: Row = right_meta.iter().map(|_| Value::Null).collect();
         let mut result_rows = Vec::new();
 
@@ -1138,27 +1260,32 @@ impl Executor {
             };
             if matches!(lookup_val, Value::Null) {
                 if join_type == JoinType::Left {
-                    let combined: Row = left_row.iter().chain(right_nulls.iter()).cloned().collect();
+                    let combined: Row =
+                        left_row.iter().chain(right_nulls.iter()).cloned().collect();
                     result_rows.push(combined);
                 }
                 continue;
             }
 
             let mut matched = false;
-            let probed_rows = match self
-                .storage
-                .index_lookup_sync(&table_name, &right_index_name, lookup_val)
-            {
-                Ok(Some(rows)) => rows,
-                _ => Vec::new(),
-            };
+            let probed_rows =
+                match self
+                    .storage
+                    .index_lookup_sync(&table_name, &right_index_name, lookup_val)
+                {
+                    Ok(Some(rows)) => rows,
+                    _ => Vec::new(),
+                };
             self.metrics.rows_scanned.inc_by(probed_rows.len() as u64);
 
             for right_row in probed_rows {
                 if let Some(ref pred) = right_pushdown
-                    && !self.eval_where(pred, &right_row, &right_meta).unwrap_or(false) {
-                        continue;
-                    }
+                    && !self
+                        .eval_where(pred, &right_row, &right_meta)
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
 
                 // Validate all equi-join keys (the index probe may cover only one key).
                 let mut keys_match = true;
@@ -1176,7 +1303,8 @@ impl Executor {
 
                 let combined: Row = left_row.iter().chain(right_row.iter()).cloned().collect();
                 let residual_ok = if let Some(ref residual) = residual_on {
-                    self.eval_where(residual, &combined, &combined_meta).unwrap_or(false)
+                    self.eval_where(residual, &combined, &combined_meta)
+                        .unwrap_or(false)
                 } else {
                     true
                 };
@@ -1224,12 +1352,24 @@ impl Executor {
             planner::PlanNode::Project { input, .. } => Self::plan_is_executable(input),
             planner::PlanNode::Aggregate { input, .. } => Self::plan_is_executable(input),
             planner::PlanNode::HashAggregate { input, .. } => Self::plan_is_executable(input),
-            planner::PlanNode::NestedLoopJoin { left, right, join_type, .. } => {
-                matches!(join_type, planner::JoinPlanType::Inner | planner::JoinPlanType::Cross)
-                    && Self::plan_is_executable(left)
+            planner::PlanNode::NestedLoopJoin {
+                left,
+                right,
+                join_type,
+                ..
+            } => {
+                matches!(
+                    join_type,
+                    planner::JoinPlanType::Inner | planner::JoinPlanType::Cross
+                ) && Self::plan_is_executable(left)
                     && Self::plan_is_executable(right)
             }
-            planner::PlanNode::HashJoin { left, right, join_type, .. } => {
+            planner::PlanNode::HashJoin {
+                left,
+                right,
+                join_type,
+                ..
+            } => {
                 matches!(join_type, planner::JoinPlanType::Inner)
                     && Self::plan_is_executable(left)
                     && Self::plan_is_executable(right)
@@ -1244,14 +1384,18 @@ impl Executor {
         let dialect = PostgreSqlDialect {};
         // Parse as "SELECT <expr>" and extract the expression
         let sql = format!("SELECT {s}");
-        let stmts = Parser::parse_sql(&dialect, &sql)
-            .map_err(|e| ExecError::Unsupported(format!("Failed to parse plan expression '{s}': {e}")))?;
+        let stmts = Parser::parse_sql(&dialect, &sql).map_err(|e| {
+            ExecError::Unsupported(format!("Failed to parse plan expression '{s}': {e}"))
+        })?;
         if let Some(Statement::Query(q)) = stmts.into_iter().next()
             && let SetExpr::Select(sel) = *q.body
-                && let Some(SelectItem::UnnamedExpr(expr)) = sel.projection.into_iter().next() {
-                    return Ok(expr);
-                }
-        Err(ExecError::Unsupported(format!("Could not parse expression: {s}")))
+            && let Some(SelectItem::UnnamedExpr(expr)) = sel.projection.into_iter().next()
+        {
+            return Ok(expr);
+        }
+        Err(ExecError::Unsupported(format!(
+            "Could not parse expression: {s}"
+        )))
     }
 
     /// Execute a plan node tree, returning column metadata and result rows.
@@ -1263,19 +1407,29 @@ impl Executor {
     ) -> BoxedExecFuture<'a> {
         Box::pin(async move {
             match plan {
-                planner::PlanNode::SeqScan { table, filter, filter_expr, scan_limit, projection, .. } => {
+                planner::PlanNode::SeqScan {
+                    table,
+                    filter,
+                    filter_expr,
+                    scan_limit,
+                    projection,
+                    ..
+                } => {
                     // Check CTEs first
                     if let Some((cols, rows)) = cte_tables.get(table.as_str()) {
                         let meta = cols.clone();
                         let mut result_rows = rows.clone();
                         // Use pre-parsed expr if available, otherwise fall back to parsing
-                        let resolved_expr = filter_expr.as_ref().cloned()
-                            .or_else(|| filter.as_ref().and_then(|s| Self::parse_expr_string(s).ok()));
+                        let resolved_expr = filter_expr.as_ref().cloned().or_else(|| {
+                            filter
+                                .as_ref()
+                                .and_then(|s| Self::parse_expr_string(s).ok())
+                        });
                         if let Some(expr) = resolved_expr {
-                                result_rows.retain(|row| {
-                                    self.eval_where_plan(&expr, row, &meta).unwrap_or(false)
-                                });
-                            }
+                            result_rows.retain(|row| {
+                                self.eval_where_plan(&expr, row, &meta).unwrap_or(false)
+                            });
+                        }
                         return Ok((meta, result_rows));
                     }
 
@@ -1308,16 +1462,23 @@ impl Executor {
                         // projection.
                     }
 
-                    let meta: Vec<ColMeta> = table_def.columns.iter().map(|c| ColMeta {
-                        table: Some(table.clone()),
-                        name: c.name.clone(),
-                        dtype: c.data_type.clone(),
-                    }).collect();
+                    let meta: Vec<ColMeta> = table_def
+                        .columns
+                        .iter()
+                        .map(|c| ColMeta {
+                            table: Some(table.clone()),
+                            name: c.name.clone(),
+                            dtype: c.data_type.clone(),
+                        })
+                        .collect();
                     let storage = self.storage_for(table);
 
                     // Use pre-parsed expr if available, otherwise fall back to parsing
-                    let resolved_expr = filter_expr.as_ref().cloned()
-                        .or_else(|| filter.as_ref().and_then(|s| Self::parse_expr_string(s).ok()));
+                    let resolved_expr = filter_expr.as_ref().cloned().or_else(|| {
+                        filter
+                            .as_ref()
+                            .and_then(|s| Self::parse_expr_string(s).ok())
+                    });
 
                     // ── Fast equality scan path ──────────────────────────────
                     // When the filter is a simple `col = literal`, use the
@@ -1326,21 +1487,24 @@ impl Executor {
                     // all rows then filtering — only matching rows are cloned.
                     if let Some(ref expr) = resolved_expr
                         && let Some((col_name, _)) = planner::is_equality_predicate(expr)
-                            && let Some(col_idx) = meta.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name))
-                                && let Some(val) = Self::extract_equality_value(expr) {
-                                    // Coerce to the column's declared type. Two
-                                    // distinct adjustments happen here:
-                                    //   • integer-width (Int64→Int32 for INT cols)
-                                    //   • text→native (pgx SimpleProtocol literals)
-                                    // After typed coercion, normalise small ints
-                                    // back to Int32 so storage row-format matches.
-                                    let typed = Self::coerce_to_column_type(&val, &meta[col_idx].dtype);
-                                    let coerced = Self::coerce_to_storage_type(&typed);
-                                    if let Some(rows) = storage.fast_scan_where_eq(table, col_idx, &coerced) {
-                                        self.metrics.rows_scanned.inc_by(rows.len() as u64);
-                                        return Ok((meta, rows));
-                                    }
-                                }
+                        && let Some(col_idx) = meta
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(&col_name))
+                        && let Some(val) = Self::extract_equality_value(expr)
+                    {
+                        // Coerce to the column's declared type. Two
+                        // distinct adjustments happen here:
+                        //   • integer-width (Int64→Int32 for INT cols)
+                        //   • text→native (pgx SimpleProtocol literals)
+                        // After typed coercion, normalise small ints
+                        // back to Int32 so storage row-format matches.
+                        let typed = Self::coerce_to_column_type(&val, &meta[col_idx].dtype);
+                        let coerced = Self::coerce_to_storage_type(&typed);
+                        if let Some(rows) = storage.fast_scan_where_eq(table, col_idx, &coerced) {
+                            self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                            return Ok((meta, rows));
+                        }
+                    }
 
                     let mut rows = if let Some(lim) = scan_limit {
                         storage.scan_limit(table, *lim).await?
@@ -1350,52 +1514,76 @@ impl Executor {
                     self.metrics.rows_scanned.inc_by(rows.len() as u64);
 
                     if let Some(expr) = resolved_expr {
-                            // ── Zone map pruning ────────────────────────────────
-                            // Before evaluating the WHERE clause row-by-row, try
-                            // to skip entire granules whose min/max stats prove
-                            // no row can match the predicate.
-                            if let Some((col_id, ref predicate)) =
-                                Self::extract_zone_map_predicate(&expr, &meta)
-                            {
-                                rows = self.apply_zone_map_pruning(rows, table, col_id, predicate);
-                            }
-
-                            // Try SIMD-accelerated filter first (simple col op literal predicates)
-                            if let Some(indices) = self.try_simd_filter(&expr, &rows, &meta) {
-                                rows = indices.into_iter().map(|i| rows[i].clone()).collect();
-                            } else if cfg!(feature = "server") && rows.len() > 10_000 {
-                                #[cfg(feature = "server")]
-                                {
-                                    use rayon::prelude::*;
-                                    rows = rows.into_par_iter()
-                                        .filter(|row| self.eval_where_plan(&expr, row, &meta).unwrap_or(false))
-                                        .collect();
-                                }
-                            } else {
-                                rows.retain(|row| {
-                                    self.eval_where_plan(&expr, row, &meta).unwrap_or(false)
-                                });
-                            }
+                        // ── Zone map pruning ────────────────────────────────
+                        // Before evaluating the WHERE clause row-by-row, try
+                        // to skip entire granules whose min/max stats prove
+                        // no row can match the predicate.
+                        if let Some((col_id, ref predicate)) =
+                            Self::extract_zone_map_predicate(&expr, &meta)
+                        {
+                            rows = self.apply_zone_map_pruning(rows, table, col_id, predicate);
                         }
+
+                        // Try SIMD-accelerated filter first (simple col op literal predicates)
+                        if let Some(indices) = self.try_simd_filter(&expr, &rows, &meta) {
+                            rows = indices.into_iter().map(|i| rows[i].clone()).collect();
+                        } else if cfg!(feature = "server") && rows.len() > 10_000 {
+                            #[cfg(feature = "server")]
+                            {
+                                use rayon::prelude::*;
+                                rows = rows
+                                    .into_par_iter()
+                                    .filter(|row| {
+                                        self.eval_where_plan(&expr, row, &meta).unwrap_or(false)
+                                    })
+                                    .collect();
+                            }
+                        } else {
+                            rows.retain(|row| {
+                                self.eval_where_plan(&expr, row, &meta).unwrap_or(false)
+                            });
+                        }
+                    }
                     Ok((meta, rows))
                 }
 
-                planner::PlanNode::IndexScan { table, index_name, estimated_rows, lookup_key, lookup_key_expr,
-                    range_lo, range_lo_expr, range_hi, range_hi_expr,
-                    range_predicate, range_predicate_expr, .. } => {
+                planner::PlanNode::IndexScan {
+                    table,
+                    index_name,
+                    estimated_rows,
+                    lookup_key,
+                    lookup_key_expr,
+                    range_lo,
+                    range_lo_expr,
+                    range_hi,
+                    range_hi_expr,
+                    range_predicate,
+                    range_predicate_expr,
+                    ..
+                } => {
                     let table_def = self.get_table(table).await?;
-                    let meta: Vec<ColMeta> = table_def.columns.iter().map(|c| ColMeta {
-                        table: Some(table.clone()),
-                        name: c.name.clone(),
-                        dtype: c.data_type.clone(),
-                    }).collect();
+                    let meta: Vec<ColMeta> = table_def
+                        .columns
+                        .iter()
+                        .map(|c| ColMeta {
+                            table: Some(table.clone()),
+                            name: c.name.clone(),
+                            dtype: c.data_type.clone(),
+                        })
+                        .collect();
 
                     // ── Range index scan ──────────────────────────────────────
                     // Use pre-parsed exprs if available, otherwise fall back to parsing
-                    let lo_resolved = range_lo_expr.as_ref().cloned()
-                        .or_else(|| range_lo.as_ref().and_then(|s| Self::parse_expr_string(s).ok()));
-                    let hi_resolved = range_hi_expr.as_ref().cloned()
-                        .or_else(|| range_hi.as_ref().and_then(|s| Self::parse_expr_string(s).ok()));
+                    let lo_resolved = range_lo_expr.as_ref().cloned().or_else(|| {
+                        range_lo
+                            .as_ref()
+                            .and_then(|s| Self::parse_expr_string(s).ok())
+                    });
+                    let hi_resolved = range_hi_expr.as_ref().cloned().or_else(|| {
+                        range_hi
+                            .as_ref()
+                            .and_then(|s| Self::parse_expr_string(s).ok())
+                    });
 
                     if let (Some(lo_expr), Some(hi_expr)) = (lo_resolved, hi_resolved)
                         && let (Ok(lo_raw), Ok(hi_raw)) = (
@@ -1405,15 +1593,25 @@ impl Executor {
                     {
                         // Coerce range bounds to indexed column type (Int64→Int32 for INT columns)
                         let (lo_val, hi_val) = Self::coerce_index_bounds(
-                            lo_raw, hi_raw, table, index_name, &table_def, &self.catalog,
+                            lo_raw,
+                            hi_raw,
+                            table,
+                            index_name,
+                            &table_def,
+                            &self.catalog,
                         );
-                        if let Ok(Some(mut rows)) = self.storage
+                        if let Ok(Some(mut rows)) = self
+                            .storage
                             .index_lookup_range(table, index_name, &lo_val, &hi_val)
                             .await
                         {
                             // Post-filter: enforce strict bounds and residual predicates.
-                            let rp_resolved = range_predicate_expr.as_ref().cloned()
-                                .or_else(|| range_predicate.as_ref().and_then(|s| Self::parse_expr_string(s).ok()));
+                            let rp_resolved =
+                                range_predicate_expr.as_ref().cloned().or_else(|| {
+                                    range_predicate
+                                        .as_ref()
+                                        .and_then(|s| Self::parse_expr_string(s).ok())
+                                });
                             if let Some(pred_expr) = rp_resolved {
                                 rows.retain(|row| {
                                     self.eval_where_plan(&pred_expr, row, &meta)
@@ -1428,40 +1626,51 @@ impl Executor {
                     // ── Equality index scan ───────────────────────────────────
                     // The lookup_key_expr is the full predicate (e.g. `id = 500`).
                     // We need to extract the literal value from the equality for the index lookup.
-                    let key_resolved = lookup_key_expr.as_ref().cloned()
-                        .or_else(|| lookup_key.as_ref().and_then(|s| Self::parse_expr_string(s).ok()));
+                    let key_resolved = lookup_key_expr.as_ref().cloned().or_else(|| {
+                        lookup_key
+                            .as_ref()
+                            .and_then(|s| Self::parse_expr_string(s).ok())
+                    });
                     if let Some(ref key_expr) = key_resolved {
                         // Try eval_const_expr first (works for simple literal expressions)
-                        let key_val = self.eval_const_expr(key_expr).ok()
-                            .or_else(|| {
-                                // Extract the literal side of `col = literal` or `literal = col`
-                                Self::extract_equality_value(key_expr)
-                            });
+                        let key_val = self.eval_const_expr(key_expr).ok().or_else(|| {
+                            // Extract the literal side of `col = literal` or `literal = col`
+                            Self::extract_equality_value(key_expr)
+                        });
                         if let Some(val) = key_val {
                             // For non-PK equality scans with many expected rows, prefer
                             // fast_scan_where_eq which has better cache locality than
                             // cloning from the index BTreeMap. For PK/unique lookups
                             // (estimated_rows ≤ 10), use O(log N) index lookup instead.
                             if *estimated_rows > 10
-                                && let Some((col_name, _)) = planner::is_equality_predicate(key_expr)
-                                    && let Some(col_idx) = table_def.columns.iter()
-                                        .position(|c| c.name.eq_ignore_ascii_case(&col_name))
-                                    {
-                                        let coerced_scan = Self::coerce_to_storage_type(&val);
-                                        let storage = self.storage_for(table);
-                                        if let Some(rows) = storage.fast_scan_where_eq(
-                                            table, col_idx, &coerced_scan,
-                                        ) {
-                                            self.metrics.rows_scanned.inc_by(rows.len() as u64);
-                                            return Ok((meta, rows));
-                                        }
-                                    }
+                                && let Some((col_name, _)) =
+                                    planner::is_equality_predicate(key_expr)
+                                && let Some(col_idx) = table_def
+                                    .columns
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case(&col_name))
+                            {
+                                let coerced_scan = Self::coerce_to_storage_type(&val);
+                                let storage = self.storage_for(table);
+                                if let Some(rows) =
+                                    storage.fast_scan_where_eq(table, col_idx, &coerced_scan)
+                                {
+                                    self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                                    return Ok((meta, rows));
+                                }
+                            }
 
                             // Coerce to the indexed column's type (e.g. Int64→Int32 for INT columns)
                             let coerced = Self::coerce_index_value(
-                                val, table, index_name, &table_def, &self.catalog,
+                                val,
+                                table,
+                                index_name,
+                                &table_def,
+                                &self.catalog,
                             );
-                            if let Ok(Some(rows)) = self.storage.index_lookup(table, index_name, &coerced).await {
+                            if let Ok(Some(rows)) =
+                                self.storage.index_lookup(table, index_name, &coerced).await
+                            {
                                 self.metrics.rows_scanned.inc_by(rows.len() as u64);
                                 return Ok((meta, rows));
                             }
@@ -1470,13 +1679,22 @@ impl Executor {
 
                     // Index lookup failed -- return error to trigger AST fallback
                     // (doing an unfiltered seq scan here would lose the WHERE clause)
-                    Err(ExecError::Unsupported("IndexScan lookup failed, falling back to AST".into()))
+                    Err(ExecError::Unsupported(
+                        "IndexScan lookup failed, falling back to AST".into(),
+                    ))
                 }
 
-                planner::PlanNode::Filter { input, predicate, predicate_expr, .. } => {
+                planner::PlanNode::Filter {
+                    input,
+                    predicate,
+                    predicate_expr,
+                    ..
+                } => {
                     let (meta, mut rows) = self.execute_plan_node(input, cte_tables).await?;
                     // Use pre-parsed expr if available, otherwise fall back to parsing
-                    let resolved_expr = predicate_expr.as_ref().cloned()
+                    let resolved_expr = predicate_expr
+                        .as_ref()
+                        .cloned()
                         .or_else(|| Self::parse_expr_string(predicate).ok());
                     if let Some(expr) = resolved_expr {
                         // Try SIMD-accelerated filter first (simple col op literal predicates)
@@ -1487,8 +1705,11 @@ impl Executor {
                             #[cfg(feature = "server")]
                             {
                                 use rayon::prelude::*;
-                                rows = rows.into_par_iter()
-                                    .filter(|row| self.eval_where_plan(&expr, row, &meta).unwrap_or(false))
+                                rows = rows
+                                    .into_par_iter()
+                                    .filter(|row| {
+                                        self.eval_where_plan(&expr, row, &meta).unwrap_or(false)
+                                    })
                                     .collect();
                             }
                         } else {
@@ -1505,10 +1726,18 @@ impl Executor {
                     // Parse sort keys: "col_name ASC|DESC [NULLS FIRST|LAST]"
                     for key_str in keys.iter().rev() {
                         // Strip optional NULLS FIRST/LAST suffix
-                        let (base, nulls_first) = if let Some(_s) = key_str.to_uppercase().strip_suffix("NULLS FIRST") {
-                            (key_str[..key_str.len() - "NULLS FIRST".len()].trim(), Some(true))
+                        let (base, nulls_first) = if let Some(_s) =
+                            key_str.to_uppercase().strip_suffix("NULLS FIRST")
+                        {
+                            (
+                                key_str[..key_str.len() - "NULLS FIRST".len()].trim(),
+                                Some(true),
+                            )
                         } else if let Some(_s) = key_str.to_uppercase().strip_suffix("NULLS LAST") {
-                            (key_str[..key_str.len() - "NULLS LAST".len()].trim(), Some(false))
+                            (
+                                key_str[..key_str.len() - "NULLS LAST".len()].trim(),
+                                Some(false),
+                            )
                         } else {
                             (key_str.as_str(), None)
                         };
@@ -1527,8 +1756,20 @@ impl Executor {
                                 let b_null = b[idx] == Value::Null;
                                 match (a_null, b_null) {
                                     (true, true) => std::cmp::Ordering::Equal,
-                                    (true, false) => if nulls_first { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater },
-                                    (false, true) => if nulls_first { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less },
+                                    (true, false) => {
+                                        if nulls_first {
+                                            std::cmp::Ordering::Less
+                                        } else {
+                                            std::cmp::Ordering::Greater
+                                        }
+                                    }
+                                    (false, true) => {
+                                        if nulls_first {
+                                            std::cmp::Ordering::Greater
+                                        } else {
+                                            std::cmp::Ordering::Less
+                                        }
+                                    }
                                     (false, false) => {
                                         let cmp = a[idx].cmp(&b[idx]);
                                         if desc { cmp.reverse() } else { cmp }
@@ -1540,88 +1781,159 @@ impl Executor {
                     Ok((meta, rows))
                 }
 
-                planner::PlanNode::Limit { input, limit, offset, .. } => {
+                planner::PlanNode::Limit {
+                    input,
+                    limit,
+                    offset,
+                    ..
+                } => {
                     // ── Streaming top-K scan fusion ──────────────────────
                     // Limit → Sort → IndexScan/Filter: push sort+limit into the scan
                     // itself via fast_scan_where_eq_topk. Avoids materializing the
                     // full intermediate result (e.g. 83K rows → only 20 cloned).
-                    if let planner::PlanNode::Sort { input: sort_input, keys, .. } = input.as_ref()
+                    if let planner::PlanNode::Sort {
+                        input: sort_input,
+                        keys,
+                        ..
+                    } = input.as_ref()
                         && let (Some(lim), None | Some(0)) = (limit, offset.as_ref())
-                            && keys.len() == 1 && *lim > 0 {
-                                // Parse single sort key
-                                let key_str = &keys[0];
-                                let (base, _nulls) = if key_str.to_uppercase().strip_suffix("NULLS FIRST").is_some() {
-                                    (key_str[..key_str.len() - "NULLS FIRST".len()].trim(), Some(true))
-                                } else if key_str.to_uppercase().strip_suffix("NULLS LAST").is_some() {
-                                    (key_str[..key_str.len() - "NULLS LAST".len()].trim(), Some(false))
-                                } else {
-                                    (key_str.as_str(), None)
-                                };
-                                let parts: Vec<&str> = base.rsplitn(2, ' ').collect();
-                                let (sort_col_name, sort_desc) = if parts.len() == 2 {
-                                    (parts[1].trim(), parts[0].eq_ignore_ascii_case("DESC"))
-                                } else {
-                                    (base, false)
-                                };
+                        && keys.len() == 1
+                        && *lim > 0
+                    {
+                        // Parse single sort key
+                        let key_str = &keys[0];
+                        let (base, _nulls) =
+                            if key_str.to_uppercase().strip_suffix("NULLS FIRST").is_some() {
+                                (
+                                    key_str[..key_str.len() - "NULLS FIRST".len()].trim(),
+                                    Some(true),
+                                )
+                            } else if key_str.to_uppercase().strip_suffix("NULLS LAST").is_some() {
+                                (
+                                    key_str[..key_str.len() - "NULLS LAST".len()].trim(),
+                                    Some(false),
+                                )
+                            } else {
+                                (key_str.as_str(), None)
+                            };
+                        let parts: Vec<&str> = base.rsplitn(2, ' ').collect();
+                        let (sort_col_name, sort_desc) = if parts.len() == 2 {
+                            (parts[1].trim(), parts[0].eq_ignore_ascii_case("DESC"))
+                        } else {
+                            (base, false)
+                        };
 
-                                // Extract (table, filter_expr) from IndexScan or SeqScan
-                                let scan_table_and_expr: Option<(String, sqlparser::ast::Expr)> =
-                                    if let planner::PlanNode::IndexScan {
-                                        table, estimated_rows, lookup_key_expr, lookup_key, ..
-                                    } = sort_input.as_ref() {
-                                        if *estimated_rows > 10 {
-                                            let key_resolved = lookup_key_expr.as_ref().cloned()
-                                                .or_else(|| lookup_key.as_ref().and_then(|s| Self::parse_expr_string(s).ok()));
-                                            key_resolved.map(|e| (table.clone(), e))
-                                        } else { None }
-                                    } else if let planner::PlanNode::SeqScan {
-                                        table, filter_expr: Some(fexpr), ..
-                                    } = sort_input.as_ref() {
-                                        Some((table.clone(), fexpr.clone()))
-                                    } else { None };
+                        // Extract (table, filter_expr) from IndexScan or SeqScan
+                        let scan_table_and_expr: Option<(String, sqlparser::ast::Expr)> =
+                            if let planner::PlanNode::IndexScan {
+                                table,
+                                estimated_rows,
+                                lookup_key_expr,
+                                lookup_key,
+                                ..
+                            } = sort_input.as_ref()
+                            {
+                                if *estimated_rows > 10 {
+                                    let key_resolved =
+                                        lookup_key_expr.as_ref().cloned().or_else(|| {
+                                            lookup_key
+                                                .as_ref()
+                                                .and_then(|s| Self::parse_expr_string(s).ok())
+                                        });
+                                    key_resolved.map(|e| (table.clone(), e))
+                                } else {
+                                    None
+                                }
+                            } else if let planner::PlanNode::SeqScan {
+                                table,
+                                filter_expr: Some(fexpr),
+                                ..
+                            } = sort_input.as_ref()
+                            {
+                                Some((table.clone(), fexpr.clone()))
+                            } else {
+                                None
+                            };
 
-                                if let Some((table, key_expr)) = scan_table_and_expr
-                                    && let Some((col_name, _)) = planner::is_equality_predicate(&key_expr)
-                                        && let Some(filter_val) = Self::extract_equality_value(&key_expr)
-                                            && let Ok(table_def) = self.get_table(&table).await {
-                                                let meta: Vec<ColMeta> = table_def.columns.iter().map(|c| ColMeta {
-                                                    table: Some(table.clone()),
-                                                    name: c.name.clone(),
-                                                    dtype: c.data_type.clone(),
-                                                }).collect();
-                                                if let (Some(filter_col_idx), Some(sort_col_idx)) = (
-                                                    table_def.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name)),
-                                                    table_def.columns.iter().position(|c| c.name.eq_ignore_ascii_case(sort_col_name)),
-                                                ) {
-                                                    let coerced = Self::coerce_to_storage_type(&filter_val);
-                                                    let storage = self.storage_for(&table);
-                                                    if let Some(rows) = storage.fast_scan_where_eq_topk(
-                                                        &table, filter_col_idx, &coerced,
-                                                        sort_col_idx, sort_desc, *lim,
-                                                    ) {
-                                                        self.metrics.rows_scanned.inc_by(rows.len() as u64);
-                                                        return Ok((meta, rows));
-                                                    }
-                                                }
-                                            }
+                        if let Some((table, key_expr)) = scan_table_and_expr
+                            && let Some((col_name, _)) = planner::is_equality_predicate(&key_expr)
+                            && let Some(filter_val) = Self::extract_equality_value(&key_expr)
+                            && let Ok(table_def) = self.get_table(&table).await
+                        {
+                            let meta: Vec<ColMeta> = table_def
+                                .columns
+                                .iter()
+                                .map(|c| ColMeta {
+                                    table: Some(table.clone()),
+                                    name: c.name.clone(),
+                                    dtype: c.data_type.clone(),
+                                })
+                                .collect();
+                            if let (Some(filter_col_idx), Some(sort_col_idx)) = (
+                                table_def
+                                    .columns
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case(&col_name)),
+                                table_def
+                                    .columns
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case(sort_col_name)),
+                            ) {
+                                let coerced = Self::coerce_to_storage_type(&filter_val);
+                                let storage = self.storage_for(&table);
+                                if let Some(rows) = storage.fast_scan_where_eq_topk(
+                                    &table,
+                                    filter_col_idx,
+                                    &coerced,
+                                    sort_col_idx,
+                                    sort_desc,
+                                    *lim,
+                                ) {
+                                    self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                                    return Ok((meta, rows));
+                                }
                             }
+                        }
+                    }
 
                     // ── Top-K sort fusion ────────────────────────────────
 
                     // When Limit wraps Sort, avoid sorting all N rows.
                     // Use select_nth_unstable_by to partition in O(N), then
                     // sort only the top K elements in O(K log K).
-                    if let planner::PlanNode::Sort { input: sort_input, keys, .. } = input.as_ref()
-                        && let (Some(lim), None | Some(0)) = (limit, offset.as_ref()) {
-                            let (meta, mut rows) = self.execute_plan_node(sort_input, cte_tables).await?;
-                            let k = (*lim).min(rows.len());
-                            if k > 0 && k < rows.len() {
-                                // Build comparator from sort keys
-                                let sort_specs: Vec<(usize, bool, bool)> = keys.iter().filter_map(|key_str| {
-                                    let (base, nulls_first) = if key_str.to_uppercase().strip_suffix("NULLS FIRST").is_some() {
-                                        (key_str[..key_str.len() - "NULLS FIRST".len()].trim(), Some(true))
-                                    } else if key_str.to_uppercase().strip_suffix("NULLS LAST").is_some() {
-                                        (key_str[..key_str.len() - "NULLS LAST".len()].trim(), Some(false))
+                    if let planner::PlanNode::Sort {
+                        input: sort_input,
+                        keys,
+                        ..
+                    } = input.as_ref()
+                        && let (Some(lim), None | Some(0)) = (limit, offset.as_ref())
+                    {
+                        let (meta, mut rows) =
+                            self.execute_plan_node(sort_input, cte_tables).await?;
+                        let k = (*lim).min(rows.len());
+                        if k > 0 && k < rows.len() {
+                            // Build comparator from sort keys
+                            let sort_specs: Vec<(usize, bool, bool)> = keys
+                                .iter()
+                                .filter_map(|key_str| {
+                                    let (base, nulls_first) = if key_str
+                                        .to_uppercase()
+                                        .strip_suffix("NULLS FIRST")
+                                        .is_some()
+                                    {
+                                        (
+                                            key_str[..key_str.len() - "NULLS FIRST".len()].trim(),
+                                            Some(true),
+                                        )
+                                    } else if key_str
+                                        .to_uppercase()
+                                        .strip_suffix("NULLS LAST")
+                                        .is_some()
+                                    {
+                                        (
+                                            key_str[..key_str.len() - "NULLS LAST".len()].trim(),
+                                            Some(false),
+                                        )
                                     } else {
                                         (key_str.as_str(), None)
                                     };
@@ -1634,42 +1946,55 @@ impl Executor {
                                     let nulls_first = nulls_first.unwrap_or(desc);
                                     Self::resolve_plan_col_idx(&meta, col_name)
                                         .map(|idx| (idx, desc, nulls_first))
-                                }).collect();
+                                })
+                                .collect();
 
-                                if !sort_specs.is_empty() {
-                                    let cmp = |a: &Row, b: &Row| -> std::cmp::Ordering {
-                                        for &(idx, desc, nulls_first) in &sort_specs {
-                                            let a_null = a[idx] == Value::Null;
-                                            let b_null = b[idx] == Value::Null;
-                                            let ord = match (a_null, b_null) {
-                                                (true, true) => std::cmp::Ordering::Equal,
-                                                (true, false) => if nulls_first { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater },
-                                                (false, true) => if nulls_first { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less },
-                                                (false, false) => {
-                                                    let c = a[idx].cmp(&b[idx]);
-                                                    if desc { c.reverse() } else { c }
+                            if !sort_specs.is_empty() {
+                                let cmp = |a: &Row, b: &Row| -> std::cmp::Ordering {
+                                    for &(idx, desc, nulls_first) in &sort_specs {
+                                        let a_null = a[idx] == Value::Null;
+                                        let b_null = b[idx] == Value::Null;
+                                        let ord = match (a_null, b_null) {
+                                            (true, true) => std::cmp::Ordering::Equal,
+                                            (true, false) => {
+                                                if nulls_first {
+                                                    std::cmp::Ordering::Less
+                                                } else {
+                                                    std::cmp::Ordering::Greater
                                                 }
-                                            };
-                                            if ord != std::cmp::Ordering::Equal {
-                                                return ord;
                                             }
+                                            (false, true) => {
+                                                if nulls_first {
+                                                    std::cmp::Ordering::Greater
+                                                } else {
+                                                    std::cmp::Ordering::Less
+                                                }
+                                            }
+                                            (false, false) => {
+                                                let c = a[idx].cmp(&b[idx]);
+                                                if desc { c.reverse() } else { c }
+                                            }
+                                        };
+                                        if ord != std::cmp::Ordering::Equal {
+                                            return ord;
                                         }
-                                        std::cmp::Ordering::Equal
-                                    };
-                                    // Partition around the k-th element in O(N)
-                                    rows.select_nth_unstable_by(k - 1, cmp);
-                                    rows.truncate(k);
-                                    // Sort only the top K in O(K log K)
-                                    rows.sort_by(cmp);
-                                    return Ok((meta, rows));
-                                }
-                            } else if k == 0 {
-                                rows.clear();
+                                    }
+                                    std::cmp::Ordering::Equal
+                                };
+                                // Partition around the k-th element in O(N)
+                                rows.select_nth_unstable_by(k - 1, cmp);
+                                rows.truncate(k);
+                                // Sort only the top K in O(K log K)
+                                rows.sort_by(cmp);
                                 return Ok((meta, rows));
                             }
-                            // k == rows.len(): no truncation needed, but still sort
-                            // Fall through to full sort below
+                        } else if k == 0 {
+                            rows.clear();
+                            return Ok((meta, rows));
                         }
+                        // k == rows.len(): no truncation needed, but still sort
+                        // Fall through to full sort below
+                    }
 
                     let (meta, mut rows) = self.execute_plan_node(input, cte_tables).await?;
                     if let Some(off) = offset {
@@ -1692,16 +2017,20 @@ impl Executor {
                         return Ok((meta, rows));
                     }
                     // Map column names/expressions to indices or parsed expressions
-                    enum ProjItem { ColIdx(usize), Expr(Box<Expr>) }
+                    enum ProjItem {
+                        ColIdx(usize),
+                        Expr(Box<Expr>),
+                    }
                     let mut proj_meta = Vec::new();
                     let mut proj_items: Vec<ProjItem> = Vec::new();
                     for col_spec in columns {
                         // Handle "expr AS alias"
-                        let (col_name, alias) = if let Some(pos) = col_spec.to_uppercase().rfind(" AS ") {
-                            (&col_spec[..pos], Some(col_spec[pos+4..].trim()))
-                        } else {
-                            (col_spec.as_str(), None)
-                        };
+                        let (col_name, alias) =
+                            if let Some(pos) = col_spec.to_uppercase().rfind(" AS ") {
+                                (&col_spec[..pos], Some(col_spec[pos + 4..].trim()))
+                            } else {
+                                (col_spec.as_str(), None)
+                            };
                         if let Some(idx) = Self::resolve_plan_col_idx(&meta, col_name) {
                             proj_meta.push(ColMeta {
                                 table: meta[idx].table.clone(),
@@ -1728,7 +2057,8 @@ impl Executor {
                                     None
                                 }
                             });
-                            let dtype = upstream_dt.unwrap_or_else(|| infer_expr_type(&expr, &meta));
+                            let dtype =
+                                upstream_dt.unwrap_or_else(|| infer_expr_type(&expr, &meta));
                             proj_meta.push(ColMeta {
                                 table: None,
                                 name: alias.unwrap_or(col_name).to_string(),
@@ -1744,27 +2074,43 @@ impl Executor {
                             proj_items.push(ProjItem::ColIdx(usize::MAX)); // sentinel → Null
                         }
                     }
-                    let projected_rows: Vec<Row> = rows.iter().map(|row| {
-                        proj_items.iter().map(|item| {
-                            match item {
-                                ProjItem::ColIdx(idx) => row.get(*idx).cloned().unwrap_or(Value::Null),
-                                ProjItem::Expr(expr) => self.eval_expr_plan(expr, row, &meta).unwrap_or(Value::Null),
-                            }
-                        }).collect()
-                    }).collect();
+                    let projected_rows: Vec<Row> = rows
+                        .iter()
+                        .map(|row| {
+                            proj_items
+                                .iter()
+                                .map(|item| match item {
+                                    ProjItem::ColIdx(idx) => {
+                                        row.get(*idx).cloned().unwrap_or(Value::Null)
+                                    }
+                                    ProjItem::Expr(expr) => {
+                                        self.eval_expr_plan(expr, row, &meta).unwrap_or(Value::Null)
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect();
                     Ok((proj_meta, projected_rows))
                 }
 
-                planner::PlanNode::NestedLoopJoin { left, right, condition, condition_expr, .. } => {
+                planner::PlanNode::NestedLoopJoin {
+                    left,
+                    right,
+                    condition,
+                    condition_expr,
+                    ..
+                } => {
                     let (left_meta, left_rows) = self.execute_plan_node(left, cte_tables).await?;
-                    let (right_meta, right_rows) = self.execute_plan_node(right, cte_tables).await?;
+                    let (right_meta, right_rows) =
+                        self.execute_plan_node(right, cte_tables).await?;
 
                     // Guard against cartesian explosion.
                     let product = left_rows.len().saturating_mul(right_rows.len());
                     if product > Self::MAX_CROSS_JOIN_ROWS {
                         return Err(ExecError::Runtime(format!(
                             "nested loop join would produce {} rows, exceeding limit of {}",
-                            product, Self::MAX_CROSS_JOIN_ROWS
+                            product,
+                            Self::MAX_CROSS_JOIN_ROWS
                         )));
                     }
 
@@ -1773,15 +2119,21 @@ impl Executor {
 
                     let mut result_rows = Vec::new();
                     // Use pre-parsed expr if available, otherwise fall back to parsing
-                    let cond_expr = condition_expr.as_ref().cloned()
-                        .or_else(|| condition.as_ref().and_then(|s| Self::parse_expr_string(s).ok()));
+                    let cond_expr = condition_expr.as_ref().cloned().or_else(|| {
+                        condition
+                            .as_ref()
+                            .and_then(|s| Self::parse_expr_string(s).ok())
+                    });
 
                     for lrow in &left_rows {
                         for rrow in &right_rows {
                             let mut combined = lrow.clone();
                             combined.extend(rrow.clone());
                             if let Some(ref expr) = cond_expr {
-                                if self.eval_where_plan(expr, &combined, &combined_meta).unwrap_or(false) {
+                                if self
+                                    .eval_where_plan(expr, &combined, &combined_meta)
+                                    .unwrap_or(false)
+                                {
                                     result_rows.push(combined);
                                 }
                             } else {
@@ -1792,9 +2144,15 @@ impl Executor {
                     Ok((combined_meta, result_rows))
                 }
 
-                planner::PlanNode::HashJoin { left, right, hash_keys, .. } => {
+                planner::PlanNode::HashJoin {
+                    left,
+                    right,
+                    hash_keys,
+                    ..
+                } => {
                     let (left_meta, left_rows) = self.execute_plan_node(left, cte_tables).await?;
-                    let (right_meta, right_rows) = self.execute_plan_node(right, cte_tables).await?;
+                    let (right_meta, right_rows) =
+                        self.execute_plan_node(right, cte_tables).await?;
 
                     let mut combined_meta = left_meta.clone();
                     combined_meta.extend(right_meta.clone());
@@ -1812,7 +2170,8 @@ impl Executor {
                                 Self::resolve_plan_col_idx_for_join_side(&left_meta, rhs),
                                 Self::resolve_plan_col_idx_for_join_side(&right_meta, lhs),
                             );
-                            let (left_idx, right_idx) = if direct.0.is_some() && direct.1.is_some() {
+                            let (left_idx, right_idx) = if direct.0.is_some() && direct.1.is_some()
+                            {
                                 direct
                             } else if swapped.0.is_some() && swapped.1.is_some() {
                                 swapped
@@ -1825,13 +2184,17 @@ impl Executor {
                                 // Use Value directly as key (Hash+Eq implemented) — avoids format!("{:?}") allocation per row
                                 let mut hash_table: HashMap<Value, Vec<&Row>> = HashMap::new();
                                 for rrow in &right_rows {
-                                    if rrow[ri] == Value::Null { continue; }
+                                    if rrow[ri] == Value::Null {
+                                        continue;
+                                    }
                                     hash_table.entry(rrow[ri].clone()).or_default().push(rrow);
                                 }
                                 // Probe with left side (skip NULL keys)
                                 let mut result_rows = Vec::new();
                                 for lrow in &left_rows {
-                                    if lrow[li] == Value::Null { continue; }
+                                    if lrow[li] == Value::Null {
+                                        continue;
+                                    }
                                     if let Some(matches) = hash_table.get(&lrow[li]) {
                                         for rrow in matches {
                                             let mut combined = lrow.clone();
@@ -1849,7 +2212,8 @@ impl Executor {
                     if product > Self::MAX_CROSS_JOIN_ROWS {
                         return Err(ExecError::Runtime(format!(
                             "cross join would produce {} rows, exceeding limit of {}",
-                            product, Self::MAX_CROSS_JOIN_ROWS
+                            product,
+                            Self::MAX_CROSS_JOIN_ROWS
                         )));
                     }
                     let mut result_rows = Vec::new();
@@ -1863,7 +2227,9 @@ impl Executor {
                     Ok((combined_meta, result_rows))
                 }
 
-                planner::PlanNode::Aggregate { input, aggregates, .. } => {
+                planner::PlanNode::Aggregate {
+                    input, aggregates, ..
+                } => {
                     // Fast path: simple aggregate over bare SeqScan — use storage
                     // engine's O(1) count / O(n) sum instead of loading all rows.
                     if let planner::PlanNode::SeqScan { table, filter, .. } = input.as_ref()
@@ -1881,68 +2247,159 @@ impl Executor {
                                 let (func_name, col_name) = parse_agg_spec(agg_str);
                                 match func_name.as_str() {
                                     "COUNT" if col_name == "*" => {
-                                        let n = tbl_storage.fast_count_all(table).unwrap_or(0) as i64;
-                                        result_meta.push(ColMeta { table: None, name: agg_str.clone(), dtype: DataType::Int64 });
+                                        let n =
+                                            tbl_storage.fast_count_all(table).unwrap_or(0) as i64;
+                                        result_meta.push(ColMeta {
+                                            table: None,
+                                            name: agg_str.clone(),
+                                            dtype: DataType::Int64,
+                                        });
                                         result_values.push(Value::Int64(n));
                                     }
                                     "SUM" | "AVG" | "MIN" | "MAX" => {
                                         let resolve = |name: &str| -> Option<usize> {
-                                            ci.iter().position(|(c, _)| c.eq_ignore_ascii_case(name))
+                                            ci.iter()
+                                                .position(|(c, _)| c.eq_ignore_ascii_case(name))
                                         };
                                         if let Some(col_idx) = resolve(&col_name) {
                                             match func_name.as_str() {
-                                                "SUM" => match tbl_storage.fast_sum_f64(table, col_idx) {
-                                                    Some((sum, cnt)) => {
-                                                        let v = if cnt == 0 { Value::Null } else {
-                                                            let is_int = ci.get(col_idx).is_some_and(|(_, dt)| matches!(dt, DataType::Int32 | DataType::Int64));
-                                                            if is_int { Value::Int64(sum as i64) } else { Value::Float64(sum) }
-                                                        };
-                                                        result_meta.push(ColMeta { table: None, name: agg_str.clone(), dtype: if cnt == 0 { DataType::Float64 } else { DataType::Int64 } });
-                                                        result_values.push(v);
+                                                "SUM" => {
+                                                    match tbl_storage.fast_sum_f64(table, col_idx) {
+                                                        Some((sum, cnt)) => {
+                                                            let v = if cnt == 0 {
+                                                                Value::Null
+                                                            } else {
+                                                                let is_int = ci
+                                                                    .get(col_idx)
+                                                                    .is_some_and(|(_, dt)| {
+                                                                        matches!(
+                                                                            dt,
+                                                                            DataType::Int32
+                                                                                | DataType::Int64
+                                                                        )
+                                                                    });
+                                                                if is_int {
+                                                                    Value::Int64(sum as i64)
+                                                                } else {
+                                                                    Value::Float64(sum)
+                                                                }
+                                                            };
+                                                            result_meta.push(ColMeta {
+                                                                table: None,
+                                                                name: agg_str.clone(),
+                                                                dtype: if cnt == 0 {
+                                                                    DataType::Float64
+                                                                } else {
+                                                                    DataType::Int64
+                                                                },
+                                                            });
+                                                            result_values.push(v);
+                                                        }
+                                                        None => {
+                                                            all_handled = false;
+                                                            break;
+                                                        }
                                                     }
-                                                    None => { all_handled = false; break; }
-                                                },
-                                                "AVG" => match tbl_storage.fast_sum_f64(table, col_idx) {
-                                                    Some((sum, cnt)) => {
-                                                        let v = if cnt == 0 { Value::Null } else { Value::Float64(sum / cnt as f64) };
-                                                        result_meta.push(ColMeta { table: None, name: agg_str.clone(), dtype: DataType::Float64 });
-                                                        result_values.push(v);
+                                                }
+                                                "AVG" => {
+                                                    match tbl_storage.fast_sum_f64(table, col_idx) {
+                                                        Some((sum, cnt)) => {
+                                                            let v = if cnt == 0 {
+                                                                Value::Null
+                                                            } else {
+                                                                Value::Float64(sum / cnt as f64)
+                                                            };
+                                                            result_meta.push(ColMeta {
+                                                                table: None,
+                                                                name: agg_str.clone(),
+                                                                dtype: DataType::Float64,
+                                                            });
+                                                            result_values.push(v);
+                                                        }
+                                                        None => {
+                                                            all_handled = false;
+                                                            break;
+                                                        }
                                                     }
-                                                    None => { all_handled = false; break; }
-                                                },
-                                                "MIN" => match tbl_storage.fast_min_f64(table, col_idx) {
-                                                    Some(v) => {
-                                                        let col_dt = ci.get(col_idx).map(|(_, dt)| dt);
-                                                        let (dtype, val) = match col_dt {
-                                                            Some(DataType::Int32) => (DataType::Int32, Value::Int32(v as i32)),
-                                                            Some(DataType::Int64) => (DataType::Int64, Value::Int64(v as i64)),
-                                                            _ => (DataType::Float64, Value::Float64(v)),
-                                                        };
-                                                        result_meta.push(ColMeta { table: None, name: agg_str.clone(), dtype });
-                                                        result_values.push(val);
+                                                }
+                                                "MIN" => {
+                                                    match tbl_storage.fast_min_f64(table, col_idx) {
+                                                        Some(v) => {
+                                                            let col_dt =
+                                                                ci.get(col_idx).map(|(_, dt)| dt);
+                                                            let (dtype, val) = match col_dt {
+                                                                Some(DataType::Int32) => (
+                                                                    DataType::Int32,
+                                                                    Value::Int32(v as i32),
+                                                                ),
+                                                                Some(DataType::Int64) => (
+                                                                    DataType::Int64,
+                                                                    Value::Int64(v as i64),
+                                                                ),
+                                                                _ => (
+                                                                    DataType::Float64,
+                                                                    Value::Float64(v),
+                                                                ),
+                                                            };
+                                                            result_meta.push(ColMeta {
+                                                                table: None,
+                                                                name: agg_str.clone(),
+                                                                dtype,
+                                                            });
+                                                            result_values.push(val);
+                                                        }
+                                                        None => {
+                                                            all_handled = false;
+                                                            break;
+                                                        }
                                                     }
-                                                    None => { all_handled = false; break; }
-                                                },
-                                                "MAX" => match tbl_storage.fast_max_f64(table, col_idx) {
-                                                    Some(v) => {
-                                                        let col_dt = ci.get(col_idx).map(|(_, dt)| dt);
-                                                        let (dtype, val) = match col_dt {
-                                                            Some(DataType::Int32) => (DataType::Int32, Value::Int32(v as i32)),
-                                                            Some(DataType::Int64) => (DataType::Int64, Value::Int64(v as i64)),
-                                                            _ => (DataType::Float64, Value::Float64(v)),
-                                                        };
-                                                        result_meta.push(ColMeta { table: None, name: agg_str.clone(), dtype });
-                                                        result_values.push(val);
+                                                }
+                                                "MAX" => {
+                                                    match tbl_storage.fast_max_f64(table, col_idx) {
+                                                        Some(v) => {
+                                                            let col_dt =
+                                                                ci.get(col_idx).map(|(_, dt)| dt);
+                                                            let (dtype, val) = match col_dt {
+                                                                Some(DataType::Int32) => (
+                                                                    DataType::Int32,
+                                                                    Value::Int32(v as i32),
+                                                                ),
+                                                                Some(DataType::Int64) => (
+                                                                    DataType::Int64,
+                                                                    Value::Int64(v as i64),
+                                                                ),
+                                                                _ => (
+                                                                    DataType::Float64,
+                                                                    Value::Float64(v),
+                                                                ),
+                                                            };
+                                                            result_meta.push(ColMeta {
+                                                                table: None,
+                                                                name: agg_str.clone(),
+                                                                dtype,
+                                                            });
+                                                            result_values.push(val);
+                                                        }
+                                                        None => {
+                                                            all_handled = false;
+                                                            break;
+                                                        }
                                                     }
-                                                    None => { all_handled = false; break; }
-                                                },
-                                                _ => { all_handled = false; break; }
+                                                }
+                                                _ => {
+                                                    all_handled = false;
+                                                    break;
+                                                }
                                             }
                                         } else {
-                                            all_handled = false; break;
+                                            all_handled = false;
+                                            break;
                                         }
                                     }
-                                    _ => { all_handled = false; break; }
+                                    _ => {
+                                        all_handled = false;
+                                        break;
+                                    }
                                 }
                             }
                             if all_handled {
@@ -1974,7 +2431,9 @@ impl Executor {
                         let static_dt = match func_name.as_str() {
                             "COUNT" => Some(DataType::Int64),
                             "SUM" => match &arg_dt {
-                                Some(DataType::Int32) | Some(DataType::Int64) => Some(DataType::Int64),
+                                Some(DataType::Int32) | Some(DataType::Int64) => {
+                                    Some(DataType::Int64)
+                                }
                                 Some(dt) => Some(dt.clone()),
                                 None => None,
                             },
@@ -2002,7 +2461,12 @@ impl Executor {
                     Ok((result_meta, vec![result_values]))
                 }
 
-                planner::PlanNode::HashAggregate { input, group_keys, aggregates, .. } => {
+                planner::PlanNode::HashAggregate {
+                    input,
+                    group_keys,
+                    aggregates,
+                    ..
+                } => {
                     // Fast path: single-key GROUP BY over a bare SeqScan — use storage
                     // engine's O(n) columnar aggregate instead of loading all rows first.
                     if let planner::PlanNode::SeqScan { table, filter, .. } = input.as_ref()
@@ -2026,15 +2490,24 @@ impl Executor {
                             });
                             if let Some(ki) = key_idx {
                                 let tbl_storage = self.storage_for(table);
-                                if let Some(groups) = tbl_storage.fast_group_by(table, ki, val_idx) {
+                                if let Some(groups) = tbl_storage.fast_group_by(table, ki, val_idx)
+                                {
                                     // Check if the value column is integer-typed for correct SUM return type
-                                    let val_is_int = val_idx
-                                        .and_then(|vi| ci.get(vi))
-                                        .is_some_and(|(_, dt)| matches!(dt, DataType::Int32 | DataType::Int64));
+                                    let val_is_int =
+                                        val_idx.and_then(|vi| ci.get(vi)).is_some_and(|(_, dt)| {
+                                            matches!(dt, DataType::Int32 | DataType::Int64)
+                                        });
                                     // Build result meta
                                     let mut result_meta = Vec::new();
-                                    let key_dt = ci.get(ki).map(|(_, dt)| dt.clone()).unwrap_or(DataType::Text);
-                                    result_meta.push(ColMeta { table: Some(table.clone()), name: group_keys[0].clone(), dtype: key_dt });
+                                    let key_dt = ci
+                                        .get(ki)
+                                        .map(|(_, dt)| dt.clone())
+                                        .unwrap_or(DataType::Text);
+                                    result_meta.push(ColMeta {
+                                        table: Some(table.clone()),
+                                        name: group_keys[0].clone(),
+                                        dtype: key_dt,
+                                    });
                                     for agg_str in aggregates {
                                         let (func_name, col_name) = parse_agg_spec(agg_str);
                                         // Resolve the aggregate's argument column type so MAX/MIN
@@ -2060,20 +2533,31 @@ impl Executor {
                                         });
                                     }
                                     // Build result rows from fast_group_by output
-                                    let result_rows: Vec<Row> = groups.into_iter().map(|(key, count, avg)| {
-                                        let mut row = vec![key];
-                                        for agg_str in aggregates {
-                                            let (func_name, _) = parse_agg_spec(agg_str);
-                                            row.push(match func_name.as_str() {
-                                                "COUNT" => Value::Int64(count),
-                                                "SUM" if val_is_int => avg.map(|a| Value::Int64((a * count as f64) as i64)).unwrap_or(Value::Null),
-                                                "SUM" => avg.map(|a| Value::Float64(a * count as f64)).unwrap_or(Value::Null),
-                                                "AVG" => avg.map(Value::Float64).unwrap_or(Value::Null),
-                                                _ => Value::Null,
-                                            });
-                                        }
-                                        row
-                                    }).collect();
+                                    let result_rows: Vec<Row> = groups
+                                        .into_iter()
+                                        .map(|(key, count, avg)| {
+                                            let mut row = vec![key];
+                                            for agg_str in aggregates {
+                                                let (func_name, _) = parse_agg_spec(agg_str);
+                                                row.push(match func_name.as_str() {
+                                                    "COUNT" => Value::Int64(count),
+                                                    "SUM" if val_is_int => avg
+                                                        .map(|a| {
+                                                            Value::Int64((a * count as f64) as i64)
+                                                        })
+                                                        .unwrap_or(Value::Null),
+                                                    "SUM" => avg
+                                                        .map(|a| Value::Float64(a * count as f64))
+                                                        .unwrap_or(Value::Null),
+                                                    "AVG" => avg
+                                                        .map(Value::Float64)
+                                                        .unwrap_or(Value::Null),
+                                                    _ => Value::Null,
+                                                });
+                                            }
+                                            row
+                                        })
+                                        .collect();
                                     return Ok((result_meta, result_rows));
                                 }
                             }
@@ -2087,9 +2571,11 @@ impl Executor {
                     for k in group_keys {
                         match Self::resolve_plan_col_idx(&meta, k) {
                             Some(idx) => key_indices.push(idx),
-                            None => return Err(ExecError::Unsupported(
-                                format!("HashAggregate: GROUP BY column '{k}' not found in input")
-                            )),
+                            None => {
+                                return Err(ExecError::Unsupported(format!(
+                                    "HashAggregate: GROUP BY column '{k}' not found in input"
+                                )));
+                            }
                         }
                     }
                     // Build groups: store row indices instead of full row clones.
@@ -2133,7 +2619,8 @@ impl Executor {
                     if key_indices.len() == 1 {
                         // Single-key fast path: use Value directly (no Vec wrapper allocation)
                         let ki = key_indices[0];
-                        let mut groups: HashMap<Value, Vec<usize>> = HashMap::with_capacity(estimated_groups);
+                        let mut groups: HashMap<Value, Vec<usize>> =
+                            HashMap::with_capacity(estimated_groups);
                         for (idx, row) in rows.iter().enumerate() {
                             let key = row.get(ki).cloned().unwrap_or(Value::Null);
                             groups.entry(key).or_default().push(idx);
@@ -2141,10 +2628,12 @@ impl Executor {
                         let mut result_rows = Vec::with_capacity(groups.len());
                         for group_indices in groups.values() {
                             let first = &rows[group_indices[0]];
-                            let mut row_out: Vec<Value> = key_indices.iter().map(|&i| {
-                                first.get(i).cloned().unwrap_or(Value::Null)
-                            }).collect();
-                            let group_rows: Vec<&Row> = group_indices.iter().map(|&i| &rows[i]).collect();
+                            let mut row_out: Vec<Value> = key_indices
+                                .iter()
+                                .map(|&i| first.get(i).cloned().unwrap_or(Value::Null))
+                                .collect();
+                            let group_rows: Vec<&Row> =
+                                group_indices.iter().map(|&i| &rows[i]).collect();
                             for agg_str in aggregates {
                                 let (func_name, col_name) = parse_agg_spec(agg_str);
                                 let col_idx = if col_name == "*" {
@@ -2152,29 +2641,37 @@ impl Executor {
                                 } else {
                                     Self::resolve_plan_col_idx(&meta, &col_name)
                                 };
-                                row_out.push(compute_aggregate_refs(&func_name, col_idx, &group_rows));
+                                row_out.push(compute_aggregate_refs(
+                                    &func_name,
+                                    col_idx,
+                                    &group_rows,
+                                ));
                             }
                             result_rows.push(row_out);
                         }
                         return Ok((result_meta, result_rows));
                     }
                     // Multi-key path: use Vec<Value> as key
-                    let mut groups: HashMap<Vec<Value>, Vec<usize>> = HashMap::with_capacity(estimated_groups);
+                    let mut groups: HashMap<Vec<Value>, Vec<usize>> =
+                        HashMap::with_capacity(estimated_groups);
                     for (idx, row) in rows.iter().enumerate() {
-                        let key: Vec<Value> = key_indices.iter().map(|&i| {
-                            row.get(i).cloned().unwrap_or(Value::Null)
-                        }).collect();
+                        let key: Vec<Value> = key_indices
+                            .iter()
+                            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                            .collect();
                         groups.entry(key).or_default().push(idx);
                     }
                     // Compute per-group — reference rows by index instead of clones
                     let mut result_rows = Vec::new();
                     for group_indices in groups.values() {
                         let first = &rows[group_indices[0]];
-                        let mut row_out: Vec<Value> = key_indices.iter().map(|&i| {
-                            first.get(i).cloned().unwrap_or(Value::Null)
-                        }).collect();
+                        let mut row_out: Vec<Value> = key_indices
+                            .iter()
+                            .map(|&i| first.get(i).cloned().unwrap_or(Value::Null))
+                            .collect();
                         // Collect group rows for aggregate computation
-                        let group_rows: Vec<&Row> = group_indices.iter().map(|&i| &rows[i]).collect();
+                        let group_rows: Vec<&Row> =
+                            group_indices.iter().map(|&i| &rows[i]).collect();
                         for agg_str in aggregates {
                             let (func_name, col_name) = parse_agg_spec(agg_str);
                             let col_idx = if col_name == "*" {
@@ -2210,7 +2707,10 @@ impl Executor {
             .position(|c| c.name.eq_ignore_ascii_case(unqualified))
     }
 
-    pub(super) fn resolve_plan_col_idx_for_join_side(meta: &[ColMeta], col_spec: &str) -> Option<usize> {
+    pub(super) fn resolve_plan_col_idx_for_join_side(
+        meta: &[ColMeta],
+        col_spec: &str,
+    ) -> Option<usize> {
         let trimmed = col_spec.trim();
         if let Some(dot) = trimmed.rfind('.') {
             let table = trimmed[..dot].trim().trim_matches('"');
@@ -2230,7 +2730,12 @@ impl Executor {
     }
 
     /// Evaluate a WHERE expression against a row using plan-provided column metadata.
-    pub(super) fn eval_where_plan(&self, expr: &Expr, row: &Row, meta: &[ColMeta]) -> Result<bool, ExecError> {
+    pub(super) fn eval_where_plan(
+        &self,
+        expr: &Expr,
+        row: &Row,
+        meta: &[ColMeta],
+    ) -> Result<bool, ExecError> {
         let val = self.eval_expr_plan(expr, row, meta)?;
         match val {
             Value::Bool(b) => Ok(b),
@@ -2240,7 +2745,12 @@ impl Executor {
     }
 
     /// Evaluate an expression against a row using plan column metadata.
-    pub(super) fn eval_expr_plan(&self, expr: &Expr, row: &Row, meta: &[ColMeta]) -> Result<Value, ExecError> {
+    pub(super) fn eval_expr_plan(
+        &self,
+        expr: &Expr,
+        row: &Row,
+        meta: &[ColMeta],
+    ) -> Result<Value, ExecError> {
         match expr {
             Expr::Identifier(ident) => {
                 let name = ident.value.as_str();
@@ -2258,35 +2768,39 @@ impl Executor {
                     // First try exact table+column match
                     if let Some(idx) = meta.iter().position(|c| {
                         c.name.eq_ignore_ascii_case(col_name)
-                            && c.table.as_deref().map(|t| t.eq_ignore_ascii_case(table_qual)).unwrap_or(false)
+                            && c.table
+                                .as_deref()
+                                .map(|t| t.eq_ignore_ascii_case(table_qual))
+                                .unwrap_or(false)
                     }) {
                         return Ok(row.get(idx).cloned().unwrap_or(Value::Null));
                     }
                 }
                 // Fallback: unqualified column name match
-                if let Some(idx) = meta.iter().position(|c| c.name.eq_ignore_ascii_case(col_name)) {
+                if let Some(idx) = meta
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                {
                     Ok(row.get(idx).cloned().unwrap_or(Value::Null))
                 } else {
                     Ok(Value::Null)
                 }
             }
-            Expr::Value(v) => {
-                match &v.value {
-                    ast::Value::Number(n, _) => {
-                        if let Ok(i) = n.parse::<i64>() {
-                            Ok(Value::Int64(i))
-                        } else if let Ok(f) = n.parse::<f64>() {
-                            Ok(Value::Float64(f))
-                        } else {
-                            Ok(Value::Text(n.clone()))
-                        }
+            Expr::Value(v) => match &v.value {
+                ast::Value::Number(n, _) => {
+                    if let Ok(i) = n.parse::<i64>() {
+                        Ok(Value::Int64(i))
+                    } else if let Ok(f) = n.parse::<f64>() {
+                        Ok(Value::Float64(f))
+                    } else {
+                        Ok(Value::Text(n.clone()))
                     }
-                    ast::Value::SingleQuotedString(s) => Ok(Value::Text(s.clone())),
-                    ast::Value::Boolean(b) => Ok(Value::Bool(*b)),
-                    ast::Value::Null => Ok(Value::Null),
-                    _ => Ok(Value::Null),
                 }
-            }
+                ast::Value::SingleQuotedString(s) => Ok(Value::Text(s.clone())),
+                ast::Value::Boolean(b) => Ok(Value::Bool(*b)),
+                ast::Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            },
             Expr::BinaryOp { left, op, right } => {
                 let lv = self.eval_expr_plan(left, row, meta)?;
                 let rv = self.eval_expr_plan(right, row, meta)?;
@@ -2310,48 +2824,106 @@ impl Executor {
                 // hard error on unparseable text.
                 let cmp = || super::helpers::compare_values(&lv, &rv);
                 match op {
-                    ast::BinaryOperator::Eq => Ok(Value::Bool(cmp() == Some(std::cmp::Ordering::Equal))),
-                    ast::BinaryOperator::NotEq => Ok(Value::Bool(matches!(cmp(), Some(o) if o != std::cmp::Ordering::Equal))),
-                    ast::BinaryOperator::Lt => Ok(Value::Bool(cmp() == Some(std::cmp::Ordering::Less))),
-                    ast::BinaryOperator::LtEq => Ok(Value::Bool(matches!(cmp(), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)))),
-                    ast::BinaryOperator::Gt => Ok(Value::Bool(cmp() == Some(std::cmp::Ordering::Greater))),
-                    ast::BinaryOperator::GtEq => Ok(Value::Bool(matches!(cmp(), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)))),
-                    ast::BinaryOperator::And => {
-                        match (&lv, &rv) {
-                            (Value::Bool(false), _) | (_, Value::Bool(false)) => Ok(Value::Bool(false)),
-                            (Value::Bool(true), Value::Bool(true)) => Ok(Value::Bool(true)),
-                            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                            _ => Ok(Value::Bool(false)),
-                        }
+                    ast::BinaryOperator::Eq => {
+                        Ok(Value::Bool(cmp() == Some(std::cmp::Ordering::Equal)))
                     }
-                    ast::BinaryOperator::Or => {
-                        match (&lv, &rv) {
-                            (Value::Bool(true), _) | (_, Value::Bool(true)) => Ok(Value::Bool(true)),
-                            (Value::Bool(false), Value::Bool(false)) => Ok(Value::Bool(false)),
-                            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                            _ => Ok(Value::Bool(false)),
-                        }
+                    ast::BinaryOperator::NotEq => Ok(Value::Bool(
+                        matches!(cmp(), Some(o) if o != std::cmp::Ordering::Equal),
+                    )),
+                    ast::BinaryOperator::Lt => {
+                        Ok(Value::Bool(cmp() == Some(std::cmp::Ordering::Less)))
                     }
-                    ast::BinaryOperator::Plus => self.eval_arith_plan_checked(&lv, &rv, |a, b| a.checked_add(b), |a, b| Ok(a + b)),
-                    ast::BinaryOperator::Minus => self.eval_arith_plan_checked(&lv, &rv, |a, b| a.checked_sub(b), |a, b| Ok(a - b)),
-                    ast::BinaryOperator::Multiply => self.eval_arith_plan_checked(&lv, &rv, |a, b| a.checked_mul(b), |a, b| Ok(a * b)),
-                    ast::BinaryOperator::Divide => self.eval_arith_plan_checked(&lv, &rv, |a, b| if b == 0 { None } else { a.checked_div(b) }, |a, b| if b == 0.0 { Err(ExecError::Runtime("division by zero".into())) } else { Ok(a / b) }),
-                    ast::BinaryOperator::Modulo => self.eval_arith_plan_checked(&lv, &rv, |a, b| if b == 0 { None } else { Some(a % b) }, |a, b| if b == 0.0 { Err(ExecError::Runtime("division by zero".into())) } else { Ok(a % b) }),
-                    ast::BinaryOperator::StringConcat => {
-                        Ok(Value::Text(format!("{}{}", lv, rv)))
+                    ast::BinaryOperator::LtEq => Ok(Value::Bool(matches!(
+                        cmp(),
+                        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                    ))),
+                    ast::BinaryOperator::Gt => {
+                        Ok(Value::Bool(cmp() == Some(std::cmp::Ordering::Greater)))
                     }
+                    ast::BinaryOperator::GtEq => Ok(Value::Bool(matches!(
+                        cmp(),
+                        Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                    ))),
+                    ast::BinaryOperator::And => match (&lv, &rv) {
+                        (Value::Bool(false), _) | (_, Value::Bool(false)) => Ok(Value::Bool(false)),
+                        (Value::Bool(true), Value::Bool(true)) => Ok(Value::Bool(true)),
+                        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                        _ => Ok(Value::Bool(false)),
+                    },
+                    ast::BinaryOperator::Or => match (&lv, &rv) {
+                        (Value::Bool(true), _) | (_, Value::Bool(true)) => Ok(Value::Bool(true)),
+                        (Value::Bool(false), Value::Bool(false)) => Ok(Value::Bool(false)),
+                        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                        _ => Ok(Value::Bool(false)),
+                    },
+                    ast::BinaryOperator::Plus => self.eval_arith_plan_checked(
+                        &lv,
+                        &rv,
+                        |a, b| a.checked_add(b),
+                        |a, b| Ok(a + b),
+                    ),
+                    ast::BinaryOperator::Minus => self.eval_arith_plan_checked(
+                        &lv,
+                        &rv,
+                        |a, b| a.checked_sub(b),
+                        |a, b| Ok(a - b),
+                    ),
+                    ast::BinaryOperator::Multiply => self.eval_arith_plan_checked(
+                        &lv,
+                        &rv,
+                        |a, b| a.checked_mul(b),
+                        |a, b| Ok(a * b),
+                    ),
+                    ast::BinaryOperator::Divide => self.eval_arith_plan_checked(
+                        &lv,
+                        &rv,
+                        |a, b| if b == 0 { None } else { a.checked_div(b) },
+                        |a, b| {
+                            if b == 0.0 {
+                                Err(ExecError::Runtime("division by zero".into()))
+                            } else {
+                                Ok(a / b)
+                            }
+                        },
+                    ),
+                    ast::BinaryOperator::Modulo => self.eval_arith_plan_checked(
+                        &lv,
+                        &rv,
+                        |a, b| if b == 0 { None } else { Some(a % b) },
+                        |a, b| {
+                            if b == 0.0 {
+                                Err(ExecError::Runtime("division by zero".into()))
+                            } else {
+                                Ok(a % b)
+                            }
+                        },
+                    ),
+                    ast::BinaryOperator::StringConcat => Ok(Value::Text(format!("{}{}", lv, rv))),
                     _ => Ok(Value::Null),
                 }
             }
-            Expr::Between { expr, low, high, negated } => {
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
                 let v = self.eval_expr_plan(expr, row, meta)?;
                 let lo = self.eval_expr_plan(low, row, meta)?;
                 let hi = self.eval_expr_plan(high, row, meta)?;
-                if matches!(v, Value::Null) || matches!(lo, Value::Null) || matches!(hi, Value::Null) {
+                if matches!(v, Value::Null)
+                    || matches!(lo, Value::Null)
+                    || matches!(hi, Value::Null)
+                {
                     return Ok(Value::Null);
                 }
-                let in_range = matches!(super::helpers::compare_values(&v, &lo), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal))
-                    && matches!(super::helpers::compare_values(&v, &hi), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal));
+                let in_range = matches!(
+                    super::helpers::compare_values(&v, &lo),
+                    Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                ) && matches!(
+                    super::helpers::compare_values(&v, &hi),
+                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                );
                 Ok(Value::Bool(if *negated { !in_range } else { in_range }))
             }
             Expr::Function(func) => {
@@ -2376,14 +2948,20 @@ impl Executor {
                 Ok(Value::Bool(v != Value::Null))
             }
             Expr::Nested(inner) => self.eval_expr_plan(inner, row, meta),
-            Expr::UnaryOp { op: ast::UnaryOperator::Not, expr } => {
+            Expr::UnaryOp {
+                op: ast::UnaryOperator::Not,
+                expr,
+            } => {
                 let v = self.eval_expr_plan(expr, row, meta)?;
                 match v {
                     Value::Bool(b) => Ok(Value::Bool(!b)),
                     _ => Ok(Value::Null),
                 }
             }
-            Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } => {
+            Expr::UnaryOp {
+                op: ast::UnaryOperator::Minus,
+                expr,
+            } => {
                 let v = self.eval_expr_plan(expr, row, meta)?;
                 match v {
                     Value::Int32(n) => Ok(Value::Int64(-(n as i64))),
@@ -2393,7 +2971,13 @@ impl Executor {
                 }
             }
             // ── LIKE / ILIKE ────────────────────────────────────────
-            Expr::Like { negated, expr, pattern, escape_char, .. } => {
+            Expr::Like {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+                ..
+            } => {
                 let val = self.eval_expr_plan(expr, row, meta)?;
                 let pat = self.eval_expr_plan(pattern, row, meta)?;
                 if matches!(val, Value::Null) || matches!(pat, Value::Null) {
@@ -2402,12 +2986,22 @@ impl Executor {
                 let val_str = val.to_string();
                 let pat_str = pat.to_string();
                 let esc = escape_char.as_ref().and_then(|v| {
-                    if let ast::Value::SingleQuotedString(s) = v { s.chars().next() } else { None }
+                    if let ast::Value::SingleQuotedString(s) = v {
+                        s.chars().next()
+                    } else {
+                        None
+                    }
                 });
                 let matched = Self::sql_like_match(&val_str, &pat_str, esc, false);
                 Ok(Value::Bool(if *negated { !matched } else { matched }))
             }
-            Expr::ILike { negated, expr, pattern, escape_char, .. } => {
+            Expr::ILike {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+                ..
+            } => {
                 let val = self.eval_expr_plan(expr, row, meta)?;
                 let pat = self.eval_expr_plan(pattern, row, meta)?;
                 if matches!(val, Value::Null) || matches!(pat, Value::Null) {
@@ -2416,18 +3010,29 @@ impl Executor {
                 let val_str = val.to_string();
                 let pat_str = pat.to_string();
                 let esc = escape_char.as_ref().and_then(|v| {
-                    if let ast::Value::SingleQuotedString(s) = v { s.chars().next() } else { None }
+                    if let ast::Value::SingleQuotedString(s) = v {
+                        s.chars().next()
+                    } else {
+                        None
+                    }
                 });
                 let matched = Self::sql_like_match(&val_str, &pat_str, esc, true);
                 Ok(Value::Bool(if *negated { !matched } else { matched }))
             }
             // ── CAST ────────────────────────────────────────────────
-            Expr::Cast { expr, data_type, .. } => {
+            Expr::Cast {
+                expr, data_type, ..
+            } => {
                 let v = self.eval_expr_plan(expr, row, meta)?;
                 Ok(self.plan_cast_value(v, data_type))
             }
             // ── CASE WHEN ───────────────────────────────────────────
-            Expr::Case { operand, conditions, else_result, .. } => {
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
                 if let Some(operand_expr) = operand {
                     // Simple CASE: CASE expr WHEN val1 THEN res1 ...
                     let op_val = self.eval_expr_plan(operand_expr, row, meta)?;
@@ -2453,9 +3058,15 @@ impl Executor {
                 }
             }
             // ── IN list ─────────────────────────────────────────────
-            Expr::InList { expr, list, negated } => {
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
                 let val = self.eval_expr_plan(expr, row, meta)?;
-                if matches!(val, Value::Null) { return Ok(Value::Null); }
+                if matches!(val, Value::Null) {
+                    return Ok(Value::Null);
+                }
                 let mut found = false;
                 for item in list {
                     let item_val = self.eval_expr_plan(item, row, meta)?;
@@ -2479,10 +3090,18 @@ impl Executor {
         float_op: impl Fn(f64, f64) -> Result<f64, ExecError>,
     ) -> Result<Value, ExecError> {
         match (lv, rv) {
-            (Value::Int32(a), Value::Int32(b)) => int_op(*a as i64, *b as i64).map(Value::Int64).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
-            (Value::Int64(a), Value::Int64(b)) => int_op(*a, *b).map(Value::Int64).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
-            (Value::Int32(a), Value::Int64(b)) => int_op(*a as i64, *b).map(Value::Int64).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
-            (Value::Int64(a), Value::Int32(b)) => int_op(*a, *b as i64).map(Value::Int64).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+            (Value::Int32(a), Value::Int32(b)) => int_op(*a as i64, *b as i64)
+                .map(Value::Int64)
+                .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+            (Value::Int64(a), Value::Int64(b)) => int_op(*a, *b)
+                .map(Value::Int64)
+                .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+            (Value::Int32(a), Value::Int64(b)) => int_op(*a as i64, *b)
+                .map(Value::Int64)
+                .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+            (Value::Int64(a), Value::Int32(b)) => int_op(*a, *b as i64)
+                .map(Value::Int64)
+                .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
             (Value::Float64(a), Value::Float64(b)) => float_op(*a, *b).map(Value::Float64),
             (Value::Float64(a), Value::Int64(b)) => float_op(*a, *b as f64).map(Value::Float64),
             (Value::Int64(a), Value::Float64(b)) => float_op(*a as f64, *b).map(Value::Float64),
@@ -2506,7 +3125,12 @@ impl Executor {
 
     /// SQL LIKE pattern matching. Supports `%` (any sequence) and `_` (any char).
     /// If `case_insensitive` is true, performs ILIKE matching.
-    pub(super) fn sql_like_match(text: &str, pattern: &str, escape: Option<char>, case_insensitive: bool) -> bool {
+    pub(super) fn sql_like_match(
+        text: &str,
+        pattern: &str,
+        escape: Option<char>,
+        case_insensitive: bool,
+    ) -> bool {
         let (t, p) = if case_insensitive {
             (text.to_lowercase(), pattern.to_lowercase())
         } else {
@@ -2525,29 +3149,48 @@ impl Executor {
             if pi < plen {
                 let escaped = if let Some(e) = esc {
                     pi + 1 < plen && p[pi] == e
-                } else { false };
+                } else {
+                    false
+                };
                 if escaped {
                     pi += 1; // skip escape char
                     if pi < plen && t[ti] == p[pi] {
-                        ti += 1; pi += 1; continue;
+                        ti += 1;
+                        pi += 1;
+                        continue;
                     } else {
-                        if star_pi != usize::MAX { pi = star_pi + 1; star_ti += 1; ti = star_ti; continue; }
+                        if star_pi != usize::MAX {
+                            pi = star_pi + 1;
+                            star_ti += 1;
+                            ti = star_ti;
+                            continue;
+                        }
                         return false;
                     }
                 }
                 if p[pi] == b'%' {
-                    star_pi = pi; star_ti = ti; pi += 1; continue;
+                    star_pi = pi;
+                    star_ti = ti;
+                    pi += 1;
+                    continue;
                 }
                 if p[pi] == b'_' || p[pi] == t[ti] {
-                    ti += 1; pi += 1; continue;
+                    ti += 1;
+                    pi += 1;
+                    continue;
                 }
             }
             if star_pi != usize::MAX {
-                pi = star_pi + 1; star_ti += 1; ti = star_ti; continue;
+                pi = star_pi + 1;
+                star_ti += 1;
+                ti = star_ti;
+                continue;
             }
             return false;
         }
-        while pi < plen && p[pi] == b'%' { pi += 1; }
+        while pi < plen && p[pi] == b'%' {
+            pi += 1;
+        }
         pi == plen
     }
 
@@ -2563,15 +3206,13 @@ impl Executor {
                     _ => Value::Null,
                 }
             }
-            ast::DataType::BigInt(_) | ast::DataType::Int8(_) => {
-                match &v {
-                    Value::Int32(n) => Value::Int64(*n as i64),
-                    Value::Int64(_) => v,
-                    Value::Float64(n) => Value::Int64(*n as i64),
-                    Value::Text(s) => s.parse::<i64>().map(Value::Int64).unwrap_or(Value::Null),
-                    _ => Value::Null,
-                }
-            }
+            ast::DataType::BigInt(_) | ast::DataType::Int8(_) => match &v {
+                Value::Int32(n) => Value::Int64(*n as i64),
+                Value::Int64(_) => v,
+                Value::Float64(n) => Value::Int64(*n as i64),
+                Value::Text(s) => s.parse::<i64>().map(Value::Int64).unwrap_or(Value::Null),
+                _ => Value::Null,
+            },
             ast::DataType::Float64 | ast::DataType::Double(_) | ast::DataType::DoublePrecision => {
                 match &v {
                     Value::Int32(n) => Value::Float64(*n as f64),
@@ -2581,21 +3222,22 @@ impl Executor {
                     _ => Value::Null,
                 }
             }
-            ast::DataType::Varchar(_) | ast::DataType::Text | ast::DataType::CharacterVarying(_) => {
-                Value::Text(v.to_string())
-            }
-            ast::DataType::Boolean => {
-                match &v {
-                    Value::Bool(_) => v,
-                    Value::Int32(n) => Value::Bool(*n != 0),
-                    Value::Int64(n) => Value::Bool(*n != 0),
-                    Value::Text(s) => {
-                        let lower = s.to_lowercase();
-                        Value::Bool(matches!(lower.as_str(), "true" | "t" | "yes" | "y" | "1" | "on"))
-                    }
-                    _ => Value::Null,
+            ast::DataType::Varchar(_)
+            | ast::DataType::Text
+            | ast::DataType::CharacterVarying(_) => Value::Text(v.to_string()),
+            ast::DataType::Boolean => match &v {
+                Value::Bool(_) => v,
+                Value::Int32(n) => Value::Bool(*n != 0),
+                Value::Int64(n) => Value::Bool(*n != 0),
+                Value::Text(s) => {
+                    let lower = s.to_lowercase();
+                    Value::Bool(matches!(
+                        lower.as_str(),
+                        "true" | "t" | "yes" | "y" | "1" | "on"
+                    ))
                 }
-            }
+                _ => Value::Null,
+            },
             _ => v, // unsupported cast → return as-is
         }
     }
@@ -2604,268 +3246,336 @@ impl Executor {
     // Query execution: SELECT with ORDER BY, LIMIT, OFFSET
     // ========================================================================
 
-    pub(super) fn execute_query(&self, query: ast::Query) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExecResult, ExecError>> + Send + '_>> {
+    /// Execute a SELECT query, computing its own plan-cache key from the query.
+    ///
+    /// This is the form used by every nested/subquery/CTE/view-expansion caller.
+    /// It deliberately does NOT read the shared `plan_cache_key_hint`: that slot
+    /// is only valid for the single top-level statement, and reentrant execution
+    /// (e.g. a per-row scalar subquery over a VIEW) used to let one query consume
+    /// a hint set for another — caching the wrong plan under the wrong key and
+    /// producing nondeterministic, incorrect results. Threading the key as an
+    /// explicit parameter (below) removes that hazard entirely.
+    pub(super) fn execute_query(
+        &self,
+        query: ast::Query,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ExecResult, ExecError>> + Send + '_>,
+    > {
+        self.execute_query_planned(query, None)
+    }
+
+    /// Execute a SELECT query with an optional precomputed plan-cache key.
+    ///
+    /// Only the top-level statement dispatcher passes `Some(key)` (the key set by
+    /// `parse_with_ast_cache`/`execute_prepared` for exactly this statement). All
+    /// nested callers go through [`Self::execute_query`] and pass `None`, so each
+    /// recomputes its own key and no key can leak across reentrant boundaries.
+    pub(super) fn execute_query_planned(
+        &self,
+        query: ast::Query,
+        plan_cache_key: Option<String>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ExecResult, ExecError>> + Send + '_>,
+    > {
         Box::pin(async move {
-        // Take the plan cache key hint BEFORE resolving CTEs. If we don't,
-        // nested execute_query() calls inside resolve_ctes() will steal the
-        // hint meant for this (outer) query, causing the inner CTE query's
-        // plan to be cached under the outer query's key — a catastrophic
-        // cross-contamination that breaks ORDER BY, LIMIT, etc.
-        let saved_plan_cache_key_hint = self.plan_cache_key_hint.lock().take();
+            let saved_plan_cache_key_hint = plan_cache_key;
 
-        // Handle CTEs (WITH clause)
-        let mut cte_tables = if let Some(ref with) = query.with {
-            self.resolve_ctes(with).await?
-        } else {
-            HashMap::new()
-        };
+            // Handle CTEs (WITH clause)
+            let mut cte_tables = if let Some(ref with) = query.with {
+                self.resolve_ctes(with).await?
+            } else {
+                HashMap::new()
+            };
 
-        // Merge in active CTEs from DML context (WITH ... INSERT/UPDATE/DELETE)
-        // Only add CTEs that don't already exist (query-level CTEs take precedence)
-        {
-            let sess = self.current_session();
-            let active = sess.active_ctes.read();
-            for (name, data) in active.iter() {
-                cte_tables.entry(name.clone()).or_insert_with(|| data.clone());
+            // Merge in active CTEs from DML context (WITH ... INSERT/UPDATE/DELETE)
+            // Only add CTEs that don't already exist (query-level CTEs take precedence)
+            {
+                let sess = self.current_session();
+                let active = sess.active_ctes.read();
+                for (name, data) in active.iter() {
+                    cte_tables
+                        .entry(name.clone())
+                        .or_insert_with(|| data.clone());
+                }
             }
-        }
 
-        // --- Columnar fast aggregate short-circuit (O(1) COUNT(*), fast SUM/AVG) ---
-        // Only intercept simple single-row aggregates: no GROUP BY, no ORDER BY,
-        // no LIMIT/OFFSET. These always return exactly one row, so post-processing
-        // is unnecessary. GROUP BY queries need ORDER BY handling and go through
-        // the normal path (which has its own fast aggregate call).
-        if let SetExpr::Select(ref select) = *query.body
-            && matches!(&select.group_by, ast::GroupByExpr::Expressions(e, _) if e.is_empty())
-            && query.order_by.is_none()
-            && query.limit_clause.is_none()
-            && let Ok(Some(result)) = self.try_columnar_fast_aggregate(select, &cte_tables) {
+            // --- Columnar fast aggregate short-circuit (O(1) COUNT(*), fast SUM/AVG) ---
+            // Only intercept simple single-row aggregates: no GROUP BY, no ORDER BY,
+            // no LIMIT/OFFSET. These always return exactly one row, so post-processing
+            // is unnecessary. GROUP BY queries need ORDER BY handling and go through
+            // the normal path (which has its own fast aggregate call).
+            if let SetExpr::Select(ref select) = *query.body
+                && matches!(&select.group_by, ast::GroupByExpr::Expressions(e, _) if e.is_empty())
+                && query.order_by.is_none()
+                && query.limit_clause.is_none()
+                && let Ok(Some(result)) = self.try_columnar_fast_aggregate(select, &cte_tables)
+            {
                 return Ok(result);
             }
 
-        // --- PK lookup super-fast path ---
-        // For `SELECT * FROM table WHERE pk = literal` (no JOINs, ORDER BY, LIMIT,
-        // GROUP BY, HAVING, DISTINCT), bypass plan cache and plan executor entirely.
-        // Directly calls index_lookup → saves 2 plan clones + 2 write lock acqs.
-        if let SetExpr::Select(ref select) = *query.body
-            && select.from.len() == 1
-            && select.from[0].joins.is_empty()
-            && select.distinct.is_none()
-            && matches!(&select.group_by, ast::GroupByExpr::Expressions(e, _) if e.is_empty())
-            && select.having.is_none()
-            && query.order_by.is_none()
-            && query.limit_clause.is_none()
-            && select.projection.len() == 1
-            && matches!(&select.projection[0], SelectItem::Wildcard(_))
-            && let Some(ref where_expr) = select.selection {
+            // --- PK lookup super-fast path ---
+            // For `SELECT * FROM table WHERE pk = literal` (no JOINs, ORDER BY, LIMIT,
+            // GROUP BY, HAVING, DISTINCT), bypass plan cache and plan executor entirely.
+            // Directly calls index_lookup → saves 2 plan clones + 2 write lock acqs.
+            if let SetExpr::Select(ref select) = *query.body
+                && select.from.len() == 1
+                && select.from[0].joins.is_empty()
+                && select.distinct.is_none()
+                && matches!(&select.group_by, ast::GroupByExpr::Expressions(e, _) if e.is_empty())
+                && select.having.is_none()
+                && query.order_by.is_none()
+                && query.limit_clause.is_none()
+                && select.projection.len() == 1
+                && matches!(&select.projection[0], SelectItem::Wildcard(_))
+                && let Some(ref where_expr) = select.selection
+            {
                 let preds = planner::split_conjunction(where_expr);
                 if preds.len() == 1
-                    && let Some((col, _)) = planner::is_equality_predicate(preds[0]) {
-                        let table_name = match &select.from[0].relation {
-                            TableFactor::Table { name, .. } => name.to_string(),
-                            _ => String::new(),
-                        };
-                        if !table_name.is_empty()
-                            && let Ok(table_def) = self.get_table(&table_name).await
-                                && let Some(pk_cols) = table_def.primary_key_columns()
-                                    && pk_cols.len() == 1
-                                    && pk_cols[0].eq_ignore_ascii_case(&col)
-                                    && let Some(val) = Self::extract_equality_value(preds[0]) {
-                                        let coerced = Self::coerce_to_storage_type(&val);
-                                        // Find PK btree index
-                                        let indexes = self.catalog.get_indexes_cached(&table_name)
-                                            .unwrap_or_default();
-                                        let pk_idx = indexes.iter().find(|idx| {
-                                            matches!(idx.index_type, crate::catalog::IndexType::BTree)
-                                                && idx.columns.len() == 1
-                                                && idx.columns[0].eq_ignore_ascii_case(&col)
-                                        });
-                                        if let Some(idx) = pk_idx
-                                            && let Ok(Some(rows)) = self.storage.index_lookup(
-                                                &table_name, &idx.name, &coerced,
-                                            ).await {
-                                                let columns: Vec<(String, DataType)> = table_def.columns.iter()
-                                                    .map(|c| (c.name.clone(), c.data_type.clone()))
-                                                    .collect();
-                                                return Ok(ExecResult::Select { columns, rows });
-                                            }
-                                    }
+                    && let Some((col, _)) = planner::is_equality_predicate(preds[0])
+                {
+                    let table_name = match &select.from[0].relation {
+                        TableFactor::Table { name, .. } => name.to_string(),
+                        _ => String::new(),
+                    };
+                    if !table_name.is_empty()
+                        && let Ok(table_def) = self.get_table(&table_name).await
+                        && let Some(pk_cols) = table_def.primary_key_columns()
+                        && pk_cols.len() == 1
+                        && pk_cols[0].eq_ignore_ascii_case(&col)
+                        && let Some(val) = Self::extract_equality_value(preds[0])
+                    {
+                        let coerced = Self::coerce_to_storage_type(&val);
+                        // Find PK btree index
+                        let indexes = self
+                            .catalog
+                            .get_indexes_cached(&table_name)
+                            .unwrap_or_default();
+                        let pk_idx = indexes.iter().find(|idx| {
+                            matches!(idx.index_type, crate::catalog::IndexType::BTree)
+                                && idx.columns.len() == 1
+                                && idx.columns[0].eq_ignore_ascii_case(&col)
+                        });
+                        if let Some(idx) = pk_idx
+                            && let Ok(Some(rows)) = self
+                                .storage
+                                .index_lookup(&table_name, &idx.name, &coerced)
+                                .await
+                        {
+                            let columns: Vec<(String, DataType)> = table_def
+                                .columns
+                                .iter()
+                                .map(|c| (c.name.clone(), c.data_type.clone()))
+                                .collect();
+                            return Ok(ExecResult::Select { columns, rows });
+                        }
                     }
+                }
             }
 
-        // --- Plan-driven execution (default ON, disable via SET plan_execution = off) ---
-        // The plan-based path walks the PlanNode tree from the planner. It handles
-        // SeqScan, IndexScan, Filter, Sort, Limit, Project, NestedLoopJoin, HashJoin.
-        // Falls back to AST execution for unsupported features (LIKE/ILIKE, CASE, subqueries,
-        // outer joins, UNION/INTERSECT, etc.) — plan_is_executable() guards the hot path.
-        {
-            let sess = self.current_session();
-            let use_plan = sess.settings.read().get("plan_execution")
-                .map(|v| !v.eq_ignore_ascii_case("off"))
-                .unwrap_or(true); // default ON
-            if use_plan
-                && let SetExpr::Select(ref select) = *query.body
-                    && Self::query_eligible_for_plan(select, &query) {
-                        // Use pre-computed normalized key from parse_with_ast_cache()
-                        // when available (avoids expensive query.to_string() + re-normalize).
-                        let cache_key = saved_plan_cache_key_hint
-                            .unwrap_or_else(|| {
-                                let raw_sql = query.to_string();
-                                Self::normalize_sql_for_cache(&raw_sql)
-                            });
-                        // Try read-only lookup first to avoid write lock contention.
-                        // PlanCache::get requires &mut (bumps access count), so we use write().
-                        let cached_plan = self.plan_cache.write().get(&cache_key);
-                        let cache_was_hit = cached_plan.is_some();
+            // --- Plan-driven execution (default ON, disable via SET plan_execution = off) ---
+            // The plan-based path walks the PlanNode tree from the planner. It handles
+            // SeqScan, IndexScan, Filter, Sort, Limit, Project, NestedLoopJoin, HashJoin.
+            // Falls back to AST execution for unsupported features (LIKE/ILIKE, CASE, subqueries,
+            // outer joins, UNION/INTERSECT, etc.) — plan_is_executable() guards the hot path.
+            {
+                let sess = self.current_session();
+                let use_plan = sess
+                    .settings
+                    .read()
+                    .get("plan_execution")
+                    .map(|v| !v.eq_ignore_ascii_case("off"))
+                    .unwrap_or(true); // default ON
+                if use_plan
+                    && let SetExpr::Select(ref select) = *query.body
+                    && Self::query_eligible_for_plan(select, &query)
+                {
+                    // Use pre-computed normalized key from parse_with_ast_cache()
+                    // when available (avoids expensive query.to_string() + re-normalize).
+                    let cache_key = saved_plan_cache_key_hint.unwrap_or_else(|| {
+                        let raw_sql = query.to_string();
+                        Self::normalize_sql_for_cache(&raw_sql)
+                    });
+                    // Try read-only lookup first to avoid write lock contention.
+                    // PlanCache::get requires &mut (bumps access count), so we use write().
+                    let cached_plan = self.plan_cache.write().get(&cache_key);
+                    let cache_was_hit = cached_plan.is_some();
 
-                        // On cache HIT: try to reuse the cached plan directly by
-                        // transplanting the current query's WHERE clause expressions.
-                        // This skips plan_query() entirely (~500-1000ns savings).
-                        // Falls back to re-planning if transplanting fails.
-                        let plan = if let Some(cached) = cached_plan {
-                            if let Some(reused) = Self::try_reuse_plan(cached, select) {
-                                Some(reused)
-                            } else {
-                                // Transplant failed — re-plan with current AST
-                                self.plan_query(&query).await.ok()
-                            }
+                    // On cache HIT: try to reuse the cached plan directly by
+                    // transplanting the current query's WHERE clause expressions.
+                    // This skips plan_query() entirely (~500-1000ns savings).
+                    // Falls back to re-planning if transplanting fails.
+                    let plan = if let Some(cached) = cached_plan {
+                        if let Some(reused) = Self::try_reuse_plan(cached, select) {
+                            Some(reused)
                         } else {
-                            // Cache miss — plan from scratch, check executability
+                            // Transplant failed — re-plan with current AST
                             self.plan_query(&query).await.ok()
-                                .filter(Self::plan_is_executable)
-                        };
+                        }
+                    } else {
+                        // Cache miss — plan from scratch, check executability
+                        self.plan_query(&query)
+                            .await
+                            .ok()
+                            .filter(Self::plan_is_executable)
+                    };
 
-                        if let Some(plan) = plan {
-                                // Only insert into cache on miss (not on hit — plan structure
-                                // is the same, just literal values differ, and access count
-                                // was already bumped by get()).
-                                if !cache_was_hit {
-                                    self.plan_cache.write().insert(cache_key, plan.clone());
-                                }
-                                if let Ok((meta, rows)) = self.execute_plan_node(&plan, &cte_tables).await {
-                                    let columns: Vec<(String, DataType)> = meta.iter()
-                                        .map(|c| (c.name.clone(), c.dtype.clone()))
-                                        .collect();
-                                    let mut exec_result = ExecResult::Select { columns, rows };
-                                    // Apply DISTINCT
-                                    if let Some(ast::Distinct::Distinct) = &select.distinct
-                                        && let ExecResult::Select { ref mut rows, .. } = exec_result {
-                                            let mut seen: HashSet<Vec<Value>> = HashSet::new();
-                                            rows.retain(|row| seen.insert(row.clone()));
-                                        }
-                                    return Ok(exec_result);
-                                }
+                    if let Some(plan) = plan {
+                        // Only insert into cache on miss (not on hit — plan structure
+                        // is the same, just literal values differ, and access count
+                        // was already bumped by get()).
+                        if !cache_was_hit {
+                            self.plan_cache.write().insert(cache_key, plan.clone());
+                        }
+                        if let Ok((meta, rows)) = self.execute_plan_node(&plan, &cte_tables).await {
+                            let columns: Vec<(String, DataType)> = meta
+                                .iter()
+                                .map(|c| (c.name.clone(), c.dtype.clone()))
+                                .collect();
+                            let mut exec_result = ExecResult::Select { columns, rows };
+                            // Apply DISTINCT
+                            if let Some(ast::Distinct::Distinct) = &select.distinct
+                                && let ExecResult::Select { ref mut rows, .. } = exec_result
+                            {
+                                let mut seen: HashSet<Vec<Value>> = HashSet::new();
+                                rows.retain(|row| seen.insert(row.clone()));
                             }
+                            return Ok(exec_result);
+                        }
                     }
-        }
+                }
+            }
 
-        // --- AST-based execution fallback ---
-        let order_by = query.order_by;
-        let limit_clause = query.limit_clause;
+            // --- AST-based execution fallback ---
+            let order_by = query.order_by;
+            let limit_clause = query.limit_clause;
 
-        // Extract DISTINCT info from select body before consuming it
-        let distinct_mode = if let SetExpr::Select(ref select) = *query.body {
-            select.distinct.clone()
-        } else {
-            None
-        };
+            // Extract DISTINCT info from select body before consuming it
+            let distinct_mode = if let SetExpr::Select(ref select) = *query.body {
+                select.distinct.clone()
+            } else {
+                None
+            };
 
-        let result = self.execute_set_expr(*query.body, &cte_tables).await?;
+            let result = self.execute_set_expr(*query.body, &cte_tables).await?;
 
-        let mut exec_result = match result {
-            // Aggregate queries are already fully projected -- ORDER BY works on output columns
-            SelectResult::Projected(mut exec_result) => {
-                let top_k = self.extract_top_k(limit_clause.as_ref());
-                if let Some(ob) = order_by
-                    && let ExecResult::Select {
-                        ref columns,
-                        ref mut rows,
-                    } = exec_result
+            let mut exec_result = match result {
+                // Aggregate queries are already fully projected -- ORDER BY works on output columns
+                SelectResult::Projected(mut exec_result) => {
+                    let top_k = self.extract_top_k(limit_clause.as_ref());
+                    if let Some(ob) = order_by
+                        && let ExecResult::Select {
+                            ref columns,
+                            ref mut rows,
+                        } = exec_result
                     {
                         self.apply_order_by(rows, columns, &ob, None, None, top_k)?;
                     }
-                if let Some(lc) = limit_clause
-                    && let ExecResult::Select { ref mut rows, .. } = exec_result {
+                    if let Some(lc) = limit_clause
+                        && let ExecResult::Select { ref mut rows, .. } = exec_result
+                    {
                         self.apply_limit_offset(rows, &lc)?;
                     }
-                exec_result
-            }
-            // Non-aggregate queries return full rows -- ORDER BY resolves against source columns,
-            // then we project
-            SelectResult::Full {
-                col_meta,
-                mut rows,
-                projection,
-            } => {
-                // Try vector index optimization: ORDER BY VECTOR_DISTANCE(...) LIMIT k
-                let mut used_vec_index = false;
-                if let Some(ref ob) = order_by
-                    && let Some(optimized) = self.try_vector_index_scan(ob, &limit_clause, &rows, &col_meta) {
+                    exec_result
+                }
+                // Non-aggregate queries return full rows -- ORDER BY resolves against source columns,
+                // then we project
+                SelectResult::Full {
+                    col_meta,
+                    mut rows,
+                    projection,
+                } => {
+                    // Try vector index optimization: ORDER BY VECTOR_DISTANCE(...) LIMIT k
+                    let mut used_vec_index = false;
+                    if let Some(ref ob) = order_by
+                        && let Some(optimized) =
+                            self.try_vector_index_scan(ob, &limit_clause, &rows, &col_meta)
+                    {
                         rows = optimized;
                         used_vec_index = true;
                     }
 
-                // Fall back to standard ORDER BY + LIMIT if vector index not used
-                if !used_vec_index {
-                    let top_k = self.extract_top_k(limit_clause.as_ref());
-                    let col_pairs: Vec<(String, DataType)> = col_meta
-                        .iter()
-                        .map(|c| (c.name.clone(), c.dtype.clone()))
-                        .collect();
+                    // Fall back to standard ORDER BY + LIMIT if vector index not used
+                    if !used_vec_index {
+                        let top_k = self.extract_top_k(limit_clause.as_ref());
+                        let col_pairs: Vec<(String, DataType)> = col_meta
+                            .iter()
+                            .map(|c| (c.name.clone(), c.dtype.clone()))
+                            .collect();
 
-                    // Try heap-based top-K for simple column ORDER BY with small LIMIT.
-                    // This path consumes the rows Vec and returns a compact K-element Vec,
-                    // freeing N-K rows of capacity immediately.
-                    let mut used_heap = false;
-                    if let (Some(k), Some(ob)) = (top_k, &order_by)
-                        && k <= 1024 && k < rows.len() {
+                        // Try heap-based top-K for simple column ORDER BY with small LIMIT.
+                        // This path consumes the rows Vec and returns a compact K-element Vec,
+                        // freeing N-K rows of capacity immediately.
+                        let mut used_heap = false;
+                        if let (Some(k), Some(ob)) = (top_k, &order_by)
+                            && k <= 1024
+                            && k < rows.len()
+                        {
                             // Try resolving all ORDER BY expressions to column indices
                             let exprs = match &ob.kind {
                                 ast::OrderByKind::Expressions(exprs) => Some(exprs),
                                 _ => None,
                             };
                             if let Some(exprs) = exprs {
-                                let resolved: Vec<Option<(usize, bool, bool)>> = exprs.iter().map(|e| {
-                                    let asc = e.options.asc.unwrap_or(true);
-                                    let nulls_first = e.options.nulls_first.unwrap_or(!asc);
-                                    self.resolve_order_by_expr(&e.expr, &col_pairs, Some(&col_meta), Some(&projection))
+                                let resolved: Vec<Option<(usize, bool, bool)>> = exprs
+                                    .iter()
+                                    .map(|e| {
+                                        let asc = e.options.asc.unwrap_or(true);
+                                        let nulls_first = e.options.nulls_first.unwrap_or(!asc);
+                                        self.resolve_order_by_expr(
+                                            &e.expr,
+                                            &col_pairs,
+                                            Some(&col_meta),
+                                            Some(&projection),
+                                        )
                                         .ok()
                                         .map(|idx| (idx, asc, nulls_first))
-                                }).collect();
+                                    })
+                                    .collect();
 
                                 if resolved.iter().all(|r| r.is_some()) {
-                                    let sort_cols: Vec<(usize, bool, bool)> = resolved.into_iter().map(|r| r.unwrap()).collect();
+                                    let sort_cols: Vec<(usize, bool, bool)> =
+                                        resolved.into_iter().map(|r| r.unwrap()).collect();
                                     rows = Self::top_k_heap_sort(rows, &sort_cols, k);
                                     used_heap = true;
                                 }
                             }
                         }
 
-                    if !used_heap
-                        && let Some(ob) = order_by {
-                            self.apply_order_by(&mut rows, &col_pairs, &ob, Some(&col_meta), Some(&projection), top_k)?;
+                        if !used_heap && let Some(ob) = order_by {
+                            self.apply_order_by(
+                                &mut rows,
+                                &col_pairs,
+                                &ob,
+                                Some(&col_meta),
+                                Some(&projection),
+                                top_k,
+                            )?;
                         }
 
-                    // Apply LIMIT/OFFSET — needed even after heap sort since the heap
-                    // returns limit+offset rows (top K) and OFFSET still needs stripping.
-                    if let Some(lc) = limit_clause {
-                        self.apply_limit_offset(&mut rows, &lc)?;
+                        // Apply LIMIT/OFFSET — needed even after heap sort since the heap
+                        // returns limit+offset rows (top K) and OFFSET still needs stripping.
+                        if let Some(lc) = limit_clause {
+                            self.apply_limit_offset(&mut rows, &lc)?;
+                        }
+                    }
+
+                    // Now project
+                    let (columns, projected) =
+                        self.project_columns(&projection, &col_meta, &rows)?;
+                    ExecResult::Select {
+                        columns,
+                        rows: projected,
                     }
                 }
+            };
 
-                // Now project
-                let (columns, projected) =
-                    self.project_columns(&projection, &col_meta, &rows)?;
-                ExecResult::Select {
-                    columns,
-                    rows: projected,
-                }
-            }
-        };
-
-        // Apply DISTINCT / DISTINCT ON
-        if let Some(distinct) = distinct_mode
-            && let ExecResult::Select { ref columns, ref mut rows } = exec_result {
+            // Apply DISTINCT / DISTINCT ON
+            if let Some(distinct) = distinct_mode
+                && let ExecResult::Select {
+                    ref columns,
+                    ref mut rows,
+                } = exec_result
+            {
                 match distinct {
                     ast::Distinct::Distinct => {
                         // Remove duplicate rows using HashSet for O(n) dedup
@@ -2874,24 +3584,38 @@ impl Executor {
                     }
                     ast::Distinct::On(on_exprs) => {
                         // DISTINCT ON: keep first row for each distinct value of on_exprs
-                        let col_meta: Vec<ColMeta> = columns.iter().map(|(name, dtype)| ColMeta {
-                            table: None,
-                            name: name.clone(),
-                            dtype: dtype.clone(),
-                        }).collect();
+                        let col_meta: Vec<ColMeta> = columns
+                            .iter()
+                            .map(|(name, dtype)| ColMeta {
+                                table: None,
+                                name: name.clone(),
+                                dtype: dtype.clone(),
+                            })
+                            .collect();
+                        // Propagate evaluation errors instead of dropping them with
+                        // `.ok()` — a dropped error would yield an incomplete key and
+                        // silently merge rows that are not actually duplicates.
                         let mut seen_keys: HashSet<Vec<Value>> = HashSet::new();
-                        rows.retain(|row| {
-                            let key: Vec<Value> = on_exprs.iter().filter_map(|expr| {
-                                self.eval_row_expr(expr, row, &col_meta).ok()
-                            }).collect();
-                            seen_keys.insert(key)
+                        let mut keep: Vec<bool> = Vec::with_capacity(rows.len());
+                        for row in rows.iter() {
+                            let key: Vec<Value> = on_exprs
+                                .iter()
+                                .map(|expr| self.eval_row_expr(expr, row, &col_meta))
+                                .collect::<Result<_, _>>()?;
+                            keep.push(seen_keys.insert(key));
+                        }
+                        let mut idx = 0;
+                        rows.retain(|_| {
+                            let k = keep[idx];
+                            idx += 1;
+                            k
                         });
                     }
                     ast::Distinct::All => {} // No deduplication
                 }
             }
 
-        Ok(exec_result)
+            Ok(exec_result)
         }) // end Box::pin
     }
 
@@ -2903,150 +3627,148 @@ impl Executor {
         &'a self,
         body: SetExpr,
         cte_tables: &'a CteTableMap,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SelectResult, ExecError>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SelectResult, ExecError>> + Send + 'a>,
+    > {
         Box::pin(async move {
-        match body {
-            SetExpr::Select(select) => {
-                self.execute_select_inner_with_ctes(&select, cte_tables).await
-            }
-            SetExpr::SetOperation {
-                op,
-                set_quantifier,
-                left,
-                right,
-            } => {
-                let left_result = self.execute_set_expr(*left, cte_tables).await?;
-                let right_result = self.execute_set_expr(*right, cte_tables).await?;
-
-                let (left_cols, left_rows) = self.select_result_to_rows(left_result)?;
-                let (_right_cols, right_rows) = self.select_result_to_rows(right_result)?;
-
-                let all = matches!(
+            match body {
+                SetExpr::Select(select) => {
+                    self.execute_select_inner_with_ctes(&select, cte_tables)
+                        .await
+                }
+                SetExpr::SetOperation {
+                    op,
                     set_quantifier,
-                    ast::SetQuantifier::All | ast::SetQuantifier::AllByName
-                );
+                    left,
+                    right,
+                } => {
+                    let left_result = self.execute_set_expr(*left, cte_tables).await?;
+                    let right_result = self.execute_set_expr(*right, cte_tables).await?;
 
-                let combined_rows = match op {
-                    ast::SetOperator::Union => {
-                        if all {
-                            left_rows.into_iter().chain(right_rows).collect()
-                        } else {
-                            let mut result: Vec<Row> = left_rows;
-                            for row in right_rows {
-                                if !result.contains(&row) {
-                                    result.push(row);
+                    let (left_cols, left_rows) = self.select_result_to_rows(left_result)?;
+                    let (_right_cols, right_rows) = self.select_result_to_rows(right_result)?;
+
+                    let all = matches!(
+                        set_quantifier,
+                        ast::SetQuantifier::All | ast::SetQuantifier::AllByName
+                    );
+
+                    let combined_rows = match op {
+                        ast::SetOperator::Union => {
+                            if all {
+                                left_rows.into_iter().chain(right_rows).collect()
+                            } else {
+                                let mut result: Vec<Row> = left_rows;
+                                for row in right_rows {
+                                    if !result.contains(&row) {
+                                        result.push(row);
+                                    }
                                 }
-                            }
-                            // Also deduplicate the left side
-                            let mut deduped = Vec::new();
-                            for row in result {
-                                if !deduped.contains(&row) {
-                                    deduped.push(row);
+                                // Also deduplicate the left side
+                                let mut deduped = Vec::new();
+                                for row in result {
+                                    if !deduped.contains(&row) {
+                                        deduped.push(row);
+                                    }
                                 }
+                                deduped
                             }
-                            deduped
                         }
-                    }
-                    ast::SetOperator::Intersect => {
-                        let mut result = Vec::new();
-                        for row in &left_rows {
-                            if right_rows.contains(row)
-                                && (all || !result.contains(row)) {
+                        ast::SetOperator::Intersect => {
+                            let mut result = Vec::new();
+                            for row in &left_rows {
+                                if right_rows.contains(row) && (all || !result.contains(row)) {
                                     result.push(row.clone());
                                 }
+                            }
+                            result
                         }
-                        result
-                    }
-                    ast::SetOperator::Except => {
-                        let mut result = Vec::new();
-                        for row in &left_rows {
-                            if !right_rows.contains(row)
-                                && (all || !result.contains(row)) {
+                        ast::SetOperator::Except => {
+                            let mut result = Vec::new();
+                            for row in &left_rows {
+                                if !right_rows.contains(row) && (all || !result.contains(row)) {
                                     result.push(row.clone());
                                 }
+                            }
+                            result
                         }
-                        result
-                    }
-                    _ => {
-                        return Err(ExecError::Unsupported("unsupported set operation".into()));
-                    }
-                };
+                        _ => {
+                            return Err(ExecError::Unsupported("unsupported set operation".into()));
+                        }
+                    };
 
-                Ok(SelectResult::Projected(ExecResult::Select {
-                    columns: left_cols,
-                    rows: combined_rows,
-                }))
-            }
-            SetExpr::Query(q) => {
-                // Nested query: run as subquery
-                let inner_result = self.execute_query(*q).await?;
-                Ok(SelectResult::Projected(inner_result))
-            }
-            SetExpr::Values(values) => {
-                // VALUES (1, 'a'), (2, 'b'), ...
-                let mut result_rows = Vec::new();
-                for row_exprs in &values.rows {
-                    let mut row = Vec::new();
-                    for expr in row_exprs {
-                        row.push(self.eval_const_expr(expr)?);
+                    Ok(SelectResult::Projected(ExecResult::Select {
+                        columns: left_cols,
+                        rows: combined_rows,
+                    }))
+                }
+                SetExpr::Query(q) => {
+                    // Nested query: run as subquery
+                    let inner_result = self.execute_query(*q).await?;
+                    Ok(SelectResult::Projected(inner_result))
+                }
+                SetExpr::Values(values) => {
+                    // VALUES (1, 'a'), (2, 'b'), ...
+                    let mut result_rows = Vec::new();
+                    for row_exprs in &values.rows {
+                        let mut row = Vec::new();
+                        for expr in row_exprs {
+                            row.push(self.eval_const_expr(expr)?);
+                        }
+                        result_rows.push(row);
                     }
-                    result_rows.push(row);
+                    let columns = if let Some(first) = result_rows.first() {
+                        first
+                            .iter()
+                            .enumerate()
+                            .map(|(i, v)| (format!("column{}", i + 1), value_type(v)))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(SelectResult::Projected(ExecResult::Select {
+                        columns,
+                        rows: result_rows,
+                    }))
                 }
-                let columns = if let Some(first) = result_rows.first() {
-                    first
-                        .iter()
-                        .enumerate()
-                        .map(|(i, v)| (format!("column{}", i + 1), value_type(v)))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                Ok(SelectResult::Projected(ExecResult::Select {
-                    columns,
-                    rows: result_rows,
-                }))
-            }
-            // CTE + INSERT: WITH ... INSERT INTO ...
-            SetExpr::Insert(Statement::Insert(insert)) => {
-                // Store active CTEs so execute_query can find them when
-                // executing the INSERT's source SELECT or subqueries.
-                let sess = self.current_session();
-                if !cte_tables.is_empty() {
-                    *sess.active_ctes.write() = cte_tables.clone();
+                // CTE + INSERT: WITH ... INSERT INTO ...
+                SetExpr::Insert(Statement::Insert(insert)) => {
+                    // Store active CTEs so execute_query can find them when
+                    // executing the INSERT's source SELECT or subqueries.
+                    let sess = self.current_session();
+                    if !cte_tables.is_empty() {
+                        *sess.active_ctes.write() = cte_tables.clone();
+                    }
+                    let result = self.execute_insert(insert).await;
+                    *sess.active_ctes.write() = HashMap::new();
+                    Ok(SelectResult::Projected(result?))
                 }
-                let result = self.execute_insert(insert).await;
-                *sess.active_ctes.write() = HashMap::new();
-                Ok(SelectResult::Projected(result?))
-            }
-            // CTE + UPDATE: WITH ... UPDATE ...
-            SetExpr::Update(Statement::Update(update)) => {
-                let sess = self.current_session();
-                if !cte_tables.is_empty() {
-                    *sess.active_ctes.write() = cte_tables.clone();
+                // CTE + UPDATE: WITH ... UPDATE ...
+                SetExpr::Update(Statement::Update(update)) => {
+                    let sess = self.current_session();
+                    if !cte_tables.is_empty() {
+                        *sess.active_ctes.write() = cte_tables.clone();
+                    }
+                    let result = self.execute_update(update).await;
+                    *sess.active_ctes.write() = HashMap::new();
+                    Ok(SelectResult::Projected(result?))
                 }
-                let result = self.execute_update(update).await;
-                *sess.active_ctes.write() = HashMap::new();
-                Ok(SelectResult::Projected(result?))
-            }
-            // CTE + DELETE: WITH ... DELETE FROM ...
-            SetExpr::Delete(Statement::Delete(delete)) => {
-                let sess = self.current_session();
-                if !cte_tables.is_empty() {
-                    *sess.active_ctes.write() = cte_tables.clone();
+                // CTE + DELETE: WITH ... DELETE FROM ...
+                SetExpr::Delete(Statement::Delete(delete)) => {
+                    let sess = self.current_session();
+                    if !cte_tables.is_empty() {
+                        *sess.active_ctes.write() = cte_tables.clone();
+                    }
+                    let result = self.execute_delete(delete).await;
+                    *sess.active_ctes.write() = HashMap::new();
+                    Ok(SelectResult::Projected(result?))
                 }
-                let result = self.execute_delete(delete).await;
-                *sess.active_ctes.write() = HashMap::new();
-                Ok(SelectResult::Projected(result?))
+                _ => Err(ExecError::Unsupported("unsupported set expression".into())),
             }
-            _ => Err(ExecError::Unsupported("unsupported set expression".into())),
-        }
         }) // end Box::pin
     }
 
-    pub(super) fn select_result_to_rows(
-        &self,
-        result: SelectResult,
-    ) -> ProjectedResult {
+    pub(super) fn select_result_to_rows(&self, result: SelectResult) -> ProjectedResult {
         match result {
             SelectResult::Projected(ExecResult::Select { columns, rows }) => Ok((columns, rows)),
             SelectResult::Full {
@@ -3068,7 +3790,9 @@ impl Executor {
     pub(super) fn resolve_ctes(
         &self,
         with: &ast::With,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<CteTableMap, ExecError>> + Send + '_>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<CteTableMap, ExecError>> + Send + '_>,
+    > {
         let with = with.clone();
         Box::pin(async move {
             let mut cte_tables = HashMap::new();
@@ -3083,53 +3807,61 @@ impl Executor {
                         ref left,
                         ref right,
                     } = *cte.query.body
-                    {
-                        let is_all = matches!(
-                            set_quantifier,
-                            ast::SetQuantifier::All | ast::SetQuantifier::AllByName
-                        );
-                        if is_all {
-                            // Execute base case (left side of UNION ALL)
-                            let base_result = self.execute_set_expr(*left.clone(), &cte_tables).await?;
-                            let (base_cols, base_rows) = self.select_result_to_rows(base_result)?;
-                            // Apply CTE alias column names if provided
-                            let cte_col_names: Vec<String> = cte.alias.columns
-                                .iter()
-                                .map(|c| c.name.value.clone())
-                                .collect();
-                            let col_meta: Vec<ColMeta> = base_cols
-                                .iter()
-                                .enumerate()
-                                .map(|(i, (name, dtype))| ColMeta {
-                                    table: Some(cte_name.clone()),
-                                    name: cte_col_names.get(i).cloned().unwrap_or_else(|| name.clone()),
-                                    dtype: dtype.clone(),
-                                })
-                                .collect();
-                            let mut all_rows = base_rows.clone();
-                            let mut working_rows = base_rows;
-                            const MAX_RECURSION: usize = 1000;
-                            for _iteration in 0..MAX_RECURSION {
-                                // Make current working set available as the CTE
-                                cte_tables.insert(cte_name.clone(), (col_meta.clone(), working_rows));
-                                // Execute recursive part (right side of UNION ALL)
-                                let rec_result = self.execute_set_expr(*right.clone(), &cte_tables).await?;
-                                let (_rec_cols, new_rows) = self.select_result_to_rows(rec_result)?;
-                                if new_rows.is_empty() {
-                                    break; // fixpoint reached
-                                }
-                                all_rows.extend(new_rows.clone());
-                                working_rows = new_rows;
+                {
+                    let is_all = matches!(
+                        set_quantifier,
+                        ast::SetQuantifier::All | ast::SetQuantifier::AllByName
+                    );
+                    if is_all {
+                        // Execute base case (left side of UNION ALL)
+                        let base_result = self.execute_set_expr(*left.clone(), &cte_tables).await?;
+                        let (base_cols, base_rows) = self.select_result_to_rows(base_result)?;
+                        // Apply CTE alias column names if provided
+                        let cte_col_names: Vec<String> = cte
+                            .alias
+                            .columns
+                            .iter()
+                            .map(|c| c.name.value.clone())
+                            .collect();
+                        let col_meta: Vec<ColMeta> = base_cols
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (name, dtype))| ColMeta {
+                                table: Some(cte_name.clone()),
+                                name: cte_col_names
+                                    .get(i)
+                                    .cloned()
+                                    .unwrap_or_else(|| name.clone()),
+                                dtype: dtype.clone(),
+                            })
+                            .collect();
+                        let mut all_rows = base_rows.clone();
+                        let mut working_rows = base_rows;
+                        const MAX_RECURSION: usize = 1000;
+                        for _iteration in 0..MAX_RECURSION {
+                            // Make current working set available as the CTE
+                            cte_tables.insert(cte_name.clone(), (col_meta.clone(), working_rows));
+                            // Execute recursive part (right side of UNION ALL)
+                            let rec_result =
+                                self.execute_set_expr(*right.clone(), &cte_tables).await?;
+                            let (_rec_cols, new_rows) = self.select_result_to_rows(rec_result)?;
+                            if new_rows.is_empty() {
+                                break; // fixpoint reached
                             }
-                            cte_tables.insert(cte_name, (col_meta, all_rows));
-                            continue;
+                            all_rows.extend(new_rows.clone());
+                            working_rows = new_rows;
                         }
+                        cte_tables.insert(cte_name, (col_meta, all_rows));
+                        continue;
                     }
+                }
 
                 // Non-recursive CTE
                 let cte_result = self.execute_query(*cte.query.clone()).await?;
                 if let ExecResult::Select { columns, rows } = cte_result {
-                    let cte_col_names: Vec<String> = cte.alias.columns
+                    let cte_col_names: Vec<String> = cte
+                        .alias
+                        .columns
                         .iter()
                         .map(|c| c.name.value.clone())
                         .collect();
@@ -3138,7 +3870,10 @@ impl Executor {
                         .enumerate()
                         .map(|(i, (name, dtype))| ColMeta {
                             table: Some(cte_name.clone()),
-                            name: cte_col_names.get(i).cloned().unwrap_or_else(|| name.clone()),
+                            name: cte_col_names
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_else(|| name.clone()),
                             dtype: dtype.clone(),
                         })
                         .collect();
@@ -3153,12 +3888,13 @@ impl Executor {
     /// Returns a list of (column_name, value) pairs for predicates of the form
     /// `column = literal` or `literal = column`, and the remaining expression
     /// that couldn't be pushed down (if any).
-    pub(super) fn extract_index_predicates(
-        &self,
-        expr: &Expr,
-    ) -> IndexPredicates {
+    pub(super) fn extract_index_predicates(&self, expr: &Expr) -> IndexPredicates {
         match expr {
-            Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, right } => {
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Eq,
+                right,
+            } => {
                 if let Some((col, val)) = self.try_extract_col_eq_literal(left, right) {
                     return (vec![(col, val)], vec![], None);
                 }
@@ -3171,9 +3907,11 @@ impl Executor {
                 negated,
             } => {
                 if !*negated
-                    && let Some((col, lo, hi)) = self.try_extract_col_between_literals(target, low, high) {
-                        return (vec![], vec![(col, lo, hi)], None);
-                    }
+                    && let Some((col, lo, hi)) =
+                        self.try_extract_col_between_literals(target, low, high)
+                {
+                    return (vec![], vec![(col, lo, hi)], None);
+                }
                 (vec![], vec![], Some(expr.clone()))
             }
             // Comparison operators: >, <, >=, <=
@@ -3181,15 +3919,32 @@ impl Executor {
             // end.  The full WHERE clause is reapplied after the index scan,
             // so inclusive sentinels are safe (the filter enforces strict vs
             // non-strict semantics).
-            Expr::BinaryOp { left, op: ast::BinaryOperator::Gt, right }
-            | Expr::BinaryOp { left, op: ast::BinaryOperator::Lt, right }
-            | Expr::BinaryOp { left, op: ast::BinaryOperator::GtEq, right }
-            | Expr::BinaryOp { left, op: ast::BinaryOperator::LtEq, right } => {
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Gt,
+                right,
+            }
+            | Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Lt,
+                right,
+            }
+            | Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::GtEq,
+                right,
+            }
+            | Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::LtEq,
+                right,
+            } => {
                 let op = match expr {
                     Expr::BinaryOp { op, .. } => op.clone(),
                     _ => unreachable!(),
                 };
-                if let Some((col, val, col_on_left)) = self.try_extract_col_cmp_literal(left, right) {
+                if let Some((col, val, col_on_left)) = self.try_extract_col_cmp_literal(left, right)
+                {
                     // Normalise so we always think in terms of `col OP val`.
                     // If the column was on the right, flip the operator.
                     let effective_op = if col_on_left {
@@ -3218,7 +3973,11 @@ impl Executor {
                 }
                 (vec![], vec![], Some(expr.clone()))
             }
-            Expr::BinaryOp { left, op: ast::BinaryOperator::And, right } => {
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::And,
+                right,
+            } => {
                 let (mut left_eq, mut left_ranges, left_rest) = self.extract_index_predicates(left);
                 let (right_eq, right_ranges, right_rest) = self.extract_index_predicates(right);
                 left_eq.extend(right_eq);
@@ -3253,7 +4012,11 @@ impl Executor {
         Some((col, low_val, high_val))
     }
 
-    pub(super) fn build_col_meta_from_cache(&self, table_name: &str, label: &str) -> Option<Vec<ColMeta>> {
+    pub(super) fn build_col_meta_from_cache(
+        &self,
+        table_name: &str,
+        label: &str,
+    ) -> Option<Vec<ColMeta>> {
         // Clone column metadata and release the lock before building ColMeta
         // to avoid holding the read lock during the allocation-heavy map.
         let col_info = self.table_columns.read().get(table_name)?.clone();
@@ -3284,7 +4047,10 @@ impl Executor {
         low: &Value,
         high: &Value,
     ) -> Option<Vec<Row>> {
-        if let Ok(Some(rows)) = self.storage.index_lookup_range_sync(table_name, index_name, low, high) {
+        if let Ok(Some(rows)) = self
+            .storage
+            .index_lookup_range_sync(table_name, index_name, low, high)
+        {
             return Some(rows);
         }
 
@@ -3305,12 +4071,15 @@ impl Executor {
             let candidates = [Value::Int32(k as i32), Value::Int64(k)];
             let mut matched = false;
             for candidate in &candidates {
-                if let Ok(Some(mut found)) = self.storage.index_lookup_sync(table_name, index_name, candidate)
-                    && !found.is_empty() {
-                        rows.append(&mut found);
-                        matched = true;
-                        break;
-                    }
+                if let Ok(Some(mut found)) = self
+                    .storage
+                    .index_lookup_sync(table_name, index_name, candidate)
+                    && !found.is_empty()
+                {
+                    rows.append(&mut found);
+                    matched = true;
+                    break;
+                }
             }
             if matched {
                 continue;
@@ -3320,17 +4089,23 @@ impl Executor {
     }
 
     /// Try to extract a (column_name, literal_value) from an equality expression.
-    pub(super) fn try_extract_col_eq_literal(&self, left: &Expr, right: &Expr) -> Option<(String, Value)> {
+    pub(super) fn try_extract_col_eq_literal(
+        &self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Option<(String, Value)> {
         // column = literal
         if let Some(col) = self.expr_as_column_name(left)
-            && let Ok(val) = self.eval_const_expr(right) {
-                return Some((col, val));
-            }
+            && let Ok(val) = self.eval_const_expr(right)
+        {
+            return Some((col, val));
+        }
         // literal = column
         if let Some(col) = self.expr_as_column_name(right)
-            && let Ok(val) = self.eval_const_expr(left) {
-                return Some((col, val));
-            }
+            && let Ok(val) = self.eval_const_expr(left)
+        {
+            return Some((col, val));
+        }
         None
     }
 
@@ -3345,14 +4120,16 @@ impl Executor {
     ) -> Option<(String, Value, bool)> {
         // column OP literal
         if let Some(col) = self.expr_as_column_name(left)
-            && let Ok(val) = self.eval_const_expr(right) {
-                return Some((col, val, true));
-            }
+            && let Ok(val) = self.eval_const_expr(right)
+        {
+            return Some((col, val, true));
+        }
         // literal OP column  ->  column (flipped-OP) literal
         if let Some(col) = self.expr_as_column_name(right)
-            && let Ok(val) = self.eval_const_expr(left) {
-                return Some((col, val, false));
-            }
+            && let Ok(val) = self.eval_const_expr(left)
+        {
+            return Some((col, val, false));
+        }
         None
     }
 
@@ -3364,9 +4141,7 @@ impl Executor {
             Value::Int32(_) => Value::Int32(i32::MAX),
             Value::Int64(_) => Value::Int64(i64::MAX),
             Value::Float64(_) => Value::Float64(f64::MAX),
-            Value::Text(_) => {
-                Value::Text("\u{10FFFF}\u{10FFFF}\u{10FFFF}\u{10FFFF}".to_string())
-            }
+            Value::Text(_) => Value::Text("\u{10FFFF}\u{10FFFF}\u{10FFFF}\u{10FFFF}".to_string()),
             Value::Date(_) => Value::Date(i32::MAX),
             Value::Timestamp(_) => Value::Timestamp(i64::MAX),
             Value::TimestampTz(_) => Value::TimestampTz(i64::MAX),
@@ -3421,7 +4196,9 @@ impl Executor {
         }
         // Guard 2: simple table reference (not a subquery)
         let table_name = match &select.from[0].relation {
-            TableFactor::Table { name, args: None, .. } => name.to_string(),
+            TableFactor::Table {
+                name, args: None, ..
+            } => name.to_string(),
             _ => return Ok(None),
         };
         // Guard 3: not a CTE
@@ -3447,7 +4224,9 @@ impl Executor {
             return Ok(None);
         }
         let resolve_col = |name: &str| -> Option<usize> {
-            col_info.iter().position(|(c, _)| c.eq_ignore_ascii_case(name))
+            col_info
+                .iter()
+                .position(|(c, _)| c.eq_ignore_ascii_case(name))
         };
 
         // WHERE: attempt to extract a single equality predicate
@@ -3490,7 +4269,14 @@ impl Executor {
         // Parse projection -- COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col),
         // and the GROUP BY key column are all fast-pathed.
         #[derive(Clone)]
-        enum FastAgg { Count, Sum(usize), Avg(usize), Min(usize), Max(usize), GroupKey }
+        enum FastAgg {
+            Count,
+            Sum(usize),
+            Avg(usize),
+            Min(usize),
+            Max(usize),
+            GroupKey,
+        }
 
         let mut items: Vec<(String, FastAgg)> = Vec::new();
 
@@ -3510,25 +4296,25 @@ impl Executor {
                     // DISTINCT aggregates (e.g. SUM(DISTINCT col)) cannot use
                     // the fast path because the engine sums all rows, not distinct values.
                     if let ast::FunctionArguments::List(l) = &func.args
-                        && matches!(l.duplicate_treatment, Some(ast::DuplicateTreatment::Distinct)) {
-                            return Ok(None);
+                        && matches!(
+                            l.duplicate_treatment,
+                            Some(ast::DuplicateTreatment::Distinct)
+                        )
+                    {
+                        return Ok(None);
                     }
                     // Extract the single column-reference argument, if present
                     let arg_col_idx = match &func.args {
-                        ast::FunctionArguments::List(l) if l.args.len() == 1 => {
-                            match &l.args[0] {
-                                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
-                                    match e {
-                                        Expr::Identifier(id) => resolve_col(&id.value),
-                                        Expr::CompoundIdentifier(ids) => {
-                                            ids.last().and_then(|id| resolve_col(&id.value))
-                                        }
-                                        _ => None,
-                                    }
+                        ast::FunctionArguments::List(l) if l.args.len() == 1 => match &l.args[0] {
+                            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => match e {
+                                Expr::Identifier(id) => resolve_col(&id.value),
+                                Expr::CompoundIdentifier(ids) => {
+                                    ids.last().and_then(|id| resolve_col(&id.value))
                                 }
                                 _ => None,
-                            }
-                        }
+                            },
+                            _ => None,
+                        },
                         _ => None,
                     };
                     match fname.as_str() {
@@ -3545,23 +4331,37 @@ impl Executor {
                                 }
                                 _ => false,
                             };
-                            if !is_star { return Ok(None); }
+                            if !is_star {
+                                return Ok(None);
+                            }
                             items.push((col_label, FastAgg::Count));
                         }
                         "SUM" => {
-                            let ci = match arg_col_idx { Some(i) => i, None => return Ok(None) };
+                            let ci = match arg_col_idx {
+                                Some(i) => i,
+                                None => return Ok(None),
+                            };
                             items.push((col_label, FastAgg::Sum(ci)));
                         }
                         "AVG" => {
-                            let ci = match arg_col_idx { Some(i) => i, None => return Ok(None) };
+                            let ci = match arg_col_idx {
+                                Some(i) => i,
+                                None => return Ok(None),
+                            };
                             items.push((col_label, FastAgg::Avg(ci)));
                         }
                         "MIN" => {
-                            let ci = match arg_col_idx { Some(i) => i, None => return Ok(None) };
+                            let ci = match arg_col_idx {
+                                Some(i) => i,
+                                None => return Ok(None),
+                            };
                             items.push((col_label, FastAgg::Min(ci)));
                         }
                         "MAX" => {
-                            let ci = match arg_col_idx { Some(i) => i, None => return Ok(None) };
+                            let ci = match arg_col_idx {
+                                Some(i) => i,
+                                None => return Ok(None),
+                            };
                             items.push((col_label, FastAgg::Max(ci)));
                         }
                         _ => return Ok(None),
@@ -3571,14 +4371,22 @@ impl Executor {
                 Expr::Identifier(id) => {
                     if let Some(gc) = group_by_col
                         && let Some(idx) = resolve_col(&id.value)
-                            && idx == gc { items.push((col_label, FastAgg::GroupKey)); continue; }
+                        && idx == gc
+                    {
+                        items.push((col_label, FastAgg::GroupKey));
+                        continue;
+                    }
                     return Ok(None);
                 }
                 Expr::CompoundIdentifier(ids) => {
                     if let Some(gc) = group_by_col
                         && let Some(last) = ids.last()
-                            && let Some(idx) = resolve_col(&last.value)
-                                && idx == gc { items.push((col_label, FastAgg::GroupKey)); continue; }
+                        && let Some(idx) = resolve_col(&last.value)
+                        && idx == gc
+                    {
+                        items.push((col_label, FastAgg::GroupKey));
+                        continue;
+                    }
                     return Ok(None);
                 }
                 _ => return Ok(None),
@@ -3606,7 +4414,9 @@ impl Executor {
                     let dtype = match t {
                         FastAgg::GroupKey => DataType::Text,
                         FastAgg::Count => DataType::Int64,
-                        FastAgg::Sum(_) | FastAgg::Avg(_) | FastAgg::Min(_) | FastAgg::Max(_) => DataType::Float64,
+                        FastAgg::Sum(_) | FastAgg::Avg(_) | FastAgg::Min(_) | FastAgg::Max(_) => {
+                            DataType::Float64
+                        }
                     };
                     (name.clone(), dtype)
                 })
@@ -3630,7 +4440,10 @@ impl Executor {
                 })
                 .collect();
 
-            return Ok(Some(ExecResult::Select { columns: col_defs, rows }));
+            return Ok(Some(ExecResult::Select {
+                columns: col_defs,
+                rows,
+            }));
         }
 
         // No GROUP BY -- single-row aggregate
@@ -3650,10 +4463,12 @@ impl Executor {
             match agg {
                 FastAgg::Count => {
                     let n = match &eq_filter {
-                        Some((fc, fv)) => match tbl_storage.fast_count_filtered(&table_name, *fc, fv) {
-                            Some(c) => c as i64,
-                            None => return Ok(None),
-                        },
+                        Some((fc, fv)) => {
+                            match tbl_storage.fast_count_filtered(&table_name, *fc, fv) {
+                                Some(c) => c as i64,
+                                None => return Ok(None),
+                            }
+                        }
                         None => tbl_storage.fast_count_all(&table_name).unwrap_or(0) as i64,
                     };
                     col_defs.push((col_label.clone(), DataType::Int64));
@@ -3683,7 +4498,11 @@ impl Executor {
                 },
                 FastAgg::Avg(ci) => match sum_or_filtered(*ci) {
                     Some((sum, cnt)) => {
-                        let avg = if cnt == 0 { Value::Null } else { Value::Float64(sum / cnt as f64) };
+                        let avg = if cnt == 0 {
+                            Value::Null
+                        } else {
+                            Value::Float64(sum / cnt as f64)
+                        };
                         col_defs.push((col_label.clone(), DataType::Float64));
                         result_row.push(avg);
                     }
@@ -3747,7 +4566,11 @@ impl Executor {
         resolve_col: &dyn Fn(&str) -> Option<usize>,
     ) -> Option<(usize, Value)> {
         match expr {
-            Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, right } => {
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Eq,
+                right,
+            } => {
                 // Determine which side is the column and which is the literal
                 let (col_expr, lit_expr) = {
                     let left_is_col = matches!(
@@ -3796,8 +4619,12 @@ impl Executor {
         match expr {
             Expr::Value(v) => match &v.value {
                 ast::Value::Number(s, _) => {
-                    if let Ok(i) = s.parse::<i64>() { return Some(Value::Int64(i)); }
-                    if let Ok(f) = s.parse::<f64>() { return Some(Value::Float64(f)); }
+                    if let Ok(i) = s.parse::<i64>() {
+                        return Some(Value::Int64(i));
+                    }
+                    if let Ok(f) = s.parse::<f64>() {
+                        return Some(Value::Float64(f));
+                    }
                     None
                 }
                 ast::Value::SingleQuotedString(s) => Some(Value::Text(s.clone())),
@@ -3805,13 +4632,14 @@ impl Executor {
                 ast::Value::Null => Some(Value::Null),
                 _ => None,
             },
-            Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } => {
-                match Self::ast_expr_to_literal(expr) {
-                    Some(Value::Int64(n)) => Some(Value::Int64(-n)),
-                    Some(Value::Float64(f)) => Some(Value::Float64(-f)),
-                    _ => None,
-                }
-            }
+            Expr::UnaryOp {
+                op: ast::UnaryOperator::Minus,
+                expr,
+            } => match Self::ast_expr_to_literal(expr) {
+                Some(Value::Int64(n)) => Some(Value::Int64(-n)),
+                Some(Value::Float64(f)) => Some(Value::Float64(-f)),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -3820,10 +4648,13 @@ impl Executor {
     /// Returns `None` if the expression isn't a simple equality with a literal.
     pub(super) fn extract_equality_value(expr: &Expr) -> Option<Value> {
         match expr {
-            Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, right } => {
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Eq,
+                right,
+            } => {
                 // Try right side as literal (col = literal)
-                Self::ast_expr_to_literal(right)
-                    .or_else(|| Self::ast_expr_to_literal(left))
+                Self::ast_expr_to_literal(right).or_else(|| Self::ast_expr_to_literal(left))
             }
             _ => None,
         }
@@ -3848,7 +4679,9 @@ impl Executor {
         match (val, target) {
             // Integer-width / int↔float adjustments (preserve original
             // fast-path; `Value::cast` would also work but allocates more).
-            (Value::Int64(n), DataType::Int32) if *n >= i32::MIN as i64 && *n <= i32::MAX as i64 => {
+            (Value::Int64(n), DataType::Int32)
+                if *n >= i32::MIN as i64 && *n <= i32::MAX as i64 =>
+            {
                 Value::Int32(*n as i32)
             }
             (Value::Int32(n), DataType::Int64) => Value::Int64(*n as i64),
@@ -3859,47 +4692,65 @@ impl Executor {
             // so we share behavior with explicit CAST(...) expressions. On
             // parse failure, fall back to the original text — storage will
             // miss the row, the post-scan WHERE filter will catch it.
-            (Value::Text(_), DataType::Int32 | DataType::Int64 | DataType::Float64
-                | DataType::Bool | DataType::Numeric | DataType::Date
-                | DataType::Timestamp | DataType::TimestampTz | DataType::Uuid) => {
-                val.cast(target).unwrap_or_else(|_| val.clone())
-            }
+            (
+                Value::Text(_),
+                DataType::Int32
+                | DataType::Int64
+                | DataType::Float64
+                | DataType::Bool
+                | DataType::Numeric
+                | DataType::Date
+                | DataType::Timestamp
+                | DataType::TimestampTz
+                | DataType::Uuid,
+            ) => val.cast(target).unwrap_or_else(|_| val.clone()),
             _ => val.clone(),
         }
     }
 
     /// Coerce range bounds to the indexed column's data type.
     fn coerce_index_bounds(
-        lo: Value, hi: Value,
-        table: &str, index_name: &str,
+        lo: Value,
+        hi: Value,
+        table: &str,
+        index_name: &str,
         table_def: &crate::catalog::TableDef,
         catalog: &crate::catalog::Catalog,
     ) -> (Value, Value) {
         let idx_defs = catalog.get_indexes_cached(table).unwrap_or_default();
         if let Some(idx) = idx_defs.iter().find(|i| i.name == index_name)
             && let Some(col_name) = idx.columns.first()
-                && let Some(col) = table_def.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col_name)) {
-                    return (
-                        Self::coerce_to_column_type(&lo, &col.data_type),
-                        Self::coerce_to_column_type(&hi, &col.data_type),
-                    );
-                }
+            && let Some(col) = table_def
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(col_name))
+        {
+            return (
+                Self::coerce_to_column_type(&lo, &col.data_type),
+                Self::coerce_to_column_type(&hi, &col.data_type),
+            );
+        }
         (lo, hi)
     }
 
     /// Coerce an index lookup value to the indexed column's data type.
     fn coerce_index_value(
         val: Value,
-        table: &str, index_name: &str,
+        table: &str,
+        index_name: &str,
         table_def: &crate::catalog::TableDef,
         catalog: &crate::catalog::Catalog,
     ) -> Value {
         let idx_defs = catalog.get_indexes_cached(table).unwrap_or_default();
         if let Some(idx) = idx_defs.iter().find(|i| i.name == index_name)
             && let Some(col_name) = idx.columns.first()
-                && let Some(col) = table_def.columns.iter().find(|c| c.name.eq_ignore_ascii_case(col_name)) {
-                    return Self::coerce_to_column_type(&val, &col.data_type);
-                }
+            && let Some(col) = table_def
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(col_name))
+        {
+            return Self::coerce_to_column_type(&val, &col.data_type);
+        }
         val
     }
 
@@ -3953,10 +4804,14 @@ impl Executor {
         };
 
         // Only handle Eq, NotEq, Gt, Lt, GtEq, LtEq
-        if !matches!(op,
-            ast::BinaryOperator::Eq | ast::BinaryOperator::NotEq
-            | ast::BinaryOperator::Gt | ast::BinaryOperator::Lt
-            | ast::BinaryOperator::GtEq | ast::BinaryOperator::LtEq
+        if !matches!(
+            op,
+            ast::BinaryOperator::Eq
+                | ast::BinaryOperator::NotEq
+                | ast::BinaryOperator::Gt
+                | ast::BinaryOperator::Lt
+                | ast::BinaryOperator::GtEq
+                | ast::BinaryOperator::LtEq
         ) {
             return None;
         }
@@ -3997,16 +4852,25 @@ impl Executor {
 
                 let matching_dense = match op {
                     ast::BinaryOperator::Eq => simd::filter_i64_equals(&dense_vals, threshold),
-                    ast::BinaryOperator::NotEq => simd::filter_i64_not_equals(&dense_vals, threshold),
+                    ast::BinaryOperator::NotEq => {
+                        simd::filter_i64_not_equals(&dense_vals, threshold)
+                    }
                     ast::BinaryOperator::Gt => simd::filter_i64_greater(&dense_vals, threshold),
                     ast::BinaryOperator::Lt => simd::filter_i64_less(&dense_vals, threshold),
-                    ast::BinaryOperator::GtEq => simd::filter_i64_greater_eq(&dense_vals, threshold),
+                    ast::BinaryOperator::GtEq => {
+                        simd::filter_i64_greater_eq(&dense_vals, threshold)
+                    }
                     ast::BinaryOperator::LtEq => simd::filter_i64_less_eq(&dense_vals, threshold),
                     _ => return None,
                 };
 
                 // Map dense indices back to original row indices
-                Some(matching_dense.into_iter().map(|di| row_indices[di]).collect())
+                Some(
+                    matching_dense
+                        .into_iter()
+                        .map(|di| row_indices[di])
+                        .collect(),
+                )
             }
             DataType::Float64 => {
                 let threshold = match &literal_val {
@@ -4041,16 +4905,25 @@ impl Executor {
 
                 let matching_dense = match op {
                     ast::BinaryOperator::Eq => simd::filter_f64_equals(&dense_vals, threshold),
-                    ast::BinaryOperator::NotEq => simd::filter_f64_not_equals(&dense_vals, threshold),
+                    ast::BinaryOperator::NotEq => {
+                        simd::filter_f64_not_equals(&dense_vals, threshold)
+                    }
                     ast::BinaryOperator::Gt => simd::filter_f64_greater(&dense_vals, threshold),
                     ast::BinaryOperator::Lt => simd::filter_f64_less(&dense_vals, threshold),
-                    ast::BinaryOperator::GtEq => simd::filter_f64_greater_eq(&dense_vals, threshold),
+                    ast::BinaryOperator::GtEq => {
+                        simd::filter_f64_greater_eq(&dense_vals, threshold)
+                    }
                     ast::BinaryOperator::LtEq => simd::filter_f64_less_eq(&dense_vals, threshold),
                     _ => return None,
                 };
 
                 // Map dense indices back to original row indices
-                Some(matching_dense.into_iter().map(|di| row_indices[di]).collect())
+                Some(
+                    matching_dense
+                        .into_iter()
+                        .map(|di| row_indices[di])
+                        .collect(),
+                )
             }
             DataType::Text => {
                 // Fast text equality/inequality filter: direct string comparison without AST eval
@@ -4065,8 +4938,13 @@ impl Executor {
                 let negate = matches!(op, ast::BinaryOperator::NotEq);
                 for (i, row) in rows.iter().enumerate() {
                     if let Some(Value::Text(s)) = row.get(col_idx) {
-                        if negate { if s != needle { matching.push(i); } }
-                        else if s == needle { matching.push(i); }
+                        if negate {
+                            if s != needle {
+                                matching.push(i);
+                            }
+                        } else if s == needle {
+                            matching.push(i);
+                        }
                     }
                 }
                 Some(matching)
@@ -4102,16 +4980,29 @@ impl Executor {
         }
 
         let kind = match where_expr {
-            Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, right } => {
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Eq,
+                right,
+            } => {
                 let (col, val) = self.try_extract_col_eq_literal(left, right)?;
                 FilterKind::Eq(col, val)
             }
-            Expr::Between { expr, low, high, negated } if !*negated => {
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } if !*negated => {
                 let (col, lo, hi) = self.try_extract_col_between_literals(expr, low, high)?;
                 FilterKind::Range(col, lo, hi)
             }
             // AND of two range comparisons on same column: col >= X AND col <= Y
-            Expr::BinaryOp { left, op: ast::BinaryOperator::And, right } => {
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::And,
+                right,
+            } => {
                 let (col, lo, hi) = self.try_extract_range_from_and(left, right)?;
                 FilterKind::Range(col, lo, hi)
             }
@@ -4119,9 +5010,17 @@ impl Executor {
         };
 
         let (table_name, label) = match &select.from[0].relation {
-            TableFactor::Table { name, alias, args: None, .. } => {
+            TableFactor::Table {
+                name,
+                alias,
+                args: None,
+                ..
+            } => {
                 let t = name.to_string();
-                let l = alias.as_ref().map(|a| a.name.value.clone()).unwrap_or_else(|| t.clone());
+                let l = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| t.clone());
                 (t, l)
             }
             _ => return None,
@@ -4142,7 +5041,8 @@ impl Executor {
                 // text, so `WHERE bigint_col = '5'` arrives with `filter_val =
                 // Value::Text("5")` and the storage engine's typed comparator
                 // would otherwise miss every row.
-                let coerced = Self::coerce_literal_to_column_type(filter_val, &col_meta[col_idx].dtype)?;
+                let coerced =
+                    Self::coerce_literal_to_column_type(filter_val, &col_meta[col_idx].dtype)?;
                 let rows = storage.fast_scan_where_eq(&table_name, col_idx, &coerced)?;
                 Some((col_meta, rows))
             }
@@ -4205,7 +5105,9 @@ impl Executor {
         // (or vice versa). Both must reference the same column.
         let (col1, val1, is_lower1) = self.try_extract_col_bound(left)?;
         let (col2, val2, is_lower2) = self.try_extract_col_bound(right)?;
-        if col1 != col2 { return None; }
+        if col1 != col2 {
+            return None;
+        }
         // One must be a lower bound and one an upper bound
         if is_lower1 && !is_lower2 {
             Some((col1, val1, val2))
@@ -4267,13 +5169,22 @@ impl Executor {
         let storage = self.storage_for(table_name);
 
         match where_expr {
-            Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, right } => {
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Eq,
+                right,
+            } => {
                 let (col_name, filter_val) = self.try_extract_col_eq_literal(left, right)?;
                 let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
                 let filter_val = Self::coerce_to_column_type(&filter_val, &col_meta[col_idx].dtype);
                 storage.fast_scan_where_eq(table_name, col_idx, &filter_val)
             }
-            Expr::Between { expr, low, high, negated } if !*negated => {
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } if !*negated => {
                 let (col_name, lo, hi) = self.try_extract_col_between_literals(expr, low, high)?;
                 let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
                 let dtype = &col_meta[col_idx].dtype;
@@ -4283,9 +5194,15 @@ impl Executor {
             }
             // Single range comparison: col < val, col > val, col <= val, col >= val
             // Use a wide sentinel bound on the open end
-            Expr::BinaryOp { left: _, op: ast::BinaryOperator::Lt | ast::BinaryOperator::LtEq |
-                    ast::BinaryOperator::Gt | ast::BinaryOperator::GtEq, right: _ } =>
-            {
+            Expr::BinaryOp {
+                left: _,
+                op:
+                    ast::BinaryOperator::Lt
+                    | ast::BinaryOperator::LtEq
+                    | ast::BinaryOperator::Gt
+                    | ast::BinaryOperator::GtEq,
+                right: _,
+            } => {
                 let (col_name, val, is_lower) = self.try_extract_col_bound(where_expr)?;
                 let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
                 let val = Self::coerce_to_column_type(&val, &col_meta[col_idx].dtype);
@@ -4300,7 +5217,11 @@ impl Executor {
                 // is always applied after load_table_factor_with_ctes returns.
                 storage.fast_scan_where_range(table_name, col_idx, &lo, &hi)
             }
-            Expr::BinaryOp { left, op: ast::BinaryOperator::And, right } => {
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::And,
+                right,
+            } => {
                 let (col_name, lo, hi) = self.try_extract_range_from_and(left, right)?;
                 let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
                 let dtype = &col_meta[col_idx].dtype;
@@ -4334,7 +5255,8 @@ impl Executor {
             return None;
         }
         // No GROUP BY, HAVING, or window functions — those need full rows
-        if matches!(&select.group_by, ast::GroupByExpr::Expressions(exprs, _) if !exprs.is_empty()) {
+        if matches!(&select.group_by, ast::GroupByExpr::Expressions(exprs, _) if !exprs.is_empty())
+        {
             return None;
         }
         if select.having.is_some() {
@@ -4363,10 +5285,16 @@ impl Executor {
                 SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
                     select_columns.push(parts[1].value.to_lowercase());
                 }
-                SelectItem::ExprWithAlias { expr: Expr::Identifier(ident), .. } => {
+                SelectItem::ExprWithAlias {
+                    expr: Expr::Identifier(ident),
+                    ..
+                } => {
                     select_columns.push(ident.value.to_lowercase());
                 }
-                SelectItem::ExprWithAlias { expr: Expr::CompoundIdentifier(parts), .. } if parts.len() == 2 => {
+                SelectItem::ExprWithAlias {
+                    expr: Expr::CompoundIdentifier(parts),
+                    ..
+                } if parts.len() == 2 => {
                     select_columns.push(parts[1].value.to_lowercase());
                 }
                 // Wildcard or expression — can't do index-only scan
@@ -4402,7 +5330,9 @@ impl Executor {
 
         // Get column metadata for the output
         let col_meta = self.build_col_meta_from_cache(table_name, label)?;
-        let col_idx = col_meta.iter().position(|c| c.name.to_lowercase() == *covered_col)?;
+        let col_idx = col_meta
+            .iter()
+            .position(|c| c.name.to_lowercase() == *covered_col)?;
         let col_dtype = col_meta[col_idx].dtype.clone();
 
         // Determine the scan parameters from WHERE clause.
@@ -4413,7 +5343,10 @@ impl Executor {
         let (eq_value, range_bounds) = if let Some(ref where_expr) = select.selection {
             match where_expr {
                 // Simple equality: col = literal
-                Expr::BinaryOp { op: ast::BinaryOperator::Eq, .. } => {
+                Expr::BinaryOp {
+                    op: ast::BinaryOperator::Eq,
+                    ..
+                } => {
                     let (eq_preds, _, remaining) = self.extract_index_predicates(where_expr);
                     if remaining.is_some() || eq_preds.len() != 1 {
                         return None;
@@ -4478,7 +5411,9 @@ impl Executor {
                 self.collect_column_refs(left, columns);
                 self.collect_column_refs(right, columns);
             }
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 self.collect_column_refs(expr, columns);
                 self.collect_column_refs(low, columns);
                 self.collect_column_refs(high, columns);
@@ -4524,7 +5459,10 @@ impl Executor {
                 let index_name = index_name_ref.clone();
                 drop(index_name_ref);
                 // Try synchronous index lookup via storage engine
-                match self.storage.index_lookup_sync(table_name, &index_name, value) {
+                match self
+                    .storage
+                    .index_lookup_sync(table_name, &index_name, value)
+                {
                     Ok(Some(rows)) => {
                         self.metrics.rows_scanned.inc_by(rows.len() as u64);
                         let col_meta = self.build_col_meta_from_cache(table_name, label)?;
@@ -4536,7 +5474,9 @@ impl Executor {
                                 continue;
                             }
                             other_preds.push(Expr::BinaryOp {
-                                left: Box::new(Expr::Identifier(ast::Ident::new(other_col.clone()))),
+                                left: Box::new(Expr::Identifier(ast::Ident::new(
+                                    other_col.clone(),
+                                ))),
                                 op: ast::BinaryOperator::Eq,
                                 right: Box::new(self.value_to_expr(other_val)),
                             });
@@ -4544,13 +5484,12 @@ impl Executor {
                         if let Some(rest) = &remaining {
                             other_preds.push(rest.clone());
                         }
-                        let final_remaining = other_preds.into_iter().reduce(|a, b| {
-                            Expr::BinaryOp {
+                        let final_remaining =
+                            other_preds.into_iter().reduce(|a, b| Expr::BinaryOp {
                                 left: Box::new(a),
                                 op: ast::BinaryOperator::And,
                                 right: Box::new(b),
-                            }
-                        });
+                            });
 
                         return Some((col_meta, rows, final_remaining, None));
                     }
@@ -4567,7 +5506,9 @@ impl Executor {
             if let Some(index_name_ref) = self.btree_indexes.get(&key) {
                 let index_name = index_name_ref.clone();
                 drop(index_name_ref);
-                if let Some(rows) = self.try_index_lookup_range_sync(table_name, &index_name, low, high) {
+                if let Some(rows) =
+                    self.try_index_lookup_range_sync(table_name, &index_name, low, high)
+                {
                     self.metrics.rows_scanned.inc_by(rows.len() as u64);
                     let col_meta = self.build_col_meta_from_cache(table_name, label)?;
                     let full_filter = Some(where_expr.clone());
@@ -4622,84 +5563,114 @@ impl Executor {
         // (SELECT list + WHERE) are covered by a single B-tree index, return
         // results directly from the index without any heap/table access.
         // This achieves 1.5-2x speedup for covering index queries.
-        if select.from.len() == 1 && select.from[0].joins.is_empty()
-            && let TableFactor::Table { name, alias, args: None, .. } = &select.from[0].relation {
-                let table_name = name.to_string();
-                let label = alias.as_ref()
-                    .map(|a| a.name.value.clone())
-                    .unwrap_or_else(|| table_name.clone());
-                if let Some(result) = self.try_index_only_scan(select, &table_name, &label, cte_tables) {
-                    return Ok(SelectResult::Projected(result));
-                }
+        if select.from.len() == 1
+            && select.from[0].joins.is_empty()
+            && let TableFactor::Table {
+                name,
+                alias,
+                args: None,
+                ..
+            } = &select.from[0].relation
+        {
+            let table_name = name.to_string();
+            let label = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| table_name.clone());
+            if let Some(result) = self.try_index_only_scan(select, &table_name, &label, cte_tables)
+            {
+                return Ok(SelectResult::Projected(result));
             }
+        }
 
         // Index-aware optimization (fully synchronous)
         // For simple single-table queries with WHERE equality predicates,
         // try to use a B-tree index instead of a full table scan.
-        let index_result: IndexScanResult = if select.from.len() == 1
-            && select.from[0].joins.is_empty()
-        {
-            if let (Some(selection), TableFactor::Table { name, alias, args: None, .. }) =
-                (&select.selection, &select.from[0].relation) {
-                let table_name = name.to_string();
-                let label = alias.as_ref()
-                    .map(|a| a.name.value.clone())
-                    .unwrap_or_else(|| table_name.clone());
-                // Don't try index scan for CTEs or virtual tables
-                if !cte_tables.contains_key(&table_name) {
-                    self.try_index_scan_sync(&table_name, &label, selection)
+        let index_result: IndexScanResult =
+            if select.from.len() == 1 && select.from[0].joins.is_empty() {
+                if let (
+                    Some(selection),
+                    TableFactor::Table {
+                        name,
+                        alias,
+                        args: None,
+                        ..
+                    },
+                ) = (&select.selection, &select.from[0].relation)
+                {
+                    let table_name = name.to_string();
+                    let label = alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| table_name.clone());
+                    // Don't try index scan for CTEs or virtual tables
+                    if !cte_tables.contains_key(&table_name) {
+                        self.try_index_scan_sync(&table_name, &label, selection)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
-        let (col_meta, filtered, sorted_by_col) = if let Some((col_meta, rows, remaining_where, sorted_by)) = index_result {
-            // Index scan succeeded -- apply remaining predicates if any
-            // Note: filtering preserves relative row order, so sorted_by remains valid.
-            let filtered = if let Some(ref expr) = remaining_where {
-                // Try SIMD-accelerated filter for simple col op literal predicates
-                if let Some(indices) = self.try_simd_filter(expr, &rows, &col_meta) {
-                    indices.into_iter().map(|i| rows[i].clone()).collect()
+        let (col_meta, filtered, sorted_by_col) =
+            if let Some((col_meta, rows, remaining_where, sorted_by)) = index_result {
+                // Index scan succeeded -- apply remaining predicates if any
+                // Note: filtering preserves relative row order, so sorted_by remains valid.
+                let filtered = if let Some(ref expr) = remaining_where {
+                    // Try SIMD-accelerated filter for simple col op literal predicates
+                    if let Some(indices) = self.try_simd_filter(expr, &rows, &col_meta) {
+                        indices.into_iter().map(|i| rows[i].clone()).collect()
+                    } else {
+                        // Parallel Rayon filter for large sets, serial for small
+                        self.parallel_filter(rows, expr, &col_meta)
+                    }
                 } else {
-                    // Parallel Rayon filter for large sets, serial for small
-                    self.parallel_filter(rows, expr, &col_meta)
-                }
+                    rows
+                };
+                (col_meta, filtered, sorted_by)
+            } else if let Some((col_meta, rows)) =
+                self.try_columnar_filtered_scan(select, cte_tables)
+            {
+                // Columnar filter pushdown: engine filtered non-matching rows before
+                // materialising -- no further WHERE evaluation needed.
+                (col_meta, rows, None)
             } else {
-                rows
-            };
-            (col_meta, filtered, sorted_by)
-        } else if let Some((col_meta, rows)) = self.try_columnar_filtered_scan(select, cte_tables) {
-            // Columnar filter pushdown: engine filtered non-matching rows before
-            // materialising -- no further WHERE evaluation needed.
-            (col_meta, rows, None)
-        } else {
-            // Fall back to AST execution with safe relation-level WHERE pushdown.
-            let (pushdown_map, remaining_where) = if let Some(ref where_expr) = select.selection {
-                self.partition_where_for_ast_pushdown(&select.from, where_expr)
-            } else {
-                (HashMap::new(), None)
-            };
-            let (col_meta, combined_rows, unconsumed) =
-                self.build_from_rows_with_ctes(&select.from, cte_tables, Some(&pushdown_map), remaining_where.as_ref()).await?;
+                // Fall back to AST execution with safe relation-level WHERE pushdown.
+                let (pushdown_map, remaining_where) = if let Some(ref where_expr) = select.selection
+                {
+                    self.partition_where_for_ast_pushdown(&select.from, where_expr)
+                } else {
+                    (HashMap::new(), None)
+                };
+                let (col_meta, combined_rows, unconsumed) = self
+                    .build_from_rows_with_ctes(
+                        &select.from,
+                        cte_tables,
+                        Some(&pushdown_map),
+                        remaining_where.as_ref(),
+                    )
+                    .await?;
 
-            let filtered: Vec<Row> = if let Some(ref expr) = unconsumed {
-                // Try SIMD-accelerated filter for simple col op literal predicates
-                if let Some(indices) = self.try_simd_filter(expr, &combined_rows, &col_meta) {
-                    indices.into_iter().map(|i| combined_rows[i].clone()).collect()
+                let filtered: Vec<Row> = if let Some(ref expr) = unconsumed {
+                    // Try SIMD-accelerated filter for simple col op literal predicates
+                    if let Some(indices) = self.try_simd_filter(expr, &combined_rows, &col_meta) {
+                        indices
+                            .into_iter()
+                            .map(|i| combined_rows[i].clone())
+                            .collect()
+                    } else {
+                        // Parallel Rayon filter for large sets, serial for small
+                        self.parallel_filter(combined_rows, expr, &col_meta)
+                    }
                 } else {
-                    // Parallel Rayon filter for large sets, serial for small
-                    self.parallel_filter(combined_rows, expr, &col_meta)
-                }
-            } else {
-                combined_rows
+                    combined_rows
+                };
+                (col_meta, filtered, None)
             };
-            (col_meta, filtered, None)
-        };
 
         // Check for window functions
         let has_window = select.projection.iter().any(|item| match item {
@@ -4725,9 +5696,12 @@ impl Executor {
                 self.execute_window_query(select, &col_meta, filtered)?,
             ))
         } else if has_aggregates || has_group_by {
-            Ok(SelectResult::Projected(
-                self.execute_aggregate(select, &col_meta, filtered, sorted_by_col.as_deref())?,
-            ))
+            Ok(SelectResult::Projected(self.execute_aggregate(
+                select,
+                &col_meta,
+                filtered,
+                sorted_by_col.as_deref(),
+            )?))
         } else {
             Ok(SelectResult::Full {
                 col_meta,
@@ -4784,64 +5758,87 @@ impl Executor {
             };
 
             if let Some(ref lt_name) = left_table_name
-                && let Ok(left_table_def) = self.get_table(lt_name).await {
-                    let left_meta: Vec<ColMeta> = left_table_def.columns.iter()
-                        .map(|c| ColMeta {
-                            table: Some(left_label.clone()),
-                            name: c.name.clone(),
-                            dtype: c.data_type.clone(),
-                        })
-                        .collect();
+                && let Ok(left_table_def) = self.get_table(lt_name).await
+            {
+                let left_meta: Vec<ColMeta> = left_table_def
+                    .columns
+                    .iter()
+                    .map(|c| ColMeta {
+                        table: Some(left_label.clone()),
+                        name: c.name.clone(),
+                        dtype: c.data_type.clone(),
+                    })
+                    .collect();
 
-                    // Load right side with pushdown
-                    let twj = &from[1];
-                    let twj_pushdown = Self::factor_pushdown_expr(&twj.relation, pushdown);
-                    let (right_meta, right_rows0) = self
-                        .load_table_factor_with_ctes(&twj.relation, cte_tables, twj_pushdown.as_ref())
-                        .await?;
-                    let right_rows = self.apply_pushdown_for_factor(&twj.relation, right_rows0, &right_meta, pushdown);
+                // Load right side with pushdown
+                let twj = &from[1];
+                let twj_pushdown = Self::factor_pushdown_expr(&twj.relation, pushdown);
+                let (right_meta, right_rows0) = self
+                    .load_table_factor_with_ctes(&twj.relation, cte_tables, twj_pushdown.as_ref())
+                    .await?;
+                let right_rows = self.apply_pushdown_for_factor(
+                    &twj.relation,
+                    right_rows0,
+                    &right_meta,
+                    pushdown,
+                );
 
-                    if let Some(join_expr) = Self::combine_predicates(remaining_preds.clone())
-                        && let Some((left_keys, right_keys, residual)) =
-                            Self::extract_equijoin_keys(&join_expr, &left_meta, &right_meta)
-                        {
-                            // Check if we can do index nested-loop
-                            if right_rows.len() < 1000 && left_keys.len() == 1 {
-                                let lk = left_keys[0];
-                                let rk = right_keys[0];
-                                let left_col_name = &left_meta[lk].name;
-                                let idx_key = (lt_name.clone(), left_col_name.clone());
-                                let idx_name = self.btree_indexes.get(&idx_key).map(|r| r.clone());
-                                if let Some(index_name) = idx_name {
-                                    // Batch index lookup — avoid scanning all left rows
-                                    let mut key_set: HashSet<Value> = HashSet::new();
-                                    for rr in &right_rows {
-                                        key_set.insert(rr[rk].clone());
-                                    }
-                                    let mut left_rows = Vec::new();
-                                    for key_val in &key_set {
-                                        if let Ok(Some(mut found)) = self.storage.index_lookup_sync(
-                                            lt_name, &index_name, key_val,
-                                        ) {
-                                            left_rows.append(&mut found);
-                                        }
-                                    }
-                                    let combined_meta: Vec<ColMeta> = left_meta.iter()
-                                        .chain(right_meta.iter()).cloned().collect();
-                                    let join_rows = self.execute_hash_join(
-                                        &left_meta, &left_rows, &right_meta, &right_rows,
-                                        &left_keys, &right_keys, JoinType::Inner,
-                                        residual.as_ref(), &combined_meta,
-                                    )?;
-                                    let unconsumed = residual
-                                        .map(|e| planner::split_conjunction(&e).into_iter().cloned().collect::<Vec<_>>())
-                                        .unwrap_or_default();
-                                    return Ok((combined_meta, join_rows,
-                                        Self::combine_predicates(unconsumed)));
+                if let Some(join_expr) = Self::combine_predicates(remaining_preds.clone())
+                    && let Some((left_keys, right_keys, residual)) =
+                        Self::extract_equijoin_keys(&join_expr, &left_meta, &right_meta)
+                {
+                    // Check if we can do index nested-loop
+                    if right_rows.len() < 1000 && left_keys.len() == 1 {
+                        let lk = left_keys[0];
+                        let rk = right_keys[0];
+                        let left_col_name = &left_meta[lk].name;
+                        let idx_key = (lt_name.clone(), left_col_name.clone());
+                        let idx_name = self.btree_indexes.get(&idx_key).map(|r| r.clone());
+                        if let Some(index_name) = idx_name {
+                            // Batch index lookup — avoid scanning all left rows
+                            let mut key_set: HashSet<Value> = HashSet::new();
+                            for rr in &right_rows {
+                                key_set.insert(rr[rk].clone());
+                            }
+                            let mut left_rows = Vec::new();
+                            for key_val in &key_set {
+                                if let Ok(Some(mut found)) =
+                                    self.storage
+                                        .index_lookup_sync(lt_name, &index_name, key_val)
+                                {
+                                    left_rows.append(&mut found);
                                 }
                             }
+                            let combined_meta: Vec<ColMeta> =
+                                left_meta.iter().chain(right_meta.iter()).cloned().collect();
+                            let join_rows = self.execute_hash_join(
+                                &left_meta,
+                                &left_rows,
+                                &right_meta,
+                                &right_rows,
+                                &left_keys,
+                                &right_keys,
+                                JoinType::Inner,
+                                residual.as_ref(),
+                                &combined_meta,
+                            )?;
+                            let unconsumed = residual
+                                .map(|e| {
+                                    planner::split_conjunction(&e)
+                                        .into_iter()
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            return Ok((
+                                combined_meta,
+                                join_rows,
+                                Self::combine_predicates(unconsumed),
+                            ));
                         }
+                    }
                 }
+            }
         }
 
         let first = &from[0];
@@ -4854,9 +5851,15 @@ impl Executor {
         for join in &first.joins {
             // Check for LATERAL derived table
             if matches!(&join.relation, TableFactor::Derived { lateral: true, .. }) {
-                let (new_meta, new_rows) = self.execute_lateral_join(
-                    &col_meta, &rows, &join.relation, &join.join_operator, cte_tables,
-                ).await?;
+                let (new_meta, new_rows) = self
+                    .execute_lateral_join(
+                        &col_meta,
+                        &rows,
+                        &join.relation,
+                        &join.join_operator,
+                        cte_tables,
+                    )
+                    .await?;
                 col_meta = new_meta;
                 rows = new_rows;
                 continue;
@@ -4873,9 +5876,15 @@ impl Executor {
             let (right_meta, right_rows0) = self
                 .load_table_factor_with_ctes(&join.relation, cte_tables, right_pushdown.as_ref())
                 .await?;
-            let right_rows = self.apply_pushdown_for_factor(&join.relation, right_rows0, &right_meta, pushdown);
-            let (new_meta, new_rows) =
-                self.execute_join(&col_meta, &rows, &right_meta, &right_rows, &join.join_operator)?;
+            let right_rows =
+                self.apply_pushdown_for_factor(&join.relation, right_rows0, &right_meta, pushdown);
+            let (new_meta, new_rows) = self.execute_join(
+                &col_meta,
+                &rows,
+                &right_meta,
+                &right_rows,
+                &join.join_operator,
+            )?;
             col_meta = new_meta;
             rows = new_rows;
         }
@@ -4885,7 +5894,8 @@ impl Executor {
             let (right_meta, right_rows0) = self
                 .load_table_factor_with_ctes(&twj.relation, cte_tables, twj_pushdown.as_ref())
                 .await?;
-            let right_rows = self.apply_pushdown_for_factor(&twj.relation, right_rows0, &right_meta, pushdown);
+            let right_rows =
+                self.apply_pushdown_for_factor(&twj.relation, right_rows0, &right_meta, pushdown);
 
             // Optimization: implicit hash join for comma-separated FROM
             // Instead of O(N*M) cross join + filter, try to extract equi-join
@@ -4893,122 +5903,142 @@ impl Executor {
             // use O(N+M) hash join.
             if !remaining_preds.is_empty()
                 && let Some(join_expr) = Self::combine_predicates(remaining_preds.clone())
-                    && let Some((left_keys, right_keys, residual)) =
-                        Self::extract_equijoin_keys(&join_expr, &col_meta, &right_meta)
-                    {
-                        // Predicate pushdown: pre-filter each side with single-table predicates
-                        // before building the hash table, dramatically reducing join input size.
-                        let right_names = Self::table_factor_names(&twj.relation);
-                        let (filtered_right, join_residual) = if let Some(ref res) = residual {
-                            let conjuncts = planner::split_conjunction(res);
-                            let mut right_only: Vec<Expr> = Vec::new();
-                            let mut cross: Vec<Expr> = Vec::new();
-                            for conj in conjuncts {
-                                let mut refs = HashSet::new();
-                                Self::collect_expr_table_refs(conj, &mut refs);
-                                if !refs.is_empty() && refs.iter().all(|r| right_names.contains(r)) {
-                                    right_only.push(conj.clone());
-                                } else {
-                                    cross.push(conj.clone());
-                                }
-                            }
-                            let filtered = if right_only.is_empty() {
-                                right_rows.clone()
-                            } else {
-                                let filter_expr = Self::combine_predicates(right_only).unwrap();
-                                right_rows.iter()
-                                    .filter(|r| self.eval_where(&filter_expr, r, &right_meta).unwrap_or(false))
-                                    .cloned()
-                                    .collect()
-                            };
-                            (filtered, Self::combine_predicates(cross))
+                && let Some((left_keys, right_keys, residual)) =
+                    Self::extract_equijoin_keys(&join_expr, &col_meta, &right_meta)
+            {
+                // Predicate pushdown: pre-filter each side with single-table predicates
+                // before building the hash table, dramatically reducing join input size.
+                let right_names = Self::table_factor_names(&twj.relation);
+                let (filtered_right, join_residual) = if let Some(ref res) = residual {
+                    let conjuncts = planner::split_conjunction(res);
+                    let mut right_only: Vec<Expr> = Vec::new();
+                    let mut cross: Vec<Expr> = Vec::new();
+                    for conj in conjuncts {
+                        let mut refs = HashSet::new();
+                        Self::collect_expr_table_refs(conj, &mut refs);
+                        if !refs.is_empty() && refs.iter().all(|r| right_names.contains(r)) {
+                            right_only.push(conj.clone());
                         } else {
-                            (right_rows.clone(), None)
-                        };
+                            cross.push(conj.clone());
+                        }
+                    }
+                    let filtered = if right_only.is_empty() {
+                        right_rows.clone()
+                    } else {
+                        let filter_expr = Self::combine_predicates(right_only).unwrap();
+                        right_rows
+                            .iter()
+                            .filter(|r| {
+                                self.eval_where(&filter_expr, r, &right_meta)
+                                    .unwrap_or(false)
+                            })
+                            .cloned()
+                            .collect()
+                    };
+                    (filtered, Self::combine_predicates(cross))
+                } else {
+                    (right_rows.clone(), None)
+                };
 
-                        // Index nested-loop optimization: when one side is small and the
-                        // join key on the other side is indexed, replace the full table
-                        // with batch index lookups — avoids scanning the large table.
-                        let effective_left = if filtered_right.len() < 1000 && left_keys.len() == 1 {
-                            let lk = left_keys[0];
-                            let rk = right_keys[0];
-                            let left_col = &col_meta[lk];
-                            let left_alias = left_col.table.as_deref().unwrap_or("");
-                            // Resolve alias to real table name for index lookup
-                            let left_table = Self::resolve_alias_to_table(from, left_alias);
-                            let left_col_name = &left_col.name;
-                            let idx_key = (left_table.clone(), left_col_name.clone());
-                            let has_index = self.btree_indexes.contains_key(&idx_key);
-                            if has_index {
-                                // Collect distinct join key values from right side
-                                let mut key_set: HashSet<Value> = HashSet::new();
-                                for rr in &filtered_right {
-                                    key_set.insert(rr[rk].clone());
+                // Index nested-loop optimization: when one side is small and the
+                // join key on the other side is indexed, replace the full table
+                // with batch index lookups — avoids scanning the large table.
+                let effective_left = if filtered_right.len() < 1000 && left_keys.len() == 1 {
+                    let lk = left_keys[0];
+                    let rk = right_keys[0];
+                    let left_col = &col_meta[lk];
+                    let left_alias = left_col.table.as_deref().unwrap_or("");
+                    // Resolve alias to real table name for index lookup
+                    let left_table = Self::resolve_alias_to_table(from, left_alias);
+                    let left_col_name = &left_col.name;
+                    let idx_key = (left_table.clone(), left_col_name.clone());
+                    let has_index = self.btree_indexes.contains_key(&idx_key);
+                    if has_index {
+                        // Collect distinct join key values from right side
+                        let mut key_set: HashSet<Value> = HashSet::new();
+                        for rr in &filtered_right {
+                            key_set.insert(rr[rk].clone());
+                        }
+                        // Batch index lookup on left table
+                        let idx_name = self.btree_indexes.get(&idx_key).map(|r| r.clone());
+                        if let Some(index_name) = idx_name {
+                            let mut left_rows = Vec::new();
+                            for key_val in &key_set {
+                                if let Ok(Some(mut found)) = self.storage.index_lookup_sync(
+                                    &left_table,
+                                    &index_name,
+                                    key_val,
+                                ) {
+                                    left_rows.append(&mut found);
                                 }
-                                // Batch index lookup on left table
-                                let idx_name = self.btree_indexes.get(&idx_key).map(|r| r.clone());
-                                if let Some(index_name) = idx_name {
-                                    let mut left_rows = Vec::new();
-                                    for key_val in &key_set {
-                                        if let Ok(Some(mut found)) = self.storage.index_lookup_sync(
-                                            &left_table, &index_name, key_val,
-                                        ) {
-                                            left_rows.append(&mut found);
-                                        }
-                                    }
-                                    Some(left_rows)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
                             }
+                            Some(left_rows)
                         } else {
                             None
-                        };
-
-                        let left_rows_ref = effective_left.as_ref().unwrap_or(&rows);
-
-                        let combined_meta: Vec<ColMeta> = col_meta
-                            .iter()
-                            .chain(right_meta.iter())
-                            .cloned()
-                            .collect();
-                        let join_rows = self.execute_hash_join(
-                            &col_meta, left_rows_ref, &right_meta, &filtered_right,
-                            &left_keys, &right_keys, JoinType::Inner,
-                            join_residual.as_ref(), &combined_meta,
-                        )?;
-                        // Update remaining predicates: only keep cross-table residual
-                        // (right-only predicates were already applied as pre-filters)
-                        remaining_preds = join_residual
-                            .map(|e| planner::split_conjunction(&e).into_iter().cloned().collect())
-                            .unwrap_or_default();
-                        col_meta = combined_meta;
-                        rows = join_rows;
-
-                        // Process explicit JOINs on this table (rare with comma syntax)
-                        for join in &twj.joins {
-                            if let Some((nm, nr)) = self
-                                .try_execute_index_join_for_factor(&col_meta, &rows, join, cte_tables, pushdown)
-                                .await?
-                            {
-                                col_meta = nm;
-                                rows = nr;
-                                continue;
-                            }
-                            let join_pushdown = Self::factor_pushdown_expr(&join.relation, pushdown);
-                            let (jm, jr0) = self
-                                .load_table_factor_with_ctes(&join.relation, cte_tables, join_pushdown.as_ref())
-                                .await?;
-                            let jr = self.apply_pushdown_for_factor(&join.relation, jr0, &jm, pushdown);
-                            let (nm, nr) =
-                                self.execute_join(&col_meta, &rows, &jm, &jr, &join.join_operator)?;
-                            col_meta = nm;
-                            rows = nr;
                         }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let left_rows_ref = effective_left.as_ref().unwrap_or(&rows);
+
+                let combined_meta: Vec<ColMeta> =
+                    col_meta.iter().chain(right_meta.iter()).cloned().collect();
+                let join_rows = self.execute_hash_join(
+                    &col_meta,
+                    left_rows_ref,
+                    &right_meta,
+                    &filtered_right,
+                    &left_keys,
+                    &right_keys,
+                    JoinType::Inner,
+                    join_residual.as_ref(),
+                    &combined_meta,
+                )?;
+                // Update remaining predicates: only keep cross-table residual
+                // (right-only predicates were already applied as pre-filters)
+                remaining_preds = join_residual
+                    .map(|e| {
+                        planner::split_conjunction(&e)
+                            .into_iter()
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                col_meta = combined_meta;
+                rows = join_rows;
+
+                // Process explicit JOINs on this table (rare with comma syntax)
+                for join in &twj.joins {
+                    if let Some((nm, nr)) = self
+                        .try_execute_index_join_for_factor(
+                            &col_meta, &rows, join, cte_tables, pushdown,
+                        )
+                        .await?
+                    {
+                        col_meta = nm;
+                        rows = nr;
                         continue;
                     }
+                    let join_pushdown = Self::factor_pushdown_expr(&join.relation, pushdown);
+                    let (jm, jr0) = self
+                        .load_table_factor_with_ctes(
+                            &join.relation,
+                            cte_tables,
+                            join_pushdown.as_ref(),
+                        )
+                        .await?;
+                    let jr = self.apply_pushdown_for_factor(&join.relation, jr0, &jm, pushdown);
+                    let (nm, nr) =
+                        self.execute_join(&col_meta, &rows, &jm, &jr, &join.join_operator)?;
+                    col_meta = nm;
+                    rows = nr;
+                }
+                continue;
+            }
 
             // Fallback: cross join (no equi-join keys found in WHERE)
             let (new_meta, new_rows) =
@@ -5049,7 +6079,9 @@ impl Executor {
         pushdown_expr: Option<&Expr>,
     ) -> Result<(Vec<ColMeta>, Vec<Row>), ExecError> {
         match factor {
-            TableFactor::Table { name, alias, args, .. } => {
+            TableFactor::Table {
+                name, alias, args, ..
+            } => {
                 let table_name = name.to_string();
                 let alias_str = alias.as_ref().map(|a| a.name.value.clone());
                 let label = alias_str.unwrap_or_else(|| table_name.clone());
@@ -5057,13 +6089,17 @@ impl Executor {
                 // Check if this is a table function call (e.g., generate_series(1, 5))
                 if let Some(fn_args) = args {
                     let func_name = table_name.to_lowercase();
-                    let arg_values: Vec<Value> = fn_args.args.iter().filter_map(|a| {
-                        if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) = a {
-                            self.eval_const_expr(e).ok()
-                        } else {
-                            None
-                        }
-                    }).collect();
+                    let arg_values: Vec<Value> = fn_args
+                        .args
+                        .iter()
+                        .filter_map(|a| {
+                            if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) = a {
+                                self.eval_const_expr(e).ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     return self.execute_table_function(&func_name, &arg_values, &label);
                 }
 
@@ -5081,9 +6117,15 @@ impl Executor {
                 }
 
                 // Check materialized views
-                let mv_opt = self.materialized_views.read().await.get(&table_name).cloned();
+                let mv_opt = self
+                    .materialized_views
+                    .read()
+                    .await
+                    .get(&table_name)
+                    .cloned();
                 if let Some(mv) = mv_opt {
-                    let col_meta: Vec<ColMeta> = mv.columns
+                    let col_meta: Vec<ColMeta> = mv
+                        .columns
                         .iter()
                         .map(|(name, dtype)| ColMeta {
                             table: Some(label.clone()),
@@ -5098,7 +6140,8 @@ impl Executor {
                 let view_opt = self.views.read().await.get(&table_name).cloned();
                 if let Some(view_def) = view_opt {
                     let view_result = self.execute(&view_def.sql).await?;
-                    if let Some(ExecResult::Select { columns, rows }) = view_result.into_iter().next()
+                    if let Some(ExecResult::Select { columns, rows }) =
+                        view_result.into_iter().next()
                     {
                         let col_meta: Vec<ColMeta> = columns
                             .iter()
@@ -5110,7 +6153,9 @@ impl Executor {
                             .collect();
                         return Ok((col_meta, rows));
                     }
-                    return Err(ExecError::Unsupported("view did not return SELECT result".into()));
+                    return Err(ExecError::Unsupported(
+                        "view did not return SELECT result".into(),
+                    ));
                 }
 
                 // Check information_schema / pg_catalog virtual tables
@@ -5124,14 +6169,14 @@ impl Executor {
                 if let Some(where_expr) = pushdown_expr
                     && let Some((col_meta, rows, remaining_where, _sorted_by)) =
                         self.try_index_scan_sync(&table_name, &label, where_expr)
-                    {
-                        let filtered_rows = if let Some(ref expr) = remaining_where {
-                            self.parallel_filter(rows, expr, &col_meta)
-                        } else {
-                            rows
-                        };
-                        return Ok((col_meta, filtered_rows));
-                    }
+                {
+                    let filtered_rows = if let Some(ref expr) = remaining_where {
+                        self.parallel_filter(rows, expr, &col_meta)
+                    } else {
+                        rows
+                    };
+                    return Ok((col_meta, filtered_rows));
+                }
 
                 // Regular table
                 let table_def = self.get_table(&table_name).await?;
@@ -5147,10 +6192,12 @@ impl Executor {
 
                 // Try storage-level filtered scan for pushed-down predicates
                 if let Some(where_expr) = pushdown_expr
-                    && let Some(rows) = self.try_storage_fast_scan(&table_name, where_expr, &col_meta) {
-                        self.metrics.rows_scanned.inc_by(rows.len() as u64);
-                        return Ok((col_meta, rows));
-                    }
+                    && let Some(rows) =
+                        self.try_storage_fast_scan(&table_name, where_expr, &col_meta)
+                {
+                    self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                    return Ok((col_meta, rows));
+                }
 
                 let mut rows = self.storage_for(&table_name).scan(&table_name).await?;
                 self.metrics.rows_scanned.inc_by(rows.len() as u64);
@@ -5161,9 +6208,9 @@ impl Executor {
                 if let Some(where_expr) = pushdown_expr
                     && let Some((col_id, ref predicate)) =
                         Self::extract_zone_map_predicate(where_expr, &col_meta)
-                    {
-                        rows = self.apply_zone_map_pruning(rows, &table_name, col_id, predicate);
-                    }
+                {
+                    rows = self.apply_zone_map_pruning(rows, &table_name, col_id, predicate);
+                }
 
                 Ok((col_meta, rows))
             }
@@ -5173,7 +6220,8 @@ impl Executor {
                 // Subquery in FROM: SELECT * FROM (SELECT ...) AS alias
                 self.check_subquery_depth()?;
                 let sub_result = self.execute_query(*subquery.clone()).await?;
-                self.query_depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                self.query_depth
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 let alias_name = alias
                     .as_ref()
                     .map(|a| a.name.value.clone())
@@ -5192,24 +6240,33 @@ impl Executor {
                     Err(ExecError::Unsupported("subquery must return rows".into()))
                 }
             }
-            TableFactor::Function { name, args, alias, .. } => {
-                let alias_name = alias.as_ref()
+            TableFactor::Function {
+                name, args, alias, ..
+            } => {
+                let alias_name = alias
+                    .as_ref()
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| "func".into());
 
                 let func_name = name.to_string().to_lowercase();
-                let fn_args: Vec<Value> = args.iter().filter_map(|a| {
-                    if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) = a {
-                        self.eval_const_expr(e).ok()
-                    } else {
-                        None
-                    }
-                }).collect();
+                let fn_args: Vec<Value> = args
+                    .iter()
+                    .filter_map(|a| {
+                        if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) = a {
+                            self.eval_const_expr(e).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
 
                 self.execute_table_function(&func_name, &fn_args, &alias_name)
             }
-            TableFactor::UNNEST { alias, array_exprs, .. } => {
-                let alias_name = alias.as_ref()
+            TableFactor::UNNEST {
+                alias, array_exprs, ..
+            } => {
+                let alias_name = alias
+                    .as_ref()
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| "unnest".into());
                 let col_meta = vec![ColMeta {
@@ -5241,8 +6298,13 @@ impl Executor {
         join_operator: &ast::JoinOperator,
         _cte_tables: &CteTableMap,
     ) -> Result<(Vec<ColMeta>, Vec<Row>), ExecError> {
-        let TableFactor::Derived { subquery, alias, .. } = right_factor else {
-            return Err(ExecError::Unsupported("LATERAL only supported on derived tables".into()));
+        let TableFactor::Derived {
+            subquery, alias, ..
+        } = right_factor
+        else {
+            return Err(ExecError::Unsupported(
+                "LATERAL only supported on derived tables".into(),
+            ));
         };
         let alias_name = alias
             .as_ref()
@@ -5278,8 +6340,8 @@ impl Executor {
                 .collect();
 
             if result_meta.is_none() {
-                let combined: Vec<ColMeta> = left_meta.iter()
-                    .chain(right_meta.iter()).cloned().collect();
+                let combined: Vec<ColMeta> =
+                    left_meta.iter().chain(right_meta.iter()).cloned().collect();
                 result_meta = Some(combined);
             }
 
@@ -5310,22 +6372,36 @@ impl Executor {
                 let start = match args.first() {
                     Some(Value::Int32(n)) => *n as i64,
                     Some(Value::Int64(n)) => *n,
-                    _ => return Err(ExecError::Unsupported("generate_series requires integer arguments".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "generate_series requires integer arguments".into(),
+                        ));
+                    }
                 };
                 let stop = match args.get(1) {
                     Some(Value::Int32(n)) => *n as i64,
                     Some(Value::Int64(n)) => *n,
-                    _ => return Err(ExecError::Unsupported("generate_series requires integer arguments".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "generate_series requires integer arguments".into(),
+                        ));
+                    }
                 };
                 let step = match args.get(2) {
                     Some(Value::Int32(n)) => *n as i64,
                     Some(Value::Int64(n)) => *n,
                     None => 1, // PostgreSQL default: always 1
-                    _ => return Err(ExecError::Unsupported("generate_series step must be integer".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "generate_series step must be integer".into(),
+                        ));
+                    }
                 };
 
                 if step == 0 {
-                    return Err(ExecError::Unsupported("generate_series step cannot be zero".into()));
+                    return Err(ExecError::Unsupported(
+                        "generate_series step cannot be zero".into(),
+                    ));
                 }
 
                 let col_meta = vec![ColMeta {
@@ -5349,7 +6425,9 @@ impl Executor {
                 }
                 Ok((col_meta, rows))
             }
-            _ => Err(ExecError::Unsupported(format!("unknown table function: {name}"))),
+            _ => Err(ExecError::Unsupported(format!(
+                "unknown table function: {name}"
+            ))),
         }
     }
 
@@ -5434,7 +6512,9 @@ impl Executor {
                 // ORDER BY ALL: expand to order by every projection column (1-indexed)
                 all_exprs = (0..columns.len())
                     .map(|i| ast::OrderByExpr {
-                        expr: ast::Expr::Value(ast::Value::Number(format!("{}", i + 1), false).into()),
+                        expr: ast::Expr::Value(
+                            ast::Value::Number(format!("{}", i + 1), false).into(),
+                        ),
                         options: *options,
                         with_fill: None,
                     })
@@ -5455,7 +6535,11 @@ impl Executor {
             let nulls_first = ob_expr.options.nulls_first.unwrap_or(!asc);
             match self.resolve_order_by_expr(&ob_expr.expr, columns, col_meta, projection) {
                 Ok(col_idx) => sort_keys.push((SortKey::Column(col_idx), asc, nulls_first)),
-                Err(_) => sort_keys.push((SortKey::Expr(Box::new(ob_expr.expr.clone())), asc, nulls_first)),
+                Err(_) => sort_keys.push((
+                    SortKey::Expr(Box::new(ob_expr.expr.clone())),
+                    asc,
+                    nulls_first,
+                )),
             }
         }
 
@@ -5464,26 +6548,36 @@ impl Executor {
         let effective_meta = match col_meta {
             Some(m) => m,
             None => {
-                derived_meta = columns.iter().map(|(name, dtype)| ColMeta {
-                    table: None,
-                    name: name.clone(),
-                    dtype: dtype.clone(),
-                }).collect();
+                derived_meta = columns
+                    .iter()
+                    .map(|(name, dtype)| ColMeta {
+                        table: None,
+                        name: name.clone(),
+                        dtype: dtype.clone(),
+                    })
+                    .collect();
                 &derived_meta
             }
         };
 
         // For expression-based sort keys, precompute values for each row
-        let needs_eval = sort_keys.iter().any(|(k, _, _)| matches!(k, SortKey::Expr(_)));
+        let needs_eval = sort_keys
+            .iter()
+            .any(|(k, _, _)| matches!(k, SortKey::Expr(_)));
         let precomputed: Vec<Vec<Value>> = if needs_eval {
-            rows.iter().map(|row| {
-                sort_keys.iter().map(|(key, _, _)| match key {
-                    SortKey::Column(idx) => row.get(*idx).cloned().unwrap_or(Value::Null),
-                    SortKey::Expr(expr) => {
-                        self.eval_row_expr(expr, row, effective_meta).unwrap_or(Value::Null)
-                    }
-                }).collect()
-            }).collect()
+            rows.iter()
+                .map(|row| {
+                    sort_keys
+                        .iter()
+                        .map(|(key, _, _)| match key {
+                            SortKey::Column(idx) => row.get(*idx).cloned().unwrap_or(Value::Null),
+                            SortKey::Expr(expr) => self
+                                .eval_row_expr(expr, row, effective_meta)
+                                .unwrap_or(Value::Null),
+                        })
+                        .collect()
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -5493,30 +6587,36 @@ impl Executor {
             let mut indexed: Vec<(usize, &Row)> = rows.iter().enumerate().collect();
             // Top-K optimisation: O(n) partition + O(k log k) sort of prefix
             if let Some(k) = top_k
-                && k > 0 && k < indexed.len() {
-                    indexed.select_nth_unstable_by(k - 1, |a, b| {
-                        for (i, (_, asc, nulls_first)) in sort_keys.iter().enumerate() {
-                            let va = &precomputed[a.0][i];
-                            let vb = &precomputed[b.0][i];
-                            let ord = cmp_with_nulls(va, vb, *asc, *nulls_first);
-                            if ord != std::cmp::Ordering::Equal { return ord; }
+                && k > 0
+                && k < indexed.len()
+            {
+                indexed.select_nth_unstable_by(k - 1, |a, b| {
+                    for (i, (_, asc, nulls_first)) in sort_keys.iter().enumerate() {
+                        let va = &precomputed[a.0][i];
+                        let vb = &precomputed[b.0][i];
+                        let ord = cmp_with_nulls(va, vb, *asc, *nulls_first);
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
                         }
-                        std::cmp::Ordering::Equal
-                    });
-                    indexed[..k].sort_by(|a, b| {
-                        for (i, (_, asc, nulls_first)) in sort_keys.iter().enumerate() {
-                            let va = &precomputed[a.0][i];
-                            let vb = &precomputed[b.0][i];
-                            let ord = cmp_with_nulls(va, vb, *asc, *nulls_first);
-                            if ord != std::cmp::Ordering::Equal { return ord; }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                indexed[..k].sort_by(|a, b| {
+                    for (i, (_, asc, nulls_first)) in sort_keys.iter().enumerate() {
+                        let va = &precomputed[a.0][i];
+                        let vb = &precomputed[b.0][i];
+                        let ord = cmp_with_nulls(va, vb, *asc, *nulls_first);
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
                         }
-                        std::cmp::Ordering::Equal
-                    });
-                    let sorted: Vec<Row> = indexed[..k].iter().map(|(_, r)| (*r).clone()).collect();
-                    *rows = sorted;
-                    rows.shrink_to_fit();
-                    return Ok(());
-                }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                let sorted: Vec<Row> = indexed[..k].iter().map(|(_, r)| (*r).clone()).collect();
+                *rows = sorted;
+                rows.shrink_to_fit();
+                return Ok(());
+            }
             indexed.sort_by(|a, b| {
                 for (i, (_, asc, nulls_first)) in sort_keys.iter().enumerate() {
                     let va = &precomputed[a.0][i];
@@ -5533,37 +6633,45 @@ impl Executor {
         } else {
             // Top-K optimisation: O(n) partition + O(k log k) sort of prefix
             if let Some(k) = top_k
-                && k > 0 && k < rows.len() {
-                    rows.select_nth_unstable_by(k - 1, |a, b| {
-                        for (key, asc, nulls_first) in &sort_keys {
-                            if let SortKey::Column(idx) = key {
-                                let ord = cmp_with_nulls(
-                                    a.get(*idx).unwrap_or(&Value::Null),
-                                    b.get(*idx).unwrap_or(&Value::Null),
-                                    *asc, *nulls_first,
-                                );
-                                if ord != std::cmp::Ordering::Equal { return ord; }
+                && k > 0
+                && k < rows.len()
+            {
+                rows.select_nth_unstable_by(k - 1, |a, b| {
+                    for (key, asc, nulls_first) in &sort_keys {
+                        if let SortKey::Column(idx) = key {
+                            let ord = cmp_with_nulls(
+                                a.get(*idx).unwrap_or(&Value::Null),
+                                b.get(*idx).unwrap_or(&Value::Null),
+                                *asc,
+                                *nulls_first,
+                            );
+                            if ord != std::cmp::Ordering::Equal {
+                                return ord;
                             }
                         }
-                        std::cmp::Ordering::Equal
-                    });
-                    rows[..k].sort_by(|a, b| {
-                        for (key, asc, nulls_first) in &sort_keys {
-                            if let SortKey::Column(idx) = key {
-                                let ord = cmp_with_nulls(
-                                    a.get(*idx).unwrap_or(&Value::Null),
-                                    b.get(*idx).unwrap_or(&Value::Null),
-                                    *asc, *nulls_first,
-                                );
-                                if ord != std::cmp::Ordering::Equal { return ord; }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                rows[..k].sort_by(|a, b| {
+                    for (key, asc, nulls_first) in &sort_keys {
+                        if let SortKey::Column(idx) = key {
+                            let ord = cmp_with_nulls(
+                                a.get(*idx).unwrap_or(&Value::Null),
+                                b.get(*idx).unwrap_or(&Value::Null),
+                                *asc,
+                                *nulls_first,
+                            );
+                            if ord != std::cmp::Ordering::Equal {
+                                return ord;
                             }
                         }
-                        std::cmp::Ordering::Equal
-                    });
-                    rows.truncate(k);
-                    rows.shrink_to_fit();
-                    return Ok(());
-                }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                rows.truncate(k);
+                rows.shrink_to_fit();
+                return Ok(());
+            }
             rows.sort_by(|a, b| {
                 for (key, asc, nulls_first) in &sort_keys {
                     if let SortKey::Column(idx) = key {
@@ -5597,31 +6705,46 @@ impl Executor {
                 // in the SELECT list. An alias like `SELECT id AS i` means ORDER BY i
                 // should resolve to the column that `id` maps to.
                 if let Some(proj) = projection
-                    && let Some(meta) = col_meta {
-                        for item in proj {
-                            if let SelectItem::ExprWithAlias { expr: proj_expr, alias } = item
-                                && alias.value == ident.value {
-                                    // Found alias match -- resolve the underlying expression
-                                    // to a column index in the source columns
-                                    match proj_expr {
-                                        Expr::Identifier(src_ident) => {
-                                            return meta.iter().position(|c| c.name == src_ident.value)
-                                                .ok_or_else(|| ExecError::ColumnNotFound(src_ident.value.clone()));
-                                        }
-                                        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-                                            let tbl = &parts[0].value;
-                                            let col = &parts[1].value;
-                                            return meta.iter().position(|c| {
-                                                c.table.as_deref() == Some(tbl.as_str()) && c.name == *col
-                                            }).ok_or_else(|| ExecError::ColumnNotFound(format!("{tbl}.{col}")));
-                                        }
-                                        _ => {
-                                            // For complex expressions, fall through
-                                        }
-                                    }
+                    && let Some(meta) = col_meta
+                {
+                    for item in proj {
+                        if let SelectItem::ExprWithAlias {
+                            expr: proj_expr,
+                            alias,
+                        } = item
+                            && alias.value == ident.value
+                        {
+                            // Found alias match -- resolve the underlying expression
+                            // to a column index in the source columns
+                            match proj_expr {
+                                Expr::Identifier(src_ident) => {
+                                    return meta
+                                        .iter()
+                                        .position(|c| c.name == src_ident.value)
+                                        .ok_or_else(|| {
+                                            ExecError::ColumnNotFound(src_ident.value.clone())
+                                        });
                                 }
+                                Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                                    let tbl = &parts[0].value;
+                                    let col = &parts[1].value;
+                                    return meta
+                                        .iter()
+                                        .position(|c| {
+                                            c.table.as_deref() == Some(tbl.as_str())
+                                                && c.name == *col
+                                        })
+                                        .ok_or_else(|| {
+                                            ExecError::ColumnNotFound(format!("{tbl}.{col}"))
+                                        });
+                                }
+                                _ => {
+                                    // For complex expressions, fall through
+                                }
+                            }
                         }
                     }
+                }
                 Err(ExecError::ColumnNotFound(ident.value.clone()))
             }
             Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
@@ -5629,11 +6752,12 @@ impl Executor {
                 let col = &parts[1].value;
                 // Try col_meta first (has table info for qualified lookup)
                 if let Some(meta) = col_meta
-                    && let Some(pos) = meta.iter().position(|c| {
-                        c.table.as_deref() == Some(tbl.as_str()) && c.name == *col
-                    }) {
-                        return Ok(pos);
-                    }
+                    && let Some(pos) = meta
+                        .iter()
+                        .position(|c| c.table.as_deref() == Some(tbl.as_str()) && c.name == *col)
+                {
+                    return Ok(pos);
+                }
                 // Fallback: try matching "table.column" as a string against column names
                 let qualified = format!("{tbl}.{col}");
                 columns
@@ -5654,10 +6778,14 @@ impl Executor {
                     }
                     Ok(pos - 1)
                 } else {
-                    Err(ExecError::Unsupported(format!("ORDER BY expression: {expr}")))
+                    Err(ExecError::Unsupported(format!(
+                        "ORDER BY expression: {expr}"
+                    )))
                 }
             }
-            _ => Err(ExecError::Unsupported(format!("ORDER BY expression: {expr}"))),
+            _ => Err(ExecError::Unsupported(format!(
+                "ORDER BY expression: {expr}"
+            ))),
         }
     }
 
@@ -5667,12 +6795,10 @@ impl Executor {
         lc: &ast::LimitClause,
     ) -> Result<(), ExecError> {
         let (limit_expr, offset_expr) = match lc {
-            ast::LimitClause::LimitOffset {
-                limit, offset, ..
-            } => (limit.as_ref(), offset.as_ref().map(|o| &o.value)),
-            ast::LimitClause::OffsetCommaLimit { offset, limit } => {
-                (Some(limit), Some(offset))
+            ast::LimitClause::LimitOffset { limit, offset, .. } => {
+                (limit.as_ref(), offset.as_ref().map(|o| &o.value))
             }
+            ast::LimitClause::OffsetCommaLimit { offset, limit } => (Some(limit), Some(offset)),
         };
 
         let offset = match offset_expr {
@@ -5701,7 +6827,9 @@ impl Executor {
         match val {
             Value::Int32(n) if n >= 0 => Ok(n as usize),
             Value::Int64(n) if n >= 0 => Ok(n as usize),
-            _ => Err(ExecError::Unsupported("LIMIT/OFFSET must be non-negative integer".into())),
+            _ => Err(ExecError::Unsupported(
+                "LIMIT/OFFSET must be non-negative integer".into(),
+            )),
         }
     }
 
@@ -5714,15 +6842,15 @@ impl Executor {
             ast::LimitClause::LimitOffset { limit, offset, .. } => {
                 (limit.as_ref(), offset.as_ref().map(|o| &o.value))
             }
-            ast::LimitClause::OffsetCommaLimit { offset, limit } => {
-                (Some(limit), Some(offset))
-            }
+            ast::LimitClause::OffsetCommaLimit { offset, limit } => (Some(limit), Some(offset)),
         };
         let limit = self.expr_to_usize(limit_expr?).ok()?;
         let offset = offset_expr
             .and_then(|e| self.expr_to_usize(e).ok())
             .unwrap_or(0);
-        Some(limit + offset)
+        // checked_add: a wrapped limit+offset could pass the later `k < rows.len()`
+        // check and corrupt the top-K optimization. On overflow, skip top-K.
+        limit.checked_add(offset)
     }
     // ========================================================================
     // Plan reuse: transplant expressions from current query into cached plan
@@ -5752,22 +6880,29 @@ impl Executor {
     /// Recursively traverse the plan tree to find the leaf scan node and
     /// transplant the current WHERE clause expressions into it.
     /// Returns true if transplanting succeeded.
-    fn transplant_scan_exprs(
-        plan: &mut planner::PlanNode,
-        where_expr: &Option<ast::Expr>,
-    ) -> bool {
+    fn transplant_scan_exprs(plan: &mut planner::PlanNode, where_expr: &Option<ast::Expr>) -> bool {
         match plan {
             // Leaf: SeqScan — replace filter with current WHERE
-            planner::PlanNode::SeqScan { filter, filter_expr, .. } => {
+            planner::PlanNode::SeqScan {
+                filter,
+                filter_expr,
+                ..
+            } => {
                 *filter_expr = where_expr.clone();
                 *filter = where_expr.as_ref().map(|e| e.to_string());
                 true
             }
             // Leaf: IndexScan with equality lookup — replace lookup key
             planner::PlanNode::IndexScan {
-                lookup_key, lookup_key_expr,
-                range_lo, range_lo_expr, range_hi, range_hi_expr,
-                range_predicate, range_predicate_expr, ..
+                lookup_key,
+                lookup_key_expr,
+                range_lo,
+                range_lo_expr,
+                range_hi,
+                range_hi_expr,
+                range_predicate,
+                range_predicate_expr,
+                ..
             } => {
                 let expr = match where_expr {
                     Some(e) => e,
@@ -5798,7 +6933,10 @@ impl Executor {
             // Filter wrapping a scan — transplant child first, then
             // extract remaining predicates for the filter.
             planner::PlanNode::Filter {
-                input, predicate, predicate_expr, ..
+                input,
+                predicate,
+                predicate_expr,
+                ..
             } => {
                 let full_where = match where_expr {
                     Some(e) => e,
@@ -5814,7 +6952,7 @@ impl Executor {
                 // For IndexScan: the index column name tells us which predicate matches.
                 let scan_pred_idx = if let planner::PlanNode::IndexScan { .. } = input.as_ref() {
                     // Find the predicate that references the indexed column
-                    
+
                     {
                         // Index name format is typically "idx_<table>_<col>" or user-defined.
                         // We check each predicate against the index name stored in the plan.
@@ -5828,12 +6966,17 @@ impl Executor {
                             // Use planner's extract helpers for accuracy.
                             if let Some((col, _)) = planner::is_equality_predicate(p) {
                                 // Match against the cached IndexScan's column
-                                if let planner::PlanNode::IndexScan { lookup_key_expr: Some(old_expr), .. } = input.as_ref()
-                                    && let Some((old_col, _)) = planner::is_equality_predicate(old_expr)
-                                        && col.eq_ignore_ascii_case(&old_col) {
-                                            found = Some(i);
-                                            break;
-                                        }
+                                if let planner::PlanNode::IndexScan {
+                                    lookup_key_expr: Some(old_expr),
+                                    ..
+                                } = input.as_ref()
+                                    && let Some((old_col, _)) =
+                                        planner::is_equality_predicate(old_expr)
+                                    && col.eq_ignore_ascii_case(&old_col)
+                                {
+                                    found = Some(i);
+                                    break;
+                                }
                             }
                         }
                         found
@@ -5854,11 +6997,14 @@ impl Executor {
                 }
 
                 // Remaining predicates go to the Filter
-                let remaining: Vec<ast::Expr> = preds.iter().enumerate()
+                let remaining: Vec<ast::Expr> = preds
+                    .iter()
+                    .enumerate()
                     .filter(|(i, _)| *i != scan_idx)
                     .map(|(_, p)| (*p).clone())
                     .collect();
-                let combined = remaining.into_iter()
+                let combined = remaining
+                    .into_iter()
                     .reduce(|a, b| ast::Expr::BinaryOp {
                         left: Box::new(a),
                         op: ast::BinaryOperator::And,
@@ -6122,7 +7268,9 @@ impl Executor {
                         break;
                     }
                 }
-                let num_str = std::str::from_utf8(&bytes[start..i]).unwrap_or("0").to_string();
+                let num_str = std::str::from_utf8(&bytes[start..i])
+                    .unwrap_or("0")
+                    .to_string();
                 literals.push(CacheLiteral::Number(num_str));
                 out.push_str("$N");
                 continue;
@@ -6168,14 +7316,15 @@ impl Executor {
                 // ON CONFLICT ... DO UPDATE SET ...
                 if let Some(ref mut on_conflict) = insert.on
                     && let sqlparser::ast::OnInsert::OnConflict(oc) = on_conflict
-                        && let sqlparser::ast::OnConflictAction::DoUpdate(du) = &mut oc.action {
-                            for assign in &mut du.assignments {
-                                Self::substitute_expr_literals(&mut assign.value, lits, count);
-                            }
-                            if let Some(ref mut sel) = du.selection {
-                                Self::substitute_expr_literals(sel, lits, count);
-                            }
-                        }
+                    && let sqlparser::ast::OnConflictAction::DoUpdate(du) = &mut oc.action
+                {
+                    for assign in &mut du.assignments {
+                        Self::substitute_expr_literals(&mut assign.value, lits, count);
+                    }
+                    if let Some(ref mut sel) = du.selection {
+                        Self::substitute_expr_literals(sel, lits, count);
+                    }
+                }
                 // RETURNING expressions
                 if let Some(ref mut returning) = insert.returning {
                     for item in returning {
@@ -6227,21 +7376,23 @@ impl Executor {
         Self::substitute_set_expr_literals(&mut query.body, lits, count);
         // ORDER BY
         if let Some(ref mut order_by) = query.order_by
-            && let ast::OrderByKind::Expressions(ref mut exprs) = order_by.kind {
-                for item in exprs {
-                    Self::substitute_expr_literals(&mut item.expr, lits, count);
-                }
+            && let ast::OrderByKind::Expressions(ref mut exprs) = order_by.kind
+        {
+            for item in exprs {
+                Self::substitute_expr_literals(&mut item.expr, lits, count);
             }
+        }
         // LIMIT / OFFSET
         if let Some(ref mut limit_clause) = query.limit_clause
-            && let sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. } = limit_clause {
-                if let Some(l) = limit {
-                    Self::substitute_expr_literals(l, lits, count);
-                }
-                if let Some(o) = offset {
-                    Self::substitute_expr_literals(&mut o.value, lits, count);
-                }
+            && let sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. } = limit_clause
+        {
+            if let Some(l) = limit {
+                Self::substitute_expr_literals(l, lits, count);
             }
+            if let Some(o) = offset {
+                Self::substitute_expr_literals(&mut o.value, lits, count);
+            }
+        }
     }
 
     fn substitute_set_expr_literals(
@@ -6258,7 +7409,11 @@ impl Executor {
                 }
                 // FROM (join conditions)
                 for table_with_joins in &mut select.from {
-                    Self::substitute_table_factor_literals(&mut table_with_joins.relation, lits, count);
+                    Self::substitute_table_factor_literals(
+                        &mut table_with_joins.relation,
+                        lits,
+                        count,
+                    );
                     for join in &mut table_with_joins.joins {
                         Self::substitute_table_factor_literals(&mut join.relation, lits, count);
                         // Extract join constraint from the JoinOperator variant
@@ -6368,12 +7523,19 @@ impl Executor {
             Expr::UnaryOp { expr: inner, .. } => {
                 Self::substitute_expr_literals(inner, lits, count);
             }
-            Expr::Between { expr: inner, low, high, .. } => {
+            Expr::Between {
+                expr: inner,
+                low,
+                high,
+                ..
+            } => {
                 Self::substitute_expr_literals(inner, lits, count);
                 Self::substitute_expr_literals(low, lits, count);
                 Self::substitute_expr_literals(high, lits, count);
             }
-            Expr::InList { expr: inner, list, .. } => {
+            Expr::InList {
+                expr: inner, list, ..
+            } => {
                 Self::substitute_expr_literals(inner, lits, count);
                 for item in list {
                     Self::substitute_expr_literals(item, lits, count);
@@ -6392,7 +7554,12 @@ impl Executor {
             Expr::Cast { expr: inner, .. } => {
                 Self::substitute_expr_literals(inner, lits, count);
             }
-            Expr::Case { operand, conditions, else_result, .. } => {
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
                 if let Some(op) = operand {
                     Self::substitute_expr_literals(op, lits, count);
                 }
@@ -6431,28 +7598,45 @@ impl Executor {
                 }
                 // OVER clause (window functions)
                 if let Some(ref mut over) = func.over
-                    && let sqlparser::ast::WindowType::WindowSpec(ws) = over {
-                        for expr in &mut ws.partition_by {
-                            Self::substitute_expr_literals(expr, lits, count);
-                        }
-                        for ob in &mut ws.order_by {
-                            Self::substitute_expr_literals(&mut ob.expr, lits, count);
-                        }
+                    && let sqlparser::ast::WindowType::WindowSpec(ws) = over
+                {
+                    for expr in &mut ws.partition_by {
+                        Self::substitute_expr_literals(expr, lits, count);
                     }
+                    for ob in &mut ws.order_by {
+                        Self::substitute_expr_literals(&mut ob.expr, lits, count);
+                    }
+                }
             }
             Expr::Subquery(query) => {
                 Self::substitute_query_literals(query, lits, count);
             }
-            Expr::InSubquery { expr: inner, subquery, .. } => {
+            Expr::InSubquery {
+                expr: inner,
+                subquery,
+                ..
+            } => {
                 Self::substitute_expr_literals(inner, lits, count);
                 Self::substitute_query_literals(subquery, lits, count);
             }
             Expr::Exists { subquery, .. } => {
                 Self::substitute_query_literals(subquery, lits, count);
             }
-            Expr::Like { expr: inner, pattern, .. }
-            | Expr::ILike { expr: inner, pattern, .. }
-            | Expr::SimilarTo { expr: inner, pattern, .. } => {
+            Expr::Like {
+                expr: inner,
+                pattern,
+                ..
+            }
+            | Expr::ILike {
+                expr: inner,
+                pattern,
+                ..
+            }
+            | Expr::SimilarTo {
+                expr: inner,
+                pattern,
+                ..
+            } => {
                 Self::substitute_expr_literals(inner, lits, count);
                 Self::substitute_expr_literals(pattern, lits, count);
             }
@@ -6468,11 +7652,20 @@ impl Executor {
             Expr::Extract { expr: inner, .. } => {
                 Self::substitute_expr_literals(inner, lits, count);
             }
-            Expr::Position { expr: inner, r#in: in_expr, .. } => {
+            Expr::Position {
+                expr: inner,
+                r#in: in_expr,
+                ..
+            } => {
                 Self::substitute_expr_literals(inner, lits, count);
                 Self::substitute_expr_literals(in_expr, lits, count);
             }
-            Expr::Substring { expr: inner, substring_from, substring_for, .. } => {
+            Expr::Substring {
+                expr: inner,
+                substring_from,
+                substring_for,
+                ..
+            } => {
                 Self::substitute_expr_literals(inner, lits, count);
                 if let Some(f) = substring_from {
                     Self::substitute_expr_literals(f, lits, count);
@@ -6481,7 +7674,11 @@ impl Executor {
                     Self::substitute_expr_literals(f, lits, count);
                 }
             }
-            Expr::Trim { expr: inner, trim_what, .. } => {
+            Expr::Trim {
+                expr: inner,
+                trim_what,
+                ..
+            } => {
                 Self::substitute_expr_literals(inner, lits, count);
                 if let Some(tw) = trim_what {
                     Self::substitute_expr_literals(tw, lits, count);
@@ -6504,28 +7701,29 @@ impl Executor {
         // Try cache lookup
         let cache_result = self.ast_cache.write().get(&norm_key);
         if let Some((cached_arc, expected_count)) = cache_result
-            && expected_count == literals.len() {
-                if literals.is_empty() {
-                    // No literals to substitute — return deep clone directly
-                    let stmts = (*cached_arc).clone();
-                    // Store hint for plan cache key (avoids query.to_string() + re-normalize)
-                    if stmts.len() == 1 {
-                        *self.plan_cache_key_hint.lock() = Some(norm_key);
-                    }
-                    return Ok(stmts);
+            && expected_count == literals.len()
+        {
+            if literals.is_empty() {
+                // No literals to substitute — return deep clone directly
+                let stmts = (*cached_arc).clone();
+                // Store hint for plan cache key (avoids query.to_string() + re-normalize)
+                if stmts.len() == 1 {
+                    *self.plan_cache_key_hint.lock() = Some(norm_key);
                 }
-                let mut cloned = (*cached_arc).clone();
-                let subs = Self::substitute_ast_literals(&mut cloned, &literals);
-                if subs == expected_count {
-                    // Store hint for plan cache key
-                    if cloned.len() == 1 {
-                        *self.plan_cache_key_hint.lock() = Some(norm_key);
-                    }
-                    return Ok(cloned);
-                }
-                // Substitution count mismatch — fall through to re-parse
+                return Ok(stmts);
             }
-            // Literal count mismatch — fall through to re-parse
+            let mut cloned = (*cached_arc).clone();
+            let subs = Self::substitute_ast_literals(&mut cloned, &literals);
+            if subs == expected_count {
+                // Store hint for plan cache key
+                if cloned.len() == 1 {
+                    *self.plan_cache_key_hint.lock() = Some(norm_key);
+                }
+                return Ok(cloned);
+            }
+            // Substitution count mismatch — fall through to re-parse
+        }
+        // Literal count mismatch — fall through to re-parse
 
         // Cache miss or mismatch — parse and cache
         let ast = crate::sql::parse(sql)?;
@@ -6533,7 +7731,9 @@ impl Executor {
         if ast.len() == 1 {
             *self.plan_cache_key_hint.lock() = Some(norm_key.clone());
         }
-        self.ast_cache.write().insert(norm_key, ast.clone(), literals.len());
+        self.ast_cache
+            .write()
+            .insert(norm_key, ast.clone(), literals.len());
         Ok(ast)
     }
 
@@ -6563,7 +7763,9 @@ impl Executor {
         match expr {
             Expr::BinaryOp { left, op, right } => {
                 // Try col op literal (left=col, right=literal)
-                if let Some((col_idx, val)) = Self::zm_extract_col_and_literal(left, right, col_meta) {
+                if let Some((col_idx, val)) =
+                    Self::zm_extract_col_and_literal(left, right, col_meta)
+                {
                     let val = coerce(val, col_idx);
                     let pred = match op {
                         ast::BinaryOperator::Eq => FilterPredicate::Equal(val),
@@ -6576,7 +7778,9 @@ impl Executor {
                     return Some((col_idx as u32, pred));
                 }
                 // Try literal op col (reversed): e.g., 5 < col means col > 5
-                if let Some((col_idx, val)) = Self::zm_extract_col_and_literal(right, left, col_meta) {
+                if let Some((col_idx, val)) =
+                    Self::zm_extract_col_and_literal(right, left, col_meta)
+                {
                     let val = coerce(val, col_idx);
                     let pred = match op {
                         ast::BinaryOperator::Eq => FilterPredicate::Equal(val),
@@ -6590,31 +7794,54 @@ impl Executor {
                 }
                 None
             }
-            Expr::Between { expr: col_expr, low, high, negated } if !*negated => {
+            Expr::Between {
+                expr: col_expr,
+                low,
+                high,
+                negated,
+            } if !*negated => {
                 let col_name = Self::zm_expr_to_col_name(col_expr)?;
-                let col_idx = col_meta.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
+                let col_idx = col_meta
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
                 let lo = coerce(Self::zm_expr_to_value(low)?, col_idx);
                 let hi = coerce(Self::zm_expr_to_value(high)?, col_idx);
-                Some((col_idx as u32, FilterPredicate::Between { min: lo, max: hi }))
+                Some((
+                    col_idx as u32,
+                    FilterPredicate::Between { min: lo, max: hi },
+                ))
             }
             Expr::IsNull(col_expr) => {
                 let col_name = Self::zm_expr_to_col_name(col_expr)?;
-                let col_idx = col_meta.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
+                let col_idx = col_meta
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
                 Some((col_idx as u32, FilterPredicate::IsNull))
             }
             Expr::IsNotNull(col_expr) => {
                 let col_name = Self::zm_expr_to_col_name(col_expr)?;
-                let col_idx = col_meta.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
+                let col_idx = col_meta
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
                 Some((col_idx as u32, FilterPredicate::IsNotNull))
             }
-            Expr::InList { expr: col_expr, list, negated } if !*negated => {
+            Expr::InList {
+                expr: col_expr,
+                list,
+                negated,
+            } if !*negated => {
                 let col_name = Self::zm_expr_to_col_name(col_expr)?;
-                let col_idx = col_meta.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
-                let values: Vec<Value> = list.iter()
+                let col_idx = col_meta
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
+                let values: Vec<Value> = list
+                    .iter()
                     .filter_map(Self::zm_expr_to_value)
                     .map(|v| coerce(v, col_idx))
                     .collect();
-                if values.is_empty() { return None; }
+                if values.is_empty() {
+                    return None;
+                }
                 Some((col_idx as u32, FilterPredicate::In(values)))
             }
             _ => None,
@@ -6635,28 +7862,29 @@ impl Executor {
     /// Extract a Value from a literal expression.
     fn zm_expr_to_value(expr: &Expr) -> Option<Value> {
         match expr {
-            Expr::Value(val_with_span) => {
-                match &val_with_span.value {
-                    ast::Value::Number(n, _) => {
-                        if let Ok(i) = n.parse::<i32>() {
-                            Some(Value::Int32(i))
-                        } else if let Ok(i) = n.parse::<i64>() {
-                            Some(Value::Int64(i))
-                        } else if let Ok(f) = n.parse::<f64>() {
-                            Some(Value::Float64(f))
-                        } else {
-                            None
-                        }
+            Expr::Value(val_with_span) => match &val_with_span.value {
+                ast::Value::Number(n, _) => {
+                    if let Ok(i) = n.parse::<i32>() {
+                        Some(Value::Int32(i))
+                    } else if let Ok(i) = n.parse::<i64>() {
+                        Some(Value::Int64(i))
+                    } else if let Ok(f) = n.parse::<f64>() {
+                        Some(Value::Float64(f))
+                    } else {
+                        None
                     }
-                    ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => {
-                        Some(Value::Text(s.clone()))
-                    }
-                    ast::Value::Boolean(b) => Some(Value::Bool(*b)),
-                    ast::Value::Null => Some(Value::Null),
-                    _ => None,
                 }
-            }
-            Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr: inner } => {
+                ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => {
+                    Some(Value::Text(s.clone()))
+                }
+                ast::Value::Boolean(b) => Some(Value::Bool(*b)),
+                ast::Value::Null => Some(Value::Null),
+                _ => None,
+            },
+            Expr::UnaryOp {
+                op: ast::UnaryOperator::Minus,
+                expr: inner,
+            } => {
                 if let Some(val) = Self::zm_expr_to_value(inner) {
                     match val {
                         Value::Int32(i) => Some(Value::Int32(-i)),
@@ -6679,7 +7907,9 @@ impl Executor {
         col_meta: &[ColMeta],
     ) -> Option<(usize, Value)> {
         let col_name = Self::zm_expr_to_col_name(col_expr)?;
-        let col_idx = col_meta.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
+        let col_idx = col_meta
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
         let val = Self::zm_expr_to_value(val_expr)?;
         Some((col_idx, val))
     }
@@ -6708,14 +7938,13 @@ impl Executor {
 
         for (chunk_idx, chunk) in rows.chunks(GRANULE_SIZE).enumerate() {
             if let Some(granule) = granules.get(chunk_idx)
-                && can_skip_granule(granule, col_id, predicate) {
-                    // Mark all rows in this granule as skippable
-                    let start = chunk_idx * GRANULE_SIZE;
-                    for i in start..start + chunk.len() {
-                        keep[i] = false;
-                    }
-                    any_skipped = true;
-                }
+                && can_skip_granule(granule, col_id, predicate)
+            {
+                // Mark all rows in this granule as skippable
+                let start = chunk_idx * GRANULE_SIZE;
+                keep[start..start + chunk.len()].fill(false);
+                any_skipped = true;
+            }
         }
 
         if !any_skipped {
@@ -6873,7 +8102,8 @@ mod ast_cache_tests {
 
     #[test]
     fn test_extract_literals_string() {
-        let (norm, lits) = Executor::normalize_sql_with_literals("SELECT * FROM t WHERE name = 'hello'");
+        let (norm, lits) =
+            Executor::normalize_sql_with_literals("SELECT * FROM t WHERE name = 'hello'");
         assert_eq!(norm, "SELECT * FROM t WHERE name = $S");
         assert_eq!(lits.len(), 1);
         assert!(matches!(&lits[0], CacheLiteral::String(s) if s == "hello"));
@@ -6881,9 +8111,8 @@ mod ast_cache_tests {
 
     #[test]
     fn test_extract_literals_mixed() {
-        let (norm, lits) = Executor::normalize_sql_with_literals(
-            "INSERT INTO t VALUES (1, 'abc', 3.14)"
-        );
+        let (norm, lits) =
+            Executor::normalize_sql_with_literals("INSERT INTO t VALUES (1, 'abc', 3.14)");
         assert_eq!(norm, "INSERT INTO t VALUES ($N, $S, $N)");
         assert_eq!(lits.len(), 3);
         assert!(matches!(&lits[0], CacheLiteral::Number(n) if n == "1"));
@@ -6900,7 +8129,8 @@ mod ast_cache_tests {
 
     #[test]
     fn test_extract_literals_escaped_string() {
-        let (norm, lits) = Executor::normalize_sql_with_literals("SELECT * FROM t WHERE x = 'it''s'");
+        let (norm, lits) =
+            Executor::normalize_sql_with_literals("SELECT * FROM t WHERE x = 'it''s'");
         assert_eq!(norm, "SELECT * FROM t WHERE x = $S");
         assert_eq!(lits.len(), 1);
         assert!(matches!(&lits[0], CacheLiteral::String(s) if s == "it's"));
@@ -6908,7 +8138,8 @@ mod ast_cache_tests {
 
     #[test]
     fn test_extract_preserves_identifiers() {
-        let (norm, lits) = Executor::normalize_sql_with_literals("SELECT col1 FROM table2 WHERE id = 7");
+        let (norm, lits) =
+            Executor::normalize_sql_with_literals("SELECT col1 FROM table2 WHERE id = 7");
         assert_eq!(norm, "SELECT col1 FROM table2 WHERE id = $N");
         assert_eq!(lits.len(), 1);
     }
@@ -6923,7 +8154,10 @@ mod ast_cache_tests {
         // Verify the AST now contains 99
         let sql_out = stmts[0].to_string();
         assert!(sql_out.contains("99"), "Expected '99' in: {sql_out}");
-        assert!(!sql_out.contains(" 1"), "Should not contain ' 1' in: {sql_out}");
+        assert!(
+            !sql_out.contains(" 1"),
+            "Should not contain ' 1' in: {sql_out}"
+        );
     }
 
     #[test]

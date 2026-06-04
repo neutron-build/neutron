@@ -187,14 +187,15 @@ impl BranchManager {
 
         // Walk parent chain
         if let Some(parent_id) = branch.parent_id
-            && let Some(parent) = self.branches.get(&parent_id) {
-                if parent.deleted_pages.contains(&page_id) {
-                    return None;
-                }
-                if let Some(data) = parent.modified_pages.get(&page_id) {
-                    return Some(data.as_slice());
-                }
+            && let Some(parent) = self.branches.get(&parent_id)
+        {
+            if parent.deleted_pages.contains(&page_id) {
+                return None;
             }
+            if let Some(data) = parent.modified_pages.get(&page_id) {
+                return Some(data.as_slice());
+            }
+        }
 
         None
     }
@@ -242,9 +243,7 @@ impl BranchManager {
         let deleted: Vec<u64> = a_pages.difference(&b_pages).copied().collect();
         let modified: Vec<u64> = a_pages
             .intersection(&b_pages)
-            .filter(|&&page_id| {
-                a.modified_pages.get(&page_id) != b.modified_pages.get(&page_id)
-            })
+            .filter(|&&page_id| a.modified_pages.get(&page_id) != b.modified_pages.get(&page_id))
             .copied()
             .collect();
 
@@ -257,11 +256,7 @@ impl BranchManager {
 
     /// Merge a source branch into a target branch.
     /// Source branch's modified pages override target's.
-    pub fn merge(
-        &mut self,
-        source_name: &str,
-        target_name: &str,
-    ) -> Result<usize, BranchError> {
+    pub fn merge(&mut self, source_name: &str, target_name: &str) -> Result<usize, BranchError> {
         let source = self
             .find_branch_by_name(source_name)
             .ok_or_else(|| BranchError::NotFound(source_name.to_string()))?;
@@ -310,11 +305,15 @@ impl BranchManager {
     }
 
     fn find_branch_by_name(&self, name: &str) -> Option<&DatabaseBranch> {
-        self.branches.values().find(|b| b.name == name && b.is_active)
+        self.branches
+            .values()
+            .find(|b| b.name == name && b.is_active)
     }
 
     fn find_branch_by_name_mut(&mut self, name: &str) -> Option<&mut DatabaseBranch> {
-        self.branches.values_mut().find(|b| b.name == name && b.is_active)
+        self.branches
+            .values_mut()
+            .find(|b| b.name == name && b.is_active)
     }
 }
 
@@ -513,8 +512,8 @@ mod tests {
 
         mgr.create_branch("f", "main").unwrap();
         mgr.write_page("f", 1, vec![100]).unwrap(); // modify
-        mgr.write_page("f", 3, vec![30]).unwrap();  // add
-        mgr.write_page("f", 4, vec![40]).unwrap();  // add
+        mgr.write_page("f", 3, vec![30]).unwrap(); // add
+        mgr.write_page("f", 4, vec![40]).unwrap(); // add
 
         let merged = mgr.merge("f", "main").unwrap();
         assert_eq!(merged, 3); // 1 modified + 2 added

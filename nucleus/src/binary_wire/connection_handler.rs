@@ -56,11 +56,7 @@ pub struct ConnectionHandler {
 
 impl ConnectionHandler {
     /// Create a new connection handler.
-    pub fn new(
-        stream: TcpStream,
-        executor: Arc<Executor>,
-        password: Option<String>,
-    ) -> Self {
+    pub fn new(stream: TcpStream, executor: Arc<Executor>, password: Option<String>) -> Self {
         let session_id = executor.create_session();
         let query_handler = QueryHandler::new(executor.clone());
         Self {
@@ -124,8 +120,7 @@ impl ConnectionHandler {
 
         // Read auth response
         let auth_frame = self.read_frame().await.map_err(|e| e.to_string())?;
-        let auth_frame =
-            auth_frame.ok_or_else(|| "connection closed during auth".to_string())?;
+        let auth_frame = auth_frame.ok_or_else(|| "connection closed during auth".to_string())?;
 
         if auth_frame.message_type != message_types::AUTHENTICATION {
             return Err(format!(
@@ -235,10 +230,8 @@ impl ConnectionHandler {
         match self.query_handler.prepare_statement(stmt_id, sql) {
             Ok(prepared) => {
                 self.encoder.reset();
-                self.encoder.encode_command_complete(
-                    0,
-                    &format!("PREPARE {}", prepared.param_count),
-                );
+                self.encoder
+                    .encode_command_complete(0, &format!("PREPARE {}", prepared.param_count));
                 let buf = self.encoder.buffer().to_vec();
                 self.stream.write_all(&buf).await?;
                 self.send_ready().await?;
@@ -461,10 +454,7 @@ impl ConnectionHandler {
                 let buf = self.encoder.buffer().to_vec();
                 self.stream.write_all(&buf).await?;
             }
-            ExecResult::Command {
-                tag,
-                rows_affected,
-            } => {
+            ExecResult::Command { tag, rows_affected } => {
                 self.encoder.reset();
                 self.encoder
                     .encode_command_complete(rows_affected as u32, &tag);
@@ -480,8 +470,7 @@ impl ConnectionHandler {
                 // Send the copy data as a data row frame
                 if !data.is_empty() {
                     self.encoder.reset();
-                    self.encoder
-                        .encode_data_row(1, data.as_bytes());
+                    self.encoder.encode_data_row(1, data.as_bytes());
                     let buf = self.encoder.buffer().to_vec();
                     self.stream.write_all(&buf).await?;
                 }
@@ -530,7 +519,10 @@ impl ConnectionHandler {
                 }
                 Err(e) => {
                     tracing::debug!("Binary protocol decode error: {e}");
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    ));
                 }
             }
         }

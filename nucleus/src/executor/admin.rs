@@ -10,21 +10,21 @@ use sqlparser::ast;
 use crate::fault::SubsystemHealth;
 use crate::types::{DataType, Row, Value};
 
+use super::helpers::{grantee_name, parse_grant_objects, parse_privileges};
 use super::schema_types::{CursorDef, RoleDef};
 use super::{ExecError, ExecResult, Executor};
-use super::helpers::{grantee_name, parse_grant_objects, parse_privileges};
 
 impl Executor {
     // ========================================================================
     // SET / SHOW
     // ========================================================================
 
-    pub(super) fn execute_set(
-        &self,
-        set: ast::Set,
-    ) -> Result<ExecResult, ExecError> {
+    pub(super) fn execute_set(&self, set: ast::Set) -> Result<ExecResult, ExecError> {
         // Store SET values for SHOW to retrieve
-        if let ast::Set::SingleAssignment { variable, values, .. } = &set {
+        if let ast::Set::SingleAssignment {
+            variable, values, ..
+        } = &set
+        {
             let var_name = variable.to_string().to_lowercase();
             let val_str: Vec<String> = values.iter().map(|v| v.to_string()).collect();
             let val = val_str.join(", ");
@@ -35,7 +35,10 @@ impl Executor {
                 self.storage.set_next_isolation_level(&level);
             }
 
-            self.current_session().settings.write().insert(var_name, val);
+            self.current_session()
+                .settings
+                .write()
+                .insert(var_name, val);
         }
         Ok(ExecResult::Command {
             tag: "SET".into(),
@@ -192,7 +195,10 @@ impl Executor {
     /// Returns a result set with columns: column_name, distinct_count, null_count, min_value, max_value.
     pub(super) async fn show_table_stats(&self, table_name: &str) -> Result<ExecResult, ExecError> {
         // Verify the table exists
-        let table_def = self.catalog.get_table(table_name).await
+        let table_def = self
+            .catalog
+            .get_table(table_name)
+            .await
             .ok_or_else(|| ExecError::TableNotFound(table_name.to_string()))?;
 
         let stats_opt = self.stats_store.get(table_name).await;
@@ -244,23 +250,46 @@ impl Executor {
         let mvcc = self.storage.supports_mvcc();
 
         let mut rows = vec![
-            vec![Value::Text("pool_mode".into()), Value::Text("session".into())],
-            vec![Value::Text("mvcc_enabled".into()), Value::Text(mvcc.to_string())],
-            vec![Value::Text("storage_engine".into()), Value::Text(
-                if mvcc { "MvccStorageAdapter" } else { "MemoryEngine/DiskEngine" }.into(),
-            )],
+            vec![
+                Value::Text("pool_mode".into()),
+                Value::Text("session".into()),
+            ],
+            vec![
+                Value::Text("mvcc_enabled".into()),
+                Value::Text(mvcc.to_string()),
+            ],
+            vec![
+                Value::Text("storage_engine".into()),
+                Value::Text(
+                    if mvcc {
+                        "MvccStorageAdapter"
+                    } else {
+                        "MemoryEngine/DiskEngine"
+                    }
+                    .into(),
+                ),
+            ],
         ];
 
         // Report live connection pool stats if available
         #[cfg(feature = "server")]
         if let Some(ref pool) = self.conn_pool {
             let available = pool.available_permits();
-            rows.push(vec![Value::Text("pool_available_permits".into()), Value::Text(available.to_string())]);
+            rows.push(vec![
+                Value::Text("pool_available_permits".into()),
+                Value::Text(available.to_string()),
+            ]);
         } else {
-            rows.push(vec![Value::Text("pool_status".into()), Value::Text("not wired".into())]);
+            rows.push(vec![
+                Value::Text("pool_status".into()),
+                Value::Text("not wired".into()),
+            ]);
         }
         #[cfg(not(feature = "server"))]
-        rows.push(vec![Value::Text("pool_status".into()), Value::Text("not wired".into())]);
+        rows.push(vec![
+            Value::Text("pool_status".into()),
+            Value::Text("not wired".into()),
+        ]);
 
         Ok(ExecResult::Select {
             columns: vec![
@@ -281,24 +310,48 @@ impl Executor {
                 crate::distributed::ClusterMode::MultiRaft => "multi-raft",
             };
             vec![
-                vec![Value::Text("node_id".into()), Value::Text(format!("{:#x}", status.node_id))],
+                vec![
+                    Value::Text("node_id".into()),
+                    Value::Text(format!("{:#x}", status.node_id)),
+                ],
                 vec![Value::Text("mode".into()), Value::Text(mode_str.into())],
-                vec![Value::Text("node_count".into()), Value::Text(status.node_count.to_string())],
-                vec![Value::Text("shard_count".into()), Value::Text(status.shard_count.to_string())],
-                vec![Value::Text("shards_led".into()), Value::Text(status.shards_led.to_string())],
-                vec![Value::Text("epoch".into()), Value::Text(status.epoch.to_string())],
-                vec![Value::Text("active_txns".into()), Value::Text(status.active_txns.to_string())],
+                vec![
+                    Value::Text("node_count".into()),
+                    Value::Text(status.node_count.to_string()),
+                ],
+                vec![
+                    Value::Text("shard_count".into()),
+                    Value::Text(status.shard_count.to_string()),
+                ],
+                vec![
+                    Value::Text("shards_led".into()),
+                    Value::Text(status.shards_led.to_string()),
+                ],
+                vec![
+                    Value::Text("epoch".into()),
+                    Value::Text(status.epoch.to_string()),
+                ],
+                vec![
+                    Value::Text("active_txns".into()),
+                    Value::Text(status.active_txns.to_string()),
+                ],
             ]
         } else {
             vec![
                 vec![Value::Text("mode".into()), Value::Text("standalone".into())],
-                vec![Value::Text("cluster".into()), Value::Text("not configured".into())],
+                vec![
+                    Value::Text("cluster".into()),
+                    Value::Text("not configured".into()),
+                ],
             ]
         };
         #[cfg(not(feature = "server"))]
         let rows = vec![
             vec![Value::Text("mode".into()), Value::Text("standalone".into())],
-            vec![Value::Text("cluster".into()), Value::Text("not configured".into())],
+            vec![
+                Value::Text("cluster".into()),
+                Value::Text("not configured".into()),
+            ],
         ];
 
         Ok(ExecResult::Select {
@@ -314,13 +367,7 @@ impl Executor {
         let metric_rows = self.metrics.as_rows();
         let rows: Vec<Row> = metric_rows
             .into_iter()
-            .map(|(name, typ, val)| {
-                vec![
-                    Value::Text(name),
-                    Value::Text(typ),
-                    Value::Text(val),
-                ]
-            })
+            .map(|(name, typ, val)| vec![Value::Text(name), Value::Text(typ), Value::Text(val)])
             .collect();
         Ok(ExecResult::Select {
             columns: vec![
@@ -342,8 +389,21 @@ impl Executor {
                 ("value".into(), DataType::Text),
             ],
             rows: vec![
-                vec![Value::Text("engine".into()), Value::Text(if self.storage.supports_mvcc() { "mvcc" } else { "standard" }.into())],
-                vec![Value::Text("supports_mvcc".into()), Value::Text(self.storage.supports_mvcc().to_string())],
+                vec![
+                    Value::Text("engine".into()),
+                    Value::Text(
+                        if self.storage.supports_mvcc() {
+                            "mvcc"
+                        } else {
+                            "standard"
+                        }
+                        .into(),
+                    ),
+                ],
+                vec![
+                    Value::Text("supports_mvcc".into()),
+                    Value::Text(self.storage.supports_mvcc().to_string()),
+                ],
             ],
         })
     }
@@ -474,7 +534,10 @@ impl Executor {
         grantees: Vec<ast::Grantee>,
     ) -> Result<ExecResult, ExecError> {
         let privs = parse_privileges(&privileges);
-        let object_names = objects.as_ref().map(parse_grant_objects).unwrap_or_else(|| vec!["*".to_string()]);
+        let object_names = objects
+            .as_ref()
+            .map(parse_grant_objects)
+            .unwrap_or_else(|| vec!["*".to_string()]);
         let mut roles = self.roles.write().await;
 
         for grantee in &grantees {
@@ -509,7 +572,10 @@ impl Executor {
         grantees: Vec<ast::Grantee>,
     ) -> Result<ExecResult, ExecError> {
         let privs = parse_privileges(&privileges);
-        let object_names = objects.as_ref().map(parse_grant_objects).unwrap_or_else(|| vec!["*".to_string()]);
+        let object_names = objects
+            .as_ref()
+            .map(parse_grant_objects)
+            .unwrap_or_else(|| vec!["*".to_string()]);
         let mut roles = self.roles.write().await;
 
         for grantee in &grantees {
@@ -547,7 +613,8 @@ impl Executor {
                 match pwd {
                     ast::Password::Password(expr) => {
                         let raw = expr.to_string().trim_matches('\'').to_string();
-                        role.password_hash = Some(blake3::hash(raw.as_bytes()).to_hex().to_string());
+                        role.password_hash =
+                            Some(blake3::hash(raw.as_bytes()).to_hex().to_string());
                     }
                     ast::Password::NullPassword => {}
                 }
@@ -566,9 +633,9 @@ impl Executor {
         operation: ast::AlterRoleOperation,
     ) -> Result<ExecResult, ExecError> {
         let mut roles = self.roles.write().await;
-        let role = roles.get_mut(role_name).ok_or_else(|| {
-            ExecError::Unsupported(format!("role '{role_name}' does not exist"))
-        })?;
+        let role = roles
+            .get_mut(role_name)
+            .ok_or_else(|| ExecError::Unsupported(format!("role '{role_name}' does not exist")))?;
 
         match operation {
             ast::AlterRoleOperation::WithOptions { options } => {
@@ -579,7 +646,8 @@ impl Executor {
                         ast::RoleOption::Password(pwd) => match pwd {
                             ast::Password::Password(expr) => {
                                 let raw = expr.to_string().trim_matches('\'').to_string();
-                                role.password_hash = Some(blake3::hash(raw.as_bytes()).to_hex().to_string());
+                                role.password_hash =
+                                    Some(blake3::hash(raw.as_bytes()).to_hex().to_string());
                             }
                             ast::Password::NullPassword => {
                                 role.password_hash = None;
@@ -589,7 +657,9 @@ impl Executor {
                     }
                 }
             }
-            ast::AlterRoleOperation::RenameRole { role_name: new_name } => {
+            ast::AlterRoleOperation::RenameRole {
+                role_name: new_name,
+            } => {
                 let new_name = new_name.value.clone();
                 let mut role_data = roles.remove(role_name).unwrap();
                 role_data.name = new_name.clone();
@@ -612,11 +682,15 @@ impl Executor {
         &self,
         stmt: &ast::Declare,
     ) -> Result<ExecResult, ExecError> {
-        let cursor_name = stmt.names.first()
+        let cursor_name = stmt
+            .names
+            .first()
             .map(|n| n.value.clone())
             .unwrap_or_else(|| "unnamed".to_string());
 
-        let query = stmt.for_query.as_ref()
+        let query = stmt
+            .for_query
+            .as_ref()
             .ok_or_else(|| ExecError::Unsupported("DECLARE requires FOR query".into()))?;
 
         let result = self.execute_query(*query.clone()).await?;
@@ -624,18 +698,23 @@ impl Executor {
             ExecResult::Select { columns, rows } => {
                 let sess = self.current_session();
                 let mut cursors = sess.cursors.write().await;
-                cursors.insert(cursor_name.clone(), CursorDef {
-                    name: cursor_name,
-                    rows,
-                    columns,
-                    position: 0,
-                });
+                cursors.insert(
+                    cursor_name.clone(),
+                    CursorDef {
+                        name: cursor_name,
+                        rows,
+                        columns,
+                        position: 0,
+                    },
+                );
                 Ok(ExecResult::Command {
                     tag: "DECLARE CURSOR".into(),
                     rows_affected: 0,
                 })
             }
-            _ => Err(ExecError::Unsupported("DECLARE cursor query must be SELECT".into())),
+            _ => Err(ExecError::Unsupported(
+                "DECLARE cursor query must be SELECT".into(),
+            )),
         }
     }
 
@@ -645,9 +724,9 @@ impl Executor {
         direction: &ast::FetchDirection,
     ) -> Result<ExecResult, ExecError> {
         let count = match direction {
-            ast::FetchDirection::Count { limit: ast::Value::Number(n, _) } => {
-                n.parse::<usize>().unwrap_or(1)
-            }
+            ast::FetchDirection::Count {
+                limit: ast::Value::Number(n, _),
+            } => n.parse::<usize>().unwrap_or(1),
             ast::FetchDirection::Next | ast::FetchDirection::Forward { .. } => 1,
             ast::FetchDirection::All | ast::FetchDirection::ForwardAll => usize::MAX,
             ast::FetchDirection::First => 1,
@@ -656,7 +735,8 @@ impl Executor {
 
         let sess = self.current_session();
         let mut cursors = sess.cursors.write().await;
-        let cursor = cursors.get_mut(cursor_name)
+        let cursor = cursors
+            .get_mut(cursor_name)
             .ok_or_else(|| ExecError::Unsupported(format!("cursor '{cursor_name}' not found")))?;
 
         let start = cursor.position;
@@ -726,10 +806,7 @@ impl Executor {
         })
     }
 
-    pub(super) async fn execute_listen(
-        &self,
-        channel: &str,
-    ) -> Result<ExecResult, ExecError> {
+    pub(super) async fn execute_listen(&self, channel: &str) -> Result<ExecResult, ExecError> {
         // Subscribe on the local async hub.
         {
             let mut pubsub = self.pubsub.write().await;
@@ -752,10 +829,7 @@ impl Executor {
         })
     }
 
-    pub(super) async fn execute_unlisten(
-        &self,
-        channel: &str,
-    ) -> Result<ExecResult, ExecError> {
+    pub(super) async fn execute_unlisten(&self, channel: &str) -> Result<ExecResult, ExecError> {
         // Unsubscribing is handled by dropping the receiver; we just acknowledge
         let _ = channel;
         Ok(ExecResult::Command {

@@ -69,7 +69,6 @@ async fn test_subquery_in_from() {
     assert_eq!(rows(&results[0]).len(), 2);
 }
 
-
 // ======================================================================
 // CTE tests
 // ======================================================================
@@ -108,11 +107,7 @@ async fn test_union_all() {
     exec(&ex, "INSERT INTO t2 VALUES (2)").await;
     exec(&ex, "INSERT INTO t2 VALUES (3)").await;
 
-    let results = exec(
-        &ex,
-        "SELECT x FROM t1 UNION ALL SELECT x FROM t2",
-    )
-    .await;
+    let results = exec(&ex, "SELECT x FROM t1 UNION ALL SELECT x FROM t2").await;
     assert_eq!(rows(&results[0]).len(), 4);
 }
 
@@ -127,11 +122,7 @@ async fn test_union_distinct() {
     exec(&ex, "INSERT INTO u2 VALUES (2)").await;
     exec(&ex, "INSERT INTO u2 VALUES (3)").await;
 
-    let results = exec(
-        &ex,
-        "SELECT x FROM u1 UNION SELECT x FROM u2",
-    )
-    .await;
+    let results = exec(&ex, "SELECT x FROM u1 UNION SELECT x FROM u2").await;
     assert_eq!(rows(&results[0]).len(), 3); // 1, 2, 3
 }
 
@@ -146,11 +137,7 @@ async fn test_intersect() {
     exec(&ex, "INSERT INTO i2 VALUES (2)").await;
     exec(&ex, "INSERT INTO i2 VALUES (3)").await;
 
-    let results = exec(
-        &ex,
-        "SELECT x FROM i1 INTERSECT SELECT x FROM i2",
-    )
-    .await;
+    let results = exec(&ex, "SELECT x FROM i1 INTERSECT SELECT x FROM i2").await;
     assert_eq!(rows(&results[0]).len(), 1); // just 2
     assert_eq!(rows(&results[0])[0][0], Value::Int32(2));
 }
@@ -166,11 +153,7 @@ async fn test_except() {
     exec(&ex, "INSERT INTO e2 VALUES (2)").await;
     exec(&ex, "INSERT INTO e2 VALUES (3)").await;
 
-    let results = exec(
-        &ex,
-        "SELECT x FROM e1 EXCEPT SELECT x FROM e2",
-    )
-    .await;
+    let results = exec(&ex, "SELECT x FROM e1 EXCEPT SELECT x FROM e2").await;
     assert_eq!(rows(&results[0]).len(), 1); // just 1
     assert_eq!(rows(&results[0])[0][0], Value::Int32(1));
 }
@@ -233,10 +216,10 @@ async fn test_lag_lead() {
     )
     .await;
     let r = rows(&results[0]);
-    assert_eq!(r[0][1], Value::Null);       // LAG of first
-    assert_eq!(r[1][1], Value::Int32(10));   // LAG of second
-    assert_eq!(r[1][2], Value::Int32(30));   // LEAD of second
-    assert_eq!(r[2][2], Value::Null);        // LEAD of last
+    assert_eq!(r[0][1], Value::Null); // LAG of first
+    assert_eq!(r[1][1], Value::Int32(10)); // LAG of second
+    assert_eq!(r[1][2], Value::Int32(30)); // LEAD of second
+    assert_eq!(r[2][2], Value::Null); // LEAD of last
 }
 
 #[tokio::test]
@@ -247,15 +230,11 @@ async fn test_sum_over() {
     exec(&ex, "INSERT INTO running VALUES (2)").await;
     exec(&ex, "INSERT INTO running VALUES (3)").await;
 
-    let results = exec(
-        &ex,
-        "SELECT val, SUM(val) OVER (ORDER BY val) FROM running",
-    )
-    .await;
+    let results = exec(&ex, "SELECT val, SUM(val) OVER (ORDER BY val) FROM running").await;
     let r = rows(&results[0]);
-    assert_eq!(r[0][1], Value::Float64(1.0));  // running sum: 1
-    assert_eq!(r[1][1], Value::Float64(3.0));  // running sum: 1+2
-    assert_eq!(r[2][1], Value::Float64(6.0));  // running sum: 1+2+3
+    assert_eq!(r[0][1], Value::Float64(1.0)); // running sum: 1
+    assert_eq!(r[1][1], Value::Float64(3.0)); // running sum: 1+2
+    assert_eq!(r[2][1], Value::Float64(6.0)); // running sum: 1+2+3
 }
 
 // ======================================================================
@@ -305,7 +284,10 @@ async fn test_values_clause() {
 /// Helper: join all EXPLAIN output rows into a single string.
 fn plan_text(result: &ExecResult) -> String {
     let r = rows(result);
-    r.iter().map(|row| row[0].to_string()).collect::<Vec<_>>().join("\n")
+    r.iter()
+        .map(|row| row[0].to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[tokio::test]
@@ -316,7 +298,10 @@ async fn test_explain_basic_scan() {
     let text = plan_text(&results[0]);
     // Should show Seq Scan with the table name
     assert!(text.contains("Seq Scan"), "expected 'Seq Scan' in: {text}");
-    assert!(text.contains("expl"), "expected table name 'expl' in: {text}");
+    assert!(
+        text.contains("expl"),
+        "expected table name 'expl' in: {text}"
+    );
     assert!(text.contains("rows="), "expected row estimate in: {text}");
     // Column name should be QUERY PLAN
     if let ExecResult::Select { columns, .. } = &results[0] {
@@ -335,14 +320,24 @@ async fn test_explain_with_filter() {
     let results = exec(&ex, "EXPLAIN SELECT * FROM users_expl WHERE age > 18").await;
     let text = plan_text(&results[0]);
     assert!(text.contains("Seq Scan"), "expected 'Seq Scan' in: {text}");
-    assert!(text.contains("users_expl"), "expected table name in: {text}");
-    assert!(text.contains("age > 18") || text.contains("Filter"), "expected filter info in: {text}");
+    assert!(
+        text.contains("users_expl"),
+        "expected table name in: {text}"
+    );
+    assert!(
+        text.contains("age > 18") || text.contains("Filter"),
+        "expected filter info in: {text}"
+    );
 }
 
 #[tokio::test]
 async fn test_explain_with_join() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE orders_expl (id INT, user_id INT, amount INT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE orders_expl (id INT, user_id INT, amount INT)",
+    )
+    .await;
     exec(&ex, "CREATE TABLE customers_expl (id INT, name TEXT)").await;
     let results = exec(
         &ex,
@@ -354,8 +349,14 @@ async fn test_explain_with_join() {
         text.contains("Join") || text.contains("Loop"),
         "expected join node in: {text}"
     );
-    assert!(text.contains("orders_expl"), "expected 'orders_expl' in: {text}");
-    assert!(text.contains("customers_expl"), "expected 'customers_expl' in: {text}");
+    assert!(
+        text.contains("orders_expl"),
+        "expected 'orders_expl' in: {text}"
+    );
+    assert!(
+        text.contains("customers_expl"),
+        "expected 'customers_expl' in: {text}"
+    );
 }
 
 #[tokio::test]
@@ -374,20 +375,39 @@ async fn test_explain_with_aggregate() {
     exec(&ex, "CREATE TABLE sales_expl (id INT, amount INT)").await;
     let results = exec(&ex, "EXPLAIN SELECT SUM(amount) FROM sales_expl").await;
     let text = plan_text(&results[0]);
-    assert!(text.contains("Aggregate"), "expected 'Aggregate' in: {text}");
+    assert!(
+        text.contains("Aggregate"),
+        "expected 'Aggregate' in: {text}"
+    );
     assert!(text.contains("SUM"), "expected 'SUM' in: {text}");
-    assert!(text.contains("Scan"), "expected scan node under aggregate in: {text}");
+    assert!(
+        text.contains("Scan"),
+        "expected scan node under aggregate in: {text}"
+    );
 }
 
 #[tokio::test]
 async fn test_explain_with_group_by() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE grouped_expl (category TEXT, amount INT)").await;
-    let results = exec(&ex, "EXPLAIN SELECT category, COUNT(*) FROM grouped_expl GROUP BY category").await;
+    let results = exec(
+        &ex,
+        "EXPLAIN SELECT category, COUNT(*) FROM grouped_expl GROUP BY category",
+    )
+    .await;
     let text = plan_text(&results[0]);
-    assert!(text.contains("HashAggregate"), "expected 'HashAggregate' in: {text}");
-    assert!(text.contains("Group Key"), "expected 'Group Key' in: {text}");
-    assert!(text.contains("category"), "expected 'category' in group key in: {text}");
+    assert!(
+        text.contains("HashAggregate"),
+        "expected 'HashAggregate' in: {text}"
+    );
+    assert!(
+        text.contains("Group Key"),
+        "expected 'Group Key' in: {text}"
+    );
+    assert!(
+        text.contains("category"),
+        "expected 'category' in group key in: {text}"
+    );
 }
 
 #[tokio::test]
@@ -401,8 +421,14 @@ async fn test_explain_analyze() {
     let text = plan_text(&results[0]);
     // EXPLAIN ANALYZE should show the plan plus actual execution stats
     assert!(text.contains("Seq Scan"), "expected 'Seq Scan' in: {text}");
-    assert!(text.contains("Actual Rows: 3"), "expected 'Actual Rows: 3' in: {text}");
-    assert!(text.contains("Execution Time"), "expected 'Execution Time' in: {text}");
+    assert!(
+        text.contains("Actual Rows: 3"),
+        "expected 'Actual Rows: 3' in: {text}"
+    );
+    assert!(
+        text.contains("Execution Time"),
+        "expected 'Execution Time' in: {text}"
+    );
     assert!(text.contains("ms"), "expected time unit 'ms' in: {text}");
 }
 
@@ -450,8 +476,14 @@ async fn test_explain_shows_index_scan_with_index() {
     let results = exec(&ex, "EXPLAIN SELECT * FROM plan_idx WHERE id = 42").await;
     let text = plan_text(&results[0]);
     // With 200 rows and a B-tree index, the planner should choose IndexScan
-    assert!(text.contains("Index Scan"), "expected 'Index Scan' in: {text}");
-    assert!(text.contains("idx_plan_id"), "expected index name in: {text}");
+    assert!(
+        text.contains("Index Scan"),
+        "expected 'Index Scan' in: {text}"
+    );
+    assert!(
+        text.contains("idx_plan_id"),
+        "expected index name in: {text}"
+    );
 }
 
 #[tokio::test]
@@ -483,7 +515,10 @@ async fn test_explain_index_scan_analyze_stats_accuracy() {
     let results = exec(&ex, "EXPLAIN SELECT * FROM plan_acc WHERE id = 42").await;
     let text = plan_text(&results[0]);
     // 500 rows → 5 pages, seq scan cost ≈10. Index scan for 1 row ≈3.3.
-    assert!(text.contains("Index Scan"), "expected 'Index Scan' in: {text}");
+    assert!(
+        text.contains("Index Scan"),
+        "expected 'Index Scan' in: {text}"
+    );
 }
 
 #[tokio::test]
@@ -499,9 +534,18 @@ async fn test_explain_analyze_with_index() {
     let results = exec(&ex, "EXPLAIN ANALYZE SELECT * FROM plan_ea WHERE id = 50").await;
     let text = plan_text(&results[0]);
     // EXPLAIN ANALYZE should show the plan (Index Scan) + actual execution stats
-    assert!(text.contains("Index Scan"), "expected 'Index Scan' in: {text}");
-    assert!(text.contains("Actual Rows"), "expected actual rows in: {text}");
-    assert!(text.contains("Execution Time"), "expected execution time in: {text}");
+    assert!(
+        text.contains("Index Scan"),
+        "expected 'Index Scan' in: {text}"
+    );
+    assert!(
+        text.contains("Actual Rows"),
+        "expected actual rows in: {text}"
+    );
+    assert!(
+        text.contains("Execution Time"),
+        "expected execution time in: {text}"
+    );
 }
 
 #[tokio::test]
@@ -517,12 +561,18 @@ async fn test_explain_join_uses_shared_stats() {
     }
     exec(&ex, "ANALYZE plan_ord").await;
     exec(&ex, "ANALYZE plan_cust").await;
-    let results = exec(&ex, "EXPLAIN SELECT * FROM plan_ord JOIN plan_cust ON plan_ord.cust_id = plan_cust.id").await;
+    let results = exec(
+        &ex,
+        "EXPLAIN SELECT * FROM plan_ord JOIN plan_cust ON plan_ord.cust_id = plan_cust.id",
+    )
+    .await;
     let text = plan_text(&results[0]);
     // Should show a join node with both tables
     assert!(text.contains("Join"), "expected Join in: {text}");
-    assert!(text.contains("plan_ord") || text.contains("plan_cust"),
-        "expected table name in: {text}");
+    assert!(
+        text.contains("plan_ord") || text.contains("plan_cust"),
+        "expected table name in: {text}"
+    );
 }
 
 // ======================================================================
@@ -614,7 +664,11 @@ async fn test_plan_exec_between_predicate() {
         exec(&ex, &format!("INSERT INTO pe_between VALUES ({i}, 'v{i}')")).await;
     }
     exec(&ex, "SET plan_execution = on").await;
-    let results = exec(&ex, "SELECT id FROM pe_between WHERE id BETWEEN 2 AND 4 ORDER BY id").await;
+    let results = exec(
+        &ex,
+        "SELECT id FROM pe_between WHERE id BETWEEN 2 AND 4 ORDER BY id",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 3);
     assert_eq!(r[0][0], Value::Int32(2));
@@ -625,8 +679,16 @@ async fn test_plan_exec_between_predicate() {
 #[tokio::test]
 async fn test_plan_exec_group_by_with_qualified_columns() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE pe_orders (id INT, amount INT, category INT, day_key INT)").await;
-    exec(&ex, "INSERT INTO pe_orders VALUES (1, 100, 1, 2), (2, 150, 1, 4), (3, 75, 2, 3), (4, 40, 1, 8)").await;
+    exec(
+        &ex,
+        "CREATE TABLE pe_orders (id INT, amount INT, category INT, day_key INT)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO pe_orders VALUES (1, 100, 1, 2), (2, 150, 1, 4), (3, 75, 2, 3), (4, 40, 1, 8)",
+    )
+    .await;
     exec(&ex, "SET plan_execution = on").await;
     let sql = "SELECT o.category, COUNT(*), SUM(o.amount) \
                FROM pe_orders o \
@@ -647,8 +709,16 @@ async fn test_plan_exec_group_by_with_qualified_columns() {
 async fn test_plan_exec_join_with_qualified_where_filters() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE pe_join_accounts (id INT, region INT)").await;
-    exec(&ex, "CREATE TABLE pe_join_orders (id INT, account_id INT, amount INT, day_key INT)").await;
-    exec(&ex, "INSERT INTO pe_join_accounts VALUES (1, 1), (2, 2), (3, 2)").await;
+    exec(
+        &ex,
+        "CREATE TABLE pe_join_orders (id INT, account_id INT, amount INT, day_key INT)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO pe_join_accounts VALUES (1, 1), (2, 2), (3, 2)",
+    )
+    .await;
     exec(&ex, "INSERT INTO pe_join_orders VALUES (1, 1, 100, 2), (2, 2, 50, 3), (3, 3, 30, 4), (4, 3, 90, 9)").await;
     exec(&ex, "SET plan_execution = on").await;
     let results = exec(
@@ -668,8 +738,16 @@ async fn test_plan_exec_join_with_qualified_where_filters() {
 async fn test_ast_join_with_qualified_where_filters() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE ast_join_accounts (id INT, region INT)").await;
-    exec(&ex, "CREATE TABLE ast_join_orders (id INT, account_id INT, amount INT, day_key INT)").await;
-    exec(&ex, "INSERT INTO ast_join_accounts VALUES (1, 1), (2, 2), (3, 2)").await;
+    exec(
+        &ex,
+        "CREATE TABLE ast_join_orders (id INT, account_id INT, amount INT, day_key INT)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO ast_join_accounts VALUES (1, 1), (2, 2), (3, 2)",
+    )
+    .await;
     exec(&ex, "INSERT INTO ast_join_orders VALUES (1, 1, 100, 2), (2, 2, 50, 3), (3, 3, 30, 4), (4, 3, 90, 9)").await;
     // plan_execution is OFF by default; this validates AST path behavior.
     let results = exec(
@@ -711,7 +789,7 @@ async fn test_plan_exec_having_count_function() {
 #[tokio::test]
 async fn test_aggregate_plan_execution() {
     // Test the Aggregate plan node (no GROUP BY) by constructing one directly
-    use crate::planner::{PlanNode, Cost};
+    use crate::planner::{Cost, PlanNode};
     let ex = test_executor();
     // Populate table
     exec(&ex, "CREATE TABLE agg_plan (val INT)").await;
@@ -744,7 +822,7 @@ async fn test_aggregate_plan_execution() {
 
 #[tokio::test]
 async fn test_hash_aggregate_plan_execution() {
-    use crate::planner::{PlanNode, Cost};
+    use crate::planner::{Cost, PlanNode};
     let ex = test_executor();
     exec(&ex, "CREATE TABLE hagg (grp TEXT, val INT)").await;
     exec(&ex, "INSERT INTO hagg VALUES ('a', 10)").await;
@@ -770,7 +848,10 @@ async fn test_hash_aggregate_plan_execution() {
     };
     let cte_tables = std::collections::HashMap::new();
     let result = ex.execute_plan_node(&plan, &cte_tables).await;
-    assert!(result.is_ok(), "hash aggregate plan should succeed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "hash aggregate plan should succeed: {result:?}"
+    );
     let (meta, rows) = result.unwrap();
     assert_eq!(rows.len(), 2, "should have 2 groups");
     assert_eq!(meta.len(), 3); // grp, COUNT(*), SUM(val)
@@ -837,8 +918,8 @@ async fn test_plan_driven_hash_join_matches_execution() {
     let r = rows(&results[0]);
     assert_eq!(r.len(), 30); // Every b row has a matching a row
     // Verify ordering
-    for i in 0..30 {
-        assert_eq!(r[i][1], Value::Int32(i as i32));
+    for (i, row) in r.iter().enumerate() {
+        assert_eq!(row[1], Value::Int32(i as i32));
     }
 }
 
@@ -850,7 +931,11 @@ async fn test_plan_driven_hash_join_matches_execution() {
 #[tokio::test]
 async fn test_hash_join_inner() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE hj_orders (id INT, cust_id INT, amount INT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE hj_orders (id INT, cust_id INT, amount INT)",
+    )
+    .await;
     exec(&ex, "CREATE TABLE hj_customers (id INT, name TEXT)").await;
     exec(&ex, "INSERT INTO hj_customers VALUES (1, 'alice')").await;
     exec(&ex, "INSERT INTO hj_customers VALUES (2, 'bob')").await;
@@ -951,7 +1036,11 @@ async fn test_hash_join_null_handling() {
     exec(&ex, "INSERT INTO hjn_a VALUES (NULL, 'y')").await;
     exec(&ex, "INSERT INTO hjn_b VALUES (1, 'match')").await;
     exec(&ex, "INSERT INTO hjn_b VALUES (NULL, 'null_match')").await;
-    let results = exec(&ex, "SELECT hjn_a.val, hjn_b.info FROM hjn_a JOIN hjn_b ON hjn_a.id = hjn_b.id").await;
+    let results = exec(
+        &ex,
+        "SELECT hjn_a.val, hjn_b.info FROM hjn_a JOIN hjn_b ON hjn_a.id = hjn_b.id",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1); // NULL = NULL should NOT match
     assert_eq!(r[0][0], Value::Text("x".into()));
@@ -1008,14 +1097,18 @@ async fn test_generate_series_empty() {
 #[tokio::test]
 async fn test_recursive_cte() {
     let ex = test_executor();
-    let results = exec(&ex, "
+    let results = exec(
+        &ex,
+        "
         WITH RECURSIVE cnt(x) AS (
             SELECT 1
             UNION ALL
             SELECT x + 1 FROM cnt WHERE x < 5
         )
         SELECT x FROM cnt
-    ").await;
+    ",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 5);
     // Literal 1 produces Int32, arithmetic x+1 also produces Int32
@@ -1036,13 +1129,19 @@ async fn test_recursive_cte() {
 #[tokio::test]
 async fn test_recursive_cte_hierarchy() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, manager_id INT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, manager_id INT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO employees VALUES (1, 'CEO', NULL)").await;
     exec(&ex, "INSERT INTO employees VALUES (2, 'VP', 1)").await;
     exec(&ex, "INSERT INTO employees VALUES (3, 'Director', 2)").await;
     exec(&ex, "INSERT INTO employees VALUES (4, 'Manager', 3)").await;
 
-    let results = exec(&ex, "
+    let results = exec(
+        &ex,
+        "
         WITH RECURSIVE org(id, name, depth) AS (
             SELECT id, name, 0 FROM employees WHERE manager_id IS NULL
             UNION ALL
@@ -1050,7 +1149,9 @@ async fn test_recursive_cte_hierarchy() {
             FROM employees e JOIN org ON e.manager_id = org.id
         )
         SELECT name, depth FROM org ORDER BY depth
-    ").await;
+    ",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 4);
     assert_eq!(r[0][0], Value::Text("CEO".into()));
@@ -1086,7 +1187,9 @@ async fn test_string_agg() {
     let results = exec(&ex, "SELECT STRING_AGG(tag, ', ') FROM tags WHERE id = 1").await;
     let val = scalar(&results[0]);
     match val {
-        Value::Text(s) => assert!(s.contains("rust") && s.contains("database") && s.contains("sql")),
+        Value::Text(s) => {
+            assert!(s.contains("rust") && s.contains("database") && s.contains("sql"))
+        }
         _ => panic!("expected text, got {val:?}"),
     }
 }
@@ -1182,7 +1285,11 @@ async fn test_percent_rank() {
     exec(&ex, "INSERT INTO prank VALUES (30)").await;
     exec(&ex, "INSERT INTO prank VALUES (40)").await;
 
-    let results = exec(&ex, "SELECT val, PERCENT_RANK() OVER (ORDER BY val) AS pr FROM prank").await;
+    let results = exec(
+        &ex,
+        "SELECT val, PERCENT_RANK() OVER (ORDER BY val) AS pr FROM prank",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 4);
     // First row: (10 - 1) / (4 - 1) = 0.0
@@ -1200,7 +1307,11 @@ async fn test_cume_dist() {
     exec(&ex, "INSERT INTO cdist VALUES (30)").await;
     exec(&ex, "INSERT INTO cdist VALUES (40)").await;
 
-    let results = exec(&ex, "SELECT val, CUME_DIST() OVER (ORDER BY val) AS cd FROM cdist").await;
+    let results = exec(
+        &ex,
+        "SELECT val, CUME_DIST() OVER (ORDER BY val) AS cd FROM cdist",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 4);
     // First row: 1/4 = 0.25
@@ -1217,37 +1328,61 @@ async fn test_cume_dist() {
 #[tokio::test]
 async fn test_rollup() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE sales (region TEXT, product TEXT, amount INT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE sales (region TEXT, product TEXT, amount INT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO sales VALUES ('East', 'A', 100)").await;
     exec(&ex, "INSERT INTO sales VALUES ('East', 'B', 200)").await;
     exec(&ex, "INSERT INTO sales VALUES ('West', 'A', 150)").await;
 
-    let results = exec(&ex, "
+    let results = exec(
+        &ex,
+        "
         SELECT region, SUM(amount) AS total
         FROM sales
         GROUP BY ROLLUP(region)
-    ").await;
+    ",
+    )
+    .await;
     let r = rows(&results[0]);
     // ROLLUP(region) = GROUPING SETS ((region), ())
     // Should have: East=300, West=150, grand total=450
-    assert!(r.len() >= 3, "Expected at least 3 rows for ROLLUP, got {}", r.len());
+    assert!(
+        r.len() >= 3,
+        "Expected at least 3 rows for ROLLUP, got {}",
+        r.len()
+    );
 }
 
 #[tokio::test]
 async fn test_cube() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE cube_sales (region TEXT, product TEXT, amount INT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE cube_sales (region TEXT, product TEXT, amount INT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO cube_sales VALUES ('East', 'A', 100)").await;
     exec(&ex, "INSERT INTO cube_sales VALUES ('West', 'B', 200)").await;
 
-    let results = exec(&ex, "
+    let results = exec(
+        &ex,
+        "
         SELECT region, SUM(amount) AS total
         FROM cube_sales
         GROUP BY CUBE(region)
-    ").await;
+    ",
+    )
+    .await;
     let r = rows(&results[0]);
     // CUBE(region) = GROUPING SETS ((), (region))
-    assert!(r.len() >= 3, "Expected at least 3 rows for CUBE, got {}", r.len());
+    assert!(
+        r.len() >= 3,
+        "Expected at least 3 rows for CUBE, got {}",
+        r.len()
+    );
 }
 
 // ======================================================================
@@ -1262,20 +1397,28 @@ async fn test_lateral_join() {
     exec(&ex, "INSERT INTO lat_dept VALUES (1, 'Engineering')").await;
     exec(&ex, "INSERT INTO lat_dept VALUES (2, 'Sales')").await;
 
-    exec(&ex, "CREATE TABLE lat_emp (id INT, dept_id INT, name TEXT, salary INT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE lat_emp (id INT, dept_id INT, name TEXT, salary INT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO lat_emp VALUES (1, 1, 'Alice', 100)").await;
     exec(&ex, "INSERT INTO lat_emp VALUES (2, 1, 'Bob', 90)").await;
     exec(&ex, "INSERT INTO lat_emp VALUES (3, 2, 'Charlie', 80)").await;
 
     // Simple LATERAL join: for each dept, get matching employees
-    let results = exec(&ex, "
+    let results = exec(
+        &ex,
+        "
         SELECT lat_dept.name, sub.name AS emp_name
         FROM lat_dept
         JOIN LATERAL (
             SELECT lat_emp.name FROM lat_emp
             WHERE lat_emp.dept_id = lat_dept.id
         ) AS sub ON true
-    ").await;
+    ",
+    )
+    .await;
     let r = rows(&results[0]);
     // Dept 1 has 2 employees, dept 2 has 1 = 3 total
     assert_eq!(r.len(), 3);
@@ -1312,7 +1455,11 @@ async fn test_select_distinct_on() {
     exec(&ex, "INSERT INTO scores VALUES ('Bob', 80)").await;
     exec(&ex, "INSERT INTO scores VALUES ('Bob', 95)").await;
 
-    let results = exec(&ex, "SELECT DISTINCT ON (name) name, score FROM scores ORDER BY name, score DESC").await;
+    let results = exec(
+        &ex,
+        "SELECT DISTINCT ON (name) name, score FROM scores ORDER BY name, score DESC",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
     assert_eq!(r[0][0], Value::Text("Alice".into()));
@@ -1338,7 +1485,11 @@ async fn test_qualified_wildcard() {
     exec(&ex, "INSERT INTO qw_a VALUES (1, 'foo')").await;
     exec(&ex, "INSERT INTO qw_b VALUES (1, 'bar')").await;
 
-    let results = exec(&ex, "SELECT qw_a.* FROM qw_a JOIN qw_b ON qw_a.id = qw_b.id").await;
+    let results = exec(
+        &ex,
+        "SELECT qw_a.* FROM qw_a JOIN qw_b ON qw_a.id = qw_b.id",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].len(), 2); // id and name from qw_a only
@@ -1410,11 +1561,11 @@ async fn test_window_frame_rows_between_preceding_and_following() {
     ).await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 5);
-    assert_eq!(r[0][1], Value::Float64(30.0));   // 10 + 20
-    assert_eq!(r[1][1], Value::Float64(60.0));   // 10 + 20 + 30
-    assert_eq!(r[2][1], Value::Float64(90.0));   // 20 + 30 + 40
-    assert_eq!(r[3][1], Value::Float64(120.0));  // 30 + 40 + 50
-    assert_eq!(r[4][1], Value::Float64(90.0));   // 40 + 50
+    assert_eq!(r[0][1], Value::Float64(30.0)); // 10 + 20
+    assert_eq!(r[1][1], Value::Float64(60.0)); // 10 + 20 + 30
+    assert_eq!(r[2][1], Value::Float64(90.0)); // 20 + 30 + 40
+    assert_eq!(r[3][1], Value::Float64(120.0)); // 30 + 40 + 50
+    assert_eq!(r[4][1], Value::Float64(90.0)); // 40 + 50
 }
 
 #[tokio::test]
@@ -1502,10 +1653,10 @@ async fn test_window_frame_count_min_max() {
         "SELECT id, COUNT(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) as cnt FROM wf5",
     ).await;
     let r = rows(&results[0]);
-    assert_eq!(r[0][1], Value::Int64(2));  // rows 1,2
-    assert_eq!(r[1][1], Value::Int64(3));  // rows 1,2,3
-    assert_eq!(r[2][1], Value::Int64(3));  // rows 2,3,4
-    assert_eq!(r[3][1], Value::Int64(2));  // rows 3,4
+    assert_eq!(r[0][1], Value::Int64(2)); // rows 1,2
+    assert_eq!(r[1][1], Value::Int64(3)); // rows 1,2,3
+    assert_eq!(r[2][1], Value::Int64(3)); // rows 2,3,4
+    assert_eq!(r[3][1], Value::Int64(2)); // rows 3,4
 
     // MIN(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
     let results = exec(
@@ -1513,10 +1664,10 @@ async fn test_window_frame_count_min_max() {
         "SELECT id, MIN(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) as mn FROM wf5",
     ).await;
     let r = rows(&results[0]);
-    assert_eq!(r[0][1], Value::Int32(10));  // min(10,20)
-    assert_eq!(r[1][1], Value::Int32(10));  // min(10,20,30)
-    assert_eq!(r[2][1], Value::Int32(20));  // min(20,30,40)
-    assert_eq!(r[3][1], Value::Int32(30));  // min(30,40)
+    assert_eq!(r[0][1], Value::Int32(10)); // min(10,20)
+    assert_eq!(r[1][1], Value::Int32(10)); // min(10,20,30)
+    assert_eq!(r[2][1], Value::Int32(20)); // min(20,30,40)
+    assert_eq!(r[3][1], Value::Int32(30)); // min(30,40)
 
     // MAX(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
     let results = exec(
@@ -1524,10 +1675,10 @@ async fn test_window_frame_count_min_max() {
         "SELECT id, MAX(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) as mx FROM wf5",
     ).await;
     let r = rows(&results[0]);
-    assert_eq!(r[0][1], Value::Int32(20));  // max(10,20)
-    assert_eq!(r[1][1], Value::Int32(30));  // max(10,20,30)
-    assert_eq!(r[2][1], Value::Int32(40));  // max(20,30,40)
-    assert_eq!(r[3][1], Value::Int32(40));  // max(30,40)
+    assert_eq!(r[0][1], Value::Int32(20)); // max(10,20)
+    assert_eq!(r[1][1], Value::Int32(30)); // max(10,20,30)
+    assert_eq!(r[2][1], Value::Int32(40)); // max(20,30,40)
+    assert_eq!(r[3][1], Value::Int32(40)); // max(30,40)
 }
 
 // ======================================================================
@@ -1553,7 +1704,7 @@ async fn test_check_route_with_cluster() {
     {
         let mut coord = cluster.write();
         let router = coord.router_mut();
-        router.add_shard(1, 0x2, 0, 100);  // shard 1 owned by node 0x2 (remote)
+        router.add_shard(1, 0x2, 0, 100); // shard 1 owned by node 0x2 (remote)
         router.add_shard(2, 0x1, 100, 200); // shard 2 owned by us (local)
     }
     let catalog = Arc::new(Catalog::new());
@@ -1576,9 +1727,17 @@ async fn test_check_route_with_cluster() {
 async fn test_group_by_null_groups_together() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE grp_null_test (cat TEXT, val INT)").await;
-    exec(&ex, "INSERT INTO grp_null_test VALUES (NULL, 1), (NULL, 2), ('a', 3), ('a', 4), (NULL, 5)").await;
+    exec(
+        &ex,
+        "INSERT INTO grp_null_test VALUES (NULL, 1), (NULL, 2), ('a', 3), ('a', 4), (NULL, 5)",
+    )
+    .await;
 
-    let res = exec(&ex, "SELECT cat, SUM(val) FROM grp_null_test GROUP BY cat ORDER BY cat").await;
+    let res = exec(
+        &ex,
+        "SELECT cat, SUM(val) FROM grp_null_test GROUP BY cat ORDER BY cat",
+    )
+    .await;
     let r = rows(&res[0]);
     // Expect two groups: NULL (sum=8) and 'a' (sum=7).
     // ORDER BY NULL LAST by default — NULL group goes last.
@@ -1588,8 +1747,16 @@ async fn test_group_by_null_groups_together() {
     let a_group = r.iter().find(|row| row[0] == Value::Text("a".into()));
     assert!(null_group.is_some(), "missing NULL group");
     assert!(a_group.is_some(), "missing 'a' group");
-    assert_eq!(null_group.unwrap()[1], Value::Int64(8), "NULL group SUM should be 8");
-    assert_eq!(a_group.unwrap()[1], Value::Int64(7), "'a' group SUM should be 7");
+    assert_eq!(
+        null_group.unwrap()[1],
+        Value::Int64(8),
+        "NULL group SUM should be 8"
+    );
+    assert_eq!(
+        a_group.unwrap()[1],
+        Value::Int64(7),
+        "'a' group SUM should be 7"
+    );
 }
 
 // NULLIF edge cases: NULLIF(NULL, NULL), NULLIF(NULL, x), NULLIF(x, NULL).
@@ -1598,7 +1765,10 @@ async fn test_nullif_null_edge_cases() {
     let ex = test_executor();
     // NULLIF(1, NULL) → 1  (second arg NULL: never equal, return first)
     let r = exec(&ex, "SELECT NULLIF(1, NULL)").await;
-    assert!(!matches!(scalar(&r[0]), Value::Null), "NULLIF(1, NULL) should not be NULL");
+    assert!(
+        !matches!(scalar(&r[0]), Value::Null),
+        "NULLIF(1, NULL) should not be NULL"
+    );
 
     // NULLIF(NULL, 1) → NULL  (first arg is NULL, return NULL)
     let r = exec(&ex, "SELECT NULLIF(NULL, 1)").await;
@@ -1614,6 +1784,8 @@ async fn test_nullif_null_edge_cases() {
 
     // NULLIF(5, 6) → 5  (different args)
     let r = exec(&ex, "SELECT NULLIF(5, 6)").await;
-    assert!(!matches!(scalar(&r[0]), Value::Null), "NULLIF(5, 6) should not be NULL");
+    assert!(
+        !matches!(scalar(&r[0]), Value::Null),
+        "NULLIF(5, 6) should not be NULL"
+    );
 }
-

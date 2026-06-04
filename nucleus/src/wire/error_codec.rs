@@ -92,30 +92,22 @@ pub struct PgWireErrorCodec;
 impl ErrorCodec for PgWireErrorCodec {
     fn encode(&self, err: &ExecError) -> ErrorDetails {
         match err {
-            ExecError::Parse(_) => {
-                ErrorDetails::new(ErrorCode::SyntaxError, err.to_string())
-            }
-            ExecError::TableNotFound(name) => {
-                ErrorDetails::new(
-                    ErrorCode::UndefinedTable,
-                    format!("relation \"{}\" does not exist", name),
-                )
-            }
-            ExecError::ColumnNotFound(name) => {
-                ErrorDetails::new(
-                    ErrorCode::UndefinedColumn,
-                    format!("column \"{}\" does not exist", name),
-                )
-            }
-            ExecError::ColumnCountMismatch { expected, got } => {
-                ErrorDetails::new(
-                    ErrorCode::ColumnCountMismatch,
-                    format!(
-                        "INSERT has more expressions than target columns; {} vs {}",
-                        got, expected
-                    ),
-                )
-            }
+            ExecError::Parse(_) => ErrorDetails::new(ErrorCode::SyntaxError, err.to_string()),
+            ExecError::TableNotFound(name) => ErrorDetails::new(
+                ErrorCode::UndefinedTable,
+                format!("relation \"{}\" does not exist", name),
+            ),
+            ExecError::ColumnNotFound(name) => ErrorDetails::new(
+                ErrorCode::UndefinedColumn,
+                format!("column \"{}\" does not exist", name),
+            ),
+            ExecError::ColumnCountMismatch { expected, got } => ErrorDetails::new(
+                ErrorCode::ColumnCountMismatch,
+                format!(
+                    "INSERT has more expressions than target columns; {} vs {}",
+                    got, expected
+                ),
+            ),
             ExecError::Unsupported(msg) => {
                 ErrorDetails::new(ErrorCode::FeatureNotSupported, msg.clone())
             }
@@ -210,30 +202,22 @@ impl ErrorCodec for BinaryErrorCodec {
         // Binary protocol uses same error categorization,
         // just with different code representation (see code_to_string)
         match err {
-            ExecError::Parse(_) => {
-                ErrorDetails::new(ErrorCode::SyntaxError, err.to_string())
-            }
-            ExecError::TableNotFound(name) => {
-                ErrorDetails::new(
-                    ErrorCode::UndefinedTable,
-                    format!("relation \"{}\" does not exist", name),
-                )
-            }
-            ExecError::ColumnNotFound(name) => {
-                ErrorDetails::new(
-                    ErrorCode::UndefinedColumn,
-                    format!("column \"{}\" does not exist", name),
-                )
-            }
-            ExecError::ColumnCountMismatch { expected, got } => {
-                ErrorDetails::new(
-                    ErrorCode::ColumnCountMismatch,
-                    format!(
-                        "INSERT has more expressions than target columns; {} vs {}",
-                        got, expected
-                    ),
-                )
-            }
+            ExecError::Parse(_) => ErrorDetails::new(ErrorCode::SyntaxError, err.to_string()),
+            ExecError::TableNotFound(name) => ErrorDetails::new(
+                ErrorCode::UndefinedTable,
+                format!("relation \"{}\" does not exist", name),
+            ),
+            ExecError::ColumnNotFound(name) => ErrorDetails::new(
+                ErrorCode::UndefinedColumn,
+                format!("column \"{}\" does not exist", name),
+            ),
+            ExecError::ColumnCountMismatch { expected, got } => ErrorDetails::new(
+                ErrorCode::ColumnCountMismatch,
+                format!(
+                    "INSERT has more expressions than target columns; {} vs {}",
+                    got, expected
+                ),
+            ),
             ExecError::Unsupported(msg) => {
                 ErrorDetails::new(ErrorCode::FeatureNotSupported, msg.clone())
             }
@@ -340,7 +324,10 @@ mod tests {
         let err = ExecError::Unsupported("distributed transactions not supported".to_string());
         let details = codec.encode(&err);
         assert_eq!(details.code, ErrorCode::FeatureNotSupported);
-        assert_eq!(codec.code_to_string(ErrorCode::FeatureNotSupported), "0A000");
+        assert_eq!(
+            codec.code_to_string(ErrorCode::FeatureNotSupported),
+            "0A000"
+        );
     }
 
     #[test]
@@ -349,13 +336,17 @@ mod tests {
         let err = ExecError::PermissionDenied("user lacks privilege".to_string());
         let details = codec.encode(&err);
         assert_eq!(details.code, ErrorCode::InsufficientPrivilege);
-        assert_eq!(codec.code_to_string(ErrorCode::InsufficientPrivilege), "42501");
+        assert_eq!(
+            codec.code_to_string(ErrorCode::InsufficientPrivilege),
+            "42501"
+        );
     }
 
     #[test]
     fn test_pgwire_codec_unique_violation() {
         let codec = PgWireErrorCodec;
-        let err = ExecError::ConstraintViolation("duplicate key violates unique constraint".to_string());
+        let err =
+            ExecError::ConstraintViolation("duplicate key violates unique constraint".to_string());
         let details = codec.encode(&err);
         assert_eq!(details.code, ErrorCode::UniqueViolation);
         assert_eq!(codec.code_to_string(ErrorCode::UniqueViolation), "23505");
@@ -367,7 +358,10 @@ mod tests {
         let err = ExecError::ConstraintViolation("violates foreign key constraint".to_string());
         let details = codec.encode(&err);
         assert_eq!(details.code, ErrorCode::ForeignKeyViolation);
-        assert_eq!(codec.code_to_string(ErrorCode::ForeignKeyViolation), "23503");
+        assert_eq!(
+            codec.code_to_string(ErrorCode::ForeignKeyViolation),
+            "23503"
+        );
     }
 
     #[test]

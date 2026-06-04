@@ -34,11 +34,21 @@ pub fn serialize_row(row: &Row, col_types: &[DataType]) -> Vec<u8> {
     for (i, val) in row.iter().enumerate() {
         let coerced: std::borrow::Cow<'_, Value> = if i < col_types.len() {
             match (val, &col_types[i]) {
-                (Value::Int64(n), DataType::Int32) => std::borrow::Cow::Owned(Value::Int32(*n as i32)),
-                (Value::Int32(n), DataType::Int64) => std::borrow::Cow::Owned(Value::Int64(*n as i64)),
-                (Value::Int64(n), DataType::Float64) => std::borrow::Cow::Owned(Value::Float64(*n as f64)),
-                (Value::Float64(f), DataType::Int32) => std::borrow::Cow::Owned(Value::Int32(*f as i32)),
-                (Value::Float64(f), DataType::Int64) => std::borrow::Cow::Owned(Value::Int64(*f as i64)),
+                (Value::Int64(n), DataType::Int32) => {
+                    std::borrow::Cow::Owned(Value::Int32(*n as i32))
+                }
+                (Value::Int32(n), DataType::Int64) => {
+                    std::borrow::Cow::Owned(Value::Int64(*n as i64))
+                }
+                (Value::Int64(n), DataType::Float64) => {
+                    std::borrow::Cow::Owned(Value::Float64(*n as f64))
+                }
+                (Value::Float64(f), DataType::Int32) => {
+                    std::borrow::Cow::Owned(Value::Int32(*f as i32))
+                }
+                (Value::Float64(f), DataType::Int64) => {
+                    std::borrow::Cow::Owned(Value::Int64(*f as i64))
+                }
                 _ => std::borrow::Cow::Borrowed(val),
             }
         } else {
@@ -84,10 +94,22 @@ pub fn serialize_row(row: &Row, col_types: &[DataType]) -> Vec<u8> {
                 for elem in elems {
                     match elem {
                         Value::Null => arr_buf.push(5),
-                        Value::Bool(b) => { arr_buf.push(0); arr_buf.push(if *b { 1 } else { 0 }); }
-                        Value::Int32(n) => { arr_buf.push(1); arr_buf.extend_from_slice(&n.to_le_bytes()); }
-                        Value::Int64(n) => { arr_buf.push(2); arr_buf.extend_from_slice(&n.to_le_bytes()); }
-                        Value::Float64(n) => { arr_buf.push(3); arr_buf.extend_from_slice(&n.to_le_bytes()); }
+                        Value::Bool(b) => {
+                            arr_buf.push(0);
+                            arr_buf.push(if *b { 1 } else { 0 });
+                        }
+                        Value::Int32(n) => {
+                            arr_buf.push(1);
+                            arr_buf.extend_from_slice(&n.to_le_bytes());
+                        }
+                        Value::Int64(n) => {
+                            arr_buf.push(2);
+                            arr_buf.extend_from_slice(&n.to_le_bytes());
+                        }
+                        Value::Float64(n) => {
+                            arr_buf.push(3);
+                            arr_buf.extend_from_slice(&n.to_le_bytes());
+                        }
                         Value::Text(s) => {
                             arr_buf.push(4);
                             let b = s.as_bytes();
@@ -114,7 +136,11 @@ pub fn serialize_row(row: &Row, col_types: &[DataType]) -> Vec<u8> {
                     buf.extend_from_slice(&f.to_le_bytes());
                 }
             }
-            Value::Interval { months, days, microseconds } => {
+            Value::Interval {
+                months,
+                days,
+                microseconds,
+            } => {
                 buf.extend_from_slice(&months.to_le_bytes());
                 buf.extend_from_slice(&days.to_le_bytes());
                 buf.extend_from_slice(&microseconds.to_le_bytes());
@@ -157,7 +183,8 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 if pos + 4 > data.len() {
                     return None;
                 }
-                let n = i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                let n =
+                    i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
                 row.push(Value::Int32(n));
                 pos += 4;
             }
@@ -166,8 +193,14 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                     return None;
                 }
                 let n = i64::from_le_bytes([
-                    data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                    data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
+                    data[pos + 5],
+                    data[pos + 6],
+                    data[pos + 7],
                 ]);
                 row.push(Value::Int64(n));
                 pos += 8;
@@ -177,8 +210,14 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                     return None;
                 }
                 let n = f64::from_le_bytes([
-                    data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                    data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
+                    data[pos + 5],
+                    data[pos + 6],
+                    data[pos + 7],
                 ]);
                 row.push(Value::Float64(n));
                 pos += 8;
@@ -187,7 +226,9 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 if pos + 4 > data.len() {
                     return None;
                 }
-                let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+                let len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
                 if pos + len > data.len() {
                     return None;
@@ -200,7 +241,9 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 if pos + 4 > data.len() {
                     return None;
                 }
-                let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+                let len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
                 if pos + len > data.len() {
                     return None;
@@ -213,7 +256,8 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 if pos + 4 > data.len() {
                     return None;
                 }
-                let d = i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                let d =
+                    i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
                 row.push(Value::Date(d));
                 pos += 4;
             }
@@ -222,8 +266,14 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                     return None;
                 }
                 let us = i64::from_le_bytes([
-                    data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                    data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
+                    data[pos + 5],
+                    data[pos + 6],
+                    data[pos + 7],
                 ]);
                 row.push(Value::Timestamp(us));
                 pos += 8;
@@ -233,8 +283,14 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                     return None;
                 }
                 let us = i64::from_le_bytes([
-                    data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                    data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
+                    data[pos + 5],
+                    data[pos + 6],
+                    data[pos + 7],
                 ]);
                 row.push(Value::TimestampTz(us));
                 pos += 8;
@@ -243,7 +299,9 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 if pos + 4 > data.len() {
                     return None;
                 }
-                let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+                let len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
                 if pos + len > data.len() {
                     return None;
@@ -265,7 +323,9 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 if pos + 4 > data.len() {
                     return None;
                 }
-                let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+                let len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
                 if pos + len > data.len() {
                     return None;
@@ -278,7 +338,9 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 if pos + 4 > data.len() {
                     return None;
                 }
-                let total_len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+                let total_len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
                 if pos + total_len > data.len() {
                     return None;
@@ -288,7 +350,9 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 if pos + 4 > arr_end {
                     return None;
                 }
-                let elem_count = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+                let elem_count =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
                 let mut elems = Vec::with_capacity(elem_count);
                 for _ in 0..elem_count {
@@ -298,45 +362,85 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                     let tag = data[pos];
                     pos += 1;
                     match tag {
-                        0 => { // Bool
-                            if pos >= arr_end { return None; }
+                        0 => {
+                            // Bool
+                            if pos >= arr_end {
+                                return None;
+                            }
                             elems.push(Value::Bool(data[pos] != 0));
                             pos += 1;
                         }
-                        1 => { // Int32
-                            if pos + 4 > arr_end { return None; }
-                            let n = i32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+                        1 => {
+                            // Int32
+                            if pos + 4 > arr_end {
+                                return None;
+                            }
+                            let n = i32::from_le_bytes([
+                                data[pos],
+                                data[pos + 1],
+                                data[pos + 2],
+                                data[pos + 3],
+                            ]);
                             elems.push(Value::Int32(n));
                             pos += 4;
                         }
-                        2 => { // Int64
-                            if pos + 8 > arr_end { return None; }
+                        2 => {
+                            // Int64
+                            if pos + 8 > arr_end {
+                                return None;
+                            }
                             let n = i64::from_le_bytes([
-                                data[pos], data[pos+1], data[pos+2], data[pos+3],
-                                data[pos+4], data[pos+5], data[pos+6], data[pos+7],
+                                data[pos],
+                                data[pos + 1],
+                                data[pos + 2],
+                                data[pos + 3],
+                                data[pos + 4],
+                                data[pos + 5],
+                                data[pos + 6],
+                                data[pos + 7],
                             ]);
                             elems.push(Value::Int64(n));
                             pos += 8;
                         }
-                        3 => { // Float64
-                            if pos + 8 > arr_end { return None; }
+                        3 => {
+                            // Float64
+                            if pos + 8 > arr_end {
+                                return None;
+                            }
                             let n = f64::from_le_bytes([
-                                data[pos], data[pos+1], data[pos+2], data[pos+3],
-                                data[pos+4], data[pos+5], data[pos+6], data[pos+7],
+                                data[pos],
+                                data[pos + 1],
+                                data[pos + 2],
+                                data[pos + 3],
+                                data[pos + 4],
+                                data[pos + 5],
+                                data[pos + 6],
+                                data[pos + 7],
                             ]);
                             elems.push(Value::Float64(n));
                             pos += 8;
                         }
-                        4 => { // Text
-                            if pos + 4 > arr_end { return None; }
-                            let slen = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+                        4 => {
+                            // Text
+                            if pos + 4 > arr_end {
+                                return None;
+                            }
+                            let slen = u32::from_le_bytes([
+                                data[pos],
+                                data[pos + 1],
+                                data[pos + 2],
+                                data[pos + 3],
+                            ]) as usize;
                             pos += 4;
-                            if pos + slen > arr_end { return None; }
+                            if pos + slen > arr_end {
+                                return None;
+                            }
                             let s = std::str::from_utf8(&data[pos..pos + slen]).ok()?;
                             elems.push(Value::Text(s.to_string()));
                             pos += slen;
                         }
-                        5 => { // Null
+                        5 => {
+                            // Null
                             elems.push(Value::Null);
                         }
                         _ => return None, // Unknown tag
@@ -350,14 +454,21 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 if pos + 4 > data.len() {
                     return None;
                 }
-                let count = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+                let count =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
                 if count != *dim || pos + count * 4 > data.len() {
                     return None;
                 }
                 let mut vec = Vec::with_capacity(count);
                 for _ in 0..count {
-                    let f = f32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                    let f = f32::from_le_bytes([
+                        data[pos],
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                    ]);
                     vec.push(f);
                     pos += 4;
                 }
@@ -367,24 +478,42 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                 if pos + 16 > data.len() {
                     return None;
                 }
-                let months = i32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+                let months =
+                    i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
                 pos += 4;
-                let days = i32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+                let days =
+                    i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
                 pos += 4;
                 let microseconds = i64::from_le_bytes([
-                    data[pos], data[pos+1], data[pos+2], data[pos+3],
-                    data[pos+4], data[pos+5], data[pos+6], data[pos+7],
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                    data[pos + 4],
+                    data[pos + 5],
+                    data[pos + 6],
+                    data[pos + 7],
                 ]);
                 pos += 8;
-                row.push(Value::Interval { months, days, microseconds });
+                row.push(Value::Interval {
+                    months,
+                    days,
+                    microseconds,
+                });
             }
             DataType::UserDefined(_) => {
                 // Enum values stored as length-prefixed UTF-8, same as Text.
-                if pos + 4 > data.len() { return None; }
-                let len = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+                if pos + 4 > data.len() {
+                    return None;
+                }
+                let len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
-                if pos + len > data.len() { return None; }
-                let s = std::str::from_utf8(&data[pos..pos+len]).ok()?.to_string();
+                if pos + len > data.len() {
+                    return None;
+                }
+                let s = std::str::from_utf8(&data[pos..pos + len]).ok()?.to_string();
                 pos += len;
                 row.push(Value::Text(s));
             }
@@ -402,50 +531,81 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
 fn column_byte_size(data: &[u8], pos: usize, dtype: &DataType) -> Option<usize> {
     match dtype {
         DataType::Bool => {
-            if pos >= data.len() { return None; }
+            if pos >= data.len() {
+                return None;
+            }
             Some(1)
         }
         DataType::Int32 | DataType::Date => {
-            if pos + 4 > data.len() { return None; }
+            if pos + 4 > data.len() {
+                return None;
+            }
             Some(4)
         }
         DataType::Int64 | DataType::Float64 | DataType::Timestamp | DataType::TimestampTz => {
-            if pos + 8 > data.len() { return None; }
+            if pos + 8 > data.len() {
+                return None;
+            }
             Some(8)
         }
         DataType::Text | DataType::Numeric | DataType::Bytea | DataType::UserDefined(_) => {
-            if pos + 4 > data.len() { return None; }
-            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-            if pos + 4 + len > data.len() { return None; }
+            if pos + 4 > data.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                as usize;
+            if pos + 4 + len > data.len() {
+                return None;
+            }
             Some(4 + len)
         }
         DataType::Jsonb => {
-            if pos + 4 > data.len() { return None; }
-            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-            if pos + 4 + len > data.len() { return None; }
+            if pos + 4 > data.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                as usize;
+            if pos + 4 + len > data.len() {
+                return None;
+            }
             Some(4 + len)
         }
         DataType::Uuid => {
-            if pos + 16 > data.len() { return None; }
+            if pos + 16 > data.len() {
+                return None;
+            }
             Some(16)
         }
         DataType::Array(_) => {
             // Format: [total_len: u32] [array_data: total_len bytes]
-            if pos + 4 > data.len() { return None; }
-            let total_len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-            if pos + 4 + total_len > data.len() { return None; }
+            if pos + 4 > data.len() {
+                return None;
+            }
+            let total_len =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                    as usize;
+            if pos + 4 + total_len > data.len() {
+                return None;
+            }
             Some(4 + total_len)
         }
         DataType::Vector(dim) => {
             // Format: [count: u32] [count * f32]
-            if pos + 4 > data.len() { return None; }
-            let count = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-            if count != *dim || pos + 4 + count * 4 > data.len() { return None; }
+            if pos + 4 > data.len() {
+                return None;
+            }
+            let count = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                as usize;
+            if count != *dim || pos + 4 + count * 4 > data.len() {
+                return None;
+            }
             Some(4 + count * 4)
         }
         DataType::Interval => {
             // months(i32) + days(i32) + microseconds(i64) = 16 bytes
-            if pos + 16 > data.len() { return None; }
+            if pos + 16 > data.len() {
+                return None;
+            }
             Some(16)
         }
     }
@@ -534,138 +694,244 @@ pub fn deserialize_row_projected(
 fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> {
     match dtype {
         DataType::Bool => {
-            if pos >= data.len() { return None; }
+            if pos >= data.len() {
+                return None;
+            }
             Some(Value::Bool(data[pos] != 0))
         }
         DataType::Int32 => {
-            if pos + 4 > data.len() { return None; }
+            if pos + 4 > data.len() {
+                return None;
+            }
             let n = i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
             Some(Value::Int32(n))
         }
         DataType::Int64 => {
-            if pos + 8 > data.len() { return None; }
+            if pos + 8 > data.len() {
+                return None;
+            }
             let n = i64::from_le_bytes([
-                data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
             ]);
             Some(Value::Int64(n))
         }
         DataType::Float64 => {
-            if pos + 8 > data.len() { return None; }
+            if pos + 8 > data.len() {
+                return None;
+            }
             let n = f64::from_le_bytes([
-                data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
             ]);
             Some(Value::Float64(n))
         }
         DataType::Text => {
-            if pos + 4 > data.len() { return None; }
-            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+            if pos + 4 > data.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                as usize;
             let start = pos + 4;
-            if start + len > data.len() { return None; }
+            if start + len > data.len() {
+                return None;
+            }
             let s = std::str::from_utf8(&data[start..start + len]).ok()?;
             Some(Value::Text(s.to_string()))
         }
         DataType::Jsonb => {
-            if pos + 4 > data.len() { return None; }
-            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+            if pos + 4 > data.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                as usize;
             let start = pos + 4;
-            if start + len > data.len() { return None; }
+            if start + len > data.len() {
+                return None;
+            }
             let v: serde_json::Value = serde_json::from_slice(&data[start..start + len]).ok()?;
             Some(Value::Jsonb(v))
         }
         DataType::Date => {
-            if pos + 4 > data.len() { return None; }
+            if pos + 4 > data.len() {
+                return None;
+            }
             let d = i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
             Some(Value::Date(d))
         }
         DataType::Timestamp => {
-            if pos + 8 > data.len() { return None; }
+            if pos + 8 > data.len() {
+                return None;
+            }
             let us = i64::from_le_bytes([
-                data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
             ]);
             Some(Value::Timestamp(us))
         }
         DataType::TimestampTz => {
-            if pos + 8 > data.len() { return None; }
+            if pos + 8 > data.len() {
+                return None;
+            }
             let us = i64::from_le_bytes([
-                data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
             ]);
             Some(Value::TimestampTz(us))
         }
         DataType::Numeric => {
-            if pos + 4 > data.len() { return None; }
-            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+            if pos + 4 > data.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                as usize;
             let start = pos + 4;
-            if start + len > data.len() { return None; }
+            if start + len > data.len() {
+                return None;
+            }
             let s = std::str::from_utf8(&data[start..start + len]).ok()?;
             Some(Value::Numeric(s.to_string()))
         }
         DataType::Uuid => {
-            if pos + 16 > data.len() { return None; }
+            if pos + 16 > data.len() {
+                return None;
+            }
             let mut b = [0u8; 16];
             b.copy_from_slice(&data[pos..pos + 16]);
             Some(Value::Uuid(b))
         }
         DataType::Bytea => {
-            if pos + 4 > data.len() { return None; }
-            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+            if pos + 4 > data.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                as usize;
             let start = pos + 4;
-            if start + len > data.len() { return None; }
+            if start + len > data.len() {
+                return None;
+            }
             Some(Value::Bytea(data[start..start + len].to_vec()))
         }
         DataType::Array(_) => {
-            if pos + 4 > data.len() { return None; }
-            let total_len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+            if pos + 4 > data.len() {
+                return None;
+            }
+            let total_len =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                    as usize;
             let arr_start = pos + 4;
-            if arr_start + total_len > data.len() { return None; }
+            if arr_start + total_len > data.len() {
+                return None;
+            }
             let arr_end = arr_start + total_len;
             let mut apos = arr_start;
-            if apos + 4 > arr_end { return None; }
-            let elem_count = u32::from_le_bytes([data[apos], data[apos + 1], data[apos + 2], data[apos + 3]]) as usize;
+            if apos + 4 > arr_end {
+                return None;
+            }
+            let elem_count =
+                u32::from_le_bytes([data[apos], data[apos + 1], data[apos + 2], data[apos + 3]])
+                    as usize;
             apos += 4;
             let mut elems = Vec::with_capacity(elem_count);
             for _ in 0..elem_count {
-                if apos >= arr_end { return None; }
+                if apos >= arr_end {
+                    return None;
+                }
                 let tag = data[apos];
                 apos += 1;
                 match tag {
                     0 => {
-                        if apos >= arr_end { return None; }
+                        if apos >= arr_end {
+                            return None;
+                        }
                         elems.push(Value::Bool(data[apos] != 0));
                         apos += 1;
                     }
                     1 => {
-                        if apos + 4 > arr_end { return None; }
-                        let n = i32::from_le_bytes([data[apos], data[apos+1], data[apos+2], data[apos+3]]);
+                        if apos + 4 > arr_end {
+                            return None;
+                        }
+                        let n = i32::from_le_bytes([
+                            data[apos],
+                            data[apos + 1],
+                            data[apos + 2],
+                            data[apos + 3],
+                        ]);
                         elems.push(Value::Int32(n));
                         apos += 4;
                     }
                     2 => {
-                        if apos + 8 > arr_end { return None; }
+                        if apos + 8 > arr_end {
+                            return None;
+                        }
                         let n = i64::from_le_bytes([
-                            data[apos], data[apos+1], data[apos+2], data[apos+3],
-                            data[apos+4], data[apos+5], data[apos+6], data[apos+7],
+                            data[apos],
+                            data[apos + 1],
+                            data[apos + 2],
+                            data[apos + 3],
+                            data[apos + 4],
+                            data[apos + 5],
+                            data[apos + 6],
+                            data[apos + 7],
                         ]);
                         elems.push(Value::Int64(n));
                         apos += 8;
                     }
                     3 => {
-                        if apos + 8 > arr_end { return None; }
+                        if apos + 8 > arr_end {
+                            return None;
+                        }
                         let n = f64::from_le_bytes([
-                            data[apos], data[apos+1], data[apos+2], data[apos+3],
-                            data[apos+4], data[apos+5], data[apos+6], data[apos+7],
+                            data[apos],
+                            data[apos + 1],
+                            data[apos + 2],
+                            data[apos + 3],
+                            data[apos + 4],
+                            data[apos + 5],
+                            data[apos + 6],
+                            data[apos + 7],
                         ]);
                         elems.push(Value::Float64(n));
                         apos += 8;
                     }
                     4 => {
-                        if apos + 4 > arr_end { return None; }
-                        let slen = u32::from_le_bytes([data[apos], data[apos+1], data[apos+2], data[apos+3]]) as usize;
+                        if apos + 4 > arr_end {
+                            return None;
+                        }
+                        let slen = u32::from_le_bytes([
+                            data[apos],
+                            data[apos + 1],
+                            data[apos + 2],
+                            data[apos + 3],
+                        ]) as usize;
                         apos += 4;
-                        if apos + slen > arr_end { return None; }
+                        if apos + slen > arr_end {
+                            return None;
+                        }
                         let s = std::str::from_utf8(&data[apos..apos + slen]).ok()?;
                         elems.push(Value::Text(s.to_string()));
                         apos += slen;
@@ -679,35 +945,66 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
             Some(Value::Array(elems))
         }
         DataType::Vector(dim) => {
-            if pos + 4 > data.len() { return None; }
-            let count = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+            if pos + 4 > data.len() {
+                return None;
+            }
+            let count = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                as usize;
             let start = pos + 4;
-            if count != *dim || start + count * 4 > data.len() { return None; }
+            if count != *dim || start + count * 4 > data.len() {
+                return None;
+            }
             let mut vec = Vec::with_capacity(count);
             let mut fpos = start;
             for _ in 0..count {
-                let f = f32::from_le_bytes([data[fpos], data[fpos + 1], data[fpos + 2], data[fpos + 3]]);
+                let f = f32::from_le_bytes([
+                    data[fpos],
+                    data[fpos + 1],
+                    data[fpos + 2],
+                    data[fpos + 3],
+                ]);
                 vec.push(f);
                 fpos += 4;
             }
             Some(Value::Vector(vec))
         }
         DataType::Interval => {
-            if pos + 16 > data.len() { return None; }
-            let months = i32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
-            let days = i32::from_le_bytes([data[pos+4], data[pos+5], data[pos+6], data[pos+7]]);
+            if pos + 16 > data.len() {
+                return None;
+            }
+            let months =
+                i32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            let days =
+                i32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
             let microseconds = i64::from_le_bytes([
-                data[pos+8], data[pos+9], data[pos+10], data[pos+11],
-                data[pos+12], data[pos+13], data[pos+14], data[pos+15],
+                data[pos + 8],
+                data[pos + 9],
+                data[pos + 10],
+                data[pos + 11],
+                data[pos + 12],
+                data[pos + 13],
+                data[pos + 14],
+                data[pos + 15],
             ]);
-            Some(Value::Interval { months, days, microseconds })
+            Some(Value::Interval {
+                months,
+                days,
+                microseconds,
+            })
         }
         DataType::UserDefined(_) => {
-            if pos + 4 > data.len() { return None; }
-            let len = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]) as usize;
+            if pos + 4 > data.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                as usize;
             let start = pos + 4;
-            if start + len > data.len() { return None; }
-            let s = std::str::from_utf8(&data[start..start + len]).ok()?.to_string();
+            if start + len > data.len() {
+                return None;
+            }
+            let s = std::str::from_utf8(&data[start..start + len])
+                .ok()?
+                .to_string();
             Some(Value::Text(s))
         }
     }
@@ -715,6 +1012,8 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
 
     #[test]
@@ -828,11 +1127,11 @@ mod tests {
             DataType::Jsonb,
         ];
         let row = vec![
-            Value::Date(18000),  // some date
+            Value::Date(18000), // some date
             Value::Timestamp(1700000000000000),
             Value::TimestampTz(1700000000000000),
             Value::Numeric("3.14159".into()),
-            Value::Uuid([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]),
+            Value::Uuid([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
             Value::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF]),
             Value::Jsonb(serde_json::json!({"key": "value", "num": 42})),
         ];
@@ -864,7 +1163,12 @@ mod tests {
 
     #[test]
     fn projected_subset_columns() {
-        let types = vec![DataType::Int32, DataType::Text, DataType::Bool, DataType::Float64];
+        let types = vec![
+            DataType::Int32,
+            DataType::Text,
+            DataType::Bool,
+            DataType::Float64,
+        ];
         let row = vec![
             Value::Int32(42),
             Value::Text("hello".into()),
@@ -971,7 +1275,7 @@ mod tests {
             Value::Timestamp(1700000000000000),
             Value::TimestampTz(1700000000000000),
             Value::Numeric("3.14159".into()),
-            Value::Uuid([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]),
+            Value::Uuid([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
             Value::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF]),
             Value::Jsonb(serde_json::json!({"key": "value"})),
         ];
@@ -980,9 +1284,15 @@ mod tests {
         // Project a mix: Uuid (col 4), Date (col 0), Jsonb (col 6)
         let projected = deserialize_row_projected(&bytes, &types, &[4, 0, 6]).unwrap();
         assert_eq!(projected.len(), 3);
-        assert_eq!(projected[0], Value::Uuid([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]));
+        assert_eq!(
+            projected[0],
+            Value::Uuid([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+        );
         assert_eq!(projected[1], Value::Date(18000));
-        assert_eq!(projected[2], Value::Jsonb(serde_json::json!({"key": "value"})));
+        assert_eq!(
+            projected[2],
+            Value::Jsonb(serde_json::json!({"key": "value"}))
+        );
     }
 
     #[test]
@@ -1006,7 +1316,11 @@ mod tests {
         let row = vec![
             Value::Int32(1),
             Value::Vector(vec![1.0, 2.0, 3.0]),
-            Value::Interval { months: 1, days: 2, microseconds: 3000 },
+            Value::Interval {
+                months: 1,
+                days: 2,
+                microseconds: 3000,
+            },
             Value::Bool(false),
         ];
         let bytes = serialize_row(&row, &types);

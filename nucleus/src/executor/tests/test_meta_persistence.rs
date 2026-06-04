@@ -4,15 +4,15 @@
 //! constructing a new one from the same directory.  Metadata (views, sequences,
 //! triggers, roles, functions) must survive that cycle.
 
-use std::sync::Arc;
 use std::path::Path;
+use std::sync::Arc;
 
-use crate::catalog::Catalog;
-use crate::storage::{StorageEngine, DiskEngine};
-use crate::storage::persistence::CatalogPersistence;
-use crate::types::Value;
 use super::super::Executor;
 use super::{exec, rows, scalar};
+use crate::catalog::Catalog;
+use crate::storage::persistence::CatalogPersistence;
+use crate::storage::{DiskEngine, StorageEngine};
+use crate::types::Value;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -49,7 +49,11 @@ async fn test_view_survives_restart() {
         let ex = open_executor(dir.path()).await;
         exec(&ex, "CREATE TABLE products (id INT, price FLOAT)").await;
         exec(&ex, "INSERT INTO products VALUES (1, 9.99), (2, 19.99)").await;
-        exec(&ex, "CREATE VIEW cheap_products AS SELECT * FROM products WHERE price < 15.0").await;
+        exec(
+            &ex,
+            "CREATE VIEW cheap_products AS SELECT * FROM products WHERE price < 15.0",
+        )
+        .await;
         // Verify it works now
         let r = exec(&ex, "SELECT * FROM cheap_products").await;
         assert_eq!(rows(&r[0]).len(), 1);
@@ -59,7 +63,11 @@ async fn test_view_survives_restart() {
     {
         let ex = open_executor(dir.path()).await;
         let r = exec(&ex, "SELECT * FROM cheap_products").await;
-        assert_eq!(rows(&r[0]).len(), 1, "view definition should survive restart");
+        assert_eq!(
+            rows(&r[0]).len(),
+            1,
+            "view definition should survive restart"
+        );
         assert_eq!(rows(&r[0])[0][0], Value::Int32(1));
     }
 }
@@ -96,8 +104,8 @@ async fn test_sequence_survives_restart() {
         let ex = open_executor(dir.path()).await;
         exec(&ex, "CREATE SEQUENCE counter INCREMENT BY 5 START WITH 10").await;
         // Advance the sequence a few times
-        exec(&ex, "SELECT nextval('counter')").await;  // → 10
-        exec(&ex, "SELECT nextval('counter')").await;  // → 15
+        exec(&ex, "SELECT nextval('counter')").await; // → 10
+        exec(&ex, "SELECT nextval('counter')").await; // → 15
     }
 
     {
@@ -106,7 +114,11 @@ async fn test_sequence_survives_restart() {
         let r = exec(&ex, "SELECT nextval('counter')").await;
         let v = scalar(&r[0]);
         // After two calls (10→15), next should be 20
-        assert_eq!(*v, Value::Int64(20), "sequence should resume from persisted value");
+        assert_eq!(
+            *v,
+            Value::Int64(20),
+            "sequence should resume from persisted value"
+        );
     }
 }
 
@@ -117,16 +129,20 @@ async fn test_sequence_currval_after_restart() {
     {
         let ex = open_executor(dir.path()).await;
         exec(&ex, "CREATE SEQUENCE myseq INCREMENT BY 1 START WITH 1").await;
-        exec(&ex, "SELECT nextval('myseq')").await;  // → 1
-        exec(&ex, "SELECT nextval('myseq')").await;  // → 2
-        exec(&ex, "SELECT nextval('myseq')").await;  // → 3
+        exec(&ex, "SELECT nextval('myseq')").await; // → 1
+        exec(&ex, "SELECT nextval('myseq')").await; // → 2
+        exec(&ex, "SELECT nextval('myseq')").await; // → 3
     }
 
     {
         let ex = open_executor(dir.path()).await;
         // Next call should yield 4
         let r = exec(&ex, "SELECT nextval('myseq')").await;
-        assert_eq!(*scalar(&r[0]), Value::Int64(4), "sequence value should continue from 3");
+        assert_eq!(
+            *scalar(&r[0]),
+            Value::Int64(4),
+            "sequence value should continue from 3"
+        );
     }
 }
 
@@ -138,7 +154,11 @@ async fn test_function_survives_restart() {
 
     {
         let ex = open_executor(dir.path()).await;
-        exec(&ex, "CREATE FUNCTION add_ten(n INT) RETURNS INT LANGUAGE SQL AS $$ SELECT $1 + 10 $$").await;
+        exec(
+            &ex,
+            "CREATE FUNCTION add_ten(n INT) RETURNS INT LANGUAGE SQL AS $$ SELECT $1 + 10 $$",
+        )
+        .await;
         let r = exec(&ex, "SELECT add_ten(5)").await;
         assert_eq!(*scalar(&r[0]), Value::Int32(15));
     }
@@ -146,7 +166,11 @@ async fn test_function_survives_restart() {
     {
         let ex = open_executor(dir.path()).await;
         let r = exec(&ex, "SELECT add_ten(5)").await;
-        assert_eq!(*scalar(&r[0]), Value::Int32(15), "function should survive restart");
+        assert_eq!(
+            *scalar(&r[0]),
+            Value::Int32(15),
+            "function should survive restart"
+        );
     }
 }
 
@@ -190,7 +214,8 @@ async fn test_role_survives_restart() {
         let ex = open_executor(dir.path()).await;
         // Verify the role still exists by querying pg_roles / information_schema
         let r = exec(&ex, "SELECT rolname FROM pg_catalog.pg_roles").await;
-        let role_names: Vec<String> = rows(&r[0]).iter()
+        let role_names: Vec<String> = rows(&r[0])
+            .iter()
             .filter_map(|row| match &row[0] {
                 Value::Text(s) => Some(s.clone()),
                 _ => None,
@@ -212,10 +237,22 @@ async fn test_all_metadata_survives_restart() {
     {
         let ex = open_executor(dir.path()).await;
         exec(&ex, "CREATE TABLE items (id INT, name TEXT, price FLOAT)").await;
-        exec(&ex, "INSERT INTO items VALUES (1, 'apple', 1.5), (2, 'banana', 0.5), (3, 'cherry', 3.0)").await;
-        exec(&ex, "CREATE VIEW affordable AS SELECT name FROM items WHERE price < 2.0").await;
-        exec(&ex, "CREATE SEQUENCE item_seq INCREMENT BY 10 START WITH 100").await;
-        exec(&ex, "SELECT nextval('item_seq')").await;  // advance to 100
+        exec(
+            &ex,
+            "INSERT INTO items VALUES (1, 'apple', 1.5), (2, 'banana', 0.5), (3, 'cherry', 3.0)",
+        )
+        .await;
+        exec(
+            &ex,
+            "CREATE VIEW affordable AS SELECT name FROM items WHERE price < 2.0",
+        )
+        .await;
+        exec(
+            &ex,
+            "CREATE SEQUENCE item_seq INCREMENT BY 10 START WITH 100",
+        )
+        .await;
+        exec(&ex, "SELECT nextval('item_seq')").await; // advance to 100
         exec(&ex, "CREATE FUNCTION double_price(p FLOAT) RETURNS FLOAT LANGUAGE SQL AS $$ SELECT $1 * 2.0 $$").await;
         exec(&ex, "CREATE ROLE shopper WITH LOGIN").await;
         exec(&ex, "GRANT SELECT ON items TO shopper").await;
@@ -226,21 +263,40 @@ async fn test_all_metadata_survives_restart() {
 
         // View works (rows persisted by DiskEngine, view definition by meta.json)
         let r = exec(&ex, "SELECT * FROM affordable").await;
-        assert_eq!(rows(&r[0]).len(), 2, "view should return 2 affordable items");
+        assert_eq!(
+            rows(&r[0]).len(),
+            2,
+            "view should return 2 affordable items"
+        );
 
         // Sequence resumes
         let r = exec(&ex, "SELECT nextval('item_seq')").await;
-        assert_eq!(*scalar(&r[0]), Value::Int64(110), "sequence should resume at 110");
+        assert_eq!(
+            *scalar(&r[0]),
+            Value::Int64(110),
+            "sequence should resume at 110"
+        );
 
         // Function works
         let r = exec(&ex, "SELECT double_price(5.0)").await;
-        assert_eq!(*scalar(&r[0]), Value::Float64(10.0), "function should still work");
+        assert_eq!(
+            *scalar(&r[0]),
+            Value::Float64(10.0),
+            "function should still work"
+        );
 
         // Role exists
         let r = exec(&ex, "SELECT rolname FROM pg_catalog.pg_roles").await;
-        let names: Vec<String> = rows(&r[0]).iter()
-            .filter_map(|row| match &row[0] { Value::Text(s) => Some(s.clone()), _ => None })
+        let names: Vec<String> = rows(&r[0])
+            .iter()
+            .filter_map(|row| match &row[0] {
+                Value::Text(s) => Some(s.clone()),
+                _ => None,
+            })
             .collect();
-        assert!(names.iter().any(|n| n == "shopper"), "role 'shopper' should survive");
+        assert!(
+            names.iter().any(|n| n == "shopper"),
+            "role 'shopper' should survive"
+        );
     }
 }

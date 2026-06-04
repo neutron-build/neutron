@@ -226,13 +226,14 @@ impl EncryptedIndex {
     pub fn remove(&mut self, plaintext: &[u8], row_id: u64) -> bool {
         let encrypted = self.encrypt_value(plaintext);
         if let Some(ids) = self.entries.get_mut(&encrypted)
-            && let Some(pos) = ids.iter().position(|&id| id == row_id) {
-                ids.remove(pos);
-                if ids.is_empty() {
-                    self.entries.remove(&encrypted);
-                }
-                return true;
+            && let Some(pos) = ids.iter().position(|&id| id == row_id)
+        {
+            ids.remove(pos);
+            if ids.is_empty() {
+                self.entries.remove(&encrypted);
             }
+            return true;
+        }
         false
     }
 
@@ -297,7 +298,10 @@ mod tests {
 
         let c1 = idx.encrypt_value(b"hello");
         let c2 = idx.encrypt_value(b"hello");
-        assert_eq!(c1, c2, "deterministic mode must produce identical ciphertext");
+        assert_eq!(
+            c1, c2,
+            "deterministic mode must produce identical ciphertext"
+        );
 
         // Different plaintext must produce different ciphertext.
         let c3 = idx.encrypt_value(b"world");
@@ -343,13 +347,19 @@ mod tests {
 
         let c1 = idx.encrypt_value(b"same");
         let c2 = idx.encrypt_value(b"same");
-        assert_ne!(c1, c2, "randomized mode must produce different ciphertext each time");
+        assert_ne!(
+            c1, c2,
+            "randomized mode must produce different ciphertext each time"
+        );
 
         // Equality lookup should therefore return nothing (no deterministic match).
         let mut ridx = EncryptedIndex::new(test_key(), EncryptionMode::Randomized);
         ridx.insert(b"data", 100);
         let result = ridx.lookup_equal(b"data");
-        assert!(result.is_empty(), "randomized mode should not support equality lookup");
+        assert!(
+            result.is_empty(),
+            "randomized mode should not support equality lookup"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -430,7 +440,8 @@ mod tests {
         // obscured payload — they must differ from the original plaintext.
         let payload = &encrypted[8..];
         assert_ne!(
-            payload, plaintext.as_slice(),
+            payload,
+            plaintext.as_slice(),
             "order-preserving mode must not store plaintext bytes directly"
         );
     }

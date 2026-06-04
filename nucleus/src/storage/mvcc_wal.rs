@@ -102,10 +102,7 @@ impl MvccWal {
         } else {
             MvccWalState::default()
         };
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok((
             Self {
                 path,
@@ -184,13 +181,22 @@ fn encode_record(rec: &MvccWalRecord) -> Vec<u8> {
             write_u64(&mut buf, *txn_id);
             write_row(&mut buf, row);
         }
-        MvccWalRecord::Delete { table, txn_id, row_idx } => {
+        MvccWalRecord::Delete {
+            table,
+            txn_id,
+            row_idx,
+        } => {
             buf.push(TAG_DELETE);
             write_str(&mut buf, table);
             write_u64(&mut buf, *txn_id);
             write_u32(&mut buf, *row_idx);
         }
-        MvccWalRecord::Update { table, txn_id, row_idx, new_row } => {
+        MvccWalRecord::Update {
+            table,
+            txn_id,
+            row_idx,
+            new_row,
+        } => {
             buf.push(TAG_UPDATE);
             write_str(&mut buf, table);
             write_u64(&mut buf, *txn_id);
@@ -294,7 +300,11 @@ fn write_value(buf: &mut Vec<u8>, val: &Value) {
                 buf.extend_from_slice(&f.to_le_bytes());
             }
         }
-        Value::Interval { months, days, microseconds } => {
+        Value::Interval {
+            months,
+            days,
+            microseconds,
+        } => {
             buf.push(VAL_INTERVAL);
             buf.extend_from_slice(&months.to_le_bytes());
             buf.extend_from_slice(&days.to_le_bytes());
@@ -345,7 +355,9 @@ fn read_value(data: &[u8], pos: &mut usize) -> Option<Value> {
         }
         VAL_BYTEA => {
             let len = read_u32_val(data, pos)? as usize;
-            if *pos + len > data.len() { return None; }
+            if *pos + len > data.len() {
+                return None;
+            }
             let b = data[*pos..*pos + len].to_vec();
             *pos += len;
             Some(Value::Bytea(b))
@@ -388,7 +400,9 @@ fn read_value(data: &[u8], pos: &mut usize) -> Option<Value> {
         VAL_VECTOR => {
             let count = read_u32_val(data, pos)? as usize;
             let byte_len = count * 4;
-            if *pos + byte_len > data.len() { return None; }
+            if *pos + byte_len > data.len() {
+                return None;
+            }
             let mut v = Vec::with_capacity(count);
             for _ in 0..count {
                 let b = data.get(*pos..*pos + 4)?;
@@ -406,10 +420,13 @@ fn read_value(data: &[u8], pos: &mut usize) -> Option<Value> {
             let days = i32::from_le_bytes([db[0], db[1], db[2], db[3]]);
             let ub = data.get(*pos..*pos + 8)?;
             *pos += 8;
-            let microseconds = i64::from_le_bytes([
-                ub[0], ub[1], ub[2], ub[3], ub[4], ub[5], ub[6], ub[7],
-            ]);
-            Some(Value::Interval { months, days, microseconds })
+            let microseconds =
+                i64::from_le_bytes([ub[0], ub[1], ub[2], ub[3], ub[4], ub[5], ub[6], ub[7]]);
+            Some(Value::Interval {
+                months,
+                days,
+                microseconds,
+            })
         }
         VAL_ARRAY => {
             let count = read_u32_val(data, pos)? as usize;
@@ -441,9 +458,15 @@ fn read_row(data: &[u8], pos: &mut usize) -> Option<Vec<Value>> {
 
 // ── Primitive helpers ────────────────────────────────────────────────────────
 
-fn write_u8(buf: &mut Vec<u8>, v: u8) { buf.push(v); }
-fn write_u32(buf: &mut Vec<u8>, v: u32) { buf.extend_from_slice(&v.to_le_bytes()); }
-fn write_u64(buf: &mut Vec<u8>, v: u64) { buf.extend_from_slice(&v.to_le_bytes()); }
+fn write_u8(buf: &mut Vec<u8>, v: u8) {
+    buf.push(v);
+}
+fn write_u32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+fn write_u64(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
 fn write_str(buf: &mut Vec<u8>, s: &str) {
     let b = s.as_bytes();
     write_u32(buf, b.len() as u32);
@@ -466,8 +489,12 @@ fn read_u64_val(data: &[u8], pos: &mut usize) -> Option<u64> {
 
 fn read_str(data: &[u8], pos: &mut usize) -> Option<String> {
     let len = read_u32_val(data, pos)? as usize;
-    if *pos + len > data.len() { return None; }
-    let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+    if *pos + len > data.len() {
+        return None;
+    }
+    let s = std::str::from_utf8(&data[*pos..*pos + len])
+        .ok()?
+        .to_string();
     *pos += len;
     Some(s)
 }
@@ -540,19 +567,21 @@ fn replay(data: &[u8]) -> MvccWalState {
 
     // Phase 1: Parse all records
     while pos + 4 <= data.len() {
-        let len = u32::from_le_bytes([
-            data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-        ]) as usize;
+        let len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
-        if pos + len + 4 > data.len() { break; } // truncated
+        if pos + len + 4 > data.len() {
+            break;
+        } // truncated
         let payload = &data[pos..pos + len];
         pos += len;
-        let stored_crc = u32::from_le_bytes([
-            data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-        ]);
+        let stored_crc =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
         pos += 4;
         let computed_crc = crc32c(payload);
-        if stored_crc != computed_crc { break; } // corrupt
+        if stored_crc != computed_crc {
+            break;
+        } // corrupt
 
         if let Some(rec) = decode_record(payload) {
             records.push(rec);
@@ -566,8 +595,12 @@ fn replay(data: &[u8]) -> MvccWalState {
     let mut aborted: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for rec in &records {
         match rec {
-            MvccWalRecord::Commit { txn_id } => { committed.insert(*txn_id); }
-            MvccWalRecord::Abort { txn_id } => { aborted.insert(*txn_id); }
+            MvccWalRecord::Commit { txn_id } => {
+                committed.insert(*txn_id);
+            }
+            MvccWalRecord::Abort { txn_id } => {
+                aborted.insert(*txn_id);
+            }
             _ => {}
         }
     }
@@ -578,10 +611,13 @@ fn replay(data: &[u8]) -> MvccWalState {
     for rec in &records {
         match rec {
             MvccWalRecord::CreateTable { name, columns } => {
-                tables.insert(name.clone(), RecoveredTable {
-                    columns: columns.clone(),
-                    rows: Vec::new(),
-                });
+                tables.insert(
+                    name.clone(),
+                    RecoveredTable {
+                        columns: columns.clone(),
+                        rows: Vec::new(),
+                    },
+                );
             }
             MvccWalRecord::DropTable { name } => {
                 tables.remove(name);
@@ -589,30 +625,42 @@ fn replay(data: &[u8]) -> MvccWalState {
             MvccWalRecord::Insert { table, txn_id, row } => {
                 // Auto-commit txns (id 0) or explicitly committed txns
                 if (*txn_id == 0 || committed.contains(txn_id))
-                    && let Some(tbl) = tables.get_mut(table) {
-                        tbl.rows.push(row.clone());
-                    }
+                    && let Some(tbl) = tables.get_mut(table)
+                {
+                    tbl.rows.push(row.clone());
+                }
             }
-            MvccWalRecord::Delete { table, txn_id, row_idx } => {
+            MvccWalRecord::Delete {
+                table,
+                txn_id,
+                row_idx,
+            } => {
                 if (*txn_id == 0 || committed.contains(txn_id))
-                    && let Some(tbl) = tables.get_mut(table) {
-                        let idx = *row_idx as usize;
-                        if idx < tbl.rows.len() {
-                            // Mark deleted with tombstone (empty row) instead
-                            // of Vec::remove() to avoid shifting indices that
-                            // subsequent WAL records reference.
-                            tbl.rows[idx] = Vec::new();
-                        }
+                    && let Some(tbl) = tables.get_mut(table)
+                {
+                    let idx = *row_idx as usize;
+                    if idx < tbl.rows.len() {
+                        // Mark deleted with tombstone (empty row) instead
+                        // of Vec::remove() to avoid shifting indices that
+                        // subsequent WAL records reference.
+                        tbl.rows[idx] = Vec::new();
                     }
+                }
             }
-            MvccWalRecord::Update { table, txn_id, row_idx, new_row } => {
+            MvccWalRecord::Update {
+                table,
+                txn_id,
+                row_idx,
+                new_row,
+            } => {
                 if (*txn_id == 0 || committed.contains(txn_id))
-                    && let Some(tbl) = tables.get_mut(table) {
-                        let idx = *row_idx as usize;
-                        if idx < tbl.rows.len() {
-                            tbl.rows[idx] = new_row.clone();
-                        }
+                    && let Some(tbl) = tables.get_mut(table)
+                {
+                    let idx = *row_idx as usize;
+                    if idx < tbl.rows.len() {
+                        tbl.rows[idx] = new_row.clone();
                     }
+                }
             }
             MvccWalRecord::Checkpoint => {
                 // After a checkpoint, previous records can be ignored.
@@ -661,14 +709,23 @@ fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
             let table = read_str(data, &mut pos)?;
             let txn_id = read_u64_val(data, &mut pos)?;
             let row_idx = read_u32_val(data, &mut pos)?;
-            Some(MvccWalRecord::Delete { table, txn_id, row_idx })
+            Some(MvccWalRecord::Delete {
+                table,
+                txn_id,
+                row_idx,
+            })
         }
         TAG_UPDATE => {
             let table = read_str(data, &mut pos)?;
             let txn_id = read_u64_val(data, &mut pos)?;
             let row_idx = read_u32_val(data, &mut pos)?;
             let new_row = read_row(data, &mut pos)?;
-            Some(MvccWalRecord::Update { table, txn_id, row_idx, new_row })
+            Some(MvccWalRecord::Update {
+                table,
+                txn_id,
+                row_idx,
+                new_row,
+            })
         }
         TAG_BEGIN => {
             let txn_id = read_u64_val(data, &mut pos)?;
@@ -708,18 +765,21 @@ mod tests {
                     ("id".into(), DataType::Int64),
                     ("name".into(), DataType::Text),
                 ],
-            }).unwrap();
+            })
+            .unwrap();
             wal.log(&MvccWalRecord::Begin { txn_id: 1 }).unwrap();
             wal.log(&MvccWalRecord::Insert {
                 table: "users".into(),
                 txn_id: 1,
                 row: vec![Value::Int64(1), Value::Text("Alice".into())],
-            }).unwrap();
+            })
+            .unwrap();
             wal.log(&MvccWalRecord::Insert {
                 table: "users".into(),
                 txn_id: 1,
                 row: vec![Value::Int64(2), Value::Text("Bob".into())],
-            }).unwrap();
+            })
+            .unwrap();
             wal.log_commit(1).unwrap();
             drop(wal);
         }
@@ -741,12 +801,15 @@ mod tests {
             wal.log(&MvccWalRecord::CreateTable {
                 name: "t".into(),
                 columns: vec![("x".into(), DataType::Int32)],
-            }).unwrap();
+            })
+            .unwrap();
             wal.log(&MvccWalRecord::Begin { txn_id: 1 }).unwrap();
             wal.log(&MvccWalRecord::Insert {
-                table: "t".into(), txn_id: 1,
+                table: "t".into(),
+                txn_id: 1,
                 row: vec![Value::Int32(10)],
-            }).unwrap();
+            })
+            .unwrap();
             wal.log(&MvccWalRecord::Abort { txn_id: 1 }).unwrap();
             drop(wal);
         }
@@ -765,13 +828,16 @@ mod tests {
             wal.log(&MvccWalRecord::CreateTable {
                 name: "t".into(),
                 columns: vec![("x".into(), DataType::Int32)],
-            }).unwrap();
+            })
+            .unwrap();
             // Begin but never commit/abort
             wal.log(&MvccWalRecord::Begin { txn_id: 1 }).unwrap();
             wal.log(&MvccWalRecord::Insert {
-                table: "t".into(), txn_id: 1,
+                table: "t".into(),
+                txn_id: 1,
                 row: vec![Value::Int32(42)],
-            }).unwrap();
+            })
+            .unwrap();
             drop(wal);
         }
 
@@ -789,12 +855,15 @@ mod tests {
             wal.log(&MvccWalRecord::CreateTable {
                 name: "t".into(),
                 columns: vec![("x".into(), DataType::Int32)],
-            }).unwrap();
+            })
+            .unwrap();
             wal.log(&MvccWalRecord::Begin { txn_id: 1 }).unwrap();
             wal.log(&MvccWalRecord::Insert {
-                table: "t".into(), txn_id: 1,
+                table: "t".into(),
+                txn_id: 1,
                 row: vec![Value::Int32(99)],
-            }).unwrap();
+            })
+            .unwrap();
             wal.log_commit(1).unwrap();
             drop(wal);
         }
@@ -825,12 +894,18 @@ mod tests {
             wal.log(&MvccWalRecord::CreateTable {
                 name: "temp".into(),
                 columns: vec![("x".into(), DataType::Int32)],
-            }).unwrap();
+            })
+            .unwrap();
             wal.log(&MvccWalRecord::Insert {
-                table: "temp".into(), txn_id: 0,
+                table: "temp".into(),
+                txn_id: 0,
                 row: vec![Value::Int32(1)],
-            }).unwrap();
-            wal.log(&MvccWalRecord::DropTable { name: "temp".into() }).unwrap();
+            })
+            .unwrap();
+            wal.log(&MvccWalRecord::DropTable {
+                name: "temp".into(),
+            })
+            .unwrap();
             drop(wal);
         }
 

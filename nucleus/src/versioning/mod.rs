@@ -280,10 +280,7 @@ impl VersionStore {
         for (key, source_data) in &source_snap {
             match target_snap.get(key) {
                 None => {
-                    changes.insert(
-                        key.clone(),
-                        RowChange::Insert(source_data.clone()),
-                    );
+                    changes.insert(key.clone(), RowChange::Insert(source_data.clone()));
                 }
                 Some(target_data) => {
                     if target_data != source_data {
@@ -445,11 +442,7 @@ impl TemporalTable {
     /// (i.e. `valid_to` is `None` or `> timestamp`).
     pub fn as_of(&self, key: &RowKey, timestamp: u64) -> Option<&RowData> {
         // Collect the slice of rows belonging to this key.
-        let key_rows: Vec<&TemporalRow> = self
-            .rows
-            .iter()
-            .filter(|r| r.key == *key)
-            .collect();
+        let key_rows: Vec<&TemporalRow> = self.rows.iter().filter(|r| r.key == *key).collect();
 
         if key_rows.is_empty() {
             return None;
@@ -489,10 +482,7 @@ impl TemporalTable {
 /// This is the standard technique to prevent *data leakage* in ML feature
 /// engineering: features are always looked up as of the event time, so no
 /// future information can leak into the training set.
-pub fn as_of_join(
-    events: &[(u64, RowKey)],
-    temporal_table: &TemporalTable,
-) -> Vec<(u64, RowData)> {
+pub fn as_of_join(events: &[(u64, RowKey)], temporal_table: &TemporalTable) -> Vec<(u64, RowData)> {
     let mut results = Vec::new();
 
     for (event_ts, key) in events {
@@ -521,11 +511,17 @@ mod tests {
 
         let mut changes = HashMap::new();
         changes.insert(
-            RowKey { table: "users".into(), pk: "1".into() },
+            RowKey {
+                table: "users".into(),
+                pk: "1".into(),
+            },
             RowChange::Insert(make_row(&[("name", "Alice"), ("age", "30")])),
         );
         changes.insert(
-            RowKey { table: "users".into(), pk: "2".into() },
+            RowKey {
+                table: "users".into(),
+                pk: "2".into(),
+            },
             RowChange::Insert(make_row(&[("name", "Bob"), ("age", "25")])),
         );
 
@@ -542,7 +538,10 @@ mod tests {
         // Commit 1: add Alice
         let mut c1 = HashMap::new();
         c1.insert(
-            RowKey { table: "users".into(), pk: "1".into() },
+            RowKey {
+                table: "users".into(),
+                pk: "1".into(),
+            },
             RowChange::Insert(make_row(&[("name", "Alice")])),
         );
         let commit1 = vs.commit("main", "add alice", c1).unwrap();
@@ -550,7 +549,10 @@ mod tests {
         // Commit 2: add Bob
         let mut c2 = HashMap::new();
         c2.insert(
-            RowKey { table: "users".into(), pk: "2".into() },
+            RowKey {
+                table: "users".into(),
+                pk: "2".into(),
+            },
             RowChange::Insert(make_row(&[("name", "Bob")])),
         );
         vs.commit("main", "add bob", c2).unwrap();
@@ -572,7 +574,10 @@ mod tests {
         // Add data on main
         let mut c1 = HashMap::new();
         c1.insert(
-            RowKey { table: "data".into(), pk: "1".into() },
+            RowKey {
+                table: "data".into(),
+                pk: "1".into(),
+            },
             RowChange::Insert(make_row(&[("value", "original")])),
         );
         vs.commit("main", "initial data", c1).unwrap();
@@ -583,14 +588,20 @@ mod tests {
         // Modify on feature branch
         let mut c2 = HashMap::new();
         c2.insert(
-            RowKey { table: "data".into(), pk: "1".into() },
+            RowKey {
+                table: "data".into(),
+                pk: "1".into(),
+            },
             RowChange::Update {
                 old: make_row(&[("value", "original")]),
                 new: make_row(&[("value", "modified")]),
             },
         );
         c2.insert(
-            RowKey { table: "data".into(), pk: "2".into() },
+            RowKey {
+                table: "data".into(),
+                pk: "2".into(),
+            },
             RowChange::Insert(make_row(&[("value", "new_row")])),
         );
         vs.commit("feature", "modify on feature", c2).unwrap();
@@ -619,29 +630,44 @@ mod tests {
 
         let mut c1 = HashMap::new();
         c1.insert(
-            RowKey { table: "t".into(), pk: "1".into() },
+            RowKey {
+                table: "t".into(),
+                pk: "1".into(),
+            },
             RowChange::Insert(make_row(&[("v", "a")])),
         );
         c1.insert(
-            RowKey { table: "t".into(), pk: "2".into() },
+            RowKey {
+                table: "t".into(),
+                pk: "2".into(),
+            },
             RowChange::Insert(make_row(&[("v", "b")])),
         );
         let commit1 = vs.commit("main", "c1", c1).unwrap();
 
         let mut c2 = HashMap::new();
         c2.insert(
-            RowKey { table: "t".into(), pk: "2".into() },
+            RowKey {
+                table: "t".into(),
+                pk: "2".into(),
+            },
             RowChange::Update {
                 old: make_row(&[("v", "b")]),
                 new: make_row(&[("v", "b2")]),
             },
         );
         c2.insert(
-            RowKey { table: "t".into(), pk: "3".into() },
+            RowKey {
+                table: "t".into(),
+                pk: "3".into(),
+            },
             RowChange::Insert(make_row(&[("v", "c")])),
         );
         c2.insert(
-            RowKey { table: "t".into(), pk: "1".into() },
+            RowKey {
+                table: "t".into(),
+                pk: "1".into(),
+            },
             RowChange::Delete(make_row(&[("v", "a")])),
         );
         vs.commit("main", "c2", c2).unwrap();
@@ -685,7 +711,10 @@ mod tests {
     #[test]
     fn temporal_table_basic() {
         let mut tt = TemporalTable::new("prices");
-        let key = RowKey { table: "prices".into(), pk: "AAPL".into() };
+        let key = RowKey {
+            table: "prices".into(),
+            pk: "AAPL".into(),
+        };
 
         // t=100: price = 150
         tt.insert(key.clone(), make_row(&[("price", "150")]), 100);
@@ -719,7 +748,10 @@ mod tests {
     #[test]
     fn temporal_table_history() {
         let mut tt = TemporalTable::new("accounts");
-        let key = RowKey { table: "accounts".into(), pk: "acct_1".into() };
+        let key = RowKey {
+            table: "accounts".into(),
+            pk: "acct_1".into(),
+        };
 
         tt.insert(key.clone(), make_row(&[("balance", "100")]), 10);
         tt.insert(key.clone(), make_row(&[("balance", "250")]), 20);
@@ -742,15 +774,24 @@ mod tests {
         assert_eq!(hist[2].valid_to, None); // current
 
         // History for a non-existent key is empty
-        let other = RowKey { table: "accounts".into(), pk: "nope".into() };
+        let other = RowKey {
+            table: "accounts".into(),
+            pk: "nope".into(),
+        };
         assert!(tt.history(&other).is_empty());
     }
 
     #[test]
     fn as_of_join_basic() {
         let mut tt = TemporalTable::new("features");
-        let key_a = RowKey { table: "features".into(), pk: "user_1".into() };
-        let key_b = RowKey { table: "features".into(), pk: "user_2".into() };
+        let key_a = RowKey {
+            table: "features".into(),
+            pk: "user_1".into(),
+        };
+        let key_b = RowKey {
+            table: "features".into(),
+            pk: "user_2".into(),
+        };
 
         // user_1 feature versions
         tt.insert(key_a.clone(), make_row(&[("score", "0.5")]), 100);
@@ -783,7 +824,10 @@ mod tests {
         // This is the critical ML correctness test: an event at t=150 must
         // NOT see data that was only inserted at t=200.
         let mut tt = TemporalTable::new("features");
-        let key = RowKey { table: "features".into(), pk: "item_1".into() };
+        let key = RowKey {
+            table: "features".into(),
+            pk: "item_1".into(),
+        };
 
         // Version 1 at t=100
         tt.insert(key.clone(), make_row(&[("flag", "old")]), 100);

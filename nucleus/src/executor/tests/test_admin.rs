@@ -111,7 +111,11 @@ async fn test_prepare_execute() {
     exec(&ex, "INSERT INTO prep_test VALUES (1, 'alice')").await;
     exec(&ex, "INSERT INTO prep_test VALUES (2, 'bob')").await;
 
-    exec(&ex, "PREPARE find_user AS SELECT name FROM prep_test WHERE id = $1").await;
+    exec(
+        &ex,
+        "PREPARE find_user AS SELECT name FROM prep_test WHERE id = $1",
+    )
+    .await;
     let results = exec(&ex, "EXECUTE find_user(1)").await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
@@ -235,14 +239,22 @@ async fn test_pg_table_is_visible() {
 #[tokio::test]
 async fn test_has_table_privilege() {
     let ex = test_executor();
-    let results = exec(&ex, "SELECT has_table_privilege('nucleus', 'pg_class', 'SELECT')").await;
+    let results = exec(
+        &ex,
+        "SELECT has_table_privilege('nucleus', 'pg_class', 'SELECT')",
+    )
+    .await;
     assert_eq!(scalar(&results[0]), &Value::Bool(true));
 }
 
 #[tokio::test]
 async fn test_has_schema_privilege() {
     let ex = test_executor();
-    let results = exec(&ex, "SELECT has_schema_privilege('nucleus', 'public', 'USAGE')").await;
+    let results = exec(
+        &ex,
+        "SELECT has_schema_privilege('nucleus', 'public', 'USAGE')",
+    )
+    .await;
     assert_eq!(scalar(&results[0]), &Value::Bool(true));
 }
 
@@ -318,7 +330,11 @@ async fn test_information_schema_tables_ordered() {
     exec(&ex, "CREATE TABLE users (id INT, name TEXT)").await;
     exec(&ex, "CREATE TABLE orders (id INT, total FLOAT)").await;
 
-    let results = exec(&ex, "SELECT table_name FROM information_schema.tables ORDER BY table_name").await;
+    let results = exec(
+        &ex,
+        "SELECT table_name FROM information_schema.tables ORDER BY table_name",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
     assert_eq!(r[0][0], Value::Text("orders".into()));
@@ -330,7 +346,11 @@ async fn test_information_schema_tables_all_columns() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE items (id INT)").await;
 
-    let results = exec(&ex, "SELECT table_catalog, table_schema, table_name, table_type FROM information_schema.tables").await;
+    let results = exec(
+        &ex,
+        "SELECT table_catalog, table_schema, table_name, table_type FROM information_schema.tables",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Text("nucleus".into()));
@@ -342,7 +362,11 @@ async fn test_information_schema_tables_all_columns() {
 #[tokio::test]
 async fn test_information_schema_columns_udt_name() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE products (id INT NOT NULL, name TEXT, price FLOAT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE products (id INT NOT NULL, name TEXT, price FLOAT)",
+    )
+    .await;
 
     let results = exec(&ex, "SELECT column_name, ordinal_position, is_nullable, data_type, udt_name FROM information_schema.columns WHERE table_name = 'products' ORDER BY ordinal_position").await;
     let r = rows(&results[0]);
@@ -366,7 +390,11 @@ async fn test_pg_tables_full_columns() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE abc (id INT)").await;
 
-    let results = exec(&ex, "SELECT schemaname, tablename, tableowner FROM pg_tables").await;
+    let results = exec(
+        &ex,
+        "SELECT schemaname, tablename, tableowner FROM pg_tables",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Text("public".into()));
@@ -390,7 +418,11 @@ async fn test_pg_type() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE typed (a INT, b TEXT, c BOOLEAN)").await;
 
-    let results = exec(&ex, "SELECT typname, typcategory FROM pg_catalog.pg_type WHERE typname = 'int4'").await;
+    let results = exec(
+        &ex,
+        "SELECT typname, typcategory FROM pg_catalog.pg_type WHERE typname = 'int4'",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Text("int4".into()));
@@ -412,7 +444,11 @@ async fn test_pg_class() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE cls_test (id INT, name TEXT)").await;
 
-    let results = exec(&ex, "SELECT relname, relkind FROM pg_catalog.pg_class WHERE relkind = 'r'").await;
+    let results = exec(
+        &ex,
+        "SELECT relname, relkind FROM pg_catalog.pg_class WHERE relkind = 'r'",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Text("cls_test".into()));
@@ -425,7 +461,11 @@ async fn test_pg_class_with_indexes() {
     exec(&ex, "CREATE TABLE idx_cls (id INT, name TEXT)").await;
     exec(&ex, "CREATE INDEX idx_cls_name ON idx_cls (name)").await;
 
-    let results = exec(&ex, "SELECT relname, relkind FROM pg_catalog.pg_class ORDER BY relname").await;
+    let results = exec(
+        &ex,
+        "SELECT relname, relkind FROM pg_catalog.pg_class ORDER BY relname",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
     // Should have the table and the index
@@ -438,7 +478,11 @@ async fn test_pg_class_with_indexes() {
 async fn test_pg_namespace() {
     let ex = test_executor();
 
-    let results = exec(&ex, "SELECT nspname FROM pg_catalog.pg_namespace ORDER BY oid").await;
+    let results = exec(
+        &ex,
+        "SELECT nspname FROM pg_catalog.pg_namespace ORDER BY oid",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 3);
     assert_eq!(r[0][0], Value::Text("pg_catalog".into()));
@@ -449,9 +493,17 @@ async fn test_pg_namespace() {
 #[tokio::test]
 async fn test_pg_attribute() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE attr_test (id INT NOT NULL, name TEXT, active BOOLEAN NOT NULL)").await;
+    exec(
+        &ex,
+        "CREATE TABLE attr_test (id INT NOT NULL, name TEXT, active BOOLEAN NOT NULL)",
+    )
+    .await;
 
-    let results = exec(&ex, "SELECT attname, attnum, attnotnull FROM pg_catalog.pg_attribute ORDER BY attnum").await;
+    let results = exec(
+        &ex,
+        "SELECT attname, attnum, attnotnull FROM pg_catalog.pg_attribute ORDER BY attnum",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 3);
     assert_eq!(r[0][0], Value::Text("id".into()));
@@ -471,10 +523,14 @@ async fn test_pg_index() {
     exec(&ex, "CREATE TABLE idx_test (id INT, email TEXT, name TEXT)").await;
     exec(&ex, "CREATE UNIQUE INDEX idx_email ON idx_test (email)").await;
 
-    let results = exec(&ex, "SELECT indisunique, indisprimary, indkey FROM pg_catalog.pg_index").await;
+    let results = exec(
+        &ex,
+        "SELECT indisunique, indisprimary, indkey FROM pg_catalog.pg_index",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
-    assert_eq!(r[0][0], Value::Bool(true));  // unique
+    assert_eq!(r[0][0], Value::Bool(true)); // unique
     assert_eq!(r[0][1], Value::Bool(false)); // not primary
     assert_eq!(r[0][2], Value::Text("2".into())); // email is column 2
 }
@@ -483,7 +539,11 @@ async fn test_pg_index() {
 async fn test_pg_database() {
     let ex = test_executor();
 
-    let results = exec(&ex, "SELECT oid, datname, datcollate FROM pg_catalog.pg_database").await;
+    let results = exec(
+        &ex,
+        "SELECT oid, datname, datcollate FROM pg_catalog.pg_database",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Int32(1));
@@ -495,7 +555,11 @@ async fn test_pg_database() {
 async fn test_pg_settings() {
     let ex = test_executor();
 
-    let results = exec(&ex, "SELECT name, setting FROM pg_catalog.pg_settings WHERE name = 'timezone'").await;
+    let results = exec(
+        &ex,
+        "SELECT name, setting FROM pg_catalog.pg_settings WHERE name = 'timezone'",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Text("timezone".into()));
@@ -520,7 +584,11 @@ async fn test_pg_settings_all_defaults() {
 async fn test_information_schema_schemata() {
     let ex = test_executor();
 
-    let results = exec(&ex, "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name").await;
+    let results = exec(
+        &ex,
+        "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 3);
     assert_eq!(r[0][0], Value::Text("information_schema".into()));
@@ -533,7 +601,11 @@ async fn test_virtual_table_with_alias() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE aliased (id INT)").await;
 
-    let results = exec(&ex, "SELECT t.table_name FROM information_schema.tables AS t").await;
+    let results = exec(
+        &ex,
+        "SELECT t.table_name FROM information_schema.tables AS t",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Text("aliased".into()));
@@ -552,9 +624,17 @@ async fn test_virtual_table_empty_catalog() {
 #[tokio::test]
 async fn test_pg_attribute_type_oid() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE type_oid_test (flag BOOLEAN, label TEXT, count BIGINT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE type_oid_test (flag BOOLEAN, label TEXT, count BIGINT)",
+    )
+    .await;
 
-    let results = exec(&ex, "SELECT attname, atttypid FROM pg_attribute ORDER BY attnum").await;
+    let results = exec(
+        &ex,
+        "SELECT attname, atttypid FROM pg_attribute ORDER BY attnum",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 3);
     // bool OID = 16, text OID = 25, int8 OID = 20
@@ -620,7 +700,10 @@ async fn test_privilege_checking_insert() {
 
     // Attempt to INSERT should fail due to lack of INSERT privilege
     let result = ex.execute("INSERT INTO priv_test VALUES (1, 'test')").await;
-    assert!(result.is_err(), "INSERT should fail without INSERT privilege");
+    assert!(
+        result.is_err(),
+        "INSERT should fail without INSERT privilege"
+    );
 
     // Check the error is PermissionDenied
     match result {
@@ -652,7 +735,10 @@ async fn test_privilege_checking_update() {
 
     // Attempt to UPDATE should fail
     let result = ex.execute("UPDATE priv_test SET name = 'updated'").await;
-    assert!(result.is_err(), "UPDATE should fail without UPDATE privilege");
+    assert!(
+        result.is_err(),
+        "UPDATE should fail without UPDATE privilege"
+    );
 
     match result {
         Err(error) => {
@@ -683,7 +769,10 @@ async fn test_privilege_checking_delete() {
 
     // Attempt to DELETE should fail
     let result = ex.execute("DELETE FROM priv_test WHERE id = 1").await;
-    assert!(result.is_err(), "DELETE should fail without DELETE privilege");
+    assert!(
+        result.is_err(),
+        "DELETE should fail without DELETE privilege"
+    );
 
     match result {
         Err(error) => {
@@ -767,11 +856,19 @@ async fn test_pg_stat_user_tables() {
 #[tokio::test]
 async fn test_pg_stat_user_indexes() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE idx_stat_test (id INT PRIMARY KEY, name TEXT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE idx_stat_test (id INT PRIMARY KEY, name TEXT)",
+    )
+    .await;
     exec(&ex, "CREATE INDEX idx_name ON idx_stat_test (name)").await;
-    let results = exec(&ex, "SELECT relname, indexrelname FROM pg_stat_user_indexes").await;
+    let results = exec(
+        &ex,
+        "SELECT relname, indexrelname FROM pg_stat_user_indexes",
+    )
+    .await;
     let r = rows(&results[0]);
-    assert!(r.len() >= 1, "should have at least one index");
+    assert!(!r.is_empty(), "should have at least one index");
 }
 
 #[tokio::test]
@@ -804,7 +901,11 @@ async fn test_query_cache_put_get() {
     // Should hit
     let cached = ex.query_cache_get("SELECT * FROM users");
     assert!(cached.is_some());
-    if let Some(ExecResult::Select { columns: c, rows: r }) = cached {
+    if let Some(ExecResult::Select {
+        columns: c,
+        rows: r,
+    }) = cached
+    {
         assert_eq!(c.len(), 2);
         assert_eq!(r.len(), 2);
         assert_eq!(r[0][0], Value::Int32(1));
@@ -881,7 +982,10 @@ fn test_follower_read_stale_data() {
     mgr.max_staleness_ms = 5_000; // 5 second threshold
     // Set up as follower via multi-raft cluster coordinator (has raft_manager, is NOT leader)
     let cluster = Arc::new(parking_lot::RwLock::new(
-        crate::distributed::ClusterCoordinator::new_multi_raft(0x2, vec![(0x1, "127.0.0.1:5432".into())]),
+        crate::distributed::ClusterCoordinator::new_multi_raft(
+            0x2,
+            vec![(0x1, "127.0.0.1:5432".into())],
+        ),
     ));
     let ex = Executor {
         follower_read_mgr: Some(Arc::new(parking_lot::RwLock::new(mgr))),

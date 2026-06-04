@@ -6,6 +6,10 @@
 //!
 //!     cargo test --test pg_compat -- --nocapture
 
+// 3.14 here is an arbitrary test fixture, not a PI approximation; the value
+// asserts (parse/round-trip with a tolerance) rely on the exact literal.
+#![allow(clippy::approx_constant)]
+
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
@@ -43,12 +47,9 @@ async fn start_nucleus_server() -> (u16, tokio::task::JoinHandle<()>) {
             };
             let srv = server.clone();
             tokio::spawn(async move {
-                let _ = pgwire::tokio::process_socket(
-                    socket,
-                    None::<pgwire::tokio::TlsAcceptor>,
-                    srv,
-                )
-                .await;
+                let _ =
+                    pgwire::tokio::process_socket(socket, None::<pgwire::tokio::TlsAcceptor>, srv)
+                        .await;
             });
         }
     });
@@ -139,18 +140,12 @@ async fn pg_prepared_statement() {
     // column they target on the other side of `INSERT ... VALUES`, so we can
     // bind native typed values via pgx-style scanners.
     client
-        .execute(
-            "INSERT INTO prep_t VALUES ($1, $2)",
-            &[&1_i32, &"hello"],
-        )
+        .execute("INSERT INTO prep_t VALUES ($1, $2)", &[&1_i32, &"hello"])
         .await
         .expect("INSERT with params");
 
     client
-        .execute(
-            "INSERT INTO prep_t VALUES ($1, $2)",
-            &[&2_i32, &"world"],
-        )
+        .execute("INSERT INTO prep_t VALUES ($1, $2)", &[&2_i32, &"world"])
         .await
         .expect("INSERT 2 with params");
 
@@ -247,9 +242,7 @@ async fn pg_error_codes() {
     let client = connect(port).await;
 
     // Query a table that does not exist.
-    let result = client
-        .simple_query("SELECT * FROM nonexistent_table")
-        .await;
+    let result = client.simple_query("SELECT * FROM nonexistent_table").await;
     assert!(result.is_err(), "querying missing table should fail");
 
     let err = result.unwrap_err();
@@ -270,9 +263,7 @@ async fn pg_error_codes() {
     // basic correctness check — some drivers wrap the error differently.
 
     // Syntax error.
-    let result = client
-        .simple_query("SELECTTTT broken sql here!!!")
-        .await;
+    let result = client.simple_query("SELECTTTT broken sql here!!!").await;
     assert!(result.is_err(), "broken SQL should produce an error");
 
     server.abort();
@@ -327,11 +318,7 @@ async fn pg_data_type_roundtrip() {
     // Row 1: -1, 0.0, '', FALSE   (ORDER BY i ascending)
     assert_eq!(data_rows[0].get(0), Some("-1"));
     // Float representation may vary (0, 0.0, 0.00, etc.) — just check it parses.
-    let f0: f64 = data_rows[0]
-        .get(1)
-        .unwrap()
-        .parse()
-        .expect("parse float");
+    let f0: f64 = data_rows[0].get(1).unwrap().parse().expect("parse float");
     assert!((f0 - 0.0).abs() < f64::EPSILON, "expected 0.0, got {f0}");
     assert_eq!(data_rows[0].get(2), Some(""));
     // Boolean may be rendered as "f", "false", "FALSE", or "0".
@@ -343,11 +330,7 @@ async fn pg_data_type_roundtrip() {
 
     // Row 2: 42, 3.14, 'hello world', TRUE
     assert_eq!(data_rows[1].get(0), Some("42"));
-    let f1: f64 = data_rows[1]
-        .get(1)
-        .unwrap()
-        .parse()
-        .expect("parse float");
+    let f1: f64 = data_rows[1].get(1).unwrap().parse().expect("parse float");
     assert!((f1 - 3.14).abs() < 0.001, "expected ~3.14, got {f1}");
     assert_eq!(data_rows[1].get(2), Some("hello world"));
     let b1 = data_rows[1].get(3).unwrap().to_lowercase();
@@ -387,21 +370,15 @@ async fn pg_copy_from_stdin() {
             let mut writer = std::pin::pin!(sink);
             let data = b"1,alice\n2,bob\n3,charlie\n";
             let written = writer.as_mut().send(bytes::Bytes::from_static(data)).await;
-            if written.is_err() {
+            if let Err(e) = written {
                 // If sending data fails, COPY might not be fully supported.
-                eprintln!(
-                    "COPY data send failed (partial support): {}",
-                    written.unwrap_err()
-                );
+                eprintln!("COPY data send failed (partial support): {e}");
                 server.abort();
                 return;
             }
             let finish_result: Result<u64, _> = writer.as_mut().finish().await;
-            if finish_result.is_err() {
-                eprintln!(
-                    "COPY finish failed (partial support): {}",
-                    finish_result.unwrap_err()
-                );
+            if let Err(e) = finish_result {
+                eprintln!("COPY finish failed (partial support): {e}");
                 server.abort();
                 return;
             }
@@ -651,7 +628,6 @@ async fn pg_large_result_set() {
     server.abort();
 }
 
-
 // ============================================================================
 // Test: pgwire RowDescription type advertisement (regression for finding #6)
 // ============================================================================
@@ -680,7 +656,10 @@ async fn pg_row_description_advertises_int8_for_bigint() {
     // Use the extended protocol with native typed scanners. If RowDescription
     // still reported these columns as TEXT, pgx would fail to decode.
     let row = client
-        .query_one("SELECT id, ts, ratio, ok FROM rd_t WHERE id = $1", &[&1_i32])
+        .query_one(
+            "SELECT id, ts, ratio, ok FROM rd_t WHERE id = $1",
+            &[&1_i32],
+        )
         .await
         .expect("typed SELECT");
 
@@ -699,10 +678,26 @@ async fn pg_row_description_advertises_int8_for_bigint() {
         .await
         .expect("prepare");
     let cols = stmt.columns();
-    assert_eq!(cols[0].type_(), &tokio_postgres::types::Type::INT4, "id should be int4");
-    assert_eq!(cols[1].type_(), &tokio_postgres::types::Type::INT8, "ts should be int8");
-    assert_eq!(cols[2].type_(), &tokio_postgres::types::Type::FLOAT8, "ratio should be float8");
-    assert_eq!(cols[3].type_(), &tokio_postgres::types::Type::BOOL, "ok should be bool");
+    assert_eq!(
+        cols[0].type_(),
+        &tokio_postgres::types::Type::INT4,
+        "id should be int4"
+    );
+    assert_eq!(
+        cols[1].type_(),
+        &tokio_postgres::types::Type::INT8,
+        "ts should be int8"
+    );
+    assert_eq!(
+        cols[2].type_(),
+        &tokio_postgres::types::Type::FLOAT8,
+        "ratio should be float8"
+    );
+    assert_eq!(
+        cols[3].type_(),
+        &tokio_postgres::types::Type::BOOL,
+        "ok should be bool"
+    );
 
     server.abort();
 }
@@ -830,31 +825,51 @@ async fn text_literal_coerces_to_int8_in_comparison() {
 
     // Native int literal: baseline.
     assert_eq!(
-        count_simple(&client, "SELECT * FROM coerce_int8 WHERE ts >= 1700000000000").await,
+        count_simple(
+            &client,
+            "SELECT * FROM coerce_int8 WHERE ts >= 1700000000000"
+        )
+        .await,
         2,
         "baseline native int comparison",
     );
     // Text literal on the right: pgx SimpleProtocol shape.
     assert_eq!(
-        count_simple(&client, "SELECT * FROM coerce_int8 WHERE ts >= '1700000000000'").await,
+        count_simple(
+            &client,
+            "SELECT * FROM coerce_int8 WHERE ts >= '1700000000000'"
+        )
+        .await,
         2,
         "text literal coerces to int8 for >=",
     );
     // Equality.
     assert_eq!(
-        count_simple(&client, "SELECT * FROM coerce_int8 WHERE ts = '1700000000000'").await,
+        count_simple(
+            &client,
+            "SELECT * FROM coerce_int8 WHERE ts = '1700000000000'"
+        )
+        .await,
         1,
         "text literal coerces to int8 for =",
     );
     // Strict <.
     assert_eq!(
-        count_simple(&client, "SELECT * FROM coerce_int8 WHERE ts < '1700000000001'").await,
+        count_simple(
+            &client,
+            "SELECT * FROM coerce_int8 WHERE ts < '1700000000001'"
+        )
+        .await,
         1,
         "text literal coerces to int8 for <",
     );
     // Reversed: literal on the left.
     assert_eq!(
-        count_simple(&client, "SELECT * FROM coerce_int8 WHERE '1700000000000' <= ts").await,
+        count_simple(
+            &client,
+            "SELECT * FROM coerce_int8 WHERE '1700000000000' <= ts"
+        )
+        .await,
         2,
         "text literal coerces when on the left side",
     );
@@ -863,7 +878,8 @@ async fn text_literal_coerces_to_int8_in_comparison() {
         count_simple(
             &client,
             "SELECT * FROM coerce_int8 WHERE ts BETWEEN '1700000000000' AND '1700000000001'",
-        ).await,
+        )
+        .await,
         2,
         "text bounds in BETWEEN coerce to int8",
     );
@@ -1022,9 +1038,7 @@ async fn text_literal_coercion_with_simple_protocol_via_pgx_shape() {
     let client = connect(port).await;
 
     client
-        .simple_query(
-            "CREATE TABLE events (site_id TEXT, timestamp BIGINT, name TEXT)",
-        )
+        .simple_query("CREATE TABLE events (site_id TEXT, timestamp BIGINT, name TEXT)")
         .await
         .expect("CREATE TABLE");
     client

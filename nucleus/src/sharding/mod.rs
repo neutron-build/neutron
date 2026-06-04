@@ -145,7 +145,11 @@ impl ShardMap {
             PartitionStrategy::Range { split_points } => {
                 let n = split_points.len() + 1;
                 for i in 0..n {
-                    let start = if i == 0 { i64::MIN } else { split_points[i - 1] };
+                    let start = if i == 0 {
+                        i64::MIN
+                    } else {
+                        split_points[i - 1]
+                    };
                     let end = if i == split_points.len() {
                         i64::MAX
                     } else {
@@ -199,9 +203,7 @@ impl ShardMap {
     pub fn shards_for_node(&self, node: NodeId) -> Vec<ShardId> {
         self.shards
             .values()
-            .filter(|s| {
-                s.assigned_node == Some(node) || s.replica_nodes.contains(&node)
-            })
+            .filter(|s| s.assigned_node == Some(node) || s.replica_nodes.contains(&node))
             .map(|s| s.id)
             .collect()
     }
@@ -341,9 +343,14 @@ pub struct ShardMove {
 }
 
 /// A complete rebalancing plan: an ordered list of shard moves.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RebalancePlan {
     pub moves: Vec<ShardMove>,
+    /// Shards that could not be placed on any alive, constraint-satisfying node.
+    /// Surfaced explicitly so callers can alert rather than silently orphaning
+    /// the data. A non-empty list means the cluster cannot host every shard
+    /// under its current topology + geo constraints.
+    pub unplaceable: Vec<ShardId>,
 }
 
 /// Computes and applies rebalancing plans.
@@ -365,7 +372,11 @@ impl Rebalancer {
         };
 
         if alive.is_empty() {
-            return RebalancePlan { moves: Vec::new() };
+            // No node can host anything — every shard is unplaceable.
+            return RebalancePlan {
+                moves: Vec::new(),
+                unplaceable: shard_map.all_shards().map(|s| s.id).collect(),
+            };
         }
 
         // Build current assignment: node -> set of shard ids.
@@ -375,6 +386,7 @@ impl Rebalancer {
         }
 
         let mut moves: Vec<ShardMove> = Vec::new();
+        let mut unplaceable: Vec<ShardId> = Vec::new();
 
         // Collect all shards sorted by id for determinism.
         let mut all_shards: Vec<&Shard> = shard_map.all_shards().collect();
@@ -384,12 +396,13 @@ impl Rebalancer {
         for shard in &all_shards {
             let current = shard.assigned_node;
             let on_alive = current.is_some_and(|n| alive.contains(&n));
-            let geo_ok = current.is_some_and(|n| {
-                Self::geo_check(shard, n, topology)
-            });
+            let geo_ok = current.is_some_and(|n| Self::geo_check(shard, n, topology));
 
             if on_alive && geo_ok {
-                assignment.get_mut(&current.unwrap()).unwrap().push(shard.id);
+                assignment
+                    .get_mut(&current.unwrap())
+                    .unwrap()
+                    .push(shard.id);
             } else {
                 // Pick the least-loaded alive node that satisfies geo.
                 let target = Self::pick_least_loaded(&assignment, &alive, shard, topology);
@@ -404,6 +417,26 @@ impl Rebalancer {
                     // Even if there was no previous node we still record it in
                     // the assignment map so the balancing phase sees it.
                     assignment.get_mut(&target_node).unwrap().push(shard.id);
+                } else if on_alive {
+                    // No geo-valid alive node exists, but the shard's current node
+                    // is alive. Keep it there rather than orphan live data — a geo
+                    // constraint violation is far less harmful than inaccessibility.
+                    let node = current.unwrap();
+                    tracing::warn!(
+                        target: "nucleus::sharding",
+                        "shard {} has no geo-valid alive target; keeping it on current node {} (geo constraint violated)",
+                        shard.id, node
+                    );
+                    assignment.get_mut(&node).unwrap().push(shard.id);
+                } else {
+                    // No alive node can host this shard and it is not currently on
+                    // an alive node. Surface it instead of silently orphaning.
+                    tracing::error!(
+                        target: "nucleus::sharding",
+                        "shard {} cannot be placed: no alive node satisfies its constraints",
+                        shard.id
+                    );
+                    unplaceable.push(shard.id);
                 }
             }
         }
@@ -429,13 +462,17 @@ impl Rebalancer {
             // Find a shard on max_node that can move to min_node (geo-ok).
             let movable = {
                 let shards_on_max = &assignment[&max_node];
-                shards_on_max.iter().rev().find(|&&sid| {
-                    if let Some(s) = shard_map.get_shard(sid) {
-                        Self::geo_check(s, min_node, topology)
-                    } else {
-                        false
-                    }
-                }).copied()
+                shards_on_max
+                    .iter()
+                    .rev()
+                    .find(|&&sid| {
+                        if let Some(s) = shard_map.get_shard(sid) {
+                            Self::geo_check(s, min_node, topology)
+                        } else {
+                            false
+                        }
+                    })
+                    .copied()
             };
 
             if let Some(sid) = movable {
@@ -451,7 +488,7 @@ impl Rebalancer {
             }
         }
 
-        RebalancePlan { moves }
+        RebalancePlan { moves, unplaceable }
     }
 
     /// Apply a computed plan to the shard map by updating each shard's
@@ -638,7 +675,11 @@ impl<'a> ShardRouter<'a> {
     /// (minimum 1), and a [`HashRing`] is populated with all alive nodes.
     pub fn new(topology: &'a ClusterTopology) -> Self {
         let alive = topology.alive_nodes();
-        let num_shards = if alive.is_empty() { 1 } else { alive.len() as u64 };
+        let num_shards = if alive.is_empty() {
+            1
+        } else {
+            alive.len() as u64
+        };
 
         let mut shard_map = ShardMap::new(PartitionStrategy::Hash { num_shards });
 
@@ -894,14 +935,17 @@ impl RebalanceExecution {
     pub fn apply_completed(&self, shard_map: &mut ShardMap) {
         for (i, m) in self.plan.moves.iter().enumerate() {
             if self.states[i] == TransferState::Completed
-                && let Some(shard) = shard_map.get_shard_mut(m.shard_id) {
-                    shard.assigned_node = Some(m.to_node);
-                }
+                && let Some(shard) = shard_map.get_shard_mut(m.shard_id)
+            {
+                shard.assigned_node = Some(m.to_node);
+            }
         }
     }
 
     /// Get the underlying plan.
-    pub fn plan(&self) -> &RebalancePlan { &self.plan }
+    pub fn plan(&self) -> &RebalancePlan {
+        &self.plan
+    }
 }
 
 // ============================================================================
@@ -1000,11 +1044,7 @@ impl DistributedTableEngine {
     }
 
     /// Route an aggregation query (scatter-gather).
-    pub fn route_aggregation(
-        &self,
-        table: &str,
-        agg_type: AggType,
-    ) -> Option<QueryPlan> {
+    pub fn route_aggregation(&self, table: &str, agg_type: AggType) -> Option<QueryPlan> {
         let def = self.tables.get(table)?;
         Some(QueryPlan::ScatterGather {
             shards: def.shard_ids.clone(),
@@ -1013,10 +1053,7 @@ impl DistributedTableEngine {
     }
 
     /// Merge partial aggregation results from multiple shards.
-    pub fn merge_partial_aggs(
-        results: &[PartialAggResult],
-        agg_type: AggType,
-    ) -> f64 {
+    pub fn merge_partial_aggs(results: &[PartialAggResult], agg_type: AggType) -> f64 {
         match agg_type {
             AggType::Count => results.iter().map(|r| r.count as f64).sum(),
             AggType::Sum => results.iter().map(|r| r.sum).sum(),
@@ -1081,7 +1118,11 @@ mod tests {
             seen.insert(shard_map.assign_key(key));
         }
         // With 8 shards and 100 distinct keys we expect most shards hit.
-        assert!(seen.len() >= 4, "poor distribution: only {} shards used", seen.len());
+        assert!(
+            seen.len() >= 4,
+            "poor distribution: only {} shards used",
+            seen.len()
+        );
     }
 
     // -- 2. Range partitioning --
@@ -1243,6 +1284,28 @@ mod tests {
         );
     }
 
+    // Regression: when no alive node satisfies a shard's geo constraint, the
+    // rebalancer used to silently drop the shard (orphaning its data). It must
+    // surface the shard in `unplaceable` instead.
+    #[test]
+    fn test_unplaceable_shard_is_surfaced() {
+        let mut shard_map = ShardMap::new(PartitionStrategy::Hash { num_shards: 1 });
+        // Shard 0 must live in EU, currently on a node that isn't in the cluster
+        // (dead), and there is no alive EU node anywhere.
+        shard_map.get_shard_mut(0).unwrap().geo_constraint =
+            Some(GeoConstraint::new(&[Region::EuWest]));
+        shard_map.get_shard_mut(0).unwrap().assigned_node = Some(99);
+
+        let mut topo = ClusterTopology::new();
+        topo.add_node_with_region(10, "us-east-1:5000", Region::UsEast);
+
+        let plan = Rebalancer::compute_plan(&shard_map, &topo);
+        assert!(
+            plan.unplaceable.contains(&0),
+            "unplaceable shard must be surfaced, not orphaned; plan={plan:?}"
+        );
+    }
+
     // -- 7. Consistent hashing --
 
     #[test]
@@ -1258,16 +1321,12 @@ mod tests {
         }
 
         // Record assignments before adding a node.
-        let before: Vec<NodeId> = (0..1000)
-            .map(|k| ring.get_node(k).unwrap())
-            .collect();
+        let before: Vec<NodeId> = (0..1000).map(|k| ring.get_node(k).unwrap()).collect();
 
         // Add a fourth node.
         ring.add_node(4);
 
-        let after: Vec<NodeId> = (0..1000)
-            .map(|k| ring.get_node(k).unwrap())
-            .collect();
+        let after: Vec<NodeId> = (0..1000).map(|k| ring.get_node(k).unwrap()).collect();
 
         // Count how many keys moved.
         let moved = before
@@ -1564,10 +1623,7 @@ mod tests {
         // All 4 nodes must receive at least some keys.
         for nid in 1..=4 {
             let count = *counts.get(&nid).unwrap_or(&0);
-            assert!(
-                count > 0,
-                "node {nid} received 0 keys out of {total}"
-            );
+            assert!(count > 0, "node {nid} received 0 keys out of {total}");
         }
 
         // No single node should hog more than 60% of all keys.
@@ -1697,10 +1753,16 @@ mod tests {
         assert_eq!(nodes.len(), 2);
         assert!(nodes.contains(&10));
         assert!(nodes.contains(&30));
-        assert!(!nodes.contains(&20), "dead node 20 should not be in scatter-gather list");
+        assert!(
+            !nodes.contains(&20),
+            "dead node 20 should not be in scatter-gather list"
+        );
 
         // Should be sorted.
-        assert!(nodes.windows(2).all(|w| w[0] <= w[1]), "scatter_gather_nodes not sorted");
+        assert!(
+            nodes.windows(2).all(|w| w[0] <= w[1]),
+            "scatter_gather_nodes not sorted"
+        );
     }
 
     #[test]
@@ -1742,7 +1804,10 @@ mod tests {
 
         // remote_nodes must exclude the local node.
         let remotes = aware.remote_nodes();
-        assert!(!remotes.contains(&1), "remote_nodes should not include local node");
+        assert!(
+            !remotes.contains(&1),
+            "remote_nodes should not include local node"
+        );
         assert_eq!(remotes.len(), 2);
         assert!(remotes.contains(&2));
         assert!(remotes.contains(&3));
@@ -1787,7 +1852,10 @@ mod tests {
                 to_node: 2 + (i as NodeId),
             })
             .collect();
-        RebalancePlan { moves }
+        RebalancePlan {
+            moves,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1806,7 +1874,10 @@ mod tests {
         assert!(exec.is_started());
 
         exec.update_progress(0, 50);
-        assert_eq!(*exec.state(0).unwrap(), TransferState::Transferring { progress_pct: 50 });
+        assert_eq!(
+            *exec.state(0).unwrap(),
+            TransferState::Transferring { progress_pct: 50 }
+        );
 
         exec.complete_move(0);
         assert_eq!(exec.completed_count(), 1);
@@ -1833,7 +1904,9 @@ mod tests {
         assert_eq!(exec.failed_count(), 1);
         assert_eq!(
             *exec.state(1).unwrap(),
-            TransferState::Failed { reason: "network timeout".into() }
+            TransferState::Failed {
+                reason: "network timeout".into()
+            }
         );
     }
 
@@ -1846,10 +1919,23 @@ mod tests {
 
         let plan = RebalancePlan {
             moves: vec![
-                ShardMove { shard_id: 0, from_node: 1, to_node: 2 },
-                ShardMove { shard_id: 1, from_node: 1, to_node: 3 },
-                ShardMove { shard_id: 2, from_node: 1, to_node: 4 },
+                ShardMove {
+                    shard_id: 0,
+                    from_node: 1,
+                    to_node: 2,
+                },
+                ShardMove {
+                    shard_id: 1,
+                    from_node: 1,
+                    to_node: 3,
+                },
+                ShardMove {
+                    shard_id: 2,
+                    from_node: 1,
+                    to_node: 4,
+                },
             ],
+            ..Default::default()
         };
         let mut exec = RebalanceExecution::new(plan);
         exec.start();
@@ -1867,7 +1953,10 @@ mod tests {
 
     #[test]
     fn test_rebalance_empty_plan() {
-        let plan = RebalancePlan { moves: vec![] };
+        let plan = RebalancePlan {
+            moves: vec![],
+            ..Default::default()
+        };
         let exec = RebalanceExecution::new(plan);
         assert!(exec.is_finished()); // no moves = already done
         assert_eq!(exec.progress_pct(), 100);
@@ -1879,7 +1968,10 @@ mod tests {
         let mut exec = RebalanceExecution::new(plan);
         exec.start();
         exec.update_progress(0, 200); // should clamp to 100
-        assert_eq!(*exec.state(0).unwrap(), TransferState::Transferring { progress_pct: 100 });
+        assert_eq!(
+            *exec.state(0).unwrap(),
+            TransferState::Transferring { progress_pct: 100 }
+        );
     }
 
     // ================================================================
@@ -1941,39 +2033,108 @@ mod tests {
     #[test]
     fn dist_table_merge_partial_count() {
         let results = vec![
-            PartialAggResult { shard_id: 0, count: 100, sum: 0.0, min: None, max: None },
-            PartialAggResult { shard_id: 1, count: 200, sum: 0.0, min: None, max: None },
-            PartialAggResult { shard_id: 2, count: 150, sum: 0.0, min: None, max: None },
+            PartialAggResult {
+                shard_id: 0,
+                count: 100,
+                sum: 0.0,
+                min: None,
+                max: None,
+            },
+            PartialAggResult {
+                shard_id: 1,
+                count: 200,
+                sum: 0.0,
+                min: None,
+                max: None,
+            },
+            PartialAggResult {
+                shard_id: 2,
+                count: 150,
+                sum: 0.0,
+                min: None,
+                max: None,
+            },
         ];
-        assert_eq!(DistributedTableEngine::merge_partial_aggs(&results, AggType::Count), 450.0);
+        assert_eq!(
+            DistributedTableEngine::merge_partial_aggs(&results, AggType::Count),
+            450.0
+        );
     }
 
     #[test]
     fn dist_table_merge_partial_sum() {
         let results = vec![
-            PartialAggResult { shard_id: 0, count: 10, sum: 100.5, min: None, max: None },
-            PartialAggResult { shard_id: 1, count: 20, sum: 200.5, min: None, max: None },
+            PartialAggResult {
+                shard_id: 0,
+                count: 10,
+                sum: 100.5,
+                min: None,
+                max: None,
+            },
+            PartialAggResult {
+                shard_id: 1,
+                count: 20,
+                sum: 200.5,
+                min: None,
+                max: None,
+            },
         ];
-        assert_eq!(DistributedTableEngine::merge_partial_aggs(&results, AggType::Sum), 301.0);
+        assert_eq!(
+            DistributedTableEngine::merge_partial_aggs(&results, AggType::Sum),
+            301.0
+        );
     }
 
     #[test]
     fn dist_table_merge_partial_min_max() {
         let results = vec![
-            PartialAggResult { shard_id: 0, count: 0, sum: 0.0, min: Some(10.0), max: Some(50.0) },
-            PartialAggResult { shard_id: 1, count: 0, sum: 0.0, min: Some(5.0), max: Some(90.0) },
+            PartialAggResult {
+                shard_id: 0,
+                count: 0,
+                sum: 0.0,
+                min: Some(10.0),
+                max: Some(50.0),
+            },
+            PartialAggResult {
+                shard_id: 1,
+                count: 0,
+                sum: 0.0,
+                min: Some(5.0),
+                max: Some(90.0),
+            },
         ];
-        assert_eq!(DistributedTableEngine::merge_partial_aggs(&results, AggType::Min), 5.0);
-        assert_eq!(DistributedTableEngine::merge_partial_aggs(&results, AggType::Max), 90.0);
+        assert_eq!(
+            DistributedTableEngine::merge_partial_aggs(&results, AggType::Min),
+            5.0
+        );
+        assert_eq!(
+            DistributedTableEngine::merge_partial_aggs(&results, AggType::Max),
+            90.0
+        );
     }
 
     #[test]
     fn dist_table_merge_partial_avg() {
         let results = vec![
-            PartialAggResult { shard_id: 0, count: 100, sum: 500.0, min: None, max: None },
-            PartialAggResult { shard_id: 1, count: 100, sum: 700.0, min: None, max: None },
+            PartialAggResult {
+                shard_id: 0,
+                count: 100,
+                sum: 500.0,
+                min: None,
+                max: None,
+            },
+            PartialAggResult {
+                shard_id: 1,
+                count: 100,
+                sum: 700.0,
+                min: None,
+                max: None,
+            },
         ];
-        assert_eq!(DistributedTableEngine::merge_partial_aggs(&results, AggType::Avg), 6.0);
+        assert_eq!(
+            DistributedTableEngine::merge_partial_aggs(&results, AggType::Avg),
+            6.0
+        );
     }
 
     #[test]

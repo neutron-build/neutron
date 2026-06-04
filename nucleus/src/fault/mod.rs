@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -357,9 +357,7 @@ mod tests {
         let reg = registry.read();
         assert_eq!(
             reg.status("storage"),
-            Some(&SubsystemHealth::Degraded(
-                "disk latency high".to_string()
-            ))
+            Some(&SubsystemHealth::Degraded("disk latency high".to_string()))
         );
         assert!(!reg.all_healthy());
         assert_eq!(reg.degraded_subsystems(), vec!["storage".to_string()]);
@@ -375,7 +373,10 @@ mod tests {
 
         {
             let reg = registry.read();
-            assert!(matches!(reg.status("fts"), Some(SubsystemHealth::Failed(_))));
+            assert!(matches!(
+                reg.status("fts"),
+                Some(SubsystemHealth::Failed(_))
+            ));
         }
 
         // Manual recovery: an operator or self-heal routine marks it healthy.
@@ -464,7 +465,10 @@ mod tests {
         assert!(run_isolated("fts", &registry, || 3).is_err());
 
         let reg = registry.read();
-        assert!(matches!(reg.status("fts"), Some(SubsystemHealth::Failed(_))));
+        assert!(matches!(
+            reg.status("fts"),
+            Some(SubsystemHealth::Failed(_))
+        ));
         assert_eq!(reg.status("geo"), Some(&SubsystemHealth::Healthy));
         assert_eq!(reg.status("vector"), Some(&SubsystemHealth::Healthy));
     }
@@ -486,7 +490,8 @@ mod tests {
         // Panic with String
         let err = run_isolated::<_, ()>("test1", &registry, || {
             panic!("{}", "formatted panic".to_string())
-        }).unwrap_err();
+        })
+        .unwrap_err();
         match err {
             SubsystemError::Panicked(msg) => assert!(msg.contains("formatted panic")),
             _ => panic!("expected Panicked"),
@@ -550,10 +555,16 @@ mod tests {
         assert_eq!(reg.status("svc"), Some(&SubsystemHealth::Healthy));
 
         reg.mark_degraded("svc", "slow");
-        assert!(matches!(reg.status("svc"), Some(SubsystemHealth::Degraded(_))));
+        assert!(matches!(
+            reg.status("svc"),
+            Some(SubsystemHealth::Degraded(_))
+        ));
 
         reg.mark_failed("svc", "crash");
-        assert!(matches!(reg.status("svc"), Some(SubsystemHealth::Failed(_))));
+        assert!(matches!(
+            reg.status("svc"),
+            Some(SubsystemHealth::Failed(_))
+        ));
 
         reg.mark_healthy("svc");
         assert_eq!(reg.status("svc"), Some(&SubsystemHealth::Healthy));

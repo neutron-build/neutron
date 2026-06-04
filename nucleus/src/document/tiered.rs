@@ -269,9 +269,10 @@ impl TieredDocumentStore {
     pub fn get(&mut self, collection: &str, doc_id: &str) -> Option<JsonValue> {
         // Check hot tier.
         if let Some(coll) = self.hot.get(collection)
-            && let Some(doc) = coll.get(doc_id) {
-                return Some(doc.clone());
-            }
+            && let Some(doc) = coll.get(doc_id)
+        {
+            return Some(doc.clone());
+        }
 
         // Check cold tier.
         let key = make_key(collection, doc_id);
@@ -281,11 +282,12 @@ impl TieredDocumentStore {
         };
 
         if let Some(bytes) = cold_val
-            && let Some(doc) = json_value_from_bytes(&bytes) {
-                // Promote to hot tier.
-                self.promote(collection, doc_id, doc.clone());
-                return Some(doc);
-            }
+            && let Some(doc) = json_value_from_bytes(&bytes)
+        {
+            // Promote to hot tier.
+            self.promote(collection, doc_id, doc.clone());
+            return Some(doc);
+        }
 
         None
     }
@@ -296,13 +298,14 @@ impl TieredDocumentStore {
 
         // Remove from hot.
         if let Some(coll) = self.hot.get_mut(collection)
-            && coll.remove(doc_id).is_some() {
-                self.hot_count -= 1;
-                found = true;
-                if coll.is_empty() {
-                    self.hot.remove(collection);
-                }
+            && coll.remove(doc_id).is_some()
+        {
+            self.hot_count -= 1;
+            found = true;
+            if coll.is_empty() {
+                self.hot.remove(collection);
             }
+        }
 
         // Remove from cold.
         let key = make_key(collection, doc_id);
@@ -351,9 +354,10 @@ impl TieredDocumentStore {
                     continue; // Already found in hot tier.
                 }
                 if let Some(doc) = json_value_from_bytes(&val_bytes)
-                    && doc.get_path(path) == Some(value) {
-                        results.push((doc_id, doc));
-                    }
+                    && doc.get_path(path) == Some(value)
+                {
+                    results.push((doc_id, doc));
+                }
             }
         }
 
@@ -362,11 +366,7 @@ impl TieredDocumentStore {
 
     /// Count documents in a collection across both tiers.
     pub fn count(&self, collection: &str) -> usize {
-        let hot_count = self
-            .hot
-            .get(collection)
-            .map(|c| c.len())
-            .unwrap_or(0);
+        let hot_count = self.hot.get(collection).map(|c| c.len()).unwrap_or(0);
 
         // Scan cold for this collection, excluding docs also in hot.
         let (start, end) = collection_range(collection);
@@ -381,9 +381,7 @@ impl TieredDocumentStore {
             .filter(|(key, _)| {
                 if let Some((_, doc_id)) = split_key(key) {
                     // Only count if not in hot tier.
-                    hot_coll
-                        .map(|c| !c.contains_key(&doc_id))
-                        .unwrap_or(true)
+                    hot_coll.map(|c| !c.contains_key(&doc_id)).unwrap_or(true)
                 } else {
                     false
                 }
@@ -540,7 +538,11 @@ mod tests {
         let mut store = TieredDocumentStore::new(3);
         // Insert 5 docs -- only 3 should remain in hot.
         for i in 0..5 {
-            store.insert("coll", &i.to_string(), make_doc(&format!("doc{i}"), i as f64));
+            store.insert(
+                "coll",
+                &i.to_string(),
+                make_doc(&format!("doc{i}"), i as f64),
+            );
         }
         assert!(store.hot_count <= 3);
         // All 5 should still be accessible (from hot or cold).
@@ -560,11 +562,20 @@ mod tests {
         store.insert("coll", "c", make_doc("C", 3.0));
         // At least one doc was evicted to cold. All 3 should still be readable.
         let doc_a = store.get("coll", "a").unwrap();
-        assert_eq!(doc_a.get_path(&["name"]), Some(&JsonValue::Str("A".to_string())));
+        assert_eq!(
+            doc_a.get_path(&["name"]),
+            Some(&JsonValue::Str("A".to_string()))
+        );
         let doc_b = store.get("coll", "b").unwrap();
-        assert_eq!(doc_b.get_path(&["name"]), Some(&JsonValue::Str("B".to_string())));
+        assert_eq!(
+            doc_b.get_path(&["name"]),
+            Some(&JsonValue::Str("B".to_string()))
+        );
         let doc_c = store.get("coll", "c").unwrap();
-        assert_eq!(doc_c.get_path(&["name"]), Some(&JsonValue::Str("C".to_string())));
+        assert_eq!(
+            doc_c.get_path(&["name"]),
+            Some(&JsonValue::Str("C".to_string()))
+        );
         // Verify cold tier was involved (not everything stayed in hot).
         assert!(store.hot_count <= 2);
     }
@@ -577,7 +588,7 @@ mod tests {
         store.insert("coll", "z", make_doc("Z", 30.0));
 
         // Delete one from each potential tier.
-        assert!(store.delete("coll", "x") || store.delete("coll", "x") == false);
+        assert!(store.delete("coll", "x") || !store.delete("coll", "x"));
         // Actually test deletion.
         store.delete("coll", "z");
         assert!(store.get("coll", "z").is_none());
@@ -602,7 +613,11 @@ mod tests {
     fn test_tiered_doc_count() {
         let mut store = TieredDocumentStore::new(5);
         for i in 0..20 {
-            store.insert("items", &i.to_string(), make_doc(&format!("item{i}"), i as f64));
+            store.insert(
+                "items",
+                &i.to_string(),
+                make_doc(&format!("item{i}"), i as f64),
+            );
         }
         assert_eq!(store.count("items"), 20);
     }
@@ -615,7 +630,11 @@ mod tests {
         store.insert("gamma", "1", make_doc("c", 1.0));
         // Fill up to trigger eviction.
         for i in 0..10 {
-            store.insert("delta", &i.to_string(), make_doc(&format!("d{i}"), i as f64));
+            store.insert(
+                "delta",
+                &i.to_string(),
+                make_doc(&format!("d{i}"), i as f64),
+            );
         }
         let colls = store.collections();
         assert!(colls.contains(&"alpha".to_string()));
@@ -637,10 +656,7 @@ mod tests {
             result.get_path(&["name"]),
             Some(&JsonValue::Str("v2".to_string()))
         );
-        assert_eq!(
-            result.get_path(&["value"]),
-            Some(&JsonValue::Number(10.0))
-        );
+        assert_eq!(result.get_path(&["value"]), Some(&JsonValue::Number(10.0)));
     }
 
     #[test]
@@ -652,7 +668,11 @@ mod tests {
         {
             let mut store = TieredDocumentStore::open(dir_path, 2);
             for i in 0..10 {
-                store.insert("persist", &i.to_string(), make_doc(&format!("p{i}"), i as f64));
+                store.insert(
+                    "persist",
+                    &i.to_string(),
+                    make_doc(&format!("p{i}"), i as f64),
+                );
             }
             // Flush all hot docs to cold, then cold memtable to disk.
             store.flush_to_cold();

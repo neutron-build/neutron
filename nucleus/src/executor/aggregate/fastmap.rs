@@ -15,8 +15,8 @@
 // and are exercised by unit tests in this module.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use crate::types::{DataType, Value};
+use std::collections::HashMap;
 
 /// State accumulated during aggregation for a single group.
 /// This is the minimal data needed to compute aggregate functions.
@@ -28,11 +28,15 @@ pub struct AggregateState {
 
 impl AggregateState {
     pub fn new() -> Self {
-        Self { indices: Vec::new() }
+        Self {
+            indices: Vec::new(),
+        }
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { indices: Vec::with_capacity(capacity) }
+        Self {
+            indices: Vec::with_capacity(capacity),
+        }
     }
 
     pub fn add_row(&mut self, idx: usize) {
@@ -82,7 +86,10 @@ impl FastHashMap for FastHashMapI32 {
                 if !self.map.contains_key(n) {
                     self.key_order.push(*n);
                 }
-                self.map.entry(*n).or_insert_with(AggregateState::new).add_row(row_idx);
+                self.map
+                    .entry(*n)
+                    .or_insert_with(AggregateState::new)
+                    .add_row(row_idx);
                 Ok(())
             }
             Value::Null => {
@@ -105,13 +112,11 @@ impl FastHashMap for FastHashMapI32 {
                     let indices = self.map[&k].indices.clone();
                     (Value::Int32(k), indices)
                 })
-                .chain(
-                    if self.null_indices.is_empty() {
-                        vec![]
-                    } else {
-                        vec![(Value::Null, self.null_indices.clone())]
-                    },
-                ),
+                .chain(if self.null_indices.is_empty() {
+                    vec![]
+                } else {
+                    vec![(Value::Null, self.null_indices.clone())]
+                }),
         )
     }
 }
@@ -141,14 +146,20 @@ impl FastHashMap for FastHashMapI64 {
                 if !self.map.contains_key(&key_i64) {
                     self.key_order.push(key_i64);
                 }
-                self.map.entry(key_i64).or_insert_with(AggregateState::new).add_row(row_idx);
+                self.map
+                    .entry(key_i64)
+                    .or_insert_with(AggregateState::new)
+                    .add_row(row_idx);
                 Ok(())
             }
             Value::Int64(n) => {
                 if !self.map.contains_key(n) {
                     self.key_order.push(*n);
                 }
-                self.map.entry(*n).or_insert_with(AggregateState::new).add_row(row_idx);
+                self.map
+                    .entry(*n)
+                    .or_insert_with(AggregateState::new)
+                    .add_row(row_idx);
                 Ok(())
             }
             Value::Null => {
@@ -171,13 +182,11 @@ impl FastHashMap for FastHashMapI64 {
                     let indices = self.map[&k].indices.clone();
                     (Value::Int64(k), indices)
                 })
-                .chain(
-                    if self.null_indices.is_empty() {
-                        vec![]
-                    } else {
-                        vec![(Value::Null, self.null_indices.clone())]
-                    },
-                ),
+                .chain(if self.null_indices.is_empty() {
+                    vec![]
+                } else {
+                    vec![(Value::Null, self.null_indices.clone())]
+                }),
         )
     }
 }
@@ -221,7 +230,10 @@ impl FastHashMap for FastHashMapF64 {
                 if !self.map.contains_key(&bits) {
                     self.key_order.push(*f);
                 }
-                self.map.entry(bits).or_insert_with(AggregateState::new).add_row(row_idx);
+                self.map
+                    .entry(bits)
+                    .or_insert_with(AggregateState::new)
+                    .add_row(row_idx);
                 Ok(())
             }
             Value::Int32(n) => {
@@ -230,7 +242,10 @@ impl FastHashMap for FastHashMapF64 {
                 if !self.map.contains_key(&bits) {
                     self.key_order.push(f);
                 }
-                self.map.entry(bits).or_insert_with(AggregateState::new).add_row(row_idx);
+                self.map
+                    .entry(bits)
+                    .or_insert_with(AggregateState::new)
+                    .add_row(row_idx);
                 Ok(())
             }
             Value::Int64(n) => {
@@ -239,7 +254,10 @@ impl FastHashMap for FastHashMapF64 {
                 if !self.map.contains_key(&bits) {
                     self.key_order.push(f);
                 }
-                self.map.entry(bits).or_insert_with(AggregateState::new).add_row(row_idx);
+                self.map
+                    .entry(bits)
+                    .or_insert_with(AggregateState::new)
+                    .add_row(row_idx);
                 Ok(())
             }
             Value::Null => {
@@ -263,13 +281,11 @@ impl FastHashMap for FastHashMapF64 {
                     let indices = self.map[&bits].indices.clone();
                     (Value::Float64(f), indices)
                 })
-                .chain(
-                    if self.null_indices.is_empty() {
-                        vec![]
-                    } else {
-                        vec![(Value::Null, self.null_indices.clone())]
-                    },
-                ),
+                .chain(if self.null_indices.is_empty() {
+                    vec![]
+                } else {
+                    vec![(Value::Null, self.null_indices.clone())]
+                }),
         )
     }
 }
@@ -298,7 +314,10 @@ impl FastHashMap for FastHashMapString {
                 if !self.map.contains_key(s) {
                     self.key_order.push(s.clone());
                 }
-                self.map.entry(s.clone()).or_insert_with(AggregateState::new).add_row(row_idx);
+                self.map
+                    .entry(s.clone())
+                    .or_insert_with(AggregateState::new)
+                    .add_row(row_idx);
                 Ok(())
             }
             Value::Null => {
@@ -321,13 +340,11 @@ impl FastHashMap for FastHashMapString {
                     let indices = self.map[s].indices.clone();
                     (Value::Text(s.clone()), indices)
                 })
-                .chain(
-                    if self.null_indices.is_empty() {
-                        vec![]
-                    } else {
-                        vec![(Value::Null, self.null_indices.clone())]
-                    },
-                ),
+                .chain(if self.null_indices.is_empty() {
+                    vec![]
+                } else {
+                    vec![(Value::Null, self.null_indices.clone())]
+                }),
         )
     }
 }
@@ -352,7 +369,10 @@ impl FastHashMap for FastHashMapGeneric {
         if !self.map.contains_key(key) {
             self.key_order.push(key.clone());
         }
-        self.map.entry(key.clone()).or_insert_with(AggregateState::new).add_row(row_idx);
+        self.map
+            .entry(key.clone())
+            .or_insert_with(AggregateState::new)
+            .add_row(row_idx);
         Ok(())
     }
 
@@ -408,7 +428,7 @@ mod tests {
         map.add_row(&Value::Int32(10), 1).unwrap();
         map.add_row(&Value::Int32(20), 2).unwrap();
 
-        let mut items: Vec<_> = map.iter().collect();
+        let items: Vec<_> = map.iter().collect();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].1.len(), 2); // key 10 has 2 rows
         assert_eq!(items[1].1.len(), 1); // key 20 has 1 row
@@ -472,7 +492,11 @@ mod tests {
 
         let items: Vec<_> = map.iter().collect();
         // Should have one "x" group and one NULL group
-        assert!(items.iter().any(|(k, _)| matches!(k, Value::Text(s) if s == "x")));
+        assert!(
+            items
+                .iter()
+                .any(|(k, _)| matches!(k, Value::Text(s) if s == "x"))
+        );
         assert!(items.iter().any(|(k, _)| matches!(k, Value::Null)));
     }
 

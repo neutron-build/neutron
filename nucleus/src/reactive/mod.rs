@@ -10,8 +10,8 @@
 pub mod cdc_wal;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::broadcast;
 use tokio::time::Duration;
 
@@ -146,10 +146,7 @@ impl SubscriptionManager {
         };
 
         for table in &depends_on {
-            self.table_deps
-                .entry(table.clone())
-                .or_default()
-                .push(id);
+            self.table_deps.entry(table.clone()).or_default().push(id);
         }
 
         self.subscriptions.insert(id, sub);
@@ -180,10 +177,7 @@ impl SubscriptionManager {
 
     /// Get subscription IDs affected by a table change.
     pub fn affected_subscriptions(&self, table: &str) -> Vec<u64> {
-        self.table_deps
-            .get(table)
-            .cloned()
-            .unwrap_or_default()
+        self.table_deps.get(table).cloned().unwrap_or_default()
     }
 
     /// Push a diff to all listeners and buffer it for polling.
@@ -191,12 +185,13 @@ impl SubscriptionManager {
         let diff = Arc::new(diff);
         // Buffer for FETCH SUBSCRIPTION polling (cap 1000 per sub).
         if let Ok(mut map) = self.pending_diffs.lock()
-            && let Some(queue) = map.get_mut(&diff.subscription_id) {
-                if queue.len() >= 1000 {
-                    queue.pop_front();
-                }
-                queue.push_back(Arc::clone(&diff));
+            && let Some(queue) = map.get_mut(&diff.subscription_id)
+        {
+            if queue.len() >= 1000 {
+                queue.pop_front();
             }
+            queue.push_back(Arc::clone(&diff));
+        }
         self.diff_tx.send(diff).unwrap_or(0)
     }
 
@@ -292,12 +287,7 @@ impl TaskScheduler {
     }
 
     /// Schedule a new task. Returns the task ID.
-    pub fn schedule(
-        &mut self,
-        name: &str,
-        sql: &str,
-        schedule: Schedule,
-    ) -> u64 {
+    pub fn schedule(&mut self, name: &str, sql: &str, schedule: Schedule) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -420,7 +410,12 @@ impl CdcLog {
     }
 
     /// Append a change event.
-    pub fn append(&mut self, table: &str, change_type: ChangeType, row_data: HashMap<String, String>) -> u64 {
+    pub fn append(
+        &mut self,
+        table: &str,
+        change_type: ChangeType,
+        row_data: HashMap<String, String>,
+    ) -> u64 {
         let seq = self.next_sequence;
         self.next_sequence += 1;
 
@@ -450,7 +445,12 @@ impl CdcLog {
     }
 
     /// Read events for a specific table after a sequence number.
-    pub fn read_table_from(&self, table: &str, after_sequence: u64, limit: usize) -> Vec<&CdcLogEntry> {
+    pub fn read_table_from(
+        &self,
+        table: &str,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Vec<&CdcLogEntry> {
         self.events
             .iter()
             .filter(|e| e.sequence > after_sequence && e.table == table)
@@ -638,7 +638,10 @@ mod tests {
     use super::*;
 
     fn make_row(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[tokio::test]
@@ -675,10 +678,7 @@ mod tests {
             "SELECT * FROM orders WHERE status = 'pending'",
             vec!["orders".into()],
         );
-        let (_id2, _rx2) = mgr.subscribe(
-            "SELECT count(*) FROM users",
-            vec!["users".into()],
-        );
+        let (_id2, _rx2) = mgr.subscribe("SELECT count(*) FROM users", vec!["users".into()]);
 
         assert_eq!(mgr.active_count(), 2);
 
@@ -744,9 +744,21 @@ mod tests {
     fn cdc_log() {
         let mut cdc = CdcLog::new();
 
-        let _s1 = cdc.append("users", ChangeType::Insert, make_row(&[("id", "1"), ("name", "Alice")]));
-        let s2 = cdc.append("orders", ChangeType::Insert, make_row(&[("id", "1"), ("user_id", "1")]));
-        let _s3 = cdc.append("users", ChangeType::Update, make_row(&[("id", "1"), ("name", "Alice B")]));
+        let _s1 = cdc.append(
+            "users",
+            ChangeType::Insert,
+            make_row(&[("id", "1"), ("name", "Alice")]),
+        );
+        let s2 = cdc.append(
+            "orders",
+            ChangeType::Insert,
+            make_row(&[("id", "1"), ("user_id", "1")]),
+        );
+        let _s3 = cdc.append(
+            "users",
+            ChangeType::Update,
+            make_row(&[("id", "1"), ("name", "Alice B")]),
+        );
 
         assert_eq!(cdc.len(), 3);
 
@@ -884,14 +896,8 @@ mod tests {
         let mut mgr = SubscriptionManager::new(16);
         assert_eq!(mgr.active_count(), 0);
 
-        let (id1, _rx1) = mgr.subscribe(
-            "SELECT * FROM orders",
-            vec!["orders".into()],
-        );
-        let (id2, _rx2) = mgr.subscribe(
-            "SELECT sum(amount) FROM orders",
-            vec!["orders".into()],
-        );
+        let (id1, _rx1) = mgr.subscribe("SELECT * FROM orders", vec!["orders".into()]);
+        let (id2, _rx2) = mgr.subscribe("SELECT sum(amount) FROM orders", vec!["orders".into()]);
         assert_eq!(mgr.active_count(), 2);
 
         let mut affected = mgr.affected_subscriptions("orders");
@@ -927,10 +933,7 @@ mod tests {
             vec!["orders".into(), "users".into()],
         );
 
-        let (id_users, _rx2) = mgr.subscribe(
-            "SELECT * FROM users",
-            vec!["users".into()],
-        );
+        let (id_users, _rx2) = mgr.subscribe("SELECT * FROM users", vec!["users".into()]);
 
         let affected_orders = mgr.affected_subscriptions("orders");
         assert_eq!(affected_orders, vec![id_join]);
@@ -946,10 +949,7 @@ mod tests {
     #[tokio::test]
     async fn subscription_manager_push_diff() {
         let mut mgr = SubscriptionManager::new(16);
-        let (id, mut rx) = mgr.subscribe(
-            "SELECT * FROM items",
-            vec!["items".into()],
-        );
+        let (id, mut rx) = mgr.subscribe("SELECT * FROM items", vec!["items".into()]);
 
         let diff = QueryDiff {
             subscription_id: id,
@@ -970,10 +970,7 @@ mod tests {
     #[test]
     fn subscription_manager_active_flag() {
         let mut mgr = SubscriptionManager::new(16);
-        let (id, _rx) = mgr.subscribe(
-            "SELECT 1",
-            vec!["t".into()],
-        );
+        let (id, _rx) = mgr.subscribe("SELECT 1", vec!["t".into()]);
 
         assert_eq!(mgr.active_count(), 1);
 
@@ -1209,10 +1206,18 @@ mod tests {
         let mut mgr = SubscriptionManager::new(16);
         let (id, _rx) = mgr.subscribe("SELECT 1", vec!["t".into()]);
 
-        mgr.push_diff(QueryDiff { subscription_id: id, added_rows: vec![make_row(&[("x", "1")])], removed_rows: vec![] });
+        mgr.push_diff(QueryDiff {
+            subscription_id: id,
+            added_rows: vec![make_row(&[("x", "1")])],
+            removed_rows: vec![],
+        });
         assert_eq!(mgr.fetch_diffs(id, 100).len(), 1); // puts it back... wait no - drain removes
         // Re-push and then unsubscribe
-        mgr.push_diff(QueryDiff { subscription_id: id, added_rows: vec![make_row(&[("x", "2")])], removed_rows: vec![] });
+        mgr.push_diff(QueryDiff {
+            subscription_id: id,
+            added_rows: vec![make_row(&[("x", "2")])],
+            removed_rows: vec![],
+        });
         mgr.unsubscribe(id);
         // After unsubscribe the buffer is gone; fetching by ID returns empty
         assert!(mgr.fetch_diffs(id, 100).is_empty());
@@ -1276,7 +1281,10 @@ mod tests {
         assert!(matches!(&events[2], CdcEvent::Delete { row_id: 1, .. }));
 
         // Verify data in update event
-        if let CdcEvent::Update { old_data, new_data, .. } = &events[1] {
+        if let CdcEvent::Update {
+            old_data, new_data, ..
+        } = &events[1]
+        {
             assert_eq!(old_data["price"], "10");
             assert_eq!(new_data["price"], "20");
         } else {

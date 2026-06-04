@@ -63,14 +63,21 @@ async fn test_create_hash_index() {
     exec(&ex, "INSERT INTO products VALUES (3, 'Doohickey', 100)").await;
 
     // Create a hash index
-    let results = exec(&ex, "CREATE INDEX idx_products_price ON products USING hash (price)").await;
+    let results = exec(
+        &ex,
+        "CREATE INDEX idx_products_price ON products USING hash (price)",
+    )
+    .await;
     match &results[0] {
         ExecResult::Command { tag, .. } => assert_eq!(tag, "CREATE INDEX"),
         _ => panic!("expected Command"),
     }
 
     // Verify hash_indexes was populated
-    assert!(ex.hash_indexes.contains_key(&("products".to_string(), "price".to_string())));
+    assert!(
+        ex.hash_indexes
+            .contains_key(&("products".to_string(), "price".to_string()))
+    );
 
     // Equality lookup on the hash-indexed column should still work
     let results = exec(&ex, "SELECT name FROM products WHERE price = 100").await;
@@ -94,7 +101,6 @@ async fn test_truncate() {
     assert_eq!(rows(&results[0]).len(), 0);
 }
 
-
 // View tests
 // ======================================================================
 
@@ -105,7 +111,11 @@ async fn test_create_and_query_view() {
     exec(&ex, "INSERT INTO vt VALUES (1, 'Alice')").await;
     exec(&ex, "INSERT INTO vt VALUES (2, 'Bob')").await;
 
-    exec(&ex, "CREATE VIEW active_users AS SELECT id, name FROM vt WHERE id > 0").await;
+    exec(
+        &ex,
+        "CREATE VIEW active_users AS SELECT id, name FROM vt WHERE id > 0",
+    )
+    .await;
     let results = exec(&ex, "SELECT name FROM active_users").await;
     assert_eq!(rows(&results[0]).len(), 2);
 }
@@ -141,7 +151,6 @@ async fn test_create_sequence_and_nextval() {
     let results = exec(&ex, "SELECT CURRVAL('my_seq')").await;
     assert_eq!(scalar(&results[0]), &Value::Int64(2));
 }
-
 
 // ALTER TABLE tests
 // ======================================================================
@@ -212,7 +221,11 @@ async fn test_alter_table_rename_table() {
 async fn test_alter_column_set_default() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE t_def (id INT, status TEXT)").await;
-    exec(&ex, "ALTER TABLE t_def ALTER COLUMN status SET DEFAULT 'active'").await;
+    exec(
+        &ex,
+        "ALTER TABLE t_def ALTER COLUMN status SET DEFAULT 'active'",
+    )
+    .await;
 
     // Insert a row without specifying status — should get the default
     exec(&ex, "INSERT INTO t_def (id) VALUES (1)").await;
@@ -225,7 +238,11 @@ async fn test_alter_column_set_default() {
 #[tokio::test]
 async fn test_alter_column_drop_default() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE t_ddef (id INT, status TEXT DEFAULT 'pending')").await;
+    exec(
+        &ex,
+        "CREATE TABLE t_ddef (id INT, status TEXT DEFAULT 'pending')",
+    )
+    .await;
 
     // Drop the default
     exec(&ex, "ALTER TABLE t_ddef ALTER COLUMN status DROP DEFAULT").await;
@@ -246,7 +263,10 @@ async fn test_alter_column_set_not_null() {
 
     // Inserting NULL into a NOT NULL column should fail
     let err = ex.execute("INSERT INTO t_nn VALUES (1, NULL)").await;
-    assert!(err.is_err(), "inserting NULL into NOT NULL column should fail");
+    assert!(
+        err.is_err(),
+        "inserting NULL into NOT NULL column should fail"
+    );
 }
 
 #[tokio::test]
@@ -278,10 +298,14 @@ async fn test_alter_table_drop_column_if_exists() {
     exec(&ex, "ALTER TABLE t_dce DROP COLUMN IF EXISTS nonexistent").await;
 
     // DROP COLUMN without IF EXISTS on nonexistent column should error
-    let err = ex.execute("ALTER TABLE t_dce DROP COLUMN nonexistent").await;
-    assert!(err.is_err(), "DROP COLUMN on nonexistent should fail without IF EXISTS");
+    let err = ex
+        .execute("ALTER TABLE t_dce DROP COLUMN nonexistent")
+        .await;
+    assert!(
+        err.is_err(),
+        "DROP COLUMN on nonexistent should fail without IF EXISTS"
+    );
 }
-
 
 // ANALYZE tests
 // ========================================================================
@@ -407,8 +431,8 @@ async fn test_analyze_empty_table() {
     assert_eq!(r[0][0], Value::Text("id".into()));
     assert_eq!(r[0][1], Value::Int64(1)); // distinct_count is max(0, 1) = 1
     assert_eq!(r[0][2], Value::Int64(0)); // null_count
-    assert_eq!(r[0][3], Value::Null);     // min_value (no data)
-    assert_eq!(r[0][4], Value::Null);     // max_value (no data)
+    assert_eq!(r[0][3], Value::Null); // min_value (no data)
+    assert_eq!(r[0][4], Value::Null); // max_value (no data)
 }
 
 #[tokio::test]
@@ -483,7 +507,11 @@ async fn test_analyze_no_table_name() {
 #[tokio::test]
 async fn test_create_and_call_function() {
     let ex = test_executor();
-    exec(&ex, "CREATE FUNCTION double_it(x INT) RETURNS INT LANGUAGE SQL AS $$ SELECT $1 * 2 $$").await;
+    exec(
+        &ex,
+        "CREATE FUNCTION double_it(x INT) RETURNS INT LANGUAGE SQL AS $$ SELECT $1 * 2 $$",
+    )
+    .await;
 
     // Call the UDF
     let results = exec(&ex, "SELECT double_it(21)").await;
@@ -493,7 +521,11 @@ async fn test_create_and_call_function() {
 #[tokio::test]
 async fn test_create_and_drop_function() {
     let ex = test_executor();
-    exec(&ex, "CREATE FUNCTION my_func() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$").await;
+    exec(
+        &ex,
+        "CREATE FUNCTION my_func() RETURNS INT LANGUAGE SQL AS $$ SELECT 1 $$",
+    )
+    .await;
 
     let results = exec(&ex, "SELECT my_func()").await;
     assert_eq!(*scalar(&results[0]), Value::Int32(1));
@@ -515,7 +547,11 @@ async fn test_drop_function_if_exists() {
 #[tokio::test]
 async fn test_udf_with_named_params() {
     let ex = test_executor();
-    exec(&ex, "CREATE FUNCTION add_nums(a INT, b INT) RETURNS INT LANGUAGE SQL AS $$ SELECT $1 + $2 $$").await;
+    exec(
+        &ex,
+        "CREATE FUNCTION add_nums(a INT, b INT) RETURNS INT LANGUAGE SQL AS $$ SELECT $1 + $2 $$",
+    )
+    .await;
 
     let results = exec(&ex, "SELECT add_nums(10, 32)").await;
     assert_eq!(*scalar(&results[0]), Value::Int32(42));
@@ -578,7 +614,11 @@ async fn test_materialized_view() {
     exec(&ex, "INSERT INTO mv_data VALUES (1, 'hello')").await;
     exec(&ex, "INSERT INTO mv_data VALUES (2, 'world')").await;
 
-    exec(&ex, "CREATE MATERIALIZED VIEW mv_test AS SELECT id, val FROM mv_data").await;
+    exec(
+        &ex,
+        "CREATE MATERIALIZED VIEW mv_test AS SELECT id, val FROM mv_data",
+    )
+    .await;
 
     let results = exec(&ex, "SELECT id, val FROM mv_test").await;
     let r = rows(&results[0]);
@@ -611,7 +651,11 @@ async fn test_create_table_if_not_exists() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE ine_tbl (id INT, name TEXT)").await;
     // This should succeed without error since IF NOT EXISTS is specified
-    exec(&ex, "CREATE TABLE IF NOT EXISTS ine_tbl (id INT, name TEXT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE IF NOT EXISTS ine_tbl (id INT, name TEXT)",
+    )
+    .await;
     // Verify table still has original structure
     exec(&ex, "INSERT INTO ine_tbl VALUES (1, 'alice')").await;
     let results = exec(&ex, "SELECT id, name FROM ine_tbl").await;
@@ -634,7 +678,11 @@ async fn test_alter_table_add_column_if_not_exists() {
     exec(&ex, "CREATE TABLE altcol_tbl (id INT, name TEXT)").await;
     exec(&ex, "ALTER TABLE altcol_tbl ADD COLUMN age INT").await;
     // This should succeed without error since IF NOT EXISTS is specified
-    exec(&ex, "ALTER TABLE altcol_tbl ADD COLUMN IF NOT EXISTS age INT").await;
+    exec(
+        &ex,
+        "ALTER TABLE altcol_tbl ADD COLUMN IF NOT EXISTS age INT",
+    )
+    .await;
     // Verify only one age column exists
     exec(&ex, "INSERT INTO altcol_tbl VALUES (1, 'alice', 30)").await;
     let results = exec(&ex, "SELECT id, name, age FROM altcol_tbl").await;
@@ -659,7 +707,11 @@ async fn test_create_or_replace_view() {
     exec(&ex, "INSERT INTO orv_tbl VALUES (1, 'a'), (2, 'b')").await;
     exec(&ex, "CREATE VIEW orv AS SELECT id FROM orv_tbl").await;
     // Replace the view with a different query
-    exec(&ex, "CREATE OR REPLACE VIEW orv AS SELECT id, val FROM orv_tbl WHERE id > 1").await;
+    exec(
+        &ex,
+        "CREATE OR REPLACE VIEW orv AS SELECT id, val FROM orv_tbl WHERE id > 1",
+    )
+    .await;
     let results = exec(&ex, "SELECT * FROM orv").await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1); // Only one row with id > 1
@@ -683,19 +735,33 @@ async fn test_serial_column_creates_sequence() {
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     // id should be 1 (first nextval)
-    assert_eq!(r[0][0], Value::Int32(1), "first SERIAL id should be 1, got {:?}", r[0][0]);
+    assert_eq!(
+        r[0][0],
+        Value::Int32(1),
+        "first SERIAL id should be 1, got {:?}",
+        r[0][0]
+    );
 }
 
 #[tokio::test]
 async fn test_bigserial_column() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE bigserial_test (id BIGSERIAL PRIMARY KEY, val TEXT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE bigserial_test (id BIGSERIAL PRIMARY KEY, val TEXT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO bigserial_test (val) VALUES ('row1')").await;
     let results = exec(&ex, "SELECT id FROM bigserial_test").await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     // BIGSERIAL returns Int64
-    assert_eq!(r[0][0], Value::Int64(1), "first BIGSERIAL id should be Int64(1), got {:?}", r[0][0]);
+    assert_eq!(
+        r[0][0],
+        Value::Int64(1),
+        "first BIGSERIAL id should be Int64(1), got {:?}",
+        r[0][0]
+    );
 }
 
 #[tokio::test]
@@ -716,7 +782,11 @@ async fn test_serial_multiple_inserts() {
 #[tokio::test]
 async fn test_smallserial_column() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE smallserial_test (id SMALLSERIAL, label TEXT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE smallserial_test (id SMALLSERIAL, label TEXT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO smallserial_test (label) VALUES ('x')").await;
     exec(&ex, "INSERT INTO smallserial_test (label) VALUES ('y')").await;
     let results = exec(&ex, "SELECT id FROM smallserial_test ORDER BY id").await;
@@ -730,15 +800,29 @@ async fn test_smallserial_column() {
 async fn test_identity_column_generated_always() {
     let ex = test_executor();
     // INT GENERATED ALWAYS AS IDENTITY: column is INT (Int32), sequence auto-increments.
-    exec(&ex, "CREATE TABLE identity_test (id INT GENERATED ALWAYS AS IDENTITY, val TEXT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE identity_test (id INT GENERATED ALWAYS AS IDENTITY, val TEXT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO identity_test (val) VALUES ('hello')").await;
     exec(&ex, "INSERT INTO identity_test (val) VALUES ('world')").await;
     let results = exec(&ex, "SELECT id FROM identity_test ORDER BY id").await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
     // GENERATED ALWAYS AS IDENTITY on INT column: coerced to Int32 (column type)
-    assert_eq!(r[0][0], Value::Int32(1), "first identity id should be 1, got {:?}", r[0][0]);
-    assert_eq!(r[1][0], Value::Int32(2), "second identity id should be 2, got {:?}", r[1][0]);
+    assert_eq!(
+        r[0][0],
+        Value::Int32(1),
+        "first identity id should be 1, got {:?}",
+        r[0][0]
+    );
+    assert_eq!(
+        r[1][0],
+        Value::Int32(2),
+        "second identity id should be 2, got {:?}",
+        r[1][0]
+    );
 }
 
 #[tokio::test]
@@ -767,7 +851,9 @@ async fn test_json_agg_preserves_types() {
     if let crate::executor::ExecResult::Select { rows, .. } = &results[0] {
         if let crate::types::Value::Jsonb(serde_json::Value::Array(arr)) = &rows[0][0] {
             assert_eq!(arr.len(), 3);
-        } else { panic!("expected JSON array"); }
+        } else {
+            panic!("expected JSON array");
+        }
     }
 }
 
@@ -787,7 +873,9 @@ async fn test_create_type_enum_basic() {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][1], Value::Text("happy".into()));
         assert_eq!(rows[1][1], Value::Text("sad".into()));
-    } else { panic!("expected select"); }
+    } else {
+        panic!("expected select");
+    }
 }
 
 #[tokio::test]
@@ -801,8 +889,13 @@ async fn test_create_type_enum_invalid_value() {
     assert!(matches!(r[0], ExecResult::Command { .. }));
 
     // Invalid value should return an error
-    let r = ex.execute("INSERT INTO items VALUES ('y', 'unknown')").await;
-    assert!(r.is_err(), "expected enum constraint violation for invalid value");
+    let r = ex
+        .execute("INSERT INTO items VALUES ('y', 'unknown')")
+        .await;
+    assert!(
+        r.is_err(),
+        "expected enum constraint violation for invalid value"
+    );
 }
 
 #[tokio::test]
@@ -818,7 +911,11 @@ async fn test_drop_type_enum() {
 async fn test_nulls_first_last_order_by() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE ntest (val INT)").await;
-    exec(&ex, "INSERT INTO ntest VALUES (3), (NULL), (1), (NULL), (2)").await;
+    exec(
+        &ex,
+        "INSERT INTO ntest VALUES (3), (NULL), (1), (NULL), (2)",
+    )
+    .await;
 
     // NULLS LAST (default for ASC): NULLs at end
     let r = exec(&ex, "SELECT val FROM ntest ORDER BY val ASC NULLS LAST").await;
@@ -829,7 +926,9 @@ async fn test_nulls_first_last_order_by() {
         assert_eq!(vals[2], Value::Int32(3));
         assert_eq!(vals[3], Value::Null);
         assert_eq!(vals[4], Value::Null);
-    } else { panic!("expected select"); }
+    } else {
+        panic!("expected select");
+    }
 
     // NULLS FIRST (explicit): NULLs at start
     let r = exec(&ex, "SELECT val FROM ntest ORDER BY val ASC NULLS FIRST").await;
@@ -838,7 +937,9 @@ async fn test_nulls_first_last_order_by() {
         assert_eq!(vals[0], Value::Null);
         assert_eq!(vals[1], Value::Null);
         assert_eq!(vals[2], Value::Int32(1));
-    } else { panic!("expected select"); }
+    } else {
+        panic!("expected select");
+    }
 
     // DESC NULLS LAST (non-default): NULLs at end
     let r = exec(&ex, "SELECT val FROM ntest ORDER BY val DESC NULLS LAST").await;
@@ -847,7 +948,9 @@ async fn test_nulls_first_last_order_by() {
         assert_eq!(vals[0], Value::Int32(3));
         assert_eq!(vals[3], Value::Null);
         assert_eq!(vals[4], Value::Null);
-    } else { panic!("expected select"); }
+    } else {
+        panic!("expected select");
+    }
 }
 
 #[tokio::test]
@@ -860,19 +963,25 @@ async fn test_json_path_operators() {
     let r = exec(&ex, r#"SELECT data::jsonb #> '{a,b}' FROM jptest"#).await;
     if let ExecResult::Select { rows, .. } = &r[0] {
         assert_eq!(rows[0][0], Value::Jsonb(serde_json::json!(42)));
-    } else { panic!("expected select"); }
+    } else {
+        panic!("expected select");
+    }
 
     // #>> returns Text
     let r = exec(&ex, r#"SELECT data::jsonb #>> '{a,b}' FROM jptest"#).await;
     if let ExecResult::Select { rows, .. } = &r[0] {
         assert_eq!(rows[0][0], Value::Text("42".to_string()));
-    } else { panic!("expected select"); }
+    } else {
+        panic!("expected select");
+    }
 
     // Missing path returns NULL
     let r = exec(&ex, r#"SELECT data::jsonb #> '{a,z}' FROM jptest"#).await;
     if let ExecResult::Select { rows, .. } = &r[0] {
         assert_eq!(rows[0][0], Value::Null);
-    } else { panic!("expected select"); }
+    } else {
+        panic!("expected select");
+    }
 }
 
 // ======================================================================
@@ -886,7 +995,11 @@ async fn test_alter_table_add_unique_constraint() {
     exec(&ex, "INSERT INTO t_uq1 VALUES (1, 'a@b.com')").await;
 
     // Add a named UNIQUE constraint.
-    let r = exec(&ex, "ALTER TABLE t_uq1 ADD CONSTRAINT uq_email UNIQUE (email)").await;
+    let r = exec(
+        &ex,
+        "ALTER TABLE t_uq1 ADD CONSTRAINT uq_email UNIQUE (email)",
+    )
+    .await;
     match &r[0] {
         ExecResult::Command { tag, .. } => assert_eq!(tag, "ALTER TABLE"),
         _ => panic!("expected Command"),
@@ -897,7 +1010,9 @@ async fn test_alter_table_add_unique_constraint() {
     assert!(err.is_err(), "expected unique constraint violation");
     let msg = format!("{}", err.unwrap_err());
     assert!(
-        msg.to_lowercase().contains("unique") || msg.to_lowercase().contains("duplicate") || msg.to_lowercase().contains("constraint"),
+        msg.to_lowercase().contains("unique")
+            || msg.to_lowercase().contains("duplicate")
+            || msg.to_lowercase().contains("constraint"),
         "error should mention constraint: {msg}"
     );
 }
@@ -909,7 +1024,11 @@ async fn test_alter_table_add_check_constraint() {
     exec(&ex, "INSERT INTO t_ck1 VALUES (1, 25)").await;
 
     // Add a CHECK constraint.
-    let r = exec(&ex, "ALTER TABLE t_ck1 ADD CONSTRAINT ck_age CHECK (age > 0)").await;
+    let r = exec(
+        &ex,
+        "ALTER TABLE t_ck1 ADD CONSTRAINT ck_age CHECK (age > 0)",
+    )
+    .await;
     match &r[0] {
         ExecResult::Command { tag, .. } => assert_eq!(tag, "ALTER TABLE"),
         _ => panic!("expected Command"),
@@ -919,7 +1038,10 @@ async fn test_alter_table_add_check_constraint() {
     let err = ex.execute("INSERT INTO t_ck1 VALUES (2, -1)").await;
     assert!(err.is_err(), "expected check constraint violation");
     let msg = format!("{}", err.unwrap_err());
-    assert!(msg.contains("check constraint"), "error should mention check constraint: {msg}");
+    assert!(
+        msg.contains("check constraint"),
+        "error should mention check constraint: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -929,7 +1051,9 @@ async fn test_alter_table_add_check_constraint_validates_existing_rows() {
     exec(&ex, "INSERT INTO t_ck2 VALUES (1, -5)").await;
 
     // Adding a CHECK that existing data violates should fail.
-    let err = ex.execute("ALTER TABLE t_ck2 ADD CONSTRAINT ck_val CHECK (val > 0)").await;
+    let err = ex
+        .execute("ALTER TABLE t_ck2 ADD CONSTRAINT ck_val CHECK (val > 0)")
+        .await;
     assert!(err.is_err(), "existing rows violate the new CHECK");
 }
 
@@ -939,7 +1063,11 @@ async fn test_alter_table_add_primary_key_constraint() {
     exec(&ex, "CREATE TABLE t_pk1 (id INT, name TEXT)").await;
     exec(&ex, "INSERT INTO t_pk1 VALUES (1, 'Alice')").await;
 
-    let r = exec(&ex, "ALTER TABLE t_pk1 ADD CONSTRAINT pk_t4 PRIMARY KEY (id)").await;
+    let r = exec(
+        &ex,
+        "ALTER TABLE t_pk1 ADD CONSTRAINT pk_t4 PRIMARY KEY (id)",
+    )
+    .await;
     match &r[0] {
         ExecResult::Command { tag, .. } => assert_eq!(tag, "ALTER TABLE"),
         _ => panic!("expected Command"),
@@ -956,17 +1084,26 @@ async fn test_alter_table_add_primary_key_rejects_second_pk() {
     exec(&ex, "CREATE TABLE t_pk2 (id INT PRIMARY KEY, name TEXT)").await;
 
     // Adding a second PK should fail.
-    let err = ex.execute("ALTER TABLE t_pk2 ADD CONSTRAINT pk2 PRIMARY KEY (name)").await;
+    let err = ex
+        .execute("ALTER TABLE t_pk2 ADD CONSTRAINT pk2 PRIMARY KEY (name)")
+        .await;
     assert!(err.is_err(), "should reject second PRIMARY KEY");
     let msg = format!("{}", err.unwrap_err());
-    assert!(msg.contains("already has a PRIMARY KEY"), "error should mention existing PK: {msg}");
+    assert!(
+        msg.contains("already has a PRIMARY KEY"),
+        "error should mention existing PK: {msg}"
+    );
 }
 
 #[tokio::test]
 async fn test_alter_table_drop_constraint() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE t_dc1 (id INT, email TEXT)").await;
-    exec(&ex, "ALTER TABLE t_dc1 ADD CONSTRAINT uq_email2 UNIQUE (email)").await;
+    exec(
+        &ex,
+        "ALTER TABLE t_dc1 ADD CONSTRAINT uq_email2 UNIQUE (email)",
+    )
+    .await;
     exec(&ex, "INSERT INTO t_dc1 VALUES (1, 'a@b.com')").await;
 
     // Drop the constraint.
@@ -983,7 +1120,9 @@ async fn test_alter_table_drop_constraint_not_found() {
     exec(&ex, "CREATE TABLE t_dc2 (id INT)").await;
 
     // Drop nonexistent should fail.
-    let err = ex.execute("ALTER TABLE t_dc2 DROP CONSTRAINT no_such").await;
+    let err = ex
+        .execute("ALTER TABLE t_dc2 DROP CONSTRAINT no_such")
+        .await;
     assert!(err.is_err(), "should fail for nonexistent constraint");
 }
 
@@ -1004,7 +1143,11 @@ async fn test_alter_table_drop_constraint_if_exists() {
 async fn test_alter_table_drop_check_constraint() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE t_dc4 (id INT, val INT)").await;
-    exec(&ex, "ALTER TABLE t_dc4 ADD CONSTRAINT ck_val CHECK (val > 0)").await;
+    exec(
+        &ex,
+        "ALTER TABLE t_dc4 ADD CONSTRAINT ck_val CHECK (val > 0)",
+    )
+    .await;
 
     // The check is enforced.
     let err = ex.execute("INSERT INTO t_dc4 VALUES (1, -1)").await;
@@ -1034,10 +1177,15 @@ async fn test_alter_table_add_constraint_nonexistent_column() {
     exec(&ex, "CREATE TABLE t_ac1 (id INT)").await;
 
     // Adding UNIQUE on nonexistent column should fail.
-    let err = ex.execute("ALTER TABLE t_ac1 ADD CONSTRAINT uq_bad UNIQUE (nope)").await;
+    let err = ex
+        .execute("ALTER TABLE t_ac1 ADD CONSTRAINT uq_bad UNIQUE (nope)")
+        .await;
     assert!(err.is_err(), "should fail for nonexistent column");
     let msg = format!("{}", err.unwrap_err());
-    assert!(msg.contains("nope"), "error should mention column name: {msg}");
+    assert!(
+        msg.contains("nope"),
+        "error should mention column name: {msg}"
+    );
 }
 
 // ======================================================================

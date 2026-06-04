@@ -28,11 +28,24 @@ use crate::types::{Row, Value};
 /// A buffered write operation within a transaction.
 #[derive(Debug, Clone)]
 enum BufferedOp {
-    Insert { table: String, row: Row },
-    Delete { table: String, positions: Vec<usize> },
-    Update { table: String, updates: Vec<(usize, Row)> },
-    CreateTable { table: String },
-    DropTable { table: String },
+    Insert {
+        table: String,
+        row: Row,
+    },
+    Delete {
+        table: String,
+        positions: Vec<usize>,
+    },
+    Update {
+        table: String,
+        updates: Vec<(usize, Row)>,
+    },
+    CreateTable {
+        table: String,
+    },
+    DropTable {
+        table: String,
+    },
 }
 
 /// Transaction state — holds buffered operations until commit/abort.
@@ -101,7 +114,9 @@ impl StorageEngine for BufferedDiskEngine {
         if self.is_in_txn() {
             let mut buf = self.txn_buf.write();
             if let Some(ref mut txn) = *buf {
-                txn.ops.push(BufferedOp::CreateTable { table: table.to_string() });
+                txn.ops.push(BufferedOp::CreateTable {
+                    table: table.to_string(),
+                });
             }
             Ok(())
         } else {
@@ -113,7 +128,9 @@ impl StorageEngine for BufferedDiskEngine {
         if self.is_in_txn() {
             let mut buf = self.txn_buf.write();
             if let Some(ref mut txn) = *buf {
-                txn.ops.push(BufferedOp::DropTable { table: table.to_string() });
+                txn.ops.push(BufferedOp::DropTable {
+                    table: table.to_string(),
+                });
             }
             Ok(())
         } else {
@@ -147,7 +164,10 @@ impl StorageEngine for BufferedDiskEngine {
                     BufferedOp::Insert { table: t, row } if t == table => {
                         rows.push(row.clone());
                     }
-                    BufferedOp::Delete { table: t, positions } if t == table => {
+                    BufferedOp::Delete {
+                        table: t,
+                        positions,
+                    } if t == table => {
                         // Mark deleted positions (apply in reverse order to handle shifts)
                         let mut deleted = vec![false; rows.len()];
                         for &pos in positions {
@@ -155,7 +175,9 @@ impl StorageEngine for BufferedDiskEngine {
                                 deleted[pos] = true;
                             }
                         }
-                        rows = rows.into_iter().enumerate()
+                        rows = rows
+                            .into_iter()
+                            .enumerate()
                             .filter(|(i, _)| !deleted.get(*i).copied().unwrap_or(false))
                             .map(|(_, r)| r)
                             .collect();
@@ -183,7 +205,10 @@ impl StorageEngine for BufferedDiskEngine {
             for op in &txn.ops {
                 match op {
                     BufferedOp::Insert { table: t, .. } if t == table => count += 1,
-                    BufferedOp::Delete { table: t, positions } if t == table => {
+                    BufferedOp::Delete {
+                        table: t,
+                        positions,
+                    } if t == table => {
                         count = count.saturating_sub(positions.len());
                     }
                     _ => {}
@@ -259,7 +284,12 @@ impl StorageEngine for BufferedDiskEngine {
 
     // -- Delegate everything else to inner DiskEngine --
 
-    async fn create_index(&self, table: &str, index_name: &str, col_idx: usize) -> Result<(), StorageError> {
+    async fn create_index(
+        &self,
+        table: &str,
+        index_name: &str,
+        col_idx: usize,
+    ) -> Result<(), StorageError> {
         self.inner.create_index(table, index_name, col_idx).await
     }
 
@@ -267,7 +297,12 @@ impl StorageEngine for BufferedDiskEngine {
         self.inner.drop_index(index_name).await
     }
 
-    async fn index_lookup(&self, table: &str, index_name: &str, value: &Value) -> Result<Option<Vec<Row>>, StorageError> {
+    async fn index_lookup(
+        &self,
+        table: &str,
+        index_name: &str,
+        value: &Value,
+    ) -> Result<Option<Vec<Row>>, StorageError> {
         self.inner.index_lookup(table, index_name, value).await
     }
 
@@ -278,10 +313,17 @@ impl StorageEngine for BufferedDiskEngine {
         low: &Value,
         high: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
-        self.inner.index_lookup_range(table, index_name, low, high).await
+        self.inner
+            .index_lookup_range(table, index_name, low, high)
+            .await
     }
 
-    fn index_lookup_sync(&self, table: &str, index_name: &str, value: &Value) -> Result<Option<Vec<Row>>, StorageError> {
+    fn index_lookup_sync(
+        &self,
+        table: &str,
+        index_name: &str,
+        value: &Value,
+    ) -> Result<Option<Vec<Row>>, StorageError> {
         self.inner.index_lookup_sync(table, index_name, value)
     }
 
@@ -292,7 +334,8 @@ impl StorageEngine for BufferedDiskEngine {
         low: &Value,
         high: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
-        self.inner.index_lookup_range_sync(table, index_name, low, high)
+        self.inner
+            .index_lookup_range_sync(table, index_name, low, high)
     }
 
     fn index_only_scan(
@@ -302,7 +345,8 @@ impl StorageEngine for BufferedDiskEngine {
         eq_value: Option<&Value>,
         range: Option<(&Value, &Value)>,
     ) -> Option<Vec<Row>> {
-        self.inner.index_only_scan(table, index_name, eq_value, range)
+        self.inner
+            .index_only_scan(table, index_name, eq_value, range)
     }
 
     async fn flush_all_dirty(&self) -> Result<(), StorageError> {
@@ -330,15 +374,28 @@ mod tests {
         let disk = Arc::new(DiskEngine::open(path, catalog.clone()).unwrap());
         let engine = Arc::new(BufferedDiskEngine::new(disk));
         // Register a test table
-        catalog.create_table(TableDef {
-            name: "t".to_string(),
-            columns: vec![
-                ColumnDef { name: "id".into(), data_type: DataType::Int32, nullable: false, default_expr: None },
-                ColumnDef { name: "name".into(), data_type: DataType::Text, nullable: true, default_expr: None },
-            ],
-            constraints: vec![],
-            append_only: false,
-        }).await.unwrap();
+        catalog
+            .create_table(TableDef {
+                name: "t".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".into(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "name".into(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        default_expr: None,
+                    },
+                ],
+                constraints: vec![],
+                append_only: false,
+            })
+            .await
+            .unwrap();
         engine.create_table("t").await.unwrap();
         (engine, catalog)
     }

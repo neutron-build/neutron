@@ -3,15 +3,15 @@
 //! Each test simulates a restart by dropping the first `Executor` and opening a
 //! new one from the same directory, then calling `rebuild_specialty_indexes()`.
 
-use std::sync::Arc;
 use std::path::Path;
+use std::sync::Arc;
 
-use crate::catalog::Catalog;
-use crate::storage::{StorageEngine, DiskEngine};
-use crate::storage::persistence::CatalogPersistence;
-use crate::types::Value;
 use super::super::Executor;
 use super::{exec, rows};
+use crate::catalog::Catalog;
+use crate::storage::persistence::CatalogPersistence;
+use crate::storage::{DiskEngine, StorageEngine};
+use crate::types::Value;
 
 // ── Helper ────────────────────────────────────────────────────────────────────
 
@@ -49,7 +49,11 @@ async fn test_ivfflat_index_survives_restart() {
         exec(&ex, "INSERT INTO vecs VALUES (3, VECTOR('[0,0,1]'))").await;
         exec(&ex, "INSERT INTO vecs VALUES (4, VECTOR('[1,1,0]'))").await;
         exec(&ex, "INSERT INTO vecs VALUES (5, VECTOR('[0,1,1]'))").await;
-        exec(&ex, "CREATE INDEX idx_vecs_embedding ON vecs USING IVFFLAT (embedding)").await;
+        exec(
+            &ex,
+            "CREATE INDEX idx_vecs_embedding ON vecs USING IVFFLAT (embedding)",
+        )
+        .await;
 
         // Verify search works before restart
         let r = exec(&ex, "SELECT id FROM vecs ORDER BY VECTOR_DISTANCE(embedding, VECTOR('[1,0,0]'), 'l2') LIMIT 1").await;
@@ -57,7 +61,10 @@ async fn test_ivfflat_index_survives_restart() {
             Some(Value::Int32(v)) => *v,
             _ => -1,
         };
-        assert_eq!(found_id, 1, "nearest to [1,0,0] should be row 1 before restart");
+        assert_eq!(
+            found_id, 1,
+            "nearest to [1,0,0] should be row 1 before restart"
+        );
     } // drop — simulate restart
 
     // ── Second boot: index should be rebuilt automatically ──
@@ -70,7 +77,10 @@ async fn test_ivfflat_index_survives_restart() {
             Some(Value::Int32(v)) => *v,
             _ => -1,
         };
-        assert_eq!(found_id, 1, "IvfFlat index should survive restart: nearest to [1,0,0] must be row 1");
+        assert_eq!(
+            found_id, 1,
+            "IvfFlat index should survive restart: nearest to [1,0,0] must be row 1"
+        );
     }
 }
 
@@ -85,7 +95,11 @@ async fn test_ivfflat_multiple_indexes_survive_restart() {
         exec(&ex, "INSERT INTO items VALUES (2, VECTOR('[3,4]'))").await;
         exec(&ex, "INSERT INTO items VALUES (3, VECTOR('[5,6]'))").await;
         exec(&ex, "INSERT INTO items VALUES (4, VECTOR('[7,8]'))").await;
-        exec(&ex, "CREATE INDEX idx_items_feat ON items USING IVFFLAT (feat)").await;
+        exec(
+            &ex,
+            "CREATE INDEX idx_items_feat ON items USING IVFFLAT (feat)",
+        )
+        .await;
 
         exec(&ex, "CREATE TABLE docs (id INT, vec VECTOR(2))").await;
         exec(&ex, "INSERT INTO docs VALUES (10, VECTOR('[0,0]'))").await;
@@ -115,14 +129,22 @@ async fn test_ivfflat_multiple_indexes_survive_restart() {
         assert_eq!(count, 3, "docs table should have 3 rows after restart");
 
         // Vector search still works on both tables
-        let r1 = exec(&ex, "SELECT id FROM items ORDER BY VECTOR_DISTANCE(feat, VECTOR('[1,2]'), 'l2') LIMIT 1").await;
+        let r1 = exec(
+            &ex,
+            "SELECT id FROM items ORDER BY VECTOR_DISTANCE(feat, VECTOR('[1,2]'), 'l2') LIMIT 1",
+        )
+        .await;
         let id1 = match rows(&r1[0]).first().and_then(|row| row.first()) {
             Some(Value::Int32(v)) => *v,
             _ => -1,
         };
         assert_eq!(id1, 1, "items: nearest to [1,2] should be row 1");
 
-        let r2 = exec(&ex, "SELECT id FROM docs ORDER BY VECTOR_DISTANCE(vec, VECTOR('[0,0]'), 'l2') LIMIT 1").await;
+        let r2 = exec(
+            &ex,
+            "SELECT id FROM docs ORDER BY VECTOR_DISTANCE(vec, VECTOR('[0,0]'), 'l2') LIMIT 1",
+        )
+        .await;
         let id2 = match rows(&r2[0]).first().and_then(|row| row.first()) {
             Some(Value::Int32(v)) => *v,
             _ => -1,
@@ -139,7 +161,9 @@ async fn test_encrypted_index_survives_restart() {
 
     // Use a 32-byte key via env var
     // SAFETY: single-threaded test; no other thread reads this env var.
-    unsafe { std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "abcdefghijklmnopqrstuvwxyz012345"); }
+    unsafe {
+        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "abcdefghijklmnopqrstuvwxyz012345");
+    }
 
     {
         let ex = open_executor(dir.path()).await;
@@ -147,7 +171,11 @@ async fn test_encrypted_index_survives_restart() {
         exec(&ex, "INSERT INTO secrets VALUES (1, 'alpha')").await;
         exec(&ex, "INSERT INTO secrets VALUES (2, 'beta')").await;
         exec(&ex, "INSERT INTO secrets VALUES (3, 'gamma')").await;
-        exec(&ex, "CREATE INDEX idx_secrets_token ON secrets USING ENCRYPTED (token)").await;
+        exec(
+            &ex,
+            "CREATE INDEX idx_secrets_token ON secrets USING ENCRYPTED (token)",
+        )
+        .await;
     }
 
     {

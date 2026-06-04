@@ -32,21 +32,21 @@ pub(super) fn scalar(result: &ExecResult) -> &Value {
     &r[0][0]
 }
 
-mod test_scalar_fns;
-mod test_query;
-mod test_dml;
-mod test_ddl;
 mod test_admin;
-mod test_multimodel;
-mod test_index;
-mod test_txn;
-mod test_integration;
 mod test_collections;
 mod test_cross_model;
+mod test_ddl;
+mod test_dml;
+mod test_e2e_smoke; // End-to-end smoke tests exercising all Nucleus capabilities
+mod test_filter_lazy; // Phase 2C: Lazy materialization for WHERE clause filtering
+mod test_index;
+mod test_integration;
+mod test_jsonb;
 mod test_meta_persistence;
-mod test_specialty_persistence;
 mod test_module_wiring;
-mod test_filter_lazy;  // Phase 2C: Lazy materialization for WHERE clause filtering
-mod test_e2e_smoke;    // End-to-end smoke tests exercising all Nucleus capabilities
+mod test_multimodel;
 mod test_mv_writetime; // Phase 3: Write-time materialized view refresh
-mod test_jsonb;        // Phase 4: JSONB @> containment, GIN indexes, subscript syntax
+mod test_query;
+mod test_scalar_fns;
+mod test_specialty_persistence;
+mod test_txn; // Phase 4: JSONB @> containment, GIN indexes, subscript syntax

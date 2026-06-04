@@ -74,16 +74,26 @@ pub fn simd_min(values: &[f64]) -> f64 {
         let v1 = values[base + 1];
         let v2 = values[base + 2];
         let v3 = values[base + 3];
-        if v0 < min0 { min0 = v0; }
-        if v1 < min1 { min1 = v1; }
-        if v2 < min2 { min2 = v2; }
-        if v3 < min3 { min3 = v3; }
+        if v0 < min0 {
+            min0 = v0;
+        }
+        if v1 < min1 {
+            min1 = v1;
+        }
+        if v2 < min2 {
+            min2 = v2;
+        }
+        if v3 < min3 {
+            min3 = v3;
+        }
     }
 
     let tail_start = chunks * 4;
     for i in 0..remainder {
         let v = values[tail_start + i];
-        if v < min0 { min0 = v; }
+        if v < min0 {
+            min0 = v;
+        }
     }
 
     let a = if min0 < min1 { min0 } else { min1 };
@@ -112,16 +122,26 @@ pub fn simd_max(values: &[f64]) -> f64 {
         let v1 = values[base + 1];
         let v2 = values[base + 2];
         let v3 = values[base + 3];
-        if v0 > max0 { max0 = v0; }
-        if v1 > max1 { max1 = v1; }
-        if v2 > max2 { max2 = v2; }
-        if v3 > max3 { max3 = v3; }
+        if v0 > max0 {
+            max0 = v0;
+        }
+        if v1 > max1 {
+            max1 = v1;
+        }
+        if v2 > max2 {
+            max2 = v2;
+        }
+        if v3 > max3 {
+            max3 = v3;
+        }
     }
 
     let tail_start = chunks * 4;
     for i in 0..remainder {
         let v = values[tail_start + i];
-        if v > max0 { max0 = v; }
+        if v > max0 {
+            max0 = v;
+        }
     }
 
     let a = if max0 > max1 { max0 } else { max1 };
@@ -166,23 +186,43 @@ pub fn simd_sum_min_max(values: &[f64]) -> (f64, f64, f64) {
         sum2 += v2;
         sum3 += v3;
 
-        if v0 < min0 { min0 = v0; }
-        if v1 < min1 { min1 = v1; }
-        if v2 < min2 { min2 = v2; }
-        if v3 < min3 { min3 = v3; }
+        if v0 < min0 {
+            min0 = v0;
+        }
+        if v1 < min1 {
+            min1 = v1;
+        }
+        if v2 < min2 {
+            min2 = v2;
+        }
+        if v3 < min3 {
+            min3 = v3;
+        }
 
-        if v0 > max0 { max0 = v0; }
-        if v1 > max1 { max1 = v1; }
-        if v2 > max2 { max2 = v2; }
-        if v3 > max3 { max3 = v3; }
+        if v0 > max0 {
+            max0 = v0;
+        }
+        if v1 > max1 {
+            max1 = v1;
+        }
+        if v2 > max2 {
+            max2 = v2;
+        }
+        if v3 > max3 {
+            max3 = v3;
+        }
     }
 
     let tail_start = chunks * 4;
     for i in 0..remainder {
         let v = values[tail_start + i];
         sum0 += v;
-        if v < min0 { min0 = v; }
-        if v > max0 { max0 = v; }
+        if v < min0 {
+            min0 = v;
+        }
+        if v > max0 {
+            max0 = v;
+        }
     }
 
     let sum = (sum0 + sum1) + (sum2 + sum3);
@@ -432,13 +472,15 @@ impl TimeIndex {
 
     /// Get or insert a partition for the given bucket boundary.
     fn ensure_partition(&mut self, bucket_start: u64) -> &mut PartitionMeta {
-        self.boundaries.entry(bucket_start).or_insert(PartitionMeta {
-            start_offset: 0,
-            count: 0,
-            min_ts: u64::MAX,
-            max_ts: 0,
-            compressed: false,
-        })
+        self.boundaries
+            .entry(bucket_start)
+            .or_insert(PartitionMeta {
+                start_offset: 0,
+                count: 0,
+                min_ts: u64::MAX,
+                max_ts: 0,
+                compressed: false,
+            })
     }
 
     fn len(&self) -> usize {
@@ -477,9 +519,7 @@ impl Series {
     /// Insert a data point into the columnar storage. Maintains sorted order.
     fn insert(&mut self, ts: u64, value: f64, tags: &[(String, String)], partition_size: u64) {
         // Find sorted insertion position
-        let pos = self.timestamps
-            .binary_search(&ts)
-            .unwrap_or_else(|i| i);
+        let pos = self.timestamps.binary_search(&ts).unwrap_or_else(|i| i);
 
         let is_append = pos == self.timestamps.len();
 
@@ -494,7 +534,8 @@ impl Series {
         }
         // Then set the tags that are present
         for (key, val) in tags {
-            let col = self.tag_columns
+            let col = self
+                .tag_columns
                 .entry(key.clone())
                 .or_insert_with(|| vec![None; self.timestamps.len()]);
             // If the column was just created, it already has the right length
@@ -541,7 +582,8 @@ impl Series {
                 } else if meta.start_offset == pos {
                     // This could be the partition we just inserted into,
                     // or a different one. If different, shift it.
-                    let this_bucket = (self.timestamps[meta.start_offset] / partition_size) * partition_size;
+                    let this_bucket =
+                        (self.timestamps[meta.start_offset] / partition_size) * partition_size;
                     if this_bucket != bucket_start && meta.start_offset > 0 {
                         // Not our target partition but has same start_offset.
                         // After insert, our element is at `pos` so this one shifted to pos+1.
@@ -714,13 +756,15 @@ impl Series {
         // If enough partitions, aggregate each independently then merge
         let partial_results: Vec<AggResult> = if partitions.len() > 4 {
             // Parallel-style: aggregate each partition independently
-            partitions.iter().filter_map(|(_, meta)| {
-                self.aggregate_partition(meta, start, end)
-            }).collect()
+            partitions
+                .iter()
+                .filter_map(|(_, meta)| self.aggregate_partition(meta, start, end))
+                .collect()
         } else {
-            partitions.iter().filter_map(|(_, meta)| {
-                self.aggregate_partition(meta, start, end)
-            }).collect()
+            partitions
+                .iter()
+                .filter_map(|(_, meta)| self.aggregate_partition(meta, start, end))
+                .collect()
         };
 
         // Merge partial results
@@ -787,8 +831,12 @@ impl Series {
         for r in partials {
             total_count += r.count;
             total_sum += r.sum;
-            if r.min < total_min { total_min = r.min; }
-            if r.max > total_max { total_max = r.max; }
+            if r.min < total_min {
+                total_min = r.min;
+            }
+            if r.max > total_max {
+                total_max = r.max;
+            }
         }
 
         if total_count == 0 {
@@ -843,9 +891,7 @@ struct TsWal {
 
 impl std::fmt::Debug for TsWal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TsWal")
-            .field("dir", &self.dir)
-            .finish()
+        f.debug_struct("TsWal").field("dir", &self.dir).finish()
     }
 }
 
@@ -1029,7 +1075,9 @@ impl TsWal {
             match entry_type {
                 WAL_CREATE_SERIES => {
                     if let Some((name, _ps, new_pos)) = Self::read_create_series(&data, pos) {
-                        series_map.entry(name.clone()).or_insert_with(|| Series::new(&name));
+                        series_map
+                            .entry(name.clone())
+                            .or_insert_with(|| Series::new(&name));
                         pos = new_pos;
                     } else {
                         // Corrupt — stop replay
@@ -1351,7 +1399,12 @@ impl TimeSeriesStore {
             .entry(series_name.to_string())
             .or_insert_with(|| Series::new(series_name));
 
-        series.insert(point.timestamp, point.value, &point.tags, self.partition_size);
+        series.insert(
+            point.timestamp,
+            point.value,
+            &point.tags,
+            self.partition_size,
+        );
 
         // Update last value
         let update = self
@@ -1365,12 +1418,7 @@ impl TimeSeriesStore {
 
     /// Query data points in a time range [start, end).
     /// Returns references to reconstructed DataPoints.
-    pub fn query(
-        &self,
-        series_name: &str,
-        start: u64,
-        end: u64,
-    ) -> Vec<DataPoint> {
+    pub fn query(&self, series_name: &str, start: u64, end: u64) -> Vec<DataPoint> {
         if let Some(series) = self.series.get(series_name) {
             let indices = series.query_range_indices(start, end);
             series.to_datapoints(&indices)
@@ -1397,11 +1445,10 @@ impl TimeSeriesStore {
             .as_millis() as u64;
         let cutoff = now.saturating_sub(policy.max_age_ms);
 
-        for series in self.series.values_mut() {
+        let mut emptied: Vec<String> = Vec::new();
+        for (name, series) in self.series.iter_mut() {
             // Find the first index that's >= cutoff
-            let keep_from = series
-                .timestamps
-                .partition_point(|&ts| ts < cutoff);
+            let keep_from = series.timestamps.partition_point(|&ts| ts < cutoff);
 
             if keep_from > 0 {
                 // Remove old data from all columns
@@ -1413,7 +1460,16 @@ impl TimeSeriesStore {
                 // Recompute stats and index
                 series.stats = SeriesStats::recompute(&series.timestamps, &series.values);
                 series.rebuild_partition_index(self.partition_size);
+
+                if series.timestamps.is_empty() {
+                    emptied.push(name.clone());
+                }
             }
+        }
+        // Drop the cached "last value" for any series fully purged by retention,
+        // otherwise last_value() would return a point that no longer exists.
+        for name in emptied {
+            self.last_values.remove(&name);
         }
     }
 
@@ -1464,7 +1520,6 @@ impl Series {
             .filter_map(|(_, meta)| self.aggregate_partition(meta, start, end))
             .collect()
     }
-
 }
 
 /// Snapshot of `TimeSeriesStore` mutable state for transaction rollback.
@@ -1632,10 +1687,7 @@ impl TimeSeriesStore {
                 .map(|chunk| {
                     s.spawn(|| {
                         let partials = series.aggregate_partition_batch(chunk, start, end);
-                        partials
-                            .iter()
-                            .map(|r| r.min)
-                            .fold(f64::INFINITY, f64::min)
+                        partials.iter().map(|r| r.min).fold(f64::INFINITY, f64::min)
                     })
                 })
                 .collect();
@@ -1713,7 +1765,9 @@ impl TimeSeriesStore {
             return series_names
                 .iter()
                 .map(|&name| {
-                    let val = self.last_value(name).map(|dp| (dp.timestamp as i64, dp.value));
+                    let val = self
+                        .last_value(name)
+                        .map(|dp| (dp.timestamp as i64, dp.value));
                     (name.to_string(), val)
                 })
                 .collect();
@@ -1724,16 +1778,14 @@ impl TimeSeriesStore {
                 .iter()
                 .map(|&name| {
                     s.spawn(move || {
-                        let val =
-                            self.last_value(name).map(|dp| (dp.timestamp as i64, dp.value));
+                        let val = self
+                            .last_value(name)
+                            .map(|dp| (dp.timestamp as i64, dp.value));
                         (name.to_string(), val)
                     })
                 })
                 .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap())
-                .collect()
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         })
     }
 
@@ -1761,8 +1813,10 @@ impl TimeSeriesStore {
                 if !self.series.contains_key(*name) {
                     wal.log_create_series(name, self.partition_size);
                 }
-                let batch: Vec<_> =
-                    pts.iter().map(|&(ts, val)| (ts, val, Vec::<(String, String)>::new())).collect();
+                let batch: Vec<_> = pts
+                    .iter()
+                    .map(|&(ts, val)| (ts, val, Vec::<(String, String)>::new()))
+                    .collect();
                 wal.log_insert_batch(name, &batch);
             }
 
@@ -2150,11 +2204,7 @@ mod tests {
 
         let (ts0, avg0) = results[0];
         assert_eq!(ts0, base_ts as i64);
-        assert!(
-            (avg0 - 30.5).abs() < 1e-10,
-            "first bucket avg was {}",
-            avg0
-        );
+        assert!((avg0 - 30.5).abs() < 1e-10, "first bucket avg was {}", avg0);
 
         let (ts1, avg1) = results[1];
         assert_eq!(ts1, (base_ts + BucketSize::Minute.millis()) as i64);
@@ -2182,11 +2232,7 @@ mod tests {
         manager.refresh("sensor_1m_sum", &store);
 
         let after_phase1 = manager.query("sensor_1m_sum", 0, i64::MAX);
-        assert_eq!(
-            after_phase1.len(),
-            2,
-            "phase 1: expected 2 closed buckets"
-        );
+        assert_eq!(after_phase1.len(), 2, "phase 1: expected 2 closed buckets");
 
         let wm1 = manager
             .aggregates
@@ -2199,11 +2245,7 @@ mod tests {
         manager.refresh("sensor_1m_sum", &store);
 
         let after_phase2 = manager.query("sensor_1m_sum", 0, i64::MAX);
-        assert_eq!(
-            after_phase2.len(),
-            3,
-            "phase 2: expected 3 closed buckets"
-        );
+        assert_eq!(after_phase2.len(), 3, "phase 2: expected 3 closed buckets");
 
         let wm2 = manager
             .aggregates
@@ -2498,7 +2540,7 @@ mod tests {
         assert_eq!(series.partition_index.len(), 3);
 
         // Each partition should have 5 points
-        for (_, meta) in &series.partition_index.boundaries {
+        for meta in series.partition_index.boundaries.values() {
             assert_eq!(meta.count, 5);
         }
 
@@ -2667,9 +2709,10 @@ mod tests {
                 "tagged",
                 DataPoint {
                     timestamp: base_ts + i * 1000,
-                    tags: vec![
-                        ("host".into(), if i % 2 == 0 { "a".into() } else { "b".into() }),
-                    ],
+                    tags: vec![(
+                        "host".into(),
+                        if i % 2 == 0 { "a".into() } else { "b".into() },
+                    )],
                     value: i as f64,
                 },
             );
@@ -2679,8 +2722,14 @@ mod tests {
         let host_col = series.tag_columns.get("host").unwrap();
 
         // Count host=a entries
-        let a_count = host_col.iter().filter(|v| v.as_deref() == Some("a")).count();
-        let b_count = host_col.iter().filter(|v| v.as_deref() == Some("b")).count();
+        let a_count = host_col
+            .iter()
+            .filter(|v| v.as_deref() == Some("a"))
+            .count();
+        let b_count = host_col
+            .iter()
+            .filter(|v| v.as_deref() == Some("b"))
+            .count();
         assert_eq!(a_count, 10);
         assert_eq!(b_count, 10);
 
@@ -3037,13 +3086,18 @@ mod tests {
         // Full-series should use O(1) stats path
         let full = series.fast_aggregate(0, u64::MAX).unwrap();
         assert_eq!(full.count, n as usize);
-        assert!((full.sum - naive_sum).abs() < 1e-4, "sum: {} vs {}", full.sum, naive_sum);
+        assert!(
+            (full.sum - naive_sum).abs() < 1e-4,
+            "sum: {} vs {}",
+            full.sum,
+            naive_sum
+        );
         assert!((full.min - naive_min).abs() < 1e-10);
         assert!((full.max - naive_max).abs() < 1e-10);
 
         // Partial range that spans multiple partitions — exercises SIMD path
         let range_start = base_ts + 1000 * 1000; // skip first 1000 points
-        let range_end = base_ts + 9000 * 1000;   // skip last 1000 points
+        let range_end = base_ts + 9000 * 1000; // skip last 1000 points
         let partial = series.fast_aggregate(range_start, range_end).unwrap();
 
         // Compute expected values for the range
@@ -3094,13 +3148,23 @@ mod tests {
         let series = store.get_series("agg_range_verify").unwrap();
         let columnar = series.aggregate_range(0, u64::MAX, BucketSize::Minute);
 
-        assert_eq!(naive.len(), columnar.len(),
-            "bucket count mismatch: naive={} columnar={}", naive.len(), columnar.len());
+        assert_eq!(
+            naive.len(),
+            columnar.len(),
+            "bucket count mismatch: naive={} columnar={}",
+            naive.len(),
+            columnar.len()
+        );
         for (n_agg, c_agg) in naive.iter().zip(columnar.iter()) {
             assert_eq!(n_agg.bucket_start, c_agg.bucket_start);
             assert_eq!(n_agg.count, c_agg.count);
-            assert!((n_agg.sum - c_agg.sum).abs() < 1e-6,
-                "sum mismatch in bucket {}: {} vs {}", n_agg.bucket_start, n_agg.sum, c_agg.sum);
+            assert!(
+                (n_agg.sum - c_agg.sum).abs() < 1e-6,
+                "sum mismatch in bucket {}: {} vs {}",
+                n_agg.bucket_start,
+                n_agg.sum,
+                c_agg.sum
+            );
             assert!((n_agg.min - c_agg.min).abs() < 1e-10);
             assert!((n_agg.max - c_agg.max).abs() < 1e-10);
         }
@@ -3197,7 +3261,11 @@ mod tests {
         assert_eq!(store.total_points(), n as usize);
         let series = store.get_series("bench").unwrap();
         let partitions = store.partition_count("bench");
-        assert!(partitions > 1, "should have multiple partitions, got {}", partitions);
+        assert!(
+            partitions > 1,
+            "should have multiple partitions, got {}",
+            partitions
+        );
 
         // --- Full-series aggregate (O(1) via stats) ---
         let t0 = std::time::Instant::now();
@@ -3235,8 +3303,12 @@ mod tests {
         // = 42 + 0.001 * (0 + 1 + ... + 99999) / 100000
         // = 42 + 0.001 * 49999.5 = 42 + 49.9995 = 91.9995
         let expected_avg = 42.0 + 0.001 * (n as f64 - 1.0) / 2.0;
-        assert!((avg - expected_avg).abs() < 1e-4,
-            "avg mismatch: {} vs expected {}", avg, expected_avg);
+        assert!(
+            (avg - expected_avg).abs() < 1e-4,
+            "avg mismatch: {} vs expected {}",
+            avg,
+            expected_avg
+        );
 
         // Print timing results (visible with `cargo test -- --nocapture`)
         eprintln!("=== 100K TimeSeries Aggregation Benchmark ===");
@@ -3355,7 +3427,7 @@ mod tests {
         assert!((par_max - seq.max).abs() < 1e-10);
 
         // Partial range (hours 1-5)
-        let start = base_ts + 1 * 3_600_000;
+        let start = base_ts + 3_600_000;
         let end = base_ts + 6 * 3_600_000;
         let seq_partial = store
             .get_series("par_series")
@@ -3420,7 +3492,11 @@ mod tests {
         }
 
         let partitions = store.partition_count("par_large");
-        assert!(partitions >= 3, "should have multiple partitions, got {}", partitions);
+        assert!(
+            partitions >= 3,
+            "should have multiple partitions, got {}",
+            partitions
+        );
 
         let par_sum = store.par_range_sum("par_large", 0, u64::MAX).unwrap();
         let par_count = store.par_range_count("par_large", 0, u64::MAX).unwrap();
@@ -3428,7 +3504,12 @@ mod tests {
         let par_min = store.par_range_min("par_large", 0, u64::MAX).unwrap();
         let par_max = store.par_range_max("par_large", 0, u64::MAX).unwrap();
 
-        assert!((par_sum - expected_sum).abs() < 1e-4, "sum: {} vs {}", par_sum, expected_sum);
+        assert!(
+            (par_sum - expected_sum).abs() < 1e-4,
+            "sum: {} vs {}",
+            par_sum,
+            expected_sum
+        );
         assert_eq!(par_count, n as usize);
         assert!((par_avg - expected_sum / n as f64).abs() < 1e-6);
         assert!((par_min - expected_min).abs() < 1e-10);
@@ -3500,7 +3581,11 @@ mod tests {
         let mut points: Vec<(String, i64, f64)> = Vec::new();
         for i in 0..100 {
             points.push(("bulk_a".to_string(), (base_ts + i * 1000) as i64, i as f64));
-            points.push(("bulk_b".to_string(), (base_ts + i * 1000) as i64, i as f64 * 2.0));
+            points.push((
+                "bulk_b".to_string(),
+                (base_ts + i * 1000) as i64,
+                i as f64 * 2.0,
+            ));
         }
 
         store.par_bulk_insert(&points);

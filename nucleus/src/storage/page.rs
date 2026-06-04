@@ -382,8 +382,7 @@ pub fn update_tuple_in_place(page: &mut PageBuf, slot_idx: u16, new_data: &[u8])
         // If shorter, the leftover becomes fragmented free
         if new_data.len() < old_len {
             let diff = (old_len - new_data.len()) as u16;
-            let new_entry =
-                SlotEntry::new(entry.offset(), new_data.len() as u16, false, false);
+            let new_entry = SlotEntry::new(entry.offset(), new_data.len() as u16, false, false);
             write_slot(page, slot_idx, new_entry);
             let frag = read_u16(page, DATA_FRAG_FREE);
             write_u16(page, DATA_FRAG_FREE, frag + diff);
@@ -537,10 +536,10 @@ mod tests {
         init_data_page(&mut page, 1);
 
         let tuples: Vec<Vec<u8>> = vec![
-            vec![0xAA; 1],       // minimal
-            vec![0xBB; 100],     // medium
-            vec![0xCC; 1000],    // large
-            vec![0xDD; 255],     // odd size
+            vec![0xAA; 1],    // minimal
+            vec![0xBB; 100],  // medium
+            vec![0xCC; 1000], // large
+            vec![0xDD; 255],  // odd size
         ];
 
         let mut slots = Vec::new();
@@ -588,7 +587,7 @@ mod tests {
         init_data_page(&mut page, 1);
 
         let original = b"hello world!"; // 12 bytes
-        let updated  = b"HELLO WORLD!"; // 12 bytes
+        let updated = b"HELLO WORLD!"; // 12 bytes
 
         let slot = insert_tuple(&mut page, original).unwrap();
         assert_eq!(read_tuple(&page, slot), Some(original.as_slice()));
@@ -633,11 +632,8 @@ mod tests {
 
         let tuple_data = [0xABu8; 100];
         let mut count = 0u32;
-        loop {
-            match insert_tuple(&mut page, &tuple_data) {
-                Some(_) => count += 1,
-                None => break,
-            }
+        while insert_tuple(&mut page, &tuple_data).is_some() {
+            count += 1;
         }
         assert!(count > 0);
         // After filling with 100-byte tuples, can't fit another 100-byte tuple

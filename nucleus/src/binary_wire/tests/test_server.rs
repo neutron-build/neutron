@@ -5,10 +5,10 @@
 //!
 //! Uses the real ConnectionHandler and encoder/decoder for end-to-end testing.
 
+use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use std::io;
 
 use crate::binary_wire::connection_handler::ConnectionHandler;
 use crate::binary_wire::decoder::{DecodedFrame, Decoder, message_types};
@@ -121,7 +121,10 @@ impl TestClient {
         if auth_frame.message_type != message_types::AUTHENTICATION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("expected auth challenge, got type {}", auth_frame.message_type),
+                format!(
+                    "expected auth challenge, got type {}",
+                    auth_frame.message_type
+                ),
             ));
         }
 
@@ -164,7 +167,10 @@ impl TestClient {
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("unexpected message type {} during handshake", frame.message_type),
+                        format!(
+                            "unexpected message type {} during handshake",
+                            frame.message_type
+                        ),
                     ));
                 }
             }
@@ -277,8 +283,9 @@ impl TestClient {
             match frame.message_type {
                 message_types::COLUMN_METADATA => {
                     let (_col_id, name, _type_code, _flags) =
-                        Decoder::parse_column_metadata(&frame.payload)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                        Decoder::parse_column_metadata(&frame.payload).map_err(|e| {
+                            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                        })?;
                     columns.push(name.to_string());
                 }
                 message_types::DATA_ROW => {
@@ -504,15 +511,11 @@ fn decode_row_values(data: &[u8]) -> io::Result<Row> {
                 }
             }
             type_codes::STRING | type_codes::JSON => {
-                let s = std::str::from_utf8(value_bytes)
-                    .unwrap_or("")
-                    .to_string();
+                let s = std::str::from_utf8(value_bytes).unwrap_or("").to_string();
                 Value::Text(s)
             }
             _ => {
-                let s = std::str::from_utf8(value_bytes)
-                    .unwrap_or("")
-                    .to_string();
+                let s = std::str::from_utf8(value_bytes).unwrap_or("").to_string();
                 Value::Text(s)
             }
         };
@@ -529,13 +532,17 @@ fn decode_row_values(data: &[u8]) -> io::Result<Row> {
 
 #[tokio::test]
 async fn test_server_startup() {
-    let server = spawn_binary_server(0).await.expect("failed to spawn server");
+    let server = spawn_binary_server(0)
+        .await
+        .expect("failed to spawn server");
     assert!(server.listener.local_addr().is_ok());
 }
 
 #[tokio::test]
 async fn test_client_connect() {
-    let server = spawn_binary_server(0).await.expect("failed to spawn server");
+    let server = spawn_binary_server(0)
+        .await
+        .expect("failed to spawn server");
     let addr = server.listener.local_addr().unwrap();
 
     tokio::spawn(async move {
@@ -550,7 +557,9 @@ async fn test_client_connect() {
 
 #[tokio::test]
 async fn test_handshake_completes() {
-    let server = spawn_binary_server(0).await.expect("failed to spawn server");
+    let server = spawn_binary_server(0)
+        .await
+        .expect("failed to spawn server");
     let addr = server.listener.local_addr().unwrap();
 
     tokio::spawn(async move {
@@ -561,12 +570,18 @@ async fn test_handshake_completes() {
 
     let mut client = TestClient::connect(&addr.to_string()).await.unwrap();
     let result = client.handshake().await;
-    assert!(result.is_ok(), "handshake should complete: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "handshake should complete: {:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]
 async fn test_simple_query() {
-    let server = spawn_binary_server(0).await.expect("failed to spawn server");
+    let server = spawn_binary_server(0)
+        .await
+        .expect("failed to spawn server");
     let addr = server.listener.local_addr().unwrap();
 
     tokio::spawn(async move {
@@ -579,7 +594,11 @@ async fn test_simple_query() {
     client.handshake().await.unwrap();
 
     let result = client.query("SELECT 1 AS num").await.unwrap();
-    assert!(!result.is_error(), "query should succeed: {:?}", result.error);
+    assert!(
+        !result.is_error(),
+        "query should succeed: {:?}",
+        result.error
+    );
     assert_eq!(result.columns.len(), 1);
     assert_eq!(result.columns[0], "num");
     assert_eq!(result.rows.len(), 1);
@@ -587,7 +606,9 @@ async fn test_simple_query() {
 
 #[tokio::test]
 async fn test_create_insert_select() {
-    let server = spawn_binary_server(0).await.expect("failed to spawn server");
+    let server = spawn_binary_server(0)
+        .await
+        .expect("failed to spawn server");
     let addr = server.listener.local_addr().unwrap();
 
     tokio::spawn(async move {
@@ -604,28 +625,39 @@ async fn test_create_insert_select() {
         .execute("CREATE TABLE test_bp (id INT, name TEXT)")
         .await
         .unwrap();
-    assert!(!result.is_error(), "CREATE should succeed: {:?}", result.error);
+    assert!(
+        !result.is_error(),
+        "CREATE should succeed: {:?}",
+        result.error
+    );
 
     // INSERT
     let result = client
         .execute("INSERT INTO test_bp VALUES (1, 'Alice')")
         .await
         .unwrap();
-    assert!(!result.is_error(), "INSERT should succeed: {:?}", result.error);
+    assert!(
+        !result.is_error(),
+        "INSERT should succeed: {:?}",
+        result.error
+    );
 
     // SELECT
-    let result = client
-        .query("SELECT id, name FROM test_bp")
-        .await
-        .unwrap();
-    assert!(!result.is_error(), "SELECT should succeed: {:?}", result.error);
+    let result = client.query("SELECT id, name FROM test_bp").await.unwrap();
+    assert!(
+        !result.is_error(),
+        "SELECT should succeed: {:?}",
+        result.error
+    );
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.columns.len(), 2);
 }
 
 #[tokio::test]
 async fn test_prepared_statement() {
-    let server = spawn_binary_server(0).await.expect("failed to spawn server");
+    let server = spawn_binary_server(0)
+        .await
+        .expect("failed to spawn server");
     let addr = server.listener.local_addr().unwrap();
 
     tokio::spawn(async move {
@@ -638,21 +670,28 @@ async fn test_prepared_statement() {
     client.handshake().await.unwrap();
 
     // Prepare a statement
-    let result = client
-        .prepare(1, "SELECT 1 AS val")
-        .await
-        .unwrap();
-    assert!(!result.is_error(), "PREPARE should succeed: {:?}", result.error);
+    let result = client.prepare(1, "SELECT 1 AS val").await.unwrap();
+    assert!(
+        !result.is_error(),
+        "PREPARE should succeed: {:?}",
+        result.error
+    );
 
     // Execute the prepared statement
     let result = client.execute_prepared(1).await.unwrap();
-    assert!(!result.is_error(), "EXECUTE should succeed: {:?}", result.error);
+    assert!(
+        !result.is_error(),
+        "EXECUTE should succeed: {:?}",
+        result.error
+    );
     assert_eq!(result.rows.len(), 1);
 }
 
 #[tokio::test]
 async fn test_transaction_lifecycle() {
-    let server = spawn_binary_server(0).await.expect("failed to spawn server");
+    let server = spawn_binary_server(0)
+        .await
+        .expect("failed to spawn server");
     let addr = server.listener.local_addr().unwrap();
 
     tokio::spawn(async move {
@@ -672,7 +711,11 @@ async fn test_transaction_lifecycle() {
 
     // BEGIN
     let result = client.begin().await.unwrap();
-    assert!(!result.is_error(), "BEGIN should succeed: {:?}", result.error);
+    assert!(
+        !result.is_error(),
+        "BEGIN should succeed: {:?}",
+        result.error
+    );
     assert_eq!(result.ready_status, 1); // IN_TXN
 
     // INSERT within transaction
@@ -680,11 +723,19 @@ async fn test_transaction_lifecycle() {
         .execute("INSERT INTO txn_test VALUES (1, 'in_txn')")
         .await
         .unwrap();
-    assert!(!result.is_error(), "INSERT should succeed: {:?}", result.error);
+    assert!(
+        !result.is_error(),
+        "INSERT should succeed: {:?}",
+        result.error
+    );
 
     // COMMIT
     let result = client.commit().await.unwrap();
-    assert!(!result.is_error(), "COMMIT should succeed: {:?}", result.error);
+    assert!(
+        !result.is_error(),
+        "COMMIT should succeed: {:?}",
+        result.error
+    );
     assert_eq!(result.ready_status, 0); // IDLE
 
     // Verify data persisted
@@ -698,7 +749,9 @@ async fn test_transaction_lifecycle() {
 
 #[tokio::test]
 async fn test_transaction_rollback() {
-    let server = spawn_binary_server(0).await.expect("failed to spawn server");
+    let server = spawn_binary_server(0)
+        .await
+        .expect("failed to spawn server");
     let addr = server.listener.local_addr().unwrap();
 
     tokio::spawn(async move {
@@ -722,7 +775,11 @@ async fn test_transaction_rollback() {
         .await
         .unwrap();
     let result = client.rollback().await.unwrap();
-    assert!(!result.is_error(), "ROLLBACK should succeed: {:?}", result.error);
+    assert!(
+        !result.is_error(),
+        "ROLLBACK should succeed: {:?}",
+        result.error
+    );
     assert_eq!(result.ready_status, 0); // IDLE
 
     // Verify rollback: no rows
@@ -736,7 +793,9 @@ async fn test_transaction_rollback() {
 
 #[tokio::test]
 async fn test_error_response() {
-    let server = spawn_binary_server(0).await.expect("failed to spawn server");
+    let server = spawn_binary_server(0)
+        .await
+        .expect("failed to spawn server");
     let addr = server.listener.local_addr().unwrap();
 
     tokio::spawn(async move {
@@ -764,7 +823,9 @@ async fn test_error_response() {
 
 #[tokio::test]
 async fn test_error_response_format() {
-    let server = spawn_binary_server(0).await.expect("failed to spawn server");
+    let server = spawn_binary_server(0)
+        .await
+        .expect("failed to spawn server");
     let addr = server.listener.local_addr().unwrap();
 
     tokio::spawn(async move {

@@ -36,9 +36,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::{
-    ColumnBatch, ColumnData, ColumnZoneMap, CompressionCodec, ScalarValue, ZoneMap,
-};
+use super::{ColumnBatch, ColumnData, ColumnZoneMap, CompressionCodec, ScalarValue, ZoneMap};
 
 // ============================================================================
 // Constants
@@ -83,15 +81,14 @@ pub fn estimate_batch_size(batch: &ColumnBatch) -> usize {
 
 fn estimate_column_size(col: &ColumnData) -> usize {
     match col {
-        ColumnData::Bool(v) => v.len(),               // 1 byte per value approx
-        ColumnData::Int32(v) => v.len() * 5,           // 4 bytes + null flag
-        ColumnData::Int64(v) => v.len() * 9,           // 8 bytes + null flag
-        ColumnData::Float64(v) => v.len() * 9,         // 8 bytes + null flag
-        ColumnData::Text(v) => {
-            v.iter()
-                .map(|s| s.as_ref().map_or(1, |s| s.len() + 5))
-                .sum()
-        }
+        ColumnData::Bool(v) => v.len(),        // 1 byte per value approx
+        ColumnData::Int32(v) => v.len() * 5,   // 4 bytes + null flag
+        ColumnData::Int64(v) => v.len() * 9,   // 8 bytes + null flag
+        ColumnData::Float64(v) => v.len() * 9, // 8 bytes + null flag
+        ColumnData::Text(v) => v
+            .iter()
+            .map(|s| s.as_ref().map_or(1, |s| s.len() + 5))
+            .sum(),
     }
 }
 
@@ -410,7 +407,7 @@ fn read_i64_le(data: &[u8], pos: &mut usize) -> io::Result<i64> {
 }
 
 fn read_f64_le(data: &[u8], pos: &mut usize) -> io::Result<f64> {
-    read_u64_le(data, pos).map(|v| f64::from_bits(v))
+    read_u64_le(data, pos).map(f64::from_bits)
 }
 
 // ============================================================================
@@ -470,10 +467,10 @@ impl SegmentWriter {
 
             // Zone map for this column
             if let Some(czm) = zone_map.columns.get(name) {
-                if czm.min.is_some() && czm.max.is_some() {
+                if let (Some(min), Some(max)) = (czm.min.as_ref(), czm.max.as_ref()) {
                     buf.push(1); // has zone map
-                    serialize_scalar(czm.min.as_ref().unwrap(), &mut buf);
-                    serialize_scalar(czm.max.as_ref().unwrap(), &mut buf);
+                    serialize_scalar(min, &mut buf);
+                    serialize_scalar(max, &mut buf);
                     buf.extend_from_slice(&(czm.null_count as u32).to_le_bytes());
                 } else {
                     buf.push(0); // no zone map (all nulls)
@@ -664,8 +661,12 @@ impl SegmentReader {
             pos = end;
 
             // Decompress LZ4
-            let raw = lz4_flex::decompress_size_prepended(compressed)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("LZ4 decompress error: {e}")))?;
+            let raw = lz4_flex::decompress_size_prepended(compressed).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("LZ4 decompress error: {e}"),
+                )
+            })?;
 
             let col = deserialize_column(&raw, meta.col_type, self.row_count as usize)?;
             columns.push((meta.name.clone(), col));
@@ -732,9 +733,7 @@ mod tests {
 
     fn make_text_batch(n: usize) -> ColumnBatch {
         let ids: Vec<Option<i64>> = (0..n).map(|i| Some(i as i64)).collect();
-        let names: Vec<Option<String>> = (0..n)
-            .map(|i| Some(format!("item_{i}")))
-            .collect();
+        let names: Vec<Option<String>> = (0..n).map(|i| Some(format!("item_{i}"))).collect();
         ColumnBatch::new(vec![
             ("id".to_string(), ColumnData::Int64(ids)),
             ("name".to_string(), ColumnData::Text(names)),
@@ -767,9 +766,7 @@ mod tests {
 
     fn make_int32_batch(n: usize) -> ColumnBatch {
         let ids: Vec<Option<i32>> = (0..n).map(|i| Some(i as i32)).collect();
-        ColumnBatch::new(vec![
-            ("id".to_string(), ColumnData::Int32(ids)),
-        ])
+        ColumnBatch::new(vec![("id".to_string(), ColumnData::Int32(ids))])
     }
 
     // ---- Roundtrip tests per codec ----
@@ -835,9 +832,9 @@ mod tests {
         assert_eq!(recovered.row_count, 30);
 
         if let ColumnData::Int64(vals) = recovered.column("id").unwrap() {
-            assert_eq!(vals[0], None);   // i=0, 0%3==0 => None
+            assert_eq!(vals[0], None); // i=0, 0%3==0 => None
             assert_eq!(vals[1], Some(1));
-            assert_eq!(vals[3], None);   // i=3, 3%3==0 => None
+            assert_eq!(vals[3], None); // i=3, 3%3==0 => None
         } else {
             panic!("expected Int64 column");
         }
@@ -855,9 +852,9 @@ mod tests {
         assert_eq!(recovered.row_count, 20);
 
         if let ColumnData::Bool(vals) = recovered.column("flag").unwrap() {
-            assert_eq!(vals[0], None);        // 0%4==0 => None
+            assert_eq!(vals[0], None); // 0%4==0 => None
             assert_eq!(vals[1], Some(false)); // 1%2!=0 => false
-            assert_eq!(vals[2], Some(true));  // 2%2==0 => true
+            assert_eq!(vals[2], Some(true)); // 2%2==0 => true
         } else {
             panic!("expected Bool column");
         }
@@ -893,8 +890,8 @@ mod tests {
         assert_eq!(recovered.row_count, 200);
 
         if let ColumnData::Int64(vals) = recovered.column("id").unwrap() {
-            for i in 0..200 {
-                assert_eq!(vals[i], Some(i as i64), "mismatch at row {i}");
+            for (i, v) in vals.iter().enumerate() {
+                assert_eq!(*v, Some(i as i64), "mismatch at row {i}");
             }
         } else {
             panic!("expected Int64 column");
@@ -913,8 +910,8 @@ mod tests {
         assert_eq!(recovered.row_count, 150);
 
         if let ColumnData::Int64(vals) = recovered.column("id").unwrap() {
-            for i in 0..150 {
-                assert_eq!(vals[i], Some(i as i64), "mismatch at row {i}");
+            for (i, v) in vals.iter().enumerate() {
+                assert_eq!(*v, Some(i as i64), "mismatch at row {i}");
             }
         } else {
             panic!("expected Int64 column");
@@ -946,9 +943,7 @@ mod tests {
         let path = dir.path().join("for.seg");
         // Make a batch with values in a narrow range for FOR to work
         let ids: Vec<Option<i64>> = (1000..1050).map(|i| Some(i as i64)).collect();
-        let batch = ColumnBatch::new(vec![
-            ("id".to_string(), ColumnData::Int64(ids)),
-        ]);
+        let batch = ColumnBatch::new(vec![("id".to_string(), ColumnData::Int64(ids))]);
         SegmentWriter::write(&path, &batch, CompressionCodec::FrameOfReference, 13).unwrap();
 
         let reader = SegmentReader::open(&path).unwrap();
@@ -956,8 +951,8 @@ mod tests {
         assert_eq!(recovered.row_count, 50);
 
         if let ColumnData::Int64(vals) = recovered.column("id").unwrap() {
-            for i in 0..50 {
-                assert_eq!(vals[i], Some(1000 + i as i64));
+            for (i, v) in vals.iter().enumerate() {
+                assert_eq!(*v, Some(1000 + i as i64));
             }
         } else {
             panic!("expected Int64 column");
@@ -1017,7 +1012,10 @@ mod tests {
         let result = SegmentReader::open(&path);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("checksum"), "expected checksum error, got: {err_msg}");
+        assert!(
+            err_msg.contains("checksum"),
+            "expected checksum error, got: {err_msg}"
+        );
     }
 
     #[test]
@@ -1055,8 +1053,14 @@ mod tests {
 
         // Insert a small batch (well below 64KB threshold)
         let batch = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(1), Some(2), Some(3)])),
-            ("value".into(), ColumnData::Float64(vec![Some(1.0), Some(2.0), Some(3.0)])),
+            (
+                "id".into(),
+                ColumnData::Int64(vec![Some(1), Some(2), Some(3)]),
+            ),
+            (
+                "value".into(),
+                ColumnData::Float64(vec![Some(1.0), Some(2.0), Some(3.0)]),
+            ),
         ]);
         mt.insert(batch);
 
@@ -1118,7 +1122,10 @@ mod tests {
         // Insert a small batch (will stay hot)
         let batch2 = ColumnBatch::new(vec![
             ("id".into(), ColumnData::Int64(vec![Some(1000), Some(1001)])),
-            ("value".into(), ColumnData::Float64(vec![Some(1000.0), Some(1001.0)])),
+            (
+                "value".into(),
+                ColumnData::Float64(vec![Some(1000.0), Some(1001.0)]),
+            ),
         ]);
         mt.insert(batch2);
         assert_eq!(mt.part_count(), 1);
@@ -1144,9 +1151,10 @@ mod tests {
 
         // Insert batch that will become cold (20 Int64 values = ~180 bytes)
         let n = 20;
-        let batch = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64((1..=n).map(|i| Some(i as i64 * 10)).collect())),
-        ]);
+        let batch = ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64((1..=n).map(|i| Some(i as i64 * 10)).collect()),
+        )]);
         mt.insert(batch);
 
         // Verify it went cold
@@ -1176,8 +1184,14 @@ mod tests {
             mt.cold_threshold_bytes = 100;
 
             let batch = ColumnBatch::new(vec![
-                ("id".into(), ColumnData::Int64((0..50).map(|i| Some(i as i64)).collect())),
-                ("val".into(), ColumnData::Float64((0..50).map(|i| Some(i as f64)).collect())),
+                (
+                    "id".into(),
+                    ColumnData::Int64((0..50).map(|i| Some(i as i64)).collect()),
+                ),
+                (
+                    "val".into(),
+                    ColumnData::Float64((0..50).map(|i| Some(i as f64)).collect()),
+                ),
             ]);
             mt.insert(batch);
             assert_eq!(mt.cold_part_count(), 1);
@@ -1214,22 +1228,20 @@ mod tests {
             mt.cold_threshold_bytes = 100;
 
             // This batch will be flushed cold
-            let batch = ColumnBatch::new(vec![
-                ("id".into(), ColumnData::Int64((0..30).map(|i| Some(i as i64)).collect())),
-            ]);
+            let batch = ColumnBatch::new(vec![(
+                "id".into(),
+                ColumnData::Int64((0..30).map(|i| Some(i as i64)).collect()),
+            )]);
             mt.insert(batch);
             assert_eq!(mt.cold_part_count(), 1);
         }
 
         // Simulate crash recovery: load segments + replay WAL unflushed data
-        let wal_batch = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64(vec![Some(100), Some(101), Some(102)])),
-        ]);
-        let mt = MergeTree::recover(
-            vec!["id".into()],
-            dir.path(),
-            vec![wal_batch],
-        ).unwrap();
+        let wal_batch = ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64(vec![Some(100), Some(101), Some(102)]),
+        )]);
+        let mt = MergeTree::recover(vec!["id".into()], dir.path(), vec![wal_batch]).unwrap();
 
         // Should have 1 cold part (from segments) + 1 hot part (from WAL)
         assert_eq!(mt.cold_part_count(), 1);
@@ -1250,32 +1262,46 @@ mod tests {
         mt.cold_threshold_bytes = 100;
 
         // Cold part 1: ids 0..49
-        let batch1 = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64((0..50).map(|i| Some(i as i64)).collect())),
-        ]);
+        let batch1 = ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64((0..50).map(|i| Some(i as i64)).collect()),
+        )]);
         mt.insert(batch1);
 
         // Cold part 2: ids 1000..1049
-        let batch2 = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64((1000..1050).map(|i| Some(i as i64)).collect())),
-        ]);
+        let batch2 = ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64((1000..1050).map(|i| Some(i as i64)).collect()),
+        )]);
         mt.insert(batch2);
 
         assert_eq!(mt.cold_part_count(), 2);
 
         // Scan for id > 500: should only load cold part 2 (ids 1000..1049)
         let results = mt.scan("id", CmpOp::Gt, &ScalarValue::Int64(500));
-        assert_eq!(results.len(), 1, "expected 1 batch, zone map should prune part 1");
+        assert_eq!(
+            results.len(),
+            1,
+            "expected 1 batch, zone map should prune part 1"
+        );
         let total_rows: usize = results.iter().map(|b| b.row_count).sum();
         assert_eq!(total_rows, 50);
 
         // Scan for id < 25: should only load cold part 1
         let results2 = mt.scan("id", CmpOp::Lt, &ScalarValue::Int64(25));
-        assert_eq!(results2.len(), 1, "expected 1 batch, zone map should prune part 2");
+        assert_eq!(
+            results2.len(),
+            1,
+            "expected 1 batch, zone map should prune part 2"
+        );
 
         // Scan for id == 2000: should load nothing (both parts pruned)
         let results3 = mt.scan("id", CmpOp::Eq, &ScalarValue::Int64(2000));
-        assert_eq!(results3.len(), 0, "expected 0 batches, both parts should be pruned");
+        assert_eq!(
+            results3.len(),
+            0,
+            "expected 0 batches, both parts should be pruned"
+        );
     }
 
     #[test]
@@ -1290,11 +1316,10 @@ mod tests {
 
             for batch_idx in 0..5 {
                 let start = batch_idx * 20;
-                let batch = ColumnBatch::new(vec![
-                    ("id".into(), ColumnData::Int64(
-                        (start..start + 20).map(|i| Some(i as i64)).collect()
-                    )),
-                ]);
+                let batch = ColumnBatch::new(vec![(
+                    "id".into(),
+                    ColumnData::Int64((start..start + 20).map(|i| Some(i as i64)).collect()),
+                )]);
                 mt.insert(batch);
             }
 
@@ -1313,9 +1338,10 @@ mod tests {
         let mut mt = MergeTree::new(vec!["id".into()]);
         mt.cold_threshold_bytes = 1; // extremely low, but no data_dir
 
-        let batch = ColumnBatch::new(vec![
-            ("id".into(), ColumnData::Int64((0..1000).map(|i| Some(i as i64)).collect())),
-        ]);
+        let batch = ColumnBatch::new(vec![(
+            "id".into(),
+            ColumnData::Int64((0..1000).map(|i| Some(i as i64)).collect()),
+        )]);
         mt.insert(batch);
 
         // Everything stays hot because there's no disk to flush to
