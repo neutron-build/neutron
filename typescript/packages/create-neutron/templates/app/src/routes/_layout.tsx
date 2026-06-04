@@ -1,4 +1,8 @@
 import type { ComponentChildren } from "preact";
+export function head() {
+  return { link: { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" } };
+}
+
 export default function Layout(props: { children?: ComponentChildren }) {
   return (
     <div style="max-width: 900px; margin: 0 auto; padding: 2rem; font-family: system-ui, sans-serif;">

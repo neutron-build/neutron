@@ -39,6 +39,12 @@ export interface SeoMetaInput {
   jsonLd?: object | object[];
   /** Trusted inline scripts to inject in <head>. Bypasses HTML sanitization. */
   headScripts?: HeadScript | HeadScript[];
+  /**
+   * Additional <link> tags — favicon, preconnect, manifest, alternate, etc.
+   * Each entry is the tag's attributes.
+   * @example link: { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" }
+   */
+  link?: Record<string, string> | Record<string, string>[];
   /** Attributes to set on the <html> element. lang defaults to "en" if not specified. */
   htmlAttrs?: Record<string, string>;
   /** Attributes to set on the <body> element. */
@@ -74,6 +80,13 @@ export function buildMetaTags(input: SeoMetaInput): SeoTag[] {
 
   if (input.canonical) {
     tags.push({ tag: "link", attrs: { rel: "canonical", href: input.canonical } });
+  }
+
+  if (input.link) {
+    const links = Array.isArray(input.link) ? input.link : [input.link];
+    for (const attrs of links) {
+      tags.push({ tag: "link", attrs });
+    }
   }
 
   if (input.noindex) {
@@ -127,7 +140,8 @@ function dedupeMetaTags(tags: SeoTag[]): SeoTag[] {
     if (tag.tag === "meta") {
       key += `:${tag.attrs.name || tag.attrs.property || ""}`;
     } else if (tag.tag === "link") {
-      key += `:${tag.attrs.rel || ""}`;
+      // Include href so multiple same-rel links (e.g. preconnect) aren't dropped.
+      key += `:${tag.attrs.rel || ""}:${tag.attrs.href || ""}`;
     }
     if (seen.has(key)) {
       continue;
@@ -214,6 +228,16 @@ export function mergeSeoMetaInput(
     merged.headScripts = allScripts;
   } else {
     delete merged.headScripts;
+  }
+
+  // Concatenate link arrays from both base and override (favicon, preconnect, …)
+  const baseLinks = base.link ? (Array.isArray(base.link) ? base.link : [base.link]) : [];
+  const overrideLinks = override.link ? (Array.isArray(override.link) ? override.link : [override.link]) : [];
+  const allLinks = [...baseLinks, ...overrideLinks];
+  if (allLinks.length > 0) {
+    merged.link = allLinks;
+  } else {
+    delete merged.link;
   }
 
   // Merge htmlAttrs and bodyAttrs (route overrides layout per-attribute)
@@ -440,6 +464,7 @@ function cloneSeoMetaInput(input: SeoMetaInput): SeoMetaInput {
     ...(input.twitter ? { twitter: { ...input.twitter } } : {}),
     ...(input.jsonLd ? { jsonLd: Array.isArray(input.jsonLd) ? [...input.jsonLd] : input.jsonLd } : {}),
     ...(input.headScripts ? { headScripts: Array.isArray(input.headScripts) ? [...input.headScripts] : input.headScripts } : {}),
+    ...(input.link ? { link: Array.isArray(input.link) ? [...input.link] : input.link } : {}),
     ...(input.htmlAttrs ? { htmlAttrs: { ...input.htmlAttrs } } : {}),
     ...(input.bodyAttrs ? { bodyAttrs: { ...input.bodyAttrs } } : {}),
   };
