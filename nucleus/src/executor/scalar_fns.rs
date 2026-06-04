@@ -605,8 +605,20 @@ impl Executor {
             "MOD" => {
                 require_args(fname, &args, 2)?;
                 match (&args[0], &args[1]) {
-                    (Value::Int32(a), Value::Int32(b)) if *b != 0 => Ok(Value::Int32(a % b)),
-                    (Value::Int64(a), Value::Int64(b)) if *b != 0 => Ok(Value::Int64(a % b)),
+                    // Postgres errors (not NULL) on mod-by-zero; give the right message.
+                    (Value::Int32(_), Value::Int32(0)) | (Value::Int64(_), Value::Int64(0)) => {
+                        Err(ExecError::Runtime("division by zero".into()))
+                    }
+                    (Value::Float64(_), Value::Float64(b)) if *b == 0.0 => {
+                        Err(ExecError::Runtime("division by zero".into()))
+                    }
+                    // checked_rem avoids the i32::MIN % -1 / i64::MIN % -1 panic (result is 0).
+                    (Value::Int32(a), Value::Int32(b)) => {
+                        Ok(Value::Int32(a.checked_rem(*b).unwrap_or(0)))
+                    }
+                    (Value::Int64(a), Value::Int64(b)) => {
+                        Ok(Value::Int64(a.checked_rem(*b).unwrap_or(0)))
+                    }
                     (Value::Float64(a), Value::Float64(b)) => Ok(Value::Float64(a % b)),
                     _ => Err(ExecError::Unsupported("MOD requires numeric".into())),
                 }
@@ -735,15 +747,23 @@ impl Executor {
                 }
                 let mut vals = Vec::new();
                 let mut current = start;
+                // checked_add: stepping past i64::MAX/MIN must stop the series, not
+                // panic (debug) or wrap into an infinite loop (release).
                 if step > 0 {
                     while current <= stop {
                         vals.push(Value::Int64(current));
-                        current += step;
+                        match current.checked_add(step) {
+                            Some(next) => current = next,
+                            None => break,
+                        }
                     }
                 } else {
                     while current >= stop {
                         vals.push(Value::Int64(current));
-                        current += step;
+                        match current.checked_add(step) {
+                            Some(next) => current = next,
+                            None => break,
+                        }
                     }
                 }
                 Ok(Value::Array(vals))
