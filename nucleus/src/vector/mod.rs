@@ -14,8 +14,8 @@ pub mod wal;
 
 pub use wal::VectorWal;
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 // ============================================================================
 // Vector type
@@ -92,7 +92,10 @@ pub fn distance(a: &Vector, b: &Vector, metric: DistanceMetric) -> f32 {
 #[inline]
 pub fn simd_dot_product(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "slice lengths must match");
-    let n = a.len();
+    // min(): every raw-pointer access below uses indices < n, so clamping n to
+    // the shorter slice makes the unsafe blocks sound for ANY input (not just the
+    // debug_assert'd equal-length case) — no out-of-bounds read is possible.
+    let n = a.len().min(b.len());
     // Use 4 accumulators to break dependency chains and maximise ILP.
     let mut sum0: f32 = 0.0;
     let mut sum1: f32 = 0.0;
@@ -137,6 +140,7 @@ pub fn simd_dot_product(a: &[f32], b: &[f32]) -> f32 {
     // Handle remaining elements
     let tail_start = chunks * 8;
     for i in 0..remainder {
+        // SAFETY: tail_start + i < n = min(a.len(), b.len()), so both reads are in bounds.
         unsafe {
             sum0 += *pa.add(tail_start + i) * *pb.add(tail_start + i);
         }
@@ -152,7 +156,10 @@ pub fn simd_dot_product(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 pub fn simd_l2_distance(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "slice lengths must match");
-    let n = a.len();
+    // min(): every raw-pointer access below uses indices < n, so clamping n to
+    // the shorter slice makes the unsafe blocks sound for ANY input (not just the
+    // debug_assert'd equal-length case) — no out-of-bounds read is possible.
+    let n = a.len().min(b.len());
     let mut sum0: f32 = 0.0;
     let mut sum1: f32 = 0.0;
     let mut sum2: f32 = 0.0;
@@ -166,6 +173,7 @@ pub fn simd_l2_distance(a: &[f32], b: &[f32]) -> f32 {
 
     for i in 0..chunks {
         let base = i * 8;
+        // SAFETY: base+7 < chunks*8 <= n = min(a.len(), b.len()); reads in bounds.
         unsafe {
             let d0 = *pa.add(base) - *pb.add(base);
             let d1 = *pa.add(base + 1) - *pb.add(base + 1);
@@ -185,6 +193,7 @@ pub fn simd_l2_distance(a: &[f32], b: &[f32]) -> f32 {
 
     let tail_start = chunks * 8;
     for i in 0..remainder {
+        // SAFETY: tail_start + i < n = min(a.len(), b.len()); reads in bounds.
         unsafe {
             let d = *pa.add(tail_start + i) - *pb.add(tail_start + i);
             sum0 += d * d;
@@ -201,7 +210,10 @@ pub fn simd_l2_distance(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 pub fn simd_cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "slice lengths must match");
-    let n = a.len();
+    // min(): every raw-pointer access below uses indices < n, so clamping n to
+    // the shorter slice makes the unsafe blocks sound for ANY input (not just the
+    // debug_assert'd equal-length case) — no out-of-bounds read is possible.
+    let n = a.len().min(b.len());
     // Three quantities computed in parallel: dot, norm_a^2, norm_b^2.
     // Each uses 2 accumulators (8 lanes / 4 groups, doubled up).
     let mut dot0: f32 = 0.0;
@@ -467,8 +479,7 @@ impl HnswIndex {
         // Phase 2: From min(node_layer, max_layer) down to 0, do ef_construction search
         let top = node_layer.min(self.max_layer);
         for layer in (0..=top).rev() {
-            let candidates =
-                self.search_layer(ep, &vector, self.config.ef_construction, layer);
+            let candidates = self.search_layer(ep, &vector, self.config.ef_construction, layer);
 
             // Update ep to the closest result for the next layer down
             if let Some(first) = candidates.first() {
@@ -528,23 +539,25 @@ impl HnswIndex {
         loop {
             let mut improved = false;
             if let Some(node) = self.nodes.get(&current)
-                && layer < node.neighbors.len() {
-                    let neighbors = &node.neighbors[layer];
-                    for (idx, &neighbor_id) in neighbors.iter().enumerate() {
-                        // Prefetch the next neighbor's vector data
-                        if idx + 1 < neighbors.len()
-                            && let Some(next_node) = self.nodes.get(&neighbors[idx + 1])
-                                && !next_node.vector.data.is_empty() {
-                                    prefetch_read_data(next_node.vector.data.as_ptr());
-                                }
-                        let d = self.dist(neighbor_id, query);
-                        if d < current_dist {
-                            current = neighbor_id;
-                            current_dist = d;
-                            improved = true;
-                        }
+                && layer < node.neighbors.len()
+            {
+                let neighbors = &node.neighbors[layer];
+                for (idx, &neighbor_id) in neighbors.iter().enumerate() {
+                    // Prefetch the next neighbor's vector data
+                    if idx + 1 < neighbors.len()
+                        && let Some(next_node) = self.nodes.get(&neighbors[idx + 1])
+                        && !next_node.vector.data.is_empty()
+                    {
+                        prefetch_read_data(next_node.vector.data.as_ptr());
+                    }
+                    let d = self.dist(neighbor_id, query);
+                    if d < current_dist {
+                        current = neighbor_id;
+                        current_dist = d;
+                        improved = true;
                     }
                 }
+            }
             if !improved {
                 break;
             }
@@ -554,13 +567,7 @@ impl HnswIndex {
     }
 
     /// ef-bounded search at a single layer. Returns candidates sorted by distance.
-    fn search_layer(
-        &self,
-        start: u64,
-        query: &Vector,
-        ef: usize,
-        layer: usize,
-    ) -> Vec<Candidate> {
+    fn search_layer(&self, start: u64, query: &Vector, ef: usize, layer: usize) -> Vec<Candidate> {
         let mut visited = HashSet::new();
         let mut candidates = BinaryHeap::new(); // min-heap
         let mut results = BinaryHeap::new(); // max-heap (worst at top)
@@ -583,39 +590,41 @@ impl HnswIndex {
             }
 
             if let Some(node) = self.nodes.get(&closest.id)
-                && layer < node.neighbors.len() {
-                    let neighbors = &node.neighbors[layer];
-                    for (idx, &neighbor_id) in neighbors.iter().enumerate() {
-                        if visited.insert(neighbor_id) {
-                            // Prefetch the *next* unvisited neighbor's vector
-                            // data into L1 cache so it's warm when we reach it.
-                            if idx + 1 < neighbors.len() {
-                                let next_id = neighbors[idx + 1];
-                                if let Some(next_node) = self.nodes.get(&next_id)
-                                    && !next_node.vector.data.is_empty() {
-                                        prefetch_read_data(next_node.vector.data.as_ptr());
-                                    }
+                && layer < node.neighbors.len()
+            {
+                let neighbors = &node.neighbors[layer];
+                for (idx, &neighbor_id) in neighbors.iter().enumerate() {
+                    if visited.insert(neighbor_id) {
+                        // Prefetch the *next* unvisited neighbor's vector
+                        // data into L1 cache so it's warm when we reach it.
+                        if idx + 1 < neighbors.len() {
+                            let next_id = neighbors[idx + 1];
+                            if let Some(next_node) = self.nodes.get(&next_id)
+                                && !next_node.vector.data.is_empty()
+                            {
+                                prefetch_read_data(next_node.vector.data.as_ptr());
                             }
+                        }
 
-                            let d = self.dist(neighbor_id, query);
-                            let worst = results.peek().map(|r| r.dist).unwrap_or(f32::MAX);
+                        let d = self.dist(neighbor_id, query);
+                        let worst = results.peek().map(|r| r.dist).unwrap_or(f32::MAX);
 
-                            if d < worst || results.len() < ef {
-                                candidates.push(Candidate {
-                                    id: neighbor_id,
-                                    dist: d,
-                                });
-                                results.push(MaxCandidate {
-                                    id: neighbor_id,
-                                    dist: d,
-                                });
-                                if results.len() > ef {
-                                    results.pop();
-                                }
+                        if d < worst || results.len() < ef {
+                            candidates.push(Candidate {
+                                id: neighbor_id,
+                                dist: d,
+                            });
+                            results.push(MaxCandidate {
+                                id: neighbor_id,
+                                dist: d,
+                            });
+                            if results.len() > ef {
+                                results.pop();
                             }
                         }
                     }
                 }
+            }
         }
 
         let mut result: Vec<Candidate> = results
@@ -688,8 +697,7 @@ impl HnswIndex {
         }
 
         // Phase 2: ef-bounded search at layer 0
-        let candidates =
-            self.search_layer(current, query, self.config.ef_search.max(k), 0);
+        let candidates = self.search_layer(current, query, self.config.ef_search.max(k), 0);
 
         candidates
             .into_iter()
@@ -842,13 +850,25 @@ impl HnswIndex {
         };
         pos += 1;
 
-        let m = u32::from_le_bytes(data[pos..pos + 4].try_into().map_err(|_| "truncated m field")?);
+        let m = u32::from_le_bytes(
+            data[pos..pos + 4]
+                .try_into()
+                .map_err(|_| "truncated m field")?,
+        );
         let m = m as usize;
         pos += 4;
-        let ef_search = u32::from_le_bytes(data[pos..pos + 4].try_into().map_err(|_| "truncated ef_search")?);
+        let ef_search = u32::from_le_bytes(
+            data[pos..pos + 4]
+                .try_into()
+                .map_err(|_| "truncated ef_search")?,
+        );
         let ef_search = ef_search as usize;
         pos += 4;
-        let num_nodes = u32::from_le_bytes(data[pos..pos + 4].try_into().map_err(|_| "truncated num_nodes")?);
+        let num_nodes = u32::from_le_bytes(
+            data[pos..pos + 4]
+                .try_into()
+                .map_err(|_| "truncated num_nodes")?,
+        );
         let num_nodes = num_nodes as usize;
         pos += 4;
 
@@ -865,9 +885,14 @@ impl HnswIndex {
             if pos + 12 > data.len() {
                 return Err("unexpected end of data reading node".into());
             }
-            let id = u64::from_le_bytes(data[pos..pos + 8].try_into().map_err(|_| "truncated node id")?);
+            let id = u64::from_le_bytes(
+                data[pos..pos + 8]
+                    .try_into()
+                    .map_err(|_| "truncated node id")?,
+            );
             pos += 8;
-            let dim = u32::from_le_bytes(data[pos..pos + 4].try_into().map_err(|_| "truncated dim")?);
+            let dim =
+                u32::from_le_bytes(data[pos..pos + 4].try_into().map_err(|_| "truncated dim")?);
             let dim = dim as usize;
             pos += 4;
 
@@ -876,14 +901,22 @@ impl HnswIndex {
             }
             let mut vec_data = Vec::with_capacity(dim);
             for _ in 0..dim {
-                vec_data.push(f32::from_le_bytes(data[pos..pos + 4].try_into().map_err(|_| "truncated vector element")?));
+                vec_data.push(f32::from_le_bytes(
+                    data[pos..pos + 4]
+                        .try_into()
+                        .map_err(|_| "truncated vector element")?,
+                ));
                 pos += 4;
             }
 
             if pos + 4 > data.len() {
                 return Err("unexpected end of data reading num_layers".into());
             }
-            let num_layers = u32::from_le_bytes(data[pos..pos + 4].try_into().map_err(|_| "truncated num_layers")?);
+            let num_layers = u32::from_le_bytes(
+                data[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| "truncated num_layers")?,
+            );
             let num_layers = num_layers as usize;
             pos += 4;
 
@@ -892,7 +925,11 @@ impl HnswIndex {
                 if pos + 4 > data.len() {
                     return Err("unexpected end of data reading neighbor count".into());
                 }
-                let nn = u32::from_le_bytes(data[pos..pos + 4].try_into().map_err(|_| "truncated neighbor count")?);
+                let nn = u32::from_le_bytes(
+                    data[pos..pos + 4]
+                        .try_into()
+                        .map_err(|_| "truncated neighbor count")?,
+                );
                 let nn = nn as usize;
                 pos += 4;
                 if pos + nn * 8 > data.len() {
@@ -900,27 +937,46 @@ impl HnswIndex {
                 }
                 let mut layer = Vec::with_capacity(nn);
                 for _ in 0..nn {
-                    layer.push(u64::from_le_bytes(data[pos..pos + 8].try_into().map_err(|_| "truncated neighbor id")?));
+                    layer.push(u64::from_le_bytes(
+                        data[pos..pos + 8]
+                            .try_into()
+                            .map_err(|_| "truncated neighbor id")?,
+                    ));
                     pos += 8;
                 }
                 neighbors.push(layer);
             }
 
-            nodes.insert(id, HnswNode {
-                _id: id,
-                vector: Vector::new(vec_data),
-                neighbors,
-            });
+            nodes.insert(
+                id,
+                HnswNode {
+                    _id: id,
+                    vector: Vector::new(vec_data),
+                    neighbors,
+                },
+            );
         }
 
         if pos + 12 > data.len() {
             return Err("unexpected end of data reading footer".into());
         }
-        let max_layer = u32::from_le_bytes(data[pos..pos + 4].try_into().map_err(|_| "truncated max_layer")?);
+        let max_layer = u32::from_le_bytes(
+            data[pos..pos + 4]
+                .try_into()
+                .map_err(|_| "truncated max_layer")?,
+        );
         let max_layer = max_layer as usize;
         pos += 4;
-        let entry_raw = u64::from_le_bytes(data[pos..pos + 8].try_into().map_err(|_| "truncated entry_point")?);
-        let entry_point = if entry_raw == u64::MAX { None } else { Some(entry_raw) };
+        let entry_raw = u64::from_le_bytes(
+            data[pos..pos + 8]
+                .try_into()
+                .map_err(|_| "truncated entry_point")?,
+        );
+        let entry_point = if entry_raw == u64::MAX {
+            None
+        } else {
+            Some(entry_raw)
+        };
 
         let ml = 1.0 / (config.m as f64).ln();
         Ok(Self {
@@ -1050,11 +1106,7 @@ impl IvfFlatIndex {
     ///
     /// The vector is assigned to the nearest centroid's inverted list.
     pub fn add(&mut self, id: usize, vector: Vec<f32>) {
-        assert_eq!(
-            vector.len(),
-            self.dimension,
-            "vector dimension mismatch"
-        );
+        assert_eq!(vector.len(), self.dimension, "vector dimension mismatch");
         assert!(
             !self.centroids.is_empty(),
             "index must be trained before adding vectors"
@@ -1068,7 +1120,17 @@ impl IvfFlatIndex {
     ///
     /// Returns `(id, distance)` pairs sorted by ascending distance.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(usize, f32)> {
-        assert_eq!(query.len(), self.dimension, "query dimension mismatch");
+        // A dimension mismatch is a caller bug, but it must not panic the server
+        // (DoS). Log and return no results.
+        if query.len() != self.dimension {
+            tracing::error!(
+                target: "nucleus::vector",
+                "IVFFlat search: query dimension {} != index dimension {}",
+                query.len(),
+                self.dimension
+            );
+            return Vec::new();
+        }
         if self.centroids.is_empty() {
             return Vec::new();
         }
@@ -1083,8 +1145,7 @@ impl IvfFlatIndex {
                 (i, d)
             })
             .collect();
-        centroid_dists
-            .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        centroid_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
         let nprobe = self.nprobe.min(centroid_dists.len());
 
@@ -1284,15 +1345,10 @@ pub fn par_batch_search(
     std::thread::scope(|s| {
         let handles: Vec<_> = queries
             .iter()
-            .map(|query| {
-                s.spawn(move || exact_search(vectors, query, k, metric))
-            })
+            .map(|query| s.spawn(move || exact_search(vectors, query, k, metric)))
             .collect();
 
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .collect()
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     })
 }
 
@@ -1706,10 +1762,7 @@ mod tests {
         let exact_results = exact_search(&exact_data, &query_vec, k, DistanceMetric::L2);
 
         let ivf_ids: HashSet<usize> = ivf_results.iter().map(|(id, _)| *id).collect();
-        let exact_ids: HashSet<usize> = exact_results
-            .iter()
-            .map(|(id, _)| *id as usize)
-            .collect();
+        let exact_ids: HashSet<usize> = exact_results.iter().map(|(id, _)| *id as usize).collect();
 
         let overlap = ivf_ids.intersection(&exact_ids).count();
         let recall = overlap as f64 / k as f64;
@@ -1877,7 +1930,10 @@ mod tests {
         let a = vec![0.0f32; 32];
         let b = vec![0.0f32; 32];
         let d = simd_l2_distance(&a, &b);
-        assert!(d.abs() < 1e-10, "L2 of identical zero vectors should be 0, got {d}");
+        assert!(
+            d.abs() < 1e-10,
+            "L2 of identical zero vectors should be 0, got {d}"
+        );
     }
 
     #[test]
@@ -1958,7 +2014,11 @@ mod tests {
         let va = Vector::new(a_data.clone());
         let vb = Vector::new(b_data.clone());
 
-        for metric in [DistanceMetric::L2, DistanceMetric::Cosine, DistanceMetric::InnerProduct] {
+        for metric in [
+            DistanceMetric::L2,
+            DistanceMetric::Cosine,
+            DistanceMetric::InnerProduct,
+        ] {
             let d1 = distance(&va, &vb, metric);
             let d2 = distance_raw(&a_data, &b_data, metric);
             assert!(
@@ -1980,9 +2040,7 @@ mod tests {
         let n = 2000; // above PAR_THRESHOLD (1000)
         let k = 10;
 
-        let vectors: Vec<(u64, Vector)> = (0..n)
-            .map(|i| (i as u64, rand_vec(dim)))
-            .collect();
+        let vectors: Vec<(u64, Vector)> = (0..n).map(|i| (i as u64, rand_vec(dim))).collect();
         let query = rand_vec(dim);
 
         let seq = exact_search(&vectors, &query, k, DistanceMetric::L2);
@@ -2009,9 +2067,7 @@ mod tests {
         let n = 50; // well below threshold
         let k = 5;
 
-        let vectors: Vec<(u64, Vector)> = (0..n)
-            .map(|i| (i as u64, rand_vec(dim)))
-            .collect();
+        let vectors: Vec<(u64, Vector)> = (0..n).map(|i| (i as u64, rand_vec(dim))).collect();
         let query = rand_vec(dim);
 
         let seq = exact_search(&vectors, &query, k, DistanceMetric::Cosine);
@@ -2031,9 +2087,7 @@ mod tests {
         let n = 200;
         let k = 5;
 
-        let vectors: Vec<(u64, Vector)> = (0..n)
-            .map(|i| (i as u64, rand_vec(dim)))
-            .collect();
+        let vectors: Vec<(u64, Vector)> = (0..n).map(|i| (i as u64, rand_vec(dim))).collect();
         let queries: Vec<Vector> = (0..10).map(|_| rand_vec(dim)).collect();
 
         let batch_results = par_batch_search(&vectors, &queries, k, DistanceMetric::L2);
@@ -2048,10 +2102,7 @@ mod tests {
             );
             for (b, s) in batch_results[i].iter().zip(sequential.iter()) {
                 assert_eq!(b.0, s.0, "query {i}: id mismatch");
-                assert!(
-                    (b.1 - s.1).abs() < 1e-6,
-                    "query {i}: distance mismatch"
-                );
+                assert!((b.1 - s.1).abs() < 1e-6, "query {i}: distance mismatch");
             }
         }
     }
@@ -2077,8 +2128,7 @@ mod tests {
         let candidates: Vec<u64> = (0..200).collect();
         let query = rand_vec(dim);
 
-        let par_results =
-            index.par_evaluate_candidates(&query, &candidates, DistanceMetric::L2);
+        let par_results = index.par_evaluate_candidates(&query, &candidates, DistanceMetric::L2);
 
         // Compute sequential reference
         let mut seq_results: Vec<(u64, f32)> = candidates
@@ -2088,8 +2138,7 @@ mod tests {
                 (id, distance(&node.vector, &query, DistanceMetric::L2))
             })
             .collect();
-        seq_results
-            .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        seq_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
         assert_eq!(par_results.len(), seq_results.len());
         for (p, s) in par_results.iter().zip(seq_results.iter()) {
@@ -2111,9 +2160,7 @@ mod tests {
         let n = 5000;
         let k = 20;
 
-        let vectors: Vec<(u64, Vector)> = (0..n)
-            .map(|i| (i as u64, rand_vec(dim)))
-            .collect();
+        let vectors: Vec<(u64, Vector)> = (0..n).map(|i| (i as u64, rand_vec(dim))).collect();
         let query = rand_vec(dim);
 
         let par = par_search_brute_force(&vectors, &query, k, DistanceMetric::L2);
@@ -2135,9 +2182,7 @@ mod tests {
         let n = 300;
         let k = 5;
 
-        let vectors: Vec<(u64, Vector)> = (0..n)
-            .map(|i| (i as u64, rand_vec(dim)))
-            .collect();
+        let vectors: Vec<(u64, Vector)> = (0..n).map(|i| (i as u64, rand_vec(dim))).collect();
         let queries: Vec<Vector> = (0..5).map(|_| rand_vec(dim)).collect();
 
         let run1 = par_batch_search(&vectors, &queries, k, DistanceMetric::InnerProduct);

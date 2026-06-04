@@ -6,6 +6,8 @@
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use std::sync::Arc;
 
     use crate::catalog::Catalog;
@@ -112,9 +114,21 @@ mod tests {
         .await;
 
         // -- Seed data --
-        run(&ex, "INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')").await;
-        run(&ex, "INSERT INTO users VALUES (2, 'Bob', 'bob@example.com')").await;
-        run(&ex, "INSERT INTO users VALUES (3, 'Charlie', 'charlie@example.com')").await;
+        run(
+            &ex,
+            "INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO users VALUES (2, 'Bob', 'bob@example.com')",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO users VALUES (3, 'Charlie', 'charlie@example.com')",
+        )
+        .await;
 
         run(&ex, "INSERT INTO products VALUES (10, 'Widget', 25)").await;
         run(&ex, "INSERT INTO products VALUES (20, 'Gadget', 50)").await;
@@ -230,7 +244,9 @@ mod tests {
         run(&ex, "INSERT INTO employees VALUES (100, 'Alice', 1)").await;
 
         // FK violation: dept_id=99 does not exist
-        let err = ex.execute("INSERT INTO employees VALUES (101, 'Bob', 99)").await;
+        let err = ex
+            .execute("INSERT INTO employees VALUES (101, 'Bob', 99)")
+            .await;
         assert!(err.is_err(), "should reject FK violation");
         let msg = err.unwrap_err().to_string();
         assert!(
@@ -239,7 +255,9 @@ mod tests {
         );
 
         // Primary key violation
-        let err = ex.execute("INSERT INTO departments VALUES (1, 'Duplicate')").await;
+        let err = ex
+            .execute("INSERT INTO departments VALUES (1, 'Duplicate')")
+            .await;
         assert!(err.is_err(), "should reject PK duplicate");
 
         // ON CONFLICT DO NOTHING: silently skip conflicting row
@@ -374,7 +392,11 @@ mod tests {
     async fn test_view_lifecycle() {
         let ex = setup();
 
-        run(&ex, "CREATE TABLE inventory (id INT, product TEXT, qty INT)").await;
+        run(
+            &ex,
+            "CREATE TABLE inventory (id INT, product TEXT, qty INT)",
+        )
+        .await;
         run(&ex, "INSERT INTO inventory VALUES (1, 'Apples', 50)").await;
         run(&ex, "INSERT INTO inventory VALUES (2, 'Bananas', 120)").await;
         run(&ex, "INSERT INTO inventory VALUES (3, 'Cherries', 30)").await;
@@ -480,7 +502,11 @@ mod tests {
     async fn test_prepared_statement_workflow() {
         let ex = setup();
 
-        run(&ex, "CREATE TABLE contacts (id INT PRIMARY KEY, name TEXT, city TEXT)").await;
+        run(
+            &ex,
+            "CREATE TABLE contacts (id INT PRIMARY KEY, name TEXT, city TEXT)",
+        )
+        .await;
         run(&ex, "INSERT INTO contacts VALUES (1, 'Alice', 'Seattle')").await;
         run(&ex, "INSERT INTO contacts VALUES (2, 'Bob', 'Portland')").await;
         run(&ex, "INSERT INTO contacts VALUES (3, 'Charlie', 'Seattle')").await;
@@ -560,7 +586,11 @@ mod tests {
         assert_eq!(r[0][1], Value::Text("alice".into()));
 
         // ADD COLUMN with a default value
-        run(&ex, "ALTER TABLE profiles ADD COLUMN bio TEXT DEFAULT 'No bio yet'").await;
+        run(
+            &ex,
+            "ALTER TABLE profiles ADD COLUMN bio TEXT DEFAULT 'No bio yet'",
+        )
+        .await;
 
         // Existing rows should have the default value
         let res = run(&ex, "SELECT bio FROM profiles WHERE id = 1").await;
@@ -765,20 +795,13 @@ mod tests {
         assert_eq!(*scalar(&res[0]), Value::Text("==x--".into()));
 
         // REPLACE + UPPER
-        let res = run(
-            &ex,
-            "SELECT UPPER(REPLACE('hello world', 'world', 'rust'))",
-        )
-        .await;
+        let res = run(&ex, "SELECT UPPER(REPLACE('hello world', 'world', 'rust'))").await;
         assert_eq!(*scalar(&res[0]), Value::Text("HELLO RUST".into()));
 
         // Nested math: POWER, SQRT, ABS
         let res = run(&ex, "SELECT SQRT(POWER(3.0, 2.0) + POWER(4.0, 2.0))").await;
         match scalar(&res[0]) {
-            Value::Float64(f) => assert!(
-                (*f - 5.0).abs() < 0.0001,
-                "expected 5.0, got {f}"
-            ),
+            Value::Float64(f) => assert!((*f - 5.0).abs() < 0.0001, "expected 5.0, got {f}"),
             other => panic!("expected Float64, got {other:?}"),
         }
 
@@ -879,11 +902,17 @@ mod tests {
         // Insert child data respecting FK constraints
         run(&ex, "INSERT INTO books VALUES (101, '1984', 1, 328)").await;
         run(&ex, "INSERT INTO books VALUES (102, 'Animal Farm', 1, 112)").await;
-        run(&ex, "INSERT INTO books VALUES (103, 'Pride and Prejudice', 2, 432)").await;
+        run(
+            &ex,
+            "INSERT INTO books VALUES (103, 'Pride and Prejudice', 2, 432)",
+        )
+        .await;
         run(&ex, "INSERT INTO books VALUES (104, 'Tom Sawyer', 3, 274)").await;
 
         // FK violation: author_id=99 does not exist
-        let err = ex.execute("INSERT INTO books VALUES (105, 'Unknown', 99, 200)").await;
+        let err = ex
+            .execute("INSERT INTO books VALUES (105, 'Unknown', 99, 200)")
+            .await;
         assert!(err.is_err(), "should reject FK violation");
         assert!(err.unwrap_err().to_string().contains("foreign key"));
 
@@ -958,7 +987,11 @@ mod tests {
         .await;
 
         // Query the view directly
-        let res = run(&ex, "SELECT region, total_sales FROM regional_sales ORDER BY total_sales DESC").await;
+        let res = run(
+            &ex,
+            "SELECT region, total_sales FROM regional_sales ORDER BY total_sales DESC",
+        )
+        .await;
         let r = rows(&res[0]);
         assert_eq!(r.len(), 3);
         assert_eq!(r[0][0], Value::Text("South".into()));
@@ -1027,8 +1060,16 @@ mod tests {
         run(&ex, "BEGIN").await;
 
         // Make changes
-        run(&ex, "UPDATE accounts SET balance = balance - 300 WHERE id = 1").await;
-        run(&ex, "UPDATE accounts SET balance = balance + 300 WHERE id = 2").await;
+        run(
+            &ex,
+            "UPDATE accounts SET balance = balance - 300 WHERE id = 1",
+        )
+        .await;
+        run(
+            &ex,
+            "UPDATE accounts SET balance = balance + 300 WHERE id = 2",
+        )
+        .await;
 
         // Verify changes are visible within transaction
         let res = run(&ex, "SELECT balance FROM accounts WHERE id = 1").await;
@@ -1073,14 +1114,46 @@ mod tests {
         .await;
 
         // Insert diverse order data
-        run(&ex, "INSERT INTO orders_detail VALUES (1, 100, 'Electronics', 2, 500)").await;
-        run(&ex, "INSERT INTO orders_detail VALUES (2, 100, 'Electronics', 1, 300)").await;
-        run(&ex, "INSERT INTO orders_detail VALUES (3, 100, 'Books', 5, 20)").await;
-        run(&ex, "INSERT INTO orders_detail VALUES (4, 101, 'Electronics', 3, 400)").await;
-        run(&ex, "INSERT INTO orders_detail VALUES (5, 101, 'Books', 2, 15)").await;
-        run(&ex, "INSERT INTO orders_detail VALUES (6, 102, 'Electronics', 1, 600)").await;
-        run(&ex, "INSERT INTO orders_detail VALUES (7, 102, 'Books', 10, 25)").await;
-        run(&ex, "INSERT INTO orders_detail VALUES (8, 102, 'Clothing', 4, 50)").await;
+        run(
+            &ex,
+            "INSERT INTO orders_detail VALUES (1, 100, 'Electronics', 2, 500)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO orders_detail VALUES (2, 100, 'Electronics', 1, 300)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO orders_detail VALUES (3, 100, 'Books', 5, 20)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO orders_detail VALUES (4, 101, 'Electronics', 3, 400)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO orders_detail VALUES (5, 101, 'Books', 2, 15)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO orders_detail VALUES (6, 102, 'Electronics', 1, 600)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO orders_detail VALUES (7, 102, 'Books', 10, 25)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO orders_detail VALUES (8, 102, 'Clothing', 4, 50)",
+        )
+        .await;
 
         // Complex aggregation: GROUP BY with multiple aggregates and HAVING
         let res = run(
@@ -1150,7 +1223,11 @@ mod tests {
         run(&ex, "INSERT INTO events VALUES (7, 'Login', 1)").await;
 
         // DISTINCT event types ordered alphabetically
-        let res = run(&ex, "SELECT DISTINCT event_type FROM events ORDER BY event_type").await;
+        let res = run(
+            &ex,
+            "SELECT DISTINCT event_type FROM events ORDER BY event_type",
+        )
+        .await;
         let r = rows(&res[0]);
         assert_eq!(r.len(), 4);
         assert_eq!(r[0][0], Value::Text("Error".into()));
@@ -1159,7 +1236,11 @@ mod tests {
         assert_eq!(r[3][0], Value::Text("Purchase".into()));
 
         // DISTINCT priorities ordered descending
-        let res = run(&ex, "SELECT DISTINCT priority FROM events ORDER BY priority DESC").await;
+        let res = run(
+            &ex,
+            "SELECT DISTINCT priority FROM events ORDER BY priority DESC",
+        )
+        .await;
         let r = rows(&res[0]);
         assert_eq!(r.len(), 3);
         assert_eq!(r[0][0], Value::Int32(5));
@@ -1201,11 +1282,31 @@ mod tests {
         )
         .await;
 
-        run(&ex, "INSERT INTO employees VALUES (1, 'Alice', 50000, 'Engineering')").await;
-        run(&ex, "INSERT INTO employees VALUES (2, 'Bob', 75000, 'Engineering')").await;
-        run(&ex, "INSERT INTO employees VALUES (3, 'Charlie', 60000, 'Sales')").await;
-        run(&ex, "INSERT INTO employees VALUES (4, 'Diana', 90000, 'Management')").await;
-        run(&ex, "INSERT INTO employees VALUES (5, 'Eve', 45000, 'Sales')").await;
+        run(
+            &ex,
+            "INSERT INTO employees VALUES (1, 'Alice', 50000, 'Engineering')",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO employees VALUES (2, 'Bob', 75000, 'Engineering')",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO employees VALUES (3, 'Charlie', 60000, 'Sales')",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO employees VALUES (4, 'Diana', 90000, 'Management')",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO employees VALUES (5, 'Eve', 45000, 'Sales')",
+        )
+        .await;
 
         // CASE in SELECT for categorization
         let res = run(
@@ -1319,15 +1420,31 @@ mod tests {
         .await;
 
         // Insert data
-        run(&ex, "INSERT INTO customers VALUES (1, 'ACME Corp', 'Seattle')").await;
-        run(&ex, "INSERT INTO customers VALUES (2, 'Widget Inc', 'Portland')").await;
+        run(
+            &ex,
+            "INSERT INTO customers VALUES (1, 'ACME Corp', 'Seattle')",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO customers VALUES (2, 'Widget Inc', 'Portland')",
+        )
+        .await;
 
         run(&ex, "INSERT INTO orders_main VALUES (100, 1, '2024-01-15')").await;
         run(&ex, "INSERT INTO orders_main VALUES (101, 2, '2024-01-20')").await;
 
-        run(&ex, "INSERT INTO products_catalog VALUES (1, 'Laptop', 1000)").await;
+        run(
+            &ex,
+            "INSERT INTO products_catalog VALUES (1, 'Laptop', 1000)",
+        )
+        .await;
         run(&ex, "INSERT INTO products_catalog VALUES (2, 'Mouse', 25)").await;
-        run(&ex, "INSERT INTO products_catalog VALUES (3, 'Keyboard', 75)").await;
+        run(
+            &ex,
+            "INSERT INTO products_catalog VALUES (3, 'Keyboard', 75)",
+        )
+        .await;
 
         run(&ex, "INSERT INTO order_lines VALUES (1, 100, 1, 2)").await;
         run(&ex, "INSERT INTO order_lines VALUES (2, 100, 2, 5)").await;
@@ -1350,7 +1467,10 @@ mod tests {
         let r = rows(&res[0]);
         assert_eq!(r.len(), 3);
         // Verify we have data from all four tables
-        assert!(r.iter().any(|row| row[0] == Value::Text("ACME Corp".into())));
+        assert!(
+            r.iter()
+                .any(|row| row[0] == Value::Text("ACME Corp".into()))
+        );
         assert!(r.iter().any(|row| row[2] == Value::Text("Laptop".into())));
         // Check that we can compute line totals
         let has_2000 = r.iter().any(|row| row[4] == Value::Int32(2000));
@@ -1464,8 +1584,16 @@ mod tests {
         .await;
 
         // Insert department data
-        run(&ex, "INSERT INTO departments_info VALUES (1, 'Engineering', 500000)").await;
-        run(&ex, "INSERT INTO departments_info VALUES (2, 'Sales', 300000)").await;
+        run(
+            &ex,
+            "INSERT INTO departments_info VALUES (1, 'Engineering', 500000)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO departments_info VALUES (2, 'Sales', 300000)",
+        )
+        .await;
         run(&ex, "INSERT INTO departments_info VALUES (3, 'HR', 200000)").await;
 
         // Insert staff data
@@ -1543,32 +1671,34 @@ mod tests {
             };
             run(
                 &ex,
-                &format!("INSERT INTO large_table VALUES ({}, '{}', {}, '2024-01-{:02}')", i, category, i * 10, (i % 28) + 1),
+                &format!(
+                    "INSERT INTO large_table VALUES ({}, '{}', {}, '2024-01-{:02}')",
+                    i,
+                    category,
+                    i * 10,
+                    (i % 28) + 1
+                ),
             )
             .await;
         }
 
         // Query without index
-        let res = run(
-            &ex,
-            "SELECT COUNT(*) FROM large_table WHERE category = 'A'",
-        )
-        .await;
+        let res = run(&ex, "SELECT COUNT(*) FROM large_table WHERE category = 'A'").await;
         assert_eq!(*scalar(&res[0]), Value::Int64(33));
 
         // Create index on category
         run(&ex, "CREATE INDEX idx_category ON large_table (category)").await;
 
         // Query with index (should still work correctly)
-        let res = run(
-            &ex,
-            "SELECT COUNT(*) FROM large_table WHERE category = 'A'",
-        )
-        .await;
+        let res = run(&ex, "SELECT COUNT(*) FROM large_table WHERE category = 'A'").await;
         assert_eq!(*scalar(&res[0]), Value::Int64(33));
 
         // Create composite index
-        run(&ex, "CREATE INDEX idx_cat_val ON large_table (category, value)").await;
+        run(
+            &ex,
+            "CREATE INDEX idx_cat_val ON large_table (category, value)",
+        )
+        .await;
 
         // Query using composite index
         let res = run(
@@ -1580,7 +1710,7 @@ mod tests {
         )
         .await;
         let r = rows(&res[0]);
-        assert!(r.len() > 0);
+        assert!(!r.is_empty());
 
         // Verify index existence via information_schema
         let res = run(
@@ -1613,8 +1743,7 @@ mod tests {
     /// Create an executor backed by the MVCC storage adapter.
     fn setup_mvcc() -> Arc<Executor> {
         let catalog = Arc::new(Catalog::new());
-        let storage: Arc<dyn StorageEngine> =
-            Arc::new(crate::storage::MvccStorageAdapter::new());
+        let storage: Arc<dyn StorageEngine> = Arc::new(crate::storage::MvccStorageAdapter::new());
         Arc::new(Executor::new(catalog, storage))
     }
 
@@ -1723,7 +1852,9 @@ mod tests {
         let res = run(&ex, "SHOW pool_status").await;
         let r = rows(&res[0]);
         // Should have at least one row about mvcc_enabled=true
-        let mvcc_row = r.iter().find(|row| row[0] == Value::Text("mvcc_enabled".into()));
+        let mvcc_row = r
+            .iter()
+            .find(|row| row[0] == Value::Text("mvcc_enabled".into()));
         assert!(mvcc_row.is_some());
         assert_eq!(mvcc_row.unwrap()[1], Value::Text("true".into()));
     }
@@ -1750,8 +1881,16 @@ mod tests {
     #[tokio::test]
     async fn mvcc_complex_workflow() {
         let ex = setup_mvcc();
-        run(&ex, "CREATE TABLE products (id INT NOT NULL, name TEXT, price INT NOT NULL)").await;
-        run(&ex, "INSERT INTO products VALUES (1, 'Laptop', 999), (2, 'Phone', 699), (3, 'Tablet', 499)").await;
+        run(
+            &ex,
+            "CREATE TABLE products (id INT NOT NULL, name TEXT, price INT NOT NULL)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO products VALUES (1, 'Laptop', 999), (2, 'Phone', 699), (3, 'Tablet', 499)",
+        )
+        .await;
 
         // Transaction: increase all prices by 10%
         run(&ex, "BEGIN").await;
@@ -1834,9 +1973,16 @@ mod tests {
         )
         .await;
         let r = rows(&res[0]);
-        assert_eq!(r.len(), 6, "UNION ALL should keep all rows including duplicates");
+        assert_eq!(
+            r.len(),
+            6,
+            "UNION ALL should keep all rows including duplicates"
+        );
         // Tomato should appear twice
-        let tomato_count = r.iter().filter(|row| row[0] == Value::Text("Tomato".into())).count();
+        let tomato_count = r
+            .iter()
+            .filter(|row| row[0] == Value::Text("Tomato".into()))
+            .count();
         assert_eq!(tomato_count, 2, "Tomato should appear twice in UNION ALL");
     }
 
@@ -2056,11 +2202,31 @@ mod tests {
         .await;
 
         // Insert sales across regions and products
-        run(&ex, "INSERT INTO sales_data VALUES ('North', 'Widget', 100)").await;
-        run(&ex, "INSERT INTO sales_data VALUES ('North', 'Widget', 150)").await;
-        run(&ex, "INSERT INTO sales_data VALUES ('North', 'Gadget', 200)").await;
-        run(&ex, "INSERT INTO sales_data VALUES ('South', 'Widget', 300)").await;
-        run(&ex, "INSERT INTO sales_data VALUES ('South', 'Gadget', 250)").await;
+        run(
+            &ex,
+            "INSERT INTO sales_data VALUES ('North', 'Widget', 100)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO sales_data VALUES ('North', 'Widget', 150)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO sales_data VALUES ('North', 'Gadget', 200)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO sales_data VALUES ('South', 'Widget', 300)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO sales_data VALUES ('South', 'Gadget', 250)",
+        )
+        .await;
         run(&ex, "INSERT INTO sales_data VALUES ('East', 'Widget', 120)").await;
         run(&ex, "INSERT INTO sales_data VALUES ('East', 'Gadget', 80)").await;
         run(&ex, "INSERT INTO sales_data VALUES ('East', 'Gadget', 100)").await;
@@ -2083,9 +2249,9 @@ mod tests {
         .await;
         let r = rows(&res[0]);
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0][0], Value::Int64(3));   // 3 regions
-        assert_eq!(r[0][1], Value::Int64(300));  // min = East (300)
-        assert_eq!(r[0][2], Value::Int64(550));  // max = South (550)
+        assert_eq!(r[0][0], Value::Int64(3)); // 3 regions
+        assert_eq!(r[0][1], Value::Int64(300)); // min = East (300)
+        assert_eq!(r[0][2], Value::Int64(550)); // max = South (550)
         assert_eq!(r[0][3], Value::Int64(1300)); // grand total = 450+550+300
 
         // Another nested aggregation: average of per-product totals
@@ -2103,10 +2269,7 @@ mod tests {
         .await;
         let avg = scalar(&res[0]);
         match avg {
-            Value::Float64(f) => assert!(
-                (*f - 650.0).abs() < 0.01,
-                "expected avg ~650.0, got {f}"
-            ),
+            Value::Float64(f) => assert!((*f - 650.0).abs() < 0.01, "expected avg ~650.0, got {f}"),
             other => panic!("expected Float64, got {other:?}"),
         }
     }
@@ -2159,7 +2322,11 @@ mod tests {
             .filter(|row| row[0] == Value::Text("Green Team".into()))
             .collect();
         assert_eq!(green_rows.len(), 1, "Green Team should appear once");
-        assert_eq!(green_rows[0][1], Value::Null, "Green Team player should be NULL");
+        assert_eq!(
+            green_rows[0][1],
+            Value::Null,
+            "Green Team player should be NULL"
+        );
 
         // Verify Red Team has two players
         let red_rows: Vec<_> = r
@@ -2253,11 +2420,7 @@ mod tests {
         assert_eq!(r[3][0], Value::Text("color".into()));
 
         // Verify existing rows got the default value (storage + executor cooperation)
-        let res = run(
-            &ex,
-            "SELECT name, color FROM widgets ORDER BY id",
-        )
-        .await;
+        let res = run(&ex, "SELECT name, color FROM widgets ORDER BY id").await;
         let r = rows(&res[0]);
         assert_eq!(r.len(), 3);
         assert_eq!(r[0][0], Value::Text("Sprocket".into()));
@@ -2331,9 +2494,21 @@ mod tests {
         .await;
 
         // Seed data outside of transaction (auto-commit)
-        run(&ex, "INSERT INTO departments VALUES (1, 'Engineering', 500000)").await;
-        run(&ex, "INSERT INTO departments VALUES (2, 'Marketing', 300000)").await;
-        run(&ex, "INSERT INTO departments VALUES (3, 'Research', 400000)").await;
+        run(
+            &ex,
+            "INSERT INTO departments VALUES (1, 'Engineering', 500000)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO departments VALUES (2, 'Marketing', 300000)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO departments VALUES (3, 'Research', 400000)",
+        )
+        .await;
 
         run(&ex, "INSERT INTO employees VALUES (1, 'Alice', 1, 120000)").await;
         run(&ex, "INSERT INTO employees VALUES (2, 'Bob', 1, 110000)").await;
@@ -2395,7 +2570,11 @@ mod tests {
         )
         .await;
         let r = rows(&res[0]);
-        assert_eq!(r.len(), 3, "all 3 departments should have >= 2 employees after commit");
+        assert_eq!(
+            r.len(),
+            3,
+            "all 3 departments should have >= 2 employees after commit"
+        );
         // Engineering has 3, then Marketing and Research each have 2
         assert_eq!(r[0][0], Value::Text("Engineering".into()));
         assert_eq!(r[0][1], Value::Int64(3));
@@ -2458,13 +2637,41 @@ mod tests {
         run(&ex, "INSERT INTO stores VALUES (30, 3, 'Chicago Store')").await;
 
         // -- Populate inventory (referencing stores) --
-        run(&ex, "INSERT INTO store_inventory VALUES (100, 10, 'Laptop', 50)").await;
-        run(&ex, "INSERT INTO store_inventory VALUES (101, 10, 'Phone', 120)").await;
-        run(&ex, "INSERT INTO store_inventory VALUES (102, 11, 'Laptop', 30)").await;
-        run(&ex, "INSERT INTO store_inventory VALUES (103, 20, 'Tablet', 80)").await;
-        run(&ex, "INSERT INTO store_inventory VALUES (104, 20, 'Phone', 200)").await;
-        run(&ex, "INSERT INTO store_inventory VALUES (105, 30, 'Laptop', 45)").await;
-        run(&ex, "INSERT INTO store_inventory VALUES (106, 30, 'Tablet', 60)").await;
+        run(
+            &ex,
+            "INSERT INTO store_inventory VALUES (100, 10, 'Laptop', 50)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO store_inventory VALUES (101, 10, 'Phone', 120)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO store_inventory VALUES (102, 11, 'Laptop', 30)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO store_inventory VALUES (103, 20, 'Tablet', 80)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO store_inventory VALUES (104, 20, 'Phone', 200)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO store_inventory VALUES (105, 30, 'Laptop', 45)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO store_inventory VALUES (106, 30, 'Tablet', 60)",
+        )
+        .await;
 
         // -- Verify initial counts --
         let res = run(&ex, "SELECT COUNT(*) FROM regions").await;
@@ -2502,7 +2709,11 @@ mod tests {
         assert_eq!(*scalar(&res[0]), Value::Int64(6));
 
         // -- INSERT new inventory --
-        run(&ex, "INSERT INTO store_inventory VALUES (107, 11, 'Monitor', 75)").await;
+        run(
+            &ex,
+            "INSERT INTO store_inventory VALUES (107, 11, 'Monitor', 75)",
+        )
+        .await;
 
         // Verify insert
         let res = run(&ex, "SELECT COUNT(*) FROM store_inventory").await;
@@ -2644,8 +2855,8 @@ mod tests {
         assert_eq!(r[0][1], Value::Int64(185000));
 
         // Verify rank values are in valid range
-        for i in 0..r.len() {
-            match &r[i][3] {
+        for row in r {
+            match &row[3] {
                 Value::Int64(rank) => assert!(
                     *rank >= 1 && *rank <= 5,
                     "rank should be between 1 and 5, got {rank}"
@@ -2707,7 +2918,10 @@ mod tests {
         assert_eq!(r[0][2], Value::Int64(180000));
 
         // Beta team: Charlie(185k) should be rank 1
-        let beta_rows: Vec<_> = r.iter().filter(|row| row[1] == Value::Text("Beta".into())).collect();
+        let beta_rows: Vec<_> = r
+            .iter()
+            .filter(|row| row[1] == Value::Text("Beta".into()))
+            .collect();
         assert_eq!(beta_rows.len(), 2);
         assert_eq!(beta_rows[0][0], Value::Text("Charlie".into()));
         assert_eq!(beta_rows[0][3], Value::Int64(1)); // rank 1 within Beta
@@ -2752,19 +2966,41 @@ mod tests {
     #[tokio::test]
     async fn test_right_join() {
         let ex = setup();
-        run(&ex, "CREATE TABLE departments (id INT PRIMARY KEY, name TEXT NOT NULL)").await;
-        run(&ex, "CREATE TABLE employees (id INT PRIMARY KEY, name TEXT NOT NULL, dept_id INT)").await;
+        run(
+            &ex,
+            "CREATE TABLE departments (id INT PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .await;
+        run(
+            &ex,
+            "CREATE TABLE employees (id INT PRIMARY KEY, name TEXT NOT NULL, dept_id INT)",
+        )
+        .await;
 
-        run(&ex, "INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Marketing'), (3, 'Sales')").await;
-        run(&ex, "INSERT INTO employees VALUES (1, 'Alice', 1), (2, 'Bob', 1), (3, 'Charlie', NULL)").await;
+        run(
+            &ex,
+            "INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Marketing'), (3, 'Sales')",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO employees VALUES (1, 'Alice', 1), (2, 'Bob', 1), (3, 'Charlie', NULL)",
+        )
+        .await;
 
         // RIGHT JOIN: all departments, even those with no employees
         let res = run(&ex, "SELECT e.name, d.name AS dept FROM employees e RIGHT JOIN departments d ON e.dept_id = d.id ORDER BY d.name").await;
         let r = rows(&res[0]);
-        assert!(r.len() >= 3, "should have at least 3 rows (Engineering x2, Marketing, Sales)");
+        assert!(
+            r.len() >= 3,
+            "should have at least 3 rows (Engineering x2, Marketing, Sales)"
+        );
 
         // Marketing and Sales should have NULL employee names
-        let marketing_rows: Vec<_> = r.iter().filter(|row| row[1] == Value::Text("Marketing".into())).collect();
+        let marketing_rows: Vec<_> = r
+            .iter()
+            .filter(|row| row[1] == Value::Text("Marketing".into()))
+            .collect();
         assert_eq!(marketing_rows.len(), 1);
         assert_eq!(marketing_rows[0][0], Value::Null);
     }
@@ -2779,7 +3015,11 @@ mod tests {
         run(&ex, "INSERT INTO sizes VALUES ('S'), ('M'), ('L')").await;
 
         // CROSS JOIN: cartesian product = 2 * 3 = 6 rows
-        let res = run(&ex, "SELECT c.name, s.label FROM colors c CROSS JOIN sizes s ORDER BY c.name, s.label").await;
+        let res = run(
+            &ex,
+            "SELECT c.name, s.label FROM colors c CROSS JOIN sizes s ORDER BY c.name, s.label",
+        )
+        .await;
         let r = rows(&res[0]);
         assert_eq!(r.len(), 6, "cross join should produce 6 rows");
         assert_eq!(r[0][0], Value::Text("Blue".into()));
@@ -2800,7 +3040,11 @@ mod tests {
         run(&ex, "INSERT INTO set_b VALUES (3), (4), (5), (6), (7)").await;
 
         // INTERSECT: common values {3, 4, 5}
-        let res = run(&ex, "SELECT val FROM set_a INTERSECT SELECT val FROM set_b ORDER BY val").await;
+        let res = run(
+            &ex,
+            "SELECT val FROM set_a INTERSECT SELECT val FROM set_b ORDER BY val",
+        )
+        .await;
         let r = rows(&res[0]);
         assert_eq!(r.len(), 3);
         assert_eq!(r[0][0], Value::Int32(3));
@@ -2808,7 +3052,11 @@ mod tests {
         assert_eq!(r[2][0], Value::Int32(5));
 
         // EXCEPT: in A but not in B {1, 2}
-        let res = run(&ex, "SELECT val FROM set_a EXCEPT SELECT val FROM set_b ORDER BY val").await;
+        let res = run(
+            &ex,
+            "SELECT val FROM set_a EXCEPT SELECT val FROM set_b ORDER BY val",
+        )
+        .await;
         let r = rows(&res[0]);
         assert_eq!(r.len(), 2);
         assert_eq!(r[0][0], Value::Int32(1));
@@ -2822,14 +3070,22 @@ mod tests {
     #[tokio::test]
     async fn test_null_functions() {
         let ex = setup();
-        run(&ex, "CREATE TABLE nullable (id INT PRIMARY KEY, val TEXT, num INT)").await;
+        run(
+            &ex,
+            "CREATE TABLE nullable (id INT PRIMARY KEY, val TEXT, num INT)",
+        )
+        .await;
         run(&ex, "INSERT INTO nullable VALUES (1, 'hello', 10)").await;
         run(&ex, "INSERT INTO nullable VALUES (2, NULL, 20)").await;
         run(&ex, "INSERT INTO nullable VALUES (3, 'world', NULL)").await;
         run(&ex, "INSERT INTO nullable VALUES (4, NULL, NULL)").await;
 
         // COALESCE: return first non-null
-        let res = run(&ex, "SELECT id, COALESCE(val, 'default') AS v FROM nullable ORDER BY id").await;
+        let res = run(
+            &ex,
+            "SELECT id, COALESCE(val, 'default') AS v FROM nullable ORDER BY id",
+        )
+        .await;
         let r = rows(&res[0]);
         assert_eq!(r[0][1], Value::Text("hello".into()));
         assert_eq!(r[1][1], Value::Text("default".into()));
@@ -2860,27 +3116,47 @@ mod tests {
     #[tokio::test]
     async fn test_between_like_offset() {
         let ex = setup();
-        run(&ex, "CREATE TABLE products (id INT PRIMARY KEY, name TEXT NOT NULL, price INT NOT NULL)").await;
+        run(
+            &ex,
+            "CREATE TABLE products (id INT PRIMARY KEY, name TEXT NOT NULL, price INT NOT NULL)",
+        )
+        .await;
         run(&ex, "INSERT INTO products VALUES (1, 'Apple Pie', 500)").await;
         run(&ex, "INSERT INTO products VALUES (2, 'Banana Bread', 350)").await;
         run(&ex, "INSERT INTO products VALUES (3, 'Cherry Cake', 700)").await;
         run(&ex, "INSERT INTO products VALUES (4, 'Apple Sauce', 200)").await;
-        run(&ex, "INSERT INTO products VALUES (5, 'Blueberry Muffin', 450)").await;
+        run(
+            &ex,
+            "INSERT INTO products VALUES (5, 'Blueberry Muffin', 450)",
+        )
+        .await;
 
         // BETWEEN
-        let res = run(&ex, "SELECT name FROM products WHERE price BETWEEN 300 AND 600 ORDER BY name").await;
+        let res = run(
+            &ex,
+            "SELECT name FROM products WHERE price BETWEEN 300 AND 600 ORDER BY name",
+        )
+        .await;
         let r = rows(&res[0]);
         assert!(r.len() >= 2, "should have items in price range 300-600");
 
         // LIKE with wildcard
-        let res = run(&ex, "SELECT name FROM products WHERE name LIKE 'Apple%' ORDER BY name").await;
+        let res = run(
+            &ex,
+            "SELECT name FROM products WHERE name LIKE 'Apple%' ORDER BY name",
+        )
+        .await;
         let r = rows(&res[0]);
         assert_eq!(r.len(), 2);
         assert_eq!(r[0][0], Value::Text("Apple Pie".into()));
         assert_eq!(r[1][0], Value::Text("Apple Sauce".into()));
 
         // LIMIT + OFFSET for pagination
-        let res = run(&ex, "SELECT name FROM products ORDER BY id LIMIT 2 OFFSET 2").await;
+        let res = run(
+            &ex,
+            "SELECT name FROM products ORDER BY id LIMIT 2 OFFSET 2",
+        )
+        .await;
         let r = rows(&res[0]);
         assert_eq!(r.len(), 2);
         assert_eq!(r[0][0], Value::Text("Cherry Cake".into()));
@@ -2895,21 +3171,49 @@ mod tests {
     async fn test_delete_and_update_complex() {
         let ex = setup();
         run(&ex, "CREATE TABLE inventory (id INT PRIMARY KEY, item TEXT NOT NULL, qty INT NOT NULL, category TEXT)").await;
-        run(&ex, "INSERT INTO inventory VALUES (1, 'Widget A', 100, 'hardware')").await;
-        run(&ex, "INSERT INTO inventory VALUES (2, 'Widget B', 50, 'hardware')").await;
-        run(&ex, "INSERT INTO inventory VALUES (3, 'Gadget X', 200, 'electronics')").await;
-        run(&ex, "INSERT INTO inventory VALUES (4, 'Gadget Y', 30, 'electronics')").await;
-        run(&ex, "INSERT INTO inventory VALUES (5, 'Tool Z', 75, 'hardware')").await;
+        run(
+            &ex,
+            "INSERT INTO inventory VALUES (1, 'Widget A', 100, 'hardware')",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO inventory VALUES (2, 'Widget B', 50, 'hardware')",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO inventory VALUES (3, 'Gadget X', 200, 'electronics')",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO inventory VALUES (4, 'Gadget Y', 30, 'electronics')",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO inventory VALUES (5, 'Tool Z', 75, 'hardware')",
+        )
+        .await;
 
         // UPDATE multiple columns
-        run(&ex, "UPDATE inventory SET qty = 999, category = 'premium' WHERE id = 1").await;
+        run(
+            &ex,
+            "UPDATE inventory SET qty = 999, category = 'premium' WHERE id = 1",
+        )
+        .await;
         let res = run(&ex, "SELECT qty, category FROM inventory WHERE id = 1").await;
         let r = rows(&res[0]);
         assert_eq!(r[0][0], Value::Int32(999));
         assert_eq!(r[0][1], Value::Text("premium".into()));
 
         // DELETE with compound WHERE
-        run(&ex, "DELETE FROM inventory WHERE category = 'hardware' AND qty < 100").await;
+        run(
+            &ex,
+            "DELETE FROM inventory WHERE category = 'hardware' AND qty < 100",
+        )
+        .await;
         let res = run(&ex, "SELECT COUNT(*) FROM inventory").await;
         // Should have deleted Widget B (qty=50) and Tool Z (qty=75). Widget A is now 'premium'.
         // Remaining: Widget A (premium, 999), Gadget X (200), Gadget Y (30) = 3 rows
@@ -2928,7 +3232,11 @@ mod tests {
     #[tokio::test]
     async fn test_avg_and_aggregates() {
         let ex = setup();
-        run(&ex, "CREATE TABLE scores (student TEXT NOT NULL, score INT NOT NULL)").await;
+        run(
+            &ex,
+            "CREATE TABLE scores (student TEXT NOT NULL, score INT NOT NULL)",
+        )
+        .await;
         run(&ex, "INSERT INTO scores VALUES ('Alice', 90), ('Bob', 80), ('Charlie', 70), ('Alice', 100), ('Bob', 60)").await;
 
         // AVG
@@ -2941,7 +3249,11 @@ mod tests {
         }
 
         // GROUP BY with AVG
-        let res = run(&ex, "SELECT student, AVG(score) AS avg_score FROM scores GROUP BY student ORDER BY student").await;
+        let res = run(
+            &ex,
+            "SELECT student, AVG(score) AS avg_score FROM scores GROUP BY student ORDER BY student",
+        )
+        .await;
         let r = rows(&res[0]);
         assert_eq!(r.len(), 3);
         assert_eq!(r[0][0], Value::Text("Alice".into())); // avg=95
@@ -2991,18 +3303,30 @@ mod tests {
     #[tokio::test]
     async fn test_transaction_isolation() {
         let ex = setup();
-        run(&ex, "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT NOT NULL)").await;
+        run(
+            &ex,
+            "CREATE TABLE accounts (id INT PRIMARY KEY, balance INT NOT NULL)",
+        )
+        .await;
         run(&ex, "INSERT INTO accounts VALUES (1, 1000), (2, 2000)").await;
 
         // Transfer 500 from account 1 to account 2 within a transaction
         run(&ex, "BEGIN").await;
-        run(&ex, "UPDATE accounts SET balance = balance - 500 WHERE id = 1").await;
-        run(&ex, "UPDATE accounts SET balance = balance + 500 WHERE id = 2").await;
+        run(
+            &ex,
+            "UPDATE accounts SET balance = balance - 500 WHERE id = 1",
+        )
+        .await;
+        run(
+            &ex,
+            "UPDATE accounts SET balance = balance + 500 WHERE id = 2",
+        )
+        .await;
         run(&ex, "COMMIT").await;
 
         let res = run(&ex, "SELECT id, balance FROM accounts ORDER BY id").await;
         let r = rows(&res[0]);
-        assert_eq!(r[0][1], Value::Int32(500));  // 1000 - 500
+        assert_eq!(r[0][1], Value::Int32(500)); // 1000 - 500
         assert_eq!(r[1][1], Value::Int32(2500)); // 2000 + 500
     }
 
@@ -3014,7 +3338,11 @@ mod tests {
     async fn test_nested_subqueries() {
         let ex = setup();
         run(&ex, "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT NOT NULL, total INT NOT NULL)").await;
-        run(&ex, "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT NOT NULL, tier TEXT NOT NULL)").await;
+        run(
+            &ex,
+            "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT NOT NULL, tier TEXT NOT NULL)",
+        )
+        .await;
 
         run(&ex, "INSERT INTO customers VALUES (1, 'Alice', 'gold'), (2, 'Bob', 'silver'), (3, 'Charlie', 'gold')").await;
         run(&ex, "INSERT INTO orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150), (4, 3, 300), (5, 3, 50)").await;
@@ -3031,8 +3359,8 @@ mod tests {
         let res = run(&ex, "SELECT c.name, (SELECT SUM(total) FROM orders o WHERE o.customer_id = c.id) AS order_total FROM customers c ORDER BY c.name").await;
         let r = rows(&res[0]);
         assert_eq!(r.len(), 3);
-        assert_eq!(r[0][0], Value::Text("Alice".into()));   // 100+200=300
-        assert_eq!(r[1][0], Value::Text("Bob".into()));     // 150
+        assert_eq!(r[0][0], Value::Text("Alice".into())); // 100+200=300
+        assert_eq!(r[1][0], Value::Text("Bob".into())); // 150
         assert_eq!(r[2][0], Value::Text("Charlie".into())); // 300+50=350
     }
 
@@ -3052,7 +3380,11 @@ mod tests {
         run(&ex, "DROP TABLE temp").await;
 
         // Recreate with different schema
-        run(&ex, "CREATE TABLE temp (id INT PRIMARY KEY, label TEXT NOT NULL, score INT)").await;
+        run(
+            &ex,
+            "CREATE TABLE temp (id INT PRIMARY KEY, label TEXT NOT NULL, score INT)",
+        )
+        .await;
         run(&ex, "INSERT INTO temp VALUES (10, 'new', 99)").await;
 
         let res = run(&ex, "SELECT label, score FROM temp").await;
@@ -3069,7 +3401,11 @@ mod tests {
     #[tokio::test]
     async fn test_explain() {
         let ex = setup();
-        run(&ex, "CREATE TABLE explain_t (id INT PRIMARY KEY, name TEXT NOT NULL)").await;
+        run(
+            &ex,
+            "CREATE TABLE explain_t (id INT PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .await;
         run(&ex, "INSERT INTO explain_t VALUES (1, 'Alice'), (2, 'Bob')").await;
 
         // EXPLAIN should return a plan (one or more rows with text)
@@ -3085,7 +3421,11 @@ mod tests {
     #[tokio::test]
     async fn test_window_functions_extended() {
         let ex = setup();
-        run(&ex, "CREATE TABLE sales (id INT PRIMARY KEY, region TEXT NOT NULL, amount INT NOT NULL)").await;
+        run(
+            &ex,
+            "CREATE TABLE sales (id INT PRIMARY KEY, region TEXT NOT NULL, amount INT NOT NULL)",
+        )
+        .await;
         run(&ex, "INSERT INTO sales VALUES (1, 'East', 100), (2, 'East', 200), (3, 'West', 150), (4, 'West', 300), (5, 'East', 100)").await;
 
         // DENSE_RANK
@@ -3100,11 +3440,14 @@ mod tests {
         let res = run(&ex, "SELECT id, amount, SUM(amount) OVER (ORDER BY id) AS running_total FROM sales ORDER BY id").await;
         let r = rows(&res[0]);
         assert_eq!(r.len(), 5);
-        let running_vals: Vec<f64> = r.iter().map(|row| match &row[2] {
-            Value::Float64(v) => *v,
-            Value::Int64(v) => *v as f64,
-            other => panic!("expected numeric for SUM OVER, got {other:?}"),
-        }).collect();
+        let running_vals: Vec<f64> = r
+            .iter()
+            .map(|row| match &row[2] {
+                Value::Float64(v) => *v,
+                Value::Int64(v) => *v as f64,
+                other => panic!("expected numeric for SUM OVER, got {other:?}"),
+            })
+            .collect();
         assert_eq!(running_vals[0], 100.0);
         assert_eq!(running_vals[1], 300.0);
         assert_eq!(running_vals[2], 450.0);
@@ -3126,11 +3469,21 @@ mod tests {
     #[tokio::test]
     async fn test_cte_multiple_references() {
         let ex = setup();
-        run(&ex, "CREATE TABLE metrics (day INT NOT NULL, value INT NOT NULL)").await;
-        run(&ex, "INSERT INTO metrics VALUES (1, 10), (2, 20), (3, 15), (4, 25), (5, 30)").await;
+        run(
+            &ex,
+            "CREATE TABLE metrics (day INT NOT NULL, value INT NOT NULL)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO metrics VALUES (1, 10), (2, 20), (3, 15), (4, 25), (5, 30)",
+        )
+        .await;
 
         // CTE used in main query: compute avg inline and filter
-        let res = run(&ex, "
+        let res = run(
+            &ex,
+            "
             WITH daily AS (
                 SELECT day, value FROM metrics
             )
@@ -3138,7 +3491,9 @@ mod tests {
             FROM daily d
             WHERE d.value > 20
             ORDER BY d.day
-        ").await;
+        ",
+        )
+        .await;
         let r = rows(&res[0]);
         // Values > 20: day4=25, day5=30
         assert_eq!(r.len(), 2);
@@ -3192,8 +3547,16 @@ mod tests {
     async fn test_having_with_multiple_aggregates() {
         let ex = setup();
         run(&ex, "CREATE TABLE log_entries (user_id INT NOT NULL, action TEXT NOT NULL, duration INT NOT NULL)").await;
-        run(&ex, "INSERT INTO log_entries VALUES (1, 'login', 5), (1, 'view', 10), (1, 'edit', 20)").await;
-        run(&ex, "INSERT INTO log_entries VALUES (2, 'login', 3), (2, 'view', 7)").await;
+        run(
+            &ex,
+            "INSERT INTO log_entries VALUES (1, 'login', 5), (1, 'view', 10), (1, 'edit', 20)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO log_entries VALUES (2, 'login', 3), (2, 'view', 7)",
+        )
+        .await;
         run(&ex, "INSERT INTO log_entries VALUES (3, 'login', 2), (3, 'view', 5), (3, 'edit', 15), (3, 'delete', 1)").await;
 
         // Users with > 2 actions and total duration > 10
@@ -3233,7 +3596,11 @@ mod tests {
         let ex = setup();
 
         // Create initial schema
-        run(&ex, "CREATE TABLE evolve (id INT PRIMARY KEY, name TEXT NOT NULL)").await;
+        run(
+            &ex,
+            "CREATE TABLE evolve (id INT PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .await;
         run(&ex, "INSERT INTO evolve VALUES (1, 'v1')").await;
 
         // Add a column
@@ -3244,8 +3611,8 @@ mod tests {
         let res = run(&ex, "SELECT id, name, version FROM evolve ORDER BY id").await;
         let r = rows(&res[0]);
         assert_eq!(r.len(), 2);
-        assert_eq!(r[0][2], Value::Null);     // old row, new column = NULL
-        assert_eq!(r[1][2], Value::Int32(2));  // new row has value
+        assert_eq!(r[0][2], Value::Null); // old row, new column = NULL
+        assert_eq!(r[1][2], Value::Int32(2)); // new row has value
 
         // Drop a column
         run(&ex, "ALTER TABLE evolve DROP COLUMN version").await;
@@ -3263,7 +3630,11 @@ mod tests {
     #[tokio::test]
     async fn test_count_distinct() {
         let ex = setup();
-        run(&ex, "CREATE TABLE visits (user_id INT NOT NULL, page TEXT NOT NULL)").await;
+        run(
+            &ex,
+            "CREATE TABLE visits (user_id INT NOT NULL, page TEXT NOT NULL)",
+        )
+        .await;
         run(&ex, "INSERT INTO visits VALUES (1, '/home'), (1, '/about'), (2, '/home'), (1, '/home'), (3, '/home')").await;
 
         // COUNT(DISTINCT user_id)
@@ -3277,8 +3648,8 @@ mod tests {
         // Regular COUNT vs COUNT DISTINCT
         let res = run(&ex, "SELECT COUNT(*), COUNT(DISTINCT user_id) FROM visits").await;
         let r = rows(&res[0]);
-        assert_eq!(r[0][0], Value::Int64(5));  // total rows
-        assert_eq!(r[0][1], Value::Int64(3));  // distinct users
+        assert_eq!(r[0][0], Value::Int64(5)); // total rows
+        assert_eq!(r[0][1], Value::Int64(3)); // distinct users
     }
 
     // ========================================================================
@@ -3374,7 +3745,11 @@ mod tests {
         assert_eq!(scalar(&res[0]), &Value::Text("array".into()));
 
         // JSONB_EXTRACT_PATH_TEXT — extract a nested value as text
-        let res = run(&ex, "SELECT JSONB_EXTRACT_PATH_TEXT('{\"name\":\"Alice\",\"age\":30}'::JSONB, 'name')").await;
+        let res = run(
+            &ex,
+            "SELECT JSONB_EXTRACT_PATH_TEXT('{\"name\":\"Alice\",\"age\":30}'::JSONB, 'name')",
+        )
+        .await;
         assert_eq!(scalar(&res[0]), &Value::Text("Alice".into()));
     }
 
@@ -3385,22 +3760,38 @@ mod tests {
     #[tokio::test]
     async fn test_explain_analyze() {
         let ex = setup();
-        run(&ex, "CREATE TABLE explain_data (id INT PRIMARY KEY, val TEXT NOT NULL)").await;
-        run(&ex, "INSERT INTO explain_data VALUES (1, 'a'), (2, 'b'), (3, 'c')").await;
+        run(
+            &ex,
+            "CREATE TABLE explain_data (id INT PRIMARY KEY, val TEXT NOT NULL)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO explain_data VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        )
+        .await;
 
         // EXPLAIN ANALYZE should execute and include timing/row info
-        let res = run(&ex, "EXPLAIN ANALYZE SELECT * FROM explain_data WHERE id > 1").await;
+        let res = run(
+            &ex,
+            "EXPLAIN ANALYZE SELECT * FROM explain_data WHERE id > 1",
+        )
+        .await;
         let r = rows(&res[0]);
         assert!(!r.is_empty(), "EXPLAIN ANALYZE should return plan rows");
         // The plan text should mention "Actual Rows" from the analyze output
-        let plan_text: String = r.iter()
+        let plan_text: String = r
+            .iter()
             .filter_map(|row| match &row[0] {
                 Value::Text(t) => Some(t.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(plan_text.contains("Actual Rows"), "EXPLAIN ANALYZE should include actual rows: {plan_text}");
+        assert!(
+            plan_text.contains("Actual Rows"),
+            "EXPLAIN ANALYZE should include actual rows: {plan_text}"
+        );
     }
 
     // ========================================================================
@@ -3410,13 +3801,33 @@ mod tests {
     #[tokio::test]
     async fn test_explain_join() {
         let ex = setup();
-        run(&ex, "CREATE TABLE dept (id INT PRIMARY KEY, name TEXT NOT NULL)").await;
-        run(&ex, "CREATE TABLE emp (id INT PRIMARY KEY, name TEXT NOT NULL, dept_id INT NOT NULL)").await;
-        run(&ex, "INSERT INTO dept VALUES (1, 'Engineering'), (2, 'Sales')").await;
-        run(&ex, "INSERT INTO emp VALUES (1, 'Alice', 1), (2, 'Bob', 2), (3, 'Charlie', 1)").await;
+        run(
+            &ex,
+            "CREATE TABLE dept (id INT PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .await;
+        run(
+            &ex,
+            "CREATE TABLE emp (id INT PRIMARY KEY, name TEXT NOT NULL, dept_id INT NOT NULL)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO dept VALUES (1, 'Engineering'), (2, 'Sales')",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO emp VALUES (1, 'Alice', 1), (2, 'Bob', 2), (3, 'Charlie', 1)",
+        )
+        .await;
 
         // EXPLAIN a JOIN query should return a plan
-        let res = run(&ex, "EXPLAIN SELECT e.name, d.name FROM emp e JOIN dept d ON e.dept_id = d.id").await;
+        let res = run(
+            &ex,
+            "EXPLAIN SELECT e.name, d.name FROM emp e JOIN dept d ON e.dept_id = d.id",
+        )
+        .await;
         let r = rows(&res[0]);
         assert!(!r.is_empty(), "EXPLAIN JOIN should return plan rows");
     }
@@ -3459,9 +3870,17 @@ mod tests {
     #[tokio::test]
     async fn test_jsonb_column_storage() {
         let ex = setup();
-        run(&ex, "CREATE TABLE docs (id INT PRIMARY KEY, data JSONB NOT NULL)").await;
+        run(
+            &ex,
+            "CREATE TABLE docs (id INT PRIMARY KEY, data JSONB NOT NULL)",
+        )
+        .await;
         run(&ex, "INSERT INTO docs VALUES (1, '{\"name\":\"Alice\",\"tags\":[\"admin\",\"user\"]}'::JSONB)").await;
-        run(&ex, "INSERT INTO docs VALUES (2, '{\"name\":\"Bob\",\"tags\":[\"user\"]}'::JSONB)").await;
+        run(
+            &ex,
+            "INSERT INTO docs VALUES (2, '{\"name\":\"Bob\",\"tags\":[\"user\"]}'::JSONB)",
+        )
+        .await;
 
         // Query all docs
         let res = run(&ex, "SELECT id, data FROM docs ORDER BY id").await;
@@ -3520,7 +3939,9 @@ mod tests {
         let sid = ex.create_session();
 
         // Set a custom setting (sqlparser preserves single quotes in the value)
-        ex.execute_with_session(sid, "SET search_path = 'custom_schema'").await.unwrap();
+        ex.execute_with_session(sid, "SET search_path = 'custom_schema'")
+            .await
+            .unwrap();
 
         // Verify it's set (value includes quotes as stored by SET)
         let val = ex.get_session_setting(sid, "search_path");
@@ -3542,7 +3963,9 @@ mod tests {
         let sid = ex.create_session();
 
         // Prepare a statement
-        ex.execute_with_session(sid, "PREPARE my_stmt AS SELECT * FROM prep_test").await.unwrap();
+        ex.execute_with_session(sid, "PREPARE my_stmt AS SELECT * FROM prep_test")
+            .await
+            .unwrap();
 
         // Reset should report DEALLOCATE
         let actions = ex.reset_session(sid).await;
@@ -3557,7 +3980,9 @@ mod tests {
 
         // Begin a transaction
         ex.execute_with_session(sid, "BEGIN").await.unwrap();
-        ex.execute_with_session(sid, "INSERT INTO txn_reset VALUES (42)").await.unwrap();
+        ex.execute_with_session(sid, "INSERT INTO txn_reset VALUES (42)")
+            .await
+            .unwrap();
 
         // Reset should abort the transaction
         let actions = ex.reset_session(sid).await;
@@ -3587,14 +4012,22 @@ mod tests {
 
         // Default settings
         assert_eq!(ex.get_session_setting(sid, "timezone"), Some("UTC".into()));
-        assert_eq!(ex.get_session_setting(sid, "client_encoding"), Some("UTF8".into()));
+        assert_eq!(
+            ex.get_session_setting(sid, "client_encoding"),
+            Some("UTF8".into())
+        );
 
         // Non-existent setting
         assert_eq!(ex.get_session_setting(sid, "nonexistent"), None);
 
         // Set and read back (sqlparser preserves quotes)
-        ex.execute_with_session(sid, "SET timezone = 'US/Pacific'").await.unwrap();
-        assert_eq!(ex.get_session_setting(sid, "timezone"), Some("'US/Pacific'".into()));
+        ex.execute_with_session(sid, "SET timezone = 'US/Pacific'")
+            .await
+            .unwrap();
+        assert_eq!(
+            ex.get_session_setting(sid, "timezone"),
+            Some("'US/Pacific'".into())
+        );
     }
 
     #[tokio::test]
@@ -3606,8 +4039,13 @@ mod tests {
         assert_eq!(ex.get_session_setting(sid, "statement_timeout"), None);
 
         // Set it
-        ex.execute_with_session(sid, "SET statement_timeout = 60").await.unwrap();
-        assert_eq!(ex.get_session_setting(sid, "statement_timeout"), Some("60".into()));
+        ex.execute_with_session(sid, "SET statement_timeout = 60")
+            .await
+            .unwrap();
+        assert_eq!(
+            ex.get_session_setting(sid, "statement_timeout"),
+            Some("60".into())
+        );
 
         // Reset clears it
         ex.reset_session(sid).await;
@@ -3633,12 +4071,17 @@ mod tests {
 
         // Session A: open a transaction and insert a row.
         ex.execute_with_session(sid_a, "BEGIN").await.unwrap();
-        ex.execute_with_session(sid_a, "INSERT INTO iso_test VALUES (1)").await.unwrap();
+        ex.execute_with_session(sid_a, "INSERT INTO iso_test VALUES (1)")
+            .await
+            .unwrap();
 
         // Session B: ROLLBACK while not in a transaction must warn, not error.
         // If txn_state were shared, session B would try to roll back session A's work.
         let rollback_b = ex.execute_with_session(sid_b, "ROLLBACK").await;
-        assert!(rollback_b.is_ok(), "session B ROLLBACK outside txn must not error");
+        assert!(
+            rollback_b.is_ok(),
+            "session B ROLLBACK outside txn must not error"
+        );
 
         // Session A: ROLLBACK undoes its own insert only.
         ex.execute_with_session(sid_a, "ROLLBACK").await.unwrap();
@@ -3653,22 +4096,40 @@ mod tests {
         };
 
         // Both sessions: table must be empty.
-        let count_a = ex.execute_with_session(sid_a, "SELECT COUNT(*) FROM iso_test").await.unwrap();
-        let count_b = ex.execute_with_session(sid_b, "SELECT COUNT(*) FROM iso_test").await.unwrap();
+        let count_a = ex
+            .execute_with_session(sid_a, "SELECT COUNT(*) FROM iso_test")
+            .await
+            .unwrap();
+        let count_b = ex
+            .execute_with_session(sid_b, "SELECT COUNT(*) FROM iso_test")
+            .await
+            .unwrap();
         assert_eq!(extract_count(count_a), 0, "session A: rolled-back row gone");
         assert_eq!(extract_count(count_b), 0, "session B: never saw the row");
 
         // Session B BEGIN + INSERT must be independent from session A.
         ex.execute_with_session(sid_b, "BEGIN").await.unwrap();
-        ex.execute_with_session(sid_b, "INSERT INTO iso_test VALUES (2)").await.unwrap();
+        ex.execute_with_session(sid_b, "INSERT INTO iso_test VALUES (2)")
+            .await
+            .unwrap();
         // Session A must not be in a transaction — so its ROLLBACK should warn, not error.
         let rollback_a = ex.execute_with_session(sid_a, "ROLLBACK").await;
-        assert!(rollback_a.is_ok(), "session A ROLLBACK outside txn after B's BEGIN must not error");
+        assert!(
+            rollback_a.is_ok(),
+            "session A ROLLBACK outside txn after B's BEGIN must not error"
+        );
         // Session B commits cleanly.
         ex.execute_with_session(sid_b, "COMMIT").await.unwrap();
 
-        let count_final = ex.execute_with_session(sid_a, "SELECT COUNT(*) FROM iso_test").await.unwrap();
-        assert_eq!(extract_count(count_final), 1, "only session B's committed row present");
+        let count_final = ex
+            .execute_with_session(sid_a, "SELECT COUNT(*) FROM iso_test")
+            .await
+            .unwrap();
+        assert_eq!(
+            extract_count(count_final),
+            1,
+            "only session B's committed row present"
+        );
 
         ex.drop_session(sid_a);
         ex.drop_session(sid_b);
@@ -3682,8 +4143,12 @@ mod tests {
         let sid_a = ex.create_session();
         let sid_b = ex.create_session();
 
-        ex.execute_with_session(sid_a, "SET timezone = 'US/Eastern'").await.unwrap();
-        ex.execute_with_session(sid_b, "SET timezone = 'US/Pacific'").await.unwrap();
+        ex.execute_with_session(sid_a, "SET timezone = 'US/Eastern'")
+            .await
+            .unwrap();
+        ex.execute_with_session(sid_b, "SET timezone = 'US/Pacific'")
+            .await
+            .unwrap();
 
         // Each session retains its own setting.
         assert_eq!(
@@ -3710,11 +4175,16 @@ mod tests {
         let sid_a = ex.create_session();
         let sid_b = ex.create_session();
 
-        ex.execute_with_session(sid_a, "PREPARE my_stmt AS SELECT * FROM prep_iso").await.unwrap();
+        ex.execute_with_session(sid_a, "PREPARE my_stmt AS SELECT * FROM prep_iso")
+            .await
+            .unwrap();
 
         // Session B must not see session A's prepared statement — EXECUTE should fail.
         let result = ex.execute_with_session(sid_b, "EXECUTE my_stmt").await;
-        assert!(result.is_err(), "session B must not see session A's prepared statement");
+        assert!(
+            result.is_err(),
+            "session B must not see session A's prepared statement"
+        );
 
         ex.drop_session(sid_a);
         ex.drop_session(sid_b);
@@ -3751,7 +4221,11 @@ mod tests {
     #[tokio::test]
     async fn test_disk_engine_update_delete() {
         let (ex, _dir) = setup_disk();
-        run(&ex, "CREATE TABLE disk_ud (id INT NOT NULL, val INT NOT NULL)").await;
+        run(
+            &ex,
+            "CREATE TABLE disk_ud (id INT NOT NULL, val INT NOT NULL)",
+        )
+        .await;
         run(&ex, "INSERT INTO disk_ud VALUES (1, 10), (2, 20), (3, 30)").await;
 
         run(&ex, "UPDATE disk_ud SET val = 99 WHERE id = 2").await;
@@ -3766,8 +4240,16 @@ mod tests {
     #[tokio::test]
     async fn test_disk_engine_index_operations() {
         let (ex, _dir) = setup_disk();
-        run(&ex, "CREATE TABLE disk_idx (id INT PRIMARY KEY, name TEXT NOT NULL)").await;
-        run(&ex, "INSERT INTO disk_idx VALUES (1, 'Alpha'), (2, 'Beta'), (3, 'Gamma')").await;
+        run(
+            &ex,
+            "CREATE TABLE disk_idx (id INT PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO disk_idx VALUES (1, 'Alpha'), (2, 'Beta'), (3, 'Gamma')",
+        )
+        .await;
 
         // Point query via primary key index
         let res = run(&ex, "SELECT name FROM disk_idx WHERE id = 2").await;
@@ -3784,10 +4266,22 @@ mod tests {
     #[tokio::test]
     async fn test_disk_engine_join() {
         let (ex, _dir) = setup_disk();
-        run(&ex, "CREATE TABLE disk_users (id INT PRIMARY KEY, name TEXT NOT NULL)").await;
+        run(
+            &ex,
+            "CREATE TABLE disk_users (id INT PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .await;
         run(&ex, "CREATE TABLE disk_orders (id INT PRIMARY KEY, user_id INT NOT NULL, amount INT NOT NULL)").await;
-        run(&ex, "INSERT INTO disk_users VALUES (1, 'Alice'), (2, 'Bob')").await;
-        run(&ex, "INSERT INTO disk_orders VALUES (10, 1, 100), (20, 2, 200), (30, 1, 150)").await;
+        run(
+            &ex,
+            "INSERT INTO disk_users VALUES (1, 'Alice'), (2, 'Bob')",
+        )
+        .await;
+        run(
+            &ex,
+            "INSERT INTO disk_orders VALUES (10, 1, 100), (20, 2, 200), (30, 1, 150)",
+        )
+        .await;
 
         let res = run(&ex, "SELECT u.name, SUM(o.amount) FROM disk_users u JOIN disk_orders o ON u.id = o.user_id GROUP BY u.name ORDER BY u.name").await;
         let r = rows(&res[0]);
@@ -3841,7 +4335,11 @@ mod tests {
     #[tokio::test]
     async fn test_disk_engine_rollback_update() {
         let (ex, _dir) = setup_disk_mvcc();
-        run(&ex, "CREATE TABLE disk_rb_upd (id INT NOT NULL, val INT NOT NULL)").await;
+        run(
+            &ex,
+            "CREATE TABLE disk_rb_upd (id INT NOT NULL, val INT NOT NULL)",
+        )
+        .await;
         run(&ex, "INSERT INTO disk_rb_upd VALUES (1, 100), (2, 200)").await;
 
         run(&ex, "BEGIN").await;
@@ -3861,7 +4359,11 @@ mod tests {
     async fn test_disk_engine_rollback_delete() {
         let (ex, _dir) = setup_disk_mvcc();
         run(&ex, "CREATE TABLE disk_rb_del (id INT NOT NULL, name TEXT)").await;
-        run(&ex, "INSERT INTO disk_rb_del VALUES (1, 'keep'), (2, 'delete_me')").await;
+        run(
+            &ex,
+            "INSERT INTO disk_rb_del VALUES (1, 'keep'), (2, 'delete_me')",
+        )
+        .await;
 
         run(&ex, "BEGIN").await;
         run(&ex, "DELETE FROM disk_rb_del WHERE id = 2").await;
@@ -3899,7 +4401,11 @@ mod tests {
     #[tokio::test]
     async fn test_disk_engine_aggregate_pipeline() {
         let (ex, _dir) = setup_disk();
-        run(&ex, "CREATE TABLE disk_sales (product TEXT NOT NULL, amount INT NOT NULL)").await;
+        run(
+            &ex,
+            "CREATE TABLE disk_sales (product TEXT NOT NULL, amount INT NOT NULL)",
+        )
+        .await;
         run(&ex, "INSERT INTO disk_sales VALUES ('Widget', 100), ('Widget', 150), ('Gadget', 200), ('Gadget', 50)").await;
 
         // GROUP BY + HAVING + ORDER BY (both products sum to 250, so filter > 250)

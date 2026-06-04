@@ -10,8 +10,8 @@
 //! behind an `Arc` to allow shared routing from multiple acceptor threads.
 //! [`RuntimeStats`] provides a snapshot of the current load distribution.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::available_parallelism;
 
 // ---------------------------------------------------------------------------
@@ -38,9 +38,7 @@ pub struct CoreConfig {
 
 impl Default for CoreConfig {
     fn default() -> Self {
-        let num_cores = available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let num_cores = available_parallelism().map(|n| n.get()).unwrap_or(4);
         Self {
             num_cores,
             pin_to_cpu: false,
@@ -192,9 +190,10 @@ impl NucleusRuntime {
     /// Returns `true` if pinning succeeded, `false` otherwise.
     pub fn pin_current_thread(core: CoreId) -> bool {
         if let Some(core_ids) = core_affinity::get_core_ids()
-            && let Some(cid) = core_ids.get(core.0 % core_ids.len()) {
-                return core_affinity::set_for_current(*cid);
-            }
+            && let Some(cid) = core_ids.get(core.0 % core_ids.len())
+        {
+            return core_affinity::set_for_current(*cid);
+        }
         false
     }
 }
@@ -279,9 +278,7 @@ pub struct SpawnConfig {
 
 impl Default for SpawnConfig {
     fn default() -> Self {
-        let num_workers = available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let num_workers = available_parallelism().map(|n| n.get()).unwrap_or(4);
         Self {
             num_workers,
             pin_to_cpu: false,
@@ -290,7 +287,8 @@ impl Default for SpawnConfig {
 }
 
 /// A boxed async task that can be sent to a worker thread.
-type BoxedTask = Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+type BoxedTask =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
 
 /// A pool of actual OS threads, one per core.
 ///
@@ -345,9 +343,10 @@ impl WorkerPool {
                     // platform or core index is unavailable, we skip silently.
                     if pin
                         && let Some(core_ids) = core_affinity::get_core_ids()
-                            && let Some(cid) = core_ids.get(i % core_ids.len()) {
-                                core_affinity::set_for_current(*cid);
-                            }
+                        && let Some(cid) = core_ids.get(i % core_ids.len())
+                    {
+                        core_affinity::set_for_current(*cid);
+                    }
 
                     // Run a single-threaded tokio runtime on this core.
                     let rt = tokio::runtime::Builder::new_current_thread()
@@ -512,10 +511,10 @@ impl SharedNothingPool {
                 .spawn(move || {
                     if pin_to_cpu
                         && let Some(core_ids) = core_affinity::get_core_ids()
-                            && let Some(cid) = core_ids.get(i % core_ids.len())
-                        {
-                            core_affinity::set_for_current(*cid);
-                        }
+                        && let Some(cid) = core_ids.get(i % core_ids.len())
+                    {
+                        core_affinity::set_for_current(*cid);
+                    }
 
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -864,7 +863,12 @@ impl CrossCoreChannelMesh {
             receivers.push(std::sync::Mutex::new(rx));
         }
 
-        Self { senders, receivers, num_cores, capacity }
+        Self {
+            senders,
+            receivers,
+            num_cores,
+            capacity,
+        }
     }
 
     #[inline]
@@ -1028,9 +1032,15 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                CoreId(0), CoreId(1), CoreId(2),
-                CoreId(0), CoreId(1), CoreId(2),
-                CoreId(0), CoreId(1), CoreId(2),
+                CoreId(0),
+                CoreId(1),
+                CoreId(2),
+                CoreId(0),
+                CoreId(1),
+                CoreId(2),
+                CoreId(0),
+                CoreId(1),
+                CoreId(2),
             ]
         );
     }
@@ -1087,7 +1097,10 @@ mod tests {
 
     #[test]
     fn worker_pool_spawn_and_shutdown() {
-        let cfg = SpawnConfig { num_workers: 2, pin_to_cpu: false };
+        let cfg = SpawnConfig {
+            num_workers: 2,
+            pin_to_cpu: false,
+        };
         let mut pool = WorkerPool::new(cfg);
         assert!(!pool.is_running());
         assert_eq!(pool.worker_count(), 0);
@@ -1103,7 +1116,10 @@ mod tests {
 
     #[test]
     fn worker_pool_task_counter() {
-        let cfg = SpawnConfig { num_workers: 1, pin_to_cpu: false };
+        let cfg = SpawnConfig {
+            num_workers: 1,
+            pin_to_cpu: false,
+        };
         let mut pool = WorkerPool::new(cfg);
         pool.spawn();
 
@@ -1124,7 +1140,10 @@ mod tests {
 
     #[test]
     fn worker_pool_drop_shuts_down() {
-        let cfg = SpawnConfig { num_workers: 2, pin_to_cpu: false };
+        let cfg = SpawnConfig {
+            num_workers: 2,
+            pin_to_cpu: false,
+        };
         let mut pool = WorkerPool::new(cfg);
         pool.spawn();
         assert!(pool.is_running());
@@ -1136,7 +1155,10 @@ mod tests {
     // 12. CPU pinning with core_affinity doesn't panic
     #[test]
     fn cpu_pinning_does_not_panic() {
-        let cfg = SpawnConfig { num_workers: 2, pin_to_cpu: true };
+        let cfg = SpawnConfig {
+            num_workers: 2,
+            pin_to_cpu: true,
+        };
         let mut pool = WorkerPool::new(cfg);
         let spawned = pool.spawn();
         assert_eq!(spawned, 2);
@@ -1158,7 +1180,10 @@ mod tests {
     // 14. Worker pool with per-core tokio runtimes
     #[test]
     fn worker_pool_with_tokio_runtimes() {
-        let cfg = SpawnConfig { num_workers: 3, pin_to_cpu: false };
+        let cfg = SpawnConfig {
+            num_workers: 3,
+            pin_to_cpu: false,
+        };
         let mut pool = WorkerPool::new(cfg);
         let spawned = pool.spawn();
         assert_eq!(spawned, 3);
@@ -1229,7 +1254,9 @@ mod tests {
         let c = Arc::clone(&counter);
         let ok = pool.dispatch(CoreId(0), move || {
             let c = Arc::clone(&c);
-            async move { c.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+            async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
         });
         assert!(ok, "dispatch should succeed");
 
@@ -1279,7 +1306,11 @@ mod tests {
             .map(|k| p.partition_for("orders", k).0)
             .collect();
         // With 100 keys across 8 cores we expect good spread (at least 4 unique cores).
-        assert!(cores.len() >= 4, "expected spread across cores, got {:?}", cores);
+        assert!(
+            cores.len() >= 4,
+            "expected spread across cores, got {:?}",
+            cores
+        );
     }
 
     // 22. DataPartitioner: different tables with same key go to different cores (usually)
@@ -1298,7 +1329,10 @@ mod tests {
     #[test]
     fn data_partitioner_table_partition_deterministic() {
         let p = DataPartitioner::new(4);
-        assert_eq!(p.partition_for_table("events"), p.partition_for_table("events"));
+        assert_eq!(
+            p.partition_for_table("events"),
+            p.partition_for_table("events")
+        );
     }
 
     // 24. DataPartitioner: num_cores() matches construction
@@ -1342,7 +1376,10 @@ mod tests {
         let _ = slab.alloc(64).expect("first full alloc");
         assert!(slab.alloc(1).is_none(), "should be exhausted");
         slab.reset();
-        assert!(slab.alloc(64).is_some(), "should be available again after reset");
+        assert!(
+            slab.alloc(64).is_some(),
+            "should be available again after reset"
+        );
     }
 
     // 28. MemorySlab: used() tracks allocated bytes
@@ -1375,8 +1412,14 @@ mod tests {
     #[test]
     fn per_core_memory_pool_reset_single_core() {
         let pool = PerCoreMemoryPool::new(2, 64);
-        { let mut g = pool.slab_for(CoreId(0)); let _ = g.alloc(32); }
-        { let mut g = pool.slab_for(CoreId(1)); let _ = g.alloc(16); }
+        {
+            let mut g = pool.slab_for(CoreId(0));
+            let _ = g.alloc(32);
+        }
+        {
+            let mut g = pool.slab_for(CoreId(1));
+            let _ = g.alloc(16);
+        }
         pool.reset_core(CoreId(0));
         assert_eq!(pool.slab_for(CoreId(0)).used(), 0);
         assert_eq!(pool.slab_for(CoreId(1)).used(), 16);
@@ -1386,8 +1429,14 @@ mod tests {
     #[test]
     fn per_core_memory_pool_usage_per_core() {
         let pool = PerCoreMemoryPool::new(3, 128);
-        { let mut g = pool.slab_for(CoreId(0)); let _ = g.alloc(10); }
-        { let mut g = pool.slab_for(CoreId(1)); let _ = g.alloc(20); }
+        {
+            let mut g = pool.slab_for(CoreId(0));
+            let _ = g.alloc(10);
+        }
+        {
+            let mut g = pool.slab_for(CoreId(1));
+            let _ = g.alloc(20);
+        }
         let usage = pool.usage_per_core();
         assert_eq!(usage[0], 10);
         assert_eq!(usage[1], 20);
@@ -1411,7 +1460,10 @@ mod tests {
 
         let received = mesh.drain_for(CoreId(1));
         assert_eq!(received.len(), 1);
-        assert!(matches!(received[0].kind, CrossCoreMessageKind::Ping { .. }));
+        assert!(matches!(
+            received[0].kind,
+            CrossCoreMessageKind::Ping { .. }
+        ));
         assert_eq!(received[0].from, CoreId(0));
     }
 
@@ -1419,8 +1471,16 @@ mod tests {
     #[test]
     fn cross_core_mesh_drain_is_selective() {
         let mesh = CrossCoreChannelMesh::new(3, 16);
-        assert!(mesh.send(CrossCoreMessage { from: CoreId(0), to: CoreId(1), kind: CrossCoreMessageKind::Ping { timestamp_ns: 1 } }));
-        assert!(mesh.send(CrossCoreMessage { from: CoreId(0), to: CoreId(2), kind: CrossCoreMessageKind::Ping { timestamp_ns: 2 } }));
+        assert!(mesh.send(CrossCoreMessage {
+            from: CoreId(0),
+            to: CoreId(1),
+            kind: CrossCoreMessageKind::Ping { timestamp_ns: 1 }
+        }));
+        assert!(mesh.send(CrossCoreMessage {
+            from: CoreId(0),
+            to: CoreId(2),
+            kind: CrossCoreMessageKind::Ping { timestamp_ns: 2 }
+        }));
 
         // Core 1 should only see its own message.
         let for_1 = mesh.drain_for(CoreId(1));
@@ -1443,11 +1503,20 @@ mod tests {
             filter_key: None,
             request_id: 7,
         };
-        assert!(mesh.send(CrossCoreMessage { from: CoreId(0), to: CoreId(2), kind: req }));
+        assert!(mesh.send(CrossCoreMessage {
+            from: CoreId(0),
+            to: CoreId(2),
+            kind: req
+        }));
 
         let msgs = mesh.drain_for(CoreId(2));
         assert_eq!(msgs.len(), 1);
-        if let CrossCoreMessageKind::ScanRequest { ref table, filter_key, request_id } = msgs[0].kind {
+        if let CrossCoreMessageKind::ScanRequest {
+            ref table,
+            filter_key,
+            request_id,
+        } = msgs[0].kind
+        {
             assert_eq!(table, "items");
             assert!(filter_key.is_none());
             assert_eq!(request_id, 7);

@@ -89,17 +89,17 @@ pub enum Statement {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Token {
-    Atom(String),       // lowercase identifier
-    Variable(String),   // uppercase identifier
-    StringLit(String),  // "quoted" or 'quoted'
-    Number(String),     // integer or decimal
-    LParen,             // (
-    RParen,             // )
-    Comma,              // ,
-    Dot,                // .
-    ColonDash,          // :-
-    NegPrefix,          // \+
-    QueryPrefix,        // ?-
+    Atom(String),      // lowercase identifier
+    Variable(String),  // uppercase identifier
+    StringLit(String), // "quoted" or 'quoted'
+    Number(String),    // integer or decimal
+    LParen,            // (
+    RParen,            // )
+    Comma,             // ,
+    Dot,               // .
+    ColonDash,         // :-
+    NegPrefix,         // \+
+    QueryPrefix,       // ?-
 }
 
 /// Tokenize Datalog source text.
@@ -145,9 +145,21 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
 
         // Single-character tokens
         match ch {
-            '(' => { tokens.push(Token::LParen); i += 1; continue; }
-            ')' => { tokens.push(Token::RParen); i += 1; continue; }
-            ',' => { tokens.push(Token::Comma); i += 1; continue; }
+            '(' => {
+                tokens.push(Token::LParen);
+                i += 1;
+                continue;
+            }
+            ')' => {
+                tokens.push(Token::RParen);
+                i += 1;
+                continue;
+            }
+            ',' => {
+                tokens.push(Token::Comma);
+                i += 1;
+                continue;
+            }
             '.' => {
                 // Check if it's a decimal number (e.g., .5)
                 if i + 1 < len && chars[i + 1].is_ascii_digit() {
@@ -180,7 +192,9 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 }
             }
             if i >= len {
-                return Err(format!("Unterminated string literal starting at position {start}"));
+                return Err(format!(
+                    "Unterminated string literal starting at position {start}"
+                ));
             }
             let s: String = chars[start..i].iter().collect();
             tokens.push(Token::StringLit(s));
@@ -304,7 +318,10 @@ impl Parser {
                         }
                     }
                 }
-                Ok(Statement::Fact(Fact { predicate: head.predicate, args }))
+                Ok(Statement::Fact(Fact {
+                    predicate: head.predicate,
+                    args,
+                }))
             }
             Some(Token::ColonDash) => {
                 // It's a rule: head :- body .
@@ -336,7 +353,11 @@ impl Parser {
         let args = self.parse_args()?;
         self.expect(&Token::RParen)?;
 
-        Ok(Literal { predicate, args, negated })
+        Ok(Literal {
+            predicate,
+            args,
+            negated,
+        })
     }
 
     /// Parse comma-separated term list.
@@ -494,7 +515,6 @@ pub struct DatalogStore {
     derived: HashMap<String, HashSet<Vec<String>>>,
 }
 
-
 impl DatalogStore {
     /// Create an empty Datalog store.
     pub fn new() -> Self {
@@ -512,10 +532,7 @@ impl DatalogStore {
                 .or_default()
                 .push(args.clone());
         }
-        self.facts
-            .entry(pred.to_string())
-            .or_default()
-            .insert(args);
+        self.facts.entry(pred.to_string()).or_default().insert(args);
         // Invalidate derived facts (rules may produce different results)
         self.derived.clear();
     }
@@ -558,7 +575,9 @@ impl DatalogStore {
     pub fn clear_predicate(&mut self, pred: &str) {
         self.facts.remove(pred);
         // Remove all indexes for this predicate
-        let keys_to_remove: Vec<_> = self.indexes.keys()
+        let keys_to_remove: Vec<_> = self
+            .indexes
+            .keys()
             .filter(|(p, _)| p == pred)
             .cloned()
             .collect();
@@ -597,7 +616,10 @@ impl DatalogStore {
     fn all_facts_map(&self) -> HashMap<String, HashSet<Vec<String>>> {
         let mut combined = self.facts.clone();
         for (pred, tuples) in &self.derived {
-            combined.entry(pred.clone()).or_default().extend(tuples.iter().cloned());
+            combined
+                .entry(pred.clone())
+                .or_default()
+                .extend(tuples.iter().cloned());
         }
         combined
     }
@@ -641,7 +663,10 @@ fn unify(pattern: &[Term], fact: &[String]) -> Option<HashMap<String, String>> {
 
 /// Apply variable bindings to a literal, producing a ground tuple.
 /// Returns None if any variable is unbound or if aggregates are present.
-fn apply_substitution(literal: &Literal, bindings: &HashMap<String, String>) -> Option<Vec<String>> {
+fn apply_substitution(
+    literal: &Literal,
+    bindings: &HashMap<String, String>,
+) -> Option<Vec<String>> {
     let mut result = Vec::with_capacity(literal.args.len());
     for term in &literal.args {
         match term {
@@ -698,7 +723,9 @@ fn join_body(
     }
 
     // Find which positive body literals match the delta predicate
-    let delta_positions: Vec<usize> = body.iter().enumerate()
+    let delta_positions: Vec<usize> = body
+        .iter()
+        .enumerate()
         .filter(|(_, lit)| !lit.negated && lit.predicate == delta_pred)
         .map(|(i, _)| i)
         .collect();
@@ -755,9 +782,10 @@ fn join_body(
             for bindings in &current_bindings {
                 for fact in &facts_vec {
                     if let Some(new_bindings) = unify(&lit.args, fact)
-                        && let Some(merged) = merge_bindings(bindings, &new_bindings) {
-                            next_bindings.push(merged);
-                        }
+                        && let Some(merged) = merge_bindings(bindings, &new_bindings)
+                    {
+                        next_bindings.push(merged);
+                    }
                 }
             }
             current_bindings = next_bindings;
@@ -781,7 +809,10 @@ fn stratify(rules: &[Rule]) -> Result<Vec<Vec<usize>>, String> {
     // Build dependency graph: head_pred -> set of predicates it depends on negatively
     let mut pred_to_rules: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, rule) in rules.iter().enumerate() {
-        pred_to_rules.entry(rule.head.predicate.clone()).or_default().push(i);
+        pred_to_rules
+            .entry(rule.head.predicate.clone())
+            .or_default()
+            .push(i);
     }
 
     // Collect all predicates that appear as rule heads
@@ -796,10 +827,16 @@ fn stratify(rules: &[Rule]) -> Result<Vec<Vec<usize>>, String> {
         let head_pred = &rule.head.predicate;
         for lit in &rule.body {
             if lit.negated && head_preds.contains(&lit.predicate) {
-                neg_deps.entry(head_pred.clone()).or_default().insert(lit.predicate.clone());
+                neg_deps
+                    .entry(head_pred.clone())
+                    .or_default()
+                    .insert(lit.predicate.clone());
             }
             if head_preds.contains(&lit.predicate) {
-                all_deps.entry(head_pred.clone()).or_default().insert(lit.predicate.clone());
+                all_deps
+                    .entry(head_pred.clone())
+                    .or_default()
+                    .insert(lit.predicate.clone());
             }
         }
     }
@@ -905,7 +942,9 @@ fn evaluate_aggregate_rule(
     // Collect all body bindings using every positive body predicate as delta
     let mut all_bindings: Vec<HashMap<String, String>> = Vec::new();
 
-    let body_preds: HashSet<String> = rule.body.iter()
+    let body_preds: HashSet<String> = rule
+        .body
+        .iter()
         .filter(|l| !l.negated)
         .map(|l| l.predicate.clone())
         .collect();
@@ -917,9 +956,8 @@ fn evaluate_aggregate_rule(
         for b in bindings_list {
             // Deduplicate by the full binding map to avoid double-counting
             // when multiple body predicates produce the same binding set
-            let mut sig: Vec<(String, String)> = b.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            let mut sig: Vec<(String, String)> =
+                b.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             sig.sort();
             if seen.insert(sig) {
                 all_bindings.push(b);
@@ -968,7 +1006,8 @@ fn evaluate_aggregate_rule(
                     let agg_val = match agg {
                         AggFunc::Count => group_bindings.len().to_string(),
                         AggFunc::Sum(var) => {
-                            let sum: f64 = group_bindings.iter()
+                            let sum: f64 = group_bindings
+                                .iter()
                                 .filter_map(|b| b.get(var))
                                 .filter_map(|v| v.parse::<f64>().ok())
                                 .sum();
@@ -980,7 +1019,8 @@ fn evaluate_aggregate_rule(
                             }
                         }
                         AggFunc::Min(var) => {
-                            let vals: Vec<f64> = group_bindings.iter()
+                            let vals: Vec<f64> = group_bindings
+                                .iter()
                                 .filter_map(|b| b.get(var))
                                 .filter_map(|v| v.parse::<f64>().ok())
                                 .collect();
@@ -993,7 +1033,8 @@ fn evaluate_aggregate_rule(
                             }
                         }
                         AggFunc::Max(var) => {
-                            let vals: Vec<f64> = group_bindings.iter()
+                            let vals: Vec<f64> = group_bindings
+                                .iter()
                                 .filter_map(|b| b.get(var))
                                 .filter_map(|v| v.parse::<f64>().ok())
                                 .collect();
@@ -1038,8 +1079,10 @@ impl DatalogStore {
 
         for stratum in &strata {
             // Separate aggregate rules from normal rules
-            let (agg_rule_indices, normal_rule_indices): (Vec<usize>, Vec<usize>) =
-                stratum.iter().copied().partition(|&idx| rule_has_aggregates(&rules[idx]));
+            let (agg_rule_indices, normal_rule_indices): (Vec<usize>, Vec<usize>) = stratum
+                .iter()
+                .copied()
+                .partition(|&idx| rule_has_aggregates(&rules[idx]));
 
             // ── Phase 1: Normal (non-aggregate) rules via semi-naive ──
 
@@ -1048,52 +1091,86 @@ impl DatalogStore {
 
             // Determine if we should parallelize this stratum
             let use_parallel = normal_rule_indices.len() >= 2
-                && total_facts + self.derived.values().map(|s| s.len()).sum::<usize>() >= parallelism_threshold;
+                && total_facts + self.derived.values().map(|s| s.len()).sum::<usize>()
+                    >= parallelism_threshold;
 
             if use_parallel {
                 // Parallel initial pass
-                let thread_deltas: Vec<HashMap<String, HashSet<Vec<String>>>> =
-                    std::thread::scope(|s| {
-                        let handles: Vec<_> = normal_rule_indices.iter().map(|&rule_idx| {
-                            let rule = &rules[rule_idx];
-                            let all_facts_ref = &all_facts;
-                            s.spawn(move || {
-                                let mut local_delta: HashMap<String, HashSet<Vec<String>>> = HashMap::new();
-                                let head_pred = &rule.head.predicate;
-                                let body_preds: HashSet<String> = rule.body.iter()
-                                    .filter(|l| !l.negated)
-                                    .map(|l| l.predicate.clone())
-                                    .collect();
+                let thread_deltas: Vec<HashMap<String, HashSet<Vec<String>>>> = std::thread::scope(
+                    |s| {
+                        let handles: Vec<_> = normal_rule_indices
+                            .iter()
+                            .map(|&rule_idx| {
+                                let rule = &rules[rule_idx];
+                                let all_facts_ref = &all_facts;
+                                s.spawn(move || {
+                                    let mut local_delta: HashMap<String, HashSet<Vec<String>>> =
+                                        HashMap::new();
+                                    let head_pred = &rule.head.predicate;
+                                    let body_preds: HashSet<String> = rule
+                                        .body
+                                        .iter()
+                                        .filter(|l| !l.negated)
+                                        .map(|l| l.predicate.clone())
+                                        .collect();
 
-                                for bp in &body_preds {
-                                    let bp_facts = all_facts_ref.get(bp).cloned().unwrap_or_default();
-                                    let bindings_list = join_body(&rule.body, all_facts_ref, bp, &bp_facts);
-                                    for bindings in bindings_list {
-                                        if let Some(result) = apply_substitution(&rule.head, &bindings) {
-                                            local_delta.entry(head_pred.clone())
-                                                .or_default()
-                                                .insert(result);
+                                    for bp in &body_preds {
+                                        let bp_facts =
+                                            all_facts_ref.get(bp).cloned().unwrap_or_default();
+                                        let bindings_list =
+                                            join_body(&rule.body, all_facts_ref, bp, &bp_facts);
+                                        for bindings in bindings_list {
+                                            if let Some(result) =
+                                                apply_substitution(&rule.head, &bindings)
+                                            {
+                                                local_delta
+                                                    .entry(head_pred.clone())
+                                                    .or_default()
+                                                    .insert(result);
+                                            }
                                         }
                                     }
-                                }
 
-                                if body_preds.is_empty() && !rule.body.is_empty() {
-                                    let bindings_list = join_body(&rule.body, all_facts_ref, "", &HashSet::new());
-                                    for bindings in bindings_list {
-                                        if let Some(result) = apply_substitution(&rule.head, &bindings) {
-                                            local_delta.entry(head_pred.clone())
-                                                .or_default()
-                                                .insert(result);
+                                    if body_preds.is_empty() && !rule.body.is_empty() {
+                                        let bindings_list = join_body(
+                                            &rule.body,
+                                            all_facts_ref,
+                                            "",
+                                            &HashSet::new(),
+                                        );
+                                        for bindings in bindings_list {
+                                            if let Some(result) =
+                                                apply_substitution(&rule.head, &bindings)
+                                            {
+                                                local_delta
+                                                    .entry(head_pred.clone())
+                                                    .or_default()
+                                                    .insert(result);
+                                            }
                                         }
                                     }
-                                }
 
-                                local_delta
+                                    local_delta
+                                })
                             })
-                        }).collect();
+                            .collect();
 
-                        handles.into_iter().map(|h| h.join().unwrap()).collect()
-                    });
+                        handles
+                            .into_iter()
+                            .map(|h| match h.join() {
+                                Ok(delta) => delta,
+                                Err(_) => {
+                                    // A worker panic must not bring down the server.
+                                    tracing::error!(
+                                        target: "nucleus::datalog",
+                                        "datalog worker thread panicked; its partition contributed no facts this round"
+                                    );
+                                    Default::default()
+                                }
+                            })
+                            .collect()
+                    },
+                );
 
                 // Merge thread results, filtering already-known facts
                 for thread_delta in thread_deltas {
@@ -1112,7 +1189,9 @@ impl DatalogStore {
                     let rule = &rules[rule_idx];
                     let head_pred = &rule.head.predicate;
 
-                    let body_preds: HashSet<String> = rule.body.iter()
+                    let body_preds: HashSet<String> = rule
+                        .body
+                        .iter()
                         .filter(|l| !l.negated)
                         .map(|l| l.predicate.clone())
                         .collect();
@@ -1147,7 +1226,10 @@ impl DatalogStore {
 
             // Merge initial delta into derived
             for (pred, tuples) in &delta {
-                self.derived.entry(pred.clone()).or_default().extend(tuples.iter().cloned());
+                self.derived
+                    .entry(pred.clone())
+                    .or_default()
+                    .extend(tuples.iter().cloned());
             }
 
             // Fixed-point loop: keep applying rules until no new facts are derived
@@ -1164,35 +1246,57 @@ impl DatalogStore {
                     // Parallel fixpoint iteration
                     let thread_deltas: Vec<HashMap<String, HashSet<Vec<String>>>> =
                         std::thread::scope(|s| {
-                            let handles: Vec<_> = normal_rule_indices.iter().map(|&rule_idx| {
-                                let rule = &rules[rule_idx];
-                                let all_facts_ref = &all_facts;
-                                let delta_ref = &delta;
-                                s.spawn(move || {
-                                    let mut local_delta: HashMap<String, HashSet<Vec<String>>> = HashMap::new();
-                                    let head_pred = &rule.head.predicate;
+                            let handles: Vec<_> = normal_rule_indices
+                                .iter()
+                                .map(|&rule_idx| {
+                                    let rule = &rules[rule_idx];
+                                    let all_facts_ref = &all_facts;
+                                    let delta_ref = &delta;
+                                    s.spawn(move || {
+                                        let mut local_delta: HashMap<String, HashSet<Vec<String>>> =
+                                            HashMap::new();
+                                        let head_pred = &rule.head.predicate;
 
-                                    for (delta_pred, delta_facts) in delta_ref {
-                                        if delta_facts.is_empty() {
-                                            continue;
-                                        }
-                                        let bindings_list = join_body(
-                                            &rule.body, all_facts_ref, delta_pred, delta_facts,
-                                        );
-                                        for bindings in bindings_list {
-                                            if let Some(result) = apply_substitution(&rule.head, &bindings) {
-                                                local_delta.entry(head_pred.clone())
-                                                    .or_default()
-                                                    .insert(result);
+                                        for (delta_pred, delta_facts) in delta_ref {
+                                            if delta_facts.is_empty() {
+                                                continue;
+                                            }
+                                            let bindings_list = join_body(
+                                                &rule.body,
+                                                all_facts_ref,
+                                                delta_pred,
+                                                delta_facts,
+                                            );
+                                            for bindings in bindings_list {
+                                                if let Some(result) =
+                                                    apply_substitution(&rule.head, &bindings)
+                                                {
+                                                    local_delta
+                                                        .entry(head_pred.clone())
+                                                        .or_default()
+                                                        .insert(result);
+                                                }
                                             }
                                         }
-                                    }
 
-                                    local_delta
+                                        local_delta
+                                    })
                                 })
-                            }).collect();
+                                .collect();
 
-                            handles.into_iter().map(|h| h.join().unwrap()).collect()
+                            handles
+                                .into_iter()
+                                .map(|h| match h.join() {
+                                    Ok(delta) => delta,
+                                    Err(_) => {
+                                        tracing::error!(
+                                            target: "nucleus::datalog",
+                                            "datalog worker thread panicked; its partition contributed no facts this round"
+                                        );
+                                        Default::default()
+                                    }
+                                })
+                                .collect()
                         });
 
                     // Merge thread results, filtering already-known facts
@@ -1217,15 +1321,15 @@ impl DatalogStore {
                                 continue;
                             }
 
-                            let bindings_list = join_body(
-                                &rule.body, &all_facts, delta_pred, delta_facts,
-                            );
+                            let bindings_list =
+                                join_body(&rule.body, &all_facts, delta_pred, delta_facts);
 
                             for bindings in bindings_list {
                                 if let Some(result) = apply_substitution(&rule.head, &bindings) {
                                     let existing = self.all_facts(head_pred);
                                     if !existing.contains(&result) {
-                                        new_delta.entry(head_pred.clone())
+                                        new_delta
+                                            .entry(head_pred.clone())
                                             .or_default()
                                             .insert(result);
                                     }
@@ -1241,7 +1345,10 @@ impl DatalogStore {
 
                 // Merge new_delta into derived and prepare for next iteration
                 for (pred, tuples) in &new_delta {
-                    self.derived.entry(pred.clone()).or_default().extend(tuples.iter().cloned());
+                    self.derived
+                        .entry(pred.clone())
+                        .or_default()
+                        .extend(tuples.iter().cloned());
                 }
                 delta = new_delta;
             }
@@ -1253,7 +1360,8 @@ impl DatalogStore {
                 for &rule_idx in &agg_rule_indices {
                     let rule = &rules[rule_idx];
                     let agg_results = evaluate_aggregate_rule(rule, &all_facts);
-                    self.derived.entry(rule.head.predicate.clone())
+                    self.derived
+                        .entry(rule.head.predicate.clone())
                         .or_default()
                         .extend(agg_results);
                 }
@@ -1323,12 +1431,16 @@ impl DatalogStore {
         let results = self.query(&literal);
 
         // Build JSON output
-        let json_rows: Vec<String> = results.iter().map(|tuple| {
-            let vals: Vec<String> = tuple.iter()
-                .map(|v| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")))
-                .collect();
-            format!("[{}]", vals.join(", "))
-        }).collect();
+        let json_rows: Vec<String> = results
+            .iter()
+            .map(|tuple| {
+                let vals: Vec<String> = tuple
+                    .iter()
+                    .map(|v| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .collect();
+                format!("[{}]", vals.join(", "))
+            })
+            .collect();
 
         Ok(format!("[{}]", json_rows.join(", ")))
     }
@@ -1403,8 +1515,8 @@ const WAL_SNAPSHOT: u8 = 0x10;
 
 /// Recovered state from a Datalog WAL replay.
 pub struct DatalogWalState {
-    pub facts: Vec<(String, Vec<String>)>,  // (predicate, args)
-    pub rules: Vec<String>,                 // rule text
+    pub facts: Vec<(String, Vec<String>)>, // (predicate, args)
+    pub rules: Vec<String>,                // rule text
 }
 
 /// Append-only WAL for the Datalog engine.
@@ -1426,13 +1538,19 @@ impl DatalogWal {
             let data = std::fs::read(&path)?;
             replay_wal(&data)
         } else {
-            DatalogWalState { facts: Vec::new(), rules: Vec::new() }
+            DatalogWalState {
+                facts: Vec::new(),
+                rules: Vec::new(),
+            }
         };
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        Ok((Self { path, writer: Mutex::new(BufWriter::new(file)) }, state))
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok((
+            Self {
+                path,
+                writer: Mutex::new(BufWriter::new(file)),
+            },
+            state,
+        ))
     }
 
     /// Log an ASSERT operation. The text should be parseable as a Datalog fact
@@ -1487,7 +1605,9 @@ impl DatalogWal {
         }
 
         // Flush existing writer, truncate, write snapshot
-        { self.writer.lock().flush()?; }
+        {
+            self.writer.lock().flush()?;
+        }
 
         let file = OpenOptions::new()
             .write(true)
@@ -1529,16 +1649,20 @@ fn format_rule(rule: &Rule) -> String {
 /// Format a Literal to Datalog text.
 fn format_literal(lit: &Literal) -> String {
     let prefix = if lit.negated { "\\+ " } else { "" };
-    let args: Vec<String> = lit.args.iter().map(|t| match t {
-        Term::Const(c) => c.clone(),
-        Term::Var(v) => v.clone(),
-        Term::Agg(agg) => match agg {
-            AggFunc::Count => "count()".to_string(),
-            AggFunc::Sum(v) => format!("sum({v})"),
-            AggFunc::Min(v) => format!("min({v})"),
-            AggFunc::Max(v) => format!("max({v})"),
-        },
-    }).collect();
+    let args: Vec<String> = lit
+        .args
+        .iter()
+        .map(|t| match t {
+            Term::Const(c) => c.clone(),
+            Term::Var(v) => v.clone(),
+            Term::Agg(agg) => match agg {
+                AggFunc::Count => "count()".to_string(),
+                AggFunc::Sum(v) => format!("sum({v})"),
+                AggFunc::Min(v) => format!("min({v})"),
+                AggFunc::Max(v) => format!("max({v})"),
+            },
+        })
+        .collect();
     format!("{prefix}{}({})", lit.predicate, args.join(", "))
 }
 
@@ -1552,12 +1676,18 @@ fn replay_wal(data: &[u8]) -> DatalogWalState {
     let mut pos = 0usize;
 
     while pos < data.len() {
-        let Some(&entry_type) = data.get(pos) else { break };
+        let Some(&entry_type) = data.get(pos) else {
+            break;
+        };
         pos += 1;
 
-        let Some(text_len) = wal_read_u32(data, &mut pos) else { break };
+        let Some(text_len) = wal_read_u32(data, &mut pos) else {
+            break;
+        };
         let text_len = text_len as usize;
-        if pos + text_len > data.len() { break; }
+        if pos + text_len > data.len() {
+            break;
+        }
         let text_bytes = &data[pos..pos + text_len];
         pos += text_len;
 
@@ -1569,19 +1699,21 @@ fn replay_wal(data: &[u8]) -> DatalogWalState {
         match entry_type {
             WAL_ASSERT => {
                 if let Ok(Statement::Fact(fact)) = parse_single_statement(&text) {
-                    fact_set.entry(fact.predicate.clone())
+                    fact_set
+                        .entry(fact.predicate.clone())
                         .or_default()
                         .insert(fact.args.clone());
                 }
             }
             WAL_RETRACT => {
                 if let Ok(Statement::Fact(fact)) = parse_single_statement(&text)
-                    && let Some(set) = fact_set.get_mut(&fact.predicate) {
-                        set.remove(&fact.args);
-                        if set.is_empty() {
-                            fact_set.remove(&fact.predicate);
-                        }
+                    && let Some(set) = fact_set.get_mut(&fact.predicate)
+                {
+                    set.remove(&fact.args);
+                    if set.is_empty() {
+                        fact_set.remove(&fact.predicate);
                     }
+                }
             }
             WAL_ADD_RULE => {
                 // Verify it parses as a rule
@@ -1611,7 +1743,9 @@ fn replay_wal(data: &[u8]) -> DatalogWalState {
                         Some(n) => n as usize,
                         None => break,
                     };
-                    if spos + flen > payload.len() { break; }
+                    if spos + flen > payload.len() {
+                        break;
+                    }
                     let ftext = match std::str::from_utf8(&payload[spos..spos + flen]) {
                         Ok(s) => s.to_string(),
                         Err(_) => break,
@@ -1619,7 +1753,8 @@ fn replay_wal(data: &[u8]) -> DatalogWalState {
                     spos += flen;
 
                     if let Ok(Statement::Fact(fact)) = parse_single_statement(&ftext) {
-                        fact_set.entry(fact.predicate.clone())
+                        fact_set
+                            .entry(fact.predicate.clone())
                             .or_default()
                             .insert(fact.args.clone());
                     }
@@ -1635,7 +1770,9 @@ fn replay_wal(data: &[u8]) -> DatalogWalState {
                         Some(n) => n as usize,
                         None => break,
                     };
-                    if spos + rlen > payload.len() { break; }
+                    if spos + rlen > payload.len() {
+                        break;
+                    }
                     let rtext = match std::str::from_utf8(&payload[spos..spos + rlen]) {
                         Ok(s) => s.to_string(),
                         Err(_) => break,
@@ -1928,9 +2065,7 @@ mod tests {
 
         // alice -> bob, alice -> charlie, alice -> dave
         assert_eq!(results.len(), 3);
-        let names: HashSet<&str> = results.iter()
-            .map(|r| r[1].as_str())
-            .collect();
+        let names: HashSet<&str> = results.iter().map(|r| r[1].as_str()).collect();
         assert!(names.contains("bob"));
         assert!(names.contains("charlie"));
         assert!(names.contains("dave"));
@@ -2224,9 +2359,18 @@ mod tests {
     #[test]
     fn test_multi_argument_rules() {
         let mut store = DatalogStore::new();
-        store.assert_fact("employee", vec!["alice".into(), "engineering".into(), "150000".into()]);
-        store.assert_fact("employee", vec!["bob".into(), "engineering".into(), "120000".into()]);
-        store.assert_fact("employee", vec!["charlie".into(), "marketing".into(), "100000".into()]);
+        store.assert_fact(
+            "employee",
+            vec!["alice".into(), "engineering".into(), "150000".into()],
+        );
+        store.assert_fact(
+            "employee",
+            vec!["bob".into(), "engineering".into(), "120000".into()],
+        );
+        store.assert_fact(
+            "employee",
+            vec!["charlie".into(), "marketing".into(), "100000".into()],
+        );
 
         // in_dept(Name, Dept) :- employee(Name, Dept, Salary).
         store.add_rule(Rule {
@@ -2237,7 +2381,11 @@ mod tests {
             },
             body: vec![Literal {
                 predicate: "employee".into(),
-                args: vec![Term::Var("Name".into()), Term::Var("Dept".into()), Term::Var("Salary".into())],
+                args: vec![
+                    Term::Var("Name".into()),
+                    Term::Var("Dept".into()),
+                    Term::Var("Salary".into()),
+                ],
                 negated: false,
             }],
         });
@@ -2372,7 +2520,8 @@ mod tests {
 
         // Expected TC: (a,b), (b,c), (c,d), (a,c), (a,d), (b,d)
         assert_eq!(results.len(), 6);
-        let pairs: HashSet<(String, String)> = results.iter()
+        let pairs: HashSet<(String, String)> = results
+            .iter()
             .map(|r| (r[0].clone(), r[1].clone()))
             .collect();
         assert!(pairs.contains(&("a".into(), "b".into())));
@@ -2403,7 +2552,9 @@ mod tests {
         store.sql_assert("parent(charlie, dave)").unwrap();
 
         store.sql_rule("ancestor(X, Y) :- parent(X, Y)").unwrap();
-        store.sql_rule("ancestor(X, Z) :- ancestor(X, Y), parent(Y, Z)").unwrap();
+        store
+            .sql_rule("ancestor(X, Z) :- ancestor(X, Y), parent(Y, Z)")
+            .unwrap();
 
         let result = store.sql_query("ancestor(alice, Who)").unwrap();
         assert!(result.contains("bob"));
@@ -2438,11 +2589,14 @@ mod tests {
     #[test]
     fn test_import_rows() {
         let mut store = DatalogStore::new();
-        store.import_rows("employee", vec![
-            vec!["alice".into(), "engineering".into()],
-            vec!["bob".into(), "marketing".into()],
-            vec!["charlie".into(), "engineering".into()],
-        ]);
+        store.import_rows(
+            "employee",
+            vec![
+                vec!["alice".into(), "engineering".into()],
+                vec!["bob".into(), "marketing".into()],
+                vec!["charlie".into(), "engineering".into()],
+            ],
+        );
 
         let result = store.sql_query("employee(X, engineering)").unwrap();
         assert!(result.contains("alice"));
@@ -2516,7 +2670,8 @@ mod tests {
         wal.log_assert("parent(alice, bob).").unwrap();
         wal.log_assert("parent(bob, charlie).").unwrap();
         wal.log_rule("ancestor(X, Y) :- parent(X, Y).").unwrap();
-        wal.log_rule("ancestor(X, Z) :- ancestor(X, Y), parent(Y, Z).").unwrap();
+        wal.log_rule("ancestor(X, Z) :- ancestor(X, Y), parent(Y, Z).")
+            .unwrap();
         drop(wal);
 
         let (_wal2, state2) = DatalogWal::open(dir.path()).unwrap();
@@ -2536,7 +2691,8 @@ mod tests {
         wal.log_assert("edge(a, b).").unwrap();
         wal.log_assert("edge(b, c).").unwrap();
         wal.log_rule("path(X, Y) :- edge(X, Y).").unwrap();
-        wal.log_rule("path(X, Z) :- edge(X, Y), path(Y, Z).").unwrap();
+        wal.log_rule("path(X, Z) :- edge(X, Y), path(Y, Z).")
+            .unwrap();
         drop(wal);
 
         let (_wal2, state2) = DatalogWal::open(dir.path()).unwrap();
@@ -2564,8 +2720,16 @@ mod tests {
         assert_eq!(state2.facts.len(), 1);
 
         let store = restore_from_wal(state2);
-        assert!(store.get_facts("parent").contains(&vec!["bob".to_string(), "charlie".to_string()]));
-        assert!(!store.get_facts("parent").contains(&vec!["alice".to_string(), "bob".to_string()]));
+        assert!(
+            store
+                .get_facts("parent")
+                .contains(&vec!["bob".to_string(), "charlie".to_string()])
+        );
+        assert!(
+            !store
+                .get_facts("parent")
+                .contains(&vec!["alice".to_string(), "bob".to_string()])
+        );
     }
 
     #[test]
@@ -2640,12 +2804,23 @@ mod tests {
     #[test]
     fn test_agg_count_per_group() {
         let mut store = DatalogStore::new();
-        store.assert_fact("employee", vec!["alice".into(), "engineering".into(), "150000".into()]);
-        store.assert_fact("employee", vec!["bob".into(), "engineering".into(), "120000".into()]);
-        store.assert_fact("employee", vec!["charlie".into(), "marketing".into(), "100000".into()]);
+        store.assert_fact(
+            "employee",
+            vec!["alice".into(), "engineering".into(), "150000".into()],
+        );
+        store.assert_fact(
+            "employee",
+            vec!["bob".into(), "engineering".into(), "120000".into()],
+        );
+        store.assert_fact(
+            "employee",
+            vec!["charlie".into(), "marketing".into(), "100000".into()],
+        );
 
         // dept_count(Dept, count()) :- employee(_, Dept, _).
-        store.sql_rule("dept_count(Dept, count()) :- employee(Name, Dept, Sal)").unwrap();
+        store
+            .sql_rule("dept_count(Dept, count()) :- employee(Name, Dept, Sal)")
+            .unwrap();
 
         let results = store.query(&Literal {
             predicate: "dept_count".into(),
@@ -2653,7 +2828,10 @@ mod tests {
             negated: false,
         });
         assert_eq!(results.len(), 2);
-        let map: HashMap<&str, &str> = results.iter().map(|r| (r[0].as_str(), r[1].as_str())).collect();
+        let map: HashMap<&str, &str> = results
+            .iter()
+            .map(|r| (r[0].as_str(), r[1].as_str()))
+            .collect();
         assert_eq!(map["engineering"], "2");
         assert_eq!(map["marketing"], "1");
     }
@@ -2661,12 +2839,23 @@ mod tests {
     #[test]
     fn test_agg_sum_per_group() {
         let mut store = DatalogStore::new();
-        store.assert_fact("employee", vec!["alice".into(), "engineering".into(), "150000".into()]);
-        store.assert_fact("employee", vec!["bob".into(), "engineering".into(), "120000".into()]);
-        store.assert_fact("employee", vec!["charlie".into(), "marketing".into(), "100000".into()]);
+        store.assert_fact(
+            "employee",
+            vec!["alice".into(), "engineering".into(), "150000".into()],
+        );
+        store.assert_fact(
+            "employee",
+            vec!["bob".into(), "engineering".into(), "120000".into()],
+        );
+        store.assert_fact(
+            "employee",
+            vec!["charlie".into(), "marketing".into(), "100000".into()],
+        );
 
         // dept_salary(Dept, sum(Sal)) :- employee(_, Dept, Sal).
-        store.sql_rule("dept_salary(Dept, sum(Sal)) :- employee(Name, Dept, Sal)").unwrap();
+        store
+            .sql_rule("dept_salary(Dept, sum(Sal)) :- employee(Name, Dept, Sal)")
+            .unwrap();
 
         let results = store.query(&Literal {
             predicate: "dept_salary".into(),
@@ -2674,7 +2863,10 @@ mod tests {
             negated: false,
         });
         assert_eq!(results.len(), 2);
-        let map: HashMap<&str, &str> = results.iter().map(|r| (r[0].as_str(), r[1].as_str())).collect();
+        let map: HashMap<&str, &str> = results
+            .iter()
+            .map(|r| (r[0].as_str(), r[1].as_str()))
+            .collect();
         assert_eq!(map["engineering"], "270000");
         assert_eq!(map["marketing"], "100000");
     }
@@ -2682,18 +2874,32 @@ mod tests {
     #[test]
     fn test_agg_min_per_group() {
         let mut store = DatalogStore::new();
-        store.assert_fact("employee", vec!["alice".into(), "engineering".into(), "150000".into()]);
-        store.assert_fact("employee", vec!["bob".into(), "engineering".into(), "120000".into()]);
-        store.assert_fact("employee", vec!["charlie".into(), "marketing".into(), "100000".into()]);
+        store.assert_fact(
+            "employee",
+            vec!["alice".into(), "engineering".into(), "150000".into()],
+        );
+        store.assert_fact(
+            "employee",
+            vec!["bob".into(), "engineering".into(), "120000".into()],
+        );
+        store.assert_fact(
+            "employee",
+            vec!["charlie".into(), "marketing".into(), "100000".into()],
+        );
 
-        store.sql_rule("dept_min(Dept, min(Sal)) :- employee(Name, Dept, Sal)").unwrap();
+        store
+            .sql_rule("dept_min(Dept, min(Sal)) :- employee(Name, Dept, Sal)")
+            .unwrap();
 
         let results = store.query(&Literal {
             predicate: "dept_min".into(),
             args: vec![Term::Var("D".into()), Term::Var("M".into())],
             negated: false,
         });
-        let map: HashMap<&str, &str> = results.iter().map(|r| (r[0].as_str(), r[1].as_str())).collect();
+        let map: HashMap<&str, &str> = results
+            .iter()
+            .map(|r| (r[0].as_str(), r[1].as_str()))
+            .collect();
         assert_eq!(map["engineering"], "120000");
         assert_eq!(map["marketing"], "100000");
     }
@@ -2701,18 +2907,32 @@ mod tests {
     #[test]
     fn test_agg_max_per_group() {
         let mut store = DatalogStore::new();
-        store.assert_fact("employee", vec!["alice".into(), "engineering".into(), "150000".into()]);
-        store.assert_fact("employee", vec!["bob".into(), "engineering".into(), "120000".into()]);
-        store.assert_fact("employee", vec!["charlie".into(), "marketing".into(), "100000".into()]);
+        store.assert_fact(
+            "employee",
+            vec!["alice".into(), "engineering".into(), "150000".into()],
+        );
+        store.assert_fact(
+            "employee",
+            vec!["bob".into(), "engineering".into(), "120000".into()],
+        );
+        store.assert_fact(
+            "employee",
+            vec!["charlie".into(), "marketing".into(), "100000".into()],
+        );
 
-        store.sql_rule("dept_max(Dept, max(Sal)) :- employee(Name, Dept, Sal)").unwrap();
+        store
+            .sql_rule("dept_max(Dept, max(Sal)) :- employee(Name, Dept, Sal)")
+            .unwrap();
 
         let results = store.query(&Literal {
             predicate: "dept_max".into(),
             args: vec![Term::Var("D".into()), Term::Var("M".into())],
             negated: false,
         });
-        let map: HashMap<&str, &str> = results.iter().map(|r| (r[0].as_str(), r[1].as_str())).collect();
+        let map: HashMap<&str, &str> = results
+            .iter()
+            .map(|r| (r[0].as_str(), r[1].as_str()))
+            .collect();
         assert_eq!(map["engineering"], "150000");
         assert_eq!(map["marketing"], "100000");
     }
@@ -2795,16 +3015,23 @@ mod tests {
         store.assert_fact("parent", vec!["bob".into(), "eve".into()]);
 
         // child_of(Parent, Child) :- parent(Parent, Child).
-        store.sql_rule("child_of(Parent, Child) :- parent(Parent, Child)").unwrap();
+        store
+            .sql_rule("child_of(Parent, Child) :- parent(Parent, Child)")
+            .unwrap();
         // child_count(Parent, count()) :- child_of(Parent, Child).
-        store.sql_rule("child_count(Parent, count()) :- child_of(Parent, Child)").unwrap();
+        store
+            .sql_rule("child_count(Parent, count()) :- child_of(Parent, Child)")
+            .unwrap();
 
         let results = store.query(&Literal {
             predicate: "child_count".into(),
             args: vec![Term::Var("P".into()), Term::Var("N".into())],
             negated: false,
         });
-        let map: HashMap<&str, &str> = results.iter().map(|r| (r[0].as_str(), r[1].as_str())).collect();
+        let map: HashMap<&str, &str> = results
+            .iter()
+            .map(|r| (r[0].as_str(), r[1].as_str()))
+            .collect();
         assert_eq!(map["alice"], "2");
         assert_eq!(map["bob"], "2");
     }
@@ -2818,15 +3045,22 @@ mod tests {
         store.assert_fact("sale", vec!["clothing".into(), "50".into()]);
 
         // We test count and sum separately since a single head can have both
-        store.sql_rule("sale_count(Cat, count()) :- sale(Cat, Amt)").unwrap();
-        store.sql_rule("sale_total(Cat, sum(Amt)) :- sale(Cat, Amt)").unwrap();
+        store
+            .sql_rule("sale_count(Cat, count()) :- sale(Cat, Amt)")
+            .unwrap();
+        store
+            .sql_rule("sale_total(Cat, sum(Amt)) :- sale(Cat, Amt)")
+            .unwrap();
 
         let count_results = store.query(&Literal {
             predicate: "sale_count".into(),
             args: vec![Term::Var("C".into()), Term::Var("N".into())],
             negated: false,
         });
-        let count_map: HashMap<&str, &str> = count_results.iter().map(|r| (r[0].as_str(), r[1].as_str())).collect();
+        let count_map: HashMap<&str, &str> = count_results
+            .iter()
+            .map(|r| (r[0].as_str(), r[1].as_str()))
+            .collect();
         assert_eq!(count_map["electronics"], "2");
         assert_eq!(count_map["clothing"], "1");
 
@@ -2835,7 +3069,10 @@ mod tests {
             args: vec![Term::Var("C".into()), Term::Var("T".into())],
             negated: false,
         });
-        let total_map: HashMap<&str, &str> = total_results.iter().map(|r| (r[0].as_str(), r[1].as_str())).collect();
+        let total_map: HashMap<&str, &str> = total_results
+            .iter()
+            .map(|r| (r[0].as_str(), r[1].as_str()))
+            .collect();
         assert_eq!(total_map["electronics"], "300");
         assert_eq!(total_map["clothing"], "50");
     }

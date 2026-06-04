@@ -5,8 +5,8 @@
 //! that subsystems use to report their memory usage.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
 // MemoryBudget

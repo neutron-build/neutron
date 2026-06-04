@@ -12,9 +12,9 @@ use crate::metrics::{Counter, Gauge, Histogram};
 /// Binary protocol metrics.
 pub struct BinaryProtocolMetrics {
     pub connections_active: Gauge,
-    pub latency_histogram: Histogram,  // microseconds: [1, 5, 10, 50, 100, 500, 1000, 5000]
+    pub latency_histogram: Histogram, // microseconds: [1, 5, 10, 50, 100, 500, 1000, 5000]
     pub parse_errors_total: Counter,
-    pub message_size_bytes: Histogram,  // bytes: [100, 1K, 10K, 100K, 1M]
+    pub message_size_bytes: Histogram, // bytes: [100, 1K, 10K, 100K, 1M]
     pub handshake_failures: Counter,
     pub protocol_violations: Counter,
 }
@@ -70,7 +70,7 @@ impl Default for BinaryProtocolMetrics {
 pub struct ZoneMapMetrics {
     pub granules_scanned_total: Counter,
     pub granules_skipped_total: Counter,
-    pub skip_ratio_gauge: Gauge,  // percentage: 0-100
+    pub skip_ratio_gauge: Gauge, // percentage: 0-100
     pub recompute_operations: Counter,
     pub recompute_duration_seconds: Histogram,
 }
@@ -213,7 +213,7 @@ pub struct LazyMaterializationMetrics {
     pub materialized_rows_total: Counter,
     pub deferred_rows_total: Counter,
     pub memory_saved_bytes_total: Counter,
-    pub materialization_ratio_gauge: Gauge,  // percentage
+    pub materialization_ratio_gauge: Gauge, // percentage
     pub materialization_duration_seconds: Histogram,
     pub deferred_cleanup_duration_seconds: Histogram,
 }
@@ -267,7 +267,8 @@ impl LazyMaterializationMetrics {
     }
 
     pub fn record_cleanup(&self, duration_secs: f64) {
-        self.deferred_cleanup_duration_seconds.observe(duration_secs);
+        self.deferred_cleanup_duration_seconds
+            .observe(duration_secs);
     }
 }
 
@@ -284,8 +285,8 @@ pub struct SimdMetrics {
     pub cpu_dispatch_avx2_total: Counter,
     pub cpu_dispatch_sse42_total: Counter,
     pub cpu_dispatch_scalar_total: Counter,
-    pub cpu_dispatch_ratio_avx512_gauge: Gauge,  // percentage
-    pub cpu_dispatch_ratio_scalar_gauge: Gauge,  // percentage
+    pub cpu_dispatch_ratio_avx512_gauge: Gauge, // percentage
+    pub cpu_dispatch_ratio_scalar_gauge: Gauge, // percentage
     pub aggregate_duration_seconds: Histogram,
     pub correctness_mismatches_total: Counter,
 }
@@ -349,8 +350,10 @@ impl SimdMetrics {
         if total > 0 {
             let avx512_ratio = (avx512 as f64 / total as f64) * 100.0;
             let scalar_ratio = (scalar as f64 / total as f64) * 100.0;
-            self.cpu_dispatch_ratio_avx512_gauge.set(avx512_ratio as i64);
-            self.cpu_dispatch_ratio_scalar_gauge.set(scalar_ratio as i64);
+            self.cpu_dispatch_ratio_avx512_gauge
+                .set(avx512_ratio as i64);
+            self.cpu_dispatch_ratio_scalar_gauge
+                .set(scalar_ratio as i64);
         }
     }
 
@@ -371,7 +374,7 @@ pub struct FilterLazyMetrics {
     pub positions_returned_total: Counter,
     pub filter_positions_memory_saved_bytes_total: Counter,
     pub filter_evaluation_time_us: Histogram,
-    pub lazy_materialization_hit_rate_gauge: Gauge,  // percentage: (matches / total) * 100
+    pub lazy_materialization_hit_rate_gauge: Gauge, // percentage: (matches / total) * 100
 }
 
 impl FilterLazyMetrics {
@@ -408,14 +411,16 @@ impl FilterLazyMetrics {
         // Estimate: 100 bytes per non-matching row saved
         let non_matching = total_rows.saturating_sub(matching_rows);
         let memory_saved = non_matching * 100;
-        self.filter_positions_memory_saved_bytes_total.inc_by(memory_saved);
+        self.filter_positions_memory_saved_bytes_total
+            .inc_by(memory_saved);
 
         self.filter_evaluation_time_us.observe(duration_us);
 
         // Hit rate: matching / total * 100
         if total_rows > 0 {
             let hit_rate = (matching_rows as f64 / total_rows as f64) * 100.0;
-            self.lazy_materialization_hit_rate_gauge.set(hit_rate as i64);
+            self.lazy_materialization_hit_rate_gauge
+                .set(hit_rate as i64);
         }
     }
 }
@@ -483,7 +488,7 @@ mod tests {
 
         assert_eq!(m.granules_scanned_total.get(), 3);
         assert_eq!(m.granules_skipped_total.get(), 2);
-        assert_eq!(m.skip_ratio_gauge.get(), 66);  // 2/3 * 100
+        assert_eq!(m.skip_ratio_gauge.get(), 66); // 2/3 * 100
         assert_eq!(m.recompute_operations.get(), 1);
     }
 
@@ -505,13 +510,13 @@ mod tests {
     fn lazy_materialization_metrics() {
         let m = LazyMaterializationMetrics::new();
         m.record_materialization(100, 900, 0.05);
-        m.record_memory_saved(1024 * 1024);  // 1 MB
+        m.record_memory_saved(1024 * 1024); // 1 MB
         m.record_cleanup(0.01);
 
         assert_eq!(m.materialized_rows_total.get(), 100);
         assert_eq!(m.deferred_rows_total.get(), 900);
         assert_eq!(m.memory_saved_bytes_total.get(), 1024 * 1024);
-        assert_eq!(m.materialization_ratio_gauge.get(), 90);  // 900/1000 * 100
+        assert_eq!(m.materialization_ratio_gauge.get(), 90); // 900/1000 * 100
     }
 
     #[test]
@@ -526,7 +531,7 @@ mod tests {
         // 1000 - 100 = 900 non-matching * 100 = 90000 bytes
         // Total: 160000 bytes saved
         assert_eq!(m.filter_positions_memory_saved_bytes_total.get(), 160000);
-        assert_eq!(m.lazy_materialization_hit_rate_gauge.get(), 10);  // 100/1000 * 100 = 10%
+        assert_eq!(m.lazy_materialization_hit_rate_gauge.get(), 10); // 100/1000 * 100 = 10%
     }
 
     #[test]

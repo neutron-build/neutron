@@ -34,7 +34,11 @@ impl Cost {
 
     /// Zero cost.
     pub fn zero() -> Self {
-        Self { cpu: 0.0, io: 0.0, network: 0.0 }
+        Self {
+            cpu: 0.0,
+            io: 0.0,
+            network: 0.0,
+        }
     }
 
     /// Weighted total — single scalar for comparison.
@@ -211,7 +215,10 @@ impl AccessMethod for BTreeAccess {
     }
 
     fn supports_predicate(&self, predicate_type: &PredicateType) -> bool {
-        matches!(predicate_type, PredicateType::Equality | PredicateType::Range | PredicateType::Prefix)
+        matches!(
+            predicate_type,
+            PredicateType::Equality | PredicateType::Range | PredicateType::Prefix
+        )
     }
 }
 
@@ -366,7 +373,10 @@ pub struct FtsAccess {
 
 impl FtsAccess {
     pub fn new(avg_postings: f64, query_terms: f64) -> Self {
-        Self { avg_postings, query_terms }
+        Self {
+            avg_postings,
+            query_terms,
+        }
     }
 }
 
@@ -381,7 +391,7 @@ impl AccessMethod for FtsAccess {
         let matching = (rows_in * selectivity).max(1.0);
         Cost {
             cpu: postings_read * 0.01 + matching * 0.02, // decode + BM25 score
-            io: self.query_terms * 1.0,                   // one page per term's posting list
+            io: self.query_terms * 1.0,                  // one page per term's posting list
             network: 0.0,
         }
     }
@@ -585,7 +595,10 @@ mod tests {
         let winner = best.unwrap();
         // For a highly selective equality lookup, hash or btree should
         // beat sequential scan (index 0).
-        assert_ne!(winner, 0, "Sequential scan should not win for selective lookups");
+        assert_ne!(
+            winner, 0,
+            "Sequential scan should not win for selective lookups"
+        );
     }
 
     #[test]
@@ -633,10 +646,7 @@ mod tests {
             PredicateType::GraphTraversal,
         ];
         for pt in &all_types {
-            assert!(
-                seq.supports_predicate(pt),
-                "SeqScan should support {pt:?}"
-            );
+            assert!(seq.supports_predicate(pt), "SeqScan should support {pt:?}");
         }
     }
 

@@ -86,10 +86,7 @@ impl CdcWal {
                 next_sequence: 1,
             }
         };
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok((
             Self {
                 path,
@@ -177,7 +174,9 @@ impl CdcWal {
         payload.extend_from_slice(&0u32.to_le_bytes());
 
         // Flush existing writer
-        { self.writer.lock().flush()?; }
+        {
+            self.writer.lock().flush()?;
+        }
 
         // Truncate and rewrite as single SNAPSHOT entry
         let file = OpenOptions::new()
@@ -237,41 +236,68 @@ fn replay(data: &[u8]) -> CdcWalState {
     let mut pos = 0usize;
 
     while pos < data.len() {
-        let Some(&entry_type) = data.get(pos) else { break };
+        let Some(&entry_type) = data.get(pos) else {
+            break;
+        };
         pos += 1;
 
         match entry_type {
             ENTRY_APPEND => {
-                let Some(entry) = replay_append(data, &mut pos) else { break };
+                let Some(entry) = replay_append(data, &mut pos) else {
+                    break;
+                };
                 if entry.sequence >= next_sequence {
                     next_sequence = entry.sequence + 1;
                 }
                 entries.push(entry);
             }
             ENTRY_CONSUMER => {
-                let Some(name) = read_string(data, &mut pos) else { break };
-                let Some(position) = read_u64(data, &mut pos) else { break };
+                let Some(name) = read_string(data, &mut pos) else {
+                    break;
+                };
+                let Some(position) = read_u64(data, &mut pos) else {
+                    break;
+                };
                 consumers.insert(name, position);
             }
             ENTRY_SNAPSHOT => {
                 entries.clear();
                 consumers.clear();
-                let Some(ns) = read_u64(data, &mut pos) else { break };
+                let Some(ns) = read_u64(data, &mut pos) else {
+                    break;
+                };
                 next_sequence = ns;
-                let Some(n_entries) = read_u32(data, &mut pos) else { break };
+                let Some(n_entries) = read_u32(data, &mut pos) else {
+                    break;
+                };
                 let mut ok = true;
                 for _ in 0..n_entries as usize {
-                    let Some(entry) = replay_append(data, &mut pos) else { ok = false; break };
+                    let Some(entry) = replay_append(data, &mut pos) else {
+                        ok = false;
+                        break;
+                    };
                     entries.push(entry);
                 }
-                if !ok { break; }
-                let Some(n_consumers) = read_u32(data, &mut pos) else { break };
+                if !ok {
+                    break;
+                }
+                let Some(n_consumers) = read_u32(data, &mut pos) else {
+                    break;
+                };
                 for _ in 0..n_consumers as usize {
-                    let Some(name) = read_string(data, &mut pos) else { ok = false; break };
-                    let Some(position) = read_u64(data, &mut pos) else { ok = false; break };
+                    let Some(name) = read_string(data, &mut pos) else {
+                        ok = false;
+                        break;
+                    };
+                    let Some(position) = read_u64(data, &mut pos) else {
+                        ok = false;
+                        break;
+                    };
                     consumers.insert(name, position);
                 }
-                if !ok { break; }
+                if !ok {
+                    break;
+                }
             }
             _ => {
                 break;
@@ -330,7 +356,9 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
     if *pos + len > data.len() {
         return None;
     }
-    let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+    let s = std::str::from_utf8(&data[*pos..*pos + len])
+        .ok()?
+        .to_string();
     *pos += len;
     Some(s)
 }
@@ -342,7 +370,10 @@ mod tests {
     use super::*;
 
     fn make_row(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -499,14 +530,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = CdcWal::open(dir.path()).unwrap();
 
-        for (seq, ct) in [(1, ChangeType::Insert), (2, ChangeType::Update), (3, ChangeType::Delete)] {
+        for (seq, ct) in [
+            (1, ChangeType::Insert),
+            (2, ChangeType::Update),
+            (3, ChangeType::Delete),
+        ] {
             wal.log_append(&CdcLogEntry {
                 sequence: seq,
                 table: "t".to_string(),
                 change_type: ct,
                 row_data: HashMap::new(),
                 timestamp: seq * 100,
-            }).unwrap();
+            })
+            .unwrap();
         }
         drop(wal);
 

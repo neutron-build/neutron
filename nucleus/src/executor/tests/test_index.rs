@@ -15,10 +15,17 @@ async fn test_btree_range_scan_exclusive_bounds() {
     exec(&ex, "CREATE INDEX idx_nums_val ON nums (val)").await;
 
     // Exclusive bounds: val > 10 AND val < 20  →  should return 11..=19
-    let results = exec(&ex, "SELECT val FROM nums WHERE val > 10 AND val < 20 ORDER BY val").await;
+    let results = exec(
+        &ex,
+        "SELECT val FROM nums WHERE val > 10 AND val < 20 ORDER BY val",
+    )
+    .await;
     let vals: Vec<i32> = rows(&results[0])
         .iter()
-        .map(|r| match &r[0] { Value::Int32(n) => *n, _ => panic!("expected i32") })
+        .map(|r| match &r[0] {
+            Value::Int32(n) => *n,
+            _ => panic!("expected i32"),
+        })
         .collect();
     assert_eq!(vals, (11..=19).collect::<Vec<_>>());
 }
@@ -34,11 +41,17 @@ async fn test_btree_range_scan_inclusive_bounds() {
     exec(&ex, "CREATE INDEX idx_scores_score ON scores (score)").await;
 
     // Inclusive bounds: score >= 20 AND score <= 30  →  20..=30
-    let results =
-        exec(&ex, "SELECT score FROM scores WHERE score >= 20 AND score <= 30 ORDER BY score").await;
+    let results = exec(
+        &ex,
+        "SELECT score FROM scores WHERE score >= 20 AND score <= 30 ORDER BY score",
+    )
+    .await;
     let vals: Vec<i32> = rows(&results[0])
         .iter()
-        .map(|r| match &r[0] { Value::Int32(n) => *n, _ => panic!("expected i32") })
+        .map(|r| match &r[0] {
+            Value::Int32(n) => *n,
+            _ => panic!("expected i32"),
+        })
         .collect();
     assert_eq!(vals, (20..=30).collect::<Vec<_>>());
 }
@@ -54,11 +67,17 @@ async fn test_btree_range_scan_mixed_bounds() {
     exec(&ex, "CREATE INDEX idx_events_ts ON events (ts)").await;
 
     // ts >= 5 AND ts < 15  →  5..=14
-    let results =
-        exec(&ex, "SELECT ts FROM events WHERE ts >= 5 AND ts < 15 ORDER BY ts").await;
+    let results = exec(
+        &ex,
+        "SELECT ts FROM events WHERE ts >= 5 AND ts < 15 ORDER BY ts",
+    )
+    .await;
     let vals: Vec<i32> = rows(&results[0])
         .iter()
-        .map(|r| match &r[0] { Value::Int32(n) => *n, _ => panic!("expected i32") })
+        .map(|r| match &r[0] {
+            Value::Int32(n) => *n,
+            _ => panic!("expected i32"),
+        })
         .collect();
     assert_eq!(vals, (5..=14).collect::<Vec<_>>());
 }
@@ -74,8 +93,7 @@ async fn test_btree_range_scan_large_table() {
     exec(&ex, "CREATE INDEX idx_big_v ON big (v)").await;
 
     // v >= 400 AND v <= 600 → 201 rows
-    let results =
-        exec(&ex, "SELECT COUNT(*) FROM big WHERE v >= 400 AND v <= 600").await;
+    let results = exec(&ex, "SELECT COUNT(*) FROM big WHERE v >= 400 AND v <= 600").await;
     let count = match &rows(&results[0])[0][0] {
         Value::Int64(n) => *n,
         Value::Int32(n) => *n as i64,
@@ -112,7 +130,10 @@ async fn test_btree_range_scan_explain_shows_index_range() {
     let results = exec(&ex, "EXPLAIN SELECT * FROM things WHERE n > 50 AND n < 150").await;
     let plan_text: String = rows(&results[0])
         .iter()
-        .map(|r| match &r[0] { Value::Text(s) => s.clone(), _ => String::new() })
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.clone(),
+            _ => String::new(),
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -158,10 +179,18 @@ async fn test_encrypted_index_lookup_function() {
     exec(&ex, "INSERT INTO patients VALUES (2, 'BBB')").await;
     exec(&ex, "INSERT INTO patients VALUES (3, 'AAA')").await;
 
-    exec(&ex, "CREATE INDEX pat_ssn_enc ON patients USING encrypted (ssn)").await;
+    exec(
+        &ex,
+        "CREATE INDEX pat_ssn_enc ON patients USING encrypted (ssn)",
+    )
+    .await;
 
     // Lookup via ENCRYPTED_LOOKUP function.
-    let results = exec(&ex, "SELECT ENCRYPTED_LOOKUP('pat_ssn_enc', 'AAA') FROM patients LIMIT 1").await;
+    let results = exec(
+        &ex,
+        "SELECT ENCRYPTED_LOOKUP('pat_ssn_enc', 'AAA') FROM patients LIMIT 1",
+    )
+    .await;
     let r = rows(&results[0]);
     // Should find row IDs for both rows with 'AAA'.
     let ids_str = match &r[0][0] {
@@ -180,7 +209,11 @@ async fn test_encrypted_index_maintained_on_insert() {
     exec(&ex, "CREATE TABLE enc_data (id INT, code TEXT)").await;
 
     // Create index first (empty table).
-    exec(&ex, "CREATE INDEX code_enc ON enc_data USING encrypted (code)").await;
+    exec(
+        &ex,
+        "CREATE INDEX code_enc ON enc_data USING encrypted (code)",
+    )
+    .await;
     {
         let indexes = ex.encrypted_indexes.read();
         assert_eq!(indexes.get("code_enc").unwrap().index.len(), 0);
@@ -225,7 +258,11 @@ async fn test_simd_sum_with_group_by() {
     exec(&ex, "INSERT INTO sales VALUES ('b', 30)").await;
     exec(&ex, "INSERT INTO sales VALUES ('b', 40)").await;
 
-    let results = exec(&ex, "SELECT cat, SUM(amount) FROM sales GROUP BY cat ORDER BY cat").await;
+    let results = exec(
+        &ex,
+        "SELECT cat, SUM(amount) FROM sales GROUP BY cat ORDER BY cat",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r[0][0], Value::Text("a".into()));
     assert_eq!(r[0][1], Value::Int64(30));
@@ -283,7 +320,11 @@ async fn test_index_scan_no_match() {
 #[tokio::test]
 async fn test_index_scan_with_remaining_predicate() {
     let (ex, _tmp) = disk_executor();
-    exec(&ex, "CREATE TABLE products (id INT, category TEXT, price INT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE products (id INT, category TEXT, price INT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO products VALUES (1, 'A', 10)").await;
     exec(&ex, "INSERT INTO products VALUES (2, 'A', 20)").await;
     exec(&ex, "INSERT INTO products VALUES (3, 'B', 10)").await;
@@ -291,7 +332,11 @@ async fn test_index_scan_with_remaining_predicate() {
     exec(&ex, "CREATE INDEX idx_cat ON products (category)").await;
 
     // Index on category, but also filter by price
-    let results = exec(&ex, "SELECT * FROM products WHERE category = 'A' AND price = 10").await;
+    let results = exec(
+        &ex,
+        "SELECT * FROM products WHERE category = 'A' AND price = 10",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2); // id=1 and id=4
 }
@@ -547,17 +592,28 @@ async fn test_index_maintained_delete_all_reinsert() {
 async fn test_simd_filter_i64_equals() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE sf_eq (id INT, val BIGINT)").await;
-    exec(&ex, "INSERT INTO sf_eq VALUES (1, 10), (2, 20), (3, 10), (4, 30), (5, 10)").await;
+    exec(
+        &ex,
+        "INSERT INTO sf_eq VALUES (1, 10), (2, 20), (3, 10), (4, 30), (5, 10)",
+    )
+    .await;
     let r = exec(&ex, "SELECT id FROM sf_eq WHERE val = 10").await;
     let ids: Vec<&Value> = rows(&r[0]).iter().map(|r| &r[0]).collect();
-    assert_eq!(ids, vec![&Value::Int32(1), &Value::Int32(3), &Value::Int32(5)]);
+    assert_eq!(
+        ids,
+        vec![&Value::Int32(1), &Value::Int32(3), &Value::Int32(5)]
+    );
 }
 
 #[tokio::test]
 async fn test_simd_filter_i64_greater() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE sf_gt (id INT, val BIGINT)").await;
-    exec(&ex, "INSERT INTO sf_gt VALUES (1, 5), (2, 15), (3, 25), (4, 35)").await;
+    exec(
+        &ex,
+        "INSERT INTO sf_gt VALUES (1, 5), (2, 15), (3, 25), (4, 35)",
+    )
+    .await;
     let r = exec(&ex, "SELECT id FROM sf_gt WHERE val > 15").await;
     let ids: Vec<&Value> = rows(&r[0]).iter().map(|r| &r[0]).collect();
     assert_eq!(ids, vec![&Value::Int32(3), &Value::Int32(4)]);
@@ -567,7 +623,11 @@ async fn test_simd_filter_i64_greater() {
 async fn test_simd_filter_i64_less() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE sf_lt (id INT, val BIGINT)").await;
-    exec(&ex, "INSERT INTO sf_lt VALUES (1, 5), (2, 15), (3, 25), (4, 35)").await;
+    exec(
+        &ex,
+        "INSERT INTO sf_lt VALUES (1, 5), (2, 15), (3, 25), (4, 35)",
+    )
+    .await;
     let r = exec(&ex, "SELECT id FROM sf_lt WHERE val < 20").await;
     let ids: Vec<&Value> = rows(&r[0]).iter().map(|r| &r[0]).collect();
     assert_eq!(ids, vec![&Value::Int32(1), &Value::Int32(2)]);
@@ -577,7 +637,11 @@ async fn test_simd_filter_i64_less() {
 async fn test_simd_filter_f64_greater() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE sf_fgt (id INT, val DOUBLE PRECISION)").await;
-    exec(&ex, "INSERT INTO sf_fgt VALUES (1, 1.5), (2, 3.7), (3, 5.9), (4, 8.1)").await;
+    exec(
+        &ex,
+        "INSERT INTO sf_fgt VALUES (1, 1.5), (2, 3.7), (3, 5.9), (4, 8.1)",
+    )
+    .await;
     let r = exec(&ex, "SELECT id FROM sf_fgt WHERE val > 4.0").await;
     let ids: Vec<&Value> = rows(&r[0]).iter().map(|r| &r[0]).collect();
     assert_eq!(ids, vec![&Value::Int32(3), &Value::Int32(4)]);
@@ -588,7 +652,11 @@ async fn test_simd_filter_compound_fallback() {
     // Compound predicate (AND) should fall back to per-row eval, not SIMD
     let ex = test_executor();
     exec(&ex, "CREATE TABLE sf_comp (id INT, a BIGINT, b BIGINT)").await;
-    exec(&ex, "INSERT INTO sf_comp VALUES (1, 10, 100), (2, 20, 200), (3, 10, 300)").await;
+    exec(
+        &ex,
+        "INSERT INTO sf_comp VALUES (1, 10, 100), (2, 20, 200), (3, 10, 300)",
+    )
+    .await;
     let r = exec(&ex, "SELECT id FROM sf_comp WHERE a = 10 AND b > 150").await;
     let ids: Vec<&Value> = rows(&r[0]).iter().map(|r| &r[0]).collect();
     assert_eq!(ids, vec![&Value::Int32(3)]);
@@ -598,11 +666,18 @@ async fn test_simd_filter_compound_fallback() {
 async fn test_simd_filter_preserves_row_order() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE sf_ord (id INT, val BIGINT)").await;
-    exec(&ex, "INSERT INTO sf_ord VALUES (10, 1), (20, 2), (30, 1), (40, 2), (50, 1)").await;
+    exec(
+        &ex,
+        "INSERT INTO sf_ord VALUES (10, 1), (20, 2), (30, 1), (40, 2), (50, 1)",
+    )
+    .await;
     let r = exec(&ex, "SELECT id FROM sf_ord WHERE val = 1").await;
     let ids: Vec<&Value> = rows(&r[0]).iter().map(|r| &r[0]).collect();
     // Must preserve insertion order
-    assert_eq!(ids, vec![&Value::Int32(10), &Value::Int32(30), &Value::Int32(50)]);
+    assert_eq!(
+        ids,
+        vec![&Value::Int32(10), &Value::Int32(30), &Value::Int32(50)]
+    );
 }
 
 #[tokio::test]
@@ -617,10 +692,17 @@ async fn test_simd_filter_empty_table() {
 async fn test_simd_filter_all_rows_match() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE sf_all (id INT, val BIGINT)").await;
-    exec(&ex, "INSERT INTO sf_all VALUES (1, 100), (2, 200), (3, 300)").await;
+    exec(
+        &ex,
+        "INSERT INTO sf_all VALUES (1, 100), (2, 200), (3, 300)",
+    )
+    .await;
     let r = exec(&ex, "SELECT id FROM sf_all WHERE val > 0").await;
     let ids: Vec<&Value> = rows(&r[0]).iter().map(|r| &r[0]).collect();
-    assert_eq!(ids, vec![&Value::Int32(1), &Value::Int32(2), &Value::Int32(3)]);
+    assert_eq!(
+        ids,
+        vec![&Value::Int32(1), &Value::Int32(2), &Value::Int32(3)]
+    );
 }
 
 // ========================================================================
@@ -634,7 +716,11 @@ async fn test_i64_group_by_count() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE ig_cnt (dept INT, name TEXT)").await;
     exec(&ex, "INSERT INTO ig_cnt VALUES (1, 'alice'), (1, 'bob'), (2, 'charlie'), (3, 'dave'), (2, 'eve')").await;
-    let r = exec(&ex, "SELECT dept, COUNT(*) FROM ig_cnt GROUP BY dept ORDER BY dept").await;
+    let r = exec(
+        &ex,
+        "SELECT dept, COUNT(*) FROM ig_cnt GROUP BY dept ORDER BY dept",
+    )
+    .await;
     let rr = rows(&r[0]);
     assert_eq!(rr.len(), 3);
     assert_eq!(rr[0][0], Value::Int32(1));
@@ -650,8 +736,16 @@ async fn test_i64_group_by_sum() {
     // Single integer GROUP BY with SUM — should use the i64 fast path.
     let ex = test_executor();
     exec(&ex, "CREATE TABLE ig_sum (cat INT, amount INT)").await;
-    exec(&ex, "INSERT INTO ig_sum VALUES (10, 100), (10, 200), (20, 300), (20, 400), (30, 500)").await;
-    let r = exec(&ex, "SELECT cat, SUM(amount) FROM ig_sum GROUP BY cat ORDER BY cat").await;
+    exec(
+        &ex,
+        "INSERT INTO ig_sum VALUES (10, 100), (10, 200), (20, 300), (20, 400), (30, 500)",
+    )
+    .await;
+    let r = exec(
+        &ex,
+        "SELECT cat, SUM(amount) FROM ig_sum GROUP BY cat ORDER BY cat",
+    )
+    .await;
     let rr = rows(&r[0]);
     assert_eq!(rr.len(), 3);
     assert_eq!(rr[0][0], Value::Int32(10));
@@ -667,8 +761,16 @@ async fn test_i64_group_by_avg() {
     // Single integer GROUP BY with AVG — should use the i64 fast path.
     let ex = test_executor();
     exec(&ex, "CREATE TABLE ig_avg (grp BIGINT, val FLOAT)").await;
-    exec(&ex, "INSERT INTO ig_avg VALUES (1, 10.0), (1, 20.0), (2, 30.0), (2, 40.0), (2, 50.0)").await;
-    let r = exec(&ex, "SELECT grp, AVG(val) FROM ig_avg GROUP BY grp ORDER BY grp").await;
+    exec(
+        &ex,
+        "INSERT INTO ig_avg VALUES (1, 10.0), (1, 20.0), (2, 30.0), (2, 40.0), (2, 50.0)",
+    )
+    .await;
+    let r = exec(
+        &ex,
+        "SELECT grp, AVG(val) FROM ig_avg GROUP BY grp ORDER BY grp",
+    )
+    .await;
     let rr = rows(&r[0]);
     assert_eq!(rr.len(), 2);
     assert_eq!(rr[0][0], Value::Int32(1));
@@ -684,7 +786,11 @@ async fn test_i64_group_by_having() {
     // HAVING clause works with the i64 fast path.
     let ex = test_executor();
     exec(&ex, "CREATE TABLE ig_hav (region INT, sales INT)").await;
-    exec(&ex, "INSERT INTO ig_hav VALUES (1, 10), (1, 20), (2, 5), (3, 100), (3, 200)").await;
+    exec(
+        &ex,
+        "INSERT INTO ig_hav VALUES (1, 10), (1, 20), (2, 5), (3, 100), (3, 200)",
+    )
+    .await;
     let r = exec(&ex, "SELECT region, SUM(sales) FROM ig_hav GROUP BY region HAVING SUM(sales) > 25 ORDER BY region").await;
     let rr = rows(&r[0]);
     // Region 1: SUM=30 (>25), Region 2: SUM=5 (<=25), Region 3: SUM=300 (>25)
@@ -700,8 +806,16 @@ async fn test_multi_col_group_by_fallback() {
     // Multi-column GROUP BY should fall back to the generic path (not i64 fast path).
     let ex = test_executor();
     exec(&ex, "CREATE TABLE ig_multi (a INT, b INT, val INT)").await;
-    exec(&ex, "INSERT INTO ig_multi VALUES (1, 10, 100), (1, 10, 200), (1, 20, 300), (2, 10, 400)").await;
-    let r = exec(&ex, "SELECT a, b, SUM(val) FROM ig_multi GROUP BY a, b ORDER BY a, b").await;
+    exec(
+        &ex,
+        "INSERT INTO ig_multi VALUES (1, 10, 100), (1, 10, 200), (1, 20, 300), (2, 10, 400)",
+    )
+    .await;
+    let r = exec(
+        &ex,
+        "SELECT a, b, SUM(val) FROM ig_multi GROUP BY a, b ORDER BY a, b",
+    )
+    .await;
     let rr = rows(&r[0]);
     assert_eq!(rr.len(), 3);
     assert_eq!(rr[0][0], Value::Int32(1));
@@ -720,8 +834,16 @@ async fn test_text_group_by_fallback() {
     // Text column GROUP BY should fall back to the generic path (not i64 fast path).
     let ex = test_executor();
     exec(&ex, "CREATE TABLE ig_text (label TEXT, amount INT)").await;
-    exec(&ex, "INSERT INTO ig_text VALUES ('x', 10), ('y', 20), ('x', 30), ('y', 40)").await;
-    let r = exec(&ex, "SELECT label, SUM(amount) FROM ig_text GROUP BY label ORDER BY label").await;
+    exec(
+        &ex,
+        "INSERT INTO ig_text VALUES ('x', 10), ('y', 20), ('x', 30), ('y', 40)",
+    )
+    .await;
+    let r = exec(
+        &ex,
+        "SELECT label, SUM(amount) FROM ig_text GROUP BY label ORDER BY label",
+    )
+    .await;
     let rr = rows(&r[0]);
     assert_eq!(rr.len(), 2);
     assert_eq!(rr[0][0], Value::Text("x".into()));
@@ -750,10 +872,13 @@ async fn test_index_gt() {
     setup_indexed_table(&ex, "gt_tbl").await;
 
     let r = exec(&ex, "SELECT id FROM gt_tbl WHERE id > 7 ORDER BY id").await;
-    let ids: Vec<i32> = rows(&r[0]).iter().map(|r| match &r[0] {
-        Value::Int32(v) => *v,
-        other => panic!("expected Int32, got {other:?}"),
-    }).collect();
+    let ids: Vec<i32> = rows(&r[0])
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Int32(v) => *v,
+            other => panic!("expected Int32, got {other:?}"),
+        })
+        .collect();
     assert_eq!(ids, vec![8, 9, 10], "WHERE id > 7 should return 8, 9, 10");
 }
 
@@ -766,10 +891,13 @@ async fn test_index_lt() {
     setup_indexed_table(&ex, "lt_tbl").await;
 
     let r = exec(&ex, "SELECT id FROM lt_tbl WHERE id < 4 ORDER BY id").await;
-    let ids: Vec<i32> = rows(&r[0]).iter().map(|r| match &r[0] {
-        Value::Int32(v) => *v,
-        other => panic!("expected Int32, got {other:?}"),
-    }).collect();
+    let ids: Vec<i32> = rows(&r[0])
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Int32(v) => *v,
+            other => panic!("expected Int32, got {other:?}"),
+        })
+        .collect();
     assert_eq!(ids, vec![1, 2, 3], "WHERE id < 4 should return 1, 2, 3");
 }
 
@@ -782,10 +910,13 @@ async fn test_index_gte_disk() {
     setup_indexed_table(&ex, "gte_tbl").await;
 
     let r = exec(&ex, "SELECT id FROM gte_tbl WHERE id >= 9 ORDER BY id").await;
-    let ids: Vec<i32> = rows(&r[0]).iter().map(|r| match &r[0] {
-        Value::Int32(v) => *v,
-        other => panic!("expected Int32, got {other:?}"),
-    }).collect();
+    let ids: Vec<i32> = rows(&r[0])
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Int32(v) => *v,
+            other => panic!("expected Int32, got {other:?}"),
+        })
+        .collect();
     assert_eq!(ids, vec![9, 10], "WHERE id >= 9 should return 9, 10");
 }
 
@@ -798,10 +929,13 @@ async fn test_index_lte_disk() {
     setup_indexed_table(&ex, "lte_tbl").await;
 
     let r = exec(&ex, "SELECT id FROM lte_tbl WHERE id <= 2 ORDER BY id").await;
-    let ids: Vec<i32> = rows(&r[0]).iter().map(|r| match &r[0] {
-        Value::Int32(v) => *v,
-        other => panic!("expected Int32, got {other:?}"),
-    }).collect();
+    let ids: Vec<i32> = rows(&r[0])
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Int32(v) => *v,
+            other => panic!("expected Int32, got {other:?}"),
+        })
+        .collect();
     assert_eq!(ids, vec![1, 2], "WHERE id <= 2 should return 1, 2");
 }
 
@@ -819,12 +953,23 @@ async fn test_index_gt_with_additional_filter() {
     exec(&ex, "CREATE INDEX idx_combo_id ON combo (id)").await;
 
     // id > 15 AND category = 'even' → only 16, 18, 20
-    let r = exec(&ex, "SELECT id FROM combo WHERE id > 15 AND category = 'even' ORDER BY id").await;
-    let ids: Vec<i32> = rows(&r[0]).iter().map(|r| match &r[0] {
-        Value::Int32(v) => *v,
-        other => panic!("expected Int32, got {other:?}"),
-    }).collect();
-    assert_eq!(ids, vec![16, 18, 20], "WHERE id > 15 AND category = 'even' should return 16, 18, 20");
+    let r = exec(
+        &ex,
+        "SELECT id FROM combo WHERE id > 15 AND category = 'even' ORDER BY id",
+    )
+    .await;
+    let ids: Vec<i32> = rows(&r[0])
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Int32(v) => *v,
+            other => panic!("expected Int32, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![16, 18, 20],
+        "WHERE id > 15 AND category = 'even' should return 16, 18, 20"
+    );
 }
 
 // ------------------------------------------------------------------
@@ -836,7 +981,10 @@ async fn test_index_gt_empty_result() {
     setup_indexed_table(&ex, "empty_tbl").await;
 
     let r = exec(&ex, "SELECT id FROM empty_tbl WHERE id > 100 ORDER BY id").await;
-    assert!(rows(&r[0]).is_empty(), "WHERE id > 100 should return no rows");
+    assert!(
+        rows(&r[0]).is_empty(),
+        "WHERE id > 100 should return no rows"
+    );
 
     let r = exec(&ex, "SELECT id FROM empty_tbl WHERE id < 0 ORDER BY id").await;
     assert!(rows(&r[0]).is_empty(), "WHERE id < 0 should return no rows");
@@ -857,13 +1005,23 @@ async fn test_index_text_comparison() {
     exec(&ex, "CREATE INDEX idx_txt_label ON txt_cmp (label)").await;
 
     // label >= 'cherry' should return cherry, date, elderberry
-    let r = exec(&ex, "SELECT label FROM txt_cmp WHERE label >= 'cherry' ORDER BY label").await;
-    let labels: Vec<String> = rows(&r[0]).iter().map(|r| match &r[0] {
-        Value::Text(s) => s.clone(),
-        other => panic!("expected Text, got {other:?}"),
-    }).collect();
-    assert_eq!(labels, vec!["cherry", "date", "elderberry"],
-        "WHERE label >= 'cherry' should return cherry, date, elderberry");
+    let r = exec(
+        &ex,
+        "SELECT label FROM txt_cmp WHERE label >= 'cherry' ORDER BY label",
+    )
+    .await;
+    let labels: Vec<String> = rows(&r[0])
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.clone(),
+            other => panic!("expected Text, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["cherry", "date", "elderberry"],
+        "WHERE label >= 'cherry' should return cherry, date, elderberry"
+    );
 }
 
 // Parallel scan tests
@@ -877,7 +1035,11 @@ async fn test_parallel_filter_large_table() {
     exec(&ex, "CREATE TABLE pf_large (id INT, val INT)").await;
     // Insert 100 rows: val cycles 0..9
     for i in 1..=100 {
-        exec(&ex, &format!("INSERT INTO pf_large VALUES ({i}, {})", i % 10)).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO pf_large VALUES ({i}, {})", i % 10),
+        )
+        .await;
     }
     let r = exec(&ex, "SELECT id FROM pf_large WHERE val = 5").await;
     let rr = rows(&r[0]);
@@ -952,7 +1114,11 @@ async fn test_parallel_sum() {
     exec(&ex, "CREATE TABLE pf_sum (id INT, val INT, grp INT)").await;
     // Insert 200 rows: grp = id % 2
     for i in 1..=200 {
-        exec(&ex, &format!("INSERT INTO pf_sum VALUES ({i}, {i}, {})", i % 2)).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO pf_sum VALUES ({i}, {i}, {})", i % 2),
+        )
+        .await;
     }
     // SUM of val WHERE grp = 0 → sum of even numbers 2+4+...+200 = 100*101 = 10100
     let r = exec(&ex, "SELECT SUM(val) FROM pf_sum WHERE grp = 0").await;
@@ -995,7 +1161,11 @@ async fn test_parallel_avg() {
     // Insert 100 rows: pass = TRUE for even ids
     for i in 1..=100 {
         let pass = if i % 2 == 0 { "TRUE" } else { "FALSE" };
-        exec(&ex, &format!("INSERT INTO pf_avg VALUES ({i}, {i}, {pass})")).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO pf_avg VALUES ({i}, {i}, {pass})"),
+        )
+        .await;
     }
     // AVG(score) WHERE pass = TRUE → avg of 2,4,6,...,100 = 51
     let r = exec(&ex, "SELECT AVG(score) FROM pf_avg WHERE pass = TRUE").await;
@@ -1016,7 +1186,11 @@ async fn test_parallel_avg() {
 async fn test_simd_aggregate_sum_f64() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE sa_f64 (id INT, val DOUBLE PRECISION)").await;
-    exec(&ex, "INSERT INTO sa_f64 VALUES (1, 1.5), (2, 2.5), (3, 3.0), (4, 4.0)").await;
+    exec(
+        &ex,
+        "INSERT INTO sa_f64 VALUES (1, 1.5), (2, 2.5), (3, 3.0), (4, 4.0)",
+    )
+    .await;
     let r = exec(&ex, "SELECT SUM(val) FROM sa_f64").await;
     let v = scalar(&r[0]);
     match v {
@@ -1030,7 +1204,11 @@ async fn test_simd_aggregate_sum_f64() {
 async fn test_simd_aggregate_min_f64() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE sa_min (id INT, score DOUBLE PRECISION)").await;
-    exec(&ex, "INSERT INTO sa_min VALUES (1, 5.5), (2, 1.2), (3, 9.9), (4, 3.3)").await;
+    exec(
+        &ex,
+        "INSERT INTO sa_min VALUES (1, 5.5), (2, 1.2), (3, 9.9), (4, 3.3)",
+    )
+    .await;
     let r = exec(&ex, "SELECT MIN(score) FROM sa_min").await;
     let v = scalar(&r[0]);
     match v {
@@ -1044,7 +1222,11 @@ async fn test_simd_aggregate_min_f64() {
 async fn test_simd_aggregate_max_f64() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE sa_max (id INT, score DOUBLE PRECISION)").await;
-    exec(&ex, "INSERT INTO sa_max VALUES (1, 5.5), (2, 1.2), (3, 9.9), (4, 3.3)").await;
+    exec(
+        &ex,
+        "INSERT INTO sa_max VALUES (1, 5.5), (2, 1.2), (3, 9.9), (4, 3.3)",
+    )
+    .await;
     let r = exec(&ex, "SELECT MAX(score) FROM sa_max").await;
     let v = scalar(&r[0]);
     match v {
@@ -1058,7 +1240,11 @@ async fn test_simd_aggregate_max_f64() {
 async fn test_simd_aggregate_sum_i64_plan() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE sa_i64 (id INT, amount BIGINT)").await;
-    exec(&ex, "INSERT INTO sa_i64 VALUES (1, 100), (2, 200), (3, 300), (4, 400)").await;
+    exec(
+        &ex,
+        "INSERT INTO sa_i64 VALUES (1, 100), (2, 200), (3, 300), (4, 400)",
+    )
+    .await;
     let r = exec(&ex, "SELECT SUM(amount) FROM sa_i64").await;
     let v = scalar(&r[0]);
     match v {
@@ -1087,15 +1273,20 @@ async fn test_simd_plan_filter_node() {
         exec(&ex, &format!("INSERT INTO pf_plan VALUES ({i}, {i}00)")).await;
     }
     // Force plan-path Filter node via CTE
-    let r = exec(&ex,
+    let r = exec(
+        &ex,
         "WITH base AS (SELECT id, amount FROM pf_plan) \
-         SELECT id FROM base WHERE amount > 1000 ORDER BY id"
-    ).await;
-    let ids: Vec<i64> = rows(&r[0]).iter().map(|row| match &row[0] {
-        Value::Int32(n) => *n as i64,
-        Value::Int64(n) => *n,
-        other => panic!("expected int, got {other:?}"),
-    }).collect();
+         SELECT id FROM base WHERE amount > 1000 ORDER BY id",
+    )
+    .await;
+    let ids: Vec<i64> = rows(&r[0])
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Int32(n) => *n as i64,
+            Value::Int64(n) => *n,
+            other => panic!("expected int, got {other:?}"),
+        })
+        .collect();
     // amount > 1000 → ids 11..=20
     assert_eq!(ids, (11..=20).collect::<Vec<_>>());
 }
@@ -1133,10 +1324,13 @@ async fn test_index_only_scan_between() {
     exec(&ex, "CREATE INDEX idx_ios_bt_id ON ios_bt (id)").await;
 
     let results = exec(&ex, "SELECT id FROM ios_bt WHERE id BETWEEN 5 AND 10").await;
-    let vals: Vec<i32> = rows(&results[0]).iter().map(|r| match &r[0] {
-        Value::Int32(n) => *n,
-        other => panic!("expected i32, got {other:?}"),
-    }).collect();
+    let vals: Vec<i32> = rows(&results[0])
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Int32(n) => *n,
+            other => panic!("expected i32, got {other:?}"),
+        })
+        .collect();
     assert_eq!(vals, vec![5, 6, 7, 8, 9, 10]);
 }
 
@@ -1151,10 +1345,13 @@ async fn test_index_only_scan_full() {
     exec(&ex, "CREATE INDEX idx_ios_full_id ON ios_full (id)").await;
 
     let results = exec(&ex, "SELECT id FROM ios_full").await;
-    let vals: Vec<i32> = rows(&results[0]).iter().map(|r| match &r[0] {
-        Value::Int32(n) => *n,
-        other => panic!("expected i32, got {other:?}"),
-    }).collect();
+    let vals: Vec<i32> = rows(&results[0])
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Int32(n) => *n,
+            other => panic!("expected i32, got {other:?}"),
+        })
+        .collect();
     // Index-only full scan returns entries in B-tree key order
     assert_eq!(vals, vec![1, 2, 3, 4, 5]);
 }
@@ -1183,7 +1380,11 @@ async fn test_index_only_scan_disk_engine() {
     let (ex, _tmp) = disk_executor();
     exec(&ex, "CREATE TABLE ios_disk (id INT, payload TEXT)").await;
     for i in 1..=50i32 {
-        exec(&ex, &format!("INSERT INTO ios_disk VALUES ({i}, 'data_{i}')")).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO ios_disk VALUES ({i}, 'data_{i}')"),
+        )
+        .await;
     }
     exec(&ex, "CREATE INDEX idx_ios_disk_id ON ios_disk (id)").await;
 
@@ -1195,10 +1396,13 @@ async fn test_index_only_scan_disk_engine() {
 
     // BETWEEN — index-only
     let results = exec(&ex, "SELECT id FROM ios_disk WHERE id BETWEEN 10 AND 15").await;
-    let vals: Vec<i32> = rows(&results[0]).iter().map(|r| match &r[0] {
-        Value::Int32(n) => *n,
-        other => panic!("expected i32, got {other:?}"),
-    }).collect();
+    let vals: Vec<i32> = rows(&results[0])
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Int32(n) => *n,
+            other => panic!("expected i32, got {other:?}"),
+        })
+        .collect();
     assert_eq!(vals, vec![10, 11, 12, 13, 14, 15]);
 }
 

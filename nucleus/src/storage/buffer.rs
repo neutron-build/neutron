@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use parking_lot::{Mutex, RwLock};
 
 use super::disk::DiskManager;
-use super::page::{self, PageBuf, INVALID_PAGE_ID, PAGE_SIZE};
+use super::page::{self, INVALID_PAGE_ID, PAGE_SIZE, PageBuf};
 
 /// Default buffer pool: 2048 frames x 16 KB = 32 MB.
 pub const DEFAULT_POOL_SIZE: usize = 2048;
@@ -253,7 +253,9 @@ impl LruKReplacer {
     }
 
     fn remove(&self, frame_id: u32) {
-        self.shards[self.shard_for(frame_id)].lock().remove(&frame_id);
+        self.shards[self.shard_for(frame_id)]
+            .lock()
+            .remove(&frame_id);
     }
 }
 
@@ -294,7 +296,12 @@ pub enum BufferError {
 
 impl BufferPool {
     /// Create a new buffer pool with the given number of frames.
-    pub fn new(disk: DiskManager, wal: Option<Box<dyn super::wal::WalBackend>>, pool_size: usize, initial_pages: u32) -> Self {
+    pub fn new(
+        disk: DiskManager,
+        wal: Option<Box<dyn super::wal::WalBackend>>,
+        pool_size: usize,
+        initial_pages: u32,
+    ) -> Self {
         let mut frames = Vec::with_capacity(pool_size);
         let mut descriptors = Vec::with_capacity(pool_size);
         let mut free_list = Vec::with_capacity(pool_size);
@@ -364,10 +371,12 @@ impl BufferPool {
 
         // Verify checksum (skip for freshly allocated pages with all zeros)
         let page_data = self.frame_data(frame_id);
-        if (page::get_page_type(page_data) != page::PAGE_TYPE_FREE || page::read_u32(page_data, page::HEADER_CHECKSUM) != 0)
-            && !page::verify_checksum(page_data) {
-                return Err(BufferError::ChecksumMismatch(page_id));
-            }
+        if (page::get_page_type(page_data) != page::PAGE_TYPE_FREE
+            || page::read_u32(page_data, page::HEADER_CHECKSUM) != 0)
+            && !page::verify_checksum(page_data)
+        {
+            return Err(BufferError::ChecksumMismatch(page_id));
+        }
 
         // Setup descriptor
         let desc = &self.descriptors[frame_id as usize];
@@ -506,7 +515,8 @@ impl BufferPool {
                 let data = self.frame_data_mut(frame_id);
                 // WAL protocol: sync WAL before writing data pages
                 if let Some(ref wal) = self.wal {
-                    let lsn = wal.log_page_write(0, page_id, data)
+                    let lsn = wal
+                        .log_page_write(0, page_id, data)
                         .map_err(BufferError::Io)?;
                     page::set_page_lsn(data, lsn);
                     wal.group_sync();
@@ -537,7 +547,8 @@ impl BufferPool {
             if page_id != INVALID_PAGE_ID && desc.is_dirty.load(Ordering::Acquire) {
                 let data = self.frame_data_mut(i as u32);
                 if let Some(ref wal) = self.wal {
-                    let lsn = wal.log_page_write(0, page_id, data)
+                    let lsn = wal
+                        .log_page_write(0, page_id, data)
                         .map_err(BufferError::Io)?;
                     page::set_page_lsn(data, lsn);
                 }
@@ -580,7 +591,9 @@ impl BufferPool {
             if page_id != INVALID_PAGE_ID && desc.is_dirty.load(Ordering::Acquire) {
                 let data = self.frame_data_mut(frame_id);
                 if let Some(ref wal) = self.wal {
-                    let lsn = wal.log_page_write(0, page_id, data).map_err(BufferError::Io)?;
+                    let lsn = wal
+                        .log_page_write(0, page_id, data)
+                        .map_err(BufferError::Io)?;
                     page::set_page_lsn(data, lsn);
                 }
                 page::write_checksum(data);
@@ -627,10 +640,11 @@ impl BufferPool {
         // WAL protocol: sync WAL before writing data pages to ensure
         // recoverability if we crash mid-flush.
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.sync() {
-                tracing::error!("WAL sync failed before data page flush: {e}");
-                return 0; // Do NOT write data pages if WAL is not durable
-            }
+            && let Err(e) = wal.sync()
+        {
+            tracing::error!("WAL sync failed before data page flush: {e}");
+            return 0; // Do NOT write data pages if WAL is not durable
+        }
 
         let mut flushed = 0;
         for frame_id in &to_flush {
@@ -640,9 +654,10 @@ impl BufferPool {
             if page_id != INVALID_PAGE_ID && desc.is_dirty.load(Ordering::Acquire) {
                 let data = self.frame_data_mut(*frame_id);
                 if let Some(ref wal) = self.wal
-                    && let Ok(lsn) = wal.log_page_write(0, page_id, data) {
-                        page::set_page_lsn(data, lsn);
-                    }
+                    && let Ok(lsn) = wal.log_page_write(0, page_id, data)
+                {
+                    page::set_page_lsn(data, lsn);
+                }
                 page::write_checksum(data);
                 if self.disk.write_page(page_id, data).is_ok() {
                     desc.is_dirty.store(false, Ordering::Release);
@@ -654,9 +669,10 @@ impl BufferPool {
 
         // Sync data pages to stable storage so they survive power failure.
         if flushed > 0
-            && let Err(e) = self.disk.sync() {
-                tracing::error!("disk sync failed after flushing {flushed} pages: {e}");
-            }
+            && let Err(e) = self.disk.sync()
+        {
+            tracing::error!("disk sync failed after flushing {flushed} pages: {e}");
+        }
 
         flushed
     }
@@ -758,7 +774,8 @@ impl BufferPool {
             let data = self.frame_data_mut(frame_id);
             // WAL protocol: log before flush, set LSN first
             if let Some(ref wal) = self.wal {
-                let lsn = wal.log_page_write(0, old_page_id, data)
+                let lsn = wal
+                    .log_page_write(0, old_page_id, data)
                     .map_err(BufferError::Io)?;
                 page::set_page_lsn(data, lsn);
             }
@@ -799,9 +816,7 @@ pub fn spawn_background_flusher(
     batch_size: usize,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(
-            std::time::Duration::from_millis(interval_ms),
-        );
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
         loop {
             interval.tick().await;
             let dirty = pool.dirty_page_count();
@@ -883,7 +898,9 @@ mod tests {
         // Fetch the page fresh and mark it dirty via our tracked API
         let fid = pool.fetch_page(page_id).unwrap();
         // Clear the descriptor dirty flag first (new_page sets it directly)
-        pool.descriptors[fid as usize].is_dirty.store(false, Ordering::Release);
+        pool.descriptors[fid as usize]
+            .is_dirty
+            .store(false, Ordering::Release);
 
         pool.mark_dirty(fid);
         assert_eq!(pool.stats().dirty_pages.load(Ordering::Relaxed), 1);
@@ -952,7 +969,10 @@ mod tests {
         let misses_after = pool.stats().misses.load(Ordering::Relaxed);
 
         // Should have loaded some pages (misses increased)
-        assert!(misses_after > misses_before, "prefetch should cause disk reads");
+        assert!(
+            misses_after > misses_before,
+            "prefetch should cause disk reads"
+        );
 
         // Now fetching them should be hits
         let hits_before = pool.stats().hits.load(Ordering::Relaxed);

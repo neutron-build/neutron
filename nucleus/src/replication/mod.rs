@@ -364,13 +364,14 @@ impl FailoverManager {
         }
 
         if now_ms.saturating_sub(self.peer_last_seen_ms) >= self.failover_timeout_ms
-            && self.local_role == NodeRole::Replica {
-                let evt = FailoverEvent::PrimaryDown {
-                    detected_at_ms: now_ms,
-                };
-                self.history.push(evt.clone());
-                return Some(evt);
-            }
+            && self.local_role == NodeRole::Replica
+        {
+            let evt = FailoverEvent::PrimaryDown {
+                detected_at_ms: now_ms,
+            };
+            self.history.push(evt.clone());
+            return Some(evt);
+        }
         None
     }
 
@@ -1561,7 +1562,8 @@ impl ReplicationMessage {
                     return Err("truncated auth token length".into());
                 }
                 let tlen = u64::from_le_bytes(
-                    data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                    data.get(pos..pos + 8)
+                        .and_then(|s| s.try_into().ok())
                         .ok_or("truncated auth token length")?,
                 ) as usize;
                 pos += 8;
@@ -1578,7 +1580,8 @@ impl ReplicationMessage {
                     return Err("truncated batch count".into());
                 }
                 let count = u64::from_le_bytes(
-                    data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                    data.get(pos..pos + 8)
+                        .and_then(|s| s.try_into().ok())
                         .ok_or("truncated batch count")?,
                 ) as usize;
                 pos += 8;
@@ -1588,12 +1591,14 @@ impl ReplicationMessage {
                         return Err("truncated record header".into());
                     }
                     let lsn = u64::from_le_bytes(
-                        data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                        data.get(pos..pos + 8)
+                            .and_then(|s| s.try_into().ok())
                             .ok_or("truncated record lsn")?,
                     );
                     pos += 8;
                     let timestamp_ms = u64::from_le_bytes(
-                        data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                        data.get(pos..pos + 8)
+                            .and_then(|s| s.try_into().ok())
                             .ok_or("truncated record timestamp")?,
                     );
                     pos += 8;
@@ -1607,12 +1612,14 @@ impl ReplicationMessage {
                                 return Err("truncated page write".into());
                             }
                             let page_id = u64::from_le_bytes(
-                                data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                                data.get(pos..pos + 8)
+                                    .and_then(|s| s.try_into().ok())
                                     .ok_or("truncated page id")?,
                             );
                             pos += 8;
                             let dlen = u64::from_le_bytes(
-                                data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                                data.get(pos..pos + 8)
+                                    .and_then(|s| s.try_into().ok())
                                     .ok_or("truncated page data length")?,
                             ) as usize;
                             pos += 8;
@@ -1629,7 +1636,8 @@ impl ReplicationMessage {
                                 return Err("truncated commit".into());
                             }
                             let txn_id = u64::from_le_bytes(
-                                data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                                data.get(pos..pos + 8)
+                                    .and_then(|s| s.try_into().ok())
                                     .ok_or("truncated commit txn_id")?,
                             );
                             pos += 8;
@@ -1641,7 +1649,8 @@ impl ReplicationMessage {
                                 return Err("truncated abort".into());
                             }
                             let txn_id = u64::from_le_bytes(
-                                data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                                data.get(pos..pos + 8)
+                                    .and_then(|s| s.try_into().ok())
                                     .ok_or("truncated abort txn_id")?,
                             );
                             pos += 8;
@@ -1666,7 +1675,8 @@ impl ReplicationMessage {
                     return Err("truncated confirm".into());
                 }
                 let lsn = u64::from_le_bytes(
-                    data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                    data.get(pos..pos + 8)
+                        .and_then(|s| s.try_into().ok())
                         .ok_or("truncated confirm lsn")?,
                 );
                 Ok(ReplicationMessage::Confirm { applied_lsn: lsn })
@@ -1676,7 +1686,8 @@ impl ReplicationMessage {
                     return Err("truncated heartbeat".into());
                 }
                 let lsn = u64::from_le_bytes(
-                    data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                    data.get(pos..pos + 8)
+                        .and_then(|s| s.try_into().ok())
                         .ok_or("truncated heartbeat lsn")?,
                 );
                 Ok(ReplicationMessage::Heartbeat { primary_lsn: lsn })
@@ -1686,7 +1697,8 @@ impl ReplicationMessage {
                     return Err("truncated heartbeat response".into());
                 }
                 let lsn = u64::from_le_bytes(
-                    data.get(pos..pos + 8).and_then(|s| s.try_into().ok())
+                    data.get(pos..pos + 8)
+                        .and_then(|s| s.try_into().ok())
                         .ok_or("truncated heartbeat response lsn")?,
                 );
                 Ok(ReplicationMessage::HeartbeatResponse { replica_lsn: lsn })
@@ -1939,12 +1951,12 @@ impl WalBridge {
             let srec = to_storage_wal_record(rrec);
             if srec.record_type == crate::storage::wal::RECORD_PAGE_WRITE
                 && let Some(ref page_image) = srec.page_image
-                    && storage_wal
-                        .log_page_write(srec.txn_id, srec.page_id, page_image)
-                        .is_ok()
-                    {
-                        count += 1;
-                    }
+                && storage_wal
+                    .log_page_write(srec.txn_id, srec.page_id, page_image)
+                    .is_ok()
+            {
+                count += 1;
+            }
             // Control records (commit/abort/checkpoint) don't need to be written
             // to the local WAL — they're implicit in the replayed page state.
         }
@@ -3890,20 +3902,15 @@ mod tests {
             let mut rx = rx;
             let sender_task = tokio::spawn(async move {
                 let mut sent = 0u32;
-                loop {
-                    match rx.recv().await {
-                        Ok(notification) => {
-                            let msg = ReplicationMessage::WalBatch {
-                                records: vec![notification.record],
-                            };
-                            let mut w = writer_clone.lock().await;
-                            framing::write_message(&mut *w, &msg).await.unwrap();
-                            sent += 1;
-                            if sent >= 3 {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
+                while let Ok(notification) = rx.recv().await {
+                    let msg = ReplicationMessage::WalBatch {
+                        records: vec![notification.record],
+                    };
+                    let mut w = writer_clone.lock().await;
+                    framing::write_message(&mut *w, &msg).await.unwrap();
+                    sent += 1;
+                    if sent >= 3 {
+                        break;
                     }
                 }
             });

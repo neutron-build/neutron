@@ -1,10 +1,10 @@
 //! Internal type aliases and data structures used throughout the executor.
 
-use std::collections::HashMap;
-use sqlparser::ast::{Expr, SelectItem};
+use super::ExecError;
 use crate::types::{DataType, Row, Value};
 use crate::vector;
-use super::ExecError;
+use sqlparser::ast::{Expr, SelectItem};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JoinType {
@@ -41,13 +41,19 @@ pub(crate) type CteTableMap = HashMap<String, (Vec<ColMeta>, Vec<Row>)>;
 pub(crate) type ProjectedResult = Result<(Vec<(String, DataType)>, Vec<Row>), ExecError>;
 
 /// Index predicate extraction: (equalities, range predicates, remaining expr).
-pub(crate) type IndexPredicates = (Vec<(String, Value)>, Vec<(String, Value, Value)>, Option<Expr>);
+pub(crate) type IndexPredicates = (
+    Vec<(String, Value)>,
+    Vec<(String, Value, Value)>,
+    Option<Expr>,
+);
 
 /// Index scan result: column metadata, rows, remaining filter, and index name used.
 pub(crate) type IndexScanResult = Option<(Vec<ColMeta>, Vec<Row>, Option<Expr>, Option<String>)>;
 
 /// Boxed future for async recursive methods returning (Vec<ColMeta>, Vec<Row>).
-pub(crate) type BoxedExecFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Vec<ColMeta>, Vec<Row>), ExecError>> + Send + 'a>>;
+pub(crate) type BoxedExecFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(Vec<ColMeta>, Vec<Row>), ExecError>> + Send + 'a>,
+>;
 
 /// A live vector index backed by HNSW or IVFFlat.
 #[derive(Clone)]
@@ -73,6 +79,11 @@ pub(crate) struct EncryptedIndexEntry {
 
 /// A live GIN (Generalized Inverted Index) for a JSONB column.
 /// Maps (path, encoded_leaf) pairs to row IDs for fast containment (`@>`) queries.
+// NOTE: the GIN index is built at CREATE INDEX time and stored in
+// `Executor::gin_indexes`, but the query planner does not yet consult it to
+// accelerate `@>` containment scans — so these fields are write-only for now.
+// Tracked in AUDIT_FINDINGS.md (Phase 3: wire up the GIN read path).
+#[allow(dead_code)]
 pub(crate) struct GinIndexEntry {
     pub table_name: String,
     pub column_name: String,
@@ -148,7 +159,10 @@ impl AstCache {
 
     /// Look up a cached AST by normalized SQL key. Returns cloned Arc + literal count.
     /// Bumps access counter on hit. The Arc clone is O(1); deep clone happens outside the lock.
-    pub fn get(&mut self, key: &str) -> Option<(std::sync::Arc<Vec<sqlparser::ast::Statement>>, usize)> {
+    pub fn get(
+        &mut self,
+        key: &str,
+    ) -> Option<(std::sync::Arc<Vec<sqlparser::ast::Statement>>, usize)> {
         if let Some(entry) = self.entries.get_mut(key) {
             entry.access_count = entry.access_count.saturating_add(1);
             Some((std::sync::Arc::clone(&entry.ast), entry.literal_count))
@@ -158,19 +172,30 @@ impl AstCache {
     }
 
     /// Insert a parsed AST into the cache. Evicts the least-accessed entry if full.
-    pub fn insert(&mut self, key: String, ast: Vec<sqlparser::ast::Statement>, literal_count: usize) {
-        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&key)
-            && let Some(victim_key) = self.entries.iter()
+    pub fn insert(
+        &mut self,
+        key: String,
+        ast: Vec<sqlparser::ast::Statement>,
+        literal_count: usize,
+    ) {
+        if self.entries.len() >= self.max_entries
+            && !self.entries.contains_key(&key)
+            && let Some(victim_key) = self
+                .entries
+                .iter()
                 .min_by_key(|(_, e)| e.access_count)
                 .map(|(k, _)| k.clone())
-            {
-                self.entries.remove(&victim_key);
-            }
-        self.entries.insert(key, AstCacheEntry {
-            ast: std::sync::Arc::new(ast),
-            literal_count,
-            access_count: 1,
-        });
+        {
+            self.entries.remove(&victim_key);
+        }
+        self.entries.insert(
+            key,
+            AstCacheEntry {
+                ast: std::sync::Arc::new(ast),
+                literal_count,
+                access_count: 1,
+            },
+        );
     }
 
     /// Clear all cached ASTs (called on DDL).
@@ -216,17 +241,23 @@ impl GlobalPreparedCache {
 
     /// Insert a prepared statement. Evicts the least-accessed entry if full.
     pub fn insert(&mut self, sql: String, stmt: std::sync::Arc<PreparedStmt>) {
-        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&sql)
-            && let Some(victim_key) = self.entries.iter()
+        if self.entries.len() >= self.max_entries
+            && !self.entries.contains_key(&sql)
+            && let Some(victim_key) = self
+                .entries
+                .iter()
                 .min_by_key(|(_, e)| e.access_count)
                 .map(|(k, _)| k.clone())
-            {
-                self.entries.remove(&victim_key);
-            }
-        self.entries.insert(sql, GlobalPreparedEntry {
-            stmt,
-            access_count: 1,
-        });
+        {
+            self.entries.remove(&victim_key);
+        }
+        self.entries.insert(
+            sql,
+            GlobalPreparedEntry {
+                stmt,
+                access_count: 1,
+            },
+        );
     }
 }
 
@@ -270,17 +301,22 @@ impl PlanCache {
     pub fn insert(&mut self, sql: String, plan: crate::planner::PlanNode) {
         if self.entries.len() >= self.max_entries && !self.entries.contains_key(&sql) {
             // Evict the entry with the lowest access count
-            if let Some(victim_key) = self.entries.iter()
+            if let Some(victim_key) = self
+                .entries
+                .iter()
                 .min_by_key(|(_, e)| e.access_count)
                 .map(|(k, _)| k.clone())
             {
                 self.entries.remove(&victim_key);
             }
         }
-        self.entries.insert(sql, PlanCacheEntry {
-            plan,
-            access_count: 1,
-        });
+        self.entries.insert(
+            sql,
+            PlanCacheEntry {
+                plan,
+                access_count: 1,
+            },
+        );
     }
 
     /// Clear all cached plans (called on DDL).

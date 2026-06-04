@@ -117,7 +117,9 @@ impl BloomFilter {
             h1 = h1.wrapping_mul(0x100000001b3);
         }
         // Simple derived second hash.
-        let h2 = h1.wrapping_mul(0x517cc1b727220a95).wrapping_add(0x6c62272e07bb0142);
+        let h2 = h1
+            .wrapping_mul(0x517cc1b727220a95)
+            .wrapping_add(0x6c62272e07bb0142);
         (h1, h2)
     }
 }
@@ -155,7 +157,13 @@ impl SSTable {
             bloom.insert(k);
             size_bytes += k.len() + v.as_ref().map_or(0, |v| v.len());
         }
-        Self { entries, bloom, level, seq, size_bytes }
+        Self {
+            entries,
+            bloom,
+            level,
+            seq,
+            size_bytes,
+        }
     }
 
     /// Point lookup using bloom filter + binary search.
@@ -247,11 +255,15 @@ impl LsmTree {
     }
 
     fn sst_path(&self, level: usize, seq: u64) -> Option<PathBuf> {
-        self.disk_dir.as_ref().map(|d| d.join(Self::sst_filename(level, seq)))
+        self.disk_dir
+            .as_ref()
+            .map(|d| d.join(Self::sst_filename(level, seq)))
     }
 
     fn write_sst_to_disk(&self, sst: &SSTable) -> io::Result<()> {
-        let Some(path) = self.sst_path(sst.level, sst.seq) else { return Ok(()); };
+        let Some(path) = self.sst_path(sst.level, sst.seq) else {
+            return Ok(());
+        };
         let mut buf = Vec::with_capacity(sst.size_bytes + 64);
         buf.extend_from_slice(b"LSMS");
         buf.push(sst.level as u8);
@@ -349,13 +361,17 @@ impl LsmTree {
         if self.memtable.is_empty() {
             return;
         }
-        let entries: Vec<(Vec<u8>, Option<Vec<u8>>)> = std::mem::take(&mut self.memtable).into_iter().collect();
+        let entries: Vec<(Vec<u8>, Option<Vec<u8>>)> =
+            std::mem::take(&mut self.memtable).into_iter().collect();
         let seq = self.next_seq;
         self.next_seq += 1;
         let sst = SSTable::from_sorted(entries, 0, seq, self.config.bloom_bits_per_key);
         // Write to disk before adding to in-memory levels (WAL semantics).
         if let Err(e) = self.write_sst_to_disk(&sst) {
-            eprintln!("LSM: failed to write SSTable L{}/seq{} to disk: {e}", sst.level, sst.seq);
+            eprintln!(
+                "LSM: failed to write SSTable L{}/seq{} to disk: {e}",
+                sst.level, sst.seq
+            );
         }
         if !self.levels.is_empty() {
             self.levels[0].push(sst);
@@ -419,7 +435,10 @@ impl LsmTree {
         let sst = SSTable::from_sorted(entries, level + 1, seq, self.config.bloom_bits_per_key);
         // Write merged SSTable to disk first, then delete superseded files.
         if let Err(e) = self.write_sst_to_disk(&sst) {
-            eprintln!("LSM: failed to write compacted SSTable L{}/seq{} to disk: {e}", sst.level, sst.seq);
+            eprintln!(
+                "LSM: failed to write compacted SSTable L{}/seq{} to disk: {e}",
+                sst.level, sst.seq
+            );
         }
         self.levels[level + 1].push(sst);
         self.compaction_count += 1;
@@ -459,12 +478,16 @@ impl LsmTree {
         }
 
         // Memtable (newest, always wins).
-        for (k, v) in self.memtable.range::<Vec<u8>, _>(start.to_vec()..end.to_vec()) {
+        for (k, v) in self
+            .memtable
+            .range::<Vec<u8>, _>(start.to_vec()..end.to_vec())
+        {
             merged.insert(k.clone(), v.clone());
         }
 
         // Filter out tombstones.
-        merged.into_iter()
+        merged
+            .into_iter()
             .filter_map(|(k, v)| v.map(|val| (k, val)))
             .collect()
     }
@@ -481,7 +504,9 @@ impl LsmTree {
 
     /// Summary of entries per level.
     pub fn level_summary(&self) -> Vec<(usize, usize)> {
-        self.levels.iter().enumerate()
+        self.levels
+            .iter()
+            .enumerate()
             .map(|(i, l)| (i, l.iter().map(|s| s.len()).sum()))
             .collect()
     }
@@ -502,7 +527,10 @@ fn load_sst_file(path: &Path) -> io::Result<SSTable> {
 
     // Check magic.
     if data.get(..4) != Some(b"LSMS") {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad SSTable magic"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad SSTable magic",
+        ));
     }
     let mut pos = 4usize;
 
@@ -515,7 +543,9 @@ fn load_sst_file(path: &Path) -> io::Result<SSTable> {
     let mut entries = Vec::with_capacity(n);
     for _ in 0..n {
         let key_len = read_u32_le(&data, &mut pos).ok_or_else(eof)? as usize;
-        if pos + key_len > data.len() { return Err(eof()); }
+        if pos + key_len > data.len() {
+            return Err(eof());
+        }
         let key = data[pos..pos + key_len].to_vec();
         pos += key_len;
 
@@ -524,7 +554,9 @@ fn load_sst_file(path: &Path) -> io::Result<SSTable> {
 
         let value = if kind == 1 {
             let val_len = read_u32_le(&data, &mut pos).ok_or_else(eof)? as usize;
-            if pos + val_len > data.len() { return Err(eof()); }
+            if pos + val_len > data.len() {
+                return Err(eof());
+            }
             let v = data[pos..pos + val_len].to_vec();
             pos += val_len;
             Some(v)
@@ -550,7 +582,9 @@ fn read_u32_le(data: &[u8], pos: &mut usize) -> Option<u32> {
 fn read_u64_le(data: &[u8], pos: &mut usize) -> Option<u64> {
     let b = data.get(*pos..*pos + 8)?;
     *pos += 8;
-    Some(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    Some(u64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
 }
 
 // ============================================================================
@@ -602,7 +636,10 @@ mod tests {
 
     #[test]
     fn lsm_put_and_get() {
-        let mut tree = LsmTree::new(LsmConfig { memtable_flush_threshold: 100, ..small_config() });
+        let mut tree = LsmTree::new(LsmConfig {
+            memtable_flush_threshold: 100,
+            ..small_config()
+        });
         tree.put(b"key1".to_vec(), b"val1".to_vec());
         tree.put(b"key2".to_vec(), b"val2".to_vec());
         assert_eq!(tree.get(b"key1"), Some(b"val1".to_vec()));
@@ -612,7 +649,10 @@ mod tests {
 
     #[test]
     fn lsm_overwrite() {
-        let mut tree = LsmTree::new(LsmConfig { memtable_flush_threshold: 100, ..small_config() });
+        let mut tree = LsmTree::new(LsmConfig {
+            memtable_flush_threshold: 100,
+            ..small_config()
+        });
         tree.put(b"k".to_vec(), b"v1".to_vec());
         assert_eq!(tree.get(b"k"), Some(b"v1".to_vec()));
         tree.put(b"k".to_vec(), b"v2".to_vec());
@@ -621,7 +661,10 @@ mod tests {
 
     #[test]
     fn lsm_delete() {
-        let mut tree = LsmTree::new(LsmConfig { memtable_flush_threshold: 100, ..small_config() });
+        let mut tree = LsmTree::new(LsmConfig {
+            memtable_flush_threshold: 100,
+            ..small_config()
+        });
         tree.put(b"k".to_vec(), b"v".to_vec());
         assert_eq!(tree.get(b"k"), Some(b"v".to_vec()));
         tree.delete(b"k".to_vec());
@@ -651,7 +694,11 @@ mod tests {
         for i in 0..20u8 {
             tree.put(vec![i], vec![i]);
         }
-        assert!(tree.compaction_count >= 1, "expected at least 1 compaction, got {}", tree.compaction_count);
+        assert!(
+            tree.compaction_count >= 1,
+            "expected at least 1 compaction, got {}",
+            tree.compaction_count
+        );
         // All keys still readable.
         for i in 0..20u8 {
             assert_eq!(tree.get(&[i]), Some(vec![i]));
@@ -660,7 +707,10 @@ mod tests {
 
     #[test]
     fn lsm_range_scan() {
-        let mut tree = LsmTree::new(LsmConfig { memtable_flush_threshold: 100, ..small_config() });
+        let mut tree = LsmTree::new(LsmConfig {
+            memtable_flush_threshold: 100,
+            ..small_config()
+        });
         for i in 0..10u8 {
             tree.put(vec![i], vec![i * 10]);
         }
@@ -672,7 +722,10 @@ mod tests {
 
     #[test]
     fn lsm_range_excludes_tombstones() {
-        let mut tree = LsmTree::new(LsmConfig { memtable_flush_threshold: 100, ..small_config() });
+        let mut tree = LsmTree::new(LsmConfig {
+            memtable_flush_threshold: 100,
+            ..small_config()
+        });
         for i in 0..5u8 {
             tree.put(vec![i], vec![i]);
         }
@@ -696,7 +749,10 @@ mod tests {
 
     #[test]
     fn lsm_memtable_size() {
-        let mut tree = LsmTree::new(LsmConfig { memtable_flush_threshold: 100, ..small_config() });
+        let mut tree = LsmTree::new(LsmConfig {
+            memtable_flush_threshold: 100,
+            ..small_config()
+        });
         assert_eq!(tree.memtable_size(), 0);
         tree.put(b"a".to_vec(), b"1".to_vec());
         assert_eq!(tree.memtable_size(), 1);
@@ -706,7 +762,11 @@ mod tests {
 
     #[test]
     fn lsm_force_compact() {
-        let mut tree = LsmTree::new(LsmConfig { memtable_flush_threshold: 3, level_max_sstables: 10, ..small_config() });
+        let mut tree = LsmTree::new(LsmConfig {
+            memtable_flush_threshold: 3,
+            level_max_sstables: 10,
+            ..small_config()
+        });
         // Create some SSTables at level 0 via flushes.
         for batch in 0..3u8 {
             for i in 0..3u8 {
@@ -721,7 +781,10 @@ mod tests {
 
     #[test]
     fn lsm_delete_then_reinsert() {
-        let mut tree = LsmTree::new(LsmConfig { memtable_flush_threshold: 100, ..small_config() });
+        let mut tree = LsmTree::new(LsmConfig {
+            memtable_flush_threshold: 100,
+            ..small_config()
+        });
         tree.put(b"k".to_vec(), b"v1".to_vec());
         tree.delete(b"k".to_vec());
         assert_eq!(tree.get(b"k"), None);
@@ -748,7 +811,11 @@ mod tests {
         {
             let tree = LsmTree::open(small_config(), dir.path()).unwrap();
             for i in 0..10u8 {
-                assert_eq!(tree.get(&[i]), Some(vec![i * 2]), "key {i} missing after recovery");
+                assert_eq!(
+                    tree.get(&[i]),
+                    Some(vec![i * 2]),
+                    "key {i} missing after recovery"
+                );
             }
         }
     }
@@ -780,7 +847,11 @@ mod tests {
         {
             let tree = LsmTree::open(cfg, dir.path()).unwrap();
             for i in 0..20u8 {
-                assert_eq!(tree.get(&[i]), Some(vec![i]), "key {i} missing after compaction + recovery");
+                assert_eq!(
+                    tree.get(&[i]),
+                    Some(vec![i]),
+                    "key {i} missing after compaction + recovery"
+                );
             }
         }
     }
@@ -811,7 +882,11 @@ mod tests {
             buf.extend_from_slice(k);
             match v {
                 None => buf.push(0),
-                Some(val) => { buf.push(1); buf.extend_from_slice(&(val.len() as u32).to_le_bytes()); buf.extend_from_slice(val); }
+                Some(val) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&(val.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(val);
+                }
             }
         }
         std::fs::write(&path, &buf).unwrap();

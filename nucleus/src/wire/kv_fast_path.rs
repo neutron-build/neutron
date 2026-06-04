@@ -119,9 +119,7 @@ pub fn execute_kv_command(cmd: &KvCommand, kv: &Arc<KvStore>) -> ExecResult {
                     // we only get here with well-formed queries.
                     ExecResult::Select {
                         columns: vec![("kv_incr".to_string(), DataType::Text)],
-                        rows: vec![vec![Value::Text(
-                            "ERR value is not an integer".to_string(),
-                        )]],
+                        rows: vec![vec![Value::Text("ERR value is not an integer".to_string())]],
                     }
                 }
             }
@@ -583,13 +581,15 @@ fn parse_sql_literal(s: &str) -> Option<(SqlLiteral, &str)> {
 
     // TRUE / FALSE
     if let Some(rest) = strip_prefix_ci(s, "TRUE")
-        && (rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric()) {
-            return Some((SqlLiteral::Bool(true), rest));
-        }
+        && (rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric())
+    {
+        return Some((SqlLiteral::Bool(true), rest));
+    }
     if let Some(rest) = strip_prefix_ci(s, "FALSE")
-        && (rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric()) {
-            return Some((SqlLiteral::Bool(false), rest));
-        }
+        && (rest.is_empty() || !rest.as_bytes()[0].is_ascii_alphanumeric())
+    {
+        return Some((SqlLiteral::Bool(false), rest));
+    }
 
     // String literal
     if bytes[0] == b'\'' {
@@ -598,7 +598,9 @@ fn parse_sql_literal(s: &str) -> Option<(SqlLiteral, &str)> {
     }
 
     // Numeric: [+-]?[0-9]+ or [+-]?[0-9]+.[0-9]+
-    if bytes[0].is_ascii_digit() || ((bytes[0] == b'-' || bytes[0] == b'+') && bytes.len() > 1 && bytes[1].is_ascii_digit()) {
+    if bytes[0].is_ascii_digit()
+        || ((bytes[0] == b'-' || bytes[0] == b'+') && bytes.len() > 1 && bytes[1].is_ascii_digit())
+    {
         let mut i = 0;
         if bytes[0] == b'-' || bytes[0] == b'+' {
             i = 1;
@@ -672,6 +674,8 @@ fn parse_assignments(s: &str) -> Option<(Vec<(String, SqlLiteral)>, &str)> {
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
 
     // ── Basic parsing tests ─────────────────────────────────────────────
@@ -820,10 +824,7 @@ mod tests {
     #[test]
     fn empty_value() {
         let cmd = try_parse_kv("SELECT kv_set('k', '')").unwrap();
-        assert_eq!(
-            cmd,
-            KvCommand::Set("k".to_string(), "".to_string(), None)
-        );
+        assert_eq!(cmd, KvCommand::Set("k".to_string(), "".to_string(), None));
     }
 
     #[test]
@@ -946,7 +947,8 @@ mod tests {
 
     #[test]
     fn sql_fp_point_select_string_pk() {
-        let cmd = try_parse_sql_fast_path("SELECT * FROM users WHERE email = 'alice@example.com'").unwrap();
+        let cmd = try_parse_sql_fast_path("SELECT * FROM users WHERE email = 'alice@example.com'")
+            .unwrap();
         assert_eq!(
             cmd,
             SqlFastPathCommand::PointSelect {
@@ -1017,7 +1019,8 @@ mod tests {
 
     #[test]
     fn sql_fp_point_update() {
-        let cmd = try_parse_sql_fast_path("UPDATE users SET name = 'bob', age = 30 WHERE id = 1").unwrap();
+        let cmd = try_parse_sql_fast_path("UPDATE users SET name = 'bob', age = 30 WHERE id = 1")
+            .unwrap();
         assert_eq!(
             cmd,
             SqlFastPathCommand::PointUpdate {
@@ -1096,9 +1099,15 @@ mod tests {
     fn sql_fp_literal_to_value() {
         assert_eq!(SqlLiteral::Null.to_value(), Value::Null);
         assert_eq!(SqlLiteral::Integer(42).to_value(), Value::Int32(42));
-        assert_eq!(SqlLiteral::Integer(i64::MAX).to_value(), Value::Int64(i64::MAX));
+        assert_eq!(
+            SqlLiteral::Integer(i64::MAX).to_value(),
+            Value::Int64(i64::MAX)
+        );
         assert_eq!(SqlLiteral::Float(3.14).to_value(), Value::Float64(3.14));
-        assert_eq!(SqlLiteral::Text("hi".into()).to_value(), Value::Text("hi".into()));
+        assert_eq!(
+            SqlLiteral::Text("hi".into()).to_value(),
+            Value::Text("hi".into())
+        );
         assert_eq!(SqlLiteral::Bool(true).to_value(), Value::Bool(true));
     }
 }

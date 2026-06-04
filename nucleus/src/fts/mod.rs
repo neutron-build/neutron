@@ -58,14 +58,76 @@ pub fn tokenize(text: &str) -> Vec<Token> {
 fn is_stopword(word: &str) -> bool {
     matches!(
         word,
-        "a" | "an" | "the" | "is" | "are" | "was" | "were" | "be" | "been" | "being"
-            | "have" | "has" | "had" | "do" | "does" | "did" | "will" | "would" | "could"
-            | "should" | "may" | "might" | "shall" | "can" | "to" | "of" | "in" | "for"
-            | "on" | "with" | "at" | "by" | "from" | "as" | "into" | "through" | "during"
-            | "before" | "after" | "and" | "but" | "or" | "not" | "no" | "if" | "then"
-            | "than" | "so" | "that" | "this" | "it" | "its" | "i" | "me" | "my" | "we"
-            | "our" | "you" | "your" | "he" | "him" | "his" | "she" | "her" | "they"
-            | "them" | "their" | "what" | "which" | "who" | "whom"
+        "a" | "an"
+            | "the"
+            | "is"
+            | "are"
+            | "was"
+            | "were"
+            | "be"
+            | "been"
+            | "being"
+            | "have"
+            | "has"
+            | "had"
+            | "do"
+            | "does"
+            | "did"
+            | "will"
+            | "would"
+            | "could"
+            | "should"
+            | "may"
+            | "might"
+            | "shall"
+            | "can"
+            | "to"
+            | "of"
+            | "in"
+            | "for"
+            | "on"
+            | "with"
+            | "at"
+            | "by"
+            | "from"
+            | "as"
+            | "into"
+            | "through"
+            | "during"
+            | "before"
+            | "after"
+            | "and"
+            | "but"
+            | "or"
+            | "not"
+            | "no"
+            | "if"
+            | "then"
+            | "than"
+            | "so"
+            | "that"
+            | "this"
+            | "it"
+            | "its"
+            | "i"
+            | "me"
+            | "my"
+            | "we"
+            | "our"
+            | "you"
+            | "your"
+            | "he"
+            | "him"
+            | "his"
+            | "she"
+            | "her"
+            | "they"
+            | "them"
+            | "their"
+            | "what"
+            | "which"
+            | "who"
+            | "whom"
     )
 }
 
@@ -228,11 +290,21 @@ pub fn stem(word: &str) -> String {
         w.truncate(w.len() - 5);
     } else if w.ends_with("ing") && w.len() > 5 {
         w.truncate(w.len() - 3);
-        if w.ends_with(|c: char| c == w.chars().last().unwrap_or(' '))
-            && w.len() > 3
-            && matches!(w.chars().last(), Some('b' | 'd' | 'g' | 'l' | 'm' | 'n' | 'p' | 'r' | 't'))
-        {
-            w.pop(); // Remove doubled consonant
+        // Undo consonant-doubling (e.g. "running" -> "runn" -> "run"), but ONLY
+        // when the last two characters are actually a doubled consonant. The old
+        // predicate (`c == last char`) was a tautology and stripped a consonant
+        // after every -ing ("eating" -> "ea" instead of "eat").
+        let doubled_consonant = {
+            let mut rev = w.chars().rev();
+            match (rev.next(), rev.next()) {
+                (Some(a), Some(b)) => {
+                    a == b && matches!(a, 'b' | 'd' | 'g' | 'l' | 'm' | 'n' | 'p' | 'r' | 't')
+                }
+                _ => false,
+            }
+        };
+        if doubled_consonant && w.len() > 3 {
+            w.pop();
         }
     } else if (w.ends_with("ed") || w.ends_with("ly") || w.ends_with("er")) && w.len() > 4 {
         w.truncate(w.len() - 2);
@@ -259,14 +331,14 @@ pub struct Posting {
 
 /// Statistics for a single document.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct DocInfo {
+pub(crate) struct DocInfo {
     /// Number of tokens in this document.
     length: usize,
 }
 
 /// A single undo operation for FTS transaction rollback.
 #[derive(Debug, Clone)]
-pub enum FtsUndoOp {
+pub(crate) enum FtsUndoOp {
     /// A document was added during the transaction. Undo = remove it.
     AddedDoc { doc_id: u64 },
     /// A document was removed during the transaction. Undo = re-insert it.
@@ -281,7 +353,7 @@ pub enum FtsUndoOp {
 /// Undo log for FTS operations within a transaction.
 /// O(1) to create, O(mutations) memory — replaces the old O(index_size) deep-clone.
 #[derive(Debug, Clone, Default)]
-pub struct FtsUndoLog {
+pub(crate) struct FtsUndoLog {
     pub ops: Vec<FtsUndoOp>,
 }
 
@@ -371,9 +443,10 @@ impl InvertedIndex {
     pub fn add_document(&mut self, doc_id: u64, text: &str) {
         // Log to WAL before mutating in-memory state.
         if let Some(wal) = &self.wal
-            && let Err(e) = wal.log_index_doc(doc_id, text) {
-                eprintln!("FTS WAL: failed to log index_doc {doc_id}: {e}");
-            }
+            && let Err(e) = wal.log_index_doc(doc_id, text)
+        {
+            eprintln!("FTS WAL: failed to log index_doc {doc_id}: {e}");
+        }
         self.index_document_internal(doc_id, text);
     }
 
@@ -420,9 +493,10 @@ impl InvertedIndex {
     pub fn remove_document(&mut self, doc_id: u64) {
         // Log to WAL before mutating in-memory state.
         if let Some(wal) = &self.wal
-            && let Err(e) = wal.log_remove_doc(doc_id) {
-                eprintln!("FTS WAL: failed to log remove_doc {doc_id}: {e}");
-            }
+            && let Err(e) = wal.log_remove_doc(doc_id)
+        {
+            eprintln!("FTS WAL: failed to log remove_doc {doc_id}: {e}");
+        }
         self.remove_document_internal(doc_id);
     }
 
@@ -474,10 +548,8 @@ impl InvertedIndex {
 
         // Tokenize query to get search terms (lowercased via tokenizer)
         let query_tokens = tokenize(query);
-        let terms: std::collections::HashSet<String> = query_tokens
-            .iter()
-            .map(|t| t.term.clone())
-            .collect();
+        let terms: std::collections::HashSet<String> =
+            query_tokens.iter().map(|t| t.term.clone()).collect();
 
         if terms.is_empty() {
             return Some(original.to_string());
@@ -509,11 +581,12 @@ impl InvertedIndex {
             let start = pos.saturating_sub(context_words);
             let end = (pos + context_words + 1).min(words.len());
             if let Some(last) = ranges.last_mut()
-                && start <= last.1 {
-                    // Merge overlapping ranges
-                    last.1 = last.1.max(end);
-                    continue;
-                }
+                && start <= last.1
+            {
+                // Merge overlapping ranges
+                last.1 = last.1.max(end);
+                continue;
+            }
             ranges.push((start, end));
         }
 
@@ -544,9 +617,10 @@ impl InvertedIndex {
         let query_tokens = tokenize(query);
         for token in &query_tokens {
             if let Some(postings) = self.postings.get(&token.term)
-                && postings.iter().any(|p| p.doc_id == doc_id) {
-                    return true;
-                }
+                && postings.iter().any(|p| p.doc_id == doc_id)
+            {
+                return true;
+            }
         }
         false
     }
@@ -599,12 +673,12 @@ impl InvertedIndex {
     // ====================================================================
 
     /// Create an empty undo log — O(1) memory. Replaces txn_snapshot().
-    pub fn begin_undo_log(&self) -> FtsUndoLog {
+    pub(crate) fn begin_undo_log(&self) -> FtsUndoLog {
         FtsUndoLog::default()
     }
 
     /// Capture a document's state before removal for potential rollback.
-    pub fn record_remove(&self, log: &mut FtsUndoLog, doc_id: u64) {
+    pub(crate) fn record_remove(&self, log: &mut FtsUndoLog, doc_id: u64) {
         if let Some(info) = self.docs.get(&doc_id) {
             let mut postings = Vec::new();
             for (term, posting_list) in &self.postings {
@@ -625,7 +699,7 @@ impl InvertedIndex {
     }
 
     /// Replay the undo log in reverse to roll back all FTS mutations.
-    pub fn undo(&mut self, log: FtsUndoLog) {
+    pub(crate) fn undo(&mut self, log: FtsUndoLog) {
         for op in log.ops.into_iter().rev() {
             match op {
                 FtsUndoOp::AddedDoc { doc_id } => {
@@ -744,9 +818,7 @@ impl InvertedIndex {
         for &doc_id in &matching_ids {
             if let Some(doc_facet_map) = self.doc_facets.get(&doc_id) {
                 for (field, values) in doc_facet_map {
-                    if !facet_fields.is_empty()
-                        && !facet_fields.contains(&field.as_str())
-                    {
+                    if !facet_fields.is_empty() && !facet_fields.contains(&field.as_str()) {
                         continue;
                     }
                     let field_counts = facets.entry(field.clone()).or_default();
@@ -1204,36 +1276,34 @@ impl InvertedIndex {
 
         // Phase 1: tokenize in parallel.
         // Each thread returns (doc_id, doc_length, term→positions).
-        let tokenized: Vec<(u64, usize, HashMap<String, Vec<usize>>)> =
-            std::thread::scope(|s| {
-                let handles: Vec<_> = docs
-                    .chunks(chunk_size)
-                    .map(|chunk| {
-                        s.spawn(move || {
-                            let mut results = Vec::with_capacity(chunk.len());
-                            for &(doc_id, text) in chunk {
-                                let tokens = tokenize(text);
-                                let doc_length = tokens.len();
-                                let mut term_positions: HashMap<String, Vec<usize>> =
-                                    HashMap::new();
-                                for token in &tokens {
-                                    term_positions
-                                        .entry(token.term.clone())
-                                        .or_default()
-                                        .push(token.position);
-                                }
-                                results.push((doc_id, doc_length, term_positions));
+        let tokenized: Vec<(u64, usize, HashMap<String, Vec<usize>>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = docs
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(move || {
+                        let mut results = Vec::with_capacity(chunk.len());
+                        for &(doc_id, text) in chunk {
+                            let tokens = tokenize(text);
+                            let doc_length = tokens.len();
+                            let mut term_positions: HashMap<String, Vec<usize>> = HashMap::new();
+                            for token in &tokens {
+                                term_positions
+                                    .entry(token.term.clone())
+                                    .or_default()
+                                    .push(token.position);
                             }
-                            results
-                        })
+                            results.push((doc_id, doc_length, term_positions));
+                        }
+                        results
                     })
-                    .collect();
+                })
+                .collect();
 
-                handles
-                    .into_iter()
-                    .flat_map(|h| h.join().unwrap())
-                    .collect()
-            });
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
 
         // Phase 2: merge into index sequentially.
         for (doc_id, doc_length, term_positions) in tokenized {
@@ -1600,8 +1670,7 @@ impl InvertedIndex {
 
         // Threshold: minimum score to enter top-k (starts at 0)
         let mut threshold = 0.0f64;
-        let mut heap: std::collections::BinaryHeap<ScoredDoc> =
-            std::collections::BinaryHeap::new();
+        let mut heap: std::collections::BinaryHeap<ScoredDoc> = std::collections::BinaryHeap::new();
 
         for bpl in &block_lists {
             for block in &bpl.blocks {
@@ -1773,7 +1842,10 @@ impl SegmentedIndex {
     pub fn delete_document(&mut self, doc_id: u64) {
         self.writer.remove_document(doc_id);
         // Only tombstone if the doc exists in a segment (otherwise removal from writer suffices)
-        let in_segment = self.segments.iter().any(|s| s.index.docs.contains_key(&doc_id));
+        let in_segment = self
+            .segments
+            .iter()
+            .any(|s| s.index.docs.contains_key(&doc_id));
         if in_segment {
             self.tombstones.insert(doc_id);
         }
@@ -1838,7 +1910,9 @@ impl SegmentedIndex {
                         continue;
                     }
                     // Re-insert into merged index's postings directly
-                    if let std::collections::hash_map::Entry::Vacant(e) = merged.docs.entry(posting.doc_id) {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        merged.docs.entry(posting.doc_id)
+                    {
                         let length = seg
                             .index
                             .docs
@@ -1902,9 +1976,8 @@ impl SegmentedIndex {
         // Search the active writer
         for (doc_id, score) in self.writer.search(query, usize::MAX) {
             if !self.tombstones.contains(&doc_id) {
-                *combined_scores.entry(doc_id).or_default() = score.max(
-                    *combined_scores.get(&doc_id).unwrap_or(&0.0),
-                );
+                *combined_scores.entry(doc_id).or_default() =
+                    score.max(*combined_scores.get(&doc_id).unwrap_or(&0.0));
             }
         }
 
@@ -2101,10 +2174,7 @@ pub struct WhitespaceTokenizer;
 
 impl TokenizerPlugin for WhitespaceTokenizer {
     fn tokenize(&self, input: &str) -> Vec<String> {
-        input
-            .split_whitespace()
-            .map(|s| s.to_string())
-            .collect()
+        input.split_whitespace().map(|s| s.to_string()).collect()
     }
 }
 
@@ -2184,14 +2254,13 @@ pub struct StopwordTokenFilter {
 impl StopwordTokenFilter {
     pub fn english() -> Self {
         let words = [
-            "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-            "have", "has", "had", "do", "does", "did", "will", "would", "could",
-            "should", "may", "might", "shall", "can", "to", "of", "in", "for",
-            "on", "with", "at", "by", "from", "as", "into", "through", "during",
-            "before", "after", "and", "but", "or", "not", "no", "if", "then",
-            "than", "so", "that", "this", "it", "its", "i", "me", "my", "we",
-            "our", "you", "your", "he", "him", "his", "she", "her", "they",
-            "them", "their", "what", "which", "who", "whom",
+            "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has",
+            "had", "do", "does", "did", "will", "would", "could", "should", "may", "might",
+            "shall", "can", "to", "of", "in", "for", "on", "with", "at", "by", "from", "as",
+            "into", "through", "during", "before", "after", "and", "but", "or", "not", "no", "if",
+            "then", "than", "so", "that", "this", "it", "its", "i", "me", "my", "we", "our", "you",
+            "your", "he", "him", "his", "she", "her", "they", "them", "their", "what", "which",
+            "who", "whom",
         ];
         StopwordTokenFilter {
             stopwords: words.iter().map(|w| w.to_string()).collect(),
@@ -2337,8 +2406,10 @@ mod tests {
         assert!(top_ids.contains(&1));
         assert!(top_ids.contains(&3));
         // Doc 2 only has "quick", not "fox"
-        assert!(results.iter().find(|r| r.0 == 2).unwrap().1
-            < results.iter().find(|r| r.0 == 1).unwrap().1);
+        assert!(
+            results.iter().find(|r| r.0 == 2).unwrap().1
+                < results.iter().find(|r| r.0 == 1).unwrap().1
+        );
     }
 
     #[test]
@@ -2926,7 +2997,10 @@ mod tests {
     #[test]
     fn whitespace_tokenizer() {
         let tok = WhitespaceTokenizer;
-        assert_eq!(tok.tokenize("hello world  test"), vec!["hello", "world", "test"]);
+        assert_eq!(
+            tok.tokenize("hello world  test"),
+            vec!["hello", "world", "test"]
+        );
         assert!(tok.tokenize("").is_empty());
     }
 
@@ -2968,7 +3042,12 @@ mod tests {
     #[test]
     fn stopword_token_filter() {
         let f = StopwordTokenFilter::english();
-        let result = f.filter(vec!["the".into(), "quick".into(), "fox".into(), "is".into()]);
+        let result = f.filter(vec![
+            "the".into(),
+            "quick".into(),
+            "fox".into(),
+            "is".into(),
+        ]);
         assert_eq!(result, vec!["quick", "fox"]);
     }
 
@@ -2982,7 +3061,10 @@ mod tests {
     #[test]
     fn synonym_token_filter() {
         let mut syns = HashMap::new();
-        syns.insert("quick".to_string(), vec!["fast".to_string(), "speedy".to_string()]);
+        syns.insert(
+            "quick".to_string(),
+            vec!["fast".to_string(), "speedy".to_string()],
+        );
         let f = SynonymTokenFilter::new(syns);
         let result = f.filter(vec!["quick".into(), "fox".into()]);
         assert_eq!(result, vec!["quick", "fast", "speedy", "fox"]);
@@ -2991,7 +3073,12 @@ mod tests {
     #[test]
     fn length_token_filter() {
         let f = LengthTokenFilter::new(2, 5);
-        let result = f.filter(vec!["a".into(), "ab".into(), "abcde".into(), "abcdef".into()]);
+        let result = f.filter(vec![
+            "a".into(),
+            "ab".into(),
+            "abcde".into(),
+            "abcdef".into(),
+        ]);
         assert_eq!(result, vec!["ab", "abcde"]);
     }
 
@@ -3050,7 +3137,12 @@ mod tests {
     #[test]
     fn custom_stopword_filter() {
         let f = StopwordTokenFilter::custom(vec!["foo".into(), "bar".into()]);
-        let result = f.filter(vec!["foo".into(), "hello".into(), "bar".into(), "world".into()]);
+        let result = f.filter(vec![
+            "foo".into(),
+            "hello".into(),
+            "bar".into(),
+            "world".into(),
+        ]);
         assert_eq!(result, vec!["hello", "world"]);
     }
 
@@ -3358,11 +3450,15 @@ mod tests {
         // doc 5 specifically: "document 5 about rust systems programming"
         // search("rust systems", usize::MAX) should include doc 5
         let search_results = idx.search("rust systems", usize::MAX);
-        let search_ids: std::collections::HashSet<u64> = search_results.iter().map(|(id, _)| *id).collect();
+        let search_ids: std::collections::HashSet<u64> =
+            search_results.iter().map(|(id, _)| *id).collect();
         for i in 1u64..=20 {
             let in_search = search_ids.contains(&i);
             let in_contains = idx.contains_doc(i, "rust systems");
-            assert_eq!(in_search, in_contains, "doc {i}: search={in_search} contains={in_contains}");
+            assert_eq!(
+                in_search, in_contains,
+                "doc {i}: search={in_search} contains={in_contains}"
+            );
         }
     }
 
@@ -3373,10 +3469,26 @@ mod tests {
 
         // Categories of terms to create realistic document distributions
         let topics = [
-            "database", "storage", "engine", "query", "index",
-            "server", "network", "protocol", "cache", "memory",
-            "compiler", "parser", "lexer", "optimizer", "runtime",
-            "machine", "learning", "neural", "training", "model",
+            "database",
+            "storage",
+            "engine",
+            "query",
+            "index",
+            "server",
+            "network",
+            "protocol",
+            "cache",
+            "memory",
+            "compiler",
+            "parser",
+            "lexer",
+            "optimizer",
+            "runtime",
+            "machine",
+            "learning",
+            "neural",
+            "training",
+            "model",
         ];
 
         // Index 10K documents with varying term combinations
@@ -3463,10 +3575,7 @@ mod tests {
             let topic = if i % 3 == 0 { "rust" } else { "python" };
             // Vary document length using i to create distinct BM25 scores.
             let extra: String = (0..(i % 7)).map(|j| format!(" filler{j}")).collect();
-            idx.add_document(
-                i,
-                &format!("{topic} programming language document{extra}"),
-            );
+            idx.add_document(i, &format!("{topic} programming language document{extra}"));
         }
 
         let mut seq = idx.search_scored("rust programming", 20);
@@ -3516,8 +3625,8 @@ mod tests {
     fn par_search_large_corpus() {
         let mut idx = InvertedIndex::new();
         let topics = [
-            "database", "storage", "engine", "query", "index",
-            "server", "network", "protocol", "cache", "memory",
+            "database", "storage", "engine", "query", "index", "server", "network", "protocol",
+            "cache", "memory",
         ];
         for i in 0..2000u64 {
             let t1 = topics[(i as usize) % topics.len()];
@@ -3602,10 +3711,7 @@ mod tests {
         // appears in the full result set with the same score.
         let seq_total: f64 = seq.iter().map(|r| r.1).sum();
         let par_total: f64 = par.iter().map(|r| r.1).sum();
-        assert!(
-            (seq_total - par_total).abs() < 1e-6,
-            "score totals differ"
-        );
+        assert!((seq_total - par_total).abs() < 1e-6, "score totals differ");
 
         // Both results should be sorted descending by score.
         for w in par.windows(2) {
@@ -3621,10 +3727,7 @@ mod tests {
         let mut idx = InvertedIndex::new();
         for i in 0..1000u64 {
             let extra: String = (0..(i % 5)).map(|j| format!(" word{j}")).collect();
-            idx.add_document(
-                i,
-                &format!("rust systems programming document{extra}"),
-            );
+            idx.add_document(i, &format!("rust systems programming document{extra}"));
         }
 
         let mut first = idx.par_search_scored("rust programming", 10);
@@ -3634,10 +3737,7 @@ mod tests {
             sort_deterministic(&mut again);
             assert_eq!(first.len(), again.len());
             for (a, b) in first.iter().zip(again.iter()) {
-                assert!(
-                    (a.1 - b.1).abs() < 1e-10,
-                    "scores differ across runs"
-                );
+                assert!((a.1 - b.1).abs() < 1e-10, "scores differ across runs");
             }
         }
     }
@@ -3666,7 +3766,12 @@ mod tests {
     #[test]
     fn par_bulk_index_large() {
         let docs: Vec<(u64, String)> = (0..2000)
-            .map(|i| (i as u64, format!("document number {i} about various topics and content")))
+            .map(|i| {
+                (
+                    i as u64,
+                    format!("document number {i} about various topics and content"),
+                )
+            })
             .collect();
         let doc_refs: Vec<(u64, &str)> = docs.iter().map(|(id, t)| (*id, t.as_str())).collect();
 
@@ -3696,7 +3801,10 @@ mod tests {
     #[test]
     fn highlight_multiple_terms() {
         let mut idx = InvertedIndex::new();
-        idx.add_document(1, "Rust is a systems programming language that is fast and safe");
+        idx.add_document(
+            1,
+            "Rust is a systems programming language that is fast and safe",
+        );
 
         // Highlight returns None because original texts are no longer kept in memory.
         let result = idx.highlight(1, "rust safe", "<b>", "</b>", 2);
@@ -3801,7 +3909,10 @@ mod tests {
         idx.add_document(2, "hello there");
         idx.set_facets(1, {
             let mut m = HashMap::new();
-            m.insert("tag".to_string(), vec!["greeting".to_string(), "general".to_string()]);
+            m.insert(
+                "tag".to_string(),
+                vec!["greeting".to_string(), "general".to_string()],
+            );
             m
         });
         idx.set_facets(2, {

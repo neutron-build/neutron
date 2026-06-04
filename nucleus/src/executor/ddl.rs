@@ -13,7 +13,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use sqlparser::ast::{self, Expr, SetExpr, SelectItem, Statement};
+use sqlparser::ast::{self, Expr, SelectItem, SetExpr, Statement};
 
 use crate::catalog::TableDef;
 use crate::planner;
@@ -22,12 +22,16 @@ use crate::storage::StorageEngine;
 use crate::types::{DataType, Row, Value};
 use crate::vector;
 
+use super::helpers::{
+    sql_replacement_for_value, strip_dollar_quotes, substitute_sql_placeholders, value_to_doc_json,
+};
 use super::schema_types::{
     FunctionDef, FunctionKind, FunctionLanguage, SequenceDef, TriggerDef, TriggerEvent,
     TriggerTiming, ViewDef,
 };
-use super::types::{ColMeta, EncryptedIndexEntry, GinIndexEntry, VectorIndexEntry, VectorIndexKind};
-use super::helpers::{sql_replacement_for_value, strip_dollar_quotes, substitute_sql_placeholders, value_to_doc_json};
+use super::types::{
+    ColMeta, EncryptedIndexEntry, GinIndexEntry, VectorIndexEntry, VectorIndexKind,
+};
 use super::{ExecError, ExecResult, Executor};
 
 impl Executor {
@@ -86,7 +90,7 @@ impl Executor {
             let seq_name = format!("{table_name}_{col_name}_seq");
             // Create the sequence (start=1, increment=1).
             let seq = SequenceDef {
-                current: 0,   // nextval will add increment (1), yielding 1 on first call
+                current: 0, // nextval will add increment (1), yielding 1 on first call
                 increment: 1,
                 min_value: 1,
                 max_value: i64::MAX,
@@ -119,20 +123,28 @@ impl Executor {
                     #[cfg(feature = "server")]
                     Some("columnar") => {
                         let eng = Arc::new(crate::storage::ColumnarStorageEngine::new());
-                        self.table_engines.write().insert(table_name.clone(), eng.clone());
+                        self.table_engines
+                            .write()
+                            .insert(table_name.clone(), eng.clone());
                         eng
                     }
                     #[cfg(feature = "server")]
-                    Some("mergetree") | Some("replacing_mergetree") | Some("aggregating_mergetree") => {
+                    Some("mergetree")
+                    | Some("replacing_mergetree")
+                    | Some("aggregating_mergetree") => {
                         // MergeTree variants use the columnar storage engine backed by MergeTree.
                         let eng = Arc::new(crate::storage::ColumnarStorageEngine::new());
-                        self.table_engines.write().insert(table_name.clone(), eng.clone());
+                        self.table_engines
+                            .write()
+                            .insert(table_name.clone(), eng.clone());
                         eng
                     }
                     #[cfg(feature = "server")]
                     Some("lsm") => {
                         let eng = Arc::new(crate::storage::LsmStorageEngine::new());
-                        self.table_engines.write().insert(table_name.clone(), eng.clone());
+                        self.table_engines
+                            .write()
+                            .insert(table_name.clone(), eng.clone());
                         eng
                     }
                     _ => self.storage.clone(),
@@ -146,7 +158,8 @@ impl Executor {
                     let strategy = match engine_name.as_deref() {
                         Some("replacing_mergetree") => {
                             let version_col = Self::extract_string_option(
-                                &create.table_options, "version_column",
+                                &create.table_options,
+                                "version_column",
                             );
                             // Register read-time dedup so SELECT collapses
                             // superseded versions. We resolve ORDER BY column
@@ -157,28 +170,28 @@ impl Executor {
                             let pk_idx: Vec<usize> = order_by_cols
                                 .iter()
                                 .filter_map(|name| {
-                                    table_def.columns.iter().position(|c|
-                                        c.name.eq_ignore_ascii_case(name)
-                                    )
+                                    table_def
+                                        .columns
+                                        .iter()
+                                        .position(|c| c.name.eq_ignore_ascii_case(name))
                                 })
                                 .collect();
                             let ver_idx = version_col.as_ref().and_then(|name| {
-                                table_def.columns.iter().position(|c|
-                                    c.name.eq_ignore_ascii_case(name)
-                                )
+                                table_def
+                                    .columns
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case(name))
                             });
-                            crate::columnar::register_replacing_table(
-                                &table_name, pk_idx, ver_idx,
-                            );
-                            MergeStrategy::Replacing { version_column: version_col }
+                            crate::columnar::register_replacing_table(&table_name, pk_idx, ver_idx);
+                            MergeStrategy::Replacing {
+                                version_column: version_col,
+                            }
                         }
                         Some("aggregating_mergetree") => {
-                            let sum_cols = Self::extract_csv_option(
-                                &create.table_options, "sum_columns",
-                            );
-                            let count_cols = Self::extract_csv_option(
-                                &create.table_options, "count_columns",
-                            );
+                            let sum_cols =
+                                Self::extract_csv_option(&create.table_options, "sum_columns");
+                            let count_cols =
+                                Self::extract_csv_option(&create.table_options, "count_columns");
                             MergeStrategy::Aggregating {
                                 group_columns: order_by_cols.clone(),
                                 sum_columns: sum_cols,
@@ -187,14 +200,18 @@ impl Executor {
                         }
                         _ => MergeStrategy::Default,
                     };
-                    self.columnar_store.write().create_merge_tree_table_with_strategy(
-                        &table_name,
-                        order_by_cols.clone(),
-                        strategy,
-                    );
+                    self.columnar_store
+                        .write()
+                        .create_merge_tree_table_with_strategy(
+                            &table_name,
+                            order_by_cols.clone(),
+                            strategy,
+                        );
                 }
                 // Cache column metadata for sync index scan path
-                let col_info: Vec<(String, DataType)> = table_def.columns.iter()
+                let col_info: Vec<(String, DataType)> = table_def
+                    .columns
+                    .iter()
                     .map(|c| (c.name.clone(), c.data_type.clone()))
                     .collect();
                 // Notify storage engine of schema (for WAL-based durability)
@@ -224,17 +241,20 @@ impl Executor {
     /// Check `WITH (append_only = true)` in CREATE TABLE options.
     fn extract_append_only_option(opts: &ast::CreateTableOptions) -> bool {
         let sql_opts = match opts {
-            ast::CreateTableOptions::With(v) | ast::CreateTableOptions::Options(v)
-            | ast::CreateTableOptions::Plain(v) | ast::CreateTableOptions::TableProperties(v) => v,
+            ast::CreateTableOptions::With(v)
+            | ast::CreateTableOptions::Options(v)
+            | ast::CreateTableOptions::Plain(v)
+            | ast::CreateTableOptions::TableProperties(v) => v,
             ast::CreateTableOptions::None => return false,
         };
         for opt in sql_opts {
             if let ast::SqlOption::KeyValue { key, value } = opt
                 && key.value.eq_ignore_ascii_case("append_only")
-                    && let ast::Expr::Value(v) = value {
-                        let s = v.to_string().to_lowercase();
-                        return s == "true" || s == "'true'" || s == "1";
-                    }
+                && let ast::Expr::Value(v) = value
+            {
+                let s = v.to_string().to_lowercase();
+                return s == "true" || s == "'true'" || s == "1";
+            }
         }
         false
     }
@@ -243,18 +263,21 @@ impl Executor {
     /// Returns the engine name (lowercase) if specified.
     fn extract_engine_option(opts: &ast::CreateTableOptions) -> Option<String> {
         let sql_opts = match opts {
-            ast::CreateTableOptions::With(v) | ast::CreateTableOptions::Options(v)
-            | ast::CreateTableOptions::Plain(v) | ast::CreateTableOptions::TableProperties(v) => v,
+            ast::CreateTableOptions::With(v)
+            | ast::CreateTableOptions::Options(v)
+            | ast::CreateTableOptions::Plain(v)
+            | ast::CreateTableOptions::TableProperties(v) => v,
             ast::CreateTableOptions::None => return None,
         };
         for opt in sql_opts {
             if let ast::SqlOption::KeyValue { key, value } = opt
-                && key.value.eq_ignore_ascii_case("engine") {
-                    let raw = value.to_string();
-                    // Strip surrounding quotes if present.
-                    let cleaned = raw.trim_matches('\'').trim_matches('"').to_lowercase();
-                    return Some(cleaned);
-                }
+                && key.value.eq_ignore_ascii_case("engine")
+            {
+                let raw = value.to_string();
+                // Strip surrounding quotes if present.
+                let cleaned = raw.trim_matches('\'').trim_matches('"').to_lowercase();
+                return Some(cleaned);
+            }
         }
         None
     }
@@ -262,17 +285,20 @@ impl Executor {
     /// Extract `WITH (version_column = 'col')` from CREATE TABLE options.
     fn extract_string_option(opts: &ast::CreateTableOptions, key_name: &str) -> Option<String> {
         let sql_opts = match opts {
-            ast::CreateTableOptions::With(v) | ast::CreateTableOptions::Options(v)
-            | ast::CreateTableOptions::Plain(v) | ast::CreateTableOptions::TableProperties(v) => v,
+            ast::CreateTableOptions::With(v)
+            | ast::CreateTableOptions::Options(v)
+            | ast::CreateTableOptions::Plain(v)
+            | ast::CreateTableOptions::TableProperties(v) => v,
             ast::CreateTableOptions::None => return None,
         };
         for opt in sql_opts {
             if let ast::SqlOption::KeyValue { key, value } = opt
-                && key.value.eq_ignore_ascii_case(key_name) {
-                    let raw = value.to_string();
-                    let cleaned = raw.trim_matches('\'').trim_matches('"').to_string();
-                    return Some(cleaned);
-                }
+                && key.value.eq_ignore_ascii_case(key_name)
+            {
+                let raw = value.to_string();
+                let cleaned = raw.trim_matches('\'').trim_matches('"').to_string();
+                return Some(cleaned);
+            }
         }
         None
     }
@@ -302,7 +328,11 @@ impl Executor {
     /// Return the storage engine for a specific table. Falls back to the global
     /// engine if no per-table override was registered (e.g. regular tables).
     pub(super) fn storage_for(&self, table: &str) -> Arc<dyn StorageEngine> {
-        self.table_engines.read().get(table).cloned().unwrap_or_else(|| self.storage.clone())
+        self.table_engines
+            .read()
+            .get(table)
+            .cloned()
+            .unwrap_or_else(|| self.storage.clone())
     }
 
     pub(super) async fn execute_drop(
@@ -319,19 +349,24 @@ impl Executor {
                     {
                         let deps = self.view_deps.read();
                         if let Some(views) = deps.get(&table_name)
-                            && !views.is_empty() {
-                                let dep_list: Vec<&str> = views.iter().map(|s| s.as_str()).collect();
-                                return Err(ExecError::Unsupported(format!(
-                                    "cannot drop table '{}' because view(s) {} depend on it",
-                                    table_name,
-                                    dep_list.join(", ")
-                                )));
-                            }
+                            && !views.is_empty()
+                        {
+                            let dep_list: Vec<&str> = views.iter().map(|s| s.as_str()).collect();
+                            return Err(ExecError::Unsupported(format!(
+                                "cannot drop table '{}' because view(s) {} depend on it",
+                                table_name,
+                                dep_list.join(", ")
+                            )));
+                        }
                     }
                     match self.catalog.drop_table(&table_name).await {
                         Ok(()) => {
-                            if let Err(e) = self.storage_for(&table_name).drop_table(&table_name).await {
-                                eprintln!("DDL: failed to drop storage for table '{table_name}': {e}");
+                            if let Err(e) =
+                                self.storage_for(&table_name).drop_table(&table_name).await
+                            {
+                                eprintln!(
+                                    "DDL: failed to drop storage for table '{table_name}': {e}"
+                                );
                             }
                             // Remove per-table engine entry if present.
                             self.table_engines.write().remove(&table_name);
@@ -344,8 +379,12 @@ impl Executor {
                             #[cfg(feature = "server")]
                             self.hash_indexes.retain(|(t, _), _| t != &table_name);
                             // Clean up vector and encrypted indexes
-                            self.vector_indexes.write().retain(|_, entry| entry.table_name != table_name);
-                            self.encrypted_indexes.write().retain(|_, entry| entry.table_name != table_name);
+                            self.vector_indexes
+                                .write()
+                                .retain(|_, entry| entry.table_name != table_name);
+                            self.encrypted_indexes
+                                .write()
+                                .retain(|_, entry| entry.table_name != table_name);
                             // Clean up view dependency tracking
                             self.view_deps.write().remove(&table_name);
                             // Clean up zone map stats
@@ -370,7 +409,9 @@ impl Executor {
                     let view_name = name.to_string();
                     let removed = self.views.write().await.remove(&view_name);
                     if removed.is_none() && !if_exists {
-                        return Err(ExecError::Unsupported(format!("view {view_name} does not exist")));
+                        return Err(ExecError::Unsupported(format!(
+                            "view {view_name} does not exist"
+                        )));
                     }
                     // Remove this view from dependency tracking.
                     let mut deps = self.view_deps.write();
@@ -434,7 +475,9 @@ impl Executor {
                     let role_name = name.to_string();
                     let removed = roles.remove(&role_name);
                     if removed.is_none() && !if_exists {
-                        return Err(ExecError::Unsupported(format!("role '{role_name}' does not exist")));
+                        return Err(ExecError::Unsupported(format!(
+                            "role '{role_name}' does not exist"
+                        )));
                     }
                 }
                 Ok(ExecResult::Command {
@@ -442,7 +485,9 @@ impl Executor {
                     rows_affected: 0,
                 })
             }
-            _ => Err(ExecError::Unsupported(format!("DROP {object_type:?} not supported"))),
+            _ => Err(ExecError::Unsupported(format!(
+                "DROP {object_type:?} not supported"
+            ))),
         }
     }
 
@@ -471,7 +516,11 @@ impl Executor {
             .collect();
 
         // Determine index type from USING clause
-        let index_type = match create_index.using.as_ref().map(|u| u.to_string().to_uppercase()) {
+        let index_type = match create_index
+            .using
+            .as_ref()
+            .map(|u| u.to_string().to_uppercase())
+        {
             Some(ref s) if s == "HASH" => crate::catalog::IndexType::Hash,
             Some(ref s) if s == "GIN" => crate::catalog::IndexType::Gin,
             Some(ref s) if s == "GIST" => crate::catalog::IndexType::Gist,
@@ -486,7 +535,11 @@ impl Executor {
         let mut vec_dims: usize = 0;
 
         // For encrypted indexes, build the encrypted index data structure.
-        let encryption_mode = match create_index.using.as_ref().map(|u| u.to_string().to_uppercase()) {
+        let encryption_mode = match create_index
+            .using
+            .as_ref()
+            .map(|u| u.to_string().to_uppercase())
+        {
             Some(ref s) if s.starts_with("ENCRYPTED") => {
                 let mode = if s.contains("OPE") || s.contains("ORDER") {
                     crate::storage::encrypted_index::EncryptionMode::OrderPreserving
@@ -540,25 +593,32 @@ impl Executor {
 
             options.insert("encryption_mode".to_string(), format!("{mode:?}"));
 
-            self.encrypted_indexes.write().insert(index_name.clone(), EncryptedIndexEntry {
-                table_name: table_name.clone(),
-                column_name: col_name,
-                index: enc_idx,
-            });
+            self.encrypted_indexes.write().insert(
+                index_name.clone(),
+                EncryptedIndexEntry {
+                    table_name: table_name.clone(),
+                    column_name: col_name,
+                    index: enc_idx,
+                },
+            );
         }
 
         // For vector indexes, extract column type to determine dimensions
-        if matches!(index_type, crate::catalog::IndexType::Hnsw | crate::catalog::IndexType::IvfFlat) {
+        if matches!(
+            index_type,
+            crate::catalog::IndexType::Hnsw | crate::catalog::IndexType::IvfFlat
+        ) {
             let table_def = self.get_table(&table_name).await?;
             if let Some(col_name) = create_index.columns.first() {
                 let col_name_str = col_name.column.expr.to_string();
                 if let Some(ci) = table_def.column_index(&col_name_str)
-                    && let crate::types::DataType::Vector(dims) = table_def.columns[ci].data_type {
-                        vec_col_idx = Some(ci);
-                        vec_dims = dims;
-                        options.insert("dims".to_string(), dims.to_string());
-                        options.insert("metric".to_string(), "l2".to_string());
-                    }
+                    && let crate::types::DataType::Vector(dims) = table_def.columns[ci].data_type
+                {
+                    vec_col_idx = Some(ci);
+                    vec_dims = dims;
+                    options.insert("dims".to_string(), dims.to_string());
+                    options.insert("metric".to_string(), "l2".to_string());
+                }
             }
         }
 
@@ -577,8 +637,7 @@ impl Executor {
             let metric = vector::DistanceMetric::L2;
             let col_name = columns.first().cloned().unwrap_or_default();
 
-            let existing_rows = self.storage.scan(&table_name).await
-                .unwrap_or_default();
+            let existing_rows = self.storage.scan(&table_name).await.unwrap_or_default();
 
             match &index_type {
                 crate::catalog::IndexType::Hnsw => {
@@ -593,16 +652,20 @@ impl Executor {
                     // Scan existing rows and insert into index
                     for (row_id, row) in existing_rows.iter().enumerate() {
                         if col_idx < row.len()
-                            && let Value::Vector(v) = &row[col_idx] {
-                                hnsw.insert(row_id as u64, vector::Vector::new(v.clone()));
-                            }
+                            && let Value::Vector(v) = &row[col_idx]
+                        {
+                            hnsw.insert(row_id as u64, vector::Vector::new(v.clone()));
+                        }
                     }
 
-                    self.vector_indexes.write().insert(index_name.clone(), VectorIndexEntry {
-                        table_name: table_name.clone(),
-                        column_name: col_name,
-                        kind: VectorIndexKind::Hnsw(hnsw),
-                    });
+                    self.vector_indexes.write().insert(
+                        index_name.clone(),
+                        VectorIndexEntry {
+                            table_name: table_name.clone(),
+                            column_name: col_name,
+                            kind: VectorIndexKind::Hnsw(hnsw),
+                        },
+                    );
 
                     // Log CREATE INDEX + existing row insertions to WAL
                     if let Some(ref wal) = self.vector_wal {
@@ -624,15 +687,19 @@ impl Executor {
                         for (row_id, row) in existing_rows.iter().enumerate() {
                             if col_idx < row.len()
                                 && let Value::Vector(v) = &row[col_idx]
-                                    && let Err(e) = wal.log_insert(&index_name, row_id as u64, v, "") {
-                                        eprintln!("vector WAL: failed to log insert for '{index_name}/{row_id}': {e}");
-                                    }
+                                && let Err(e) = wal.log_insert(&index_name, row_id as u64, v, "")
+                            {
+                                eprintln!(
+                                    "vector WAL: failed to log insert for '{index_name}/{row_id}': {e}"
+                                );
+                            }
                         }
                         self.save_vector_index_meta();
                     }
                 }
                 crate::catalog::IndexType::IvfFlat => {
-                    let vectors: Vec<Vec<f32>> = existing_rows.iter()
+                    let vectors: Vec<Vec<f32>> = existing_rows
+                        .iter()
                         .filter_map(|row| {
                             if col_idx < row.len() {
                                 if let Value::Vector(v) = &row[col_idx] {
@@ -655,48 +722,58 @@ impl Executor {
                         ivf.train(&vectors);
                         for (row_id, row) in existing_rows.iter().enumerate() {
                             if col_idx < row.len()
-                                && let Value::Vector(v) = &row[col_idx] {
-                                    ivf.add(row_id, v.clone());
-                                }
+                                && let Value::Vector(v) = &row[col_idx]
+                            {
+                                ivf.add(row_id, v.clone());
+                            }
                         }
                     }
 
-                    self.vector_indexes.write().insert(index_name.clone(), VectorIndexEntry {
-                        table_name: table_name.clone(),
-                        column_name: col_name,
-                        kind: VectorIndexKind::IvfFlat(ivf),
-                    });
+                    self.vector_indexes.write().insert(
+                        index_name.clone(),
+                        VectorIndexEntry {
+                            table_name: table_name.clone(),
+                            column_name: col_name,
+                            kind: VectorIndexKind::IvfFlat(ivf),
+                        },
+                    );
                 }
                 _ => {}
             }
         }
 
         // For BTree/Hash indexes, build the index in the storage engine.
-        if matches!(index_type, crate::catalog::IndexType::BTree | crate::catalog::IndexType::Hash) {
+        if matches!(
+            index_type,
+            crate::catalog::IndexType::BTree | crate::catalog::IndexType::Hash
+        ) {
             let table_def = self.get_table(&table_name).await?;
             if let Some(col_name) = columns.first()
-                && let Some(col_idx) = table_def.column_index(col_name) {
-                    if let Err(e) = self.storage.create_index(&table_name, &index_name, col_idx).await {
-                        tracing::warn!("Storage index creation failed for {index_name}: {e}");
-                    } else {
-                        // Register in sync index map for use during query execution
-                        self.btree_indexes.insert(
+                && let Some(col_idx) = table_def.column_index(col_name)
+            {
+                if let Err(e) = self
+                    .storage
+                    .create_index(&table_name, &index_name, col_idx)
+                    .await
+                {
+                    tracing::warn!("Storage index creation failed for {index_name}: {e}");
+                } else {
+                    // Register in sync index map for use during query execution
+                    self.btree_indexes
+                        .insert((table_name.clone(), col_name.clone()), index_name.clone());
+                    // For hash indexes, also register in hash_indexes so the
+                    // planner can use O(1) cost estimation instead of O(log n).
+                    #[cfg(feature = "server")]
+                    if matches!(index_type, crate::catalog::IndexType::Hash) {
+                        self.hash_indexes.insert(
                             (table_name.clone(), col_name.clone()),
-                            index_name.clone(),
+                            crate::storage::btree::HashIndex::new(
+                                table_def.columns[col_idx].data_type.clone(),
+                            ),
                         );
-                        // For hash indexes, also register in hash_indexes so the
-                        // planner can use O(1) cost estimation instead of O(log n).
-                        #[cfg(feature = "server")]
-                        if matches!(index_type, crate::catalog::IndexType::Hash) {
-                            self.hash_indexes.insert(
-                                (table_name.clone(), col_name.clone()),
-                                crate::storage::btree::HashIndex::new(
-                                    table_def.columns[col_idx].data_type.clone(),
-                                ),
-                            );
-                        }
                     }
                 }
+            }
         }
 
         // For GIN indexes on JSONB columns, build an in-memory inverted index.
@@ -715,12 +792,15 @@ impl Executor {
                         gin.insert(row_id as u64, &doc);
                     }
                 }
-                self.gin_indexes.write().insert(index_name.clone(), GinIndexEntry {
-                    table_name: table_name.clone(),
-                    column_name: col_name.clone(),
-                    col_idx,
-                    index: gin,
-                });
+                self.gin_indexes.write().insert(
+                    index_name.clone(),
+                    GinIndexEntry {
+                        table_name: table_name.clone(),
+                        column_name: col_name.clone(),
+                        col_idx,
+                        index: gin,
+                    },
+                );
             }
         }
 
@@ -739,7 +819,9 @@ impl Executor {
                     rows_affected: 0,
                 })
             }
-            Err(e) => Err(ExecError::Unsupported(format!("index creation failed: {e}"))),
+            Err(e) => Err(ExecError::Unsupported(format!(
+                "index creation failed: {e}"
+            ))),
         }
     }
 
@@ -760,8 +842,11 @@ impl Executor {
             self.storage.create_table(&table_name).await?;
             // Re-store schema in WAL after truncate recreate
             if let Some(td) = self.catalog.get_table(&table_name).await {
-                let col_info: Vec<(String, DataType)> = td.columns.iter()
-                    .map(|c| (c.name.clone(), c.data_type.clone())).collect();
+                let col_info: Vec<(String, DataType)> = td
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.data_type.clone()))
+                    .collect();
                 self.storage.store_table_schema(&table_name, &col_info);
             }
 
@@ -769,8 +854,12 @@ impl Executor {
             self.btree_indexes.retain(|(t, _), _| t != &table_name);
             #[cfg(feature = "server")]
             self.hash_indexes.retain(|(t, _), _| t != &table_name);
-            self.vector_indexes.write().retain(|_, entry| entry.table_name != table_name);
-            self.encrypted_indexes.write().retain(|_, entry| entry.table_name != table_name);
+            self.vector_indexes
+                .write()
+                .retain(|_, entry| entry.table_name != table_name);
+            self.encrypted_indexes
+                .write()
+                .retain(|_, entry| entry.table_name != table_name);
             // Clear zone map stats for the truncated table
             {
                 let mut hasher = DefaultHasher::new();
@@ -798,7 +887,9 @@ impl Executor {
 
         for op in &alter_table.operations {
             match op {
-                ast::AlterTableOperation::RenameTable { table_name: new_name } => {
+                ast::AlterTableOperation::RenameTable {
+                    table_name: new_name,
+                } => {
                     // Extract the ObjectName from the RenameTableNameKind enum
                     let new = match new_name {
                         ast::RenameTableNameKind::To(obj) | ast::RenameTableNameKind::As(obj) => {
@@ -814,11 +905,15 @@ impl Executor {
                         engine.insert(&new, row).await?;
                     }
                     if let Err(e) = engine.drop_table(&table_name).await {
-                        eprintln!("ALTER TABLE RENAME: failed to drop old table '{table_name}': {e}");
+                        eprintln!(
+                            "ALTER TABLE RENAME: failed to drop old table '{table_name}': {e}"
+                        );
                     }
                     // Update the table_columns cache for the new name
                     if let Some(updated_def) = self.catalog.get_table(&new).await {
-                        let col_info: Vec<(String, DataType)> = updated_def.columns.iter()
+                        let col_info: Vec<(String, DataType)> = updated_def
+                            .columns
+                            .iter()
                             .map(|c| (c.name.clone(), c.data_type.clone()))
                             .collect();
                         self.table_columns.write().insert(new.clone(), col_info);
@@ -840,7 +935,9 @@ impl Executor {
                             // Column already exists, but IF NOT EXISTS was specified, skip
                             continue;
                         } else {
-                            return Err(ExecError::Unsupported(format!("column {col_name} already exists")));
+                            return Err(ExecError::Unsupported(format!(
+                                "column {col_name} already exists"
+                            )));
                         }
                     }
 
@@ -851,10 +948,11 @@ impl Executor {
                             ast::ColumnOption::NotNull | ast::ColumnOption::PrimaryKey(_)
                         )
                     });
-                    let default_expr = column_def.options.iter().find_map(|opt| match &opt.option {
-                        ast::ColumnOption::Default(expr) => Some(expr.to_string()),
-                        _ => None,
-                    });
+                    let default_expr =
+                        column_def.options.iter().find_map(|opt| match &opt.option {
+                            ast::ColumnOption::Default(expr) => Some(expr.to_string()),
+                            _ => None,
+                        });
                     let new_col = crate::catalog::ColumnDef {
                         name: col_name.clone(),
                         data_type: dtype,
@@ -872,21 +970,38 @@ impl Executor {
                             if let SetExpr::Select(sel) = q.body.as_ref() {
                                 if let SelectItem::UnnamedExpr(expr) = &sel.projection[0] {
                                     self.eval_const_expr(expr)?
-                                } else { Value::Null }
-                            } else { Value::Null }
-                        } else { Value::Null }
-                    } else { Value::Null };
+                                } else {
+                                    Value::Null
+                                }
+                            } else {
+                                Value::Null
+                            }
+                        } else {
+                            Value::Null
+                        }
+                    } else {
+                        Value::Null
+                    };
 
                     let engine = self.storage_for(&table_name);
                     let rows = engine.scan(&table_name).await?;
-                    let updates: Vec<(usize, Row)> = rows.into_iter().enumerate()
-                        .map(|(i, mut r)| { r.push(default_val.clone()); (i, r) })
+                    let updates: Vec<(usize, Row)> = rows
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, mut r)| {
+                            r.push(default_val.clone());
+                            (i, r)
+                        })
                         .collect();
                     if !updates.is_empty() {
                         engine.update(&table_name, &updates).await?;
                     }
                 }
-                ast::AlterTableOperation::DropColumn { column_names, if_exists, .. } => {
+                ast::AlterTableOperation::DropColumn {
+                    column_names,
+                    if_exists,
+                    ..
+                } => {
                     let mut updated = (*table_def).clone();
                     let mut drop_indices = Vec::new();
                     for col_name in column_names {
@@ -909,9 +1024,13 @@ impl Executor {
                     // Remove column data from existing rows
                     let engine = self.storage_for(&table_name);
                     let rows = engine.scan(&table_name).await?;
-                    let updates: Vec<(usize, Row)> = rows.into_iter().enumerate()
+                    let updates: Vec<(usize, Row)> = rows
+                        .into_iter()
+                        .enumerate()
                         .map(|(i, r)| {
-                            let new_row: Vec<Value> = r.into_iter().enumerate()
+                            let new_row: Vec<Value> = r
+                                .into_iter()
+                                .enumerate()
                                 .filter(|(j, _)| !drop_indices.contains(j))
                                 .map(|(_, v)| v)
                                 .collect();
@@ -922,9 +1041,14 @@ impl Executor {
                         engine.update(&table_name, &updates).await?;
                     }
                 }
-                ast::AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                ast::AlterTableOperation::RenameColumn {
+                    old_column_name,
+                    new_column_name,
+                } => {
                     let mut updated = (*table_def).clone();
-                    let col = updated.columns.iter_mut()
+                    let col = updated
+                        .columns
+                        .iter_mut()
                         .find(|c| c.name == old_column_name.value)
                         .ok_or_else(|| ExecError::ColumnNotFound(old_column_name.value.clone()))?;
                     col.name = new_column_name.value.clone();
@@ -932,7 +1056,9 @@ impl Executor {
                 }
                 ast::AlterTableOperation::AlterColumn { column_name, op } => {
                     let mut updated = (*table_def).clone();
-                    let col = updated.columns.iter_mut()
+                    let col = updated
+                        .columns
+                        .iter_mut()
                         .find(|c| c.name == column_name.value)
                         .ok_or_else(|| ExecError::ColumnNotFound(column_name.value.clone()))?;
                     match op {
@@ -961,44 +1087,62 @@ impl Executor {
                     match constraint {
                         ast::TableConstraint::PrimaryKey(pk) => {
                             // Reject if there's already a PK.
-                            if updated.constraints.iter().any(|c| matches!(c, crate::catalog::TableConstraint::PrimaryKey { .. })) {
+                            if updated.constraints.iter().any(|c| {
+                                matches!(c, crate::catalog::TableConstraint::PrimaryKey { .. })
+                            }) {
                                 return Err(ExecError::ConstraintViolation(
                                     "table already has a PRIMARY KEY".into(),
                                 ));
                             }
-                            let columns: Vec<String> = pk.columns.iter().map(|c| c.column.expr.to_string()).collect();
+                            let columns: Vec<String> = pk
+                                .columns
+                                .iter()
+                                .map(|c| c.column.expr.to_string())
+                                .collect();
                             // Validate columns exist.
                             for col_name in &columns {
                                 if updated.column_index(col_name).is_none() {
                                     return Err(ExecError::ColumnNotFound(col_name.clone()));
                                 }
                             }
-                            updated.constraints.push(crate::catalog::TableConstraint::PrimaryKey {
-                                columns: columns.clone(),
-                            });
+                            updated
+                                .constraints
+                                .push(crate::catalog::TableConstraint::PrimaryKey {
+                                    columns: columns.clone(),
+                                });
                             self.catalog.update_table(updated.clone()).await?;
                             // Create backing unique index.
                             if let Err(e) = self.create_implicit_unique_indexes(&updated).await {
-                                tracing::warn!("ADD CONSTRAINT PRIMARY KEY: implicit index warning: {e}");
+                                tracing::warn!(
+                                    "ADD CONSTRAINT PRIMARY KEY: implicit index warning: {e}"
+                                );
                             }
                         }
                         ast::TableConstraint::Unique(u) => {
                             let constraint_name = u.name.as_ref().map(|n| n.to_string());
-                            let columns: Vec<String> = u.columns.iter().map(|c| c.column.expr.to_string()).collect();
+                            let columns: Vec<String> = u
+                                .columns
+                                .iter()
+                                .map(|c| c.column.expr.to_string())
+                                .collect();
                             // Validate columns exist.
                             for col_name in &columns {
                                 if updated.column_index(col_name).is_none() {
                                     return Err(ExecError::ColumnNotFound(col_name.clone()));
                                 }
                             }
-                            updated.constraints.push(crate::catalog::TableConstraint::Unique {
-                                name: constraint_name,
-                                columns: columns.clone(),
-                            });
+                            updated
+                                .constraints
+                                .push(crate::catalog::TableConstraint::Unique {
+                                    name: constraint_name,
+                                    columns: columns.clone(),
+                                });
                             self.catalog.update_table(updated.clone()).await?;
                             // Create backing unique index.
                             if let Err(e) = self.create_implicit_unique_indexes(&updated).await {
-                                tracing::warn!("ADD CONSTRAINT UNIQUE: implicit index warning: {e}");
+                                tracing::warn!(
+                                    "ADD CONSTRAINT UNIQUE: implicit index warning: {e}"
+                                );
                             }
                         }
                         ast::TableConstraint::Check(ck) => {
@@ -1022,23 +1166,30 @@ impl Executor {
                         }
                         ast::TableConstraint::ForeignKey(fk) => {
                             let constraint_name = fk.name.as_ref().map(|n| n.to_string());
-                            let columns: Vec<String> = fk.columns.iter().map(|c| c.value.clone()).collect();
+                            let columns: Vec<String> =
+                                fk.columns.iter().map(|c| c.value.clone()).collect();
                             let ref_table = fk.foreign_table.to_string();
-                            let ref_columns: Vec<String> = fk.referred_columns.iter().map(|c| c.value.clone()).collect();
+                            let ref_columns: Vec<String> = fk
+                                .referred_columns
+                                .iter()
+                                .map(|c| c.value.clone())
+                                .collect();
                             // Validate local columns exist.
                             for col_name in &columns {
                                 if updated.column_index(col_name).is_none() {
                                     return Err(ExecError::ColumnNotFound(col_name.clone()));
                                 }
                             }
-                            updated.constraints.push(crate::catalog::TableConstraint::ForeignKey {
-                                name: constraint_name,
-                                columns,
-                                ref_table,
-                                ref_columns,
-                                on_delete: sql::convert_fk_action(&fk.on_delete),
-                                on_update: sql::convert_fk_action(&fk.on_update),
-                            });
+                            updated
+                                .constraints
+                                .push(crate::catalog::TableConstraint::ForeignKey {
+                                    name: constraint_name,
+                                    columns,
+                                    ref_table,
+                                    ref_columns,
+                                    on_delete: sql::convert_fk_action(&fk.on_delete),
+                                    on_update: sql::convert_fk_action(&fk.on_update),
+                                });
                             self.catalog.update_table(updated).await?;
                         }
                         _ => {
@@ -1049,7 +1200,9 @@ impl Executor {
                     }
                 }
                 // ── DROP CONSTRAINT ────────────────────────────────────────────
-                ast::AlterTableOperation::DropConstraint { name, if_exists, .. } => {
+                ast::AlterTableOperation::DropConstraint {
+                    name, if_exists, ..
+                } => {
                     let constraint_name = name.to_string();
                     let mut updated = (*table_def).clone();
                     let original_len = updated.constraints.len();
@@ -1059,7 +1212,9 @@ impl Executor {
                             crate::catalog::TableConstraint::PrimaryKey { .. } => None,
                             crate::catalog::TableConstraint::Unique { name, .. } => name.as_deref(),
                             crate::catalog::TableConstraint::Check { name, .. } => name.as_deref(),
-                            crate::catalog::TableConstraint::ForeignKey { name, .. } => name.as_deref(),
+                            crate::catalog::TableConstraint::ForeignKey { name, .. } => {
+                                name.as_deref()
+                            }
                         };
                         cname != Some(constraint_name.as_str())
                     });
@@ -1088,10 +1243,14 @@ impl Executor {
 
         // Refresh the table_columns cache so the index scan path sees the new schema.
         if let Some(updated_def) = self.catalog.get_table(&table_name).await {
-            let col_info: Vec<(String, DataType)> = updated_def.columns.iter()
+            let col_info: Vec<(String, DataType)> = updated_def
+                .columns
+                .iter()
                 .map(|c| (c.name.clone(), c.data_type.clone()))
                 .collect();
-            self.table_columns.write().insert(table_name.clone(), col_info);
+            self.table_columns
+                .write()
+                .insert(table_name.clone(), col_info);
         } else {
             self.table_columns.write().remove(&table_name);
         }
@@ -1159,7 +1318,9 @@ impl Executor {
             ast::TableFactor::Derived { subquery, .. } => {
                 out.extend(Self::extract_table_refs(subquery));
             }
-            ast::TableFactor::NestedJoin { table_with_joins, .. } => {
+            ast::TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
                 Self::collect_table_factor(&table_with_joins.relation, out);
                 for join in &table_with_joins.joins {
                     Self::collect_table_factor(&join.relation, out);
@@ -1176,22 +1337,36 @@ impl Executor {
         let name = create_fn.name.to_string().to_lowercase();
 
         // Extract parameter names and types
-        let params: Vec<(String, DataType)> = create_fn.args.unwrap_or_default().iter().map(|arg| {
-            let param_name = arg.name.as_ref().map(|n| n.value.clone()).unwrap_or_default();
-            let param_type = crate::sql::convert_data_type(&arg.data_type)
-                .unwrap_or(DataType::Text);
-            (param_name, param_type)
-        }).collect();
+        let params: Vec<(String, DataType)> = create_fn
+            .args
+            .unwrap_or_default()
+            .iter()
+            .map(|arg| {
+                let param_name = arg
+                    .name
+                    .as_ref()
+                    .map(|n| n.value.clone())
+                    .unwrap_or_default();
+                let param_type =
+                    crate::sql::convert_data_type(&arg.data_type).unwrap_or(DataType::Text);
+                (param_name, param_type)
+            })
+            .collect();
 
         // Extract return type
-        let return_type = create_fn.return_type
+        let return_type = create_fn
+            .return_type
             .as_ref()
             .and_then(|dt| crate::sql::convert_data_type(dt).ok());
 
         // Extract function body, stripping dollar-quoting if present
         let body = match &create_fn.function_body {
-            Some(ast::CreateFunctionBody::AsBeforeOptions { body, .. }) => strip_dollar_quotes(&body.to_string()),
-            Some(ast::CreateFunctionBody::AsAfterOptions(expr)) => strip_dollar_quotes(&expr.to_string()),
+            Some(ast::CreateFunctionBody::AsBeforeOptions { body, .. }) => {
+                strip_dollar_quotes(&body.to_string())
+            }
+            Some(ast::CreateFunctionBody::AsAfterOptions(expr)) => {
+                strip_dollar_quotes(&expr.to_string())
+            }
             Some(ast::CreateFunctionBody::Return(expr)) => expr.to_string(),
             _ => String::new(),
         };
@@ -1203,7 +1378,11 @@ impl Executor {
         };
 
         let is_procedure = name.starts_with("proc_");
-        let kind = if is_procedure { FunctionKind::Procedure } else { FunctionKind::Function };
+        let kind = if is_procedure {
+            FunctionKind::Procedure
+        } else {
+            FunctionKind::Function
+        };
 
         let func_def = FunctionDef {
             name: name.clone(),
@@ -1230,7 +1409,9 @@ impl Executor {
             let name = desc.name.to_string().to_lowercase();
             let removed = self.functions.write().remove(&name).is_some();
             if !removed && !if_exists {
-                return Err(ExecError::Unsupported(format!("function {name} does not exist")));
+                return Err(ExecError::Unsupported(format!(
+                    "function {name} does not exist"
+                )));
             }
         }
         Ok(ExecResult::Command {
@@ -1257,14 +1438,16 @@ impl Executor {
         let empty_row: Row = Vec::new();
         let empty_meta: Vec<ColMeta> = Vec::new();
         let args: Vec<Value> = if let ast::FunctionArguments::List(ref arg_list) = func.args {
-            arg_list.args.iter().map(|arg| {
-                match arg {
-                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => {
-                        self.eval_row_expr(expr, &empty_row, &empty_meta).unwrap_or(Value::Null)
-                    }
+            arg_list
+                .args
+                .iter()
+                .map(|arg| match arg {
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => self
+                        .eval_row_expr(expr, &empty_row, &empty_meta)
+                        .unwrap_or(Value::Null),
                     _ => Value::Null,
-                }
-            }).collect()
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -1304,9 +1487,17 @@ impl Executor {
     ) -> Result<ExecResult, ExecError> {
         let table = match &analyze.table_name {
             Some(name) => name.to_string().to_lowercase(),
-            None => return Ok(ExecResult::Command { tag: "ANALYZE".into(), rows_affected: 0 }),
+            None => {
+                return Ok(ExecResult::Command {
+                    tag: "ANALYZE".into(),
+                    rows_affected: 0,
+                });
+            }
         };
-        let table_def = self.catalog.get_table(&table).await
+        let table_def = self
+            .catalog
+            .get_table(&table)
+            .await
             .ok_or_else(|| ExecError::TableNotFound(table.clone()))?;
 
         // Count rows by scanning the table
@@ -1340,39 +1531,65 @@ impl Executor {
                             // Track min/max (Value implements Ord)
                             match &min_val {
                                 None => min_val = Some(val.clone()),
-                                Some(cur) => if val < cur { min_val = Some(val.clone()); }
+                                Some(cur) => {
+                                    if val < cur {
+                                        min_val = Some(val.clone());
+                                    }
+                                }
                             }
                             match &max_val {
                                 None => max_val = Some(val.clone()),
-                                Some(cur) => if val > cur { max_val = Some(val.clone()); }
+                                Some(cur) => {
+                                    if val > cur {
+                                        max_val = Some(val.clone());
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
 
-            let null_fraction = if row_count > 0 { null_count as f64 / row_count as f64 } else { 0.0 };
-            let avg_width = if row_count > null_count { total_width / (row_count - null_count).max(1) } else { 0 };
+            let null_fraction = if row_count > 0 {
+                null_count as f64 / row_count as f64
+            } else {
+                0.0
+            };
+            let avg_width = if row_count > null_count {
+                total_width / (row_count - null_count).max(1)
+            } else {
+                0
+            };
 
-            column_stats.insert(col_def.name.clone(), planner::ColumnStats {
-                distinct_count: distinct.len().max(1),
-                null_fraction,
-                avg_width,
-                min_value: min_val.as_ref().map(|v| format!("{v}")),
-                max_value: max_val.as_ref().map(|v| format!("{v}")),
-            });
+            column_stats.insert(
+                col_def.name.clone(),
+                planner::ColumnStats {
+                    distinct_count: distinct.len().max(1),
+                    null_fraction,
+                    avg_width,
+                    min_value: min_val.as_ref().map(|v| format!("{v}")),
+                    max_value: max_val.as_ref().map(|v| format!("{v}")),
+                },
+            );
         }
 
         let page_count = (row_count / 100).max(1);
         let mut stats = planner::TableStats::new(&table, row_count, page_count);
         stats.column_stats = column_stats;
-        stats.last_analyzed = Some(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
+        stats.last_analyzed = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
 
         // Persist stats to the shared store so EXPLAIN / query planner can use them
         self.stats_store.update(stats).await;
 
-        Ok(ExecResult::Command { tag: "ANALYZE".into(), rows_affected: row_count })
+        Ok(ExecResult::Command {
+            tag: "ANALYZE".into(),
+            rows_affected: row_count,
+        })
     }
 
     pub(super) async fn execute_prepare(
@@ -1398,7 +1615,10 @@ impl Executor {
             }
         };
         let sess = self.current_session();
-        sess.prepared_stmts.write().await.insert(name.to_string(), prepared);
+        sess.prepared_stmts
+            .write()
+            .await
+            .insert(name.to_string(), prepared);
         Ok(ExecResult::Command {
             tag: "PREPARE".into(),
             rows_affected: 0,
@@ -1409,14 +1629,17 @@ impl Executor {
         &self,
         name: &str,
         parameters: &[Expr],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExecResult, ExecError>> + Send + '_>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ExecResult, ExecError>> + Send + '_>,
+    > {
         let name = name.to_string();
         let parameters = parameters.to_vec();
         Box::pin(async move {
             let sess = self.current_session();
             let stmts = sess.prepared_stmts.read().await;
-            let prepared = stmts.get(&name)
-                .ok_or_else(|| ExecError::Unsupported(format!("prepared statement '{name}' not found")))?;
+            let prepared = stmts.get(&name).ok_or_else(|| {
+                ExecError::Unsupported(format!("prepared statement '{name}' not found"))
+            })?;
 
             // Evaluate parameter expressions to Nucleus Values
             let param_values: Vec<Value> = parameters
@@ -1502,7 +1725,9 @@ impl Executor {
         let tokens: Vec<&str> = sql.split_whitespace().collect();
         // tokens[0]="ALTER", tokens[1]="SEQUENCE", tokens[2]=name
         if tokens.len() < 4 {
-            return Err(ExecError::Unsupported("ALTER SEQUENCE requires options".into()));
+            return Err(ExecError::Unsupported(
+                "ALTER SEQUENCE requires options".into(),
+            ));
         }
         let seq_name = tokens[2].to_lowercase();
         let seqs = self.sequences.read();
@@ -1521,10 +1746,14 @@ impl Executor {
                                 seq.current = val - seq.increment;
                                 i += 3;
                             } else {
-                                return Err(ExecError::Unsupported("RESTART WITH requires a number".into()));
+                                return Err(ExecError::Unsupported(
+                                    "RESTART WITH requires a number".into(),
+                                ));
                             }
                         } else {
-                            return Err(ExecError::Unsupported("RESTART WITH requires a value".into()));
+                            return Err(ExecError::Unsupported(
+                                "RESTART WITH requires a value".into(),
+                            ));
                         }
                     } else {
                         seq.current = seq.min_value - seq.increment;
@@ -1532,13 +1761,19 @@ impl Executor {
                     }
                 }
                 "INCREMENT" => {
-                    let skip = if i + 1 < tokens.len() && tokens[i + 1].to_uppercase() == "BY" { 2 } else { 1 };
+                    let skip = if i + 1 < tokens.len() && tokens[i + 1].to_uppercase() == "BY" {
+                        2
+                    } else {
+                        1
+                    };
                     if i + skip < tokens.len() {
                         if let Ok(val) = tokens[i + skip].parse::<i64>() {
                             seq.increment = val;
                             i += skip + 1;
                         } else {
-                            return Err(ExecError::Unsupported("INCREMENT requires a number".into()));
+                            return Err(ExecError::Unsupported(
+                                "INCREMENT requires a number".into(),
+                            ));
                         }
                     } else {
                         return Err(ExecError::Unsupported("INCREMENT requires a value".into()));
@@ -1550,7 +1785,9 @@ impl Executor {
                             seq.min_value = val;
                             i += 2;
                         } else {
-                            return Err(ExecError::Unsupported("MINVALUE requires a number".into()));
+                            return Err(ExecError::Unsupported(
+                                "MINVALUE requires a number".into(),
+                            ));
                         }
                     } else {
                         return Err(ExecError::Unsupported("MINVALUE requires a value".into()));
@@ -1562,13 +1799,17 @@ impl Executor {
                             seq.max_value = val;
                             i += 2;
                         } else {
-                            return Err(ExecError::Unsupported("MAXVALUE requires a number".into()));
+                            return Err(ExecError::Unsupported(
+                                "MAXVALUE requires a number".into(),
+                            ));
                         }
                     } else {
                         return Err(ExecError::Unsupported("MAXVALUE requires a value".into()));
                     }
                 }
-                _ => { i += 1; }
+                _ => {
+                    i += 1;
+                }
             }
         }
 
@@ -1611,7 +1852,10 @@ impl Executor {
     // REFRESH MATERIALIZED VIEW, VACUUM, DISCARD, RESET
     // ========================================================================
 
-    pub(super) async fn execute_refresh_matview(&self, view_name: &str) -> Result<ExecResult, ExecError> {
+    pub(super) async fn execute_refresh_matview(
+        &self,
+        view_name: &str,
+    ) -> Result<ExecResult, ExecError> {
         let view_name = view_name.to_lowercase();
         let sql = {
             let views = self.materialized_views.read().await;
@@ -1636,15 +1880,23 @@ impl Executor {
                 rows_affected: row_count,
             })
         } else {
-            Err(ExecError::Unsupported("materialized view query must return rows".into()))
+            Err(ExecError::Unsupported(
+                "materialized view query must return rows".into(),
+            ))
         }
     }
 
-    pub(super) async fn execute_drop_matview(&self, view_name: &str, if_exists: bool) -> Result<ExecResult, ExecError> {
+    pub(super) async fn execute_drop_matview(
+        &self,
+        view_name: &str,
+        if_exists: bool,
+    ) -> Result<ExecResult, ExecError> {
         let view_name = view_name.to_lowercase();
         let removed = self.materialized_views.write().await.remove(&view_name);
         if removed.is_none() && !if_exists {
-            return Err(ExecError::TableNotFound(format!("materialized view '{view_name}' not found")));
+            return Err(ExecError::TableNotFound(format!(
+                "materialized view '{view_name}' not found"
+            )));
         }
         // Clean up mv_deps: remove this MV from all base table dependency lists.
         {
@@ -1661,13 +1913,17 @@ impl Executor {
         })
     }
 
-    pub(super) async fn execute_vacuum(&self, vacuum_stmt: &ast::VacuumStatement) -> Result<ExecResult, ExecError> {
-        let (pages_scanned, dead_reclaimed, pages_freed, bytes_reclaimed) = if let Some(ref table_name) = vacuum_stmt.table_name {
-            let table = table_name.to_string().to_lowercase();
-            self.storage.vacuum(&table).await?
-        } else {
-            self.storage.vacuum_all().await?
-        };
+    pub(super) async fn execute_vacuum(
+        &self,
+        vacuum_stmt: &ast::VacuumStatement,
+    ) -> Result<ExecResult, ExecError> {
+        let (pages_scanned, dead_reclaimed, pages_freed, bytes_reclaimed) =
+            if let Some(ref table_name) = vacuum_stmt.table_name {
+                let table = table_name.to_string().to_lowercase();
+                self.storage.vacuum(&table).await?
+            } else {
+                self.storage.vacuum_all().await?
+            };
         let columns = vec![
             ("pages_scanned".into(), DataType::Int64),
             ("dead_tuples_reclaimed".into(), DataType::Int64),
@@ -1683,7 +1939,10 @@ impl Executor {
         Ok(ExecResult::Select { columns, rows })
     }
 
-    pub(super) async fn execute_discard(&self, object_type: ast::DiscardObject) -> Result<ExecResult, ExecError> {
+    pub(super) async fn execute_discard(
+        &self,
+        object_type: ast::DiscardObject,
+    ) -> Result<ExecResult, ExecError> {
         use ast::DiscardObject;
         match object_type {
             DiscardObject::ALL => {
@@ -1700,23 +1959,34 @@ impl Executor {
                 }
                 let mut txn = sess.txn_state.write().await;
                 *txn = super::session::TxnState::new();
-                Ok(ExecResult::Command { tag: "DISCARD ALL".into(), rows_affected: 0 })
+                Ok(ExecResult::Command {
+                    tag: "DISCARD ALL".into(),
+                    rows_affected: 0,
+                })
             }
             DiscardObject::PLANS => {
                 let sess = self.current_session();
                 sess.prepared_stmts.write().await.clear();
-                Ok(ExecResult::Command { tag: "DISCARD PLANS".into(), rows_affected: 0 })
+                Ok(ExecResult::Command {
+                    tag: "DISCARD PLANS".into(),
+                    rows_affected: 0,
+                })
             }
-            DiscardObject::SEQUENCES => {
-                Ok(ExecResult::Command { tag: "DISCARD SEQUENCES".into(), rows_affected: 0 })
-            }
-            DiscardObject::TEMP => {
-                Ok(ExecResult::Command { tag: "DISCARD TEMP".into(), rows_affected: 0 })
-            }
+            DiscardObject::SEQUENCES => Ok(ExecResult::Command {
+                tag: "DISCARD SEQUENCES".into(),
+                rows_affected: 0,
+            }),
+            DiscardObject::TEMP => Ok(ExecResult::Command {
+                tag: "DISCARD TEMP".into(),
+                rows_affected: 0,
+            }),
         }
     }
 
-    pub(super) async fn execute_reset(&self, reset_stmt: ast::ResetStatement) -> Result<ExecResult, ExecError> {
+    pub(super) async fn execute_reset(
+        &self,
+        reset_stmt: ast::ResetStatement,
+    ) -> Result<ExecResult, ExecError> {
         use ast::Reset;
         let sess = self.current_session();
         match reset_stmt.reset {
@@ -1727,19 +1997,35 @@ impl Executor {
                 settings.insert("client_encoding".to_string(), "UTF8".to_string());
                 settings.insert("standard_conforming_strings".to_string(), "on".to_string());
                 settings.insert("timezone".to_string(), "UTC".to_string());
-                Ok(ExecResult::Command { tag: "RESET".into(), rows_affected: 0 })
+                Ok(ExecResult::Command {
+                    tag: "RESET".into(),
+                    rows_affected: 0,
+                })
             }
             Reset::ConfigurationParameter(param) => {
                 let param_name = param.to_string().to_lowercase();
                 let mut settings = sess.settings.write();
                 match param_name.as_str() {
-                    "search_path" => { settings.insert(param_name, "public".to_string()); }
-                    "client_encoding" => { settings.insert(param_name, "UTF8".to_string()); }
-                    "standard_conforming_strings" => { settings.insert(param_name, "on".to_string()); }
-                    "timezone" => { settings.insert(param_name, "UTC".to_string()); }
-                    _ => { settings.remove(&param_name); }
+                    "search_path" => {
+                        settings.insert(param_name, "public".to_string());
+                    }
+                    "client_encoding" => {
+                        settings.insert(param_name, "UTF8".to_string());
+                    }
+                    "standard_conforming_strings" => {
+                        settings.insert(param_name, "on".to_string());
+                    }
+                    "timezone" => {
+                        settings.insert(param_name, "UTC".to_string());
+                    }
+                    _ => {
+                        settings.remove(&param_name);
+                    }
                 }
-                Ok(ExecResult::Command { tag: "RESET".into(), rows_affected: 0 })
+                Ok(ExecResult::Command {
+                    tag: "RESET".into(),
+                    rows_affected: 0,
+                })
             }
         }
     }

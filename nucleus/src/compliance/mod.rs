@@ -50,16 +50,93 @@ impl PiiDetector {
 
         // ---- column-name heuristics ----------------------------------------
         let name_hints: &[(&[&str], PiiCategory, f64, &str)] = &[
-            (&["email", "e_mail", "e-mail", "email_address"], PiiCategory::Email, 0.8, "column name contains 'email'"),
-            (&["phone", "telephone", "mobile", "cell", "phone_number"], PiiCategory::Phone, 0.8, "column name contains 'phone'"),
-            (&["ssn", "social_security", "social-security"], PiiCategory::Ssn, 0.9, "column name contains 'ssn'"),
-            (&["credit_card", "creditcard", "cc_number", "card_number"], PiiCategory::CreditCard, 0.8, "column name contains 'credit_card'"),
-            (&["ip_address", "ip_addr", "ipaddress", "ip"], PiiCategory::IpAddress, 0.7, "column name contains 'ip'"),
-            (&["first_name", "last_name", "full_name", "firstname", "lastname", "fullname", "name"], PiiCategory::Name, 0.7, "column name contains 'name'"),
-            (&["address", "street", "addr", "street_address"], PiiCategory::Address, 0.7, "column name contains 'address'"),
-            (&["dob", "date_of_birth", "birth_date", "birthday", "birthdate"], PiiCategory::DateOfBirth, 0.8, "column name contains date-of-birth keyword"),
-            (&["salary", "income", "bank_account", "account_number", "routing_number", "iban"], PiiCategory::Financial, 0.7, "column name contains financial keyword"),
-            (&["diagnosis", "medical_record", "prescription", "icd_code", "health"], PiiCategory::Medical, 0.7, "column name contains medical keyword"),
+            (
+                &["email", "e_mail", "e-mail", "email_address"],
+                PiiCategory::Email,
+                0.8,
+                "column name contains 'email'",
+            ),
+            (
+                &["phone", "telephone", "mobile", "cell", "phone_number"],
+                PiiCategory::Phone,
+                0.8,
+                "column name contains 'phone'",
+            ),
+            (
+                &["ssn", "social_security", "social-security"],
+                PiiCategory::Ssn,
+                0.9,
+                "column name contains 'ssn'",
+            ),
+            (
+                &["credit_card", "creditcard", "cc_number", "card_number"],
+                PiiCategory::CreditCard,
+                0.8,
+                "column name contains 'credit_card'",
+            ),
+            (
+                &["ip_address", "ip_addr", "ipaddress", "ip"],
+                PiiCategory::IpAddress,
+                0.7,
+                "column name contains 'ip'",
+            ),
+            (
+                &[
+                    "first_name",
+                    "last_name",
+                    "full_name",
+                    "firstname",
+                    "lastname",
+                    "fullname",
+                    "name",
+                ],
+                PiiCategory::Name,
+                0.7,
+                "column name contains 'name'",
+            ),
+            (
+                &["address", "street", "addr", "street_address"],
+                PiiCategory::Address,
+                0.7,
+                "column name contains 'address'",
+            ),
+            (
+                &[
+                    "dob",
+                    "date_of_birth",
+                    "birth_date",
+                    "birthday",
+                    "birthdate",
+                ],
+                PiiCategory::DateOfBirth,
+                0.8,
+                "column name contains date-of-birth keyword",
+            ),
+            (
+                &[
+                    "salary",
+                    "income",
+                    "bank_account",
+                    "account_number",
+                    "routing_number",
+                    "iban",
+                ],
+                PiiCategory::Financial,
+                0.7,
+                "column name contains financial keyword",
+            ),
+            (
+                &[
+                    "diagnosis",
+                    "medical_record",
+                    "prescription",
+                    "icd_code",
+                    "health",
+                ],
+                PiiCategory::Medical,
+                0.7,
+                "column name contains medical keyword",
+            ),
         ];
 
         // Split column name into words on underscore/hyphen boundaries for matching.
@@ -69,9 +146,8 @@ impl PiiDetector {
             for kw in *keywords {
                 // Exact full-name match OR exact word match to avoid substring false positives
                 // (e.g., "ip" inside "description" should NOT match IpAddress).
-                let hit = lower == *kw
-                    || words.contains(kw)
-                    || (kw.len() > 3 && lower.contains(kw));
+                let hit =
+                    lower == *kw || words.contains(kw) || (kw.len() > 3 && lower.contains(kw));
                 if hit {
                     matches.push(PiiMatch {
                         column_name: column_name.to_string(),
@@ -91,53 +167,69 @@ impl PiiDetector {
                 let at_pos = value.find('@').unwrap();
                 let after_at = &value[at_pos + 1..];
                 if after_at.contains('.') && at_pos > 0 && after_at.len() > 2 {
-                    Self::push_unique(&mut matches, PiiMatch {
-                        column_name: column_name.to_string(),
-                        category: PiiCategory::Email,
-                        confidence: 0.9,
-                        matched_pattern: "value matches email pattern: [REDACTED]".to_string(),
-                    });
+                    Self::push_unique(
+                        &mut matches,
+                        PiiMatch {
+                            column_name: column_name.to_string(),
+                            category: PiiCategory::Email,
+                            confidence: 0.9,
+                            matched_pattern: "value matches email pattern: [REDACTED]".to_string(),
+                        },
+                    );
                 }
             }
 
             // SSN: ###-##-#### pattern
             if Self::looks_like_ssn(value) {
-                Self::push_unique(&mut matches, PiiMatch {
-                    column_name: column_name.to_string(),
-                    category: PiiCategory::Ssn,
-                    confidence: 0.95,
-                    matched_pattern: "value matches SSN pattern: [REDACTED]".to_string(),
-                });
+                Self::push_unique(
+                    &mut matches,
+                    PiiMatch {
+                        column_name: column_name.to_string(),
+                        category: PiiCategory::Ssn,
+                        confidence: 0.95,
+                        matched_pattern: "value matches SSN pattern: [REDACTED]".to_string(),
+                    },
+                );
             }
 
             // Credit Card: 13-19 digits (possibly separated by spaces/dashes)
             if Self::looks_like_credit_card(value) {
-                Self::push_unique(&mut matches, PiiMatch {
-                    column_name: column_name.to_string(),
-                    category: PiiCategory::CreditCard,
-                    confidence: 0.9,
-                    matched_pattern: "value matches credit card pattern: [REDACTED]".to_string(),
-                });
+                Self::push_unique(
+                    &mut matches,
+                    PiiMatch {
+                        column_name: column_name.to_string(),
+                        category: PiiCategory::CreditCard,
+                        confidence: 0.9,
+                        matched_pattern: "value matches credit card pattern: [REDACTED]"
+                            .to_string(),
+                    },
+                );
             }
 
             // Phone: 10+ digits with optional separators
             if Self::looks_like_phone(value) {
-                Self::push_unique(&mut matches, PiiMatch {
-                    column_name: column_name.to_string(),
-                    category: PiiCategory::Phone,
-                    confidence: 0.85,
-                    matched_pattern: "value matches phone pattern: [REDACTED]".to_string(),
-                });
+                Self::push_unique(
+                    &mut matches,
+                    PiiMatch {
+                        column_name: column_name.to_string(),
+                        category: PiiCategory::Phone,
+                        confidence: 0.85,
+                        matched_pattern: "value matches phone pattern: [REDACTED]".to_string(),
+                    },
+                );
             }
 
             // IP Address: four dot-separated numbers 0-255
             if Self::looks_like_ipv4(value) {
-                Self::push_unique(&mut matches, PiiMatch {
-                    column_name: column_name.to_string(),
-                    category: PiiCategory::IpAddress,
-                    confidence: 0.9,
-                    matched_pattern: "value matches IPv4 pattern: [REDACTED]".to_string(),
-                });
+                Self::push_unique(
+                    &mut matches,
+                    PiiMatch {
+                        column_name: column_name.to_string(),
+                        category: PiiCategory::IpAddress,
+                        confidence: 0.9,
+                        matched_pattern: "value matches IPv4 pattern: [REDACTED]".to_string(),
+                    },
+                );
             }
         }
 
@@ -159,8 +251,7 @@ impl PiiDetector {
     fn push_unique(matches: &mut Vec<PiiMatch>, m: PiiMatch) {
         // Avoid duplicate categories from content scan on the same column.
         if !matches.iter().any(|existing| {
-            existing.category == m.category
-                && existing.matched_pattern.starts_with("value ")
+            existing.category == m.category && existing.matched_pattern.starts_with("value ")
         }) {
             matches.push(m);
         }
@@ -188,7 +279,9 @@ impl PiiDetector {
 
     fn looks_like_credit_card(s: &str) -> bool {
         let digits_only: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
-        let non_digit_non_sep = s.chars().any(|c| !c.is_ascii_digit() && c != ' ' && c != '-');
+        let non_digit_non_sep = s
+            .chars()
+            .any(|c| !c.is_ascii_digit() && c != ' ' && c != '-');
         if non_digit_non_sep {
             return false;
         }
@@ -196,10 +289,7 @@ impl PiiDetector {
     }
 
     fn looks_like_phone(s: &str) -> bool {
-        let stripped: String = s
-            .chars()
-            .filter(|c| c.is_ascii_digit())
-            .collect();
+        let stripped: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
         // Allow only digits, spaces, dashes, parens, plus sign
         let all_phone_chars = s
             .chars()
@@ -290,8 +380,7 @@ pub fn add_noise(value: f64, sensitivity: f64, config: &DpConfig) -> f64 {
         }
         DpMechanism::Gaussian => {
             let delta = config.delta.unwrap_or(1e-5);
-            let sigma =
-                sensitivity * (2.0 * (1.25_f64 / delta).ln()).sqrt() / config.epsilon;
+            let sigma = sensitivity * (2.0 * (1.25_f64 / delta).ln()).sqrt() / config.epsilon;
             value + CryptoRng::gaussian(sigma)
         }
     }
@@ -389,12 +478,7 @@ impl DeletionCascade {
     /// and cascade to all dependent (child) tables first.
     ///
     /// The plan deletes children before parents to respect FK constraints.
-    pub fn plan_deletion(
-        &self,
-        table: &str,
-        user_id_column: &str,
-        user_id: &str,
-    ) -> DeletionPlan {
+    pub fn plan_deletion(&self, table: &str, user_id_column: &str, user_id: &str) -> DeletionPlan {
         let mut steps: Vec<DeletionStep> = Vec::new();
         let mut visited: Vec<String> = Vec::new();
         self.collect_dependents(table, user_id_column, user_id, &mut steps, &mut visited);
@@ -420,13 +504,7 @@ impl DeletionCascade {
         for fk in &self.foreign_keys {
             if fk.to_table == table {
                 // The child table references us; recurse into it first.
-                self.collect_dependents(
-                    &fk.from_table,
-                    &fk.from_column,
-                    id_value,
-                    steps,
-                    visited,
-                );
+                self.collect_dependents(&fk.from_table, &fk.from_column, id_value, steps, visited);
             }
         }
 
@@ -617,13 +695,14 @@ impl ResidencyEnforcer {
                 ));
             }
             // If allowed_regions is specified and non-empty, target must be in it.
-            if !rule.allowed_regions.is_empty()
-                && !rule.allowed_regions.contains(target_region)
-            {
+            if !rule.allowed_regions.is_empty() && !rule.allowed_regions.contains(target_region) {
                 return ResidencyVerdict::Denied(format!(
                     "table '{}' can only be stored in {:?}, not {}",
                     table_name,
-                    rule.allowed_regions.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+                    rule.allowed_regions
+                        .iter()
+                        .map(|r| r.to_string())
+                        .collect::<Vec<_>>(),
                     target_region
                 ));
             }
@@ -738,7 +817,9 @@ mod tests {
         // Credit card pattern
         let matches = detector.detect("payment", &["4111111111111111"]);
         assert!(
-            matches.iter().any(|m| m.category == PiiCategory::CreditCard),
+            matches
+                .iter()
+                .any(|m| m.category == PiiCategory::CreditCard),
             "Should detect credit card from value '4111111111111111'"
         );
 
@@ -973,7 +1054,10 @@ mod tests {
         assert!(ssn_match.is_some(), "Should detect SSN in value");
         let masked = mask_value(ssn_value, &PiiCategory::Ssn);
         assert_eq!(masked, "***-**-6789");
-        assert!(!masked.contains("123"), "Masked SSN must not contain original prefix");
+        assert!(
+            !masked.contains("123"),
+            "Masked SSN must not contain original prefix"
+        );
 
         // Email masking
         let email_value = "sensitive@corp.com";
@@ -982,16 +1066,24 @@ mod tests {
         assert!(email_match.is_some(), "Should detect email in value");
         let masked = mask_value(email_value, &PiiCategory::Email);
         assert_eq!(masked, "***@corp.com");
-        assert!(!masked.contains("sensitive"), "Masked email must not contain local part");
+        assert!(
+            !masked.contains("sensitive"),
+            "Masked email must not contain local part"
+        );
 
         // Credit card masking
         let cc_value = "4111111111111111";
         let matches = detector.detect("data", &[cc_value]);
-        let cc_match = matches.iter().find(|m| m.category == PiiCategory::CreditCard);
+        let cc_match = matches
+            .iter()
+            .find(|m| m.category == PiiCategory::CreditCard);
         assert!(cc_match.is_some(), "Should detect credit card in value");
         let masked = mask_value(cc_value, &PiiCategory::CreditCard);
         assert_eq!(masked, "****-****-****-1111");
-        assert!(!masked.contains("41111111"), "Masked CC must not contain full prefix");
+        assert!(
+            !masked.contains("41111111"),
+            "Masked CC must not contain full prefix"
+        );
     }
 
     // 10. Audit trail recording — verify that compliance operations can be logged
@@ -1014,6 +1106,8 @@ mod tests {
             timestamp_ms: u64,
             action: AuditAction,
             actor: String,
+            // Part of the realistic audit-entry shape; recorded but not asserted here.
+            #[allow(dead_code)]
             target: String,
             details: String,
         }
@@ -1024,7 +1118,9 @@ mod tests {
 
         impl AuditTrail {
             fn new() -> Self {
-                Self { entries: Vec::new() }
+                Self {
+                    entries: Vec::new(),
+                }
             }
 
             fn record(&mut self, entry: AuditEntry) {
@@ -1036,7 +1132,10 @@ mod tests {
             }
 
             fn entries_for_action(&self, action: &AuditAction) -> Vec<&AuditEntry> {
-                self.entries.iter().filter(|e| &e.action == action).collect()
+                self.entries
+                    .iter()
+                    .filter(|e| &e.action == action)
+                    .collect()
             }
         }
 
@@ -1083,7 +1182,11 @@ mod tests {
         assert_eq!(bot_entries.len(), 2, "compliance_bot should have 2 entries");
 
         let scan_entries = trail.entries_for_action(&AuditAction::PiiScanPerformed);
-        assert_eq!(scan_entries.len(), 1, "Should have exactly 1 PII scan entry");
+        assert_eq!(
+            scan_entries.len(),
+            1,
+            "Should have exactly 1 PII scan entry"
+        );
         assert!(scan_entries[0].details.contains("PII matches"));
 
         // Verify chronological ordering
@@ -1134,10 +1237,7 @@ mod tests {
                         | ComplianceOp::ViewRetentionPolicies
                         | ComplianceOp::ExportAuditLog
                 ),
-                Role::ReadOnly => matches!(
-                    op,
-                    ComplianceOp::ViewRetentionPolicies
-                ),
+                Role::ReadOnly => matches!(op, ComplianceOp::ViewRetentionPolicies),
             }
         }
 
@@ -1147,32 +1247,65 @@ mod tests {
         assert!(is_authorized(&Role::Admin, &ComplianceOp::MaskData));
 
         // ComplianceOfficer can do all compliance operations
-        assert!(is_authorized(&Role::ComplianceOfficer, &ComplianceOp::ScanPii));
-        assert!(is_authorized(&Role::ComplianceOfficer, &ComplianceOp::ExecuteDeletion));
-        assert!(is_authorized(&Role::ComplianceOfficer, &ComplianceOp::MaskData));
-        assert!(is_authorized(&Role::ComplianceOfficer, &ComplianceOp::ModifyRetentionPolicies));
+        assert!(is_authorized(
+            &Role::ComplianceOfficer,
+            &ComplianceOp::ScanPii
+        ));
+        assert!(is_authorized(
+            &Role::ComplianceOfficer,
+            &ComplianceOp::ExecuteDeletion
+        ));
+        assert!(is_authorized(
+            &Role::ComplianceOfficer,
+            &ComplianceOp::MaskData
+        ));
+        assert!(is_authorized(
+            &Role::ComplianceOfficer,
+            &ComplianceOp::ModifyRetentionPolicies
+        ));
 
         // Analyst can scan and view but not modify or delete
         assert!(is_authorized(&Role::Analyst, &ComplianceOp::ScanPii));
-        assert!(is_authorized(&Role::Analyst, &ComplianceOp::ViewRetentionPolicies));
+        assert!(is_authorized(
+            &Role::Analyst,
+            &ComplianceOp::ViewRetentionPolicies
+        ));
         assert!(is_authorized(&Role::Analyst, &ComplianceOp::ExportAuditLog));
-        assert!(!is_authorized(&Role::Analyst, &ComplianceOp::ExecuteDeletion));
-        assert!(!is_authorized(&Role::Analyst, &ComplianceOp::ModifyRetentionPolicies));
+        assert!(!is_authorized(
+            &Role::Analyst,
+            &ComplianceOp::ExecuteDeletion
+        ));
+        assert!(!is_authorized(
+            &Role::Analyst,
+            &ComplianceOp::ModifyRetentionPolicies
+        ));
         assert!(!is_authorized(&Role::Analyst, &ComplianceOp::MaskData));
 
         // ReadOnly can only view retention policies
-        assert!(is_authorized(&Role::ReadOnly, &ComplianceOp::ViewRetentionPolicies));
+        assert!(is_authorized(
+            &Role::ReadOnly,
+            &ComplianceOp::ViewRetentionPolicies
+        ));
         assert!(!is_authorized(&Role::ReadOnly, &ComplianceOp::ScanPii));
-        assert!(!is_authorized(&Role::ReadOnly, &ComplianceOp::ExecuteDeletion));
+        assert!(!is_authorized(
+            &Role::ReadOnly,
+            &ComplianceOp::ExecuteDeletion
+        ));
         assert!(!is_authorized(&Role::ReadOnly, &ComplianceOp::MaskData));
-        assert!(!is_authorized(&Role::ReadOnly, &ComplianceOp::ExportAuditLog));
+        assert!(!is_authorized(
+            &Role::ReadOnly,
+            &ComplianceOp::ExportAuditLog
+        ));
 
         // Verify access control works with actual compliance engine call
         let detector = PiiDetector::new();
         let role = Role::Analyst;
         if is_authorized(&role, &ComplianceOp::ScanPii) {
             let results = detector.detect("email", &["user@example.com"]);
-            assert!(!results.is_empty(), "Authorized analyst should be able to scan");
+            assert!(
+                !results.is_empty(),
+                "Authorized analyst should be able to scan"
+            );
         }
     }
 
@@ -1215,9 +1348,18 @@ mod tests {
         });
 
         let expired_tables: Vec<&str> = actions.iter().map(|a| a.table.as_str()).collect();
-        assert!(expired_tables.contains(&"debug_logs"), "debug_logs should be expired at day 30");
-        assert!(!expired_tables.contains(&"user_sessions"), "user_sessions should NOT be expired at day 30");
-        assert!(!expired_tables.contains(&"financial_records"), "financial_records should NOT be expired at day 30");
+        assert!(
+            expired_tables.contains(&"debug_logs"),
+            "debug_logs should be expired at day 30"
+        );
+        assert!(
+            !expired_tables.contains(&"user_sessions"),
+            "user_sessions should NOT be expired at day 30"
+        );
+        assert!(
+            !expired_tables.contains(&"financial_records"),
+            "financial_records should NOT be expired at day 30"
+        );
 
         // At day 100: debug_logs and user_sessions expired
         let day_100_ms: u64 = 100 * 24 * 60 * 60 * 1000;
@@ -1245,7 +1387,10 @@ mod tests {
         // Verify estimated row counts are preserved
         let debug_action = actions.iter().find(|a| a.table == "debug_logs").unwrap();
         assert_eq!(debug_action.estimated_rows, 10_000);
-        let financial_action = actions.iter().find(|a| a.table == "financial_records").unwrap();
+        let financial_action = actions
+            .iter()
+            .find(|a| a.table == "financial_records")
+            .unwrap();
         assert_eq!(financial_action.estimated_rows, 1_000);
     }
 
@@ -1271,7 +1416,9 @@ mod tests {
         // DateOfBirth category via column name
         let matches = detector.detect("date_of_birth", &[]);
         assert!(
-            matches.iter().any(|m| m.category == PiiCategory::DateOfBirth),
+            matches
+                .iter()
+                .any(|m| m.category == PiiCategory::DateOfBirth),
             "Should detect DateOfBirth from column 'date_of_birth'"
         );
 
@@ -1290,11 +1437,10 @@ mod tests {
         );
 
         // Multiple PII values in same column detected via content
-        let matches = detector.detect("misc_data", &[
-            "alice@example.com",
-            "192.168.0.1",
-            "123-45-6789",
-        ]);
+        let matches = detector.detect(
+            "misc_data",
+            &["alice@example.com", "192.168.0.1", "123-45-6789"],
+        );
         let categories: Vec<&PiiCategory> = matches.iter().map(|m| &m.category).collect();
         assert!(categories.contains(&&PiiCategory::Email));
         assert!(categories.contains(&&PiiCategory::IpAddress));
@@ -1318,7 +1464,10 @@ mod tests {
 
         // Empty column name, no values — should produce no matches
         let matches = detector.detect("", &[]);
-        assert!(matches.is_empty(), "Empty column name with no values should have no PII matches");
+        assert!(
+            matches.is_empty(),
+            "Empty column name with no values should have no PII matches"
+        );
 
         // Empty values array — only column name heuristics should fire
         let matches = detector.detect("user_email", &[]);
@@ -1328,17 +1477,22 @@ mod tests {
         );
 
         // Values with special characters that are NOT PII
-        let matches = detector.detect("notes", &[
-            "",                      // empty string
-            "   ",                   // whitespace only
-            "hello!@#$%^&*()",       // special chars (not a valid email)
-            "....",                   // dots only
-            "@@@",                   // at signs without valid email structure
-            "not-an-email@",         // incomplete email (no domain after @)
-        ]);
+        let matches = detector.detect(
+            "notes",
+            &[
+                "",                // empty string
+                "   ",             // whitespace only
+                "hello!@#$%^&*()", // special chars (not a valid email)
+                "....",            // dots only
+                "@@@",             // at signs without valid email structure
+                "not-an-email@",   // incomplete email (no domain after @)
+            ],
+        );
         // "notes" column name should not trigger any PII
         assert!(
-            !matches.iter().any(|m| m.matched_pattern.starts_with("column name")),
+            !matches
+                .iter()
+                .any(|m| m.matched_pattern.starts_with("column name")),
             "'notes' should not trigger column-name heuristics"
         );
         // None of these values should look like a valid email
@@ -1348,25 +1502,31 @@ mod tests {
         );
 
         // Boundary SSN-like values that should NOT match
-        let matches = detector.detect("data", &[
-            "12-345-6789",   // wrong grouping
-            "123-45-678",    // too short
-            "1234-56-7890",  // too long
-            "abc-de-fghi",   // letters, not digits
-        ]);
+        let matches = detector.detect(
+            "data",
+            &[
+                "12-345-6789",  // wrong grouping
+                "123-45-678",   // too short
+                "1234-56-7890", // too long
+                "abc-de-fghi",  // letters, not digits
+            ],
+        );
         assert!(
             !matches.iter().any(|m| m.category == PiiCategory::Ssn),
             "Malformed SSN-like strings should not be detected"
         );
 
         // Boundary IP-like values that should NOT match
-        let matches = detector.detect("data", &[
-            "256.1.1.1",     // octet > 255
-            "1.2.3",         // only 3 octets
-            "1.2.3.4.5",     // 5 octets
-            "a.b.c.d",       // non-numeric
-            "",              // empty
-        ]);
+        let matches = detector.detect(
+            "data",
+            &[
+                "256.1.1.1", // octet > 255
+                "1.2.3",     // only 3 octets
+                "1.2.3.4.5", // 5 octets
+                "a.b.c.d",   // non-numeric
+                "",          // empty
+            ],
+        );
         assert!(
             !matches.iter().any(|m| m.category == PiiCategory::IpAddress),
             "Invalid IP-like strings should not be detected"
@@ -1375,19 +1535,25 @@ mod tests {
         // Credit card boundary: 12 digits (too few) and 20 digits (too many)
         let matches = detector.detect("data", &["123456789012"]);
         assert!(
-            !matches.iter().any(|m| m.category == PiiCategory::CreditCard),
+            !matches
+                .iter()
+                .any(|m| m.category == PiiCategory::CreditCard),
             "12-digit number should not match credit card (min 13)"
         );
         let matches = detector.detect("data", &["12345678901234567890"]);
         assert!(
-            !matches.iter().any(|m| m.category == PiiCategory::CreditCard),
+            !matches
+                .iter()
+                .any(|m| m.category == PiiCategory::CreditCard),
             "20-digit number should not match credit card (max 19)"
         );
 
         // Exactly 13 digits (minimum valid CC length) should match
         let matches = detector.detect("data", &["1234567890123"]);
         assert!(
-            matches.iter().any(|m| m.category == PiiCategory::CreditCard),
+            matches
+                .iter()
+                .any(|m| m.category == PiiCategory::CreditCard),
             "13-digit number should match credit card pattern"
         );
 
@@ -1409,15 +1575,25 @@ mod tests {
 
         // current_time is 0 — no data should expire
         let actions = engine.find_expired(&policy, 0, 100);
-        assert!(actions.is_empty(), "No data should expire when current_time is 0");
+        assert!(
+            actions.is_empty(),
+            "No data should expire when current_time is 0"
+        );
 
         // Deletion cascade with no FK relationships — only root table deleted
         let mut cascade = DeletionCascade::new();
         cascade.add_table("standalone");
         let plan = cascade.plan_deletion("standalone", "id", "1");
-        assert_eq!(plan.steps.len(), 1, "Standalone table should have exactly 1 step");
+        assert_eq!(
+            plan.steps.len(),
+            1,
+            "Standalone table should have exactly 1 step"
+        );
         assert_eq!(plan.steps[0].table, "standalone");
-        assert!(plan.steps[0].cascade_from.is_none(), "Standalone deletion should have no cascade_from");
+        assert!(
+            plan.steps[0].cascade_from.is_none(),
+            "Standalone deletion should have no cascade_from"
+        );
     }
 
     // 15. Gaussian DP mechanism — verify it produces noise with correct properties
@@ -1483,8 +1659,8 @@ mod tests {
 
         // Unicode column names that happen to contain PII keywords
         let columns: Vec<(String, Vec<String>)> = vec![
-            ("user_email_\u{00E9}".into(), vec![]),   // email with accented char
-            ("\u{2603}_phone".into(), vec![]),          // snowman + phone
+            ("user_email_\u{00E9}".into(), vec![]), // email with accented char
+            ("\u{2603}_phone".into(), vec![]),      // snowman + phone
             ("safe_column".into(), vec!["hello".into()]),
         ];
 

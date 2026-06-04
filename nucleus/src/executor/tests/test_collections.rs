@@ -242,13 +242,21 @@ async fn test_kv_pfadd_pfcount() {
 #[tokio::test]
 async fn test_stream_xadd_xlen() {
     let ex = test_executor();
-    let r = exec(&ex, "SELECT stream_xadd('events', 'user', 'alice', 'action', 'login')").await;
+    let r = exec(
+        &ex,
+        "SELECT stream_xadd('events', 'user', 'alice', 'action', 'login')",
+    )
+    .await;
     let id1 = match scalar(&r[0]) {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
     };
     assert!(id1.contains("-"), "stream ID should have ms-seq format");
-    let r = exec(&ex, "SELECT stream_xadd('events', 'user', 'bob', 'action', 'logout')").await;
+    let r = exec(
+        &ex,
+        "SELECT stream_xadd('events', 'user', 'bob', 'action', 'logout')",
+    )
+    .await;
     let _id2 = match scalar(&r[0]) {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
@@ -287,7 +295,11 @@ async fn test_stream_xread() {
     };
     // Should have at most 2 entries
     let entry_count = text.split(',').filter(|s| !s.is_empty()).count();
-    assert!(entry_count <= 2, "xread count=2 should return at most 2 entries, got {}", entry_count);
+    assert!(
+        entry_count <= 2,
+        "xread count=2 should return at most 2 entries, got {}",
+        entry_count
+    );
 }
 
 #[tokio::test]
@@ -297,10 +309,18 @@ async fn test_stream_xgroup_xreadgroup_xack() {
     exec(&ex, "SELECT stream_xadd('grp_stream', 'msg', 'hello')").await;
     exec(&ex, "SELECT stream_xadd('grp_stream', 'msg', 'world')").await;
     // Create consumer group starting from 0
-    let r = exec(&ex, "SELECT stream_xgroup_create('grp_stream', 'mygroup', 0)").await;
+    let r = exec(
+        &ex,
+        "SELECT stream_xgroup_create('grp_stream', 'mygroup', 0)",
+    )
+    .await;
     assert_eq!(scalar(&r[0]), &Value::Text("OK".into()));
     // Read via consumer group
-    let r = exec(&ex, "SELECT stream_xreadgroup('grp_stream', 'mygroup', 'worker1', 10)").await;
+    let r = exec(
+        &ex,
+        "SELECT stream_xreadgroup('grp_stream', 'mygroup', 'worker1', 10)",
+    )
+    .await;
     let text = match scalar(&r[0]) {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
@@ -499,7 +519,9 @@ fn test_distributed_router_deliver_remote() {
     let mut router = DistributedPubSubRouter::new(1, 64);
     let mut rx = router.subscribe_local("ch");
     router.deliver_remote("ch", "from_node_2".into());
-    let msg = rx.try_recv().expect("message from remote should arrive locally");
+    let msg = rx
+        .try_recv()
+        .expect("message from remote should arrive locally");
     assert_eq!(msg.payload, "from_node_2");
 }
 
@@ -521,7 +543,7 @@ fn test_distributed_router_apply_gossip() {
 /// Transport: PubSubPublish round-trips through encode/decode.
 #[test]
 fn test_transport_pubsub_publish_codec() {
-    use crate::transport::{encode, decode, Message};
+    use crate::transport::{Message, decode, encode};
     let msg = Message::PubSubPublish {
         channel: "events".into(),
         payload: "hello cluster".into(),
@@ -540,7 +562,7 @@ fn test_transport_pubsub_publish_codec() {
 /// Transport: PubSubGossip round-trips through encode/decode.
 #[test]
 fn test_transport_pubsub_gossip_codec() {
-    use crate::transport::{encode, decode, Message};
+    use crate::transport::{Message, decode, encode};
     let msg = Message::PubSubGossip {
         node_id: 42,
         channels: vec!["ch1".into(), "ch2".into(), "ch3".into()],
@@ -555,4 +577,3 @@ fn test_transport_pubsub_gossip_codec() {
         other => panic!("expected PubSubGossip, got {other:?}"),
     }
 }
-

@@ -134,7 +134,10 @@ async fn test_nested_begin_warning() {
     let results = exec(&ex, "BEGIN").await;
     match &results[0] {
         ExecResult::Command { tag, .. } => {
-            assert!(tag.contains("already in a transaction"), "expected warning, got: {tag}");
+            assert!(
+                tag.contains("already in a transaction"),
+                "expected warning, got: {tag}"
+            );
         }
         _ => panic!("expected Command result for nested BEGIN"),
     }
@@ -207,9 +210,7 @@ async fn test_nested_savepoints() {
 /// Create an MVCC-backed executor for testing snapshot isolation.
 fn mvcc_executor() -> Executor {
     let catalog = Arc::new(Catalog::new());
-    let storage: Arc<dyn StorageEngine> = Arc::new(
-        crate::storage::MvccStorageAdapter::new()
-    );
+    let storage: Arc<dyn StorageEngine> = Arc::new(crate::storage::MvccStorageAdapter::new());
     Executor::new(catalog, storage)
 }
 
@@ -364,13 +365,19 @@ async fn test_rollback_reverts_kv_mutations() {
 
     // 'pre' should be restored to 'original'
     let r = exec(&ex, "SELECT kv_get('pre')").await;
-    assert_eq!(scalar(&r[0]), &Value::Text("original".into()),
-        "KV value should be rolled back to original");
+    assert_eq!(
+        scalar(&r[0]),
+        &Value::Text("original".into()),
+        "KV value should be rolled back to original"
+    );
 
     // 'new_key' should not exist
     let r = exec(&ex, "SELECT kv_get('new_key')").await;
-    assert_eq!(scalar(&r[0]), &Value::Null,
-        "New KV key should be rolled back (not exist)");
+    assert_eq!(
+        scalar(&r[0]),
+        &Value::Null,
+        "New KV key should be rolled back (not exist)"
+    );
 }
 
 #[tokio::test]
@@ -386,8 +393,11 @@ async fn test_rollback_reverts_graph_mutations() {
     exec(&ex, "ROLLBACK").await;
 
     // Should be back to 1 node
-    assert_eq!(ex.graph_store().read().node_count(), 1,
-        "Graph node added in txn should be rolled back");
+    assert_eq!(
+        ex.graph_store().read().node_count(),
+        1,
+        "Graph node added in txn should be rolled back"
+    );
 }
 
 #[tokio::test]
@@ -487,24 +497,37 @@ async fn test_executor_disk_mode_opens_durable_stores() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = Arc::new(Catalog::new());
     let storage: Arc<dyn StorageEngine> = Arc::new(MemoryEngine::new());
-    let ex = Executor::new_with_persistence(
-        catalog,
-        storage,
-        None,
-        Some(dir.path()),
-    );
+    let ex = Executor::new_with_persistence(catalog, storage, None, Some(dir.path()));
     // All three stores should have cold tiers
-    assert!(ex.kv_store().has_cold_tier(), "KV store should have cold tier in disk mode");
-    assert!(ex.doc_store().read().has_cold_tier(), "Doc store should have cold tier in disk mode");
-    assert!(ex.graph_store().read().has_cold_tier(), "Graph store should have cold tier in disk mode");
+    assert!(
+        ex.kv_store().has_cold_tier(),
+        "KV store should have cold tier in disk mode"
+    );
+    assert!(
+        ex.doc_store().read().has_cold_tier(),
+        "Doc store should have cold tier in disk mode"
+    );
+    assert!(
+        ex.graph_store().read().has_cold_tier(),
+        "Graph store should have cold tier in disk mode"
+    );
 }
 
 #[tokio::test]
 async fn test_executor_memory_mode_no_cold_tier() {
     let ex = test_executor();
-    assert!(!ex.kv_store().has_cold_tier(), "KV store should not have cold tier in memory mode");
-    assert!(!ex.doc_store().read().has_cold_tier(), "Doc store should not have cold tier in memory mode");
-    assert!(!ex.graph_store().read().has_cold_tier(), "Graph store should not have cold tier in memory mode");
+    assert!(
+        !ex.kv_store().has_cold_tier(),
+        "KV store should not have cold tier in memory mode"
+    );
+    assert!(
+        !ex.doc_store().read().has_cold_tier(),
+        "Doc store should not have cold tier in memory mode"
+    );
+    assert!(
+        !ex.graph_store().read().has_cold_tier(),
+        "Graph store should not have cold tier in memory mode"
+    );
 }
 
 #[tokio::test]
@@ -512,12 +535,7 @@ async fn test_executor_disk_kv_survives_cold_tier() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = Arc::new(Catalog::new());
     let storage: Arc<dyn StorageEngine> = Arc::new(MemoryEngine::new());
-    let ex = Executor::new_with_persistence(
-        catalog,
-        storage,
-        None,
-        Some(dir.path()),
-    );
+    let ex = Executor::new_with_persistence(catalog, storage, None, Some(dir.path()));
     // Use SQL to set a KV value
     exec(&ex, "SELECT kv_set('mykey', 'myval')").await;
     let r = exec(&ex, "SELECT kv_get('mykey')").await;
@@ -547,9 +565,17 @@ async fn test_index_visibility_within_transaction() {
     assert_eq!(r[0][1], Value::Text("b".into()));
 
     // Range query — should also work
-    let results = exec(&ex, "SELECT * FROM idx_vis WHERE id BETWEEN 1 AND 3 ORDER BY id").await;
+    let results = exec(
+        &ex,
+        "SELECT * FROM idx_vis WHERE id BETWEEN 1 AND 3 ORDER BY id",
+    )
+    .await;
     let r = rows(&results[0]);
-    assert_eq!(r.len(), 3, "range query should find all 3 rows within transaction");
+    assert_eq!(
+        r.len(),
+        3,
+        "range query should find all 3 rows within transaction"
+    );
 
     // COUNT(*) within transaction
     let results = exec(&ex, "SELECT COUNT(*) FROM idx_vis").await;

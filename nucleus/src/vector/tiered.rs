@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use parking_lot::{Mutex, RwLock};
 
 use crate::storage::lsm::{LsmConfig, LsmTree};
-use crate::vector::{distance, DistanceMetric, Vector};
+use crate::vector::{DistanceMetric, Vector, distance};
 
 // ============================================================================
 // Encoding helpers
@@ -340,6 +340,8 @@ impl DiskBackedVectorStore {
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
 
     fn make_vec(dims: usize, val: f32) -> Vector {

@@ -1,8 +1,8 @@
 //! Tests for the five previously-orphaned modules wired to the executor:
 //! tensor, branching, versioning, compliance, and procedures.
 
-use crate::types::Value;
 use super::{exec, scalar, test_executor};
+use crate::types::Value;
 
 // ============================================================================
 // Tensor SQL function tests
@@ -12,7 +12,11 @@ use super::{exec, scalar, test_executor};
 async fn test_tensor_store_and_shape() {
     let ex = test_executor();
     // Store a 2x3 float32 tensor (zero-filled, no hex data needed)
-    let res = exec(&ex, "SELECT tensor_store('weights', 'v1', '[2,3]', 'float32')").await;
+    let res = exec(
+        &ex,
+        "SELECT tensor_store('weights', 'v1', '[2,3]', 'float32')",
+    )
+    .await;
     assert_eq!(scalar(&res[0]), &Value::Text("OK".into()));
 
     // Shape should be [2,3]
@@ -55,8 +59,16 @@ async fn test_tensor_size_bytes() {
 #[tokio::test]
 async fn test_tensor_list_versions() {
     let ex = test_executor();
-    exec(&ex, "SELECT tensor_store('net', 'epoch1', '[2]', 'float32')").await;
-    exec(&ex, "SELECT tensor_store('net', 'epoch2', '[2]', 'float32')").await;
+    exec(
+        &ex,
+        "SELECT tensor_store('net', 'epoch1', '[2]', 'float32')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT tensor_store('net', 'epoch2', '[2]', 'float32')",
+    )
+    .await;
 
     let res = exec(&ex, "SELECT tensor_list_versions('net')").await;
     let json = match scalar(&res[0]) {
@@ -74,19 +86,30 @@ async fn test_tensor_list_versions() {
 #[tokio::test]
 async fn test_pii_detect_email() {
     let ex = test_executor();
-    let res = exec(&ex, "SELECT pii_detect('email_address', 'user@example.com', 'admin@test.org')").await;
+    let res = exec(
+        &ex,
+        "SELECT pii_detect('email_address', 'user@example.com', 'admin@test.org')",
+    )
+    .await;
     let json = match scalar(&res[0]) {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
     };
     // Should detect Email category
-    assert!(json.contains("Email") || json.len() > 2, "expected PII matches, got: {json}");
+    assert!(
+        json.contains("Email") || json.len() > 2,
+        "expected PII matches, got: {json}"
+    );
 }
 
 #[tokio::test]
 async fn test_pii_detect_category() {
     let ex = test_executor();
-    let res = exec(&ex, "SELECT pii_detect_category('email', 'user@example.com')").await;
+    let res = exec(
+        &ex,
+        "SELECT pii_detect_category('email', 'user@example.com')",
+    )
+    .await;
     let category = match scalar(&res[0]) {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
@@ -97,7 +120,11 @@ async fn test_pii_detect_category() {
 #[tokio::test]
 async fn test_pii_detect_no_match() {
     let ex = test_executor();
-    let res = exec(&ex, "SELECT pii_detect_category('description', 'This is a normal text field')").await;
+    let res = exec(
+        &ex,
+        "SELECT pii_detect_category('description', 'This is a normal text field')",
+    )
+    .await;
     let category = match scalar(&res[0]) {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
@@ -129,7 +156,10 @@ async fn test_gdpr_delete_plan() {
         other => panic!("expected Text, got {other:?}"),
     };
     // Should return a JSON plan with 'users' table
-    assert!(json.contains("users"), "expected users in plan, got: {json}");
+    assert!(
+        json.contains("users"),
+        "expected users in plan, got: {json}"
+    );
 }
 
 // ============================================================================
@@ -178,7 +208,10 @@ async fn test_version_commit_and_log() {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
     };
-    assert!(json.contains("initial data load"), "commit message missing from log: {json}");
+    assert!(
+        json.contains("initial data load"),
+        "commit message missing from log: {json}"
+    );
 }
 
 // ============================================================================
@@ -237,8 +270,10 @@ async fn test_db_branch_diff() {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
     };
-    assert!(json.contains("added") && json.contains("modified") && json.contains("deleted"),
-        "unexpected diff JSON: {json}");
+    assert!(
+        json.contains("added") && json.contains("modified") && json.contains("deleted"),
+        "unexpected diff JSON: {json}"
+    );
 }
 
 #[tokio::test]
@@ -246,10 +281,16 @@ async fn test_show_branches_command() {
     let ex = test_executor();
     exec(&ex, "SELECT db_branch_create('dev', 'main')").await;
     // SHOW BRANCHES returns a result set
-    let results = ex.execute("SHOW BRANCHES").await.expect("SHOW BRANCHES failed");
+    let results = ex
+        .execute("SHOW BRANCHES")
+        .await
+        .expect("SHOW BRANCHES failed");
     assert!(!results.is_empty());
     if let super::super::ExecResult::Select { rows, .. } = &results[0] {
-        assert!(!rows.is_empty(), "expected at least 'main' in SHOW BRANCHES");
+        assert!(
+            !rows.is_empty(),
+            "expected at least 'main' in SHOW BRANCHES"
+        );
     }
 }
 
@@ -268,7 +309,10 @@ async fn test_proc_register_and_list() {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
     };
-    assert!(json.contains("greet"), "registered procedure missing from list: {json}");
+    assert!(
+        json.contains("greet"),
+        "registered procedure missing from list: {json}"
+    );
 }
 
 #[tokio::test]
@@ -288,7 +332,10 @@ async fn test_proc_drop() {
 async fn test_show_procedures_command() {
     let ex = test_executor();
     // Built-in procedures are auto-registered
-    let results = ex.execute("SHOW PROCEDURES").await.expect("SHOW PROCEDURES failed");
+    let results = ex
+        .execute("SHOW PROCEDURES")
+        .await
+        .expect("SHOW PROCEDURES failed");
     assert!(!results.is_empty());
     if let super::super::ExecResult::Select { rows, .. } = &results[0] {
         // At least the built-in 'nucleus_version' procedure should be present
@@ -299,7 +346,11 @@ async fn test_show_procedures_command() {
 #[tokio::test]
 async fn test_create_and_call_procedure() {
     let ex = test_executor();
-    exec(&ex, "CREATE PROCEDURE count_one() LANGUAGE sql AS 'SELECT 1 AS n'").await;
+    exec(
+        &ex,
+        "CREATE PROCEDURE count_one() LANGUAGE sql AS 'SELECT 1 AS n'",
+    )
+    .await;
 
     // Verify it's registered
     let res = exec(&ex, "SELECT proc_list()").await;
@@ -307,14 +358,20 @@ async fn test_create_and_call_procedure() {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
     };
-    assert!(json.contains("count_one"), "procedure not registered: {json}");
+    assert!(
+        json.contains("count_one"),
+        "procedure not registered: {json}"
+    );
 }
 
 #[tokio::test]
 async fn test_call_builtin_procedure() {
     let ex = test_executor();
     // 'nucleus_version' is a built-in procedure registered in ProcedureEngine::new()
-    let results = ex.execute("CALL nucleus_version()").await.expect("CALL failed");
+    let results = ex
+        .execute("CALL nucleus_version()")
+        .await
+        .expect("CALL failed");
     assert!(!results.is_empty());
 }
 
@@ -322,11 +379,18 @@ async fn test_call_builtin_procedure() {
 async fn test_proc_with_params() {
     let ex = test_executor();
     // Register a procedure with parameters
-    let res = exec(&ex, "SELECT proc_register('add_vals', 'a,b', 'SELECT $1 + $2')").await;
+    let res = exec(
+        &ex,
+        "SELECT proc_register('add_vals', 'a,b', 'SELECT $1 + $2')",
+    )
+    .await;
     assert_eq!(scalar(&res[0]), &Value::Text("OK".into()));
 
     // The procedure body with parameter substitution should be callable via CALL
     // (CALL returns the substituted SQL body for SQL procedures)
-    let results = ex.execute("CALL add_vals(10, 20)").await.expect("CALL add_vals failed");
+    let results = ex
+        .execute("CALL add_vals(10, 20)")
+        .await
+        .expect("CALL add_vals failed");
     assert!(!results.is_empty());
 }

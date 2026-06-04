@@ -3,8 +3,8 @@
 //! These are metadata types for views, triggers, roles, sequences, cursors,
 //! and stored functions.
 
-use std::collections::HashMap;
 use crate::types::{DataType, Row};
+use std::collections::HashMap;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]

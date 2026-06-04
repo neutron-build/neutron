@@ -17,10 +17,7 @@ const COL_TYPES: &[&str] = &["INT", "TEXT", "FLOAT"];
 fn arb_create_table() -> impl Strategy<Value = String> {
     (
         prop::sample::select(TABLES),
-        prop::collection::vec(
-            prop::sample::select(COL_TYPES),
-            1..4,
-        ),
+        prop::collection::vec(prop::sample::select(COL_TYPES), 1..4),
     )
         .prop_map(|(table, col_types)| {
             let col_defs: Vec<String> = col_types
@@ -41,9 +38,7 @@ fn arb_insert() -> impl Strategy<Value = String> {
         prop::sample::select(TABLES),
         prop::collection::vec(arb_literal(), 1..4),
     )
-        .prop_map(|(table, vals)| {
-            format!("INSERT INTO {table} VALUES ({})", vals.join(", "))
-        })
+        .prop_map(|(table, vals)| format!("INSERT INTO {table} VALUES ({})", vals.join(", ")))
 }
 
 /// Generate a random SQL literal value (integer, float, or string).
@@ -60,24 +55,19 @@ fn arb_literal() -> impl Strategy<Value = String> {
 
 /// Generate a `SELECT` statement — either `SELECT *` or `SELECT` specific columns.
 fn arb_select() -> impl Strategy<Value = String> {
-    (
-        prop::sample::select(TABLES),
-        prop::bool::ANY,
-    )
-        .prop_map(|(table, select_star)| {
-            if select_star {
-                format!("SELECT * FROM {table}")
-            } else {
-                // Pick a deterministic column name that may or may not exist.
-                format!("SELECT c0 FROM {table}")
-            }
-        })
+    (prop::sample::select(TABLES), prop::bool::ANY).prop_map(|(table, select_star)| {
+        if select_star {
+            format!("SELECT * FROM {table}")
+        } else {
+            // Pick a deterministic column name that may or may not exist.
+            format!("SELECT c0 FROM {table}")
+        }
+    })
 }
 
 /// Generate a `DROP TABLE IF EXISTS` statement.
 fn arb_drop_table() -> impl Strategy<Value = String> {
-    prop::sample::select(TABLES)
-        .prop_map(|table| format!("DROP TABLE IF EXISTS {table}"))
+    prop::sample::select(TABLES).prop_map(|table| format!("DROP TABLE IF EXISTS {table}"))
 }
 
 /// Generate a single arbitrary SQL statement (one of the four kinds).

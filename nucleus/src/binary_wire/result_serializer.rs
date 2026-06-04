@@ -7,8 +7,8 @@
 //! - Status responses (errors, command completion)
 //! - NULL handling
 
-use bytes::{BytesMut, BufMut};
 use crate::types::Value;
+use bytes::{BufMut, BytesMut};
 
 /// Column metadata for result set.
 #[derive(Debug, Clone)]
@@ -91,7 +91,8 @@ impl ResultEncoder {
         self.buffer.clear();
 
         // Column count
-        self.buffer.extend_from_slice(&(row.len() as u16).to_be_bytes());
+        self.buffer
+            .extend_from_slice(&(row.len() as u16).to_be_bytes());
 
         // Each column value
         for value in row {
@@ -131,7 +132,8 @@ impl ResultEncoder {
             Value::Text(s) => {
                 self.buffer.put_u8(type_codes::STRING);
                 let bytes = s.as_bytes();
-                self.buffer.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                self.buffer
+                    .extend_from_slice(&(bytes.len() as u32).to_be_bytes());
                 self.buffer.extend_from_slice(bytes);
             }
             _ => {
@@ -139,7 +141,8 @@ impl ResultEncoder {
                 let json_str = value.to_string();
                 self.buffer.put_u8(type_codes::JSON);
                 let bytes = json_str.as_bytes();
-                self.buffer.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                self.buffer
+                    .extend_from_slice(&(bytes.len() as u32).to_be_bytes());
                 self.buffer.extend_from_slice(bytes);
             }
         }
@@ -216,6 +219,8 @@ impl Default for ResultFormatter {
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
 
     #[test]
@@ -230,7 +235,7 @@ mod tests {
     fn test_column_metadata_encode() {
         let col = ColumnMetadata::new(0, "id", type_codes::INT64);
         let encoded = col.encode();
-        assert!(encoded.len() > 0);
+        assert!(!encoded.is_empty());
         assert_eq!(encoded[0], 0); // column_id high byte
         assert_eq!(encoded[1], 0); // column_id low byte
     }
@@ -305,9 +310,7 @@ mod tests {
             ColumnMetadata::new(0, "id", type_codes::INT64),
             ColumnMetadata::new(1, "name", type_codes::STRING),
         ];
-        let rows = vec![
-            vec![Value::Int64(1), Value::Text("Alice".to_string())],
-        ];
+        let rows = vec![vec![Value::Int64(1), Value::Text("Alice".to_string())]];
         let result = formatter.format_result_set(columns, rows);
         assert_eq!(result.len(), 3); // 2 column metadata + 1 row
     }
@@ -316,13 +319,13 @@ mod tests {
     fn test_command_complete_encoding() {
         let mut encoder = ResultEncoder::new();
         let encoded = encoder.encode_command_complete(1, "INSERT 0 1");
-        assert!(encoded.len() > 0);
+        assert!(!encoded.is_empty());
     }
 
     #[test]
     fn test_error_encoding() {
         let mut encoder = ResultEncoder::new();
         let encoded = encoder.encode_error(1001, "Syntax error");
-        assert!(encoded.len() > 0);
+        assert!(!encoded.is_empty());
     }
 }

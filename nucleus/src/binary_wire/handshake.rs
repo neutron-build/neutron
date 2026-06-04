@@ -140,10 +140,8 @@ impl AuthResponse {
         if payload.len() < proof_len_offset + 2 {
             return Err("response payload incomplete (proof length)".to_string());
         }
-        let proof_len = u16::from_be_bytes([
-            payload[proof_len_offset],
-            payload[proof_len_offset + 1],
-        ]) as usize;
+        let proof_len =
+            u16::from_be_bytes([payload[proof_len_offset], payload[proof_len_offset + 1]]) as usize;
         if payload.len() < proof_len_offset + 2 + proof_len {
             return Err("response payload incomplete (proof)".to_string());
         }
@@ -199,7 +197,10 @@ impl ServerParameters {
         vec![
             ("database".to_string(), self.database.clone()),
             ("user".to_string(), self.user.clone()),
-            ("application_name".to_string(), self.application_name.clone()),
+            (
+                "application_name".to_string(),
+                self.application_name.clone(),
+            ),
             ("client_timezone".to_string(), self.client_timezone.clone()),
             ("server_timezone".to_string(), self.server_timezone.clone()),
         ]
@@ -270,10 +271,7 @@ impl HandshakeHandler {
 
     /// Process incoming client handshake message.
     /// Payload format: [version:4][client_id:4][flags:1]
-    pub fn handle_client_handshake(
-        &mut self,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    pub fn handle_client_handshake(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
         if self.state != HandshakeState::WaitingForClientHandshake {
             return Err("not waiting for client handshake".to_string());
         }
@@ -282,8 +280,7 @@ impl HandshakeHandler {
             return Err("client handshake payload too short".to_string());
         }
 
-        let client_version =
-            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let client_version = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
         let _client_id = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
         let client_flags = payload[8];
 
@@ -305,7 +302,8 @@ impl HandshakeHandler {
 
         // Send server handshake
         self.encoder.reset();
-        self.encoder.encode_handshake(PROTOCOL_VERSION, self.server_id);
+        self.encoder
+            .encode_handshake(PROTOCOL_VERSION, self.server_id);
         // Append flags byte manually (encode_handshake uses 0)
         let buf = self.encoder.buffer_mut();
         if buf.len() > 5 {
@@ -374,10 +372,7 @@ impl HandshakeHandler {
         }
 
         // Verify nonce includes server's nonce
-        if !response
-            .combined_nonce
-            .starts_with(&challenge.server_nonce)
-        {
+        if !response.combined_nonce.starts_with(&challenge.server_nonce) {
             return Err("server nonce not found in response".to_string());
         }
 
@@ -394,10 +389,7 @@ impl HandshakeHandler {
     }
 
     /// Send parameter status messages to client.
-    pub fn send_parameters(
-        &mut self,
-        parameters: ServerParameters,
-    ) -> Result<Vec<u8>, String> {
+    pub fn send_parameters(&mut self, parameters: ServerParameters) -> Result<Vec<u8>, String> {
         if self.state != HandshakeState::ParameterExchange {
             return Err("not in parameter exchange state".to_string());
         }

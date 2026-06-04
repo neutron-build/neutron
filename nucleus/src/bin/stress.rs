@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
@@ -14,7 +14,10 @@ use tokio::sync::Barrier;
 // ============================================================================
 
 #[derive(Parser, Debug)]
-#[command(name = "nucleus-stress", about = "Stress test all Nucleus protocols and data models")]
+#[command(
+    name = "nucleus-stress",
+    about = "Stress test all Nucleus protocols and data models"
+)]
 struct Args {
     #[arg(long, default_value_t = 5432)]
     pg_port: u16,
@@ -147,7 +150,6 @@ fn get_stats(map: &StatsMap, proto: Protocol, model: Model) -> Arc<Stats> {
         .clone()
 }
 
-
 // ============================================================================
 // RESP helpers (manual framing)
 // ============================================================================
@@ -162,10 +164,15 @@ fn resp_encode_command(args: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-async fn resp_read_reply(reader: &mut BufReader<tokio::io::ReadHalf<TcpStream>>) -> Result<RespReply, String> {
+async fn resp_read_reply(
+    reader: &mut BufReader<tokio::io::ReadHalf<TcpStream>>,
+) -> Result<RespReply, String> {
     use tokio::io::AsyncBufReadExt;
     let mut line = String::new();
-    let n = reader.read_line(&mut line).await.map_err(|e| e.to_string())?;
+    let n = reader
+        .read_line(&mut line)
+        .await
+        .map_err(|e| e.to_string())?;
     if n == 0 {
         return Err("connection closed".into());
     }
@@ -191,9 +198,15 @@ async fn resp_read_reply(reader: &mut BufReader<tokio::io::ReadHalf<TcpStream>>)
             }
             let len = len as usize;
             let mut buf = vec![0u8; len];
-            reader.read_exact(&mut buf).await.map_err(|e| e.to_string())?;
+            reader
+                .read_exact(&mut buf)
+                .await
+                .map_err(|e| e.to_string())?;
             let mut crlf = [0u8; 2];
-            reader.read_exact(&mut crlf).await.map_err(|e| e.to_string())?;
+            reader
+                .read_exact(&mut crlf)
+                .await
+                .map_err(|e| e.to_string())?;
             Ok(RespReply::Bulk(String::from_utf8_lossy(&buf).to_string()))
         }
         b'*' => {
@@ -306,26 +319,39 @@ struct BinaryFrame {
     payload: Vec<u8>,
 }
 
-async fn binary_read_frame(stream: &mut tokio::io::ReadHalf<TcpStream>) -> Result<BinaryFrame, String> {
+async fn binary_read_frame(
+    stream: &mut tokio::io::ReadHalf<TcpStream>,
+) -> Result<BinaryFrame, String> {
     let mut header = [0u8; 5];
-    stream.read_exact(&mut header).await.map_err(|e| e.to_string())?;
+    stream
+        .read_exact(&mut header)
+        .await
+        .map_err(|e| e.to_string())?;
     let msg_type = header[0];
     let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
     let mut payload = vec![0u8; len];
     if len > 0 {
-        stream.read_exact(&mut payload).await.map_err(|e| e.to_string())?;
+        stream
+            .read_exact(&mut payload)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(BinaryFrame { msg_type, payload })
 }
 
 /// Read frames until we get a READY, COMMAND_COMPLETE, RESULT_END, or ERROR.
-async fn binary_read_response(stream: &mut tokio::io::ReadHalf<TcpStream>) -> Result<Vec<BinaryFrame>, String> {
+async fn binary_read_response(
+    stream: &mut tokio::io::ReadHalf<TcpStream>,
+) -> Result<Vec<BinaryFrame>, String> {
     let mut frames = Vec::new();
     loop {
         let frame = binary_read_frame(stream).await?;
         let done = matches!(
             frame.msg_type,
-            binary_msg::READY | binary_msg::COMMAND_COMPLETE | binary_msg::RESULT_END | binary_msg::ERROR
+            binary_msg::READY
+                | binary_msg::COMMAND_COMPLETE
+                | binary_msg::RESULT_END
+                | binary_msg::ERROR
         );
         let is_error = frame.msg_type == binary_msg::ERROR;
         frames.push(frame);
@@ -335,9 +361,11 @@ async fn binary_read_response(stream: &mut tokio::io::ReadHalf<TcpStream>) -> Re
             // Keep reading until we see READY.
             if !is_error && frames.last().map(|f| f.msg_type) != Some(binary_msg::READY) {
                 // Try to read one more for READY
-                match tokio::time::timeout(Duration::from_millis(100), binary_read_frame(stream)).await {
-                    Ok(Ok(f)) => { frames.push(f); }
-                    _ => {}
+                if let Ok(Ok(f)) =
+                    tokio::time::timeout(Duration::from_millis(100), binary_read_frame(stream))
+                        .await
+                {
+                    frames.push(f);
                 }
             }
             break;
@@ -369,7 +397,10 @@ async fn binary_handshake(
     // Step 3: Read authentication challenge
     let auth_frame = binary_read_frame(read).await?;
     if auth_frame.msg_type != binary_msg::AUTHENTICATION {
-        return Err(format!("expected AUTHENTICATION, got type {}", auth_frame.msg_type));
+        return Err(format!(
+            "expected AUTHENTICATION, got type {}",
+            auth_frame.msg_type
+        ));
     }
 
     // Step 4: Parse challenge and send response
@@ -378,8 +409,10 @@ async fn binary_handshake(
         return Err("auth challenge too short".into());
     }
     let challenge_id = u32::from_be_bytes([
-        auth_frame.payload[0], auth_frame.payload[1],
-        auth_frame.payload[2], auth_frame.payload[3],
+        auth_frame.payload[0],
+        auth_frame.payload[1],
+        auth_frame.payload[2],
+        auth_frame.payload[3],
     ]);
     let nonce_len = u16::from_be_bytes([auth_frame.payload[4], auth_frame.payload[5]]) as usize;
     let server_nonce = &auth_frame.payload[6..6 + nonce_len];
@@ -394,7 +427,10 @@ async fn binary_handshake(
     resp_payload.extend_from_slice(proof);
 
     let auth_resp = binary_encode_frame(binary_msg::AUTHENTICATION, &resp_payload);
-    write.write_all(&auth_resp).await.map_err(|e| e.to_string())?;
+    write
+        .write_all(&auth_resp)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Step 5: Read ParameterStatus messages and final READY
     loop {
@@ -421,13 +457,11 @@ async fn binary_handshake(
 // pgwire stress tests
 // ============================================================================
 
-async fn pgwire_stress(
-    stats: StatsMap,
-    port: u16,
-    concurrency: usize,
-    duration: Duration,
-) {
-    println!("[pgwire] Starting {} concurrent connections on port {}...", concurrency, port);
+async fn pgwire_stress(stats: StatsMap, port: u16, concurrency: usize, duration: Duration) {
+    println!(
+        "[pgwire] Starting {} concurrent connections on port {}...",
+        concurrency, port
+    );
 
     let barrier = Arc::new(Barrier::new(concurrency));
     let mut handles = Vec::new();
@@ -439,10 +473,15 @@ async fn pgwire_stress(
             barrier.wait().await;
             let deadline = Instant::now() + duration;
 
-            let conn_str = format!("host=127.0.0.1 port={} user=nucleus password=nucleus dbname=nucleus", port);
+            let conn_str = format!(
+                "host=127.0.0.1 port={} user=nucleus password=nucleus dbname=nucleus",
+                port
+            );
             let conn = match tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await {
                 Ok((client, connection)) => {
-                    tokio::spawn(async move { let _ = connection.await; });
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
                     client
                 }
                 Err(e) => {
@@ -453,7 +492,15 @@ async fn pgwire_stress(
 
             // Setup tables for this task
             let tbl = format!("stress_pg_{}", task_id);
-            let _ = conn.execute(&format!("CREATE TABLE IF NOT EXISTS {} (id INT NOT NULL, name TEXT, score FLOAT)", tbl), &[]).await;
+            let _ = conn
+                .execute(
+                    &format!(
+                        "CREATE TABLE IF NOT EXISTS {} (id INT NOT NULL, name TEXT, score FLOAT)",
+                        tbl
+                    ),
+                    &[],
+                )
+                .await;
 
             let mut counter = 0u64;
             while Instant::now() < deadline {
@@ -572,13 +619,11 @@ async fn pgwire_stress(
 // RESP stress tests
 // ============================================================================
 
-async fn resp_stress(
-    stats: StatsMap,
-    port: u16,
-    concurrency: usize,
-    duration: Duration,
-) {
-    println!("[resp] Starting {} concurrent connections on port {}...", concurrency, port);
+async fn resp_stress(stats: StatsMap, port: u16, concurrency: usize, duration: Duration) {
+    println!(
+        "[resp] Starting {} concurrent connections on port {}...",
+        concurrency, port
+    );
 
     let barrier = Arc::new(Barrier::new(concurrency));
     let mut handles = Vec::new();
@@ -611,7 +656,14 @@ async fn resp_stress(
                     // KV ops
                     0 => {
                         let key = format!("resp_kv_{}_{}", task_id, counter);
-                        (Model::Kv, resp_encode_command(&[b"SET", key.as_bytes(), format!("val_{}", counter).as_bytes()]))
+                        (
+                            Model::Kv,
+                            resp_encode_command(&[
+                                b"SET",
+                                key.as_bytes(),
+                                format!("val_{}", counter).as_bytes(),
+                            ]),
+                        )
                     }
                     1 => {
                         let key = format!("resp_kv_{}_{}", task_id, counter.saturating_sub(1));
@@ -624,41 +676,83 @@ async fn resp_stress(
                     // List ops
                     3 => {
                         let key = format!("resp_list_{}", task_id);
-                        (Model::Kv, resp_encode_command(&[b"LPUSH", key.as_bytes(), format!("item_{}", counter).as_bytes()]))
+                        (
+                            Model::Kv,
+                            resp_encode_command(&[
+                                b"LPUSH",
+                                key.as_bytes(),
+                                format!("item_{}", counter).as_bytes(),
+                            ]),
+                        )
                     }
                     4 => {
                         let key = format!("resp_list_{}", task_id);
-                        (Model::Kv, resp_encode_command(&[b"LRANGE", key.as_bytes(), b"0", b"5"]))
+                        (
+                            Model::Kv,
+                            resp_encode_command(&[b"LRANGE", key.as_bytes(), b"0", b"5"]),
+                        )
                     }
                     // Hash ops
                     5 => {
                         let key = format!("resp_hash_{}", task_id);
                         let field = format!("field_{}", counter % 10);
-                        (Model::Kv, resp_encode_command(&[b"HSET", key.as_bytes(), field.as_bytes(), format!("hval_{}", counter).as_bytes()]))
+                        (
+                            Model::Kv,
+                            resp_encode_command(&[
+                                b"HSET",
+                                key.as_bytes(),
+                                field.as_bytes(),
+                                format!("hval_{}", counter).as_bytes(),
+                            ]),
+                        )
                     }
                     6 => {
                         let key = format!("resp_hash_{}", task_id);
                         let field = format!("field_{}", counter % 10);
-                        (Model::Kv, resp_encode_command(&[b"HGET", key.as_bytes(), field.as_bytes()]))
+                        (
+                            Model::Kv,
+                            resp_encode_command(&[b"HGET", key.as_bytes(), field.as_bytes()]),
+                        )
                     }
                     // Set ops
                     7 => {
                         let key = format!("resp_set_{}", task_id);
-                        (Model::Kv, resp_encode_command(&[b"SADD", key.as_bytes(), format!("member_{}", counter % 20).as_bytes()]))
+                        (
+                            Model::Kv,
+                            resp_encode_command(&[
+                                b"SADD",
+                                key.as_bytes(),
+                                format!("member_{}", counter % 20).as_bytes(),
+                            ]),
+                        )
                     }
                     8 => {
                         let key = format!("resp_set_{}", task_id);
-                        (Model::Kv, resp_encode_command(&[b"SMEMBERS", key.as_bytes()]))
+                        (
+                            Model::Kv,
+                            resp_encode_command(&[b"SMEMBERS", key.as_bytes()]),
+                        )
                     }
                     // Sorted set ops
                     9 => {
                         let key = format!("resp_zset_{}", task_id);
                         let score = format!("{}", counter as f64 * 0.5);
-                        (Model::Kv, resp_encode_command(&[b"ZADD", key.as_bytes(), score.as_bytes(), format!("zmem_{}", counter % 50).as_bytes()]))
+                        (
+                            Model::Kv,
+                            resp_encode_command(&[
+                                b"ZADD",
+                                key.as_bytes(),
+                                score.as_bytes(),
+                                format!("zmem_{}", counter % 50).as_bytes(),
+                            ]),
+                        )
                     }
                     10 => {
                         let key = format!("resp_zset_{}", task_id);
-                        (Model::Kv, resp_encode_command(&[b"ZRANGE", key.as_bytes(), b"0", b"10"]))
+                        (
+                            Model::Kv,
+                            resp_encode_command(&[b"ZRANGE", key.as_bytes(), b"0", b"10"]),
+                        )
                     }
                     // DEL
                     11 => {
@@ -672,14 +766,18 @@ async fn resp_stress(
                 let start = Instant::now();
 
                 let result = async {
-                    write_half.write_all(&cmd).await.map_err(|e| e.to_string())?;
+                    write_half
+                        .write_all(&cmd)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     let reply = resp_read_reply(&mut reader).await?;
                     if reply.is_error() {
                         Err(format!("RESP error: {:?}", reply))
                     } else {
                         Ok(())
                     }
-                }.await;
+                }
+                .await;
 
                 let elapsed = start.elapsed();
                 match result {
@@ -704,13 +802,11 @@ async fn resp_stress(
 // Binary wire stress tests
 // ============================================================================
 
-async fn binary_stress(
-    stats: StatsMap,
-    port: u16,
-    concurrency: usize,
-    duration: Duration,
-) {
-    println!("[binary] Starting {} concurrent connections on port {}...", concurrency, port);
+async fn binary_stress(stats: StatsMap, port: u16, concurrency: usize, duration: Duration) {
+    println!(
+        "[binary] Starting {} concurrent connections on port {}...",
+        concurrency, port
+    );
 
     let barrier = Arc::new(Barrier::new(concurrency));
     let mut handles = Vec::new();
@@ -740,7 +836,13 @@ async fn binary_stress(
 
             let tbl = format!("stress_bin_{}", task_id);
             // Create table
-            let create_q = binary_encode_query(0, &format!("CREATE TABLE IF NOT EXISTS {} (id INT NOT NULL, val TEXT)", tbl));
+            let create_q = binary_encode_query(
+                0,
+                &format!(
+                    "CREATE TABLE IF NOT EXISTS {} (id INT NOT NULL, val TEXT)",
+                    tbl
+                ),
+            );
             let _ = write_half.write_all(&create_q).await;
             let _ = binary_read_response(&mut read_half).await;
 
@@ -758,7 +860,13 @@ async fn binary_stress(
                     match op_type {
                         // Simple query
                         0 => {
-                            let q = binary_encode_query(query_id, &format!("INSERT INTO {} VALUES ({}, 'bin_{}')", tbl, counter, counter));
+                            let q = binary_encode_query(
+                                query_id,
+                                &format!(
+                                    "INSERT INTO {} VALUES ({}, 'bin_{}')",
+                                    tbl, counter, counter
+                                ),
+                            );
                             write_half.write_all(&q).await.map_err(|e| e.to_string())?;
                             let frames = binary_read_response(&mut read_half).await?;
                             if frames.iter().any(|f| f.msg_type == binary_msg::ERROR) {
@@ -769,7 +877,10 @@ async fn binary_stress(
                         }
                         // SELECT
                         1 => {
-                            let q = binary_encode_query(query_id, &format!("SELECT * FROM {} LIMIT 5", tbl));
+                            let q = binary_encode_query(
+                                query_id,
+                                &format!("SELECT * FROM {} LIMIT 5", tbl),
+                            );
                             write_half.write_all(&q).await.map_err(|e| e.to_string())?;
                             let frames = binary_read_response(&mut read_half).await?;
                             if frames.iter().any(|f| f.msg_type == binary_msg::ERROR) {
@@ -780,12 +891,21 @@ async fn binary_stress(
                         }
                         // Prepared statement
                         2 => {
-                            let stmt = binary_encode_prepared_stmt(query_id, &format!("SELECT * FROM {} WHERE id = 1", tbl));
-                            write_half.write_all(&stmt).await.map_err(|e| e.to_string())?;
+                            let stmt = binary_encode_prepared_stmt(
+                                query_id,
+                                &format!("SELECT * FROM {} WHERE id = 1", tbl),
+                            );
+                            write_half
+                                .write_all(&stmt)
+                                .await
+                                .map_err(|e| e.to_string())?;
                             let _ = binary_read_response(&mut read_half).await;
 
                             let exec = binary_encode_execute(query_id);
-                            write_half.write_all(&exec).await.map_err(|e| e.to_string())?;
+                            write_half
+                                .write_all(&exec)
+                                .await
+                                .map_err(|e| e.to_string())?;
                             let frames = binary_read_response(&mut read_half).await?;
                             if frames.iter().any(|f| f.msg_type == binary_msg::ERROR) {
                                 Err("execute error".into())
@@ -796,15 +916,29 @@ async fn binary_stress(
                         // Transaction commit
                         3 => {
                             let begin = binary_encode_begin_txn(0);
-                            write_half.write_all(&begin).await.map_err(|e| e.to_string())?;
+                            write_half
+                                .write_all(&begin)
+                                .await
+                                .map_err(|e| e.to_string())?;
                             let _ = binary_read_response(&mut read_half).await;
 
-                            let q = binary_encode_query(query_id, &format!("INSERT INTO {} VALUES ({}, 'txn_{}')", tbl, counter + 100000, counter));
+                            let q = binary_encode_query(
+                                query_id,
+                                &format!(
+                                    "INSERT INTO {} VALUES ({}, 'txn_{}')",
+                                    tbl,
+                                    counter + 100000,
+                                    counter
+                                ),
+                            );
                             write_half.write_all(&q).await.map_err(|e| e.to_string())?;
                             let _ = binary_read_response(&mut read_half).await;
 
                             let commit = binary_encode_commit_txn();
-                            write_half.write_all(&commit).await.map_err(|e| e.to_string())?;
+                            write_half
+                                .write_all(&commit)
+                                .await
+                                .map_err(|e| e.to_string())?;
                             let frames = binary_read_response(&mut read_half).await?;
                             if frames.iter().any(|f| f.msg_type == binary_msg::ERROR) {
                                 Err("commit error".into())
@@ -815,15 +949,24 @@ async fn binary_stress(
                         // Transaction rollback
                         4 => {
                             let begin = binary_encode_begin_txn(0);
-                            write_half.write_all(&begin).await.map_err(|e| e.to_string())?;
+                            write_half
+                                .write_all(&begin)
+                                .await
+                                .map_err(|e| e.to_string())?;
                             let _ = binary_read_response(&mut read_half).await;
 
-                            let q = binary_encode_query(query_id, &format!("INSERT INTO {} VALUES (999999, 'rollback')", tbl));
+                            let q = binary_encode_query(
+                                query_id,
+                                &format!("INSERT INTO {} VALUES (999999, 'rollback')", tbl),
+                            );
                             write_half.write_all(&q).await.map_err(|e| e.to_string())?;
                             let _ = binary_read_response(&mut read_half).await;
 
                             let rollback = binary_encode_rollback_txn();
-                            write_half.write_all(&rollback).await.map_err(|e| e.to_string())?;
+                            write_half
+                                .write_all(&rollback)
+                                .await
+                                .map_err(|e| e.to_string())?;
                             let frames = binary_read_response(&mut read_half).await?;
                             if frames.iter().any(|f| f.msg_type == binary_msg::ERROR) {
                                 Err("rollback error".into())
@@ -833,7 +976,8 @@ async fn binary_stress(
                         }
                         _ => Ok(()),
                     }
-                }.await;
+                }
+                .await;
 
                 let elapsed = start.elapsed();
                 match result {
@@ -858,11 +1002,7 @@ async fn binary_stress(
 // Embedded stress tests
 // ============================================================================
 
-async fn embedded_stress(
-    stats: StatsMap,
-    concurrency: usize,
-    duration: Duration,
-) {
+async fn embedded_stress(stats: StatsMap, concurrency: usize, duration: Duration) {
     use nucleus::embedded::Database;
     use nucleus::types::Value;
 
@@ -871,7 +1011,9 @@ async fn embedded_stress(
     let db = Arc::new(Database::memory());
 
     // Create SQL table for embedded tests
-    db.execute("CREATE TABLE stress_emb (id INT NOT NULL, name TEXT)").await.unwrap();
+    db.execute("CREATE TABLE stress_emb (id INT NOT NULL, name TEXT)")
+        .await
+        .unwrap();
 
     let barrier = Arc::new(Barrier::new(concurrency));
     let mut handles = Vec::new();
@@ -908,20 +1050,35 @@ async fn embedded_stress(
                 let result: Result<(), String> = async {
                     match model {
                         Model::Sql => {
-                            db.execute(&format!("INSERT INTO stress_emb VALUES ({}, 'emb_{}')", counter * 1000 + task_id as u64, counter)).await.map_err(|e| e.to_string())?;
-                            db.query("SELECT COUNT(*) FROM stress_emb").await.map_err(|e| e.to_string())?;
+                            db.execute(&format!(
+                                "INSERT INTO stress_emb VALUES ({}, 'emb_{}')",
+                                counter * 1000 + task_id as u64,
+                                counter
+                            ))
+                            .await
+                            .map_err(|e| e.to_string())?;
+                            db.query("SELECT COUNT(*) FROM stress_emb")
+                                .await
+                                .map_err(|e| e.to_string())?;
                             Ok(())
                         }
                         Model::Kv => {
                             let key = format!("emb_kv_{}_{}", task_id, counter);
-                            db.kv().set(&key, Value::Text(format!("val_{}", counter)), None);
+                            db.kv()
+                                .set(&key, Value::Text(format!("val_{}", counter)), None);
                             let _ = db.kv().get(&key);
                             db.kv().del(&key);
                             Ok(())
                         }
                         Model::Fts => {
                             let doc_id = (task_id as u64) * 1_000_000 + counter;
-                            db.fts().index(doc_id, &format!("embedded stress test document {} with words alpha beta gamma", counter));
+                            db.fts().index(
+                                doc_id,
+                                &format!(
+                                    "embedded stress test document {} with words alpha beta gamma",
+                                    counter
+                                ),
+                            );
                             let _ = db.fts().search("stress alpha", 5);
                             Ok(())
                         }
@@ -930,14 +1087,20 @@ async fn embedded_stress(
                             let mut obj = BTreeMap::new();
                             obj.insert("task".to_string(), JsonValue::Number(task_id as f64));
                             obj.insert("counter".to_string(), JsonValue::Number(counter as f64));
-                            obj.insert("name".to_string(), JsonValue::Str(format!("doc_{}", counter)));
+                            obj.insert(
+                                "name".to_string(),
+                                JsonValue::Str(format!("doc_{}", counter)),
+                            );
                             let id = db.doc().insert(JsonValue::Object(obj));
                             let _ = db.doc().get(id);
                             Ok(())
                         }
                         Model::TimeSeries => {
                             use nucleus::timeseries::DataPoint;
-                            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                            let ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64;
                             let dp = DataPoint {
                                 timestamp: ts,
                                 tags: vec![("host".to_string(), format!("task_{}", task_id))],
@@ -954,26 +1117,40 @@ async fn embedded_stress(
                             Ok(())
                         }
                         Model::Graph => {
-                            use nucleus::graph::{Properties, PropValue};
+                            use nucleus::graph::{PropValue, Properties};
                             let mut props = Properties::new();
-                            props.insert("name".to_string(), PropValue::Text(format!("node_{}_{}", task_id, counter)));
-                            let _node_id = db.graph().write().create_node(vec!["person".to_string()], props);
+                            props.insert(
+                                "name".to_string(),
+                                PropValue::Text(format!("node_{}_{}", task_id, counter)),
+                            );
+                            let _node_id = db
+                                .graph()
+                                .write()
+                                .create_node(vec!["person".to_string()], props);
                             Ok(())
                         }
                         Model::Columnar => {
                             use nucleus::columnar::{ColumnBatch, ColumnData};
                             let batch = ColumnBatch::new(vec![
-                                ("id".to_string(), ColumnData::Int64(vec![Some(counter as i64)])),
-                                ("value".to_string(), ColumnData::Float64(vec![Some(counter as f64 * 0.5)])),
+                                (
+                                    "id".to_string(),
+                                    ColumnData::Int64(vec![Some(counter as i64)]),
+                                ),
+                                (
+                                    "value".to_string(),
+                                    ColumnData::Float64(vec![Some(counter as f64 * 0.5)]),
+                                ),
                             ]);
-                            db.columnar().write().append(&format!("emb_col_{}", task_id), batch);
+                            db.columnar()
+                                .write()
+                                .append(&format!("emb_col_{}", task_id), batch);
                             Ok(())
                         }
                         Model::Datalog => {
-                            db.datalog().assert_fact("parent", vec![
-                                format!("person_{}", task_id),
-                                format!("child_{}", counter),
-                            ]);
+                            db.datalog().assert_fact(
+                                "parent",
+                                vec![format!("person_{}", task_id), format!("child_{}", counter)],
+                            );
                             use nucleus::datalog::{Literal, Term};
                             let q = Literal {
                                 predicate: "parent".to_string(),
@@ -999,7 +1176,8 @@ async fn embedded_stress(
                         }
                         _ => Ok(()),
                     }
-                }.await;
+                }
+                .await;
 
                 let elapsed = start.elapsed();
                 match result {
@@ -1026,11 +1204,10 @@ async fn embedded_stress(
             let mut rx = db_sub.pubsub().subscribe("emb_channel");
             let deadline = Instant::now() + duration;
             while Instant::now() < deadline {
-                match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
-                    Ok(Ok(_msg)) => {
-                        s.record_op(Duration::from_micros(10));
-                    }
-                    _ => {}
+                if let Ok(Ok(_msg)) =
+                    tokio::time::timeout(Duration::from_millis(50), rx.recv()).await
+                {
+                    s.record_op(Duration::from_micros(10));
                 }
             }
         });
@@ -1042,7 +1219,9 @@ async fn embedded_stress(
             while Instant::now() < deadline {
                 counter += 1;
                 let start = Instant::now();
-                db_pub.pubsub().publish("emb_channel", format!("msg_{}", counter));
+                db_pub
+                    .pubsub()
+                    .publish("emb_channel", format!("msg_{}", counter));
                 s.record_op(start.elapsed());
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
@@ -1084,14 +1263,18 @@ async fn persistent_stress(duration: Duration) {
     use nucleus::types::Value;
 
     // Create a temp directory for disk storage
-    let tmp_dir = std::env::temp_dir().join(format!("nucleus_persist_stress_{}", std::process::id()));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("nucleus_persist_stress_{}", std::process::id()));
     if tmp_dir.exists() {
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
     std::fs::create_dir_all(&tmp_dir).expect("failed to create temp dir");
 
     println!("[persistent] Storage path: {}", tmp_dir.display());
-    println!("[persistent] Running data model workload for {}s...", duration.as_secs());
+    println!(
+        "[persistent] Running data model workload for {}s...",
+        duration.as_secs()
+    );
 
     // Counters per model for verification
     let sql_count = Arc::new(AtomicU64::new(0));
@@ -1190,14 +1373,16 @@ async fn persistent_stress(duration: Duration) {
                 }
                 6 => {
                     // Graph: create_node
-                    use nucleus::graph::{Properties, PropValue};
+                    use nucleus::graph::{PropValue, Properties};
                     let mut props = Properties::new();
                     props.insert(
                         "name".to_string(),
                         PropValue::Text(format!("node_{}", counter)),
                     );
-                    let _node_id =
-                        db.graph().write().create_node(vec!["person".to_string()], props);
+                    let _node_id = db
+                        .graph()
+                        .write()
+                        .create_node(vec!["person".to_string()], props);
                     graph_count.fetch_add(1, Ordering::Relaxed);
                 }
                 7 => {
@@ -1254,9 +1439,14 @@ async fn persistent_stress(duration: Duration) {
         let str_n = streams_count.load(Ordering::Relaxed);
 
         let total = sql_n + kv_n + fts_n + doc_n + ts_n + blob_n + graph_n + col_n + dl_n + str_n;
-        println!("[persistent] Phase 1 complete: {} total operations written.", total);
-        println!("[persistent]   sql={} kv={} fts={} doc={} ts={} blob={} graph={} col={} datalog={} streams={}",
-            sql_n, kv_n, fts_n, doc_n, ts_n, blob_n, graph_n, col_n, dl_n, str_n);
+        println!(
+            "[persistent] Phase 1 complete: {} total operations written.",
+            total
+        );
+        println!(
+            "[persistent]   sql={} kv={} fts={} doc={} ts={} blob={} graph={} col={} datalog={} streams={}",
+            sql_n, kv_n, fts_n, doc_n, ts_n, blob_n, graph_n, col_n, dl_n, str_n
+        );
 
         // Simulate crash: close the database (drop all handles)
         println!("[persistent] Closing database (simulating crash)...");
@@ -1264,7 +1454,10 @@ async fn persistent_stress(duration: Duration) {
     }
 
     // Phase 2: Reopen and verify
-    println!("[persistent] Reopening database from {}...", tmp_dir.display());
+    println!(
+        "[persistent] Reopening database from {}...",
+        tmp_dir.display()
+    );
     {
         let db = Database::durable_mvcc(&tmp_dir).expect("failed to reopen durable MVCC db");
 
@@ -1291,7 +1484,12 @@ async fn persistent_stress(duration: Duration) {
             },
             _ => 0,
         };
-        results.push(("sql", sql_written, sql_recovered, sql_recovered == sql_written));
+        results.push((
+            "sql",
+            sql_written,
+            sql_recovered,
+            sql_recovered == sql_written,
+        ));
 
         // KV: spot-check 10 random keys that were written
         // KV is in-memory (not WAL-backed) so keys don't survive reopen.
@@ -1361,10 +1559,7 @@ async fn persistent_stress(duration: Duration) {
             use nucleus::datalog::{Literal, Term};
             let q = Literal {
                 predicate: "parent".to_string(),
-                args: vec![
-                    Term::Var("X".to_string()),
-                    Term::Var("Y".to_string()),
-                ],
+                args: vec![Term::Var("X".to_string()), Term::Var("Y".to_string())],
                 negated: false,
             };
             let _ = db.datalog().query(&q);
@@ -1381,9 +1576,13 @@ async fn persistent_stress(duration: Duration) {
 
         // Print recovery report
         println!();
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
         println!("  CRASH RECOVERY VERIFICATION");
-        println!("================================================================================");
+        println!(
+            "================================================================================"
+        );
         println!();
         println!(
             "{:<12}| {:<10}| {:<10}| {:<6}",
@@ -1426,12 +1625,8 @@ async fn persistent_stress(duration: Duration) {
         println!(
             "NOTE: KV, FTS, Document, TimeSeries, Blob, Graph, Columnar, Datalog, and Streams"
         );
-        println!(
-            "      are in-memory data models. Recovery verification confirms the database"
-        );
-        println!(
-            "      reopens without error. Only SQL (WAL-backed) verifies exact row counts."
-        );
+        println!("      are in-memory data models. Recovery verification confirms the database");
+        println!("      reopens without error. Only SQL (WAL-backed) verifies exact row counts.");
     }
 
     // Cleanup
@@ -1443,19 +1638,23 @@ async fn persistent_stress(duration: Duration) {
 // Cross-protocol consistency tests
 // ============================================================================
 
-async fn cross_protocol_tests(
-    pg_port: u16,
-    resp_port: u16,
-) -> (u64, u64) {
+async fn cross_protocol_tests(pg_port: u16, resp_port: u16) -> (u64, u64) {
     println!("[cross-protocol] Running consistency tests...");
 
     let mut passed = 0u64;
     let mut total = 0u64;
 
     // Test 1: Write via pgwire KV_SET, read via RESP GET (reuse single connections)
-    let conn_str = format!("host=127.0.0.1 port={} user=nucleus password=nucleus dbname=nucleus", pg_port);
-    if let Ok((pg_client, pg_conn)) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await {
-        tokio::spawn(async move { let _ = pg_conn.await; });
+    let conn_str = format!(
+        "host=127.0.0.1 port={} user=nucleus password=nucleus dbname=nucleus",
+        pg_port
+    );
+    if let Ok((pg_client, pg_conn)) =
+        tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await
+    {
+        tokio::spawn(async move {
+            let _ = pg_conn.await;
+        });
         if let Ok(resp_stream) = TcpStream::connect(format!("127.0.0.1:{}", resp_port)).await {
             let (read_half, mut write_half) = tokio::io::split(resp_stream);
             let mut reader = BufReader::new(read_half);
@@ -1465,24 +1664,36 @@ async fn cross_protocol_tests(
                 let key = format!("cross_pg_to_resp_{}", i);
                 let val = format!("cross_val_{}", i);
 
-                if pg_client.execute(&format!("SELECT KV_SET('{}', '{}')", key, val), &[]).await.is_err() {
+                if pg_client
+                    .execute(&format!("SELECT KV_SET('{}', '{}')", key, val), &[])
+                    .await
+                    .is_err()
+                {
                     continue;
                 }
 
                 let cmd = resp_encode_command(&[b"GET", key.as_bytes()]);
-                if write_half.write_all(&cmd).await.is_ok() {
-                    if let Ok(RespReply::Bulk(v)) = resp_read_reply(&mut reader).await {
-                        if v == val { passed += 1; }
-                    }
+                if write_half.write_all(&cmd).await.is_ok()
+                    && let Ok(RespReply::Bulk(v)) = resp_read_reply(&mut reader).await
+                    && v == val
+                {
+                    passed += 1;
                 }
             }
         }
     }
 
     // Test 2: Write via RESP SET, read via pgwire KV_GET (reuse single connections)
-    let conn_str = format!("host=127.0.0.1 port={} user=nucleus password=nucleus dbname=nucleus", pg_port);
-    if let Ok((pg_client, pg_conn)) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await {
-        tokio::spawn(async move { let _ = pg_conn.await; });
+    let conn_str = format!(
+        "host=127.0.0.1 port={} user=nucleus password=nucleus dbname=nucleus",
+        pg_port
+    );
+    if let Ok((pg_client, pg_conn)) =
+        tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await
+    {
+        tokio::spawn(async move {
+            let _ = pg_conn.await;
+        });
         if let Ok(resp_stream) = TcpStream::connect(format!("127.0.0.1:{}", resp_port)).await {
             let (read_half, mut write_half) = tokio::io::split(resp_stream);
             let mut reader = BufReader::new(read_half);
@@ -1503,16 +1714,15 @@ async fn cross_protocol_tests(
                     continue;
                 }
 
-                match pg_client.query(&format!("SELECT KV_GET('{}')", key), &[]).await {
-                    Ok(rows) => {
-                        if !rows.is_empty() {
-                            let col_val: Option<String> = rows[0].try_get(0).ok();
-                            if col_val.as_deref() == Some(&val) {
-                                passed += 1;
-                            }
-                        }
+                if let Ok(rows) = pg_client
+                    .query(&format!("SELECT KV_GET('{}')", key), &[])
+                    .await
+                    && !rows.is_empty()
+                {
+                    let col_val: Option<String> = rows[0].try_get(0).ok();
+                    if col_val.as_deref() == Some(&val) {
+                        passed += 1;
                     }
-                    Err(_) => {}
                 }
             }
         }
@@ -1538,19 +1748,27 @@ fn print_report(stats: &StatsMap, cross_passed: u64, cross_total: u64) {
     );
     println!(
         "{}|{}|{}|{}|{}|{}|{}",
-        "-".repeat(12), "-".repeat(12), "-".repeat(8), "-".repeat(8),
-        "-".repeat(8), "-".repeat(8), "-".repeat(8)
+        "-".repeat(12),
+        "-".repeat(12),
+        "-".repeat(8),
+        "-".repeat(8),
+        "-".repeat(8),
+        "-".repeat(8),
+        "-".repeat(8)
     );
 
     let mut total_ops = 0u64;
     let mut total_errors = 0u64;
 
     // Collect and sort entries
-    let mut entries: Vec<_> = stats.iter().map(|entry| {
-        let (proto, model) = entry.key().clone();
-        let s = entry.value().clone();
-        (proto, model, s)
-    }).collect();
+    let mut entries: Vec<_> = stats
+        .iter()
+        .map(|entry| {
+            let (proto, model) = *entry.key();
+            let s = entry.value().clone();
+            (proto, model, s)
+        })
+        .collect();
 
     entries.sort_by(|a, b| {
         let proto_ord = |p: &Protocol| match p {
@@ -1575,7 +1793,8 @@ fn print_report(stats: &StatsMap, cross_passed: u64, cross_total: u64) {
             Model::Datalog => 12,
             Model::Cdc => 13,
         };
-        proto_ord(&a.0).cmp(&proto_ord(&b.0))
+        proto_ord(&a.0)
+            .cmp(&proto_ord(&b.0))
             .then(model_ord(&a.1).cmp(&model_ord(&b.1)))
     });
 
@@ -1610,27 +1829,42 @@ fn print_report(stats: &StatsMap, cross_passed: u64, cross_total: u64) {
 
         println!(
             "{:<12}| {:<12}| {:<8}| {:<8}| {:<8}| {:<8}| {:<8}",
-            proto, model,
-            fmt_num(ops), fmt_num(errors),
-            fmt_ms(p50), fmt_ms(p95), fmt_ms(p99)
+            proto,
+            model,
+            fmt_num(ops),
+            fmt_num(errors),
+            fmt_ms(p50),
+            fmt_ms(p95),
+            fmt_ms(p99)
         );
     }
 
     println!(
         "{}|{}|{}|{}|{}|{}|{}",
-        "-".repeat(12), "-".repeat(12), "-".repeat(8), "-".repeat(8),
-        "-".repeat(8), "-".repeat(8), "-".repeat(8)
+        "-".repeat(12),
+        "-".repeat(12),
+        "-".repeat(8),
+        "-".repeat(8),
+        "-".repeat(8),
+        "-".repeat(8),
+        "-".repeat(8)
     );
     println!(
         "{:<12}| {:<12}| {:<8}| {:<8}|",
-        "TOTAL", "",
-        total_ops, total_errors
+        "TOTAL", "", total_ops, total_errors
     );
     println!();
 
     if cross_total > 0 {
-        let status = if cross_passed == cross_total { "ALL PASSED" } else { "FAILURES" };
-        println!("CROSS-PROTOCOL CONSISTENCY: {}/{} passed  [{}]", cross_passed, cross_total, status);
+        let status = if cross_passed == cross_total {
+            "ALL PASSED"
+        } else {
+            "FAILURES"
+        };
+        println!(
+            "CROSS-PROTOCOL CONSISTENCY: {}/{} passed  [{}]",
+            cross_passed, cross_total, status
+        );
     }
     println!();
 }

@@ -144,9 +144,7 @@ impl BlobIndex {
             return None;
         }
         // Binary search: find the last chunk whose cumulative offset <= target
-        let idx = self
-            .offsets
-            .partition_point(|(cum, _)| *cum <= offset);
+        let idx = self.offsets.partition_point(|(cum, _)| *cum <= offset);
         if idx == 0 {
             // offset is before the first chunk start — it IS the first chunk
             Some(0)
@@ -295,9 +293,10 @@ impl BlobStore {
 
         // Log to WAL before in-memory mutation
         if let Some(wal) = &self.wal
-            && let Err(e) = wal.log_store(key, content_type, data.len() as u64, &wal_chunks) {
-                eprintln!("blob WAL: failed to log store for '{key}': {e}");
-            }
+            && let Err(e) = wal.log_store(key, content_type, data.len() as u64, &wal_chunks)
+        {
+            eprintln!("blob WAL: failed to log store for '{key}': {e}");
+        }
 
         let index = BlobIndex::build(&chunk_sizes);
 
@@ -377,9 +376,10 @@ impl BlobStore {
     pub fn delete(&mut self, key: &str) -> bool {
         // Log to WAL before in-memory mutation
         if let Some(wal) = &self.wal
-            && let Err(e) = wal.log_delete(key) {
-                eprintln!("blob WAL: failed to log delete for '{key}': {e}");
-            }
+            && let Err(e) = wal.log_delete(key)
+        {
+            eprintln!("blob WAL: failed to log delete for '{key}': {e}");
+        }
         self.blobs.remove(key).is_some()
     }
 
@@ -393,11 +393,11 @@ impl BlobStore {
         if let Some(meta) = self.blobs.get_mut(key) {
             // Log to WAL before in-memory mutation
             if let Some(wal) = &self.wal
-                && let Err(e) = wal.log_tag(key, tag_key, tag_value) {
-                    eprintln!("blob WAL: failed to log tag for '{key}': {e}");
-                }
-            meta.tags
-                .insert(tag_key.to_string(), tag_value.to_string());
+                && let Err(e) = wal.log_tag(key, tag_key, tag_value)
+            {
+                eprintln!("blob WAL: failed to log tag for '{key}': {e}");
+            }
+            meta.tags.insert(tag_key.to_string(), tag_value.to_string());
             true
         } else {
             false

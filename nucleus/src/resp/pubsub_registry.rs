@@ -50,6 +50,12 @@ struct PubSubInner {
     next_id: u64,
 }
 
+impl Default for PubSubRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PubSubRegistry {
     pub fn new() -> Self {
         Self {

@@ -15,7 +15,9 @@ async fn test_e2e_schema_setup() {
     let ex = test_executor();
 
     // Create tables with diverse column types
-    exec(&ex, "CREATE TABLE users (
+    exec(
+        &ex,
+        "CREATE TABLE users (
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
         email TEXT UNIQUE,
@@ -24,21 +26,33 @@ async fn test_e2e_schema_setup() {
         is_active BOOLEAN DEFAULT true,
         metadata JSONB,
         created_at TIMESTAMP
-    )").await;
+    )",
+    )
+    .await;
 
-    exec(&ex, "CREATE TABLE organizations (
+    exec(
+        &ex,
+        "CREATE TABLE organizations (
         id SERIAL PRIMARY KEY,
         name TEXT NOT NULL,
         slug TEXT UNIQUE
-    )").await;
+    )",
+    )
+    .await;
 
-    exec(&ex, "CREATE TABLE memberships (
+    exec(
+        &ex,
+        "CREATE TABLE memberships (
         user_id INT REFERENCES users(id) ON DELETE CASCADE,
         org_id INT REFERENCES organizations(id) ON DELETE CASCADE,
         role TEXT DEFAULT 'member'
-    )").await;
+    )",
+    )
+    .await;
 
-    exec(&ex, "CREATE TABLE products (
+    exec(
+        &ex,
+        "CREATE TABLE products (
         id SERIAL PRIMARY KEY,
         org_id INT REFERENCES organizations(id),
         name TEXT NOT NULL,
@@ -46,21 +60,35 @@ async fn test_e2e_schema_setup() {
         stock INT DEFAULT 0,
         tags JSONB,
         embedding VECTOR(4)
-    )").await;
+    )",
+    )
+    .await;
 
-    exec(&ex, "CREATE TABLE orders (
+    exec(
+        &ex,
+        "CREATE TABLE orders (
         id SERIAL PRIMARY KEY,
         user_id INT REFERENCES users(id),
         product_id INT REFERENCES products(id),
         quantity INT NOT NULL,
         total FLOAT NOT NULL,
         status TEXT DEFAULT 'pending'
-    )").await;
+    )",
+    )
+    .await;
 
     // Verify tables were created
-    let results = exec(&ex, "SELECT table_name FROM information_schema.tables ORDER BY table_name").await;
+    let results = exec(
+        &ex,
+        "SELECT table_name FROM information_schema.tables ORDER BY table_name",
+    )
+    .await;
     let r = rows(&results[0]);
-    assert!(r.len() >= 5, "should have at least 5 tables, got {}", r.len());
+    assert!(
+        r.len() >= 5,
+        "should have at least 5 tables, got {}",
+        r.len()
+    );
 }
 
 // ======================================================================
@@ -71,8 +99,16 @@ async fn test_e2e_schema_setup() {
 async fn test_e2e_indexes() {
     let ex = test_executor();
 
-    exec(&ex, "CREATE TABLE idx_users (id INT PRIMARY KEY, name TEXT, email TEXT UNIQUE, age INT)").await;
-    exec(&ex, "CREATE TABLE idx_orders (id INT, user_id INT, amount INT, status TEXT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE idx_users (id INT PRIMARY KEY, name TEXT, email TEXT UNIQUE, age INT)",
+    )
+    .await;
+    exec(
+        &ex,
+        "CREATE TABLE idx_orders (id INT, user_id INT, amount INT, status TEXT)",
+    )
+    .await;
 
     // Create B-tree index
     exec(&ex, "CREATE INDEX idx_orders_user ON idx_orders (user_id)").await;
@@ -80,31 +116,46 @@ async fn test_e2e_indexes() {
 
     // Insert data
     for i in 1..=20 {
-        exec(&ex, &format!(
-            "INSERT INTO idx_users VALUES ({i}, 'user_{i}', 'user{i}@test.com', {})",
-            20 + i
-        )).await;
+        exec(
+            &ex,
+            &format!(
+                "INSERT INTO idx_users VALUES ({i}, 'user_{i}', 'user{i}@test.com', {})",
+                20 + i
+            ),
+        )
+        .await;
     }
     for i in 1..=50 {
         let uid = (i % 20) + 1;
         let status = if i % 3 == 0 { "complete" } else { "pending" };
-        exec(&ex, &format!(
-            "INSERT INTO idx_orders VALUES ({i}, {uid}, {}, '{status}')",
-            i * 10
-        )).await;
+        exec(
+            &ex,
+            &format!(
+                "INSERT INTO idx_orders VALUES ({i}, {uid}, {}, '{status}')",
+                i * 10
+            ),
+        )
+        .await;
     }
 
     // Verify indexes work via queries
     let results = exec(&ex, "SELECT COUNT(*) FROM idx_orders WHERE user_id = 5").await;
-    let count = match scalar(&results[0]) { Value::Int64(n) => *n, ref v => panic!("{v:?}") };
+    let count = match scalar(&results[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
     assert!(count >= 1, "should find orders for user 5");
 
     // Verify unique index rejects duplicates
-    let err = ex.execute("INSERT INTO idx_users VALUES (100, 'dup', 'user1@test.com', 25)").await;
+    let err = ex
+        .execute("INSERT INTO idx_users VALUES (100, 'dup', 'user1@test.com', 25)")
+        .await;
     assert!(err.is_err(), "unique index should reject duplicate email");
 
     // Verify primary key index
-    let err = ex.execute("INSERT INTO idx_users VALUES (1, 'dup', 'unique@test.com', 25)").await;
+    let err = ex
+        .execute("INSERT INTO idx_users VALUES (1, 'dup', 'unique@test.com', 25)")
+        .await;
     assert!(err.is_err(), "primary key should reject duplicate id");
 }
 
@@ -116,16 +167,40 @@ async fn test_e2e_indexes() {
 async fn test_e2e_crud() {
     let ex = test_executor();
 
-    exec(&ex, "CREATE TABLE crud_items (id INT PRIMARY KEY, name TEXT, price FLOAT, active BOOLEAN)").await;
+    exec(
+        &ex,
+        "CREATE TABLE crud_items (id INT PRIMARY KEY, name TEXT, price FLOAT, active BOOLEAN)",
+    )
+    .await;
 
     // INSERT multiple rows
-    exec(&ex, "INSERT INTO crud_items VALUES (1, 'Widget', 9.99, true)").await;
-    exec(&ex, "INSERT INTO crud_items VALUES (2, 'Gadget', 19.99, true)").await;
-    exec(&ex, "INSERT INTO crud_items VALUES (3, 'Doohickey', 5.49, false)").await;
-    exec(&ex, "INSERT INTO crud_items VALUES (4, 'Thingamajig', 29.99, true)").await;
+    exec(
+        &ex,
+        "INSERT INTO crud_items VALUES (1, 'Widget', 9.99, true)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO crud_items VALUES (2, 'Gadget', 19.99, true)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO crud_items VALUES (3, 'Doohickey', 5.49, false)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO crud_items VALUES (4, 'Thingamajig', 29.99, true)",
+    )
+    .await;
 
     // SELECT with WHERE
-    let results = exec(&ex, "SELECT name, price FROM crud_items WHERE active = true ORDER BY price").await;
+    let results = exec(
+        &ex,
+        "SELECT name, price FROM crud_items WHERE active = true ORDER BY price",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 3);
     assert_eq!(r[0][0], Value::Text("Widget".into()));
@@ -137,7 +212,11 @@ async fn test_e2e_crud() {
     assert_eq!(*scalar(&results[0]), Value::Float64(7.99));
 
     // UPDATE multiple rows — Gadget (19.99) and Thingamajig (29.99) get deactivated
-    exec(&ex, "UPDATE crud_items SET active = false WHERE price > 15.0").await;
+    exec(
+        &ex,
+        "UPDATE crud_items SET active = false WHERE price > 15.0",
+    )
+    .await;
     let results = exec(&ex, "SELECT COUNT(*) FROM crud_items WHERE active = true").await;
     assert_eq!(*scalar(&results[0]), Value::Int64(1)); // Only Widget (9.99) remains active
 
@@ -147,8 +226,12 @@ async fn test_e2e_crud() {
     assert_eq!(*scalar(&results[0]), Value::Int64(3));
 
     // UPSERT (ON CONFLICT DO UPDATE)
-    exec(&ex, "INSERT INTO crud_items VALUES (1, 'Super Widget', 12.99, true)
-               ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, price = EXCLUDED.price").await;
+    exec(
+        &ex,
+        "INSERT INTO crud_items VALUES (1, 'Super Widget', 12.99, true)
+               ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, price = EXCLUDED.price",
+    )
+    .await;
     let results = exec(&ex, "SELECT name, price FROM crud_items WHERE id = 1").await;
     let r = rows(&results[0]);
     assert_eq!(r[0][0], Value::Text("Super Widget".into()));
@@ -169,14 +252,26 @@ async fn test_e2e_crud() {
 async fn test_e2e_transactions() {
     let ex = test_executor();
 
-    exec(&ex, "CREATE TABLE txn_accounts (id INT PRIMARY KEY, name TEXT, balance FLOAT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE txn_accounts (id INT PRIMARY KEY, name TEXT, balance FLOAT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO txn_accounts VALUES (1, 'Alice', 1000.0)").await;
     exec(&ex, "INSERT INTO txn_accounts VALUES (2, 'Bob', 500.0)").await;
 
     // Transaction that COMMITs (transfer money)
     exec(&ex, "BEGIN").await;
-    exec(&ex, "UPDATE txn_accounts SET balance = balance - 200.0 WHERE id = 1").await;
-    exec(&ex, "UPDATE txn_accounts SET balance = balance + 200.0 WHERE id = 2").await;
+    exec(
+        &ex,
+        "UPDATE txn_accounts SET balance = balance - 200.0 WHERE id = 1",
+    )
+    .await;
+    exec(
+        &ex,
+        "UPDATE txn_accounts SET balance = balance + 200.0 WHERE id = 2",
+    )
+    .await;
     exec(&ex, "COMMIT").await;
 
     // Verify balances persisted
@@ -187,7 +282,11 @@ async fn test_e2e_transactions() {
 
     // Transaction that ROLLBACKs (failed transfer)
     exec(&ex, "BEGIN").await;
-    exec(&ex, "UPDATE txn_accounts SET balance = balance - 5000.0 WHERE id = 1").await;
+    exec(
+        &ex,
+        "UPDATE txn_accounts SET balance = balance - 5000.0 WHERE id = 1",
+    )
+    .await;
     // Oops, overdraft — rollback
     exec(&ex, "ROLLBACK").await;
 
@@ -220,13 +319,41 @@ async fn test_e2e_transactions() {
 async fn test_e2e_aggregations() {
     let ex = test_executor();
 
-    exec(&ex, "CREATE TABLE agg_sales (id INT, region TEXT, product TEXT, amount FLOAT)").await;
-    exec(&ex, "INSERT INTO agg_sales VALUES (1, 'East', 'Widget', 100.0)").await;
-    exec(&ex, "INSERT INTO agg_sales VALUES (2, 'East', 'Widget', 150.0)").await;
-    exec(&ex, "INSERT INTO agg_sales VALUES (3, 'West', 'Gadget', 200.0)").await;
-    exec(&ex, "INSERT INTO agg_sales VALUES (4, 'East', 'Gadget', 75.0)").await;
-    exec(&ex, "INSERT INTO agg_sales VALUES (5, 'West', 'Widget', 300.0)").await;
-    exec(&ex, "INSERT INTO agg_sales VALUES (6, 'West', 'Gadget', 125.0)").await;
+    exec(
+        &ex,
+        "CREATE TABLE agg_sales (id INT, region TEXT, product TEXT, amount FLOAT)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO agg_sales VALUES (1, 'East', 'Widget', 100.0)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO agg_sales VALUES (2, 'East', 'Widget', 150.0)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO agg_sales VALUES (3, 'West', 'Gadget', 200.0)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO agg_sales VALUES (4, 'East', 'Gadget', 75.0)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO agg_sales VALUES (5, 'West', 'Widget', 300.0)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO agg_sales VALUES (6, 'West', 'Gadget', 125.0)",
+    )
+    .await;
 
     // COUNT
     let results = exec(&ex, "SELECT COUNT(*) FROM agg_sales").await;
@@ -258,7 +385,11 @@ async fn test_e2e_aggregations() {
     }
 
     // GROUP BY
-    let results = exec(&ex, "SELECT region, SUM(amount) AS total FROM agg_sales GROUP BY region ORDER BY region").await;
+    let results = exec(
+        &ex,
+        "SELECT region, SUM(amount) AS total FROM agg_sales GROUP BY region ORDER BY region",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
     assert_eq!(r[0][0], Value::Text("East".into()));
@@ -267,7 +398,7 @@ async fn test_e2e_aggregations() {
     // HAVING
     let results = exec(&ex, "SELECT product, COUNT(*) AS cnt FROM agg_sales GROUP BY product HAVING COUNT(*) >= 3 ORDER BY product").await;
     let r = rows(&results[0]);
-    assert!(r.len() >= 1, "at least one product with >= 3 sales");
+    assert!(!r.is_empty(), "at least one product with >= 3 sales");
 }
 
 // ======================================================================
@@ -278,23 +409,33 @@ async fn test_e2e_aggregations() {
 async fn test_e2e_joins() {
     let ex = test_executor();
 
-    exec(&ex, "CREATE TABLE join_depts (id INT PRIMARY KEY, name TEXT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE join_depts (id INT PRIMARY KEY, name TEXT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO join_depts VALUES (1, 'Engineering')").await;
     exec(&ex, "INSERT INTO join_depts VALUES (2, 'Sales')").await;
     exec(&ex, "INSERT INTO join_depts VALUES (3, 'Marketing')").await;
 
-    exec(&ex, "CREATE TABLE join_emps (id INT PRIMARY KEY, name TEXT, dept_id INT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE join_emps (id INT PRIMARY KEY, name TEXT, dept_id INT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO join_emps VALUES (1, 'Alice', 1)").await;
     exec(&ex, "INSERT INTO join_emps VALUES (2, 'Bob', 1)").await;
     exec(&ex, "INSERT INTO join_emps VALUES (3, 'Charlie', 2)").await;
     exec(&ex, "INSERT INTO join_emps VALUES (4, 'Diana', NULL)").await;
 
     // INNER JOIN
-    let results = exec(&ex,
+    let results = exec(
+        &ex,
         "SELECT join_emps.name AS emp_name, join_depts.name AS dept_name \
          FROM join_emps INNER JOIN join_depts ON join_emps.dept_id = join_depts.id \
-         ORDER BY join_emps.name"
-    ).await;
+         ORDER BY join_emps.name",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 3); // Alice, Bob, Charlie (Diana has no dept)
     // Verify column names in result
@@ -309,28 +450,38 @@ async fn test_e2e_joins() {
     assert_eq!(r[0][0], Value::Text("Alice".into()));
 
     // LEFT JOIN — should include Diana with NULL department
-    let results = exec(&ex,
+    let results = exec(
+        &ex,
         "SELECT join_emps.name AS emp_name, join_depts.name AS dept_name \
          FROM join_emps LEFT JOIN join_depts ON join_emps.dept_id = join_depts.id \
-         ORDER BY join_emps.name"
-    ).await;
+         ORDER BY join_emps.name",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 4);
     // Diana should have NULL for department name
-    let diana = r.iter().find(|row| row[0] == Value::Text("Diana".into())).unwrap();
+    let diana = r
+        .iter()
+        .find(|row| row[0] == Value::Text("Diana".into()))
+        .unwrap();
     assert_eq!(diana[1], Value::Null, "Diana has no department");
 
     // LEFT JOIN — department with no employees
-    let results = exec(&ex,
+    let results = exec(
+        &ex,
         "SELECT join_depts.name, COUNT(join_emps.id) AS emp_count \
          FROM join_depts LEFT JOIN join_emps ON join_depts.id = join_emps.dept_id \
          GROUP BY join_depts.name \
-         ORDER BY join_depts.name"
-    ).await;
+         ORDER BY join_depts.name",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 3);
     // Marketing has 0 employees
-    let marketing = r.iter().find(|row| row[0] == Value::Text("Marketing".into())).unwrap();
+    let marketing = r
+        .iter()
+        .find(|row| row[0] == Value::Text("Marketing".into()))
+        .unwrap();
     assert_eq!(marketing[1], Value::Int64(0));
 }
 
@@ -342,35 +493,67 @@ async fn test_e2e_joins() {
 async fn test_e2e_subqueries() {
     let ex = test_executor();
 
-    exec(&ex, "CREATE TABLE sub_categories (id INT PRIMARY KEY, name TEXT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE sub_categories (id INT PRIMARY KEY, name TEXT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO sub_categories VALUES (1, 'electronics')").await;
     exec(&ex, "INSERT INTO sub_categories VALUES (2, 'books')").await;
     exec(&ex, "INSERT INTO sub_categories VALUES (3, 'clothing')").await;
 
-    exec(&ex, "CREATE TABLE sub_products (id INT PRIMARY KEY, name TEXT, cat_id INT, price FLOAT)").await;
-    exec(&ex, "INSERT INTO sub_products VALUES (1, 'Laptop', 1, 999.99)").await;
-    exec(&ex, "INSERT INTO sub_products VALUES (2, 'Phone', 1, 699.99)").await;
-    exec(&ex, "INSERT INTO sub_products VALUES (3, 'Novel', 2, 14.99)").await;
-    exec(&ex, "INSERT INTO sub_products VALUES (4, 'T-Shirt', 3, 24.99)").await;
-    exec(&ex, "INSERT INTO sub_products VALUES (5, 'Jacket', 3, 89.99)").await;
+    exec(
+        &ex,
+        "CREATE TABLE sub_products (id INT PRIMARY KEY, name TEXT, cat_id INT, price FLOAT)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO sub_products VALUES (1, 'Laptop', 1, 999.99)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO sub_products VALUES (2, 'Phone', 1, 699.99)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO sub_products VALUES (3, 'Novel', 2, 14.99)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO sub_products VALUES (4, 'T-Shirt', 3, 24.99)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO sub_products VALUES (5, 'Jacket', 3, 89.99)",
+    )
+    .await;
 
     // WHERE col IN (SELECT ...)
-    let results = exec(&ex,
+    let results = exec(
+        &ex,
         "SELECT name FROM sub_products \
          WHERE cat_id IN (SELECT id FROM sub_categories WHERE name = 'electronics') \
-         ORDER BY name"
-    ).await;
+         ORDER BY name",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
     assert_eq!(r[0][0], Value::Text("Laptop".into()));
     assert_eq!(r[1][0], Value::Text("Phone".into()));
 
     // EXISTS
-    let results = exec(&ex,
+    let results = exec(
+        &ex,
         "SELECT name FROM sub_categories c \
          WHERE EXISTS (SELECT 1 FROM sub_products p WHERE p.cat_id = c.id AND p.price > 500.0) \
-         ORDER BY name"
-    ).await;
+         ORDER BY name",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Text("electronics".into()));
@@ -398,9 +581,11 @@ async fn test_e2e_window_functions() {
     exec(&ex, "INSERT INTO win_sales VALUES ('Charlie', 70)").await;
 
     // ROW_NUMBER() OVER (ORDER BY ...)
-    let results = exec(&ex,
-        "SELECT name, ROW_NUMBER() OVER (ORDER BY score DESC) FROM win_sales"
-    ).await;
+    let results = exec(
+        &ex,
+        "SELECT name, ROW_NUMBER() OVER (ORDER BY score DESC) FROM win_sales",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 3);
     assert_eq!(r[0][1], Value::Int64(1)); // Alice (90)
@@ -413,9 +598,11 @@ async fn test_e2e_window_functions() {
     exec(&ex, "INSERT INTO win_ranked VALUES ('B', 90)").await;
     exec(&ex, "INSERT INTO win_ranked VALUES ('C', 80)").await;
 
-    let results = exec(&ex,
-        "SELECT name, RANK() OVER (ORDER BY score DESC) FROM win_ranked"
-    ).await;
+    let results = exec(
+        &ex,
+        "SELECT name, RANK() OVER (ORDER BY score DESC) FROM win_ranked",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r[0][1], Value::Int64(1)); // tied at 90
     assert_eq!(r[1][1], Value::Int64(1)); // tied at 90
@@ -427,13 +614,15 @@ async fn test_e2e_window_functions() {
     exec(&ex, "INSERT INTO win_running VALUES (2)").await;
     exec(&ex, "INSERT INTO win_running VALUES (3)").await;
 
-    let results = exec(&ex,
-        "SELECT val, SUM(val) OVER (ORDER BY val) FROM win_running"
-    ).await;
+    let results = exec(
+        &ex,
+        "SELECT val, SUM(val) OVER (ORDER BY val) FROM win_running",
+    )
+    .await;
     let r = rows(&results[0]);
-    assert_eq!(r[0][1], Value::Float64(1.0));  // running sum: 1
-    assert_eq!(r[1][1], Value::Float64(3.0));  // running sum: 1+2
-    assert_eq!(r[2][1], Value::Float64(6.0));  // running sum: 1+2+3
+    assert_eq!(r[0][1], Value::Float64(1.0)); // running sum: 1
+    assert_eq!(r[1][1], Value::Float64(3.0)); // running sum: 1+2
+    assert_eq!(r[2][1], Value::Float64(6.0)); // running sum: 1+2+3
 }
 
 // ======================================================================
@@ -497,9 +686,21 @@ async fn test_e2e_fts_operations() {
 
     // Index documents
     exec(&ex, "SELECT fts_index(1, 'Rust is a systems programming language focused on safety and performance')").await;
-    exec(&ex, "SELECT fts_index(2, 'Python is great for data science and machine learning applications')").await;
-    exec(&ex, "SELECT fts_index(3, 'JavaScript powers the modern web with React and Node.js')").await;
-    exec(&ex, "SELECT fts_index(4, 'Rust and WebAssembly enable high-performance web applications')").await;
+    exec(
+        &ex,
+        "SELECT fts_index(2, 'Python is great for data science and machine learning applications')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT fts_index(3, 'JavaScript powers the modern web with React and Node.js')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT fts_index(4, 'Rust and WebAssembly enable high-performance web applications')",
+    )
+    .await;
 
     // Search for "rust" — should find docs 1 and 4
     let res = exec(&ex, "SELECT fts_search('rust', 10)").await;
@@ -507,8 +708,10 @@ async fn test_e2e_fts_operations() {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
     };
-    assert!(json.contains("\"doc_id\":1") || json.contains("\"doc_id\":4"),
-        "should find rust docs: {json}");
+    assert!(
+        json.contains("\"doc_id\":1") || json.contains("\"doc_id\":4"),
+        "should find rust docs: {json}"
+    );
 
     // Search for "machine learning" — should find doc 2
     let res = exec(&ex, "SELECT fts_search('machine learning', 10)").await;
@@ -540,27 +743,53 @@ async fn test_e2e_fts_operations() {
 async fn test_e2e_vector_operations() {
     let ex = test_executor();
 
-    exec(&ex, "CREATE TABLE vec_docs (id INT PRIMARY KEY, title TEXT, embedding VECTOR(3))").await;
+    exec(
+        &ex,
+        "CREATE TABLE vec_docs (id INT PRIMARY KEY, title TEXT, embedding VECTOR(3))",
+    )
+    .await;
 
     // Insert vectors
-    exec(&ex, "INSERT INTO vec_docs VALUES (1, 'Database internals', VECTOR('[1.0, 0.0, 0.0]'))").await;
-    exec(&ex, "INSERT INTO vec_docs VALUES (2, 'Machine learning', VECTOR('[0.0, 1.0, 0.0]'))").await;
-    exec(&ex, "INSERT INTO vec_docs VALUES (3, 'Web development', VECTOR('[0.0, 0.0, 1.0]'))").await;
-    exec(&ex, "INSERT INTO vec_docs VALUES (4, 'Data engineering', VECTOR('[0.7, 0.7, 0.0]'))").await;
+    exec(
+        &ex,
+        "INSERT INTO vec_docs VALUES (1, 'Database internals', VECTOR('[1.0, 0.0, 0.0]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO vec_docs VALUES (2, 'Machine learning', VECTOR('[0.0, 1.0, 0.0]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO vec_docs VALUES (3, 'Web development', VECTOR('[0.0, 0.0, 1.0]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO vec_docs VALUES (4, 'Data engineering', VECTOR('[0.7, 0.7, 0.0]'))",
+    )
+    .await;
 
     // Verify vectors stored correctly
     let results = exec(&ex, "SELECT embedding FROM vec_docs WHERE id = 1").await;
     assert_eq!(*scalar(&results[0]), Value::Vector(vec![1.0, 0.0, 0.0]));
 
     // VECTOR_DIMS
-    let results = exec(&ex, "SELECT VECTOR_DIMS(embedding) FROM vec_docs WHERE id = 1").await;
+    let results = exec(
+        &ex,
+        "SELECT VECTOR_DIMS(embedding) FROM vec_docs WHERE id = 1",
+    )
+    .await;
     assert_eq!(*scalar(&results[0]), Value::Int32(3));
 
     // VECTOR_DISTANCE — L2
-    let results = exec(&ex,
+    let results = exec(
+        &ex,
         "SELECT id, VECTOR_DISTANCE(embedding, VECTOR('[1,0,0]'), 'l2') AS dist \
-         FROM vec_docs WHERE id = 1"
-    ).await;
+         FROM vec_docs WHERE id = 1",
+    )
+    .await;
     let r = rows(&results[0]);
     match &r[0][1] {
         Value::Float64(d) => assert!(d.abs() < 0.001, "self-distance should be ~0"),
@@ -568,20 +797,27 @@ async fn test_e2e_vector_operations() {
     }
 
     // VECTOR_DISTANCE — cosine
-    let results = exec(&ex,
-        "SELECT VECTOR_DISTANCE(VECTOR('[1,0,0]'), VECTOR('[0,1,0]'), 'cosine')"
-    ).await;
+    let results = exec(
+        &ex,
+        "SELECT VECTOR_DISTANCE(VECTOR('[1,0,0]'), VECTOR('[0,1,0]'), 'cosine')",
+    )
+    .await;
     match scalar(&results[0]) {
-        Value::Float64(d) => assert!((*d - 1.0).abs() < 0.001, "orthogonal vectors cosine distance = 1"),
+        Value::Float64(d) => assert!(
+            (*d - 1.0).abs() < 0.001,
+            "orthogonal vectors cosine distance = 1"
+        ),
         other => panic!("expected Float64, got {other:?}"),
     }
 
     // ORDER BY vector distance (nearest neighbor search)
-    let results = exec(&ex,
+    let results = exec(
+        &ex,
         "SELECT id, title FROM vec_docs \
          ORDER BY VECTOR_DISTANCE(embedding, VECTOR('[1,0,0]'), 'l2') \
-         LIMIT 2"
-    ).await;
+         LIMIT 2",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
     // Closest to [1,0,0] should be id=1, then id=4 ([0.7,0.7,0])
@@ -609,42 +845,85 @@ async fn test_e2e_graph_operations() {
     let ex = test_executor();
 
     // Add nodes
-    let res = exec(&ex, "SELECT GRAPH_ADD_NODE('Person', '{\"name\":\"Alice\"}')").await;
-    let alice_id = match scalar(&res[0]) { Value::Int64(n) => *n, ref v => panic!("{v:?}") };
+    let res = exec(
+        &ex,
+        "SELECT GRAPH_ADD_NODE('Person', '{\"name\":\"Alice\"}')",
+    )
+    .await;
+    let alice_id = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
     assert!(alice_id > 0);
 
     let res = exec(&ex, "SELECT GRAPH_ADD_NODE('Person', '{\"name\":\"Bob\"}')").await;
-    let bob_id = match scalar(&res[0]) { Value::Int64(n) => *n, ref v => panic!("{v:?}") };
+    let bob_id = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
 
-    let res = exec(&ex, "SELECT GRAPH_ADD_NODE('Person', '{\"name\":\"Charlie\"}')").await;
-    let charlie_id = match scalar(&res[0]) { Value::Int64(n) => *n, ref v => panic!("{v:?}") };
+    let res = exec(
+        &ex,
+        "SELECT GRAPH_ADD_NODE('Person', '{\"name\":\"Charlie\"}')",
+    )
+    .await;
+    let charlie_id = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
 
-    let res = exec(&ex, "SELECT GRAPH_ADD_NODE('Person', '{\"name\":\"Diana\"}')").await;
-    let diana_id = match scalar(&res[0]) { Value::Int64(n) => *n, ref v => panic!("{v:?}") };
+    let res = exec(
+        &ex,
+        "SELECT GRAPH_ADD_NODE('Person', '{\"name\":\"Diana\"}')",
+    )
+    .await;
+    let diana_id = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
 
     // Add edges: Alice -> Bob -> Charlie, Alice -> Diana
-    exec(&ex, &format!("SELECT GRAPH_ADD_EDGE({alice_id}, {bob_id}, 'KNOWS')")).await;
-    exec(&ex, &format!("SELECT GRAPH_ADD_EDGE({bob_id}, {charlie_id}, 'KNOWS')")).await;
-    exec(&ex, &format!("SELECT GRAPH_ADD_EDGE({alice_id}, {diana_id}, 'KNOWS')")).await;
+    exec(
+        &ex,
+        &format!("SELECT GRAPH_ADD_EDGE({alice_id}, {bob_id}, 'KNOWS')"),
+    )
+    .await;
+    exec(
+        &ex,
+        &format!("SELECT GRAPH_ADD_EDGE({bob_id}, {charlie_id}, 'KNOWS')"),
+    )
+    .await;
+    exec(
+        &ex,
+        &format!("SELECT GRAPH_ADD_EDGE({alice_id}, {diana_id}, 'KNOWS')"),
+    )
+    .await;
 
     // Verify node count
     assert_eq!(ex.graph_store().read().node_count(), 4);
 
     // Shortest path: Alice -> Charlie (should be Alice -> Bob -> Charlie)
-    let results = exec(&ex,
-        &format!("SELECT GRAPH_SHORTEST_PATH({alice_id}, {charlie_id})")
-    ).await;
+    let results = exec(
+        &ex,
+        &format!("SELECT GRAPH_SHORTEST_PATH({alice_id}, {charlie_id})"),
+    )
+    .await;
     let path = match scalar(&results[0]) {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text path, got {other:?}"),
     };
     // Path should contain all three node IDs
-    assert!(!path.is_empty(), "path should exist between Alice and Charlie");
+    assert!(
+        !path.is_empty(),
+        "path should exist between Alice and Charlie"
+    );
 
     // Shortest path: Alice -> Diana (direct)
-    let results = exec(&ex,
-        &format!("SELECT GRAPH_SHORTEST_PATH({alice_id}, {diana_id})")
-    ).await;
+    let results = exec(
+        &ex,
+        &format!("SELECT GRAPH_SHORTEST_PATH({alice_id}, {diana_id})"),
+    )
+    .await;
     let path = match scalar(&results[0]) {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text path, got {other:?}"),
@@ -661,16 +940,37 @@ async fn test_e2e_document_operations() {
     let ex = test_executor();
 
     // Insert JSON documents
-    let res = exec(&ex, r#"SELECT doc_insert('{"type":"user","name":"Alice","role":"admin","age":30}')"#).await;
-    let id1 = match scalar(&res[0]) { Value::Int64(n) => *n, ref v => panic!("{v:?}") };
+    let res = exec(
+        &ex,
+        r#"SELECT doc_insert('{"type":"user","name":"Alice","role":"admin","age":30}')"#,
+    )
+    .await;
+    let id1 = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
     assert_eq!(id1, 1);
 
-    let res = exec(&ex, r#"SELECT doc_insert('{"type":"user","name":"Bob","role":"viewer","age":25}')"#).await;
-    let id2 = match scalar(&res[0]) { Value::Int64(n) => *n, ref v => panic!("{v:?}") };
+    let res = exec(
+        &ex,
+        r#"SELECT doc_insert('{"type":"user","name":"Bob","role":"viewer","age":25}')"#,
+    )
+    .await;
+    let id2 = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
     assert_eq!(id2, 2);
 
-    let res = exec(&ex, r#"SELECT doc_insert('{"type":"event","action":"login","user":"Alice"}')"#).await;
-    let id3 = match scalar(&res[0]) { Value::Int64(n) => *n, ref v => panic!("{v:?}") };
+    let res = exec(
+        &ex,
+        r#"SELECT doc_insert('{"type":"event","action":"login","user":"Alice"}')"#,
+    )
+    .await;
+    let id3 = match scalar(&res[0]) {
+        Value::Int64(n) => *n,
+        ref v => panic!("{v:?}"),
+    };
     assert_eq!(id3, 3);
 
     // Get by ID
@@ -749,16 +1049,25 @@ async fn test_e2e_timeseries() {
 async fn test_e2e_prepared_statements() {
     let ex = test_executor();
 
-    exec(&ex, "CREATE TABLE prep_users (id INT PRIMARY KEY, name TEXT, age INT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE prep_users (id INT PRIMARY KEY, name TEXT, age INT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO prep_users VALUES (1, 'Alice', 30)").await;
     exec(&ex, "INSERT INTO prep_users VALUES (2, 'Bob', 25)").await;
     exec(&ex, "INSERT INTO prep_users VALUES (3, 'Charlie', 35)").await;
 
     // Prepare a parameterized query
-    let handle = ex.prepare("SELECT name, age FROM prep_users WHERE id = $1").unwrap();
+    let handle = ex
+        .prepare("SELECT name, age FROM prep_users WHERE id = $1")
+        .unwrap();
 
     // Execute with different parameters
-    let result = ex.execute_prepared(&handle, &[Value::Int32(1)]).await.unwrap();
+    let result = ex
+        .execute_prepared(&handle, &[Value::Int32(1)])
+        .await
+        .unwrap();
     match &result {
         ExecResult::Select { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -768,7 +1077,10 @@ async fn test_e2e_prepared_statements() {
         _ => panic!("expected Select"),
     }
 
-    let result = ex.execute_prepared(&handle, &[Value::Int32(2)]).await.unwrap();
+    let result = ex
+        .execute_prepared(&handle, &[Value::Int32(2)])
+        .await
+        .unwrap();
     match &result {
         ExecResult::Select { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -778,11 +1090,20 @@ async fn test_e2e_prepared_statements() {
     }
 
     // Prepare an INSERT
-    let insert_handle = ex.prepare("INSERT INTO prep_users VALUES ($1, $2, $3)").unwrap();
-    let result = ex.execute_prepared(
-        &insert_handle,
-        &[Value::Int32(4), Value::Text("Diana".into()), Value::Int32(28)],
-    ).await.unwrap();
+    let insert_handle = ex
+        .prepare("INSERT INTO prep_users VALUES ($1, $2, $3)")
+        .unwrap();
+    let result = ex
+        .execute_prepared(
+            &insert_handle,
+            &[
+                Value::Int32(4),
+                Value::Text("Diana".into()),
+                Value::Int32(28),
+            ],
+        )
+        .await
+        .unwrap();
     match &result {
         ExecResult::Command { tag, rows_affected } => {
             assert_eq!(tag, "INSERT");
@@ -792,7 +1113,10 @@ async fn test_e2e_prepared_statements() {
     }
 
     // Verify the insert worked
-    let result = ex.execute_prepared(&handle, &[Value::Int32(4)]).await.unwrap();
+    let result = ex
+        .execute_prepared(&handle, &[Value::Int32(4)])
+        .await
+        .unwrap();
     match &result {
         ExecResult::Select { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -821,14 +1145,22 @@ async fn test_e2e_null_handling() {
     assert_eq!(*scalar(&results[0]), Value::Int64(2));
 
     // IS NOT NULL
-    let results = exec(&ex, "SELECT COUNT(*) FROM null_test WHERE value IS NOT NULL").await;
+    let results = exec(
+        &ex,
+        "SELECT COUNT(*) FROM null_test WHERE value IS NOT NULL",
+    )
+    .await;
     assert_eq!(*scalar(&results[0]), Value::Int64(2));
 
     // COALESCE — returns first non-NULL
     let results = exec(&ex, "SELECT COALESCE(NULL, NULL, 42)").await;
     assert_eq!(*scalar(&results[0]), Value::Int32(42));
 
-    let results = exec(&ex, "SELECT id, COALESCE(name, 'Unknown') FROM null_test WHERE id = 2").await;
+    let results = exec(
+        &ex,
+        "SELECT id, COALESCE(name, 'Unknown') FROM null_test WHERE id = 2",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r[0][1], Value::Text("Unknown".into()));
 
@@ -848,7 +1180,11 @@ async fn test_e2e_null_handling() {
 
     // NULL comparison behavior
     let results = exec(&ex, "SELECT COUNT(*) FROM null_test WHERE value > 0").await;
-    assert_eq!(*scalar(&results[0]), Value::Int64(2), "NULL values should not match > comparison");
+    assert_eq!(
+        *scalar(&results[0]),
+        Value::Int64(2),
+        "NULL values should not match > comparison"
+    );
 }
 
 // ======================================================================
@@ -859,7 +1195,11 @@ async fn test_e2e_null_handling() {
 async fn test_e2e_alter_table() {
     let ex = test_executor();
 
-    exec(&ex, "CREATE TABLE alter_test (id INT PRIMARY KEY, name TEXT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE alter_test (id INT PRIMARY KEY, name TEXT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO alter_test VALUES (1, 'Alice')").await;
     exec(&ex, "INSERT INTO alter_test VALUES (2, 'Bob')").await;
 
@@ -871,7 +1211,11 @@ async fn test_e2e_alter_table() {
     assert_eq!(r[0][2], Value::Null, "new column defaults to NULL");
 
     // ADD COLUMN with DEFAULT
-    exec(&ex, "ALTER TABLE alter_test ADD COLUMN status TEXT DEFAULT 'active'").await;
+    exec(
+        &ex,
+        "ALTER TABLE alter_test ADD COLUMN status TEXT DEFAULT 'active'",
+    )
+    .await;
     let results = exec(&ex, "SELECT status FROM alter_test WHERE id = 1").await;
     assert_eq!(*scalar(&results[0]), Value::Text("active".into()));
 
@@ -879,24 +1223,45 @@ async fn test_e2e_alter_table() {
     exec(&ex, "ALTER TABLE alter_test DROP COLUMN age").await;
     let results = exec(&ex, "SELECT * FROM alter_test WHERE id = 1").await;
     let r = rows(&results[0]);
-    assert_eq!(r[0].len(), 3, "should have 3 columns after drop (id, name, status)");
+    assert_eq!(
+        r[0].len(),
+        3,
+        "should have 3 columns after drop (id, name, status)"
+    );
 
     // ADD CONSTRAINT (UNIQUE)
-    exec(&ex, "ALTER TABLE alter_test ADD CONSTRAINT uq_name UNIQUE (name)").await;
-    let err = ex.execute("INSERT INTO alter_test VALUES (3, 'Alice', 'active')").await;
-    assert!(err.is_err(), "unique constraint should prevent duplicate name");
+    exec(
+        &ex,
+        "ALTER TABLE alter_test ADD CONSTRAINT uq_name UNIQUE (name)",
+    )
+    .await;
+    let err = ex
+        .execute("INSERT INTO alter_test VALUES (3, 'Alice', 'active')")
+        .await;
+    assert!(
+        err.is_err(),
+        "unique constraint should prevent duplicate name"
+    );
 
     // DROP CONSTRAINT
     exec(&ex, "ALTER TABLE alter_test DROP CONSTRAINT uq_name").await;
     // Now duplicate should be allowed
-    exec(&ex, "INSERT INTO alter_test VALUES (3, 'Alice', 'inactive')").await;
+    exec(
+        &ex,
+        "INSERT INTO alter_test VALUES (3, 'Alice', 'inactive')",
+    )
+    .await;
     let results = exec(&ex, "SELECT COUNT(*) FROM alter_test WHERE name = 'Alice'").await;
     assert_eq!(*scalar(&results[0]), Value::Int64(2));
 
     // ADD CHECK CONSTRAINT
     exec(&ex, "CREATE TABLE alter_check (id INT, age INT)").await;
     exec(&ex, "INSERT INTO alter_check VALUES (1, 25)").await;
-    exec(&ex, "ALTER TABLE alter_check ADD CONSTRAINT ck_age CHECK (age >= 0)").await;
+    exec(
+        &ex,
+        "ALTER TABLE alter_check ADD CONSTRAINT ck_age CHECK (age >= 0)",
+    )
+    .await;
     let err = ex.execute("INSERT INTO alter_check VALUES (2, -5)").await;
     assert!(err.is_err(), "check constraint should prevent negative age");
 
@@ -915,7 +1280,11 @@ async fn test_e2e_edge_cases() {
     let ex = test_executor();
 
     // Empty table queries
-    exec(&ex, "CREATE TABLE empty_tbl (id INT, name TEXT, value FLOAT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE empty_tbl (id INT, name TEXT, value FLOAT)",
+    )
+    .await;
     let results = exec(&ex, "SELECT COUNT(*) FROM empty_tbl").await;
     assert_eq!(*scalar(&results[0]), Value::Int64(0));
 
@@ -929,23 +1298,38 @@ async fn test_e2e_edge_cases() {
     // Very long strings
     let long_str = "x".repeat(10_000);
     exec(&ex, "CREATE TABLE long_str_tbl (id INT, data TEXT)").await;
-    exec(&ex, &format!("INSERT INTO long_str_tbl VALUES (1, '{long_str}')")).await;
+    exec(
+        &ex,
+        &format!("INSERT INTO long_str_tbl VALUES (1, '{long_str}')"),
+    )
+    .await;
     let results = exec(&ex, "SELECT LENGTH(data) FROM long_str_tbl WHERE id = 1").await;
     assert_eq!(*scalar(&results[0]), Value::Int32(10_000));
 
     // Special characters in data
     exec(&ex, "CREATE TABLE special_chars (id INT, data TEXT)").await;
     exec(&ex, "INSERT INTO special_chars VALUES (1, 'hello world')").await;
-    exec(&ex, "INSERT INTO special_chars VALUES (2, 'quotes: don''t stop')").await;
+    exec(
+        &ex,
+        "INSERT INTO special_chars VALUES (2, 'quotes: don''t stop')",
+    )
+    .await;
     exec(&ex, "INSERT INTO special_chars VALUES (3, 'unicode: cafe')").await;
-    exec(&ex, "INSERT INTO special_chars VALUES (4, 'tabs\tand\nnewlines')").await;
+    exec(
+        &ex,
+        "INSERT INTO special_chars VALUES (4, 'tabs\tand\nnewlines')",
+    )
+    .await;
 
     let results = exec(&ex, "SELECT COUNT(*) FROM special_chars").await;
     assert_eq!(*scalar(&results[0]), Value::Int64(4));
 
     // Verify special chars round-trip
     let results = exec(&ex, "SELECT data FROM special_chars WHERE id = 2").await;
-    assert_eq!(*scalar(&results[0]), Value::Text("quotes: don't stop".into()));
+    assert_eq!(
+        *scalar(&results[0]),
+        Value::Text("quotes: don't stop".into())
+    );
 
     // Zero-row UPDATE/DELETE
     exec(&ex, "CREATE TABLE zero_ops (id INT, val TEXT)").await;
@@ -968,7 +1352,11 @@ async fn test_e2e_edge_cases() {
 
     // SELECT with DISTINCT
     exec(&ex, "CREATE TABLE dup_vals (val TEXT)").await;
-    exec(&ex, "INSERT INTO dup_vals VALUES ('a'), ('b'), ('a'), ('c'), ('b')").await;
+    exec(
+        &ex,
+        "INSERT INTO dup_vals VALUES ('a'), ('b'), ('a'), ('c'), ('b')",
+    )
+    .await;
     let results = exec(&ex, "SELECT DISTINCT val FROM dup_vals ORDER BY val").await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 3);
@@ -976,11 +1364,19 @@ async fn test_e2e_edge_cases() {
     // BETWEEN
     exec(&ex, "CREATE TABLE between_test (n INT)").await;
     exec(&ex, "INSERT INTO between_test VALUES (1),(2),(3),(4),(5)").await;
-    let results = exec(&ex, "SELECT COUNT(*) FROM between_test WHERE n BETWEEN 2 AND 4").await;
+    let results = exec(
+        &ex,
+        "SELECT COUNT(*) FROM between_test WHERE n BETWEEN 2 AND 4",
+    )
+    .await;
     assert_eq!(*scalar(&results[0]), Value::Int64(3));
 
     // IN list
-    let results = exec(&ex, "SELECT COUNT(*) FROM between_test WHERE n IN (1, 3, 5)").await;
+    let results = exec(
+        &ex,
+        "SELECT COUNT(*) FROM between_test WHERE n IN (1, 3, 5)",
+    )
+    .await;
     assert_eq!(*scalar(&results[0]), Value::Int64(3));
 }
 
@@ -1043,9 +1439,7 @@ async fn test_e2e_builtin_functions() {
 async fn test_e2e_mvcc_isolation() {
     // Use MVCC executor for snapshot isolation tests
     let catalog = Arc::new(Catalog::new());
-    let storage: Arc<dyn StorageEngine> = Arc::new(
-        crate::storage::MvccStorageAdapter::new()
-    );
+    let storage: Arc<dyn StorageEngine> = Arc::new(crate::storage::MvccStorageAdapter::new());
     let ex = Executor::new(catalog, storage);
 
     exec(&ex, "CREATE TABLE mvcc_test (id INT, val TEXT)").await;
@@ -1064,7 +1458,11 @@ async fn test_e2e_mvcc_isolation() {
     exec(&ex, "ROLLBACK").await;
 
     let results = exec(&ex, "SELECT * FROM mvcc_test").await;
-    assert_eq!(rows(&results[0]).len(), 1, "rolled back insert should vanish");
+    assert_eq!(
+        rows(&results[0]).len(),
+        1,
+        "rolled back insert should vanish"
+    );
 
     // Cycle 3: another COMMIT
     exec(&ex, "BEGIN").await;
@@ -1101,17 +1499,37 @@ async fn test_e2e_cross_model_saas_workflow() {
     let ex = test_executor();
 
     // --- Set up relational tables ---
-    exec(&ex, "CREATE TABLE cm_users (id INT PRIMARY KEY, name TEXT, email TEXT)").await;
-    exec(&ex, "INSERT INTO cm_users VALUES (1, 'Alice', 'alice@example.com')").await;
-    exec(&ex, "INSERT INTO cm_users VALUES (2, 'Bob', 'bob@example.com')").await;
+    exec(
+        &ex,
+        "CREATE TABLE cm_users (id INT PRIMARY KEY, name TEXT, email TEXT)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO cm_users VALUES (1, 'Alice', 'alice@example.com')",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO cm_users VALUES (2, 'Bob', 'bob@example.com')",
+    )
+    .await;
 
     // --- KV: session tokens ---
     exec(&ex, "SELECT kv_set('session:alice', 'tok_alice_123')").await;
     exec(&ex, "SELECT kv_set('session:bob', 'tok_bob_456')").await;
 
     // --- FTS: index user profiles ---
-    exec(&ex, "SELECT fts_index(1, 'Alice is a senior engineer working on databases')").await;
-    exec(&ex, "SELECT fts_index(2, 'Bob is a product manager focused on growth')").await;
+    exec(
+        &ex,
+        "SELECT fts_index(1, 'Alice is a senior engineer working on databases')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT fts_index(2, 'Bob is a product manager focused on growth')",
+    )
+    .await;
 
     // --- TimeSeries: activity metrics ---
     exec(&ex, "SELECT ts_insert('user:1:logins', 1000, 1.0)").await;
@@ -1125,8 +1543,16 @@ async fn test_e2e_cross_model_saas_workflow() {
     exec(&ex, "SELECT GRAPH_ADD_EDGE(1, 2, 'FOLLOWS')").await;
 
     // --- Document: user preferences ---
-    exec(&ex, r#"SELECT doc_insert('{"user_id":1,"theme":"dark","notifications":true}')"#).await;
-    exec(&ex, r#"SELECT doc_insert('{"user_id":2,"theme":"light","notifications":false}')"#).await;
+    exec(
+        &ex,
+        r#"SELECT doc_insert('{"user_id":1,"theme":"dark","notifications":true}')"#,
+    )
+    .await;
+    exec(
+        &ex,
+        r#"SELECT doc_insert('{"user_id":2,"theme":"light","notifications":false}')"#,
+    )
+    .await;
 
     // --- Verify cross-model data ---
 
@@ -1176,25 +1602,51 @@ async fn test_e2e_cross_model_saas_workflow() {
 async fn test_e2e_views_ctes_set_ops() {
     let ex = test_executor();
 
-    exec(&ex, "CREATE TABLE v_orders (id INT, product TEXT, region TEXT, amount FLOAT)").await;
-    exec(&ex, "INSERT INTO v_orders VALUES (1, 'Widget', 'East', 100.0)").await;
-    exec(&ex, "INSERT INTO v_orders VALUES (2, 'Gadget', 'West', 200.0)").await;
-    exec(&ex, "INSERT INTO v_orders VALUES (3, 'Widget', 'East', 150.0)").await;
-    exec(&ex, "INSERT INTO v_orders VALUES (4, 'Widget', 'West', 75.0)").await;
+    exec(
+        &ex,
+        "CREATE TABLE v_orders (id INT, product TEXT, region TEXT, amount FLOAT)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO v_orders VALUES (1, 'Widget', 'East', 100.0)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO v_orders VALUES (2, 'Gadget', 'West', 200.0)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO v_orders VALUES (3, 'Widget', 'East', 150.0)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO v_orders VALUES (4, 'Widget', 'West', 75.0)",
+    )
+    .await;
 
     // CREATE VIEW
-    exec(&ex, "CREATE VIEW east_orders AS SELECT * FROM v_orders WHERE region = 'East'").await;
+    exec(
+        &ex,
+        "CREATE VIEW east_orders AS SELECT * FROM v_orders WHERE region = 'East'",
+    )
+    .await;
     let results = exec(&ex, "SELECT COUNT(*) FROM east_orders").await;
     assert_eq!(*scalar(&results[0]), Value::Int64(2));
 
     // CTE
-    let results = exec(&ex,
+    let results = exec(
+        &ex,
         "WITH summary AS (
             SELECT product, SUM(amount) AS total
             FROM v_orders GROUP BY product
         )
-        SELECT product, total FROM summary ORDER BY total DESC"
-    ).await;
+        SELECT product, total FROM summary ORDER BY total DESC",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
     assert_eq!(r[0][0], Value::Text("Widget".into())); // 325.0
@@ -1204,18 +1656,30 @@ async fn test_e2e_views_ctes_set_ops() {
     exec(&ex, "INSERT INTO v_products1 VALUES ('A'), ('B')").await;
     exec(&ex, "CREATE TABLE v_products2 (name TEXT)").await;
     exec(&ex, "INSERT INTO v_products2 VALUES ('B'), ('C')").await;
-    let results = exec(&ex, "SELECT name FROM v_products1 UNION SELECT name FROM v_products2 ORDER BY name").await;
+    let results = exec(
+        &ex,
+        "SELECT name FROM v_products1 UNION SELECT name FROM v_products2 ORDER BY name",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 3); // A, B, C (distinct)
 
     // INTERSECT
-    let results = exec(&ex, "SELECT name FROM v_products1 INTERSECT SELECT name FROM v_products2").await;
+    let results = exec(
+        &ex,
+        "SELECT name FROM v_products1 INTERSECT SELECT name FROM v_products2",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Text("B".into()));
 
     // EXCEPT
-    let results = exec(&ex, "SELECT name FROM v_products1 EXCEPT SELECT name FROM v_products2").await;
+    let results = exec(
+        &ex,
+        "SELECT name FROM v_products1 EXCEPT SELECT name FROM v_products2",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Text("A".into()));
@@ -1236,30 +1700,40 @@ async fn test_e2e_patterns_and_expressions() {
     exec(&ex, "INSERT INTO pat_test VALUES ('alex', 72)").await;
 
     // LIKE
-    let results = exec(&ex, "SELECT name FROM pat_test WHERE name LIKE 'A%' ORDER BY name").await;
+    let results = exec(
+        &ex,
+        "SELECT name FROM pat_test WHERE name LIKE 'A%' ORDER BY name",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2); // Alice, Anna
 
     // ILIKE (case-insensitive)
-    let results = exec(&ex, "SELECT name FROM pat_test WHERE name ILIKE 'a%' ORDER BY name").await;
+    let results = exec(
+        &ex,
+        "SELECT name FROM pat_test WHERE name ILIKE 'a%' ORDER BY name",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 3); // Alice, Anna, alex
 
     // CASE expression
-    let results = exec(&ex,
+    let results = exec(
+        &ex,
         "SELECT name, CASE
             WHEN score >= 90 THEN 'A'
             WHEN score >= 80 THEN 'B'
             WHEN score >= 70 THEN 'C'
             ELSE 'F'
          END AS grade
-         FROM pat_test ORDER BY name"
-    ).await;
+         FROM pat_test ORDER BY name",
+    )
+    .await;
     let r = rows(&results[0]);
-    assert_eq!(r[0][1], Value::Text("A".into()));  // Alice: 95
-    assert_eq!(r[1][1], Value::Text("B".into()));  // Anna: 88
-    assert_eq!(r[2][1], Value::Text("F".into()));  // Bob: 60
-    assert_eq!(r[3][1], Value::Text("C".into()));  // alex: 72
+    assert_eq!(r[0][1], Value::Text("A".into())); // Alice: 95
+    assert_eq!(r[1][1], Value::Text("B".into())); // Anna: 88
+    assert_eq!(r[2][1], Value::Text("F".into())); // Bob: 60
+    assert_eq!(r[3][1], Value::Text("C".into())); // alex: 72
 
     // Arithmetic expressions
     let results = exec(&ex, "SELECT 2 + 3 * 4").await;
@@ -1316,7 +1790,11 @@ async fn test_e2e_sequences_and_serial() {
     let ex = test_executor();
 
     // Explicit sequence
-    exec(&ex, "CREATE SEQUENCE order_seq INCREMENT BY 1 START WITH 1000").await;
+    exec(
+        &ex,
+        "CREATE SEQUENCE order_seq INCREMENT BY 1 START WITH 1000",
+    )
+    .await;
     let results = exec(&ex, "SELECT NEXTVAL('order_seq')").await;
     assert_eq!(*scalar(&results[0]), Value::Int64(1000));
     let results = exec(&ex, "SELECT NEXTVAL('order_seq')").await;
@@ -1325,7 +1803,11 @@ async fn test_e2e_sequences_and_serial() {
     assert_eq!(*scalar(&results[0]), Value::Int64(1001));
 
     // SERIAL column
-    exec(&ex, "CREATE TABLE serial_test (id SERIAL PRIMARY KEY, name TEXT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE serial_test (id SERIAL PRIMARY KEY, name TEXT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO serial_test (name) VALUES ('first')").await;
     exec(&ex, "INSERT INTO serial_test (name) VALUES ('second')").await;
     exec(&ex, "INSERT INTO serial_test (name) VALUES ('third')").await;
@@ -1350,7 +1832,11 @@ async fn test_e2e_foreign_keys() {
     exec(&ex, "INSERT INTO fk_orgs VALUES (1, 'Acme')").await;
     exec(&ex, "INSERT INTO fk_orgs VALUES (2, 'Globex')").await;
 
-    exec(&ex, "CREATE TABLE fk_members (id INT, org_id INT REFERENCES fk_orgs(id) ON DELETE CASCADE)").await;
+    exec(
+        &ex,
+        "CREATE TABLE fk_members (id INT, org_id INT REFERENCES fk_orgs(id) ON DELETE CASCADE)",
+    )
+    .await;
     exec(&ex, "INSERT INTO fk_members VALUES (1, 1)").await;
     exec(&ex, "INSERT INTO fk_members VALUES (2, 1)").await;
     exec(&ex, "INSERT INTO fk_members VALUES (3, 2)").await;
@@ -1362,10 +1848,18 @@ async fn test_e2e_foreign_keys() {
     // CASCADE DELETE
     exec(&ex, "DELETE FROM fk_orgs WHERE id = 1").await;
     let results = exec(&ex, "SELECT COUNT(*) FROM fk_members").await;
-    assert_eq!(*scalar(&results[0]), Value::Int64(1), "cascade should delete members of org 1");
+    assert_eq!(
+        *scalar(&results[0]),
+        Value::Int64(1),
+        "cascade should delete members of org 1"
+    );
 
     let results = exec(&ex, "SELECT id FROM fk_members").await;
-    assert_eq!(rows(&results[0])[0][0], Value::Int32(3), "only member 3 (org 2) should remain");
+    assert_eq!(
+        rows(&results[0])[0][0],
+        Value::Int32(3),
+        "only member 3 (org 2) should remain"
+    );
 }
 
 // ======================================================================
@@ -1377,7 +1871,11 @@ async fn test_e2e_truncate_and_drop() {
     let ex = test_executor();
 
     exec(&ex, "CREATE TABLE trunc_test (id INT, val TEXT)").await;
-    exec(&ex, "INSERT INTO trunc_test VALUES (1, 'a'), (2, 'b'), (3, 'c')").await;
+    exec(
+        &ex,
+        "INSERT INTO trunc_test VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .await;
 
     let results = exec(&ex, "SELECT COUNT(*) FROM trunc_test").await;
     assert_eq!(*scalar(&results[0]), Value::Int64(3));
@@ -1411,13 +1909,21 @@ async fn test_e2e_insert_select_and_multi_row() {
 
     // Multi-row INSERT
     exec(&ex, "CREATE TABLE multi_src (id INT, val TEXT)").await;
-    exec(&ex, "INSERT INTO multi_src VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')").await;
+    exec(
+        &ex,
+        "INSERT INTO multi_src VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
+    )
+    .await;
     let results = exec(&ex, "SELECT COUNT(*) FROM multi_src").await;
     assert_eq!(*scalar(&results[0]), Value::Int64(5));
 
     // INSERT ... SELECT
     exec(&ex, "CREATE TABLE multi_dst (id INT, val TEXT)").await;
-    exec(&ex, "INSERT INTO multi_dst SELECT * FROM multi_src WHERE id > 2").await;
+    exec(
+        &ex,
+        "INSERT INTO multi_dst SELECT * FROM multi_src WHERE id > 2",
+    )
+    .await;
     let results = exec(&ex, "SELECT COUNT(*) FROM multi_dst").await;
     assert_eq!(*scalar(&results[0]), Value::Int64(3));
 
@@ -1447,7 +1953,10 @@ async fn test_e2e_datalog() {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
     };
-    assert!(json.contains("bob") || json.contains("liz"), "should find tom's children: {json}");
+    assert!(
+        json.contains("bob") || json.contains("liz"),
+        "should find tom's children: {json}"
+    );
 
     // Query with different pattern
     let res = exec(&ex, "SELECT DATALOG_QUERY('parent(X, ann)')").await;
@@ -1467,9 +1976,21 @@ async fn test_e2e_columnar() {
     let ex = test_executor();
 
     // Insert into columnar store
-    exec(&ex, "SELECT columnar_insert('metrics', 'value', 10, 'host', 'web1')").await;
-    exec(&ex, "SELECT columnar_insert('metrics', 'value', 20, 'host', 'web2')").await;
-    exec(&ex, "SELECT columnar_insert('metrics', 'value', 30, 'host', 'web3')").await;
+    exec(
+        &ex,
+        "SELECT columnar_insert('metrics', 'value', 10, 'host', 'web1')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT columnar_insert('metrics', 'value', 20, 'host', 'web2')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT columnar_insert('metrics', 'value', 30, 'host', 'web3')",
+    )
+    .await;
 
     // Count
     let res = exec(&ex, "SELECT columnar_count('metrics')").await;

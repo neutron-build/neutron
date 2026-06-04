@@ -160,10 +160,7 @@ impl SoftmaxModel {
             .collect();
 
         // Numerically-stable softmax: subtract max before exp.
-        let max_logit = logits
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = logits.iter().map(|l| (l - max_logit).exp()).collect();
         let sum_exp: f32 = exps.iter().sum();
         Ok(exps.into_iter().map(|e| e / sum_exp).collect())
@@ -321,7 +318,9 @@ impl OnnxModel {
             .first()
             .and_then(|i| {
                 if let ort::value::ValueType::Tensor { shape, .. } = i.dtype() {
-                    shape.last().and_then(|&d| if d > 0 { Some(d as usize) } else { None })
+                    shape
+                        .last()
+                        .and_then(|&d| if d > 0 { Some(d as usize) } else { None })
                 } else {
                     None
                 }
@@ -368,7 +367,9 @@ impl OnnxModel {
         let input_tensor = ort::value::Tensor::from_array(arr)
             .map_err(|e| InferenceError::InvalidInput(format!("tensor error: {e}")))?;
 
-        let mut session = self.session.lock()
+        let mut session = self
+            .session
+            .lock()
             .map_err(|e| InferenceError::InvalidInput(format!("session lock error: {e}")))?;
         let outputs = session
             .run(ort::inputs![input_tensor])
@@ -407,7 +408,9 @@ impl OnnxModel {
         let input_tensor = ort::value::Tensor::from_array(arr)
             .map_err(|e| InferenceError::InvalidInput(format!("tensor error: {e}")))?;
 
-        let mut session = self.session.lock()
+        let mut session = self
+            .session
+            .lock()
             .map_err(|e| InferenceError::InvalidInput(format!("session lock error: {e}")))?;
         let outputs = session
             .run(ort::inputs![input_tensor])
@@ -496,12 +499,7 @@ impl ModelRegistry {
     ///
     /// `class_names` optionally maps each output index to a human-readable
     /// label; if `None`, labels `"0"`, `"1"`, ... are generated.
-    pub fn register_softmax(
-        &mut self,
-        name: &str,
-        weight_matrix: Vec<Vec<f32>>,
-        biases: Vec<f32>,
-    ) {
+    pub fn register_softmax(&mut self, name: &str, weight_matrix: Vec<Vec<f32>>, biases: Vec<f32>) {
         self.register_softmax_with_labels(name, weight_matrix, biases, None);
     }
 
@@ -525,21 +523,15 @@ impl ModelRegistry {
             description: "softmax classifier".into(),
             version: "1.0".into(),
         };
-        let labels = class_names.unwrap_or_else(|| {
-            (0..num_classes).map(|i| i.to_string()).collect()
-        });
+        let labels =
+            class_names.unwrap_or_else(|| (0..num_classes).map(|i| i.to_string()).collect());
         self.class_labels.insert(name.to_string(), labels);
         let model = BuiltinModel::Softmax(SoftmaxModel::new(weight_matrix, biases));
         self.models.insert(name.to_string(), (meta, model));
     }
 
     /// Register a [`KNearestNeighbors`] model.
-    pub fn register_knn(
-        &mut self,
-        name: &str,
-        vectors: Vec<(Vec<f32>, String)>,
-        k: usize,
-    ) {
+    pub fn register_knn(&mut self, name: &str, vectors: Vec<(Vec<f32>, String)>, k: usize) {
         let dim = vectors.first().map(|(v, _)| v.len()).unwrap_or(0);
         // Collect unique labels preserving insertion order.
         let mut labels: Vec<String> = Vec::new();
@@ -818,11 +810,7 @@ impl EmbeddingGenerator {
         }
         for (word, &idx) in &self.vocabulary {
             let tf = counts.get(word.as_str()).copied().unwrap_or(0.0) / total;
-            let df = doc_frequencies
-                .get(word)
-                .copied()
-                .unwrap_or(0)
-                .max(1) as f32;
+            let df = doc_frequencies.get(word).copied().unwrap_or(0).max(1) as f32;
             let idf = (corpus_size as f32 / df).ln();
             vec[idx] = tf * idf;
         }
@@ -1057,10 +1045,7 @@ mod tests {
     #[test]
     fn test_knn_tie_breaking() {
         // Two classes with equal representation near the query point
-        let vectors = vec![
-            (vec![0.0], "a".to_string()),
-            (vec![0.1], "b".to_string()),
-        ];
+        let vectors = vec![(vec![0.0], "a".to_string()), (vec![0.1], "b".to_string())];
         let knn = KNearestNeighbors::new(vectors, 2);
         // Should still return a valid class
         let label = knn.classify(&[0.05]).unwrap();
@@ -1097,7 +1082,9 @@ mod tests {
         let out = engine.predict("m", &[1.0, 1.0]).unwrap();
         assert!((out[0] - 6.0).abs() < 1e-5); // 2*1 + 3*1 + 1
 
-        let batch = engine.batch_predict("m", &[vec![1.0, 0.0], vec![0.0, 1.0]]).unwrap();
+        let batch = engine
+            .batch_predict("m", &[vec![1.0, 0.0], vec![0.0, 1.0]])
+            .unwrap();
         assert!((batch[0][0] - 3.0).abs() < 1e-5); // 2*1 + 3*0 + 1
         assert!((batch[1][0] - 4.0).abs() < 1e-5); // 2*0 + 3*1 + 1
     }
@@ -1107,7 +1094,11 @@ mod tests {
     fn test_error_display() {
         assert_eq!(InferenceError::ModelNotFound.to_string(), "model not found");
         assert_eq!(
-            InferenceError::DimensionMismatch { expected: 3, got: 2 }.to_string(),
+            InferenceError::DimensionMismatch {
+                expected: 3,
+                got: 2
+            }
+            .to_string(),
             "dimension mismatch: expected 3, got 2"
         );
         assert_eq!(

@@ -6,8 +6,6 @@
 //! - No panics on any input
 //! - Idempotent operations
 
-use proptest::prelude::*;
-
 // ============================================================================
 // Property: Binary protocol produces identical results to pgwire
 // ============================================================================

@@ -10,11 +10,6 @@
 //!
 //! These tests run BOTH protocols simultaneously and compare results.
 
-use crate::executor::Executor;
-use crate::catalog::Catalog;
-use crate::storage::MemoryEngine;
-use std::sync::Arc;
-
 // ============================================================================
 // Protocol Equivalence Tests
 // ============================================================================

@@ -124,15 +124,15 @@ impl GranuleStats {
                     if other_stats.min_value != Value::Null
                         && (stats.min_value == Value::Null
                             || other_stats.min_value < stats.min_value)
-                        {
-                            stats.min_value = other_stats.min_value.clone();
-                        }
+                    {
+                        stats.min_value = other_stats.min_value.clone();
+                    }
                     if other_stats.max_value != Value::Null
                         && (stats.max_value == Value::Null
                             || other_stats.max_value > stats.max_value)
-                        {
-                            stats.max_value = other_stats.max_value.clone();
-                        }
+                    {
+                        stats.max_value = other_stats.max_value.clone();
+                    }
                     stats.null_count += other_stats.null_count;
                     stats.total_count += other_stats.total_count;
                 })
@@ -158,12 +158,7 @@ impl ZoneMapIndex {
     }
 
     /// Register or update granule stats for a table.
-    pub fn update_granule(
-        &self,
-        table_id: u64,
-        granule_id: u32,
-        stats: GranuleStats,
-    ) {
+    pub fn update_granule(&self, table_id: u64, granule_id: u32, stats: GranuleStats) {
         let mut map = self.stats_by_table.write();
         let granules = map.entry(table_id).or_default();
 
@@ -189,8 +184,7 @@ impl ZoneMapIndex {
     /// Get all granules for a table.
     pub fn get_table_granules(&self, table_id: u64) -> Vec<GranuleStats> {
         let map = self.stats_by_table.read();
-        map.get(&table_id).cloned()
-            .unwrap_or_default()
+        map.get(&table_id).cloned().unwrap_or_default()
     }
 
     /// Clear all stats for a table (e.g., on DROP TABLE or VACUUM).
@@ -298,15 +292,13 @@ pub fn can_skip_granule(granule: &GranuleStats, col_id: u32, filter: &FilterPred
         }
 
         // col IN (X, Y, Z): skip if none of X, Y, Z are in [min, max]
-        In(values) => {
-            !values.iter().any(|v| {
-                if *v == Value::Null {
-                    stats.null_count > 0
-                } else {
-                    stats.contains(v)
-                }
-            })
-        }
+        In(values) => !values.iter().any(|v| {
+            if *v == Value::Null {
+                stats.null_count > 0
+            } else {
+                stats.contains(v)
+            }
+        }),
 
         // col BETWEEN X AND Y: skip if no overlap
         Between { min, max } => !stats.overlaps_range(min, max),
@@ -625,21 +617,13 @@ mod tests {
         granule.add_row(&row(&[Value::Int64(20)]), &[0]);
 
         // No NULLs in granule: skip IS NULL
-        assert!(can_skip_granule(
-            &granule,
-            0,
-            &FilterPredicate::IsNull
-        ));
+        assert!(can_skip_granule(&granule, 0, &FilterPredicate::IsNull));
 
         // Add a NULL
         granule.add_row(&row(&[Value::Null]), &[0]);
 
         // Now has NULLs: don't skip
-        assert!(!can_skip_granule(
-            &granule,
-            0,
-            &FilterPredicate::IsNull
-        ));
+        assert!(!can_skip_granule(&granule, 0, &FilterPredicate::IsNull));
     }
 
     #[test]
@@ -649,21 +633,13 @@ mod tests {
         granule.add_row(&row(&[Value::Null]), &[0]);
 
         // All NULLs: skip IS NOT NULL
-        assert!(can_skip_granule(
-            &granule,
-            0,
-            &FilterPredicate::IsNotNull
-        ));
+        assert!(can_skip_granule(&granule, 0, &FilterPredicate::IsNotNull));
 
         // Add a non-NULL
         granule.add_row(&row(&[Value::Int64(10)]), &[0]);
 
         // Has non-NULLs: don't skip
-        assert!(!can_skip_granule(
-            &granule,
-            0,
-            &FilterPredicate::IsNotNull
-        ));
+        assert!(!can_skip_granule(&granule, 0, &FilterPredicate::IsNotNull));
     }
 
     #[test]
@@ -775,11 +751,7 @@ mod tests {
         let result = apply_zone_map_filter(
             &granules,
             0,
-            &FilterPredicate::In(vec![
-                Value::Int64(5),
-                Value::Int64(12),
-                Value::Int64(15),
-            ]),
+            &FilterPredicate::In(vec![Value::Int64(5), Value::Int64(12), Value::Int64(15)]),
         );
         assert_eq!(result, vec![true, false]);
 

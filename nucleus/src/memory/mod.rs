@@ -436,7 +436,10 @@ mod tests {
         assert_eq!(alloc.allocation("cache").unwrap().priority, Priority::Low);
 
         alloc.set_priority("cache", Priority::Critical);
-        assert_eq!(alloc.allocation("cache").unwrap().priority, Priority::Critical);
+        assert_eq!(
+            alloc.allocation("cache").unwrap().priority,
+            Priority::Critical
+        );
     }
 
     #[test]
@@ -519,5 +522,4 @@ mod tests {
         assert_eq!(a.current_bytes, 0);
         assert_eq!(a.allocation_count, 1);
     }
-
 }

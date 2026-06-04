@@ -13,9 +13,9 @@
 //! console.log(result); // { columns: ["id", "name"], rows: [[1, "Alice"]] }
 //! ```
 
-use wasm_bindgen::prelude::*;
 use serde::Serialize;
 use std::sync::Arc;
+use wasm_bindgen::prelude::*;
 
 use crate::catalog::Catalog;
 use crate::executor::{ExecResult, Executor};
@@ -73,8 +73,7 @@ impl NucleusWasm {
 
         let js_results: Vec<JsResultRepr> = results.into_iter().map(exec_result_to_js).collect();
 
-        serde_wasm_bindgen::to_value(&js_results)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        serde_wasm_bindgen::to_value(&js_results).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Execute a query and return just the rows (convenience for SELECT).
@@ -192,10 +191,22 @@ fn value_to_js(v: Value) -> JsVal {
         Value::Numeric(s) => JsVal::Text(s),
         Value::Uuid(bytes) => JsVal::Text(format!(
             "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
-            bytes[8], bytes[9], bytes[10], bytes[11],
-            bytes[12], bytes[13], bytes[14], bytes[15],
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3],
+            bytes[4],
+            bytes[5],
+            bytes[6],
+            bytes[7],
+            bytes[8],
+            bytes[9],
+            bytes[10],
+            bytes[11],
+            bytes[12],
+            bytes[13],
+            bytes[14],
+            bytes[15],
         )),
         Value::Bytea(b) => {
             use base64::Engine;

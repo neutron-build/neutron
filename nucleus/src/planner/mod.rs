@@ -202,9 +202,9 @@ impl PlanNode {
             | PlanNode::Filter { estimated_rows, .. }
             | PlanNode::HashAggregate { estimated_rows, .. } => *estimated_rows,
             PlanNode::Sort { input, .. } => input.estimated_rows(),
-            PlanNode::Limit { limit, input, .. } => {
-                limit.unwrap_or(input.estimated_rows()).min(input.estimated_rows())
-            }
+            PlanNode::Limit { limit, input, .. } => limit
+                .unwrap_or(input.estimated_rows())
+                .min(input.estimated_rows()),
             PlanNode::Project { input, .. } => input.estimated_rows(),
             PlanNode::Aggregate { .. } => 1,
         }
@@ -233,8 +233,19 @@ impl PlanNode {
     fn fmt_indented(&self, f: &mut fmt::Formatter<'_>, indent: usize) -> fmt::Result {
         let pad = " ".repeat(indent);
         match self {
-            PlanNode::SeqScan { table, estimated_rows, estimated_cost, filter, projection, .. } => {
-                write!(f, "{pad}Seq Scan on {table} (cost={:.2} rows={estimated_rows})", estimated_cost.0)?;
+            PlanNode::SeqScan {
+                table,
+                estimated_rows,
+                estimated_cost,
+                filter,
+                projection,
+                ..
+            } => {
+                write!(
+                    f,
+                    "{pad}Seq Scan on {table} (cost={:.2} rows={estimated_rows})",
+                    estimated_cost.0
+                )?;
                 if let Some(flt) = filter {
                     write!(f, "\n{pad}  Filter: {flt}")?;
                 }
@@ -242,8 +253,22 @@ impl PlanNode {
                     write!(f, "\n{pad}  Projection: cols {proj:?}")?;
                 }
             }
-            PlanNode::IndexScan { table, index_name, estimated_rows, estimated_cost, lookup_key, range_lo, range_hi, range_predicate, .. } => {
-                write!(f, "{pad}Index Scan using {index_name} on {table} (cost={:.2} rows={estimated_rows})", estimated_cost.0)?;
+            PlanNode::IndexScan {
+                table,
+                index_name,
+                estimated_rows,
+                estimated_cost,
+                lookup_key,
+                range_lo,
+                range_hi,
+                range_predicate,
+                ..
+            } => {
+                write!(
+                    f,
+                    "{pad}Index Scan using {index_name} on {table} (cost={:.2} rows={estimated_rows})",
+                    estimated_cost.0
+                )?;
                 if let Some(key) = lookup_key {
                     write!(f, "\n{pad}  Index Cond: {key}")?;
                 }
@@ -256,8 +281,20 @@ impl PlanNode {
                     write!(f, "\n{pad}  Filter: {pred}")?;
                 }
             }
-            PlanNode::NestedLoopJoin { left, right, join_type, estimated_rows, estimated_cost, condition, .. } => {
-                write!(f, "{pad}Nested Loop {join_type:?} Join (cost={:.2} rows={estimated_rows})", estimated_cost.0)?;
+            PlanNode::NestedLoopJoin {
+                left,
+                right,
+                join_type,
+                estimated_rows,
+                estimated_cost,
+                condition,
+                ..
+            } => {
+                write!(
+                    f,
+                    "{pad}Nested Loop {join_type:?} Join (cost={:.2} rows={estimated_rows})",
+                    estimated_cost.0
+                )?;
                 if let Some(cond) = condition {
                     write!(f, "\n{pad}  Join Cond: {cond}")?;
                 }
@@ -266,8 +303,19 @@ impl PlanNode {
                 writeln!(f)?;
                 right.fmt_indented(f, indent + 2)?;
             }
-            PlanNode::HashJoin { left, right, join_type, hash_keys, estimated_rows, estimated_cost } => {
-                write!(f, "{pad}Hash {join_type:?} Join (cost={:.2} rows={estimated_rows})", estimated_cost.0)?;
+            PlanNode::HashJoin {
+                left,
+                right,
+                join_type,
+                hash_keys,
+                estimated_rows,
+                estimated_cost,
+            } => {
+                write!(
+                    f,
+                    "{pad}Hash {join_type:?} Join (cost={:.2} rows={estimated_rows})",
+                    estimated_cost.0
+                )?;
                 if !hash_keys.is_empty() {
                     write!(f, "\n{pad}  Hash Key: {}", hash_keys.join(", "))?;
                 }
@@ -276,18 +324,42 @@ impl PlanNode {
                 writeln!(f)?;
                 right.fmt_indented(f, indent + 2)?;
             }
-            PlanNode::Filter { input, predicate, estimated_rows, estimated_cost, .. } => {
-                write!(f, "{pad}Filter (cost={:.2} rows={estimated_rows})", estimated_cost.0)?;
+            PlanNode::Filter {
+                input,
+                predicate,
+                estimated_rows,
+                estimated_cost,
+                ..
+            } => {
+                write!(
+                    f,
+                    "{pad}Filter (cost={:.2} rows={estimated_rows})",
+                    estimated_cost.0
+                )?;
                 write!(f, "\n{pad}  Predicate: {predicate}")?;
                 writeln!(f)?;
                 input.fmt_indented(f, indent + 2)?;
             }
-            PlanNode::Sort { input, keys, estimated_cost } => {
-                write!(f, "{pad}Sort (cost={:.2})\n{pad}  Sort Key: {}", estimated_cost.0, keys.join(", "))?;
+            PlanNode::Sort {
+                input,
+                keys,
+                estimated_cost,
+            } => {
+                write!(
+                    f,
+                    "{pad}Sort (cost={:.2})\n{pad}  Sort Key: {}",
+                    estimated_cost.0,
+                    keys.join(", ")
+                )?;
                 writeln!(f)?;
                 input.fmt_indented(f, indent + 2)?;
             }
-            PlanNode::Limit { input, limit, offset, estimated_cost } => {
+            PlanNode::Limit {
+                input,
+                limit,
+                offset,
+                estimated_cost,
+            } => {
                 write!(f, "{pad}Limit (cost={:.2}", estimated_cost.0)?;
                 if let Some(l) = limit {
                     write!(f, " limit={l}")?;
@@ -298,21 +370,49 @@ impl PlanNode {
                 writeln!(f, ")")?;
                 input.fmt_indented(f, indent + 2)?;
             }
-            PlanNode::HashAggregate { input, group_keys, estimated_rows, estimated_cost, .. } => {
-                write!(f, "{pad}HashAggregate (cost={:.2} rows={estimated_rows})", estimated_cost.0)?;
+            PlanNode::HashAggregate {
+                input,
+                group_keys,
+                estimated_rows,
+                estimated_cost,
+                ..
+            } => {
+                write!(
+                    f,
+                    "{pad}HashAggregate (cost={:.2} rows={estimated_rows})",
+                    estimated_cost.0
+                )?;
                 if !group_keys.is_empty() {
                     write!(f, "\n{pad}  Group Key: {}", group_keys.join(", "))?;
                 }
                 writeln!(f)?;
                 input.fmt_indented(f, indent + 2)?;
             }
-            PlanNode::Project { input, columns, estimated_cost } => {
-                write!(f, "{pad}Project [{}] (cost={:.2})", columns.join(", "), estimated_cost.0)?;
+            PlanNode::Project {
+                input,
+                columns,
+                estimated_cost,
+            } => {
+                write!(
+                    f,
+                    "{pad}Project [{}] (cost={:.2})",
+                    columns.join(", "),
+                    estimated_cost.0
+                )?;
                 writeln!(f)?;
                 input.fmt_indented(f, indent + 2)?;
             }
-            PlanNode::Aggregate { input, aggregates, estimated_cost } => {
-                write!(f, "{pad}Aggregate [{}] (cost={:.2})", aggregates.join(", "), estimated_cost.0)?;
+            PlanNode::Aggregate {
+                input,
+                aggregates,
+                estimated_cost,
+            } => {
+                write!(
+                    f,
+                    "{pad}Aggregate [{}] (cost={:.2})",
+                    aggregates.join(", "),
+                    estimated_cost.0
+                )?;
                 writeln!(f)?;
                 input.fmt_indented(f, indent + 2)?;
             }
@@ -332,7 +432,8 @@ pub fn estimate_seq_scan_cost(total_pages: usize, total_rows: usize) -> Cost {
 
 /// Estimate index scan cost (point lookup via B-tree: O(log n) pages).
 pub fn estimate_index_scan_cost(tree_height: usize, estimated_matches: usize) -> Cost {
-    let index_cost = tree_height as f64 * RANDOM_PAGE_COST + estimated_matches as f64 * CPU_INDEX_COST;
+    let index_cost =
+        tree_height as f64 * RANDOM_PAGE_COST + estimated_matches as f64 * CPU_INDEX_COST;
     let tuple_cost = estimated_matches as f64 * (RANDOM_PAGE_COST + CPU_TUPLE_COST);
     Cost(index_cost + tuple_cost)
 }
@@ -419,9 +520,10 @@ impl TableStats {
         }
         if let Some(col) = column
             && let Some(stats) = self.column_stats.get(col)
-                && stats.distinct_count > 0 {
-                    return 1.0 / stats.distinct_count as f64;
-                }
+            && stats.distinct_count > 0
+        {
+            return 1.0 / stats.distinct_count as f64;
+        }
         // Default: assume 10% selectivity
         0.1
     }
@@ -434,22 +536,27 @@ impl TableStats {
     /// Estimate selectivity of a range predicate using actual column statistics.
     /// `low` / `high` are the predicate bounds as f64 (None = open-ended).
     /// Falls back to 0.33 when stats are absent or non-numeric.
-    pub fn estimate_range_sel(&self, column: Option<&str>, low: Option<f64>, high: Option<f64>) -> f64 {
+    pub fn estimate_range_sel(
+        &self,
+        column: Option<&str>,
+        low: Option<f64>,
+        high: Option<f64>,
+    ) -> f64 {
         if let Some(col) = column
             && let Some(cs) = self.column_stats.get(col)
-                && let (Some(min_s), Some(max_s)) = (&cs.min_value, &cs.max_value)
-                    && let (Ok(min_v), Ok(max_v)) = (min_s.parse::<f64>(), max_s.parse::<f64>())
-                        && max_v > min_v {
-                            let col_range = max_v - min_v;
-                            let covered = match (low, high) {
-                                (Some(lo), Some(hi)) => (hi.min(max_v) - lo.max(min_v)).max(0.0),
-                                (Some(lo), None)     => (max_v - lo.max(min_v)).max(0.0),
-                                (None,     Some(hi)) => (hi.min(max_v) - min_v).max(0.0),
-                                (None,     None)     => col_range,
-                            };
-                            return ((covered / col_range) * (1.0 - cs.null_fraction))
-                                .clamp(0.01, 1.0);
-                        }
+            && let (Some(min_s), Some(max_s)) = (&cs.min_value, &cs.max_value)
+            && let (Ok(min_v), Ok(max_v)) = (min_s.parse::<f64>(), max_s.parse::<f64>())
+            && max_v > min_v
+        {
+            let col_range = max_v - min_v;
+            let covered = match (low, high) {
+                (Some(lo), Some(hi)) => (hi.min(max_v) - lo.max(min_v)).max(0.0),
+                (Some(lo), None) => (max_v - lo.max(min_v)).max(0.0),
+                (None, Some(hi)) => (hi.min(max_v) - min_v).max(0.0),
+                (None, None) => col_range,
+            };
+            return ((covered / col_range) * (1.0 - cs.null_fraction)).clamp(0.01, 1.0);
+        }
         0.33
     }
 
@@ -461,9 +568,10 @@ impl TableStats {
     /// Estimate selectivity of IS NULL.
     pub fn null_selectivity(&self, column: Option<&str>) -> f64 {
         if let Some(col) = column
-            && let Some(stats) = self.column_stats.get(col) {
-                return stats.null_fraction;
-            }
+            && let Some(stats) = self.column_stats.get(col)
+        {
+            return stats.null_fraction;
+        }
         0.01
     }
 }
@@ -491,7 +599,10 @@ impl StatsStore {
     }
 
     pub async fn update(&self, stats: TableStats) {
-        self.stats.write().await.insert(stats.table_name.clone(), stats);
+        self.stats
+            .write()
+            .await
+            .insert(stats.table_name.clone(), stats);
     }
 
     /// Get or create default stats for a table using catalog info.
@@ -514,25 +625,35 @@ impl StatsStore {
         if guard.is_empty() {
             return Ok(());
         }
-        let ser: Vec<TableStatsSer> = guard.values().map(|s| TableStatsSer {
-            table_name: s.table_name.clone(),
-            row_count: s.row_count,
-            page_count: s.page_count,
-            column_stats: s.column_stats.iter().map(|(k, v)| {
-                (k.clone(), ColumnStatsSer {
-                    distinct_count: v.distinct_count,
-                    null_fraction: v.null_fraction,
-                    avg_width: v.avg_width,
-                    min_value: v.min_value.clone(),
-                    max_value: v.max_value.clone(),
-                })
-            }).collect(),
-            last_analyzed: s.last_analyzed,
-        }).collect();
+        let ser: Vec<TableStatsSer> = guard
+            .values()
+            .map(|s| TableStatsSer {
+                table_name: s.table_name.clone(),
+                row_count: s.row_count,
+                page_count: s.page_count,
+                column_stats: s
+                    .column_stats
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            ColumnStatsSer {
+                                distinct_count: v.distinct_count,
+                                null_fraction: v.null_fraction,
+                                avg_width: v.avg_width,
+                                min_value: v.min_value.clone(),
+                                max_value: v.max_value.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+                last_analyzed: s.last_analyzed,
+            })
+            .collect();
         drop(guard);
 
-        let json = serde_json::to_string_pretty(&ser)
-            .map_err(|e| format!("serialize stats: {e}"))?;
+        let json =
+            serde_json::to_string_pretty(&ser).map_err(|e| format!("serialize stats: {e}"))?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json.as_bytes()).map_err(|e| format!("write stats: {e}"))?;
         std::fs::rename(&tmp, path).map_err(|e| format!("rename stats: {e}"))?;
@@ -544,29 +665,38 @@ impl StatsStore {
         if !path.exists() {
             return Ok(0);
         }
-        let json = std::fs::read_to_string(path)
-            .map_err(|e| format!("read stats: {e}"))?;
-        let entries: Vec<TableStatsSer> = serde_json::from_str(&json)
-            .map_err(|e| format!("parse stats: {e}"))?;
+        let json = std::fs::read_to_string(path).map_err(|e| format!("read stats: {e}"))?;
+        let entries: Vec<TableStatsSer> =
+            serde_json::from_str(&json).map_err(|e| format!("parse stats: {e}"))?;
         let count = entries.len();
         let mut guard = self.stats.write().await;
         for e in entries {
-            let cs = e.column_stats.into_iter().map(|(k, v)| {
-                (k, ColumnStats {
-                    distinct_count: v.distinct_count,
-                    null_fraction: v.null_fraction,
-                    avg_width: v.avg_width,
-                    min_value: v.min_value,
-                    max_value: v.max_value,
+            let cs = e
+                .column_stats
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        ColumnStats {
+                            distinct_count: v.distinct_count,
+                            null_fraction: v.null_fraction,
+                            avg_width: v.avg_width,
+                            min_value: v.min_value,
+                            max_value: v.max_value,
+                        },
+                    )
                 })
-            }).collect();
-            guard.insert(e.table_name.clone(), TableStats {
-                table_name: e.table_name,
-                row_count: e.row_count,
-                page_count: e.page_count,
-                column_stats: cs,
-                last_analyzed: e.last_analyzed,
-            });
+                .collect();
+            guard.insert(
+                e.table_name.clone(),
+                TableStats {
+                    table_name: e.table_name,
+                    row_count: e.row_count,
+                    page_count: e.page_count,
+                    column_stats: cs,
+                    last_analyzed: e.last_analyzed,
+                },
+            );
         }
         Ok(count)
     }
@@ -605,9 +735,10 @@ impl fmt::Debug for StatsStore {
 /// Extract a numeric literal as f64 from an expression (for range bound estimation).
 fn extract_literal_f64(expr: &sqlparser::ast::Expr) -> Option<f64> {
     if let sqlparser::ast::Expr::Value(v) = expr
-        && let sqlparser::ast::Value::Number(n, _) = &v.value {
-            return n.parse::<f64>().ok();
-        }
+        && let sqlparser::ast::Value::Number(n, _) = &v.value
+    {
+        return n.parse::<f64>().ok();
+    }
     None
 }
 
@@ -615,9 +746,7 @@ fn extract_literal_f64(expr: &sqlparser::ast::Expr) -> Option<f64> {
 pub fn extract_column_name(expr: &sqlparser::ast::Expr) -> Option<String> {
     match expr {
         sqlparser::ast::Expr::Identifier(ident) => Some(ident.value.clone()),
-        sqlparser::ast::Expr::CompoundIdentifier(idents) => {
-            idents.last().map(|i| i.value.clone())
-        }
+        sqlparser::ast::Expr::CompoundIdentifier(idents) => idents.last().map(|i| i.value.clone()),
         _ => None,
     }
 }
@@ -674,15 +803,21 @@ pub fn find_range_scan_opportunity(
 
     // Fast path: handle BETWEEN expressions directly (single AST node with both bounds).
     for pred in predicates {
-        if let sqlparser::ast::Expr::Between { expr, negated, low, high } = pred
+        if let sqlparser::ast::Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } = pred
             && !negated
             && let Some(col) = extract_column_name(expr)
-                && indexed_cols.iter().any(|ic| ic.eq_ignore_ascii_case(&col)) {
-                    let lo_val = low.to_string();
-                    let hi_val = high.to_string();
-                    let pred_str = pred.to_string();
-                    return Some((col.to_lowercase(), lo_val, hi_val, pred_str));
-                }
+            && indexed_cols.iter().any(|ic| ic.eq_ignore_ascii_case(&col))
+        {
+            let lo_val = low.to_string();
+            let hi_val = high.to_string();
+            let pred_str = pred.to_string();
+            return Some((col.to_lowercase(), lo_val, hi_val, pred_str));
+        }
     }
 
     // col → (lo_val, hi_val, predicate_strings)
@@ -697,7 +832,10 @@ pub fn find_range_scan_opportunity(
                 continue;
             }
             let key = col.to_lowercase();
-            pred_map.entry(key.clone()).or_default().push(pred.to_string());
+            pred_map
+                .entry(key.clone())
+                .or_default()
+                .push(pred.to_string());
             if bound.is_lo {
                 lo_map.entry(key).or_insert(bound.val);
             } else {
@@ -721,33 +859,38 @@ pub fn find_range_scan_opportunity(
 /// Check if an expression is a simple equality predicate (col = literal).
 pub fn is_equality_predicate(expr: &sqlparser::ast::Expr) -> Option<(String, String)> {
     if let sqlparser::ast::Expr::BinaryOp { left, op, right } = expr
-        && matches!(op, sqlparser::ast::BinaryOperator::Eq) {
-            if let Some(col) = extract_column_name(left) {
-                return Some((col, right.to_string()));
-            }
-            if let Some(col) = extract_column_name(right) {
-                return Some((col, left.to_string()));
-            }
+        && matches!(op, sqlparser::ast::BinaryOperator::Eq)
+    {
+        if let Some(col) = extract_column_name(left) {
+            return Some((col, right.to_string()));
         }
+        if let Some(col) = extract_column_name(right) {
+            return Some((col, left.to_string()));
+        }
+    }
     None
 }
 
 /// Check if an expression is an equi-join condition (left_table.col = right_table.col).
-pub fn is_equi_join_condition(expr: &sqlparser::ast::Expr) -> Option<(String, String, String, String)> {
+pub fn is_equi_join_condition(
+    expr: &sqlparser::ast::Expr,
+) -> Option<(String, String, String, String)> {
     if let sqlparser::ast::Expr::BinaryOp { left, op, right } = expr
         && matches!(op, sqlparser::ast::BinaryOperator::Eq)
-            && let (
-                sqlparser::ast::Expr::CompoundIdentifier(left_idents),
-                sqlparser::ast::Expr::CompoundIdentifier(right_idents),
-            ) = (left.as_ref(), right.as_ref())
-                && left_idents.len() == 2 && right_idents.len() == 2 {
-                    return Some((
-                        left_idents[0].value.clone(),
-                        left_idents[1].value.clone(),
-                        right_idents[0].value.clone(),
-                        right_idents[1].value.clone(),
-                    ));
-                }
+        && let (
+            sqlparser::ast::Expr::CompoundIdentifier(left_idents),
+            sqlparser::ast::Expr::CompoundIdentifier(right_idents),
+        ) = (left.as_ref(), right.as_ref())
+        && left_idents.len() == 2
+        && right_idents.len() == 2
+    {
+        return Some((
+            left_idents[0].value.clone(),
+            left_idents[1].value.clone(),
+            right_idents[0].value.clone(),
+            right_idents[1].value.clone(),
+        ));
+    }
     None
 }
 
@@ -763,69 +906,75 @@ fn split_conjunction_inner<'a>(
     out: &mut Vec<&'a sqlparser::ast::Expr>,
 ) {
     if let sqlparser::ast::Expr::BinaryOp { left, op, right } = expr
-        && matches!(op, sqlparser::ast::BinaryOperator::And) {
-            split_conjunction_inner(left, out);
-            split_conjunction_inner(right, out);
-            return;
-        }
+        && matches!(op, sqlparser::ast::BinaryOperator::And)
+    {
+        split_conjunction_inner(left, out);
+        split_conjunction_inner(right, out);
+        return;
+    }
     if let sqlparser::ast::Expr::Nested(inner) = expr
         && let sqlparser::ast::Expr::BinaryOp { op, .. } = inner.as_ref()
-            && matches!(op, sqlparser::ast::BinaryOperator::And) {
-                split_conjunction_inner(inner, out);
-                return;
-            }
+        && matches!(op, sqlparser::ast::BinaryOperator::And)
+    {
+        split_conjunction_inner(inner, out);
+        return;
+    }
     out.push(expr);
 }
 
 /// Estimate selectivity of a predicate.
-pub fn estimate_selectivity(
-    expr: &sqlparser::ast::Expr,
-    stats: &TableStats,
-) -> f64 {
+pub fn estimate_selectivity(expr: &sqlparser::ast::Expr, stats: &TableStats) -> f64 {
     match expr {
-        sqlparser::ast::Expr::BinaryOp { left, op, right } => {
-            match op {
-                sqlparser::ast::BinaryOperator::Eq => {
-                    let col = extract_column_name(left)
-                        .or_else(|| extract_column_name(right));
-                    stats.equality_selectivity(col.as_deref())
-                }
-                sqlparser::ast::BinaryOperator::NotEq => {
-                    let col = extract_column_name(left)
-                        .or_else(|| extract_column_name(right));
-                    1.0 - stats.equality_selectivity(col.as_deref())
-                }
-                sqlparser::ast::BinaryOperator::Lt | sqlparser::ast::BinaryOperator::LtEq => {
-                    let col = extract_column_name(left).or_else(|| extract_column_name(right));
-                    let bound = extract_literal_f64(right).or_else(|| extract_literal_f64(left));
-                    stats.estimate_range_sel(col.as_deref(), None, bound)
-                }
-                sqlparser::ast::BinaryOperator::Gt | sqlparser::ast::BinaryOperator::GtEq => {
-                    let col = extract_column_name(left).or_else(|| extract_column_name(right));
-                    let bound = extract_literal_f64(right).or_else(|| extract_literal_f64(left));
-                    stats.estimate_range_sel(col.as_deref(), bound, None)
-                }
-                sqlparser::ast::BinaryOperator::And => {
-                    let left_sel = estimate_selectivity(left, stats);
-                    let right_sel = estimate_selectivity(right, stats);
-                    left_sel * right_sel
-                }
-                sqlparser::ast::BinaryOperator::Or => {
-                    let left_sel = estimate_selectivity(left, stats);
-                    let right_sel = estimate_selectivity(right, stats);
-                    (left_sel + right_sel - left_sel * right_sel).min(1.0)
-                }
-                _ => 0.5,
+        sqlparser::ast::Expr::BinaryOp { left, op, right } => match op {
+            sqlparser::ast::BinaryOperator::Eq => {
+                let col = extract_column_name(left).or_else(|| extract_column_name(right));
+                stats.equality_selectivity(col.as_deref())
             }
-        }
+            sqlparser::ast::BinaryOperator::NotEq => {
+                let col = extract_column_name(left).or_else(|| extract_column_name(right));
+                1.0 - stats.equality_selectivity(col.as_deref())
+            }
+            sqlparser::ast::BinaryOperator::Lt | sqlparser::ast::BinaryOperator::LtEq => {
+                let col = extract_column_name(left).or_else(|| extract_column_name(right));
+                let bound = extract_literal_f64(right).or_else(|| extract_literal_f64(left));
+                stats.estimate_range_sel(col.as_deref(), None, bound)
+            }
+            sqlparser::ast::BinaryOperator::Gt | sqlparser::ast::BinaryOperator::GtEq => {
+                let col = extract_column_name(left).or_else(|| extract_column_name(right));
+                let bound = extract_literal_f64(right).or_else(|| extract_literal_f64(left));
+                stats.estimate_range_sel(col.as_deref(), bound, None)
+            }
+            sqlparser::ast::BinaryOperator::And => {
+                let left_sel = estimate_selectivity(left, stats);
+                let right_sel = estimate_selectivity(right, stats);
+                left_sel * right_sel
+            }
+            sqlparser::ast::BinaryOperator::Or => {
+                let left_sel = estimate_selectivity(left, stats);
+                let right_sel = estimate_selectivity(right, stats);
+                (left_sel + right_sel - left_sel * right_sel).min(1.0)
+            }
+            _ => 0.5,
+        },
         sqlparser::ast::Expr::IsNull(_) => stats.null_selectivity(None),
         sqlparser::ast::Expr::IsNotNull(_) => 1.0 - stats.null_selectivity(None),
-        sqlparser::ast::Expr::Like { .. } | sqlparser::ast::Expr::ILike { .. } => stats.like_selectivity(),
+        sqlparser::ast::Expr::Like { .. } | sqlparser::ast::Expr::ILike { .. } => {
+            stats.like_selectivity()
+        }
         sqlparser::ast::Expr::InList { list, negated, .. } => {
             let sel = list.len() as f64 * stats.equality_selectivity(None);
-            if *negated { 1.0 - sel.min(1.0) } else { sel.min(1.0) }
+            if *negated {
+                1.0 - sel.min(1.0)
+            } else {
+                sel.min(1.0)
+            }
         }
-        sqlparser::ast::Expr::Between { expr, low, high, negated } => {
+        sqlparser::ast::Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
             let col = extract_column_name(expr);
             let lo_val = extract_literal_f64(low);
             let hi_val = extract_literal_f64(high);
@@ -849,15 +998,14 @@ pub struct QueryPlanner {
 
 impl QueryPlanner {
     pub fn new(catalog: Arc<Catalog>, stats_store: Arc<StatsStore>) -> Self {
-        Self { catalog, stats_store }
+        Self {
+            catalog,
+            stats_store,
+        }
     }
 
     /// Plan a table scan, choosing between seq scan and index scan.
-    pub async fn plan_scan(
-        &self,
-        table: &str,
-        predicates: &[&sqlparser::ast::Expr],
-    ) -> PlanNode {
+    pub async fn plan_scan(&self, table: &str, predicates: &[&sqlparser::ast::Expr]) -> PlanNode {
         let stats = self.stats_store.get_or_default(table, &self.catalog).await;
 
         // Use sync cached lookups to avoid async RwLock overhead on the hot path.
@@ -874,7 +1022,9 @@ impl QueryPlanner {
                     // Check indexes on this table
                     for idx in indexes {
                         let idx_col = idx.columns.first().map(|c| c.as_str()).unwrap_or("");
-                        if idx_col.eq_ignore_ascii_case(&col) && matches!(idx.index_type, IndexType::BTree) {
+                        if idx_col.eq_ignore_ascii_case(&col)
+                            && matches!(idx.index_type, IndexType::BTree)
+                        {
                             let is_unique = table_def
                                 .primary_key_columns()
                                 .map(|pk| pk.len() == 1 && pk[0].eq_ignore_ascii_case(&col))
@@ -882,11 +1032,13 @@ impl QueryPlanner {
                             let estimated_matches = if is_unique {
                                 1
                             } else {
-                                (stats.row_count as f64 * stats.equality_selectivity(Some(&col))).max(1.0) as usize
+                                (stats.row_count as f64 * stats.equality_selectivity(Some(&col)))
+                                    .max(1.0) as usize
                             };
                             let tree_height = ((stats.page_count as f64).log2() as usize).max(1);
                             let idx_cost = estimate_index_scan_cost(tree_height, estimated_matches);
-                            let seq_cost = estimate_seq_scan_cost(stats.page_count, stats.row_count);
+                            let seq_cost =
+                                estimate_seq_scan_cost(stats.page_count, stats.row_count);
 
                             if idx_cost.0 < seq_cost.0 {
                                 let lookup_str = format!("{col} = {val}");
@@ -929,15 +1081,13 @@ impl QueryPlanner {
                     find_range_scan_opportunity(predicates, &btree_indexed_cols)
             {
                 // Find the index name for this column.
-                let maybe_idx = indexes
-                    .iter()
-                    .find(|i| {
-                        matches!(i.index_type, IndexType::BTree)
-                            && i.columns
-                                .first()
-                                .map(|c| c.eq_ignore_ascii_case(&col))
-                                .unwrap_or(false)
-                    });
+                let maybe_idx = indexes.iter().find(|i| {
+                    matches!(i.index_type, IndexType::BTree)
+                        && i.columns
+                            .first()
+                            .map(|c| c.eq_ignore_ascii_case(&col))
+                            .unwrap_or(false)
+                });
 
                 if let Some(idx) = maybe_idx {
                     // Use 20% selectivity as a conservative range estimate.
@@ -945,14 +1095,10 @@ impl QueryPlanner {
                     // even this rough estimate is almost always cheaper than a
                     // full sequential scan for selective ranges.
                     let _ = table_def; // accessed above for column check
-                    let estimated_matches =
-                        (stats.row_count as f64 * 0.20).max(1.0) as usize;
-                    let tree_height =
-                        ((stats.page_count as f64).log2() as usize).max(1);
-                    let idx_cost =
-                        estimate_index_scan_cost(tree_height, estimated_matches);
-                    let seq_cost =
-                        estimate_seq_scan_cost(stats.page_count, stats.row_count);
+                    let estimated_matches = (stats.row_count as f64 * 0.20).max(1.0) as usize;
+                    let tree_height = ((stats.page_count as f64).log2() as usize).max(1);
+                    let idx_cost = estimate_index_scan_cost(tree_height, estimated_matches);
+                    let seq_cost = estimate_seq_scan_cost(stats.page_count, stats.row_count);
 
                     if idx_cost.0 < seq_cost.0 {
                         let lo_expr = parse_expr_safe(&lo_val);
@@ -993,7 +1139,11 @@ impl QueryPlanner {
         let (filter, filter_expr) = if predicates.is_empty() {
             (None, None)
         } else {
-            let filter_str = predicates.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" AND ");
+            let filter_str = predicates
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(" AND ");
             let expr = combine_predicate_exprs(predicates);
             (Some(filter_str), expr)
         };
@@ -1020,7 +1170,9 @@ impl QueryPlanner {
                 | sqlparser::ast::BinaryOperator::GtEq => Some(cost::PredicateType::Range),
                 _ => None,
             },
-            sqlparser::ast::Expr::Between { negated, .. } if !negated => Some(cost::PredicateType::Range),
+            sqlparser::ast::Expr::Between { negated, .. } if !negated => {
+                Some(cost::PredicateType::Range)
+            }
             sqlparser::ast::Expr::Like { .. } | sqlparser::ast::Expr::ILike { .. } => {
                 Some(cost::PredicateType::Prefix)
             }
@@ -1053,9 +1205,7 @@ impl QueryPlanner {
                 Some(Box::new(cost::HnswAccess::for_dataset(row_count)))
             }
             IndexType::Gin => Some(Box::new(cost::FtsAccess::new(500.0, 2.0))),
-            IndexType::Gist | IndexType::Rtree => {
-                Some(Box::new(cost::RTreeAccess::new(50.0)))
-            }
+            IndexType::Gist | IndexType::Rtree => Some(Box::new(cost::RTreeAccess::new(50.0))),
         }
     }
 
@@ -1089,7 +1239,9 @@ impl QueryPlanner {
                 let pred_type = pred_type.unwrap();
 
                 for idx in &indexes {
-                    if let Some(access) = Self::access_method_for_index_type(&idx.index_type, row_count) {
+                    if let Some(access) =
+                        Self::access_method_for_index_type(&idx.index_type, row_count)
+                    {
                         if !access.supports_predicate(&pred_type) {
                             continue;
                         }
@@ -1109,9 +1261,10 @@ impl QueryPlanner {
                             None
                         };
                         if let Some(ref pc) = pred_col
-                            && !col.eq_ignore_ascii_case(pc) {
-                                continue;
-                            }
+                            && !col.eq_ignore_ascii_case(pc)
+                        {
+                            continue;
+                        }
                         let selectivity = stats.equality_selectivity(Some(col));
                         let idx_cost = access.estimate_cost(row_count, selectivity);
                         let est = access.estimate_rows(row_count, selectivity);
@@ -1120,7 +1273,8 @@ impl QueryPlanner {
                             best_total = idx_cost.total();
                             best_pred_idx = Some(pred_i);
                             // BETWEEN predicates → range scan; equality → point lookup
-                            let plan = if let sqlparser::ast::Expr::Between { low, high, .. } = pred {
+                            let plan = if let sqlparser::ast::Expr::Between { low, high, .. } = pred
+                            {
                                 PlanNode::IndexScan {
                                     table: table.to_string(),
                                     index_name: idx.name.clone(),
@@ -1161,7 +1315,9 @@ impl QueryPlanner {
         // If a specialty index won, use it — with a Filter for remaining predicates.
         if let Some(plan) = best_plan {
             // Collect predicates NOT covered by the index scan.
-            let remaining: Vec<&sqlparser::ast::Expr> = predicates.iter().enumerate()
+            let remaining: Vec<&sqlparser::ast::Expr> = predicates
+                .iter()
+                .enumerate()
                 .filter(|(i, _)| Some(*i) != best_pred_idx)
                 .map(|(_, p)| *p)
                 .collect();
@@ -1169,7 +1325,8 @@ impl QueryPlanner {
                 return plan;
             }
             // Combine remaining predicates with AND and wrap in a Filter node.
-            let combined = remaining.iter()
+            let combined = remaining
+                .iter()
                 .map(|e| (*e).clone())
                 .reduce(|a, b| sqlparser::ast::Expr::BinaryOp {
                     left: Box::new(a),
@@ -1178,7 +1335,8 @@ impl QueryPlanner {
                 })
                 .unwrap();
             let est_rows = (plan.estimated_rows() / 2).max(1);
-            let filter_cost = Cost(plan.total_cost().0 + plan.estimated_rows() as f64 * CPU_OPERATOR_COST);
+            let filter_cost =
+                Cost(plan.total_cost().0 + plan.estimated_rows() as f64 * CPU_OPERATOR_COST);
             return PlanNode::Filter {
                 input: Box::new(plan),
                 predicate: combined.to_string(),
@@ -1212,21 +1370,22 @@ impl QueryPlanner {
 
         // Check if this is an equi-join (can use hash join)
         if let Some(cond) = condition
-            && let Some((lt, lc, rt, rc)) = is_equi_join_condition(cond) {
-                let hash_cost = estimate_hash_join_cost(left_rows, right_rows, result_rows);
-                let nl_cost = estimate_nested_loop_cost(left_rows, right.total_cost(), result_rows);
+            && let Some((lt, lc, rt, rc)) = is_equi_join_condition(cond)
+        {
+            let hash_cost = estimate_hash_join_cost(left_rows, right_rows, result_rows);
+            let nl_cost = estimate_nested_loop_cost(left_rows, right.total_cost(), result_rows);
 
-                if hash_cost.0 < nl_cost.0 && left_rows > 10 {
-                    return PlanNode::HashJoin {
-                        left: Box::new(left),
-                        right: Box::new(right),
-                        join_type,
-                        hash_keys: vec![format!("{lt}.{lc} = {rt}.{rc}")],
-                        estimated_rows: result_rows.max(1),
-                        estimated_cost: hash_cost,
-                    };
-                }
+            if hash_cost.0 < nl_cost.0 && left_rows > 10 {
+                return PlanNode::HashJoin {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    join_type,
+                    hash_keys: vec![format!("{lt}.{lc} = {rt}.{rc}")],
+                    estimated_rows: result_rows.max(1),
+                    estimated_cost: hash_cost,
+                };
             }
+        }
 
         // Fallback: nested loop join
         let nl_cost = estimate_nested_loop_cost(left_rows, right.total_cost(), result_rows);
@@ -1262,7 +1421,16 @@ pub fn choose_scan_plan(
     index_name: Option<String>,
     lookup_key: Option<String>,
 ) -> PlanNode {
-    choose_scan_plan_ex(stats, has_index, is_equality_lookup, is_unique_index, false, filter_desc, index_name, lookup_key)
+    choose_scan_plan_ex(
+        stats,
+        has_index,
+        is_equality_lookup,
+        is_unique_index,
+        false,
+        filter_desc,
+        index_name,
+        lookup_key,
+    )
 }
 
 /// Choose the cheapest scan method, with hash index awareness.
@@ -1289,7 +1457,11 @@ pub fn choose_scan_plan_ex(
             // Hash index: O(1) probe cost — always cheaper than B-tree for equality
             estimate_hash_index_cost(estimated_matches)
         } else {
-            let tree_height = if stats.page_count == 0 { 1 } else { ((stats.page_count as f64).log2() as usize).max(1) };
+            let tree_height = if stats.page_count == 0 {
+                1
+            } else {
+                ((stats.page_count as f64).log2() as usize).max(1)
+            };
             estimate_index_scan_cost(tree_height, estimated_matches)
         };
 
@@ -1337,7 +1509,8 @@ pub fn parse_expr_safe(s: &str) -> Option<sqlparser::ast::Expr> {
     let stmts = Parser::parse_sql(&PostgreSqlDialect {}, &sql).ok()?;
     if let Some(sqlparser::ast::Statement::Query(q)) = stmts.into_iter().next()
         && let sqlparser::ast::SetExpr::Select(sel) = *q.body
-        && let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) = sel.projection.into_iter().next()
+        && let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) =
+            sel.projection.into_iter().next()
     {
         return Some(expr);
     }
@@ -1346,7 +1519,9 @@ pub fn parse_expr_safe(s: &str) -> Option<sqlparser::ast::Expr> {
 
 /// Combine multiple predicate expressions into a single AND conjunction.
 /// Returns None if the slice is empty.
-pub fn combine_predicate_exprs(predicates: &[&sqlparser::ast::Expr]) -> Option<sqlparser::ast::Expr> {
+pub fn combine_predicate_exprs(
+    predicates: &[&sqlparser::ast::Expr],
+) -> Option<sqlparser::ast::Expr> {
     if predicates.is_empty() {
         return None;
     }
@@ -1380,8 +1555,13 @@ mod tests {
     fn index_cheaper_for_point_lookup() {
         let stats = TableStats::new("users", 100000, 1000);
         let plan = choose_scan_plan(
-            &stats, true, true, true,
-            None, Some("idx_users_id".into()), Some("id = 42".into()),
+            &stats,
+            true,
+            true,
+            true,
+            None,
+            Some("idx_users_id".into()),
+            Some("id = 42".into()),
         );
         assert!(matches!(plan, PlanNode::IndexScan { .. }));
     }
@@ -1390,8 +1570,13 @@ mod tests {
     fn seq_scan_for_no_index() {
         let stats = TableStats::new("users", 100, 10);
         let plan = choose_scan_plan(
-            &stats, false, true, false,
-            Some("age > 30".into()), None, None,
+            &stats,
+            false,
+            true,
+            false,
+            Some("age > 30".into()),
+            None,
+            None,
         );
         assert!(matches!(plan, PlanNode::SeqScan { .. }));
     }
@@ -1425,7 +1610,10 @@ mod tests {
         let hash_cost = estimate_hash_join_cost(left_rows, right_rows, result_rows);
         let right_cost = estimate_seq_scan_cost(500, right_rows);
         let nl_cost = estimate_nested_loop_cost(left_rows, right_cost, result_rows);
-        assert!(hash_cost.0 < nl_cost.0, "Hash join should be cheaper for large equi-joins");
+        assert!(
+            hash_cost.0 < nl_cost.0,
+            "Hash join should be cheaper for large equi-joins"
+        );
     }
 
     #[test]
@@ -1434,26 +1622,28 @@ mod tests {
         use sqlparser::parser::Parser;
         let sql = "SELECT 1 WHERE a = 1 AND b = 2 AND c > 3";
         let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
-        if let sqlparser::ast::Statement::Query(q) = &stmts[0] {
-            if let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() {
-                if let Some(where_expr) = &sel.selection {
-                    let preds = split_conjunction(where_expr);
-                    assert_eq!(preds.len(), 3);
-                }
-            }
+        if let sqlparser::ast::Statement::Query(q) = &stmts[0]
+            && let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref()
+            && let Some(where_expr) = &sel.selection
+        {
+            let preds = split_conjunction(where_expr);
+            assert_eq!(preds.len(), 3);
         }
     }
 
     #[test]
     fn selectivity_equality() {
         let mut stats = TableStats::new("users", 1000, 10);
-        stats.column_stats.insert("id".to_string(), ColumnStats {
-            distinct_count: 1000,
-            null_fraction: 0.0,
-            avg_width: 4,
-            min_value: Some("1".into()),
-            max_value: Some("1000".into()),
-        });
+        stats.column_stats.insert(
+            "id".to_string(),
+            ColumnStats {
+                distinct_count: 1000,
+                null_fraction: 0.0,
+                avg_width: 4,
+                min_value: Some("1".into()),
+                max_value: Some("1000".into()),
+            },
+        );
         let sel = stats.equality_selectivity(Some("id"));
         assert!((sel - 0.001).abs() < 0.001);
     }
@@ -1596,18 +1786,17 @@ mod tests {
         use sqlparser::parser::Parser;
         let sql = "SELECT 1 WHERE a.id = b.user_id";
         let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
-        if let sqlparser::ast::Statement::Query(q) = &stmts[0] {
-            if let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() {
-                if let Some(where_expr) = &sel.selection {
-                    let result = is_equi_join_condition(where_expr);
-                    assert!(result.is_some());
-                    let (lt, lc, rt, rc) = result.unwrap();
-                    assert_eq!(lt, "a");
-                    assert_eq!(lc, "id");
-                    assert_eq!(rt, "b");
-                    assert_eq!(rc, "user_id");
-                }
-            }
+        if let sqlparser::ast::Statement::Query(q) = &stmts[0]
+            && let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref()
+            && let Some(where_expr) = &sel.selection
+        {
+            let result = is_equi_join_condition(where_expr);
+            assert!(result.is_some());
+            let (lt, lc, rt, rc) = result.unwrap();
+            assert_eq!(lt, "a");
+            assert_eq!(lc, "id");
+            assert_eq!(rt, "b");
+            assert_eq!(rc, "user_id");
         }
     }
 
@@ -1617,16 +1806,15 @@ mod tests {
         use sqlparser::parser::Parser;
         let sql = "SELECT 1 WHERE name = 'alice'";
         let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
-        if let sqlparser::ast::Statement::Query(q) = &stmts[0] {
-            if let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() {
-                if let Some(where_expr) = &sel.selection {
-                    let result = is_equality_predicate(where_expr);
-                    assert!(result.is_some());
-                    let (col, val) = result.unwrap();
-                    assert_eq!(col, "name");
-                    assert!(val.contains("alice"));
-                }
-            }
+        if let sqlparser::ast::Statement::Query(q) = &stmts[0]
+            && let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref()
+            && let Some(where_expr) = &sel.selection
+        {
+            let result = is_equality_predicate(where_expr);
+            assert!(result.is_some());
+            let (col, val) = result.unwrap();
+            assert_eq!(col, "name");
+            assert!(val.contains("alice"));
         }
     }
 
@@ -1640,13 +1828,12 @@ mod tests {
         use sqlparser::parser::Parser;
         let sql = "SELECT 1 WHERE id = 5";
         let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
-        if let sqlparser::ast::Statement::Query(q) = &stmts[0] {
-            if let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() {
-                if let Some(expr) = &sel.selection {
-                    let pt = QueryPlanner::classify_predicate(expr);
-                    assert_eq!(pt, Some(cost::PredicateType::Equality));
-                }
-            }
+        if let sqlparser::ast::Statement::Query(q) = &stmts[0]
+            && let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref()
+            && let Some(expr) = &sel.selection
+        {
+            let pt = QueryPlanner::classify_predicate(expr);
+            assert_eq!(pt, Some(cost::PredicateType::Equality));
         }
     }
 
@@ -1656,13 +1843,12 @@ mod tests {
         use sqlparser::parser::Parser;
         let sql = "SELECT 1 WHERE age > 18";
         let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
-        if let sqlparser::ast::Statement::Query(q) = &stmts[0] {
-            if let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref() {
-                if let Some(expr) = &sel.selection {
-                    let pt = QueryPlanner::classify_predicate(expr);
-                    assert_eq!(pt, Some(cost::PredicateType::Range));
-                }
-            }
+        if let sqlparser::ast::Statement::Query(q) = &stmts[0]
+            && let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref()
+            && let Some(expr) = &sel.selection
+        {
+            let pt = QueryPlanner::classify_predicate(expr);
+            assert_eq!(pt, Some(cost::PredicateType::Range));
         }
     }
 

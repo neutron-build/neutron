@@ -7,18 +7,18 @@
 //! single-engine replacement for Elasticsearch, Neo4j, PostGIS, TimescaleDB,
 //! Pinecone, Redis, etc.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use rand::Rng;
 
 use nucleus::fts::InvertedIndex;
 use nucleus::geo::{self, Point};
-use nucleus::graph::{self, Direction, GraphStore, Properties, PropValue};
 use nucleus::graph::cypher::parse_cypher;
 use nucleus::graph::cypher_executor::execute_cypher;
-use nucleus::timeseries::{self, BucketSize, DataPoint, TimeSeriesStore};
-use nucleus::vector::{DistanceMetric, HnswConfig, HnswIndex, IvfFlatIndex, Vector};
+use nucleus::graph::{self, Direction, GraphStore, PropValue, Properties};
 use nucleus::kv::KvStore;
+use nucleus::timeseries::{self, BucketSize, DataPoint, TimeSeriesStore};
 use nucleus::types::Value;
+use nucleus::vector::{DistanceMetric, HnswConfig, HnswIndex, IvfFlatIndex, Vector};
 
 // ============================================================================
 // Helpers
@@ -162,7 +162,11 @@ fn build_random_graph(num_nodes: usize, edges_per_node: usize) -> GraphStore {
         for _ in 0..edges_per_node {
             let to = (rng.r#gen::<u64>() % (num_nodes as u64)) + 1;
             if to != from {
-                let edge_type = if rng.r#gen::<bool>() { "KNOWS" } else { "LINKS" };
+                let edge_type = if rng.r#gen::<bool>() {
+                    "KNOWS"
+                } else {
+                    "LINKS"
+                };
                 g.create_edge(from, to, edge_type.to_string(), Properties::new());
             }
         }
@@ -187,12 +191,7 @@ fn graph_shortest_path(c: &mut Criterion) {
 
     c.bench_function("graph_shortest_path_100_nodes", |b| {
         b.iter(|| {
-            let path = g.shortest_path(
-                black_box(1),
-                black_box(50),
-                Direction::Outgoing,
-                None,
-            );
+            let path = g.shortest_path(black_box(1), black_box(50), Direction::Outgoing, None);
             black_box(path);
         });
     });
@@ -214,9 +213,7 @@ fn graph_cypher_match(c: &mut Criterion) {
     for i in 0..20 {
         g.create_node(
             vec!["Company".to_string()],
-            graph::props(vec![
-                ("name", PropValue::Text(format!("Company{}", i))),
-            ]),
+            graph::props(vec![("name", PropValue::Text(format!("Company{}", i)))]),
         );
     }
 
@@ -235,9 +232,8 @@ fn graph_cypher_match(c: &mut Criterion) {
         );
     }
 
-    let stmt = parse_cypher(
-        "MATCH (n:Person)-[r:WORKS_AT]->(m:Company) RETURN n.name, m.name"
-    ).unwrap();
+    let stmt =
+        parse_cypher("MATCH (n:Person)-[r:WORKS_AT]->(m:Company) RETURN n.name, m.name").unwrap();
 
     c.bench_function("graph_cypher_match_person_works_at_company", |b| {
         b.iter(|| {
@@ -314,7 +310,6 @@ fn timeseries_bucket(c: &mut Criterion) {
     });
 }
 
-
 // ============================================================================
 // Key-Value store benchmarks
 // ============================================================================
@@ -366,11 +361,7 @@ fn kv_mixed_workload(c: &mut Criterion) {
 
     // Pre-populate with 500 keys
     for i in 0..500 {
-        store.set(
-            &format!("key:{}", i),
-            Value::Int64(i as i64),
-            None,
-        );
+        store.set(&format!("key:{}", i), Value::Int64(i as i64), None);
     }
 
     c.bench_function("kv_mixed_workload_1000_ops", |b| {
@@ -384,11 +375,7 @@ fn kv_mixed_workload(c: &mut Criterion) {
                     }
                     5..8 => {
                         // 30% writes
-                        store.set(
-                            black_box(&key),
-                            Value::Int64(i as i64),
-                            None,
-                        );
+                        store.set(black_box(&key), Value::Int64(i as i64), None);
                     }
                     _ => {
                         // 20% deletes (then re-insert so store stays populated)

@@ -12,11 +12,11 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use rayon::prelude::*;
 use sqlparser::ast::{self, Expr};
 
-use crate::types::{Row, Value};
-use super::types::ColMeta;
-use super::{ExecError, ExecResult, Executor};
 use super::helpers::*;
 use super::session::sync_block_on;
+use super::types::ColMeta;
+use super::{ExecError, ExecResult, Executor};
+use crate::types::{Row, Value};
 
 // ---------------------------------------------------------------------------
 // Lazy Materialization — Phase 2C
@@ -112,8 +112,14 @@ impl Executor {
             Expr::UnaryOp { op, expr } => {
                 let val = self.eval_const_expr(expr)?;
                 match (op, val) {
-                    (ast::UnaryOperator::Minus, Value::Int32(n)) => n.checked_neg().map(Value::Int32).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
-                    (ast::UnaryOperator::Minus, Value::Int64(n)) => n.checked_neg().map(Value::Int64).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+                    (ast::UnaryOperator::Minus, Value::Int32(n)) => n
+                        .checked_neg()
+                        .map(Value::Int32)
+                        .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+                    (ast::UnaryOperator::Minus, Value::Int64(n)) => n
+                        .checked_neg()
+                        .map(Value::Int64)
+                        .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
                     (ast::UnaryOperator::Minus, Value::Float64(n)) => Ok(Value::Float64(-n)),
                     _ => Err(ExecError::Unsupported("unsupported unary op".into())),
                 }
@@ -124,7 +130,9 @@ impl Executor {
                 self.eval_binary_op(&l, op, &r)
             }
             Expr::Nested(inner) => self.eval_const_expr(inner),
-            Expr::Cast { expr, data_type, .. } => {
+            Expr::Cast {
+                expr, data_type, ..
+            } => {
                 let val = self.eval_const_expr(expr)?;
                 self.eval_cast(val, data_type)
             }
@@ -175,7 +183,8 @@ impl Executor {
             }
             Expr::Exists { subquery, negated } => {
                 let sub_result = sync_block_on(self.execute_query(*subquery.clone()))?;
-                let has_rows = matches!(&sub_result, ExecResult::Select { rows, .. } if !rows.is_empty());
+                let has_rows =
+                    matches!(&sub_result, ExecResult::Select { rows, .. } if !rows.is_empty());
                 Ok(Value::Bool(if *negated { !has_rows } else { has_rows }))
             }
             _ => Err(ExecError::Unsupported(format!("expression: {expr}"))),
@@ -209,12 +218,13 @@ impl Executor {
         let parsed_json;
         let json = match left {
             Value::Jsonb(v) => v,
-            Value::Text(s) => {
-                match serde_json::from_str::<serde_json::Value>(s) {
-                    Ok(v) => { parsed_json = v; &parsed_json }
-                    Err(_) => return Ok(Value::Null),
+            Value::Text(s) => match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(v) => {
+                    parsed_json = v;
+                    &parsed_json
                 }
-            }
+                Err(_) => return Ok(Value::Null),
+            },
             _ => return Ok(Value::Null),
         };
 
@@ -232,7 +242,11 @@ impl Executor {
     }
 
     /// Evaluate JSONB double arrow operator: `jsonb_val ->> key` (returns Text).
-    pub(super) fn eval_json_double_arrow(&self, left: &Value, key: &Value) -> Result<Value, ExecError> {
+    pub(super) fn eval_json_double_arrow(
+        &self,
+        left: &Value,
+        key: &Value,
+    ) -> Result<Value, ExecError> {
         let result = self.eval_json_arrow(left, key)?;
         match result {
             Value::Jsonb(serde_json::Value::String(s)) => Ok(Value::Text(s)),
@@ -243,7 +257,11 @@ impl Executor {
     }
 
     /// Evaluate JSONB path arrow operator: `jsonb_val #> '{a,b}'` (returns JSONB).
-    pub(super) fn eval_json_path_arrow(&self, left: &Value, path: &Value) -> Result<Value, ExecError> {
+    pub(super) fn eval_json_path_arrow(
+        &self,
+        left: &Value,
+        path: &Value,
+    ) -> Result<Value, ExecError> {
         let json = match left {
             Value::Jsonb(v) => v.clone(),
             Value::Text(s) => match serde_json::from_str::<serde_json::Value>(s) {
@@ -259,7 +277,11 @@ impl Executor {
         let trimmed = path_str.trim();
         if trimmed.starts_with('{') && trimmed.ends_with('}') {
             let inner = &trimmed[1..trimmed.len() - 1];
-            let keys: Vec<&str> = if inner.is_empty() { vec![] } else { inner.split(',').collect() };
+            let keys: Vec<&str> = if inner.is_empty() {
+                vec![]
+            } else {
+                inner.split(',').collect()
+            };
             let mut current = json;
             for key in &keys {
                 let k = key.trim();
@@ -280,7 +302,11 @@ impl Executor {
     }
 
     /// Evaluate JSONB path long-arrow operator: `jsonb_val #>> '{a,b}'` (returns Text).
-    pub(super) fn eval_json_path_long_arrow(&self, left: &Value, path: &Value) -> Result<Value, ExecError> {
+    pub(super) fn eval_json_path_long_arrow(
+        &self,
+        left: &Value,
+        path: &Value,
+    ) -> Result<Value, ExecError> {
         let result = self.eval_json_path_arrow(left, path)?;
         match result {
             Value::Jsonb(serde_json::Value::String(s)) => Ok(Value::Text(s)),
@@ -299,7 +325,11 @@ impl Executor {
     /// - Array A contains Array B when every element in B has a matching
     ///   element in A (order-independent).
     /// - Scalars are compared for equality.
-    pub(super) fn eval_json_contains(&self, left: &Value, right: &Value) -> Result<Value, ExecError> {
+    pub(super) fn eval_json_contains(
+        &self,
+        left: &Value,
+        right: &Value,
+    ) -> Result<Value, ExecError> {
         let left_json = match left {
             Value::Jsonb(v) => v.clone(),
             Value::Text(s) => serde_json::from_str(s).unwrap_or(serde_json::Value::Null),
@@ -415,22 +445,54 @@ impl Executor {
         // Arithmetic and string operations
         match (left, right) {
             (Value::Int32(l), Value::Int32(r)) => match op {
-                ast::BinaryOperator::Plus => l.checked_add(*r).map(Value::Int32).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
-                ast::BinaryOperator::Minus => l.checked_sub(*r).map(Value::Int32).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
-                ast::BinaryOperator::Multiply => l.checked_mul(*r).map(Value::Int32).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
-                ast::BinaryOperator::Divide if *r == 0 => Err(ExecError::Runtime("division by zero".into())),
-                ast::BinaryOperator::Divide => l.checked_div(*r).map(Value::Int32).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
-                ast::BinaryOperator::Modulo if *r == 0 => Err(ExecError::Runtime("division by zero".into())),
+                ast::BinaryOperator::Plus => l
+                    .checked_add(*r)
+                    .map(Value::Int32)
+                    .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+                ast::BinaryOperator::Minus => l
+                    .checked_sub(*r)
+                    .map(Value::Int32)
+                    .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+                ast::BinaryOperator::Multiply => l
+                    .checked_mul(*r)
+                    .map(Value::Int32)
+                    .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+                ast::BinaryOperator::Divide if *r == 0 => {
+                    Err(ExecError::Runtime("division by zero".into()))
+                }
+                ast::BinaryOperator::Divide => l
+                    .checked_div(*r)
+                    .map(Value::Int32)
+                    .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+                ast::BinaryOperator::Modulo if *r == 0 => {
+                    Err(ExecError::Runtime("division by zero".into()))
+                }
                 ast::BinaryOperator::Modulo => Ok(Value::Int32(l % r)),
                 _ => Err(ExecError::Unsupported(format!("op: {op}"))),
             },
             (Value::Int64(l), Value::Int64(r)) => match op {
-                ast::BinaryOperator::Plus => l.checked_add(*r).map(Value::Int64).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
-                ast::BinaryOperator::Minus => l.checked_sub(*r).map(Value::Int64).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
-                ast::BinaryOperator::Multiply => l.checked_mul(*r).map(Value::Int64).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
-                ast::BinaryOperator::Divide if *r == 0 => Err(ExecError::Runtime("division by zero".into())),
-                ast::BinaryOperator::Divide => l.checked_div(*r).map(Value::Int64).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
-                ast::BinaryOperator::Modulo if *r == 0 => Err(ExecError::Runtime("division by zero".into())),
+                ast::BinaryOperator::Plus => l
+                    .checked_add(*r)
+                    .map(Value::Int64)
+                    .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+                ast::BinaryOperator::Minus => l
+                    .checked_sub(*r)
+                    .map(Value::Int64)
+                    .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+                ast::BinaryOperator::Multiply => l
+                    .checked_mul(*r)
+                    .map(Value::Int64)
+                    .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+                ast::BinaryOperator::Divide if *r == 0 => {
+                    Err(ExecError::Runtime("division by zero".into()))
+                }
+                ast::BinaryOperator::Divide => l
+                    .checked_div(*r)
+                    .map(Value::Int64)
+                    .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+                ast::BinaryOperator::Modulo if *r == 0 => {
+                    Err(ExecError::Runtime("division by zero".into()))
+                }
                 ast::BinaryOperator::Modulo => Ok(Value::Int64(l % r)),
                 _ => Err(ExecError::Unsupported(format!("op: {op}"))),
             },
@@ -445,7 +507,9 @@ impl Executor {
                 ast::BinaryOperator::Plus => Ok(Value::Float64(l + r)),
                 ast::BinaryOperator::Minus => Ok(Value::Float64(l - r)),
                 ast::BinaryOperator::Multiply => Ok(Value::Float64(l * r)),
-                ast::BinaryOperator::Divide if *r == 0.0 => Err(ExecError::Runtime("division by zero".into())),
+                ast::BinaryOperator::Divide if *r == 0.0 => {
+                    Err(ExecError::Runtime("division by zero".into()))
+                }
                 ast::BinaryOperator::Divide => Ok(Value::Float64(l / r)),
                 _ => Err(ExecError::Unsupported(format!("op: {op}"))),
             },
@@ -473,11 +537,18 @@ impl Executor {
     }
 
     /// Evaluate a WHERE clause expression against a row.
-    pub(super) fn eval_where(&self, expr: &Expr, row: &Row, col_meta: &[ColMeta]) -> Result<bool, ExecError> {
+    pub(super) fn eval_where(
+        &self,
+        expr: &Expr,
+        row: &Row,
+        col_meta: &[ColMeta],
+    ) -> Result<bool, ExecError> {
         match self.eval_row_expr(expr, row, col_meta)? {
             Value::Bool(b) => Ok(b),
             Value::Null => Ok(false),
-            other => Err(ExecError::Unsupported(format!("WHERE expects boolean, got {other}"))),
+            other => Err(ExecError::Unsupported(format!(
+                "WHERE expects boolean, got {other}"
+            ))),
         }
     }
 
@@ -501,7 +572,9 @@ impl Executor {
                     .collect()
             }
             #[cfg(not(feature = "server"))]
-            { unreachable!() }
+            {
+                unreachable!()
+            }
         } else {
             // Serial path for small result sets or non-server (WASM) builds
             rows.into_iter()
@@ -611,15 +684,16 @@ impl Executor {
                 Ok(row[idx].clone())
             }
             Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-                let idx =
-                    self.resolve_column(col_meta, Some(&parts[0].value), &parts[1].value)?;
+                let idx = self.resolve_column(col_meta, Some(&parts[0].value), &parts[1].value)?;
                 Ok(row[idx].clone())
             }
             Expr::Value(val) => self.eval_value(&val.value),
             // Typed string literals: TIMESTAMP '2024-01-01', DATE '2024-01-01', UUID 'xxx'
             Expr::TypedString(ts) => {
                 let s = match &ts.value.value {
-                    ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => s.clone(),
+                    ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => {
+                        s.clone()
+                    }
                     other => other.to_string(),
                 };
                 match &ts.data_type {
@@ -658,17 +732,16 @@ impl Executor {
                                 parts[0].parse::<i32>(),
                                 parts[1].parse::<u32>(),
                                 parts[2].trim().parse::<u32>(),
-                            ) {
-                                return Ok(Value::Date(crate::types::ymd_to_days(y, m, d)));
-                            }
+                            )
+                        {
+                            return Ok(Value::Date(crate::types::ymd_to_days(y, m, d)));
+                        }
                         Ok(Value::Text(s))
                     }
-                    ast::DataType::Uuid => {
-                        match crate::types::parse_uuid(&s) {
-                            Ok(bytes) => Ok(Value::Uuid(bytes)),
-                            Err(_) => Ok(Value::Text(s)),
-                        }
-                    }
+                    ast::DataType::Uuid => match crate::types::parse_uuid(&s) {
+                        Ok(bytes) => Ok(Value::Uuid(bytes)),
+                        Err(_) => Ok(Value::Text(s)),
+                    },
                     _ => Ok(Value::Text(s)),
                 }
             }
@@ -680,8 +753,14 @@ impl Executor {
             Expr::UnaryOp { op, expr } => {
                 let val = self.eval_row_expr(expr, row, col_meta)?;
                 match (op, val) {
-                    (ast::UnaryOperator::Minus, Value::Int32(n)) => n.checked_neg().map(Value::Int32).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
-                    (ast::UnaryOperator::Minus, Value::Int64(n)) => n.checked_neg().map(Value::Int64).ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+                    (ast::UnaryOperator::Minus, Value::Int32(n)) => n
+                        .checked_neg()
+                        .map(Value::Int32)
+                        .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+                    (ast::UnaryOperator::Minus, Value::Int64(n)) => n
+                        .checked_neg()
+                        .map(Value::Int64)
+                        .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
                     (ast::UnaryOperator::Minus, Value::Float64(n)) => Ok(Value::Float64(-n)),
                     (ast::UnaryOperator::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                     _ => Err(ExecError::Unsupported("unsupported unary op".into())),
@@ -706,14 +785,24 @@ impl Executor {
                 let lo = self.eval_row_expr(low, row, col_meta)?;
                 let hi = self.eval_row_expr(high, row, col_meta)?;
                 // SQL 3-valued logic: BETWEEN with any NULL operand yields NULL
-                if matches!(val, Value::Null) || matches!(lo, Value::Null) || matches!(hi, Value::Null) {
+                if matches!(val, Value::Null)
+                    || matches!(lo, Value::Null)
+                    || matches!(hi, Value::Null)
+                {
                     return Ok(Value::Null);
                 }
-                let in_range = matches!(compare_values(&val, &lo), Some(Ordering::Greater | Ordering::Equal))
-                    && matches!(compare_values(&val, &hi), Some(Ordering::Less | Ordering::Equal));
+                let in_range = matches!(
+                    compare_values(&val, &lo),
+                    Some(Ordering::Greater | Ordering::Equal)
+                ) && matches!(
+                    compare_values(&val, &hi),
+                    Some(Ordering::Less | Ordering::Equal)
+                );
                 Ok(Value::Bool(if *negated { !in_range } else { in_range }))
             }
-            Expr::Cast { expr, data_type, .. } => {
+            Expr::Cast {
+                expr, data_type, ..
+            } => {
                 let val = self.eval_row_expr(expr, row, col_meta)?;
                 self.eval_cast(val, data_type)
             }
@@ -724,18 +813,18 @@ impl Executor {
             } => {
                 let val = self.eval_row_expr(expr, row, col_meta)?;
                 // Compare by reference — avoids cloning val for every list item
-                let found = list
-                    .iter()
-                    .any(|item| self.eval_row_expr(item, row, col_meta).ok().as_ref() == Some(&val));
+                let found = list.iter().any(|item| {
+                    self.eval_row_expr(item, row, col_meta).ok().as_ref() == Some(&val)
+                });
                 Ok(Value::Bool(if *negated { !found } else { found }))
             }
             Expr::Function(func) => {
                 let fname = func.name.to_string().to_uppercase();
                 // Don't handle aggregates here -- they're handled in eval_aggregate_expr
                 if matches!(fname.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX") {
-                    return Err(ExecError::Unsupported(
-                        format!("aggregate function {fname} outside of aggregate context"),
-                    ));
+                    return Err(ExecError::Unsupported(format!(
+                        "aggregate function {fname} outside of aggregate context"
+                    )));
                 }
                 self.eval_scalar_fn(&fname, func, row, col_meta)
             }
@@ -829,12 +918,8 @@ impl Executor {
                             }
                         } else {
                             match trim_where {
-                                Some(ast::TrimWhereField::Leading) => {
-                                    s.trim_start().to_string()
-                                }
-                                Some(ast::TrimWhereField::Trailing) => {
-                                    s.trim_end().to_string()
-                                }
+                                Some(ast::TrimWhereField::Leading) => s.trim_start().to_string(),
+                                Some(ast::TrimWhereField::Trailing) => s.trim_end().to_string(),
                                 _ => s.trim().to_string(),
                             }
                         };
@@ -927,8 +1012,9 @@ impl Executor {
                         } else {
                             r.len()
                         };
-                        let mut result: String =
-                            chars[..std::cmp::min(start_idx, chars.len())].iter().collect();
+                        let mut result: String = chars[..std::cmp::min(start_idx, chars.len())]
+                            .iter()
+                            .collect();
                         result.push_str(r);
                         let end = std::cmp::min(start_idx + len, chars.len());
                         result.extend(&chars[end..]);
@@ -957,7 +1043,9 @@ impl Executor {
                                 Ok(Value::Int32(d - jan1 + 1))
                             }
                             "epoch" => Ok(Value::Int64(d as i64 * 86400)),
-                            _ => Err(ExecError::Unsupported(format!("EXTRACT({field_str}) from date"))),
+                            _ => Err(ExecError::Unsupported(format!(
+                                "EXTRACT({field_str}) from date"
+                            ))),
                         }
                     }
                     Value::Timestamp(ts) => {
@@ -973,7 +1061,9 @@ impl Executor {
                             "minute" => Ok(Value::Int32(((time_secs % 3600) / 60) as i32)),
                             "second" => Ok(Value::Int32((time_secs % 60) as i32)),
                             "epoch" => Ok(Value::Int64(total_secs)),
-                            _ => Err(ExecError::Unsupported(format!("EXTRACT({field_str}) from timestamp"))),
+                            _ => Err(ExecError::Unsupported(format!(
+                                "EXTRACT({field_str}) from timestamp"
+                            ))),
                         }
                     }
                     Value::Text(s) => {
@@ -998,13 +1088,18 @@ impl Executor {
                                 "epoch" => {
                                     let d = crate::types::ymd_to_days(y, m, day);
                                     let day_secs = d as i64 * 86400;
-                                    let time_secs = hour as i64 * 3600 + minute as i64 * 60 + second as i64;
+                                    let time_secs =
+                                        hour as i64 * 3600 + minute as i64 * 60 + second as i64;
                                     Ok(Value::Int64(day_secs + time_secs))
                                 }
-                                _ => Err(ExecError::Unsupported(format!("EXTRACT({field_str}) from text"))),
+                                _ => Err(ExecError::Unsupported(format!(
+                                    "EXTRACT({field_str}) from text"
+                                ))),
                             }
                         } else {
-                            Err(ExecError::Unsupported(format!("cannot parse date/time from text: {s}")))
+                            Err(ExecError::Unsupported(format!(
+                                "cannot parse date/time from text: {s}"
+                            )))
                         }
                     }
                     Value::Null => Ok(Value::Null),
@@ -1034,7 +1129,12 @@ impl Executor {
                 Ok(Value::Bool(not_distinct))
             }
             // -- ANY/ALL with subquery --
-            Expr::AnyOp { left, compare_op, right, .. } => {
+            Expr::AnyOp {
+                left,
+                compare_op,
+                right,
+                ..
+            } => {
                 let l = self.eval_row_expr(left, row, col_meta)?;
                 // Right side should evaluate to an array or subquery
                 let r = self.eval_row_expr(right, row, col_meta)?;
@@ -1045,10 +1145,17 @@ impl Executor {
                         });
                         Ok(Value::Bool(found))
                     }
-                    _ => Err(ExecError::Unsupported("ANY requires array or subquery".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "ANY requires array or subquery".into(),
+                    )),
                 }
             }
-            Expr::AllOp { left, compare_op, right, .. } => {
+            Expr::AllOp {
+                left,
+                compare_op,
+                right,
+                ..
+            } => {
                 let l = self.eval_row_expr(left, row, col_meta)?;
                 let r = self.eval_row_expr(right, row, col_meta)?;
                 match r {
@@ -1058,7 +1165,9 @@ impl Executor {
                         });
                         Ok(Value::Bool(all_match))
                     }
-                    _ => Err(ExecError::Unsupported("ALL requires array or subquery".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "ALL requires array or subquery".into(),
+                    )),
                 }
             }
             // -- Array constructor --
@@ -1091,8 +1200,15 @@ impl Executor {
                 // Cache key is the canonical text of the subquery before outer-ref substitution.
                 let cache_key = format!("{subquery}");
                 // Check if we already have the result of this non-correlated subquery cached.
-                if let Some(cached) = self.uncorrelated_subquery_cache.read().get(&cache_key).cloned() {
-                    let found = cached.iter().any(|v| compare_values(&val, v) == Some(Ordering::Equal));
+                if let Some(cached) = self
+                    .uncorrelated_subquery_cache
+                    .read()
+                    .get(&cache_key)
+                    .cloned()
+                {
+                    let found = cached
+                        .iter()
+                        .any(|v| compare_values(&val, v) == Some(Ordering::Equal));
                     return Ok(Value::Bool(if *negated { !found } else { found }));
                 }
                 self.check_subquery_depth()?;
@@ -1102,16 +1218,20 @@ impl Executor {
                 self.query_depth.fetch_sub(1, AtomicOrdering::Relaxed);
                 let sub_result = sub_result?;
                 let values: std::sync::Arc<Vec<Value>> = match &sub_result {
-                    ExecResult::Select { rows, .. } => {
-                        std::sync::Arc::new(rows.iter().filter_map(|r| r.first().cloned()).collect())
-                    }
+                    ExecResult::Select { rows, .. } => std::sync::Arc::new(
+                        rows.iter().filter_map(|r| r.first().cloned()).collect(),
+                    ),
                     _ => std::sync::Arc::new(vec![]),
                 };
                 // Only cache if non-correlated (resolved query text == original).
                 if cache_key == resolved_key {
-                    self.uncorrelated_subquery_cache.write().insert(cache_key, values.clone());
+                    self.uncorrelated_subquery_cache
+                        .write()
+                        .insert(cache_key, values.clone());
                 }
-                let found = values.iter().any(|v| compare_values(&val, v) == Some(Ordering::Equal));
+                let found = values
+                    .iter()
+                    .any(|v| compare_values(&val, v) == Some(Ordering::Equal));
                 Ok(Value::Bool(if *negated { !found } else { found }))
             }
             Expr::Subquery(subquery) => {
@@ -1142,7 +1262,9 @@ impl Executor {
                             let key_expr = match sub {
                                 sqlparser::ast::Subscript::Index { index } => index,
                                 sqlparser::ast::Subscript::Slice { .. } => {
-                                    return Err(ExecError::Unsupported("array slice subscript".into()));
+                                    return Err(ExecError::Unsupported(
+                                        "array slice subscript".into(),
+                                    ));
                                 }
                             };
                             let key = self.eval_row_expr(key_expr, row, col_meta)?;
@@ -1164,49 +1286,45 @@ impl Executor {
 
     pub(super) fn eval_cast(&self, val: Value, target: &ast::DataType) -> Result<Value, ExecError> {
         match target {
-            ast::DataType::JSONB | ast::DataType::JSON => {
-                match val {
-                    Value::Text(s) => {
-                        let v: serde_json::Value = serde_json::from_str(&s)
-                            .map_err(|e| ExecError::Unsupported(format!("invalid JSON: {e}")))?;
-                        Ok(Value::Jsonb(v))
-                    }
-                    Value::Jsonb(_) => Ok(val),
-                    _ => Err(ExecError::Unsupported(format!("cannot cast {val:?} to JSONB"))),
+            ast::DataType::JSONB | ast::DataType::JSON => match val {
+                Value::Text(s) => {
+                    let v: serde_json::Value = serde_json::from_str(&s)
+                        .map_err(|e| ExecError::Unsupported(format!("invalid JSON: {e}")))?;
+                    Ok(Value::Jsonb(v))
                 }
-            }
-            ast::DataType::Text | ast::DataType::Varchar(_) => {
-                match val {
-                    Value::Null => Ok(Value::Null),
-                    _ => Ok(Value::Text(val.to_string())),
-                }
-            }
-            ast::DataType::Int(_) | ast::DataType::Integer(_) => {
-                match val {
-                    Value::Null => Ok(Value::Null),
-                    Value::Int32(_) => Ok(val),
-                    Value::Int64(n) => Ok(Value::Int32(n as i32)),
-                    Value::Float64(n) => Ok(Value::Int32(n as i32)),
-                    Value::Bool(b) => Ok(Value::Int32(if b { 1 } else { 0 })),
-                    Value::Text(s) => s.parse::<i32>()
-                        .map(Value::Int32)
-                        .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to INT"))),
-                    _ => Err(ExecError::Unsupported("cannot cast to INT".to_string())),
-                }
-            }
-            ast::DataType::BigInt(_) => {
-                match val {
-                    Value::Null => Ok(Value::Null),
-                    Value::Int32(n) => Ok(Value::Int64(n as i64)),
-                    Value::Int64(_) => Ok(val),
-                    Value::Float64(n) => Ok(Value::Int64(n as i64)),
-                    Value::Bool(b) => Ok(Value::Int64(if b { 1 } else { 0 })),
-                    Value::Text(s) => s.parse::<i64>()
-                        .map(Value::Int64)
-                        .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to BIGINT"))),
-                    _ => Err(ExecError::Unsupported("cannot cast to BIGINT".to_string())),
-                }
-            }
+                Value::Jsonb(_) => Ok(val),
+                _ => Err(ExecError::Unsupported(format!(
+                    "cannot cast {val:?} to JSONB"
+                ))),
+            },
+            ast::DataType::Text | ast::DataType::Varchar(_) => match val {
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Text(val.to_string())),
+            },
+            ast::DataType::Int(_) | ast::DataType::Integer(_) => match val {
+                Value::Null => Ok(Value::Null),
+                Value::Int32(_) => Ok(val),
+                Value::Int64(n) => Ok(Value::Int32(n as i32)),
+                Value::Float64(n) => Ok(Value::Int32(n as i32)),
+                Value::Bool(b) => Ok(Value::Int32(if b { 1 } else { 0 })),
+                Value::Text(s) => s
+                    .parse::<i32>()
+                    .map(Value::Int32)
+                    .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to INT"))),
+                _ => Err(ExecError::Unsupported("cannot cast to INT".to_string())),
+            },
+            ast::DataType::BigInt(_) => match val {
+                Value::Null => Ok(Value::Null),
+                Value::Int32(n) => Ok(Value::Int64(n as i64)),
+                Value::Int64(_) => Ok(val),
+                Value::Float64(n) => Ok(Value::Int64(n as i64)),
+                Value::Bool(b) => Ok(Value::Int64(if b { 1 } else { 0 })),
+                Value::Text(s) => s
+                    .parse::<i64>()
+                    .map(Value::Int64)
+                    .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to BIGINT"))),
+                _ => Err(ExecError::Unsupported("cannot cast to BIGINT".to_string())),
+            },
             ast::DataType::Float(_) | ast::DataType::Double(_) | ast::DataType::DoublePrecision => {
                 match val {
                     Value::Null => Ok(Value::Null),
@@ -1214,88 +1332,81 @@ impl Executor {
                     Value::Int64(n) => Ok(Value::Float64(n as f64)),
                     Value::Float64(_) => Ok(val),
                     Value::Bool(b) => Ok(Value::Float64(if b { 1.0 } else { 0.0 })),
-                    Value::Text(s) => s.parse::<f64>()
+                    Value::Text(s) => s
+                        .parse::<f64>()
                         .map(Value::Float64)
                         .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to FLOAT"))),
                     _ => Err(ExecError::Unsupported("cannot cast to FLOAT".to_string())),
                 }
             }
-            ast::DataType::Boolean => {
-                match val {
-                    Value::Null => Ok(Value::Null),
-                    Value::Bool(_) => Ok(val),
-                    Value::Int32(n) => Ok(Value::Bool(n != 0)),
-                    Value::Int64(n) => Ok(Value::Bool(n != 0)),
-                    Value::Float64(n) => Ok(Value::Bool(n != 0.0)),
-                    Value::Text(s) => match s.to_lowercase().as_str() {
-                        "true" | "t" | "1" | "yes" => Ok(Value::Bool(true)),
-                        "false" | "f" | "0" | "no" => Ok(Value::Bool(false)),
-                        _ => Err(ExecError::Unsupported(format!("cannot cast '{s}' to BOOLEAN"))),
-                    },
-                    _ => Err(ExecError::Unsupported("cannot cast to BOOLEAN".to_string())),
-                }
-            }
-            ast::DataType::Date => {
-                match val {
-                    Value::Date(_) => Ok(val),
-                    Value::Text(s) => {
-                        match parse_date_string(&s) {
-                            Some(d) => Ok(Value::Date(d)),
-                            None => Err(ExecError::Unsupported(format!("cannot cast '{s}' to DATE"))),
-                        }
+            ast::DataType::Boolean => match val {
+                Value::Null => Ok(Value::Null),
+                Value::Bool(_) => Ok(val),
+                Value::Int32(n) => Ok(Value::Bool(n != 0)),
+                Value::Int64(n) => Ok(Value::Bool(n != 0)),
+                Value::Float64(n) => Ok(Value::Bool(n != 0.0)),
+                Value::Text(s) => match s.to_lowercase().as_str() {
+                    "true" | "t" | "1" | "yes" => Ok(Value::Bool(true)),
+                    "false" | "f" | "0" | "no" => Ok(Value::Bool(false)),
+                    _ => Err(ExecError::Unsupported(format!(
+                        "cannot cast '{s}' to BOOLEAN"
+                    ))),
+                },
+                _ => Err(ExecError::Unsupported("cannot cast to BOOLEAN".to_string())),
+            },
+            ast::DataType::Date => match val {
+                Value::Date(_) => Ok(val),
+                Value::Text(s) => match parse_date_string(&s) {
+                    Some(d) => Ok(Value::Date(d)),
+                    None => Err(ExecError::Unsupported(format!("cannot cast '{s}' to DATE"))),
+                },
+                Value::Timestamp(ts) => Ok(Value::Date((ts / 1_000_000 / 86400) as i32)),
+                Value::Int32(n) => Ok(Value::Date(n)),
+                _ => Err(ExecError::Unsupported("cannot cast to DATE".to_string())),
+            },
+            ast::DataType::Timestamp(_, _) => match val {
+                Value::Timestamp(_) | Value::TimestampTz(_) => Ok(val),
+                Value::Date(d) => Ok(Value::Timestamp(d as i64 * 86400 * 1_000_000)),
+                Value::Text(s) => match parse_date_string(&s) {
+                    Some(d) => Ok(Value::Timestamp(d as i64 * 86400 * 1_000_000)),
+                    None => Err(ExecError::Unsupported(format!(
+                        "cannot cast '{s}' to TIMESTAMP"
+                    ))),
+                },
+                Value::Int64(n) => Ok(Value::Timestamp(n * 1_000_000)),
+                Value::Int32(n) => Ok(Value::Timestamp(n as i64 * 1_000_000)),
+                _ => Err(ExecError::Unsupported(
+                    "cannot cast to TIMESTAMP".to_string(),
+                )),
+            },
+            ast::DataType::Uuid => match val {
+                Value::Uuid(_) => Ok(val),
+                Value::Text(s) => {
+                    let bytes: Vec<u8> = s
+                        .replace('-', "")
+                        .as_bytes()
+                        .chunks(2)
+                        .filter_map(|chunk| {
+                            std::str::from_utf8(chunk)
+                                .ok()
+                                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                        })
+                        .collect();
+                    if bytes.len() == 16 {
+                        let mut arr = [0u8; 16];
+                        arr.copy_from_slice(&bytes);
+                        Ok(Value::Uuid(arr))
+                    } else {
+                        Err(ExecError::Unsupported(format!("cannot cast '{s}' to UUID")))
                     }
-                    Value::Timestamp(ts) => {
-                        Ok(Value::Date((ts / 1_000_000 / 86400) as i32))
-                    }
-                    Value::Int32(n) => Ok(Value::Date(n)),
-                    _ => Err(ExecError::Unsupported("cannot cast to DATE".to_string())),
                 }
-            }
-            ast::DataType::Timestamp(_, _) => {
-                match val {
-                    Value::Timestamp(_) | Value::TimestampTz(_) => Ok(val),
-                    Value::Date(d) => Ok(Value::Timestamp(d as i64 * 86400 * 1_000_000)),
-                    Value::Text(s) => {
-                        match parse_date_string(&s) {
-                            Some(d) => Ok(Value::Timestamp(d as i64 * 86400 * 1_000_000)),
-                            None => Err(ExecError::Unsupported(format!("cannot cast '{s}' to TIMESTAMP"))),
-                        }
-                    }
-                    Value::Int64(n) => Ok(Value::Timestamp(n * 1_000_000)),
-                    Value::Int32(n) => Ok(Value::Timestamp(n as i64 * 1_000_000)),
-                    _ => Err(ExecError::Unsupported("cannot cast to TIMESTAMP".to_string())),
-                }
-            }
-            ast::DataType::Uuid => {
-                match val {
-                    Value::Uuid(_) => Ok(val),
-                    Value::Text(s) => {
-                        let bytes: Vec<u8> = s.replace('-', "")
-                            .as_bytes()
-                            .chunks(2)
-                            .filter_map(|chunk| {
-                                std::str::from_utf8(chunk).ok()
-                                    .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-                            })
-                            .collect();
-                        if bytes.len() == 16 {
-                            let mut arr = [0u8; 16];
-                            arr.copy_from_slice(&bytes);
-                            Ok(Value::Uuid(arr))
-                        } else {
-                            Err(ExecError::Unsupported(format!("cannot cast '{s}' to UUID")))
-                        }
-                    }
-                    _ => Err(ExecError::Unsupported("cannot cast to UUID".to_string())),
-                }
-            }
-            ast::DataType::Bytea => {
-                match val {
-                    Value::Bytea(_) => Ok(val),
-                    Value::Text(s) => Ok(Value::Bytea(s.into_bytes())),
-                    _ => Err(ExecError::Unsupported("cannot cast to BYTEA".to_string())),
-                }
-            }
+                _ => Err(ExecError::Unsupported("cannot cast to UUID".to_string())),
+            },
+            ast::DataType::Bytea => match val {
+                Value::Bytea(_) => Ok(val),
+                Value::Text(s) => Ok(Value::Bytea(s.into_bytes())),
+                _ => Err(ExecError::Unsupported("cannot cast to BYTEA".to_string())),
+            },
             ast::DataType::Numeric(_) | ast::DataType::Decimal(_) | ast::DataType::Dec(_) => {
                 match val {
                     Value::Numeric(_) => Ok(val),
@@ -1316,28 +1427,28 @@ impl Executor {
             ast::DataType::Char(_) | ast::DataType::Character(_) => {
                 Ok(Value::Text(val.to_string()))
             }
-            ast::DataType::Real => {
-                match val {
-                    Value::Float64(_) => Ok(val),
-                    Value::Int32(n) => Ok(Value::Float64(n as f64)),
-                    Value::Int64(n) => Ok(Value::Float64(n as f64)),
-                    Value::Text(s) => s.parse::<f64>()
-                        .map(Value::Float64)
-                        .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to REAL"))),
-                    _ => Err(ExecError::Unsupported("cannot cast to REAL".to_string())),
-                }
-            }
-            ast::DataType::SmallInt(_) | ast::DataType::TinyInt(_) => {
-                match val {
-                    Value::Int32(_) => Ok(val),
-                    Value::Int64(n) => Ok(Value::Int32(n as i32)),
-                    Value::Float64(n) => Ok(Value::Int32(n as i32)),
-                    Value::Text(s) => s.parse::<i32>()
-                        .map(Value::Int32)
-                        .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to SMALLINT"))),
-                    _ => Err(ExecError::Unsupported("cannot cast to SMALLINT".to_string())),
-                }
-            }
+            ast::DataType::Real => match val {
+                Value::Float64(_) => Ok(val),
+                Value::Int32(n) => Ok(Value::Float64(n as f64)),
+                Value::Int64(n) => Ok(Value::Float64(n as f64)),
+                Value::Text(s) => s
+                    .parse::<f64>()
+                    .map(Value::Float64)
+                    .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to REAL"))),
+                _ => Err(ExecError::Unsupported("cannot cast to REAL".to_string())),
+            },
+            ast::DataType::SmallInt(_) | ast::DataType::TinyInt(_) => match val {
+                Value::Int32(_) => Ok(val),
+                Value::Int64(n) => Ok(Value::Int32(n as i32)),
+                Value::Float64(n) => Ok(Value::Int32(n as i32)),
+                Value::Text(s) => s
+                    .parse::<i32>()
+                    .map(Value::Int32)
+                    .map_err(|_| ExecError::Unsupported(format!("cannot cast '{s}' to SMALLINT"))),
+                _ => Err(ExecError::Unsupported(
+                    "cannot cast to SMALLINT".to_string(),
+                )),
+            },
             _ => Err(ExecError::Unsupported(format!("cast to {target}"))),
         }
     }
@@ -1346,7 +1457,6 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Value;
 
     #[test]
     fn filter_result_empty() {

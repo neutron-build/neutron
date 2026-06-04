@@ -43,9 +43,9 @@ impl Default for PoolConfig {
         Self {
             max_connections: 100,
             min_idle: 5,
-            max_idle_time_ms: 600_000,   // 10 min
-            max_lifetime_ms: 3_600_000,  // 1 hour
-            acquire_timeout_ms: 5_000,   // 5 s
+            max_idle_time_ms: 600_000,      // 10 min
+            max_lifetime_ms: 3_600_000,     // 1 hour
+            acquire_timeout_ms: 5_000,      // 5 s
             validation_interval_ms: 30_000, // 30 s
         }
     }
@@ -248,17 +248,18 @@ impl ConnectionPool {
         // --- try to reuse an idle connection (LIFO) ---
         while let Some(id) = self.idle_stack.pop_back() {
             if let Some(conn) = self.connections.get_mut(&id)
-                && conn.state == ConnectionState::Idle {
-                    conn.state = ConnectionState::InUse;
-                    conn.last_used_at = now;
-                    conn.use_count += 1;
-                    conn.client_addr = client_addr.to_string();
-                    self.acquire_time_sum_us += start.elapsed().as_micros() as f64;
-                    self.total_acquired += 1;
-                    return Ok(id);
-                }
-                // Connection was closed/validating between idle_stack push and
-                // now — skip it and keep looking.
+                && conn.state == ConnectionState::Idle
+            {
+                conn.state = ConnectionState::InUse;
+                conn.last_used_at = now;
+                conn.use_count += 1;
+                conn.client_addr = client_addr.to_string();
+                self.acquire_time_sum_us += start.elapsed().as_micros() as f64;
+                self.total_acquired += 1;
+                return Ok(id);
+            }
+            // Connection was closed/validating between idle_stack push and
+            // now — skip it and keep looking.
         }
 
         // --- create a new connection if under the limit ---
@@ -358,7 +359,9 @@ impl ConnectionPool {
             .collect();
 
         // Count current idle connections
-        let current_idle = self.connections.values()
+        let current_idle = self
+            .connections
+            .values()
             .filter(|c| c.state == ConnectionState::Idle)
             .count() as u32;
 
@@ -368,7 +371,10 @@ impl ConnectionPool {
         // Track how many idle connections we've evicted so far
         let mut idle_evicted = 0u32;
         for id in to_close {
-            let is_idle = self.connections.get(&id).is_some_and(|c| c.state == ConnectionState::Idle);
+            let is_idle = self
+                .connections
+                .get(&id)
+                .is_some_and(|c| c.state == ConnectionState::Idle);
             if is_idle {
                 if idle_evicted >= max_evictable {
                     // Skip this eviction to preserve min_idle
@@ -566,7 +572,10 @@ mod tests {
         // The connection is idle and max_idle_time_ms == 0, so it's expired.
         pool.evict_expired();
 
-        assert!(pool.get(id).is_none(), "expired connection should be removed");
+        assert!(
+            pool.get(id).is_none(),
+            "expired connection should be removed"
+        );
         assert_eq!(pool.stats().total_connections, 0);
     }
 
@@ -762,10 +771,7 @@ mod tests {
 
         // Create 5 idle connections
         let ids: Vec<_> = (0..5)
-            .map(|i| {
-                let id = pool.acquire(&format!("c{}", i)).unwrap();
-                id
-            })
+            .map(|i| pool.acquire(&format!("c{}", i)).unwrap())
             .collect();
         for &id in &ids {
             pool.release(id);

@@ -57,12 +57,9 @@ async fn start_nucleus_server() -> (u16, tokio::task::JoinHandle<()>) {
             };
             let srv = server.clone();
             tokio::spawn(async move {
-                let _ = pgwire::tokio::process_socket(
-                    socket,
-                    None::<pgwire::tokio::TlsAcceptor>,
-                    srv,
-                )
-                .await;
+                let _ =
+                    pgwire::tokio::process_socket(socket, None::<pgwire::tokio::TlsAcceptor>, srv)
+                        .await;
             });
         }
     });

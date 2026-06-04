@@ -2,13 +2,12 @@
 //!
 //! Supports CSV and text formats with configurable delimiters and headers.
 
-use sqlparser::ast;
-use crate::types::{DataType, Value};
-use super::{ExecError, ExecResult, Executor};
 use super::helpers::{value_to_csv_string_impl, value_to_text_string_impl};
+use super::{ExecError, ExecResult, Executor};
+use crate::types::{DataType, Value};
+use sqlparser::ast;
 
 impl Executor {
-
     pub(super) async fn execute_copy(
         &self,
         source: ast::CopySource,
@@ -53,10 +52,12 @@ impl Executor {
 
         if to {
             // COPY ... TO STDOUT
-            self.execute_copy_to(source, format, delimiter, header).await
+            self.execute_copy_to(source, format, delimiter, header)
+                .await
         } else {
             // COPY ... FROM STDIN
-            self.execute_copy_from(source, format, delimiter, header, values).await
+            self.execute_copy_from(source, format, delimiter, header, values)
+                .await
         }
     }
 
@@ -71,16 +72,16 @@ impl Executor {
         let table_name = match &source {
             ast::CopySource::Table { table_name, .. } => table_name.to_string(),
             ast::CopySource::Query(_) => {
-                return Err(ExecError::Unsupported("COPY FROM with query not supported".into()));
+                return Err(ExecError::Unsupported(
+                    "COPY FROM with query not supported".into(),
+                ));
             }
         };
         let table_def = self.get_table(&table_name).await?;
         let num_cols = table_def.columns.len();
         let mut count = 0;
 
-        let non_null_values: Vec<&str> = values.iter()
-            .filter_map(|v| v.as_deref())
-            .collect();
+        let non_null_values: Vec<&str> = values.iter().filter_map(|v| v.as_deref()).collect();
 
         let mut lines_iter = non_null_values.iter();
 
@@ -126,7 +127,10 @@ impl Executor {
         include_header: bool,
     ) -> Result<ExecResult, ExecError> {
         let (columns, rows) = match &source {
-            ast::CopySource::Table { table_name, columns } => {
+            ast::CopySource::Table {
+                table_name,
+                columns,
+            } => {
                 let table_def = self.get_table(&table_name.to_string()).await?;
                 let all_rows = self.storage.scan(&table_name.to_string()).await?;
 
@@ -146,7 +150,9 @@ impl Executor {
                         (col_names, rows)
                     }
                     _ => {
-                        return Err(ExecError::Unsupported("COPY query did not return a result set".into()));
+                        return Err(ExecError::Unsupported(
+                            "COPY query did not return a result set".into(),
+                        ));
                     }
                 }
             }
@@ -157,12 +163,16 @@ impl Executor {
         if format == "csv" {
             // CSV format
             if include_header {
-                output.push_str(&self.format_csv_row(&columns.iter().map(|s| s.as_str()).collect::<Vec<_>>(), delimiter));
+                output.push_str(&self.format_csv_row(
+                    &columns.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    delimiter,
+                ));
                 output.push('\n');
             }
 
             for row in &rows {
-                let row_strings: Vec<String> = row.iter().map(|v| self.value_to_csv_string(v)).collect();
+                let row_strings: Vec<String> =
+                    row.iter().map(|v| self.value_to_csv_string(v)).collect();
                 let row_refs: Vec<&str> = row_strings.iter().map(|s| s.as_str()).collect();
                 output.push_str(&self.format_csv_row(&row_refs, delimiter));
                 output.push('\n');
@@ -170,7 +180,8 @@ impl Executor {
         } else {
             // Text format (tab-delimited)
             for row in &rows {
-                let row_strings: Vec<String> = row.iter().map(|v| self.value_to_text_string(v)).collect();
+                let row_strings: Vec<String> =
+                    row.iter().map(|v| self.value_to_text_string(v)).collect();
                 output.push_str(&row_strings.join(&delimiter.to_string()));
                 output.push('\n');
             }
@@ -178,7 +189,10 @@ impl Executor {
 
         // Return a CopyOut result carrying the formatted data for the wire layer.
         let row_count = rows.len();
-        Ok(ExecResult::CopyOut { data: output, row_count })
+        Ok(ExecResult::CopyOut {
+            data: output,
+            row_count,
+        })
     }
 
     pub(super) fn parse_csv_line(&self, line: &str, delimiter: char) -> Vec<String> {
@@ -216,14 +230,22 @@ impl Executor {
     }
 
     pub(super) fn format_csv_row(&self, fields: &[&str], delimiter: char) -> String {
-        fields.iter().map(|field| {
-            // Quote field if it contains delimiter, quote, or newline
-            if field.contains(delimiter) || field.contains('"') || field.contains('\n') || field.contains('\r') {
-                format!("\"{}\"", field.replace('"', "\"\""))
-            } else {
-                field.to_string()
-            }
-        }).collect::<Vec<_>>().join(&delimiter.to_string())
+        fields
+            .iter()
+            .map(|field| {
+                // Quote field if it contains delimiter, quote, or newline
+                if field.contains(delimiter)
+                    || field.contains('"')
+                    || field.contains('\n')
+                    || field.contains('\r')
+                {
+                    format!("\"{}\"", field.replace('"', "\"\""))
+                } else {
+                    field.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(&delimiter.to_string())
     }
 
     pub(super) fn value_to_csv_string(&self, value: &Value) -> String {
@@ -236,12 +258,21 @@ impl Executor {
 
     pub(super) fn parse_field(&self, field: &str, data_type: &DataType) -> Value {
         match field {
-            "" => Value::Null, // Empty field = NULL in CSV
+            "" => Value::Null,    // Empty field = NULL in CSV
             "\\N" => Value::Null, // Explicit NULL marker
             s => match data_type {
-                DataType::Int32 => s.parse::<i32>().map(Value::Int32).unwrap_or(Value::Text(s.to_string())),
-                DataType::Int64 => s.parse::<i64>().map(Value::Int64).unwrap_or(Value::Text(s.to_string())),
-                DataType::Float64 => s.parse::<f64>().map(Value::Float64).unwrap_or(Value::Text(s.to_string())),
+                DataType::Int32 => s
+                    .parse::<i32>()
+                    .map(Value::Int32)
+                    .unwrap_or(Value::Text(s.to_string())),
+                DataType::Int64 => s
+                    .parse::<i64>()
+                    .map(Value::Int64)
+                    .unwrap_or(Value::Text(s.to_string())),
+                DataType::Float64 => s
+                    .parse::<f64>()
+                    .map(Value::Float64)
+                    .unwrap_or(Value::Text(s.to_string())),
                 DataType::Bool => match s.to_lowercase().as_str() {
                     "t" | "true" | "1" => Value::Bool(true),
                     "f" | "false" | "0" => Value::Bool(false),

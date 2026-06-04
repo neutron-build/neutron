@@ -124,11 +124,7 @@ pub struct Histogram {
 }
 
 impl Histogram {
-    pub fn new(
-        name: impl Into<String>,
-        help: impl Into<String>,
-        bounds: Vec<f64>,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, help: impl Into<String>, bounds: Vec<f64>) -> Self {
         let bucket_count = bounds.len() + 1; // +1 for +Inf
         let buckets = (0..bucket_count).map(|_| AtomicU64::new(0)).collect();
         Self {
@@ -649,7 +645,10 @@ mod tests {
         assert_eq!(rows.len(), 25);
 
         // Check a counter row
-        let qt = rows.iter().find(|r| r.0 == "nucleus_queries_total").unwrap();
+        let qt = rows
+            .iter()
+            .find(|r| r.0 == "nucleus_queries_total")
+            .unwrap();
         assert_eq!(qt.1, "counter");
         assert_eq!(qt.2, "50");
 

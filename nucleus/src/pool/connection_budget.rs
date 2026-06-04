@@ -7,8 +7,8 @@
 //!
 //! M2 Mitigation: Response Buffer DoS Protection
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Per-connection resource budget and backpressure tracking.
@@ -65,7 +65,9 @@ impl ConnectionBudget {
 
     /// Record bytes consumed from response buffer (client read).
     pub fn remove_response_bytes(&self, bytes: u64) {
-        let _ = self.current_buffer_bytes.fetch_sub(bytes, Ordering::Release);
+        let _ = self
+            .current_buffer_bytes
+            .fetch_sub(bytes, Ordering::Release);
     }
 
     /// Record a pending query. Returns Err if would exceed limit.
@@ -197,7 +199,11 @@ mod tests {
     fn test_add_pending_query_within_limit() {
         let budget = ConnectionBudget::with_limits(16 * 1024 * 1024, 10, Duration::from_secs(30));
         for i in 0..10 {
-            assert!(budget.try_add_pending_query().is_ok(), "Failed at query {}", i);
+            assert!(
+                budget.try_add_pending_query().is_ok(),
+                "Failed at query {}",
+                i
+            );
         }
         assert_eq!(budget.current_pending_queries(), 10);
     }

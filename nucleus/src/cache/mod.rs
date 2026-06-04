@@ -353,7 +353,11 @@ impl DistributedCacheRouter {
             }
         }
         ring.sort_by_key(|&(pos, _)| pos);
-        Self { partitions, vnodes_per_node, ring }
+        Self {
+            partitions,
+            vnodes_per_node,
+            ring,
+        }
     }
 
     /// Determine which node owns a given key.
@@ -364,7 +368,13 @@ impl DistributedCacheRouter {
         let hash = Self::hash_str(key);
         let idx = match self.ring.binary_search_by_key(&hash, |&(pos, _)| pos) {
             Ok(i) => i,
-            Err(i) => if i == self.ring.len() { 0 } else { i },
+            Err(i) => {
+                if i == self.ring.len() {
+                    0
+                } else {
+                    i
+                }
+            }
         };
         Some(self.ring[idx].1)
     }
@@ -388,9 +398,10 @@ impl DistributedCacheRouter {
     /// Delete a key from the owning node.
     pub fn delete(&mut self, key: &str) -> bool {
         if let Some(node_id) = self.route_key(key)
-            && let Some(cache) = self.partitions.get_mut(&node_id) {
-                return cache.delete(key);
-            }
+            && let Some(cache) = self.partitions.get_mut(&node_id)
+        {
+            return cache.delete(key);
+        }
         false
     }
 
@@ -461,7 +472,6 @@ impl DistributedCacheRouter {
     }
 }
 
-
 // ============================================================================
 // CacheConfig
 // ============================================================================
@@ -518,11 +528,7 @@ pub struct ShardedCache {
 }
 impl ShardedCache {
     /// Create a new sharded cache.
-    pub fn new(
-        shard_count: usize,
-        max_memory_per_shard: usize,
-        default_ttl: Option<u64>,
-    ) -> Self {
+    pub fn new(shard_count: usize, max_memory_per_shard: usize, default_ttl: Option<u64>) -> Self {
         let shard_count = if shard_count == 0 { 1 } else { shard_count };
         let shards = (0..shard_count)
             .map(|_| parking_lot::RwLock::new(CacheTier::new(max_memory_per_shard)))
@@ -532,7 +538,11 @@ impl ShardedCache {
             max_memory_bytes: max_memory_per_shard * shard_count,
             default_ttl_secs: default_ttl,
         };
-        Self { shards, shard_count, config }
+        Self {
+            shards,
+            shard_count,
+            config,
+        }
     }
 
     /// Retrieve a value by key. Acquires a write lock because `CacheTier::get()`
@@ -550,7 +560,9 @@ impl ShardedCache {
     pub fn peek(&self, key: &str) -> Option<String> {
         let idx = self.shard_for_key(key);
         let shard = self.shards[idx].read();
-        shard.entries.get(key)
+        shard
+            .entries
+            .get(key)
             .filter(|e| !e.is_expired())
             .map(|e| e.value.clone())
     }
@@ -749,9 +761,10 @@ impl LfShard {
             .map(|(k, _)| k.clone());
 
         if let Some(key) = victim
-            && let Some(entry) = self.entries.remove(&key) {
-                self.used_bytes -= entry.size_bytes;
-            }
+            && let Some(entry) = self.entries.remove(&key)
+        {
+            self.used_bytes -= entry.size_bytes;
+        }
     }
 
     fn evict_expired(&mut self) {
@@ -888,7 +901,11 @@ impl LockFreeCache {
         let h = self.total_hits();
         let m = self.total_misses();
         let total = h + m;
-        if total == 0 { 0.0 } else { h as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            h as f64 / total as f64
+        }
     }
 
     pub fn total_memory_bytes(&self) -> usize {
@@ -1314,7 +1331,10 @@ mod tests {
         }
         // All nodes should get some keys.
         for &nid in &[100, 200, 300] {
-            assert!(*counts.get(&nid).unwrap_or(&0) > 0, "node {nid} got no keys");
+            assert!(
+                *counts.get(&nid).unwrap_or(&0) > 0,
+                "node {nid} got no keys"
+            );
         }
     }
 
@@ -1521,11 +1541,7 @@ mod tests {
             let cache = Arc::clone(&cache);
             handles.push(std::thread::spawn(move || {
                 for i in 0..50 {
-                    cache.set(
-                        &format!("shared{i}"),
-                        &format!("updated_by_{t}_{i}"),
-                        None,
-                    );
+                    cache.set(&format!("shared{i}"), &format!("updated_by_{t}_{i}"), None);
                 }
             }));
         }
@@ -1538,7 +1554,7 @@ mod tests {
     #[test]
     fn test_sharded_shard_distribution() {
         let cache = ShardedCache::new(8, 4096, None);
-        let mut shard_hits = vec![false; 8];
+        let mut shard_hits = [false; 8];
         for i in 0..200 {
             let key = format!("dist_key_{i}");
             let idx = cache.shard_for_key(&key);
@@ -1607,9 +1623,9 @@ mod tests {
     fn lf_cache_hit_miss_tracking() {
         let cache = LockFreeCache::new(4, 4096);
         cache.set("k", "v", None);
-        cache.get("k");      // hit
-        cache.get("k");      // hit
-        cache.get("miss");   // miss
+        cache.get("k"); // hit
+        cache.get("k"); // hit
+        cache.get("miss"); // miss
         assert_eq!(cache.total_hits(), 2);
         assert_eq!(cache.total_misses(), 1);
         assert!((cache.hit_rate() - 2.0 / 3.0).abs() < 0.01);
@@ -1621,7 +1637,7 @@ mod tests {
         for i in 0..10 {
             cache.set(&format!("k{i}"), &format!("v{i}"), None);
         }
-        assert!(cache.len() > 0);
+        assert!(!cache.is_empty());
         cache.flush_all();
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());

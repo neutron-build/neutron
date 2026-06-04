@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::DataType;
 use super::schema_types::{
     FunctionDef, FunctionKind, FunctionLanguage, MaterializedViewDef, Privilege, RoleDef,
     SequenceDef, TriggerDef, TriggerEvent, TriggerTiming, ViewDef,
 };
+use crate::types::DataType;
 
 // ── DataType helpers ─────────────────────────────────────────────────────────
 
@@ -188,7 +188,9 @@ pub struct MetaPersistence {
 
 impl MetaPersistence {
     pub fn new(path: &Path) -> Self {
-        Self { path: path.to_path_buf() }
+        Self {
+            path: path.to_path_buf(),
+        }
     }
 
     /// Derive the meta.json path from the catalog.json path (same directory).
@@ -209,82 +211,126 @@ impl MetaPersistence {
         functions: &HashMap<String, FunctionDef>,
     ) -> Result<(), String> {
         let snapshot = MetaSnapshot {
-            views: views.values().map(|v| ViewSer {
-                name: v.name.clone(),
-                sql: v.sql.clone(),
-                columns: v.columns.clone(),
-            }).collect(),
+            views: views
+                .values()
+                .map(|v| ViewSer {
+                    name: v.name.clone(),
+                    sql: v.sql.clone(),
+                    columns: v.columns.clone(),
+                })
+                .collect(),
 
-            materialized_views: mat_views.values().map(|mv| MatViewSer {
-                name: mv.name.clone(),
-                sql: mv.sql.clone(),
-                columns: mv.columns.iter()
-                    .map(|(n, dt)| (n.clone(), dtype_to_str(dt)))
-                    .collect(),
-                source_tables: mv.source_tables.clone(),
-            }).collect(),
+            materialized_views: mat_views
+                .values()
+                .map(|mv| MatViewSer {
+                    name: mv.name.clone(),
+                    sql: mv.sql.clone(),
+                    columns: mv
+                        .columns
+                        .iter()
+                        .map(|(n, dt)| (n.clone(), dtype_to_str(dt)))
+                        .collect(),
+                    source_tables: mv.source_tables.clone(),
+                })
+                .collect(),
 
-            sequences: sequences.iter().map(|(name, mu)| {
-                let seq = mu.lock();
-                SequenceSer {
-                    name: name.clone(),
-                    current: seq.current,
-                    increment: seq.increment,
-                    min_value: seq.min_value,
-                    max_value: seq.max_value,
-                }
-            }).collect(),
+            sequences: sequences
+                .iter()
+                .map(|(name, mu)| {
+                    let seq = mu.lock();
+                    SequenceSer {
+                        name: name.clone(),
+                        current: seq.current,
+                        increment: seq.increment,
+                        min_value: seq.min_value,
+                        max_value: seq.max_value,
+                    }
+                })
+                .collect(),
 
-            triggers: triggers.iter().map(|t| TriggerSer {
-                name: t.name.clone(),
-                table_name: t.table_name.clone(),
-                timing: match t.timing {
-                    TriggerTiming::Before => "Before",
-                    TriggerTiming::After => "After",
-                    TriggerTiming::InsteadOf => "InsteadOf",
-                }.into(),
-                events: t.events.iter().map(|e| match e {
-                    TriggerEvent::Insert => "Insert",
-                    TriggerEvent::Update => "Update",
-                    TriggerEvent::Delete => "Delete",
-                }.into()).collect(),
-                for_each_row: t.for_each_row,
-                body: t.body.clone(),
-            }).collect(),
+            triggers: triggers
+                .iter()
+                .map(|t| TriggerSer {
+                    name: t.name.clone(),
+                    table_name: t.table_name.clone(),
+                    timing: match t.timing {
+                        TriggerTiming::Before => "Before",
+                        TriggerTiming::After => "After",
+                        TriggerTiming::InsteadOf => "InsteadOf",
+                    }
+                    .into(),
+                    events: t
+                        .events
+                        .iter()
+                        .map(|e| {
+                            match e {
+                                TriggerEvent::Insert => "Insert",
+                                TriggerEvent::Update => "Update",
+                                TriggerEvent::Delete => "Delete",
+                            }
+                            .into()
+                        })
+                        .collect(),
+                    for_each_row: t.for_each_row,
+                    body: t.body.clone(),
+                })
+                .collect(),
 
-            roles: roles.values().map(|r| RoleSer {
-                name: r.name.clone(),
-                password_hash: r.password_hash.clone(),
-                is_superuser: r.is_superuser,
-                can_login: r.can_login,
-                privileges: r.privileges.iter().map(|(table, privs)| {
-                    (table.clone(), privs.iter().map(|p| privilege_to_str(p).to_string()).collect())
-                }).collect(),
-            }).collect(),
+            roles: roles
+                .values()
+                .map(|r| RoleSer {
+                    name: r.name.clone(),
+                    password_hash: r.password_hash.clone(),
+                    is_superuser: r.is_superuser,
+                    can_login: r.can_login,
+                    privileges: r
+                        .privileges
+                        .iter()
+                        .map(|(table, privs)| {
+                            (
+                                table.clone(),
+                                privs
+                                    .iter()
+                                    .map(|p| privilege_to_str(p).to_string())
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                })
+                .collect(),
 
-            functions: functions.values().map(|f| FunctionSer {
-                name: f.name.clone(),
-                kind: match f.kind {
-                    FunctionKind::Function => "Function",
-                    FunctionKind::Procedure => "Procedure",
-                }.into(),
-                params: f.params.iter().map(|(n, dt)| (n.clone(), dtype_to_str(dt))).collect(),
-                return_type: f.return_type.as_ref().map(dtype_to_str),
-                body: f.body.clone(),
-                language: match f.language {
-                    FunctionLanguage::Sql => "Sql",
-                }.into(),
-            }).collect(),
+            functions: functions
+                .values()
+                .map(|f| FunctionSer {
+                    name: f.name.clone(),
+                    kind: match f.kind {
+                        FunctionKind::Function => "Function",
+                        FunctionKind::Procedure => "Procedure",
+                    }
+                    .into(),
+                    params: f
+                        .params
+                        .iter()
+                        .map(|(n, dt)| (n.clone(), dtype_to_str(dt)))
+                        .collect(),
+                    return_type: f.return_type.as_ref().map(dtype_to_str),
+                    body: f.body.clone(),
+                    language: match f.language {
+                        FunctionLanguage::Sql => "Sql",
+                    }
+                    .into(),
+                })
+                .collect(),
         };
 
-        let json = serde_json::to_string_pretty(&snapshot)
-            .map_err(|e| format!("meta serialize: {e}"))?;
+        let json =
+            serde_json::to_string_pretty(&snapshot).map_err(|e| format!("meta serialize: {e}"))?;
 
         let tmp = self.path.with_extension("json.tmp");
         {
-            let mut f = std::fs::File::create(&tmp)
-                .map_err(|e| format!("meta write tmp: {e}"))?;
-            f.write_all(json.as_bytes()).map_err(|e| format!("meta write: {e}"))?;
+            let mut f = std::fs::File::create(&tmp).map_err(|e| format!("meta write tmp: {e}"))?;
+            f.write_all(json.as_bytes())
+                .map_err(|e| format!("meta write: {e}"))?;
             f.sync_all().map_err(|e| format!("meta fsync: {e}"))?;
         }
         std::fs::rename(&tmp, &self.path).map_err(|e| format!("meta rename: {e}"))?;
@@ -316,24 +362,32 @@ impl MetaPersistence {
         let mut meta = LoadedMeta::default();
 
         for v in snap.views {
-            meta.views.insert(v.name.clone(), ViewDef {
-                name: v.name,
-                sql: v.sql,
-                columns: v.columns,
-            });
+            meta.views.insert(
+                v.name.clone(),
+                ViewDef {
+                    name: v.name,
+                    sql: v.sql,
+                    columns: v.columns,
+                },
+            );
         }
 
         for mv in snap.materialized_views {
-            let columns: Vec<(String, DataType)> = mv.columns.into_iter()
+            let columns: Vec<(String, DataType)> = mv
+                .columns
+                .into_iter()
                 .filter_map(|(n, t)| str_to_dtype(&t).map(|dt| (n, dt)))
                 .collect();
-            meta.materialized_views.insert(mv.name.clone(), MaterializedViewDef {
-                name: mv.name,
-                sql: mv.sql,
-                columns,
-                rows: vec![],   // rows are not persisted; user must REFRESH
-                source_tables: mv.source_tables,
-            });
+            meta.materialized_views.insert(
+                mv.name.clone(),
+                MaterializedViewDef {
+                    name: mv.name,
+                    sql: mv.sql,
+                    columns,
+                    rows: vec![], // rows are not persisted; user must REFRESH
+                    source_tables: mv.source_tables,
+                },
+            );
         }
 
         for s in snap.sequences {
@@ -352,12 +406,16 @@ impl MetaPersistence {
                 "InsteadOf" => TriggerTiming::InsteadOf,
                 _ => TriggerTiming::After,
             };
-            let events: Vec<TriggerEvent> = t.events.iter().filter_map(|e| match e.as_str() {
-                "Insert" => Some(TriggerEvent::Insert),
-                "Update" => Some(TriggerEvent::Update),
-                "Delete" => Some(TriggerEvent::Delete),
-                _ => None,
-            }).collect();
+            let events: Vec<TriggerEvent> = t
+                .events
+                .iter()
+                .filter_map(|e| match e.as_str() {
+                    "Insert" => Some(TriggerEvent::Insert),
+                    "Update" => Some(TriggerEvent::Update),
+                    "Delete" => Some(TriggerEvent::Delete),
+                    _ => None,
+                })
+                .collect();
             meta.triggers.push(TriggerDef {
                 name: t.name,
                 table_name: t.table_name,
@@ -369,21 +427,32 @@ impl MetaPersistence {
         }
 
         for r in snap.roles {
-            let privileges: HashMap<String, Vec<Privilege>> = r.privileges.into_iter()
+            let privileges: HashMap<String, Vec<Privilege>> = r
+                .privileges
+                .into_iter()
                 .map(|(table, privs)| {
-                    (table, privs.iter().filter_map(|p| str_to_privilege(p)).collect())
-                }).collect();
-            meta.roles.insert(r.name.clone(), RoleDef {
-                name: r.name,
-                password_hash: r.password_hash,
-                is_superuser: r.is_superuser,
-                can_login: r.can_login,
-                privileges,
-            });
+                    (
+                        table,
+                        privs.iter().filter_map(|p| str_to_privilege(p)).collect(),
+                    )
+                })
+                .collect();
+            meta.roles.insert(
+                r.name.clone(),
+                RoleDef {
+                    name: r.name,
+                    password_hash: r.password_hash,
+                    is_superuser: r.is_superuser,
+                    can_login: r.can_login,
+                    privileges,
+                },
+            );
         }
 
         for f in snap.functions {
-            let params: Vec<(String, DataType)> = f.params.into_iter()
+            let params: Vec<(String, DataType)> = f
+                .params
+                .into_iter()
                 .filter_map(|(n, t)| str_to_dtype(&t).map(|dt| (n, dt)))
                 .collect();
             let return_type = f.return_type.as_deref().and_then(str_to_dtype);
@@ -393,14 +462,17 @@ impl MetaPersistence {
             };
             let language = FunctionLanguage::Sql;
             let _ = f.language.as_str(); // reserved for future language variants
-            meta.functions.insert(f.name.clone(), FunctionDef {
-                name: f.name,
-                kind,
-                params,
-                return_type,
-                body: f.body,
-                language,
-            });
+            meta.functions.insert(
+                f.name.clone(),
+                FunctionDef {
+                    name: f.name,
+                    kind,
+                    params,
+                    return_type,
+                    body: f.body,
+                    language,
+                },
+            );
         }
 
         meta

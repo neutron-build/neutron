@@ -959,9 +959,16 @@ async fn cmd_start(cfg: StartConfig) {
     // Register initial peers with the transport.
     let peers: Vec<_> = {
         let coord = cluster.read();
-        coord.peer_node_ids().iter().filter_map(|peer_id| {
-            coord.cluster_nodes().get(peer_id).map(|addr| (*peer_id, addr.clone()))
-        }).collect()
+        coord
+            .peer_node_ids()
+            .iter()
+            .filter_map(|peer_id| {
+                coord
+                    .cluster_nodes()
+                    .get(peer_id)
+                    .map(|addr| (*peer_id, addr.clone()))
+            })
+            .collect()
     };
     for (peer_id, addr) in peers {
         transport.register_peer(peer_id, &addr).await;
@@ -1106,9 +1113,10 @@ async fn cmd_start(cfg: StartConfig) {
                     nucleus::background::BackgroundTask::BufferFlush
                     | nucleus::background::BackgroundTask::WalCheckpoint => {
                         if let Some(ref engine) = disk_for_workers
-                            && let Err(e) = engine.flush() {
-                                tracing::warn!("Background flush failed: {e}");
-                            }
+                            && let Err(e) = engine.flush()
+                        {
+                            tracing::warn!("Background flush failed: {e}");
+                        }
                     }
                     nucleus::background::BackgroundTask::ReplicationSync => {
                         if let Some(ref wal_path) = wal_path_for_workers {
@@ -1177,13 +1185,14 @@ async fn cmd_start(cfg: StartConfig) {
                     executor_for_mem.cleanup_expired_cache();
                     executor_for_mem.kv_store().sweep_expired();
                     {
-                        use nucleus::memory::Pressurable;
                         let mut fts = executor_for_mem.fts_index().write();
                         fts.shrink_postings();
                         let _ = fts.checkpoint_wal();
                     }
                     // Flush ALL MergeTree hot segments to cold (disk) storage
-                    let col_freed = executor_for_mem.columnar_store().write()
+                    let col_freed = executor_for_mem
+                        .columnar_store()
+                        .write()
                         .flush_all_hot_to_disk();
                     if col_freed > 0 {
                         tracing::info!(
@@ -1219,7 +1228,9 @@ async fn cmd_start(cfg: StartConfig) {
                     memory_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                     if rss_bytes > warn_threshold {
                         // Diagnostic: report per-subsystem estimates
-                        let col_bytes = executor_for_mem.columnar_store().read()
+                        let col_bytes = executor_for_mem
+                            .columnar_store()
+                            .read()
                             .estimated_memory_bytes();
                         let fts_bytes = {
                             use nucleus::memory::Pressurable;
@@ -1240,7 +1251,8 @@ async fn cmd_start(cfg: StartConfig) {
         });
         tracing::info!(
             "Memory watchdog: monitoring RSS, pressure at {}% of {} MB",
-            85, config.server.max_memory_mb
+            85,
+            config.server.max_memory_mb
         );
     }
 
@@ -1311,9 +1323,9 @@ async fn cmd_start(cfg: StartConfig) {
         // Wait for either Ctrl+C (SIGINT) or SIGTERM (on Unix).
         #[cfg(unix)]
         {
-            let mut sigterm = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            ).expect("failed to register SIGTERM handler");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to register SIGTERM handler");
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {}
                 _ = sigterm.recv() => {}
@@ -1409,14 +1421,13 @@ async fn cmd_start(cfg: StartConfig) {
         let binary_pw = resolved_password_for_binary.clone();
         let binary_shutdown = shutdown_notify.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                nucleus::binary_wire::server::start_binary_server(
-                    binary_addr,
-                    binary_exec,
-                    binary_pw,
-                    binary_shutdown,
-                )
-                .await
+            if let Err(e) = nucleus::binary_wire::server::start_binary_server(
+                binary_addr,
+                binary_exec,
+                binary_pw,
+                binary_shutdown,
+            )
+            .await
             {
                 tracing::error!("Binary protocol server error: {e}");
             }
@@ -1752,7 +1763,10 @@ async fn handle_cluster_message(
                     let rows_affected: usize = results
                         .iter()
                         .filter_map(|r| {
-                            if let nucleus::executor::ExecResult::Command { rows_affected, .. } = r {
+                            if let nucleus::executor::ExecResult::Command {
+                                rows_affected, ..
+                            } = r
+                            {
                                 Some(*rows_affected)
                             } else {
                                 None

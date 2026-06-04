@@ -75,10 +75,7 @@ impl GeoWal {
                 points: HashMap::new(),
             }
         };
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok((
             Self {
                 path,
@@ -161,7 +158,9 @@ impl GeoWal {
         }
 
         // Flush existing writer
-        { self.writer.lock().flush()?; }
+        {
+            self.writer.lock().flush()?;
+        }
 
         // Truncate and rewrite as single SNAPSHOT entry
         let file = OpenOptions::new()
@@ -215,11 +214,15 @@ fn replay(data: &[u8]) -> GeoWalState {
 
         match entry_type {
             ENTRY_INSERT => {
-                let Some(point) = replay_insert(data, &mut pos) else { break };
+                let Some(point) = replay_insert(data, &mut pos) else {
+                    break;
+                };
                 points.insert(point.doc_id, point);
             }
             ENTRY_DELETE => {
-                let Some(doc_id) = read_u64(data, &mut pos) else { break };
+                let Some(doc_id) = read_u64(data, &mut pos) else {
+                    break;
+                };
                 points.remove(&doc_id);
             }
             ENTRY_SNAPSHOT => {
@@ -258,14 +261,14 @@ fn replay_insert(data: &[u8], pos: &mut usize) -> Option<GeoWalPoint> {
     })
 }
 
-fn replay_snapshot(
-    data: &[u8],
-    pos: &mut usize,
-    points: &mut HashMap<u64, GeoWalPoint>,
-) -> bool {
-    let Some(n_points) = read_u32(data, pos) else { return false };
+fn replay_snapshot(data: &[u8], pos: &mut usize, points: &mut HashMap<u64, GeoWalPoint>) -> bool {
+    let Some(n_points) = read_u32(data, pos) else {
+        return false;
+    };
     for _ in 0..n_points as usize {
-        let Some(point) = replay_insert(data, pos) else { return false };
+        let Some(point) = replay_insert(data, pos) else {
+            return false;
+        };
         points.insert(point.doc_id, point);
     }
     true
@@ -296,7 +299,9 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
     if *pos + len > data.len() {
         return None;
     }
-    let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+    let s = std::str::from_utf8(&data[*pos..*pos + len])
+        .ok()?
+        .to_string();
     *pos += len;
     Some(s)
 }
@@ -453,11 +458,13 @@ mod tests {
 
         let mut props1 = HashMap::new();
         props1.insert("version".to_string(), "1".to_string());
-        wal.log_insert(1, &Point::new(0.0, 0.0), "p", &props1).unwrap();
+        wal.log_insert(1, &Point::new(0.0, 0.0), "p", &props1)
+            .unwrap();
 
         let mut props2 = HashMap::new();
         props2.insert("version".to_string(), "2".to_string());
-        wal.log_insert(1, &Point::new(5.0, 5.0), "p_moved", &props2).unwrap();
+        wal.log_insert(1, &Point::new(5.0, 5.0), "p_moved", &props2)
+            .unwrap();
         drop(wal);
 
         let (_wal2, state) = GeoWal::open(dir.path()).unwrap();
