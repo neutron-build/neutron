@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.1] - 2026-06-04
+
+> Patch release fixing first-run experience bugs found by smoke-testing the
+> shipped 0.1.0. Republishes `create-neutron` (0.1.1) and `@neutron-build/cli`
+> (0.1.1); the other eight packages at 0.1.0 are unaffected.
+
+### Fixed
+
+- **`create-neutron`: scaffolded apps failed to run.** Generated `package.json`
+  scripts invoked a bare `neutron` binary, but the dev CLI ships the `neutron-ts`
+  bin (`@neutron-build/cli`), so a fresh `pnpm dev`/`pnpm build` died with
+  `neutron: command not found`. Templates now call `neutron-ts` and include the
+  `preact-render-to-string` dependency.
+- **`create-neutron` (docs template): broken catch-all URLs.** The `docs`
+  `[...slug]` route keyed its `getStaticPaths` params by `"*"` while the router
+  names the catch-all param `slug`, so pages rendered at garbage paths like
+  `/docs/getting-started/installationslug`. Now keyed by `slug`, producing the
+  correct `/docs/getting-started/installation`.
+- **`@neutron-build/cli`: misleading build output.** `neutron-ts build` listed
+  `_layout` files as routes, printing duplicates (e.g. `/` twice). The listing
+  now shows only page routes; layouts were already correctly excluded from
+  rendering, so this is output-only.
+
+### Testing
+
+- `create-neutron` gains regression tests that read the real template files and
+  assert: scripts only ever call `neutron-ts` (never a bare `neutron`), the
+  Neutron deps + `preact-render-to-string` are present, and named catch-all
+  routes use the named param key rather than the bare `"*"`.
+
 ## [0.1.0] - 2026-05-28
 
 > First coordinated multi-package publish to npm. `@neutron-build/core` and

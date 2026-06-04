@@ -4,6 +4,7 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
+import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
 // Unit-testable functions extracted from create-neutron/src/index.ts
@@ -11,9 +12,9 @@ import * as os from "node:os";
 // ---------------------------------------------------------------------------
 
 type RuntimeMode = "preact" | "react-compat";
-type TemplateName = "basic" | "marketing" | "app" | "full";
+type TemplateName = "basic" | "marketing" | "app" | "full" | "docs";
 
-const TEMPLATE_NAMES: TemplateName[] = ["basic", "marketing", "app", "full"];
+const TEMPLATE_NAMES: TemplateName[] = ["basic", "marketing", "app", "full", "docs"];
 
 interface CliOptions {
   targetDir: string;
@@ -528,14 +529,98 @@ describe("resolveDependencyVersions", () => {
 // ---------------------------------------------------------------------------
 
 describe("TEMPLATE_NAMES", () => {
-  it("contains exactly 4 templates", () => {
-    assert.equal(TEMPLATE_NAMES.length, 4);
+  it("contains exactly 5 templates", () => {
+    assert.equal(TEMPLATE_NAMES.length, 5);
   });
 
-  it("includes basic, marketing, app, and full", () => {
+  it("includes basic, marketing, app, full, and docs", () => {
     assert.ok(TEMPLATE_NAMES.includes("basic"));
     assert.ok(TEMPLATE_NAMES.includes("marketing"));
     assert.ok(TEMPLATE_NAMES.includes("app"));
     assert.ok(TEMPLATE_NAMES.includes("full"));
+    assert.ok(TEMPLATE_NAMES.includes("docs"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Template package.json integrity — reads the REAL template files on disk
+// (not a mirror). Guards the class of bug where the published scaffold shipped
+// `neutron` scripts while the bin is `neutron-ts`, so a fresh `pnpm dev`/`build`
+// failed with "neutron: command not found".
+// ---------------------------------------------------------------------------
+
+describe("template package.json integrity", () => {
+  const testDir = path.dirname(fileURLToPath(import.meta.url));
+  const templatesDir = path.join(testDir, "..", "templates");
+
+  it("has a directory for every name in TEMPLATE_NAMES", () => {
+    for (const name of TEMPLATE_NAMES) {
+      const pkgPath = path.join(templatesDir, name, "package.json");
+      assert.ok(fs.existsSync(pkgPath), `missing template package.json: ${name}`);
+    }
+  });
+
+  it("invokes the neutron-ts bin in scripts (never a bare `neutron`)", () => {
+    for (const name of TEMPLATE_NAMES) {
+      const pkg = JSON.parse(
+        fs.readFileSync(path.join(templatesDir, name, "package.json"), "utf8"),
+      );
+      const scripts: Record<string, string> = pkg.scripts ?? {};
+      for (const [scriptName, body] of Object.entries(scripts)) {
+        // Any invocation of the dev CLI must be `neutron-ts`, not `neutron`.
+        const callsBareNeutron = /(^|\s|&&|;)neutron(\s|$)/.test(body);
+        assert.ok(
+          !callsBareNeutron,
+          `template ${name} script "${scriptName}" calls bare \`neutron\` (bin is \`neutron-ts\`): ${body}`,
+        );
+        if (/neutron/.test(body)) {
+          assert.ok(
+            /neutron-ts/.test(body),
+            `template ${name} script "${scriptName}" should call \`neutron-ts\`: ${body}`,
+          );
+        }
+      }
+    }
+  });
+
+  it("declares the Neutron deps and preact-render-to-string", () => {
+    for (const name of TEMPLATE_NAMES) {
+      const pkg = JSON.parse(
+        fs.readFileSync(path.join(templatesDir, name, "package.json"), "utf8"),
+      );
+      const deps: Record<string, string> = pkg.dependencies ?? {};
+      assert.ok(deps["@neutron-build/core"], `${name} missing @neutron-build/core`);
+      assert.ok(deps["@neutron-build/cli"], `${name} missing @neutron-build/cli`);
+      assert.ok(
+        deps["preact-render-to-string"],
+        `${name} missing preact-render-to-string`,
+      );
+    }
+  });
+
+  it("named catch-all routes use the named param key, not bare `*`", () => {
+    // A `[...slug]` file's catch-all param is named `slug` (per the router).
+    // Using `params["*"]` / `{ "*": ... }` leaves the literal name glued to the
+    // resolved path (e.g. `/docs/installationslug`). Only a bare `[...]` file
+    // may use the `*` key. Guard every named catch-all template route.
+    const routeFiles: string[] = [];
+    const walk = (dir: string) => {
+      if (!fs.existsSync(dir)) return;
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (/\[\.\.\.[^\]]+\]\.tsx$/.test(e.name)) routeFiles.push(p);
+      }
+    };
+    for (const name of TEMPLATE_NAMES) {
+      walk(path.join(templatesDir, name, "src", "routes"));
+    }
+    for (const file of routeFiles) {
+      const src = fs.readFileSync(file, "utf8");
+      assert.ok(
+        !/params\s*\[\s*["']\*["']\s*\]/.test(src) && !/\{\s*["']\*["']\s*:/.test(src),
+        `named catch-all route uses bare "*" param key (should be the named param): ${file}`,
+      );
+    }
   });
 });

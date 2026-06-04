@@ -108,8 +108,10 @@ export async function build(): Promise<void> {
     (fs.existsSync(srcDir) && walkForIslands(srcDir));
   void staticRouteCount;
 
-  console.log(`Found ${routes.length} routes:\n`);
-  for (const route of routes) {
+  // List only page routes — `_layout` files are layouts, not navigable routes,
+  // and listing them produced confusing duplicates (e.g. `/` shown twice).
+  console.log(`Found ${pageRoutes.length} routes:\n`);
+  for (const route of pageRoutes) {
     const isStatic = route.config.mode === "static";
     const type = isStatic ? "static" : "app";
     const hasParams = route.params.length > 0;

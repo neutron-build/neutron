@@ -13,12 +13,12 @@ export async function getStaticPaths() {
   return {
     paths: docs
       .filter((d: any) => !d.data.draft)
-      .map((d: any) => ({ params: { "*": d.slug } })),
+      .map((d: any) => ({ params: { slug: d.slug } })),
   };
 }
 
 export async function loader({ params }: { params: Record<string, string> }) {
-  const slug = params["*"] || "index";
+  const slug = params.slug || "index";
   const entry = await getEntry("docs", slug);
   if (!entry) throw new Response("Not found", { status: 404 });
 
