@@ -1,0 +1,144 @@
+---
+title: Database
+description: Connect to Nucleus or PostgreSQL with type-safe queries.
+---
+
+Neutron works with both Nucleus (multi-model) and PostgreSQL. Both use the same wire protocol, so the same client code works for either.
+
+## Connection
+
+```rust
+use tokio_postgres::{connect, NoTls};
+
+#[tokio::main]
+async fn main() {
+    let (client, conn) = connect("host=localhost port=5432", NoTls).await.unwrap();
+
+    // Spawn connection task
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Use client in handlers via State
+    let router = Router::new()
+        .state(client)
+        .get("/users/:id", get_user);
+}
+```
+
+## Queries
+
+```rust
+async fn get_user(
+    Path(id): Path<i64>,
+    State(db): State<Client>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let row = db.query_one(
+        "SELECT id, name, email FROM users WHERE id = $1",
+        &[&id],
+    ).await?;
+
+    Ok(Json(serde_json::json!({
+        "id": row.get::<_, i64>("id"),
+        "name": row.get::<_, String>("name"),
+        "email": row.get::<_, String>("email"),
+    })))
+}
+
+async fn list_users(State(db): State<Client>) -> Json<Vec<serde_json::Value>> {
+    let rows = db.query("SELECT id, name FROM users ORDER BY id", &[]).await.unwrap();
+
+    Json(rows.iter().map(|row| {
+        serde_json::json!({
+            "id": row.get::<_, i64>("id"),
+            "name": row.get::<_, String>("name"),
+        })
+    }).collect())
+}
+```
+
+## Transactions
+
+```rust
+async fn transfer(State(db): State<Client>) -> Result<String, AppError> {
+    let txn = db.transaction().await?;
+
+    txn.execute(
+        "UPDATE accounts SET balance = balance - $1 WHERE id = $2",
+        &[&100i64, &1i64],
+    ).await?;
+
+    txn.execute(
+        "UPDATE accounts SET balance = balance + $1 WHERE id = $2",
+        &[&100i64, &2i64],
+    ).await?;
+
+    txn.commit().await?;
+    Ok("Transfer complete".to_string())
+}
+```
+
+## Feature Detection
+
+Detect whether you're connected to Nucleus or PostgreSQL:
+
+```rust
+let row = db.query_one("SELECT VERSION()", &[]).await?;
+let version: String = row.get(0);
+let is_nucleus = version.contains("Nucleus");
+```
+
+## Nucleus Multi-Model
+
+When connected to Nucleus, use all 14 data models through SQL:
+
+```rust
+// Key-Value
+db.execute("SELECT KV_SET('session:1', 'data', 3600)", &[]).await?;
+
+// Vector search
+db.query(
+    "SELECT id, VECTOR_DISTANCE(embedding, VECTOR($1), 'cosine') AS score
+     FROM documents ORDER BY score LIMIT 10",
+    &[&query_embedding],
+).await?;
+
+// Full-text search
+db.query("SELECT FTS_SEARCH('machine learning', 10)", &[]).await?;
+
+// Graph
+db.execute(
+    "SELECT GRAPH_ADD_NODE('Person', '{\"name\": \"Alice\"}')",
+    &[],
+).await?;
+```
+
+## DataLoader
+
+Batch loading to prevent N+1 queries:
+
+```rust
+use neutron::data::{DataLoader, Loader};
+
+struct UserLoader { db: Client }
+
+impl Loader for UserLoader {
+    type Key = u64;
+    type Value = User;
+    type Error = String;
+
+    async fn load(keys: Vec<u64>, _ctx: ()) -> Result<HashMap<u64, User>, String> {
+        // Single query for all requested users
+        Ok(HashMap::new())
+    }
+}
+```
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `DATABASE_URL` | Connection string (`postgres://user:pass@host/db`) |
+| `DATABASE_POOL_SIZE` | Connection pool size (default: 10) |

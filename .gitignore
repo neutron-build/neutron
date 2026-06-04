@@ -112,11 +112,10 @@ mojo/specs/
 **/coord_lines.py
 **/coord_methods.rs
 
-# Old location remnants (build artifacts only, source is in rs/ and nucleus/)
-rust/
-# ...but the CLI's Rust scaffold template is real source, not a remnant.
-!cli/internal/scaffold/templates/rust/
-!cli/internal/scaffold/templates/rust/**
+# Old location remnant at repo root (build artifacts only; source is in rs/ and
+# nucleus/). Anchored to root so it does NOT swallow nested `rust/` dirs like the
+# site's Rust docs (apps/site/.../docs/rust/) or the CLI scaffold template.
+/rust/
 
 # Site build output (source is tracked, dist is not)
 typescript/apps/site/dist/

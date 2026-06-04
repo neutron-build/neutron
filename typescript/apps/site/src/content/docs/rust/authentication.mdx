@@ -1,0 +1,150 @@
+---
+title: Authentication
+description: JWT, OAuth2, sessions, passkeys, and CSRF.
+---
+
+Neutron provides multiple authentication strategies out of the box: JWT tokens, OAuth2/OIDC, server-side sessions, WebAuthn passkeys, and CSRF protection.
+
+## JWT
+
+HMAC-SHA256 token validation as middleware:
+
+```rust
+use neutron::prelude::*;
+use neutron::jwt::{JwtAuth, JwtConfig, Claims};
+
+let config = JwtConfig::new(b"your-secret-key-at-least-32-bytes")
+    .issuer("my-app")
+    .audience("my-api")
+    .leeway(30);  // Clock skew tolerance in seconds
+
+let api = Router::new()
+    .middleware(JwtAuth::new(config))
+    .get("/profile", get_profile);
+
+async fn get_profile(Extension(claims): Extension<Claims>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "user": claims.sub,
+        "issued_at": claims.iat
+    }))
+}
+```
+
+### Claims
+
+```rust
+pub struct Claims {
+    pub sub: Option<String>,      // Subject
+    pub iss: Option<String>,      // Issuer
+    pub aud: Option<String>,      // Audience
+    pub exp: Option<u64>,         // Expiration (Unix timestamp)
+    pub nbf: Option<u64>,         // Not before
+    pub iat: Option<u64>,         // Issued at
+    pub extra: serde_json::Value, // Custom claims
+}
+```
+
+## OAuth2 / OIDC
+
+Authorization code flow with PKCE:
+
+```rust
+use neutron_oauth::{OAuthProvider, oauth_redirect_handler, oauth_callback_handler};
+
+let github = OAuthProvider::github()
+    .client_id(env::var("GITHUB_CLIENT_ID")?)
+    .client_secret(env::var("GITHUB_CLIENT_SECRET")?)
+    .redirect_uri("https://myapp.com/auth/github/callback")
+    .secret(b"session-signing-secret-32-bytes!".to_vec());
+
+let router = Router::new()
+    .get("/auth/github", oauth_redirect_handler(github.clone()))
+    .get("/auth/github/callback", oauth_callback_handler(github, on_login));
+
+async fn on_login(user: OAuthUser, _req: Request) -> Response {
+    // user.id, user.email, user.name, user.avatar_url
+    format!("Welcome, {}!", user.name.unwrap_or(user.id)).into_response()
+}
+```
+
+## Sessions
+
+Server-side sessions with signed cookies:
+
+```rust
+use neutron::session::{Session, SessionLayer, MemoryStore};
+use neutron::cookie::Key;
+
+let key = Key::generate();
+let store = MemoryStore::new();
+
+let router = Router::new()
+    .middleware(SessionLayer::new(store, key))
+    .get("/count", counter);
+
+async fn counter(session: Session) -> String {
+    let count: u64 = session.get("count").unwrap_or(0);
+    session.insert("count", count + 1);
+    format!("Visit #{}", count + 1)
+}
+```
+
+For production, use Redis-backed sessions via `neutron-redis`.
+
+## Cookies
+
+```rust
+use neutron::cookie::{SetCookie, SignedCookieJar, PrivateCookieJar, Key, SameSite};
+
+// Set a cookie
+async fn login() -> SetCookie {
+    SetCookie::new("session", "abc123")
+        .path("/")
+        .http_only()
+        .same_site(SameSite::Lax)
+        .max_age(86400)
+}
+
+// Read a signed cookie (HMAC-verified)
+async fn read_signed(jar: SignedCookieJar) -> String {
+    jar.get("session").unwrap_or_default()
+}
+
+// Read an encrypted cookie (AES-GCM)
+async fn read_private(jar: PrivateCookieJar) -> String {
+    jar.get("session").unwrap_or_default()
+}
+```
+
+## CSRF Protection
+
+Double-submit cookie pattern:
+
+```rust
+use neutron::csrf::{CsrfLayer, CsrfToken};
+
+let router = Router::new()
+    .middleware(CsrfLayer::new(key))
+    .get("/form", show_form)
+    .post("/submit", handle_submit);
+
+async fn show_form(csrf: CsrfToken) -> String {
+    format!(r#"
+        <form method="post" action="/submit">
+            <input type="hidden" name="csrf" value="{}">
+            <button type="submit">Submit</button>
+        </form>
+    "#, csrf.token())
+}
+```
+
+## WebAuthn / Passkeys
+
+FIDO2 passkey authentication via `neutron-webauthn`:
+
+```toml
+[dependencies]
+neutron-webauthn = "0.1"
+```
+
+Provides P-256 ECDSA signature verification for passwordless authentication flows.

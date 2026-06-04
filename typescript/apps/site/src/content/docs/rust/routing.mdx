@@ -1,0 +1,187 @@
+---
+title: Routing
+description: Trie-based routing with type-safe extractors.
+---
+
+Neutron uses a compressed radix tree (trie) router for O(1) route matching. Routes are defined with method-specific builders and type-safe extractors.
+
+## Defining Routes
+
+```rust
+let router = Router::new()
+    .get("/users", list_users)
+    .get("/users/:id", get_user)
+    .post("/users", create_user)
+    .put("/users/:id", update_user)
+    .delete("/users/:id", delete_user)
+    .patch("/items/:id", patch_item)
+    .head("/status", check_status)
+    .options("/*", cors_preflight)
+    .any("/fallback", any_method_handler);
+```
+
+## Path Parameters
+
+Extract typed values from URL segments:
+
+```rust
+// Single parameter
+async fn get_user(Path(id): Path<u64>) -> Json<User> {
+    // /users/42 → id = 42
+}
+
+// Multiple parameters
+async fn get_repo(Path((org, repo)): Path<(String, String)>) -> String {
+    // /repos/neutron/framework → org = "neutron", repo = "framework"
+    format!("{}/{}", org, repo)
+}
+
+// Wildcard (catch-all)
+async fn serve_file(Path(path): Path<String>) -> Response {
+    // /files/images/logo.png → path = "images/logo.png"
+}
+```
+
+Supported types: `u8`–`u128`, `i8`–`i128`, `f32`, `f64`, `bool`, `String`.
+
+## Query Parameters
+
+```rust
+#[derive(Deserialize)]
+struct Filters {
+    q: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+async fn search(Query(filters): Query<Filters>) -> Json<Vec<Item>> {
+    // /search?q=rust&limit=10
+}
+```
+
+## Request Body
+
+### JSON
+
+```rust
+#[derive(Deserialize)]
+struct CreateUser {
+    name: String,
+    email: String,
+}
+
+async fn create_user(Json(body): Json<CreateUser>) -> (StatusCode, Json<User>) {
+    (StatusCode::CREATED, Json(User { id: 1, name: body.name }))
+}
+```
+
+### Form
+
+```rust
+#[derive(Deserialize)]
+struct LoginForm {
+    username: String,
+    password: String,
+}
+
+async fn login(Form(form): Form<LoginForm>) -> Response {
+    // application/x-www-form-urlencoded
+}
+```
+
+## State
+
+Share application state across handlers:
+
+```rust
+struct AppState {
+    db: DatabasePool,
+    config: Config,
+}
+
+let router = Router::new()
+    .state(AppState { db, config })
+    .get("/users", list_users);
+
+async fn list_users(State(state): State<AppState>) -> Json<Vec<User>> {
+    let users = state.db.query("SELECT * FROM users").await;
+    Json(users)
+}
+```
+
+## Extensions
+
+Per-request data set by middleware:
+
+```rust
+async fn handler(Extension(claims): Extension<Claims>) -> String {
+    // Claims injected by JwtAuth middleware
+    format!("Hello, {}", claims.sub.unwrap_or_default())
+}
+```
+
+## Nested Routers
+
+Group routes with shared middleware:
+
+```rust
+let api = Router::new()
+    .middleware(JwtAuth::new(config))
+    .get("/items", list_items)
+    .post("/items", create_item);
+
+let admin = Router::new()
+    .middleware(AdminOnly)
+    .get("/users", list_all_users)
+    .delete("/users/:id", delete_user);
+
+let router = Router::new()
+    .middleware(Logger)
+    .nest("/api", api)       // JwtAuth applies to /api/*
+    .nest("/admin", admin)   // AdminOnly applies to /admin/*
+    .get("/health", health);
+```
+
+## Static Files
+
+```rust
+let router = Router::new()
+    .static_files("/assets", "./public");
+```
+
+## Fallback Handler
+
+```rust
+let router = Router::new()
+    .get("/", home)
+    .fallback(|| async { (StatusCode::NOT_FOUND, "Not Found") });
+```
+
+## Handler Signatures
+
+Handlers are async functions that take up to 12 extractors and return anything implementing `IntoResponse`:
+
+```rust
+// Zero extractors
+|| async { "ok" }
+
+// Multiple extractors
+async fn handler(
+    Path(id): Path<u64>,
+    Query(q): Query<Filters>,
+    State(db): State<Pool>,
+    Json(body): Json<CreateItem>,
+) -> Result<Json<Item>, AppError> {
+    // ...
+}
+```
+
+### IntoResponse Implementations
+
+| Return Type | Status | Content-Type |
+|-------------|--------|--------------|
+| `String` / `&str` | 200 | text/plain |
+| `Json<T>` | 200 | application/json |
+| `(StatusCode, T)` | custom | from T |
+| `Response` | custom | custom |
+| `Result<T, E>` | 200 or error | from T |

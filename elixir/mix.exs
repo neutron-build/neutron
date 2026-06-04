@@ -14,9 +14,21 @@ defmodule Neutron.MixProject do
       name: "Neutron",
       description: "Fault-tolerant, distributed web framework for the Neutron ecosystem",
       source_url: @source_url,
+      package: package(),
       docs: docs(),
       elixirc_paths: elixirc_paths(Mix.env()),
       aliases: aliases()
+    ]
+  end
+
+  # Published to Hex as `neutron_ex` — the bare `neutron` name is taken on Hex.
+  # The OTP app atom stays `:neutron` and the module namespace stays `Neutron`,
+  # so consumers depend on it with `{:neutron, "~> 0.1", hex: :neutron_ex}`.
+  defp package do
+    [
+      name: "neutron_ex",
+      licenses: ["MIT"],
+      links: %{"GitHub" => @source_url}
     ]
   end
 
