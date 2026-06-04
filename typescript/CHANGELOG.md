@@ -52,6 +52,16 @@ All notable changes to this project are documented in this file.
   production server was already unaffected — it resolves a single deduped preact
   from `node_modules`.)
 
+### Added
+
+- **`head()` supports a `link` field (`@neutron-build/core`).** Lets routes/layouts
+  add arbitrary `<link>` tags — favicon, `preconnect`, `manifest`, `alternate`,
+  etc. Previously only `canonical` links were possible, so there was no way to
+  set a favicon. Multiple same-`rel` links (e.g. several `preconnect`s) are kept.
+- **Templates ship and reference a favicon.** Every scaffold now includes a clean
+  `public/favicon.svg` wired via `head()`, so pages no longer 404 on `/favicon.ico`
+  or show a blank tab.
+
 ### Changed
 
 - **`@neutron-build/cli` now depends on `@neutron-build/core` via caret (`^`).**
@@ -59,6 +69,9 @@ All notable changes to this project are documented in this file.
   republish and could install two core copies (re-triggering the preact-instance
   crash). Now `^0.1.x`.
 - **Every template ships a `README.md`** (commands, project structure, docs link).
+- **Docs template accessibility:** content is wrapped in a `<main>` landmark and
+  pages render a single `<h1>` (the mdx bodies no longer duplicate the
+  frontmatter title).
 
 ### Testing
 

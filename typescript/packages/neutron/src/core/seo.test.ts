@@ -93,4 +93,35 @@ describe("seo utilities", () => {
     expect(html).toContain("<title>Custom Page</title>");
     expect(html).not.toContain("<title>about - Neutron</title>");
   });
+
+  it("emits custom <link> tags (e.g. favicon)", () => {
+    const html = renderMetaTags(
+      buildMetaTags({ link: { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" } }),
+    );
+    expect(html).toContain("<link");
+    expect(html).toContain('rel="icon"');
+    expect(html).toContain('href="/favicon.svg"');
+  });
+
+  it("keeps multiple same-rel links (e.g. preconnect) instead of deduping them", () => {
+    const html = renderMetaTags(
+      buildMetaTags({
+        link: [
+          { rel: "preconnect", href: "https://a.example" },
+          { rel: "preconnect", href: "https://b.example" },
+        ],
+      }),
+    );
+    expect(html).toContain('href="https://a.example"');
+    expect(html).toContain('href="https://b.example"');
+  });
+
+  it("merges link tags from layout and route", () => {
+    const merged = mergeSeoMetaInput(
+      { link: { rel: "icon", href: "/favicon.svg" } },
+      { link: { rel: "manifest", href: "/site.webmanifest" } },
+    );
+    const links = Array.isArray(merged?.link) ? merged?.link : [merged?.link];
+    expect(links?.length).toBe(2);
+  });
 });

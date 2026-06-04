@@ -7,6 +7,7 @@ export function head() {
   return {
     titleTemplate: "%s — __PROJECT_NAME__",
     description: "__PROJECT_NAME__ Documentation",
+    link: { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
     htmlAttrs: { lang: "en", "data-theme": "dark" },
     headScripts: [
       {
