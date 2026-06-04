@@ -975,9 +975,13 @@ async function buildRuntimeBundle(
       ...(options.runtimeAliases ? { resolve: { alias: options.runtimeAliases } } : {}),
       ssr: {
         target: target === "worker" ? "webworker" : "node",
+        // Bundle @neutron-build/core with the same preact the renderer uses, so
+        // inline hook components (e.g. Link) in app-mode routes don't hit the
+        // two-preact-instance "__H" crash at runtime — matching the build/dev paths.
         noExternal: [
           "preact",
           "preact-render-to-string",
+          "@neutron-build/core",
           ...(options.runtimeNoExternal || []),
         ],
       },
