@@ -2,11 +2,25 @@
 
 All notable changes to this project are documented in this file.
 
-## [create-neutron 0.1.2 / core 0.1.2 / cli 0.1.3] - 2026-06-04
+## [0.1.x hardening wave] - 2026-06-04
 
-> DX-quality pass: scaffolded projects now typecheck clean, build with no
-> sourcemap warnings, and ship a README. Republishes `create-neutron` (0.1.2),
-> `@neutron-build/core` (0.1.2), `@neutron-build/cli` (0.1.3).
+> DX + ecosystem-hygiene pass. Scaffolded projects now typecheck clean, build
+> with no sourcemap warnings, and ship a README. Republishes **all packages**:
+> `@neutron-build/core` 0.1.2, `@neutron-build/cli` 0.1.3, `create-neutron`
+> 0.1.2, and `@neutron-build/{auth,cache-redis,data,nucleus,ops,otel,security}`
+> 0.1.1.
+
+### Ecosystem-wide (all packages)
+
+- **Sourcemaps embed their sources (`inlineSources`).** Every package shipped
+  `.js.map` files referencing `src/*.ts` not included in the tarball, so a
+  consumer importing any of them saw "points to missing source files" warnings.
+  Fixed across all packages.
+- **`@neutron-build/*` cross-deps use caret, not exact pins.** Packages depended
+  on `core`/`nucleus` via `workspace:*`, which rewrites to an *exact* version on
+  publish — so installing e.g. `@neutron-build/auth` alongside a newer `core`
+  produced two `core` copies (the same duplicate-instance hazard behind the
+  earlier `__H` crash). Now `workspace:^` -> `^0.1.x`, which dedupes to one copy.
 
 ### Fixed
 
