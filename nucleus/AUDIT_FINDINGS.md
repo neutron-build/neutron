@@ -81,6 +81,11 @@ is ~202K LOC; this is an honest checkpoint, not a claim of completeness.
 - **F-026 vector SIMD unsafe soundness** (`vector/mod.rs`). Raw-pointer distance loops relied
   on a debug-only equal-length invariant (UB in release if violated). → clamp
   `n = a.len().min(b.len())` (unconditionally in-bounds) + `// SAFETY:` docs.
+- **F-027 KV SETBIT unbounded allocation** (`resp/handler.rs`, DoS). A huge offset resized the
+  bitmap arbitrarily. → reject offsets ≥ 2^32 at the handler (Redis cap). Regression test.
+- **F-028 datalog unbound head var → empty-string key** (`datalog/mod.rs`). An ungroundable
+  head variable was substituted with `""`, corrupting the aggregate grouping key. → skip the
+  binding (`continue`) so only ground facts are produced.
 
 ## Deferred / verified-real (not changed this pass — with rationale)
 
@@ -94,8 +99,6 @@ is risky or the fix is a larger feature. Triaged honestly rather than rushed.
 - **WAL page-write CRC covers only the page, not the header** (`storage/wal.rs:210`, high).
   Header corruption (page_id/txn_id) goes undetected. Fix is a WAL-format change (extend
   CRC over header+page on both write and read) — do deliberately at a version boundary.
-- **KV SETBIT unbounded allocation** (`kv/mod.rs`, high, DoS). A single huge `offset`
-  allocates arbitrarily. Needs `setbit` → `Result` + Redis's 4 Gbit cap (signature ripple).
 - **RESP ZRANGE negative indices** (`resp/handler.rs`, high). `i64 as usize` turns `-1` into a
   huge index. Needs `col_zrange` to take `i64` + relative-index handling (signature ripple).
 - **Security: SessionContext never set to the authenticated user** (`executor/session.rs`,
@@ -106,8 +109,6 @@ is risky or the fix is a larger feature. Triaged honestly rather than rushed.
   all (GIN `query_contains` empty-query special case).
 - **vector HNSW filtered early-exit** (`vector/mod.rs`, high) — may return < k under a selective
   filter; needs careful recall analysis, not a blind reorder.
-- **datalog unbound head vars → empty string** (`datalog/mod.rs`, high) — should drop the
-  binding; needs care around aggregate-rule grounding semantics.
 - **reactive CDC consumer offsets lost on checkpoint** (`reactive/cdc_wal.rs`, high) — needs a
   CdcLog API to expose consumer positions.
 - **fts merge_segments dedup data loss** (`fts/mod.rs`, high) — add `debug_assert` / merge

@@ -979,12 +979,18 @@ fn evaluate_aggregate_rule(
     // Group by key values
     // Key = values of non-aggregate head terms
     let mut groups: HashMap<Vec<String>, Vec<HashMap<String, String>>> = HashMap::new();
-    for bindings in &all_bindings {
+    'bindings: for bindings in &all_bindings {
         let mut key = Vec::new();
         for term in head_args {
             match term {
                 Term::Const(c) => key.push(c.clone()),
-                Term::Var(v) => key.push(bindings.get(v).cloned().unwrap_or_default()),
+                Term::Var(v) => match bindings.get(v) {
+                    Some(val) => key.push(val.clone()),
+                    // An unbound head variable cannot form a ground fact. Skip the
+                    // whole binding instead of substituting an empty-string
+                    // placeholder (which silently corrupts the grouping key).
+                    None => continue 'bindings,
+                },
                 Term::Agg(_) => {} // Skip aggregates for the key
             }
         }

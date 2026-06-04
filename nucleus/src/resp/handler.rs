@@ -612,8 +612,10 @@ impl RespHandler {
                 let key = require_arg!(args, 1);
                 let offset: usize =
                     match String::from_utf8_lossy(require_arg_bytes!(args, 2)).parse() {
-                        Ok(v) => v,
-                        Err(_) => {
+                        // Redis caps the bit offset at 2^32-1 (512 MB). Reject larger
+                        // values so one command can't trigger an unbounded allocation.
+                        Ok(v) if v < (1usize << 32) => v,
+                        _ => {
                             return encoder::encode_error(
                                 "ERR bit offset is not an integer or out of range",
                             );
@@ -2228,6 +2230,22 @@ mod tests {
         assert_eq!(decode_int(&resp), 1); // old was 1
 
         let resp = h.handle_command(args(&["GETBIT", "bm", "7"]));
+        assert_eq!(decode_int(&resp), 0);
+    }
+
+    // Regression: a huge SETBIT offset must be rejected (Redis caps at 2^32),
+    // not honored — otherwise one command triggers an unbounded allocation.
+    #[test]
+    fn test_setbit_offset_cap() {
+        let mut h = new_handler();
+        let resp = h.handle_command(args(&["SETBIT", "bm", "4294967296", "1"]));
+        assert!(
+            resp.starts_with(b"-ERR"),
+            "SETBIT with offset 2^32 must error, got {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+        // A reasonable offset still works.
+        let resp = h.handle_command(args(&["SETBIT", "bm", "100", "1"]));
         assert_eq!(decode_int(&resp), 0);
     }
 
