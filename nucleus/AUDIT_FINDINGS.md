@@ -115,6 +115,11 @@ is ~202K LOC; this is an honest checkpoint, not a claim of completeness.
 - **F-030 GENERATE_SERIES step overflow** (`executor/scalar_fns.rs`). `current += step`
   overflows near i64 bounds (panic / infinite loop). → `checked_add` stops the series.
 - **F-031 BlobStore::get_range offset+length overflow** (`blob/mod.rs`). → `saturating_add`.
+- **F-032 B-tree find_child corrupt-page panic** (`storage/btree.rs`). Unchecked `key_len`
+  slice. → bounds-check + stop/log (completes the F-010 family).
+- **F-033 page iter_tuples corrupt-slot panic** (`storage/page.rs`). Slice from a corrupt
+  slot offset/len. → bounds-check + skip/log. (`insert_tuple`'s u16 cast is bounded by
+  PAGE_SIZE < 65535 — non-issue.)
 
 ### False positives confirmed (no change)
 
