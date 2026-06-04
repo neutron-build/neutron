@@ -337,7 +337,9 @@ impl BlobStore {
         let meta = self.blobs.get(key)?;
 
         let start = offset;
-        let end = offset + length;
+        // saturating: an attacker-supplied offset+length must not overflow/wrap
+        // (which would corrupt the range bounds); clamp to u64::MAX = read to end.
+        let end = offset.saturating_add(length);
 
         // Use the index to find the starting chunk via binary search
         let start_chunk_idx = meta.index.find_chunk(start).unwrap_or(0);

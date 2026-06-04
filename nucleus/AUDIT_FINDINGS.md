@@ -17,6 +17,10 @@ Severity order: correctness > memory-safety > security > durability > performanc
   comments; (2) the high deferred items that need signature changes (ZRANGE i64);
   (3) **MVCC GC** — diff against `lean4/Nucleus/Nucleus/Proofs/MvccProofs.lean` BEFORE
   touching; (4) feature-sized: RLS-to-authenticated-user wiring, WAL header-CRC format change.
+- **AFTER the engine is fully done:** audit/fix the surrounding tooling too — `studio/`,
+  the per-language ORMs/SDKs (`go/`, `ts/` neutron-data, `python/`, `rust/`, `zig/`,
+  `elixir/`, `julia/`), and anything depending on engine semantics changed here (new error
+  variants, DISTINCT ON error propagation, ON CONFLICT enforcement, etc.). Requested by Tyler.
 
 ## Phase 2+3 audit — summary (in progress)
 
@@ -101,6 +105,26 @@ is ~202K LOC; this is an honest checkpoint, not a claim of completeness.
 - **F-028 datalog unbound head var → empty-string key** (`datalog/mod.rs`). An ungroundable
   head variable was substituted with `""`, corrupting the aggregate grouping key. → skip the
   binding (`continue`) so only ground facts are produced.
+
+## Medium — FIXED
+
+- **F-029 MOD by zero / `MIN % -1` panic** (`executor/scalar_fns.rs`). `%` panics on
+  `i32::MIN % -1`; mod-by-zero gave a wrong message. → explicit "division by zero" error +
+  `checked_rem` (MIN%-1 = 0). Regression test. *(The agent's "return NULL" was wrong —
+  Postgres errors on mod-by-zero.)*
+- **F-030 GENERATE_SERIES step overflow** (`executor/scalar_fns.rs`). `current += step`
+  overflows near i64 bounds (panic / infinite loop). → `checked_add` stops the series.
+- **F-031 BlobStore::get_range offset+length overflow** (`blob/mod.rs`). → `saturating_add`.
+
+### False positives confirmed (no change)
+
+- **MOD divisor-zero "should return NULL"** — Postgres errors; returning an error is correct
+  (only the message was improved, see F-029).
+- **`BlobIndex::find_chunk` "missing bounds check"** — already handles empty and returns a
+  valid index; the caller (`get_range`) range-checks. Not a bug.
+- **INSERT DEFAULT-validation "always errors"** (F-015) and **WAL "off-by-4 at line 429"**
+  (F-009) — both were misdiagnosed by the agent; the suggested fixes would have *introduced*
+  bugs. Fixed the real issues instead.
 
 ## Deferred / verified-real (not changed this pass — with rationale)
 

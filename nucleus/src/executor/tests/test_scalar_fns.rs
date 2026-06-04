@@ -97,6 +97,16 @@ async fn test_abs_int_min_errors_not_panics() {
     assert_eq!(scalar(&results[0]), &Value::Int32(2147483647));
 }
 
+// Regression: MOD by zero must error (Postgres semantics), and MIN % -1 must not
+// panic (the unchecked `%` overflows like division).
+#[tokio::test]
+async fn test_mod_div_by_zero_and_min() {
+    let ex = test_executor();
+    assert!(ex.execute("SELECT MOD(5, 0)").await.is_err());
+    let r = exec(&ex, "SELECT MOD(CAST(-2147483648 AS INT), CAST(-1 AS INT))").await;
+    assert_eq!(scalar(&r[0]), &Value::Int32(0));
+}
+
 #[tokio::test]
 async fn test_round() {
     let ex = test_executor();
