@@ -30,6 +30,13 @@ All notable changes to this project are documented in this file.
   referenced `src/*.ts` files not shipped in the package, so consumers saw ~17
   "points to missing source files" warnings per build. Maps now embed their
   sources (`inlineSources`).
+- **Edge/worker bundle could crash app-mode inline hook components.** The
+  vercel/cloudflare/docker SSR bundle externalized `@neutron-build/core` while
+  bundling preact, so an inline `<Link>` (or any inline hook component) in an
+  `app`-mode route could hit the two-preact `__H` crash at request time. `core`
+  is now bundled into the worker too, matching the build/dev paths. (The node
+  production server was already unaffected — it resolves a single deduped preact
+  from `node_modules`.)
 
 ### Changed
 
