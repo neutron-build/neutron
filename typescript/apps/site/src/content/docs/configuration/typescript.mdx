@@ -7,19 +7,30 @@ Neutron is written in TypeScript and is designed to provide excellent type safet
 
 ## `tsconfig.json`
 
-Neutron provides a base TSConfig that you should extend.
+A scaffolded project ships a ready-to-use `tsconfig.json`. The options Neutron
+relies on are Preact JSX and bundler module resolution:
 
 ```json
 {
-  "extends": "neutron/tsconfig.base.json",
   "compilerOptions": {
-    "baseUrl": ".",
-    "paths": {
-      "~/*": ["src/*"]
-    }
-  }
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM"],
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact",
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["vite/client"]
+  },
+  "include": ["src", "src/**/.neutron-*.d.ts"]
 }
 ```
+
+The `include` glob picks up Neutron's generated type files
+(`.neutron-routes.d.ts`, `.neutron-content.d.ts`), which are written on
+`neutron-ts dev` / `neutron-ts build`. Add path aliases under
+`compilerOptions.paths` if you want them — e.g. `"~/*": ["src/*"]`.
 
 ## Type Inference
 
