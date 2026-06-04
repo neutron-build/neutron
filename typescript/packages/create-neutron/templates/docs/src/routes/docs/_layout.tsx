@@ -40,9 +40,9 @@ export default function DocsLayout({
           <Sidebar tree={data.tree} />
         </nav>
       </aside>
-      <div class="docs-content">
+      <main class="docs-content">
         {children}
-      </div>
+      </main>
     </div>
   );
 }
