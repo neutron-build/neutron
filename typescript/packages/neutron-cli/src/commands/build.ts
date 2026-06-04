@@ -266,7 +266,11 @@ export async function build(): Promise<void> {
       ssr: {
         // Process these through Vite's SSR graph (deduped) instead of native
         // node resolution, so preact-render-to-string binds to the app's preact.
-        noExternal: ["preact", "preact/hooks", "preact-render-to-string", ...runtimeNoExternal],
+        // @neutron-build/core MUST share the SSR graph's preact too: its inline
+        // components (e.g. Link) use hooks, and if core resolves preact natively
+        // while the renderer/route components use the SSR-graph copy, the hooks
+        // dispatcher is unset and pre-render crashes ("reading '__H'").
+        noExternal: ["preact", "preact/hooks", "preact-render-to-string", "@neutron-build/core", ...runtimeNoExternal],
       },
       server: {
         middlewareMode: true,

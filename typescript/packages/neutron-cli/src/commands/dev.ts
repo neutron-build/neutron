@@ -97,7 +97,9 @@ export async function dev(): Promise<void> {
         dedupe: ["preact", "preact/hooks", "preact/jsx-runtime", "preact/compat"],
       },
       ssr: {
-        noExternal: ["preact", "preact/hooks", "preact-render-to-string", ...runtimeNoExternal],
+        // @neutron-build/core shares the SSR graph's preact too, so its inline
+        // hook components (e.g. Link) don't crash dev SSR with "reading '__H'".
+        noExternal: ["preact", "preact/hooks", "preact-render-to-string", "@neutron-build/core", ...runtimeNoExternal],
       },
       server: {
         port,
