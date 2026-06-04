@@ -3,14 +3,14 @@ title: Content API
 description: API reference for content collections.
 ---
 
-Available from `neutron/content`.
+Available from `@neutron-build/core/content`.
 
 ## `defineCollection`
 
 Defines a collection schema in `src/content/config.ts`.
 
 ```ts
-import { defineCollection, z } from "neutron/content";
+import { defineCollection, z } from "@neutron-build/core/content";
 
 const blog = defineCollection({
   schema: z.object({ /* ... */ })
@@ -40,5 +40,5 @@ const post = await getEntry("blog", "hello-world");
 Re-export of the Zod library for schema definition.
 
 ```ts
-import { z } from "neutron/content";
+import { z } from "@neutron-build/core/content";
 ```

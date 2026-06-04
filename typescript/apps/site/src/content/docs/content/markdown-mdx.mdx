@@ -25,11 +25,11 @@ Here is an interactive counter:
 
 ## Querying Content
 
-To use your content, import helper functions from `neutron/content`.
+To use your content, import helper functions from `@neutron-build/core/content`.
 
 ```tsx
 // src/routes/blog/index.tsx
-import { getCollection } from "neutron/content";
+import { getCollection } from "@neutron-build/core/content";
 
 export async function loader() {
   // Get all blog posts that aren't drafts
@@ -45,7 +45,7 @@ export async function loader() {
 
 ```tsx
 // src/routes/blog/[slug].tsx
-import { getEntry } from "neutron/content";
+import { getEntry } from "@neutron-build/core/content";
 
 export async function loader({ params }) {
   const entry = await getEntry("blog", params.slug);

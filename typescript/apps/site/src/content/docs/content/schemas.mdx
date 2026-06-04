@@ -8,7 +8,7 @@ Neutron uses [Zod](https://zod.dev/) to validate the frontmatter of your content
 ## Common Validators
 
 ```ts
-import { z } from "neutron/content";
+import { z } from "@neutron-build/core/content";
 
 // Strings
 z.string()
@@ -34,4 +34,4 @@ z.enum(["red", "green", "blue"])
 
 ## Build Errors
 
-If a content file does not match the schema, `neutron build` will fail with a helpful error message pointing to the specific file and field that is invalid. This prevents broken pages from ever reaching production.
+If a content file does not match the schema, `neutron-ts build` will fail with a helpful error message pointing to the specific file and field that is invalid. This prevents broken pages from ever reaching production.

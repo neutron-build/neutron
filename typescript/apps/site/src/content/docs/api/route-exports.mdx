@@ -63,27 +63,27 @@ export function headers({ loaderHeaders, parentHeaders }) {
 }
 ```
 
-## `meta`
+## `head`
 
-**Optional**. Function to set meta tags in the `<head>`.
+**Optional**. Function to set the document `<head>` — title, meta tags, and
+`<link>` tags. It receives the route's `data` (plus `params`, `pathname`,
+`request`, `context`) and returns an SEO object.
 
 ```tsx
-export function meta({ data }) {
-  return [
-    { title: data.post.title },
-    { name: "description", content: "..." },
-  ];
+export function head({ data }) {
+  return {
+    title: data.post.title,
+    description: data.post.excerpt,
+    canonical: `https://example.com/blog/${data.post.slug}`,
+    openGraph: { image: data.post.cover },
+    // Arbitrary <link> tags: favicon, preconnect, manifest, alternate…
+    link: { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
+  };
 }
 ```
 
-## `links`
-
-**Optional**. Function to add `<link>` tags (stylesheets, preloads).
-
-```tsx
-export function links() {
-  return [
-    { rel: "stylesheet", href: "/styles.css" },
-  ];
-}
-```
+Supported fields: `title`, `titleTemplate` (e.g. `"%s — My Site"`, usually set on
+a layout so child routes inherit it), `description`, `canonical`, `keywords`,
+`noindex`, `openGraph`, `twitter`, `jsonLd`, `link`, `headScripts`, `htmlAttrs`,
+`bodyAttrs`. A layout's `head()` and a route's `head()` merge — the route wins
+per field, while `link`, `headScripts`, and `jsonLd` are concatenated.
