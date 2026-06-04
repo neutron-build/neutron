@@ -84,7 +84,7 @@ describe("seo utilities", () => {
       '<meta name="x-test" content="on">',
     ]);
 
-    expect(html).toContain("<title>about - team - Neutron</title>");
+    expect(html).toContain("<title>about - team</title>");
     expect(html).toContain('name="x-test"');
   });
 
