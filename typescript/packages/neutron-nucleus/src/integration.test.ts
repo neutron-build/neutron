@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// @neutron/nucleus — integration tests
+// @neutron-build/nucleus — integration tests
 //
 // These tests verify end-to-end wiring of the Nucleus client:
 // - Connection flow (transport -> feature detection -> plugin init)
