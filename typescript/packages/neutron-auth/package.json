@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/auth",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Auth middleware for Neutron. Better Auth and Auth.js adapters with protected route helpers.",
   "author": "Tyler",
   "license": "MIT",
@@ -35,7 +35,7 @@
     "test": "pnpm run build && node --test --experimental-test-isolation=none dist/index.test.js"
   },
   "dependencies": {
-    "@neutron-build/core": "workspace:*"
+    "@neutron-build/core": "workspace:^"
   },
   "peerDependencies": {
     "better-auth": "*",

@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/ops",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Observability middleware for Neutron. Request tracing, health checks, and structured JSON logging.",
   "author": "Tyler",
   "license": "MIT",
@@ -35,7 +35,7 @@
     "test": "pnpm run build && node --test --experimental-test-isolation=none dist/index.test.js"
   },
   "dependencies": {
-    "@neutron-build/core": "workspace:*"
+    "@neutron-build/core": "workspace:^"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",

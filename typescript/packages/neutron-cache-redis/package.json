@@ -1,6 +1,6 @@
 {
   "name": "@neutron-build/cache-redis",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Redis and Dragonfly cache store for Neutron. Distributed app and loader caching.",
   "author": "Tyler",
   "license": "MIT",
@@ -35,7 +35,7 @@
     "test": "pnpm run build && node --test --experimental-test-isolation=none dist/index.test.js"
   },
   "dependencies": {
-    "@neutron-build/core": "workspace:*"
+    "@neutron-build/core": "workspace:^"
   },
   "peerDependencies": {
     "ioredis": "^5.8.1"
