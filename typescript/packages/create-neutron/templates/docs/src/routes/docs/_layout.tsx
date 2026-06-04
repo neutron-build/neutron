@@ -1,3 +1,4 @@
+import type { ComponentChildren } from "preact";
 import { getCollection } from "@neutron-build/core/content";
 import { buildSidebarTree } from "../../lib/sidebar";
 import { Sidebar } from "../../components/Sidebar";
@@ -25,7 +26,7 @@ export default function DocsLayout({
   children,
 }: {
   data: { entries: any[]; tree: any[] };
-  children?: unknown;
+  children?: ComponentChildren;
 }) {
   return (
     <div class="docs-layout">

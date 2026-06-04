@@ -624,3 +624,66 @@ describe("template package.json integrity", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Template DX guards — keep the scaffolded project TypeScript-clean and friendly.
+// ---------------------------------------------------------------------------
+
+describe("template DX files", () => {
+  const testDir2 = path.dirname(fileURLToPath(import.meta.url));
+  const templatesDir2 = path.join(testDir2, "..", "templates");
+
+  it("ships a README.md in every template", () => {
+    for (const name of TEMPLATE_NAMES) {
+      assert.ok(
+        fs.existsSync(path.join(templatesDir2, name, "README.md")),
+        `template ${name} is missing README.md`,
+      );
+    }
+  });
+
+  it("ships src/neutron-env.d.ts declaring the routes virtual module", () => {
+    for (const name of TEMPLATE_NAMES) {
+      const p = path.join(templatesDir2, name, "src", "neutron-env.d.ts");
+      assert.ok(fs.existsSync(p), `template ${name} is missing src/neutron-env.d.ts`);
+      const src = fs.readFileSync(p, "utf8");
+      assert.ok(
+        /declare module ["']virtual:neutron\/routes["']/.test(src),
+        `template ${name} env.d.ts does not declare virtual:neutron/routes`,
+      );
+    }
+  });
+
+  it("tsconfig include picks up the generated .neutron-*.d.ts files", () => {
+    // TypeScript's wildcard include skips dot-prefixed files, so the generated
+    // route/content type files must be globbed explicitly or tsc ignores them.
+    for (const name of TEMPLATE_NAMES) {
+      const tsconfig = JSON.parse(
+        fs.readFileSync(path.join(templatesDir2, name, "tsconfig.json"), "utf8"),
+      );
+      const include: string[] = tsconfig.include ?? [];
+      assert.ok(
+        include.some((g) => g.includes(".neutron-")),
+        `template ${name} tsconfig.include must glob .neutron-*.d.ts (has: ${JSON.stringify(include)})`,
+      );
+    }
+  });
+
+  it("layouts type children as ComponentChildren, not unknown", () => {
+    const layoutFiles: string[] = [];
+    const walk = (dir: string) => {
+      if (!fs.existsSync(dir)) return;
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (e.name === "_layout.tsx") layoutFiles.push(p);
+      }
+    };
+    for (const name of TEMPLATE_NAMES) walk(path.join(templatesDir2, name, "src", "routes"));
+    assert.ok(layoutFiles.length > 0, "expected at least one _layout.tsx across templates");
+    for (const file of layoutFiles) {
+      const src = fs.readFileSync(file, "utf8");
+      assert.ok(!/children\?:\s*unknown/.test(src), `layout types children as unknown: ${file}`);
+    }
+  });
+});
