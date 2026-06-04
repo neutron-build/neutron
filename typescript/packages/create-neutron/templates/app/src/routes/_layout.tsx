@@ -1,4 +1,5 @@
-export default function Layout(props: { children?: unknown }) {
+import type { ComponentChildren } from "preact";
+export default function Layout(props: { children?: ComponentChildren }) {
   return (
     <div style="max-width: 900px; margin: 0 auto; padding: 2rem; font-family: system-ui, sans-serif;">
       <header style="margin-bottom: 1.5rem;">

@@ -2,6 +2,49 @@
 
 All notable changes to this project are documented in this file.
 
+## [create-neutron 0.1.2 / core 0.1.2 / cli 0.1.3] - 2026-06-04
+
+> DX-quality pass: scaffolded projects now typecheck clean, build with no
+> sourcemap warnings, and ship a README. Republishes `create-neutron` (0.1.2),
+> `@neutron-build/core` (0.1.2), `@neutron-build/cli` (0.1.3).
+
+### Fixed
+
+- **Scaffolds did not typecheck out of the box.** A fresh project showed
+  TypeScript errors on first open:
+  - `Cannot find module 'virtual:neutron/routes'` — templates now ship
+    `src/neutron-env.d.ts` declaring the Vite virtual module (typed as exactly
+    `registerRoutes`'s parameter, so it can't drift).
+  - `_layout` props typed `children` as `unknown` — now `ComponentChildren`.
+  - The generated `.neutron-*.d.ts` type files were invisible to `tsc`:
+    TypeScript's wildcard `include` skips dot-prefixed files, so the template
+    `tsconfig.json` now globs `src/**/.neutron-*.d.ts`.
+- **Content-collection types never applied (`@neutron-build/core`).** The
+  content type generator emitted `declare module "neutron/content"` (a stale
+  pre-rename specifier) and omitted a trailing `export {}`, so the
+  `ContentCollectionMap` augmentation neither targeted the real module nor
+  merged into it — `getEntry()`/`getCollection()` returned `unknown`. Now
+  targets `@neutron-build/core/content` and emits `export {}`, so content data
+  is properly typed.
+- **Sourcemap warnings on every build (`@neutron-build/core`).** Published maps
+  referenced `src/*.ts` files not shipped in the package, so consumers saw ~17
+  "points to missing source files" warnings per build. Maps now embed their
+  sources (`inlineSources`).
+
+### Changed
+
+- **`@neutron-build/cli` now depends on `@neutron-build/core` via caret (`^`).**
+  `workspace:*` rewrote to an exact pin, so every core patch forced a cli
+  republish and could install two core copies (re-triggering the preact-instance
+  crash). Now `^0.1.x`.
+- **Every template ships a `README.md`** (commands, project structure, docs link).
+
+### Testing
+
+- create-neutron regression tests now also assert: each template has a
+  `README.md` and `src/neutron-env.d.ts`, the tsconfig globs the generated
+  `.neutron-*.d.ts` files, and no layout types `children` as `unknown`.
+
 ## [0.1.1 / cli 0.1.2] - 2026-06-04
 
 > Patch wave fixing first-run-experience and SSR bugs found by smoke-testing the

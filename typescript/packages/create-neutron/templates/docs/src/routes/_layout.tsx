@@ -1,3 +1,4 @@
+import type { ComponentChildren } from "preact";
 import "../styles/docs.css";
 import { Island, ViewTransitions } from "@neutron-build/core/client";
 import { ThemeToggle } from "../components/ThemeToggle";
@@ -16,7 +17,7 @@ export function head() {
   };
 }
 
-export default function RootLayout({ children }: { children?: unknown }) {
+export default function RootLayout({ children }: { children?: ComponentChildren }) {
   return (
     <div class="docs-app">
       <ViewTransitions />
