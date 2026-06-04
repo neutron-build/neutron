@@ -7,7 +7,7 @@ Static rendering is the default mode in Neutron. It offers the best possible per
 
 ## How It Works
 
-When you run `neutron build`, the framework:
+When you run `neutron-ts build`, the framework:
 1.  Discovers all static routes.
 2.  Executes their `loader` functions (if any) to fetch data.
 3.  Renders the component tree to an HTML string.
@@ -28,7 +28,7 @@ This ensures:
 You can still use data in static routes via `loader` functions. The difference is that this data is fetched **once at build time**, not on every request.
 
 ```tsx
-// Fetched once during 'neutron build'
+// Fetched once during 'neutron-ts build'
 export async function loader() {
   const posts = await db.posts.findMany();
   return { posts };
