@@ -130,6 +130,9 @@ is ~202K LOC; this is an honest checkpoint, not a claim of completeness.
   dedup kept as a release safety-net.
 - **F-037 COPY FROM STDIN unbounded allocation** (`wire/mod.rs`, DoS). → cap the accumulated
   buffer at 512 MB and error (program_limit_exceeded).
+- **F-038 MemoryBudget::try_allocate check-then-act race** (`allocator/mod.rs`). Concurrent
+  callers could both pass the check and over-allocate past the limit. → CAS loop that checks
+  and reserves atomically (also `saturating_add` against overflow).
 
 ### False positives confirmed (no change)
 
