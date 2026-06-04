@@ -1,0 +1,235 @@
+---
+title: Deployment
+description: Production deployment with graceful shutdown, health checks, and Docker.
+---
+
+## Production Server
+
+```rust
+use neutron::Neutron;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let app = Neutron::new()
+        .router(router)
+        .shutdown_timeout(Duration::from_secs(30))
+        .on_shutdown(|| async { /* flush metrics, close connections */ })
+        .max_connections(10_000)
+        .workers(std::thread::available_parallelism()?.get())
+        .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .listen("0.0.0.0:8080".parse()?)
+        .await?;
+
+    Ok(())
+}
+```
+
+## Graceful Shutdown
+
+Neutron handles `SIGINT` and `SIGTERM` automatically:
+
+1. Stop accepting new connections
+2. Run pre-shutdown hooks in order
+3. Drain active connections (up to `shutdown_timeout`)
+4. Exit cleanly
+
+### Custom Shutdown Signal
+
+```rust
+let (tx, rx) = tokio::sync::oneshot::channel();
+
+Neutron::new()
+    .router(router)
+    .shutdown_signal(async move { rx.await.ok(); })
+    .serve(8080)
+    .await?;
+
+// Later: tx.send(()) triggers shutdown
+```
+
+## Health Checks
+
+Two built-in endpoints:
+
+| Endpoint | Purpose | Response |
+|----------|---------|----------|
+| `GET /healthz` | Liveness probe | Always `200 OK` |
+| `GET /readyz` | Readiness probe | Runs all registered checks |
+
+### Register Checks
+
+```rust
+use neutron::health::HealthCheck;
+
+let health = HealthCheck::new()
+    .check("database", || async {
+        pool.execute("SELECT 1").await.map(|_| ())
+    })
+    .check("redis", || async {
+        redis.ping().await
+    })
+    .timeout(Duration::from_secs(5));
+
+let app = Neutron::new()
+    .router(router)
+    .health(health);
+```
+
+### Response Format
+
+```json
+{
+    "status": "healthy",
+    "checks": {
+        "database": { "status": "pass", "duration_ms": 2 },
+        "redis": { "status": "pass", "duration_ms": 1 }
+    }
+}
+```
+
+If any check fails, status is `"unhealthy"` and HTTP status is `503`.
+
+## HTTP/2 Configuration
+
+```rust
+use neutron::Http2Config;
+
+Neutron::new()
+    .router(router)
+    .http2(Http2Config {
+        initial_stream_window_size: 2 * 1024 * 1024,
+        initial_connection_window_size: 4 * 1024 * 1024,
+        max_concurrent_streams: 200,
+        adaptive_window: true,
+        keep_alive_interval: Some(Duration::from_secs(20)),
+        ..Default::default()
+    })
+    .serve(8080)
+    .await?;
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HOST` | `127.0.0.1` | Bind address |
+| `PORT` | `3000` | Listen port |
+| `DATABASE_URL` | — | Nucleus/PostgreSQL connection string |
+| `LOG_LEVEL` | `info` | Tracing filter (`trace`, `debug`, `info`, `warn`, `error`) |
+| `LOG_FORMAT` | `json` | Log format (`json` or `pretty`) |
+
+## Docker
+
+```dockerfile
+# Build stage
+FROM rust:1.77-slim AS builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release --bin myapp
+
+# Runtime stage
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/myapp /usr/local/bin/
+EXPOSE 8080
+ENV HOST=0.0.0.0 PORT=8080
+CMD ["myapp"]
+```
+
+### Docker Compose
+
+```yaml
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://nucleus:5432/mydb
+      LOG_LEVEL: info
+    depends_on:
+      nucleus:
+        condition: service_healthy
+
+  nucleus:
+    image: ghcr.io/neutron-build/nucleus:latest
+    ports:
+      - "5432:5432"
+    volumes:
+      - nucleus_data:/var/lib/nucleus
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  nucleus_data:
+```
+
+## systemd
+
+```ini
+[Unit]
+Description=My Neutron App
+After=network.target
+
+[Service]
+Type=simple
+User=myapp
+ExecStart=/usr/local/bin/myapp
+Environment=HOST=0.0.0.0
+Environment=PORT=8080
+Environment=DATABASE_URL=postgres://localhost:5432/mydb
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## Kubernetes
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: myapp
+          image: myapp:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: url
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+```

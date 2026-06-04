@@ -1,0 +1,75 @@
+---
+title: Rust Framework
+description: Async web framework built on hyper, Tokio, and Nucleus.
+---
+
+Neutron for Rust is a lightweight async web framework built on hyper 1.0 and Tokio. Type-safe extractors, composable middleware, and built-in auth — with first-class Nucleus integration.
+
+## Features
+
+- **Fast** — 681ns plaintext, 1.57μs JSON, trie-based routing (277ns lookup with 500 routes)
+- **Type-safe** — Extractors for Path, Query, Json, Form, State, Extension
+- **Composable** — Tower-style middleware with zero-allocation chain building
+- **Full-stack** — JWT, OAuth, WebSocket, SSE, PubSub, sessions, CSRF built in
+- **Feature-gated** — Use only what you need (bare core, web, or full)
+
+## Hello World
+
+```rust
+use neutron::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let router = Router::new()
+        .get("/", || async { "Hello, Neutron!" })
+        .get("/users/:id", get_user);
+
+    Neutron::new().router(router).serve(3000).await
+}
+
+async fn get_user(Path(id): Path<u64>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "id": id, "name": "Alice" }))
+}
+```
+
+## Crate Architecture
+
+| Crate | Purpose |
+|-------|---------|
+| `neutron` | Core framework (router, extractors, middleware, auth, real-time) |
+| `neutron-cli` | CLI for scaffolding, dev server, build |
+| `neutron-cache` | Tiered L1/L2 cache (in-process + Redis) |
+| `neutron-redis` | Redis sessions, rate limiting, HTTP cache |
+| `neutron-oauth` | OAuth2/OIDC with PKCE |
+| `neutron-webauthn` | Passkey/FIDO2 authentication |
+| `neutron-jobs` | Background jobs + cron scheduling |
+| `neutron-graphql` | GraphQL HTTP + WebSocket transport |
+| `neutron-otel` | OpenTelemetry OTLP/JSON tracing |
+| `neutron-storage` | S3/R2/GCS with SigV4 signing |
+| `neutron-smtp` | Transactional email via SMTP |
+| `neutron-stripe` | Stripe payments + webhook verification |
+
+## Feature Tiers
+
+```toml
+# Minimal — just router + extractors
+neutron-rs = { version = "0.1", default-features = false }
+
+# Web — standard API server
+neutron-rs = { version = "0.1", features = ["web"] }
+
+# Full — batteries included
+neutron-rs = { version = "0.1" }  # default = "full"
+```
+
+> Published on crates.io as `neutron-rs` (the bare `neutron` name is taken). The
+> library is imported as `neutron` — you write `neutron-rs = "0.1"` in
+> `Cargo.toml` but `use neutron::...` in your code.
+
+## Built On
+
+- [hyper 1.0](https://hyper.rs) — HTTP/1.1 and HTTP/2
+- [Tokio](https://tokio.rs) — Async runtime
+- [matchit](https://docs.rs/matchit) — Compressed radix tree router
+- [fastwebsockets](https://docs.rs/fastwebsockets) — WebSocket
+- [serde](https://serde.rs) — Serialization

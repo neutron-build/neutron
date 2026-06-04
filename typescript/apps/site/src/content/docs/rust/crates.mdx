@@ -1,0 +1,180 @@
+---
+title: Crate Reference
+description: All Neutron Rust crates and their features.
+---
+
+The Neutron Rust ecosystem is organized as a Cargo workspace with feature-gated crates. Use only what you need.
+
+## Core
+
+### neutron
+
+The main framework crate. Three feature tiers:
+
+```toml
+# Minimal — router + extractors only
+neutron-rs = { version = "0.1", default-features = false }
+
+# Web — standard API features
+neutron-rs = { version = "0.1", features = ["web"] }
+
+# Full — everything (default)
+neutron-rs = "0.1"
+```
+
+**Includes:** Router, extractors (Path, Query, Json, Form, State, Extension), middleware chain, HTTP/1.1 + HTTP/2, TLS, graceful shutdown.
+
+### neutron-cli
+
+CLI for project scaffolding and development:
+
+```bash
+neutron-rs new my-app          # Scaffold project
+neutron-rs dev --port 3000     # Dev server with auto-restart
+neutron-rs build               # Release build
+neutron-rs routes              # List routes
+neutron-rs check               # Fast validation
+```
+
+## Data & Caching
+
+### neutron-cache
+
+Tiered L1 (in-process) + L2 (Redis) cache:
+
+```toml
+neutron-cache = "0.1"                          # L1 only
+neutron-cache = { version = "0.1", features = ["redis"] }  # L1 + L2
+```
+
+### neutron-redis
+
+Redis integration for sessions, rate limiting, and HTTP caching:
+
+```toml
+neutron-redis = "0.1"
+```
+
+## Authentication
+
+### neutron-oauth
+
+OAuth2/OIDC authorization code flow with PKCE:
+
+```toml
+neutron-oauth = "0.1"
+```
+
+Built-in providers: GitHub, Google, custom. Handlers: `oauth_redirect_handler`, `oauth_callback_handler`.
+
+### neutron-webauthn
+
+WebAuthn/FIDO2 passkey authentication:
+
+```toml
+neutron-webauthn = "0.1"
+```
+
+P-256 ECDSA signature verification for passwordless login.
+
+## Backend Services
+
+### neutron-jobs
+
+Background job queue with cron scheduling:
+
+```toml
+neutron-jobs = "0.1"                              # In-memory queue
+neutron-jobs = { version = "0.1", features = ["redis"] }      # Redis backend
+neutron-jobs = { version = "0.1", features = ["postgres"] }   # PostgreSQL backend
+```
+
+### neutron-graphql
+
+GraphQL HTTP transport with WebSocket subscriptions:
+
+```toml
+neutron-graphql = "0.1"
+```
+
+## Observability
+
+### neutron-otel
+
+OpenTelemetry OTLP/JSON tracing:
+
+```toml
+neutron-otel = "0.1"
+```
+
+Distributed tracing with trace IDs, span propagation, and JSON export.
+
+## Integrations
+
+### neutron-storage
+
+S3-compatible object storage (AWS S3, Cloudflare R2, GCS):
+
+```toml
+neutron-storage = "0.1"
+```
+
+SigV4 request signing included.
+
+### neutron-smtp
+
+Transactional email via SMTP:
+
+```toml
+neutron-smtp = "0.1"
+```
+
+Built on lettre.
+
+### neutron-stripe
+
+Stripe payments and webhook verification:
+
+```toml
+neutron-stripe = "0.1"
+```
+
+HMAC-SHA256 webhook signature validation, payment intent handling.
+
+## Dependency Graph
+
+```
+neutron (core)
+├── tokio, hyper, http, bytes, serde
+
+neutron-cache
+├── (optional: redis)
+
+neutron-redis
+├── neutron, redis, tokio
+
+neutron-oauth
+├── neutron, rustls, hmac, sha2
+
+neutron-webauthn
+├── serde, sha2, rand, p256
+
+neutron-jobs
+├── neutron, tokio, serde
+├── (optional: redis, tokio-postgres)
+
+neutron-graphql
+├── neutron, fastwebsockets, serde
+
+neutron-otel
+├── tokio, tracing, serde_json
+
+neutron-storage
+├── sha2, hmac, rustls
+
+neutron-smtp
+├── lettre, tokio
+
+neutron-stripe
+├── hmac, sha2, serde
+```

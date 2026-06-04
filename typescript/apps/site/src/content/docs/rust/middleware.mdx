@@ -1,0 +1,135 @@
+---
+title: Middleware
+description: Composable middleware stack with built-in essentials.
+---
+
+Neutron middleware wraps request/response processing. Middleware is composable, scoped to routers, and zero-allocation at startup.
+
+## Using Middleware
+
+```rust
+let router = Router::new()
+    .middleware(Logger)
+    .middleware(RequestId::new())
+    .middleware(Timeout::from_secs(30))
+    .get("/", handler);
+```
+
+Order matters — middleware executes top-to-bottom on request, bottom-to-top on response.
+
+## Writing Custom Middleware
+
+Any async function matching `(Request, Next) -> Response` is middleware:
+
+```rust
+async fn timing(req: Request, next: Next) -> Response {
+    let start = std::time::Instant::now();
+    let mut resp = next.run(req).await;
+    resp.headers_mut().insert(
+        "x-response-time",
+        format!("{}ms", start.elapsed().as_millis()).parse().unwrap(),
+    );
+    resp
+}
+
+let router = Router::new()
+    .middleware(timing)
+    .get("/", handler);
+```
+
+## Scoped Middleware
+
+Middleware applied to a nested router only affects its routes:
+
+```rust
+let public = Router::new()
+    .get("/health", health);
+
+let api = Router::new()
+    .middleware(JwtAuth::new(config))    // Only applies to /api/*
+    .get("/items", list_items);
+
+let router = Router::new()
+    .middleware(Logger)                  // Applies to all routes
+    .nest("/api", api)
+    .merge(public);
+```
+
+## Recommended Stack
+
+The 10-layer middleware stack in recommended order:
+
+```rust
+let router = Router::new()
+    // 1. Panic recovery → 500
+    .middleware(CatchPanic::new())
+    // 2. Request logging
+    .middleware(Logger)
+    // 3. Unique request IDs
+    .middleware(RequestId::new())
+    // 4. Request timeout
+    .middleware(Timeout::from_secs(30))
+    // 5. CORS headers
+    .middleware(CORS::new().allow_any_origin())
+    // 6. Security headers
+    .middleware(Helmet::new())
+    // 7. Rate limiting
+    .middleware(RateLimiter::new(100, Duration::from_secs(60)))
+    // 8. Body size limit
+    .middleware(BodyLimit::new(2 * 1024 * 1024))  // 2MB
+    // 9. Response compression
+    .middleware(Compress::new())
+    // 10. Your routes
+    .get("/", handler);
+```
+
+## Built-In Middleware
+
+### Logging & Observability
+
+| Middleware | Feature | Description |
+|-----------|---------|-------------|
+| `Logger` | `logging` | Request method, path, status, duration |
+| `RequestId::new()` | `request-id` | X-Request-ID header generation |
+| `TracingLayer::new()` | `tracing-mw` | OpenTelemetry distributed tracing |
+| `Metrics::new()` | `metrics` | Prometheus-compatible metrics |
+
+### Security
+
+| Middleware | Feature | Description |
+|-----------|---------|-------------|
+| `Helmet::new()` | `helmet` | HSTS, CSP, X-Frame-Options, etc. |
+| `CORS::new()` | `cors` | Cross-origin resource sharing |
+| `CsrfLayer::new(key)` | `cookie` | CSRF token validation |
+| `JwtAuth::new(config)` | `jwt` | JWT Bearer token validation |
+| `SessionLayer::new(store, key)` | `cookie` | Server-side sessions |
+
+### Performance
+
+| Middleware | Feature | Description |
+|-----------|---------|-------------|
+| `Compress::new()` | `compress` | Gzip/Brotli response compression |
+| `ResponseCache::new(100)` | `cache` | In-memory response caching with TTL |
+| `Deduplicate::new()` | `dedup` | Coalesce duplicate in-flight requests |
+| `RateLimiter::new(n, dur)` | `rate-limit` | Token bucket rate limiting |
+| `CircuitBreaker::new()` | `circuit-breaker` | Circuit breaker pattern |
+
+### Safety
+
+| Middleware | Feature | Description |
+|-----------|---------|-------------|
+| `CatchPanic::new()` | `catch-panic` | Convert panics to 500 responses |
+| `Timeout::from_secs(n)` | `timeout` | Per-request timeout |
+| `BodyLimit::new(bytes)` | `body-limit` | Request body size limit |
+| `HealthCheck::new()` | `health` | GET /health endpoint |
+
+## Middleware Trait
+
+For stateful middleware, implement the trait directly:
+
+```rust
+pub trait MiddlewareTrait: Send + Sync {
+    fn call(&self, req: Request, next: Next)
+        -> Pin<Box<dyn Future<Output = Response> + Send>>;
+}
+```

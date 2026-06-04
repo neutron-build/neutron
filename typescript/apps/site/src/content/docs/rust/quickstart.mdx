@@ -1,0 +1,103 @@
+---
+title: Quickstart
+description: Create and run a Rust API server in minutes.
+---
+
+## Install the CLI
+
+```bash
+cargo install neutron-cli
+```
+
+## Create a Project
+
+```bash
+# Basic API server
+neutron-rs new my-api
+
+# With template
+neutron-rs new my-api --template api      # REST API
+neutron-rs new my-api --template graphql   # GraphQL
+neutron-rs new my-api --template jobs      # Background workers
+neutron-rs new my-api --template full      # Everything
+```
+
+## Project Structure
+
+```
+my-api/
+├── Cargo.toml
+├── src/
+│   └── main.rs
+└── .env
+```
+
+## Your First App
+
+```rust
+use neutron::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let router = Router::new()
+        .middleware(Logger)
+        .middleware(RequestId::new())
+        .get("/", || async { "Hello, Neutron!" })
+        .get("/health", || async {
+            Json(serde_json::json!({ "status": "ok" }))
+        })
+        .get("/users/:id", get_user)
+        .post("/users", create_user);
+
+    Neutron::new().router(router).serve(3000).await
+}
+
+async fn get_user(Path(id): Path<u64>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "id": id, "name": "Alice" }))
+}
+
+async fn create_user(Json(body): Json<serde_json::Value>) -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::CREATED, Json(serde_json::json!({ "created": body })))
+}
+```
+
+## Run
+
+```bash
+# Development (auto-restart on changes)
+neutron-rs dev
+
+# With custom port
+neutron-rs dev --port 8080
+
+# Production build
+neutron-rs build
+```
+
+## CLI Commands
+
+| Command | Description |
+|---------|-------------|
+| `neutron-rs new <name>` | Scaffold a new project |
+| `neutron-rs dev` | Start dev server with auto-restart |
+| `neutron-rs build` | Release build with size reporting |
+| `neutron-rs check` | Fast validation (cargo check) |
+| `neutron-rs routes` | List registered routes |
+
+## Test It
+
+```bash
+# Plaintext
+curl http://localhost:3000/
+
+# JSON
+curl http://localhost:3000/health
+
+# Path params
+curl http://localhost:3000/users/42
+
+# POST JSON
+curl -X POST http://localhost:3000/users \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Bob", "email": "bob@example.com"}'
+```
