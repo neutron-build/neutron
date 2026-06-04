@@ -861,10 +861,22 @@ impl GraphStore {
             }
 
             for (neighbor, edge) in self.neighbors(current, direction, None) {
-                let weight = match edge.properties.get(weight_property) {
+                let raw_weight = match edge.properties.get(weight_property) {
                     Some(PropValue::Float(w)) => *w,
                     Some(PropValue::Int(w)) => *w as f64,
                     _ => 1.0,
+                };
+                // Dijkstra requires non-negative weights; a negative edge would
+                // yield an incorrect shortest path. Clamp to 0 and warn rather than
+                // silently returning a wrong result (use Bellman-Ford for negatives).
+                let weight = if raw_weight < 0.0 {
+                    tracing::warn!(
+                        target: "nucleus::graph",
+                        "dijkstra: negative edge weight {raw_weight} clamped to 0 (use Bellman-Ford for graphs with negative weights)"
+                    );
+                    0.0
+                } else {
+                    raw_weight
                 };
                 let new_dist = current_dist + weight;
                 if new_dist < *dist.get(&neighbor).unwrap_or(&f64::MAX) {

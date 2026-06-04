@@ -1551,8 +1551,18 @@ impl CopyHandler for NucleusHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // Cap the accumulated COPY buffer so a client streaming CopyData forever
+        // can't drive unbounded memory growth (DoS).
+        const MAX_COPY_BUFFER: usize = 512 * 1024 * 1024; // 512 MB
         let peer_addr = client.socket_addr();
         if let Some(state) = self.copy_state.lock().get_mut(&peer_addr) {
+            if state.data.len().saturating_add(copy_data.data.len()) > MAX_COPY_BUFFER {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "54000".to_owned(), // program_limit_exceeded
+                    format!("COPY data exceeds the {MAX_COPY_BUFFER}-byte buffer limit"),
+                ))));
+            }
             state.data.extend_from_slice(&copy_data.data);
         }
         Ok(())

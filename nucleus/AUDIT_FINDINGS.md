@@ -123,6 +123,13 @@ is ~202K LOC; this is an honest checkpoint, not a claim of completeness.
 - **F-034 Streams WAL snapshot wipes data before validating** (`pubsub/streams_wal.rs`). A
   corrupt SNAPSHOT cleared all recovered state, then failed. → parse into a temp map, swap
   in only on success.
+- **F-035 Dijkstra silently wrong on negative weights** (`graph/mod.rs`). → clamp negatives
+  to 0 + warn (Dijkstra requires non-negative; Bellman-Ford needed for negatives).
+- **F-036 FTS merge_segments silent posting loss** (`fts/mod.rs`). `dedup_by_key` dropped
+  duplicate-doc_id postings. → `debug_assert` to catch the upstream re-indexing bug early;
+  dedup kept as a release safety-net.
+- **F-037 COPY FROM STDIN unbounded allocation** (`wire/mod.rs`, DoS). → cap the accumulated
+  buffer at 512 MB and error (program_limit_exceeded).
 
 ### False positives confirmed (no change)
 
