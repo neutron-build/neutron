@@ -23,7 +23,7 @@ app/
 ## Navigation
 
 ```tsx
-import { useRouter, useParams, usePathname } from '@neutron/native/router';
+import { useRouter, useParams, usePathname } from '@neutron-build/native/router';
 
 function HomeScreen() {
     const router = useRouter();
@@ -69,7 +69,7 @@ Push/pop navigation with slide animations:
 
 ```tsx
 // app/_layout.tsx
-import { Stack } from '@neutron/native/navigation';
+import { Stack } from '@neutron-build/native/navigation';
 
 export default function Layout() {
     return (
@@ -92,7 +92,7 @@ Features:
 Bottom tab bar navigation:
 
 ```tsx
-import { Tabs } from '@neutron/native/navigation';
+import { Tabs } from '@neutron-build/native/navigation';
 
 export default function Layout() {
     return (
@@ -116,7 +116,7 @@ Features:
 Slide-in sidebar navigation:
 
 ```tsx
-import { Drawer } from '@neutron/native/navigation';
+import { Drawer } from '@neutron-build/native/navigation';
 
 export default function Layout() {
     return (
@@ -139,7 +139,7 @@ Features:
 Full support for iOS URL schemes and Android intent filters:
 
 ```tsx
-import { initDeepLinks, handleDeepLink } from '@neutron/native/router';
+import { initDeepLinks, handleDeepLink } from '@neutron-build/native/router';
 
 // Register listener on app startup
 initDeepLinks();
@@ -153,7 +153,7 @@ handleDeepLink('myapp://users/42');
 Navigate declaratively:
 
 ```tsx
-import { Link } from '@neutron/native';
+import { Link } from '@neutron-build/native';
 
 <Link href="/about">
     <Text>Go to About</Text>

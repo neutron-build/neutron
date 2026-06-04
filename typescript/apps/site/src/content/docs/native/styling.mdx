@@ -28,7 +28,7 @@ The transformation happens at build time via Babel or Rspack — no runtime CSS 
 ```javascript
 // babel.config.js
 module.exports = {
-    plugins: ['@neutron/native-styling/babel-plugin'],
+    plugins: ['@neutron-build/native-styling/babel-plugin'],
 };
 ```
 
@@ -40,7 +40,7 @@ module.exports = {
     module: {
         rules: [{
             test: /\.[jt]sx?$/,
-            use: ['@neutron/native-styling/rspack-loader'],
+            use: ['@neutron-build/native-styling/rspack-loader'],
         }],
     },
 };
