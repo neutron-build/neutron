@@ -431,7 +431,17 @@ pub fn iter_tuples(page: &PageBuf) -> Vec<(u16, &[u8])> {
         if !entry.is_dead() {
             let off = entry.offset() as usize;
             let len = entry.length() as usize;
-            result.push((i, &page[off..off + len]));
+            // Defend against a corrupt slot whose offset/length would slice past
+            // the page and panic.
+            if off + len <= PAGE_SIZE {
+                result.push((i, &page[off..off + len]));
+            } else {
+                tracing::error!(
+                    target: "nucleus::storage::page",
+                    "corrupt slot {i}: tuple range {off}..{} exceeds page; skipped",
+                    off + len
+                );
+            }
         }
     }
     result

@@ -755,7 +755,18 @@ fn find_child(pg: &PageBuf, key: &[u8]) -> u32 {
     let mut prev_child = page::read_u32(pg, LEFTMOST_CHILD_OFFSET);
 
     for _ in 0..count {
+        if pos + 2 > PAGE_SIZE {
+            break;
+        }
         let key_len = page::read_u16(pg, pos) as usize;
+        // Defend against a corrupt key_len that would slice past the page.
+        if pos + 2 + key_len + 4 > PAGE_SIZE {
+            tracing::error!(
+                target: "nucleus::btree",
+                "corrupt internal page in find_child: entry at {pos} (key_len {key_len}) exceeds page"
+            );
+            break;
+        }
         let entry_key = &pg[pos + 2..pos + 2 + key_len];
         let child_offset = pos + 2 + key_len;
         let right_child = page::read_u32(pg, child_offset);
