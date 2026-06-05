@@ -3878,6 +3878,17 @@ async fn bench_vs_clickhouse(
 
 #[tokio::main]
 async fn main() {
+    // Apples-to-apples: disable Nucleus's query RESULT cache so repeated read
+    // queries measure raw per-query compute, not cache-hit latency — PostgreSQL,
+    // SQLite, and ClickHouse have no result cache on by default, so this puts
+    // every engine on equal footing. (Nucleus's plan cache and columnar O(1)
+    // count stay on — those are real engine features the competitors also have
+    // analogues for.) Must be set before any query runs (read once, memoized).
+    // SAFETY: single-threaded startup, before any worker thread is spawned.
+    unsafe {
+        std::env::set_var("NUCLEUS_DISABLE_QUERY_CACHE", "1");
+    }
+
     let cfg = Cfg::from_args();
 
     println!();

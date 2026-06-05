@@ -1459,6 +1459,21 @@ impl Executor {
         session.settings.read().get(key).cloned()
     }
 
+    /// Whether the query result cache is globally disabled via
+    /// `NUCLEUS_DISABLE_QUERY_CACHE=1`. Benchmarks set this to measure raw
+    /// per-query compute (apples-to-apples vs engines that have no result cache,
+    /// like PostgreSQL/SQLite) instead of cache-hit latency on repeated queries.
+    /// Read once and memoized.
+    fn query_cache_disabled() -> bool {
+        use std::sync::OnceLock;
+        static DISABLED: OnceLock<bool> = OnceLock::new();
+        *DISABLED.get_or_init(|| {
+            std::env::var("NUCLEUS_DISABLE_QUERY_CACHE")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false)
+        })
+    }
+
     /// Whether the given session is inside an active transaction (BEGIN issued,
     /// not yet COMMIT/ROLLBACK). The wire handler uses this to disable its
     /// autocommit fast paths inside a transaction: those paths bypass the
@@ -2673,7 +2688,9 @@ impl Executor {
                 // Only cache deterministic SELECT queries (no RANDOM(), NOW(), etc.)
                 // and only outside of transactions.
                 let sql_text = query.to_string();
-                let cacheable = !in_txn && Self::query_result_is_cacheable(&sql_text);
+                let cacheable = !in_txn
+                    && !Self::query_cache_disabled()
+                    && Self::query_result_is_cacheable(&sql_text);
                 if cacheable {
                     if let Some(cached) = self.query_cache_get(&sql_text) {
                         self.metrics.cache_hits.inc();
