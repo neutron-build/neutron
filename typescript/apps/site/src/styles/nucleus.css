@@ -5,6 +5,17 @@
   overflow: hidden;
 }
 
+@media (max-width: 768px) {
+  .nucleus-hero { padding: var(--space-5) 0 var(--space-7); }
+  .nucleus-hero__desc { font-size: 0.9375rem; }
+  .nucleus-hero__metrics { gap: var(--space-2); }
+  .nucleus-section { padding: var(--space-7) 0; }
+  .nucleus-section__title { font-size: clamp(1.5rem, 5vw, 2rem); }
+  .nucleus-section__desc { font-size: 0.9375rem; }
+  .nucleus-cta { padding: var(--space-7) 0; }
+  .nucleus-cta__title { font-size: 1.5rem; margin-bottom: var(--space-4); }
+}
+
 .nucleus-hero__glow {
   display: none;
 }
@@ -107,6 +118,13 @@
   border: 1px solid var(--border);
   border-radius: var(--radius);
   max-width: var(--max-code);
+  overflow-x: auto;
+}
+
+@media (max-width: 640px) {
+  .branching-visual { padding: var(--space-4); }
+  .branch-label { min-width: 80px; font-size: 0.75rem; }
+  .branch-line { gap: var(--space-2); }
 }
 
 .branch-diagram {

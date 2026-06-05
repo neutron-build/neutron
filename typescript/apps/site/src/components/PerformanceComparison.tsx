@@ -55,45 +55,47 @@ const frameworks: Framework[] = [
 export default function PerformanceComparison() {
   return (
     <div class="perf-comparison" data-animate>
-      <table class="perf-comparison__table">
-        <thead>
-          <tr>
-            <th scope="col">Framework</th>
-            <th scope="col" class="text-right">
-              Avg RPS
-            </th>
-            <th scope="col" class="text-right">
-              Avg Latency
-            </th>
-            <th scope="col" class="text-right">
-              vs Neutron
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {frameworks.map((fw) => (
-            <tr
-              key={fw.name}
-              class={`perf-comparison__row perf-comparison__row--${fw.variant}`}
-            >
-              <td>
-                <strong>{fw.name}</strong>
-              </td>
-              <td class="text-right">
-                <strong>{fw.avgRPS.toLocaleString()}</strong>
-              </td>
-              <td class="text-right">
-                <strong>{fw.avgLatency}</strong>
-              </td>
-              <td class="text-right">
-                <span class={`perf-badge perf-badge--${fw.variant}`}>
-                  {fw.vsNeutron}
-                </span>
-              </td>
+      <div class="perf-comparison__scroll">
+        <table class="perf-comparison__table">
+          <thead>
+            <tr>
+              <th scope="col">Framework</th>
+              <th scope="col" class="text-right">
+                Avg RPS
+              </th>
+              <th scope="col" class="text-right">
+                Avg Latency
+              </th>
+              <th scope="col" class="text-right">
+                vs Neutron
+              </th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {frameworks.map((fw) => (
+              <tr
+                key={fw.name}
+                class={`perf-comparison__row perf-comparison__row--${fw.variant}`}
+              >
+                <td>
+                  <strong>{fw.name}</strong>
+                </td>
+                <td class="text-right">
+                  <strong>{fw.avgRPS.toLocaleString()}</strong>
+                </td>
+                <td class="text-right">
+                  <strong>{fw.avgLatency}</strong>
+                </td>
+                <td class="text-right">
+                  <span class={`perf-badge perf-badge--${fw.variant}`}>
+                    {fw.vsNeutron}
+                  </span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
       <p class="perf-comparison__note">
         autocannon, 80 concurrent connections, 5s duration, production builds. <a href="/blog/neutron-vs-nextjs-benchmarks-2026">Full methodology</a>.
       </p>

@@ -236,7 +236,7 @@
 
 @media (max-width: 768px) {
   .product-header {
-    padding: var(--space-6) 0;
+    padding: var(--space-7) 0 var(--space-6);
   }
   .product-header__title {
     font-size: clamp(1.75rem, 6vw, 3rem);
@@ -259,5 +259,34 @@
   .product-content__body > .comparison-table-wrap {
     padding-left: var(--space-4);
     padding-right: var(--space-4);
+  }
+  .product-content__body > section h2 {
+    font-size: 1.625rem;
+    margin-top: var(--space-7);
+    margin-bottom: var(--space-4);
+  }
+  .product-content__body > section h3 {
+    font-size: 1.25rem;
+    margin-top: var(--space-6);
+    margin-bottom: var(--space-3);
+  }
+  .product-content__body > section p,
+  .product-content__body > section li {
+    font-size: 0.9375rem;
+  }
+  .product-content__body > section ul {
+    padding-left: var(--space-5);
+  }
+}
+
+@media (max-width: 480px) {
+  .product-header {
+    padding-top: var(--space-6);
+  }
+  .product-header__tagline {
+    font-size: 0.875rem;
+  }
+  .product-content__body > section h2 {
+    font-size: 1.375rem;
   }
 }
