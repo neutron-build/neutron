@@ -245,11 +245,27 @@ tracked below and in the Phase C/D batches.
   the ALTER with a clear error (catalog untouched — verified). `TEXT '10' → BIGINT` now reads back
   `Int64(10)` and `SUM` works. Tests: successful rewrite + atomic rejection on an uncastable value.
 
-**Still open (Phase B3b — features, not bugs):** D-4/D-8 — `argMax`/`argMin`, `percentile_cont/disc`
-(p50/p95/p99), `SummingMergeTree`, and read-time collapse for `AggregatingMergeTree`. Blessed path
-per the brief is "implement or tell observe to use pattern Y". Plan: implement the high-value
-standard-SQL ones (percentile_cont/disc, argMax/argMin); for SummingMergeTree + aggregating
-read-time collapse, decide implement-vs-document. D-9 is doc-only (visibility caveats to observe).
+### Phase B3b — D-4 FIXED (new aggregates) · D-8 verdict
+
+- **D-4 `argMax`/`argMin` + ordered-set aggregates IMPLEMENTED** (`executor/aggregate/mod.rs`):
+  `ARGMAX(value, ordering)`/`ARGMIN` (also `ARG_MAX`/`ARG_MIN`) return the value at the
+  max/min ordering — the clean newest-wins dedup-then-pick. `PERCENTILE_CONT(expr, f)` (linear
+  interpolation), `PERCENTILE_DISC(expr, f)` (actual data point), `MEDIAN(expr)`, and `QUANTILE`
+  (cont alias) give p50/p95/p99 without client-side math. Registered in all three aggregate
+  detectors (`is_aggregate_fn_name`, `contains_aggregate`, `collect_aggregates_from_expr`); they
+  route to the AST aggregate path. `COUNT(DISTINCT)` already existed. Tests + out-of-range guard.
+- **D-8 VERDICT (no code — the considered choice):** `SummingMergeTree` is NOT implemented and
+  `AggregatingMergeTree` collapses only on background merge (no read-time registry). Building a
+  parallel read-time aggregating/summing registry is niche ClickHouse surface the brief itself
+  offers a fallback for. **Verdict to observe:** compute RED p50/p95/p99 from raw spans within
+  retention using the new `PERCENTILE_CONT/DISC`; use `ARGMAX(value, version)` or the (now correct)
+  replacing-mergetree dedup for newest-wins; do not depend on SummingMergeTree. Revisit read-time
+  aggregating collapse only if a concrete consumer needs it.
+- **D-9 (doc-only):** cross-connection visibility is immediate in the shared-Executor build; the
+  only real lags are (1) a long-lived explicit `BEGIN` on a pooled conn holding its snapshot, and
+  (2) multi-process topologies (per-process storage/cache, unsupported for shared state). Relay to observe.
+
+**All 10 teploy-observe D-cluster items are now resolved (fixed or verdict-given).**
 **Deferred to Phase G:** one-time `metrics.sh` doc-header sync (STATUS/AUDIT-REPORT/ROADMAP/etc.) —
 pre-existing drift across the whole branch; sync once when test counts stabilize.
 

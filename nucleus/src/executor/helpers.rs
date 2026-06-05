@@ -446,6 +446,14 @@ pub(super) fn contains_aggregate(expr: &Expr) -> bool {
                     | "EVERY"
                     | "BIT_AND"
                     | "BIT_OR"
+                    | "ARGMAX"
+                    | "ARG_MAX"
+                    | "ARGMIN"
+                    | "ARG_MIN"
+                    | "PERCENTILE_CONT"
+                    | "PERCENTILE_DISC"
+                    | "MEDIAN"
+                    | "QUANTILE"
             ) {
                 return true;
             }
