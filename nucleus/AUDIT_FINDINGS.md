@@ -480,7 +480,7 @@ columns store text for extended-protocol inserts and wire coercion if so.
 
 ---
 
-## F-004 — Extended-protocol params for BIGINT columns rejected by strict clients  ·  WIRE/TYPE-INFERENCE  ·  OPEN (Phase 5)
+## F-004 — Extended-protocol params for BIGINT columns rejected by strict clients  ·  WIRE/TYPE-INFERENCE  ·  RESOLVED (Phase H, 2026-06-05)
 
 **Pre-existing**, fails on a clean tree (independent of the Phase-1 work).
 
@@ -499,6 +499,64 @@ unsupported by Postgres semantics, or (b) Nucleus should declare column-inferred
 `$N` params as unknown/text-coercible (oid 0) and coerce server-side, to support
 drivers that send text (the documented neutron-go flow). Resolve in Phase 5 and then
 flip the CI `test` job to full `cargo test`.
+
+**Resolution — chose (a).** Nucleus's inference is *correct* Postgres behavior:
+`INSERT INTO spans (...) VALUES (...,$3,$4,$5,...)` makes those params inherit the
+target columns' `int8` type, so `ParameterDescription` rightly returns `Int8` and a
+strict typed client (tokio-postgres) must reject a `String` bind — real Postgres does
+the same. The production OTLP path uses pgx **SimpleProtocol** (inline text in the
+query string, no `ParameterDescription`, no client-side type check), so it was never
+affected. Fixed the test to bind `i64` for the three `BIGINT` params; all 3 tests
+green. No wire/server change.
+
+---
+
+## H-001 — Comma-join silently drops `from[1..]` in the plan path  ·  EXECUTOR/PLANNER  ·  RESOLVED (Phase H, 2026-06-05)
+
+Surfaced by `extreme_stress::extreme_cartesian_join_explosion`. `SELECT * FROM a, b`
+(implicit cross/hash join) returned only table `a`'s rows; `COUNT(*) FROM a, b`
+returned `|a|` instead of `|a|·|b|`. Explicit `a CROSS JOIN b` was unaffected.
+
+Root cause: `query_eligible_for_plan()` only inspects `select.from.first()` and its
+`.joins`, never rejecting multi-element `select.from`. The plan path
+(`plan_query` → `execute_plan_node`) likewise builds its scan from `from.first()`
+only, so additional comma-separated tables were dropped. The AST fallback
+(`build_from_rows_with_ctes`) handles `from[1..]` correctly via cross/hash join.
+
+Fix: `query_eligible_for_plan()` returns `false` when `select.from.len() > 1`, routing
+comma-joins to the correct AST path. (One-table queries and explicit-JOIN queries —
+the plan path's hot cases — are unchanged.)
+
+## H-002 — Wire fast paths bypass the connection's transaction  ·  WIRE/MVCC  ·  RESOLVED (Phase H, 2026-06-05)
+
+Surfaced by `pg_compat::pg_transactions`. An INSERT issued between `BEGIN` and
+`ROLLBACK` over the simple-query protocol stayed visible after `ROLLBACK`.
+
+Root cause: the simple-query handler's KV / SQL-OLTP / large-object fast paths run
+*before* session scoping and call `storage.insert()/update()/delete()` directly,
+auto-committing outside the session's MVCC transaction. So the row was committed
+before `ROLLBACK` executed; fast-path *reads* similarly bypassed the txn snapshot,
+breaking read-your-own-writes. The embedded API and the extended protocol (which is
+already `execute_*_with_session`-scoped) were unaffected.
+
+Fix: `Executor::session_in_transaction(session_id)`; the simple-query handler computes
+`in_txn` up front and disables all three autocommit fast paths while a transaction is
+active, routing through the session-scoped executor until `COMMIT`/`ROLLBACK`.
+
+## Note — DB health / efficiency sweep (Phase H, 2026-06-05)
+
+Ran the standard durability + leak + throughput battery (results that drove H-001/H-002):
+- **Durability:** `crash_recovery` (16) + `wal_verify` (1) green; `stress --mode persistent`
+  (16 threads, 60s, ~290K ops/model) → "ALL MODELS PASSED RECOVERY CHECK", 0 errors.
+- **Concurrency:** `concurrent_stress` (12) + `extreme_stress` (18, ignored) green.
+- **Leak signal:** `stress --embedded` (16 threads, 30s, 271K ops, fixed working set)
+  held peak RSS flat at ~147 MB — no per-op growth. Persistent mode's higher RSS is
+  durable-data accumulation, not a leak.
+- **Throughput (`benchmark`, embedded):** KV 4.8–10.4M ops/s; SQL insert ~340K/s,
+  point query ~245K/s; TimeSeries 5.3M/s; Columnar batched insert ~834M/s; HNSW top-10
+  ~860 q/s. 0 errors across all models.
+- **macOS caveat:** miri/valgrind and the `/proc/self/statm` RSS-delta feature are
+  Linux-only; RSS leak detection here is via host `time -l maximum resident set size`.
 
 ---
 
