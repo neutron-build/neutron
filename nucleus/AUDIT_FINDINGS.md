@@ -219,8 +219,28 @@ tracked below and in the Phase C/D batches.
   now calls `query_cache_invalidate_all()` on success (`executor/copy.rs`). (COPY is wire-protocol-only,
   so no executor-level test; covered by the same invalidation path the DML dispatcher uses.)
 
-**Still open (Phase B2/B3):** D-10 #24/#26 aggregate-detection bugs (B2); D-7 ALTER COLUMN TYPE
-divergence + D-4/D-8 missing features argMax/percentile/SummingMergeTree (B3); D-9 doc-only.
+### Phase B2 — FIXED (aggregate detection / evaluation)
+
+- **D-10 #24 `CAST(<aggregate> AS …)`** returned N NULL rows (aggregate not detected under the
+  cast → per-row projection). → `collect_aggregates_from_expr` now recurses into Cast/UnaryOp;
+  a cast wrapping an aggregate is made plan-ineligible (`expr_has_unsupported`) so it routes to
+  the AST aggregate path, which substitutes the aggregate then casts. Returns one row `"3"`. Test.
+- **D-10 #26 `COALESCE(MAX(x), 0)`** (and any scalar fn wrapping an aggregate) errored "aggregate
+  outside context". → `contains_aggregate` now recurses into function arguments; added
+  `eval_scalar_over_aggregates` + `substitute_aggregates_inplace` to compute the aggregate
+  sub-exprs and evaluate the wrapping scalar/cast/CASE with the full row evaluator. Test (incl.
+  empty-table → one row `0`).
+- **D-10 #28 `GROUP BY … HAVING COUNT(*) >= N`** with COUNT **not** in the SELECT list dropped
+  every group. **This was real** — the original audit's "not reproducible" verdict used
+  non-discriminating data (no group met the threshold). Root cause: `agg_funcs` was collected
+  from the projection only, so a HAVING-only aggregate was never computed. → also collect
+  aggregates from the HAVING clause. Test (count in/out of projection + threshold).
+
+**Still open (Phase B3):** D-7 ALTER COLUMN TYPE divergence; D-4/D-8 missing features
+(argMax/percentile/SummingMergeTree) — fix the safe ALTER guard, implement the high-value standard
+features (percentile_cont/disc, argMax), give observe a clear verdict on the rest. D-9 doc-only.
+**Deferred to Phase G:** one-time `metrics.sh` doc-header sync (STATUS/AUDIT-REPORT/ROADMAP/etc.) —
+pre-existing drift across the whole branch; sync once when test counts stabilize.
 
 ## Dogfood-driven findings — teploy-observe 2026-06 (verify-then-fix)
 
