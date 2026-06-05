@@ -41,16 +41,18 @@ class MockS3Client {
   }
 }
 
-// Mock command classes
-class MockPutObjectCommand {
+// Mock command classes. The mock client dispatches on `command.constructor.name`,
+// mirroring how the real driver-agnostic mock would distinguish AWS SDK commands,
+// so these classes must be named exactly like the real @aws-sdk commands.
+class PutObjectCommand {
   constructor(public input: any) {}
 }
 
-class MockGetObjectCommand {
+class GetObjectCommand {
   constructor(public input: any) {}
 }
 
-class MockDeleteObjectCommand {
+class DeleteObjectCommand {
   constructor(public input: any) {}
 }
 
@@ -60,9 +62,9 @@ test("S3StorageDriver.put stores object", async () => {
     client as any,
     "test-bucket",
     {
-      PutObjectCommand: MockPutObjectCommand as any,
-      GetObjectCommand: MockGetObjectCommand as any,
-      DeleteObjectCommand: MockDeleteObjectCommand as any,
+      PutObjectCommand: PutObjectCommand as any,
+      GetObjectCommand: GetObjectCommand as any,
+      DeleteObjectCommand: DeleteObjectCommand as any,
     }
   );
 
@@ -82,9 +84,9 @@ test("S3StorageDriver.get retrieves stored object", async () => {
     client as any,
     "test-bucket",
     {
-      PutObjectCommand: MockPutObjectCommand as any,
-      GetObjectCommand: MockGetObjectCommand as any,
-      DeleteObjectCommand: MockDeleteObjectCommand as any,
+      PutObjectCommand: PutObjectCommand as any,
+      GetObjectCommand: GetObjectCommand as any,
+      DeleteObjectCommand: DeleteObjectCommand as any,
     }
   );
 
@@ -108,9 +110,9 @@ test("S3StorageDriver.get returns null for 404", async () => {
     client as any,
     "test-bucket",
     {
-      PutObjectCommand: MockPutObjectCommand as any,
-      GetObjectCommand: MockGetObjectCommand as any,
-      DeleteObjectCommand: MockDeleteObjectCommand as any,
+      PutObjectCommand: PutObjectCommand as any,
+      GetObjectCommand: GetObjectCommand as any,
+      DeleteObjectCommand: DeleteObjectCommand as any,
     }
   );
 
@@ -124,9 +126,9 @@ test("S3StorageDriver.del removes object", async () => {
     client as any,
     "test-bucket",
     {
-      PutObjectCommand: MockPutObjectCommand as any,
-      GetObjectCommand: MockGetObjectCommand as any,
-      DeleteObjectCommand: MockDeleteObjectCommand as any,
+      PutObjectCommand: PutObjectCommand as any,
+      GetObjectCommand: GetObjectCommand as any,
+      DeleteObjectCommand: DeleteObjectCommand as any,
     }
   );
 
@@ -147,9 +149,9 @@ test("S3StorageDriver handles multiple files", async () => {
     client as any,
     "test-bucket",
     {
-      PutObjectCommand: MockPutObjectCommand as any,
-      GetObjectCommand: MockGetObjectCommand as any,
-      DeleteObjectCommand: MockDeleteObjectCommand as any,
+      PutObjectCommand: PutObjectCommand as any,
+      GetObjectCommand: GetObjectCommand as any,
+      DeleteObjectCommand: DeleteObjectCommand as any,
     }
   );
 
@@ -181,9 +183,9 @@ test("S3StorageDriver passes correct bucket name", async () => {
   };
 
   const driver = new S3StorageDriver(mockClient, "my-bucket", {
-    PutObjectCommand: MockPutObjectCommand as any,
-    GetObjectCommand: MockGetObjectCommand as any,
-    DeleteObjectCommand: MockDeleteObjectCommand as any,
+    PutObjectCommand: PutObjectCommand as any,
+    GetObjectCommand: GetObjectCommand as any,
+    DeleteObjectCommand: DeleteObjectCommand as any,
   });
 
   await driver.put({
