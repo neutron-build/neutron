@@ -294,6 +294,23 @@ convention where columns *are* named by stringified index).
   half of the finding was a false positive.
 - **wire binary unknown-OID param** (`wire/mod.rs`) — a binary-format param with an unknown OID was
   UTF-8-mangled; decode the standard fixed-width integer widths (2/4/8) instead; text path unchanged.
+
+## Phase D — FIXED (deferred highs with signature ripple)
+
+(fts merge `F-036` and graph Dijkstra `F-035` were already fixed earlier, so the remaining D items were:)
+
+- **RESP ZRANGE negative indices** (`resp/handler.rs`) — resolve Redis-style negatives (-1 = last)
+  against the set cardinality before indexing; a bare `as usize` turned -1 into a huge index. Fixed
+  at the handler so the `usize` zrange chain is unchanged. Test (0/-1, -2/-1, -1/-1, out-of-range).
+- **document empty-JSONB containment** (`document/mod.rs`) — `doc @> '{}'` now matches ALL documents
+  (the GIN index has no pairs for an empty query, so it returned nothing). Test.
+- **vector HNSW filtered early-exit** (`vector/mod.rs`) — existing oversampling + full-ef fallback can
+  still miss nodes in a disconnected layer-0 component under a selective filter. Added a
+  guaranteed-recall linear-scan final fallback (exact top-k among filter-passing nodes). Test.
+- **reactive CDC consumer offsets lost on checkpoint** (`reactive/cdc_wal.rs`, `reactive/mod.rs`) —
+  `checkpoint()` truncates the WAL but wrote `0` consumers, discarding every offset. Added
+  `CdcLog::consumers()` and serialized the real positions into the snapshot. Test (offsets survive
+  checkpoint). Binary protocol param substitution stays deferred (unimplemented stub).
 **Deferred to Phase G:** one-time `metrics.sh` doc-header sync (STATUS/AUDIT-REPORT/ROADMAP/etc.) —
 pre-existing drift across the whole branch; sync once when test counts stabilize.
 

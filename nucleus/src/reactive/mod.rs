@@ -468,6 +468,12 @@ impl CdcLog {
         self.consumers.get(name).copied().unwrap_or(0)
     }
 
+    /// All consumer positions (name → last consumed sequence). Used by the WAL
+    /// checkpoint so consumer offsets survive a snapshot+truncate.
+    pub fn consumers(&self) -> &HashMap<String, u64> {
+        &self.consumers
+    }
+
     /// Acknowledge events up to a sequence number.
     pub fn acknowledge(&mut self, consumer: &str, sequence: u64) {
         self.consumers.insert(consumer.to_string(), sequence);

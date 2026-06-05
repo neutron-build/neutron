@@ -168,10 +168,17 @@ impl CdcWal {
             }
         }
 
-        // consumers: we don't have direct access to the consumers map from CdcLog,
-        // so we write 0 consumers in the snapshot. Consumer positions are reconstructed
-        // from CONSUMER entries that follow the snapshot.
-        payload.extend_from_slice(&0u32.to_le_bytes());
+        // consumers: serialize the real positions into the snapshot. checkpoint()
+        // truncates the file below, so any CONSUMER entries written before this
+        // point are discarded — writing 0 here previously LOST every consumer
+        // offset on checkpoint (consumers would re-read from their old position
+        // or restart). Persist them in the snapshot instead.
+        let consumers = cdc_log.consumers();
+        payload.extend_from_slice(&(consumers.len() as u32).to_le_bytes());
+        for (name, position) in consumers {
+            write_str(&mut payload, name);
+            payload.extend_from_slice(&position.to_le_bytes());
+        }
 
         // Flush existing writer
         {
@@ -446,6 +453,28 @@ mod tests {
         let (_wal2, state) = CdcWal::open(dir.path()).unwrap();
         assert_eq!(state.consumers["app1"], 1);
         assert_eq!(state.consumers["app2"], 0);
+    }
+
+    #[test]
+    fn test_consumer_offsets_survive_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = CdcWal::open(dir.path()).unwrap();
+
+        // Build a CdcLog with entries and acknowledged consumer positions.
+        let mut log = crate::reactive::CdcLog::new();
+        log.append("t", ChangeType::Insert, make_row(&[("x", "1")]));
+        log.append("t", ChangeType::Insert, make_row(&[("x", "2")]));
+        log.acknowledge("app1", 2);
+        log.register_consumer("app2"); // position 0
+
+        // checkpoint() truncates the WAL — consumer offsets must be persisted
+        // into the snapshot, not lost (they were previously written as 0).
+        wal.checkpoint(&log).unwrap();
+        drop(wal);
+
+        let (_wal2, state) = CdcWal::open(dir.path()).unwrap();
+        assert_eq!(state.consumers.get("app1"), Some(&2));
+        assert_eq!(state.consumers.get("app2"), Some(&0));
     }
 
     #[test]
