@@ -441,7 +441,13 @@ body.nav-drawer-open { overflow: hidden; }
 .footer__left {
   display: flex;
   align-items: center;
-  gap: var(--space-4);
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-2) var(--space-4);
+}
+
+@media (min-width: 768px) {
+  .footer__left { justify-content: flex-start; }
 }
 
 .footer__brand {
@@ -564,6 +570,21 @@ body.nav-drawer-open { overflow: hidden; }
 .terminal__copy.copied {
   color: var(--accent);
   opacity: 1;
+}
+
+@media (hover: none) {
+  .terminal__copy { opacity: 0.6; }
+  .terminal__copy:active { color: var(--text-primary); opacity: 1; }
+}
+
+@media (max-width: 480px) {
+  .terminal__body {
+    padding: 12px 14px 14px;
+    font-size: 0.8125rem;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .terminal__text { white-space: nowrap; }
 }
 
 
@@ -827,6 +848,8 @@ body.nav-drawer-open { overflow: hidden; }
 
 .code-block__body {
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  min-width: 0;
 }
 
 .code-block__body pre {
@@ -1076,22 +1099,49 @@ body.nav-drawer-open { overflow: hidden; }
    ============================================ */
 
 .perf-comparison {
-  overflow-x: auto;
   border-radius: var(--radius);
   background: rgba(255, 255, 255, 0.02);
   border: 1px solid rgba(255, 255, 255, 0.05);
+  overflow: hidden;
+}
+
+.perf-comparison__scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .perf-comparison__table {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.9375rem;
+  min-width: 480px;
 }
 
 .perf-comparison__table th,
 .perf-comparison__table td {
   padding: 1rem 1.5rem;
   text-align: left;
+}
+
+.perf-comparison__note {
+  padding: var(--space-3) var(--space-4);
+  margin: 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  font-size: 0.8125rem;
+  color: var(--text-tertiary);
+  line-height: 1.6;
+}
+
+@media (max-width: 640px) {
+  .perf-comparison__table th,
+  .perf-comparison__table td {
+    padding: 0.75rem 1rem;
+    font-size: 0.8125rem;
+  }
+  .perf-comparison__note {
+    padding: var(--space-3);
+    font-size: 0.75rem;
+  }
 }
 
 .perf-comparison__table th {
