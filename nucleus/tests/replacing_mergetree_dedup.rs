@@ -244,3 +244,180 @@ async fn plain_table_count_unchanged_by_replacing_changes() {
     let rows = select_rows(&ex, "SELECT id, name FROM p").await;
     assert_eq!(rows.len(), 3, "plain table must NOT be deduped");
 }
+
+// ── D-1: UPDATE/DELETE on a replacing table WITHOUT a single-column PK
+// constraint must still hit the right physical rows. This is the no-PK path
+// (`extract_pk_eq_value` → None → `scan_physical`), which previously enumerated
+// *deduped* logical rows and fed those positions to update()/delete() (which
+// index physical batches) — corrupting/no-opping the mutation. This is the
+// teploy-observe "RevokeAPIKey is a silent no-op" bug.
+
+#[tokio::test]
+async fn replacing_mergetree_update_without_pk_constraint_hits_right_row() {
+    let ex = fresh_executor().await;
+    // ORDER BY only — NO PRIMARY KEY constraint, so the PK-eq fast path is not
+    // engaged and UPDATE falls into the (previously broken) physical-scan path.
+    // revoked as INT (0/1) — avoids depending on BOOLEAN literal parsing; the
+    // physical-position bug is independent of column type.
+    exec(
+        &ex,
+        "CREATE TABLE api_keys (id TEXT, revoked INT, version INT) \
+         WITH (engine='replacing_mergetree', version_column='version') \
+         ORDER BY (id)",
+    )
+    .await;
+    // Insert several distinct logical rows in non-PK-sorted order so a deduped
+    // scan reorders them and physical-position mapping would diverge.
+    exec(
+        &ex,
+        "INSERT INTO api_keys (id, revoked, version) VALUES ('k3', 0, 1)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO api_keys (id, revoked, version) VALUES ('k1', 0, 1)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO api_keys (id, revoked, version) VALUES ('k2', 0, 1)",
+    )
+    .await;
+
+    // Revoke exactly one key.
+    let res = exec(&ex, "UPDATE api_keys SET revoked=1 WHERE id='k2'").await;
+    if let ExecResult::Command { rows_affected, .. } = res {
+        assert_eq!(rows_affected, 1, "exactly one row should be updated");
+    } else {
+        panic!("expected Command for UPDATE");
+    }
+
+    // k2 must now read back revoked=1; k1/k3 unchanged.
+    let k2 = select_rows(&ex, "SELECT revoked FROM api_keys WHERE id='k2'").await;
+    assert_eq!(k2.len(), 1);
+    assert_eq!(k2[0][0], Value::Int32(1), "k2 must be revoked");
+    let others = select_rows(&ex, "SELECT id FROM api_keys WHERE revoked=1").await;
+    assert_eq!(
+        others.len(),
+        1,
+        "only k2 should be revoked, not a mis-mapped row"
+    );
+}
+
+#[tokio::test]
+async fn replacing_mergetree_delete_without_pk_constraint_removes_all_versions() {
+    let ex = fresh_executor().await;
+    exec(
+        &ex,
+        "CREATE TABLE ev (id TEXT, version INT) \
+         WITH (engine='replacing_mergetree', version_column='version') \
+         ORDER BY (id)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO ev (id, version) VALUES ('keep', 1)").await;
+    exec(&ex, "INSERT INTO ev (id, version) VALUES ('gone', 1)").await;
+    exec(&ex, "INSERT INTO ev (id, version) VALUES ('gone', 2)").await;
+
+    let res = exec(&ex, "DELETE FROM ev WHERE id='gone'").await;
+    if let ExecResult::Command { rows_affected, .. } = res {
+        assert_eq!(rows_affected, 2, "both physical versions of 'gone' deleted");
+    } else {
+        panic!("expected Command for DELETE");
+    }
+    let after = select_rows(&ex, "SELECT id FROM ev").await;
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0][0], Value::Text("keep".into()));
+}
+
+// ── D-2: a TEXT version column must still order versions numerically, not
+// collapse to last-in-scan-order (every text version previously read as 0).
+
+#[tokio::test]
+async fn replacing_mergetree_text_version_orders_numerically() {
+    let ex = fresh_executor().await;
+    exec(
+        &ex,
+        "CREATE TABLE issues (issue_id TEXT, payload TEXT, version TEXT) \
+         WITH (engine='replacing_mergetree', version_column='version') \
+         ORDER BY (issue_id)",
+    )
+    .await;
+    // Versions as TEXT, highest ('10') inserted in the middle, not last.
+    exec(
+        &ex,
+        "INSERT INTO issues (issue_id, payload, version) \
+         VALUES ('a', 'v1', '1'), ('a', 'winner', '10'), ('a', 'v2', '2')",
+    )
+    .await;
+    let rows = select_rows(&ex, "SELECT payload FROM issues WHERE issue_id='a'").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0],
+        Value::Text("winner".into()),
+        "TEXT version '10' must win numerically over '2'"
+    );
+}
+
+// ── D-3: aggregates over a replacing table must dedup to the newest version
+// per key BEFORE aggregating — COUNT and SUM/MIN/MAX must agree.
+
+#[tokio::test]
+async fn replacing_mergetree_aggregates_dedup_before_summing() {
+    let ex = fresh_executor().await;
+    exec(
+        &ex,
+        "CREATE TABLE m (k TEXT, x INT, version INT) \
+         WITH (engine='replacing_mergetree', version_column='version') \
+         ORDER BY (k)",
+    )
+    .await;
+    // key 1: superseded x=10 then x=99 (newest). key 2: single x=5.
+    exec(&ex, "INSERT INTO m (k, x, version) VALUES ('k1', 10, 1)").await;
+    exec(&ex, "INSERT INTO m (k, x, version) VALUES ('k1', 99, 2)").await;
+    exec(&ex, "INSERT INTO m (k, x, version) VALUES ('k2', 5, 1)").await;
+
+    let count = select_rows(&ex, "SELECT COUNT(*) FROM m").await;
+    assert_eq!(
+        count[0][0],
+        Value::Int64(2),
+        "COUNT dedups to 2 logical rows"
+    );
+
+    // SUM must be 99 + 5 = 104, NOT 10 + 99 + 5 = 114 (superseded version excluded).
+    let sum = select_rows(&ex, "SELECT SUM(x) FROM m").await;
+    assert_eq!(
+        sum[0][0],
+        Value::Int64(104),
+        "SUM must exclude the superseded x=10"
+    );
+
+    // MIN/MAX over the deduped (newest-per-key) rows: {99, 5}.
+    let min = select_rows(&ex, "SELECT MIN(x) FROM m").await;
+    assert_eq!(min[0][0], Value::Int32(5));
+    let max = select_rows(&ex, "SELECT MAX(x) FROM m").await;
+    assert_eq!(max[0][0], Value::Int32(99));
+}
+
+// ── D-5: fast-path point ops must emit a BARE command tag (no embedded count);
+// the wire layer appends rows_affected, so an embedded count double-renders
+// ("DELETE 1 1"). Guard the tag string at the ExecResult boundary.
+
+#[tokio::test]
+async fn fast_path_point_ops_emit_bare_command_tags() {
+    let ex = fresh_executor().await;
+    exec(&ex, "CREATE TABLE t (id INT PRIMARY KEY, v INT)").await;
+    exec(&ex, "INSERT INTO t (id, v) VALUES (1, 10)").await;
+
+    // Point UPDATE via PK fast path.
+    if let ExecResult::Command { tag, .. } = exec(&ex, "UPDATE t SET v=20 WHERE id=1").await {
+        assert_eq!(tag, "UPDATE", "fast-path UPDATE tag must be bare");
+    } else {
+        panic!("expected Command");
+    }
+    // Point DELETE via PK fast path.
+    if let ExecResult::Command { tag, .. } = exec(&ex, "DELETE FROM t WHERE id=1").await {
+        assert_eq!(tag, "DELETE", "fast-path DELETE tag must be bare");
+    } else {
+        panic!("expected Command");
+    }
+}

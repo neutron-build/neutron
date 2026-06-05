@@ -130,6 +130,19 @@ pub trait StorageEngine: Send + Sync {
             .collect())
     }
 
+    /// Scan returning every *physical* row with its physical scan-order
+    /// position — for UPDATE/DELETE, whose returned positions are fed back to
+    /// `update()`/`delete()` (which index physical storage). Unlike `scan()`,
+    /// this must NOT apply read-time dedup: on a replacing/aggregating
+    /// MergeTree, `scan()` collapses and reorders rows, so its positions would
+    /// not map to physical rows and a mutation would hit the wrong row or
+    /// silently no-op. Default: full physical scan (engines without read-time
+    /// dedup are already physical, so `scan()` is correct for them).
+    async fn scan_physical(&self, table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
+        let rows = self.scan(table).await?;
+        Ok(rows.into_iter().enumerate().collect())
+    }
+
     /// Notify the storage engine of a table's column schema (for WAL persistence).
     /// Default: no-op. Durable engines override this to log schema to WAL.
     fn store_table_schema(&self, _table: &str, _columns: &[(String, crate::types::DataType)]) {}

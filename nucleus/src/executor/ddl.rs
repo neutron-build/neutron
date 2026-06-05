@@ -182,6 +182,26 @@ impl Executor {
                                     .iter()
                                     .position(|c| c.name.eq_ignore_ascii_case(name))
                             });
+                            // ReplacingMergeTree orders versions numerically. A
+                            // non-numeric (e.g. TEXT) version column is parsed
+                            // best-effort, but ordering is only reliable for an
+                            // integer/float type — warn so the schema can be fixed.
+                            if let (Some(name), Some(idx)) = (version_col.as_ref(), ver_idx) {
+                                let dt = &table_def.columns[idx].data_type;
+                                if !matches!(
+                                    dt,
+                                    crate::types::DataType::Int32
+                                        | crate::types::DataType::Int64
+                                        | crate::types::DataType::Float64
+                                ) {
+                                    tracing::warn!(
+                                        "ReplacingMergeTree table '{table_name}': version column \
+                                         '{name}' has non-numeric type {dt}; newest-wins dedup \
+                                         orders by parsed numeric value and may be unreliable. \
+                                         Use INTEGER/BIGINT for the version column."
+                                    );
+                                }
+                            }
                             crate::columnar::register_replacing_table(&table_name, pk_idx, ver_idx);
                             MergeStrategy::Replacing {
                                 version_column: version_col,

@@ -1274,9 +1274,15 @@ impl Executor {
                     (matches.into_iter().collect::<Vec<_>>(), true)
                 }
                 None => {
-                    let rows = self.storage_for(&table_name).scan(&table_name).await?;
+                    // scan_physical (not scan): UPDATE positions are fed back to
+                    // storage.update(), which indexes physical rows. scan() would
+                    // dedup a replacing/aggregating MergeTree and misalign positions.
+                    let rows = self
+                        .storage_for(&table_name)
+                        .scan_physical(&table_name)
+                        .await?;
                     self.metrics.rows_scanned.inc_by(rows.len() as u64);
-                    (rows.into_iter().enumerate().collect::<Vec<_>>(), false)
+                    (rows, false)
                 }
             };
         // Resolve assignments: (column_index, value_expr)
@@ -1577,9 +1583,15 @@ impl Executor {
                     (matches, true)
                 }
                 None => {
-                    let rows = self.storage_for(&table_name).scan(&table_name).await?;
+                    // scan_physical (not scan): DELETE positions are fed back to
+                    // storage.delete(), which indexes physical rows. scan() would
+                    // dedup a replacing/aggregating MergeTree and misalign positions.
+                    let rows = self
+                        .storage_for(&table_name)
+                        .scan_physical(&table_name)
+                        .await?;
                     self.metrics.rows_scanned.inc_by(rows.len() as u64);
-                    (rows.into_iter().enumerate().collect::<Vec<_>>(), false)
+                    (rows, false)
                 }
             };
 

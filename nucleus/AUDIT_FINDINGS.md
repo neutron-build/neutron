@@ -17,6 +17,11 @@ Severity order: correctness > memory-safety > security > durability > performanc
   comments; (2) the high deferred items that need signature changes (ZRANGE i64);
   (3) **MVCC GC** — diff against `lean4/Nucleus/Nucleus/Proofs/MvccProofs.lean` BEFORE
   touching; (4) feature-sized: RLS-to-authenticated-user wiring, WAL header-CRC format change.
+- **Dogfood-driven cluster (D-1..D-10), see "teploy-observe 2026-06" section below:**
+  product-blocking findings from a real consumer over pgwire — **D-1 (UPDATE no-op breaks
+  API-key revocation) is security-critical**. Source brief:
+  `_internal/NUCLEUS_AUDIT_FROM_TEPLOY_OBSERVE_2026-06.md`. These are verify-first (confirm
+  current engine semantics, some may already be fixed) then fix; each owes observe a one-line verdict.
 - **AFTER the engine is fully done:** audit/fix the surrounding tooling too — `studio/`,
   the per-language ORMs/SDKs (`go/`, `ts/` neutron-data, `python/`, `rust/`, `zig/`,
   `elixir/`, `julia/`), and anything depending on engine semantics changed here (new error
@@ -179,6 +184,84 @@ is risky or the fix is a larger feature. Triaged honestly rather than rushed.
   **kv silent WAL on SET** — lower impact; batch with the relevant subsystem.
 - **24 medium + 8 low** correctness findings — full detail (description, evidence, suggested
   fix, refutation) preserved in `AUDIT_FINDINGS_RAW.json`; to be triaged subsystem-by-subsystem.
+
+## Phase A verification sweep — outcome (2026-06)
+
+A 13-agent read-only sweep re-triaged the 24 medium + 8 low against current code and
+statically answered the 10 D-cluster questions. **Med/low triage: 8 already-fixed (by
+F-005..F-038), 14 false-positive (refuted with evidence — MOD-by-zero, insert_tuple u16
+cast, COUNT SIMD, find_chunk, etc.), 10 still-real** (mostly low — Phase C). **D-cluster:
+D-1/D-2/D-3/D-5(tag)/D-10#24/#26 confirmed real bugs; D-6/D-7/D-8 partial; D-9 OK; D-10#28
+not reproducible (already correct).** Full evidence in the workflow result; still-real items
+tracked below and in the Phase C/D batches.
+
+### Phase B1 — FIXED (security + silent-wrong correctness)
+
+- **D-1 UPDATE/DELETE physical-position bug (security)** — replacing/aggregating MergeTree
+  without a single-col PK constraint fed *deduped* scan positions to `update()`/`delete()`
+  (which index physical batches) → wrong row or silent no-op (the API-key-revocation no-op).
+  → added `StorageEngine::scan_physical` (default = `scan`; columnar override returns physical
+  batches, like `scan_where_eq_positions`); UPDATE/DELETE non-PK path now uses it
+  (`storage/mod.rs`, `storage/columnar_engine.rs`, `executor/dml.rs`). Regression tests for the
+  no-PK UPDATE and DELETE paths.
+- **D-3 aggregate dedup** — `fast_sum_f64(_filtered)`/`fast_min_f64`/`fast_max_f64`/`fast_group_by`
+  summed superseded versions (COUNT deduped, SUM didn't). → added `select_batches()` helper;
+  all five route through it (dedup when `replacing_config` present). Test (COUNT/SUM/MIN/MAX agree).
+- **D-2 TEXT version column** — read as constant 0 → newest-wins collapsed to scan-order. → added
+  `Value::Text`/`ColumnData::Text` parse arms to `value_to_version_i64`/`version_value_at`
+  (`columnar/mod.rs`); DDL now `warn!`s on a non-numeric version column (`executor/ddl.rs`). Test.
+- **D-5 doubled command tag** — fast-path point INSERT/UPDATE/DELETE embedded the count in the tag
+  while the wire layer also appends `rows_affected` → `DELETE 1 1`. → fast-path now emits bare tags
+  matching the general path (`executor/mod.rs`). Test asserts bare tags. (Retention DELETE coercion
+  itself was already correct.)
+- **D-6 COPY FROM cache staleness** — `COPY … FROM STDIN` inserts rows but isn't a `Statement::Insert`,
+  so it skipped result-cache invalidation → stale SELECT for the cache TTL. → `execute_copy_from`
+  now calls `query_cache_invalidate_all()` on success (`executor/copy.rs`). (COPY is wire-protocol-only,
+  so no executor-level test; covered by the same invalidation path the DML dispatcher uses.)
+
+**Still open (Phase B2/B3):** D-10 #24/#26 aggregate-detection bugs (B2); D-7 ALTER COLUMN TYPE
+divergence + D-4/D-8 missing features argMax/percentile/SummingMergeTree (B3); D-9 doc-only.
+
+## Dogfood-driven findings — teploy-observe 2026-06 (verify-then-fix)
+
+Source brief: `_internal/NUCLEUS_AUDIT_FROM_TEPLOY_OBSERVE_2026-06.md` (cross-ref:
+`teploy-observe/_internal/AUDIT_FINDINGS_2026-06.md`, memory note `nucleus_dogfood_findings.md`).
+These came from a real consumer (teploy-observe/dash dogfooding Nucleus over pgwire/pgx), so
+they are **product-blocking, not theoretical** — until they're settled, observe's analytics,
+retention, and **security controls (API-key revocation, password change)** are untrustworthy.
+Each needs a one-line verdict back to observe: *supported as-is* / *fixed in commit X* /
+*not supported — use pattern Y*. Several are verify-first (confirm current semantics) before any
+code change; some may already be fixed (dogfood #10/#29 marked RESOLVED upstream — re-confirm).
+
+Priority order (from the brief):
+- **D-1 UPDATE semantics** (security-critical). `UPDATE` on plain/ReplacingMergeTree tables is
+  "best-effort" → `RevokeAPIKey` / `ChangePassword` / rate-limit updates are **silent no-ops**;
+  revoked keys keep authenticating. Maps to dogfood #32 (OPEN): UPDATE/DELETE on a
+  `replacing_mergetree` without a single-column PK uses `Executor::scan` which now returns
+  *deduped* rows, so row positions don't map to physical rows. → Define+document exactly which
+  engines/PK-shapes support UPDATE and the visibility timing; either make it reliable for small
+  config tables or bless the revoke-as-insert (newest-wins) pattern.
+- **D-2 ReplacingMergeTree version-column typing.** Version columns declared `TEXT DEFAULT '0'`
+  appear to be treated as 0 → newest-wins dedup silently broken everywhere. → Confirm numeric
+  comparison; decide whether DDL should **reject/warn** on a non-numeric version column.
+- **D-3 read-time dedup under AGGREGATES** (`SELECT SUM(x) FROM replacing_table`). Row-level
+  SELECT dedup (#10 fix) apparently doesn't extend to aggregates → dashboards double/triple-count.
+- **D-4 `argMax(value, version)` / `COUNT(DISTINCT)` / HLL** support — confirm which exist; the
+  cleanest dedup-then-aggregate path depends on it.
+- **D-5 retention DELETE coercion** — BIGINT column vs quoted TEXT literal matched nothing → TTLs
+  inert, storage unbounded. Maps to dogfood #29 (RESOLVED, `0b35f54`) — **re-confirm** an int64
+  `$1` cutoff actually deletes rows on the current build; also #31 command-tag (`DELETE 1 1`) pgx parse.
+- **D-6 query-result cache invalidation on DELETE/UPDATE** (dogfood #30, OPEN) — stale row set
+  served after a delete; compounds D-1/D-5.
+- **D-7 ALTER COLUMN TYPE (TEXT→BIGINT) on a populated MergeTree** — does it rewrite already-merged
+  parts or only new writes? If not a full rewrite, document the rebuild/backfill path observe must use.
+- **D-8 SummingMergeTree / AggregatingMergeTree + percentile aggregate-state** — needed for RED
+  trace metrics (p50/p95/p99); confirm if implemented or tell observe to compute from raw spans.
+- **D-9 cross-connection write-visibility lag** (dogfood #2, OPEN, ~1s) — document the real window
+  (gates how fast revocation/password/rate-limit take effect across pooled conns).
+- **D-10 open projection/aggregate eval bugs** — dogfood **#24** `CAST(<aggregate> AS TEXT)` returns
+  3 empty rows not one `"3"`; **#26** `COALESCE(MAX(...), 0)` rejected; **#28** `GROUP BY … HAVING
+  COUNT(*) >= N` returns zero rows (projection-vs-HAVING ordering). All hit observe's query layer.
 
 ## `unsafe` audit (Phase 2)
 

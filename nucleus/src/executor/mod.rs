@@ -2127,8 +2127,11 @@ impl Executor {
                     .collect();
                 let storage = self.storage_for(table);
                 match storage.insert(table, row).await {
+                    // Bare tag — the wire layer normalizes "INSERT" to "INSERT 0"
+                    // and appends rows_affected. Embedding the count here would
+                    // double it on the wire ("INSERT 0 1 1"). Matches general path.
                     Ok(()) => Some(Ok(ExecResult::Command {
-                        tag: "INSERT 0 1".into(),
+                        tag: "INSERT".into(),
                         rows_affected: 1,
                     })),
                     Err(e) => Some(Err(ExecError::Storage(e))),
@@ -2173,7 +2176,7 @@ impl Executor {
                 };
                 if matches.is_empty() {
                     return Some(Ok(ExecResult::Command {
-                        tag: "UPDATE 0".into(),
+                        tag: "UPDATE".into(),
                         rows_affected: 0,
                     }));
                 }
@@ -2193,7 +2196,8 @@ impl Executor {
                     Err(e) => return Some(Err(ExecError::Storage(e))),
                 };
                 Some(Ok(ExecResult::Command {
-                    tag: format!("UPDATE {count}"),
+                    // Bare tag; wire appends rows_affected (see PointInsert).
+                    tag: "UPDATE".into(),
                     rows_affected: count,
                 }))
             }
@@ -2221,7 +2225,7 @@ impl Executor {
                 };
                 if matches.is_empty() {
                     return Some(Ok(ExecResult::Command {
-                        tag: "DELETE 0".into(),
+                        tag: "DELETE".into(),
                         rows_affected: 0,
                     }));
                 }
@@ -2231,7 +2235,8 @@ impl Executor {
                     Err(e) => return Some(Err(ExecError::Storage(e))),
                 };
                 Some(Ok(ExecResult::Command {
-                    tag: format!("DELETE {count}"),
+                    // Bare tag; wire appends rows_affected (see PointInsert).
+                    tag: "DELETE".into(),
                     rows_affected: count,
                 }))
             }
