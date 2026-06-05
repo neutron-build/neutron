@@ -484,6 +484,11 @@ fn value_to_version_i64(v: &Value) -> i64 {
         Value::Int64(n) => *n,
         Value::Float64(f) => *f as i64,
         Value::Bool(b) => *b as i64,
+        // A TEXT version column (e.g. DEFAULT '0') must still order by its
+        // numeric value — otherwise every row collapses to 0 and newest-wins
+        // dedup degrades to last-in-scan-order. DDL warns against this; we
+        // parse the digits as a least-surprising fallback.
+        Value::Text(s) => s.trim().parse::<i64>().unwrap_or(0),
         _ => 0,
     }
 }
@@ -3288,6 +3293,12 @@ fn version_value_at(col: Option<&ColumnData>, idx: usize) -> i64 {
         Some(ColumnData::Int32(v)) => v[idx].unwrap_or(0) as i64,
         Some(ColumnData::Int64(v)) => v[idx].unwrap_or(0),
         Some(ColumnData::Float64(v)) => v[idx].unwrap_or(0.0) as i64,
+        // TEXT version column: parse digits so newest-wins still orders
+        // correctly (see value_to_version_i64). DDL warns against non-numeric.
+        Some(ColumnData::Text(v)) => v[idx]
+            .as_deref()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0),
         _ => 0,
     }
 }

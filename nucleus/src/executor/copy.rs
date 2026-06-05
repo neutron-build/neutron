@@ -113,6 +113,14 @@ impl Executor {
             count += 1;
         }
 
+        // COPY FROM is a bulk write but is not a Statement::Insert, so it is not
+        // covered by the is_dml_write invalidation in the statement dispatcher.
+        // Invalidate the query-result cache here so a previously cached SELECT
+        // doesn't serve a stale (pre-COPY) row set for up to the cache TTL.
+        if count > 0 {
+            self.query_cache_invalidate_all();
+        }
+
         Ok(ExecResult::Command {
             tag: format!("COPY {count}"),
             rows_affected: count,

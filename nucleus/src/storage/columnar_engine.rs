@@ -310,6 +310,18 @@ fn batches_to_rows_where_eq(
 ///
 /// Global position 0 = first row of first batch, len(batch0) = first row of second batch, etc.
 /// Positions need not be sorted. Unresolvable positions produce a row of Nulls.
+/// Batch selection for read-time aggregates: dedup a replacing_mergetree table
+/// (so superseded versions don't inflate SUM/AVG/MIN/MAX/GROUP BY), else return
+/// physical batches. Mirrors the guard in `fast_count_all`.
+/// NOTE: read paths only — mutations must use `batches_all` directly.
+fn select_batches(store: &ColumnarStore, table: &str) -> Vec<ColumnBatch> {
+    if crate::columnar::replacing_config(table).is_some() {
+        store.batches_all_for_select(table)
+    } else {
+        store.batches_all(table)
+    }
+}
+
 fn fetch_rows_by_positions(batches: &[ColumnBatch], positions: &[usize]) -> Vec<Row> {
     if positions.is_empty() || batches.is_empty() {
         return Vec::new();
@@ -603,6 +615,22 @@ impl StorageEngine for ColumnarStorageEngine {
             .collect())
     }
 
+    async fn scan_physical(&self, table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
+        // Same reasoning as scan_where_eq_positions, but for the no-WHERE-PK
+        // path of UPDATE/DELETE: return physical batches (NOT batches_all_for_select)
+        // so positions map to the rows update()/delete() actually rewrite.
+        // scan() here would dedup a replacing/aggregating table and corrupt mutations.
+        self.flush_write_buffer(table);
+        let store = self.store.read();
+        if !store.table_exists(table) {
+            return Err(StorageError::TableNotFound(table.to_string()));
+        }
+        Ok(batches_to_rows(&store.batches_all(table))
+            .into_iter()
+            .enumerate()
+            .collect())
+    }
+
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
         if positions.is_empty() {
             return Ok(0);
@@ -813,7 +841,7 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let batches = store.batches_all(table);
+        let batches = select_batches(&store, table);
         let (total, n) = batches.iter().fold((0.0f64, 0usize), |(s, c), batch| {
             let sum = aggregate_sum(batch, &col_name);
             let cnt = aggregate_count(batch, &col_name);
@@ -835,7 +863,7 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let batches = store.batches_all(table);
+        let batches = select_batches(&store, table);
 
         // Collect the key and value columns across all batches.
         let mut key_vec: Vec<Option<String>> = Vec::new();
@@ -946,7 +974,7 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let batches = store.batches_all(table);
+        let batches = select_batches(&store, table);
         let (sum, count) = batches.iter().fold((0.0f64, 0usize), |(s, c), batch| {
             let filter_data = match batch.column(&filter_col_name) {
                 Some(d) => d,
@@ -971,7 +999,7 @@ impl StorageEngine for ColumnarStorageEngine {
             return None;
         }
         let mut min: Option<f64> = None;
-        let batches = store.batches_all(table);
+        let batches = select_batches(&store, table);
         for batch in &batches {
             match batch.column(&col_name) {
                 Some(ColumnData::Float64(v)) => {
@@ -1005,7 +1033,7 @@ impl StorageEngine for ColumnarStorageEngine {
             return None;
         }
         let mut max: Option<f64> = None;
-        let batches = store.batches_all(table);
+        let batches = select_batches(&store, table);
         for batch in &batches {
             match batch.column(&col_name) {
                 Some(ColumnData::Float64(v)) => {
