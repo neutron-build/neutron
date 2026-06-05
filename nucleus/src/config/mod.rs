@@ -830,6 +830,7 @@ port = 5555
     #[test]
     fn test_env_override_server() {
         let mut cfg = NucleusConfig::default();
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::set_var("NUCLEUS_SERVER_HOST", "192.168.1.1");
             env::set_var("NUCLEUS_SERVER_PORT", "6543");
@@ -840,6 +841,7 @@ port = 5555
         assert_eq!(cfg.server.port, 6543);
         assert_eq!(cfg.server.max_connections, 500);
         // cleanup
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::remove_var("NUCLEUS_SERVER_HOST");
             env::remove_var("NUCLEUS_SERVER_PORT");
@@ -850,6 +852,7 @@ port = 5555
     #[test]
     fn test_env_override_storage() {
         let mut cfg = NucleusConfig::default();
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::set_var("NUCLEUS_STORAGE_DATA_DIR", "/mnt/ssd/nucleus");
             env::set_var("NUCLEUS_STORAGE_MEMORY_MODE", "true");
@@ -857,6 +860,7 @@ port = 5555
         cfg.apply_env_overrides();
         assert_eq!(cfg.storage.data_dir, "/mnt/ssd/nucleus");
         assert!(cfg.storage.memory_mode);
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::remove_var("NUCLEUS_STORAGE_DATA_DIR");
             env::remove_var("NUCLEUS_STORAGE_MEMORY_MODE");
@@ -866,6 +870,7 @@ port = 5555
     #[test]
     fn test_env_override_wal_and_logging() {
         let mut cfg = NucleusConfig::default();
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::set_var("NUCLEUS_WAL_ENABLED", "false");
             env::set_var("NUCLEUS_LOGGING_LEVEL", "trace");
@@ -873,6 +878,7 @@ port = 5555
         cfg.apply_env_overrides();
         assert!(!cfg.wal.enabled);
         assert_eq!(cfg.logging.level, "trace");
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::remove_var("NUCLEUS_WAL_ENABLED");
             env::remove_var("NUCLEUS_LOGGING_LEVEL");
@@ -882,6 +888,7 @@ port = 5555
     #[test]
     fn test_env_override_metrics_and_cache() {
         let mut cfg = NucleusConfig::default();
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::set_var("NUCLEUS_METRICS_ENABLED", "true");
             env::set_var("NUCLEUS_METRICS_PORT", "9300");
@@ -893,6 +900,7 @@ port = 5555
         assert_eq!(cfg.metrics.port, 9300);
         assert!(cfg.cache.enabled);
         assert_eq!(cfg.cache.max_memory_mb, 512);
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::remove_var("NUCLEUS_METRICS_ENABLED");
             env::remove_var("NUCLEUS_METRICS_PORT");
@@ -967,6 +975,7 @@ port = 5555
     #[test]
     fn test_env_override_pool() {
         let mut cfg = NucleusConfig::default();
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::set_var("NUCLEUS_POOL_MIN_IDLE", "10");
             env::set_var("NUCLEUS_POOL_MAX_IDLE_TIME_SECS", "300");
@@ -978,6 +987,7 @@ port = 5555
         assert_eq!(cfg.pool.max_idle_time_secs, 300);
         assert_eq!(cfg.pool.max_lifetime_secs, 7200);
         assert_eq!(cfg.pool.acquire_timeout_secs, 15);
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::remove_var("NUCLEUS_POOL_MIN_IDLE");
             env::remove_var("NUCLEUS_POOL_MAX_IDLE_TIME_SECS");
@@ -991,6 +1001,7 @@ port = 5555
     #[test]
     fn test_env_override_replication() {
         let mut cfg = NucleusConfig::default();
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::set_var("NUCLEUS_REPLICATION_MODE", "primary");
             env::set_var("NUCLEUS_REPLICATION_PRIMARY_HOST", "10.0.0.1");
@@ -1004,6 +1015,7 @@ port = 5555
         assert_eq!(cfg.replication.primary_port, Some(5432));
         assert_eq!(cfg.replication.sync_mode, "sync");
         assert_eq!(cfg.replication.failover_timeout_ms, 10000);
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::remove_var("NUCLEUS_REPLICATION_MODE");
             env::remove_var("NUCLEUS_REPLICATION_PRIMARY_HOST");
@@ -1018,6 +1030,7 @@ port = 5555
     #[test]
     fn test_env_override_storage_extended() {
         let mut cfg = NucleusConfig::default();
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::set_var("NUCLEUS_STORAGE_BUFFER_POOL_SIZE_MB", "256");
             env::set_var("NUCLEUS_STORAGE_USE_DIRECT_IO", "true");
@@ -1025,6 +1038,7 @@ port = 5555
         cfg.apply_env_overrides();
         assert_eq!(cfg.storage.buffer_pool_size_mb, 256);
         assert!(cfg.storage.use_direct_io);
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::remove_var("NUCLEUS_STORAGE_BUFFER_POOL_SIZE_MB");
             env::remove_var("NUCLEUS_STORAGE_USE_DIRECT_IO");
@@ -1034,6 +1048,7 @@ port = 5555
     #[test]
     fn test_env_override_wal_extended() {
         let mut cfg = NucleusConfig::default();
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::set_var("NUCLEUS_WAL_SEGMENT_SIZE_MB", "128");
             env::set_var("NUCLEUS_WAL_CHECKPOINT_INTERVAL_SECS", "600");
@@ -1045,6 +1060,7 @@ port = 5555
         assert_eq!(cfg.wal.checkpoint_interval_secs, 600);
         assert_eq!(cfg.wal.group_commit_interval_us, 500);
         assert_eq!(cfg.wal.sync_mode, "fdatasync");
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
         unsafe {
             env::remove_var("NUCLEUS_WAL_SEGMENT_SIZE_MB");
             env::remove_var("NUCLEUS_WAL_CHECKPOINT_INTERVAL_SECS");

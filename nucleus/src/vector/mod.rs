@@ -231,6 +231,7 @@ pub fn simd_cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 
     for i in 0..chunks {
         let base = i * 8;
+        // SAFETY: n = a.len().min(b.len()); base = i*8 with i < n/8, so each pa/pb.add(base+j) (j<8) stays < n <= both slice lengths.
         unsafe {
             let a0 = *pa.add(base);
             let a1 = *pa.add(base + 1);
@@ -263,6 +264,7 @@ pub fn simd_cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 
     let tail_start = chunks * 8;
     for i in 0..remainder {
+        // SAFETY: n = a.len().min(b.len()); base = i*8 with i < n/8, so each pa/pb.add(base+j) (j<8) stays < n <= both slice lengths.
         unsafe {
             let ai = *pa.add(tail_start + i);
             let bi = *pb.add(tail_start + i);
@@ -301,6 +303,9 @@ pub fn distance_raw(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
 /// hint only — the CPU is free to ignore it.
 #[inline(always)]
 fn prefetch_read_data<T>(ptr: *const T) {
+    // SAFETY: _mm_prefetch is a pure CPU hint — it never dereferences `ptr` and
+    // cannot fault for any address; the intrinsic is unconditionally available
+    // on the gated target_arch.
     #[cfg(target_arch = "x86_64")]
     unsafe {
         std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
