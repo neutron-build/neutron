@@ -5,3 +5,8 @@
 *.new
 *.rs2
 *mod_new.rs
+
+# Scratch single-file test binaries compiled at the crate root (rustc foo.rs -o foo)
+/test_*
+/format_test
+!/tests/
