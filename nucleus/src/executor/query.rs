@@ -604,7 +604,9 @@ impl Executor {
                 match name.as_str() {
                     "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "ARRAY_AGG" | "STRING_AGG"
                     | "JSON_AGG" | "BOOL_AND" | "BOOL_OR" | "STDDEV" | "VARIANCE"
-                    | "STDDEV_POP" | "STDDEV_SAMP" | "VAR_POP" | "VAR_SAMP" => {
+                    | "STDDEV_POP" | "STDDEV_SAMP" | "VAR_POP" | "VAR_SAMP" | "ARGMAX"
+                    | "ARG_MAX" | "ARGMIN" | "ARG_MIN" | "PERCENTILE_CONT" | "PERCENTILE_DISC"
+                    | "MEDIAN" | "QUANTILE" => {
                         out.push(format!("{expr}"));
                     }
                     _ => {}

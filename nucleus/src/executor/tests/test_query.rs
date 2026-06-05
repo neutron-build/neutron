@@ -1856,3 +1856,51 @@ async fn test_having_aggregate_not_in_projection() {
     let r3 = exec(&ex, "SELECT name FROM g GROUP BY name HAVING COUNT(*) >= 1").await;
     assert_eq!(rows(&r3[0]).len(), 2);
 }
+
+// ── D-4: argMax / argMin and ordered-set aggregates (percentile/median) ──
+
+#[tokio::test]
+async fn test_argmax_argmin() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t (k TEXT, v INT, ver INT)").await;
+    exec(&ex, "INSERT INTO t VALUES ('a', 10, 1)").await;
+    exec(&ex, "INSERT INTO t VALUES ('a', 99, 3)").await; // highest ordering
+    exec(&ex, "INSERT INTO t VALUES ('a', 50, 2)").await;
+
+    // argMax(value, ordering) returns the value at the maximum ordering.
+    let r = exec(&ex, "SELECT ARGMAX(v, ver) FROM t").await;
+    assert_eq!(scalar(&r[0]), &Value::Int32(99));
+    let r = exec(&ex, "SELECT ARGMIN(v, ver) FROM t").await;
+    assert_eq!(scalar(&r[0]), &Value::Int32(10));
+
+    // Empty table → NULL.
+    exec(&ex, "CREATE TABLE e (v INT, ver INT)").await;
+    let r = exec(&ex, "SELECT ARGMAX(v, ver) FROM e").await;
+    assert_eq!(scalar(&r[0]), &Value::Null);
+}
+
+#[tokio::test]
+async fn test_percentile_and_median() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE p (x INT)").await;
+    for i in 1..=10 {
+        exec(&ex, &format!("INSERT INTO p VALUES ({i})")).await;
+    }
+
+    // PERCENTILE_CONT interpolates: rank = 0.95*(10-1) = 8.55 → 9 + 0.55 = 9.55.
+    let r = exec(&ex, "SELECT PERCENTILE_CONT(x, 0.95) FROM p").await;
+    assert_eq!(scalar(&r[0]), &Value::Float64(9.549999999999999));
+    // PERCENTILE_DISC returns an actual data point: ceil(0.5*10)=5 → vals[4]=5.
+    let r = exec(&ex, "SELECT PERCENTILE_DISC(x, 0.5) FROM p").await;
+    assert_eq!(scalar(&r[0]), &Value::Float64(5.0));
+    // MEDIAN = percentile_cont 0.5 = 5.5.
+    let r = exec(&ex, "SELECT MEDIAN(x) FROM p").await;
+    assert_eq!(scalar(&r[0]), &Value::Float64(5.5));
+
+    // Fraction out of range errors.
+    assert!(
+        ex.execute("SELECT PERCENTILE_CONT(x, 1.5) FROM p")
+            .await
+            .is_err()
+    );
+}

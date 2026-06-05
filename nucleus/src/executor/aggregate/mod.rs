@@ -563,6 +563,14 @@ impl Executor {
                 | "EVERY"
                 | "BIT_AND"
                 | "BIT_OR"
+                | "ARGMAX"
+                | "ARG_MAX"
+                | "ARGMIN"
+                | "ARG_MIN"
+                | "PERCENTILE_CONT"
+                | "PERCENTILE_DISC"
+                | "MEDIAN"
+                | "QUANTILE"
         )
     }
 
@@ -1151,6 +1159,100 @@ impl Executor {
                     result |= value_to_i64(&v)?;
                 }
                 Ok(Value::Int64(result))
+            }
+            // argMax(value, ordering) / argMin(value, ordering): the `value` from
+            // the row with the maximum / minimum `ordering`. The cleanest
+            // dedup-then-pick primitive for newest-wins reads (teploy-observe D-4).
+            "ARGMAX" | "ARG_MAX" | "ARGMIN" | "ARG_MIN" => {
+                let val_expr = arg_expr.ok_or_else(|| {
+                    ExecError::Unsupported(format!("{fname} requires (value, ordering) arguments"))
+                })?;
+                let ord_expr = arg_expr_2.ok_or_else(|| {
+                    ExecError::Unsupported(format!("{fname} requires a second ordering argument"))
+                })?;
+                let want_max = fname == "ARGMAX" || fname == "ARG_MAX";
+                let mut best: Option<(Value, Value)> = None; // (ordering, value)
+                for &idx in effective_indices {
+                    let ord = self.eval_row_expr(ord_expr, &all_rows[idx], col_meta)?;
+                    if ord == Value::Null {
+                        continue;
+                    }
+                    match &best {
+                        None => {
+                            let val = self.eval_row_expr(val_expr, &all_rows[idx], col_meta)?;
+                            best = Some((ord, val));
+                        }
+                        Some((cur_ord, _)) => {
+                            let take = match compare_values(&ord, cur_ord) {
+                                Some(std::cmp::Ordering::Greater) => want_max,
+                                Some(std::cmp::Ordering::Less) => !want_max,
+                                _ => false,
+                            };
+                            if take {
+                                let val = self.eval_row_expr(val_expr, &all_rows[idx], col_meta)?;
+                                best = Some((ord, val));
+                            }
+                        }
+                    }
+                }
+                Ok(best.map(|(_, v)| v).unwrap_or(Value::Null))
+            }
+            // Ordered-set aggregates in functional form: PERCENTILE_CONT(expr,
+            // fraction) interpolates, PERCENTILE_DISC(expr, fraction) returns an
+            // actual data point, MEDIAN(expr) = percentile_cont 0.5, QUANTILE is a
+            // PERCENTILE_CONT alias. Gives p50/p95/p99 without client-side math.
+            "PERCENTILE_CONT" | "PERCENTILE_DISC" | "MEDIAN" | "QUANTILE" => {
+                let val_expr = arg_expr.ok_or_else(|| {
+                    ExecError::Unsupported(format!("{fname} requires a value argument"))
+                })?;
+                let fraction = if fname == "MEDIAN" {
+                    0.5
+                } else {
+                    let f_expr = arg_expr_2.ok_or_else(|| {
+                        ExecError::Unsupported(format!("{fname} requires a fraction argument"))
+                    })?;
+                    let probe = effective_indices
+                        .first()
+                        .map(|&i| all_rows[i].as_slice())
+                        .unwrap_or(&[]);
+                    let fv = self.eval_row_expr(f_expr, &probe.to_vec(), col_meta)?;
+                    value_to_f64(&fv)?
+                };
+                if !(0.0..=1.0).contains(&fraction) {
+                    return Err(ExecError::Unsupported(format!(
+                        "{fname} fraction must be between 0 and 1"
+                    )));
+                }
+                let mut vals: Vec<f64> = Vec::new();
+                for &idx in effective_indices {
+                    let v = self.eval_row_expr(val_expr, &all_rows[idx], col_meta)?;
+                    if v != Value::Null {
+                        vals.push(value_to_f64(&v)?);
+                    }
+                }
+                if vals.is_empty() {
+                    return Ok(Value::Null);
+                }
+                vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let n = vals.len();
+                let result = if fname == "PERCENTILE_DISC" {
+                    // Smallest value whose cumulative position >= fraction.
+                    let idx = ((fraction * n as f64).ceil() as usize)
+                        .saturating_sub(1)
+                        .min(n - 1);
+                    vals[idx]
+                } else {
+                    // Continuous: linear interpolation between adjacent ranks.
+                    let rank = fraction * (n - 1) as f64;
+                    let lo = rank.floor() as usize;
+                    let hi = rank.ceil() as usize;
+                    if lo == hi {
+                        vals[lo]
+                    } else {
+                        vals[lo] + (vals[hi] - vals[lo]) * (rank - lo as f64)
+                    }
+                };
+                Ok(Value::Float64(result))
             }
             _ => Err(ExecError::Unsupported(format!(
                 "unknown aggregate: {fname}"
