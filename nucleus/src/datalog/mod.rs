@@ -1620,8 +1620,16 @@ impl DatalogWal {
             .truncate(true)
             .open(&self.path)?;
         let mut w = BufWriter::new(file);
+        // Guard the length prefix: a payload over 4 GiB would silently truncate
+        // when cast to u32 and corrupt the snapshot on replay. Fail loudly instead.
+        let plen = u32::try_from(payload.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "datalog checkpoint payload exceeds 4 GiB",
+            )
+        })?;
         w.write_all(&[WAL_SNAPSHOT])?;
-        w.write_all(&(payload.len() as u32).to_le_bytes())?;
+        w.write_all(&plen.to_le_bytes())?;
         w.write_all(&payload)?;
         w.flush()?;
         drop(w);

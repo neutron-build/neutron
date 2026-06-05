@@ -2351,9 +2351,38 @@ fn decode_pg_param(
                 }))
             }
         }
-        _ => Some(DecodedParam::Text(
-            String::from_utf8_lossy(bytes).into_owned(),
-        )),
+        _ => {
+            // Unknown OID. A text-format value is UTF-8 and decodes losslessly.
+            // A binary-format value is NOT UTF-8 — from_utf8_lossy would mangle
+            // it. Undeclared binary params are overwhelmingly fixed-width
+            // integers (drivers send float/date/timestamp with their OID), so
+            // decode the standard int widths; fall back to text otherwise.
+            if is_binary {
+                match bytes.len() {
+                    2 => Some(DecodedParam::Numeric(
+                        (i16::from_be_bytes([bytes[0], bytes[1]]) as i64).to_string(),
+                    )),
+                    4 => Some(DecodedParam::Numeric(
+                        (i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64)
+                            .to_string(),
+                    )),
+                    8 => Some(DecodedParam::Numeric(
+                        i64::from_be_bytes([
+                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                            bytes[7],
+                        ])
+                        .to_string(),
+                    )),
+                    _ => Some(DecodedParam::Text(
+                        String::from_utf8_lossy(bytes).into_owned(),
+                    )),
+                }
+            } else {
+                Some(DecodedParam::Text(
+                    String::from_utf8_lossy(bytes).into_owned(),
+                ))
+            }
+        }
     }
 }
 

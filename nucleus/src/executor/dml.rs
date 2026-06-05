@@ -461,10 +461,13 @@ impl Executor {
                 let existing_granules = self.zone_map_index.get_table_granules(zm_table_id);
                 // Determine the starting row offset for new rows: sum of row_count
                 // across all existing granules.
-                let base_row_offset: u32 = existing_granules.iter().map(|g| g.row_count).sum();
+                // Accumulate in u64: the cumulative row offset overflows u32 past
+                // ~4.29B rows, which would wrap and mis-assign new rows to granule 0.
+                let base_row_offset: u64 =
+                    existing_granules.iter().map(|g| g.row_count as u64).sum();
                 for (i, row) in inserted_rows.iter().enumerate() {
-                    let row_idx = base_row_offset + i as u32;
-                    let granule_id = row_idx / GRANULE_SIZE;
+                    let row_idx = base_row_offset + i as u64;
+                    let granule_id = (row_idx / GRANULE_SIZE as u64) as u32;
                     let mut granule = self
                         .zone_map_index
                         .get_granule(zm_table_id, granule_id)
@@ -1270,7 +1273,9 @@ impl Executor {
                         .storage_for(&table_name)
                         .scan_where_eq_positions(&table_name, col_idx, &eq_value)
                         .await?;
-                    self.metrics.rows_scanned.inc_by(1);
+                    // Count rows actually matched, not a literal 1 (the equality
+                    // scan still examines the matching rows).
+                    self.metrics.rows_scanned.inc_by(matches.len() as u64);
                     (matches.into_iter().collect::<Vec<_>>(), true)
                 }
                 None => {
@@ -1579,7 +1584,7 @@ impl Executor {
                         .storage_for(&table_name)
                         .scan_where_eq_positions(&table_name, col_idx, &eq_value)
                         .await?;
-                    self.metrics.rows_scanned.inc_by(1);
+                    self.metrics.rows_scanned.inc_by(matches.len() as u64);
                     (matches, true)
                 }
                 None => {

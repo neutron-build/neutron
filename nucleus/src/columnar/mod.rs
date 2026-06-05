@@ -521,6 +521,14 @@ fn sort_batch_by_keys(batch: &ColumnBatch, keys: &[String]) -> ColumnBatch {
     if row_count <= 1 || keys.is_empty() {
         return batch.clone();
     }
+    // Keys are stringified column indices ("0","1",…) per the columnar naming
+    // convention, so every key must resolve to a real column. A missing column
+    // would make compare_column_values fall through to Equal and silently
+    // mis-sort — surface that as a bug in debug rather than degrade silently.
+    debug_assert!(
+        keys.iter().all(|k| batch.column(k).is_some()),
+        "sort key column not found in batch (keys={keys:?})"
+    );
     let mut indices: Vec<usize> = (0..row_count).collect();
     indices.sort_by(|&a, &b| {
         for k in keys {

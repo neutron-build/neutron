@@ -478,6 +478,15 @@ impl Stream {
         id: StreamEntryId,
         fields: Vec<(String, String)>,
     ) -> StreamEntryId {
+        // Enforce the strictly-increasing invariant that xrange/xread/xlen rely
+        // on. An explicit id that is not greater than the last entry's id (an
+        // out-of-order XADD or a malformed WAL entry) would corrupt stream
+        // ordering; bump it to the next sequence after last_id instead.
+        let id = if id > self.last_id {
+            id
+        } else {
+            StreamEntryId::new(self.last_id.ms, self.last_id.seq + 1)
+        };
         self.last_id = id.clone();
         self.entries.push(StreamEntry {
             id: id.clone(),
@@ -1158,5 +1167,28 @@ mod tests {
         let id2 = s.xadd(vec![("k".into(), "v2".into())]);
         assert!(id2 > id1);
         assert_eq!(s.xlen(), 2);
+    }
+
+    #[test]
+    fn stream_xadd_with_id_enforces_increasing_order() {
+        let mut s = Stream::new();
+        s.xadd_with_id(StreamEntryId::new(5, 0), vec![("k".into(), "a".into())]);
+        // An explicit id that is not strictly greater than the last is bumped
+        // to the next sequence rather than corrupting stream order.
+        let got = s.xadd_with_id(StreamEntryId::new(3, 0), vec![("k".into(), "b".into())]);
+        assert_eq!(
+            got,
+            StreamEntryId::new(5, 1),
+            "out-of-order id must be bumped"
+        );
+        assert_eq!(s.last_id, StreamEntryId::new(5, 1));
+        // Entries remain sorted, so xrange over the full range returns both.
+        let all = s.xrange(
+            &StreamEntryId::new(0, 0),
+            &StreamEntryId::new(u64::MAX, u64::MAX),
+            None,
+        );
+        assert_eq!(all.len(), 2);
+        assert!(all[0].id < all[1].id);
     }
 }
