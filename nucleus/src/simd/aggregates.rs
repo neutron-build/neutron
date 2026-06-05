@@ -340,6 +340,7 @@ pub fn count_i64(data: &[i64]) -> u64 {
     {
         if is_x86_feature_detected!("avx512f") {
             simd_dispatch_counter("count_i64", "avx512");
+            // SAFETY: avx512f availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { count_i64_avx512(data) };
         }
     }
@@ -348,6 +349,7 @@ pub fn count_i64(data: &[i64]) -> u64 {
     {
         if is_x86_feature_detected!("avx2") {
             simd_dispatch_counter("count_i64", "avx2");
+            // SAFETY: avx2 availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { count_i64_avx2(data) };
         }
     }
@@ -364,6 +366,7 @@ pub fn sum_i64(data: &[i64]) -> i64 {
     {
         if is_x86_feature_detected!("avx512f") {
             simd_dispatch_counter("sum_i64", "avx512");
+            // SAFETY: avx512f availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { sum_i64_avx512(data) };
         }
     }
@@ -372,6 +375,7 @@ pub fn sum_i64(data: &[i64]) -> i64 {
     {
         if is_x86_feature_detected!("avx2") {
             simd_dispatch_counter("sum_i64", "avx2");
+            // SAFETY: avx2 availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { sum_i64_avx2(data) };
         }
     }
@@ -388,6 +392,7 @@ pub fn min_i64(data: &[i64]) -> Option<i64> {
     {
         if is_x86_feature_detected!("avx512f") {
             simd_dispatch_counter("min_i64", "avx512");
+            // SAFETY: avx512f availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { min_i64_avx512(data) };
         }
     }
@@ -396,6 +401,7 @@ pub fn min_i64(data: &[i64]) -> Option<i64> {
     {
         if is_x86_feature_detected!("avx2") {
             simd_dispatch_counter("min_i64", "avx2");
+            // SAFETY: avx2 availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { min_i64_avx2(data) };
         }
     }
@@ -412,6 +418,7 @@ pub fn max_i64(data: &[i64]) -> Option<i64> {
     {
         if is_x86_feature_detected!("avx512f") {
             simd_dispatch_counter("max_i64", "avx512");
+            // SAFETY: avx512f availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { max_i64_avx512(data) };
         }
     }
@@ -420,6 +427,7 @@ pub fn max_i64(data: &[i64]) -> Option<i64> {
     {
         if is_x86_feature_detected!("avx2") {
             simd_dispatch_counter("max_i64", "avx2");
+            // SAFETY: avx2 availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { max_i64_avx2(data) };
         }
     }

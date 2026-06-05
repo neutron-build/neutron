@@ -98,6 +98,9 @@ pub(super) fn sync_block_on<F: std::future::Future>(fut: F) -> F::Output {
         RawWaker::new(std::ptr::null(), &VTABLE)
     }
 
+    // SAFETY: noop_raw_waker() returns a RawWaker whose vtable's clone/wake/
+    // wake_by_ref/drop are all no-ops over a null data pointer that is never
+    // dereferenced, so it upholds the RawWaker/Waker contract.
     let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
     let mut cx = Context::from_waker(&waker);
     let mut fut = pin!(fut);

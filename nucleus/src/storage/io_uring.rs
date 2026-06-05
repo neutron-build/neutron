@@ -184,6 +184,10 @@ impl AsyncDiskOps for IoUringDiskOps {
                 io::Error::new(io::ErrorKind::Other, format!("ring lock poisoned: {e}"))
             })?;
 
+            // SAFETY: the SQE references read_buf, which is owned by this closure
+            // and outlives the operation — submit_and_wait(1) below blocks until
+            // the kernel finishes the read before read_buf is returned/dropped, so
+            // the buffer stays valid for the kernel's entire access.
             unsafe {
                 ring_guard
                     .submission()
@@ -239,6 +243,9 @@ impl AsyncDiskOps for IoUringDiskOps {
                 io::Error::new(io::ErrorKind::Other, format!("ring lock poisoned: {e}"))
             })?;
 
+            // SAFETY: the SQE references write_buf, owned by this closure and
+            // kept alive past submit_and_wait(1), which blocks until the kernel
+            // finishes reading it — so the buffer stays valid for the write.
             unsafe {
                 ring_guard
                     .submission()
@@ -276,6 +283,9 @@ impl AsyncDiskOps for IoUringDiskOps {
                 io::Error::new(io::ErrorKind::Other, format!("ring lock poisoned: {e}"))
             })?;
 
+            // SAFETY: the fsync SQE references only the file descriptor (no data
+            // buffer); the fd stays open for the duration of submit_and_wait(1),
+            // which blocks until the kernel completes the fsync.
             unsafe {
                 ring_guard
                     .submission()
