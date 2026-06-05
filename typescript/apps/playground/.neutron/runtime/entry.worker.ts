@@ -16,7 +16,7 @@ import * as routeModule12 from "../../src/routes/api/stream.tsx";
 import * as routeModule13 from "../../src/routes/users/[id].tsx";
 import * as routeModule14 from "../../src/routes/api/session/refresh.tsx";
 
-const CLIENT_ENTRY_SCRIPT_SRC = "/assets/index-DUId0ORO.js";
+const CLIENT_ENTRY_SCRIPT_SRC = "/assets/index-DURrDbRB.js";
 const ROUTE_RULES = compileRouteRules({});
 
 const ROUTE_DEFS = [
@@ -188,7 +188,7 @@ for (const routeDef of ROUTE_DEFS) {
   }
 }
 
-export async function handleNeutronRequest(request) {
+async function handleNeutronRequestInner(request) {
   const requestUrl = new URL(request.url);
   const pathname = normalizePathname(requestUrl.pathname);
   if (!pathname) {
@@ -630,6 +630,23 @@ function renderErrorResponse(allRoutes, modules, route, error) {
     status: 500,
     headers: { "Content-Type": "text/html; charset=utf-8" },
   });
+}
+
+// Apply baseline security headers to every response from the production handler
+// (the dev server does this already; the generated handler must match).
+export async function handleNeutronRequest(request) {
+  const response = await handleNeutronRequestInner(request);
+  const defaults = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+  };
+  for (const [name, value] of Object.entries(defaults)) {
+    if (!response.headers.has(name)) {
+      response.headers.set(name, value);
+    }
+  }
+  return response;
 }
 
 function findNearestErrorBoundary(allRoutes, modules, route) {
