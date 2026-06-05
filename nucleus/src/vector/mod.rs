@@ -756,15 +756,33 @@ impl HnswIndex {
             }
         }
 
-        // Final fallback: search with ef = total nodes (brute-force through graph)
+        // Fallback: search with ef = total nodes (brute-force through graph).
         let ef = self.nodes.len();
         let candidates = self.search_layer(current, query, ef, 0);
-        candidates
+        let graph_results: Vec<(u64, f32)> = candidates
             .into_iter()
             .filter(|c| !self.deleted.contains(&c.id) && filter(c.id))
             .take(k)
             .map(|c| (c.id, c.dist))
-            .collect()
+            .collect();
+        if graph_results.len() >= k {
+            return graph_results;
+        }
+
+        // Guaranteed-recall fallback: graph traversal may not reach every node
+        // (e.g. a disconnected layer-0 component under a highly selective
+        // filter), so it can return < k even when k matches exist. Linear-scan
+        // all non-deleted, filter-passing nodes and return the exact top-k. This
+        // is O(n) but only runs when the graph search came up short.
+        let mut all: Vec<(u64, f32)> = self
+            .nodes
+            .iter()
+            .filter(|(id, _)| !self.deleted.contains(id) && filter(**id))
+            .map(|(id, node)| (*id, distance(query, &node.vector, self.config.metric)))
+            .collect();
+        all.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        all.truncate(k);
+        all
     }
 
     /// Mark a vector ID as deleted. It will be excluded from search results.
@@ -1514,6 +1532,34 @@ mod tests {
         let results = exact_search(&vectors, &query, 2, DistanceMetric::L2);
         assert_eq!(results[0].0, 1); // Exact match
         assert_eq!(results[1].0, 3); // Closest
+    }
+
+    #[test]
+    fn search_filtered_returns_all_matching_when_selective() {
+        // A highly selective filter must still return every passing vector
+        // (up to k), even if the HNSW graph traversal wouldn't reach them —
+        // the guaranteed-recall linear-scan fallback covers that case.
+        let config = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 100,
+            ef_search: 50,
+            metric: DistanceMetric::L2,
+        };
+        let mut index = HnswIndex::new(config);
+        let dim = 16;
+        for i in 0..300u64 {
+            index.insert(i, rand_vec(dim));
+        }
+        let allowed: HashSet<u64> = [3u64, 100, 207, 299].into_iter().collect();
+        let allowed_f = allowed.clone();
+        let query = rand_vec(dim);
+        let results = index.search_filtered(&query, 4, move |id| allowed_f.contains(&id));
+        let got: HashSet<u64> = results.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            got, allowed,
+            "all filter-passing vectors must be returned regardless of graph reachability"
+        );
     }
 
     #[test]
