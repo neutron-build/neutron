@@ -34,7 +34,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "lint": "tsc --noEmit --pretty false",
-    "test": "pnpm run build && node --test --experimental-test-isolation=none dist/ratelimit/index.test.js"
+    "test": "pnpm run build && node --test --experimental-test-isolation=none \"dist/**/*.test.js\""
   },
   "peerDependencies": {
     "@aws-sdk/client-s3": "^3.883.0",
