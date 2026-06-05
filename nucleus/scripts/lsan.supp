@@ -1,0 +1,4 @@
+# LeakSanitizer suppressions for Nucleus.
+# Add entries only for confirmed false positives in third-party/system libraries,
+# e.g.:  leak:libcrypto   or   leak:some_c_dependency_init
+# Keep Nucleus's own frames OUT of this file so real leaks always fail the run.
