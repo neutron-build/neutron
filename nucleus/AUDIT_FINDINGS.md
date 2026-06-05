@@ -569,3 +569,30 @@ so both rewriting the literal and substituting `std::f64::consts::PI` would chan
 results (PI is 0.00159 from 3.14, which breaks the tolerance asserts). Resolved with
 scoped `#[allow(clippy::approx_constant)]` on the affected test modules, each with a
 comment. Production code is unaffected (future real π misuse is still caught).
+
+---
+
+## O-001/O-002/O-003 — teploy-observe fix brief (2026-06-05)  ·  RESOLVED (commit 9d227c3)
+
+Live pgwire verification by observe surfaced three issues (brief:
+`_internal/NUCLEUS_FIX_BRIEF_FROM_OBSERVE_2026-06-05.md`).
+
+- **O-002 write-time type coercion (root cause).** The general `execute_insert`
+  path stored a text-bound value (`'5'`) into a declared numeric/bool column as
+  `Value::Text` instead of coercing to the column type. Fixed: coerce per row
+  against the declared type (mirrors the extended-protocol / fast-insert paths).
+- **O-001 columnar `concat_columns` panic (defense in depth).** A mixed-variant
+  column (legacy data) panicked the worker on read. Fixed: unify both sides to a
+  common type (numeric when representable, else Text) instead of `panic!`; no
+  rows dropped, reads never crash. New `ColumnData::{as_i64_opt,as_f64_opt,
+  as_text_opt}` + `unify_columns` helpers.
+- **O-003 ClickHouse `ENGINE=ReplacingMergeTree(v)` ignored.** That DDL parses as
+  `SqlOption::NamedParenthesizedList`, which `extract_engine_option` didn't read,
+  so the table degraded to plain (no version column / no read-time dedup) and
+  COUNT/SUM didn't collapse superseded versions. Fixed: normalize the engine name
+  and take the version column from the parenthesized arg. (Read-time aggregate
+  dedup was already correct for the native `WITH (engine=...)` form — the brief's
+  "aggregate dedup doesn't happen" was a symptom of the ignored engine clause.)
+
+Regression: `tests/observe_fix_brief_2026_06_05.rs` (both DDL forms) +
+`columnar::tests::concat_columns_unifies_mixed_types_without_panic`.
