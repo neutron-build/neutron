@@ -93,9 +93,7 @@ impl RlsPredicate {
     /// Evaluate the predicate against a row (column_name → value map) and session context.
     pub fn evaluate(&self, row: &HashMap<String, String>, ctx: &SessionContext) -> bool {
         match self {
-            RlsPredicate::ColumnEqStr { column, value } => {
-                row.get(column) == Some(value)
-            }
+            RlsPredicate::ColumnEqStr { column, value } => row.get(column) == Some(value),
             RlsPredicate::ColumnEqTenant { column } => {
                 if let Some(tenant) = &ctx.tenant_id {
                     row.get(column) == Some(tenant)
@@ -103,9 +101,7 @@ impl RlsPredicate {
                     false
                 }
             }
-            RlsPredicate::ColumnEqUser { column } => {
-                row.get(column) == Some(&ctx.user)
-            }
+            RlsPredicate::ColumnEqUser { column } => row.get(column) == Some(&ctx.user),
             RlsPredicate::HasRole { role } => ctx.has_role(role),
             RlsPredicate::And(a, b) => a.evaluate(row, ctx) && b.evaluate(row, ctx),
             RlsPredicate::Or(a, b) => a.evaluate(row, ctx) || b.evaluate(row, ctx),
@@ -227,10 +223,8 @@ impl RlsEngine {
         }
 
         // Permissive policies: at least one must pass
-        let permissive: Vec<&&RlsPolicy> =
-            applicable.iter().filter(|p| p.permissive).collect();
-        let restrictive: Vec<&&RlsPolicy> =
-            applicable.iter().filter(|p| !p.permissive).collect();
+        let permissive: Vec<&&RlsPolicy> = applicable.iter().filter(|p| p.permissive).collect();
+        let restrictive: Vec<&&RlsPolicy> = applicable.iter().filter(|p| !p.permissive).collect();
 
         // If there are permissive policies, at least one must allow
         let permissive_pass = if permissive.is_empty() {
@@ -240,9 +234,7 @@ impl RlsEngine {
         };
 
         // All restrictive policies must allow
-        let restrictive_pass = restrictive
-            .iter()
-            .all(|p| p.predicate.evaluate(row, ctx));
+        let restrictive_pass = restrictive.iter().all(|p| p.predicate.evaluate(row, ctx));
 
         permissive_pass && restrictive_pass
     }
@@ -275,7 +267,11 @@ pub enum MaskingRule {
     /// Email masking: t***@example.com
     EmailMask,
     /// Partial mask: show first N and last M characters.
-    Partial { show_first: usize, show_last: usize, mask_char: char },
+    Partial {
+        show_first: usize,
+        show_last: usize,
+        mask_char: char,
+    },
     /// Hash the value (for pseudonymization).
     Hash,
     /// No masking (pass through).
@@ -371,10 +367,7 @@ impl MaskingEngine {
     /// Get the masking rule for a specific table/column/role combination.
     pub fn get_rule(&self, table: &str, column: &str, ctx: &SessionContext) -> &MaskingRule {
         for policy in &self.policies {
-            if policy.table == table
-                && policy.column == column
-                && ctx.has_role(&policy.role)
-            {
+            if policy.table == table && policy.column == column && ctx.has_role(&policy.role) {
                 return &policy.rule;
             }
         }
@@ -521,7 +514,6 @@ impl SecurityManager {
     }
 }
 
-
 // ============================================================================
 // Per-Tenant Encryption Key Isolation
 // ============================================================================
@@ -568,9 +560,13 @@ impl TenantKeyManager {
         self.next_key_id += 1;
         // Archive the old key if one exists.
         if let Some(old) = self.active_keys.get(tenant_id) {
-            self.key_history.entry(tenant_id.to_string()).or_default().push(old.clone());
+            self.key_history
+                .entry(tenant_id.to_string())
+                .or_default()
+                .push(old.clone());
         }
-        self.active_keys.insert(tenant_id.to_string(), (key_id, key_bytes));
+        self.active_keys
+            .insert(tenant_id.to_string(), (key_id, key_bytes));
         key_id
     }
 
@@ -587,22 +583,31 @@ impl TenantKeyManager {
         if let Some((id, bytes)) = self.active_keys.get(tenant_id) {
             return Some((*id, bytes.as_slice()));
         }
-        self.default_key.as_ref().map(|(id, bytes)| (*id, bytes.as_slice()))
+        self.default_key
+            .as_ref()
+            .map(|(id, bytes)| (*id, bytes.as_slice()))
     }
 
     /// Get a specific key by key_id (searches active + history across all tenants).
     pub fn get_key_by_id(&self, key_id: u32) -> Option<&[u8]> {
         // Check default key.
         if let Some((id, bytes)) = &self.default_key
-            && *id == key_id { return Some(bytes.as_slice()); }
+            && *id == key_id
+        {
+            return Some(bytes.as_slice());
+        }
         // Check active keys.
         for (id, bytes) in self.active_keys.values() {
-            if *id == key_id { return Some(bytes.as_slice()); }
+            if *id == key_id {
+                return Some(bytes.as_slice());
+            }
         }
         // Check key history.
         for history in self.key_history.values() {
             for (id, bytes) in history {
-                if *id == key_id { return Some(bytes.as_slice()); }
+                if *id == key_id {
+                    return Some(bytes.as_slice());
+                }
             }
         }
         None
@@ -639,8 +644,15 @@ impl TenantKeyManager {
 #[derive(Debug, Clone)]
 pub enum RotationState {
     Idle,
-    InProgress { old_key_id: u32, new_key_id: u32, progress_pct: u8 },
-    Completed { old_key_id: u32, new_key_id: u32 },
+    InProgress {
+        old_key_id: u32,
+        new_key_id: u32,
+        progress_pct: u8,
+    },
+    Completed {
+        old_key_id: u32,
+        new_key_id: u32,
+    },
 }
 
 /// Record of a completed key rotation.
@@ -691,16 +703,26 @@ impl KeyRotationManager {
 
     /// Return the currently active key (id, algorithm, material).
     pub fn active_key(&self) -> Option<(u32, &str, &[u8])> {
-        self.keys.iter().find(|k| k.3).map(|k| (k.0, k.1.as_str(), k.2.as_slice()))
+        self.keys
+            .iter()
+            .find(|k| k.3)
+            .map(|k| (k.0, k.1.as_str(), k.2.as_slice()))
     }
 
     /// Look up a key by its ID.
     pub fn get_key(&self, key_id: u32) -> Option<(u32, &str, &[u8])> {
-        self.keys.iter().find(|k| k.0 == key_id).map(|k| (k.0, k.1.as_str(), k.2.as_slice()))
+        self.keys
+            .iter()
+            .find(|k| k.0 == key_id)
+            .map(|k| (k.0, k.1.as_str(), k.2.as_slice()))
     }
 
     /// Begin a key rotation: create a new key and set state to InProgress.
-    pub fn begin_rotation(&mut self, algorithm: &str, new_material: Vec<u8>) -> Result<u32, String> {
+    pub fn begin_rotation(
+        &mut self,
+        algorithm: &str,
+        new_material: Vec<u8>,
+    ) -> Result<u32, String> {
         if matches!(&self.state, RotationState::InProgress { .. }) {
             return Err("rotation already in progress".into());
         }
@@ -709,26 +731,57 @@ impl KeyRotationManager {
             None => return Err("no active key to rotate from".into()),
         };
         let new_key_id = self.create_key(algorithm, new_material);
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-        self.state = RotationState::InProgress { old_key_id, new_key_id, progress_pct: 0 };
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.state = RotationState::InProgress {
+            old_key_id,
+            new_key_id,
+            progress_pct: 0,
+        };
         self.rotation_history.push(RotationRecord {
-            old_key_id, new_key_id, started_at_ms: ts, completed_at_ms: None, pages_re_encrypted: 0,
+            old_key_id,
+            new_key_id,
+            started_at_ms: ts,
+            completed_at_ms: None,
+            pages_re_encrypted: 0,
         });
         Ok(new_key_id)
     }
 
     /// Update progress percentage of an in-progress rotation.
     pub fn update_progress(&mut self, pct: u8) {
-        if let RotationState::InProgress { old_key_id, new_key_id, .. } = self.state {
-            self.state = RotationState::InProgress { old_key_id, new_key_id, progress_pct: pct };
+        if let RotationState::InProgress {
+            old_key_id,
+            new_key_id,
+            ..
+        } = self.state
+        {
+            self.state = RotationState::InProgress {
+                old_key_id,
+                new_key_id,
+                progress_pct: pct,
+            };
         }
     }
 
     /// Finalize the current rotation.
     pub fn complete_rotation(&mut self, pages_re_encrypted: u64) -> Result<(), String> {
-        if let RotationState::InProgress { old_key_id, new_key_id, .. } = self.state {
-            let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-            self.state = RotationState::Completed { old_key_id, new_key_id };
+        if let RotationState::InProgress {
+            old_key_id,
+            new_key_id,
+            ..
+        } = self.state
+        {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.state = RotationState::Completed {
+                old_key_id,
+                new_key_id,
+            };
             if let Some(record) = self.rotation_history.last_mut() {
                 record.completed_at_ms = Some(ts);
                 record.pages_re_encrypted = pages_re_encrypted;
@@ -741,7 +794,12 @@ impl KeyRotationManager {
 
     /// Cancel an in-progress rotation, reverting active key to the old one.
     pub fn cancel_rotation(&mut self) -> Result<(), String> {
-        if let RotationState::InProgress { old_key_id, new_key_id, .. } = self.state {
+        if let RotationState::InProgress {
+            old_key_id,
+            new_key_id,
+            ..
+        } = self.state
+        {
             // Reactivate old key, deactivate new.
             for k in &mut self.keys {
                 k.3 = k.0 == old_key_id;
@@ -749,18 +807,26 @@ impl KeyRotationManager {
             self.state = RotationState::Idle;
             // Remove last history record (incomplete).
             if let Some(last) = self.rotation_history.last()
-                && last.old_key_id == old_key_id && last.new_key_id == new_key_id {
-                    self.rotation_history.pop();
-                }
+                && last.old_key_id == old_key_id
+                && last.new_key_id == new_key_id
+            {
+                self.rotation_history.pop();
+            }
             Ok(())
         } else {
             Err("no rotation in progress".into())
         }
     }
 
-    pub fn rotation_state(&self) -> &RotationState { &self.state }
-    pub fn rotation_history(&self) -> &[RotationRecord] { &self.rotation_history }
-    pub fn key_count(&self) -> usize { self.keys.len() }
+    pub fn rotation_state(&self) -> &RotationState {
+        &self.state
+    }
+    pub fn rotation_history(&self) -> &[RotationRecord] {
+        &self.rotation_history
+    }
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
+    }
 }
 
 #[cfg(test)]
@@ -947,9 +1013,30 @@ mod tests {
     fn audit_log_append_only() {
         let mut audit = AuditLog::new();
 
-        audit.log("alice", "SELECT", Some("users"), "SELECT * FROM users", 10, true);
-        audit.log("bob", "INSERT", Some("orders"), "INSERT INTO orders ...", 1, true);
-        audit.log("alice", "DELETE", Some("orders"), "DELETE FROM orders WHERE id=5", 1, false);
+        audit.log(
+            "alice",
+            "SELECT",
+            Some("users"),
+            "SELECT * FROM users",
+            10,
+            true,
+        );
+        audit.log(
+            "bob",
+            "INSERT",
+            Some("orders"),
+            "INSERT INTO orders ...",
+            1,
+            true,
+        );
+        audit.log(
+            "alice",
+            "DELETE",
+            Some("orders"),
+            "DELETE FROM orders WHERE id=5",
+            1,
+            false,
+        );
 
         assert_eq!(audit.len(), 3);
 
@@ -978,7 +1065,9 @@ mod tests {
             table: "orders".into(),
             command: PolicyCommand::All,
             target_roles: vec![],
-            predicate: RlsPredicate::ColumnEqTenant { column: "org_id".into() },
+            predicate: RlsPredicate::ColumnEqTenant {
+                column: "org_id".into(),
+            },
             permissive: true,
         });
 
@@ -1001,14 +1090,24 @@ mod tests {
         ]);
 
         // RLS check passes (same tenant)
-        assert!(mgr.rls.check_row("orders", PolicyCommand::Select, &row, &ctx));
+        assert!(
+            mgr.rls
+                .check_row("orders", PolicyCommand::Select, &row, &ctx)
+        );
 
         // Masking applies to support role
         let masked = mgr.masking.mask_row("orders", &row, &ctx);
         assert_eq!(masked["customer_email"], "j***@example.com");
 
         // Audit the access
-        mgr.audit.log(&ctx.user, "SELECT", Some("orders"), "SELECT * FROM orders", 1, true);
+        mgr.audit.log(
+            &ctx.user,
+            "SELECT",
+            Some("orders"),
+            "SELECT * FROM orders",
+            1,
+            true,
+        );
         assert_eq!(mgr.audit.len(), 1);
     }
 
@@ -1122,7 +1221,10 @@ mod tests {
         mgr.create_key("AES-256-GCM", vec![1, 2, 3]);
         let new_id = mgr.begin_rotation("AES-256-GCM", vec![4, 5, 6]).unwrap();
         assert_eq!(new_id, 2);
-        assert!(matches!(mgr.rotation_state(), RotationState::InProgress { .. }));
+        assert!(matches!(
+            mgr.rotation_state(),
+            RotationState::InProgress { .. }
+        ));
 
         mgr.update_progress(50);
         if let RotationState::InProgress { progress_pct, .. } = mgr.rotation_state() {
@@ -1130,7 +1232,10 @@ mod tests {
         }
 
         mgr.complete_rotation(1000).unwrap();
-        assert!(matches!(mgr.rotation_state(), RotationState::Completed { .. }));
+        assert!(matches!(
+            mgr.rotation_state(),
+            RotationState::Completed { .. }
+        ));
         assert_eq!(mgr.rotation_history().len(), 1);
         assert_eq!(mgr.rotation_history()[0].pages_re_encrypted, 1000);
         assert!(mgr.rotation_history()[0].completed_at_ms.is_some());
@@ -1195,5 +1300,4 @@ mod tests {
         let (_, _, mat) = mgr.active_key().unwrap();
         assert_eq!(mat, &[3]);
     }
-
 }

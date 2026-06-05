@@ -125,7 +125,10 @@ impl std::fmt::Display for TensorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TensorError::ShapeMismatch { expected, actual } => {
-                write!(f, "data size mismatch: expected {expected} bytes, got {actual}")
+                write!(
+                    f,
+                    "data size mismatch: expected {expected} bytes, got {actual}"
+                )
             }
             TensorError::VersionNotFound(v) => write!(f, "version not found: {v}"),
             TensorError::IncompatibleShapes => write!(f, "incompatible tensor shapes"),
@@ -188,7 +191,11 @@ pub fn apply_delta(old: &[u8], delta: &TensorDelta) -> Vec<u8> {
 
 /// Compression ratio of a delta.
 pub fn delta_compression_ratio(original_size: usize, delta: &TensorDelta) -> f64 {
-    let delta_size: usize = delta.patches.iter().map(|(_, p)| p.len() + 8).sum::<usize>();
+    let delta_size: usize = delta
+        .patches
+        .iter()
+        .map(|(_, p)| p.len() + 8)
+        .sum::<usize>();
     if delta_size == 0 {
         return f64::INFINITY;
     }
@@ -247,9 +254,10 @@ impl TensorStore {
         metadata: HashMap<String, String>,
     ) -> Result<(), TensorError> {
         // Check if there's a previous version to delta against
-        let prev_info = self.tensors.get(name).and_then(|versions| {
-            versions.last().map(|v| v.version.clone())
-        });
+        let prev_info = self
+            .tensors
+            .get(name)
+            .and_then(|versions| versions.last().map(|v| v.version.clone()));
 
         let storage = if let Some(prev_ver) = prev_info {
             let prev_data = self.reconstruct_data(name, &prev_ver)?;
@@ -266,13 +274,16 @@ impl TensorStore {
             VersionStorage::Full(tensor.data)
         };
 
-        self.tensors.entry(name.to_string()).or_default().push(TensorVersion {
-            version: version.to_string(),
-            storage,
-            shape: tensor.shape,
-            dtype: tensor.dtype,
-            metadata,
-        });
+        self.tensors
+            .entry(name.to_string())
+            .or_default()
+            .push(TensorVersion {
+                version: version.to_string(),
+                storage,
+                shape: tensor.shape,
+                dtype: tensor.dtype,
+                metadata,
+            });
 
         Ok(())
     }
@@ -303,7 +314,10 @@ impl TensorStore {
                     }
                     return Ok(result);
                 }
-                VersionStorage::Delta { base_version, delta } => {
+                VersionStorage::Delta {
+                    base_version,
+                    delta,
+                } => {
                     chain.push(delta.clone());
                     current_version = base_version.clone();
                 }
@@ -360,7 +374,11 @@ impl TensorStore {
 
     /// Get metadata for a specific version.
     pub fn get_metadata(&self, name: &str, version: &str) -> Option<&HashMap<String, String>> {
-        self.tensors.get(name)?.iter().find(|v| v.version == version).map(|v| &v.metadata)
+        self.tensors
+            .get(name)?
+            .iter()
+            .find(|v| v.version == version)
+            .map(|v| &v.metadata)
     }
 
     /// Number of tensors stored.
@@ -371,6 +389,8 @@ impl TensorStore {
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
 
     #[test]
@@ -414,7 +434,7 @@ mod tests {
         new[500] = 42;
 
         let delta = compute_delta(&old, &new).unwrap();
-        assert!(delta.patches.len() > 0);
+        assert!(!delta.patches.is_empty());
 
         // Apply delta and verify
         let recovered = apply_delta(&old, &delta);
@@ -461,7 +481,14 @@ mod tests {
     fn tensor_store_latest() {
         let mut store = TensorStore::new();
 
-        store.put("weights", "v1", Tensor::zeros(vec![10], DType::Float32), HashMap::new()).unwrap();
+        store
+            .put(
+                "weights",
+                "v1",
+                Tensor::zeros(vec![10], DType::Float32),
+                HashMap::new(),
+            )
+            .unwrap();
 
         let mut t2 = Tensor::zeros(vec![10], DType::Float32);
         t2.set_f32(0, 42.0);
@@ -481,11 +508,15 @@ mod tests {
         // A = [[1,2],[3,4]], B = [[5,6],[7,8]]
         // C = [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]] = [[19,22],[43,50]]
         let mut a = Tensor::zeros(vec![2, 2], DType::Float32);
-        a.set_f32(0, 1.0); a.set_f32(1, 2.0);
-        a.set_f32(2, 3.0); a.set_f32(3, 4.0);
+        a.set_f32(0, 1.0);
+        a.set_f32(1, 2.0);
+        a.set_f32(2, 3.0);
+        a.set_f32(3, 4.0);
         let mut b = Tensor::zeros(vec![2, 2], DType::Float32);
-        b.set_f32(0, 5.0); b.set_f32(1, 6.0);
-        b.set_f32(2, 7.0); b.set_f32(3, 8.0);
+        b.set_f32(0, 5.0);
+        b.set_f32(1, 6.0);
+        b.set_f32(2, 7.0);
+        b.set_f32(3, 8.0);
         // Manual matmul
         let mut c = Tensor::zeros(vec![2, 2], DType::Float32);
         for i in 0..2 {
@@ -608,9 +639,30 @@ mod tests {
     #[test]
     fn tensor_store_multiple_tensors() {
         let mut store = TensorStore::new();
-        store.put("layer1", "v1", Tensor::zeros(vec![4, 4], DType::Float32), HashMap::new()).unwrap();
-        store.put("layer2", "v1", Tensor::zeros(vec![8, 8], DType::Float32), HashMap::new()).unwrap();
-        store.put("layer3", "v1", Tensor::zeros(vec![16], DType::Float64), HashMap::new()).unwrap();
+        store
+            .put(
+                "layer1",
+                "v1",
+                Tensor::zeros(vec![4, 4], DType::Float32),
+                HashMap::new(),
+            )
+            .unwrap();
+        store
+            .put(
+                "layer2",
+                "v1",
+                Tensor::zeros(vec![8, 8], DType::Float32),
+                HashMap::new(),
+            )
+            .unwrap();
+        store
+            .put(
+                "layer3",
+                "v1",
+                Tensor::zeros(vec![16], DType::Float64),
+                HashMap::new(),
+            )
+            .unwrap();
         assert_eq!(store.tensor_count(), 3);
         let l1 = store.get("layer1", "v1").unwrap();
         assert_eq!(l1.shape, vec![4, 4]);
@@ -626,12 +678,18 @@ mod tests {
         let mut meta = HashMap::new();
         meta.insert("author".to_string(), "test".to_string());
         meta.insert("epoch".to_string(), "10".to_string());
-        store.put("weights", "v1", Tensor::zeros(vec![4], DType::Float32), meta).unwrap();
+        store
+            .put(
+                "weights",
+                "v1",
+                Tensor::zeros(vec![4], DType::Float32),
+                meta,
+            )
+            .unwrap();
         let retrieved = store.get_metadata("weights", "v1").unwrap();
         assert_eq!(retrieved.get("author").unwrap(), "test");
         assert_eq!(retrieved.get("epoch").unwrap(), "10");
         assert!(store.get_metadata("weights", "v99").is_none());
         assert!(store.get_metadata("nonexistent", "v1").is_none());
     }
-
 }

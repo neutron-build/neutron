@@ -12,10 +12,10 @@ use parking_lot::RwLock;
 
 use crate::types::Value;
 
-use super::{HyperLogLog, SortedSet, SortedSetEntry};
 #[cfg(feature = "server")]
 use super::collections_wal::CollectionWal;
 use super::streams::Stream;
+use super::{HyperLogLog, SortedSet, SortedSetEntry};
 
 // ============================================================================
 // GeoSet — stores members with (longitude, latitude) backed by the geo R-tree
@@ -41,6 +41,12 @@ impl Clone for GeoSet {
             new.add(lon, lat, member);
         }
         new
+    }
+}
+
+impl Default for GeoSet {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -92,13 +98,7 @@ impl GeoSet {
 
     /// Find all members within `radius` of (lon, lat) in the given unit.
     /// Returns (member, distance) pairs sorted by distance.
-    pub fn radius(
-        &self,
-        lon: f64,
-        lat: f64,
-        radius: f64,
-        unit: &str,
-    ) -> Vec<(String, f64)> {
+    pub fn radius(&self, lon: f64, lat: f64, radius: f64, unit: &str) -> Vec<(String, f64)> {
         let radius_m = convert_to_meters(radius, unit);
         let center = crate::geo::Point::new(lon, lat);
         let doc_ids = self.tree.search_radius(&center, radius_m);
@@ -134,6 +134,11 @@ impl GeoSet {
     /// Number of members.
     pub fn len(&self) -> usize {
         self.members.len()
+    }
+
+    /// Returns true when the set has no members.
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
     }
 
     /// Return a reference to the underlying members map.
@@ -256,9 +261,13 @@ impl std::fmt::Debug for ShardedCollections {
             .field("shards", &self.shards)
             .field("wal_enabled", &{
                 #[cfg(feature = "server")]
-                { self.wal.is_some() }
+                {
+                    self.wal.is_some()
+                }
                 #[cfg(not(feature = "server"))]
-                { false }
+                {
+                    false
+                }
             })
             .finish()
     }
@@ -311,9 +320,10 @@ impl ShardedCollections {
     pub fn lpush(&self, key: &str, value: Value) -> Result<usize, WrongTypeError> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_lpush(key, &value) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_lpush(key, &value)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let entry = data
@@ -336,9 +346,10 @@ impl ShardedCollections {
     pub fn rpush(&self, key: &str, value: Value) -> Result<usize, WrongTypeError> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_rpush(key, &value) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_rpush(key, &value)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let entry = data
@@ -360,9 +371,10 @@ impl ShardedCollections {
     pub fn lpop(&self, key: &str) -> Result<Option<Value>, WrongTypeError> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_lpop(key) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_lpop(key)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
         let shard = self.shard(key);
         let mut data = shard.data.write();
         match data.get_mut(key) {
@@ -385,9 +397,10 @@ impl ShardedCollections {
     pub fn rpop(&self, key: &str) -> Result<Option<Value>, WrongTypeError> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_rpop(key) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_rpop(key)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
         let shard = self.shard(key);
         let mut data = shard.data.write();
         match data.get_mut(key) {
@@ -472,17 +485,13 @@ impl ShardedCollections {
     // ========================================================================
 
     /// HSET -- set a field in the hash at `key`. Returns true if the field is new.
-    pub fn hset(
-        &self,
-        key: &str,
-        field: &str,
-        value: Value,
-    ) -> Result<bool, WrongTypeError> {
+    pub fn hset(&self, key: &str, field: &str, value: Value) -> Result<bool, WrongTypeError> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_hset(key, field, &value) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_hset(key, field, &value)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let entry = data
@@ -519,9 +528,10 @@ impl ShardedCollections {
     pub fn hdel(&self, key: &str, field: &str) -> Result<bool, WrongTypeError> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_hdel(key, field) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_hdel(key, field)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
         let shard = self.shard(key);
         let mut data = shard.data.write();
         match data.get_mut(key) {
@@ -546,10 +556,7 @@ impl ShardedCollections {
         let data = shard.data.read();
         match data.get(key) {
             Some(KvCollection::Hash(hash)) => {
-                let mut pairs: Vec<_> = hash
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                let mut pairs: Vec<_> = hash.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                 pairs.sort_by(|a, b| a.0.cmp(&b.0));
                 Ok(pairs)
             }
@@ -634,9 +641,10 @@ impl ShardedCollections {
     pub fn sadd(&self, key: &str, member: &str) -> Result<bool, WrongTypeError> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_sadd(key, member) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_sadd(key, member)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let entry = data
@@ -655,9 +663,10 @@ impl ShardedCollections {
     pub fn srem(&self, key: &str, member: &str) -> Result<bool, WrongTypeError> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_srem(key, member) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_srem(key, member)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
         let shard = self.shard(key);
         let mut data = shard.data.write();
         match data.get_mut(key) {
@@ -741,7 +750,7 @@ impl ShardedCollections {
                     return Err(WrongTypeError {
                         expected: "set",
                         actual: other.type_name(),
-                    })
+                    });
                 }
                 None => return Ok(vec![]), // Empty set intersected = empty
             }
@@ -779,7 +788,7 @@ impl ShardedCollections {
                     return Err(WrongTypeError {
                         expected: "set",
                         actual: other.type_name(),
-                    })
+                    });
                 }
                 None => {} // Treat as empty
             }
@@ -807,7 +816,7 @@ impl ShardedCollections {
                     return Err(WrongTypeError {
                         expected: "set",
                         actual: other.type_name(),
-                    })
+                    });
                 }
                 None => return Ok(vec![]),
             }
@@ -828,7 +837,7 @@ impl ShardedCollections {
                     return Err(WrongTypeError {
                         expected: "set",
                         actual: other.type_name(),
-                    })
+                    });
                 }
                 None => {}
             }
@@ -848,17 +857,13 @@ impl ShardedCollections {
 
     /// ZADD -- add a member with a score to the sorted set at `key`.
     /// Returns true if the member is new.
-    pub fn zadd(
-        &self,
-        key: &str,
-        member: &str,
-        score: f64,
-    ) -> Result<bool, WrongTypeError> {
+    pub fn zadd(&self, key: &str, member: &str, score: f64) -> Result<bool, WrongTypeError> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_zadd(key, member, score) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_zadd(key, member, score)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let entry = data
@@ -878,9 +883,10 @@ impl ShardedCollections {
     pub fn zrem(&self, key: &str, member: &str) -> Result<bool, WrongTypeError> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_zrem(key, member) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_zrem(key, member)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
         let shard = self.shard(key);
         let mut data = shard.data.write();
         match data.get_mut(key) {
@@ -957,11 +963,7 @@ impl ShardedCollections {
     }
 
     /// ZRANK -- return the 0-based rank of `member` by ascending score.
-    pub fn zrank(
-        &self,
-        key: &str,
-        member: &str,
-    ) -> Result<Option<usize>, WrongTypeError> {
+    pub fn zrank(&self, key: &str, member: &str) -> Result<Option<usize>, WrongTypeError> {
         let shard = self.shard(key);
         let data = shard.data.read();
         match data.get(key) {
@@ -977,17 +979,13 @@ impl ShardedCollections {
     /// ZINCRBY -- increment the score of `member` by `increment`.
     /// Creates the member with `increment` as the score if it does not exist.
     /// Returns the new score.
-    pub fn zincrby(
-        &self,
-        key: &str,
-        member: &str,
-        increment: f64,
-    ) -> Result<f64, WrongTypeError> {
+    pub fn zincrby(&self, key: &str, member: &str, increment: f64) -> Result<f64, WrongTypeError> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_zincrby(key, member, increment) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_zincrby(key, member, increment)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let entry = data
@@ -1017,12 +1015,7 @@ impl ShardedCollections {
     }
 
     /// ZCOUNT -- count entries with scores in [min, max].
-    pub fn zcount(
-        &self,
-        key: &str,
-        min: f64,
-        max: f64,
-    ) -> Result<usize, WrongTypeError> {
+    pub fn zcount(&self, key: &str, min: f64, max: f64) -> Result<usize, WrongTypeError> {
         let shard = self.shard(key);
         let data = shard.data.read();
         match data.get(key) {
@@ -1044,9 +1037,10 @@ impl ShardedCollections {
     pub fn pfadd(&self, key: &str, element: &str) -> Result<bool, WrongTypeError> {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_pfadd(key, element) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_pfadd(key, element)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let entry = data
@@ -1083,11 +1077,7 @@ impl ShardedCollections {
     /// PFMERGE -- merge HyperLogLogs from `source_keys` into `dest_key`.
     /// Creates `dest_key` if it does not exist. Source HLLs that do not exist
     /// are silently skipped.
-    pub fn pfmerge(
-        &self,
-        dest_key: &str,
-        source_keys: &[&str],
-    ) -> Result<(), WrongTypeError> {
+    pub fn pfmerge(&self, dest_key: &str, source_keys: &[&str]) -> Result<(), WrongTypeError> {
         // First, collect register snapshots from all sources.
         let mut source_registers: Vec<Vec<u8>> = Vec::new();
         for &src_key in source_keys {
@@ -1102,7 +1092,7 @@ impl ShardedCollections {
                     return Err(WrongTypeError {
                         expected: "hyperloglog",
                         actual: other.type_name(),
-                    })
+                    });
                 }
                 None => {} // Skip non-existent keys
             }
@@ -1111,9 +1101,10 @@ impl ShardedCollections {
         // Log the merge to WAL with the register snapshots
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_pfmerge(dest_key, &source_registers) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_pfmerge(dest_key, &source_registers)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
 
         // Now write-lock the destination and merge.
         let dest_shard = self.shard(dest_key);
@@ -1145,9 +1136,10 @@ impl ShardedCollections {
     pub fn del(&self, key: &str) -> bool {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_del(key) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_del(key)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
         let shard = self.shard(key);
         shard.data.write().remove(key).is_some()
     }
@@ -1232,7 +1224,9 @@ impl ShardedCollections {
 
     /// No-op checkpoint when WAL is not available.
     #[cfg(not(feature = "server"))]
-    pub fn checkpoint(&self) -> std::io::Result<()> { Ok(()) }
+    pub fn checkpoint(&self) -> std::io::Result<()> {
+        Ok(())
+    }
 
     // ====================================================================
     // Stream operations
@@ -1306,9 +1300,11 @@ impl ShardedCollections {
         let shard = self.shard(key);
         let data = shard.data.read();
         match data.get(key) {
-            Some(KvCollection::Stream(s)) => {
-                Ok(s.xrevrange(end, start, count).into_iter().cloned().collect())
-            }
+            Some(KvCollection::Stream(s)) => Ok(s
+                .xrevrange(end, start, count)
+                .into_iter()
+                .cloned()
+                .collect()),
             Some(other) => Err(WrongTypeError {
                 expected: "stream",
                 actual: other.type_name(),
@@ -1371,12 +1367,7 @@ impl ShardedCollections {
     }
 
     /// XGROUP CREATE: create a consumer group.
-    pub fn xgroup_create(
-        &self,
-        key: &str,
-        group_name: &str,
-        start_id: &str,
-    ) -> Result<(), String> {
+    pub fn xgroup_create(&self, key: &str, group_name: &str, start_id: &str) -> Result<(), String> {
         let shard = self.shard(key);
         let mut data = shard.data.write();
         let stream = data
@@ -1662,9 +1653,18 @@ mod tests {
         c.rpush("idx", Value::Text("one".into())).unwrap();
         c.rpush("idx", Value::Text("two".into())).unwrap();
 
-        assert_eq!(c.lindex("idx", 0).unwrap(), Some(Value::Text("zero".into())));
-        assert_eq!(c.lindex("idx", -1).unwrap(), Some(Value::Text("two".into())));
-        assert_eq!(c.lindex("idx", -3).unwrap(), Some(Value::Text("zero".into())));
+        assert_eq!(
+            c.lindex("idx", 0).unwrap(),
+            Some(Value::Text("zero".into()))
+        );
+        assert_eq!(
+            c.lindex("idx", -1).unwrap(),
+            Some(Value::Text("two".into()))
+        );
+        assert_eq!(
+            c.lindex("idx", -3).unwrap(),
+            Some(Value::Text("zero".into()))
+        );
         assert_eq!(c.lindex("idx", 5).unwrap(), None);
     }
 
@@ -1690,7 +1690,10 @@ mod tests {
     #[test]
     fn hash_hset_hget() {
         let c = ShardedCollections::new();
-        assert!(c.hset("user:1", "name", Value::Text("Alice".into())).unwrap());
+        assert!(
+            c.hset("user:1", "name", Value::Text("Alice".into()))
+                .unwrap()
+        );
         assert!(!c.hset("user:1", "name", Value::Text("Bob".into())).unwrap());
         assert_eq!(
             c.hget("user:1", "name").unwrap(),
@@ -1716,7 +1719,8 @@ mod tests {
     fn hash_hgetall_hkeys_hvals() {
         let c = ShardedCollections::new();
         c.hset("profile", "age", Value::Int32(30)).unwrap();
-        c.hset("profile", "city", Value::Text("NYC".into())).unwrap();
+        c.hset("profile", "city", Value::Text("NYC".into()))
+            .unwrap();
 
         let all = c.hgetall("profile").unwrap();
         assert_eq!(all.len(), 2);
@@ -2018,7 +2022,7 @@ mod tests {
         assert!(c.pfadd("visitors", "user3").unwrap());
 
         let count = c.pfcount("visitors").unwrap();
-        assert!(count >= 2 && count <= 5, "expected ~3, got {count}");
+        assert!((2..=5).contains(&count), "expected ~3, got {count}");
     }
 
     #[test]
@@ -2049,10 +2053,7 @@ mod tests {
 
         c.pfmerge("merged", &["hll1", "hll2"]).unwrap();
         let count = c.pfcount("merged").unwrap();
-        assert!(
-            count >= 85 && count <= 115,
-            "expected ~100, got {count}"
-        );
+        assert!((85..=115).contains(&count), "expected ~100, got {count}");
     }
 
     #[test]
@@ -2066,10 +2067,7 @@ mod tests {
         }
         c.pfmerge("dest", &["src"]).unwrap();
         let count = c.pfcount("dest").unwrap();
-        assert!(
-            count >= 30 && count <= 50,
-            "expected ~40, got {count}"
-        );
+        assert!((30..=50).contains(&count), "expected ~40, got {count}");
     }
 
     #[test]
@@ -2078,7 +2076,7 @@ mod tests {
         c.pfadd("base", "x").unwrap();
         c.pfmerge("base", &["ghost1", "ghost2"]).unwrap();
         let count = c.pfcount("base").unwrap();
-        assert!(count >= 1 && count <= 2);
+        assert!((1..=2).contains(&count));
     }
 
     #[test]
@@ -2204,7 +2202,8 @@ mod tests {
             let c = Arc::clone(&c);
             handles.push(thread::spawn(move || {
                 for i in 0..100 {
-                    c.rpush("shared", Value::Int64((t * 100 + i) as i64)).unwrap();
+                    c.rpush("shared", Value::Int64((t * 100 + i) as i64))
+                        .unwrap();
                 }
             }));
         }
@@ -2252,12 +2251,8 @@ mod tests {
             let c = Arc::clone(&c);
             handles.push(thread::spawn(move || {
                 for i in 0..50 {
-                    c.hset(
-                        "concurrent_hash",
-                        &format!("t{t}_f{i}"),
-                        Value::Int32(i),
-                    )
-                    .unwrap();
+                    c.hset("concurrent_hash", &format!("t{t}_f{i}"), Value::Int32(i))
+                        .unwrap();
                 }
             }));
         }

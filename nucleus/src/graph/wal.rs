@@ -104,11 +104,14 @@ impl GraphWal {
         } else {
             GraphWalState::default()
         };
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        Ok((Self { path, writer: Mutex::new(BufWriter::new(file)) }, state))
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok((
+            Self {
+                path,
+                writer: Mutex::new(BufWriter::new(file)),
+            },
+            state,
+        ))
     }
 
     /// Log an ADD_NODE operation.
@@ -208,7 +211,9 @@ impl GraphWal {
         }
 
         // Flush existing writer, truncate, write snapshot entry.
-        { self.writer.lock().flush()?; }
+        {
+            self.writer.lock().flush()?;
+        }
 
         let file = OpenOptions::new()
             .write(true)
@@ -297,43 +302,85 @@ fn replay(data: &[u8]) -> GraphWalState {
 
         match tag {
             TAG_ADD_NODE => {
-                let Some(id) = read_u64(data, &mut pos) else { break };
-                let Some(labels) = decode_labels(data, &mut pos) else { break };
-                let Some(props) = decode_props(data, &mut pos) else { break };
+                let Some(id) = read_u64(data, &mut pos) else {
+                    break;
+                };
+                let Some(labels) = decode_labels(data, &mut pos) else {
+                    break;
+                };
+                let Some(props) = decode_props(data, &mut pos) else {
+                    break;
+                };
                 if id >= state.next_node_id {
                     state.next_node_id = id + 1;
                 }
-                state.nodes.insert(id, WalNode { id, labels, properties: props });
+                state.nodes.insert(
+                    id,
+                    WalNode {
+                        id,
+                        labels,
+                        properties: props,
+                    },
+                );
             }
             TAG_ADD_EDGE => {
-                let Some(id) = read_u64(data, &mut pos) else { break };
-                let Some(src) = read_u64(data, &mut pos) else { break };
-                let Some(dst) = read_u64(data, &mut pos) else { break };
-                let Some(etype) = decode_string(data, &mut pos) else { break };
-                let Some(props) = decode_props(data, &mut pos) else { break };
+                let Some(id) = read_u64(data, &mut pos) else {
+                    break;
+                };
+                let Some(src) = read_u64(data, &mut pos) else {
+                    break;
+                };
+                let Some(dst) = read_u64(data, &mut pos) else {
+                    break;
+                };
+                let Some(etype) = decode_string(data, &mut pos) else {
+                    break;
+                };
+                let Some(props) = decode_props(data, &mut pos) else {
+                    break;
+                };
                 if id >= state.next_edge_id {
                     state.next_edge_id = id + 1;
                 }
-                state.edges.insert(id, WalEdge {
-                    id, from: src, to: dst, edge_type: etype, properties: props,
-                });
+                state.edges.insert(
+                    id,
+                    WalEdge {
+                        id,
+                        from: src,
+                        to: dst,
+                        edge_type: etype,
+                        properties: props,
+                    },
+                );
             }
             TAG_DEL_NODE => {
-                let Some(id) = read_u64(data, &mut pos) else { break };
+                let Some(id) = read_u64(data, &mut pos) else {
+                    break;
+                };
                 state.nodes.remove(&id);
                 // Cascade: remove edges referencing this node.
                 state.edges.retain(|_, e| e.from != id && e.to != id);
             }
             TAG_DEL_EDGE => {
-                let Some(id) = read_u64(data, &mut pos) else { break };
+                let Some(id) = read_u64(data, &mut pos) else {
+                    break;
+                };
                 state.edges.remove(&id);
             }
             TAG_SET_PROP => {
-                let Some(&target_byte) = data.get(pos) else { break };
+                let Some(&target_byte) = data.get(pos) else {
+                    break;
+                };
                 pos += 1;
-                let Some(id) = read_u64(data, &mut pos) else { break };
-                let Some(key) = decode_string(data, &mut pos) else { break };
-                let Some(val) = decode_prop_value(data, &mut pos) else { break };
+                let Some(id) = read_u64(data, &mut pos) else {
+                    break;
+                };
+                let Some(key) = decode_string(data, &mut pos) else {
+                    break;
+                };
+                let Some(val) = decode_prop_value(data, &mut pos) else {
+                    break;
+                };
                 if target_byte == 0 {
                     if let Some(node) = state.nodes.get_mut(&id) {
                         node.properties.insert(key, val);
@@ -343,18 +390,33 @@ fn replay(data: &[u8]) -> GraphWalState {
                 }
             }
             TAG_SNAPSHOT => {
-                let Some(payload_len) = read_u32(data, &mut pos) else { break };
+                let Some(payload_len) = read_u32(data, &mut pos) else {
+                    break;
+                };
                 let payload_len = payload_len as usize;
-                if pos + payload_len > data.len() { break; }
+                if pos + payload_len > data.len() {
+                    break;
+                }
                 let payload = &data[pos..pos + payload_len];
                 pos += payload_len;
                 match decode_snapshot(payload) {
                     Some(s) => state = s,
-                    None => break,
+                    None => {
+                        tracing::error!(
+                            target: "nucleus::graph::wal",
+                            "graph WAL: corrupt SNAPSHOT at offset {pos}; stopping replay (later entries dropped)"
+                        );
+                        break;
+                    }
                 }
             }
-            _ => {
-                // Unknown tag — stop replay (corrupt data).
+            tag => {
+                // Unknown tag — corrupt data. Stop replay, but make the data loss
+                // visible rather than silently truncating the recovered state.
+                tracing::error!(
+                    target: "nucleus::graph::wal",
+                    "graph WAL: unknown record tag {tag:#x} at offset {pos}; stopping replay (later entries dropped)"
+                );
                 break;
             }
         }
@@ -375,7 +437,14 @@ fn decode_snapshot(data: &[u8]) -> Option<GraphWalState> {
         let id = read_u64(data, &mut pos)?;
         let labels = decode_labels(data, &mut pos)?;
         let props = decode_props(data, &mut pos)?;
-        nodes.insert(id, WalNode { id, labels, properties: props });
+        nodes.insert(
+            id,
+            WalNode {
+                id,
+                labels,
+                properties: props,
+            },
+        );
     }
 
     // edges
@@ -387,20 +456,36 @@ fn decode_snapshot(data: &[u8]) -> Option<GraphWalState> {
         let dst = read_u64(data, &mut pos)?;
         let etype = decode_string(data, &mut pos)?;
         let props = decode_props(data, &mut pos)?;
-        edges.insert(id, WalEdge {
-            id, from: src, to: dst, edge_type: etype, properties: props,
-        });
+        edges.insert(
+            id,
+            WalEdge {
+                id,
+                from: src,
+                to: dst,
+                edge_type: etype,
+                properties: props,
+            },
+        );
     }
 
-    Some(GraphWalState { nodes, edges, next_node_id, next_edge_id })
+    Some(GraphWalState {
+        nodes,
+        edges,
+        next_node_id,
+        next_edge_id,
+    })
 }
 
 // ─── Decode helpers ─────────────────────────────────────────────────────────
 
 fn decode_string(data: &[u8], pos: &mut usize) -> Option<String> {
     let len = read_u32(data, pos)? as usize;
-    if *pos + len > data.len() { return None; }
-    let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+    if *pos + len > data.len() {
+        return None;
+    }
+    let s = std::str::from_utf8(&data[*pos..*pos + len])
+        .ok()?
+        .to_string();
     *pos += len;
     Some(s)
 }
@@ -462,7 +547,9 @@ fn read_u32(data: &[u8], pos: &mut usize) -> Option<u32> {
 fn read_u64(data: &[u8], pos: &mut usize) -> Option<u64> {
     let b = data.get(*pos..*pos + 8)?;
     *pos += 8;
-    Some(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    Some(u64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
 }
 
 fn read_i64(data: &[u8], pos: &mut usize) -> Option<i64> {
@@ -477,11 +564,16 @@ fn read_f64(data: &[u8], pos: &mut usize) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
     use std::collections::HashSet;
 
     fn make_props(pairs: &[(&str, PropValue)]) -> Properties {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     }
 
     #[test]
@@ -492,7 +584,10 @@ mod tests {
         assert!(state.edges.is_empty());
 
         // Add two nodes and an edge.
-        let props1 = make_props(&[("name", PropValue::Text("Alice".into())), ("age", PropValue::Int(30))]);
+        let props1 = make_props(&[
+            ("name", PropValue::Text("Alice".into())),
+            ("age", PropValue::Int(30)),
+        ]);
         wal.log_add_node(1, &["Person".into()], &props1).unwrap();
         let props2 = make_props(&[("name", PropValue::Text("Bob".into()))]);
         wal.log_add_node(2, &["Person".into()], &props2).unwrap();
@@ -506,7 +601,10 @@ mod tests {
         assert_eq!(state2.edges.len(), 1);
         let n1 = &state2.nodes[&1];
         assert_eq!(n1.labels, vec!["Person".to_string()]);
-        assert_eq!(n1.properties.get("name"), Some(&PropValue::Text("Alice".into())));
+        assert_eq!(
+            n1.properties.get("name"),
+            Some(&PropValue::Text("Alice".into()))
+        );
         assert_eq!(n1.properties.get("age"), Some(&PropValue::Int(30)));
         let e1 = &state2.edges[&1];
         assert_eq!(e1.from, 1);
@@ -519,10 +617,14 @@ mod tests {
     fn test_delete_node_cascade_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = GraphWal::open(dir.path()).unwrap();
-        wal.log_add_node(1, &["A".into()], &Properties::new()).unwrap();
-        wal.log_add_node(2, &["B".into()], &Properties::new()).unwrap();
-        wal.log_add_edge(1, 1, 2, "LINK", &Properties::new()).unwrap();
-        wal.log_add_edge(2, 2, 1, "LINK", &Properties::new()).unwrap();
+        wal.log_add_node(1, &["A".into()], &Properties::new())
+            .unwrap();
+        wal.log_add_node(2, &["B".into()], &Properties::new())
+            .unwrap();
+        wal.log_add_edge(1, 1, 2, "LINK", &Properties::new())
+            .unwrap();
+        wal.log_add_edge(2, 2, 1, "LINK", &Properties::new())
+            .unwrap();
         // Delete node 1 — should cascade edges 1 and 2.
         wal.log_del_node(1).unwrap();
         drop(wal);
@@ -549,7 +651,10 @@ mod tests {
 
         let (_, st) = GraphWal::open(dir.path()).unwrap();
         let n = &st.nodes[&1];
-        assert_eq!(n.properties.get("s"), Some(&PropValue::Text("hello".into())));
+        assert_eq!(
+            n.properties.get("s"),
+            Some(&PropValue::Text("hello".into()))
+        );
         assert_eq!(n.properties.get("i"), Some(&PropValue::Int(42)));
         assert_eq!(n.properties.get("f"), Some(&PropValue::Float(3.14)));
         assert_eq!(n.properties.get("b"), Some(&PropValue::Bool(true)));
@@ -560,9 +665,12 @@ mod tests {
     fn test_label_index_rebuilt() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = GraphWal::open(dir.path()).unwrap();
-        wal.log_add_node(1, &["Person".into(), "Employee".into()], &Properties::new()).unwrap();
-        wal.log_add_node(2, &["Person".into()], &Properties::new()).unwrap();
-        wal.log_add_node(3, &["Company".into()], &Properties::new()).unwrap();
+        wal.log_add_node(1, &["Person".into(), "Employee".into()], &Properties::new())
+            .unwrap();
+        wal.log_add_node(2, &["Person".into()], &Properties::new())
+            .unwrap();
+        wal.log_add_node(3, &["Company".into()], &Properties::new())
+            .unwrap();
         drop(wal);
 
         let (_, st) = GraphWal::open(dir.path()).unwrap();
@@ -602,7 +710,7 @@ mod tests {
         }
         assert_eq!(outgoing[&1].len(), 2); // edges 1, 2
         assert_eq!(outgoing[&2].len(), 1); // edge 3
-        assert!(outgoing.get(&3).is_none() || outgoing[&3].is_empty());
+        assert!(!outgoing.contains_key(&3) || outgoing[&3].is_empty());
         assert_eq!(incoming[&2].len(), 1);
         assert_eq!(incoming[&3].len(), 2);
     }
@@ -615,8 +723,10 @@ mod tests {
         // Write two valid entries then corrupt trailing bytes.
         {
             let (wal, _) = GraphWal::open(dir.path()).unwrap();
-            wal.log_add_node(1, &["X".into()], &Properties::new()).unwrap();
-            wal.log_add_node(2, &["Y".into()], &Properties::new()).unwrap();
+            wal.log_add_node(1, &["X".into()], &Properties::new())
+                .unwrap();
+            wal.log_add_node(2, &["Y".into()], &Properties::new())
+                .unwrap();
             drop(wal);
         }
 
@@ -653,31 +763,45 @@ mod tests {
 
         // Create 150 nodes and 149 chain edges.
         for i in 1..=150u64 {
-            wal.log_add_node(i, &["N".into()], &make_props(&[("idx", PropValue::Int(i as i64))])).unwrap();
+            wal.log_add_node(
+                i,
+                &["N".into()],
+                &make_props(&[("idx", PropValue::Int(i as i64))]),
+            )
+            .unwrap();
         }
         for i in 1..150u64 {
-            wal.log_add_edge(i, i, i + 1, "NEXT", &Properties::new()).unwrap();
+            wal.log_add_edge(i, i, i + 1, "NEXT", &Properties::new())
+                .unwrap();
         }
 
         // Checkpoint.
-        let snap_nodes: Vec<_> = (1..=150u64).map(|i| {
-            let labels = vec!["N".to_string()];
-            let props: Properties = make_props(&[("idx", PropValue::Int(i as i64))]);
-            (i, labels, props)
-        }).collect();
-        let snap_edges: Vec<_> = (1..150u64).map(|i| {
-            let props = Properties::new();
-            (i, i, i + 1, "NEXT".to_string(), props)
-        }).collect();
+        let snap_nodes: Vec<_> = (1..=150u64)
+            .map(|i| {
+                let labels = vec!["N".to_string()];
+                let props: Properties = make_props(&[("idx", PropValue::Int(i as i64))]);
+                (i, labels, props)
+            })
+            .collect();
+        let snap_edges: Vec<_> = (1..150u64)
+            .map(|i| {
+                let props = Properties::new();
+                (i, i, i + 1, "NEXT".to_string(), props)
+            })
+            .collect();
         let snap_nodes_refs: Vec<_> = snap_nodes.iter().map(|(id, l, p)| (id, l, p)).collect();
-        let snap_edges_refs: Vec<_> = snap_edges.iter().map(|(id, s, d, t, p)| (id, s, d, t.as_str(), p)).collect();
+        let snap_edges_refs: Vec<_> = snap_edges
+            .iter()
+            .map(|(id, s, d, t, p)| (id, s, d, t.as_str(), p))
+            .collect();
 
         wal.checkpoint(&GraphSnapshot {
             nodes: snap_nodes_refs,
             edges: snap_edges_refs,
             next_node_id: 151,
             next_edge_id: 150,
-        }).unwrap();
+        })
+        .unwrap();
         drop(wal);
 
         // Reopen.
@@ -687,22 +811,30 @@ mod tests {
         assert_eq!(st.next_node_id, 151);
         assert_eq!(st.next_edge_id, 150);
         // Verify a property.
-        assert_eq!(st.nodes[&42].properties.get("idx"), Some(&PropValue::Int(42)));
+        assert_eq!(
+            st.nodes[&42].properties.get("idx"),
+            Some(&PropValue::Int(42))
+        );
     }
 
     #[test]
     fn test_property_updates_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = GraphWal::open(dir.path()).unwrap();
-        wal.log_add_node(1, &[], &make_props(&[("x", PropValue::Int(1))])).unwrap();
+        wal.log_add_node(1, &[], &make_props(&[("x", PropValue::Int(1))]))
+            .unwrap();
         wal.log_set_prop(0, 1, "x", &PropValue::Int(99)).unwrap();
-        wal.log_set_prop(0, 1, "new_key", &PropValue::Text("hello".into())).unwrap();
+        wal.log_set_prop(0, 1, "new_key", &PropValue::Text("hello".into()))
+            .unwrap();
         drop(wal);
 
         let (_, st) = GraphWal::open(dir.path()).unwrap();
         let n = &st.nodes[&1];
         assert_eq!(n.properties.get("x"), Some(&PropValue::Int(99)));
-        assert_eq!(n.properties.get("new_key"), Some(&PropValue::Text("hello".into())));
+        assert_eq!(
+            n.properties.get("new_key"),
+            Some(&PropValue::Text("hello".into()))
+        );
     }
 
     #[test]
@@ -727,8 +859,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = GraphWal::open(dir.path()).unwrap();
 
-        wal.log_add_node(1, &["A".into()], &Properties::new()).unwrap();
-        wal.log_add_node(2, &["B".into()], &Properties::new()).unwrap();
+        wal.log_add_node(1, &["A".into()], &Properties::new())
+            .unwrap();
+        wal.log_add_node(2, &["B".into()], &Properties::new())
+            .unwrap();
 
         // Checkpoint with 2 nodes.
         let labels1 = vec!["A".to_string()];
@@ -741,11 +875,14 @@ mod tests {
             edges: vec![],
             next_node_id: 3,
             next_edge_id: 1,
-        }).unwrap();
+        })
+        .unwrap();
 
         // Add more after checkpoint.
-        wal.log_add_node(3, &["C".into()], &Properties::new()).unwrap();
-        wal.log_add_edge(1, 1, 3, "LINK", &Properties::new()).unwrap();
+        wal.log_add_node(3, &["C".into()], &Properties::new())
+            .unwrap();
+        wal.log_add_edge(1, 1, 3, "LINK", &Properties::new())
+            .unwrap();
         drop(wal);
 
         let (_, st) = GraphWal::open(dir.path()).unwrap();

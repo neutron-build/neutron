@@ -87,20 +87,23 @@ impl Executor {
                     let table_name = kind.to_string();
                     // Extract last identifier component for matching aliases
                     let last_part = match kind {
-                        ast::SelectItemQualifiedWildcardKind::ObjectName(obj) => {
-                            obj.0.last().and_then(|p| p.as_ident()).map(|id| id.value.clone()).unwrap_or_default()
-                        }
+                        ast::SelectItemQualifiedWildcardKind::ObjectName(obj) => obj
+                            .0
+                            .last()
+                            .and_then(|p| p.as_ident())
+                            .map(|id| id.value.clone())
+                            .unwrap_or_default(),
                         _ => table_name.clone(),
                     };
                     for (i, c) in col_meta.iter().enumerate() {
                         if let Some(ref tbl) = c.table
                             && (tbl.eq_ignore_ascii_case(&table_name)
                                 || tbl.eq_ignore_ascii_case(&last_part))
-                            {
-                                columns.push((c.name.clone(), c.dtype.clone()));
-                                col_indices.push(i);
-                                expr_items.push(None);
-                            }
+                        {
+                            columns.push((c.name.clone(), c.dtype.clone()));
+                            col_indices.push(i);
+                            expr_items.push(None);
+                        }
                     }
                 }
             }

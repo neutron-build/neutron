@@ -1,3 +1,7 @@
+// 3.14/3.14159 here are arbitrary test fixtures (e.g. ROUND/CAST inputs), not
+// PI approximations; value-sensitive asserts rely on the exact literal.
+#![allow(clippy::approx_constant)]
+
 use super::*;
 
 // ======================================================================
@@ -81,6 +85,28 @@ async fn test_math_functions() {
     assert_eq!(scalar(&results[0]), &Value::Int32(-1));
 }
 
+// Regression: ABS(i32::MIN)/ABS(i64::MIN) used to call .abs() unchecked, which
+// panics (no positive representation). It must surface a runtime error instead.
+#[tokio::test]
+async fn test_abs_int_min_errors_not_panics() {
+    let ex = test_executor();
+    let r = ex.execute("SELECT ABS(CAST(-2147483648 AS INT))").await;
+    assert!(r.is_err(), "ABS(i32::MIN) should error, got {r:?}");
+    // The value just above MIN is fine.
+    let results = exec(&ex, "SELECT ABS(CAST(-2147483647 AS INT))").await;
+    assert_eq!(scalar(&results[0]), &Value::Int32(2147483647));
+}
+
+// Regression: MOD by zero must error (Postgres semantics), and MIN % -1 must not
+// panic (the unchecked `%` overflows like division).
+#[tokio::test]
+async fn test_mod_div_by_zero_and_min() {
+    let ex = test_executor();
+    assert!(ex.execute("SELECT MOD(5, 0)").await.is_err());
+    let r = exec(&ex, "SELECT MOD(CAST(-2147483648 AS INT), CAST(-1 AS INT))").await;
+    assert_eq!(scalar(&r[0]), &Value::Int32(0));
+}
+
 #[tokio::test]
 async fn test_round() {
     let ex = test_executor();
@@ -141,7 +167,6 @@ async fn test_json_build_functions() {
     }
 }
 
-
 // ======================================================================
 // LIKE / CASE tests
 // ======================================================================
@@ -189,7 +214,6 @@ async fn test_case_expression() {
     assert_eq!(r[1][1], Value::Text("C".into()));
 }
 
-
 // ======================================================================
 // Integration: full query with functions
 // ======================================================================
@@ -202,11 +226,7 @@ async fn test_functions_in_where_clause() {
     exec(&ex, "INSERT INTO people VALUES ('bob', 30)").await;
     exec(&ex, "INSERT INTO people VALUES ('charlie', 35)").await;
 
-    let results = exec(
-        &ex,
-        "SELECT UPPER(name), age FROM people WHERE age > 27",
-    )
-    .await;
+    let results = exec(&ex, "SELECT UPPER(name), age FROM people WHERE age > 27").await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
     assert_eq!(r[0][0], Value::Text("BOB".into()));
@@ -257,7 +277,6 @@ async fn test_current_database() {
     assert_eq!(scalar(&results[0]), &Value::Text("nucleus".into()));
 }
 
-
 // ML / Embedding pipeline function tests
 // ======================================================================
 
@@ -272,7 +291,7 @@ async fn test_embed_function() {
             assert!(s.starts_with('['), "embed result should start with [: {s}");
             assert!(s.ends_with(']'), "embed result should end with ]: {s}");
             // Should have at least one float value
-            let inner = &s[1..s.len()-1];
+            let inner = &s[1..s.len() - 1];
             assert!(!inner.is_empty(), "embed result should not be empty");
         }
         _ => panic!("expected text value from embed(), got: {val:?}"),
@@ -290,7 +309,9 @@ async fn test_embed_null_input() {
 async fn test_predict_function() {
     let ex = test_executor();
     // Register a linear model: y = 2*x1 + 3*x2 + 1
-    ex.model_registry.write().register_linear("linmod", vec![2.0, 3.0], 1.0);
+    ex.model_registry
+        .write()
+        .register_linear("linmod", vec![2.0, 3.0], 1.0);
     let results = exec(&ex, "SELECT PREDICT('linmod', 1.0, 2.0)").await;
     let val = scalar(&results[0]);
     // Expected: 2*1 + 3*2 + 1 = 9.0
@@ -306,17 +327,20 @@ async fn test_predict_function() {
 async fn test_classify_function() {
     let ex = test_executor();
     // Register a softmax model with 3 classes
-    ex.model_registry.write().register_softmax("clf", vec![
-        vec![1.0, 0.0],
-        vec![0.0, 1.0],
-        vec![0.5, 0.5],
-    ], vec![0.0, 0.0, 0.0]);
+    ex.model_registry.write().register_softmax(
+        "clf",
+        vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.5, 0.5]],
+        vec![0.0, 0.0, 0.0],
+    );
     // Input [10.0, 1.0] → class 0 should have highest dot product (1*10 + 0*1 = 10)
     let results = exec(&ex, "SELECT CLASSIFY('clf', 10.0, 1.0)").await;
     let val = scalar(&results[0]);
     match val {
         Value::Text(s) => {
-            assert!(s.starts_with("class_"), "classify should return class_N: {s}");
+            assert!(
+                s.starts_with("class_"),
+                "classify should return class_N: {s}"
+            );
         }
         _ => panic!("expected text from classify(), got: {val:?}"),
     }
@@ -326,9 +350,14 @@ async fn test_classify_function() {
 async fn test_create_model_without_onnx() {
     // Without the onnx feature, CREATE MODEL should return a helpful error.
     let ex = test_executor();
-    let result = ex.execute("CREATE MODEL 'test' FROM '/tmp/model.onnx'").await;
+    let result = ex
+        .execute("CREATE MODEL 'test' FROM '/tmp/model.onnx'")
+        .await;
     #[cfg(not(feature = "onnx"))]
-    assert!(result.is_err(), "CREATE MODEL should fail without onnx feature");
+    assert!(
+        result.is_err(),
+        "CREATE MODEL should fail without onnx feature"
+    );
     #[cfg(feature = "onnx")]
     {
         // With onnx feature, it should fail because the file doesn't exist.
@@ -353,7 +382,9 @@ async fn test_show_models_empty() {
 #[tokio::test]
 async fn test_drop_model() {
     let ex = test_executor();
-    ex.model_registry.write().register_linear("to_drop", vec![1.0], 0.0);
+    ex.model_registry
+        .write()
+        .register_linear("to_drop", vec![1.0], 0.0);
     assert_eq!(ex.model_registry.read().list_models().len(), 1);
     exec(&ex, "DROP MODEL to_drop").await;
     assert_eq!(ex.model_registry.read().list_models().len(), 0);
@@ -362,7 +393,9 @@ async fn test_drop_model() {
 #[tokio::test]
 async fn test_show_models_with_registered() {
     let ex = test_executor();
-    ex.model_registry.write().register_linear("my_linear", vec![1.0, 2.0], 0.5);
+    ex.model_registry
+        .write()
+        .register_linear("my_linear", vec![1.0, 2.0], 0.5);
     let results = exec(&ex, "SHOW MODELS").await;
     match &results[0] {
         ExecResult::Select { rows, .. } => {
@@ -457,7 +490,10 @@ async fn test_date_part() {
 async fn test_make_date() {
     let ex = test_executor();
     let results = exec(&ex, "SELECT MAKE_DATE(2024, 1, 1)").await;
-    assert_eq!(*scalar(&results[0]), Value::Date(crate::types::ymd_to_days(2024, 1, 1)));
+    assert_eq!(
+        *scalar(&results[0]),
+        Value::Date(crate::types::ymd_to_days(2024, 1, 1))
+    );
 }
 
 #[tokio::test]
@@ -471,7 +507,11 @@ async fn test_to_char() {
 async fn test_jsonb_set() {
     let ex = test_executor();
     // Test JSONB_SET with jsonb args
-    let results = exec(&ex, "SELECT JSONB_SET('{\"a\": 1, \"b\": 2}'::JSONB, 'c'::TEXT, '3'::TEXT)").await;
+    let results = exec(
+        &ex,
+        "SELECT JSONB_SET('{\"a\": 1, \"b\": 2}'::JSONB, 'c'::TEXT, '3'::TEXT)",
+    )
+    .await;
     // JSONB_SET should add key 'c'
     let val = scalar(&results[0]);
     match val {
@@ -504,7 +544,11 @@ async fn test_jsonb_object_keys() {
 #[tokio::test]
 async fn test_jsonb_extract_path() {
     let ex = test_executor();
-    let results = exec(&ex, "SELECT JSONB_EXTRACT_PATH_TEXT('{\"a\":{\"b\":\"hello\"}}'::JSONB, 'a', 'b')").await;
+    let results = exec(
+        &ex,
+        "SELECT JSONB_EXTRACT_PATH_TEXT('{\"a\":{\"b\":\"hello\"}}'::JSONB, 'a', 'b')",
+    )
+    .await;
     assert_eq!(*scalar(&results[0]), Value::Text("hello".into()));
 }
 
@@ -578,7 +622,6 @@ async fn test_bit_length() {
     assert_eq!(*scalar(&results[0]), Value::Int32(40));
 }
 
-
 // EXTRACT syntax tests
 // ======================================================================
 
@@ -622,7 +665,10 @@ async fn test_is_distinct_from() {
 async fn test_cast_to_date() {
     let ex = test_executor();
     let results = exec(&ex, "SELECT CAST('2024-03-15' AS DATE)").await;
-    assert_eq!(*scalar(&results[0]), Value::Date(crate::types::ymd_to_days(2024, 3, 15)));
+    assert_eq!(
+        *scalar(&results[0]),
+        Value::Date(crate::types::ymd_to_days(2024, 3, 15))
+    );
 }
 
 #[tokio::test]
@@ -869,28 +915,40 @@ async fn test_extract_hour_minute_second_from_text() {
 async fn test_date_trunc_text_month() {
     let ex = test_executor();
     let results = exec(&ex, "SELECT DATE_TRUNC('month', '2024-06-15 14:30:00')").await;
-    assert_eq!(*scalar(&results[0]), Value::Text("2024-06-01 00:00:00".into()));
+    assert_eq!(
+        *scalar(&results[0]),
+        Value::Text("2024-06-01 00:00:00".into())
+    );
 }
 
 #[tokio::test]
 async fn test_date_trunc_text_year() {
     let ex = test_executor();
     let results = exec(&ex, "SELECT DATE_TRUNC('year', '2024-06-15 14:30:00')").await;
-    assert_eq!(*scalar(&results[0]), Value::Text("2024-01-01 00:00:00".into()));
+    assert_eq!(
+        *scalar(&results[0]),
+        Value::Text("2024-01-01 00:00:00".into())
+    );
 }
 
 #[tokio::test]
 async fn test_date_trunc_text_day() {
     let ex = test_executor();
     let results = exec(&ex, "SELECT DATE_TRUNC('day', '2024-06-15 14:30:00')").await;
-    assert_eq!(*scalar(&results[0]), Value::Text("2024-06-15 00:00:00".into()));
+    assert_eq!(
+        *scalar(&results[0]),
+        Value::Text("2024-06-15 00:00:00".into())
+    );
 }
 
 #[tokio::test]
 async fn test_date_trunc_text_hour() {
     let ex = test_executor();
     let results = exec(&ex, "SELECT DATE_TRUNC('hour', '2024-06-15 14:30:45')").await;
-    assert_eq!(*scalar(&results[0]), Value::Text("2024-06-15 14:00:00".into()));
+    assert_eq!(
+        *scalar(&results[0]),
+        Value::Text("2024-06-15 14:00:00".into())
+    );
 }
 
 #[tokio::test]

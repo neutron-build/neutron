@@ -92,7 +92,10 @@ async fn test_version_function() {
     match scalar(&results[0]) {
         Value::Text(s) => {
             assert!(s.contains("Nucleus"));
-            assert!(s.starts_with("PostgreSQL 16.0"), "version should start with PostgreSQL 16.0, got: {s}");
+            assert!(
+                s.starts_with("PostgreSQL 16.0"),
+                "version should start with PostgreSQL 16.0, got: {s}"
+            );
         }
         other => panic!("expected Text, got {other:?}"),
     }
@@ -108,7 +111,6 @@ async fn test_now_returns_timestamp() {
         other => panic!("expected TimestampTz, got {other:?}"),
     }
 }
-
 
 // ======================================================================
 // Vector function tests
@@ -138,7 +140,11 @@ async fn test_vector_dims() {
 #[tokio::test]
 async fn test_vector_distance_l2() {
     let ex = test_executor();
-    let results = exec(&ex, "SELECT VECTOR_DISTANCE(VECTOR('[1,2]'), VECTOR('[4,6]'), 'l2')").await;
+    let results = exec(
+        &ex,
+        "SELECT VECTOR_DISTANCE(VECTOR('[1,2]'), VECTOR('[4,6]'), 'l2')",
+    )
+    .await;
     match scalar(&results[0]) {
         Value::Float64(d) => assert!((d - 5.0).abs() < 0.001), // sqrt((4-1)^2 + (6-2)^2) = sqrt(9+16) = 5
         other => panic!("expected Float64, got {other:?}"),
@@ -148,7 +154,11 @@ async fn test_vector_distance_l2() {
 #[tokio::test]
 async fn test_vector_distance_cosine() {
     let ex = test_executor();
-    let results = exec(&ex, "SELECT VECTOR_DISTANCE(VECTOR('[1,0]'), VECTOR('[0,1]'), 'cosine')").await;
+    let results = exec(
+        &ex,
+        "SELECT VECTOR_DISTANCE(VECTOR('[1,0]'), VECTOR('[0,1]'), 'cosine')",
+    )
+    .await;
     match scalar(&results[0]) {
         Value::Float64(d) => assert!((d - 1.0).abs() < 0.001), // orthogonal vectors: cosine = 0, distance = 1
         other => panic!("expected Float64, got {other:?}"),
@@ -158,7 +168,11 @@ async fn test_vector_distance_cosine() {
 #[tokio::test]
 async fn test_vector_distance_default_l2() {
     let ex = test_executor();
-    let results = exec(&ex, "SELECT VECTOR_DISTANCE(VECTOR('[0,0]'), VECTOR('[3,4]'))").await;
+    let results = exec(
+        &ex,
+        "SELECT VECTOR_DISTANCE(VECTOR('[0,0]'), VECTOR('[3,4]'))",
+    )
+    .await;
     match scalar(&results[0]) {
         Value::Float64(d) => assert!((d - 5.0).abs() < 0.001), // default metric is L2
         other => panic!("expected Float64, got {other:?}"),
@@ -224,10 +238,18 @@ async fn test_vector_index_creation() {
     let ex = test_executor();
 
     // Create table with vector column
-    exec(&ex, "CREATE TABLE vectors (id INT PRIMARY KEY, embedding VECTOR(128))").await;
+    exec(
+        &ex,
+        "CREATE TABLE vectors (id INT PRIMARY KEY, embedding VECTOR(128))",
+    )
+    .await;
 
     // Create HNSW index
-    exec(&ex, "CREATE INDEX vectors_embedding_idx ON vectors USING hnsw (embedding)").await;
+    exec(
+        &ex,
+        "CREATE INDEX vectors_embedding_idx ON vectors USING hnsw (embedding)",
+    )
+    .await;
 
     // Verify the HNSW index was created with correct metadata.
     // There is also an implicit B-tree index for the PRIMARY KEY, so find by name.
@@ -261,7 +283,11 @@ async fn test_vector_hnsw_index_populated() {
     exec(&ex, "INSERT INTO items VALUES (5, VECTOR('[0,1,1]'))").await;
 
     // Create HNSW index AFTER data exists — should scan and populate
-    exec(&ex, "CREATE INDEX items_emb_idx ON items USING hnsw (embedding)").await;
+    exec(
+        &ex,
+        "CREATE INDEX items_emb_idx ON items USING hnsw (embedding)",
+    )
+    .await;
 
     // Verify the live index has 5 vectors
     let vi = ex.vector_indexes.read();
@@ -282,22 +308,58 @@ async fn test_vector_hnsw_index_populated() {
 #[tokio::test]
 async fn test_vector_index_accelerated_search() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE search_test (id INT, embedding VECTOR(3))").await;
+    exec(
+        &ex,
+        "CREATE TABLE search_test (id INT, embedding VECTOR(3))",
+    )
+    .await;
 
     // Insert 10 vectors
     exec(&ex, "INSERT INTO search_test VALUES (1, VECTOR('[1,0,0]'))").await;
     exec(&ex, "INSERT INTO search_test VALUES (2, VECTOR('[0,1,0]'))").await;
     exec(&ex, "INSERT INTO search_test VALUES (3, VECTOR('[0,0,1]'))").await;
-    exec(&ex, "INSERT INTO search_test VALUES (4, VECTOR('[0.9,0.1,0]'))").await;
-    exec(&ex, "INSERT INTO search_test VALUES (5, VECTOR('[0.1,0.9,0]'))").await;
-    exec(&ex, "INSERT INTO search_test VALUES (6, VECTOR('[0,0.1,0.9]'))").await;
-    exec(&ex, "INSERT INTO search_test VALUES (7, VECTOR('[0.5,0.5,0]'))").await;
-    exec(&ex, "INSERT INTO search_test VALUES (8, VECTOR('[0,0.5,0.5]'))").await;
-    exec(&ex, "INSERT INTO search_test VALUES (9, VECTOR('[0.5,0,0.5]'))").await;
-    exec(&ex, "INSERT INTO search_test VALUES (10, VECTOR('[0.33,0.33,0.34]'))").await;
+    exec(
+        &ex,
+        "INSERT INTO search_test VALUES (4, VECTOR('[0.9,0.1,0]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO search_test VALUES (5, VECTOR('[0.1,0.9,0]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO search_test VALUES (6, VECTOR('[0,0.1,0.9]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO search_test VALUES (7, VECTOR('[0.5,0.5,0]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO search_test VALUES (8, VECTOR('[0,0.5,0.5]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO search_test VALUES (9, VECTOR('[0.5,0,0.5]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO search_test VALUES (10, VECTOR('[0.33,0.33,0.34]'))",
+    )
+    .await;
 
     // Create HNSW index (builds from existing data)
-    exec(&ex, "CREATE INDEX search_idx ON search_test USING hnsw (embedding)").await;
+    exec(
+        &ex,
+        "CREATE INDEX search_idx ON search_test USING hnsw (embedding)",
+    )
+    .await;
 
     // Query using ORDER BY + LIMIT — should use HNSW index
     let results = exec(
@@ -321,8 +383,9 @@ async fn test_vector_order_by_distance() {
     // ORDER BY expression (vector distance)
     let results = exec(
         &ex,
-        "SELECT id FROM vecs ORDER BY VECTOR_DISTANCE(embedding, VECTOR('[1,0,0]'), 'l2') LIMIT 2"
-    ).await;
+        "SELECT id FROM vecs ORDER BY VECTOR_DISTANCE(embedding, VECTOR('[1,0,0]'), 'l2') LIMIT 2",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
     // Closest to [1,0,0]: id=1 (dist=0), then id=3 (dist≈0.14)
@@ -375,12 +438,28 @@ async fn test_vector_end_to_end() {
     let ex = test_executor();
 
     // Create table with vector column
-    exec(&ex, "CREATE TABLE documents (id INT PRIMARY KEY, title TEXT, embedding VECTOR(4))").await;
+    exec(
+        &ex,
+        "CREATE TABLE documents (id INT PRIMARY KEY, title TEXT, embedding VECTOR(4))",
+    )
+    .await;
 
     // Insert some documents with embeddings
-    exec(&ex, "INSERT INTO documents VALUES (1, 'Rust programming', VECTOR('[1.0, 0.5, 0.2, 0.1]'))").await;
-    exec(&ex, "INSERT INTO documents VALUES (2, 'Python guide', VECTOR('[0.5, 1.0, 0.3, 0.2]'))").await;
-    exec(&ex, "INSERT INTO documents VALUES (3, 'Database design', VECTOR('[0.2, 0.3, 1.0, 0.5]'))").await;
+    exec(
+        &ex,
+        "INSERT INTO documents VALUES (1, 'Rust programming', VECTOR('[1.0, 0.5, 0.2, 0.1]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO documents VALUES (2, 'Python guide', VECTOR('[0.5, 1.0, 0.3, 0.2]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO documents VALUES (3, 'Database design', VECTOR('[0.2, 0.3, 1.0, 0.5]'))",
+    )
+    .await;
 
     // Query with multiple vector functions
     let results = exec(
@@ -396,7 +475,11 @@ async fn test_vector_end_to_end() {
     assert_eq!(r[2][2], Value::Int32(4));
 
     // Test normalize function
-    let results = exec(&ex, "SELECT id, NORMALIZE(embedding) FROM documents WHERE id = 1").await;
+    let results = exec(
+        &ex,
+        "SELECT id, NORMALIZE(embedding) FROM documents WHERE id = 1",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     match &r[0][1] {
@@ -409,7 +492,6 @@ async fn test_vector_end_to_end() {
         other => panic!("expected Vector, got {other:?}"),
     }
 }
-
 
 // ======================================================================
 // KV store SQL function tests
@@ -542,9 +624,21 @@ async fn test_kv_integer_values() {
 async fn test_columnar_insert_and_count() {
     let ex = test_executor();
     // Insert rows into columnar store
-    exec(&ex, "SELECT columnar_insert('events', 'ts', 100, 'user', 'alice')").await;
-    exec(&ex, "SELECT columnar_insert('events', 'ts', 200, 'user', 'bob')").await;
-    exec(&ex, "SELECT columnar_insert('events', 'ts', 300, 'user', 'charlie')").await;
+    exec(
+        &ex,
+        "SELECT columnar_insert('events', 'ts', 100, 'user', 'alice')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT columnar_insert('events', 'ts', 200, 'user', 'bob')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT columnar_insert('events', 'ts', 300, 'user', 'charlie')",
+    )
+    .await;
     // Count
     let res = exec(&ex, "SELECT columnar_count('events')").await;
     assert_eq!(scalar(&res[0]), &Value::Int64(3));
@@ -556,9 +650,21 @@ async fn test_columnar_insert_and_count() {
 #[tokio::test]
 async fn test_columnar_sum_avg() {
     let ex = test_executor();
-    exec(&ex, "SELECT columnar_insert('metrics', 'value', 10, 'label', 'a')").await;
-    exec(&ex, "SELECT columnar_insert('metrics', 'value', 20, 'label', 'b')").await;
-    exec(&ex, "SELECT columnar_insert('metrics', 'value', 30, 'label', 'c')").await;
+    exec(
+        &ex,
+        "SELECT columnar_insert('metrics', 'value', 10, 'label', 'a')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT columnar_insert('metrics', 'value', 20, 'label', 'b')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT columnar_insert('metrics', 'value', 30, 'label', 'c')",
+    )
+    .await;
     // SUM
     let res = exec(&ex, "SELECT columnar_sum('metrics', 'value')").await;
     assert_eq!(scalar(&res[0]), &Value::Float64(60.0));
@@ -570,9 +676,21 @@ async fn test_columnar_sum_avg() {
 #[tokio::test]
 async fn test_columnar_min_max() {
     let ex = test_executor();
-    exec(&ex, "SELECT columnar_insert('temps', 'temp', 15, 'city', 'nyc')").await;
-    exec(&ex, "SELECT columnar_insert('temps', 'temp', 25, 'city', 'la')").await;
-    exec(&ex, "SELECT columnar_insert('temps', 'temp', 5, 'city', 'chi')").await;
+    exec(
+        &ex,
+        "SELECT columnar_insert('temps', 'temp', 15, 'city', 'nyc')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT columnar_insert('temps', 'temp', 25, 'city', 'la')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT columnar_insert('temps', 'temp', 5, 'city', 'chi')",
+    )
+    .await;
     // MIN
     let res = exec(&ex, "SELECT columnar_min('temps', 'temp')").await;
     assert_eq!(scalar(&res[0]), &Value::Float64(5.0));
@@ -681,9 +799,21 @@ async fn test_doc_insert_and_get() {
 #[tokio::test]
 async fn test_doc_query_containment() {
     let ex = test_executor();
-    exec(&ex, r#"SELECT doc_insert('{"type":"user","name":"Alice","role":"admin"}')"#).await;
-    exec(&ex, r#"SELECT doc_insert('{"type":"user","name":"Bob","role":"viewer"}')"#).await;
-    exec(&ex, r#"SELECT doc_insert('{"type":"event","action":"login"}')"#).await;
+    exec(
+        &ex,
+        r#"SELECT doc_insert('{"type":"user","name":"Alice","role":"admin"}')"#,
+    )
+    .await;
+    exec(
+        &ex,
+        r#"SELECT doc_insert('{"type":"user","name":"Bob","role":"viewer"}')"#,
+    )
+    .await;
+    exec(
+        &ex,
+        r#"SELECT doc_insert('{"type":"event","action":"login"}')"#,
+    )
+    .await;
     // Query for docs containing {"type":"user"}
     let res = exec(&ex, r#"SELECT doc_query('{"type":"user"}')"#).await;
     let ids = match scalar(&res[0]) {
@@ -700,7 +830,11 @@ async fn test_doc_query_containment() {
 #[tokio::test]
 async fn test_doc_path() {
     let ex = test_executor();
-    exec(&ex, r#"SELECT doc_insert('{"user":{"name":"Alice","address":{"city":"NYC"}}}')"#).await;
+    exec(
+        &ex,
+        r#"SELECT doc_insert('{"user":{"name":"Alice","address":{"city":"NYC"}}}')"#,
+    )
+    .await;
     // Path query: user → name
     let res = exec(&ex, "SELECT doc_path(1, 'user', 'name')").await;
     assert_eq!(scalar(&res[0]), &Value::Text("\"Alice\"".into()));
@@ -732,9 +866,21 @@ async fn test_doc_count() {
 async fn test_fts_index_and_search() {
     let ex = test_executor();
     // Index three documents
-    exec(&ex, "SELECT fts_index(1, 'rust programming language systems')").await;
-    exec(&ex, "SELECT fts_index(2, 'python data science machine learning')").await;
-    exec(&ex, "SELECT fts_index(3, 'rust systems performance optimization')").await;
+    exec(
+        &ex,
+        "SELECT fts_index(1, 'rust programming language systems')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT fts_index(2, 'python data science machine learning')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT fts_index(3, 'rust systems performance optimization')",
+    )
+    .await;
     // Search for "rust systems" — docs 1 and 3 should match
     let res = exec(&ex, "SELECT fts_search('rust systems', 10)").await;
     let json = match scalar(&res[0]) {
@@ -763,7 +909,10 @@ async fn test_fts_fuzzy_search() {
         Value::Text(s) => s.clone(),
         other => panic!("expected text, got {other:?}"),
     };
-    assert!(json.contains("\"doc_id\":1"), "fuzzy should match 'quantum': {json}");
+    assert!(
+        json.contains("\"doc_id\":1"),
+        "fuzzy should match 'quantum': {json}"
+    );
 }
 
 #[tokio::test]
@@ -804,14 +953,17 @@ async fn test_fts_empty_and_no_match() {
     assert_eq!(scalar(&res[0]), &Value::Text("[]".into()));
 }
 
-
 // FTS SQL integration tests
 // ==========================================================================
 
 #[tokio::test]
 async fn test_fts_ts_match() {
     let ex = test_executor();
-    let results = exec(&ex, "SELECT TS_MATCH('The quick brown fox jumps over the lazy dog', 'quick fox')").await;
+    let results = exec(
+        &ex,
+        "SELECT TS_MATCH('The quick brown fox jumps over the lazy dog', 'quick fox')",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r[0][0], Value::Bool(true));
 
@@ -823,11 +975,21 @@ async fn test_fts_ts_match() {
 #[tokio::test]
 async fn test_fts_ts_headline() {
     let ex = test_executor();
-    let results = exec(&ex, "SELECT TS_HEADLINE('The quick brown fox jumps over the lazy dog', 'quick fox')").await;
+    let results = exec(
+        &ex,
+        "SELECT TS_HEADLINE('The quick brown fox jumps over the lazy dog', 'quick fox')",
+    )
+    .await;
     let r = rows(&results[0]);
     if let Value::Text(s) = &r[0][0] {
-        assert!(s.contains("<b>quick</b>"), "headline should highlight 'quick': {s}");
-        assert!(s.contains("<b>fox</b>"), "headline should highlight 'fox': {s}");
+        assert!(
+            s.contains("<b>quick</b>"),
+            "headline should highlight 'quick': {s}"
+        );
+        assert!(
+            s.contains("<b>fox</b>"),
+            "headline should highlight 'fox': {s}"
+        );
     } else {
         panic!("expected text");
     }
@@ -855,11 +1017,24 @@ async fn test_fts_in_table() {
     exec(&ex, "INSERT INTO articles VALUES (3, 'Database Design', 'SQL databases store structured data efficiently')").await;
 
     // Search using TS_MATCH in WHERE clause
-    let results = exec(&ex, "SELECT id, title FROM articles WHERE TS_MATCH(body, 'programming language')").await;
+    let results = exec(
+        &ex,
+        "SELECT id, title FROM articles WHERE TS_MATCH(body, 'programming language')",
+    )
+    .await;
     let r = rows(&results[0]);
-    assert!(r.len() >= 1, "should find at least 1 match");
+    assert!(!r.is_empty(), "should find at least 1 match");
     // Both article 1 and 2 mention 'language'
-    let ids: Vec<i32> = r.iter().filter_map(|row| if let Value::Int32(i) = row[0] { Some(i) } else { None }).collect();
+    let ids: Vec<i32> = r
+        .iter()
+        .filter_map(|row| {
+            if let Value::Int32(i) = row[0] {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
     assert!(ids.contains(&1), "should find Rust article");
 
     // Rank-based ordering
@@ -875,9 +1050,21 @@ async fn test_fts_in_table() {
 async fn test_fts_match_uses_persistent_index() {
     let ex = test_executor();
     // Index documents into the shared persistent index
-    exec(&ex, "SELECT FTS_INDEX(10, 'rust systems programming language fast safe')").await;
-    exec(&ex, "SELECT FTS_INDEX(20, 'python scripting machine learning data science')").await;
-    exec(&ex, "SELECT FTS_INDEX(30, 'database storage engine query optimizer')").await;
+    exec(
+        &ex,
+        "SELECT FTS_INDEX(10, 'rust systems programming language fast safe')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT FTS_INDEX(20, 'python scripting machine learning data science')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT FTS_INDEX(30, 'database storage engine query optimizer')",
+    )
+    .await;
 
     // FTS_MATCH uses the persistent index (not a per-call rebuild)
     let r1 = exec(&ex, "SELECT FTS_MATCH(10, 'rust programming')").await;
@@ -901,7 +1088,11 @@ async fn test_fts_match_in_where_clause() {
     exec(&ex, "CREATE TABLE posts (id INT, title TEXT)").await;
     exec(&ex, "INSERT INTO posts VALUES (1, 'Rust is fast')").await;
     exec(&ex, "INSERT INTO posts VALUES (2, 'Python is expressive')").await;
-    exec(&ex, "INSERT INTO posts VALUES (3, 'Rust and Python coexist')").await;
+    exec(
+        &ex,
+        "INSERT INTO posts VALUES (3, 'Rust and Python coexist')",
+    )
+    .await;
 
     exec(&ex, "SELECT FTS_INDEX(1, 'Rust is fast')").await;
     exec(&ex, "SELECT FTS_INDEX(2, 'Python is expressive')").await;
@@ -910,9 +1101,16 @@ async fn test_fts_match_in_where_clause() {
     // Filter by FTS_MATCH in WHERE clause
     let results = exec(&ex, "SELECT id FROM posts WHERE FTS_MATCH(id, 'rust')").await;
     let r = rows(&results[0]);
-    let ids: Vec<i32> = r.iter().filter_map(|row| {
-        if let Value::Int32(i) = row[0] { Some(i) } else { None }
-    }).collect();
+    let ids: Vec<i32> = r
+        .iter()
+        .filter_map(|row| {
+            if let Value::Int32(i) = row[0] {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
     assert!(ids.contains(&1), "doc 1 should match 'rust'");
     assert!(ids.contains(&3), "doc 3 should match 'rust'");
     assert!(!ids.contains(&2), "doc 2 should NOT match 'rust'");
@@ -954,11 +1152,17 @@ async fn test_sparse_remove() {
     let ex = test_executor();
     exec(&ex, r#"SELECT SPARSE_INSERT(10, '{"0": 1.0}')"#).await;
     exec(&ex, r#"SELECT SPARSE_INSERT(20, '{"0": 2.0}')"#).await;
-    assert_eq!(rows(&exec(&ex, "SELECT SPARSE_DOC_COUNT()").await[0])[0][0], Value::Int64(2));
+    assert_eq!(
+        rows(&exec(&ex, "SELECT SPARSE_DOC_COUNT()").await[0])[0][0],
+        Value::Int64(2)
+    );
 
     let r = exec(&ex, "SELECT SPARSE_REMOVE(10)").await;
     assert_eq!(rows(&r[0])[0][0], Value::Bool(true));
-    assert_eq!(rows(&exec(&ex, "SELECT SPARSE_DOC_COUNT()").await[0])[0][0], Value::Int64(1));
+    assert_eq!(
+        rows(&exec(&ex, "SELECT SPARSE_DOC_COUNT()").await[0])[0][0],
+        Value::Int64(1)
+    );
 
     // Removing nonexistent doc returns false
     let r2 = exec(&ex, "SELECT SPARSE_REMOVE(999)").await;
@@ -976,7 +1180,10 @@ async fn test_sparse_search_exact() {
     let r = exec(&ex, r#"SELECT SPARSE_SEARCH('{"0": 1.0}', 3)"#).await;
     match &rows(&r[0])[0][0] {
         Value::Text(json) => {
-            assert!(json.contains(r#""doc_id":1"#), "doc 1 should be in results: {json}");
+            assert!(
+                json.contains(r#""doc_id":1"#),
+                "doc 1 should be in results: {json}"
+            );
         }
         _ => panic!("expected JSON text"),
     }
@@ -987,13 +1194,20 @@ async fn test_sparse_wand_top_k() {
     let ex = test_executor();
     // Insert 20 docs with escalating weights on dim 0
     for i in 1..=20u64 {
-        exec(&ex, &format!(r#"SELECT SPARSE_INSERT({i}, '{{"0": {}.0}}')"#, i)).await;
+        exec(
+            &ex,
+            &format!(r#"SELECT SPARSE_INSERT({i}, '{{"0": {}.0}}')"#, i),
+        )
+        .await;
     }
     // WAND top 3 should be docs 20, 19, 18
     let r = exec(&ex, r#"SELECT SPARSE_WAND('{"0": 1.0}', 3)"#).await;
     match &rows(&r[0])[0][0] {
         Value::Text(json) => {
-            assert!(json.contains(r#""doc_id":20"#), "doc 20 should be top result: {json}");
+            assert!(
+                json.contains(r#""doc_id":20"#),
+                "doc 20 should be top result: {json}"
+            );
         }
         _ => panic!("expected JSON text"),
     }
@@ -1003,10 +1217,15 @@ async fn test_sparse_wand_top_k() {
 async fn test_sparse_wand_matches_search() {
     let ex = test_executor();
     for i in 1..=15u64 {
-        exec(&ex, &format!(
-            r#"SELECT SPARSE_INSERT({i}, '{{"0": {a}.0, "1": {b}.0}}')"#,
-            a = i, b = 16 - i,
-        )).await;
+        exec(
+            &ex,
+            &format!(
+                r#"SELECT SPARSE_INSERT({i}, '{{"0": {a}.0, "1": {b}.0}}')"#,
+                a = i,
+                b = 16 - i,
+            ),
+        )
+        .await;
     }
     let query = r#"'{"0": 1.0, "1": 1.0}'"#;
     let r_exact = exec(&ex, &format!("SELECT SPARSE_SEARCH({query}, 5)")).await;
@@ -1039,7 +1258,10 @@ async fn test_mem_budget_and_available() {
     // Available should be ≤ budget
     let r2 = exec(&ex, "SELECT MEM_AVAILABLE()").await;
     match rows(&r2[0])[0][0] {
-        Value::Int64(a) => assert!(a >= 0 && a <= (1 << 30), "available should be in [0, budget]"),
+        Value::Int64(a) => assert!(
+            (0..=(1 << 30)).contains(&a),
+            "available should be in [0, budget]"
+        ),
         _ => panic!("expected Int64"),
     }
 }
@@ -1048,12 +1270,18 @@ async fn test_mem_budget_and_available() {
 async fn test_mem_usage_after_fts_insert() {
     let ex = test_executor();
     let r_before = exec(&ex, "SELECT MEM_USAGE()").await;
-    let before = match rows(&r_before[0])[0][0] { Value::Int64(v) => v, _ => panic!() };
+    let before = match rows(&r_before[0])[0][0] {
+        Value::Int64(v) => v,
+        _ => panic!(),
+    };
 
     exec(&ex, "SELECT FTS_INDEX(1, 'rust systems programming')").await;
 
     let r_after = exec(&ex, "SELECT MEM_USAGE()").await;
-    let after = match rows(&r_after[0])[0][0] { Value::Int64(v) => v, _ => panic!() };
+    let after = match rows(&r_after[0])[0][0] {
+        Value::Int64(v) => v,
+        _ => panic!(),
+    };
 
     assert!(after > before, "usage should increase after FTS_INDEX");
 }
@@ -1062,12 +1290,18 @@ async fn test_mem_usage_after_fts_insert() {
 async fn test_mem_usage_after_sparse_insert() {
     let ex = test_executor();
     let r_before = exec(&ex, "SELECT MEM_USAGE()").await;
-    let before = match rows(&r_before[0])[0][0] { Value::Int64(v) => v, _ => panic!() };
+    let before = match rows(&r_before[0])[0][0] {
+        Value::Int64(v) => v,
+        _ => panic!(),
+    };
 
     exec(&ex, r#"SELECT SPARSE_INSERT(1, '{"0": 1.0, "1": 2.0}')"#).await;
 
     let r_after = exec(&ex, "SELECT MEM_USAGE()").await;
-    let after = match rows(&r_after[0])[0][0] { Value::Int64(v) => v, _ => panic!() };
+    let after = match rows(&r_after[0])[0][0] {
+        Value::Int64(v) => v,
+        _ => panic!(),
+    };
     assert!(after > before, "usage should increase after SPARSE_INSERT");
 }
 
@@ -1076,7 +1310,7 @@ async fn test_mem_utilization() {
     let ex = test_executor();
     let r = exec(&ex, "SELECT MEM_UTILIZATION()").await;
     match rows(&r[0])[0][0] {
-        Value::Float64(u) => assert!(u >= 0.0 && u <= 100.0, "utilization should be 0-100%"),
+        Value::Float64(u) => assert!((0.0..=100.0).contains(&u), "utilization should be 0-100%"),
         _ => panic!("expected Float64"),
     }
 }
@@ -1152,7 +1386,10 @@ async fn test_geo_st_x_y() {
     let results = exec(&ex, "SELECT ST_X(ST_MAKEPOINT(-74.006, 40.7128))").await;
     let r = rows(&results[0]);
     if let Value::Float64(x) = r[0][0] {
-        assert!((x - (-74.006)).abs() < 0.001, "ST_X should return -74.006, got {x}");
+        assert!(
+            (x - (-74.006)).abs() < 0.001,
+            "ST_X should return -74.006, got {x}"
+        );
     } else {
         panic!("expected float64");
     }
@@ -1160,7 +1397,10 @@ async fn test_geo_st_x_y() {
     let results = exec(&ex, "SELECT ST_Y(ST_MAKEPOINT(-74.006, 40.7128))").await;
     let r = rows(&results[0]);
     if let Value::Float64(y) = r[0][0] {
-        assert!((y - 40.7128).abs() < 0.001, "ST_Y should return 40.7128, got {y}");
+        assert!(
+            (y - 40.7128).abs() < 0.001,
+            "ST_Y should return 40.7128, got {y}"
+        );
     } else {
         panic!("expected float64");
     }
@@ -1170,11 +1410,19 @@ async fn test_geo_st_x_y() {
 async fn test_geo_st_contains() {
     let ex = test_executor();
     // Unit square polygon, test point inside and outside
-    let results = exec(&ex, "SELECT ST_CONTAINS('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))', 'POINT(5 5)')").await;
+    let results = exec(
+        &ex,
+        "SELECT ST_CONTAINS('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))', 'POINT(5 5)')",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r[0][0], Value::Bool(true));
 
-    let results = exec(&ex, "SELECT ST_CONTAINS('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))', 'POINT(15 5)')").await;
+    let results = exec(
+        &ex,
+        "SELECT ST_CONTAINS('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))', 'POINT(15 5)')",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r[0][0], Value::Bool(false));
 }
@@ -1182,18 +1430,52 @@ async fn test_geo_st_contains() {
 #[tokio::test]
 async fn test_geo_in_table() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE locations (id INT, name TEXT, lat FLOAT, lon FLOAT)").await;
-    exec(&ex, "INSERT INTO locations VALUES (1, 'New York', 40.7128, -74.006)").await;
-    exec(&ex, "INSERT INTO locations VALUES (2, 'Los Angeles', 34.0522, -118.2437)").await;
-    exec(&ex, "INSERT INTO locations VALUES (3, 'Newark', 40.7357, -74.1724)").await;
+    exec(
+        &ex,
+        "CREATE TABLE locations (id INT, name TEXT, lat FLOAT, lon FLOAT)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO locations VALUES (1, 'New York', 40.7128, -74.006)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO locations VALUES (2, 'Los Angeles', 34.0522, -118.2437)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO locations VALUES (3, 'Newark', 40.7357, -74.1724)",
+    )
+    .await;
 
     // Find locations within 50km of NYC using existing 4-arg ST_DISTANCE
     let results = exec(&ex, "SELECT name, ST_DISTANCE(lat, lon, 40.7128, -74.006) AS dist FROM locations WHERE ST_DISTANCE(lat, lon, 40.7128, -74.006) < 50000").await;
     let r = rows(&results[0]);
-    let names: Vec<String> = r.iter().filter_map(|row| if let Value::Text(s) = &row[0] { Some(s.clone()) } else { None }).collect();
-    assert!(names.contains(&"New York".to_string()), "NYC should be within 50km of itself");
-    assert!(names.contains(&"Newark".to_string()), "Newark should be within 50km of NYC");
-    assert!(!names.contains(&"Los Angeles".to_string()), "LA should NOT be within 50km of NYC");
+    let names: Vec<String> = r
+        .iter()
+        .filter_map(|row| {
+            if let Value::Text(s) = &row[0] {
+                Some(s.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        names.contains(&"New York".to_string()),
+        "NYC should be within 50km of itself"
+    );
+    assert!(
+        names.contains(&"Newark".to_string()),
+        "Newark should be within 50km of NYC"
+    );
+    assert!(
+        !names.contains(&"Los Angeles".to_string()),
+        "LA should NOT be within 50km of NYC"
+    );
 }
 
 // ==========================================================================
@@ -1226,9 +1508,13 @@ async fn test_timeseries_time_bucket_in_table() {
     }
 
     // Group by minute bucket using TIME_BUCKET (numeric form already existed)
-    let results = exec(&ex, &format!("SELECT TIME_BUCKET(60000, ts) AS bucket, COUNT(*) FROM metrics GROUP BY TIME_BUCKET(60000, ts)")).await;
+    let results = exec(&ex, "SELECT TIME_BUCKET(60000, ts) AS bucket, COUNT(*) FROM metrics GROUP BY TIME_BUCKET(60000, ts)").await;
     let r = rows(&results[0]);
-    assert_eq!(r.len(), 10, "each minute should be its own bucket with 1-minute intervals");
+    assert_eq!(
+        r.len(),
+        10,
+        "each minute should be its own bucket with 1-minute intervals"
+    );
 }
 
 // ==========================================================================
@@ -1241,7 +1527,11 @@ async fn test_graph_shortest_path_length() {
     let ex = test_executor();
     // Simple linear graph: 1→2→3→4
     let edges = r#"[{"from":1,"to":2},{"from":2,"to":3},{"from":3,"to":4}]"#;
-    let results = exec(&ex, &format!("SELECT GRAPH_SHORTEST_PATH_LENGTH('{edges}', 1, 4)")).await;
+    let results = exec(
+        &ex,
+        &format!("SELECT GRAPH_SHORTEST_PATH_LENGTH('{edges}', 1, 4)"),
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r[0][0], Value::Int32(3), "path 1→2→3→4 has length 3");
 }
@@ -1251,7 +1541,11 @@ async fn test_graph_shortest_path_no_path() {
     let ex = test_executor();
     // Disconnected graph: 1→2, 3→4 (no path from 1 to 4)
     let edges = r#"[{"from":1,"to":2},{"from":3,"to":4}]"#;
-    let results = exec(&ex, &format!("SELECT GRAPH_SHORTEST_PATH_LENGTH('{edges}', 1, 4)")).await;
+    let results = exec(
+        &ex,
+        &format!("SELECT GRAPH_SHORTEST_PATH_LENGTH('{edges}', 1, 4)"),
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r[0][0], Value::Null, "no path should return NULL");
 }
@@ -1263,7 +1557,11 @@ async fn test_graph_node_degree() {
     let edges = r#"[{"from":1,"to":2},{"from":2,"to":3},{"from":2,"to":4}]"#;
     let results = exec(&ex, &format!("SELECT GRAPH_NODE_DEGREE('{edges}', 2)")).await;
     let r = rows(&results[0]);
-    assert_eq!(r[0][0], Value::Int32(3), "node 2 has 3 edges (1 in + 2 out)");
+    assert_eq!(
+        r[0][0],
+        Value::Int32(3),
+        "node 2 has 3 edges (1 in + 2 out)"
+    );
 }
 
 #[tokio::test]
@@ -1272,7 +1570,11 @@ async fn test_graph_in_table() {
     exec(&ex, "CREATE TABLE roads (id INT, edges_json TEXT)").await;
     exec(&ex, r#"INSERT INTO roads VALUES (1, '[{"from":1,"to":2},{"from":2,"to":3},{"from":1,"to":3}]')"#).await;
 
-    let results = exec(&ex, "SELECT GRAPH_SHORTEST_PATH_LENGTH(edges_json, 1, 3) FROM roads WHERE id = 1").await;
+    let results = exec(
+        &ex,
+        "SELECT GRAPH_SHORTEST_PATH_LENGTH(edges_json, 1, 3) FROM roads WHERE id = 1",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r[0][0], Value::Int32(1), "direct edge 1→3 has length 1");
 }
@@ -1302,7 +1604,11 @@ async fn test_datalog_rule_recursive() {
     exec(&ex, "SELECT DATALOG_ASSERT('parent(bob, charlie)')").await;
     exec(&ex, "SELECT DATALOG_ASSERT('parent(charlie, dave)')").await;
     exec(&ex, "SELECT DATALOG_RULE('ancestor(X, Y) :- parent(X, Y)')").await;
-    exec(&ex, "SELECT DATALOG_RULE('ancestor(X, Z) :- ancestor(X, Y), parent(Y, Z)')").await;
+    exec(
+        &ex,
+        "SELECT DATALOG_RULE('ancestor(X, Z) :- ancestor(X, Y), parent(Y, Z)')",
+    )
+    .await;
     let r = exec(&ex, "SELECT DATALOG_QUERY('ancestor(alice, Who)')").await;
     let json = match scalar(&r[0]) {
         Value::Text(s) => s.clone(),
@@ -1336,7 +1642,10 @@ async fn test_datalog_import_from_relational_table() {
         other => panic!("expected Text, got {other:?}"),
     };
     assert!(json.contains("alice"), "should find alice in eng: {json}");
-    assert!(json.contains("charlie"), "should find charlie in eng: {json}");
+    assert!(
+        json.contains("charlie"),
+        "should find charlie in eng: {json}"
+    );
     assert!(!json.contains("bob"), "bob is in sales, not eng: {json}");
 }
 
@@ -1344,9 +1653,17 @@ async fn test_datalog_import_from_relational_table() {
 async fn test_datalog_import_graph_edges() {
     let ex = test_executor();
     // Create graph nodes and edges
-    exec(&ex, "SELECT GRAPH_ADD_NODE('Person', '{\"name\":\"alice\"}')").await;
+    exec(
+        &ex,
+        "SELECT GRAPH_ADD_NODE('Person', '{\"name\":\"alice\"}')",
+    )
+    .await;
     exec(&ex, "SELECT GRAPH_ADD_NODE('Person', '{\"name\":\"bob\"}')").await;
-    exec(&ex, "SELECT GRAPH_ADD_NODE('Person', '{\"name\":\"charlie\"}')").await;
+    exec(
+        &ex,
+        "SELECT GRAPH_ADD_NODE('Person', '{\"name\":\"charlie\"}')",
+    )
+    .await;
     exec(&ex, "SELECT GRAPH_ADD_EDGE(1, 2, 'KNOWS')").await;
     exec(&ex, "SELECT GRAPH_ADD_EDGE(2, 3, 'KNOWS')").await;
 
@@ -1402,7 +1719,11 @@ async fn test_datalog_cross_model_reasoning() {
     exec(&ex, "SELECT DATALOG_IMPORT('staff', 'staff')").await;
 
     // Add a rule: managers manage engineers
-    exec(&ex, "SELECT DATALOG_RULE('manages(M, E) :- staff(M, manager), staff(E, engineer)')").await;
+    exec(
+        &ex,
+        "SELECT DATALOG_RULE('manages(M, E) :- staff(M, manager), staff(E, engineer)')",
+    )
+    .await;
 
     // Query: who does alice manage?
     let r = exec(&ex, "SELECT DATALOG_QUERY('manages(alice, Who)')").await;
@@ -1411,7 +1732,10 @@ async fn test_datalog_cross_model_reasoning() {
         other => panic!("expected Text, got {other:?}"),
     };
     assert!(json.contains("bob"), "alice should manage bob: {json}");
-    assert!(json.contains("charlie"), "alice should manage charlie: {json}");
+    assert!(
+        json.contains("charlie"),
+        "alice should manage charlie: {json}"
+    );
 }
 
 #[tokio::test]
@@ -1439,4 +1763,3 @@ async fn test_datalog_retract_and_clear() {
     };
     assert_eq!(json, "[]", "should be empty after clear");
 }
-

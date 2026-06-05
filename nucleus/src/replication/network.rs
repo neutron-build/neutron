@@ -17,13 +17,13 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tokio::time;
 
 #[allow(unused_imports)]
 use super::{
-    decode_stream_message, encode_stream_message, Lsn, NodeId, NodeRole, ReplicationError,
-    ReplicationManager, ReplicationMode, StreamMessage, WalPayload, WalRecord, WalWriter,
+    Lsn, NodeId, NodeRole, ReplicationError, ReplicationManager, ReplicationMode, StreamMessage,
+    WalPayload, WalRecord, WalWriter, decode_stream_message, encode_stream_message,
 };
 
 // ---------------------------------------------------------------------------
@@ -539,11 +539,8 @@ impl NetworkedReplicationManager {
         &mut self,
         primary_addr: SocketAddr,
     ) -> Result<(), ReplicationError> {
-        let client = ReplicationClient::new(
-            primary_addr,
-            self.inner.node_id(),
-            Arc::clone(&self.wal),
-        );
+        let client =
+            ReplicationClient::new(primary_addr, self.inner.node_id(), Arc::clone(&self.wal));
         client.connect().await?;
         self.client = Some(client);
         Ok(())

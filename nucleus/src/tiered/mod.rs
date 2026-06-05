@@ -156,34 +156,46 @@ impl TierManager {
     pub fn new() -> Self {
         let mut configs = HashMap::new();
 
-        configs.insert(StorageTier::Hot, TierConfig {
-            tier: StorageTier::Hot,
-            capacity_bytes: 64 * 1024 * 1024 * 1024,   // 64 GiB
-            used_bytes: 0,
-            cost_per_gb_month: 3.0,
-            avg_latency_us: 10,
-        });
-        configs.insert(StorageTier::Warm, TierConfig {
-            tier: StorageTier::Warm,
-            capacity_bytes: 256 * 1024 * 1024 * 1024,  // 256 GiB
-            used_bytes: 0,
-            cost_per_gb_month: 0.50,
-            avg_latency_us: 200,
-        });
-        configs.insert(StorageTier::Cold, TierConfig {
-            tier: StorageTier::Cold,
-            capacity_bytes: 1024 * 1024 * 1024 * 1024, // 1 TiB
-            used_bytes: 0,
-            cost_per_gb_month: 0.02,
-            avg_latency_us: 5_000,
-        });
-        configs.insert(StorageTier::Archive, TierConfig {
-            tier: StorageTier::Archive,
-            capacity_bytes: 4 * 1024 * 1024 * 1024 * 1024, // 4 TiB
-            used_bytes: 0,
-            cost_per_gb_month: 0.004,
-            avg_latency_us: 50_000,
-        });
+        configs.insert(
+            StorageTier::Hot,
+            TierConfig {
+                tier: StorageTier::Hot,
+                capacity_bytes: 64 * 1024 * 1024 * 1024, // 64 GiB
+                used_bytes: 0,
+                cost_per_gb_month: 3.0,
+                avg_latency_us: 10,
+            },
+        );
+        configs.insert(
+            StorageTier::Warm,
+            TierConfig {
+                tier: StorageTier::Warm,
+                capacity_bytes: 256 * 1024 * 1024 * 1024, // 256 GiB
+                used_bytes: 0,
+                cost_per_gb_month: 0.50,
+                avg_latency_us: 200,
+            },
+        );
+        configs.insert(
+            StorageTier::Cold,
+            TierConfig {
+                tier: StorageTier::Cold,
+                capacity_bytes: 1024 * 1024 * 1024 * 1024, // 1 TiB
+                used_bytes: 0,
+                cost_per_gb_month: 0.02,
+                avg_latency_us: 5_000,
+            },
+        );
+        configs.insert(
+            StorageTier::Archive,
+            TierConfig {
+                tier: StorageTier::Archive,
+                capacity_bytes: 4 * 1024 * 1024 * 1024 * 1024, // 4 TiB
+                used_bytes: 0,
+                cost_per_gb_month: 0.004,
+                avg_latency_us: 50_000,
+            },
+        );
 
         Self {
             configs,
@@ -234,13 +246,14 @@ impl TierManager {
         // Access-count promotion override: if the segment has been accessed
         // more than the threshold, it belongs in Hot regardless of age.
         if let Some(threshold) = policy.access_count_override
-            && seg.access_count > threshold {
-                return if seg.current_tier != StorageTier::Hot {
-                    Some(StorageTier::Hot)
-                } else {
-                    None
-                };
-            }
+            && seg.access_count > threshold
+        {
+            return if seg.current_tier != StorageTier::Hot {
+                Some(StorageTier::Hot)
+            } else {
+                None
+            };
+        }
 
         let ideal = if age_days < policy.hot_threshold_days as u64 {
             StorageTier::Hot
@@ -314,12 +327,15 @@ impl TierManager {
 
         // Initialise from configs so we include tiers that have zero segments.
         for (tier, cfg) in &self.configs {
-            stats.insert(*tier, TierStat {
-                tier: *tier,
-                segment_count: 0,
-                total_bytes: 0,
-                utilization_pct: 0.0,
-            });
+            stats.insert(
+                *tier,
+                TierStat {
+                    tier: *tier,
+                    segment_count: 0,
+                    total_bytes: 0,
+                    utilization_pct: 0.0,
+                },
+            );
             // We will compute utilization after counting bytes.
             let _ = cfg; // suppress unused warning in this block
         }
@@ -334,10 +350,11 @@ impl TierManager {
         // Compute utilization percentages.
         for (tier, stat) in stats.iter_mut() {
             if let Some(cfg) = self.configs.get(tier)
-                && cfg.capacity_bytes > 0 {
-                    stat.utilization_pct =
-                        (stat.total_bytes as f64 / cfg.capacity_bytes as f64) * 100.0;
-                }
+                && cfg.capacity_bytes > 0
+            {
+                stat.utilization_pct =
+                    (stat.total_bytes as f64 / cfg.capacity_bytes as f64) * 100.0;
+            }
         }
 
         // Return in tier order: Hot, Warm, Cold, Archive.
@@ -347,10 +364,7 @@ impl TierManager {
             StorageTier::Cold,
             StorageTier::Archive,
         ];
-        order
-            .iter()
-            .filter_map(|t| stats.remove(t))
-            .collect()
+        order.iter().filter_map(|t| stats.remove(t)).collect()
     }
 
     /// Estimates the total monthly storage cost across all tiers in dollars.
@@ -695,8 +709,8 @@ mod tests {
             table_name: "logs".into(),
             current_tier: StorageTier::Hot,
             size_bytes: 300,
-            created_at: now - 1 * MS_PER_DAY,
-            last_accessed_at: now - 1 * MS_PER_DAY,
+            created_at: now - MS_PER_DAY,
+            last_accessed_at: now - MS_PER_DAY,
             access_count: 0,
             compression_ratio: 1.0,
         };
@@ -728,9 +742,18 @@ mod tests {
         for action in &actions {
             mgr.apply_migration(action);
         }
-        assert_eq!(mgr.segments.get(&1).unwrap().current_tier, StorageTier::Warm);
-        assert_eq!(mgr.segments.get(&2).unwrap().current_tier, StorageTier::Cold);
-        assert_eq!(mgr.segments.get(&3).unwrap().current_tier, StorageTier::Archive);
+        assert_eq!(
+            mgr.segments.get(&1).unwrap().current_tier,
+            StorageTier::Warm
+        );
+        assert_eq!(
+            mgr.segments.get(&2).unwrap().current_tier,
+            StorageTier::Cold
+        );
+        assert_eq!(
+            mgr.segments.get(&3).unwrap().current_tier,
+            StorageTier::Archive
+        );
         assert_eq!(mgr.segments.get(&4).unwrap().current_tier, StorageTier::Hot);
     }
 
@@ -834,7 +857,10 @@ mod tests {
         let actions = mgr.plan_migrations(day10);
         assert_eq!(actions.len(), 1);
         mgr.apply_migration(&actions[0]);
-        assert_eq!(mgr.segments.get(&100).unwrap().current_tier, StorageTier::Warm);
+        assert_eq!(
+            mgr.segments.get(&100).unwrap().current_tier,
+            StorageTier::Warm
+        );
 
         // Phase 3: Day 50 — should move to Cold.
         let day50 = 50 * MS_PER_DAY;
@@ -842,15 +868,24 @@ mod tests {
         let actions = mgr.plan_migrations(day50);
         assert_eq!(actions.len(), 1);
         mgr.apply_migration(&actions[0]);
-        assert_eq!(mgr.segments.get(&100).unwrap().current_tier, StorageTier::Cold);
+        assert_eq!(
+            mgr.segments.get(&100).unwrap().current_tier,
+            StorageTier::Cold
+        );
 
         // Phase 4: Day 100 — should move to Archive.
         let day100 = 100 * MS_PER_DAY;
-        assert_eq!(mgr.evaluate_segment(100, day100), Some(StorageTier::Archive));
+        assert_eq!(
+            mgr.evaluate_segment(100, day100),
+            Some(StorageTier::Archive)
+        );
         let actions = mgr.plan_migrations(day100);
         assert_eq!(actions.len(), 1);
         mgr.apply_migration(&actions[0]);
-        assert_eq!(mgr.segments.get(&100).unwrap().current_tier, StorageTier::Archive);
+        assert_eq!(
+            mgr.segments.get(&100).unwrap().current_tier,
+            StorageTier::Archive
+        );
 
         // Phase 5: Day 500 — still Archive, no further migration.
         let day500 = 500 * MS_PER_DAY;
@@ -939,7 +974,10 @@ mod tests {
 
         // Before migration: all 3 on Hot.
         let stats_before = mgr.tier_stats();
-        let hot_before = stats_before.iter().find(|s| s.tier == StorageTier::Hot).unwrap();
+        let hot_before = stats_before
+            .iter()
+            .find(|s| s.tier == StorageTier::Hot)
+            .unwrap();
         assert_eq!(hot_before.segment_count, 3);
         assert_eq!(hot_before.total_bytes, 3 * seg_size);
 
@@ -952,9 +990,18 @@ mod tests {
 
         // After migration: 1 on Hot, 1 on Warm, 1 on Cold.
         let stats_after = mgr.tier_stats();
-        let hot_after = stats_after.iter().find(|s| s.tier == StorageTier::Hot).unwrap();
-        let warm_after = stats_after.iter().find(|s| s.tier == StorageTier::Warm).unwrap();
-        let cold_after = stats_after.iter().find(|s| s.tier == StorageTier::Cold).unwrap();
+        let hot_after = stats_after
+            .iter()
+            .find(|s| s.tier == StorageTier::Hot)
+            .unwrap();
+        let warm_after = stats_after
+            .iter()
+            .find(|s| s.tier == StorageTier::Warm)
+            .unwrap();
+        let cold_after = stats_after
+            .iter()
+            .find(|s| s.tier == StorageTier::Cold)
+            .unwrap();
 
         assert_eq!(hot_after.segment_count, 1);
         assert_eq!(hot_after.total_bytes, seg_size);
@@ -980,8 +1027,7 @@ mod tests {
         let cost_after = mgr.estimated_monthly_cost();
         let gb_per_seg = seg_size as f64 / BYTES_PER_GB;
         let cost_before_expected = 3.0 * gb_per_seg * 3.0;
-        let cost_after_expected =
-            gb_per_seg * 3.0 + gb_per_seg * 0.50 + gb_per_seg * 0.02;
+        let cost_after_expected = gb_per_seg * 3.0 + gb_per_seg * 0.50 + gb_per_seg * 0.02;
         assert!(cost_after < cost_before_expected);
         assert!(
             (cost_after - cost_after_expected).abs() < 1e-9,
@@ -1050,7 +1096,10 @@ mod tests {
         // Verify final state: 5 on Hot, 0 on Warm, 0 on Cold, 5 on Archive.
         let stats = mgr.tier_stats();
         let hot = stats.iter().find(|s| s.tier == StorageTier::Hot).unwrap();
-        let archive = stats.iter().find(|s| s.tier == StorageTier::Archive).unwrap();
+        let archive = stats
+            .iter()
+            .find(|s| s.tier == StorageTier::Archive)
+            .unwrap();
         assert_eq!(hot.segment_count, 5);
         assert_eq!(archive.segment_count, 5);
 
@@ -1082,7 +1131,10 @@ mod tests {
         let seg = make_segment(1, now - 60 * MS_PER_DAY, StorageTier::Hot);
         mgr.add_segment(seg);
 
-        assert_eq!(mgr.configs.get(&StorageTier::Hot).unwrap().used_bytes, seg_size);
+        assert_eq!(
+            mgr.configs.get(&StorageTier::Hot).unwrap().used_bytes,
+            seg_size
+        );
         assert_eq!(mgr.configs.get(&StorageTier::Cold).unwrap().used_bytes, 0);
 
         // Demote to Cold (age = 60 days).
@@ -1091,7 +1143,10 @@ mod tests {
         mgr.apply_migration(&actions[0]);
 
         assert_eq!(mgr.configs.get(&StorageTier::Hot).unwrap().used_bytes, 0);
-        assert_eq!(mgr.configs.get(&StorageTier::Cold).unwrap().used_bytes, seg_size);
+        assert_eq!(
+            mgr.configs.get(&StorageTier::Cold).unwrap().used_bytes,
+            seg_size
+        );
 
         // Now simulate heavy access to promote back to Hot.
         for _ in 0..101 {
@@ -1103,7 +1158,10 @@ mod tests {
         mgr.apply_migration(&actions[0]);
 
         // Bytes should be back on Hot, Cold should be zero again.
-        assert_eq!(mgr.configs.get(&StorageTier::Hot).unwrap().used_bytes, seg_size);
+        assert_eq!(
+            mgr.configs.get(&StorageTier::Hot).unwrap().used_bytes,
+            seg_size
+        );
         assert_eq!(mgr.configs.get(&StorageTier::Cold).unwrap().used_bytes, 0);
     }
 }

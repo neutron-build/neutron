@@ -340,6 +340,7 @@ pub fn count_i64(data: &[i64]) -> u64 {
     {
         if is_x86_feature_detected!("avx512f") {
             simd_dispatch_counter("count_i64", "avx512");
+            // SAFETY: avx512f availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { count_i64_avx512(data) };
         }
     }
@@ -348,6 +349,7 @@ pub fn count_i64(data: &[i64]) -> u64 {
     {
         if is_x86_feature_detected!("avx2") {
             simd_dispatch_counter("count_i64", "avx2");
+            // SAFETY: avx2 availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { count_i64_avx2(data) };
         }
     }
@@ -364,6 +366,7 @@ pub fn sum_i64(data: &[i64]) -> i64 {
     {
         if is_x86_feature_detected!("avx512f") {
             simd_dispatch_counter("sum_i64", "avx512");
+            // SAFETY: avx512f availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { sum_i64_avx512(data) };
         }
     }
@@ -372,6 +375,7 @@ pub fn sum_i64(data: &[i64]) -> i64 {
     {
         if is_x86_feature_detected!("avx2") {
             simd_dispatch_counter("sum_i64", "avx2");
+            // SAFETY: avx2 availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { sum_i64_avx2(data) };
         }
     }
@@ -388,6 +392,7 @@ pub fn min_i64(data: &[i64]) -> Option<i64> {
     {
         if is_x86_feature_detected!("avx512f") {
             simd_dispatch_counter("min_i64", "avx512");
+            // SAFETY: avx512f availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { min_i64_avx512(data) };
         }
     }
@@ -396,6 +401,7 @@ pub fn min_i64(data: &[i64]) -> Option<i64> {
     {
         if is_x86_feature_detected!("avx2") {
             simd_dispatch_counter("min_i64", "avx2");
+            // SAFETY: avx2 availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { min_i64_avx2(data) };
         }
     }
@@ -412,6 +418,7 @@ pub fn max_i64(data: &[i64]) -> Option<i64> {
     {
         if is_x86_feature_detected!("avx512f") {
             simd_dispatch_counter("max_i64", "avx512");
+            // SAFETY: avx512f availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { max_i64_avx512(data) };
         }
     }
@@ -420,6 +427,7 @@ pub fn max_i64(data: &[i64]) -> Option<i64> {
     {
         if is_x86_feature_detected!("avx2") {
             simd_dispatch_counter("max_i64", "avx2");
+            // SAFETY: avx2 availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { max_i64_avx2(data) };
         }
     }
@@ -483,7 +491,9 @@ mod tests {
     fn test_count_i64_various_sizes() {
         // Test with sizes that exercise different chunk paths
         for size in &[1, 3, 4, 5, 7, 8, 9, 15, 16, 17] {
-            let data: Vec<i64> = (0..*size).map(|i| if i % 2 == 0 { i as i64 } else { 0 }).collect();
+            let data: Vec<i64> = (0..*size)
+                .map(|i| if i % 2 == 0 { i as i64 } else { 0 })
+                .collect();
             let expected = data.iter().filter(|&&v| v != 0).count() as u64;
             assert_eq!(count_i64(&data), expected, "Failed for size {}", size);
         }
@@ -637,7 +647,11 @@ mod tests {
         for data in test_data {
             let simd_result = count_i64(&data);
             let scalar_result = count_i64_scalar(&data);
-            assert_eq!(simd_result, scalar_result, "Count mismatch for data: {:?}", data);
+            assert_eq!(
+                simd_result, scalar_result,
+                "Count mismatch for data: {:?}",
+                data
+            );
         }
     }
 
@@ -656,7 +670,11 @@ mod tests {
         for data in test_data {
             let simd_result = sum_i64(&data);
             let scalar_result = sum_i64_scalar(&data);
-            assert_eq!(simd_result, scalar_result, "Sum mismatch for data: {:?}", data);
+            assert_eq!(
+                simd_result, scalar_result,
+                "Sum mismatch for data: {:?}",
+                data
+            );
         }
     }
 
@@ -674,7 +692,11 @@ mod tests {
         for data in test_data {
             let simd_result = min_i64(&data);
             let scalar_result = min_i64_scalar(&data);
-            assert_eq!(simd_result, scalar_result, "Min mismatch for data: {:?}", data);
+            assert_eq!(
+                simd_result, scalar_result,
+                "Min mismatch for data: {:?}",
+                data
+            );
         }
     }
 
@@ -692,7 +714,11 @@ mod tests {
         for data in test_data {
             let simd_result = max_i64(&data);
             let scalar_result = max_i64_scalar(&data);
-            assert_eq!(simd_result, scalar_result, "Max mismatch for data: {:?}", data);
+            assert_eq!(
+                simd_result, scalar_result,
+                "Max mismatch for data: {:?}",
+                data
+            );
         }
     }
 

@@ -20,12 +20,12 @@
 //! - `server`: TCP listener and connection spawner
 //! - `tests`: M3 test suite (M3 parallel test infrastructure)
 
-pub mod encoder;
+pub mod connection_handler;
 pub mod decoder;
+pub mod encoder;
 pub mod handshake;
 pub mod query_handler;
 pub mod result_serializer;
-pub mod connection_handler;
 pub mod server;
 
 #[cfg(test)]

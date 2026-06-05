@@ -16,17 +16,17 @@ pub mod columnar_engine;
 pub mod columnar_wal;
 pub mod compression;
 #[cfg(feature = "server")]
-pub mod kv_wal;
-#[cfg(feature = "server")]
 pub mod disk;
 #[cfg(feature = "server")]
 pub mod disk_engine;
-pub mod fsm;
 pub mod encrypted_index;
 pub mod encryption;
+pub mod fsm;
 pub mod granule_stats;
 #[cfg(feature = "server")]
 pub mod io_uring;
+#[cfg(feature = "server")]
+pub mod kv_wal;
 pub mod lsm;
 #[cfg(feature = "server")]
 pub mod lsm_engine;
@@ -34,10 +34,10 @@ pub mod mvcc;
 #[cfg(feature = "server")]
 pub mod mvcc_wal;
 pub mod page;
-pub mod tuple;
-pub mod txn;
 #[cfg(feature = "server")]
 pub mod persistence;
+pub mod tuple;
+pub mod txn;
 #[cfg(feature = "server")]
 pub mod wal;
 
@@ -130,6 +130,19 @@ pub trait StorageEngine: Send + Sync {
             .collect())
     }
 
+    /// Scan returning every *physical* row with its physical scan-order
+    /// position — for UPDATE/DELETE, whose returned positions are fed back to
+    /// `update()`/`delete()` (which index physical storage). Unlike `scan()`,
+    /// this must NOT apply read-time dedup: on a replacing/aggregating
+    /// MergeTree, `scan()` collapses and reorders rows, so its positions would
+    /// not map to physical rows and a mutation would hit the wrong row or
+    /// silently no-op. Default: full physical scan (engines without read-time
+    /// dedup are already physical, so `scan()` is correct for them).
+    async fn scan_physical(&self, table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
+        let rows = self.scan(table).await?;
+        Ok(rows.into_iter().enumerate().collect())
+    }
+
     /// Notify the storage engine of a table's column schema (for WAL persistence).
     /// Default: no-op. Durable engines override this to log schema to WAL.
     fn store_table_schema(&self, _table: &str, _columns: &[(String, crate::types::DataType)]) {}
@@ -147,11 +160,27 @@ pub trait StorageEngine: Send + Sync {
 
     /// Build a B-tree index on the given column. `col_idx` is the 0-based
     /// column position in the table schema.
-    async fn create_index(&self, _table: &str, _index_name: &str, _col_idx: usize) -> Result<(), StorageError> { Ok(()) }
+    async fn create_index(
+        &self,
+        _table: &str,
+        _index_name: &str,
+        _col_idx: usize,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
     /// Drop an index by name.
-    async fn drop_index(&self, _index_name: &str) -> Result<(), StorageError> { Ok(()) }
+    async fn drop_index(&self, _index_name: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
     /// Point-lookup rows via a named index. Returns matching rows.
-    async fn index_lookup(&self, _table: &str, _index_name: &str, _value: &Value) -> Result<Option<Vec<Row>>, StorageError> { Ok(None) }
+    async fn index_lookup(
+        &self,
+        _table: &str,
+        _index_name: &str,
+        _value: &Value,
+    ) -> Result<Option<Vec<Row>>, StorageError> {
+        Ok(None)
+    }
     /// Range-lookup rows via a named index for inclusive bounds.
     async fn index_lookup_range(
         &self,
@@ -159,11 +188,20 @@ pub trait StorageEngine: Send + Sync {
         _index_name: &str,
         _low: &Value,
         _high: &Value,
-    ) -> Result<Option<Vec<Row>>, StorageError> { Ok(None) }
+    ) -> Result<Option<Vec<Row>>, StorageError> {
+        Ok(None)
+    }
     /// Synchronous point-lookup for use in contexts where `.await` is unsafe
     /// (e.g. deeply nested `Box::pin` futures on single-threaded runtimes).
     /// Engines with synchronous internals should override this.
-    fn index_lookup_sync(&self, _table: &str, _index_name: &str, _value: &Value) -> Result<Option<Vec<Row>>, StorageError> { Ok(None) }
+    fn index_lookup_sync(
+        &self,
+        _table: &str,
+        _index_name: &str,
+        _value: &Value,
+    ) -> Result<Option<Vec<Row>>, StorageError> {
+        Ok(None)
+    }
     /// Scan a table returning only the projected columns.
     ///
     /// `projection` contains 0-based column indices into the table schema.
@@ -179,7 +217,12 @@ pub trait StorageEngine: Send + Sync {
         let rows = self.scan(table).await?;
         Ok(rows
             .into_iter()
-            .map(|row| projection.iter().filter_map(|&i| row.get(i).cloned()).collect())
+            .map(|row| {
+                projection
+                    .iter()
+                    .filter_map(|&i| row.get(i).cloned())
+                    .collect()
+            })
             .collect())
     }
 
@@ -190,7 +233,9 @@ pub trait StorageEngine: Send + Sync {
         _index_name: &str,
         _low: &Value,
         _high: &Value,
-    ) -> Result<Option<Vec<Row>>, StorageError> { Ok(None) }
+    ) -> Result<Option<Vec<Row>>, StorageError> {
+        Ok(None)
+    }
 
     /// Index-only scan: return all distinct key values from the named index
     /// without touching the heap/table data. Each returned row contains a
@@ -207,7 +252,9 @@ pub trait StorageEngine: Send + Sync {
         _index_name: &str,
         _eq_value: Option<&Value>,
         _range: Option<(&Value, &Value)>,
-    ) -> Option<Vec<Row>> { None }
+    ) -> Option<Vec<Row>> {
+        None
+    }
 
     // -- Transaction lifecycle (default: auto-commit / no-op) --
 
@@ -216,29 +263,49 @@ pub trait StorageEngine: Send + Sync {
     fn set_next_isolation_level(&self, _level: &str) {}
     /// Fsync the WAL to stable storage. Ensures all auto-committed writes are
     /// durable against OS/power crashes. No-op for engines without a WAL.
-    fn sync(&self) -> Result<(), StorageError> { Ok(()) }
+    fn sync(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
 
     /// Begin an explicit transaction. Engines that support MVCC will take a
     /// snapshot; simple engines do nothing.
-    async fn begin_txn(&self) -> Result<(), StorageError> { Ok(()) }
+    async fn begin_txn(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
     /// Commit the current transaction.
-    async fn commit_txn(&self) -> Result<(), StorageError> { Ok(()) }
+    async fn commit_txn(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
     /// Abort (rollback) the current transaction.
-    async fn abort_txn(&self) -> Result<(), StorageError> { Ok(()) }
+    async fn abort_txn(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
     /// Create a savepoint within the current transaction.
-    async fn savepoint(&self, _name: &str) -> Result<(), StorageError> { Ok(()) }
+    async fn savepoint(&self, _name: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
     /// Rollback to a named savepoint.
-    async fn rollback_to_savepoint(&self, _name: &str) -> Result<(), StorageError> { Ok(()) }
+    async fn rollback_to_savepoint(&self, _name: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
     /// Release a named savepoint.
-    async fn release_savepoint(&self, _name: &str) -> Result<(), StorageError> { Ok(()) }
+    async fn release_savepoint(&self, _name: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
     /// Whether this engine supports real MVCC transactions.
-    fn supports_mvcc(&self) -> bool { false }
+    fn supports_mvcc(&self) -> bool {
+        false
+    }
     /// Flush all dirty data to stable storage. Engines that don't persist
     /// can no-op (the default).
-    async fn flush_all_dirty(&self) -> Result<(), StorageError> { Ok(()) }
+    async fn flush_all_dirty(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
     /// Perform a checkpoint: flush dirty pages, write a WAL checkpoint record,
     /// and truncate old WAL segments. Engines without WAL can no-op (the default).
-    async fn checkpoint(&self) -> Result<(), StorageError> { Ok(()) }
+    async fn checkpoint(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
     /// Vacuum a table: reclaim dead tuples and compact pages.
     /// Returns (pages_scanned, dead_tuples_reclaimed, pages_freed, bytes_reclaimed).
     async fn vacuum(&self, _table: &str) -> Result<(usize, usize, usize, usize), StorageError> {
@@ -252,12 +319,16 @@ pub trait StorageEngine: Send + Sync {
     // ── Aggregate fast paths (default: None = engine doesn't support it) ──────
 
     /// Fast COUNT(*) without scanning rows. Returns None if unsupported.
-    fn fast_count_all(&self, _table: &str) -> Option<usize> { None }
+    fn fast_count_all(&self, _table: &str) -> Option<usize> {
+        None
+    }
 
     /// Fast SUM + non-null-count for a numeric column addressed by scan-order
     /// index. Returns `(sum, non_null_count)` so the caller can derive AVG.
     /// Returns None if unsupported or if the column is non-numeric.
-    fn fast_sum_f64(&self, _table: &str, _col_idx: usize) -> Option<(f64, usize)> { None }
+    fn fast_sum_f64(&self, _table: &str, _col_idx: usize) -> Option<(f64, usize)> {
+        None
+    }
 
     /// Fast GROUP BY: `(key_value, row_count, avg_of_val_col)` triples.
     /// `key_col` and `val_col` are scan-order column indexes.
@@ -267,7 +338,9 @@ pub trait StorageEngine: Send + Sync {
         _table: &str,
         _key_col: usize,
         _val_col: Option<usize>,
-    ) -> Option<Vec<(crate::types::Value, i64, Option<f64>)>> { None }
+    ) -> Option<Vec<(crate::types::Value, i64, Option<f64>)>> {
+        None
+    }
 
     /// Fast COUNT where `filter_col == filter_val`. Returns None if unsupported.
     fn fast_count_filtered(
@@ -275,7 +348,9 @@ pub trait StorageEngine: Send + Sync {
         _table: &str,
         _filter_col: usize,
         _filter_val: &crate::types::Value,
-    ) -> Option<usize> { None }
+    ) -> Option<usize> {
+        None
+    }
 
     /// Fast SUM + non-null-count filtered by a single equality predicate.
     /// Returns `(sum, count)` over rows where `filter_col == filter_val`.
@@ -285,13 +360,19 @@ pub trait StorageEngine: Send + Sync {
         _val_col: usize,
         _filter_col: usize,
         _filter_val: &crate::types::Value,
-    ) -> Option<(f64, usize)> { None }
+    ) -> Option<(f64, usize)> {
+        None
+    }
 
     /// Fast MIN over a numeric column. Returns None if unsupported or column is empty.
-    fn fast_min_f64(&self, _table: &str, _col_idx: usize) -> Option<f64> { None }
+    fn fast_min_f64(&self, _table: &str, _col_idx: usize) -> Option<f64> {
+        None
+    }
 
     /// Fast MAX over a numeric column. Returns None if unsupported or column is empty.
-    fn fast_max_f64(&self, _table: &str, _col_idx: usize) -> Option<f64> { None }
+    fn fast_max_f64(&self, _table: &str, _col_idx: usize) -> Option<f64> {
+        None
+    }
 
     /// Scan rows matching a single equality predicate, avoiding full materialization.
     /// Returns `None` if the engine does not support this optimisation (caller falls
@@ -301,7 +382,9 @@ pub trait StorageEngine: Send + Sync {
         _table: &str,
         _filter_col: usize,
         _filter_val: &Value,
-    ) -> Option<Vec<Row>> { None }
+    ) -> Option<Vec<Row>> {
+        None
+    }
 
     /// Scan rows where `filter_col` is between `low` and `high` (inclusive).
     /// Returns `None` if the engine does not support this optimisation.
@@ -311,7 +394,9 @@ pub trait StorageEngine: Send + Sync {
         _filter_col: usize,
         _low: &Value,
         _high: &Value,
-    ) -> Option<Vec<Row>> { None }
+    ) -> Option<Vec<Row>> {
+        None
+    }
 
     /// Scan+filter+top-K in a single pass. Returns the top `k` rows matching
     /// `filter_col == filter_val`, ordered by `sort_col` (descending if `desc`).
@@ -324,7 +409,9 @@ pub trait StorageEngine: Send + Sync {
         _sort_col: usize,
         _desc: bool,
         _k: usize,
-    ) -> Option<Vec<Row>> { None }
+    ) -> Option<Vec<Row>> {
+        None
+    }
 
     // ── Per-connection session lifecycle (default: no-op) ──────
 
@@ -382,7 +469,9 @@ impl MemoryEngine {
             let m = self.table_idx_names.read();
             m.get(table).cloned().unwrap_or_default()
         };
-        if names.is_empty() { return; }
+        if names.is_empty() {
+            return;
+        }
         let mut indexes = self.indexes.write();
         for name in &names {
             if let Some(idx) = indexes.get_mut(name) {
@@ -401,7 +490,9 @@ impl MemoryEngine {
             let m = self.table_idx_names.read();
             m.get(table).cloned().unwrap_or_default()
         };
-        if names.is_empty() { return; }
+        if names.is_empty() {
+            return;
+        }
         let mut indexes = self.indexes.write();
         for name in &names {
             if let Some(idx) = indexes.get_mut(name) {
@@ -449,13 +540,17 @@ impl StorageEngine for MemoryEngine {
     }
 
     async fn insert_batch(&self, table: &str, rows: Vec<Row>) -> Result<(), StorageError> {
-        if rows.is_empty() { return Ok(()); }
+        if rows.is_empty() {
+            return Ok(());
+        }
         {
             let mut tables = self.tables.write().await;
             let tbl = tables
                 .get_mut(table)
                 .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
-            for row in &rows { tbl.push(row.clone()); }
+            for row in &rows {
+                tbl.push(row.clone());
+            }
         }
         self.update_indexes_for_new_rows(table, &rows);
         Ok(())
@@ -480,7 +575,9 @@ impl StorageEngine for MemoryEngine {
             sorted.dedup();
             let count = sorted.len();
             for &pos in sorted.iter().rev() {
-                if pos < rows.len() { rows.remove(pos); }
+                if pos < rows.len() {
+                    rows.remove(pos);
+                }
             }
             count
         };
@@ -488,11 +585,7 @@ impl StorageEngine for MemoryEngine {
         Ok(count)
     }
 
-    async fn update(
-        &self,
-        table: &str,
-        updates: &[(usize, Row)],
-    ) -> Result<usize, StorageError> {
+    async fn update(&self, table: &str, updates: &[(usize, Row)]) -> Result<usize, StorageError> {
         let count = {
             let mut tables = self.tables.write().await;
             let rows = tables
@@ -511,7 +604,12 @@ impl StorageEngine for MemoryEngine {
         Ok(count)
     }
 
-    async fn create_index(&self, table: &str, index_name: &str, col_idx: usize) -> Result<(), StorageError> {
+    async fn create_index(
+        &self,
+        table: &str,
+        index_name: &str,
+        col_idx: usize,
+    ) -> Result<(), StorageError> {
         // Build index from existing rows.
         let rows = {
             let tables = self.tables.read().await;
@@ -528,7 +626,10 @@ impl StorageEngine for MemoryEngine {
         }
         {
             let mut tnames = self.table_idx_names.write();
-            tnames.entry(table.to_string()).or_default().push(index_name.to_string());
+            tnames
+                .entry(table.to_string())
+                .or_default()
+                .push(index_name.to_string());
         }
         Ok(())
     }
@@ -556,9 +657,10 @@ impl StorageEngine for MemoryEngine {
             let tnames = self.table_idx_names.read();
             let indexes = self.indexes.read();
             tnames.get(table).and_then(|names| {
-                names.iter().find(|name| {
-                    indexes.get(*name).is_some_and(|idx| idx.col_idx == col_idx)
-                }).cloned()
+                names
+                    .iter()
+                    .find(|name| indexes.get(*name).is_some_and(|idx| idx.col_idx == col_idx))
+                    .cloned()
             })
         };
 
@@ -566,7 +668,8 @@ impl StorageEngine for MemoryEngine {
             // Use the B-tree index for O(log n) lookup.
             let matching_rows = {
                 let indexes = self.indexes.read();
-                indexes.get(&idx_name)
+                indexes
+                    .get(&idx_name)
                     .and_then(|idx| idx.map.get(value).cloned())
                     .unwrap_or_default()
             };
@@ -600,7 +703,12 @@ impl StorageEngine for MemoryEngine {
         }
     }
 
-    async fn index_lookup(&self, _table: &str, index_name: &str, value: &Value) -> Result<Option<Vec<Row>>, StorageError> {
+    async fn index_lookup(
+        &self,
+        _table: &str,
+        index_name: &str,
+        value: &Value,
+    ) -> Result<Option<Vec<Row>>, StorageError> {
         self.index_lookup_sync(_table, index_name, value)
     }
 
@@ -614,7 +722,12 @@ impl StorageEngine for MemoryEngine {
         self.index_lookup_range_sync(_table, index_name, low, high)
     }
 
-    fn index_lookup_sync(&self, _table: &str, index_name: &str, value: &Value) -> Result<Option<Vec<Row>>, StorageError> {
+    fn index_lookup_sync(
+        &self,
+        _table: &str,
+        index_name: &str,
+        value: &Value,
+    ) -> Result<Option<Vec<Row>>, StorageError> {
         let indexes = self.indexes.read();
         match indexes.get(index_name) {
             Some(idx) => Ok(Some(idx.map.get(value).cloned().unwrap_or_default())),
@@ -634,7 +747,8 @@ impl StorageEngine for MemoryEngine {
             Some(idx) => {
                 // BTreeMap::range gives O(log n) seek + O(k) scan — no sort needed since
                 // BTreeMap iterates in key order (= index column order).
-                let rows: Vec<Row> = idx.map
+                let rows: Vec<Row> = idx
+                    .map
                     .range(low..=high)
                     .flat_map(|(_, r)| r.iter().cloned())
                     .collect();
@@ -666,9 +780,18 @@ impl StorageEngine for MemoryEngine {
         for row in rows {
             if let Some(val) = row.get(col_idx) {
                 match val {
-                    Value::Int32(n) => { sum += *n as f64; count += 1; }
-                    Value::Int64(n) => { sum += *n as f64; count += 1; }
-                    Value::Float64(f) => { sum += f; count += 1; }
+                    Value::Int32(n) => {
+                        sum += *n as f64;
+                        count += 1;
+                    }
+                    Value::Int64(n) => {
+                        sum += *n as f64;
+                        count += 1;
+                    }
+                    Value::Float64(f) => {
+                        sum += f;
+                        count += 1;
+                    }
                     Value::Null => {}
                     _ => return None, // non-numeric column — bail
                 }
@@ -685,7 +808,8 @@ impl StorageEngine for MemoryEngine {
     ) -> Option<usize> {
         let guard = self.tables.try_read().ok()?;
         let rows = guard.get(table)?;
-        let count = rows.iter()
+        let count = rows
+            .iter()
             .filter(|row| row.get(filter_col) == Some(filter_val))
             .count();
         Some(count)
@@ -704,14 +828,24 @@ impl StorageEngine for MemoryEngine {
         let mut count = 0usize;
         for row in rows {
             if row.get(filter_col) == Some(filter_val)
-                && let Some(val) = row.get(val_col) {
-                    match val {
-                        Value::Int32(n) => { sum += *n as f64; count += 1; }
-                        Value::Int64(n) => { sum += *n as f64; count += 1; }
-                        Value::Float64(f) => { sum += f; count += 1; }
-                        Value::Null => {}
-                        _ => return None,
+                && let Some(val) = row.get(val_col)
+            {
+                match val {
+                    Value::Int32(n) => {
+                        sum += *n as f64;
+                        count += 1;
                     }
+                    Value::Int64(n) => {
+                        sum += *n as f64;
+                        count += 1;
+                    }
+                    Value::Float64(f) => {
+                        sum += f;
+                        count += 1;
+                    }
+                    Value::Null => {}
+                    _ => return None,
+                }
             }
         }
         Some((sum, count))
@@ -776,20 +910,35 @@ impl StorageEngine for MemoryEngine {
             let entry = groups.entry(key).or_insert((0, 0.0, 0));
             entry.0 += 1;
             if let Some(vc) = val_col
-                && let Some(val) = row.get(vc) {
-                    match val {
-                        Value::Int32(n) => { entry.1 += *n as f64; entry.2 += 1; }
-                        Value::Int64(n) => { entry.1 += *n as f64; entry.2 += 1; }
-                        Value::Float64(f) => { entry.1 += f; entry.2 += 1; }
-                        Value::Null => {}
-                        _ => return None,
+                && let Some(val) = row.get(vc)
+            {
+                match val {
+                    Value::Int32(n) => {
+                        entry.1 += *n as f64;
+                        entry.2 += 1;
                     }
+                    Value::Int64(n) => {
+                        entry.1 += *n as f64;
+                        entry.2 += 1;
+                    }
+                    Value::Float64(f) => {
+                        entry.1 += f;
+                        entry.2 += 1;
+                    }
+                    Value::Null => {}
+                    _ => return None,
+                }
             }
         }
-        Some(groups.into_iter().map(|(key, (count, sum, nn))| {
-            let avg = if nn > 0 { Some(sum / nn as f64) } else { None };
-            (key, count, avg)
-        }).collect())
+        Some(
+            groups
+                .into_iter()
+                .map(|(key, (count, sum, nn))| {
+                    let avg = if nn > 0 { Some(sum / nn as f64) } else { None };
+                    (key, count, avg)
+                })
+                .collect(),
+        )
     }
 
     fn fast_scan_where_eq(
@@ -800,10 +949,12 @@ impl StorageEngine for MemoryEngine {
     ) -> Option<Vec<Row>> {
         let guard = self.tables.try_read().ok()?;
         let rows = guard.get(table)?;
-        Some(rows.iter()
-            .filter(|row| row.get(filter_col) == Some(filter_val))
-            .cloned()
-            .collect())
+        Some(
+            rows.iter()
+                .filter(|row| row.get(filter_col) == Some(filter_val))
+                .cloned()
+                .collect(),
+        )
     }
 
     fn fast_scan_where_range(
@@ -815,12 +966,12 @@ impl StorageEngine for MemoryEngine {
     ) -> Option<Vec<Row>> {
         let guard = self.tables.try_read().ok()?;
         let rows = guard.get(table)?;
-        Some(rows.iter()
-            .filter(|row| {
-                row.get(filter_col).is_some_and(|v| v >= low && v <= high)
-            })
-            .cloned()
-            .collect())
+        Some(
+            rows.iter()
+                .filter(|row| row.get(filter_col).is_some_and(|v| v >= low && v <= high))
+                .cloned()
+                .collect(),
+        )
     }
 
     fn index_only_scan(

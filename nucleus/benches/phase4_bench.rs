@@ -14,14 +14,10 @@
 //! Note: setup phases (index building) are excluded from timing via
 //! criterion's iter_batched / bench setup. Only query hot-paths are timed.
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use rand::Rng;
 
-use nucleus::columnar::{
-    self, ColumnBatch, ColumnData,
-};
+use nucleus::columnar::{self, ColumnBatch, ColumnData};
 use nucleus::fts::InvertedIndex;
 use nucleus::graph::{self, Direction, GraphStore, PropValue};
 use nucleus::kv::KvStore;
@@ -44,11 +40,7 @@ fn kv_set_throughput(c: &mut Criterion) {
         b.iter(|| {
             let store = KvStore::new();
             for i in 0..n {
-                store.set(
-                    black_box(&format!("k:{i}")),
-                    Value::Int64(i as i64),
-                    None,
-                );
+                store.set(black_box(&format!("k:{i}")), Value::Int64(i as i64), None);
             }
             black_box(store.dbsize());
         });
@@ -115,8 +107,12 @@ fn kv_mixed_workload_large(c: &mut Criterion) {
             for i in 0..n {
                 let key = format!("k:{}", rng.gen_range(0..n));
                 match i % 10 {
-                    0..5 => { black_box(store.get(black_box(&key))); }
-                    5..8 => { store.set(black_box(&key), Value::Int64(i as i64), None); }
+                    0..5 => {
+                        black_box(store.get(black_box(&key)));
+                    }
+                    5..8 => {
+                        store.set(black_box(&key), Value::Int64(i as i64), None);
+                    }
                     _ => {
                         store.del(black_box(&key));
                         store.set(&key, Value::Int64(i as i64), None);
@@ -152,7 +148,9 @@ fn generate_doc(id: u64) -> String {
         "time series database influxdb prometheus metrics aggregation downsampling",
     ];
     let topic = topics[(id as usize) % topics.len()];
-    format!("Document {id}: {topic}. Article number {id} discusses {topic} in depth with practical examples and benchmarks.")
+    format!(
+        "Document {id}: {topic}. Article number {id} discusses {topic} in depth with practical examples and benchmarks."
+    )
 }
 
 fn build_fts_index_100k() -> InvertedIndex {
@@ -314,7 +312,11 @@ fn build_social_graph(num_nodes: usize, edges_per_node: usize) -> GraphStore {
         for _ in 0..edges_per_node {
             let to = (rng.r#gen::<u64>() % num_nodes as u64) + 1;
             if to != from {
-                let rel = if rng.gen_bool(0.5) { "KNOWS" } else { "FOLLOWS" };
+                let rel = if rng.gen_bool(0.5) {
+                    "KNOWS"
+                } else {
+                    "FOLLOWS"
+                };
                 g.create_edge(from, to, rel.to_string(), graph::props(vec![]));
             }
         }
@@ -377,6 +379,9 @@ fn graph_scaling(c: &mut Criterion) {
 // 4E: TimeSeries vs TimescaleDB — 1M points / 100 series aggregation
 // ============================================================================
 
+// Scaffolding for the 4E TimeSeries-vs-TimescaleDB benchmark, which is not yet
+// wired into a criterion group.
+#[allow(dead_code)]
 fn build_timeseries_store(num_series: usize, points_per_series: usize) -> TimeSeriesStore {
     let mut store = TimeSeriesStore::new(BucketSize::Hour);
     let base_ts = 1_700_000_000_000u64;
@@ -541,15 +546,11 @@ fn columnar_scaling(c: &mut Criterion) {
         let batch = build_columnar_batch(n);
         group.throughput(Throughput::Elements(n as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("sum_f64", n),
-            &batch,
-            |b, batch| {
-                b.iter(|| {
-                    black_box(columnar::aggregate_sum(black_box(batch), "amount"));
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("sum_f64", n), &batch, |b, batch| {
+            b.iter(|| {
+                black_box(columnar::aggregate_sum(black_box(batch), "amount"));
+            });
+        });
     }
     group.finish();
 }
@@ -578,11 +579,7 @@ criterion_group!(
     vector_hnsw_build_throughput,
 );
 
-criterion_group!(
-    benches_4d,
-    graph_traversal_100k,
-    graph_scaling,
-);
+criterion_group!(benches_4d, graph_traversal_100k, graph_scaling,);
 
 criterion_group!(
     benches_4e,
@@ -590,17 +587,8 @@ criterion_group!(
     timeseries_insert_throughput,
 );
 
-criterion_group!(
-    benches_4f,
-    columnar_agg_10m_rows,
-    columnar_scaling,
-);
+criterion_group!(benches_4f, columnar_agg_10m_rows, columnar_scaling,);
 
 criterion_main!(
-    benches_4a,
-    benches_4b,
-    benches_4c,
-    benches_4d,
-    benches_4e,
-    benches_4f,
+    benches_4a, benches_4b, benches_4c, benches_4d, benches_4e, benches_4f,
 );

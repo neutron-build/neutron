@@ -109,7 +109,9 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Option<Value> {
             if *pos + len > data.len() {
                 return None;
             }
-            let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+            let s = std::str::from_utf8(&data[*pos..*pos + len])
+                .ok()?
+                .to_string();
             *pos += len;
             Some(Value::Text(s))
         }
@@ -132,7 +134,9 @@ fn read_i32(data: &[u8], pos: &mut usize) -> Option<i32> {
 fn read_u64(data: &[u8], pos: &mut usize) -> Option<u64> {
     let b = data.get(*pos..*pos + 8)?;
     *pos += 8;
-    Some(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    Some(u64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
 }
 
 fn read_i64(data: &[u8], pos: &mut usize) -> Option<i64> {
@@ -148,7 +152,9 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
     if *pos + len > data.len() {
         return None;
     }
-    let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+    let s = std::str::from_utf8(&data[*pos..*pos + len])
+        .ok()?
+        .to_string();
     *pos += len;
     Some(s)
 }
@@ -193,10 +199,7 @@ impl CollectionWal {
         } else {
             ShardedCollections::new()
         };
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok((
             Self {
                 path,
@@ -312,7 +315,12 @@ impl CollectionWal {
 
     // ── Stream ops ──────────────────────────────────────────────────────────
 
-    pub fn log_xadd(&self, key: &str, id: &StreamId, fields: &[(String, String)]) -> io::Result<()> {
+    pub fn log_xadd(
+        &self,
+        key: &str,
+        id: &StreamId,
+        fields: &[(String, String)],
+    ) -> io::Result<()> {
         let mut data = Vec::new();
         data.extend_from_slice(&id.ms.to_le_bytes());
         data.extend_from_slice(&id.seq.to_le_bytes());
@@ -567,9 +575,13 @@ fn replay(data: &[u8]) -> ShardedCollections {
         pos += 1;
 
         // Read key (all entries have a key, even SNAPSHOT which uses empty key)
-        let Some(key) = read_string(data, &mut pos) else { break };
+        let Some(key) = read_string(data, &mut pos) else {
+            break;
+        };
         // Read data payload
-        let Some(data_len) = read_u32(data, &mut pos) else { break };
+        let Some(data_len) = read_u32(data, &mut pos) else {
+            break;
+        };
         let data_len = data_len as usize;
         if pos + data_len > data.len() {
             break;
@@ -581,16 +593,18 @@ fn replay(data: &[u8]) -> ShardedCollections {
             OP_LPUSH => {
                 let mut dpos = 0;
                 if let Some(val) = decode_value(payload, &mut dpos)
-                    && let Err(e) = collections.lpush(&key, val) {
-                        tracing::warn!("KV WAL replay lpush({key}) failed: {e}");
-                    }
+                    && let Err(e) = collections.lpush(&key, val)
+                {
+                    tracing::warn!("KV WAL replay lpush({key}) failed: {e}");
+                }
             }
             OP_RPUSH => {
                 let mut dpos = 0;
                 if let Some(val) = decode_value(payload, &mut dpos)
-                    && let Err(e) = collections.rpush(&key, val) {
-                        tracing::warn!("KV WAL replay rpush({key}) failed: {e}");
-                    }
+                    && let Err(e) = collections.rpush(&key, val)
+                {
+                    tracing::warn!("KV WAL replay rpush({key}) failed: {e}");
+                }
             }
             OP_LPOP => {
                 if let Err(e) = collections.lpop(&key) {
@@ -607,38 +621,42 @@ fn replay(data: &[u8]) -> ShardedCollections {
                 if let (Some(field), Some(val)) = (
                     read_string(payload, &mut dpos),
                     decode_value(payload, &mut dpos),
-                )
-                    && let Err(e) = collections.hset(&key, &field, val) {
-                        tracing::warn!("KV WAL replay hset({key}) failed: {e}");
-                    }
+                ) && let Err(e) = collections.hset(&key, &field, val)
+                {
+                    tracing::warn!("KV WAL replay hset({key}) failed: {e}");
+                }
             }
             OP_HDEL => {
                 let mut dpos = 0;
                 if let Some(field) = read_string(payload, &mut dpos)
-                    && let Err(e) = collections.hdel(&key, &field) {
-                        tracing::warn!("KV WAL replay hdel({key}) failed: {e}");
-                    }
+                    && let Err(e) = collections.hdel(&key, &field)
+                {
+                    tracing::warn!("KV WAL replay hdel({key}) failed: {e}");
+                }
             }
             OP_SADD => {
                 let mut dpos = 0;
                 if let Some(member) = read_string(payload, &mut dpos)
-                    && let Err(e) = collections.sadd(&key, &member) {
-                        tracing::warn!("KV WAL replay sadd({key}) failed: {e}");
-                    }
+                    && let Err(e) = collections.sadd(&key, &member)
+                {
+                    tracing::warn!("KV WAL replay sadd({key}) failed: {e}");
+                }
             }
             OP_SREM => {
                 let mut dpos = 0;
                 if let Some(member) = read_string(payload, &mut dpos)
-                    && let Err(e) = collections.srem(&key, &member) {
-                        tracing::warn!("KV WAL replay srem({key}) failed: {e}");
-                    }
+                    && let Err(e) = collections.srem(&key, &member)
+                {
+                    tracing::warn!("KV WAL replay srem({key}) failed: {e}");
+                }
             }
             OP_ZADD => {
                 let mut dpos = 0;
                 if let Some(member) = read_string(payload, &mut dpos)
-                    && let Some(score) = read_f64(payload, &mut dpos) {
-                        let _ = collections.zadd(&key, &member, score);
-                    }
+                    && let Some(score) = read_f64(payload, &mut dpos)
+                {
+                    let _ = collections.zadd(&key, &member, score);
+                }
             }
             OP_ZREM => {
                 let mut dpos = 0;
@@ -649,9 +667,10 @@ fn replay(data: &[u8]) -> ShardedCollections {
             OP_ZINCRBY => {
                 let mut dpos = 0;
                 if let Some(member) = read_string(payload, &mut dpos)
-                    && let Some(increment) = read_f64(payload, &mut dpos) {
-                        let _ = collections.zincrby(&key, &member, increment);
-                    }
+                    && let Some(increment) = read_f64(payload, &mut dpos)
+                {
+                    let _ = collections.zincrby(&key, &member, increment);
+                }
             }
             OP_PFADD => {
                 let mut dpos = 0;
@@ -681,15 +700,22 @@ fn replay(data: &[u8]) -> ShardedCollections {
             }
             OP_XADD => {
                 let mut dpos = 0;
-                if let (Some(ms), Some(seq)) = (read_u64(payload, &mut dpos), read_u64(payload, &mut dpos))
+                if let (Some(ms), Some(seq)) =
+                    (read_u64(payload, &mut dpos), read_u64(payload, &mut dpos))
                     && let Some(n_fields) = read_u32(payload, &mut dpos)
                 {
                     let mut fields = Vec::with_capacity(n_fields as usize);
                     let mut ok = true;
                     for _ in 0..n_fields {
-                        match (read_string(payload, &mut dpos), read_string(payload, &mut dpos)) {
+                        match (
+                            read_string(payload, &mut dpos),
+                            read_string(payload, &mut dpos),
+                        ) {
                             (Some(f), Some(v)) => fields.push((f, v)),
-                            _ => { ok = false; break; }
+                            _ => {
+                                ok = false;
+                                break;
+                            }
                         }
                     }
                     if ok {
@@ -705,7 +731,9 @@ fn replay(data: &[u8]) -> ShardedCollections {
                 if let Some(n_ids) = read_u32(payload, &mut dpos) {
                     let mut ids = Vec::with_capacity(n_ids as usize);
                     for _ in 0..n_ids {
-                        if let (Some(ms), Some(seq)) = (read_u64(payload, &mut dpos), read_u64(payload, &mut dpos)) {
+                        if let (Some(ms), Some(seq)) =
+                            (read_u64(payload, &mut dpos), read_u64(payload, &mut dpos))
+                        {
                             ids.push(StreamId::new(ms, seq));
                         }
                     }
@@ -741,6 +769,8 @@ fn replay(data: &[u8]) -> ShardedCollections {
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
     use crate::types::Value;
 
@@ -764,11 +794,14 @@ mod tests {
         let (_wal2, colls2) = CollectionWal::open(dir.path()).unwrap();
         assert_eq!(colls2.llen("mylist").unwrap(), 3);
         let items = colls2.lrange("mylist", 0, -1).unwrap();
-        assert_eq!(items, vec![
-            Value::Text("c".into()),
-            Value::Text("a".into()),
-            Value::Text("b".into()),
-        ]);
+        assert_eq!(
+            items,
+            vec![
+                Value::Text("c".into()),
+                Value::Text("a".into()),
+                Value::Text("b".into()),
+            ]
+        );
     }
 
     #[test]
@@ -790,7 +823,10 @@ mod tests {
 
         let (_wal2, colls2) = CollectionWal::open(dir.path()).unwrap();
         let items = colls2.lrange("q", 0, -1).unwrap();
-        assert_eq!(items, vec![Value::Text("b".into()), Value::Text("c".into())]);
+        assert_eq!(
+            items,
+            vec![Value::Text("b".into()), Value::Text("c".into())]
+        );
     }
 
     #[test]
@@ -798,8 +834,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
 
-        colls.hset("user", "name", Value::Text("Alice".into())).unwrap();
-        wal.log_hset("user", "name", &Value::Text("Alice".into())).unwrap();
+        colls
+            .hset("user", "name", Value::Text("Alice".into()))
+            .unwrap();
+        wal.log_hset("user", "name", &Value::Text("Alice".into()))
+            .unwrap();
 
         colls.hset("user", "age", Value::Int32(30)).unwrap();
         wal.log_hset("user", "age", &Value::Int32(30)).unwrap();
@@ -810,7 +849,10 @@ mod tests {
         drop(wal);
 
         let (_wal2, colls2) = CollectionWal::open(dir.path()).unwrap();
-        assert_eq!(colls2.hget("user", "name").unwrap(), Some(Value::Text("Alice".into())));
+        assert_eq!(
+            colls2.hget("user", "name").unwrap(),
+            Some(Value::Text("Alice".into()))
+        );
         assert_eq!(colls2.hget("user", "age").unwrap(), None);
         assert_eq!(colls2.hlen("user").unwrap(), 1);
     }
@@ -893,7 +935,7 @@ mod tests {
 
         let (_wal2, colls2) = CollectionWal::open(dir.path()).unwrap();
         let count = colls2.pfcount("visitors").unwrap();
-        assert!(count >= 40 && count <= 60, "expected ~50, got {count}");
+        assert!((40..=60).contains(&count), "expected ~50, got {count}");
     }
 
     #[test]
@@ -919,7 +961,7 @@ mod tests {
 
         let (_wal2, colls2) = CollectionWal::open(dir.path()).unwrap();
         let count = colls2.pfcount("merged").unwrap();
-        assert!(count >= 50 && count <= 70, "expected ~60, got {count}");
+        assert!((50..=70).contains(&count), "expected ~60, got {count}");
     }
 
     #[test]
@@ -968,7 +1010,10 @@ mod tests {
 
         let (_wal2, colls2) = CollectionWal::open(dir.path()).unwrap();
         let items = colls2.lrange("list", 0, -1).unwrap();
-        assert_eq!(items, vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)]);
+        assert_eq!(
+            items,
+            vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)]
+        );
         let members = colls2.smembers("set").unwrap();
         assert_eq!(members, vec!["x", "y"]);
     }
@@ -983,14 +1028,18 @@ mod tests {
             colls.rpush("big", Value::Int64(i)).unwrap();
             wal.log_rpush("big", &Value::Int64(i)).unwrap();
         }
-        let size_before = std::fs::metadata(dir.path().join("collections.wal")).unwrap().len();
+        let size_before = std::fs::metadata(dir.path().join("collections.wal"))
+            .unwrap()
+            .len();
 
         // Delete most, then checkpoint
         for _ in 0..95 {
             colls.lpop("big").unwrap();
         }
         wal.checkpoint(&colls).unwrap();
-        let size_after = std::fs::metadata(dir.path().join("collections.wal")).unwrap().len();
+        let size_after = std::fs::metadata(dir.path().join("collections.wal"))
+            .unwrap()
+            .len();
         assert!(size_after < size_before, "checkpoint should shrink WAL");
     }
 
@@ -1032,7 +1081,8 @@ mod tests {
 
         // List
         colls.rpush("mylist", Value::Text("hello".into())).unwrap();
-        wal.log_rpush("mylist", &Value::Text("hello".into())).unwrap();
+        wal.log_rpush("mylist", &Value::Text("hello".into()))
+            .unwrap();
 
         // Hash
         colls.hset("myhash", "field1", Value::Int64(42)).unwrap();
@@ -1058,7 +1108,10 @@ mod tests {
         let items = colls2.lrange("mylist", 0, -1).unwrap();
         assert_eq!(items, vec![Value::Text("hello".into())]);
 
-        assert_eq!(colls2.hget("myhash", "field1").unwrap(), Some(Value::Int64(42)));
+        assert_eq!(
+            colls2.hget("myhash", "field1").unwrap(),
+            Some(Value::Int64(42))
+        );
 
         assert!(colls2.sismember("myset", "member1").unwrap());
 
@@ -1109,12 +1162,18 @@ mod tests {
 
         // Verify all
         let items = colls2.lrange("list", 0, -1).unwrap();
-        assert_eq!(items, vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)]);
+        assert_eq!(
+            items,
+            vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)]
+        );
 
         let members = colls2.smembers("set").unwrap();
         assert_eq!(members, vec!["a", "b"]);
 
-        assert_eq!(colls2.hget("hash", "k").unwrap(), Some(Value::Text("v".into())));
+        assert_eq!(
+            colls2.hget("hash", "k").unwrap(),
+            Some(Value::Text("v".into()))
+        );
 
         let entries = colls2.zrange("zset", 0, 1).unwrap();
         assert_eq!(entries.len(), 2);
@@ -1157,7 +1216,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
 
-        let values = vec![
+        let values = [
             Value::Null,
             Value::Bool(true),
             Value::Bool(false),
@@ -1225,7 +1284,7 @@ mod tests {
         assert_eq!(entries[1].member, "m2");
 
         let count = colls2.pfcount("p").unwrap();
-        assert!(count >= 8 && count <= 12, "expected ~10, got {count}");
+        assert!((8..=12).contains(&count), "expected ~10, got {count}");
     }
 
     #[test]
@@ -1255,30 +1314,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
 
-        let id1 = colls.xadd("mystream", "1-0", vec![
-            ("name".into(), "Alice".into()),
-            ("action".into(), "login".into()),
-        ]).unwrap();
-        wal.log_xadd("mystream", &id1, &[
-            ("name".into(), "Alice".into()),
-            ("action".into(), "login".into()),
-        ]).unwrap();
+        let id1 = colls
+            .xadd(
+                "mystream",
+                "1-0",
+                vec![
+                    ("name".into(), "Alice".into()),
+                    ("action".into(), "login".into()),
+                ],
+            )
+            .unwrap();
+        wal.log_xadd(
+            "mystream",
+            &id1,
+            &[
+                ("name".into(), "Alice".into()),
+                ("action".into(), "login".into()),
+            ],
+        )
+        .unwrap();
 
-        let id2 = colls.xadd("mystream", "2-0", vec![
-            ("name".into(), "Bob".into()),
-            ("action".into(), "purchase".into()),
-        ]).unwrap();
-        wal.log_xadd("mystream", &id2, &[
-            ("name".into(), "Bob".into()),
-            ("action".into(), "purchase".into()),
-        ]).unwrap();
+        let id2 = colls
+            .xadd(
+                "mystream",
+                "2-0",
+                vec![
+                    ("name".into(), "Bob".into()),
+                    ("action".into(), "purchase".into()),
+                ],
+            )
+            .unwrap();
+        wal.log_xadd(
+            "mystream",
+            &id2,
+            &[
+                ("name".into(), "Bob".into()),
+                ("action".into(), "purchase".into()),
+            ],
+        )
+        .unwrap();
 
-        let id3 = colls.xadd("mystream", "3-0", vec![
-            ("name".into(), "Charlie".into()),
-        ]).unwrap();
-        wal.log_xadd("mystream", &id3, &[
-            ("name".into(), "Charlie".into()),
-        ]).unwrap();
+        let id3 = colls
+            .xadd("mystream", "3-0", vec![("name".into(), "Charlie".into())])
+            .unwrap();
+        wal.log_xadd("mystream", &id3, &[("name".into(), "Charlie".into())])
+            .unwrap();
 
         drop(wal);
 
@@ -1286,10 +1366,13 @@ mod tests {
         assert_eq!(colls2.xlen("mystream").unwrap(), 3);
         let entries = colls2.xrange("mystream", "-", "+", None).unwrap();
         assert_eq!(entries[0].id, StreamId::new(1, 0));
-        assert_eq!(entries[0].fields, vec![
-            ("name".into(), "Alice".into()),
-            ("action".into(), "login".into()),
-        ]);
+        assert_eq!(
+            entries[0].fields,
+            vec![
+                ("name".into(), "Alice".into()),
+                ("action".into(), "login".into()),
+            ]
+        );
         assert_eq!(entries[1].id, StreamId::new(2, 0));
         assert_eq!(entries[2].id, StreamId::new(3, 0));
         assert_eq!(entries[2].fields, vec![("name".into(), "Charlie".into())]);
@@ -1300,12 +1383,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
 
-        let id1 = colls.xadd("s", "1-0", vec![("a".into(), "1".into())]).unwrap();
-        wal.log_xadd("s", &id1, &[("a".into(), "1".into())]).unwrap();
-        let id2 = colls.xadd("s", "2-0", vec![("a".into(), "2".into())]).unwrap();
-        wal.log_xadd("s", &id2, &[("a".into(), "2".into())]).unwrap();
-        let id3 = colls.xadd("s", "3-0", vec![("a".into(), "3".into())]).unwrap();
-        wal.log_xadd("s", &id3, &[("a".into(), "3".into())]).unwrap();
+        let id1 = colls
+            .xadd("s", "1-0", vec![("a".into(), "1".into())])
+            .unwrap();
+        wal.log_xadd("s", &id1, &[("a".into(), "1".into())])
+            .unwrap();
+        let id2 = colls
+            .xadd("s", "2-0", vec![("a".into(), "2".into())])
+            .unwrap();
+        wal.log_xadd("s", &id2, &[("a".into(), "2".into())])
+            .unwrap();
+        let id3 = colls
+            .xadd("s", "3-0", vec![("a".into(), "3".into())])
+            .unwrap();
+        wal.log_xadd("s", &id3, &[("a".into(), "3".into())])
+            .unwrap();
 
         colls.xdel("s", &[StreamId::new(2, 0)]).unwrap();
         wal.log_xdel("s", &[StreamId::new(2, 0)]).unwrap();
@@ -1324,19 +1416,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
 
-        colls.xadd("events", "10-0", vec![
-            ("type".into(), "click".into()),
-            ("x".into(), "100".into()),
-            ("y".into(), "200".into()),
-        ]).unwrap();
-        colls.xadd("events", "20-0", vec![
-            ("type".into(), "scroll".into()),
-            ("delta".into(), "50".into()),
-        ]).unwrap();
-        colls.xadd("events", "30-5", vec![
-            ("type".into(), "keypress".into()),
-            ("key".into(), "Enter".into()),
-        ]).unwrap();
+        colls
+            .xadd(
+                "events",
+                "10-0",
+                vec![
+                    ("type".into(), "click".into()),
+                    ("x".into(), "100".into()),
+                    ("y".into(), "200".into()),
+                ],
+            )
+            .unwrap();
+        colls
+            .xadd(
+                "events",
+                "20-0",
+                vec![
+                    ("type".into(), "scroll".into()),
+                    ("delta".into(), "50".into()),
+                ],
+            )
+            .unwrap();
+        colls
+            .xadd(
+                "events",
+                "30-5",
+                vec![
+                    ("type".into(), "keypress".into()),
+                    ("key".into(), "Enter".into()),
+                ],
+            )
+            .unwrap();
 
         // Checkpoint and reopen
         wal.checkpoint(&colls).unwrap();
@@ -1347,21 +1457,30 @@ mod tests {
 
         let entries = colls2.xrange("events", "-", "+", None).unwrap();
         assert_eq!(entries[0].id, StreamId::new(10, 0));
-        assert_eq!(entries[0].fields, vec![
-            ("type".into(), "click".into()),
-            ("x".into(), "100".into()),
-            ("y".into(), "200".into()),
-        ]);
+        assert_eq!(
+            entries[0].fields,
+            vec![
+                ("type".into(), "click".into()),
+                ("x".into(), "100".into()),
+                ("y".into(), "200".into()),
+            ]
+        );
         assert_eq!(entries[1].id, StreamId::new(20, 0));
-        assert_eq!(entries[1].fields, vec![
-            ("type".into(), "scroll".into()),
-            ("delta".into(), "50".into()),
-        ]);
+        assert_eq!(
+            entries[1].fields,
+            vec![
+                ("type".into(), "scroll".into()),
+                ("delta".into(), "50".into()),
+            ]
+        );
         assert_eq!(entries[2].id, StreamId::new(30, 5));
-        assert_eq!(entries[2].fields, vec![
-            ("type".into(), "keypress".into()),
-            ("key".into(), "Enter".into()),
-        ]);
+        assert_eq!(
+            entries[2].fields,
+            vec![
+                ("type".into(), "keypress".into()),
+                ("key".into(), "Enter".into()),
+            ]
+        );
     }
 
     #[test]
@@ -1370,15 +1489,22 @@ mod tests {
         let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
 
         // Initial stream data
-        colls.xadd("log", "1-0", vec![("msg".into(), "first".into())]).unwrap();
-        colls.xadd("log", "2-0", vec![("msg".into(), "second".into())]).unwrap();
+        colls
+            .xadd("log", "1-0", vec![("msg".into(), "first".into())])
+            .unwrap();
+        colls
+            .xadd("log", "2-0", vec![("msg".into(), "second".into())])
+            .unwrap();
 
         // Checkpoint
         wal.checkpoint(&colls).unwrap();
 
         // More entries after checkpoint
-        let id3 = colls.xadd("log", "3-0", vec![("msg".into(), "third".into())]).unwrap();
-        wal.log_xadd("log", &id3, &[("msg".into(), "third".into())]).unwrap();
+        let id3 = colls
+            .xadd("log", "3-0", vec![("msg".into(), "third".into())])
+            .unwrap();
+        wal.log_xadd("log", &id3, &[("msg".into(), "third".into())])
+            .unwrap();
 
         drop(wal);
 
@@ -1413,8 +1539,11 @@ mod tests {
         let (wal, colls) = CollectionWal::open(dir.path()).unwrap();
 
         // Stream
-        let id = colls.xadd("stream", "1-0", vec![("k".into(), "v".into())]).unwrap();
-        wal.log_xadd("stream", &id, &[("k".into(), "v".into())]).unwrap();
+        let id = colls
+            .xadd("stream", "1-0", vec![("k".into(), "v".into())])
+            .unwrap();
+        wal.log_xadd("stream", &id, &[("k".into(), "v".into())])
+            .unwrap();
 
         // List
         colls.rpush("list", Value::Text("hello".into())).unwrap();
@@ -1444,14 +1573,26 @@ mod tests {
         colls.sadd("s", "x").unwrap();
         colls.zadd("z", "m1", 10.0).unwrap();
         colls.pfadd("p", "elem0").unwrap();
-        colls.xadd("stream", "100-0", vec![
-            ("sensor".into(), "temp".into()),
-            ("value".into(), "22.5".into()),
-        ]).unwrap();
-        colls.xadd("stream", "200-0", vec![
-            ("sensor".into(), "humidity".into()),
-            ("value".into(), "65".into()),
-        ]).unwrap();
+        colls
+            .xadd(
+                "stream",
+                "100-0",
+                vec![
+                    ("sensor".into(), "temp".into()),
+                    ("value".into(), "22.5".into()),
+                ],
+            )
+            .unwrap();
+        colls
+            .xadd(
+                "stream",
+                "200-0",
+                vec![
+                    ("sensor".into(), "humidity".into()),
+                    ("value".into(), "65".into()),
+                ],
+            )
+            .unwrap();
 
         // Checkpoint all types
         wal.checkpoint(&colls).unwrap();
@@ -1471,14 +1612,20 @@ mod tests {
         assert_eq!(colls2.xlen("stream").unwrap(), 2);
         let entries = colls2.xrange("stream", "-", "+", None).unwrap();
         assert_eq!(entries[0].id, StreamId::new(100, 0));
-        assert_eq!(entries[0].fields, vec![
-            ("sensor".into(), "temp".into()),
-            ("value".into(), "22.5".into()),
-        ]);
+        assert_eq!(
+            entries[0].fields,
+            vec![
+                ("sensor".into(), "temp".into()),
+                ("value".into(), "22.5".into()),
+            ]
+        );
         assert_eq!(entries[1].id, StreamId::new(200, 0));
-        assert_eq!(entries[1].fields, vec![
-            ("sensor".into(), "humidity".into()),
-            ("value".into(), "65".into()),
-        ]);
+        assert_eq!(
+            entries[1].fields,
+            vec![
+                ("sensor".into(), "humidity".into()),
+                ("value".into(), "65".into()),
+            ]
+        );
     }
 }

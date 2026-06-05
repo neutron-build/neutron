@@ -942,9 +942,9 @@ impl MessageRouter {
 
 use pgwire::tokio::tokio_rustls::rustls;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::tls::InternalTlsConfig;
@@ -1072,10 +1072,11 @@ impl TcpTransport {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         if let Some(expected) = auth_token.as_deref()
-            && let Err(e) = Self::perform_server_auth(&mut stream, expected).await {
-                tracing::warn!("cluster auth failed: {e}");
-                return;
-            }
+            && let Err(e) = Self::perform_server_auth(&mut stream, expected).await
+        {
+            tracing::warn!("cluster auth failed: {e}");
+            return;
+        }
 
         while let Ok(data) = Self::read_frame(&mut stream).await {
             if let Ok(envelope) = Envelope::from_bytes(&data) {
@@ -1159,12 +1160,21 @@ impl TcpTransport {
     ///
     /// The remote handler must reply using the same envelope `id` for correlation.
     /// Times out after 10 seconds.
-    pub async fn send_request(&self, to: NodeId, message: Message) -> Result<Envelope, TransportError> {
+    pub async fn send_request(
+        &self,
+        to: NodeId,
+        message: Message,
+    ) -> Result<Envelope, TransportError> {
         let id = self.next_msg_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending_replies.lock().await.insert(id, tx);
 
-        let envelope = Envelope { id, from: self.local_node_id, to, message };
+        let envelope = Envelope {
+            id,
+            from: self.local_node_id,
+            to,
+            message,
+        };
         if let Err(e) = self.send(to, &envelope).await {
             self.pending_replies.lock().await.remove(&id);
             return Err(e);

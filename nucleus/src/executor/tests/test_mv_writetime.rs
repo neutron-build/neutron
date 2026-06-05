@@ -7,10 +7,18 @@ use super::*;
 #[tokio::test]
 async fn test_mv_writetime_basic() {
     let ex = test_executor();
-    exec(&ex, "CREATE TABLE orders (id INT, product TEXT, amount INT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE orders (id INT, product TEXT, amount INT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO orders VALUES (1, 'widget', 100)").await;
 
-    exec(&ex, "CREATE MATERIALIZED VIEW mv_orders AS SELECT id, product, amount FROM orders").await;
+    exec(
+        &ex,
+        "CREATE MATERIALIZED VIEW mv_orders AS SELECT id, product, amount FROM orders",
+    )
+    .await;
 
     // MV should have the initial row
     let results = exec(&ex, "SELECT * FROM mv_orders").await;
@@ -34,7 +42,11 @@ async fn test_mv_writetime_where_filter() {
     exec(&ex, "INSERT INTO events VALUES (2, 'view', 5)").await;
 
     // MV with WHERE — only clicks
-    exec(&ex, "CREATE MATERIALIZED VIEW mv_clicks AS SELECT id, score FROM events WHERE kind = 'click'").await;
+    exec(
+        &ex,
+        "CREATE MATERIALIZED VIEW mv_clicks AS SELECT id, score FROM events WHERE kind = 'click'",
+    )
+    .await;
 
     let results = exec(&ex, "SELECT * FROM mv_clicks").await;
     let r = rows(&results[0]);
@@ -44,7 +56,11 @@ async fn test_mv_writetime_where_filter() {
     exec(&ex, "INSERT INTO events VALUES (3, 'view', 3)").await;
     let results = exec(&ex, "SELECT * FROM mv_clicks").await;
     let r = rows(&results[0]);
-    assert_eq!(r.len(), 1, "MV should still have 1 row (view events filtered out)");
+    assert_eq!(
+        r.len(),
+        1,
+        "MV should still have 1 row (view events filtered out)"
+    );
 
     // Insert a matching row
     exec(&ex, "INSERT INTO events VALUES (4, 'click', 20)").await;
@@ -75,8 +91,15 @@ async fn test_mv_writetime_aggregation() {
     assert_eq!(r.len(), 2, "Still 2 regions");
 
     // Find the east row and verify sum
-    let east_row = r.iter().find(|row| row[0] == Value::Text("east".into())).expect("east region");
-    assert_eq!(east_row[1], Value::Int64(300), "east total should be 300 (100+150+50)");
+    let east_row = r
+        .iter()
+        .find(|row| row[0] == Value::Text("east".into()))
+        .expect("east region");
+    assert_eq!(
+        east_row[1],
+        Value::Int64(300),
+        "east total should be 300 (100+150+50)"
+    );
 }
 
 #[tokio::test]
@@ -96,7 +119,10 @@ async fn test_mv_writetime_count() {
 
     let results = exec(&ex, "SELECT category, cnt FROM mv_counts").await;
     let r = rows(&results[0]);
-    let a_row = r.iter().find(|row| row[0] == Value::Text("A".into())).expect("category A");
+    let a_row = r
+        .iter()
+        .find(|row| row[0] == Value::Text("A".into()))
+        .expect("category A");
     assert_eq!(a_row[1], Value::Int64(2), "category A count should be 2");
 }
 
@@ -106,7 +132,11 @@ async fn test_mv_drop_cleanup() {
     exec(&ex, "CREATE TABLE base (id INT, val TEXT)").await;
     exec(&ex, "INSERT INTO base VALUES (1, 'x')").await;
 
-    exec(&ex, "CREATE MATERIALIZED VIEW mv_base AS SELECT id, val FROM base").await;
+    exec(
+        &ex,
+        "CREATE MATERIALIZED VIEW mv_base AS SELECT id, val FROM base",
+    )
+    .await;
 
     // Verify MV works
     let results = exec(&ex, "SELECT * FROM mv_base").await;
@@ -147,7 +177,11 @@ async fn test_mv_multiple_on_same_table() {
     exec(&ex, "INSERT INTO data VALUES (2, 'B', 20)").await;
 
     // Two MVs on the same base table
-    exec(&ex, "CREATE MATERIALIZED VIEW mv_all AS SELECT id, category, value FROM data").await;
+    exec(
+        &ex,
+        "CREATE MATERIALIZED VIEW mv_all AS SELECT id, category, value FROM data",
+    )
+    .await;
     exec(&ex, "CREATE MATERIALIZED VIEW mv_sum AS SELECT category, SUM(value) AS total FROM data GROUP BY category").await;
 
     // Insert a new row — both MVs should update
@@ -158,7 +192,10 @@ async fn test_mv_multiple_on_same_table() {
 
     let results = exec(&ex, "SELECT category, total FROM mv_sum").await;
     let r = rows(&results[0]);
-    let a_row = r.iter().find(|row| row[0] == Value::Text("A".into())).expect("category A");
+    let a_row = r
+        .iter()
+        .find(|row| row[0] == Value::Text("A".into()))
+        .expect("category A");
     assert_eq!(a_row[1], Value::Int64(40), "A total should be 40 (10+30)");
 }
 
@@ -168,7 +205,11 @@ async fn test_mv_no_overhead_on_unrelated_table() {
     exec(&ex, "CREATE TABLE tracked (id INT, val TEXT)").await;
     exec(&ex, "CREATE TABLE untracked (id INT, val TEXT)").await;
 
-    exec(&ex, "CREATE MATERIALIZED VIEW mv_tracked AS SELECT id, val FROM tracked").await;
+    exec(
+        &ex,
+        "CREATE MATERIALIZED VIEW mv_tracked AS SELECT id, val FROM tracked",
+    )
+    .await;
 
     // Insert into untracked table — should succeed with no MV overhead
     exec(&ex, "INSERT INTO untracked VALUES (1, 'hello')").await;

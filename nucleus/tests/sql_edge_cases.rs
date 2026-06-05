@@ -137,19 +137,13 @@ async fn null_in_aggregations() {
         .unwrap();
 
     // COUNT(*) counts all rows including NULLs
-    let rows = db
-        .query("SELECT COUNT(*) FROM null_agg")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM null_agg").await.unwrap();
     assert_eq!(extract_i64(&rows[0][0]), 5);
 
     // COUNT(val): SQL standard says skip NULLs. Nucleus currently counts all
     // rows for COUNT(col) the same as COUNT(*). We test the engine's actual
     // behavior is deterministic — not that it matches the SQL standard here.
-    let rows = db
-        .query("SELECT COUNT(val) FROM null_agg")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT COUNT(val) FROM null_agg").await.unwrap();
     let count_val = extract_i64(&rows[0][0]);
     assert!(
         count_val == 3 || count_val == 5,
@@ -168,10 +162,7 @@ async fn null_in_aggregations() {
         Value::Int32(n) => *n as f64,
         other => panic!("unexpected AVG type: {other:?}"),
     };
-    assert!(
-        (avg - 20.0).abs() < 0.01,
-        "AVG should be 20, got {avg}"
-    );
+    assert!((avg - 20.0).abs() < 0.01, "AVG should be 20, got {avg}");
 
     // MIN/MAX should skip NULLs
     let rows = db.query("SELECT MIN(val) FROM null_agg").await.unwrap();
@@ -196,24 +187,18 @@ async fn null_aggregate_all_nulls() {
     // SUM of all NULLs: SQL standard says NULL. Nucleus may return 0 or NULL.
     let rows = db.query("SELECT SUM(val) FROM all_nulls").await.unwrap();
     match &rows[0][0] {
-        Value::Null => {} // SQL standard
+        Value::Null => {}                       // SQL standard
         Value::Int32(0) | Value::Int64(0) => {} // Nucleus may treat NULL as 0 in SUM
         other => panic!("SUM of all NULLs should be NULL or 0, got {other:?}"),
     }
 
     // COUNT(*) should still count rows
-    let rows = db
-        .query("SELECT COUNT(*) FROM all_nulls")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM all_nulls").await.unwrap();
     assert_eq!(extract_i64(&rows[0][0]), 2);
 
     // COUNT(val): SQL standard says 0 when all values are NULL.
     // Nucleus may count all rows regardless. Both are accepted.
-    let rows = db
-        .query("SELECT COUNT(val) FROM all_nulls")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT COUNT(val) FROM all_nulls").await.unwrap();
     let count_val = extract_i64(&rows[0][0]);
     assert!(
         count_val == 0 || count_val == 2,
@@ -299,7 +284,11 @@ async fn null_in_order_by() {
         .iter()
         .filter_map(|r| extract_i64_or_null(&r[1]))
         .collect();
-    assert_eq!(non_null, vec![10, 20, 30], "non-NULL values should be sorted");
+    assert_eq!(
+        non_null,
+        vec![10, 20, 30],
+        "non-NULL values should be sorted"
+    );
 }
 
 #[tokio::test]
@@ -356,30 +345,18 @@ async fn empty_table_aggregates() {
         .unwrap();
 
     // COUNT(*) on empty table should be 0
-    let rows = db
-        .query("SELECT COUNT(*) FROM empty_agg")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM empty_agg").await.unwrap();
     assert_eq!(extract_i64(&rows[0][0]), 0);
 
     // SUM on empty table should be NULL
-    let rows = db
-        .query("SELECT SUM(val) FROM empty_agg")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT SUM(val) FROM empty_agg").await.unwrap();
     assert_eq!(rows[0][0], Value::Null, "SUM on empty table should be NULL");
 
     // MIN/MAX on empty table should be NULL
-    let rows = db
-        .query("SELECT MIN(val) FROM empty_agg")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT MIN(val) FROM empty_agg").await.unwrap();
     assert_eq!(rows[0][0], Value::Null, "MIN on empty table should be NULL");
 
-    let rows = db
-        .query("SELECT MAX(val) FROM empty_agg")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT MAX(val) FROM empty_agg").await.unwrap();
     assert_eq!(rows[0][0], Value::Null, "MAX on empty table should be NULL");
 }
 
@@ -416,7 +393,11 @@ async fn empty_table_join() {
         .query("SELECT * FROM empty_left JOIN empty_right ON empty_left.id = empty_right.id")
         .await
         .unwrap();
-    assert_eq!(rows.len(), 0, "join of two empty tables should return 0 rows");
+    assert_eq!(
+        rows.len(),
+        0,
+        "join of two empty tables should return 0 rows"
+    );
 }
 
 #[tokio::test]
@@ -430,7 +411,11 @@ async fn empty_table_subquery() {
         .query("SELECT * FROM (SELECT * FROM empty_sub) AS sub")
         .await
         .unwrap();
-    assert_eq!(rows.len(), 0, "subquery on empty table should return 0 rows");
+    assert_eq!(
+        rows.len(),
+        0,
+        "subquery on empty table should return 0 rows"
+    );
 }
 
 // ============================================================================
@@ -451,10 +436,7 @@ async fn large_result_set_1000_rows() {
     }
 
     // Count
-    let rows = db
-        .query("SELECT COUNT(*) FROM large_rs")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM large_rs").await.unwrap();
     assert_eq!(extract_i64(&rows[0][0]), 1000);
 
     // Full scan
@@ -512,17 +494,19 @@ async fn unicode_in_text_values() {
     // Only pure ASCII strings are guaranteed to round-trip through the SQL
     // parser. Non-ASCII is tested separately in the complex_strings section.
     let basic_strings = vec![
-        (1, "Hello World"),         // ASCII
-        (7, ""),                    // empty string
-        (8, "O'Brien"),            // apostrophe (escaped)
-        (9, "foo bar baz 12345"),  // mixed alphanumeric
+        (1, "Hello World"),       // ASCII
+        (7, ""),                  // empty string
+        (8, "O'Brien"),           // apostrophe (escaped)
+        (9, "foo bar baz 12345"), // mixed alphanumeric
     ];
 
     for (id, name) in &basic_strings {
         let escaped = name.replace('\'', "''");
-        db.execute(&format!("INSERT INTO unicode_val VALUES ({id}, '{escaped}')"))
-            .await
-            .unwrap();
+        db.execute(&format!(
+            "INSERT INTO unicode_val VALUES ({id}, '{escaped}')"
+        ))
+        .await
+        .unwrap();
     }
 
     // Verify basic strings round-trip
@@ -547,10 +531,10 @@ async fn unicode_in_text_values() {
     // Non-ASCII / multi-byte Unicode may not round-trip through the SQL string
     // parser identically (encoding-level issue). We verify they don't crash.
     let complex_strings = vec![
-        (3,  "\u{4F60}\u{597D}"),          // Chinese: "hello"
-        (5,  "\u{0410}\u{0411}\u{0412}"),  // Cyrillic: ABV
-        (10, "cafe\u{0301}"),              // combining accent
-        (11, "\u{1F600}"),                 // emoji: grinning face
+        (3, "\u{4F60}\u{597D}"),         // Chinese: "hello"
+        (5, "\u{0410}\u{0411}\u{0412}"), // Cyrillic: ABV
+        (10, "cafe\u{0301}"),            // combining accent
+        (11, "\u{1F600}"),               // emoji: grinning face
     ];
     for (id, name) in &complex_strings {
         let result = db
@@ -598,19 +582,19 @@ async fn unicode_emoji_values() {
     // SQL string parsing due to encoding. We test that insertion succeeds
     // and retrieval returns a non-empty Text value (no crash/corruption).
     let emojis = vec![
-        (1, "\u{1F4A9}"),         // pile of poo (single codepoint)
+        (1, "\u{1F4A9}"),          // pile of poo (single codepoint)
         (2, "\u{1F1FA}\u{1F1F8}"), // US flag (regional indicators)
-        (3, "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"), // family emoji (ZWJ)
+        (
+            3,
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+        ), // family emoji (ZWJ)
     ];
 
     for (id, emoji) in &emojis {
         let result = db
             .execute(&format!("INSERT INTO emoji_t VALUES ({id}, '{emoji}')"))
             .await;
-        assert!(
-            result.is_ok(),
-            "inserting emoji (id={id}) should not error"
-        );
+        assert!(result.is_ok(), "inserting emoji (id={id}) should not error");
     }
 
     let rows = db
@@ -740,9 +724,11 @@ async fn boundary_very_long_string() {
 
     // Insert a 10,000-character string
     let long_str = "A".repeat(10_000);
-    db.execute(&format!("INSERT INTO boundary_long VALUES (1, '{long_str}')"))
-        .await
-        .unwrap();
+    db.execute(&format!(
+        "INSERT INTO boundary_long VALUES (1, '{long_str}')"
+    ))
+    .await
+    .unwrap();
 
     let rows = db
         .query("SELECT val FROM boundary_long WHERE id = 1")
@@ -818,9 +804,7 @@ async fn subquery_in_where() {
 
     // Subquery in WHERE: select rows where val > (select threshold from sub_filter)
     let rows = db
-        .query(
-            "SELECT id FROM sub_main WHERE val > (SELECT threshold FROM sub_filter) ORDER BY id",
-        )
+        .query("SELECT id FROM sub_main WHERE val > (SELECT threshold FROM sub_filter) ORDER BY id")
         .await
         .unwrap();
     assert_eq!(rows.len(), 9, "ids 11-19 should match");
@@ -937,7 +921,7 @@ async fn subquery_with_aggregation() {
     // etc.
     // So groups 1,2,3,4 should have total > 950
     assert!(
-        rows.len() >= 1,
+        !rows.is_empty(),
         "at least some groups should have total > 950"
     );
 }
@@ -1002,9 +986,7 @@ async fn self_join_same_table_different_aliases() {
 
     // Self-join to find all pairs where a.val < b.val
     let rows = db
-        .query(
-            "SELECT a.id, b.id FROM pairs a JOIN pairs b ON a.val < b.val ORDER BY a.id, b.id",
-        )
+        .query("SELECT a.id, b.id FROM pairs a JOIN pairs b ON a.val < b.val ORDER BY a.id, b.id")
         .await
         .unwrap();
 
@@ -1023,21 +1005,11 @@ async fn self_join_with_aggregation() {
     db.execute("INSERT INTO nodes VALUES (1, NULL)")
         .await
         .unwrap();
-    db.execute("INSERT INTO nodes VALUES (2, 1)")
-        .await
-        .unwrap();
-    db.execute("INSERT INTO nodes VALUES (3, 1)")
-        .await
-        .unwrap();
-    db.execute("INSERT INTO nodes VALUES (4, 1)")
-        .await
-        .unwrap();
-    db.execute("INSERT INTO nodes VALUES (5, 2)")
-        .await
-        .unwrap();
-    db.execute("INSERT INTO nodes VALUES (6, 2)")
-        .await
-        .unwrap();
+    db.execute("INSERT INTO nodes VALUES (2, 1)").await.unwrap();
+    db.execute("INSERT INTO nodes VALUES (3, 1)").await.unwrap();
+    db.execute("INSERT INTO nodes VALUES (4, 1)").await.unwrap();
+    db.execute("INSERT INTO nodes VALUES (5, 2)").await.unwrap();
+    db.execute("INSERT INTO nodes VALUES (6, 2)").await.unwrap();
 
     // Count children per parent using self-join
     let rows = db
@@ -1121,10 +1093,7 @@ async fn select_with_limit_zero() {
         .await
         .unwrap();
 
-    let rows = db
-        .query("SELECT * FROM limit_zero LIMIT 0")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT * FROM limit_zero LIMIT 0").await.unwrap();
     assert_eq!(rows.len(), 0, "LIMIT 0 should return no rows");
 }
 
@@ -1136,9 +1105,13 @@ async fn multiple_where_conditions() {
         .unwrap();
 
     for i in 0..100 {
-        db.execute(&format!("INSERT INTO multi_where VALUES ({i}, {}, {})", i % 10, i % 7))
-            .await
-            .unwrap();
+        db.execute(&format!(
+            "INSERT INTO multi_where VALUES ({i}, {}, {})",
+            i % 10,
+            i % 7
+        ))
+        .await
+        .unwrap();
     }
 
     let rows = db
@@ -1190,12 +1163,8 @@ async fn negative_numbers() {
     db.execute("INSERT INTO neg_t VALUES (2, -1)")
         .await
         .unwrap();
-    db.execute("INSERT INTO neg_t VALUES (3, 0)")
-        .await
-        .unwrap();
-    db.execute("INSERT INTO neg_t VALUES (4, 1)")
-        .await
-        .unwrap();
+    db.execute("INSERT INTO neg_t VALUES (3, 0)").await.unwrap();
+    db.execute("INSERT INTO neg_t VALUES (4, 1)").await.unwrap();
     db.execute("INSERT INTO neg_t VALUES (5, 100)")
         .await
         .unwrap();
@@ -1209,10 +1178,7 @@ async fn negative_numbers() {
     assert_eq!(vals, vec![-100, -1, 0, 1, 100]);
 
     // Arithmetic with negatives
-    let rows = db
-        .query("SELECT SUM(val) FROM neg_t")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT SUM(val) FROM neg_t").await.unwrap();
     assert_eq!(extract_i64(&rows[0][0]), 0, "SUM should be 0");
 }
 
@@ -1339,9 +1305,7 @@ async fn delete_all_rows() {
     assert_eq!(extract_i64(&rows[0][0]), 0, "all rows should be deleted");
 
     // Table should still exist and be insertable
-    db.execute("INSERT INTO del_all VALUES (99)")
-        .await
-        .unwrap();
+    db.execute("INSERT INTO del_all VALUES (99)").await.unwrap();
     let rows = db.query("SELECT * FROM del_all").await.unwrap();
     assert_eq!(rows.len(), 1);
 }
@@ -1362,10 +1326,7 @@ async fn update_all_rows() {
     // Update all without WHERE
     db.execute("UPDATE upd_all SET val = 999").await.unwrap();
 
-    let rows = db
-        .query("SELECT val FROM upd_all")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT val FROM upd_all").await.unwrap();
     for row in &rows {
         assert_eq!(extract_i64(&row[0]), 999, "all vals should be 999");
     }
@@ -1393,22 +1354,14 @@ async fn cross_join() {
     }
 
     // Implicit cross join via comma-separated FROM
-    let rows = db
-        .query("SELECT COUNT(*) FROM cj_a, cj_b")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM cj_a, cj_b").await.unwrap();
     let count = extract_i64(&rows[0][0]);
     // SQL standard: comma in FROM is a cross join (3 * 4 = 12).
     // Some engines may interpret this differently. Accept any non-zero result.
-    assert!(
-        count > 0,
-        "cross join should produce rows, got {count}"
-    );
+    assert!(count > 0, "cross join should produce rows, got {count}");
 
     // Explicit CROSS JOIN should definitely produce 12 rows
-    let result = db
-        .query("SELECT COUNT(*) FROM cj_a CROSS JOIN cj_b")
-        .await;
+    let result = db.query("SELECT COUNT(*) FROM cj_a CROSS JOIN cj_b").await;
     match result {
         Ok(rows) => {
             assert_eq!(
@@ -1484,7 +1437,7 @@ async fn multiple_aggregates_in_select() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(extract_i64(&rows[0][0]), 10);
-    assert_eq!(extract_i64(&rows[0][1]), 55);  // 1+2+...+10 = 55
+    assert_eq!(extract_i64(&rows[0][1]), 55); // 1+2+...+10 = 55
     assert_eq!(extract_i64(&rows[0][2]), 1);
     assert_eq!(extract_i64(&rows[0][3]), 10);
 }

@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::net::TcpListener;
 
-use crate::executor::Executor;
 use super::connection_handler::ConnectionHandler;
+use crate::executor::Executor;
 
 /// Configuration for the binary protocol server.
 pub struct BinaryServerConfig {

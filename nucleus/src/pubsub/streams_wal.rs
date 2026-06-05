@@ -34,10 +34,16 @@ const ENTRY_SNAPSHOT: u8 = 0x02;
 
 // ---- Public types -----------------------------------------------------------
 
+/// One stream entry: its ID plus ordered field/value pairs.
+pub type StreamEntry = (StreamEntryId, Vec<(String, String)>);
+
+/// Per-stream recovered entries, keyed by stream name.
+pub type StreamsMap = HashMap<String, Vec<StreamEntry>>;
+
 /// Recovered streams state from WAL replay.
 pub struct StreamsWalState {
     /// `stream_name -> Vec<(entry_id, fields)>` in order.
-    pub streams: HashMap<String, Vec<(StreamEntryId, Vec<(String, String)>)>>,
+    pub streams: StreamsMap,
 }
 
 /// Append-only Streams WAL.
@@ -63,10 +69,7 @@ impl StreamsWal {
                 streams: HashMap::new(),
             }
         };
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok((
             Self {
                 path,
@@ -136,7 +139,9 @@ impl StreamsWal {
         }
 
         // Flush existing writer
-        { self.writer.lock().flush()?; }
+        {
+            self.writer.lock().flush()?;
+        }
 
         // Truncate and rewrite as single SNAPSHOT entry
         let file = OpenOptions::new()
@@ -182,7 +187,7 @@ fn write_str(buf: &mut Vec<u8>, s: &str) {
 // ---- Replay -----------------------------------------------------------------
 
 fn replay(data: &[u8]) -> StreamsWalState {
-    let mut streams: HashMap<String, Vec<(StreamEntryId, Vec<(String, String)>)>> = HashMap::new();
+    let mut streams: StreamsMap = HashMap::new();
     let mut pos = 0usize;
 
     while pos < data.len() {
@@ -193,26 +198,47 @@ fn replay(data: &[u8]) -> StreamsWalState {
 
         match entry_type {
             ENTRY_XADD => {
-                let Some(stream_name) = read_string(data, &mut pos) else { break };
-                let Some(ms) = read_u64(data, &mut pos) else { break };
-                let Some(seq) = read_u64(data, &mut pos) else { break };
-                let Some(n_fields) = read_u32(data, &mut pos) else { break };
+                let Some(stream_name) = read_string(data, &mut pos) else {
+                    break;
+                };
+                let Some(ms) = read_u64(data, &mut pos) else {
+                    break;
+                };
+                let Some(seq) = read_u64(data, &mut pos) else {
+                    break;
+                };
+                let Some(n_fields) = read_u32(data, &mut pos) else {
+                    break;
+                };
                 let mut fields = Vec::with_capacity(n_fields as usize);
                 let mut ok = true;
                 for _ in 0..n_fields {
-                    let Some(k) = read_string(data, &mut pos) else { ok = false; break };
-                    let Some(v) = read_string(data, &mut pos) else { ok = false; break };
+                    let Some(k) = read_string(data, &mut pos) else {
+                        ok = false;
+                        break;
+                    };
+                    let Some(v) = read_string(data, &mut pos) else {
+                        ok = false;
+                        break;
+                    };
                     fields.push((k, v));
                 }
-                if !ok { break; }
+                if !ok {
+                    break;
+                }
                 streams
                     .entry(stream_name)
                     .or_default()
                     .push((StreamEntryId::new(ms, seq), fields));
             }
             ENTRY_SNAPSHOT => {
-                streams.clear();
-                if !replay_snapshot(data, &mut pos, &mut streams) {
+                // Parse into a temporary map and only swap it in once the snapshot
+                // parses completely. Clearing first meant a corrupt/truncated
+                // snapshot wiped all already-recovered state before failing.
+                let mut snapshot = StreamsMap::new();
+                if replay_snapshot(data, &mut pos, &mut snapshot) {
+                    streams = snapshot;
+                } else {
                     break;
                 }
             }
@@ -225,24 +251,36 @@ fn replay(data: &[u8]) -> StreamsWalState {
     StreamsWalState { streams }
 }
 
-fn replay_snapshot(
-    data: &[u8],
-    pos: &mut usize,
-    streams: &mut HashMap<String, Vec<(StreamEntryId, Vec<(String, String)>)>>,
-) -> bool {
-    let Some(n_streams) = read_u32(data, pos) else { return false };
+fn replay_snapshot(data: &[u8], pos: &mut usize, streams: &mut StreamsMap) -> bool {
+    let Some(n_streams) = read_u32(data, pos) else {
+        return false;
+    };
     for _ in 0..n_streams as usize {
-        let Some(name) = read_string(data, pos) else { return false };
-        let Some(n_entries) = read_u32(data, pos) else { return false };
+        let Some(name) = read_string(data, pos) else {
+            return false;
+        };
+        let Some(n_entries) = read_u32(data, pos) else {
+            return false;
+        };
         let mut entries = Vec::with_capacity(n_entries as usize);
         for _ in 0..n_entries as usize {
-            let Some(ms) = read_u64(data, pos) else { return false };
-            let Some(seq) = read_u64(data, pos) else { return false };
-            let Some(n_fields) = read_u32(data, pos) else { return false };
+            let Some(ms) = read_u64(data, pos) else {
+                return false;
+            };
+            let Some(seq) = read_u64(data, pos) else {
+                return false;
+            };
+            let Some(n_fields) = read_u32(data, pos) else {
+                return false;
+            };
             let mut fields = Vec::with_capacity(n_fields as usize);
             for _ in 0..n_fields as usize {
-                let Some(k) = read_string(data, pos) else { return false };
-                let Some(v) = read_string(data, pos) else { return false };
+                let Some(k) = read_string(data, pos) else {
+                    return false;
+                };
+                let Some(v) = read_string(data, pos) else {
+                    return false;
+                };
                 fields.push((k, v));
             }
             entries.push((StreamEntryId::new(ms, seq), fields));
@@ -273,7 +311,9 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
     if *pos + len > data.len() {
         return None;
     }
-    let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+    let s = std::str::from_utf8(&data[*pos..*pos + len])
+        .ok()?
+        .to_string();
     *pos += len;
     Some(s)
 }
@@ -293,13 +333,19 @@ mod tests {
         wal.log_xadd(
             "events",
             &StreamEntryId::new(1000, 0),
-            &[("user".into(), "alice".into()), ("action".into(), "login".into())],
+            &[
+                ("user".into(), "alice".into()),
+                ("action".into(), "login".into()),
+            ],
         )
         .unwrap();
         wal.log_xadd(
             "events",
             &StreamEntryId::new(1001, 0),
-            &[("user".into(), "bob".into()), ("action".into(), "logout".into())],
+            &[
+                ("user".into(), "bob".into()),
+                ("action".into(), "logout".into()),
+            ],
         )
         .unwrap();
         wal.log_xadd(

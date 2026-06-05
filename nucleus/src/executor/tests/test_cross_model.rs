@@ -22,17 +22,53 @@ use super::*;
 async fn test_fts_vector_hybrid_search() {
     let ex = test_executor();
 
-    exec(&ex, "CREATE TABLE articles (id INT PRIMARY KEY, title TEXT, embedding VECTOR(4))").await;
-    exec(&ex, "INSERT INTO articles VALUES (1, 'Rust systems', VECTOR('[1.0, 0.1, 0.0, 0.0]'))").await;
-    exec(&ex, "INSERT INTO articles VALUES (2, 'Python ML guide', VECTOR('[0.1, 1.0, 0.0, 0.0]'))").await;
-    exec(&ex, "INSERT INTO articles VALUES (3, 'Database design', VECTOR('[0.0, 0.0, 1.0, 0.1]'))").await;
-    exec(&ex, "INSERT INTO articles VALUES (4, 'ML pipeline storage', VECTOR('[0.0, 0.9, 0.2, 0.0]'))").await;
+    exec(
+        &ex,
+        "CREATE TABLE articles (id INT PRIMARY KEY, title TEXT, embedding VECTOR(4))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO articles VALUES (1, 'Rust systems', VECTOR('[1.0, 0.1, 0.0, 0.0]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO articles VALUES (2, 'Python ML guide', VECTOR('[0.1, 1.0, 0.0, 0.0]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO articles VALUES (3, 'Database design', VECTOR('[0.0, 0.0, 1.0, 0.1]'))",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO articles VALUES (4, 'ML pipeline storage', VECTOR('[0.0, 0.9, 0.2, 0.0]'))",
+    )
+    .await;
 
     // Index body text in FTS
-    exec(&ex, "SELECT fts_index(1, 'Rust is a systems language focused on safety and performance')").await;
-    exec(&ex, "SELECT fts_index(2, 'Python is great for data science and machine learning workflows')").await;
-    exec(&ex, "SELECT fts_index(3, 'Designing databases requires knowledge of storage engines')").await;
-    exec(&ex, "SELECT fts_index(4, 'Machine learning pipelines benefit from fast storage')").await;
+    exec(
+        &ex,
+        "SELECT fts_index(1, 'Rust is a systems language focused on safety and performance')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT fts_index(2, 'Python is great for data science and machine learning workflows')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT fts_index(3, 'Designing databases requires knowledge of storage engines')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT fts_index(4, 'Machine learning pipelines benefit from fast storage')",
+    )
+    .await;
 
     // Hybrid: FTS_MATCH filter + VECTOR_DISTANCE sort
     let results = exec(
@@ -44,15 +80,21 @@ async fn test_fts_vector_hybrid_search() {
          LIMIT 5",
     ).await;
     let r = rows(&results[0]);
-    assert!(r.len() >= 1, "at least one FTS+vector result expected");
+    assert!(!r.is_empty(), "at least one FTS+vector result expected");
 
     // Articles 2 and 4 contain 'machine learning', article 1 should be absent
-    let ids: Vec<i32> = r.iter().map(|row| match row[0] {
-        Value::Int32(n) => n,
-        Value::Int64(n) => n as i32,
-        _ => panic!("unexpected id type"),
-    }).collect();
-    assert!(ids.contains(&2) || ids.contains(&4), "articles 2 or 4 should match: {ids:?}");
+    let ids: Vec<i32> = r
+        .iter()
+        .map(|row| match row[0] {
+            Value::Int32(n) => n,
+            Value::Int64(n) => n as i32,
+            _ => panic!("unexpected id type"),
+        })
+        .collect();
+    assert!(
+        ids.contains(&2) || ids.contains(&4),
+        "articles 2 or 4 should match: {ids:?}"
+    );
     assert!(!ids.contains(&1), "article 1 (Rust/no ML) must be excluded");
 }
 
@@ -65,15 +107,28 @@ async fn test_fts_match_with_relational_predicate() {
     exec(&ex, "INSERT INTO posts VALUES (2, 'cooking')").await;
     exec(&ex, "INSERT INTO posts VALUES (3, 'tech')").await;
 
-    exec(&ex, "SELECT fts_index(1, 'database storage engine btree index')").await;
-    exec(&ex, "SELECT fts_index(2, 'recipe pasta tomato sauce basil')").await;
-    exec(&ex, "SELECT fts_index(3, 'distributed consensus raft protocol cluster')").await;
+    exec(
+        &ex,
+        "SELECT fts_index(1, 'database storage engine btree index')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT fts_index(2, 'recipe pasta tomato sauce basil')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT fts_index(3, 'distributed consensus raft protocol cluster')",
+    )
+    .await;
 
     // Relational filter AND FTS filter combined
     let results = exec(
         &ex,
-        "SELECT id FROM posts WHERE category = 'tech' AND FTS_MATCH(id, 'storage')"
-    ).await;
+        "SELECT id FROM posts WHERE category = 'tech' AND FTS_MATCH(id, 'storage')",
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1, "only tech post about 'storage' should match");
     assert_eq!(r[0][0], Value::Int32(1));
@@ -87,11 +142,31 @@ async fn test_fts_match_with_relational_predicate() {
 async fn test_timeseries_relational_join() {
     let ex = test_executor();
 
-    exec(&ex, "CREATE TABLE servers (name TEXT, region TEXT, tier TEXT)").await;
-    exec(&ex, "INSERT INTO servers VALUES ('web-01', 'us-east', 'prod')").await;
-    exec(&ex, "INSERT INTO servers VALUES ('web-02', 'us-east', 'prod')").await;
-    exec(&ex, "INSERT INTO servers VALUES ('db-01', 'eu-west', 'prod')").await;
-    exec(&ex, "INSERT INTO servers VALUES ('test-01', 'us-east', 'staging')").await;
+    exec(
+        &ex,
+        "CREATE TABLE servers (name TEXT, region TEXT, tier TEXT)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO servers VALUES ('web-01', 'us-east', 'prod')",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO servers VALUES ('web-02', 'us-east', 'prod')",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO servers VALUES ('db-01', 'eu-west', 'prod')",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO servers VALUES ('test-01', 'us-east', 'staging')",
+    )
+    .await;
 
     exec(&ex, "SELECT ts_insert('web-01', 1000, 72.5)").await;
     exec(&ex, "SELECT ts_insert('web-01', 2000, 68.0)").await;
@@ -107,7 +182,8 @@ async fn test_timeseries_relational_join() {
          FROM servers s \
          WHERE s.region = 'us-east' AND s.tier = 'prod' \
          ORDER BY s.name",
-    ).await;
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2, "two prod us-east servers: {r:?}");
 
@@ -116,14 +192,20 @@ async fn test_timeseries_relational_join() {
         Value::Float64(v) => v,
         ref other => panic!("unexpected type for web-01 avg: {other:?}"),
     };
-    assert!((web01_avg - 71.833).abs() < 0.01, "web-01 avg ~71.83, got {web01_avg}");
+    assert!(
+        (web01_avg - 71.833).abs() < 0.01,
+        "web-01 avg ~71.83, got {web01_avg}"
+    );
 
     // web-02 avg = (55.0 + 60.0) / 2 = 57.5
     let web02_avg = match r[1][1] {
         Value::Float64(v) => v,
         ref other => panic!("unexpected type for web-02 avg: {other:?}"),
     };
-    assert!((web02_avg - 57.5).abs() < 0.01, "web-02 avg 57.5, got {web02_avg}");
+    assert!(
+        (web02_avg - 57.5).abs() < 0.01,
+        "web-02 avg 57.5, got {web02_avg}"
+    );
 }
 
 #[tokio::test]
@@ -143,13 +225,20 @@ async fn test_timeseries_relational_null_for_no_data() {
          FROM sensors s \
          WHERE s.location = 'floor1' \
          ORDER BY s.name",
-    ).await;
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
     // sensor-a has data
-    assert!(matches!(r[0][1], Value::Float64(_)), "sensor-a should have a numeric avg");
+    assert!(
+        matches!(r[0][1], Value::Float64(_)),
+        "sensor-a should have a numeric avg"
+    );
     // sensor-b has no data → NULL
-    assert!(matches!(r[1][1], Value::Null | Value::Float64(_)), "sensor-b avg is NULL or default");
+    assert!(
+        matches!(r[1][1], Value::Null | Value::Float64(_)),
+        "sensor-b avg is NULL or default"
+    );
 }
 
 // ============================================================================
@@ -160,7 +249,11 @@ async fn test_timeseries_relational_null_for_no_data() {
 async fn test_graph_relational_shortest_path() {
     let ex = test_executor();
 
-    exec(&ex, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, department TEXT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, department TEXT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO users VALUES (1, 'Alice', 'engineering')").await;
     exec(&ex, "INSERT INTO users VALUES (2, 'Bob', 'engineering')").await;
     exec(&ex, "INSERT INTO users VALUES (3, 'Charlie', 'sales')").await;
@@ -169,7 +262,11 @@ async fn test_graph_relational_shortest_path() {
     // Social graph: 1→2→3, 1→4
     exec(&ex, "SELECT graph_add_node('User', '{\"name\":\"Alice\"}')").await;
     exec(&ex, "SELECT graph_add_node('User', '{\"name\":\"Bob\"}')").await;
-    exec(&ex, "SELECT graph_add_node('User', '{\"name\":\"Charlie\"}')").await;
+    exec(
+        &ex,
+        "SELECT graph_add_node('User', '{\"name\":\"Charlie\"}')",
+    )
+    .await;
     exec(&ex, "SELECT graph_add_node('User', '{\"name\":\"Diana\"}')").await;
     exec(&ex, "SELECT graph_add_edge(1, 2, 'KNOWS')").await;
     exec(&ex, "SELECT graph_add_edge(2, 3, 'KNOWS')").await;
@@ -181,16 +278,23 @@ async fn test_graph_relational_shortest_path() {
         "SELECT u1.name AS eng, u2.name AS sales, GRAPH_SHORTEST_PATH(u1.id, u2.id) AS path \
          FROM users u1, users u2 \
          WHERE u1.department = 'engineering' AND u2.department = 'sales'",
-    ).await;
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 4, "2 eng x 2 sales = 4 path queries: {r:?}");
 
     // Alice(1) → Diana(4): direct edge
-    let alice_diana = r.iter().find(|row| {
-        matches!(&row[0], Value::Text(s) if s == "Alice") &&
-        matches!(&row[1], Value::Text(s) if s == "Diana")
-    }).expect("Alice-Diana row must exist");
-    assert!(!matches!(alice_diana[2], Value::Null), "Alice→Diana has a direct path");
+    let alice_diana = r
+        .iter()
+        .find(|row| {
+            matches!(&row[0], Value::Text(s) if s == "Alice")
+                && matches!(&row[1], Value::Text(s) if s == "Diana")
+        })
+        .expect("Alice-Diana row must exist");
+    assert!(
+        !matches!(alice_diana[2], Value::Null),
+        "Alice→Diana has a direct path"
+    );
 }
 
 #[tokio::test]
@@ -204,9 +308,17 @@ async fn test_graph_relational_combined_stats() {
     exec(&ex, "INSERT INTO graph_nodes VALUES (3, 'Charlie')").await;
 
     // Build matching graph nodes
-    exec(&ex, "SELECT graph_add_node('Person', '{\"name\":\"Alice\"}')").await;
+    exec(
+        &ex,
+        "SELECT graph_add_node('Person', '{\"name\":\"Alice\"}')",
+    )
+    .await;
     exec(&ex, "SELECT graph_add_node('Person', '{\"name\":\"Bob\"}')").await;
-    exec(&ex, "SELECT graph_add_node('Person', '{\"name\":\"Charlie\"}')").await;
+    exec(
+        &ex,
+        "SELECT graph_add_node('Person', '{\"name\":\"Charlie\"}')",
+    )
+    .await;
     exec(&ex, "SELECT graph_add_edge(1, 2, 'KNOWS')").await;
     exec(&ex, "SELECT graph_add_edge(2, 3, 'KNOWS')").await;
 
@@ -234,7 +346,8 @@ async fn test_graph_relational_combined_stats() {
         "SELECT GRAPH_SHORTEST_PATH(n1.id, n2.id) AS path \
          FROM graph_nodes n1, graph_nodes n2 \
          WHERE n1.label = 'Alice' AND n2.label = 'Charlie'",
-    ).await;
+    )
+    .await;
     let path_rows = rows(&path_result[0]);
     assert_eq!(path_rows.len(), 1);
     // Path from 1 to 3 via 2: should be non-null
@@ -252,7 +365,11 @@ async fn test_graph_relational_combined_stats() {
 async fn test_kv_relational_session_lookup() {
     let ex = test_executor();
 
-    exec(&ex, "CREATE TABLE accounts (id INT PRIMARY KEY, username TEXT, active BOOLEAN)").await;
+    exec(
+        &ex,
+        "CREATE TABLE accounts (id INT PRIMARY KEY, username TEXT, active BOOLEAN)",
+    )
+    .await;
     exec(&ex, "INSERT INTO accounts VALUES (1, 'alice', true)").await;
     exec(&ex, "INSERT INTO accounts VALUES (2, 'bob', true)").await;
     exec(&ex, "INSERT INTO accounts VALUES (3, 'charlie', false)").await;
@@ -267,7 +384,8 @@ async fn test_kv_relational_session_lookup() {
          FROM accounts a \
          WHERE a.active = true \
          ORDER BY a.id",
-    ).await;
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2, "two active users: {r:?}");
     assert_eq!(r[0][0], Value::Text("alice".into()));
@@ -296,14 +414,23 @@ async fn test_kv_counter_per_relational_row() {
         "SELECT p.name, kv_get('views:' || p.id::text) AS views \
          FROM products p \
          ORDER BY p.id",
-    ).await;
+    )
+    .await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 2);
     assert_eq!(r[0][0], Value::Text("widget".into()));
     // kv_incr stores as integer; kv_get returns Int64 for integer values
-    assert!(matches!(r[0][1], Value::Int64(3) | Value::Text(_)), "widget views should be 3: {:?}", r[0][1]);
+    assert!(
+        matches!(r[0][1], Value::Int64(3) | Value::Text(_)),
+        "widget views should be 3: {:?}",
+        r[0][1]
+    );
     assert_eq!(r[1][0], Value::Text("gadget".into()));
-    assert!(matches!(r[1][1], Value::Int64(1) | Value::Text(_)), "gadget views should be 1: {:?}", r[1][1]);
+    assert!(
+        matches!(r[1][1], Value::Int64(1) | Value::Text(_)),
+        "gadget views should be 1: {:?}",
+        r[1][1]
+    );
 }
 
 // ============================================================================
@@ -326,8 +453,16 @@ async fn test_datalog_relational_management_chain() {
 
     // Transitive management chain
     exec(&ex, "SELECT DATALOG_RULE('manages(M, E) :- reports(E, M)')").await;
-    exec(&ex, "SELECT DATALOG_RULE('manages_chain(M, E) :- manages(M, E)')").await;
-    exec(&ex, "SELECT DATALOG_RULE('manages_chain(M, E) :- manages(M, X), manages_chain(X, E)')").await;
+    exec(
+        &ex,
+        "SELECT DATALOG_RULE('manages_chain(M, E) :- manages(M, E)')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT DATALOG_RULE('manages_chain(M, E) :- manages(M, X), manages_chain(X, E)')",
+    )
+    .await;
 
     let r = exec(&ex, "SELECT DATALOG_QUERY('manages_chain(alice, Who)')").await;
     let json = match scalar(&r[0]) {
@@ -336,8 +471,14 @@ async fn test_datalog_relational_management_chain() {
     };
     assert!(json.contains("bob"), "alice manages bob: {json}");
     assert!(json.contains("charlie"), "alice manages charlie: {json}");
-    assert!(json.contains("diana"), "alice manages diana transitively: {json}");
-    assert!(json.contains("eve"), "alice manages eve transitively: {json}");
+    assert!(
+        json.contains("diana"),
+        "alice manages diana transitively: {json}"
+    );
+    assert!(
+        json.contains("eve"),
+        "alice manages eve transitively: {json}"
+    );
 }
 
 #[tokio::test]
@@ -355,8 +496,16 @@ async fn test_datalog_graph_reachability() {
     exec(&ex, "SELECT DATALOG_IMPORT_GRAPH('edge')").await;
 
     // Transitive reachability — T matches the edge_type column (bound variable)
-    exec(&ex, "SELECT DATALOG_RULE('reachable(X, Y) :- edge(X, T, Y)')").await;
-    exec(&ex, "SELECT DATALOG_RULE('reachable(X, Z) :- reachable(X, Y), edge(Y, T, Z)')").await;
+    exec(
+        &ex,
+        "SELECT DATALOG_RULE('reachable(X, Y) :- edge(X, T, Y)')",
+    )
+    .await;
+    exec(
+        &ex,
+        "SELECT DATALOG_RULE('reachable(X, Z) :- reachable(X, Y), edge(Y, T, Z)')",
+    )
+    .await;
 
     let r = exec(&ex, "SELECT DATALOG_QUERY('reachable(1, Who)')").await;
     let json = match scalar(&r[0]) {
@@ -448,23 +597,39 @@ async fn test_cross_model_rollback_fts() {
 
     // Verify pre-transaction state.
     let pre = exec(&ex, "SELECT fts_search('rust', 10)").await;
-    assert!(!fts_result_is_empty(&pre[0]), "pre-txn: 'rust' should match");
+    assert!(
+        !fts_result_is_empty(&pre[0]),
+        "pre-txn: 'rust' should match"
+    );
 
     // BEGIN — index a new doc, then ROLLBACK.
     exec(&ex, "BEGIN").await;
-    exec(&ex, "SELECT fts_index(99, 'transient rollback document about python')").await;
+    exec(
+        &ex,
+        "SELECT fts_index(99, 'transient rollback document about python')",
+    )
+    .await;
     // Verify the doc is visible inside the transaction.
     let mid = exec(&ex, "SELECT fts_search('python', 10)").await;
-    assert!(!fts_result_is_empty(&mid[0]), "in-txn: 'python' should match doc 99");
+    assert!(
+        !fts_result_is_empty(&mid[0]),
+        "in-txn: 'python' should match doc 99"
+    );
     exec(&ex, "ROLLBACK").await;
 
     // After ROLLBACK, doc 99 must be gone.
     let post = exec(&ex, "SELECT fts_search('python', 10)").await;
-    assert!(fts_result_is_empty(&post[0]), "after rollback: doc 99 must be gone");
+    assert!(
+        fts_result_is_empty(&post[0]),
+        "after rollback: doc 99 must be gone"
+    );
 
     // Original docs must still be present.
     let still = exec(&ex, "SELECT fts_search('rust', 10)").await;
-    assert!(!fts_result_is_empty(&still[0]), "after rollback: baseline docs intact");
+    assert!(
+        !fts_result_is_empty(&still[0]),
+        "after rollback: baseline docs intact"
+    );
 }
 
 // ============================================================================
@@ -483,7 +648,10 @@ async fn test_cross_model_rollback_timeseries() {
         Value::Float64(f) => *f,
         other => panic!("unexpected pre value: {other:?}"),
     };
-    assert!((pre_val - 50.0).abs() < 1e-6, "pre-txn baseline should be 50.0");
+    assert!(
+        (pre_val - 50.0).abs() < 1e-6,
+        "pre-txn baseline should be 50.0"
+    );
 
     // BEGIN — insert a new point, then ROLLBACK.
     exec(&ex, "BEGIN").await;
@@ -502,7 +670,10 @@ async fn test_cross_model_rollback_timeseries() {
         Value::Float64(f) => *f,
         other => panic!("unexpected post value: {other:?}"),
     };
-    assert!((post_val - 50.0).abs() < 1e-6, "after rollback: ts_last must revert to 50.0");
+    assert!(
+        (post_val - 50.0).abs() < 1e-6,
+        "after rollback: ts_last must revert to 50.0"
+    );
 }
 
 // ============================================================================
@@ -560,7 +731,11 @@ async fn test_cross_model_rollback_all_models() {
     exec(&ex, "SELECT ts_insert('events_rate', 1000, 1.0)").await;
     exec(&ex, "SELECT blob_store('evt_baseline', '64617461')").await;
     exec(&ex, "SELECT kv_set('counter', '0')").await;
-    exec(&ex, "SELECT graph_add_node('Event', '{\"kind\":\"baseline\"}')").await;
+    exec(
+        &ex,
+        "SELECT graph_add_node('Event', '{\"kind\":\"baseline\"}')",
+    )
+    .await;
 
     // BEGIN — mutate every model.
     exec(&ex, "BEGIN").await;
@@ -569,7 +744,11 @@ async fn test_cross_model_rollback_all_models() {
     exec(&ex, "SELECT ts_insert('events_rate', 9999, 999.0)").await;
     exec(&ex, "SELECT blob_store('evt_transient', '746d70')").await;
     exec(&ex, "SELECT kv_set('counter', '99')").await;
-    exec(&ex, "SELECT graph_add_node('Event', '{\"kind\":\"transient\"}')").await;
+    exec(
+        &ex,
+        "SELECT graph_add_node('Event', '{\"kind\":\"transient\"}')",
+    )
+    .await;
     exec(&ex, "ROLLBACK").await;
 
     // Relational: row 99 gone.
@@ -583,7 +762,10 @@ async fn test_cross_model_rollback_all_models() {
 
     // FTS: doc 99 gone.
     let fts = exec(&ex, "SELECT fts_search('transient', 10)").await;
-    assert!(fts_result_is_empty(&fts[0]), "fts: transient doc rolled back");
+    assert!(
+        fts_result_is_empty(&fts[0]),
+        "fts: transient doc rolled back"
+    );
 
     // KV: counter back to '0'.
     let kv = exec(&ex, "SELECT kv_get('counter')").await;

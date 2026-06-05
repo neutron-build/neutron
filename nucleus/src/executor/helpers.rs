@@ -3,15 +3,15 @@
 //! These are module-level functions (not methods on Executor) that handle
 //! type conversions, comparisons, parsing, and utility operations.
 
-use std::collections::HashMap;
-use sqlparser::ast::{self, Expr};
-use crate::types::{DataType, Row, Value};
-use crate::graph::PropValue as GraphPropValue;
 use super::ExecError;
 use super::schema_types::Privilege;
 use super::types::ColMeta;
 use crate::geo;
+use crate::graph::PropValue as GraphPropValue;
 use crate::timeseries;
+use crate::types::{DataType, Row, Value};
+use sqlparser::ast::{self, Expr};
+use std::collections::HashMap;
 
 /// Map a Nucleus DataType to its PostgreSQL `udt_name` (the short type name used in pg_type).
 pub(super) fn datatype_to_udt_name(dt: &DataType) -> &'static str {
@@ -39,52 +39,68 @@ pub(super) fn datatype_to_udt_name(dt: &DataType) -> &'static str {
 /// matching real PostgreSQL pg_type values.
 pub(super) fn pg_type_info(dt: &DataType) -> (i32, i32, &'static str, &'static str) {
     match dt {
-        DataType::Bool      => (16,   1,  "b", "B"),
-        DataType::Int32     => (23,   4,  "b", "N"),
-        DataType::Int64     => (20,   8,  "b", "N"),
-        DataType::Float64   => (701,  8,  "b", "N"),
-        DataType::Text      => (25,  -1,  "b", "S"),
-        DataType::Jsonb     => (3802, -1, "b", "U"),
-        DataType::Date      => (1082,  4, "b", "D"),
-        DataType::Timestamp => (1114,  8, "b", "D"),
+        DataType::Bool => (16, 1, "b", "B"),
+        DataType::Int32 => (23, 4, "b", "N"),
+        DataType::Int64 => (20, 8, "b", "N"),
+        DataType::Float64 => (701, 8, "b", "N"),
+        DataType::Text => (25, -1, "b", "S"),
+        DataType::Jsonb => (3802, -1, "b", "U"),
+        DataType::Date => (1082, 4, "b", "D"),
+        DataType::Timestamp => (1114, 8, "b", "D"),
         DataType::TimestampTz => (1184, 8, "b", "D"),
-        DataType::Numeric   => (1700, -1, "b", "N"),
-        DataType::Uuid      => (2950, 16, "b", "U"),
-        DataType::Bytea     => (17,   -1, "b", "U"),
-        DataType::Array(_)  => (1009, -1, "b", "A"),
+        DataType::Numeric => (1700, -1, "b", "N"),
+        DataType::Uuid => (2950, 16, "b", "U"),
+        DataType::Bytea => (17, -1, "b", "U"),
+        DataType::Array(_) => (1009, -1, "b", "A"),
         DataType::Vector(_) => (16385, -1, "b", "U"), // Custom OID for vector type
-        DataType::Interval => (1186, 16, "b", "T"),  // PostgreSQL interval OID
+        DataType::Interval => (1186, 16, "b", "T"),   // PostgreSQL interval OID
         DataType::UserDefined(_) => (25, -1, "e", "E"), // enum → text-like, typtype='e'
     }
 }
 
 /// Base PostgreSQL types that should always appear in pg_type.
 pub(super) const BASE_PG_TYPES: &[(i32, &str, i32, &str, &str)] = &[
-    (16,   "bool",        1,  "b", "B"),
-    (23,   "int4",        4,  "b", "N"),
-    (20,   "int8",        8,  "b", "N"),
-    (701,  "float8",      8,  "b", "N"),
-    (25,   "text",       -1,  "b", "S"),
-    (3802, "jsonb",      -1,  "b", "U"),
-    (1082, "date",        4,  "b", "D"),
-    (1114, "timestamp",   8,  "b", "D"),
-    (1184, "timestamptz", 8,  "b", "D"),
-    (1700, "numeric",    -1,  "b", "N"),
-    (2950, "uuid",       16,  "b", "U"),
-    (17,   "bytea",      -1,  "b", "U"),
-    (21,   "int2",        2,  "b", "N"),
-    (700,  "float4",      4,  "b", "N"),
-    (1043, "varchar",    -1,  "b", "S"),
-    (1042, "bpchar",     -1,  "b", "S"),
+    (16, "bool", 1, "b", "B"),
+    (23, "int4", 4, "b", "N"),
+    (20, "int8", 8, "b", "N"),
+    (701, "float8", 8, "b", "N"),
+    (25, "text", -1, "b", "S"),
+    (3802, "jsonb", -1, "b", "U"),
+    (1082, "date", 4, "b", "D"),
+    (1114, "timestamp", 8, "b", "D"),
+    (1184, "timestamptz", 8, "b", "D"),
+    (1700, "numeric", -1, "b", "N"),
+    (2950, "uuid", 16, "b", "U"),
+    (17, "bytea", -1, "b", "U"),
+    (21, "int2", 2, "b", "N"),
+    (700, "float4", 4, "b", "N"),
+    (1043, "varchar", -1, "b", "S"),
+    (1042, "bpchar", -1, "b", "S"),
 ];
 
 /// Return (unit, category, short_desc) metadata for a setting name.
 pub(super) fn pg_setting_metadata(name: &str) -> (&'static str, &'static str, &'static str) {
     match name {
-        "search_path" => ("", "Client Connection Defaults", "Sets the schema search order for names that are not schema-qualified."),
-        "client_encoding" => ("", "Client Connection Defaults", "Sets the client-side encoding (character set)."),
-        "standard_conforming_strings" => ("", "Version and Platform Compatibility", "Causes '...' strings to treat backslashes literally."),
-        "timezone" => ("", "Client Connection Defaults", "Sets the time zone for displaying and interpreting time stamps."),
+        "search_path" => (
+            "",
+            "Client Connection Defaults",
+            "Sets the schema search order for names that are not schema-qualified.",
+        ),
+        "client_encoding" => (
+            "",
+            "Client Connection Defaults",
+            "Sets the client-side encoding (character set).",
+        ),
+        "standard_conforming_strings" => (
+            "",
+            "Version and Platform Compatibility",
+            "Causes '...' strings to treat backslashes literally.",
+        ),
+        "timezone" => (
+            "",
+            "Client Connection Defaults",
+            "Sets the time zone for displaying and interpreting time stamps.",
+        ),
         _ => ("", "Ungrouped", ""),
     }
 }
@@ -132,7 +148,9 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
                 .iter()
                 .find(|c| {
                     c.name.eq_ignore_ascii_case(col)
-                        && c.table.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(table))
+                        && c.table
+                            .as_deref()
+                            .is_some_and(|t| t.eq_ignore_ascii_case(table))
                 })
                 .or_else(|| col_meta.iter().find(|c| c.name.eq_ignore_ascii_case(col)))
                 .map(|c| c.dtype.clone())
@@ -169,8 +187,8 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
             };
             match name.as_str() {
                 "COUNT" => DataType::Int64,
-                "AVG" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP"
-                | "VARIANCE" | "VAR_POP" | "VAR_SAMP" => DataType::Float64,
+                "AVG" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" | "VARIANCE" | "VAR_POP"
+                | "VAR_SAMP" => DataType::Float64,
                 "SUM" => match arg_expr.map(|e| infer_expr_type(e, col_meta)) {
                     Some(DataType::Int32) | Some(DataType::Int64) => DataType::Int64,
                     Some(dt) => dt,
@@ -213,7 +231,11 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
         }
         Expr::UnaryOp { expr, .. } => infer_expr_type(expr, col_meta),
         Expr::Nested(inner) => infer_expr_type(inner, col_meta),
-        Expr::Case { conditions, else_result, .. } => {
+        Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => {
             for cw in conditions {
                 let t = infer_expr_type(&cw.result, col_meta);
                 if !matches!(t, DataType::Text) {
@@ -225,13 +247,19 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
             }
             DataType::Text
         }
-        Expr::IsNull(_) | Expr::IsNotNull(_) | Expr::IsTrue(_) | Expr::IsFalse(_)
-        | Expr::IsNotTrue(_) | Expr::IsNotFalse(_) | Expr::InList { .. }
-        | Expr::Between { .. } | Expr::Like { .. } | Expr::ILike { .. } => DataType::Bool,
+        Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsNotFalse(_)
+        | Expr::InList { .. }
+        | Expr::Between { .. }
+        | Expr::Like { .. }
+        | Expr::ILike { .. } => DataType::Bool,
         _ => DataType::Text,
     }
 }
-
 
 pub(super) fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
@@ -292,8 +320,12 @@ fn coerce_text_and_compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Value::Int32(n), Value::Text(s)) => s.trim().parse::<i32>().ok().map(|v| n.cmp(&v)),
         (Value::Text(s), Value::Int64(n)) => s.trim().parse::<i64>().ok().map(|v| v.cmp(n)),
         (Value::Int64(n), Value::Text(s)) => s.trim().parse::<i64>().ok().map(|v| n.cmp(&v)),
-        (Value::Text(s), Value::Float64(f)) => s.trim().parse::<f64>().ok().and_then(|v| v.partial_cmp(f)),
-        (Value::Float64(f), Value::Text(s)) => s.trim().parse::<f64>().ok().and_then(|v| f.partial_cmp(&v)),
+        (Value::Text(s), Value::Float64(f)) => {
+            s.trim().parse::<f64>().ok().and_then(|v| v.partial_cmp(f))
+        }
+        (Value::Float64(f), Value::Text(s)) => {
+            s.trim().parse::<f64>().ok().and_then(|v| f.partial_cmp(&v))
+        }
         (Value::Text(s), Value::Numeric(n)) => {
             let lhs = s.trim().parse::<f64>().ok()?;
             let rhs = n.parse::<f64>().ok()?;
@@ -362,15 +394,30 @@ fn parse_uuid_text(s: &str) -> Option<[u8; 16]> {
 
 /// Compare two values for ORDER BY, respecting NULLS FIRST / NULLS LAST and ASC / DESC.
 /// PostgreSQL default: NULLS LAST for ASC, NULLS FIRST for DESC.
-pub(super) fn cmp_with_nulls(va: &Value, vb: &Value, asc: bool, nulls_first: bool) -> std::cmp::Ordering {
+pub(super) fn cmp_with_nulls(
+    va: &Value,
+    vb: &Value,
+    asc: bool,
+    nulls_first: bool,
+) -> std::cmp::Ordering {
     let a_null = matches!(va, Value::Null);
     let b_null = matches!(vb, Value::Null);
-    if a_null && b_null { return std::cmp::Ordering::Equal; }
+    if a_null && b_null {
+        return std::cmp::Ordering::Equal;
+    }
     if a_null {
-        return if nulls_first { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+        return if nulls_first {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        };
     }
     if b_null {
-        return if nulls_first { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less };
+        return if nulls_first {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Less
+        };
     }
     let ord = compare_values(va, vb).unwrap_or(std::cmp::Ordering::Equal);
     if asc { ord } else { ord.reverse() }
@@ -380,17 +427,52 @@ pub(super) fn cmp_with_nulls(va: &Value, vb: &Value, asc: bool, nulls_first: boo
 pub(super) fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Function(func) => {
-            let name = func.name.to_string().to_uppercase();
             if func.over.is_some() {
                 return false; // Window functions are NOT aggregates
             }
-            matches!(name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
-                | "STRING_AGG" | "ARRAY_AGG" | "JSON_AGG" | "BOOL_AND" | "BOOL_OR"
-                | "EVERY" | "BIT_AND" | "BIT_OR")
+            let name = func.name.to_string().to_uppercase();
+            if matches!(
+                name.as_str(),
+                "COUNT"
+                    | "SUM"
+                    | "AVG"
+                    | "MIN"
+                    | "MAX"
+                    | "STRING_AGG"
+                    | "ARRAY_AGG"
+                    | "JSON_AGG"
+                    | "BOOL_AND"
+                    | "BOOL_OR"
+                    | "EVERY"
+                    | "BIT_AND"
+                    | "BIT_OR"
+                    | "ARGMAX"
+                    | "ARG_MAX"
+                    | "ARGMIN"
+                    | "ARG_MIN"
+                    | "PERCENTILE_CONT"
+                    | "PERCENTILE_DISC"
+                    | "MEDIAN"
+                    | "QUANTILE"
+            ) {
+                return true;
+            }
+            // A non-aggregate scalar function may still wrap an aggregate in its
+            // arguments, e.g. COALESCE(MAX(id), 0). Recurse so the query is
+            // routed to the aggregate path instead of per-row evaluation.
+            if let ast::FunctionArguments::List(arg_list) = &func.args {
+                return arg_list.args.iter().any(|arg| match arg {
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(inner))
+                    | ast::FunctionArg::Named {
+                        arg: ast::FunctionArgExpr::Expr(inner),
+                        ..
+                    } => contains_aggregate(inner),
+                    _ => false,
+                });
+            }
+            false
         }
-        Expr::BinaryOp { left, right, .. } => {
-            contains_aggregate(left) || contains_aggregate(right)
-        }
+        Expr::BinaryOp { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
         Expr::UnaryOp { expr, .. } => contains_aggregate(expr),
         Expr::Nested(inner) => contains_aggregate(inner),
         Expr::Cast { expr: inner, .. } => contains_aggregate(inner),
@@ -427,13 +509,15 @@ pub(super) fn val_to_u64(v: &Value, context: &str) -> Result<u64, ExecError> {
     match v {
         Value::Int32(n) if *n >= 0 => Ok(*n as u64),
         Value::Int64(n) if *n >= 0 => Ok(*n as u64),
-        Value::Int32(n) => Err(ExecError::Unsupported(
-            format!("{context}: value must be non-negative, got {n}"),
-        )),
-        Value::Int64(n) => Err(ExecError::Unsupported(
-            format!("{context}: value must be non-negative, got {n}"),
-        )),
-        _ => Err(ExecError::Unsupported(format!("{context}: expected integer"))),
+        Value::Int32(n) => Err(ExecError::Unsupported(format!(
+            "{context}: value must be non-negative, got {n}"
+        ))),
+        Value::Int64(n) => Err(ExecError::Unsupported(format!(
+            "{context}: value must be non-negative, got {n}"
+        ))),
+        _ => Err(ExecError::Unsupported(format!(
+            "{context}: expected integer"
+        ))),
     }
 }
 
@@ -463,7 +547,7 @@ pub(super) fn json_escape(s: &str) -> String {
     for ch in s.chars() {
         match ch {
             '\\' => out.push_str("\\\\"),
-            '"'  => out.push_str("\\\""),
+            '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
@@ -605,14 +689,10 @@ pub(super) fn substitute_sql_placeholders(
                 }
                 continue;
             }
-            if i < bytes.len()
-                && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
-            {
+            if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
                 let ident_start = i;
                 i += 1;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 let ident = &sql[ident_start..i];
@@ -658,16 +738,34 @@ pub(super) fn compute_aggregate(func: &str, col_idx: Option<usize>, rows: &[Row]
             for row in rows {
                 if let Some(val) = row.get(col) {
                     match val {
-                        Value::Int32(n) => { int_sum += *n as i64; float_sum += *n as f64; has_value = true; }
-                        Value::Int64(n) => { int_sum += *n; float_sum += *n as f64; has_value = true; }
-                        Value::Float64(f) => { float_sum += f; has_float = true; has_value = true; }
+                        Value::Int32(n) => {
+                            int_sum += *n as i64;
+                            float_sum += *n as f64;
+                            has_value = true;
+                        }
+                        Value::Int64(n) => {
+                            int_sum += *n;
+                            float_sum += *n as f64;
+                            has_value = true;
+                        }
+                        Value::Float64(f) => {
+                            float_sum += f;
+                            has_float = true;
+                            has_value = true;
+                        }
                         _ => {}
                     }
                 }
             }
             // SQL standard: SUM of all-NULL input is NULL, not 0.
             // Preserve integer type when all inputs are integer.
-            if !has_value { Value::Null } else if has_float { Value::Float64(float_sum) } else { Value::Int64(int_sum) }
+            if !has_value {
+                Value::Null
+            } else if has_float {
+                Value::Float64(float_sum)
+            } else {
+                Value::Int64(int_sum)
+            }
         }
         "AVG" => {
             let col = col_idx.unwrap_or(0);
@@ -676,22 +774,37 @@ pub(super) fn compute_aggregate(func: &str, col_idx: Option<usize>, rows: &[Row]
             for row in rows {
                 if let Some(val) = row.get(col) {
                     match val {
-                        Value::Int32(n) => { sum += *n as f64; count += 1; }
-                        Value::Int64(n) => { sum += *n as f64; count += 1; }
-                        Value::Float64(f) => { sum += f; count += 1; }
+                        Value::Int32(n) => {
+                            sum += *n as f64;
+                            count += 1;
+                        }
+                        Value::Int64(n) => {
+                            sum += *n as f64;
+                            count += 1;
+                        }
+                        Value::Float64(f) => {
+                            sum += f;
+                            count += 1;
+                        }
                         Value::Null => {}
                         _ => {}
                     }
                 }
             }
-            if count == 0 { Value::Null } else { Value::Float64(sum / count as f64) }
+            if count == 0 {
+                Value::Null
+            } else {
+                Value::Float64(sum / count as f64)
+            }
         }
         "MIN" => {
             let col = col_idx.unwrap_or(0);
             let mut min: Option<Value> = None;
             for row in rows {
                 if let Some(val) = row.get(col) {
-                    if *val == Value::Null { continue; }
+                    if *val == Value::Null {
+                        continue;
+                    }
                     min = Some(match min {
                         Some(ref m) if val < m => val.clone(),
                         Some(m) => m,
@@ -706,7 +819,9 @@ pub(super) fn compute_aggregate(func: &str, col_idx: Option<usize>, rows: &[Row]
             let mut max: Option<Value> = None;
             for row in rows {
                 if let Some(val) = row.get(col) {
-                    if *val == Value::Null { continue; }
+                    if *val == Value::Null {
+                        continue;
+                    }
                     max = Some(match max {
                         Some(ref m) if val > m => val.clone(),
                         Some(m) => m,
@@ -734,14 +849,32 @@ pub(super) fn compute_aggregate_refs(func: &str, col_idx: Option<usize>, rows: &
             for row in rows {
                 if let Some(val) = row.get(col) {
                     match val {
-                        Value::Int32(n) => { int_sum += *n as i64; float_sum += *n as f64; has_value = true; }
-                        Value::Int64(n) => { int_sum += *n; float_sum += *n as f64; has_value = true; }
-                        Value::Float64(f) => { float_sum += f; has_float = true; has_value = true; }
+                        Value::Int32(n) => {
+                            int_sum += *n as i64;
+                            float_sum += *n as f64;
+                            has_value = true;
+                        }
+                        Value::Int64(n) => {
+                            int_sum += *n;
+                            float_sum += *n as f64;
+                            has_value = true;
+                        }
+                        Value::Float64(f) => {
+                            float_sum += f;
+                            has_float = true;
+                            has_value = true;
+                        }
                         _ => {}
                     }
                 }
             }
-            if !has_value { Value::Null } else if has_float { Value::Float64(float_sum) } else { Value::Int64(int_sum) }
+            if !has_value {
+                Value::Null
+            } else if has_float {
+                Value::Float64(float_sum)
+            } else {
+                Value::Int64(int_sum)
+            }
         }
         "AVG" => {
             let col = col_idx.unwrap_or(0);
@@ -750,22 +883,37 @@ pub(super) fn compute_aggregate_refs(func: &str, col_idx: Option<usize>, rows: &
             for row in rows {
                 if let Some(val) = row.get(col) {
                     match val {
-                        Value::Int32(n) => { sum += *n as f64; count += 1; }
-                        Value::Int64(n) => { sum += *n as f64; count += 1; }
-                        Value::Float64(f) => { sum += f; count += 1; }
+                        Value::Int32(n) => {
+                            sum += *n as f64;
+                            count += 1;
+                        }
+                        Value::Int64(n) => {
+                            sum += *n as f64;
+                            count += 1;
+                        }
+                        Value::Float64(f) => {
+                            sum += f;
+                            count += 1;
+                        }
                         Value::Null => {}
                         _ => {}
                     }
                 }
             }
-            if count == 0 { Value::Null } else { Value::Float64(sum / count as f64) }
+            if count == 0 {
+                Value::Null
+            } else {
+                Value::Float64(sum / count as f64)
+            }
         }
         "MIN" => {
             let col = col_idx.unwrap_or(0);
             let mut min: Option<Value> = None;
             for row in rows {
                 if let Some(val) = row.get(col) {
-                    if *val == Value::Null { continue; }
+                    if *val == Value::Null {
+                        continue;
+                    }
                     min = Some(match min {
                         Some(ref m) if val < m => val.clone(),
                         Some(m) => m,
@@ -780,7 +928,9 @@ pub(super) fn compute_aggregate_refs(func: &str, col_idx: Option<usize>, rows: &
             let mut max: Option<Value> = None;
             for row in rows {
                 if let Some(val) = row.get(col) {
-                    if *val == Value::Null { continue; }
+                    if *val == Value::Null {
+                        continue;
+                    }
                     max = Some(match max {
                         Some(ref m) if val > m => val.clone(),
                         Some(m) => m,
@@ -798,7 +948,12 @@ pub(super) fn compute_aggregate_refs(func: &str, col_idx: Option<usize>, rows: &
 ///
 /// Handles SUM/MIN/MAX for Int32/Int64/Float64 columns using vectorized operations.
 /// Returns `Some(value)` when a SIMD path applies, `None` to fall back to scalar.
-pub(super) fn simd_aggregate(func: &str, col_idx: usize, col_meta: &[ColMeta], rows: &[Row]) -> Option<Value> {
+pub(super) fn simd_aggregate(
+    func: &str,
+    col_idx: usize,
+    col_meta: &[ColMeta],
+    rows: &[Row],
+) -> Option<Value> {
     if rows.is_empty() {
         return None; // let scalar compute_aggregate handle the all-NULL / empty case
     }
@@ -806,22 +961,30 @@ pub(super) fn simd_aggregate(func: &str, col_idx: usize, col_meta: &[ColMeta], r
     match (func, dtype) {
         ("SUM", DataType::Int64 | DataType::Int32) => {
             let vals = crate::simd::extract_i64_column(rows, col_idx);
-            if vals.is_empty() { return Some(Value::Null); }
+            if vals.is_empty() {
+                return Some(Value::Null);
+            }
             crate::simd::sum_i64_checked(&vals).map(Value::Int64)
         }
         ("SUM", DataType::Float64) => {
             let vals = crate::simd::extract_f64_column(rows, col_idx);
-            if vals.is_empty() { return Some(Value::Null); }
+            if vals.is_empty() {
+                return Some(Value::Null);
+            }
             Some(Value::Float64(crate::simd::sum_f64(&vals)))
         }
         ("MIN", DataType::Float64) => {
             let vals = crate::simd::extract_f64_column(rows, col_idx);
-            if vals.is_empty() { return Some(Value::Null); }
+            if vals.is_empty() {
+                return Some(Value::Null);
+            }
             crate::simd::min_f64(&vals).map(Value::Float64)
         }
         ("MAX", DataType::Float64) => {
             let vals = crate::simd::extract_f64_column(rows, col_idx);
-            if vals.is_empty() { return Some(Value::Null); }
+            if vals.is_empty() {
+                return Some(Value::Null);
+            }
             crate::simd::max_f64(&vals).map(Value::Float64)
         }
         _ => None,
@@ -836,14 +999,20 @@ pub(super) fn prop_value_to_json(v: &GraphPropValue) -> String {
         GraphPropValue::Int(n) => n.to_string(),
         GraphPropValue::Float(f) => {
             // NaN and Infinity are not valid JSON — serialize as null
-            if f.is_finite() { format!("{f}") } else { "null".into() }
+            if f.is_finite() {
+                format!("{f}")
+            } else {
+                "null".into()
+            }
         }
         GraphPropValue::Text(s) => format!(r#""{}""#, json_escape(s)),
     }
 }
 
 /// Parse a JSON string into graph properties BTreeMap.
-pub(super) fn parse_json_to_graph_props(text: &str) -> Result<std::collections::BTreeMap<String, GraphPropValue>, ExecError> {
+pub(super) fn parse_json_to_graph_props(
+    text: &str,
+) -> Result<std::collections::BTreeMap<String, GraphPropValue>, ExecError> {
     let serde_val: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| ExecError::Unsupported(format!("invalid JSON: {e}")))?;
     match serde_val {
@@ -867,7 +1036,9 @@ pub(super) fn parse_json_to_graph_props(text: &str) -> Result<std::collections::
             }
             Ok(props)
         }
-        _ => Err(ExecError::Unsupported("graph properties must be a JSON object".into())),
+        _ => Err(ExecError::Unsupported(
+            "graph properties must be a JSON object".into(),
+        )),
     }
 }
 
@@ -883,7 +1054,8 @@ pub(super) fn serde_to_doc(v: serde_json::Value) -> crate::document::JsonValue {
         serde_json::Value::Bool(b) => crate::document::JsonValue::Bool(b),
         serde_json::Value::Number(n) => {
             // as_f64() can fail for u64 values > 2^53; use as_i64 fallback
-            let f = n.as_f64()
+            let f = n
+                .as_f64()
                 .or_else(|| n.as_i64().map(|i| i as f64))
                 .or_else(|| n.as_u64().map(|u| u as f64))
                 .unwrap_or(0.0);
@@ -912,16 +1084,50 @@ pub(super) fn value_to_csv_string_impl(value: &Value) -> String {
         Value::Int64(i) => i.to_string(),
         Value::Float64(f) => f.to_string(),
         Value::Text(s) => s.clone(),
-        Value::Bytea(b) => format!("\\x{}", b.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
+        Value::Bytea(b) => format!(
+            "\\x{}",
+            b.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ),
         Value::Timestamp(ts) => ts.to_string(),
         Value::Date(d) => d.to_string(),
         Value::TimestampTz(ts) => ts.to_string(),
         Value::Numeric(n) => n.to_string(),
-        Value::Uuid(u) => format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]),
+        Value::Uuid(u) => format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            u[0],
+            u[1],
+            u[2],
+            u[3],
+            u[4],
+            u[5],
+            u[6],
+            u[7],
+            u[8],
+            u[9],
+            u[10],
+            u[11],
+            u[12],
+            u[13],
+            u[14],
+            u[15]
+        ),
         Value::Jsonb(j) => j.to_string(),
-        Value::Array(arr) => format!("{{{}}}", arr.iter().map(value_to_csv_string_impl).collect::<Vec<_>>().join(",")),
-        Value::Vector(vec) => format!("[{}]", vec.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")),
+        Value::Array(arr) => format!(
+            "{{{}}}",
+            arr.iter()
+                .map(value_to_csv_string_impl)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Vector(vec) => format!(
+            "[{}]",
+            vec.iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
         Value::Interval { .. } => value.to_string(),
     }
 }
@@ -935,16 +1141,50 @@ pub(super) fn value_to_text_string_impl(value: &Value) -> String {
         Value::Int64(i) => i.to_string(),
         Value::Float64(f) => f.to_string(),
         Value::Text(s) => s.clone(),
-        Value::Bytea(b) => format!("\\x{}", b.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
+        Value::Bytea(b) => format!(
+            "\\x{}",
+            b.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ),
         Value::Timestamp(ts) => ts.to_string(),
         Value::Date(d) => d.to_string(),
         Value::TimestampTz(ts) => ts.to_string(),
         Value::Numeric(n) => n.to_string(),
-        Value::Uuid(u) => format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]),
+        Value::Uuid(u) => format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            u[0],
+            u[1],
+            u[2],
+            u[3],
+            u[4],
+            u[5],
+            u[6],
+            u[7],
+            u[8],
+            u[9],
+            u[10],
+            u[11],
+            u[12],
+            u[13],
+            u[14],
+            u[15]
+        ),
         Value::Jsonb(j) => j.to_string(),
-        Value::Array(arr) => format!("{{{}}}", arr.iter().map(value_to_text_string_impl).collect::<Vec<_>>().join(",")),
-        Value::Vector(vec) => format!("[{}]", vec.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")),
+        Value::Array(arr) => format!(
+            "{{{}}}",
+            arr.iter()
+                .map(value_to_text_string_impl)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Vector(vec) => format!(
+            "[{}]",
+            vec.iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
         Value::Interval { .. } => value.to_string(),
     }
 }
@@ -954,13 +1194,14 @@ pub(super) fn strip_dollar_quotes(s: &str) -> String {
     let trimmed = s.trim();
     // Handle $tag$...$tag$ or $$...$$
     if let Some(stripped) = trimmed.strip_prefix('$')
-        && let Some(end_tag_pos) = stripped.find('$') {
-            let tag = &trimmed[..=end_tag_pos + 1];
-            if trimmed.ends_with(tag) {
-                let inner = &trimmed[tag.len()..trimmed.len() - tag.len()];
-                return inner.trim().to_string();
-            }
+        && let Some(end_tag_pos) = stripped.find('$')
+    {
+        let tag = &trimmed[..=end_tag_pos + 1];
+        if trimmed.ends_with(tag) {
+            let inner = &trimmed[tag.len()..trimmed.len() - tag.len()];
+            return inner.trim().to_string();
         }
+    }
     // Handle single-quoted strings
     if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
         return trimmed[1..trimmed.len() - 1].replace("''", "'");
@@ -995,10 +1236,12 @@ pub(super) fn substitute_outer_refs(expr: &Expr, outer_row: &Row, outer_meta: &[
             // Look for a match in outer columns
             for (i, meta) in outer_meta.iter().enumerate() {
                 if let Some(ref t) = meta.table
-                    && t.eq_ignore_ascii_case(table) && meta.name.eq_ignore_ascii_case(col)
-                        && let Some(val) = outer_row.get(i) {
-                            return value_to_ast_expr(val);
-                        }
+                    && t.eq_ignore_ascii_case(table)
+                    && meta.name.eq_ignore_ascii_case(col)
+                    && let Some(val) = outer_row.get(i)
+                {
+                    return value_to_ast_expr(val);
+                }
             }
             expr.clone()
         }
@@ -1011,20 +1254,31 @@ pub(super) fn substitute_outer_refs(expr: &Expr, outer_row: &Row, outer_meta: &[
             op: *op,
             expr: Box::new(substitute_outer_refs(inner, outer_row, outer_meta)),
         },
-        Expr::IsNull(inner) => Expr::IsNull(Box::new(substitute_outer_refs(inner, outer_row, outer_meta))),
-        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(substitute_outer_refs(inner, outer_row, outer_meta))),
-        Expr::Nested(inner) => Expr::Nested(Box::new(substitute_outer_refs(inner, outer_row, outer_meta))),
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(substitute_outer_refs(
+            inner, outer_row, outer_meta,
+        ))),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(substitute_outer_refs(
+            inner, outer_row, outer_meta,
+        ))),
+        Expr::Nested(inner) => Expr::Nested(Box::new(substitute_outer_refs(
+            inner, outer_row, outer_meta,
+        ))),
         _ => expr.clone(),
     }
 }
 
 /// Substitute outer column references in a query's WHERE/selection clauses.
-pub(super) fn substitute_outer_refs_in_query(query: &ast::Query, outer_row: &Row, outer_meta: &[ColMeta]) -> ast::Query {
+pub(super) fn substitute_outer_refs_in_query(
+    query: &ast::Query,
+    outer_row: &Row,
+    outer_meta: &[ColMeta],
+) -> ast::Query {
     let mut q = query.clone();
     if let ast::SetExpr::Select(ref mut sel) = *q.body
-        && let Some(ref selection) = sel.selection {
-            sel.selection = Some(substitute_outer_refs(selection, outer_row, outer_meta));
-        }
+        && let Some(ref selection) = sel.selection
+    {
+        sel.selection = Some(substitute_outer_refs(selection, outer_row, outer_meta));
+    }
     q
 }
 
@@ -1046,27 +1300,28 @@ pub(super) fn compute_window_frame_bounds(
         }
     };
 
-    let resolve_bound = |bound: &ast::WindowFrameBound, _is_start: bool| -> Result<usize, ExecError> {
-        match bound {
-            ast::WindowFrameBound::CurrentRow => Ok(current_row),
-            ast::WindowFrameBound::Preceding(None) => {
-                // UNBOUNDED PRECEDING
-                Ok(0)
+    let resolve_bound =
+        |bound: &ast::WindowFrameBound, _is_start: bool| -> Result<usize, ExecError> {
+            match bound {
+                ast::WindowFrameBound::CurrentRow => Ok(current_row),
+                ast::WindowFrameBound::Preceding(None) => {
+                    // UNBOUNDED PRECEDING
+                    Ok(0)
+                }
+                ast::WindowFrameBound::Preceding(Some(expr)) => {
+                    let n = expr_to_usize(expr)?;
+                    Ok(current_row.saturating_sub(n))
+                }
+                ast::WindowFrameBound::Following(None) => {
+                    // UNBOUNDED FOLLOWING
+                    Ok(partition_size.saturating_sub(1))
+                }
+                ast::WindowFrameBound::Following(Some(expr)) => {
+                    let n = expr_to_usize(expr)?;
+                    Ok(std::cmp::min(current_row + n, partition_size - 1))
+                }
             }
-            ast::WindowFrameBound::Preceding(Some(expr)) => {
-                let n = expr_to_usize(expr)?;
-                Ok(current_row.saturating_sub(n))
-            }
-            ast::WindowFrameBound::Following(None) => {
-                // UNBOUNDED FOLLOWING
-                Ok(partition_size.saturating_sub(1))
-            }
-            ast::WindowFrameBound::Following(Some(expr)) => {
-                let n = expr_to_usize(expr)?;
-                Ok(std::cmp::min(current_row + n, partition_size - 1))
-            }
-        }
-    };
+        };
 
     let start = resolve_bound(&frame.start_bound, true)?;
     let end = match &frame.end_bound {
@@ -1092,7 +1347,8 @@ pub(super) fn expr_to_usize(expr: &Expr) -> Result<usize, ExecError> {
                 .parse::<usize>()
                 .map_err(|_| ExecError::Unsupported(format!("invalid frame offset: {s}"))),
             _ => Err(ExecError::Unsupported(format!(
-                "non-numeric frame bound: {}", val_with_span.value
+                "non-numeric frame bound: {}",
+                val_with_span.value
             ))),
         },
         _ => Err(ExecError::Unsupported(format!(
@@ -1138,13 +1394,15 @@ pub(super) fn value_to_json(val: &Value) -> serde_json::Value {
         Value::Numeric(s) => serde_json::Value::String(s.clone()),
         Value::Uuid(b) => serde_json::Value::String(Value::Uuid(*b).to_string()),
         Value::Bytea(b) => serde_json::Value::String(Value::Bytea(b.clone()).to_string()),
-        Value::Array(vals) => {
-            serde_json::Value::Array(vals.iter().map(value_to_json).collect())
-        }
+        Value::Array(vals) => serde_json::Value::Array(vals.iter().map(value_to_json).collect()),
         Value::Vector(vec) => {
             serde_json::Value::Array(vec.iter().map(|f| serde_json::json!(f)).collect())
         }
-        Value::Interval { months, days, microseconds } => {
+        Value::Interval {
+            months,
+            days,
+            microseconds,
+        } => {
             serde_json::json!({ "months": months, "days": days, "microseconds": microseconds })
         }
     }
@@ -1162,17 +1420,22 @@ pub(super) fn json_to_vector(val: &Value) -> Result<crate::vector::Vector, ExecE
         }
         Value::Text(s) => {
             // Try parsing as JSON array: "[1.0, 2.0, 3.0]"
-            if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(s) {
+            if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(s)
+            {
                 let data: Vec<f32> = arr
                     .iter()
                     .map(|v| v.as_f64().unwrap_or(0.0) as f32)
                     .collect();
                 Ok(crate::vector::Vector::new(data))
             } else {
-                Err(ExecError::Unsupported("cannot parse vector from text".into()))
+                Err(ExecError::Unsupported(
+                    "cannot parse vector from text".into(),
+                ))
             }
         }
-        _ => Err(ExecError::Unsupported("vector must be JSON array or text".into())),
+        _ => Err(ExecError::Unsupported(
+            "vector must be JSON array or text".into(),
+        )),
     }
 }
 
@@ -1254,7 +1517,8 @@ pub(super) fn json_to_sparse_vec(val: &Value) -> Result<crate::sparse::SparseVec
             Ok(crate::sparse::SparseVector::new(entries))
         }
         Value::Text(s) => {
-            if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(s) {
+            if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(s)
+            {
                 let mut entries = Vec::new();
                 for (key, value) in &obj {
                     if let Ok(idx) = key.parse::<u32>() {
@@ -1264,10 +1528,14 @@ pub(super) fn json_to_sparse_vec(val: &Value) -> Result<crate::sparse::SparseVec
                 }
                 Ok(crate::sparse::SparseVector::new(entries))
             } else {
-                Err(ExecError::Unsupported("cannot parse sparse vector from text".into()))
+                Err(ExecError::Unsupported(
+                    "cannot parse sparse vector from text".into(),
+                ))
             }
         }
-        _ => Err(ExecError::Unsupported("sparse vector must be JSON object or text".into())),
+        _ => Err(ExecError::Unsupported(
+            "sparse vector must be JSON object or text".into(),
+        )),
     }
 }
 
@@ -1348,19 +1616,18 @@ pub(super) fn grantee_name(grantee: &ast::Grantee) -> String {
 pub(super) fn parse_privileges(privs: &ast::Privileges) -> Vec<Privilege> {
     match privs {
         ast::Privileges::All { .. } => vec![Privilege::All],
-        ast::Privileges::Actions(actions) => {
-            actions.iter().map(|a| {
-                match a {
-                    ast::Action::Select { .. } => Privilege::Select,
-                    ast::Action::Insert { .. } => Privilege::Insert,
-                    ast::Action::Update { .. } => Privilege::Update,
-                    ast::Action::Delete => Privilege::Delete,
-                    ast::Action::Create { .. } => Privilege::Create,
-                    ast::Action::Usage => Privilege::Usage,
-                    _ => Privilege::Select,
-                }
-            }).collect()
-        }
+        ast::Privileges::Actions(actions) => actions
+            .iter()
+            .map(|a| match a {
+                ast::Action::Select { .. } => Privilege::Select,
+                ast::Action::Insert { .. } => Privilege::Insert,
+                ast::Action::Update { .. } => Privilege::Update,
+                ast::Action::Delete => Privilege::Delete,
+                ast::Action::Create { .. } => Privilege::Create,
+                ast::Action::Usage => Privilege::Usage,
+                _ => Privilege::Select,
+            })
+            .collect(),
     }
 }
 
@@ -1409,9 +1676,18 @@ pub(super) fn parse_timestamp_parts(s: &str) -> Option<(i32, u32, u32, u32, u32,
     let d = day_str.parse::<u32>().ok()?;
     let (hour, minute, second) = if let Some(ts) = time_str {
         let time_parts: Vec<&str> = ts.split(':').collect();
-        let h = time_parts.first().and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
-        let min = time_parts.get(1).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
-        let sec = time_parts.get(2).and_then(|p| p.trim().parse::<u32>().ok()).unwrap_or(0);
+        let h = time_parts
+            .first()
+            .and_then(|p| p.parse::<u32>().ok())
+            .unwrap_or(0);
+        let min = time_parts
+            .get(1)
+            .and_then(|p| p.parse::<u32>().ok())
+            .unwrap_or(0);
+        let sec = time_parts
+            .get(2)
+            .and_then(|p| p.trim().parse::<u32>().ok())
+            .unwrap_or(0);
         (h, min, sec)
     } else {
         (0, 0, 0)
@@ -1420,7 +1696,11 @@ pub(super) fn parse_timestamp_parts(s: &str) -> Option<(i32, u32, u32, u32, u32,
 }
 
 /// Set a value at a path within a JSON value.
-pub(super) fn jsonb_set_path(target: &mut serde_json::Value, path: &[String], new_val: serde_json::Value) {
+pub(super) fn jsonb_set_path(
+    target: &mut serde_json::Value,
+    path: &[String],
+    new_val: serde_json::Value,
+) {
     if path.is_empty() {
         return;
     }
@@ -1431,9 +1711,10 @@ pub(super) fn jsonb_set_path(target: &mut serde_json::Value, path: &[String], ne
             }
             serde_json::Value::Array(arr) => {
                 if let Ok(idx) = path[0].parse::<usize>()
-                    && idx < arr.len() {
-                        arr[idx] = new_val;
-                    }
+                    && idx < arr.len()
+                {
+                    arr[idx] = new_val;
+                }
             }
             _ => {}
         }
@@ -1469,14 +1750,6 @@ pub(super) fn strip_json_nulls(val: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Recursive JSON containment check (`@>`).
-///
-/// Returns true when `left` contains all key-value pairs present in `right`.
-/// - Object A contains Object B when every key in B exists in A and
-///   A[key] contains B[key].
-/// - Array A contains Array B when every element in B has a matching
-///   element in A (order-independent).
-/// - Scalars are compared for equality.
 /// Convert a `Value` (Jsonb or Text containing JSON) to a `document::JsonValue`.
 /// Returns `None` if the value is not valid JSON.
 pub(super) fn value_to_doc_json(val: &Value) -> Option<crate::document::JsonValue> {
@@ -1487,13 +1760,19 @@ pub(super) fn value_to_doc_json(val: &Value) -> Option<crate::document::JsonValu
     }
 }
 
+/// Recursive JSON containment check (`@>`).
+///
+/// Returns true when `left` contains all key-value pairs present in `right`.
+/// - Object A contains Object B when every key in B exists in A and
+///   A[key] contains B[key].
+/// - Array A contains Array B when every element in B has a matching
+///   element in A (order-independent).
+/// - Scalars are compared for equality.
 pub(super) fn json_contains(left: &serde_json::Value, right: &serde_json::Value) -> bool {
     match (left, right) {
-        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
-            b.iter().all(|(k, bv)| {
-                a.get(k).is_some_and(|av| json_contains(av, bv))
-            })
-        }
+        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => b
+            .iter()
+            .all(|(k, bv)| a.get(k).is_some_and(|av| json_contains(av, bv))),
         (serde_json::Value::Array(a), serde_json::Value::Array(b)) => {
             b.iter().all(|bv| a.iter().any(|av| json_contains(av, bv)))
         }

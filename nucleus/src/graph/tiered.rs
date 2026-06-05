@@ -320,14 +320,20 @@ impl TieredGraphStore {
         self.next_node_id += 1;
 
         for label in &labels {
-            self.label_index.entry(label.clone()).or_default().insert(id);
+            self.label_index
+                .entry(label.clone())
+                .or_default()
+                .insert(id);
         }
 
-        self.nodes.insert(id, NodeShell {
+        self.nodes.insert(
             id,
-            labels,
-            properties: Some(properties),
-        });
+            NodeShell {
+                id,
+                labels,
+                properties: Some(properties),
+            },
+        );
         self.hot_node_ids.insert(id);
 
         self.maybe_evict_properties();
@@ -354,13 +360,16 @@ impl TieredGraphStore {
             .or_default()
             .insert(id);
 
-        self.edges.insert(id, EdgeShell {
+        self.edges.insert(
             id,
-            edge_type: edge_type.to_string(),
-            from,
-            to,
-            properties: Some(properties),
-        });
+            EdgeShell {
+                id,
+                edge_type: edge_type.to_string(),
+                from,
+                to,
+                properties: Some(properties),
+            },
+        );
         self.hot_edge_ids.insert(id);
         self.outgoing.entry(from).or_default().push(id);
         self.incoming.entry(to).or_default().push(id);
@@ -417,29 +426,33 @@ impl TieredGraphStore {
     ) -> Vec<(NodeId, Edge)> {
         let mut results = Vec::new();
 
-        let collect = |edge_ids: &[EdgeId], get_neighbor: fn(&EdgeShell) -> NodeId| -> Vec<(NodeId, Edge)> {
-            edge_ids
-                .iter()
-                .filter_map(|eid| {
-                    let shell = self.edges.get(eid)?;
-                    if let Some(et) = edge_type
-                        && shell.edge_type != et {
+        let collect =
+            |edge_ids: &[EdgeId], get_neighbor: fn(&EdgeShell) -> NodeId| -> Vec<(NodeId, Edge)> {
+                edge_ids
+                    .iter()
+                    .filter_map(|eid| {
+                        let shell = self.edges.get(eid)?;
+                        if let Some(et) = edge_type
+                            && shell.edge_type != et
+                        {
                             return None;
                         }
-                    let edge = self.get_edge(*eid)?;
-                    Some((get_neighbor(shell), edge))
-                })
-                .collect()
-        };
+                        let edge = self.get_edge(*eid)?;
+                        Some((get_neighbor(shell), edge))
+                    })
+                    .collect()
+            };
 
         if (direction == Direction::Outgoing || direction == Direction::Both)
-            && let Some(out) = self.outgoing.get(&node_id) {
-                results.extend(collect(out, |e| e.to));
-            }
+            && let Some(out) = self.outgoing.get(&node_id)
+        {
+            results.extend(collect(out, |e| e.to));
+        }
         if (direction == Direction::Incoming || direction == Direction::Both)
-            && let Some(inc) = self.incoming.get(&node_id) {
-                results.extend(collect(inc, |e| e.from));
-            }
+            && let Some(inc) = self.incoming.get(&node_id)
+        {
+            results.extend(collect(inc, |e| e.from));
+        }
 
         results
     }
@@ -513,11 +526,7 @@ impl TieredGraphStore {
     pub fn nodes_by_label(&self, label: &str) -> Vec<Node> {
         self.label_index
             .get(label)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.get_node(*id))
-                    .collect()
-            })
+            .map(|ids| ids.iter().filter_map(|id| self.get_node(*id)).collect())
             .unwrap_or_default()
     }
 
@@ -570,10 +579,11 @@ impl TieredGraphStore {
         let mut cold = self.property_cold.lock();
         for nid in &evict_ids {
             if let Some(shell) = self.nodes.get_mut(nid)
-                && let Some(props) = shell.properties.take() {
-                    let bytes = properties_to_bytes(&props);
-                    cold.put(node_key(*nid), bytes);
-                }
+                && let Some(props) = shell.properties.take()
+            {
+                let bytes = properties_to_bytes(&props);
+                cold.put(node_key(*nid), bytes);
+            }
             self.hot_node_ids.remove(nid);
         }
 
@@ -583,10 +593,11 @@ impl TieredGraphStore {
                 for eid in out_eids.clone() {
                     if self.hot_edge_ids.contains(&eid) {
                         if let Some(eshell) = self.edges.get_mut(&eid)
-                            && let Some(props) = eshell.properties.take() {
-                                let bytes = properties_to_bytes(&props);
-                                cold.put(edge_key(eid), bytes);
-                            }
+                            && let Some(props) = eshell.properties.take()
+                        {
+                            let bytes = properties_to_bytes(&props);
+                            cold.put(edge_key(eid), bytes);
+                        }
                         self.hot_edge_ids.remove(&eid);
                     }
                 }
@@ -601,6 +612,8 @@ impl TieredGraphStore {
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
 
     fn props(pairs: &[(&str, PropValue)]) -> Properties {
@@ -750,7 +763,10 @@ mod tests {
     fn test_tiered_graph_traversal_always_works() {
         let mut store = TieredGraphStore::new(2);
         // Create a chain: a -> b -> c -> d -> e.
-        let a = store.create_node(vec!["Start".to_string()], props(&[("n", PropValue::Int(0))]));
+        let a = store.create_node(
+            vec!["Start".to_string()],
+            props(&[("n", PropValue::Int(0))]),
+        );
         let b = store.create_node(vec![], props(&[("n", PropValue::Int(1))]));
         let c = store.create_node(vec![], props(&[("n", PropValue::Int(2))]));
         let d = store.create_node(vec![], props(&[("n", PropValue::Int(3))]));
@@ -820,10 +836,7 @@ mod tests {
         let mut store = TieredGraphStore::new(500);
         let mut ids = Vec::new();
         for i in 0..5000 {
-            let id = store.create_node(
-                vec!["N".to_string()],
-                props(&[("i", PropValue::Int(i))]),
-            );
+            let id = store.create_node(vec!["N".to_string()], props(&[("i", PropValue::Int(i))]));
             ids.push(id);
         }
         assert_eq!(store.node_count(), 5000);
@@ -838,10 +851,7 @@ mod tests {
         // Spot-check cold properties.
         for &i in &[0, 100, 999, 2500, 4999] {
             let node = store.get_node(ids[i as usize]).unwrap();
-            assert_eq!(
-                node.properties.get("i"),
-                Some(&PropValue::Int(i as i64))
-            );
+            assert_eq!(node.properties.get("i"), Some(&PropValue::Int(i as i64)));
         }
     }
 

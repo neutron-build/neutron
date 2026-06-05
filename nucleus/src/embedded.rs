@@ -13,9 +13,9 @@
 //! }
 //! ```
 
+use std::collections::HashMap;
 #[cfg(feature = "server")]
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::catalog::Catalog;
@@ -34,9 +34,9 @@ pub use crate::fts::InvertedIndex;
 pub use crate::graph::GraphStore;
 pub use crate::kv::KvStore;
 pub use crate::pubsub::{Message, PubSubHub, Stream, StreamEntry, StreamEntryId};
-pub use crate::timeseries::TimeSeriesStore;
 #[cfg(feature = "server")]
 pub use crate::reactive::{CdcLog, CdcLogEntry, ChangeType};
+pub use crate::timeseries::TimeSeriesStore;
 
 /// Storage backend for the embedded database.
 #[derive(Debug, Clone, Default)]
@@ -68,7 +68,9 @@ impl Default for DatabaseBuilder {
 impl DatabaseBuilder {
     /// Create a new builder with in-memory storage.
     pub fn new() -> Self {
-        Self { mode: StorageMode::Memory }
+        Self {
+            mode: StorageMode::Memory,
+        }
     }
 
     /// Use simple in-memory storage (no MVCC, fast for single-threaded use).
@@ -100,7 +102,8 @@ impl DatabaseBuilder {
     /// Build and return the database.
     pub fn build(self) -> Result<Database, DatabaseError> {
         let catalog = Arc::new(Catalog::new());
-        let mut recovered_schemas: Vec<(String, Vec<(String, crate::types::DataType)>)> = Vec::new();
+        let mut recovered_schemas: Vec<(String, Vec<(String, crate::types::DataType)>)> =
+            Vec::new();
         let mut data_dir: Option<std::path::PathBuf> = None;
         let storage: Arc<dyn StorageEngine> = match self.mode {
             StorageMode::Memory => Arc::new(MemoryEngine::new()),
@@ -126,14 +129,15 @@ impl DatabaseBuilder {
         // Register WAL-recovered table schemas in the catalog (synchronous — safe during startup).
         for (name, columns) in recovered_schemas {
             use crate::catalog::{ColumnDef, TableDef};
-            let cols: Vec<ColumnDef> = columns.into_iter().map(|(col_name, dt)| {
-                ColumnDef {
+            let cols: Vec<ColumnDef> = columns
+                .into_iter()
+                .map(|(col_name, dt)| ColumnDef {
                     name: col_name,
                     data_type: dt,
                     nullable: true,
                     default_expr: None,
-                }
-            }).collect();
+                })
+                .collect();
             let td = TableDef {
                 name,
                 columns: cols,
@@ -178,12 +182,18 @@ impl Database {
 
     /// Create an in-memory database (no file, data lost on drop).
     pub fn memory() -> Self {
-        DatabaseBuilder::new().memory().build().expect("memory db never fails")
+        DatabaseBuilder::new()
+            .memory()
+            .build()
+            .expect("memory db never fails")
     }
 
     /// Create an in-memory database with MVCC (snapshot isolation).
     pub fn mvcc() -> Self {
-        DatabaseBuilder::new().mvcc().build().expect("mvcc db never fails")
+        DatabaseBuilder::new()
+            .mvcc()
+            .build()
+            .expect("mvcc db never fails")
     }
 
     /// Open a durable MVCC database at the given path (snapshot isolation + WAL).
@@ -217,10 +227,7 @@ impl Database {
     }
 
     /// Execute a query and return rows with column metadata.
-    pub async fn query_with_columns(
-        &self,
-        sql: &str,
-    ) -> Result<QueryResult, ExecError> {
+    pub async fn query_with_columns(&self, sql: &str) -> Result<QueryResult, ExecError> {
         let results = self.executor.execute(sql).await?;
         for result in results.into_iter().rev() {
             if let ExecResult::Select { columns, rows } = result {
@@ -248,7 +255,10 @@ impl Database {
     /// Get a single scalar value from a query (first column of first row).
     pub async fn query_one(&self, sql: &str) -> Result<Option<Value>, ExecError> {
         let rows = self.query(sql).await?;
-        Ok(rows.into_iter().next().and_then(|row| row.into_iter().next()))
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|row| row.into_iter().next()))
     }
 
     /// Execute a batch of SQL statements separated by semicolons.
@@ -300,42 +310,58 @@ impl Database {
     /// let name = db.kv().get("user:1"); // ~50ns vs ~950ns through SQL
     /// ```
     pub fn kv(&self) -> KvHandle<'_> {
-        KvHandle { store: self.executor.kv_store() }
+        KvHandle {
+            store: self.executor.kv_store(),
+        }
     }
 
     /// Direct access to the full-text search index.
     pub fn fts(&self) -> FtsHandle<'_> {
-        FtsHandle { index: self.executor.fts_index() }
+        FtsHandle {
+            index: self.executor.fts_index(),
+        }
     }
 
     /// Direct access to the document store (JSONB + GIN index).
     pub fn doc(&self) -> DocHandle<'_> {
-        DocHandle { store: self.executor.doc_store() }
+        DocHandle {
+            store: self.executor.doc_store(),
+        }
     }
 
     /// Direct access to the time-series store.
     pub fn ts(&self) -> TsHandle<'_> {
-        TsHandle { store: self.executor.ts_store() }
+        TsHandle {
+            store: self.executor.ts_store(),
+        }
     }
 
     /// Direct access to the blob store (chunked, dedup, BLAKE3).
     pub fn blob(&self) -> BlobHandle<'_> {
-        BlobHandle { store: self.executor.blob_store() }
+        BlobHandle {
+            store: self.executor.blob_store(),
+        }
     }
 
     /// Direct access to the datalog logic programming engine.
     pub fn datalog(&self) -> DatalogHandle<'_> {
-        DatalogHandle { store: self.executor.datalog_store() }
+        DatalogHandle {
+            store: self.executor.datalog_store(),
+        }
     }
 
     /// Direct access to the graph store (nodes, edges, traversal).
     pub fn graph(&self) -> GraphHandle<'_> {
-        GraphHandle { store: self.executor.graph_store() }
+        GraphHandle {
+            store: self.executor.graph_store(),
+        }
     }
 
     /// Direct access to the columnar analytics store.
     pub fn columnar(&self) -> ColumnarHandle<'_> {
-        ColumnarHandle { store: self.executor.columnar_store() }
+        ColumnarHandle {
+            store: self.executor.columnar_store(),
+        }
     }
 
     // ========================================================================
@@ -375,7 +401,9 @@ impl Database {
     /// ps.publish("events", "hello".to_string());
     /// ```
     pub fn pubsub(&self) -> PubSubHandle<'_> {
-        PubSubHandle { hub: self.executor.pubsub_sync() }
+        PubSubHandle {
+            hub: self.executor.pubsub_sync(),
+        }
     }
 
     // ========================================================================
@@ -390,7 +418,9 @@ impl Database {
     /// let id = s.xadd("mystream", vec![("key".into(), "val".into())]);
     /// ```
     pub fn streams(&self) -> StreamsHandle<'_> {
-        StreamsHandle { streams: self.executor.streams() }
+        StreamsHandle {
+            streams: self.executor.streams(),
+        }
     }
 
     // ========================================================================
@@ -408,7 +438,9 @@ impl Database {
     /// ```
     #[cfg(feature = "server")]
     pub fn cdc(&self) -> CdcHandle<'_> {
-        CdcHandle { log: self.executor.cdc_log() }
+        CdcHandle {
+            log: self.executor.cdc_log(),
+        }
     }
 
     // ========================================================================
@@ -482,70 +514,277 @@ pub struct KvHandle<'a> {
 }
 
 impl KvHandle<'_> {
-    pub fn get(&self, key: &str) -> Option<Value> { self.store.get(key) }
-    pub fn set(&self, key: &str, value: Value, ttl_secs: Option<u64>) { self.store.set(key, value, ttl_secs) }
-    pub fn del(&self, key: &str) -> bool { self.store.del(key) }
-    pub fn exists(&self, key: &str) -> bool { self.store.exists(key) }
-    pub fn incr(&self, key: &str) -> Result<i64, crate::kv::KvError> { self.store.incr(key) }
-    pub fn incr_by(&self, key: &str, amount: i64) -> Result<i64, crate::kv::KvError> { self.store.incr_by(key, amount) }
-    pub fn expire(&self, key: &str, ttl_secs: u64) -> bool { self.store.expire(key, ttl_secs) }
-    pub fn persist(&self, key: &str) -> bool { self.store.persist(key) }
-    pub fn ttl(&self, key: &str) -> i64 { self.store.ttl(key) }
-    pub fn keys(&self, pattern: &str) -> Vec<String> { self.store.keys(pattern) }
-    pub fn dbsize(&self) -> usize { self.store.dbsize() }
-    pub fn flushdb(&self) { self.store.flushdb() }
-    pub fn mget(&self, keys: &[&str]) -> Vec<Option<Value>> { self.store.mget(keys) }
-    pub fn mset(&self, pairs: &[(&str, Value)]) { self.store.mset(pairs) }
-    pub fn setnx(&self, key: &str, value: Value) -> bool { self.store.setnx(key, value) }
+    pub fn get(&self, key: &str) -> Option<Value> {
+        self.store.get(key)
+    }
+    pub fn set(&self, key: &str, value: Value, ttl_secs: Option<u64>) {
+        self.store.set(key, value, ttl_secs)
+    }
+    pub fn del(&self, key: &str) -> bool {
+        self.store.del(key)
+    }
+    pub fn exists(&self, key: &str) -> bool {
+        self.store.exists(key)
+    }
+    pub fn incr(&self, key: &str) -> Result<i64, crate::kv::KvError> {
+        self.store.incr(key)
+    }
+    pub fn incr_by(&self, key: &str, amount: i64) -> Result<i64, crate::kv::KvError> {
+        self.store.incr_by(key, amount)
+    }
+    pub fn expire(&self, key: &str, ttl_secs: u64) -> bool {
+        self.store.expire(key, ttl_secs)
+    }
+    pub fn persist(&self, key: &str) -> bool {
+        self.store.persist(key)
+    }
+    pub fn ttl(&self, key: &str) -> i64 {
+        self.store.ttl(key)
+    }
+    pub fn keys(&self, pattern: &str) -> Vec<String> {
+        self.store.keys(pattern)
+    }
+    pub fn dbsize(&self) -> usize {
+        self.store.dbsize()
+    }
+    pub fn flushdb(&self) {
+        self.store.flushdb()
+    }
+    pub fn mget(&self, keys: &[&str]) -> Vec<Option<Value>> {
+        self.store.mget(keys)
+    }
+    pub fn mset(&self, pairs: &[(&str, Value)]) {
+        self.store.mset(pairs)
+    }
+    pub fn setnx(&self, key: &str, value: Value) -> bool {
+        self.store.setnx(key, value)
+    }
 
     // ========================================================================
     // Collection operations (Lists, Hashes, Sets, Sorted Sets, HyperLogLog)
     // ========================================================================
 
     // --- Lists ---
-    pub fn lpush(&self, key: &str, value: Value) -> Result<usize, crate::kv::collections::WrongTypeError> { self.store.lpush(key, value) }
-    pub fn rpush(&self, key: &str, value: Value) -> Result<usize, crate::kv::collections::WrongTypeError> { self.store.rpush(key, value) }
-    pub fn lpop(&self, key: &str) -> Result<Option<Value>, crate::kv::collections::WrongTypeError> { self.store.lpop(key) }
-    pub fn rpop(&self, key: &str) -> Result<Option<Value>, crate::kv::collections::WrongTypeError> { self.store.rpop(key) }
-    pub fn lrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<Value>, crate::kv::collections::WrongTypeError> { self.store.lrange(key, start, stop) }
-    pub fn llen(&self, key: &str) -> Result<usize, crate::kv::collections::WrongTypeError> { self.store.llen(key) }
-    pub fn lindex(&self, key: &str, index: i64) -> Result<Option<Value>, crate::kv::collections::WrongTypeError> { self.store.lindex(key, index) }
+    pub fn lpush(
+        &self,
+        key: &str,
+        value: Value,
+    ) -> Result<usize, crate::kv::collections::WrongTypeError> {
+        self.store.lpush(key, value)
+    }
+    pub fn rpush(
+        &self,
+        key: &str,
+        value: Value,
+    ) -> Result<usize, crate::kv::collections::WrongTypeError> {
+        self.store.rpush(key, value)
+    }
+    pub fn lpop(&self, key: &str) -> Result<Option<Value>, crate::kv::collections::WrongTypeError> {
+        self.store.lpop(key)
+    }
+    pub fn rpop(&self, key: &str) -> Result<Option<Value>, crate::kv::collections::WrongTypeError> {
+        self.store.rpop(key)
+    }
+    pub fn lrange(
+        &self,
+        key: &str,
+        start: i64,
+        stop: i64,
+    ) -> Result<Vec<Value>, crate::kv::collections::WrongTypeError> {
+        self.store.lrange(key, start, stop)
+    }
+    pub fn llen(&self, key: &str) -> Result<usize, crate::kv::collections::WrongTypeError> {
+        self.store.llen(key)
+    }
+    pub fn lindex(
+        &self,
+        key: &str,
+        index: i64,
+    ) -> Result<Option<Value>, crate::kv::collections::WrongTypeError> {
+        self.store.lindex(key, index)
+    }
 
     // --- Hashes ---
-    pub fn hset(&self, key: &str, field: &str, value: Value) -> Result<bool, crate::kv::collections::WrongTypeError> { self.store.hset(key, field, value) }
-    pub fn hget(&self, key: &str, field: &str) -> Result<Option<Value>, crate::kv::collections::WrongTypeError> { self.store.hget(key, field) }
-    pub fn hdel(&self, key: &str, field: &str) -> Result<bool, crate::kv::collections::WrongTypeError> { self.store.hdel(key, field) }
-    pub fn hgetall(&self, key: &str) -> Result<Vec<(String, Value)>, crate::kv::collections::WrongTypeError> { self.store.hgetall(key) }
-    pub fn hkeys(&self, key: &str) -> Result<Vec<String>, crate::kv::collections::WrongTypeError> { self.store.hkeys(key) }
-    pub fn hvals(&self, key: &str) -> Result<Vec<Value>, crate::kv::collections::WrongTypeError> { self.store.hvals(key) }
-    pub fn hexists(&self, key: &str, field: &str) -> Result<bool, crate::kv::collections::WrongTypeError> { self.store.hexists(key, field) }
-    pub fn hlen(&self, key: &str) -> Result<usize, crate::kv::collections::WrongTypeError> { self.store.hlen(key) }
+    pub fn hset(
+        &self,
+        key: &str,
+        field: &str,
+        value: Value,
+    ) -> Result<bool, crate::kv::collections::WrongTypeError> {
+        self.store.hset(key, field, value)
+    }
+    pub fn hget(
+        &self,
+        key: &str,
+        field: &str,
+    ) -> Result<Option<Value>, crate::kv::collections::WrongTypeError> {
+        self.store.hget(key, field)
+    }
+    pub fn hdel(
+        &self,
+        key: &str,
+        field: &str,
+    ) -> Result<bool, crate::kv::collections::WrongTypeError> {
+        self.store.hdel(key, field)
+    }
+    pub fn hgetall(
+        &self,
+        key: &str,
+    ) -> Result<Vec<(String, Value)>, crate::kv::collections::WrongTypeError> {
+        self.store.hgetall(key)
+    }
+    pub fn hkeys(&self, key: &str) -> Result<Vec<String>, crate::kv::collections::WrongTypeError> {
+        self.store.hkeys(key)
+    }
+    pub fn hvals(&self, key: &str) -> Result<Vec<Value>, crate::kv::collections::WrongTypeError> {
+        self.store.hvals(key)
+    }
+    pub fn hexists(
+        &self,
+        key: &str,
+        field: &str,
+    ) -> Result<bool, crate::kv::collections::WrongTypeError> {
+        self.store.hexists(key, field)
+    }
+    pub fn hlen(&self, key: &str) -> Result<usize, crate::kv::collections::WrongTypeError> {
+        self.store.hlen(key)
+    }
 
     // --- Sets ---
-    pub fn sadd(&self, key: &str, member: &str) -> Result<bool, crate::kv::collections::WrongTypeError> { self.store.sadd(key, member) }
-    pub fn srem(&self, key: &str, member: &str) -> Result<bool, crate::kv::collections::WrongTypeError> { self.store.srem(key, member) }
-    pub fn smembers(&self, key: &str) -> Result<Vec<String>, crate::kv::collections::WrongTypeError> { self.store.smembers(key) }
-    pub fn sismember(&self, key: &str, member: &str) -> Result<bool, crate::kv::collections::WrongTypeError> { self.store.sismember(key, member) }
-    pub fn scard(&self, key: &str) -> Result<usize, crate::kv::collections::WrongTypeError> { self.store.scard(key) }
-    pub fn sinter(&self, keys: &[&str]) -> Result<Vec<String>, crate::kv::collections::WrongTypeError> { self.store.sinter(keys) }
-    pub fn sunion(&self, keys: &[&str]) -> Result<Vec<String>, crate::kv::collections::WrongTypeError> { self.store.sunion(keys) }
-    pub fn sdiff(&self, keys: &[&str]) -> Result<Vec<String>, crate::kv::collections::WrongTypeError> { self.store.sdiff(keys) }
+    pub fn sadd(
+        &self,
+        key: &str,
+        member: &str,
+    ) -> Result<bool, crate::kv::collections::WrongTypeError> {
+        self.store.sadd(key, member)
+    }
+    pub fn srem(
+        &self,
+        key: &str,
+        member: &str,
+    ) -> Result<bool, crate::kv::collections::WrongTypeError> {
+        self.store.srem(key, member)
+    }
+    pub fn smembers(
+        &self,
+        key: &str,
+    ) -> Result<Vec<String>, crate::kv::collections::WrongTypeError> {
+        self.store.smembers(key)
+    }
+    pub fn sismember(
+        &self,
+        key: &str,
+        member: &str,
+    ) -> Result<bool, crate::kv::collections::WrongTypeError> {
+        self.store.sismember(key, member)
+    }
+    pub fn scard(&self, key: &str) -> Result<usize, crate::kv::collections::WrongTypeError> {
+        self.store.scard(key)
+    }
+    pub fn sinter(
+        &self,
+        keys: &[&str],
+    ) -> Result<Vec<String>, crate::kv::collections::WrongTypeError> {
+        self.store.sinter(keys)
+    }
+    pub fn sunion(
+        &self,
+        keys: &[&str],
+    ) -> Result<Vec<String>, crate::kv::collections::WrongTypeError> {
+        self.store.sunion(keys)
+    }
+    pub fn sdiff(
+        &self,
+        keys: &[&str],
+    ) -> Result<Vec<String>, crate::kv::collections::WrongTypeError> {
+        self.store.sdiff(keys)
+    }
 
     // --- Sorted Sets ---
-    pub fn col_zadd(&self, key: &str, member: &str, score: f64) -> Result<bool, crate::kv::collections::WrongTypeError> { self.store.col_zadd(key, member, score) }
-    pub fn col_zrem(&self, key: &str, member: &str) -> Result<bool, crate::kv::collections::WrongTypeError> { self.store.col_zrem(key, member) }
-    pub fn col_zrange(&self, key: &str, start: usize, stop: usize) -> Result<Vec<crate::kv::SortedSetEntry>, crate::kv::collections::WrongTypeError> { self.store.col_zrange(key, start, stop) }
-    pub fn col_zrevrange(&self, key: &str, start: usize, stop: usize) -> Result<Vec<crate::kv::SortedSetEntry>, crate::kv::collections::WrongTypeError> { self.store.col_zrevrange(key, start, stop) }
-    pub fn col_zrangebyscore(&self, key: &str, min: f64, max: f64) -> Result<Vec<crate::kv::SortedSetEntry>, crate::kv::collections::WrongTypeError> { self.store.col_zrangebyscore(key, min, max) }
-    pub fn col_zrank(&self, key: &str, member: &str) -> Result<Option<usize>, crate::kv::collections::WrongTypeError> { self.store.col_zrank(key, member) }
-    pub fn col_zincrby(&self, key: &str, member: &str, increment: f64) -> Result<f64, crate::kv::collections::WrongTypeError> { self.store.col_zincrby(key, member, increment) }
-    pub fn col_zcard(&self, key: &str) -> Result<usize, crate::kv::collections::WrongTypeError> { self.store.col_zcard(key) }
-    pub fn col_zcount(&self, key: &str, min: f64, max: f64) -> Result<usize, crate::kv::collections::WrongTypeError> { self.store.col_zcount(key, min, max) }
+    pub fn col_zadd(
+        &self,
+        key: &str,
+        member: &str,
+        score: f64,
+    ) -> Result<bool, crate::kv::collections::WrongTypeError> {
+        self.store.col_zadd(key, member, score)
+    }
+    pub fn col_zrem(
+        &self,
+        key: &str,
+        member: &str,
+    ) -> Result<bool, crate::kv::collections::WrongTypeError> {
+        self.store.col_zrem(key, member)
+    }
+    pub fn col_zrange(
+        &self,
+        key: &str,
+        start: usize,
+        stop: usize,
+    ) -> Result<Vec<crate::kv::SortedSetEntry>, crate::kv::collections::WrongTypeError> {
+        self.store.col_zrange(key, start, stop)
+    }
+    pub fn col_zrevrange(
+        &self,
+        key: &str,
+        start: usize,
+        stop: usize,
+    ) -> Result<Vec<crate::kv::SortedSetEntry>, crate::kv::collections::WrongTypeError> {
+        self.store.col_zrevrange(key, start, stop)
+    }
+    pub fn col_zrangebyscore(
+        &self,
+        key: &str,
+        min: f64,
+        max: f64,
+    ) -> Result<Vec<crate::kv::SortedSetEntry>, crate::kv::collections::WrongTypeError> {
+        self.store.col_zrangebyscore(key, min, max)
+    }
+    pub fn col_zrank(
+        &self,
+        key: &str,
+        member: &str,
+    ) -> Result<Option<usize>, crate::kv::collections::WrongTypeError> {
+        self.store.col_zrank(key, member)
+    }
+    pub fn col_zincrby(
+        &self,
+        key: &str,
+        member: &str,
+        increment: f64,
+    ) -> Result<f64, crate::kv::collections::WrongTypeError> {
+        self.store.col_zincrby(key, member, increment)
+    }
+    pub fn col_zcard(&self, key: &str) -> Result<usize, crate::kv::collections::WrongTypeError> {
+        self.store.col_zcard(key)
+    }
+    pub fn col_zcount(
+        &self,
+        key: &str,
+        min: f64,
+        max: f64,
+    ) -> Result<usize, crate::kv::collections::WrongTypeError> {
+        self.store.col_zcount(key, min, max)
+    }
 
     // --- HyperLogLog ---
-    pub fn col_pfadd(&self, key: &str, element: &str) -> Result<bool, crate::kv::collections::WrongTypeError> { self.store.col_pfadd(key, element) }
-    pub fn col_pfcount(&self, key: &str) -> Result<u64, crate::kv::collections::WrongTypeError> { self.store.col_pfcount(key) }
-    pub fn col_pfmerge(&self, dest_key: &str, source_keys: &[&str]) -> Result<(), crate::kv::collections::WrongTypeError> { self.store.col_pfmerge(dest_key, source_keys) }
+    pub fn col_pfadd(
+        &self,
+        key: &str,
+        element: &str,
+    ) -> Result<bool, crate::kv::collections::WrongTypeError> {
+        self.store.col_pfadd(key, element)
+    }
+    pub fn col_pfcount(&self, key: &str) -> Result<u64, crate::kv::collections::WrongTypeError> {
+        self.store.col_pfcount(key)
+    }
+    pub fn col_pfmerge(
+        &self,
+        dest_key: &str,
+        source_keys: &[&str],
+    ) -> Result<(), crate::kv::collections::WrongTypeError> {
+        self.store.col_pfmerge(dest_key, source_keys)
+    }
 }
 
 /// Direct FTS access — search and index without SQL overhead.
@@ -664,7 +903,12 @@ impl BlobHandle<'_> {
     }
     /// List all blob keys.
     pub fn list_keys(&self) -> Vec<String> {
-        self.store.read().list_keys().into_iter().map(|s| s.to_string()).collect()
+        self.store
+            .read()
+            .list_keys()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 }
 
@@ -823,7 +1067,12 @@ impl PubSubHandle<'_> {
 
     /// List all active channels.
     pub fn channels(&self) -> Vec<String> {
-        self.hub.read().channels().into_iter().map(|s| s.to_string()).collect()
+        self.hub
+            .read()
+            .channels()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 }
 
@@ -841,7 +1090,7 @@ impl StreamsHandle<'_> {
     /// Returns the auto-generated entry ID.
     pub fn xadd(&self, stream: &str, fields: Vec<(String, String)>) -> StreamEntryId {
         let mut map = self.streams.write();
-        let s = map.entry(stream.to_string()).or_insert_with(crate::pubsub::Stream::new);
+        let s = map.entry(stream.to_string()).or_default();
         s.xadd(fields)
     }
 
@@ -902,13 +1151,28 @@ pub struct CdcHandle<'a> {
 impl CdcHandle<'_> {
     /// Read change events for a specific table since a sequence number.
     /// Returns up to `limit` entries after the given sequence.
-    pub fn changes(&self, table: &str, since: u64, limit: usize) -> Vec<crate::reactive::CdcLogEntry> {
-        self.log.read().read_table_from(table, since, limit).into_iter().cloned().collect()
+    pub fn changes(
+        &self,
+        table: &str,
+        since: u64,
+        limit: usize,
+    ) -> Vec<crate::reactive::CdcLogEntry> {
+        self.log
+            .read()
+            .read_table_from(table, since, limit)
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     /// Read all change events (any table) since a sequence number.
     pub fn changes_all(&self, since: u64, limit: usize) -> Vec<crate::reactive::CdcLogEntry> {
-        self.log.read().read_from(since, limit).into_iter().cloned().collect()
+        self.log
+            .read()
+            .read_from(since, limit)
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     /// Register a named consumer to track its position in the CDC log.
@@ -979,9 +1243,7 @@ mod tests {
         db.execute("CREATE TABLE nums (v INT NOT NULL)")
             .await
             .unwrap();
-        db.execute("INSERT INTO nums VALUES (42)")
-            .await
-            .unwrap();
+        db.execute("INSERT INTO nums VALUES (42)").await.unwrap();
 
         let val = db.query_one("SELECT v FROM nums").await.unwrap();
         assert_eq!(val, Some(Value::Int32(42)));
@@ -1037,7 +1299,9 @@ mod tests {
     #[tokio::test]
     async fn embedded_mvcc_transaction() {
         let db = Database::mvcc();
-        db.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)")
+            .await
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1)").await.unwrap();
 
         // Start a transaction, insert, then rollback
@@ -1054,7 +1318,9 @@ mod tests {
     #[tokio::test]
     async fn embedded_mvcc_commit() {
         let db = Database::mvcc();
-        db.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)")
+            .await
+            .unwrap();
 
         db.execute("BEGIN").await.unwrap();
         db.execute("INSERT INTO t VALUES (1)").await.unwrap();
@@ -1068,7 +1334,9 @@ mod tests {
     #[tokio::test]
     async fn embedded_builder_pattern() {
         let db = Database::builder().mvcc().build().unwrap();
-        db.execute("CREATE TABLE t (id INT NOT NULL)").await.unwrap();
+        db.execute("CREATE TABLE t (id INT NOT NULL)")
+            .await
+            .unwrap();
         db.execute("INSERT INTO t VALUES (42)").await.unwrap();
         let val = db.query_one("SELECT id FROM t").await.unwrap();
         assert_eq!(val, Some(Value::Int32(42)));
@@ -1110,7 +1378,9 @@ mod tests {
     #[tokio::test]
     async fn embedded_close() {
         let db = Database::memory();
-        db.execute("CREATE TABLE c (id INT NOT NULL)").await.unwrap();
+        db.execute("CREATE TABLE c (id INT NOT NULL)")
+            .await
+            .unwrap();
         db.execute("INSERT INTO c VALUES (1)").await.unwrap();
         db.close(); // consumes db — no further use possible
     }
@@ -1121,9 +1391,7 @@ mod tests {
         db.execute("CREATE TABLE alias (v INT NOT NULL)")
             .await
             .unwrap();
-        db.execute("INSERT INTO alias VALUES (7)")
-            .await
-            .unwrap();
+        db.execute("INSERT INTO alias VALUES (7)").await.unwrap();
         let val = db.query_one("SELECT v FROM alias").await.unwrap();
         assert_eq!(val, Some(Value::Int32(7)));
     }
@@ -1155,10 +1423,7 @@ mod tests {
         db.execute("INSERT INTO meta VALUES (1, 'x')")
             .await
             .unwrap();
-        let result = db
-            .query_with_columns("SELECT * FROM meta")
-            .await
-            .unwrap();
+        let result = db.query_with_columns("SELECT * FROM meta").await.unwrap();
         assert_eq!(result.columns.len(), 2);
         assert_eq!(result.rows.len(), 1);
     }
@@ -1252,13 +1517,16 @@ mod tests {
     async fn direct_kv_matches_sql() {
         let db = Database::memory();
         // Set via direct API
-        db.kv().set("via_direct", Value::Text("direct_val".into()), None);
+        db.kv()
+            .set("via_direct", Value::Text("direct_val".into()), None);
         // Read via SQL
         let val = db.query_one("SELECT kv_get('via_direct')").await.unwrap();
         assert_eq!(val, Some(Value::Text("direct_val".into())));
 
         // Set via SQL
-        db.execute("SELECT kv_set('via_sql', 'sql_val')").await.unwrap();
+        db.execute("SELECT kv_set('via_sql', 'sql_val')")
+            .await
+            .unwrap();
         // Read via direct API
         assert_eq!(db.kv().get("via_sql"), Some(Value::Text("sql_val".into())));
     }
@@ -1340,9 +1608,30 @@ mod tests {
         use crate::timeseries::DataPoint;
         let db = Database::memory();
         let ts = db.ts();
-        ts.insert("cpu", DataPoint { timestamp: 1000, tags: vec![], value: 50.0 });
-        ts.insert("cpu", DataPoint { timestamp: 2000, tags: vec![], value: 70.0 });
-        ts.insert("cpu", DataPoint { timestamp: 3000, tags: vec![], value: 60.0 });
+        ts.insert(
+            "cpu",
+            DataPoint {
+                timestamp: 1000,
+                tags: vec![],
+                value: 50.0,
+            },
+        );
+        ts.insert(
+            "cpu",
+            DataPoint {
+                timestamp: 2000,
+                tags: vec![],
+                value: 70.0,
+            },
+        );
+        ts.insert(
+            "cpu",
+            DataPoint {
+                timestamp: 3000,
+                tags: vec![],
+                value: 60.0,
+            },
+        );
         let last = ts.last_value("cpu");
         assert!(last.is_some());
         assert_eq!(last.unwrap().value, 60.0);
@@ -1436,13 +1725,15 @@ mod tests {
         {
             let mut c = col.write();
             c.create_table("metrics");
-            let batch = ColumnBatch::new(vec![
-                ("value".to_string(), ColumnData::Float64(vec![Some(42.0)])),
-            ]);
+            let batch = ColumnBatch::new(vec![(
+                "value".to_string(),
+                ColumnData::Float64(vec![Some(42.0)]),
+            )]);
             c.append("metrics", batch);
-            let batch2 = ColumnBatch::new(vec![
-                ("value".to_string(), ColumnData::Float64(vec![Some(58.0)])),
-            ]);
+            let batch2 = ColumnBatch::new(vec![(
+                "value".to_string(),
+                ColumnData::Float64(vec![Some(58.0)]),
+            )]);
             c.append("metrics", batch2);
         }
         {

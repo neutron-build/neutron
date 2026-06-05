@@ -86,10 +86,7 @@ impl CdcWal {
                 next_sequence: 1,
             }
         };
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok((
             Self {
                 path,
@@ -171,13 +168,22 @@ impl CdcWal {
             }
         }
 
-        // consumers: we don't have direct access to the consumers map from CdcLog,
-        // so we write 0 consumers in the snapshot. Consumer positions are reconstructed
-        // from CONSUMER entries that follow the snapshot.
-        payload.extend_from_slice(&0u32.to_le_bytes());
+        // consumers: serialize the real positions into the snapshot. checkpoint()
+        // truncates the file below, so any CONSUMER entries written before this
+        // point are discarded — writing 0 here previously LOST every consumer
+        // offset on checkpoint (consumers would re-read from their old position
+        // or restart). Persist them in the snapshot instead.
+        let consumers = cdc_log.consumers();
+        payload.extend_from_slice(&(consumers.len() as u32).to_le_bytes());
+        for (name, position) in consumers {
+            write_str(&mut payload, name);
+            payload.extend_from_slice(&position.to_le_bytes());
+        }
 
         // Flush existing writer
-        { self.writer.lock().flush()?; }
+        {
+            self.writer.lock().flush()?;
+        }
 
         // Truncate and rewrite as single SNAPSHOT entry
         let file = OpenOptions::new()
@@ -237,41 +243,68 @@ fn replay(data: &[u8]) -> CdcWalState {
     let mut pos = 0usize;
 
     while pos < data.len() {
-        let Some(&entry_type) = data.get(pos) else { break };
+        let Some(&entry_type) = data.get(pos) else {
+            break;
+        };
         pos += 1;
 
         match entry_type {
             ENTRY_APPEND => {
-                let Some(entry) = replay_append(data, &mut pos) else { break };
+                let Some(entry) = replay_append(data, &mut pos) else {
+                    break;
+                };
                 if entry.sequence >= next_sequence {
                     next_sequence = entry.sequence + 1;
                 }
                 entries.push(entry);
             }
             ENTRY_CONSUMER => {
-                let Some(name) = read_string(data, &mut pos) else { break };
-                let Some(position) = read_u64(data, &mut pos) else { break };
+                let Some(name) = read_string(data, &mut pos) else {
+                    break;
+                };
+                let Some(position) = read_u64(data, &mut pos) else {
+                    break;
+                };
                 consumers.insert(name, position);
             }
             ENTRY_SNAPSHOT => {
                 entries.clear();
                 consumers.clear();
-                let Some(ns) = read_u64(data, &mut pos) else { break };
+                let Some(ns) = read_u64(data, &mut pos) else {
+                    break;
+                };
                 next_sequence = ns;
-                let Some(n_entries) = read_u32(data, &mut pos) else { break };
+                let Some(n_entries) = read_u32(data, &mut pos) else {
+                    break;
+                };
                 let mut ok = true;
                 for _ in 0..n_entries as usize {
-                    let Some(entry) = replay_append(data, &mut pos) else { ok = false; break };
+                    let Some(entry) = replay_append(data, &mut pos) else {
+                        ok = false;
+                        break;
+                    };
                     entries.push(entry);
                 }
-                if !ok { break; }
-                let Some(n_consumers) = read_u32(data, &mut pos) else { break };
+                if !ok {
+                    break;
+                }
+                let Some(n_consumers) = read_u32(data, &mut pos) else {
+                    break;
+                };
                 for _ in 0..n_consumers as usize {
-                    let Some(name) = read_string(data, &mut pos) else { ok = false; break };
-                    let Some(position) = read_u64(data, &mut pos) else { ok = false; break };
+                    let Some(name) = read_string(data, &mut pos) else {
+                        ok = false;
+                        break;
+                    };
+                    let Some(position) = read_u64(data, &mut pos) else {
+                        ok = false;
+                        break;
+                    };
                     consumers.insert(name, position);
                 }
-                if !ok { break; }
+                if !ok {
+                    break;
+                }
             }
             _ => {
                 break;
@@ -330,7 +363,9 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
     if *pos + len > data.len() {
         return None;
     }
-    let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+    let s = std::str::from_utf8(&data[*pos..*pos + len])
+        .ok()?
+        .to_string();
     *pos += len;
     Some(s)
 }
@@ -342,7 +377,10 @@ mod tests {
     use super::*;
 
     fn make_row(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -415,6 +453,28 @@ mod tests {
         let (_wal2, state) = CdcWal::open(dir.path()).unwrap();
         assert_eq!(state.consumers["app1"], 1);
         assert_eq!(state.consumers["app2"], 0);
+    }
+
+    #[test]
+    fn test_consumer_offsets_survive_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = CdcWal::open(dir.path()).unwrap();
+
+        // Build a CdcLog with entries and acknowledged consumer positions.
+        let mut log = crate::reactive::CdcLog::new();
+        log.append("t", ChangeType::Insert, make_row(&[("x", "1")]));
+        log.append("t", ChangeType::Insert, make_row(&[("x", "2")]));
+        log.acknowledge("app1", 2);
+        log.register_consumer("app2"); // position 0
+
+        // checkpoint() truncates the WAL — consumer offsets must be persisted
+        // into the snapshot, not lost (they were previously written as 0).
+        wal.checkpoint(&log).unwrap();
+        drop(wal);
+
+        let (_wal2, state) = CdcWal::open(dir.path()).unwrap();
+        assert_eq!(state.consumers.get("app1"), Some(&2));
+        assert_eq!(state.consumers.get("app2"), Some(&0));
     }
 
     #[test]
@@ -499,14 +559,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = CdcWal::open(dir.path()).unwrap();
 
-        for (seq, ct) in [(1, ChangeType::Insert), (2, ChangeType::Update), (3, ChangeType::Delete)] {
+        for (seq, ct) in [
+            (1, ChangeType::Insert),
+            (2, ChangeType::Update),
+            (3, ChangeType::Delete),
+        ] {
             wal.log_append(&CdcLogEntry {
                 sequence: seq,
                 table: "t".to_string(),
                 change_type: ct,
                 row_data: HashMap::new(),
                 timestamp: seq * 100,
-            }).unwrap();
+            })
+            .unwrap();
         }
         drop(wal);
 

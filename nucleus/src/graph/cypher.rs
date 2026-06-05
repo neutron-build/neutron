@@ -216,9 +216,9 @@ impl fmt::Display for Token {
 }
 
 const KEYWORDS: &[&str] = &[
-    "MATCH", "CREATE", "DELETE", "RETURN", "WHERE", "AND", "OR", "NOT", "TRUE",
-    "FALSE", "NULL", "COUNT", "AS", "SET", "REMOVE", "DETACH", "OPTIONAL",
-    "WITH", "ORDER", "BY", "SKIP", "LIMIT", "DISTINCT",
+    "MATCH", "CREATE", "DELETE", "RETURN", "WHERE", "AND", "OR", "NOT", "TRUE", "FALSE", "NULL",
+    "COUNT", "AS", "SET", "REMOVE", "DETACH", "OPTIONAL", "WITH", "ORDER", "BY", "SKIP", "LIMIT",
+    "DISTINCT",
 ];
 
 fn is_keyword(word: &str) -> bool {
@@ -380,9 +380,9 @@ fn tokenize(input: &str) -> Result<Vec<Token>, CypherError> {
             }
             let num_str: String = chars[start..i].iter().collect();
             if num_str.contains('.') {
-                let val: f64 = num_str.parse().map_err(|_| {
-                    CypherError::InvalidSyntax(format!("invalid float: {num_str}"))
-                })?;
+                let val: f64 = num_str
+                    .parse()
+                    .map_err(|_| CypherError::InvalidSyntax(format!("invalid float: {num_str}")))?;
                 tokens.push(Token::FloatLit(val));
             } else {
                 let val: i64 = num_str.parse().map_err(|_| {
@@ -597,8 +597,7 @@ impl Parser {
                 items.push(node);
 
                 while self.check_token(&Token::Dash) || self.check_token(&Token::Lt) {
-                    let (edge, next_node) =
-                        self.parse_create_edge_and_node(None, &items)?;
+                    let (edge, next_node) = self.parse_create_edge_and_node(None, &items)?;
                     items.push(edge);
                     items.push(next_node);
                 }
@@ -823,9 +822,7 @@ impl Parser {
 
     /// Parse the internals of a node: variable, labels, properties.
     /// Called after consuming `(` and before consuming `)`.
-    fn parse_node_internals(
-        &mut self,
-    ) -> Result<NodeInternals, CypherError> {
+    fn parse_node_internals(&mut self) -> Result<NodeInternals, CypherError> {
         let mut variable = None;
         let mut labels = Vec::new();
         let mut properties = BTreeMap::new();
@@ -864,9 +861,7 @@ impl Parser {
 
     /// Parse the internals of an edge bracket: variable, type, properties.
     /// Called after consuming `[` and before consuming `]`.
-    fn parse_edge_internals(
-        &mut self,
-    ) -> Result<EdgeInternals, CypherError> {
+    fn parse_edge_internals(&mut self) -> Result<EdgeInternals, CypherError> {
         let mut variable = None;
         let mut edge_type = None;
         let mut properties = BTreeMap::new();
@@ -1168,17 +1163,11 @@ mod tests {
             } => {
                 assert_eq!(pattern.nodes.len(), 1);
                 assert_eq!(pattern.edges.len(), 0);
-                assert_eq!(
-                    pattern.nodes[0].variable,
-                    Some("n".into())
-                );
+                assert_eq!(pattern.nodes[0].variable, Some("n".into()));
                 assert!(pattern.nodes[0].labels.is_empty());
                 assert!(where_clause.is_none());
                 assert_eq!(return_clause.items.len(), 1);
-                assert_eq!(
-                    return_clause.items[0],
-                    ReturnItem::Variable("n".into())
-                );
+                assert_eq!(return_clause.items[0], ReturnItem::Variable("n".into()));
             }
             _ => panic!("expected Match statement"),
         }
@@ -1190,10 +1179,7 @@ mod tests {
         match stmt {
             CypherStatement::Match { pattern, .. } => {
                 assert_eq!(pattern.nodes.len(), 1);
-                assert_eq!(
-                    pattern.nodes[0].variable,
-                    Some("n".into())
-                );
+                assert_eq!(pattern.nodes[0].variable, Some("n".into()));
                 assert_eq!(pattern.nodes[0].labels, vec!["Person".to_string()]);
             }
             _ => panic!("expected Match statement"),
@@ -1202,8 +1188,7 @@ mod tests {
 
     #[test]
     fn test_parse_match_with_relationship() {
-        let stmt =
-            parse_cypher("MATCH (n:Person)-[:KNOWS]->(m:Person) RETURN n, m").unwrap();
+        let stmt = parse_cypher("MATCH (n:Person)-[:KNOWS]->(m:Person) RETURN n, m").unwrap();
         match stmt {
             CypherStatement::Match {
                 pattern,
@@ -1219,24 +1204,12 @@ mod tests {
                 assert_eq!(edge.from_idx, 0);
                 assert_eq!(edge.to_idx, 1);
 
-                assert_eq!(
-                    pattern.nodes[0].labels,
-                    vec!["Person".to_string()]
-                );
-                assert_eq!(
-                    pattern.nodes[1].labels,
-                    vec!["Person".to_string()]
-                );
+                assert_eq!(pattern.nodes[0].labels, vec!["Person".to_string()]);
+                assert_eq!(pattern.nodes[1].labels, vec!["Person".to_string()]);
 
                 assert_eq!(return_clause.items.len(), 2);
-                assert_eq!(
-                    return_clause.items[0],
-                    ReturnItem::Variable("n".into())
-                );
-                assert_eq!(
-                    return_clause.items[1],
-                    ReturnItem::Variable("m".into())
-                );
+                assert_eq!(return_clause.items[0], ReturnItem::Variable("n".into()));
+                assert_eq!(return_clause.items[1], ReturnItem::Variable("m".into()));
             }
             _ => panic!("expected Match statement"),
         }
@@ -1244,8 +1217,7 @@ mod tests {
 
     #[test]
     fn test_parse_match_with_properties() {
-        let stmt =
-            parse_cypher("MATCH (n:Person {name: 'Alice'}) RETURN n").unwrap();
+        let stmt = parse_cypher("MATCH (n:Person {name: 'Alice'}) RETURN n").unwrap();
         match stmt {
             CypherStatement::Match { pattern, .. } => {
                 assert_eq!(pattern.nodes.len(), 1);
@@ -1263,8 +1235,7 @@ mod tests {
 
     #[test]
     fn test_parse_create_node() {
-        let stmt =
-            parse_cypher("CREATE (n:Person {name: 'Bob', age: 25})").unwrap();
+        let stmt = parse_cypher("CREATE (n:Person {name: 'Bob', age: 25})").unwrap();
         match stmt {
             CypherStatement::Create { items } => {
                 assert_eq!(items.len(), 1);
@@ -1276,14 +1247,8 @@ mod tests {
                     } => {
                         assert_eq!(variable, &Some("n".into()));
                         assert_eq!(labels, &vec!["Person".to_string()]);
-                        assert_eq!(
-                            properties.get("name"),
-                            Some(&PropValue::Text("Bob".into()))
-                        );
-                        assert_eq!(
-                            properties.get("age"),
-                            Some(&PropValue::Int(25))
-                        );
+                        assert_eq!(properties.get("name"), Some(&PropValue::Text("Bob".into())));
+                        assert_eq!(properties.get("age"), Some(&PropValue::Int(25)));
                     }
                     _ => panic!("expected Node create item"),
                 }
@@ -1294,10 +1259,9 @@ mod tests {
 
     #[test]
     fn test_parse_create_with_edge() {
-        let stmt = parse_cypher(
-            "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})",
-        )
-        .unwrap();
+        let stmt =
+            parse_cypher("CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})")
+                .unwrap();
         match stmt {
             CypherStatement::Create { items } => {
                 // Should have: Node(a), Edge(a->b), Node(b)
@@ -1404,8 +1368,7 @@ mod tests {
 
     #[test]
     fn test_parse_where_clause() {
-        let stmt =
-            parse_cypher("MATCH (n:Person) WHERE n.age = 30 RETURN n").unwrap();
+        let stmt = parse_cypher("MATCH (n:Person) WHERE n.age = 30 RETURN n").unwrap();
         match stmt {
             CypherStatement::Match {
                 where_clause: Some(wc),
@@ -1431,10 +1394,8 @@ mod tests {
 
     #[test]
     fn test_parse_where_with_and() {
-        let stmt = parse_cypher(
-            "MATCH (n:Person) WHERE n.age = 30 AND n.name = 'Alice' RETURN n",
-        )
-        .unwrap();
+        let stmt = parse_cypher("MATCH (n:Person) WHERE n.age = 30 AND n.name = 'Alice' RETURN n")
+            .unwrap();
         match stmt {
             CypherStatement::Match {
                 where_clause: Some(wc),
@@ -1459,10 +1420,7 @@ mod tests {
         let stmt2 = parse_cypher("DELETE n, m").unwrap();
         match stmt2 {
             CypherStatement::Delete { variables } => {
-                assert_eq!(
-                    variables,
-                    vec!["n".to_string(), "m".to_string()]
-                );
+                assert_eq!(variables, vec!["n".to_string(), "m".to_string()]);
             }
             _ => panic!("expected Delete"),
         }
@@ -1484,30 +1442,20 @@ mod tests {
 
     #[test]
     fn test_tokenizer_string_values() {
-        let stmt = parse_cypher(
-            "CREATE (n:Movie {title: 'The Matrix', year: 1999, rating: 8.7})",
-        )
-        .unwrap();
+        let stmt = parse_cypher("CREATE (n:Movie {title: 'The Matrix', year: 1999, rating: 8.7})")
+            .unwrap();
         match stmt {
-            CypherStatement::Create { items } => {
-                match &items[0] {
-                    CreateItem::Node { properties, .. } => {
-                        assert_eq!(
-                            properties.get("title"),
-                            Some(&PropValue::Text("The Matrix".into()))
-                        );
-                        assert_eq!(
-                            properties.get("year"),
-                            Some(&PropValue::Int(1999))
-                        );
-                        assert_eq!(
-                            properties.get("rating"),
-                            Some(&PropValue::Float(8.7))
-                        );
-                    }
-                    _ => panic!("expected Node"),
+            CypherStatement::Create { items } => match &items[0] {
+                CreateItem::Node { properties, .. } => {
+                    assert_eq!(
+                        properties.get("title"),
+                        Some(&PropValue::Text("The Matrix".into()))
+                    );
+                    assert_eq!(properties.get("year"), Some(&PropValue::Int(1999)));
+                    assert_eq!(properties.get("rating"), Some(&PropValue::Float(8.7)));
                 }
-            }
+                _ => panic!("expected Node"),
+            },
             _ => panic!("expected Create"),
         }
     }

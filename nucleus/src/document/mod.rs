@@ -75,11 +75,9 @@ impl JsonValue {
     /// - Scalars are compared for equality.
     pub fn contains(&self, other: &JsonValue) -> bool {
         match (self, other) {
-            (JsonValue::Object(a), JsonValue::Object(b)) => {
-                b.iter().all(|(k, bv)| {
-                    a.get(k).is_some_and(|av| av.contains(bv))
-                })
-            }
+            (JsonValue::Object(a), JsonValue::Object(b)) => b
+                .iter()
+                .all(|(k, bv)| a.get(k).is_some_and(|av| av.contains(bv))),
             (JsonValue::Array(a), JsonValue::Array(b)) => {
                 b.iter().all(|bv| a.iter().any(|av| av.contains(bv)))
             }
@@ -161,7 +159,9 @@ impl JsonValue {
 }
 
 fn format_number(n: f64) -> String {
-    if n.fract() == 0.0 && n.is_finite() {
+    // Only render as an integer when the value actually fits in i64; otherwise the
+    // `as i64` cast saturates/wraps and corrupts large whole numbers (e.g. 2^63).
+    if n.fract() == 0.0 && n.is_finite() && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
         format!("{}", n as i64)
     } else {
         format!("{n}")
@@ -318,7 +318,9 @@ fn decode_from(data: &[u8], cursor: &mut usize) -> Option<JsonValue> {
                 if *cursor + klen > data.len() {
                     return None;
                 }
-                let key = std::str::from_utf8(&data[*cursor..*cursor + klen]).ok()?.to_string();
+                let key = std::str::from_utf8(&data[*cursor..*cursor + klen])
+                    .ok()?
+                    .to_string();
                 *cursor += klen;
                 // value
                 let val = decode_from(data, cursor)?;
@@ -380,8 +382,14 @@ impl GinIndex {
     pub fn remove(&mut self, doc_id: u64, doc: &JsonValue) {
         for (path, leaf) in doc.gin_extract() {
             let key_bytes = jsonb_encode(&leaf);
-            if let Some(set) = self.entries.get_mut(&(path, key_bytes)) {
+            let key = (path, key_bytes);
+            if let Some(set) = self.entries.get_mut(&key) {
                 set.remove(&doc_id);
+                // Drop the posting list entirely once empty — otherwise deleted
+                // keys accumulate empty sets and leak memory over a churning index.
+                if set.is_empty() {
+                    self.entries.remove(&key);
+                }
             }
         }
     }
@@ -555,9 +563,10 @@ impl DocumentStore {
     pub fn delete(&mut self, id: u64) -> bool {
         if let Some(old) = self.docs.remove(&id) {
             if let Some(ref wal) = self.wal
-                && let Err(e) = wal.log_delete(id) {
-                    eprintln!("document WAL: failed to log delete {id}: {e}");
-                }
+                && let Err(e) = wal.log_delete(id)
+            {
+                eprintln!("document WAL: failed to log delete {id}: {e}");
+            }
             self.gin.remove(id, &old);
             true
         } else {
@@ -567,9 +576,10 @@ impl DocumentStore {
                 let found = cold.lock().get(&key).is_some();
                 if found {
                     if let Some(ref wal) = self.wal
-                        && let Err(e) = wal.log_delete(id) {
-                            eprintln!("document WAL: failed to log delete {id}: {e}");
-                        }
+                        && let Err(e) = wal.log_delete(id)
+                    {
+                        eprintln!("document WAL: failed to log delete {id}: {e}");
+                    }
                     cold.lock().delete(key.to_vec());
                     return true;
                 }
@@ -601,17 +611,18 @@ impl DocumentStore {
             // Must drop the MutexGuard before re-locking for delete
             let cold_data = cold.lock().get(&key);
             if let Some(data) = cold_data
-                && let Some(jv) = cold_decode_json(&data) {
-                    // Remove from cold (lock is not held here)
-                    cold.lock().delete(key.to_vec());
-                    // Insert into hot + GIN
-                    self.gin.insert(id, &jv);
-                    self.docs.insert(id, jv.clone());
-                    if id >= self.next_id {
-                        self.next_id = id + 1;
-                    }
-                    return Some(jv);
+                && let Some(jv) = cold_decode_json(&data)
+            {
+                // Remove from cold (lock is not held here)
+                cold.lock().delete(key.to_vec());
+                // Insert into hot + GIN
+                self.gin.insert(id, &jv);
+                self.docs.insert(id, jv.clone());
+                if id >= self.next_id {
+                    self.next_id = id + 1;
                 }
+                return Some(jv);
+            }
         }
         None
     }
@@ -636,17 +647,25 @@ impl DocumentStore {
     ///
     /// Returns the IDs of all documents where `doc @> query`.
     pub fn query_contains(&self, query: &JsonValue) -> Vec<u64> {
+        // `x @> '{}'` (empty containment) matches EVERY document. The GIN index
+        // has no pairs to look up for an empty query, so it would return no
+        // candidates — handle it explicitly and return all docs (the full
+        // `contains` check below is satisfied by every doc for an empty query).
+        if query.gin_extract().is_empty() {
+            return self
+                .docs
+                .iter()
+                .filter(|(_, doc)| doc.contains(query))
+                .map(|(id, _)| *id)
+                .collect();
+        }
         // Use the GIN index to get candidates, then verify with full
         // containment check (the GIN index may produce false positives
         // in edge cases with arrays).
         let candidates = self.gin.query_contains(query);
         candidates
             .into_iter()
-            .filter(|id| {
-                self.docs
-                    .get(id)
-                    .is_some_and(|doc| doc.contains(query))
-            })
+            .filter(|id| self.docs.get(id).is_some_and(|doc| doc.contains(query)))
             .collect()
     }
 
@@ -877,10 +896,7 @@ impl DocumentStore {
                     })
                 })
                 .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap())
-                .sum()
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
         })
     }
 
@@ -977,6 +993,8 @@ fn json_obj(pairs: Vec<(&str, JsonValue)>) -> JsonValue {
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
 
     // -- 1. Encode / decode roundtrip ---------------------------------------
@@ -1029,20 +1047,16 @@ mod tests {
 
     #[test]
     fn test_path_queries() {
-        let doc = json_obj(vec![
-            (
-                "user",
-                json_obj(vec![
-                    ("name", JsonValue::Str("Bob".to_string())),
-                    (
-                        "profile",
-                        json_obj(vec![
-                            ("bio", JsonValue::Str("Developer".to_string())),
-                        ]),
-                    ),
-                ]),
-            ),
-        ]);
+        let doc = json_obj(vec![(
+            "user",
+            json_obj(vec![
+                ("name", JsonValue::Str("Bob".to_string())),
+                (
+                    "profile",
+                    json_obj(vec![("bio", JsonValue::Str("Developer".to_string()))]),
+                ),
+            ]),
+        )]);
 
         assert_eq!(
             doc.get_path(&["user", "name"]),
@@ -1069,10 +1083,7 @@ mod tests {
         ]);
 
         assert_eq!(doc.arrow("x"), Some(&JsonValue::Number(10.0)));
-        assert_eq!(
-            doc.arrow("y"),
-            Some(&JsonValue::Str("hello".to_string()))
-        );
+        assert_eq!(doc.arrow("y"), Some(&JsonValue::Str("hello".to_string())));
         assert_eq!(
             doc.arrow("nested"),
             Some(&json_obj(vec![("a", JsonValue::Number(1.0))]))
@@ -1165,16 +1176,11 @@ mod tests {
             ("a", JsonValue::Number(1.0)),
             (
                 "b",
-                json_obj(vec![
-                    ("c", JsonValue::Str("deep".to_string())),
-                ]),
+                json_obj(vec![("c", JsonValue::Str("deep".to_string()))]),
             ),
             (
                 "d",
-                JsonValue::Array(vec![
-                    JsonValue::Bool(true),
-                    JsonValue::Number(99.0),
-                ]),
+                JsonValue::Array(vec![JsonValue::Bool(true), JsonValue::Number(99.0)]),
             ),
         ]);
 
@@ -1355,9 +1361,9 @@ mod tests {
                                         ("write", JsonValue::Bool(true)),
                                         (
                                             "scopes",
-                                            JsonValue::Array(vec![
-                                                JsonValue::Str("admin".to_string()),
-                                            ]),
+                                            JsonValue::Array(vec![JsonValue::Str(
+                                                "admin".to_string(),
+                                            )]),
                                         ),
                                     ]),
                                 ),
@@ -1402,10 +1408,7 @@ mod tests {
         // GIN extraction should produce leaf entries for every scalar.
         let pairs = doc.gin_extract();
         // Verify a few specific deep paths exist.
-        assert!(pairs.contains(&(
-            "data.metadata.total".to_string(),
-            JsonValue::Number(2.0)
-        )));
+        assert!(pairs.contains(&("data.metadata.total".to_string(), JsonValue::Number(2.0))));
         assert!(pairs.contains(&(
             "data.users[0].name".to_string(),
             JsonValue::Str("Alice".to_string())
@@ -1463,10 +1466,7 @@ mod tests {
         );
         // get_path uses exact key matching per segment, so "a.b" as a single
         // path segment should match.
-        assert_eq!(
-            special.get_path(&["a.b"]),
-            Some(&JsonValue::Number(1.0))
-        );
+        assert_eq!(special.get_path(&["a.b"]), Some(&JsonValue::Number(1.0)));
 
         // Containment edge cases
         // Empty object is contained in everything.
@@ -1524,10 +1524,8 @@ mod tests {
         assert_eq!(store.len(), 1);
 
         // The old path query should no longer match the old value.
-        let old_email_results = store.query_by_path(
-            &["email"],
-            &JsonValue::Str("alice@example.com".to_string()),
-        );
+        let old_email_results =
+            store.query_by_path(&["email"], &JsonValue::Str("alice@example.com".to_string()));
         assert!(old_email_results.is_empty());
 
         // New value should be queryable.
@@ -1538,8 +1536,7 @@ mod tests {
         assert_eq!(new_email_results, vec![id]);
 
         // GIN index should also reflect the update.
-        let contains_verified =
-            json_obj(vec![("verified", JsonValue::Bool(true))]);
+        let contains_verified = json_obj(vec![("verified", JsonValue::Bool(true))]);
         let results = store.query_contains(&contains_verified);
         assert_eq!(results, vec![id]);
 
@@ -1605,8 +1602,10 @@ mod tests {
         let id_d = store.insert(doc_d);
 
         // GIN query: all electronics
-        let electronics_query =
-            json_obj(vec![("category", JsonValue::Str("electronics".to_string()))]);
+        let electronics_query = json_obj(vec![(
+            "category",
+            JsonValue::Str("electronics".to_string()),
+        )]);
         let mut electronics = store.query_contains(&electronics_query);
         electronics.sort();
         assert_eq!(electronics, {
@@ -1763,22 +1762,13 @@ mod tests {
         assert_eq!(pairs.len(), 3002);
 
         // Verify specific entries in the extraction.
-        assert!(pairs.contains(&(
-            "items[0].index".to_string(),
-            JsonValue::Number(0.0)
-        )));
+        assert!(pairs.contains(&("items[0].index".to_string(), JsonValue::Number(0.0))));
         assert!(pairs.contains(&(
             "items[999].label".to_string(),
             JsonValue::Str("item_999".to_string())
         )));
-        assert!(pairs.contains(&(
-            "items[500].active".to_string(),
-            JsonValue::Bool(true)
-        )));
-        assert!(pairs.contains(&(
-            "items[501].active".to_string(),
-            JsonValue::Bool(false)
-        )));
+        assert!(pairs.contains(&("items[500].active".to_string(), JsonValue::Bool(true))));
+        assert!(pairs.contains(&("items[501].active".to_string(), JsonValue::Bool(false))));
 
         // Insert into a store and query.
         let mut store = DocumentStore::new();
@@ -1825,12 +1815,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut store = DocumentStore::open(dir.path()).unwrap();
-            store.insert(json_obj(vec![
-                ("name", JsonValue::Str("Alice".to_string())),
-            ]));
-            store.insert(json_obj(vec![
-                ("name", JsonValue::Str("Bob".to_string())),
-            ]));
+            store.insert(json_obj(vec![(
+                "name",
+                JsonValue::Str("Alice".to_string()),
+            )]));
+            store.insert(json_obj(vec![("name", JsonValue::Str("Bob".to_string()))]));
         }
         // Reopen — documents should survive.
         let store2 = DocumentStore::open(dir.path()).unwrap();
@@ -1852,12 +1841,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut store = DocumentStore::open(dir.path()).unwrap();
-            let id1 = store.insert(json_obj(vec![
-                ("x", JsonValue::Number(1.0)),
-            ]));
-            store.insert(json_obj(vec![
-                ("x", JsonValue::Number(2.0)),
-            ]));
+            let id1 = store.insert(json_obj(vec![("x", JsonValue::Number(1.0))]));
+            store.insert(json_obj(vec![("x", JsonValue::Number(2.0))]));
             assert!(store.delete(id1));
         }
         let store2 = DocumentStore::open(dir.path()).unwrap();
@@ -1890,17 +1875,22 @@ mod tests {
     #[test]
     fn test_wal_nested_json_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let nested = json_obj(vec![
-            ("level1", json_obj(vec![
-                ("level2", json_obj(vec![
+        let nested = json_obj(vec![(
+            "level1",
+            json_obj(vec![(
+                "level2",
+                json_obj(vec![
                     ("value", JsonValue::Number(42.0)),
-                    ("tags", JsonValue::Array(vec![
-                        JsonValue::Str("a".to_string()),
-                        JsonValue::Str("b".to_string()),
-                    ])),
-                ])),
-            ])),
-        ]);
+                    (
+                        "tags",
+                        JsonValue::Array(vec![
+                            JsonValue::Str("a".to_string()),
+                            JsonValue::Str("b".to_string()),
+                        ]),
+                    ),
+                ]),
+            )]),
+        )]);
         {
             let mut store = DocumentStore::open(dir.path()).unwrap();
             store.insert(nested.clone());
@@ -1951,14 +1941,14 @@ mod tests {
     fn test_wal_large_documents() {
         let dir = tempfile::tempdir().unwrap();
         let big_arr: Vec<JsonValue> = (0..500)
-            .map(|i| json_obj(vec![
-                ("idx", JsonValue::Number(i as f64)),
-                ("data", JsonValue::Str(format!("entry_{i}"))),
-            ]))
+            .map(|i| {
+                json_obj(vec![
+                    ("idx", JsonValue::Number(i as f64)),
+                    ("data", JsonValue::Str(format!("entry_{i}"))),
+                ])
+            })
             .collect();
-        let big_doc = json_obj(vec![
-            ("items", JsonValue::Array(big_arr)),
-        ]);
+        let big_doc = json_obj(vec![("items", JsonValue::Array(big_arr))]);
         {
             let mut store = DocumentStore::open(dir.path()).unwrap();
             store.insert(big_doc.clone());
@@ -2020,7 +2010,10 @@ mod tests {
         // Verify every parallel result is also in the sequential set.
         let seq_ids: HashSet<u64> = seq_results.iter().map(|(id, _)| *id).collect();
         for (id, _) in &par_results {
-            assert!(seq_ids.contains(id), "par_query returned unexpected id {id}");
+            assert!(
+                seq_ids.contains(id),
+                "par_query returned unexpected id {id}"
+            );
         }
         // alpha: i % 3 == 0 for i in 0..1500 => 500 docs
         assert_eq!(par_results.len(), 500);
@@ -2109,9 +2102,7 @@ mod tests {
         let seq_count = store
             .docs
             .values()
-            .filter(|doc| {
-                doc.get_path(&["category"]) == Some(&JsonValue::Str("gamma".to_string()))
-            })
+            .filter(|doc| doc.get_path(&["category"]) == Some(&JsonValue::Str("gamma".to_string())))
             .count();
         assert_eq!(par_count, seq_count);
         // gamma: i % 3 == 2 for i in 0..1500 => 500 docs
@@ -2198,7 +2189,11 @@ mod tests {
             store.insert(doc);
         }
         // Hot tier should have at most max_hot_docs entries
-        assert!(store.len_hot() <= 10, "hot should have <= 10, got {}", store.len_hot());
+        assert!(
+            store.len_hot() <= 10,
+            "hot should have <= 10, got {}",
+            store.len_hot()
+        );
         // All 30 should be accessible via get (hot) or get_promoting (cold)
         for id in 1..=30u64 {
             let doc = store.get_promoting(id);
@@ -2249,6 +2244,38 @@ mod tests {
     #[test]
     fn test_doc_memory_mode_no_cold() {
         let store = DocumentStore::new();
-        assert!(!store.has_cold_tier(), "memory mode should have no cold tier");
+        assert!(
+            !store.has_cold_tier(),
+            "memory mode should have no cold tier"
+        );
+    }
+
+    #[test]
+    fn query_contains_empty_object_matches_all() {
+        // `doc @> '{}'` must match every document (Postgres semantics).
+        let mut store = DocumentStore::new();
+        store.insert(json_obj(vec![("a", JsonValue::Str("x".to_string()))]));
+        store.insert(json_obj(vec![("b", JsonValue::Str("y".to_string()))]));
+        let all = store.query_contains(&JsonValue::Object(Default::default()));
+        assert_eq!(all.len(), 2, "empty containment query must match all docs");
+    }
+
+    #[test]
+    fn gin_remove_drops_empty_posting_lists() {
+        let mut idx = GinIndex::new();
+        let doc = json_obj(vec![
+            ("type", JsonValue::Str("user".to_string())),
+            ("name", JsonValue::Str("Bob".to_string())),
+        ]);
+        idx.insert(1, &doc);
+        assert!(
+            !idx.entries.is_empty(),
+            "insert must populate posting lists"
+        );
+        idx.remove(1, &doc);
+        assert!(
+            idx.entries.is_empty(),
+            "removing the only document must drop empty posting lists, not leak them"
+        );
     }
 }

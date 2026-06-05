@@ -37,13 +37,15 @@ struct LsmTable {
 
 impl LsmTable {
     fn new() -> Self {
-        Self { tree: LsmTree::new(LSM_CONFIG), next_id: 0 }
+        Self {
+            tree: LsmTree::new(LSM_CONFIG),
+            next_id: 0,
+        }
     }
 
     /// Open (or create) a disk-backed table in `dir`.
     fn open(dir: &Path) -> Result<Self, StorageError> {
-        let tree = LsmTree::open(LSM_CONFIG, dir)
-            .map_err(|e| StorageError::Io(e.to_string()))?;
+        let tree = LsmTree::open(LSM_CONFIG, dir).map_err(|e| StorageError::Io(e.to_string()))?;
         // Recover next_id from the maximum existing key + 1.
         let start = 0u64.to_be_bytes();
         let end = u64::MAX.to_be_bytes();
@@ -73,7 +75,10 @@ pub struct LsmStorageEngine {
 impl LsmStorageEngine {
     /// Create a purely in-memory LSM engine.
     pub fn new() -> Self {
-        Self { tables: RwLock::new(HashMap::new()), disk_dir: None }
+        Self {
+            tables: RwLock::new(HashMap::new()),
+            disk_dir: None,
+        }
     }
 
     /// Open (or create) a disk-backed LSM engine in `dir`.
@@ -98,7 +103,10 @@ impl LsmStorageEngine {
                 }
             }
         }
-        Ok(Self { tables: RwLock::new(tables), disk_dir: Some(dir.to_path_buf()) })
+        Ok(Self {
+            tables: RwLock::new(tables),
+            disk_dir: Some(dir.to_path_buf()),
+        })
     }
 
     fn table_dir(&self, table: &str) -> Option<PathBuf> {
@@ -107,23 +115,39 @@ impl LsmStorageEngine {
 }
 
 impl Default for LsmStorageEngine {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn encode_row(row: &Row) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&(row.len() as u32).to_le_bytes());
-    for val in row { encode_value(val, &mut buf); }
+    for val in row {
+        encode_value(val, &mut buf);
+    }
     buf
 }
 
 fn encode_value(val: &Value, buf: &mut Vec<u8>) {
     match val {
         Value::Null => buf.push(0),
-        Value::Bool(b) => { buf.push(1); buf.push(*b as u8); }
-        Value::Int32(n) => { buf.push(2); buf.extend_from_slice(&n.to_le_bytes()); }
-        Value::Int64(n) => { buf.push(3); buf.extend_from_slice(&n.to_le_bytes()); }
-        Value::Float64(f) => { buf.push(4); buf.extend_from_slice(&f.to_le_bytes()); }
+        Value::Bool(b) => {
+            buf.push(1);
+            buf.push(*b as u8);
+        }
+        Value::Int32(n) => {
+            buf.push(2);
+            buf.extend_from_slice(&n.to_le_bytes());
+        }
+        Value::Int64(n) => {
+            buf.push(3);
+            buf.extend_from_slice(&n.to_le_bytes());
+        }
+        Value::Float64(f) => {
+            buf.push(4);
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
         Value::Text(s) => {
             buf.push(5);
             let b = s.as_bytes();
@@ -137,16 +161,28 @@ fn encode_value(val: &Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
         }
-        Value::Date(d) => { buf.push(7); buf.extend_from_slice(&d.to_le_bytes()); }
-        Value::Timestamp(t) => { buf.push(8); buf.extend_from_slice(&t.to_le_bytes()); }
-        Value::TimestampTz(t) => { buf.push(9); buf.extend_from_slice(&t.to_le_bytes()); }
+        Value::Date(d) => {
+            buf.push(7);
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        Value::Timestamp(t) => {
+            buf.push(8);
+            buf.extend_from_slice(&t.to_le_bytes());
+        }
+        Value::TimestampTz(t) => {
+            buf.push(9);
+            buf.extend_from_slice(&t.to_le_bytes());
+        }
         Value::Numeric(s) => {
             buf.push(10);
             let b = s.as_bytes();
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
         }
-        Value::Uuid(bytes) => { buf.push(11); buf.extend_from_slice(bytes); }
+        Value::Uuid(bytes) => {
+            buf.push(11);
+            buf.extend_from_slice(bytes);
+        }
         Value::Bytea(bytes) => {
             buf.push(12);
             buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -155,14 +191,22 @@ fn encode_value(val: &Value, buf: &mut Vec<u8>) {
         Value::Array(arr) => {
             buf.push(13);
             buf.extend_from_slice(&(arr.len() as u32).to_le_bytes());
-            for v in arr { encode_value(v, buf); }
+            for v in arr {
+                encode_value(v, buf);
+            }
         }
         Value::Vector(floats) => {
             buf.push(14);
             buf.extend_from_slice(&(floats.len() as u32).to_le_bytes());
-            for f in floats { buf.extend_from_slice(&f.to_le_bytes()); }
+            for f in floats {
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
         }
-        Value::Interval { months, days, microseconds } => {
+        Value::Interval {
+            months,
+            days,
+            microseconds,
+        } => {
             buf.push(15);
             buf.extend_from_slice(&months.to_le_bytes());
             buf.extend_from_slice(&days.to_le_bytes());
@@ -175,7 +219,9 @@ fn decode_row(data: &[u8]) -> Option<Row> {
     let mut pos = 0;
     let col_count = read_u32(data, &mut pos)? as usize;
     let mut row = Vec::with_capacity(col_count);
-    for _ in 0..col_count { row.push(decode_value(data, &mut pos)?); }
+    for _ in 0..col_count {
+        row.push(decode_value(data, &mut pos)?);
+    }
     Some(row)
 }
 
@@ -184,7 +230,11 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Option<Value> {
     *pos += 1;
     match tag {
         0 => Some(Value::Null),
-        1 => { let b = *data.get(*pos)?; *pos += 1; Some(Value::Bool(b != 0)) }
+        1 => {
+            let b = *data.get(*pos)?;
+            *pos += 1;
+            Some(Value::Bool(b != 0))
+        }
         2 => Some(Value::Int32(read_i32(data, pos)?)),
         3 => Some(Value::Int64(read_i64(data, pos)?)),
         4 => Some(Value::Float64(read_f64(data, pos)?)),
@@ -199,7 +249,9 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Option<Value> {
         9 => Some(Value::TimestampTz(read_i64(data, pos)?)),
         10 => Some(Value::Numeric(read_string(data, pos)?)),
         11 => {
-            if *pos + 16 > data.len() { return None; }
+            if *pos + 16 > data.len() {
+                return None;
+            }
             let mut bytes = [0u8; 16];
             bytes.copy_from_slice(&data[*pos..*pos + 16]);
             *pos += 16;
@@ -207,7 +259,9 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Option<Value> {
         }
         12 => {
             let len = read_u32(data, pos)? as usize;
-            if *pos + len > data.len() { return None; }
+            if *pos + len > data.len() {
+                return None;
+            }
             let bytes = data[*pos..*pos + len].to_vec();
             *pos += len;
             Some(Value::Bytea(bytes))
@@ -215,14 +269,18 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Option<Value> {
         13 => {
             let count = read_u32(data, pos)? as usize;
             let mut arr = Vec::with_capacity(count);
-            for _ in 0..count { arr.push(decode_value(data, pos)?); }
+            for _ in 0..count {
+                arr.push(decode_value(data, pos)?);
+            }
             Some(Value::Array(arr))
         }
         14 => {
             let count = read_u32(data, pos)? as usize;
             let mut floats = Vec::with_capacity(count);
             for _ in 0..count {
-                if *pos + 4 > data.len() { return None; }
+                if *pos + 4 > data.len() {
+                    return None;
+                }
                 let f = f32::from_le_bytes(data[*pos..*pos + 4].try_into().ok()?);
                 *pos += 4;
                 floats.push(f);
@@ -233,41 +291,62 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Option<Value> {
             let months = read_i32(data, pos)?;
             let days = read_i32(data, pos)?;
             let microseconds = read_i64(data, pos)?;
-            Some(Value::Interval { months, days, microseconds })
+            Some(Value::Interval {
+                months,
+                days,
+                microseconds,
+            })
         }
         _ => None,
     }
 }
 
 fn read_u32(data: &[u8], pos: &mut usize) -> Option<u32> {
-    if *pos + 4 > data.len() { return None; }
+    if *pos + 4 > data.len() {
+        return None;
+    }
     let v = u32::from_le_bytes(data[*pos..*pos + 4].try_into().ok()?);
-    *pos += 4; Some(v)
+    *pos += 4;
+    Some(v)
 }
 
 fn read_i32(data: &[u8], pos: &mut usize) -> Option<i32> {
-    if *pos + 4 > data.len() { return None; }
+    if *pos + 4 > data.len() {
+        return None;
+    }
     let v = i32::from_le_bytes(data[*pos..*pos + 4].try_into().ok()?);
-    *pos += 4; Some(v)
+    *pos += 4;
+    Some(v)
 }
 
 fn read_i64(data: &[u8], pos: &mut usize) -> Option<i64> {
-    if *pos + 8 > data.len() { return None; }
+    if *pos + 8 > data.len() {
+        return None;
+    }
     let v = i64::from_le_bytes(data[*pos..*pos + 8].try_into().ok()?);
-    *pos += 8; Some(v)
+    *pos += 8;
+    Some(v)
 }
 
 fn read_f64(data: &[u8], pos: &mut usize) -> Option<f64> {
-    if *pos + 8 > data.len() { return None; }
+    if *pos + 8 > data.len() {
+        return None;
+    }
     let v = f64::from_le_bytes(data[*pos..*pos + 8].try_into().ok()?);
-    *pos += 8; Some(v)
+    *pos += 8;
+    Some(v)
 }
 
 fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
     let len = read_u32(data, pos)? as usize;
-    if *pos + len > data.len() { return None; }
-    let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
-    *pos += len; Some(s)
+    if *pos + len > data.len() {
+        return None;
+    }
+    let s = std::str::from_utf8(&data[*pos..*pos + len])
+        .ok()?
+        .to_string();
+    *pos += len;
+    Some(s)
 }
 
 #[async_trait]
@@ -292,15 +371,17 @@ impl StorageEngine for LsmStorageEngine {
         self.tables.write().remove(table);
         // Remove disk directory for this table if disk-backed.
         if let Some(dir) = self.table_dir(table)
-            && dir.exists() {
-                let _ = std::fs::remove_dir_all(&dir);
-            }
+            && dir.exists()
+        {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
         Ok(())
     }
 
     async fn insert(&self, table: &str, row: Row) -> Result<(), StorageError> {
         let mut tables = self.tables.write();
-        let t = tables.get_mut(table)
+        let t = tables
+            .get_mut(table)
             .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
         let key = t.next_id.to_be_bytes().to_vec();
         t.next_id += 1;
@@ -310,18 +391,24 @@ impl StorageEngine for LsmStorageEngine {
 
     async fn scan(&self, table: &str) -> Result<Vec<Row>, StorageError> {
         let tables = self.tables.read();
-        let t = tables.get(table)
+        let t = tables
+            .get(table)
             .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
-        let rows = t.all_entries().into_iter()
+        let rows = t
+            .all_entries()
+            .into_iter()
             .filter_map(|(_, v)| decode_row(&v))
             .collect();
         Ok(rows)
     }
 
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
-        if positions.is_empty() { return Ok(0); }
+        if positions.is_empty() {
+            return Ok(0);
+        }
         let mut tables = self.tables.write();
-        let t = tables.get_mut(table)
+        let t = tables
+            .get_mut(table)
             .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
         let pos_set: HashSet<usize> = positions.iter().copied().collect();
         let entries = t.all_entries();
@@ -336,9 +423,12 @@ impl StorageEngine for LsmStorageEngine {
     }
 
     async fn update(&self, table: &str, updates: &[(usize, Row)]) -> Result<usize, StorageError> {
-        if updates.is_empty() { return Ok(0); }
+        if updates.is_empty() {
+            return Ok(0);
+        }
         let mut tables = self.tables.write();
-        let t = tables.get_mut(table)
+        let t = tables
+            .get_mut(table)
             .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
         let entries = t.all_entries();
         let mut count = 0;
@@ -354,13 +444,17 @@ impl StorageEngine for LsmStorageEngine {
     async fn flush_all_dirty(&self) -> Result<(), StorageError> {
         // Force-flush all memtables to disk (writes pending entries as SSTable files).
         let mut tables = self.tables.write();
-        for t in tables.values_mut() { t.tree.force_flush(); }
+        for t in tables.values_mut() {
+            t.tree.force_flush();
+        }
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
 
     fn make_row(id: i64, name: &str) -> Row {
@@ -399,7 +493,10 @@ mod tests {
         engine.create_table("t").await.unwrap();
         engine.insert("t", make_row(1, "alice")).await.unwrap();
         engine.insert("t", make_row(2, "bob")).await.unwrap();
-        let count = engine.update("t", &[(0, make_row(99, "updated"))]).await.unwrap();
+        let count = engine
+            .update("t", &[(0, make_row(99, "updated"))])
+            .await
+            .unwrap();
         assert_eq!(count, 1);
         let rows = engine.scan("t").await.unwrap();
         assert_eq!(rows[0][0], Value::Int64(99));
@@ -505,7 +602,10 @@ mod tests {
 
         // After drop, the table directory should be gone.
         let table_dir = dir.path().join("t");
-        assert!(!table_dir.exists(), "table directory should be removed after drop");
+        assert!(
+            !table_dir.exists(),
+            "table directory should be removed after drop"
+        );
 
         // Reopening should not see the table.
         {

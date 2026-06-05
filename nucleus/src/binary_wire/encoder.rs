@@ -23,7 +23,7 @@
 //! - 15: RollbackTxn (rollback transaction)
 //! - 16: ParameterStatus (server parameter)
 
-use bytes::{BytesMut, BufMut};
+use bytes::{BufMut, BytesMut};
 
 /// Message type constants for binary protocol.
 pub mod message_types {
@@ -270,7 +270,10 @@ mod tests {
         encoder.encode_frame(message_types::QUERY, b"SELECT 1");
         let result = encoder.buffer();
         assert_eq!(result[0], message_types::QUERY);
-        assert_eq!(u32::from_be_bytes([result[1], result[2], result[3], result[4]]), 8);
+        assert_eq!(
+            u32::from_be_bytes([result[1], result[2], result[3], result[4]]),
+            8
+        );
         assert_eq!(&result[5..], b"SELECT 1");
     }
 
@@ -301,7 +304,10 @@ mod tests {
         encoder.encode_handshake(1, 12345);
         let result = encoder.buffer();
         assert_eq!(result[0], message_types::HANDSHAKE);
-        assert_eq!(u32::from_be_bytes([result[1], result[2], result[3], result[4]]), 9);
+        assert_eq!(
+            u32::from_be_bytes([result[1], result[2], result[3], result[4]]),
+            9
+        );
     }
 
     #[test]
@@ -338,7 +344,7 @@ mod tests {
     fn test_encoder_reset() {
         let mut encoder = Encoder::new();
         encoder.encode_query(1, "SELECT 1");
-        assert!(encoder.buffer().len() > 0);
+        assert!(!encoder.buffer().is_empty());
         encoder.reset();
         assert_eq!(encoder.buffer().len(), 0);
     }
@@ -357,7 +363,10 @@ mod tests {
         encoder.encode_result_end(42);
         let result = encoder.buffer();
         assert_eq!(result[0], message_types::RESULT_END);
-        assert_eq!(u32::from_be_bytes([result[1], result[2], result[3], result[4]]), 4);
+        assert_eq!(
+            u32::from_be_bytes([result[1], result[2], result[3], result[4]]),
+            4
+        );
     }
 
     #[test]

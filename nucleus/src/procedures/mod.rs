@@ -132,12 +132,7 @@ pub struct SqlProcedure {
 /// Implementations can use wasmtime, wasmer, or any WASM runtime.
 pub trait WasmRuntime: Send + Sync {
     /// Execute a WASM module with the given function name and arguments.
-    fn execute(
-        &self,
-        module_bytes: &[u8],
-        function: &str,
-        args: &[ProcValue],
-    ) -> ProcResult;
+    fn execute(&self, module_bytes: &[u8], function: &str, args: &[ProcValue]) -> ProcResult;
 }
 
 type BuiltinProcFn = dyn Fn(&[ProcValue]) -> ProcResult + Send + Sync;
@@ -145,7 +140,10 @@ type BuiltinProcFn = dyn Fn(&[ProcValue]) -> ProcResult + Send + Sync;
 /// Type-erased procedure body.
 enum ProcedureBody {
     Sql(SqlProcedure),
-    Wasm { module_bytes: Vec<u8>, entry_point: String },
+    Wasm {
+        module_bytes: Vec<u8>,
+        entry_point: String,
+    },
     Builtin(Box<BuiltinProcFn>),
 }
 
@@ -353,19 +351,17 @@ impl ProcedureEngine {
                             positional.push("NULL".to_string());
                         }
                     }
-                    let body = substitute_proc_sql_placeholders(
-                        &sql_proc.body,
-                        &positional,
-                        &named,
-                    );
+                    let body =
+                        substitute_proc_sql_placeholders(&sql_proc.body, &positional, &named);
                     ProcResult::Ok(ProcValue::Text(body))
                 }
-                ProcedureBody::Wasm { module_bytes, entry_point } => {
-                    match &self.wasm_runtime {
-                        Some(runtime) => runtime.execute(module_bytes, entry_point, args),
-                        None => ProcResult::Error("no WASM runtime configured".into()),
-                    }
-                }
+                ProcedureBody::Wasm {
+                    module_bytes,
+                    entry_point,
+                } => match &self.wasm_runtime {
+                    Some(runtime) => runtime.execute(module_bytes, entry_point, args),
+                    None => ProcResult::Error("no WASM runtime configured".into()),
+                },
                 ProcedureBody::Builtin(func) => func(args),
             },
         };
@@ -426,12 +422,10 @@ impl ProcedureEngine {
             "array_length",
             "Returns the length of an array",
             vec!["arr".into()],
-            |args| {
-                match args.first() {
-                    Some(ProcValue::Array(arr)) => ProcResult::Ok(ProcValue::Int(arr.len() as i64)),
-                    Some(ProcValue::Text(s)) => ProcResult::Ok(ProcValue::Int(s.len() as i64)),
-                    _ => ProcResult::Error("expected array or text argument".into()),
-                }
+            |args| match args.first() {
+                Some(ProcValue::Array(arr)) => ProcResult::Ok(ProcValue::Int(arr.len() as i64)),
+                Some(ProcValue::Text(s)) => ProcResult::Ok(ProcValue::Int(s.len() as i64)),
+                _ => ProcResult::Error("expected array or text argument".into()),
             },
         );
 
@@ -624,14 +618,10 @@ fn substitute_proc_sql_placeholders(
                 }
                 continue;
             }
-            if i < bytes.len()
-                && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
-            {
+            if i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
                 let ident_start = i;
                 i += 1;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
                 let ident = &sql[ident_start..i];
@@ -673,7 +663,7 @@ pub struct WasmSandboxConfig {
 impl Default for WasmSandboxConfig {
     fn default() -> Self {
         Self {
-            max_memory_pages: 256,   // 16 MiB
+            max_memory_pages: 256, // 16 MiB
             max_fuel: 1_000_000,
             max_module_bytes: 4 * 1024 * 1024, // 4 MiB
             allowed_imports: vec![
@@ -740,7 +730,8 @@ impl SandboxedWasmRuntime {
         if bytes.len() > self.config.max_module_bytes {
             errors.push(format!(
                 "module size {}B exceeds limit {}B",
-                bytes.len(), self.config.max_module_bytes
+                bytes.len(),
+                self.config.max_module_bytes
             ));
         }
 
@@ -779,18 +770,26 @@ impl SandboxedWasmRuntime {
     }
 
     /// Load a validated WASM module into the sandbox.
-    pub fn load_module(&mut self, name: &str, bytes: Vec<u8>, exports: Vec<String>) -> Result<(), String> {
+    pub fn load_module(
+        &mut self,
+        name: &str,
+        bytes: Vec<u8>,
+        exports: Vec<String>,
+    ) -> Result<(), String> {
         let validation = self.validate_module(name, &bytes);
         if !validation.valid {
             return Err(validation.errors.join("; "));
         }
-        self.modules.insert(name.to_string(), WasmModule {
-            name: name.to_string(),
-            bytes,
-            exports,
-            imports: validation.imports,
-            memory_pages: validation.memory_pages_requested,
-        });
+        self.modules.insert(
+            name.to_string(),
+            WasmModule {
+                name: name.to_string(),
+                bytes,
+                exports,
+                imports: validation.imports,
+                memory_pages: validation.memory_pages_requested,
+            },
+        );
         Ok(())
     }
 
@@ -816,7 +815,8 @@ impl WasmRuntime for SandboxedWasmRuntime {
         if module_bytes.len() > self.config.max_module_bytes {
             return ProcResult::Error(format!(
                 "module size {}B exceeds sandbox limit {}B",
-                module_bytes.len(), self.config.max_module_bytes
+                module_bytes.len(),
+                self.config.max_module_bytes
             ));
         }
 
@@ -857,6 +857,8 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
 
     #[test]
@@ -872,12 +874,15 @@ mod tests {
     #[test]
     fn builtin_coalesce() {
         let mut engine = ProcedureEngine::new();
-        let result = engine.execute("coalesce", &[
-            ProcValue::Null,
-            ProcValue::Null,
-            ProcValue::Int(42),
-            ProcValue::Text("hello".into()),
-        ]);
+        let result = engine.execute(
+            "coalesce",
+            &[
+                ProcValue::Null,
+                ProcValue::Null,
+                ProcValue::Int(42),
+                ProcValue::Text("hello".into()),
+            ],
+        );
         match result {
             ProcResult::Ok(ProcValue::Int(42)) => {}
             _ => panic!("expected Int(42)"),
@@ -887,9 +892,14 @@ mod tests {
     #[test]
     fn builtin_array_length() {
         let mut engine = ProcedureEngine::new();
-        let result = engine.execute("array_length", &[
-            ProcValue::Array(vec![ProcValue::Int(1), ProcValue::Int(2), ProcValue::Int(3)]),
-        ]);
+        let result = engine.execute(
+            "array_length",
+            &[ProcValue::Array(vec![
+                ProcValue::Int(1),
+                ProcValue::Int(2),
+                ProcValue::Int(3),
+            ])],
+        );
         match result {
             ProcResult::Ok(ProcValue::Int(3)) => {}
             _ => panic!("expected Int(3)"),
@@ -900,19 +910,19 @@ mod tests {
     fn builtin_json_extract() {
         let mut engine = ProcedureEngine::new();
         let json = r#"{"name":"Alice","age":30}"#;
-        let result = engine.execute("json_extract", &[
-            ProcValue::Text(json.into()),
-            ProcValue::Text("name".into()),
-        ]);
+        let result = engine.execute(
+            "json_extract",
+            &[ProcValue::Text(json.into()), ProcValue::Text("name".into())],
+        );
         match result {
             ProcResult::Ok(ProcValue::Text(s)) => assert_eq!(s, "Alice"),
             _ => panic!("expected text 'Alice'"),
         }
 
-        let result = engine.execute("json_extract", &[
-            ProcValue::Text(json.into()),
-            ProcValue::Text("age".into()),
-        ]);
+        let result = engine.execute(
+            "json_extract",
+            &[ProcValue::Text(json.into()), ProcValue::Text("age".into())],
+        );
         match result {
             ProcResult::Ok(ProcValue::Int(30)) => {}
             _ => panic!("expected Int(30)"),
@@ -1022,10 +1032,10 @@ mod tests {
     #[test]
     fn coalesce_first_non_null() {
         let mut engine = ProcedureEngine::new();
-        let result = engine.execute("coalesce", &[
-            ProcValue::Text("first".into()),
-            ProcValue::Int(99),
-        ]);
+        let result = engine.execute(
+            "coalesce",
+            &[ProcValue::Text("first".into()), ProcValue::Int(99)],
+        );
         match result {
             ProcResult::Ok(ProcValue::Text(s)) => assert_eq!(s, "first"),
             _ => panic!("expected first non-null value"),
@@ -1046,10 +1056,13 @@ mod tests {
     fn json_extract_missing_key() {
         let mut engine = ProcedureEngine::new();
         let json = r#"{"name":"Alice"}"#;
-        let result = engine.execute("json_extract", &[
-            ProcValue::Text(json.into()),
-            ProcValue::Text("missing_key".into()),
-        ]);
+        let result = engine.execute(
+            "json_extract",
+            &[
+                ProcValue::Text(json.into()),
+                ProcValue::Text("missing_key".into()),
+            ],
+        );
         match result {
             ProcResult::Ok(ProcValue::Null) => {}
             _ => panic!("expected Null for missing key"),
@@ -1066,10 +1079,10 @@ mod tests {
             "SELECT * FROM orders WHERE user_id = $user_id AND status = $status",
         );
 
-        let result = engine.execute("find_orders", &[
-            ProcValue::Int(10),
-            ProcValue::Text("active".into()),
-        ]);
+        let result = engine.execute(
+            "find_orders",
+            &[ProcValue::Int(10), ProcValue::Text("active".into())],
+        );
         match result {
             ProcResult::Ok(ProcValue::Text(sql)) => {
                 assert!(sql.contains("user_id = 10"));
@@ -1094,7 +1107,7 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].procedure, "nucleus_version");
         assert!(history[0].success);
-        assert!(history[0].duration_us > 0 || history[0].duration_us == 0); // Just check field exists
+        let _ = history[0].duration_us; // u64 field; accessed to confirm it is recorded
     }
 
     #[test]
@@ -1176,7 +1189,10 @@ mod tests {
 
     #[test]
     fn wasm_validate_too_large() {
-        let config = WasmSandboxConfig { max_module_bytes: 4, ..Default::default() };
+        let config = WasmSandboxConfig {
+            max_module_bytes: 4,
+            ..Default::default()
+        };
         let sandbox = SandboxedWasmRuntime::new(config);
         let validation = sandbox.validate_module("big", &wasm_header());
         assert!(!validation.valid);
@@ -1186,7 +1202,9 @@ mod tests {
     #[test]
     fn wasm_load_and_unload_module() {
         let mut sandbox = SandboxedWasmRuntime::new(WasmSandboxConfig::default());
-        sandbox.load_module("add", wasm_header(), vec!["add".into()]).unwrap();
+        sandbox
+            .load_module("add", wasm_header(), vec!["add".into()])
+            .unwrap();
         assert_eq!(sandbox.loaded_modules().len(), 1);
         assert!(sandbox.unload_module("add"));
         assert!(sandbox.loaded_modules().is_empty());
@@ -1293,9 +1311,10 @@ mod tests {
             vec!["name".into()],
             "SELECT * FROM users WHERE name = $name",
         );
-        let result = engine.execute("lookup", &[
-            ProcValue::Text("'; DROP TABLE users; --".into()),
-        ]);
+        let result = engine.execute(
+            "lookup",
+            &[ProcValue::Text("'; DROP TABLE users; --".into())],
+        );
         match result {
             ProcResult::Ok(ProcValue::Text(sql)) => {
                 // The injected single quote must be doubled, preventing

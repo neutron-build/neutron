@@ -32,12 +32,18 @@ pub async fn read_value<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<R
     let mut line = String::new();
     let n = reader.read_line(&mut line).await?;
     if n == 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "connection closed",
+        ));
     }
     let line = line.trim_end_matches('\n').trim_end_matches('\r');
 
     if line.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty RESP line"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty RESP line",
+        ));
     }
 
     let prefix = line.as_bytes()[0];
@@ -122,11 +128,7 @@ pub fn parse_command(value: RespValue) -> Option<Vec<Vec<u8>>> {
                 .split_whitespace()
                 .map(|p| p.as_bytes().to_vec())
                 .collect();
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts)
-            }
+            if parts.is_empty() { None } else { Some(parts) }
         }
         _ => None,
     }

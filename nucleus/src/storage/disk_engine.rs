@@ -6,16 +6,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use parking_lot::RwLock;
 
 use super::btree::{BTreeIndex, RowId};
 use super::buffer::{BufferPool, DEFAULT_POOL_SIZE};
 use super::disk::DiskManager;
-use super::page::{self, PageBuf, PAGE_SIZE, INVALID_PAGE_ID, META_TABLE_DIR_START,
-    META_FREE_LIST_HEAD, META_FREE_PAGE_COUNT};
+use super::page::{
+    self, INVALID_PAGE_ID, META_FREE_LIST_HEAD, META_FREE_PAGE_COUNT, META_TABLE_DIR_START,
+    PAGE_SIZE, PageBuf,
+};
 use super::tuple;
 use super::wal;
 use super::wal::Wal;
@@ -87,19 +89,32 @@ fn deserialize_data_type(data: &[u8], offset: &mut usize) -> Option<DataType> {
                 return None;
             }
             let dim = u32::from_le_bytes([
-                data[*offset], data[*offset + 1],
-                data[*offset + 2], data[*offset + 3],
+                data[*offset],
+                data[*offset + 1],
+                data[*offset + 2],
+                data[*offset + 3],
             ]) as usize;
             *offset += 4;
             Some(DataType::Vector(dim))
         }
         14 => Some(DataType::Interval),
         15 => {
-            if *offset + 4 > data.len() { return None; }
-            let len = u32::from_le_bytes([data[*offset], data[*offset+1], data[*offset+2], data[*offset+3]]) as usize;
+            if *offset + 4 > data.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes([
+                data[*offset],
+                data[*offset + 1],
+                data[*offset + 2],
+                data[*offset + 3],
+            ]) as usize;
             *offset += 4;
-            if *offset + len > data.len() { return None; }
-            let name = std::str::from_utf8(&data[*offset..*offset+len]).ok()?.to_string();
+            if *offset + len > data.len() {
+                return None;
+            }
+            let name = std::str::from_utf8(&data[*offset..*offset + len])
+                .ok()?
+                .to_string();
             *offset += len;
             Some(DataType::UserDefined(name))
         }
@@ -198,12 +213,34 @@ impl DiskEngine {
     /// 3. Load the table directory from the (potentially recovered) meta page
     ///
     /// Open with a custom buffer pool size (in frames). Each frame is 16 KB.
-    pub fn open_with_pool_size(path: &Path, catalog: Arc<Catalog>, pool_frames: usize) -> Result<Self, StorageError> {
-        Self::open_inner(path, catalog, pool_frames, false, 0, None, false, wal::SyncMode::Fsync)
+    pub fn open_with_pool_size(
+        path: &Path,
+        catalog: Arc<Catalog>,
+        pool_frames: usize,
+    ) -> Result<Self, StorageError> {
+        Self::open_inner(
+            path,
+            catalog,
+            pool_frames,
+            false,
+            0,
+            None,
+            false,
+            wal::SyncMode::Fsync,
+        )
     }
 
     pub fn open(path: &Path, catalog: Arc<Catalog>) -> Result<Self, StorageError> {
-        Self::open_inner(path, catalog, DEFAULT_POOL_SIZE, false, 0, None, false, wal::SyncMode::Fsync)
+        Self::open_inner(
+            path,
+            catalog,
+            DEFAULT_POOL_SIZE,
+            false,
+            0,
+            None,
+            false,
+            wal::SyncMode::Fsync,
+        )
     }
 
     /// Open with encryption enabled (AES-256-GCM).
@@ -212,7 +249,16 @@ impl DiskEngine {
         catalog: Arc<Catalog>,
         encryptor: super::encryption::PageEncryptor,
     ) -> Result<Self, StorageError> {
-        Self::open_inner(path, catalog, DEFAULT_POOL_SIZE, false, 0, Some(encryptor), false, wal::SyncMode::Fsync)
+        Self::open_inner(
+            path,
+            catalog,
+            DEFAULT_POOL_SIZE,
+            false,
+            0,
+            Some(encryptor),
+            false,
+            wal::SyncMode::Fsync,
+        )
     }
 
     /// Open with both compression and encryption.
@@ -221,12 +267,30 @@ impl DiskEngine {
         catalog: Arc<Catalog>,
         encryptor: super::encryption::PageEncryptor,
     ) -> Result<Self, StorageError> {
-        Self::open_inner(path, catalog, DEFAULT_POOL_SIZE, false, 0, Some(encryptor), true, wal::SyncMode::Fsync)
+        Self::open_inner(
+            path,
+            catalog,
+            DEFAULT_POOL_SIZE,
+            false,
+            0,
+            Some(encryptor),
+            true,
+            wal::SyncMode::Fsync,
+        )
     }
 
     /// Open with compression enabled (LZ4).
     pub fn open_compressed(path: &Path, catalog: Arc<Catalog>) -> Result<Self, StorageError> {
-        Self::open_inner(path, catalog, DEFAULT_POOL_SIZE, false, 0, None, true, wal::SyncMode::Fsync)
+        Self::open_inner(
+            path,
+            catalog,
+            DEFAULT_POOL_SIZE,
+            false,
+            0,
+            None,
+            true,
+            wal::SyncMode::Fsync,
+        )
     }
 
     /// Open with async I/O enabled (io_uring on Linux, tokio::fs elsewhere).
@@ -256,7 +320,16 @@ impl DiskEngine {
         pool_frames: usize,
         max_segment_size_mb: usize,
     ) -> Result<Self, StorageError> {
-        Self::open_inner(path, catalog, pool_frames, true, max_segment_size_mb, None, false, wal::SyncMode::Fsync)
+        Self::open_inner(
+            path,
+            catalog,
+            pool_frames,
+            true,
+            max_segment_size_mb,
+            None,
+            false,
+            wal::SyncMode::Fsync,
+        )
     }
 
     /// Open with a segmented WAL and explicit sync mode.
@@ -267,7 +340,16 @@ impl DiskEngine {
         max_segment_size_mb: usize,
         sync_mode: wal::SyncMode,
     ) -> Result<Self, StorageError> {
-        Self::open_inner(path, catalog, pool_frames, true, max_segment_size_mb, None, false, sync_mode)
+        Self::open_inner(
+            path,
+            catalog,
+            pool_frames,
+            true,
+            max_segment_size_mb,
+            None,
+            false,
+            sync_mode,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -286,8 +368,10 @@ impl DiskEngine {
             (Some(enc), false) => DiskManager::open_encrypted(path, enc.clone()),
             (None, true) => DiskManager::open_compressed(path),
             (None, false) => DiskManager::open(path),
-        }.map_err(|e| StorageError::Io(e.to_string()))?;
-        let file_size = disk.file_size()
+        }
+        .map_err(|e| StorageError::Io(e.to_string()))?;
+        let file_size = disk
+            .file_size()
             .map_err(|e| StorageError::Io(e.to_string()))?;
 
         let is_new = file_size == 0;
@@ -321,20 +405,30 @@ impl DiskEngine {
             } else {
                 64 * 1024 * 1024 // 64 MB default
             };
-            Box::new(wal::SegmentedWal::open_with_sync_mode(&wal_dir, max_bytes, sync_mode)
-                .map_err(|e| StorageError::Io(format!("Segmented WAL open failed: {e}")))?)
+            Box::new(
+                wal::SegmentedWal::open_with_sync_mode(&wal_dir, max_bytes, sync_mode)
+                    .map_err(|e| StorageError::Io(format!("Segmented WAL open failed: {e}")))?,
+            )
         } else {
-            Box::new(Wal::open_with_sync_mode(&wal_path, sync_mode)
-                .map_err(|e| StorageError::Io(format!("WAL open failed: {e}")))?)
+            Box::new(
+                Wal::open_with_sync_mode(&wal_path, sync_mode)
+                    .map_err(|e| StorageError::Io(format!("WAL open failed: {e}")))?,
+            )
         };
 
-        let pool = Arc::new(BufferPool::new(disk, Some(wal_backend), pool_frames, initial_pages));
+        let pool = Arc::new(BufferPool::new(
+            disk,
+            Some(wal_backend),
+            pool_frames,
+            initial_pages,
+        ));
 
         // Load free list head from the meta page (or initialize for new databases).
         let (fl_head, fl_count) = if is_new {
             (INVALID_PAGE_ID, 0u32)
         } else {
-            let frame_id = pool.fetch_page(0)
+            let frame_id = pool
+                .fetch_page(0)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = pool.frame_data(frame_id);
             let head = page::read_u32(pg, META_FREE_LIST_HEAD);
@@ -392,9 +486,10 @@ impl DiskEngine {
         let mut latest_pages: HashMap<u32, (u64, Box<PageBuf>)> = HashMap::new();
         for record in &records {
             if record.record_type == wal::RECORD_PAGE_WRITE
-                && let Some(ref img) = record.page_image {
-                    latest_pages.insert(record.page_id, (record.lsn, img.clone()));
-                }
+                && let Some(ref img) = record.page_image
+            {
+                latest_pages.insert(record.page_id, (record.lsn, img.clone()));
+            }
         }
 
         let mut recovered = 0usize;
@@ -443,7 +538,9 @@ impl DiskEngine {
     pub fn flush(&self) -> Result<(), StorageError> {
         // Save the table directory to the meta page first
         self.save_table_directory()?;
-        self.pool.flush_all().map_err(|e| StorageError::Io(e.to_string()))
+        self.pool
+            .flush_all()
+            .map_err(|e| StorageError::Io(e.to_string()))
     }
 
     /// Record a page as dirtied during an active MVCC transaction.
@@ -467,10 +564,14 @@ impl DiskEngine {
         // 1. Flush all dirty pages (including table directory)
         self.flush()?;
         // 2. Write a checkpoint record to the WAL
-        let cp_lsn = self.pool.wal_checkpoint()
+        let cp_lsn = self
+            .pool
+            .wal_checkpoint()
             .map_err(|e| StorageError::Io(e.to_string()))?;
         // 3. Sync WAL to ensure checkpoint record is durable
-        self.pool.flush_all().map_err(|e| StorageError::Io(e.to_string()))?;
+        self.pool
+            .flush_all()
+            .map_err(|e| StorageError::Io(e.to_string()))?;
         // 4. Truncate old WAL segments before the checkpoint LSN
         if cp_lsn > 0 {
             let _ = self.pool.wal_truncate_before(cp_lsn);
@@ -513,7 +614,9 @@ impl DiskEngine {
         // Collect existing overflow page IDs so we can reuse them
         let mut existing_overflow_pages: Vec<u32> = Vec::new();
         {
-            let frame_id = self.pool.fetch_page(0)
+            let frame_id = self
+                .pool
+                .fetch_page(0)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             let overflow_ptr_offset = PAGE_SIZE - 4;
@@ -523,7 +626,9 @@ impl DiskEngine {
             // (backwards compat with databases created before overflow pointer was initialized)
             while ov_page != INVALID_PAGE_ID && ov_page != 0 {
                 existing_overflow_pages.push(ov_page);
-                let ofid = self.pool.fetch_page(ov_page)
+                let ofid = self
+                    .pool
+                    .fetch_page(ov_page)
                     .map_err(|e| StorageError::Io(e.to_string()))?;
                 let opg = self.pool.frame_data(ofid);
                 ov_page = page::read_u32(opg, 0);
@@ -532,7 +637,9 @@ impl DiskEngine {
         }
 
         // Write to meta page (page 0)
-        let frame_id = self.pool.fetch_page(0)
+        let frame_id = self
+            .pool
+            .fetch_page(0)
             .map_err(|e| StorageError::Io(e.to_string()))?;
         let pg = self.pool.frame_data_mut(frame_id);
         // Zero the directory area first
@@ -550,14 +657,19 @@ impl DiskEngine {
         } else {
             // Reuse existing overflow page or allocate a new one
             let mut reuse_idx = 0usize;
-            let (overflow_page_id, overflow_frame_id) = if reuse_idx < existing_overflow_pages.len() {
+            let (overflow_page_id, overflow_frame_id) = if reuse_idx < existing_overflow_pages.len()
+            {
                 let pid = existing_overflow_pages[reuse_idx];
                 reuse_idx += 1;
-                let fid = self.pool.fetch_page(pid)
+                let fid = self
+                    .pool
+                    .fetch_page(pid)
                     .map_err(|e| StorageError::Io(e.to_string()))?;
                 (pid, fid)
             } else {
-                self.pool.new_page().map_err(|e| StorageError::Io(e.to_string()))?
+                self.pool
+                    .new_page()
+                    .map_err(|e| StorageError::Io(e.to_string()))?
             };
             let overflow_ptr_offset = PAGE_SIZE - 4;
             page::write_u32(pg, overflow_ptr_offset, overflow_page_id);
@@ -579,14 +691,19 @@ impl DiskEngine {
                     break;
                 } else {
                     // Reuse next existing overflow page or allocate new
-                    let (next_page_id, next_frame_id) = if reuse_idx < existing_overflow_pages.len() {
+                    let (next_page_id, next_frame_id) = if reuse_idx < existing_overflow_pages.len()
+                    {
                         let pid = existing_overflow_pages[reuse_idx];
                         reuse_idx += 1;
-                        let fid = self.pool.fetch_page(pid)
+                        let fid = self
+                            .pool
+                            .fetch_page(pid)
                             .map_err(|e| StorageError::Io(e.to_string()))?;
                         (pid, fid)
                     } else {
-                        self.pool.new_page().map_err(|e| StorageError::Io(e.to_string()))?
+                        self.pool
+                            .new_page()
+                            .map_err(|e| StorageError::Io(e.to_string()))?
                     };
                     page::write_u32(cur_pg, 0, next_page_id);
                     self.pool.mark_dirty(cur_frame_id);
@@ -618,7 +735,9 @@ impl DiskEngine {
         let meta_dir_capacity = PAGE_SIZE - META_TABLE_DIR_START - 4;
         let overflow_capacity = PAGE_SIZE - 4;
 
-        let frame_id = self.pool.fetch_page(0)
+        let frame_id = self
+            .pool
+            .fetch_page(0)
             .map_err(|e| StorageError::Io(e.to_string()))?;
         let pg = self.pool.frame_data(frame_id);
 
@@ -640,7 +759,9 @@ impl DiskEngine {
 
         // Follow overflow page chain
         while overflow_page_id != INVALID_PAGE_ID {
-            let ofid = self.pool.fetch_page(overflow_page_id)
+            let ofid = self
+                .pool
+                .fetch_page(overflow_page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let opg = self.pool.frame_data(ofid);
             let next_overflow = page::read_u32(opg, 0);
@@ -654,9 +775,7 @@ impl DiskEngine {
             return Ok(());
         }
 
-        let entry_count = u32::from_le_bytes([
-            dir_data[0], dir_data[1], dir_data[2], dir_data[3],
-        ]);
+        let entry_count = u32::from_le_bytes([dir_data[0], dir_data[1], dir_data[2], dir_data[3]]);
 
         // If no entries (fresh DB or empty directory), nothing to restore
         if entry_count == 0 {
@@ -684,8 +803,10 @@ impl DiskEngine {
                 break;
             }
             let first_page = u32::from_le_bytes([
-                dir_data[offset], dir_data[offset + 1],
-                dir_data[offset + 2], dir_data[offset + 3],
+                dir_data[offset],
+                dir_data[offset + 1],
+                dir_data[offset + 2],
+                dir_data[offset + 3],
             ]);
             offset += 4;
 
@@ -711,11 +832,20 @@ impl DiskEngine {
                     let fid = self.pool.fetch_page(last).unwrap();
                     let next = get_next_page(self.pool.frame_data(fid));
                     self.pool.unpin(fid);
-                    if next == INVALID_PAGE_ID { break; }
+                    if next == INVALID_PAGE_ID {
+                        break;
+                    }
                     last = next;
                 }
             }
-            restored.insert(name, TableMeta { first_page, last_page: last, col_types });
+            restored.insert(
+                name,
+                TableMeta {
+                    first_page,
+                    last_page: last,
+                    col_types,
+                },
+            );
         }
 
         let restored_count = restored.len();
@@ -750,7 +880,9 @@ impl DiskEngine {
         let mut head = self.free_list_head.lock();
         let mut count = self.free_page_count.lock();
 
-        let frame_id = self.pool.fetch_page(page_id)
+        let frame_id = self
+            .pool
+            .fetch_page(page_id)
             .map_err(|e| StorageError::Io(e.to_string()))?;
         let pg = self.pool.frame_data_mut(frame_id);
         page::init_free_page(pg, *head);
@@ -772,7 +904,9 @@ impl DiskEngine {
         }
 
         let page_id = *head;
-        let frame_id = self.pool.fetch_page(page_id)
+        let frame_id = self
+            .pool
+            .fetch_page(page_id)
             .map_err(|e| StorageError::Io(e.to_string()))?;
         let pg = self.pool.frame_data(frame_id);
         let next = page::read_u32(pg, page::FREE_NEXT_PAGE);
@@ -789,7 +923,9 @@ impl DiskEngine {
         let head = *self.free_list_head.lock();
         let count = *self.free_page_count.lock();
 
-        let frame_id = self.pool.fetch_page(0)
+        let frame_id = self
+            .pool
+            .fetch_page(0)
             .map_err(|e| StorageError::Io(e.to_string()))?;
         let pg = self.pool.frame_data_mut(frame_id);
         page::write_u32(pg, META_FREE_LIST_HEAD, head);
@@ -811,7 +947,9 @@ impl DiskEngine {
         let mut page_id = meta.first_page;
         while page_id != INVALID_PAGE_ID {
             pages.push(page_id);
-            let frame_id = self.pool.fetch_page(page_id)
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             let next = get_next_page(pg);
@@ -825,11 +963,14 @@ impl DiskEngine {
     /// Reuses a page from the free list if available, otherwise allocates a new page.
     fn alloc_data_page(&self, table: &str) -> Result<u32, StorageError> {
         let (page_id, frame_id) = if let Some(reused_id) = self.reuse_free_page()? {
-            let fid = self.pool.fetch_page(reused_id)
+            let fid = self
+                .pool
+                .fetch_page(reused_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             (reused_id, fid)
         } else {
-            self.pool.new_page()
+            self.pool
+                .new_page()
                 .map_err(|e| StorageError::Io(e.to_string()))?
         };
         let pg = self.pool.frame_data_mut(frame_id);
@@ -851,7 +992,9 @@ impl DiskEngine {
             // Link from the cached last page (O(1) instead of chain walk)
             let last = meta.last_page;
             if last != INVALID_PAGE_ID {
-                let fid = self.pool.fetch_page(last)
+                let fid = self
+                    .pool
+                    .fetch_page(last)
                     .map_err(|e| StorageError::Io(e.to_string()))?;
                 let pg_mut = self.pool.frame_data_mut(fid);
                 set_next_page(pg_mut, page_id);
@@ -876,7 +1019,9 @@ impl DiskEngine {
 
         // Phase 1: Compact each page — remove dead slots, defragment
         for &page_id in &pages {
-            let frame_id = self.pool.fetch_page(page_id)
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             let dead_count = page::dead_tuple_count(pg);
@@ -926,7 +1071,9 @@ impl DiskEngine {
         let mut cur_page_id = meta.first_page;
 
         while cur_page_id != INVALID_PAGE_ID {
-            let frame_id = self.pool.fetch_page(cur_page_id)
+            let frame_id = self
+                .pool
+                .fetch_page(cur_page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             let live_count = page::live_tuple_count(pg);
@@ -936,7 +1083,9 @@ impl DiskEngine {
             if live_count == 0 && (prev_page_id.is_some() || next != INVALID_PAGE_ID) {
                 // Empty page — unlink from chain (keep at least one page)
                 if let Some(prev_id) = prev_page_id {
-                    let prev_frame = self.pool.fetch_page(prev_id)
+                    let prev_frame = self
+                        .pool
+                        .fetch_page(prev_id)
                         .map_err(|e| StorageError::Io(e.to_string()))?;
                     let prev_pg = self.pool.frame_data_mut(prev_frame);
                     set_next_page(prev_pg, next);
@@ -973,15 +1122,20 @@ impl StorageEngine for DiskEngine {
         // server restart), don't overwrite it — just update col_types from catalog.
         let already_restored = {
             let tables = self.tables.read();
-            tables.get(table).is_some_and(|m| m.first_page != INVALID_PAGE_ID)
+            tables
+                .get(table)
+                .is_some_and(|m| m.first_page != INVALID_PAGE_ID)
         };
 
         if already_restored {
             // Table has data pages from a previous session.
             // Refresh col_types from catalog if available.
             if let Some(table_def) = self.catalog.get_table(table).await {
-                let col_types: Vec<DataType> = table_def.columns.iter()
-                    .map(|c| c.data_type.clone()).collect();
+                let col_types: Vec<DataType> = table_def
+                    .columns
+                    .iter()
+                    .map(|c| c.data_type.clone())
+                    .collect();
                 let mut tables = self.tables.write();
                 if let Some(meta) = tables.get_mut(table) {
                     meta.col_types = col_types;
@@ -991,9 +1145,16 @@ impl StorageEngine for DiskEngine {
         }
 
         // Get column types from catalog
-        let table_def = self.catalog.get_table(table).await
+        let table_def = self
+            .catalog
+            .get_table(table)
+            .await
             .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
-        let col_types: Vec<DataType> = table_def.columns.iter().map(|c| c.data_type.clone()).collect();
+        let col_types: Vec<DataType> = table_def
+            .columns
+            .iter()
+            .map(|c| c.data_type.clone())
+            .collect();
 
         let mut tables = self.tables.write();
         tables.insert(
@@ -1009,14 +1170,17 @@ impl StorageEngine for DiskEngine {
 
     async fn drop_table(&self, table: &str) -> Result<(), StorageError> {
         let mut tables = self.tables.write();
-        let meta = tables.remove(table)
+        let meta = tables
+            .remove(table)
             .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
         drop(tables);
 
         // Walk the page chain and add each page to the free list for reuse.
         let mut page_id = meta.first_page;
         while page_id != INVALID_PAGE_ID {
-            let frame_id = self.pool.fetch_page(page_id)
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             let next = get_next_page(pg);
@@ -1039,12 +1203,15 @@ impl StorageEngine for DiskEngine {
         // Fast path: try the last page first (O(1) instead of scanning all pages)
         let last_page_id = {
             let tables = self.tables.read();
-            tables.get(table)
+            tables
+                .get(table)
                 .map(|m| m.last_page)
                 .unwrap_or(INVALID_PAGE_ID)
         };
         if last_page_id != INVALID_PAGE_ID {
-            let frame_id = self.pool.fetch_page(last_page_id)
+            let frame_id = self
+                .pool
+                .fetch_page(last_page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data_mut(frame_id);
             if let Some(slot_idx) = page::insert_tuple(pg, &data) {
@@ -1059,7 +1226,9 @@ impl StorageEngine for DiskEngine {
 
         // Last page full or no pages yet — allocate a new one
         let page_id = self.alloc_data_page(table)?;
-        let frame_id = self.pool.fetch_page(page_id)
+        let frame_id = self
+            .pool
+            .fetch_page(page_id)
             .map_err(|e| StorageError::Io(e.to_string()))?;
         let pg = self.pool.frame_data_mut(frame_id);
         let slot_idx = page::insert_tuple(pg, &data)
@@ -1098,12 +1267,20 @@ impl StorageEngine for DiskEngine {
                 self.pool.prefetch_pages(&pages[next_batch_start..end]);
             }
 
-            let frame_id = self.pool.fetch_page(page_id)
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             for (_slot_idx, tuple_data) in page::iter_tuples(pg) {
-                if let Some(row) = tuple::deserialize_row(tuple_data, &col_types) {
-                    rows.push(row);
+                match tuple::deserialize_row(tuple_data, &col_types) {
+                    Some(row) => rows.push(row),
+                    // A tuple that fails to deserialize indicates corruption. Don't
+                    // silently drop it from scan results with no trace — surface it.
+                    None => tracing::error!(
+                        target: "nucleus::storage",
+                        "failed to deserialize tuple on page {page_id} (slot {_slot_idx}); row omitted from scan"
+                    ),
                 }
             }
             self.pool.unpin(frame_id);
@@ -1134,11 +1311,15 @@ impl StorageEngine for DiskEngine {
                 self.pool.prefetch_pages(&pages[next_batch_start..end]);
             }
 
-            let frame_id = self.pool.fetch_page(page_id)
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             for (_slot_idx, tuple_data) in page::iter_tuples(pg) {
-                if let Some(row) = tuple::deserialize_row_projected(tuple_data, &col_types, projection) {
+                if let Some(row) =
+                    tuple::deserialize_row_projected(tuple_data, &col_types, projection)
+                {
                     rows.push(row);
                 }
             }
@@ -1172,7 +1353,9 @@ impl StorageEngine for DiskEngine {
                 self.pool.prefetch_pages(&pages[next_batch_start..end]);
             }
 
-            let frame_id = self.pool.fetch_page(page_id)
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             for (_slot_idx, tuple_data) in page::iter_tuples(pg) {
@@ -1228,7 +1411,9 @@ impl StorageEngine for DiskEngine {
             if to_delete.is_empty() {
                 break;
             }
-            let frame_id = self.pool.fetch_page(page_id)
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             let slot_count = page::read_u16(pg, page::DATA_SLOT_COUNT);
@@ -1285,7 +1470,9 @@ impl StorageEngine for DiskEngine {
             if update_map.is_empty() {
                 break;
             }
-            let frame_id = self.pool.fetch_page(page_id)
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             let slot_count = page::read_u16(pg, page::DATA_SLOT_COUNT);
@@ -1337,7 +1524,9 @@ impl StorageEngine for DiskEngine {
                             }
                             count += 1;
                             // Re-fetch this page to continue scanning
-                            let frame_id2 = self.pool.fetch_page(page_id)
+                            let frame_id2 = self
+                                .pool
+                                .fetch_page(page_id)
                                 .map_err(|e| StorageError::Io(e.to_string()))?;
                             self.pool.unpin(frame_id2);
                             global_idx += 1;
@@ -1361,7 +1550,8 @@ impl StorageEngine for DiskEngine {
         if let Some(ref ops) = self.async_ops {
             // Async path: collect dirty pages (sync, memory-only), write via io_uring/tokio::fs.
             self.save_table_directory()?;
-            let dirty = self.pool
+            let dirty = self
+                .pool
                 .collect_dirty_for_async_flush()
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             for (page_id, data) in &dirty {
@@ -1369,7 +1559,9 @@ impl StorageEngine for DiskEngine {
                     .await
                     .map_err(|e| StorageError::Io(e.to_string()))?;
             }
-            ops.sync().await.map_err(|e| StorageError::Io(e.to_string()))?;
+            ops.sync()
+                .await
+                .map_err(|e| StorageError::Io(e.to_string()))?;
             Ok(())
         } else {
             // Sync fallback (default when async_ops not set).
@@ -1381,7 +1573,12 @@ impl StorageEngine for DiskEngine {
         self.checkpoint()
     }
 
-    async fn create_index(&self, table: &str, index_name: &str, col_idx: usize) -> Result<(), StorageError> {
+    async fn create_index(
+        &self,
+        table: &str,
+        index_name: &str,
+        col_idx: usize,
+    ) -> Result<(), StorageError> {
         self.create_index_inner(index_name, table, col_idx)
     }
 
@@ -1389,7 +1586,12 @@ impl StorageEngine for DiskEngine {
         self.drop_index_inner(index_name)
     }
 
-    async fn index_lookup(&self, table: &str, index_name: &str, value: &Value) -> Result<Option<Vec<Row>>, StorageError> {
+    async fn index_lookup(
+        &self,
+        table: &str,
+        index_name: &str,
+        value: &Value,
+    ) -> Result<Option<Vec<Row>>, StorageError> {
         Ok(Some(self.index_lookup_inner(table, index_name, value)?))
     }
 
@@ -1400,10 +1602,17 @@ impl StorageEngine for DiskEngine {
         low: &Value,
         high: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
-        Ok(Some(self.index_lookup_range_inner(table, index_name, low, high)?))
+        Ok(Some(
+            self.index_lookup_range_inner(table, index_name, low, high)?,
+        ))
     }
 
-    fn index_lookup_sync(&self, table: &str, index_name: &str, value: &Value) -> Result<Option<Vec<Row>>, StorageError> {
+    fn index_lookup_sync(
+        &self,
+        table: &str,
+        index_name: &str,
+        value: &Value,
+    ) -> Result<Option<Vec<Row>>, StorageError> {
         Ok(Some(self.index_lookup_inner(table, index_name, value)?))
     }
 
@@ -1414,7 +1623,9 @@ impl StorageEngine for DiskEngine {
         low: &Value,
         high: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
-        Ok(Some(self.index_lookup_range_inner(table, index_name, low, high)?))
+        Ok(Some(
+            self.index_lookup_range_inner(table, index_name, low, high)?,
+        ))
     }
 
     fn index_only_scan(
@@ -1532,7 +1743,8 @@ impl StorageEngine for DiskEngine {
             // Reload pre-existing pages from disk (undo their in-memory changes).
             let existing: Vec<u32> = ts.dirty_existing.into_iter().collect();
             if !existing.is_empty() {
-                self.pool.reload_pages_from_disk(&existing)
+                self.pool
+                    .reload_pages_from_disk(&existing)
                     .map_err(|e| StorageError::Io(e.to_string()))?;
             }
 
@@ -1592,17 +1804,21 @@ impl DiskEngine {
         // Populate the index from existing data
         let mut page_id = first_page;
         while page_id != INVALID_PAGE_ID {
-            let frame_id = self.pool.fetch_page(page_id)
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             for (slot_idx, tuple_data) in page::iter_tuples(pg) {
                 if let Some(row) = tuple::deserialize_row(tuple_data, &col_types)
-                    && col_idx < row.len() {
-                        let key = serialize_index_key(&row[col_idx]);
-                        let rid = RowId { page_id, slot_idx };
-                        btree.insert(&key, rid)
-                            .map_err(|e| StorageError::Io(e.to_string()))?;
-                    }
+                    && col_idx < row.len()
+                {
+                    let key = serialize_index_key(&row[col_idx]);
+                    let rid = RowId { page_id, slot_idx };
+                    btree
+                        .insert(&key, rid)
+                        .map_err(|e| StorageError::Io(e.to_string()))?;
+                }
             }
             let next = get_next_page(pg);
             self.pool.unpin(frame_id);
@@ -1610,12 +1826,15 @@ impl DiskEngine {
         }
 
         let mut indexes = self.indexes.write();
-        indexes.insert(index_name.to_string(), IndexMeta {
-            btree,
-            table: table.to_string(),
-            col_idx,
-            col_type,
-        });
+        indexes.insert(
+            index_name.to_string(),
+            IndexMeta {
+                btree,
+                table: table.to_string(),
+                col_idx,
+                col_type,
+            },
+        );
         Ok(())
     }
 
@@ -1650,12 +1869,16 @@ impl DiskEngine {
         }
 
         let key = serialize_index_key(value);
-        let row_ids = idx.btree.lookup(&key)
+        let row_ids = idx
+            .btree
+            .lookup(&key)
             .map_err(|e| StorageError::Io(e.to_string()))?;
 
         let mut rows = Vec::with_capacity(row_ids.len());
         for rid in row_ids {
-            let frame_id = self.pool.fetch_page(rid.page_id)
+            let frame_id = self
+                .pool
+                .fetch_page(rid.page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             let entry = page::read_slot(pg, rid.slot_idx);
@@ -1732,14 +1955,21 @@ impl DiskEngine {
 
     /// Maintain indexes after an insert — called with the page and slot where the
     /// row was inserted, plus the row data.
-    fn index_insert(&self, table: &str, page_id: u32, slot_idx: u16, row: &Row) -> Result<(), StorageError> {
+    fn index_insert(
+        &self,
+        table: &str,
+        page_id: u32,
+        slot_idx: u16,
+        row: &Row,
+    ) -> Result<(), StorageError> {
         let mut indexes = self.indexes.write();
         for (idx_name, idx) in indexes.iter_mut() {
             if idx.table == table && idx.col_idx < row.len() {
                 let key = serialize_index_key(&row[idx.col_idx]);
                 let rid = RowId { page_id, slot_idx };
-                idx.btree.insert(&key, rid)
-                    .map_err(|e| StorageError::Io(format!("Index insert failed for {idx_name}: {e}")))?;
+                idx.btree.insert(&key, rid).map_err(|e| {
+                    StorageError::Io(format!("Index insert failed for {idx_name}: {e}"))
+                })?;
             }
         }
         Ok(())
@@ -1765,7 +1995,9 @@ impl DiskEngine {
         // Try existing pages
         let pages = self.table_pages(table)?;
         for &page_id in &pages {
-            let frame_id = self.pool.fetch_page(page_id)
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = self.pool.frame_data_mut(frame_id);
             if let Some(slot_idx) = page::insert_tuple(pg, data) {
@@ -1779,7 +2011,9 @@ impl DiskEngine {
 
         // Allocate new page
         let page_id = self.alloc_data_page(table)?;
-        let frame_id = self.pool.fetch_page(page_id)
+        let frame_id = self
+            .pool
+            .fetch_page(page_id)
             .map_err(|e| StorageError::Io(e.to_string()))?;
         let pg = self.pool.frame_data_mut(frame_id);
         let slot_idx = page::insert_tuple(pg, data)
@@ -1881,15 +2115,13 @@ fn deserialize_index_key(data: &[u8]) -> Option<Value> {
         }
         3 if data.len() >= 9 => {
             let u = u64::from_be_bytes([
-                data[1], data[2], data[3], data[4],
-                data[5], data[6], data[7], data[8],
+                data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
             ]);
             Some(Value::Int64((u ^ 0x8000_0000_0000_0000) as i64))
         }
         4 if data.len() >= 9 => {
             let u = u64::from_be_bytes([
-                data[1], data[2], data[3], data[4],
-                data[5], data[6], data[7], data[8],
+                data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
             ]);
             let bits = if u & 0x8000_0000_0000_0000 != 0 {
                 u ^ 0x8000_0000_0000_0000
@@ -1923,6 +2155,8 @@ impl std::fmt::Debug for DiskEngine {
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
     use crate::catalog::{Catalog, ColumnDef, TableDef};
     use crate::types::{DataType, Value};
@@ -1994,10 +2228,7 @@ mod tests {
             .insert("users", simple_row(1, "Alice"))
             .await
             .unwrap();
-        engine
-            .insert("users", simple_row(2, "Bob"))
-            .await
-            .unwrap();
+        engine.insert("users", simple_row(2, "Bob")).await.unwrap();
 
         let rows = engine.scan("users").await.unwrap();
         assert_eq!(rows.len(), 2);
@@ -2024,8 +2255,8 @@ mod tests {
 
         let rows = engine.scan("items").await.unwrap();
         assert_eq!(rows.len(), 10);
-        for i in 0..10 {
-            assert_eq!(rows[i], simple_row(i as i32, &format!("item_{i}")));
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(*row, simple_row(i as i32, &format!("item_{i}")));
         }
     }
 
@@ -2107,7 +2338,10 @@ mod tests {
 
         let result = engine.scan("ephemeral").await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), StorageError::TableNotFound(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            StorageError::TableNotFound(_)
+        ));
     }
 
     // ── 7. table_not_found ────────────────────────────────────────
@@ -2283,14 +2517,8 @@ mod tests {
         engine.create_table("grow").await.unwrap();
 
         // Insert a row with a short name
-        engine
-            .insert("grow", simple_row(1, "a"))
-            .await
-            .unwrap();
-        engine
-            .insert("grow", simple_row(2, "b"))
-            .await
-            .unwrap();
+        engine.insert("grow", simple_row(1, "a")).await.unwrap();
+        engine.insert("grow", simple_row(2, "b")).await.unwrap();
 
         // Update position 0 with a much longer text value
         let long_name = "x".repeat(500);
@@ -2332,7 +2560,11 @@ mod tests {
         assert_eq!(deleted, n as usize);
 
         let rows = engine.scan("doomed").await.unwrap();
-        assert!(rows.is_empty(), "expected empty scan after deleting all rows, got {} rows", rows.len());
+        assert!(
+            rows.is_empty(),
+            "expected empty scan after deleting all rows, got {} rows",
+            rows.len()
+        );
     }
 
     // ── 13. create_index_and_lookup ──────────────────────────────
@@ -2345,14 +2577,21 @@ mod tests {
         engine.create_table("indexed").await.unwrap();
 
         for i in 0..10 {
-            engine.insert("indexed", simple_row(i, &format!("user_{i}"))).await.unwrap();
+            engine
+                .insert("indexed", simple_row(i, &format!("user_{i}")))
+                .await
+                .unwrap();
         }
 
         // Create index on column 0 (id)
         engine.create_index("indexed", "idx_id", 0).await.unwrap();
 
         // Lookup a specific value
-        let results = engine.index_lookup("indexed", "idx_id", &Value::Int32(5)).await.unwrap().unwrap();
+        let results = engine
+            .index_lookup("indexed", "idx_id", &Value::Int32(5))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], simple_row(5, "user_5"));
     }
@@ -2369,7 +2608,11 @@ mod tests {
         engine.insert("indexed2", simple_row(1, "a")).await.unwrap();
         engine.create_index("indexed2", "idx2", 0).await.unwrap();
 
-        let results = engine.index_lookup("indexed2", "idx2", &Value::Int32(999)).await.unwrap().unwrap();
+        let results = engine
+            .index_lookup("indexed2", "idx2", &Value::Int32(999))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -2386,7 +2629,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        engine.create_index("indexed_range", "idx_range", 0).await.unwrap();
+        engine
+            .create_index("indexed_range", "idx_range", 0)
+            .await
+            .unwrap();
 
         // Bounds are Int64; indexed column is Int32.
         let results = engine
@@ -2424,7 +2670,9 @@ mod tests {
         engine.drop_index("idx_drop").await.unwrap();
 
         // Lookup should now fail (returns None since index doesn't exist)
-        let result = engine.index_lookup("di", "idx_drop", &Value::Int32(1)).await;
+        let result = engine
+            .index_lookup("di", "idx_drop", &Value::Int32(1))
+            .await;
         assert!(result.is_err());
     }
 
@@ -2437,14 +2685,27 @@ mod tests {
         register_simple_table(&catalog, "txt_idx").await;
         engine.create_table("txt_idx").await.unwrap();
 
-        engine.insert("txt_idx", simple_row(1, "alice")).await.unwrap();
-        engine.insert("txt_idx", simple_row(2, "bob")).await.unwrap();
-        engine.insert("txt_idx", simple_row(3, "alice")).await.unwrap();
+        engine
+            .insert("txt_idx", simple_row(1, "alice"))
+            .await
+            .unwrap();
+        engine
+            .insert("txt_idx", simple_row(2, "bob"))
+            .await
+            .unwrap();
+        engine
+            .insert("txt_idx", simple_row(3, "alice"))
+            .await
+            .unwrap();
 
         // Index on column 1 (name)
         engine.create_index("txt_idx", "idx_name", 1).await.unwrap();
 
-        let results = engine.index_lookup("txt_idx", "idx_name", &Value::Text("alice".into())).await.unwrap().unwrap();
+        let results = engine
+            .index_lookup("txt_idx", "idx_name", &Value::Text("alice".into()))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(results.len(), 2);
         // Both rows with "alice" should be returned
         assert!(results.iter().all(|r| r[1] == Value::Text("alice".into())));
@@ -2460,9 +2721,18 @@ mod tests {
         register_simple_table(&catalog, "items").await;
         engine.create_table("items").await.unwrap();
 
-        engine.insert("items", simple_row(10, "apple")).await.unwrap();
-        engine.insert("items", simple_row(20, "banana")).await.unwrap();
-        engine.insert("items", simple_row(30, "cherry")).await.unwrap();
+        engine
+            .insert("items", simple_row(10, "apple"))
+            .await
+            .unwrap();
+        engine
+            .insert("items", simple_row(20, "banana"))
+            .await
+            .unwrap();
+        engine
+            .insert("items", simple_row(30, "cherry"))
+            .await
+            .unwrap();
 
         let rows = engine.scan("items").await.unwrap();
         assert_eq!(rows.len(), 3);
@@ -2481,9 +2751,18 @@ mod tests {
         register_simple_table(&catalog, "del_tbl").await;
         engine.create_table("del_tbl").await.unwrap();
 
-        engine.insert("del_tbl", simple_row(1, "first")).await.unwrap();
-        engine.insert("del_tbl", simple_row(2, "second")).await.unwrap();
-        engine.insert("del_tbl", simple_row(3, "third")).await.unwrap();
+        engine
+            .insert("del_tbl", simple_row(1, "first"))
+            .await
+            .unwrap();
+        engine
+            .insert("del_tbl", simple_row(2, "second"))
+            .await
+            .unwrap();
+        engine
+            .insert("del_tbl", simple_row(3, "third"))
+            .await
+            .unwrap();
 
         // Delete the middle row (position 1)
         let deleted = engine.delete("del_tbl", &[1]).await.unwrap();
@@ -2507,7 +2786,10 @@ mod tests {
         register_simple_table(&catalog, "upd_tbl").await;
         engine.create_table("upd_tbl").await.unwrap();
 
-        engine.insert("upd_tbl", simple_row(1, "original")).await.unwrap();
+        engine
+            .insert("upd_tbl", simple_row(1, "original"))
+            .await
+            .unwrap();
 
         // Update position 0 with new values
         let updated = engine
@@ -2535,10 +2817,19 @@ mod tests {
         engine.create_table("table_b").await.unwrap();
 
         // Insert different data into each table
-        engine.insert("table_a", simple_row(1, "alpha")).await.unwrap();
-        engine.insert("table_a", simple_row(2, "beta")).await.unwrap();
+        engine
+            .insert("table_a", simple_row(1, "alpha"))
+            .await
+            .unwrap();
+        engine
+            .insert("table_a", simple_row(2, "beta"))
+            .await
+            .unwrap();
 
-        engine.insert("table_b", simple_row(100, "gamma")).await.unwrap();
+        engine
+            .insert("table_b", simple_row(100, "gamma"))
+            .await
+            .unwrap();
 
         // Verify table isolation: each table has only its own rows
         let rows_a = engine.scan("table_a").await.unwrap();
@@ -2555,7 +2846,11 @@ mod tests {
         let rows_a = engine.scan("table_a").await.unwrap();
         assert_eq!(rows_a.len(), 1);
         let rows_b = engine.scan("table_b").await.unwrap();
-        assert_eq!(rows_b.len(), 1, "table_b should be unaffected by delete on table_a");
+        assert_eq!(
+            rows_b.len(),
+            1,
+            "table_b should be unaffected by delete on table_a"
+        );
     }
 
     // -- 21. test_disk_engine_empty_scan --------------------------
@@ -2570,7 +2865,11 @@ mod tests {
 
         // Scan immediately after creation should return empty
         let rows = engine.scan("empty_tbl").await.unwrap();
-        assert!(rows.is_empty(), "expected no rows in freshly created table, got {}", rows.len());
+        assert!(
+            rows.is_empty(),
+            "expected no rows in freshly created table, got {}",
+            rows.len()
+        );
     }
 
     // ── Persistence integration tests ────────────────────────────────
@@ -2588,9 +2887,15 @@ mod tests {
             let engine = DiskEngine::open(&db_path, catalog.clone()).unwrap();
             engine.create_table("users").await.unwrap();
             engine.create_table("orders").await.unwrap();
-            engine.insert("users", simple_row(1, "Alice")).await.unwrap();
+            engine
+                .insert("users", simple_row(1, "Alice"))
+                .await
+                .unwrap();
             engine.insert("users", simple_row(2, "Bob")).await.unwrap();
-            engine.insert("orders", simple_row(100, "order-A")).await.unwrap();
+            engine
+                .insert("orders", simple_row(100, "order-A"))
+                .await
+                .unwrap();
             engine.flush().unwrap();
         }
 
@@ -2623,11 +2928,36 @@ mod tests {
         let types_table = TableDef {
             name: "typed".to_string(),
             columns: vec![
-                ColumnDef { name: "a".into(), data_type: DataType::Int32, nullable: false, default_expr: None },
-                ColumnDef { name: "b".into(), data_type: DataType::Int64, nullable: true, default_expr: None },
-                ColumnDef { name: "c".into(), data_type: DataType::Float64, nullable: true, default_expr: None },
-                ColumnDef { name: "d".into(), data_type: DataType::Bool, nullable: true, default_expr: None },
-                ColumnDef { name: "e".into(), data_type: DataType::Text, nullable: true, default_expr: None },
+                ColumnDef {
+                    name: "a".into(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "b".into(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "c".into(),
+                    data_type: DataType::Float64,
+                    nullable: true,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "d".into(),
+                    data_type: DataType::Bool,
+                    nullable: true,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "e".into(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    default_expr: None,
+                },
             ],
             constraints: vec![],
             append_only: false,
@@ -2676,7 +3006,10 @@ mod tests {
             engine.create_table("t").await.unwrap();
             engine.insert("t", simple_row(1, "old")).await.unwrap();
             engine.insert("t", simple_row(2, "keep")).await.unwrap();
-            engine.update("t", &[(0, simple_row(1, "new"))]).await.unwrap();
+            engine
+                .update("t", &[(0, simple_row(1, "new"))])
+                .await
+                .unwrap();
             engine.flush().unwrap();
         }
 
@@ -2779,10 +3112,7 @@ mod tests {
             assert_eq!(rows.len(), row_count as usize);
             for i in 0..row_count {
                 let name = format!("row_{i:04}");
-                assert!(
-                    rows.contains(&simple_row(i, &name)),
-                    "missing row {i}"
-                );
+                assert!(rows.contains(&simple_row(i, &name)), "missing row {i}");
             }
         }
     }
@@ -2814,7 +3144,11 @@ mod tests {
             serialize_data_type(ty, &mut buf);
             let mut offset = 0;
             let restored = deserialize_data_type(&buf, &mut offset).unwrap();
-            assert_eq!(format!("{ty}"), format!("{restored}"), "roundtrip failed for {ty}");
+            assert_eq!(
+                format!("{ty}"),
+                format!("{restored}"),
+                "roundtrip failed for {ty}"
+            );
         }
     }
 
@@ -2824,7 +3158,10 @@ mod tests {
         let (engine, catalog) = setup_engine(tmp.path()).await;
         register_simple_table(&catalog, "t").await;
         engine.create_table("t").await.unwrap();
-        engine.insert("t", simple_row(1, "via_trait")).await.unwrap();
+        engine
+            .insert("t", simple_row(1, "via_trait"))
+            .await
+            .unwrap();
         // Call via the StorageEngine trait method
         engine.flush_all_dirty().await.unwrap();
     }
@@ -2869,7 +3206,10 @@ mod tests {
             let engine = DiskEngine::open(&db_path, catalog.clone()).unwrap();
             register_simple_table(&catalog, "t").await;
             engine.create_table("t").await.unwrap();
-            engine.insert("t", simple_row(1, "persisted")).await.unwrap();
+            engine
+                .insert("t", simple_row(1, "persisted"))
+                .await
+                .unwrap();
             engine.flush().unwrap(); // This data is safe
 
             // Insert more data — this will be in the buffer pool but NOT flushed
@@ -2988,9 +3328,18 @@ mod tests {
             let engine = DiskEngine::open(&db_path, catalog.clone()).unwrap();
             engine.create_table("recovery_tbl").await.unwrap();
 
-            engine.insert("recovery_tbl", simple_row(1, "alice")).await.unwrap();
-            engine.insert("recovery_tbl", simple_row(2, "bob")).await.unwrap();
-            engine.insert("recovery_tbl", simple_row(3, "charlie")).await.unwrap();
+            engine
+                .insert("recovery_tbl", simple_row(1, "alice"))
+                .await
+                .unwrap();
+            engine
+                .insert("recovery_tbl", simple_row(2, "bob"))
+                .await
+                .unwrap();
+            engine
+                .insert("recovery_tbl", simple_row(3, "charlie"))
+                .await
+                .unwrap();
 
             engine.flush().unwrap();
             // engine dropped here — simulates clean shutdown
@@ -3005,7 +3354,12 @@ mod tests {
             engine2.create_table("recovery_tbl").await.unwrap();
 
             let rows = engine2.scan("recovery_tbl").await.unwrap();
-            assert_eq!(rows.len(), 3, "expected 3 rows after recovery, got {}", rows.len());
+            assert_eq!(
+                rows.len(),
+                3,
+                "expected 3 rows after recovery, got {}",
+                rows.len()
+            );
             assert!(rows.contains(&simple_row(1, "alice")));
             assert!(rows.contains(&simple_row(2, "bob")));
             assert!(rows.contains(&simple_row(3, "charlie")));
@@ -3039,7 +3393,10 @@ mod tests {
             register_simple_table(&catalog, "crash_tbl").await;
             let engine = DiskEngine::open(&db_path, catalog.clone()).unwrap();
             engine.create_table("crash_tbl").await.unwrap();
-            engine.insert("crash_tbl", simple_row(1, "before_crash")).await.unwrap();
+            engine
+                .insert("crash_tbl", simple_row(1, "before_crash"))
+                .await
+                .unwrap();
             engine.flush().unwrap();
         }
 
@@ -3057,8 +3414,14 @@ mod tests {
             assert_eq!(rows.len(), 1);
 
             // Insert new data
-            engine.insert("crash_tbl", simple_row(2, "after_crash")).await.unwrap();
-            engine.insert("crash_tbl", simple_row(3, "also_after")).await.unwrap();
+            engine
+                .insert("crash_tbl", simple_row(2, "after_crash"))
+                .await
+                .unwrap();
+            engine
+                .insert("crash_tbl", simple_row(3, "also_after"))
+                .await
+                .unwrap();
 
             // Flush writes WAL records AND data file
             engine.flush().unwrap();
@@ -3073,10 +3436,10 @@ mod tests {
 
         // Save the page images from WAL before we corrupt the data file
         for record in &wal_records {
-            if record.record_type == wal::RECORD_PAGE_WRITE {
-                if let Some(ref img) = record.page_image {
-                    saved_pages.push((record.page_id, img.clone()));
-                }
+            if record.record_type == wal::RECORD_PAGE_WRITE
+                && let Some(ref img) = record.page_image
+            {
+                saved_pages.push((record.page_id, img.clone()));
             }
         }
 
@@ -3113,7 +3476,12 @@ mod tests {
 
             let rows = engine3.scan("crash_tbl").await.unwrap();
             // All 3 rows should be recovered from WAL
-            assert_eq!(rows.len(), 3, "expected 3 rows after WAL recovery, got {}", rows.len());
+            assert_eq!(
+                rows.len(),
+                3,
+                "expected 3 rows after WAL recovery, got {}",
+                rows.len()
+            );
             assert!(rows.contains(&simple_row(1, "before_crash")));
             assert!(rows.contains(&simple_row(2, "after_crash")));
             assert!(rows.contains(&simple_row(3, "also_after")));
@@ -3142,14 +3510,18 @@ mod tests {
             let engine = DiskEngine::open_segmented(
                 &db_path,
                 catalog.clone(),
-                32,  // pool frames
-                1,   // 1 MB segment size
-            ).unwrap();
+                32, // pool frames
+                1,  // 1 MB segment size
+            )
+            .unwrap();
             engine.create_table("seg_tbl").await.unwrap();
 
             for i in 0..row_count {
                 let name = format!("seg_row_{i:03}");
-                engine.insert("seg_tbl", simple_row(i, &name)).await.unwrap();
+                engine
+                    .insert("seg_tbl", simple_row(i, &name))
+                    .await
+                    .unwrap();
             }
 
             engine.flush().unwrap();
@@ -3160,12 +3532,7 @@ mod tests {
         {
             let catalog2 = Arc::new(Catalog::new());
             register_simple_table(&catalog2, "seg_tbl").await;
-            let engine2 = DiskEngine::open_segmented(
-                &db_path,
-                catalog2.clone(),
-                32,
-                1,
-            ).unwrap();
+            let engine2 = DiskEngine::open_segmented(&db_path, catalog2.clone(), 32, 1).unwrap();
             engine2.create_table("seg_tbl").await.unwrap();
 
             let rows = engine2.scan("seg_tbl").await.unwrap();
@@ -3178,7 +3545,10 @@ mod tests {
 
             // Spot-check first and last rows
             assert!(rows.contains(&simple_row(0, "seg_row_000")));
-            assert!(rows.contains(&simple_row(row_count - 1, &format!("seg_row_{:03}", row_count - 1))));
+            assert!(rows.contains(&simple_row(
+                row_count - 1,
+                &format!("seg_row_{:03}", row_count - 1)
+            )));
         }
     }
 
@@ -3203,19 +3573,43 @@ mod tests {
             engine.create_table("orders").await.unwrap();
 
             // Insert into users
-            engine.insert("users", simple_row(1, "alice")).await.unwrap();
+            engine
+                .insert("users", simple_row(1, "alice"))
+                .await
+                .unwrap();
             engine.insert("users", simple_row(2, "bob")).await.unwrap();
-            engine.insert("users", simple_row(3, "charlie")).await.unwrap();
+            engine
+                .insert("users", simple_row(3, "charlie"))
+                .await
+                .unwrap();
 
             // Insert into products
-            engine.insert("products", simple_row(100, "widget")).await.unwrap();
-            engine.insert("products", simple_row(200, "gadget")).await.unwrap();
+            engine
+                .insert("products", simple_row(100, "widget"))
+                .await
+                .unwrap();
+            engine
+                .insert("products", simple_row(200, "gadget"))
+                .await
+                .unwrap();
 
             // Insert into orders
-            engine.insert("orders", simple_row(1000, "order_a")).await.unwrap();
-            engine.insert("orders", simple_row(1001, "order_b")).await.unwrap();
-            engine.insert("orders", simple_row(1002, "order_c")).await.unwrap();
-            engine.insert("orders", simple_row(1003, "order_d")).await.unwrap();
+            engine
+                .insert("orders", simple_row(1000, "order_a"))
+                .await
+                .unwrap();
+            engine
+                .insert("orders", simple_row(1001, "order_b"))
+                .await
+                .unwrap();
+            engine
+                .insert("orders", simple_row(1002, "order_c"))
+                .await
+                .unwrap();
+            engine
+                .insert("orders", simple_row(1003, "order_d"))
+                .await
+                .unwrap();
 
             engine.flush().unwrap();
             // engine dropped here
@@ -3242,7 +3636,12 @@ mod tests {
 
             // Verify products
             let products = engine2.scan("products").await.unwrap();
-            assert_eq!(products.len(), 2, "expected 2 products, got {}", products.len());
+            assert_eq!(
+                products.len(),
+                2,
+                "expected 2 products, got {}",
+                products.len()
+            );
             assert!(products.contains(&simple_row(100, "widget")));
             assert!(products.contains(&simple_row(200, "gadget")));
 
@@ -3256,13 +3655,24 @@ mod tests {
 
             // Verify table isolation: inserting into one table after recovery
             // doesn't affect the others
-            engine2.insert("users", simple_row(4, "diana")).await.unwrap();
+            engine2
+                .insert("users", simple_row(4, "diana"))
+                .await
+                .unwrap();
             let users_after = engine2.scan("users").await.unwrap();
             assert_eq!(users_after.len(), 4);
             let products_after = engine2.scan("products").await.unwrap();
-            assert_eq!(products_after.len(), 2, "products should be unaffected by user insert");
+            assert_eq!(
+                products_after.len(),
+                2,
+                "products should be unaffected by user insert"
+            );
             let orders_after = engine2.scan("orders").await.unwrap();
-            assert_eq!(orders_after.len(), 4, "orders should be unaffected by user insert");
+            assert_eq!(
+                orders_after.len(),
+                4,
+                "orders should be unaffected by user insert"
+            );
         }
     }
 
@@ -3297,7 +3707,10 @@ mod tests {
 
         // Insert 10 rows
         for i in 0..10 {
-            engine.insert("t", simple_row(i, &format!("row{i}"))).await.unwrap();
+            engine
+                .insert("t", simple_row(i, &format!("row{i}")))
+                .await
+                .unwrap();
         }
         assert_eq!(engine.scan("t").await.unwrap().len(), 10);
 
@@ -3329,10 +3742,16 @@ mod tests {
         // Insert enough rows to span multiple pages
         // Each page is 16 KB; each row is ~20-30 bytes, so ~500 rows per page
         for i in 0..1200 {
-            engine.insert("t", simple_row(i, &format!("row_{i:04}"))).await.unwrap();
+            engine
+                .insert("t", simple_row(i, &format!("row_{i:04}")))
+                .await
+                .unwrap();
         }
         let pages_before = engine.table_pages("t").unwrap().len();
-        assert!(pages_before >= 2, "should have at least 2 pages, got {pages_before}");
+        assert!(
+            pages_before >= 2,
+            "should have at least 2 pages, got {pages_before}"
+        );
 
         // Delete ALL rows — this should leave all pages empty
         let positions: Vec<usize> = (0..1200).collect();
@@ -3344,10 +3763,16 @@ mod tests {
         assert_eq!(dead, 1200);
         assert_eq!(scanned, pages_before);
         // Should free all but one page (keeps at least the first)
-        assert!(freed >= pages_before - 1, "should free pages: freed={freed}, had {pages_before}");
+        assert!(
+            freed >= pages_before - 1,
+            "should free pages: freed={freed}, had {pages_before}"
+        );
 
         // Table should still be usable — insert new data
-        engine.insert("t", simple_row(9999, "after_vacuum")).await.unwrap();
+        engine
+            .insert("t", simple_row(9999, "after_vacuum"))
+            .await
+            .unwrap();
         let rows = engine.scan("t").await.unwrap();
         assert_eq!(rows.len(), 1);
     }
@@ -3363,7 +3788,10 @@ mod tests {
 
         // Insert 20 rows
         for i in 0..20 {
-            engine.insert("t", simple_row(i, &format!("name_{i:02}"))).await.unwrap();
+            engine
+                .insert("t", simple_row(i, &format!("name_{i:02}")))
+                .await
+                .unwrap();
         }
 
         // Delete even-numbered positions
@@ -3380,7 +3808,10 @@ mod tests {
         assert_eq!(rows.len(), 10);
 
         // Can still insert after vacuum
-        engine.insert("t", simple_row(100, "post_vacuum")).await.unwrap();
+        engine
+            .insert("t", simple_row(100, "post_vacuum"))
+            .await
+            .unwrap();
         assert_eq!(engine.scan("t").await.unwrap().len(), 11);
     }
 
@@ -3456,7 +3887,10 @@ mod tests {
         // Create and populate a table so it allocates data pages
         engine.create_table("first").await.unwrap();
         for i in 0..10 {
-            engine.insert("first", simple_row(i, &format!("row{i}"))).await.unwrap();
+            engine
+                .insert("first", simple_row(i, &format!("row{i}")))
+                .await
+                .unwrap();
         }
 
         // Record page count before drop
@@ -3476,12 +3910,18 @@ mod tests {
         // Create a new table and insert data — should reuse freed pages
         engine.create_table("second").await.unwrap();
         for i in 0..5 {
-            engine.insert("second", simple_row(i, &format!("reused{i}"))).await.unwrap();
+            engine
+                .insert("second", simple_row(i, &format!("reused{i}")))
+                .await
+                .unwrap();
         }
 
         // Free count should have decreased (pages were reused)
         let free_after = *engine.free_page_count.lock();
-        assert!(free_after < free_count, "free list should shrink as pages are reused");
+        assert!(
+            free_after < free_count,
+            "free list should shrink as pages are reused"
+        );
 
         // Data should be intact
         let rows = engine.scan("second").await.unwrap();
@@ -3501,7 +3941,10 @@ mod tests {
             let engine = DiskEngine::open(&db_path, catalog.clone()).unwrap();
             engine.create_table("ephemeral").await.unwrap();
             for i in 0..5 {
-                engine.insert("ephemeral", simple_row(i, "data")).await.unwrap();
+                engine
+                    .insert("ephemeral", simple_row(i, "data"))
+                    .await
+                    .unwrap();
             }
             engine.drop_table("ephemeral").await.unwrap();
             assert!(*engine.free_page_count.lock() > 0);
@@ -3518,7 +3961,10 @@ mod tests {
             // Create new table — should reuse freed pages
             engine.create_table("reborn").await.unwrap();
             for i in 0..3 {
-                engine.insert("reborn", simple_row(i, "reused")).await.unwrap();
+                engine
+                    .insert("reborn", simple_row(i, "reused"))
+                    .await
+                    .unwrap();
             }
             let rows = engine.scan("reborn").await.unwrap();
             assert_eq!(rows.len(), 3);
@@ -3545,7 +3991,10 @@ mod tests {
         engine.create_table("t").await.unwrap();
 
         for i in 0..25 {
-            engine.insert("t", simple_row(i, &format!("r{i}"))).await.unwrap();
+            engine
+                .insert("t", simple_row(i, &format!("r{i}")))
+                .await
+                .unwrap();
         }
         assert_eq!(engine.fast_count_all("t"), Some(25));
     }
@@ -3626,12 +4075,17 @@ mod tests {
         engine.create_table("t").await.unwrap();
 
         for i in 0..50 {
-            engine.insert("t", simple_row(i, &format!("row{i}"))).await.unwrap();
+            engine
+                .insert("t", simple_row(i, &format!("row{i}")))
+                .await
+                .unwrap();
         }
         // Delete some
         // Delete rows at positions where id % 3 == 0
         let rows = engine.scan("t").await.unwrap();
-        let positions: Vec<usize> = rows.iter().enumerate()
+        let positions: Vec<usize> = rows
+            .iter()
+            .enumerate()
             .filter(|(_, row)| matches!(row[0], Value::Int32(v) if v % 3 == 0))
             .map(|(i, _)| i)
             .collect();

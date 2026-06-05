@@ -48,23 +48,35 @@ impl Executor {
 
         // Extract model name and path.
         let after_model = trimmed[13..].trim(); // skip "CREATE MODEL "
-        let from_pos = upper[13..].find(" FROM ")
-            .ok_or_else(|| ExecError::Unsupported("CREATE MODEL syntax: CREATE MODEL <name> FROM '<path>'".into()))?;
-        let model_name = after_model[..from_pos].trim().trim_matches('\'').trim_matches('"').to_string();
+        let from_pos = upper[13..].find(" FROM ").ok_or_else(|| {
+            ExecError::Unsupported("CREATE MODEL syntax: CREATE MODEL <name> FROM '<path>'".into())
+        })?;
+        let model_name = after_model[..from_pos]
+            .trim()
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string();
         let after_from = after_model[from_pos + 6..].trim(); // skip " FROM "
 
         // Extract path (quoted string).
         let path = if after_from.starts_with('\'') || after_from.starts_with('"') {
             let quote = after_from.as_bytes()[0] as char;
-            let end = after_from[1..].find(quote)
-                .ok_or_else(|| ExecError::Unsupported("unterminated path string in CREATE MODEL".into()))?;
+            let end = after_from[1..].find(quote).ok_or_else(|| {
+                ExecError::Unsupported("unterminated path string in CREATE MODEL".into())
+            })?;
             after_from[1..1 + end].to_string()
         } else {
-            after_from.split_whitespace().next().unwrap_or("").to_string()
+            after_from
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string()
         };
 
         if path.is_empty() {
-            return Err(ExecError::Unsupported("CREATE MODEL requires a file path".into()));
+            return Err(ExecError::Unsupported(
+                "CREATE MODEL requires a file path".into(),
+            ));
         }
 
         // Validate path to prevent directory traversal attacks
@@ -319,11 +331,18 @@ impl Executor {
         let upper = sql.to_ascii_uppercase();
         // Non-deterministic / volatile functions
         const VOLATILE_FNS: &[&str] = &[
-            "RANDOM(", "NOW(", "CURRENT_TIMESTAMP",
-            "CURRENT_DATE", "CURRENT_TIME",
-            "CLOCK_TIMESTAMP(", "STATEMENT_TIMESTAMP(",
-            "TIMEOFDAY(", "GEN_RANDOM_UUID(", "UUID_GENERATE_V4(",
-            "NEXTVAL(", "CURRVAL(",
+            "RANDOM(",
+            "NOW(",
+            "CURRENT_TIMESTAMP",
+            "CURRENT_DATE",
+            "CURRENT_TIME",
+            "CLOCK_TIMESTAMP(",
+            "STATEMENT_TIMESTAMP(",
+            "TIMEOFDAY(",
+            "GEN_RANDOM_UUID(",
+            "UUID_GENERATE_V4(",
+            "NEXTVAL(",
+            "CURRVAL(",
             "TXID_CURRENT(",
         ];
         for f in VOLATILE_FNS {
@@ -337,22 +356,44 @@ impl Executor {
         // We use prefixes/names to catch all variants.
         const STATEFUL_PATTERNS: &[&str] = &[
             // Multi-model store functions
-            "KV_", "DOC_", "FTS_", "GEO_", "GRAPH_", "BLOB_",
-            "TS_INSERT", "TS_COUNT", "TS_LAST", "TS_RANGE",
+            "KV_",
+            "DOC_",
+            "FTS_",
+            "GEO_",
+            "GRAPH_",
+            "BLOB_",
+            "TS_INSERT",
+            "TS_COUNT",
+            "TS_LAST",
+            "TS_RANGE",
             "TS_RETENTION",
-            "STREAM_", "DATALOG_", "CDC_", "PUBSUB_",
-            "SPARSE_", "COLUMNAR_", "MEM_", "TENSOR_",
-            "VERSION_", "DB_BRANCH", "PROC_",
+            "STREAM_",
+            "DATALOG_",
+            "CDC_",
+            "PUBSUB_",
+            "SPARSE_",
+            "COLUMNAR_",
+            "MEM_",
+            "TENSOR_",
+            "VERSION_",
+            "DB_BRANCH",
+            "PROC_",
             "VECTOR_DISTANCE", // vector search depends on index state
             "COMPLIANCE_",
             // Reactive / subscription functions
-            "SUBSCRIBE(", "UNSUBSCRIBE(", "SUBSCRIPTION_COUNT(",
+            "SUBSCRIBE(",
+            "UNSUBSCRIBE(",
+            "SUBSCRIPTION_COUNT(",
             // ML inference functions
-            "EMBED(", "CLASSIFY(", "PREDICT(",
+            "EMBED(",
+            "CLASSIFY(",
+            "PREDICT(",
             // Sequence functions
             "SETVAL(",
             // Retention / GDPR
-            "PII_", "RETENTION_", "GDPR_",
+            "PII_",
+            "RETENTION_",
+            "GDPR_",
             // Encrypted index lookup
             "ENCRYPTED_LOOKUP(",
         ];
@@ -370,14 +411,15 @@ impl Executor {
     /// the side of overestimation.
     fn estimate_result_size(columns: &[(String, DataType)], rows: &[Row]) -> usize {
         // Column metadata overhead
-        let col_size: usize = columns.iter()
+        let col_size: usize = columns
+            .iter()
             .map(|(name, _)| name.len() + 16) // String + DataType enum
             .sum();
         // Row data: estimate each Value
-        let row_size: usize = rows.iter()
+        let row_size: usize = rows
+            .iter()
             .map(|row| {
-                row.iter().map(Self::estimate_value_size).sum::<usize>()
-                    + 24 // Vec overhead per row
+                row.iter().map(Self::estimate_value_size).sum::<usize>() + 24 // Vec overhead per row
             })
             .sum();
         col_size + row_size + 64 // struct overhead
@@ -388,8 +430,11 @@ impl Executor {
         match v {
             Value::Null | Value::Bool(_) => 8,
             Value::Int32(_) => 8,
-            Value::Int64(_) | Value::Float64(_) | Value::Date(_)
-            | Value::Timestamp(_) | Value::TimestampTz(_) => 16,
+            Value::Int64(_)
+            | Value::Float64(_)
+            | Value::Date(_)
+            | Value::Timestamp(_)
+            | Value::TimestampTz(_) => 16,
             Value::Text(s) | Value::Numeric(s) => 24 + s.len(),
             Value::Jsonb(j) => 24 + j.to_string().len(),
             Value::Uuid(_) => 24,

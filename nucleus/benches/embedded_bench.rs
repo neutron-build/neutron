@@ -5,21 +5,17 @@
 //! These benchmarks exercise the high-level embedded API surface: the KvStore,
 //! the embedded Database (MVCC mode), and the InvertedIndex full-text search.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
-use nucleus::kv::KvStore;
 use nucleus::fts::InvertedIndex;
+use nucleus::kv::KvStore;
 use nucleus::types::Value;
 
 fn kv_get_1000_keys(c: &mut Criterion) {
     // Create a KvStore, insert 1000 keys, bench get throughput
     let store = KvStore::new();
     for i in 0..1000u32 {
-        store.set(
-            &format!("key_{i}"),
-            Value::Text(format!("val_{i}")),
-            None,
-        );
+        store.set(&format!("key_{i}"), Value::Text(format!("val_{i}")), None);
     }
     c.bench_function("kv_get_1000_keys", |b| {
         b.iter(|| {
@@ -72,5 +68,10 @@ fn fts_search_single_term(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, kv_get_1000_keys, embedded_point_query, fts_search_single_term);
+criterion_group!(
+    benches,
+    kv_get_1000_keys,
+    embedded_point_query,
+    fts_search_single_term
+);
 criterion_main!(benches);

@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use super::buffer::BufferPool;
-use super::page::{self, PageBuf, PAGE_SIZE, INVALID_PAGE_ID};
+use super::page::{self, INVALID_PAGE_ID, PAGE_SIZE, PageBuf};
 use crate::types::{DataType, Value};
 
 // ============================================================================
@@ -124,7 +124,10 @@ impl BTreeIndex {
     /// Find all RowIds matching the given key.
     pub fn lookup(&self, key: &[u8]) -> Result<Vec<RowId>, BTreeError> {
         let leaf = self.find_leaf(key)?;
-        let frame_id = self.pool.fetch_page(leaf).map_err(|e| BTreeError::Io(e.to_string()))?;
+        let frame_id = self
+            .pool
+            .fetch_page(leaf)
+            .map_err(|e| BTreeError::Io(e.to_string()))?;
         let pg = self.pool.frame_data(frame_id);
         let results = scan_leaf_for_key(pg, key);
         self.pool.unpin(frame_id);
@@ -152,7 +155,10 @@ impl BTreeIndex {
         let mut page_id = leaf;
 
         while page_id != INVALID_PAGE_ID {
-            let frame_id = self.pool.fetch_page(page_id).map_err(|e| BTreeError::Io(e.to_string()))?;
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
+                .map_err(|e| BTreeError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             let count = page::read_u16(pg, IDX_ENTRY_COUNT);
             let mut pos = IDX_HEADER_SIZE;
@@ -163,14 +169,16 @@ impl BTreeIndex {
 
                 // Check range — key is a borrowed slice, no allocation for skipped entries
                 if let Some(sk) = start_key
-                    && key < sk {
-                        continue;
-                    }
+                    && key < sk
+                {
+                    continue;
+                }
                 if let Some(ek) = end_key
-                    && key > ek {
-                        self.pool.unpin(frame_id);
-                        return Ok(results);
-                    }
+                    && key > ek
+                {
+                    self.pool.unpin(frame_id);
+                    return Ok(results);
+                }
                 // Only allocate for entries that pass the range filter
                 results.push((key.to_vec(), row_id));
             }
@@ -190,7 +198,10 @@ impl BTreeIndex {
     /// Insert a (key, RowId) entry into the B-tree.
     pub fn insert(&mut self, key: &[u8], row_id: RowId) -> Result<(), BTreeError> {
         let leaf = self.find_leaf(key)?;
-        let frame_id = self.pool.fetch_page(leaf).map_err(|e| BTreeError::Io(e.to_string()))?;
+        let frame_id = self
+            .pool
+            .fetch_page(leaf)
+            .map_err(|e| BTreeError::Io(e.to_string()))?;
 
         // Try to insert into the leaf
         let pg = self.pool.frame_data_mut(frame_id);
@@ -213,7 +224,10 @@ impl BTreeIndex {
     /// Delete a (key, RowId) entry from the B-tree.
     pub fn delete(&self, key: &[u8], row_id: RowId) -> Result<bool, BTreeError> {
         let leaf = self.find_leaf(key)?;
-        let frame_id = self.pool.fetch_page(leaf).map_err(|e| BTreeError::Io(e.to_string()))?;
+        let frame_id = self
+            .pool
+            .fetch_page(leaf)
+            .map_err(|e| BTreeError::Io(e.to_string()))?;
         let pg = self.pool.frame_data_mut(frame_id);
         let deleted = delete_leaf_entry(pg, key, &row_id);
         if deleted {
@@ -231,7 +245,10 @@ impl BTreeIndex {
     fn find_leaf(&self, key: &[u8]) -> Result<u32, BTreeError> {
         let mut page_id = self.root_page;
         loop {
-            let frame_id = self.pool.fetch_page(page_id).map_err(|e| BTreeError::Io(e.to_string()))?;
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
+                .map_err(|e| BTreeError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             let is_leaf = pg[IDX_IS_LEAF] != 0;
             if is_leaf {
@@ -249,7 +266,10 @@ impl BTreeIndex {
     fn find_leftmost_leaf(&self) -> Result<u32, BTreeError> {
         let mut page_id = self.root_page;
         loop {
-            let frame_id = self.pool.fetch_page(page_id).map_err(|e| BTreeError::Io(e.to_string()))?;
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
+                .map_err(|e| BTreeError::Io(e.to_string()))?;
             let pg = self.pool.frame_data(frame_id);
             let is_leaf = pg[IDX_IS_LEAF] != 0;
             if is_leaf {
@@ -275,7 +295,10 @@ impl BTreeIndex {
         row_id: RowId,
     ) -> Result<(), BTreeError> {
         // Read all entries from the leaf
-        let frame_id = self.pool.fetch_page(leaf_page_id).map_err(|e| BTreeError::Io(e.to_string()))?;
+        let frame_id = self
+            .pool
+            .fetch_page(leaf_page_id)
+            .map_err(|e| BTreeError::Io(e.to_string()))?;
         let pg = self.pool.frame_data(frame_id);
         let mut entries = collect_leaf_entries(pg);
         let old_sibling = page::read_u32(pg, IDX_RIGHT_SIBLING);
@@ -300,7 +323,10 @@ impl BTreeIndex {
         let split_key = extract_key(&right_entries[0]).to_vec();
 
         // Allocate new right page
-        let (right_page_id, right_frame) = self.pool.new_page().map_err(|e| BTreeError::Io(e.to_string()))?;
+        let (right_page_id, right_frame) = self
+            .pool
+            .new_page()
+            .map_err(|e| BTreeError::Io(e.to_string()))?;
         let rpg = self.pool.frame_data_mut(right_frame);
         init_index_page(rpg, true);
         page::write_u32(rpg, IDX_RIGHT_SIBLING, old_sibling);
@@ -310,7 +336,10 @@ impl BTreeIndex {
         self.pool.unpin(right_frame);
 
         // Rewrite left page
-        let left_frame = self.pool.fetch_page(leaf_page_id).map_err(|e| BTreeError::Io(e.to_string()))?;
+        let left_frame = self
+            .pool
+            .fetch_page(leaf_page_id)
+            .map_err(|e| BTreeError::Io(e.to_string()))?;
         let lpg = self.pool.frame_data_mut(left_frame);
         init_index_page(lpg, true);
         page::write_u32(lpg, IDX_RIGHT_SIBLING, right_page_id);
@@ -322,7 +351,10 @@ impl BTreeIndex {
         // Insert split key into parent
         if parent == INVALID_PAGE_ID {
             // Root was a leaf — create new root
-            let (new_root_id, root_frame) = self.pool.new_page().map_err(|e| BTreeError::Io(e.to_string()))?;
+            let (new_root_id, root_frame) = self
+                .pool
+                .new_page()
+                .map_err(|e| BTreeError::Io(e.to_string()))?;
             let rpg = self.pool.frame_data_mut(root_frame);
             init_index_page(rpg, false); // internal node
             page::write_u32(rpg, LEFTMOST_CHILD_OFFSET, leaf_page_id);
@@ -350,14 +382,20 @@ impl BTreeIndex {
         right_child: u32,
     ) -> Result<(), BTreeError> {
         // Check if the parent has space for this entry
-        let frame_id = self.pool.fetch_page(parent_page_id).map_err(|e| BTreeError::Io(e.to_string()))?;
+        let frame_id = self
+            .pool
+            .fetch_page(parent_page_id)
+            .map_err(|e| BTreeError::Io(e.to_string()))?;
         let pg = self.pool.frame_data(frame_id);
         let has_space = internal_has_space(pg, key.len());
         self.pool.unpin(frame_id);
 
         if has_space {
             // Simple case: parent has room, just insert
-            let frame_id = self.pool.fetch_page(parent_page_id).map_err(|e| BTreeError::Io(e.to_string()))?;
+            let frame_id = self
+                .pool
+                .fetch_page(parent_page_id)
+                .map_err(|e| BTreeError::Io(e.to_string()))?;
             let pg = self.pool.frame_data_mut(frame_id);
             insert_internal_entry(pg, key, right_child);
             self.pool.mark_dirty(frame_id);
@@ -380,7 +418,10 @@ impl BTreeIndex {
         right_child: u32,
     ) -> Result<(), BTreeError> {
         // Read all existing entries and the leftmost child from this internal node
-        let frame_id = self.pool.fetch_page(internal_page_id).map_err(|e| BTreeError::Io(e.to_string()))?;
+        let frame_id = self
+            .pool
+            .fetch_page(internal_page_id)
+            .map_err(|e| BTreeError::Io(e.to_string()))?;
         let pg = self.pool.frame_data(frame_id);
         let mut entries = collect_internal_entries(pg);
         let _leftmost_child = page::read_u32(pg, LEFTMOST_CHILD_OFFSET);
@@ -406,7 +447,10 @@ impl BTreeIndex {
         let new_right_leftmost = promoted_child;
 
         // Allocate the new right internal page
-        let (right_page_id, right_frame) = self.pool.new_page().map_err(|e| BTreeError::Io(e.to_string()))?;
+        let (right_page_id, right_frame) = self
+            .pool
+            .new_page()
+            .map_err(|e| BTreeError::Io(e.to_string()))?;
         let rpg = self.pool.frame_data_mut(right_frame);
         init_index_page(rpg, false); // internal node
         page::write_u32(rpg, LEFTMOST_CHILD_OFFSET, new_right_leftmost);
@@ -416,7 +460,10 @@ impl BTreeIndex {
         self.pool.unpin(right_frame);
 
         // Rewrite the left (original) page with only the left entries
-        let left_frame = self.pool.fetch_page(internal_page_id).map_err(|e| BTreeError::Io(e.to_string()))?;
+        let left_frame = self
+            .pool
+            .fetch_page(internal_page_id)
+            .map_err(|e| BTreeError::Io(e.to_string()))?;
         let lpg = self.pool.frame_data_mut(left_frame);
         // Preserve leftmost child (unchanged) and parent
         // Clear entries area and rewrite
@@ -434,7 +481,10 @@ impl BTreeIndex {
         // Promote the middle key to the grandparent
         if grandparent == INVALID_PAGE_ID {
             // We're splitting the root — create a new root
-            let (new_root_id, root_frame) = self.pool.new_page().map_err(|e| BTreeError::Io(e.to_string()))?;
+            let (new_root_id, root_frame) = self
+                .pool
+                .new_page()
+                .map_err(|e| BTreeError::Io(e.to_string()))?;
             let rpg = self.pool.frame_data_mut(root_frame);
             init_index_page(rpg, false); // internal node
             page::write_u32(rpg, LEFTMOST_CHILD_OFFSET, internal_page_id);
@@ -455,7 +505,10 @@ impl BTreeIndex {
     }
 
     fn set_parent(&self, page_id: u32, parent: u32) -> Result<(), BTreeError> {
-        let frame_id = self.pool.fetch_page(page_id).map_err(|e| BTreeError::Io(e.to_string()))?;
+        let frame_id = self
+            .pool
+            .fetch_page(page_id)
+            .map_err(|e| BTreeError::Io(e.to_string()))?;
         let pg = self.pool.frame_data_mut(frame_id);
         page::write_u32(pg, IDX_PARENT, parent);
         self.pool.mark_dirty(frame_id);
@@ -482,7 +535,11 @@ fn init_index_page(pg: &mut PageBuf, is_leaf: bool) {
 fn index_free_space(pg: &PageBuf) -> usize {
     let count = page::read_u16(pg, IDX_ENTRY_COUNT) as usize;
     let is_leaf = pg[IDX_IS_LEAF] != 0;
-    let start = if is_leaf { IDX_HEADER_SIZE } else { INTERNAL_ENTRIES_START };
+    let start = if is_leaf {
+        IDX_HEADER_SIZE
+    } else {
+        INTERNAL_ENTRIES_START
+    };
     // Calculate used space by scanning entries
     let mut pos = start;
     for _ in 0..count {
@@ -516,6 +573,18 @@ fn scan_leaf_for_key(pg: &PageBuf, key: &[u8]) -> Vec<RowId> {
     let mut pos = IDX_HEADER_SIZE;
     let mut results = Vec::new();
     for _ in 0..count {
+        // Defend against a corrupt key_len that would slice past the page.
+        if pos + 2 > PAGE_SIZE {
+            break;
+        }
+        let key_len = page::read_u16(pg, pos) as usize;
+        if pos + 2 + key_len + 6 > PAGE_SIZE {
+            tracing::error!(
+                target: "nucleus::btree",
+                "corrupt leaf page: entry at {pos} (key_len {key_len}) exceeds page bounds"
+            );
+            break;
+        }
         let (k, rid, next) = read_leaf_entry(pg, pos);
         if k == key {
             results.push(rid);
@@ -576,8 +645,20 @@ fn collect_leaf_entries(pg: &PageBuf) -> Vec<Vec<u8>> {
     let mut pos = IDX_HEADER_SIZE;
     let mut entries = Vec::with_capacity(count as usize);
     for _ in 0..count {
+        if pos + 2 > PAGE_SIZE {
+            break;
+        }
         let key_len = page::read_u16(pg, pos) as usize;
         let entry_len = 2 + key_len + 6;
+        // Defend against a corrupt key_len that would slice past the page and
+        // panic. Stop reading and surface the corruption rather than crash.
+        if pos + entry_len > PAGE_SIZE {
+            tracing::error!(
+                target: "nucleus::btree",
+                "corrupt leaf page: entry at {pos} (len {entry_len}) exceeds page bounds"
+            );
+            break;
+        }
         entries.push(pg[pos..pos + entry_len].to_vec());
         pos += entry_len;
     }
@@ -624,7 +705,18 @@ fn collect_internal_entries(pg: &PageBuf) -> Vec<(Vec<u8>, u32)> {
     let mut entries = Vec::with_capacity(count);
     let mut pos = INTERNAL_ENTRIES_START;
     for _ in 0..count {
+        if pos + 2 > PAGE_SIZE {
+            break;
+        }
         let key_len = page::read_u16(pg, pos) as usize;
+        // Defend against a corrupt key_len that would slice past the page.
+        if pos + 2 + key_len + 4 > PAGE_SIZE {
+            tracing::error!(
+                target: "nucleus::btree",
+                "corrupt internal page: entry at {pos} (key_len {key_len}) exceeds page bounds"
+            );
+            break;
+        }
         let key = pg[pos + 2..pos + 2 + key_len].to_vec();
         let child = page::read_u32(pg, pos + 2 + key_len);
         entries.push((key, child));
@@ -663,7 +755,18 @@ fn find_child(pg: &PageBuf, key: &[u8]) -> u32 {
     let mut prev_child = page::read_u32(pg, LEFTMOST_CHILD_OFFSET);
 
     for _ in 0..count {
+        if pos + 2 > PAGE_SIZE {
+            break;
+        }
         let key_len = page::read_u16(pg, pos) as usize;
+        // Defend against a corrupt key_len that would slice past the page.
+        if pos + 2 + key_len + 4 > PAGE_SIZE {
+            tracing::error!(
+                target: "nucleus::btree",
+                "corrupt internal page in find_child: entry at {pos} (key_len {key_len}) exceeds page"
+            );
+            break;
+        }
         let entry_key = &pg[pos + 2..pos + 2 + key_len];
         let child_offset = pos + 2 + key_len;
         let right_child = page::read_u32(pg, child_offset);
@@ -682,11 +785,22 @@ fn find_child(pg: &PageBuf, key: &[u8]) -> u32 {
 fn insert_internal_entry(pg: &mut PageBuf, key: &[u8], child_page_id: u32) {
     let count = page::read_u16(pg, IDX_ENTRY_COUNT) as usize;
 
-    // Collect existing entries
+    // Collect existing entries. Guard against a corrupt key_len / entry_count
+    // that would slice past the page (mirrors find_child's defense, F-032).
     let mut entries: Vec<(Vec<u8>, u32)> = Vec::new();
     let mut pos = INTERNAL_ENTRIES_START;
     for _ in 0..count {
+        if pos + 2 > PAGE_SIZE {
+            break;
+        }
         let key_len = page::read_u16(pg, pos) as usize;
+        if pos + 2 + key_len + 4 > PAGE_SIZE {
+            tracing::error!(
+                target: "nucleus::btree",
+                "corrupt internal page in insert_internal_entry: entry at {pos} (key_len {key_len}) exceeds page"
+            );
+            break;
+        }
         let ek = pg[pos + 2..pos + 2 + key_len].to_vec();
         let child = page::read_u32(pg, pos + 2 + key_len);
         entries.push((ek, child));
@@ -807,7 +921,11 @@ pub fn value_to_key(value: &Value) -> Vec<u8> {
             }
             buf
         }
-        Value::Interval { months, days, microseconds } => {
+        Value::Interval {
+            months,
+            days,
+            microseconds,
+        } => {
             let mut buf = vec![0x0F];
             // Encode as months(i32) + days(i32) + microseconds(i64) with sign-flip for ordering
             let em = (*months as u32) ^ 0x80000000;
@@ -947,7 +1065,8 @@ pub fn key_to_value(key: &[u8], dtype: &DataType) -> Value {
                 let mut vec = Vec::with_capacity(*dim);
                 for i in 0..*dim {
                     let pos = 1 + i * 4;
-                    let f = f32::from_le_bytes([key[pos], key[pos + 1], key[pos + 2], key[pos + 3]]);
+                    let f =
+                        f32::from_le_bytes([key[pos], key[pos + 1], key[pos + 2], key[pos + 3]]);
                     vec.push(f);
                 }
                 Value::Vector(vec)
@@ -959,7 +1078,9 @@ pub fn key_to_value(key: &[u8], dtype: &DataType) -> Value {
             if key.len() >= 17 {
                 let em = u32::from_be_bytes([key[1], key[2], key[3], key[4]]);
                 let ed = u32::from_be_bytes([key[5], key[6], key[7], key[8]]);
-                let eus = u64::from_be_bytes([key[9], key[10], key[11], key[12], key[13], key[14], key[15], key[16]]);
+                let eus = u64::from_be_bytes([
+                    key[9], key[10], key[11], key[12], key[13], key[14], key[15], key[16],
+                ]);
                 Value::Interval {
                     months: (em ^ 0x80000000) as i32,
                     days: (ed ^ 0x80000000) as i32,
@@ -1038,13 +1159,14 @@ impl HashIndex {
     /// Delete a specific (key, row_id) entry. Returns true if found and removed.
     pub fn delete(&mut self, key: &[u8], row_id: RowId) -> bool {
         if let Some(ids) = self.buckets.get_mut(key)
-            && let Some(pos) = ids.iter().position(|r| *r == row_id) {
-                ids.swap_remove(pos);
-                if ids.is_empty() {
-                    self.buckets.remove(key);
-                }
-                return true;
+            && let Some(pos) = ids.iter().position(|r| *r == row_id)
+        {
+            ids.swap_remove(pos);
+            if ids.is_empty() {
+                self.buckets.remove(key);
             }
+            return true;
+        }
         false
     }
 
@@ -1065,6 +1187,8 @@ impl HashIndex {
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
 
     #[test]
@@ -1131,8 +1255,8 @@ mod tests {
     // B-tree structural tests (require DiskManager + BufferPool)
     // ========================================================================
 
-    use crate::storage::disk::DiskManager;
     use crate::storage::buffer::BufferPool;
+    use crate::storage::disk::DiskManager;
 
     /// Helper: create a BTreeIndex backed by a temporary database file.
     /// Returns the index and a temp dir handle (must be kept alive).
@@ -1152,7 +1276,10 @@ mod tests {
 
     /// Helper: make a dummy RowId from a sequence number.
     fn dummy_rid(n: u32) -> RowId {
-        RowId { page_id: n, slot_idx: 0 }
+        RowId {
+            page_id: n,
+            slot_idx: 0,
+        }
     }
 
     #[test]
@@ -1218,7 +1345,11 @@ mod tests {
         let start = int_key(100);
         let end = int_key(199);
         let partial = idx.range_scan(Some(&start), Some(&end)).unwrap();
-        assert_eq!(partial.len(), 100, "partial range scan returned wrong count");
+        assert_eq!(
+            partial.len(),
+            100,
+            "partial range scan returned wrong count"
+        );
     }
 
     #[test]
@@ -1260,10 +1391,7 @@ mod tests {
         for i in 0..count {
             let key = int_key(i as i64);
             let results = idx.lookup(&key).unwrap();
-            assert!(
-                !results.is_empty(),
-                "lookup failed for sequential key {i}"
-            );
+            assert!(!results.is_empty(), "lookup failed for sequential key {i}");
             assert_eq!(results[0], dummy_rid(i));
         }
         // Verify range scan returns all in order
@@ -1283,9 +1411,18 @@ mod tests {
         let mut idx = HashIndex::new(DataType::Int32);
         let key1 = vec![0, 0, 0, 42];
         let key2 = vec![0, 0, 0, 99];
-        let rid1 = RowId { page_id: 1, slot_idx: 0 };
-        let rid2 = RowId { page_id: 1, slot_idx: 1 };
-        let rid3 = RowId { page_id: 2, slot_idx: 0 };
+        let rid1 = RowId {
+            page_id: 1,
+            slot_idx: 0,
+        };
+        let rid2 = RowId {
+            page_id: 1,
+            slot_idx: 1,
+        };
+        let rid3 = RowId {
+            page_id: 2,
+            slot_idx: 0,
+        };
 
         idx.insert(key1.clone(), rid1);
         idx.insert(key1.clone(), rid2);
@@ -1304,8 +1441,14 @@ mod tests {
     fn hash_index_delete() {
         let mut idx = HashIndex::new(DataType::Int32);
         let key = vec![1, 2, 3, 4];
-        let rid1 = RowId { page_id: 1, slot_idx: 0 };
-        let rid2 = RowId { page_id: 1, slot_idx: 1 };
+        let rid1 = RowId {
+            page_id: 1,
+            slot_idx: 0,
+        };
+        let rid2 = RowId {
+            page_id: 1,
+            slot_idx: 1,
+        };
 
         idx.insert(key.clone(), rid1);
         idx.insert(key.clone(), rid2);
