@@ -322,6 +322,25 @@ fn select_batches(store: &ColumnarStore, table: &str) -> Vec<ColumnBatch> {
     }
 }
 
+/// Batches for a read-only aggregate, borrowing the stored column data when
+/// possible. Aggregate fast-paths (sum/count/group-by) only read columns, so
+/// for a raw (non-MergeTree) table we hand back a borrow of `tables` instead of
+/// cloning every column of every row — the clone, not the math, was the cost.
+/// MergeTree and replacing tables still materialize (parts / dedup need owned).
+fn batches_for_read<'a>(
+    store: &'a ColumnarStore,
+    table: &str,
+) -> std::borrow::Cow<'a, [ColumnBatch]> {
+    use std::borrow::Cow;
+    if crate::columnar::replacing_config(table).is_some() {
+        Cow::Owned(store.batches_all_for_select(table))
+    } else if store.is_merge_tree(table) {
+        Cow::Owned(store.batches_all(table))
+    } else {
+        Cow::Borrowed(store.batches(table))
+    }
+}
+
 fn fetch_rows_by_positions(batches: &[ColumnBatch], positions: &[usize]) -> Vec<Row> {
     if positions.is_empty() || batches.is_empty() {
         return Vec::new();
@@ -841,7 +860,7 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let batches = select_batches(&store, table);
+        let batches = batches_for_read(&store, table);
         let (total, n) = batches.iter().fold((0.0f64, 0usize), |(s, c), batch| {
             let sum = aggregate_sum(batch, &col_name);
             let cnt = aggregate_count(batch, &col_name);
@@ -863,13 +882,13 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let batches = select_batches(&store, table);
+        let batches = batches_for_read(&store, table);
 
         // Collect the key and value columns across all batches.
         let mut key_vec: Vec<Option<String>> = Vec::new();
         let mut val_vec: Vec<Option<f64>> = Vec::new();
 
-        for batch in batches {
+        for batch in batches.iter() {
             let n = batch.row_count;
             // Key column — always text-converted.
             match batch.column(&key_col_name) {
@@ -943,12 +962,8 @@ impl StorageEngine for ColumnarStorageEngine {
             return None;
         }
         // For replacing_mergetree, count after dedup so superseded versions
-        // don't inflate the result.
-        let batches = if crate::columnar::replacing_config(table).is_some() {
-            store.batches_all_for_select(table)
-        } else {
-            store.batches_all(table)
-        };
+        // don't inflate the result. Raw tables borrow (no clone).
+        let batches = batches_for_read(&store, table);
         let filter_col_name = filter_col.to_string();
         let count = batches
             .iter()
@@ -974,7 +989,7 @@ impl StorageEngine for ColumnarStorageEngine {
         if !store.table_exists(table) {
             return None;
         }
-        let batches = select_batches(&store, table);
+        let batches = batches_for_read(&store, table);
         let (sum, count) = batches.iter().fold((0.0f64, 0usize), |(s, c), batch| {
             let filter_data = match batch.column(&filter_col_name) {
                 Some(d) => d,
@@ -999,8 +1014,8 @@ impl StorageEngine for ColumnarStorageEngine {
             return None;
         }
         let mut min: Option<f64> = None;
-        let batches = select_batches(&store, table);
-        for batch in &batches {
+        let batches = batches_for_read(&store, table);
+        for batch in batches.iter() {
             match batch.column(&col_name) {
                 Some(ColumnData::Float64(v)) => {
                     for f in v.iter().flatten() {
@@ -1033,8 +1048,8 @@ impl StorageEngine for ColumnarStorageEngine {
             return None;
         }
         let mut max: Option<f64> = None;
-        let batches = select_batches(&store, table);
-        for batch in &batches {
+        let batches = batches_for_read(&store, table);
+        for batch in batches.iter() {
             match batch.column(&col_name) {
                 Some(ColumnData::Float64(v)) => {
                     for f in v.iter().flatten() {
