@@ -645,6 +645,13 @@ impl Executor {
     /// Returns false for subqueries and expression features we still cannot
     /// evaluate correctly in the plan path.
     pub(super) fn query_eligible_for_plan(select: &ast::Select, query: &ast::Query) -> bool {
+        // Comma-separated FROM (implicit cross/hash join: `FROM a, b`) is not
+        // handled by the plan path — plan_query only walks select.from.first()
+        // and its explicit joins, silently dropping from[1..]. Fall back to AST
+        // execution (build_from_rows_with_ctes), which forms the full product.
+        if select.from.len() > 1 {
+            return false;
+        }
         // No DISTINCT ON (plain DISTINCT is ok)
         if let Some(ast::Distinct::On(_)) = &select.distinct {
             return false;

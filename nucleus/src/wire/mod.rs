@@ -1195,9 +1195,17 @@ impl SimpleQueryHandler for NucleusHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let peer_addr_str = client.socket_addr().to_string();
+        let session_id = self.session_id_from_client(client);
+
+        // Inside an active transaction, all autocommit fast paths are disabled:
+        // they bypass the session's MVCC snapshot and write straight to storage,
+        // which would auto-commit writes the transaction must be able to
+        // ROLLBACK and break read-your-own-writes. Route everything through the
+        // session-scoped executor until COMMIT/ROLLBACK.
+        let in_txn = self.executor.session_in_transaction(session_id);
 
         // ── Large Objects fast path: intercept lo_* function calls ───────
-        if let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, query) {
+        if !in_txn && let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, query) {
             let resp = Self::build_response(lo_result, true)?;
             self.flush_pending_notifications(client).await?;
             return Ok(vec![resp]);
@@ -1232,14 +1240,15 @@ impl SimpleQueryHandler for NucleusHandler {
         }
 
         // ── KV fast path: intercept common KV queries before SQL parsing ──
-        if let Some(kv_cmd) = kv_fast_path::try_parse_kv(query) {
+        if !in_txn && let Some(kv_cmd) = kv_fast_path::try_parse_kv(query) {
             let result = kv_fast_path::execute_kv_command(&kv_cmd, self.executor.kv_store());
             self.flush_pending_notifications(client).await?;
             return Ok(vec![Self::build_response(result, true)?]);
         }
 
         // ── SQL OLTP fast path: intercept simple point queries/mutations ──
-        if let Some(sql_cmd) = kv_fast_path::try_parse_sql_fast_path(query)
+        if !in_txn
+            && let Some(sql_cmd) = kv_fast_path::try_parse_sql_fast_path(query)
             && let Some(result) = self.executor.execute_sql_fast_path(&sql_cmd).await
         {
             self.flush_pending_notifications(client).await?;
@@ -1250,8 +1259,6 @@ impl SimpleQueryHandler for NucleusHandler {
         }
         // Fall through to normal path if fast-path couldn't handle it
         // (e.g. table not found in cache, column mismatch, etc.)
-
-        let session_id = self.session_id_from_client(client);
 
         // Detect COPY ... FROM STDIN and enter copy-in mode.
         if let Some(copy_info) = detect_copy_from_stdin(query) {
