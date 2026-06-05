@@ -1459,6 +1459,21 @@ impl Executor {
         session.settings.read().get(key).cloned()
     }
 
+    /// Whether the given session is inside an active transaction (BEGIN issued,
+    /// not yet COMMIT/ROLLBACK). The wire handler uses this to disable its
+    /// autocommit fast paths inside a transaction: those paths bypass the
+    /// session's MVCC snapshot and write directly to storage, which would both
+    /// auto-commit writes the transaction must be able to ROLLBACK and break
+    /// read-your-own-writes for fast-path reads.
+    pub fn session_in_transaction(&self, session_id: u64) -> bool {
+        let session = self.get_session(session_id);
+        session
+            .txn_state
+            .try_read()
+            .map(|t| t.active)
+            .unwrap_or(false)
+    }
+
     /// Get the current session from the task-local, or the default session
     /// if no session has been set (e.g. embedded mode or tests).
     fn current_session(&self) -> Arc<Session> {

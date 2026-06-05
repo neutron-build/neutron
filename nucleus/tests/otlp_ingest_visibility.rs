@@ -130,9 +130,13 @@ async fn otlp_style_insert_visible_same_connection() {
     for i in 0..5 {
         let trace = format!("trace_{i:02}");
         let span = format!("span_{i:02}");
-        let start = (1_700_000_000_000i64 + i).to_string();
-        let end = (1_700_000_001_000i64 + i).to_string();
-        let dur = "1000".to_string();
+        // start_time/end_time/duration_ms are BIGINT; the server infers Int8 for
+        // these params from the target columns, so they must be bound as i64
+        // (a Rust String would be rejected client-side by tokio-postgres, exactly
+        // as real Postgres rejects a text value for an int8 parameter).
+        let start = 1_700_000_000_000i64 + i;
+        let end = 1_700_000_001_000i64 + i;
+        let dur = 1000i64;
         client
             .execute(
                 "INSERT INTO spans (
@@ -187,9 +191,9 @@ async fn otlp_style_insert_visible_to_separate_connection() {
     for i in 0..4 {
         let trace = format!("xtrace_{i}");
         let span = format!("xspan_{i}");
-        let start = (1_700_000_000_000i64 + i * 1_000).to_string();
-        let end = (1_700_000_001_000i64 + i * 1_000).to_string();
-        let dur = "1000".to_string();
+        let start = 1_700_000_000_000i64 + i * 1_000;
+        let end = 1_700_000_001_000i64 + i * 1_000;
+        let dur = 1000i64;
         writer
             .execute(
                 "INSERT INTO spans (
@@ -256,9 +260,9 @@ async fn otlp_style_concurrent_inserts_all_visible() {
             for i in 0..4 {
                 let trace = format!("ctrace_{w}_{i}");
                 let span = format!("cspan_{w}_{i}");
-                let start = (1_700_000_000_000i64 + (w as i64) * 100 + i).to_string();
-                let end = (1_700_000_001_000i64 + (w as i64) * 100 + i).to_string();
-                let dur = "1000".to_string();
+                let start = 1_700_000_000_000i64 + (w as i64) * 100 + i;
+                let end = 1_700_000_001_000i64 + (w as i64) * 100 + i;
+                let dur = 1000i64;
                 client
                     .execute(
                         "INSERT INTO spans (
