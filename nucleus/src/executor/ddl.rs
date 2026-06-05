@@ -157,10 +157,14 @@ impl Executor {
                     use crate::columnar::MergeStrategy;
                     let strategy = match engine_name.as_deref() {
                         Some("replacing_mergetree") => {
+                            // Version column: prefer `WITH (version_column='v')`,
+                            // fall back to the ClickHouse `ReplacingMergeTree(v)`
+                            // parenthesized argument.
                             let version_col = Self::extract_string_option(
                                 &create.table_options,
                                 "version_column",
-                            );
+                            )
+                            .or_else(|| Self::extract_engine_paren_arg(&create.table_options));
                             // Register read-time dedup so SELECT collapses
                             // superseded versions. We resolve ORDER BY column
                             // names + version column to scan-order indices
@@ -281,6 +285,20 @@ impl Executor {
 
     /// Extract `WITH (engine = 'columnar')` from CREATE TABLE options.
     /// Returns the engine name (lowercase) if specified.
+    /// Normalize an engine name to nucleus's snake_case keys. Accepts both the
+    /// `WITH (engine='replacing_mergetree')` form and the ClickHouse CamelCase
+    /// `ENGINE=ReplacingMergeTree(...)` form (`ReplacingMergeTree` →
+    /// `replacing_mergetree`). Unknown names pass through lowercased.
+    fn normalize_engine_name(raw: &str) -> String {
+        let lower = raw.trim_matches('\'').trim_matches('"').to_lowercase();
+        match lower.as_str() {
+            "replacingmergetree" => "replacing_mergetree".to_string(),
+            "aggregatingmergetree" => "aggregating_mergetree".to_string(),
+            "summingmergetree" => "summing_mergetree".to_string(),
+            _ => lower,
+        }
+    }
+
     fn extract_engine_option(opts: &ast::CreateTableOptions) -> Option<String> {
         let sql_opts = match opts {
             ast::CreateTableOptions::With(v)
@@ -290,13 +308,47 @@ impl Executor {
             ast::CreateTableOptions::None => return None,
         };
         for opt in sql_opts {
-            if let ast::SqlOption::KeyValue { key, value } = opt
-                && key.value.eq_ignore_ascii_case("engine")
+            match opt {
+                // `WITH (engine = 'replacing_mergetree')`
+                ast::SqlOption::KeyValue { key, value }
+                    if key.value.eq_ignore_ascii_case("engine") =>
+                {
+                    return Some(Self::normalize_engine_name(&value.to_string()));
+                }
+                // ClickHouse `ENGINE=ReplacingMergeTree(v)` — parsed as a named
+                // parenthesized list (key=ENGINE, name=ReplacingMergeTree,
+                // values=[v]). Without this branch the engine clause is ignored
+                // and a ReplacingMergeTree table silently degrades to a plain
+                // table (no read-time dedup), which is exactly what observe hit.
+                ast::SqlOption::NamedParenthesizedList(npl)
+                    if npl.key.value.eq_ignore_ascii_case("engine") =>
+                {
+                    if let Some(name) = &npl.name {
+                        return Some(Self::normalize_engine_name(&name.value));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Extract the first parenthesized argument of a ClickHouse `ENGINE=Name(arg)`
+    /// clause — for `ReplacingMergeTree(v)` this is the version column `v`.
+    fn extract_engine_paren_arg(opts: &ast::CreateTableOptions) -> Option<String> {
+        let sql_opts = match opts {
+            ast::CreateTableOptions::With(v)
+            | ast::CreateTableOptions::Options(v)
+            | ast::CreateTableOptions::Plain(v)
+            | ast::CreateTableOptions::TableProperties(v) => v,
+            ast::CreateTableOptions::None => return None,
+        };
+        for opt in sql_opts {
+            if let ast::SqlOption::NamedParenthesizedList(npl) = opt
+                && npl.key.value.eq_ignore_ascii_case("engine")
+                && let Some(first) = npl.values.first()
             {
-                let raw = value.to_string();
-                // Strip surrounding quotes if present.
-                let cleaned = raw.trim_matches('\'').trim_matches('"').to_lowercase();
-                return Some(cleaned);
+                return Some(first.value.clone());
             }
         }
         None
