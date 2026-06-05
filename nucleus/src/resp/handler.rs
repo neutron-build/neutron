@@ -1306,31 +1306,42 @@ impl RespHandler {
             }
             "ZRANGE" => {
                 let key = require_arg!(args, 1);
-                let start = require_i64!(args, 2) as usize;
-                let stop = require_i64!(args, 3) as usize;
+                let start_i = require_i64!(args, 2);
+                let stop_i = require_i64!(args, 3);
                 // Check for WITHSCORES flag.
                 let with_scores = args.len() > 4
                     && String::from_utf8_lossy(&args[4]).to_uppercase().as_str() == "WITHSCORES";
-                match self.kv.col_zrange(key, start, stop) {
-                    Ok(entries) => {
-                        if with_scores {
-                            let mut out = encoder::encode_array_header(entries.len() * 2);
-                            for e in &entries {
-                                out.extend(encoder::encode_bulk_string(e.member.as_bytes()));
-                                out.extend(encoder::encode_bulk_string(
-                                    e.score.to_string().as_bytes(),
-                                ));
-                            }
-                            out
-                        } else {
-                            let mut out = encoder::encode_array_header(entries.len());
-                            for e in &entries {
-                                out.extend(encoder::encode_bulk_string(e.member.as_bytes()));
-                            }
-                            out
-                        }
+                // Resolve Redis-style negative indices (-1 = last element)
+                // against the set's cardinality. A bare `as usize` turned -1
+                // into a huge index and returned nothing.
+                let card = match self.kv.col_zcard(key) {
+                    Ok(c) => c as i64,
+                    Err(e) => return encode_wrongtype(&e),
+                };
+                let resolve = |i: i64| if i < 0 { (card + i).max(0) } else { i };
+                let start = resolve(start_i);
+                let stop = resolve(stop_i).min(card - 1);
+                let entries = if card == 0 || start >= card || start > stop {
+                    Vec::new()
+                } else {
+                    match self.kv.col_zrange(key, start as usize, stop as usize) {
+                        Ok(e) => e,
+                        Err(e) => return encode_wrongtype(&e),
                     }
-                    Err(e) => encode_wrongtype(&e),
+                };
+                if with_scores {
+                    let mut out = encoder::encode_array_header(entries.len() * 2);
+                    for e in &entries {
+                        out.extend(encoder::encode_bulk_string(e.member.as_bytes()));
+                        out.extend(encoder::encode_bulk_string(e.score.to_string().as_bytes()));
+                    }
+                    out
+                } else {
+                    let mut out = encoder::encode_array_header(entries.len());
+                    for e in &entries {
+                        out.extend(encoder::encode_bulk_string(e.member.as_bytes()));
+                    }
+                    out
                 }
             }
             "ZRANGEBYSCORE" => {
@@ -1850,6 +1861,44 @@ mod tests {
     /// Check if response is a RESP error.
     fn is_error(data: &[u8]) -> bool {
         data.first() == Some(&b'-')
+    }
+
+    /// Decode the bulk-string members of a RESP array response.
+    fn decode_array_members(data: &[u8]) -> Vec<String> {
+        let s = String::from_utf8_lossy(data);
+        assert!(s.starts_with('*'), "expected array, got: {s}");
+        let mut members = Vec::new();
+        let mut rest = &s[s.find("\r\n").unwrap() + 2..];
+        while rest.starts_with('$') {
+            let after = &rest[1..];
+            let crlf = after.find("\r\n").unwrap();
+            let len: usize = after[..crlf].parse().unwrap();
+            let body_start = crlf + 2;
+            members.push(after[body_start..body_start + len].to_string());
+            rest = &after[body_start + len + 2..];
+        }
+        members
+    }
+
+    #[test]
+    fn test_zrange_negative_indices() {
+        let mut h = new_handler();
+        h.handle_command(args(&["ZADD", "z", "1", "a"]));
+        h.handle_command(args(&["ZADD", "z", "2", "b"]));
+        h.handle_command(args(&["ZADD", "z", "3", "c"]));
+
+        // 0..-1 → whole set in rank order.
+        let resp = h.handle_command(args(&["ZRANGE", "z", "0", "-1"]));
+        assert_eq!(decode_array_members(&resp), vec!["a", "b", "c"]);
+        // -2..-1 → last two.
+        let resp = h.handle_command(args(&["ZRANGE", "z", "-2", "-1"]));
+        assert_eq!(decode_array_members(&resp), vec!["b", "c"]);
+        // -1..-1 → last only.
+        let resp = h.handle_command(args(&["ZRANGE", "z", "-1", "-1"]));
+        assert_eq!(decode_array_members(&resp), vec!["c"]);
+        // start past end → empty.
+        let resp = h.handle_command(args(&["ZRANGE", "z", "5", "10"]));
+        assert!(decode_array_members(&resp).is_empty());
     }
 
     fn new_handler() -> RespHandler {

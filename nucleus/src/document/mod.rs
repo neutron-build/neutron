@@ -647,6 +647,18 @@ impl DocumentStore {
     ///
     /// Returns the IDs of all documents where `doc @> query`.
     pub fn query_contains(&self, query: &JsonValue) -> Vec<u64> {
+        // `x @> '{}'` (empty containment) matches EVERY document. The GIN index
+        // has no pairs to look up for an empty query, so it would return no
+        // candidates — handle it explicitly and return all docs (the full
+        // `contains` check below is satisfied by every doc for an empty query).
+        if query.gin_extract().is_empty() {
+            return self
+                .docs
+                .iter()
+                .filter(|(_, doc)| doc.contains(query))
+                .map(|(id, _)| *id)
+                .collect();
+        }
         // Use the GIN index to get candidates, then verify with full
         // containment check (the GIN index may produce false positives
         // in edge cases with arrays).
@@ -2236,6 +2248,16 @@ mod tests {
             !store.has_cold_tier(),
             "memory mode should have no cold tier"
         );
+    }
+
+    #[test]
+    fn query_contains_empty_object_matches_all() {
+        // `doc @> '{}'` must match every document (Postgres semantics).
+        let mut store = DocumentStore::new();
+        store.insert(json_obj(vec![("a", JsonValue::Str("x".to_string()))]));
+        store.insert(json_obj(vec![("b", JsonValue::Str("y".to_string()))]));
+        let all = store.query_contains(&JsonValue::Object(Default::default()));
+        assert_eq!(all.len(), 2, "empty containment query must match all docs");
     }
 
     #[test]
