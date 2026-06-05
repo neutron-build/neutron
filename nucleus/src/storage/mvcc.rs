@@ -213,10 +213,16 @@ impl MvccTable {
             if deleted == TXN_INVALID {
                 return true;
             }
-            // Keep if the deleting txn hasn't committed
-            // (we only GC rows deleted by committed txns)
-            // For simplicity, we remove versions where both created_by and deleted_by
-            // are less than oldest_active_xmin (meaning no active txn could see them)
+            // Soundness (checked against lean4 `MvccProofs`/`MvccSpec`): the
+            // proven visibility predicate makes a row invisible to a snapshot S
+            // iff `deleteTs <= S.startTs`. `oldest_active_xmin` is the minimum
+            // start id over all active txns (and any future txn starts at an even
+            // larger id), so `deleted < oldest_active_xmin` implies
+            // `deleted <= startTs` for EVERY active and future snapshot — the
+            // version is invisible to all of them and is safe to collect. The
+            // `created_by < oldest_active_xmin` clause is redundant (a row is
+            // always deleted no earlier than it was created, so
+            // `created_by <= deleted_by`) but kept as an explicit guard.
             !(r.version.created_by < oldest_active_xmin
                 && deleted < oldest_active_xmin
                 && deleted != TXN_INVALID)

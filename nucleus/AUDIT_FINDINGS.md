@@ -295,6 +295,37 @@ convention where columns *are* named by stringified index).
 - **wire binary unknown-OID param** (`wire/mod.rs`) — a binary-format param with an unknown OID was
   UTF-8-mangled; decode the standard fixed-width integer widths (2/4/8) instead; text path unchanged.
 
+## Phase E — proof-sensitive / format-boundary
+
+- **MVCC GC — VERIFIED SOUND, no change** (`storage/mvcc.rs`). Diffed against
+  `lean4/Nucleus/Nucleus/{Proofs/MvccProofs,Spec/MvccSpec,Aeneas/Mvcc}.lean`. The proven
+  visibility predicate makes a row invisible to snapshot S iff `deleteTs <= S.startTs`. GC removes a
+  row only when `deleted_by < oldest_active_xmin <= every active/future startTs`, so the row is
+  invisible to all of them — safe. The agent's "may remove still-visible versions" is a **false
+  positive**; the `created_by < oldest` clause is redundant (`created_by <= deleted_by` always).
+  Documented the correctness argument inline; existing tests
+  (`gc_preserves_visible_versions`, `gc_watermark_preserves_committed_visibility`) already guard it.
+- **WAL page-write header-CRC — FIXED** (`storage/wal.rs`). The page-write CRC covered only the page
+  image, so header corruption (page_id/txn_id) went undetected → a page could be applied to the wrong
+  page or attributed to the wrong txn on replay. Added `page_write_crc()` over header+page; wired both
+  write sites and the read/verify site. (Control records already CRC'd their header.) WAL-format change
+  — taken at this pre-release boundary (no frozen WAL format yet; nucleus binary deferred). Test:
+  corrupting the page_id header field is now caught and the record dropped.
+- **RLS-to-authenticated-user wiring — DEFERRED SECURITY FEATURE (documented, not shipped).** The
+  `security` module has a complete, unit-tested RLS + column-masking engine (`RlsManager::filter_rows`,
+  `MaskingManager::mask_row`, `SessionContext` with user/role/tenant), but it is **entirely unwired**:
+  the Executor holds no RlsManager/MaskingManager, no scan path calls the enforcement functions, and
+  `Session::session_context` is hardcoded to `"nucleus"` (`#[allow(dead_code)]`). This is a missing
+  integration, not a one-line bug. Deliberately NOT half-wired — partial RLS enforcement is a security
+  liability (a missed read path leaks rows; an over-broad one breaks all queries). **Implementation
+  checklist for a dedicated, reviewed change:** (1) plumb the authenticated `username` from the wire
+  auth layer (`wire/mod.rs` has it) into `Session::session_context` on connect/reset; (2) give the
+  Executor an `RlsManager`/`MaskingManager` (DDL: CREATE POLICY / ALTER TABLE … ENABLE ROW LEVEL
+  SECURITY / column masking rules); (3) apply `filter_rows` + `mask_row` against the session context in
+  EVERY row-producing path — SELECT (plan + AST), joins, subqueries/CTEs, and the visibility scans of
+  UPDATE/DELETE/RETURNING — with superuser/`BYPASSRLS` handling; (4) adversarial tests for leakage
+  under joins/subqueries/aggregates and for masking precedence. Until then, RLS policies are inert.
+
 ## Phase D — FIXED (deferred highs with signature ripple)
 
 (fts merge `F-036` and graph Dijkstra `F-035` were already fixed earlier, so the remaining D items were:)
