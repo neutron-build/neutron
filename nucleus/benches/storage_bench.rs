@@ -5,12 +5,12 @@
 //! These benchmarks measure the raw I/O and data structure performance that
 //! underpins all query execution.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::sync::Arc;
 use tempfile::TempDir;
 
-use nucleus::storage::buffer::BufferPool;
 use nucleus::storage::btree::{BTreeIndex, RowId, value_to_key};
+use nucleus::storage::buffer::BufferPool;
 use nucleus::storage::disk::DiskManager;
 use nucleus::storage::page;
 use nucleus::storage::wal::Wal;
@@ -138,7 +138,10 @@ fn btree_lookup(c: &mut Criterion) {
 
     for i in 0..10_000i32 {
         let key = value_to_key(&Value::Int32(i));
-        let row_id = RowId { page_id: (i as u32) / 100, slot_idx: (i as u16) % 100 };
+        let row_id = RowId {
+            page_id: (i as u32) / 100,
+            slot_idx: (i as u16) % 100,
+        };
         index.insert(&key, row_id).unwrap();
     }
 
@@ -152,7 +155,6 @@ fn btree_lookup(c: &mut Criterion) {
         });
     });
 }
-
 
 // ============================================================================
 // Additional page benchmarks

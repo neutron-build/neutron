@@ -44,7 +44,10 @@ impl Complex {
 
     /// Complex conjugate.
     pub fn conj(&self) -> Self {
-        Self { re: self.re, im: -self.im }
+        Self {
+            re: self.re,
+            im: -self.im,
+        }
     }
 
     /// Magnitude (absolute value).
@@ -227,7 +230,9 @@ impl Distribution {
 
     /// Create from explicit probabilities.
     pub fn from_probabilities(probs: HashMap<String, f64>) -> Self {
-        Self { probabilities: probs }
+        Self {
+            probabilities: probs,
+        }
     }
 
     /// Shannon entropy: H = -Σ p(x) * log2(p(x)).
@@ -402,8 +407,14 @@ impl PqKeyExchange {
         let pk_data: Vec<u8> = (0..pk_size).map(|i| ((i * 37 + 13) % 256) as u8).collect();
         let sk_data: Vec<u8> = (0..sk_size).map(|i| ((i * 53 + 7) % 256) as u8).collect();
         (
-            PqPublicKey { algorithm, data: pk_data },
-            PqSecretKey { algorithm, data: sk_data },
+            PqPublicKey {
+                algorithm,
+                data: pk_data,
+            },
+            PqSecretKey {
+                algorithm,
+                data: sk_data,
+            },
         )
     }
 
@@ -422,7 +433,10 @@ impl PqKeyExchange {
             .map(|i| ct_data.get(i % ct_data.len()).copied().unwrap_or(0) ^ 0xAA)
             .collect();
         (
-            PqCiphertext { algorithm: pk.algorithm, data: ct_data },
+            PqCiphertext {
+                algorithm: pk.algorithm,
+                data: ct_data,
+            },
             SharedSecret { data: ss_data },
         )
     }
@@ -507,7 +521,11 @@ mod tests {
         assert!((trace.re - 3.0).abs() < 1e-10);
 
         // Matrix-vector multiply with identity
-        let vec = vec![Complex::new(1.0, 0.0), Complex::new(2.0, 0.0), Complex::new(3.0, 0.0)];
+        let vec = vec![
+            Complex::new(1.0, 0.0),
+            Complex::new(2.0, 0.0),
+            Complex::new(3.0, 0.0),
+        ];
         let result = id.matvec(&vec);
         assert!((result[0].re - 1.0).abs() < 1e-10);
         assert!((result[1].re - 2.0).abs() < 1e-10);
@@ -691,13 +709,23 @@ mod tests {
         cnot.set(1, 1, Complex::one());
         cnot.set(2, 3, Complex::one());
         cnot.set(3, 2, Complex::one());
-        let state_10 = vec![Complex::zero(), Complex::zero(), Complex::one(), Complex::zero()];
+        let state_10 = vec![
+            Complex::zero(),
+            Complex::zero(),
+            Complex::one(),
+            Complex::zero(),
+        ];
         let result = cnot.matvec(&state_10);
         assert!((result[0].abs()) < 1e-10);
         assert!((result[1].abs()) < 1e-10);
         assert!((result[2].abs()) < 1e-10);
         assert!((result[3].re - 1.0).abs() < 1e-10);
-        let state_00 = vec![Complex::one(), Complex::zero(), Complex::zero(), Complex::zero()];
+        let state_00 = vec![
+            Complex::one(),
+            Complex::zero(),
+            Complex::zero(),
+            Complex::zero(),
+        ];
         let result = cnot.matvec(&state_00);
         assert!((result[0].re - 1.0).abs() < 1e-10);
         assert!((result[1].abs()) < 1e-10);
@@ -709,10 +737,10 @@ mod tests {
             state[i] = Complex::one();
             let after_cnot = cnot.matvec(&state);
             let round_trip = dag.matvec(&after_cnot);
-            for j in 0..4 {
+            for (j, rt) in round_trip.iter().enumerate() {
                 let expected = if i == j { 1.0 } else { 0.0 };
-                assert!((round_trip[j].re - expected).abs() < 1e-10);
-                assert!((round_trip[j].im).abs() < 1e-10);
+                assert!((rt.re - expected).abs() < 1e-10);
+                assert!(rt.im.abs() < 1e-10);
             }
         }
     }
@@ -737,10 +765,13 @@ mod tests {
     #[test]
     fn quantum_state_normalization_check() {
         let inv_sqrt2 = 1.0 / 2.0_f64.sqrt();
-        let plus = vec![Complex::from_real(inv_sqrt2), Complex::from_real(inv_sqrt2)];
+        let plus = [Complex::from_real(inv_sqrt2), Complex::from_real(inv_sqrt2)];
         let norm_sq: f64 = plus.iter().map(|c| c.norm_sq()).sum();
         assert!((norm_sq - 1.0).abs() < 1e-10);
-        let minus = vec![Complex::from_real(inv_sqrt2), Complex::from_real(-inv_sqrt2)];
+        let minus = [
+            Complex::from_real(inv_sqrt2),
+            Complex::from_real(-inv_sqrt2),
+        ];
         let norm_sq: f64 = minus.iter().map(|c| c.norm_sq()).sum();
         assert!((norm_sq - 1.0).abs() < 1e-10);
         let i_state = vec![Complex::from_real(inv_sqrt2), Complex::new(0.0, inv_sqrt2)];

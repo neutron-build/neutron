@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
-use super::page::{PageBuf, PAGE_SIZE};
+use super::page::{PAGE_SIZE, PageBuf};
 
 // ============================================================================
 // Record types
@@ -69,6 +69,19 @@ const PAGE_WRITE_RECORD_SIZE: usize = RECORD_HEADER_SIZE + PAGE_SIZE + RECORD_CR
 /// Record size for control records (commit, abort, checkpoint) — no page data.
 const CONTROL_RECORD_SIZE: usize = RECORD_HEADER_SIZE + RECORD_CRC_SIZE;
 
+/// CRC over a page-write record's authenticated bytes: the header
+/// (lsn, txn_id, record_type, page_id) followed by the page image. Covering the
+/// header — not just the page — means a corrupt page_id or txn_id is detected on
+/// replay instead of being silently applied to the wrong page / attributed to the
+/// wrong transaction. (Control records already CRC their header fields.)
+fn page_write_crc(lsn: u64, txn_id: u64, page_id: u32, page_image: &[u8]) -> u32 {
+    let mut crc = crc32c::crc32c(&lsn.to_le_bytes());
+    crc = crc32c::crc32c_append(crc, &txn_id.to_le_bytes());
+    crc = crc32c::crc32c_append(crc, &[RECORD_PAGE_WRITE]);
+    crc = crc32c::crc32c_append(crc, &page_id.to_le_bytes());
+    crc32c::crc32c_append(crc, page_image)
+}
+
 // ============================================================================
 // WAL record (in-memory representation)
 // ============================================================================
@@ -91,11 +104,18 @@ pub struct WalRecord {
 /// Both single-file `Wal` and `SegmentedWal` implement this.
 pub trait WalBackend: Send + Sync {
     /// Log a full page image write. Returns the assigned LSN.
-    fn log_page_write(&self, txn_id: u64, page_id: u32, page_image: &PageBuf) -> std::io::Result<u64>;
+    fn log_page_write(
+        &self,
+        txn_id: u64,
+        page_id: u32,
+        page_image: &PageBuf,
+    ) -> std::io::Result<u64>;
     /// Force buffered WAL data to stable storage.
     fn sync(&self) -> std::io::Result<()>;
     /// Get WAL stats: (bytes_written, syncs).
-    fn wal_stats(&self) -> (u64, u64) { (0, 0) }
+    fn wal_stats(&self) -> (u64, u64) {
+        (0, 0)
+    }
     /// Group-commit sync: leader performs the actual sync, followers piggyback.
     fn group_sync(&self) {
         if let Err(e) = self.sync() {
@@ -103,9 +123,13 @@ pub trait WalBackend: Send + Sync {
         }
     }
     /// Log a COMMIT record for the given transaction. Returns the assigned LSN.
-    fn log_commit(&self, _txn_id: u64) -> std::io::Result<u64> { Ok(0) }
+    fn log_commit(&self, _txn_id: u64) -> std::io::Result<u64> {
+        Ok(0)
+    }
     /// Log an ABORT record for the given transaction. Returns the assigned LSN.
-    fn log_abort(&self, _txn_id: u64) -> std::io::Result<u64> { Ok(0) }
+    fn log_abort(&self, _txn_id: u64) -> std::io::Result<u64> {
+        Ok(0)
+    }
     /// Log a checkpoint record and return the checkpoint LSN.
     fn log_checkpoint(&self) -> std::io::Result<u64> {
         Ok(0)
@@ -178,7 +202,12 @@ impl Wal {
 
     /// Log a page write. Returns the LSN assigned to this record.
     /// Must be called BEFORE the dirty page is flushed to the data file.
-    pub fn log_page_write(&self, txn_id: u64, page_id: u32, page_image: &PageBuf) -> std::io::Result<u64> {
+    pub fn log_page_write(
+        &self,
+        txn_id: u64,
+        page_id: u32,
+        page_image: &PageBuf,
+    ) -> std::io::Result<u64> {
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         let mut writer = self.writer.lock();
 
@@ -190,13 +219,16 @@ impl Wal {
         writer.write_all(&page_id.to_le_bytes())?;
         writer.write_all(page_image)?;
 
-        // CRC over the entire record (excluding the record_len prefix and crc itself)
-        let crc = crc32c::crc32c(page_image);
+        // CRC over header (lsn/txn_id/type/page_id) + page image — see page_write_crc.
+        let crc = page_write_crc(lsn, txn_id, page_id, page_image);
         writer.write_all(&crc.to_le_bytes())?;
 
         self.writes.fetch_add(1, Ordering::Relaxed);
-        // 4 bytes for the record_len prefix + the record body
-        self.bytes_written.fetch_add(4 + record_len as u64, Ordering::Relaxed);
+        // record_len is the full on-disk size (it already includes the 4-byte
+        // length prefix — see RECORD_HEADER_SIZE), so the bytes written equal
+        // record_len exactly.
+        self.bytes_written
+            .fetch_add(record_len as u64, Ordering::Relaxed);
 
         Ok(lsn)
     }
@@ -248,11 +280,15 @@ impl Wal {
             }
         });
     }
-
 }
 
 impl WalBackend for Wal {
-    fn log_page_write(&self, txn_id: u64, page_id: u32, page_image: &PageBuf) -> std::io::Result<u64> {
+    fn log_page_write(
+        &self,
+        txn_id: u64,
+        page_id: u32,
+        page_image: &PageBuf,
+    ) -> std::io::Result<u64> {
         Wal::log_page_write(self, txn_id, page_id, page_image)
     }
 
@@ -306,7 +342,9 @@ impl Wal {
         writer.write_all(&crc.to_le_bytes())?;
 
         self.writes.fetch_add(1, Ordering::Relaxed);
-        self.bytes_written.fetch_add(4 + record_len as u64, Ordering::Relaxed);
+        // record_len already includes its own 4-byte length prefix.
+        self.bytes_written
+            .fetch_add(record_len as u64, Ordering::Relaxed);
 
         Ok(lsn)
     }
@@ -367,9 +405,10 @@ pub fn read_wal_records(path: &Path) -> std::io::Result<Vec<WalRecord>> {
         let stored_crc = u32::from_le_bytes(crc_buf);
 
         if record_type == RECORD_PAGE_WRITE {
-            // For page writes, CRC is over the page image
+            // For page writes, CRC is over the header (lsn/txn_id/type/page_id)
+            // plus the page image — see page_write_crc.
             if let Some(ref img) = page_image {
-                let computed = crc32c::crc32c(img.as_ref());
+                let computed = page_write_crc(lsn, txn_id, page_id, img.as_ref());
                 if computed != stored_crc {
                     tracing::error!(
                         "WAL CORRUPTION: CRC mismatch at LSN {lsn} (page write): stored={stored_crc:#x}, computed={computed:#x}. \
@@ -391,7 +430,11 @@ pub fn read_wal_records(path: &Path) -> std::io::Result<Vec<WalRecord>> {
                     "WAL CORRUPTION: CRC mismatch at LSN {lsn} (control record): stored={stored_crc:#x}, computed={computed:#x}. \
                      Skipping record — transaction state may be inconsistent."
                 );
-                pos += 4 + record_len as u64;
+                // record_len is the full record size (it includes its own 4-byte
+                // length prefix — see RECORD_HEADER_SIZE), so advance by exactly
+                // record_len. Adding 4 here over-shot and misaligned every
+                // subsequent record, silently dropping the rest of the WAL.
+                pos += record_len as u64;
                 continue;
             }
         }
@@ -507,7 +550,6 @@ impl SegmentedWal {
         let seg_path = segment_path(dir, active_seg_num);
         let file = OpenOptions::new()
             .read(true)
-            
             .create(true)
             .append(true)
             .open(&seg_path)?;
@@ -532,14 +574,23 @@ impl SegmentedWal {
     }
 
     /// Open a segmented WAL with a specific sync mode.
-    pub fn open_with_sync_mode(dir: &Path, max_segment_size: u64, sync_mode: SyncMode) -> std::io::Result<Self> {
+    pub fn open_with_sync_mode(
+        dir: &Path,
+        max_segment_size: u64,
+        sync_mode: SyncMode,
+    ) -> std::io::Result<Self> {
         let mut wal = Self::open(dir, max_segment_size)?;
         wal.sync_mode = sync_mode;
         Ok(wal)
     }
 
     /// Log a page write. Returns the assigned LSN.
-    pub fn log_page_write(&self, txn_id: u64, page_id: u32, page_image: &PageBuf) -> std::io::Result<u64> {
+    pub fn log_page_write(
+        &self,
+        txn_id: u64,
+        page_id: u32,
+        page_image: &PageBuf,
+    ) -> std::io::Result<u64> {
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         let mut active = self.active.lock();
 
@@ -550,13 +601,14 @@ impl SegmentedWal {
         active.writer.write_all(&[RECORD_PAGE_WRITE])?;
         active.writer.write_all(&page_id.to_le_bytes())?;
         active.writer.write_all(page_image)?;
-        let crc = crc32c::crc32c(page_image);
+        let crc = page_write_crc(lsn, txn_id, page_id, page_image);
         active.writer.write_all(&crc.to_le_bytes())?;
 
         active.bytes_written += record_len as u64;
 
         self.writes.fetch_add(1, Ordering::Relaxed);
-        self.bytes_written_total.fetch_add(4 + record_len as u64, Ordering::Relaxed);
+        self.bytes_written_total
+            .fetch_add(4 + record_len as u64, Ordering::Relaxed);
 
         // Check if rotation is needed
         if active.bytes_written >= self.max_segment_size {
@@ -689,7 +741,8 @@ impl SegmentedWal {
         active.bytes_written += record_len as u64;
 
         self.writes.fetch_add(1, Ordering::Relaxed);
-        self.bytes_written_total.fetch_add(4 + record_len as u64, Ordering::Relaxed);
+        self.bytes_written_total
+            .fetch_add(4 + record_len as u64, Ordering::Relaxed);
 
         if active.bytes_written >= self.max_segment_size {
             self.rotate_inner(&mut active)?;
@@ -711,7 +764,6 @@ impl SegmentedWal {
         let new_path = segment_path(&self.dir, new_seg_num);
         let file = OpenOptions::new()
             .read(true)
-            
             .create(true)
             .append(true)
             .open(&new_path)?;
@@ -734,7 +786,12 @@ impl SegmentedWal {
 }
 
 impl WalBackend for SegmentedWal {
-    fn log_page_write(&self, txn_id: u64, page_id: u32, page_image: &PageBuf) -> std::io::Result<u64> {
+    fn log_page_write(
+        &self,
+        txn_id: u64,
+        page_id: u32,
+        page_image: &PageBuf,
+    ) -> std::io::Result<u64> {
         SegmentedWal::log_page_write(self, txn_id, page_id, page_image)
     }
 
@@ -775,7 +832,10 @@ impl std::fmt::Debug for SegmentedWal {
         f.debug_struct("SegmentedWal")
             .field("dir", &self.dir)
             .field("next_lsn", &self.next_lsn.load(Ordering::Relaxed))
-            .field("checkpoint_lsn", &self.checkpoint_lsn.load(Ordering::Relaxed))
+            .field(
+                "checkpoint_lsn",
+                &self.checkpoint_lsn.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -879,9 +939,10 @@ fn list_segments(dir: &Path) -> std::io::Result<Vec<u64>> {
         let name = name.to_string_lossy();
         if let Some(stripped) = name.strip_prefix("wal-")
             && let Some(num_str) = stripped.strip_suffix(".log")
-                && let Ok(n) = num_str.parse::<u64>() {
-                    segments.push(n);
-                }
+            && let Ok(n) = num_str.parse::<u64>()
+        {
+            segments.push(n);
+        }
     }
     Ok(segments)
 }
@@ -915,6 +976,82 @@ mod tests {
         assert_eq!(records[0].record_type, RECORD_PAGE_WRITE);
         assert_eq!(records[0].page_id, 10);
         assert_eq!(records[1].record_type, RECORD_COMMIT);
+    }
+
+    // Regression: a corrupt control record must be skipped by exactly its own
+    // length so the records AFTER it still recover. The skip used to advance by
+    // `4 + record_len`, over-shooting by 4 and silently losing the rest of the WAL.
+    #[test]
+    fn wal_replay_continues_past_corrupt_control_record() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("corrupt.wal");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_commit(1).unwrap();
+            wal.log_commit(2).unwrap();
+            wal.log_commit(3).unwrap();
+            wal.sync().unwrap();
+        }
+
+        // Corrupt the CRC trailer of the FIRST control record (its last 4 bytes).
+        let crc_off = (CONTROL_RECORD_SIZE - RECORD_CRC_SIZE) as u64;
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(crc_off)).unwrap();
+            f.write_all(&[0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // The first record is dropped (CRC mismatch) but the two that follow it
+        // must still be recovered — proving the skip realigned correctly.
+        let records = read_wal_records(&wal_path).unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "records after a corrupt control record must still recover"
+        );
+        assert!(records.iter().all(|r| r.record_type == RECORD_COMMIT));
+        assert_eq!(records[0].txn_id, 2);
+        assert_eq!(records[1].txn_id, 3);
+    }
+
+    #[test]
+    fn wal_page_write_detects_header_corruption() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("hdr.wal");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            let page = Box::new([0u8; PAGE_SIZE]);
+            wal.log_page_write(42, 7, &page).unwrap(); // txn_id=42, page_id=7
+            wal.sync().unwrap();
+        }
+        // Sanity: the record reads back.
+        assert_eq!(read_wal_records(&wal_path).unwrap().len(), 1);
+
+        // Corrupt the page_id field in the HEADER (not the page body). Before the
+        // header-CRC fix the CRC covered only the page image, so this corruption
+        // went undetected and the page would be applied to the wrong page_id.
+        let page_id_off = (RECORD_HEADER_SIZE - 4) as u64; // 25 - 4 = 21
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(page_id_off)).unwrap();
+            f.write_all(&[0xAB]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let records = read_wal_records(&wal_path).unwrap();
+        assert!(
+            records.is_empty(),
+            "page-write header corruption must now be caught by the CRC"
+        );
     }
 
     #[test]
@@ -1000,11 +1137,17 @@ mod tests {
         wal.sync().unwrap();
 
         // Should have rotated at least once
-        assert!(seg_after_first > 1 || seg_after_second > seg_after_first,
-            "should rotate: seg1={seg_after_first}, seg2={seg_after_second}");
+        assert!(
+            seg_after_first > 1 || seg_after_second > seg_after_first,
+            "should rotate: seg1={seg_after_first}, seg2={seg_after_second}"
+        );
 
         let segments = list_segments(&wal_dir).unwrap();
-        assert!(segments.len() >= 2, "should have multiple segment files: {}", segments.len());
+        assert!(
+            segments.len() >= 2,
+            "should have multiple segment files: {}",
+            segments.len()
+        );
     }
 
     #[test]
@@ -1357,7 +1500,8 @@ mod tests {
     fn segmented_wal_with_fdatasync_mode() {
         let dir = tempfile::tempdir().unwrap();
         let wal_dir = dir.path().join("seg_fdatasync");
-        let wal = SegmentedWal::open_with_sync_mode(&wal_dir, 1024 * 1024, SyncMode::Fdatasync).unwrap();
+        let wal =
+            SegmentedWal::open_with_sync_mode(&wal_dir, 1024 * 1024, SyncMode::Fdatasync).unwrap();
 
         let page = [5u8; PAGE_SIZE];
         wal.log_page_write(1, 0, &page).unwrap();
@@ -1372,14 +1516,19 @@ mod tests {
 #[cfg(test)]
 mod group_commit_tests {
     use super::*;
-    use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
 
     #[test]
     fn group_commit_single_thread() {
         let gc = GroupCommitter::new();
         let count = Arc::new(AtomicU64::new(0));
         let c = count.clone();
-        gc.group_sync(move || { c.fetch_add(1, Ordering::SeqCst); });
+        gc.group_sync(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert_eq!(gc.epoch(), 1);
         assert_eq!(gc.sync_count(), 1);
@@ -1414,9 +1563,14 @@ mod group_commit_tests {
                 });
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         let total = sync_count.load(Ordering::SeqCst);
-        assert!(total < 10, "Expected batching: got {total} syncs for 10 callers");
+        assert!(
+            total < 10,
+            "Expected batching: got {total} syncs for 10 callers"
+        );
         assert!(total >= 1);
     }
 
@@ -1439,7 +1593,9 @@ mod group_commit_tests {
                 d.fetch_add(1, Ordering::SeqCst);
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         assert_eq!(done.load(Ordering::SeqCst), 5);
     }
 
@@ -1449,7 +1605,9 @@ mod group_commit_tests {
         let count = Arc::new(AtomicU64::new(0));
         for _ in 0..5 {
             let c = count.clone();
-            gc.group_sync(move || { c.fetch_add(1, Ordering::SeqCst); });
+            gc.group_sync(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            });
         }
         assert_eq!(count.load(Ordering::SeqCst), 5);
         assert_eq!(gc.sync_count(), 5);
@@ -1474,9 +1632,14 @@ mod group_commit_tests {
                 });
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         let total = sync_count.load(Ordering::SeqCst);
-        assert!(total < 100, "Expected batching: got {total} syncs for 100 callers");
+        assert!(
+            total < 100,
+            "Expected batching: got {total} syncs for 100 callers"
+        );
         assert!(total >= 1);
     }
 

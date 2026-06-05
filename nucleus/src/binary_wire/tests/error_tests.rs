@@ -16,6 +16,8 @@ async fn test_syntax_error_42601() {
 
 #[tokio::test]
 #[ignore = "awaiting Phase 1 binary protocol implementation"]
+// 42P01 is the PostgreSQL SQLSTATE for undefined_table; kept uppercase to match.
+#[allow(non_snake_case)]
 async fn test_undefined_table_42P01() {
     // TODO: Week 2
     // Query: SELECT FROM nonexistent_table

@@ -8,8 +8,8 @@
 
 use std::collections::HashMap;
 
-use super::{ExecError, ExecResult, Executor};
 use super::session::CrossModelSnapshots;
+use super::{ExecError, ExecResult, Executor};
 
 impl Executor {
     // ====================================================================
@@ -154,10 +154,7 @@ impl Executor {
     }
 
     /// SAVEPOINT -- capture current state within a transaction.
-    pub(super) async fn execute_savepoint(
-        &self,
-        name: &str,
-    ) -> Result<ExecResult, ExecError> {
+    pub(super) async fn execute_savepoint(&self, name: &str) -> Result<ExecResult, ExecError> {
         let sess = self.current_session();
         let mut txn = sess.txn_state.write().await;
         if !txn.active {

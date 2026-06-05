@@ -5,7 +5,7 @@
 //! These benchmarks measure how the embedded MVCC database handles concurrent
 //! readers and writers across multiple Tokio tasks.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::sync::Arc;
 
 fn concurrent_4_threads_mixed(c: &mut Criterion) {
@@ -38,8 +38,7 @@ fn concurrent_4_threads_mixed(c: &mut Criterion) {
                                 .await,
                             );
                             let _ = black_box(
-                                db.query(black_box("SELECT COUNT(*) FROM conc_bench"))
-                                    .await,
+                                db.query(black_box("SELECT COUNT(*) FROM conc_bench")).await,
                             );
                         }
                     }));

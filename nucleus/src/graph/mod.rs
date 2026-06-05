@@ -161,36 +161,55 @@ impl GraphStore {
         // Restore nodes.
         for (id, wn) in &state.nodes {
             for label in &wn.labels {
-                store.label_index.entry(label.clone()).or_default().insert(*id);
+                store
+                    .label_index
+                    .entry(label.clone())
+                    .or_default()
+                    .insert(*id);
             }
-            store.nodes.insert(*id, Node {
-                id: *id,
-                labels: wn.labels.clone(),
-                properties: wn.properties.clone(),
-            });
+            store.nodes.insert(
+                *id,
+                Node {
+                    id: *id,
+                    labels: wn.labels.clone(),
+                    properties: wn.properties.clone(),
+                },
+            );
             store.hot_node_ids.insert(*id);
         }
 
         // Restore edges + adjacency + type index.
         for (id, we) in &state.edges {
-            store.type_index
+            store
+                .type_index
                 .entry(we.edge_type.clone())
                 .or_default()
                 .insert(*id);
-            store.edges.insert(*id, Edge {
-                id: *id,
-                edge_type: we.edge_type.clone(),
-                from: we.from,
-                to: we.to,
-                properties: we.properties.clone(),
-            });
+            store.edges.insert(
+                *id,
+                Edge {
+                    id: *id,
+                    edge_type: we.edge_type.clone(),
+                    from: we.from,
+                    to: we.to,
+                    properties: we.properties.clone(),
+                },
+            );
             store.outgoing.entry(we.from).or_default().push(*id);
             store.incoming.entry(we.to).or_default().push(*id);
         }
 
         // Restore ID counters.
-        store.next_node_id = if state.next_node_id > 0 { state.next_node_id } else { 1 };
-        store.next_edge_id = if state.next_edge_id > 0 { state.next_edge_id } else { 1 };
+        store.next_node_id = if state.next_node_id > 0 {
+            state.next_node_id
+        } else {
+            1
+        };
+        store.next_edge_id = if state.next_edge_id > 0 {
+            state.next_edge_id
+        } else {
+            1
+        };
 
         Ok(store)
     }
@@ -254,13 +273,14 @@ impl GraphStore {
             let key = format!("n:{id}").into_bytes();
             let props_data = cold.lock().get(&key);
             if let Some(data) = props_data
-                && let Some(props) = tiered::properties_from_bytes(&data) {
-                    return Some(Node {
-                        id: node.id,
-                        labels: node.labels.clone(),
-                        properties: props,
-                    });
-                }
+                && let Some(props) = tiered::properties_from_bytes(&data)
+            {
+                return Some(Node {
+                    id: node.id,
+                    labels: node.labels.clone(),
+                    properties: props,
+                });
+            }
         }
         Some(node.clone())
     }
@@ -339,11 +359,7 @@ impl GraphStore {
     pub fn nodes_by_label(&self, label: &str) -> Vec<&Node> {
         self.label_index
             .get(label)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.nodes.get(id))
-                    .collect()
-            })
+            .map(|ids| ids.iter().filter_map(|id| self.nodes.get(id)).collect())
             .unwrap_or_default()
     }
 
@@ -419,15 +435,16 @@ impl GraphStore {
             let key = format!("e:{id}").into_bytes();
             let props_data = cold.lock().get(&key);
             if let Some(data) = props_data
-                && let Some(props) = tiered::properties_from_bytes(&data) {
-                    return Some(Edge {
-                        id: edge.id,
-                        edge_type: edge.edge_type.clone(),
-                        from: edge.from,
-                        to: edge.to,
-                        properties: props,
-                    });
-                }
+                && let Some(props) = tiered::properties_from_bytes(&data)
+            {
+                return Some(Edge {
+                    id: edge.id,
+                    edge_type: edge.edge_type.clone(),
+                    from: edge.from,
+                    to: edge.to,
+                    properties: props,
+                });
+            }
         }
         Some(edge.clone())
     }
@@ -474,11 +491,7 @@ impl GraphStore {
     pub fn edges_by_type(&self, edge_type: &str) -> Vec<&Edge> {
         self.type_index
             .get(edge_type)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.edges.get(id))
-                    .collect()
-            })
+            .map(|ids| ids.iter().filter_map(|id| self.edges.get(id)).collect())
             .unwrap_or_default()
     }
 
@@ -513,8 +526,16 @@ impl GraphStore {
     /// Create a `GraphSnapshot` for WAL checkpointing.
     pub fn snapshot(&self) -> wal::GraphSnapshot<'_> {
         wal::GraphSnapshot {
-            nodes: self.nodes.values().map(|n| (&n.id, &n.labels, &n.properties)).collect(),
-            edges: self.edges.values().map(|e| (&e.id, &e.from, &e.to, e.edge_type.as_str(), &e.properties)).collect(),
+            nodes: self
+                .nodes
+                .values()
+                .map(|n| (&n.id, &n.labels, &n.properties))
+                .collect(),
+            edges: self
+                .edges
+                .values()
+                .map(|e| (&e.id, &e.from, &e.to, e.edge_type.as_str(), &e.properties))
+                .collect(),
             next_node_id: self.next_node_id,
             next_edge_id: self.next_edge_id,
         }
@@ -577,7 +598,9 @@ impl GraphStore {
         if self.hot_node_ids.len() <= self.max_hot_nodes {
             return;
         }
-        let Some(ref cold) = self.cold_props else { return };
+        let Some(ref cold) = self.cold_props else {
+            return;
+        };
         let to_evict = self.hot_node_ids.len() - self.max_hot_nodes;
 
         // Collect node IDs to evict
@@ -586,22 +609,24 @@ impl GraphStore {
         let mut c = cold.lock();
         for nid in &evict_ids {
             if let Some(node) = self.nodes.get_mut(nid)
-                && !node.properties.is_empty() {
-                    let bytes = tiered::properties_to_bytes(&node.properties);
-                    c.put(format!("n:{nid}").into_bytes(), bytes);
-                    node.properties.clear();
-                }
+                && !node.properties.is_empty()
+            {
+                let bytes = tiered::properties_to_bytes(&node.properties);
+                c.put(format!("n:{nid}").into_bytes(), bytes);
+                node.properties.clear();
+            }
             self.hot_node_ids.remove(nid);
 
             // Also evict properties of outgoing edges from this node
             if let Some(out_eids) = self.outgoing.get(nid) {
                 for &eid in out_eids {
                     if let Some(edge) = self.edges.get_mut(&eid)
-                        && !edge.properties.is_empty() {
-                            let bytes = tiered::properties_to_bytes(&edge.properties);
-                            c.put(format!("e:{eid}").into_bytes(), bytes);
-                            edge.properties.clear();
-                        }
+                        && !edge.properties.is_empty()
+                    {
+                        let bytes = tiered::properties_to_bytes(&edge.properties);
+                        c.put(format!("e:{eid}").into_bytes(), bytes);
+                        edge.properties.clear();
+                    }
                 }
             }
         }
@@ -626,23 +651,27 @@ impl GraphStore {
             // requested type, then check adjacency.
             if let Some(type_eids) = self.type_index.get(et) {
                 if (direction == Direction::Outgoing || direction == Direction::Both)
-                    && let Some(out) = self.outgoing.get(&node_id) {
-                        for eid in out {
-                            if type_eids.contains(eid)
-                                && let Some(e) = self.edges.get(eid) {
-                                    results.push((e.to, e));
-                                }
+                    && let Some(out) = self.outgoing.get(&node_id)
+                {
+                    for eid in out {
+                        if type_eids.contains(eid)
+                            && let Some(e) = self.edges.get(eid)
+                        {
+                            results.push((e.to, e));
                         }
                     }
+                }
                 if (direction == Direction::Incoming || direction == Direction::Both)
-                    && let Some(inc) = self.incoming.get(&node_id) {
-                        for eid in inc {
-                            if type_eids.contains(eid)
-                                && let Some(e) = self.edges.get(eid) {
-                                    results.push((e.from, e));
-                                }
+                    && let Some(inc) = self.incoming.get(&node_id)
+                {
+                    for eid in inc {
+                        if type_eids.contains(eid)
+                            && let Some(e) = self.edges.get(eid)
+                        {
+                            results.push((e.from, e));
                         }
                     }
+                }
             }
         } else {
             // No type filter: scan all adjacency edges.
@@ -655,13 +684,15 @@ impl GraphStore {
             };
 
             if (direction == Direction::Outgoing || direction == Direction::Both)
-                && let Some(out) = self.outgoing.get(&node_id) {
-                    results.extend(collect(out, |e| e.to));
-                }
+                && let Some(out) = self.outgoing.get(&node_id)
+            {
+                results.extend(collect(out, |e| e.to));
+            }
             if (direction == Direction::Incoming || direction == Direction::Both)
-                && let Some(inc) = self.incoming.get(&node_id) {
-                    results.extend(collect(inc, |e| e.from));
-                }
+                && let Some(inc) = self.incoming.get(&node_id)
+            {
+                results.extend(collect(inc, |e| e.from));
+            }
         }
 
         results
@@ -795,7 +826,11 @@ impl GraphStore {
             let bits = f.to_bits();
             // Positive floats: set sign bit so they sort after negative.
             // Negative floats: flip all bits to reverse their order.
-            if bits >> 63 == 0 { bits | (1u64 << 63) } else { !bits }
+            if bits >> 63 == 0 {
+                bits | (1u64 << 63)
+            } else {
+                !bits
+            }
         }
         #[inline]
         fn ord_to_f64(o: u64) -> f64 {
@@ -826,10 +861,22 @@ impl GraphStore {
             }
 
             for (neighbor, edge) in self.neighbors(current, direction, None) {
-                let weight = match edge.properties.get(weight_property) {
+                let raw_weight = match edge.properties.get(weight_property) {
                     Some(PropValue::Float(w)) => *w,
                     Some(PropValue::Int(w)) => *w as f64,
                     _ => 1.0,
+                };
+                // Dijkstra requires non-negative weights; a negative edge would
+                // yield an incorrect shortest path. Clamp to 0 and warn rather than
+                // silently returning a wrong result (use Bellman-Ford for negatives).
+                let weight = if raw_weight < 0.0 {
+                    tracing::warn!(
+                        target: "nucleus::graph",
+                        "dijkstra: negative edge weight {raw_weight} clamped to 0 (use Bellman-Ford for graphs with negative weights)"
+                    );
+                    0.0
+                } else {
+                    raw_weight
                 };
                 let new_dist = current_dist + weight;
                 if new_dist < *dist.get(&neighbor).unwrap_or(&f64::MAX) {
@@ -885,9 +932,10 @@ impl GraphStore {
                     if let Some(edge) = self.edges.get(&eid) {
                         // Check edge type filter
                         if let Some(et) = edge_type
-                            && edge.edge_type != et {
-                                continue;
-                            }
+                            && edge.edge_type != et
+                        {
+                            continue;
+                        }
                         // Check end label filter
                         if let Some(el) = end_label {
                             if let Some(end_node) = self.nodes.get(&edge.to) {
@@ -1009,8 +1057,11 @@ impl GraphStore {
         let mut ranks: HashMap<NodeId, f64> = self.nodes.keys().map(|&id| (id, initial)).collect();
 
         for _ in 0..iterations {
-            let mut new_ranks: HashMap<NodeId, f64> =
-                self.nodes.keys().map(|&id| (id, (1.0 - damping) / n as f64)).collect();
+            let mut new_ranks: HashMap<NodeId, f64> = self
+                .nodes
+                .keys()
+                .map(|&id| (id, (1.0 - damping) / n as f64))
+                .collect();
 
             for (&node_id, &rank) in &ranks {
                 let out_degree = self.outgoing.get(&node_id).map_or(0, |v| v.len());
@@ -1025,9 +1076,10 @@ impl GraphStore {
                     if let Some(out_edges) = self.outgoing.get(&node_id) {
                         for eid in out_edges {
                             if let Some(edge) = self.edges.get(eid)
-                                && let Some(r) = new_ranks.get_mut(&edge.to) {
-                                    *r += share;
-                                }
+                                && let Some(r) = new_ranks.get_mut(&edge.to)
+                            {
+                                *r += share;
+                            }
                         }
                     }
                 }
@@ -1070,9 +1122,10 @@ impl GraphStore {
                 if let Some(out_edges) = self.outgoing.get(&node_id) {
                     for eid in out_edges {
                         if let Some(edge) = self.edges.get(eid)
-                            && let Some(&label) = labels.get(&edge.to) {
-                                *label_counts.entry(label).or_insert(0) += 1;
-                            }
+                            && let Some(&label) = labels.get(&edge.to)
+                        {
+                            *label_counts.entry(label).or_insert(0) += 1;
+                        }
                     }
                 }
 
@@ -1080,19 +1133,19 @@ impl GraphStore {
                 if let Some(in_edges) = self.incoming.get(&node_id) {
                     for eid in in_edges {
                         if let Some(edge) = self.edges.get(eid)
-                            && let Some(&label) = labels.get(&edge.from) {
-                                *label_counts.entry(label).or_insert(0) += 1;
-                            }
+                            && let Some(&label) = labels.get(&edge.from)
+                        {
+                            *label_counts.entry(label).or_insert(0) += 1;
+                        }
                     }
                 }
 
-                if let Some((&best_label, _)) = label_counts
-                    .iter()
-                    .max_by_key(|(_, count)| *count)
-                    && labels[&node_id] != best_label {
-                        labels.insert(node_id, best_label);
-                        changed = true;
-                    }
+                if let Some((&best_label, _)) = label_counts.iter().max_by_key(|(_, count)| *count)
+                    && labels[&node_id] != best_label
+                {
+                    labels.insert(node_id, best_label);
+                    changed = true;
+                }
             }
 
             if !changed {
@@ -1119,7 +1172,11 @@ impl GraphStore {
         let total_edges = self.edges.len() as f64;
         if total_edges == 0.0 {
             // Every node is its own community
-            return node_ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+            return node_ids
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| (id, i))
+                .collect();
         }
 
         // Initialize: each node in its own community
@@ -1240,7 +1297,11 @@ impl GraphStore {
             .collect();
 
         if edges.len() < 100 {
-            return edges.into_iter().filter(|e| filter_fn(e)).cloned().collect();
+            return edges
+                .into_iter()
+                .filter(|e| filter_fn(e))
+                .cloned()
+                .collect();
         }
 
         let cpus = std::thread::available_parallelism()
@@ -1292,15 +1353,10 @@ impl GraphStore {
         std::thread::scope(|s| {
             let handles: Vec<_> = sources
                 .iter()
-                .map(|&src| {
-                    s.spawn(move || (src, self.bfs(src, direction, edge_type)))
-                })
+                .map(|&src| s.spawn(move || (src, self.bfs(src, direction, edge_type))))
                 .collect();
 
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap())
-                .collect()
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         })
     }
 
@@ -1329,10 +1385,7 @@ impl GraphStore {
                 })
                 .collect();
 
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap())
-                .collect()
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         })
     }
 
@@ -1532,7 +1585,12 @@ impl CsrGraph {
 
     /// Dijkstra shortest path on the CSR graph.
     /// Returns `Some((distance, path))` or `None` if no path exists.
-    pub fn shortest_path(&self, from: NodeId, to: NodeId, weight_key: &str) -> Option<(f64, Vec<NodeId>)> {
+    pub fn shortest_path(
+        &self,
+        from: NodeId,
+        to: NodeId,
+        weight_key: &str,
+    ) -> Option<(f64, Vec<NodeId>)> {
         if !self.id_to_index.contains_key(&from) || !self.id_to_index.contains_key(&to) {
             return None;
         }
@@ -1546,7 +1604,11 @@ impl CsrGraph {
         #[inline]
         fn f64_to_ord(f: f64) -> u64 {
             let bits = f.to_bits();
-            if bits >> 63 == 0 { bits | (1u64 << 63) } else { !bits }
+            if bits >> 63 == 0 {
+                bits | (1u64 << 63)
+            } else {
+                !bits
+            }
         }
         #[inline]
         fn ord_to_f64(o: u64) -> f64 {
@@ -1598,7 +1660,8 @@ impl CsrGraph {
     pub fn memory_bytes(&self) -> usize {
         self.offsets.len() * std::mem::size_of::<usize>()
             + self.edges.len() * std::mem::size_of::<CsrEdge>()
-            + self.id_to_index.len() * (std::mem::size_of::<NodeId>() + std::mem::size_of::<usize>())
+            + self.id_to_index.len()
+                * (std::mem::size_of::<NodeId>() + std::mem::size_of::<usize>())
             + self.index_to_id.len() * std::mem::size_of::<NodeId>()
     }
 }
@@ -1687,7 +1750,10 @@ impl PropertyIndex {
     /// Exact lookup: find all nodes where property == value.
     pub fn lookup(&self, value: &PropValue) -> Vec<NodeId> {
         let key = IndexKey::from_prop(value);
-        self.tree.get(&key).map(|s| s.iter().copied().collect()).unwrap_or_default()
+        self.tree
+            .get(&key)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Range query: find all nodes where property is in [min, max].
@@ -1757,17 +1823,21 @@ impl CompositePropertyIndex {
 
     pub fn remove_node(&mut self, node: &Node) {
         if let Some(key) = self.make_key(node)
-            && let Some(set) = self.tree.get_mut(&key) {
-                set.remove(&node.id);
-                if set.is_empty() {
-                    self.tree.remove(&key);
-                }
+            && let Some(set) = self.tree.get_mut(&key)
+        {
+            set.remove(&node.id);
+            if set.is_empty() {
+                self.tree.remove(&key);
             }
+        }
     }
 
     pub fn lookup(&self, values: &[PropValue]) -> Vec<NodeId> {
         let key: Vec<IndexKey> = values.iter().map(IndexKey::from_prop).collect();
-        self.tree.get(&key).map(|s| s.iter().copied().collect()).unwrap_or_default()
+        self.tree
+            .get(&key)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     pub fn entry_count(&self) -> usize {
@@ -1902,16 +1972,8 @@ impl GraphTransaction {
                 incoming: Vec::new(),
             });
         } else if let Some(node) = graph.nodes.get(&id) {
-            let outgoing: Vec<Edge> = graph
-                .outgoing_edges(id)
-                .into_iter()
-                .cloned()
-                .collect();
-            let incoming: Vec<Edge> = graph
-                .incoming_edges(id)
-                .into_iter()
-                .cloned()
-                .collect();
+            let outgoing: Vec<Edge> = graph.outgoing_edges(id).into_iter().cloned().collect();
+            let incoming: Vec<Edge> = graph.incoming_edges(id).into_iter().cloned().collect();
             self.ops.push(GraphOp::DeleteNode {
                 id,
                 node: node.clone(),
@@ -2079,6 +2141,8 @@ impl GraphTransactionManager {
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
 
     fn social_graph() -> GraphStore {
@@ -2087,19 +2151,31 @@ mod tests {
         // People
         let alice = g.create_node(
             vec!["Person".into()],
-            props(vec![("name", PropValue::Text("Alice".into())), ("age", PropValue::Int(30))]),
+            props(vec![
+                ("name", PropValue::Text("Alice".into())),
+                ("age", PropValue::Int(30)),
+            ]),
         );
         let bob = g.create_node(
             vec!["Person".into()],
-            props(vec![("name", PropValue::Text("Bob".into())), ("age", PropValue::Int(25))]),
+            props(vec![
+                ("name", PropValue::Text("Bob".into())),
+                ("age", PropValue::Int(25)),
+            ]),
         );
         let charlie = g.create_node(
             vec!["Person".into()],
-            props(vec![("name", PropValue::Text("Charlie".into())), ("age", PropValue::Int(35))]),
+            props(vec![
+                ("name", PropValue::Text("Charlie".into())),
+                ("age", PropValue::Int(35)),
+            ]),
         );
         let dave = g.create_node(
             vec!["Person".into()],
-            props(vec![("name", PropValue::Text("Dave".into())), ("age", PropValue::Int(28))]),
+            props(vec![
+                ("name", PropValue::Text("Dave".into())),
+                ("age", PropValue::Int(28)),
+            ]),
         );
 
         // Companies
@@ -2117,8 +2193,18 @@ mod tests {
         g.create_edge(dave, charlie, "FRIENDS".into(), Properties::new());
 
         // Work relationships
-        g.create_edge(alice, acme, "WORKS_AT".into(), props(vec![("since", PropValue::Int(2020))]));
-        g.create_edge(bob, acme, "WORKS_AT".into(), props(vec![("since", PropValue::Int(2022))]));
+        g.create_edge(
+            alice,
+            acme,
+            "WORKS_AT".into(),
+            props(vec![("since", PropValue::Int(2020))]),
+        );
+        g.create_edge(
+            bob,
+            acme,
+            "WORKS_AT".into(),
+            props(vec![("since", PropValue::Int(2022))]),
+        );
 
         g
     }
@@ -2178,11 +2264,36 @@ mod tests {
         // A -> B (weight 1), A -> C (weight 4)
         // B -> C (weight 2), B -> D (weight 6)
         // C -> D (weight 1)
-        g.create_edge(a, b, "ROAD".into(), props(vec![("dist", PropValue::Float(1.0))]));
-        g.create_edge(a, c, "ROAD".into(), props(vec![("dist", PropValue::Float(4.0))]));
-        g.create_edge(b, c, "ROAD".into(), props(vec![("dist", PropValue::Float(2.0))]));
-        g.create_edge(b, d, "ROAD".into(), props(vec![("dist", PropValue::Float(6.0))]));
-        g.create_edge(c, d, "ROAD".into(), props(vec![("dist", PropValue::Float(1.0))]));
+        g.create_edge(
+            a,
+            b,
+            "ROAD".into(),
+            props(vec![("dist", PropValue::Float(1.0))]),
+        );
+        g.create_edge(
+            a,
+            c,
+            "ROAD".into(),
+            props(vec![("dist", PropValue::Float(4.0))]),
+        );
+        g.create_edge(
+            b,
+            c,
+            "ROAD".into(),
+            props(vec![("dist", PropValue::Float(2.0))]),
+        );
+        g.create_edge(
+            b,
+            d,
+            "ROAD".into(),
+            props(vec![("dist", PropValue::Float(6.0))]),
+        );
+        g.create_edge(
+            c,
+            d,
+            "ROAD".into(),
+            props(vec![("dist", PropValue::Float(1.0))]),
+        );
 
         let (dist, path) = g.dijkstra(a, d, Direction::Outgoing, "dist").unwrap();
         assert!((dist - 4.0).abs() < 1e-10); // A->B(1) + B->C(2) + C->D(1) = 4
@@ -2333,10 +2444,30 @@ mod tests {
         let c = g.create_node(vec![], Properties::new());
         let d = g.create_node(vec![], Properties::new());
 
-        g.create_edge(a, b, "ROAD".into(), props(vec![("weight", PropValue::Float(1.0))]));
-        g.create_edge(b, c, "ROAD".into(), props(vec![("weight", PropValue::Float(2.0))]));
-        g.create_edge(c, d, "ROAD".into(), props(vec![("weight", PropValue::Float(1.0))]));
-        g.create_edge(a, d, "ROAD".into(), props(vec![("weight", PropValue::Float(10.0))]));
+        g.create_edge(
+            a,
+            b,
+            "ROAD".into(),
+            props(vec![("weight", PropValue::Float(1.0))]),
+        );
+        g.create_edge(
+            b,
+            c,
+            "ROAD".into(),
+            props(vec![("weight", PropValue::Float(2.0))]),
+        );
+        g.create_edge(
+            c,
+            d,
+            "ROAD".into(),
+            props(vec![("weight", PropValue::Float(1.0))]),
+        );
+        g.create_edge(
+            a,
+            d,
+            "ROAD".into(),
+            props(vec![("weight", PropValue::Float(10.0))]),
+        );
 
         let csr = CsrGraph::from_graph(&g);
         let (dist, path) = csr.shortest_path(a, d, "weight").unwrap();
@@ -2428,7 +2559,11 @@ mod tests {
 
         let csr = CsrGraph::from_graph(&g);
         assert_eq!(csr.degree(a), 3);
-        let types: Vec<&str> = csr.neighbors(a).iter().map(|e| e.edge_type.as_str()).collect();
+        let types: Vec<&str> = csr
+            .neighbors(a)
+            .iter()
+            .map(|e| e.edge_type.as_str())
+            .collect();
         assert!(types.contains(&"ALPHA"));
         assert!(types.contains(&"BETA"));
         assert!(types.contains(&"GAMMA"));
@@ -2441,10 +2576,22 @@ mod tests {
     #[test]
     fn prop_index_build_and_lookup() {
         let mut g = GraphStore::new();
-        g.create_node(vec!["Person".into()], props(vec![("age", PropValue::Int(30))]));
-        g.create_node(vec!["Person".into()], props(vec![("age", PropValue::Int(25))]));
-        g.create_node(vec!["Person".into()], props(vec![("age", PropValue::Int(30))]));
-        g.create_node(vec!["Place".into()], props(vec![("age", PropValue::Int(30))]));
+        g.create_node(
+            vec!["Person".into()],
+            props(vec![("age", PropValue::Int(30))]),
+        );
+        g.create_node(
+            vec!["Person".into()],
+            props(vec![("age", PropValue::Int(25))]),
+        );
+        g.create_node(
+            vec!["Person".into()],
+            props(vec![("age", PropValue::Int(30))]),
+        );
+        g.create_node(
+            vec!["Place".into()],
+            props(vec![("age", PropValue::Int(30))]),
+        );
 
         let mut idx = PropertyIndex::new("Person", "age");
         idx.build_from(&g);
@@ -2461,7 +2608,10 @@ mod tests {
     fn prop_index_range_query() {
         let mut g = GraphStore::new();
         for age in [20, 25, 30, 35, 40] {
-            g.create_node(vec!["Person".into()], props(vec![("age", PropValue::Int(age))]));
+            g.create_node(
+                vec!["Person".into()],
+                props(vec![("age", PropValue::Int(age))]),
+            );
         }
 
         let mut idx = PropertyIndex::new("Person", "age");
@@ -2552,8 +2702,7 @@ mod tests {
             ]),
         );
 
-        let mut idx =
-            CompositePropertyIndex::new("Person", vec!["first".into(), "last".into()]);
+        let mut idx = CompositePropertyIndex::new("Person", vec!["first".into(), "last".into()]);
         idx.build_from(&g);
 
         let results = idx.lookup(&[
@@ -2582,7 +2731,11 @@ mod tests {
         let mut mgr = GraphTransactionManager::new();
 
         let mut txn = mgr.begin(&g);
-        let node_id = txn.create_node(&g, vec!["Person".into()], props(vec![("name", PropValue::Text("Alice".into()))]));
+        let node_id = txn.create_node(
+            &g,
+            vec!["Person".into()],
+            props(vec![("name", PropValue::Text("Alice".into()))]),
+        );
         assert!(txn.is_node_visible(node_id));
         assert_eq!(txn.op_count(), 1);
 
@@ -2688,8 +2841,16 @@ mod tests {
         let mut mgr = GraphTransactionManager::new();
 
         let mut txn = mgr.begin(&g);
-        let a = txn.create_node(&g, vec!["Person".into()], props(vec![("name", PropValue::Text("Alice".into()))]));
-        let b = txn.create_node(&g, vec!["Person".into()], props(vec![("name", PropValue::Text("Bob".into()))]));
+        let a = txn.create_node(
+            &g,
+            vec!["Person".into()],
+            props(vec![("name", PropValue::Text("Alice".into()))]),
+        );
+        let b = txn.create_node(
+            &g,
+            vec!["Person".into()],
+            props(vec![("name", PropValue::Text("Bob".into()))]),
+        );
         txn.create_edge(&g, "KNOWS", a, b, Properties::new());
 
         assert_eq!(txn.op_count(), 3);
@@ -2729,14 +2890,22 @@ mod tests {
                 vec!["Person".into()],
                 props(vec![("name", PropValue::Text("Bob".into()))]),
             );
-            g.create_edge(a, b, "KNOWS".into(), props(vec![("since", PropValue::Int(2024))]));
+            g.create_edge(
+                a,
+                b,
+                "KNOWS".into(),
+                props(vec![("since", PropValue::Int(2024))]),
+            );
         }
         // Reopen.
         let g2 = GraphStore::open(dir.path()).unwrap();
         assert_eq!(g2.node_count(), 2);
         assert_eq!(g2.edge_count(), 1);
         let alice = g2.get_node(1).unwrap();
-        assert_eq!(alice.properties.get("name"), Some(&PropValue::Text("Alice".into())));
+        assert_eq!(
+            alice.properties.get("name"),
+            Some(&PropValue::Text("Alice".into()))
+        );
         let edge = g2.get_edge(1).unwrap();
         assert_eq!(edge.edge_type, "KNOWS");
         assert_eq!(edge.properties.get("since"), Some(&PropValue::Int(2024)));
@@ -2768,17 +2937,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut g = GraphStore::open(dir.path()).unwrap();
-            g.create_node(vec![], props(vec![
-                ("s", PropValue::Text("hello".into())),
-                ("i", PropValue::Int(42)),
-                ("f", PropValue::Float(3.14)),
-                ("b", PropValue::Bool(true)),
-                ("n", PropValue::Null),
-            ]));
+            g.create_node(
+                vec![],
+                props(vec![
+                    ("s", PropValue::Text("hello".into())),
+                    ("i", PropValue::Int(42)),
+                    ("f", PropValue::Float(3.14)),
+                    ("b", PropValue::Bool(true)),
+                    ("n", PropValue::Null),
+                ]),
+            );
         }
         let g2 = GraphStore::open(dir.path()).unwrap();
         let n = g2.get_node(1).unwrap();
-        assert_eq!(n.properties.get("s"), Some(&PropValue::Text("hello".into())));
+        assert_eq!(
+            n.properties.get("s"),
+            Some(&PropValue::Text("hello".into()))
+        );
         assert_eq!(n.properties.get("i"), Some(&PropValue::Int(42)));
         assert_eq!(n.properties.get("f"), Some(&PropValue::Float(3.14)));
         assert_eq!(n.properties.get("b"), Some(&PropValue::Bool(true)));
@@ -2852,7 +3027,10 @@ mod tests {
         {
             use std::io::Write;
             let wal_path = dir.path().join("graph.wal");
-            let mut f = std::fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&wal_path)
+                .unwrap();
             f.write_all(&[0xFF, 0xFE, 0xFD]).unwrap();
         }
         // Should recover the two valid nodes.
@@ -2951,9 +3129,15 @@ mod tests {
         let mut g = GraphStore::new();
         let a = g.create_node(vec![], Properties::new());
         let b = g.create_node(vec![], Properties::new());
-        let e1 = g.create_edge(a, b, "ALPHA".into(), Properties::new()).unwrap();
-        let e2 = g.create_edge(a, b, "ALPHA".into(), Properties::new()).unwrap();
-        let _e3 = g.create_edge(a, b, "BETA".into(), Properties::new()).unwrap();
+        let e1 = g
+            .create_edge(a, b, "ALPHA".into(), Properties::new())
+            .unwrap();
+        let e2 = g
+            .create_edge(a, b, "ALPHA".into(), Properties::new())
+            .unwrap();
+        let _e3 = g
+            .create_edge(a, b, "BETA".into(), Properties::new())
+            .unwrap();
 
         assert_eq!(g.edges_by_type("ALPHA").len(), 2);
         assert_eq!(g.edges_by_type("BETA").len(), 1);
@@ -3112,17 +3296,13 @@ mod tests {
         let g = social_graph();
         // Alice(1)->Bob(2)->Charlie(3)->Dave(4)
         let queries = vec![(1, 4), (1, 3), (2, 4), (1, 2)];
-        let results = g.par_batch_shortest_path(
-            &queries,
-            Direction::Outgoing,
-            Some("FRIENDS"),
-        );
+        let results = g.par_batch_shortest_path(&queries, Direction::Outgoing, Some("FRIENDS"));
 
         assert_eq!(results.len(), 4);
         assert_eq!(results[0], Some(vec![1, 2, 3, 4])); // Alice -> Bob -> Charlie -> Dave
-        assert_eq!(results[1], Some(vec![1, 2, 3]));     // Alice -> Bob -> Charlie
-        assert_eq!(results[2], Some(vec![2, 3, 4]));     // Bob -> Charlie -> Dave
-        assert_eq!(results[3], Some(vec![1, 2]));         // Alice -> Bob
+        assert_eq!(results[1], Some(vec![1, 2, 3])); // Alice -> Bob -> Charlie
+        assert_eq!(results[2], Some(vec![2, 3, 4])); // Bob -> Charlie -> Dave
+        assert_eq!(results[3], Some(vec![1, 2])); // Alice -> Bob
     }
 
     #[test]
@@ -3144,9 +3324,10 @@ mod tests {
         }
 
         // Filter for edges with weight > 200.0
-        let filtered = g.par_neighbors_filtered(hub, |e| {
-            matches!(e.properties.get("weight"), Some(PropValue::Float(w)) if *w > 200.0)
-        });
+        let filtered = g.par_neighbors_filtered(
+            hub,
+            |e| matches!(e.properties.get("weight"), Some(PropValue::Float(w)) if *w > 200.0),
+        );
 
         // Weights 201..249 = 49 edges.
         assert_eq!(filtered.len(), 49);
@@ -3238,7 +3419,12 @@ mod tests {
         assert_eq!(counts.len(), 10);
         for i in 0..10 {
             let key = format!("TYPE_{}", i);
-            assert_eq!(counts.get(&key), Some(&5), "type {} should have 5 edges", key);
+            assert_eq!(
+                counts.get(&key),
+                Some(&5),
+                "type {} should have 5 edges",
+                key
+            );
         }
     }
 
@@ -3257,7 +3443,10 @@ mod tests {
             props(vec![("name", PropValue::Text("Alice".into()))]),
         );
         let node = g.get_node_full(id).unwrap();
-        assert_eq!(node.properties.get("name"), Some(&PropValue::Text("Alice".into())));
+        assert_eq!(
+            node.properties.get("name"),
+            Some(&PropValue::Text("Alice".into()))
+        );
     }
 
     #[test]
@@ -3267,10 +3456,7 @@ mod tests {
         g.max_hot_nodes = 5;
         let mut ids = Vec::new();
         for i in 0..20 {
-            let id = g.create_node(
-                vec!["N".into()],
-                props(vec![("val", PropValue::Int(i))]),
-            );
+            let id = g.create_node(vec!["N".into()], props(vec![("val", PropValue::Int(i))]));
             ids.push(id);
         }
         // Hot tier should have at most max_hot_nodes
@@ -3285,7 +3471,9 @@ mod tests {
             assert_eq!(
                 node.properties.get("val"),
                 Some(&PropValue::Int(i as i64)),
-                "node {} should have val={}", id, i
+                "node {} should have val={}",
+                id,
+                i
             );
         }
     }

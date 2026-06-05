@@ -126,11 +126,7 @@ pub struct IoUringDiskOps {
 #[cfg(target_os = "linux")]
 impl IoUringDiskOps {
     /// Create a new `IoUringDiskOps` with the default queue depth (256).
-    pub fn new(
-        path: impl AsRef<Path>,
-        page_size: usize,
-        use_direct_io: bool,
-    ) -> io::Result<Self> {
+    pub fn new(path: impl AsRef<Path>, page_size: usize, use_direct_io: bool) -> io::Result<Self> {
         Self::new_with_queue_depth(path, page_size, use_direct_io, 256)
     }
 
@@ -150,8 +146,9 @@ impl IoUringDiskOps {
             .truncate(false)
             .open(path.as_ref())?;
 
-        let ring = io_uring::IoUring::new(queue_depth)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("io_uring init failed: {e}")))?;
+        let ring = io_uring::IoUring::new(queue_depth).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("io_uring init failed: {e}"))
+        })?;
 
         Ok(Self {
             ring: std::sync::Arc::new(std::sync::Mutex::new(ring)),
@@ -177,19 +174,20 @@ impl AsyncDiskOps for IoUringDiskOps {
             let mut read_buf = vec![0u8; page_size];
             let fd = io_uring::types::Fd(file.as_raw_fd());
 
-            let read_e = io_uring::opcode::Read::new(
-                fd,
-                read_buf.as_mut_ptr(),
-                read_buf.len() as _,
-            )
-            .offset(offset as _)
-            .build()
-            .user_data(0x42);
+            let read_e =
+                io_uring::opcode::Read::new(fd, read_buf.as_mut_ptr(), read_buf.len() as _)
+                    .offset(offset as _)
+                    .build()
+                    .user_data(0x42);
 
             let mut ring_guard = ring.lock().map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("ring lock poisoned: {e}"))
             })?;
 
+            // SAFETY: the SQE references read_buf, which is owned by this closure
+            // and outlives the operation — submit_and_wait(1) below blocks until
+            // the kernel finishes the read before read_buf is returned/dropped, so
+            // the buffer stays valid for the kernel's entire access.
             unsafe {
                 ring_guard
                     .submission()
@@ -213,8 +211,7 @@ impl AsyncDiskOps for IoUringDiskOps {
             Ok(read_buf)
         })
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn_blocking join: {e}")))?
-        ?;
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn_blocking join: {e}")))??;
 
         let copy_len = buf.len().min(data.len());
         buf[..copy_len].copy_from_slice(&data[..copy_len]);
@@ -246,6 +243,9 @@ impl AsyncDiskOps for IoUringDiskOps {
                 io::Error::new(io::ErrorKind::Other, format!("ring lock poisoned: {e}"))
             })?;
 
+            // SAFETY: the SQE references write_buf, owned by this closure and
+            // kept alive past submit_and_wait(1), which blocks until the kernel
+            // finishes reading it — so the buffer stays valid for the write.
             unsafe {
                 ring_guard
                     .submission()
@@ -277,14 +277,15 @@ impl AsyncDiskOps for IoUringDiskOps {
         tokio::task::spawn_blocking(move || -> io::Result<()> {
             let fd = io_uring::types::Fd(file.as_raw_fd());
 
-            let fsync_e = io_uring::opcode::Fsync::new(fd)
-                .build()
-                .user_data(0x44);
+            let fsync_e = io_uring::opcode::Fsync::new(fd).build().user_data(0x44);
 
             let mut ring_guard = ring.lock().map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("ring lock poisoned: {e}"))
             })?;
 
+            // SAFETY: the fsync SQE references only the file descriptor (no data
+            // buffer); the fd stays open for the duration of submit_and_wait(1),
+            // which blocks until the kernel completes the fsync.
             unsafe {
                 ring_guard
                     .submission()
@@ -327,11 +328,7 @@ pub struct IoUringDiskOps {
 impl IoUringDiskOps {
     /// Create a new `IoUringDiskOps`. On non-Linux platforms this delegates
     /// to `StandardDiskOps`.
-    pub fn new(
-        path: impl AsRef<Path>,
-        page_size: usize,
-        use_direct_io: bool,
-    ) -> io::Result<Self> {
+    pub fn new(path: impl AsRef<Path>, page_size: usize, use_direct_io: bool) -> io::Result<Self> {
         let inner = StandardDiskOps::new(path, page_size)?;
         Ok(Self {
             inner,
@@ -535,45 +532,47 @@ impl IoBatchQueue {
                         }
                     }
                 }
-                IoRequest::Write { page_id, data } => {
-                    match ops.write_page(*page_id, data).await {
-                        Ok(()) => {
-                            self.completed_count += 1;
-                            results.push(IoResult::WriteComplete { page_id: *page_id });
-                        }
-                        Err(e) => {
-                            results.push(IoResult::Error {
-                                request_index: i,
-                                error: e.to_string(),
-                            });
-                        }
+                IoRequest::Write { page_id, data } => match ops.write_page(*page_id, data).await {
+                    Ok(()) => {
+                        self.completed_count += 1;
+                        results.push(IoResult::WriteComplete { page_id: *page_id });
                     }
-                }
-                IoRequest::Sync => {
-                    match ops.sync().await {
-                        Ok(()) => {
-                            self.completed_count += 1;
-                            results.push(IoResult::SyncComplete);
-                        }
-                        Err(e) => {
-                            results.push(IoResult::Error {
-                                request_index: i,
-                                error: e.to_string(),
-                            });
-                        }
+                    Err(e) => {
+                        results.push(IoResult::Error {
+                            request_index: i,
+                            error: e.to_string(),
+                        });
                     }
-                }
+                },
+                IoRequest::Sync => match ops.sync().await {
+                    Ok(()) => {
+                        self.completed_count += 1;
+                        results.push(IoResult::SyncComplete);
+                    }
+                    Err(e) => {
+                        results.push(IoResult::Error {
+                            request_index: i,
+                            error: e.to_string(),
+                        });
+                    }
+                },
             }
         }
         results
     }
 
     /// Total requests that have been submitted.
-    pub fn submitted_count(&self) -> u64 { self.submitted_count }
+    pub fn submitted_count(&self) -> u64 {
+        self.submitted_count
+    }
     /// Total requests that completed successfully.
-    pub fn completed_count(&self) -> u64 { self.completed_count }
+    pub fn completed_count(&self) -> u64 {
+        self.completed_count
+    }
     /// The configured queue depth.
-    pub fn queue_depth(&self) -> u32 { self.queue_depth }
+    pub fn queue_depth(&self) -> u32 {
+        self.queue_depth
+    }
 }
 
 // ---------------------------------------------------------------------------

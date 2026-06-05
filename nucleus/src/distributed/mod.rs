@@ -8,9 +8,9 @@
 pub mod replicator;
 pub use replicator::RaftReplicator;
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::cmp::Ordering;
 use std::fmt;
 use std::time::SystemTime;
 
@@ -42,12 +42,21 @@ pub enum TxnPhase {
 
 #[derive(Debug)]
 pub enum DistributedError {
-    NotLeader { shard_id: ShardId, leader: Option<NodeId> },
+    NotLeader {
+        shard_id: ShardId,
+        leader: Option<NodeId>,
+    },
     ShardNotFound(ShardId),
     TxnNotFound(TxnId),
     TxnNotActive(TxnId),
-    InvalidPhase { txn_id: TxnId, expected: TxnPhase, actual: TxnPhase },
-    NoRoute { key: i64 },
+    InvalidPhase {
+        txn_id: TxnId,
+        expected: TxnPhase,
+        actual: TxnPhase,
+    },
+    NoRoute {
+        key: i64,
+    },
     StandaloneMode,
     MessageTooShort,
     UnknownMessageTag(u8),
@@ -62,8 +71,15 @@ impl fmt::Display for DistributedError {
             Self::ShardNotFound(id) => write!(f, "shard {id} not found"),
             Self::TxnNotFound(id) => write!(f, "transaction {id} not found"),
             Self::TxnNotActive(id) => write!(f, "transaction {id} is not active"),
-            Self::InvalidPhase { txn_id, expected, actual } => {
-                write!(f, "txn {txn_id}: expected phase {expected:?}, got {actual:?}")
+            Self::InvalidPhase {
+                txn_id,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "txn {txn_id}: expected phase {expected:?}, got {actual:?}"
+                )
             }
             Self::NoRoute { key } => write!(f, "no route for key {key}"),
             Self::StandaloneMode => write!(f, "operation not supported in standalone mode"),
@@ -96,7 +112,11 @@ pub struct LogEntry {
 // --- RaftGroup ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RaftRole { Follower, Candidate, Leader }
+pub enum RaftRole {
+    Follower,
+    Candidate,
+    Leader,
+}
 
 /// A single Raft consensus group managing one shard.
 pub struct RaftGroup {
@@ -115,9 +135,16 @@ pub struct RaftGroup {
 impl RaftGroup {
     pub fn new(shard_id: ShardId, members: Vec<NodeId>) -> Self {
         Self {
-            shard_id, role: RaftRole::Follower, term: 0, leader_id: None,
-            members, log: Vec::new(), commit_index: 0, last_applied: 0,
-            voted_for: None, votes_received: 0,
+            shard_id,
+            role: RaftRole::Follower,
+            term: 0,
+            leader_id: None,
+            members,
+            log: Vec::new(),
+            commit_index: 0,
+            last_applied: 0,
+            voted_for: None,
+            votes_received: 0,
         }
     }
 
@@ -125,11 +152,16 @@ impl RaftGroup {
     pub fn propose(&mut self, op: Operation) -> Result<u64, DistributedError> {
         if self.role != RaftRole::Leader {
             return Err(DistributedError::NotLeader {
-                shard_id: self.shard_id, leader: self.leader_id,
+                shard_id: self.shard_id,
+                leader: self.leader_id,
             });
         }
         let index = self.log.len() as u64 + 1;
-        self.log.push(LogEntry { index, term: self.term, operation: op });
+        self.log.push(LogEntry {
+            index,
+            term: self.term,
+            operation: op,
+        });
         Ok(index)
     }
 
@@ -144,8 +176,12 @@ impl RaftGroup {
 
     /// Receive a vote. Returns `true` if now elected leader (majority reached).
     pub fn receive_vote(&mut self, _from: NodeId, granted: bool) -> bool {
-        if self.role != RaftRole::Candidate { return false; }
-        if granted { self.votes_received += 1; }
+        if self.role != RaftRole::Candidate {
+            return false;
+        }
+        if granted {
+            self.votes_received += 1;
+        }
         let majority = self.members.len() / 2 + 1;
         if self.votes_received >= majority {
             self.role = RaftRole::Leader;
@@ -176,13 +212,17 @@ impl RaftGroup {
     /// Return entries between last_applied and commit_index, then advance last_applied.
     pub fn apply_committed(&mut self) -> Vec<&LogEntry> {
         let (start, end) = (self.last_applied as usize, self.commit_index as usize);
-        if start >= end { return Vec::new(); }
+        if start >= end {
+            return Vec::new();
+        }
         let entries: Vec<&LogEntry> = self.log[start..end].iter().collect();
         self.last_applied = self.commit_index;
         entries
     }
 
-    pub fn is_leader(&self) -> bool { self.role == RaftRole::Leader }
+    pub fn is_leader(&self) -> bool {
+        self.role == RaftRole::Leader
+    }
 }
 
 // --- MultiRaftManager ---
@@ -196,11 +236,16 @@ pub struct MultiRaftManager {
 
 impl MultiRaftManager {
     pub fn new(local_node_id: NodeId) -> Self {
-        Self { local_node_id, groups: HashMap::new(), shard_leaders: HashMap::new() }
+        Self {
+            local_node_id,
+            groups: HashMap::new(),
+            shard_leaders: HashMap::new(),
+        }
     }
 
     pub fn create_group(&mut self, shard_id: ShardId, members: Vec<NodeId>) {
-        self.groups.insert(shard_id, RaftGroup::new(shard_id, members));
+        self.groups
+            .insert(shard_id, RaftGroup::new(shard_id, members));
     }
 
     pub fn remove_group(&mut self, shard_id: ShardId) {
@@ -218,27 +263,41 @@ impl MultiRaftManager {
 
     /// Return all shard IDs where this node is the leader.
     pub fn groups_led_by_self(&self) -> Vec<ShardId> {
-        self.groups.iter()
+        self.groups
+            .iter()
             .filter(|(_, g)| g.is_leader() && g.leader_id == Some(self.local_node_id))
             .map(|(id, _)| *id)
             .collect()
     }
 
     /// Route a proposal to the correct Raft group.
-    pub fn propose_to_shard(&mut self, shard_id: ShardId, op: Operation) -> Result<u64, DistributedError> {
-        let group = self.groups.get_mut(&shard_id)
+    pub fn propose_to_shard(
+        &mut self,
+        shard_id: ShardId,
+        op: Operation,
+    ) -> Result<u64, DistributedError> {
+        let group = self
+            .groups
+            .get_mut(&shard_id)
             .ok_or(DistributedError::ShardNotFound(shard_id))?;
         group.propose(op)
     }
 
     pub fn leader_for_shard(&self, shard_id: ShardId) -> Option<NodeId> {
         if let Some(group) = self.groups.get(&shard_id)
-            && let Some(leader) = group.leader_id { return Some(leader); }
+            && let Some(leader) = group.leader_id
+        {
+            return Some(leader);
+        }
         self.shard_leaders.get(&shard_id).copied()
     }
 
-    pub fn all_shards(&self) -> Vec<ShardId> { self.groups.keys().copied().collect() }
-    pub fn group_count(&self) -> usize { self.groups.len() }
+    pub fn all_shards(&self) -> Vec<ShardId> {
+        self.groups.keys().copied().collect()
+    }
+    pub fn group_count(&self) -> usize {
+        self.groups.len()
+    }
 }
 
 // --- RaftMessage (wire-format for inter-node Raft communication) ---
@@ -322,7 +381,13 @@ impl RaftMessage {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         match self {
-            RaftMessage::RequestVote { shard_id, term, candidate_id, last_log_index, last_log_term } => {
+            RaftMessage::RequestVote {
+                shard_id,
+                term,
+                candidate_id,
+                last_log_index,
+                last_log_term,
+            } => {
                 buf.push(1);
                 buf.extend_from_slice(&shard_id.to_le_bytes());
                 buf.extend_from_slice(&term.to_le_bytes());
@@ -330,14 +395,27 @@ impl RaftMessage {
                 buf.extend_from_slice(&last_log_index.to_le_bytes());
                 buf.extend_from_slice(&last_log_term.to_le_bytes());
             }
-            RaftMessage::VoteResponse { shard_id, term, voter_id, granted } => {
+            RaftMessage::VoteResponse {
+                shard_id,
+                term,
+                voter_id,
+                granted,
+            } => {
                 buf.push(2);
                 buf.extend_from_slice(&shard_id.to_le_bytes());
                 buf.extend_from_slice(&term.to_le_bytes());
                 buf.extend_from_slice(&voter_id.to_le_bytes());
                 buf.push(if *granted { 1 } else { 0 });
             }
-            RaftMessage::AppendEntries { shard_id, term, leader_id, prev_log_index, prev_log_term, entries, leader_commit } => {
+            RaftMessage::AppendEntries {
+                shard_id,
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            } => {
                 buf.push(3);
                 buf.extend_from_slice(&shard_id.to_le_bytes());
                 buf.extend_from_slice(&term.to_le_bytes());
@@ -354,7 +432,13 @@ impl RaftMessage {
                     buf.extend_from_slice(&op_bytes);
                 }
             }
-            RaftMessage::AppendEntriesResponse { shard_id, term, follower_id, success, match_index } => {
+            RaftMessage::AppendEntriesResponse {
+                shard_id,
+                term,
+                follower_id,
+                success,
+                match_index,
+            } => {
                 buf.push(4);
                 buf.extend_from_slice(&shard_id.to_le_bytes());
                 buf.extend_from_slice(&term.to_le_bytes());
@@ -362,13 +446,21 @@ impl RaftMessage {
                 buf.push(if *success { 1 } else { 0 });
                 buf.extend_from_slice(&match_index.to_le_bytes());
             }
-            RaftMessage::Heartbeat { shard_id, term, leader_id } => {
+            RaftMessage::Heartbeat {
+                shard_id,
+                term,
+                leader_id,
+            } => {
                 buf.push(5);
                 buf.extend_from_slice(&shard_id.to_le_bytes());
                 buf.extend_from_slice(&term.to_le_bytes());
                 buf.extend_from_slice(&leader_id.to_le_bytes());
             }
-            RaftMessage::HeartbeatResponse { shard_id, term, follower_id } => {
+            RaftMessage::HeartbeatResponse {
+                shard_id,
+                term,
+                follower_id,
+            } => {
                 buf.push(6);
                 buf.extend_from_slice(&shard_id.to_le_bytes());
                 buf.extend_from_slice(&term.to_le_bytes());
@@ -400,7 +492,9 @@ impl RaftMessage {
         if offset + 8 > data.len() {
             return Err(DistributedError::MessageTooShort);
         }
-        let bytes: [u8; 8] = data[offset..offset+8].try_into().map_err(|_| DistributedError::MessageTooShort)?;
+        let bytes: [u8; 8] = data[offset..offset + 8]
+            .try_into()
+            .map_err(|_| DistributedError::MessageTooShort)?;
         Ok(u64::from_le_bytes(bytes))
     }
 
@@ -408,29 +502,41 @@ impl RaftMessage {
         if offset + 4 > data.len() {
             return Err(DistributedError::MessageTooShort);
         }
-        let bytes: [u8; 4] = data[offset..offset+4].try_into().map_err(|_| DistributedError::MessageTooShort)?;
+        let bytes: [u8; 4] = data[offset..offset + 4]
+            .try_into()
+            .map_err(|_| DistributedError::MessageTooShort)?;
         Ok(u32::from_le_bytes(bytes))
     }
 
     fn parse_request_vote(d: &[u8]) -> Result<RaftMessage, DistributedError> {
-        if d.len() < 40 { return Err(DistributedError::MessageTooShort); }
+        if d.len() < 40 {
+            return Err(DistributedError::MessageTooShort);
+        }
         Ok(RaftMessage::RequestVote {
-            shard_id: Self::read_u64(d, 0)?, term: Self::read_u64(d, 8)?,
-            candidate_id: Self::read_u64(d, 16)?, last_log_index: Self::read_u64(d, 24)?,
+            shard_id: Self::read_u64(d, 0)?,
+            term: Self::read_u64(d, 8)?,
+            candidate_id: Self::read_u64(d, 16)?,
+            last_log_index: Self::read_u64(d, 24)?,
             last_log_term: Self::read_u64(d, 32)?,
         })
     }
 
     fn parse_vote_response(d: &[u8]) -> Result<RaftMessage, DistributedError> {
-        if d.len() < 25 { return Err(DistributedError::MessageTooShort); }
+        if d.len() < 25 {
+            return Err(DistributedError::MessageTooShort);
+        }
         Ok(RaftMessage::VoteResponse {
-            shard_id: Self::read_u64(d, 0)?, term: Self::read_u64(d, 8)?,
-            voter_id: Self::read_u64(d, 16)?, granted: d[24] != 0,
+            shard_id: Self::read_u64(d, 0)?,
+            term: Self::read_u64(d, 8)?,
+            voter_id: Self::read_u64(d, 16)?,
+            granted: d[24] != 0,
         })
     }
 
     fn parse_append_entries(d: &[u8]) -> Result<RaftMessage, DistributedError> {
-        if d.len() < 52 { return Err(DistributedError::MessageTooShort); }
+        if d.len() < 52 {
+            return Err(DistributedError::MessageTooShort);
+        }
         let shard_id = Self::read_u64(d, 0)?;
         let term = Self::read_u64(d, 8)?;
         let leader_id = Self::read_u64(d, 16)?;
@@ -441,39 +547,67 @@ impl RaftMessage {
         let mut entries = Vec::with_capacity(entry_count);
         let mut offset = 52;
         for _ in 0..entry_count {
-            if d.len() < offset + 20 { return Err(DistributedError::MessageTooShort); }
+            if d.len() < offset + 20 {
+                return Err(DistributedError::MessageTooShort);
+            }
             let index = Self::read_u64(d, offset)?;
             let entry_term = Self::read_u64(d, offset + 8)?;
             let op_len = Self::read_u32(d, offset + 16)? as usize;
             offset += 20;
-            if d.len() < offset + op_len { return Err(DistributedError::MessageTooShort); }
-            let operation = Self::operation_from_bytes(&d[offset..offset+op_len])?;
+            if d.len() < offset + op_len {
+                return Err(DistributedError::MessageTooShort);
+            }
+            let operation = Self::operation_from_bytes(&d[offset..offset + op_len])?;
             offset += op_len;
-            entries.push(LogEntry { index, term: entry_term, operation });
+            entries.push(LogEntry {
+                index,
+                term: entry_term,
+                operation,
+            });
         }
-        Ok(RaftMessage::AppendEntries { shard_id, term, leader_id, prev_log_index, prev_log_term, entries, leader_commit })
+        Ok(RaftMessage::AppendEntries {
+            shard_id,
+            term,
+            leader_id,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit,
+        })
     }
 
     fn parse_append_entries_response(d: &[u8]) -> Result<RaftMessage, DistributedError> {
-        if d.len() < 33 { return Err(DistributedError::MessageTooShort); }
+        if d.len() < 33 {
+            return Err(DistributedError::MessageTooShort);
+        }
         Ok(RaftMessage::AppendEntriesResponse {
-            shard_id: Self::read_u64(d, 0)?, term: Self::read_u64(d, 8)?,
-            follower_id: Self::read_u64(d, 16)?, success: d[24] != 0,
+            shard_id: Self::read_u64(d, 0)?,
+            term: Self::read_u64(d, 8)?,
+            follower_id: Self::read_u64(d, 16)?,
+            success: d[24] != 0,
             match_index: Self::read_u64(d, 25)?,
         })
     }
 
     fn parse_heartbeat(d: &[u8]) -> Result<RaftMessage, DistributedError> {
-        if d.len() < 24 { return Err(DistributedError::MessageTooShort); }
+        if d.len() < 24 {
+            return Err(DistributedError::MessageTooShort);
+        }
         Ok(RaftMessage::Heartbeat {
-            shard_id: Self::read_u64(d, 0)?, term: Self::read_u64(d, 8)?, leader_id: Self::read_u64(d, 16)?,
+            shard_id: Self::read_u64(d, 0)?,
+            term: Self::read_u64(d, 8)?,
+            leader_id: Self::read_u64(d, 16)?,
         })
     }
 
     fn parse_heartbeat_response(d: &[u8]) -> Result<RaftMessage, DistributedError> {
-        if d.len() < 24 { return Err(DistributedError::MessageTooShort); }
+        if d.len() < 24 {
+            return Err(DistributedError::MessageTooShort);
+        }
         Ok(RaftMessage::HeartbeatResponse {
-            shard_id: Self::read_u64(d, 0)?, term: Self::read_u64(d, 8)?, follower_id: Self::read_u64(d, 16)?,
+            shard_id: Self::read_u64(d, 0)?,
+            term: Self::read_u64(d, 8)?,
+            follower_id: Self::read_u64(d, 16)?,
         })
     }
 
@@ -516,28 +650,38 @@ impl RaftMessage {
     }
 
     fn operation_from_bytes(data: &[u8]) -> Result<Operation, DistributedError> {
-        if data.is_empty() { return Err(DistributedError::MessageTooShort); }
+        if data.is_empty() {
+            return Err(DistributedError::MessageTooShort);
+        }
         match data[0] {
             0 => Ok(Operation::Noop),
             1 => {
                 let key_len = Self::read_u32(data, 1)? as usize;
-                if 5 + key_len > data.len() { return Err(DistributedError::MessageTooShort); }
-                let key = data[5..5+key_len].to_vec();
-                let value_len = Self::read_u32(data, 5+key_len)? as usize;
-                if 9 + key_len + value_len > data.len() { return Err(DistributedError::MessageTooShort); }
-                let value = data[9+key_len..9+key_len+value_len].to_vec();
+                if 5 + key_len > data.len() {
+                    return Err(DistributedError::MessageTooShort);
+                }
+                let key = data[5..5 + key_len].to_vec();
+                let value_len = Self::read_u32(data, 5 + key_len)? as usize;
+                if 9 + key_len + value_len > data.len() {
+                    return Err(DistributedError::MessageTooShort);
+                }
+                let value = data[9 + key_len..9 + key_len + value_len].to_vec();
                 Ok(Operation::Put { key, value })
             }
             2 => {
                 let key_len = Self::read_u32(data, 1)? as usize;
-                if 5 + key_len > data.len() { return Err(DistributedError::MessageTooShort); }
-                let key = data[5..5+key_len].to_vec();
+                if 5 + key_len > data.len() {
+                    return Err(DistributedError::MessageTooShort);
+                }
+                let key = data[5..5 + key_len].to_vec();
                 Ok(Operation::Delete { key })
             }
             3 => {
                 let len = Self::read_u32(data, 1)? as usize;
-                if 5 + len > data.len() { return Err(DistributedError::MessageTooShort); }
-                let sql = String::from_utf8_lossy(&data[5..5+len]).into_owned();
+                if 5 + len > data.len() {
+                    return Err(DistributedError::MessageTooShort);
+                }
+                let sql = String::from_utf8_lossy(&data[5..5 + len]).into_owned();
                 Ok(Operation::Sql(sql))
             }
             4 => {
@@ -556,7 +700,6 @@ impl RaftMessage {
         }
     }
 }
-
 
 // --- DistributedTxn & TransactionCoordinator ---
 
@@ -592,12 +735,25 @@ impl Default for TxnRecoveryLog {
 
 impl TxnRecoveryLog {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Append a state-transition entry to the log.
-    pub fn log_transition(&mut self, txn_id: TxnId, phase: TxnPhase, shard_ids: Vec<ShardId>, timestamp_ms: u64) {
-        self.entries.push(TxnLogEntry { txn_id, phase, shard_ids, timestamp_ms });
+    pub fn log_transition(
+        &mut self,
+        txn_id: TxnId,
+        phase: TxnPhase,
+        shard_ids: Vec<ShardId>,
+        timestamp_ms: u64,
+    ) {
+        self.entries.push(TxnLogEntry {
+            txn_id,
+            phase,
+            shard_ids,
+            timestamp_ms,
+        });
     }
 
     /// Return the last logged entry for each txn whose final phase is Preparing or Committing.
@@ -606,7 +762,8 @@ impl TxnRecoveryLog {
         for entry in &self.entries {
             last_phase.insert(entry.txn_id, entry);
         }
-        last_phase.into_values()
+        last_phase
+            .into_values()
             .filter(|e| e.phase == TxnPhase::Preparing || e.phase == TxnPhase::Committing)
             .cloned()
             .collect()
@@ -633,10 +790,13 @@ impl TxnRecoveryLog {
         self.entries.retain(|e| e.txn_id >= txn_id);
     }
 
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
-
 
 pub struct TransactionCoordinator {
     local_node_id: NodeId,
@@ -649,8 +809,11 @@ pub struct TransactionCoordinator {
 impl TransactionCoordinator {
     pub fn new(local_node_id: NodeId) -> Self {
         Self {
-            local_node_id, active_txns: HashMap::new(),
-            next_txn_id: 1, completed_txns: Vec::new(), timeout_ms: 30_000,
+            local_node_id,
+            active_txns: HashMap::new(),
+            next_txn_id: 1,
+            completed_txns: Vec::new(),
+            timeout_ms: 30_000,
         }
     }
 
@@ -658,11 +821,17 @@ impl TransactionCoordinator {
     pub fn begin(&mut self) -> TxnId {
         let txn_id = self.next_txn_id;
         self.next_txn_id += 1;
-        self.active_txns.insert(txn_id, DistributedTxn {
-            txn_id, coordinator_node: self.local_node_id, phase: TxnPhase::Active,
-            shard_operations: HashMap::new(), prepare_votes: HashMap::new(),
-            created_at_ms: 0,
-        });
+        self.active_txns.insert(
+            txn_id,
+            DistributedTxn {
+                txn_id,
+                coordinator_node: self.local_node_id,
+                phase: TxnPhase::Active,
+                shard_operations: HashMap::new(),
+                prepare_votes: HashMap::new(),
+                created_at_ms: 0,
+            },
+        );
         txn_id
     }
 
@@ -676,34 +845,61 @@ impl TransactionCoordinator {
     }
 
     /// Add an operation to the transaction, targeting a specific shard.
-    pub fn add_operation(&mut self, txn_id: TxnId, shard_id: ShardId, op: Operation) -> Result<(), DistributedError> {
-        let txn = self.active_txns.get_mut(&txn_id).ok_or(DistributedError::TxnNotFound(txn_id))?;
-        if txn.phase != TxnPhase::Active { return Err(DistributedError::TxnNotActive(txn_id)); }
+    pub fn add_operation(
+        &mut self,
+        txn_id: TxnId,
+        shard_id: ShardId,
+        op: Operation,
+    ) -> Result<(), DistributedError> {
+        let txn = self
+            .active_txns
+            .get_mut(&txn_id)
+            .ok_or(DistributedError::TxnNotFound(txn_id))?;
+        if txn.phase != TxnPhase::Active {
+            return Err(DistributedError::TxnNotActive(txn_id));
+        }
         txn.shard_operations.entry(shard_id).or_default().push(op);
         Ok(())
     }
 
     /// Move to Preparing phase. Returns list of shard IDs that must vote.
     pub fn prepare(&mut self, txn_id: TxnId) -> Result<Vec<ShardId>, DistributedError> {
-        let txn = self.active_txns.get_mut(&txn_id).ok_or(DistributedError::TxnNotFound(txn_id))?;
+        let txn = self
+            .active_txns
+            .get_mut(&txn_id)
+            .ok_or(DistributedError::TxnNotFound(txn_id))?;
         if txn.phase != TxnPhase::Active {
             return Err(DistributedError::InvalidPhase {
-                txn_id, expected: TxnPhase::Active, actual: txn.phase,
+                txn_id,
+                expected: TxnPhase::Active,
+                actual: txn.phase,
             });
         }
         txn.phase = TxnPhase::Preparing;
         let shards: Vec<ShardId> = txn.shard_operations.keys().copied().collect();
-        for &s in &shards { txn.prepare_votes.insert(s, false); }
+        for &s in &shards {
+            txn.prepare_votes.insert(s, false);
+        }
         Ok(shards)
     }
 
     /// Record a shard's prepare vote. Returns `Some(new_phase)` on transition,
     /// `None` if still waiting.
-    pub fn vote(&mut self, txn_id: TxnId, shard_id: ShardId, prepared: bool) -> Result<Option<TxnPhase>, DistributedError> {
-        let txn = self.active_txns.get_mut(&txn_id).ok_or(DistributedError::TxnNotFound(txn_id))?;
+    pub fn vote(
+        &mut self,
+        txn_id: TxnId,
+        shard_id: ShardId,
+        prepared: bool,
+    ) -> Result<Option<TxnPhase>, DistributedError> {
+        let txn = self
+            .active_txns
+            .get_mut(&txn_id)
+            .ok_or(DistributedError::TxnNotFound(txn_id))?;
         if txn.phase != TxnPhase::Preparing {
             return Err(DistributedError::InvalidPhase {
-                txn_id, expected: TxnPhase::Preparing, actual: txn.phase,
+                txn_id,
+                expected: TxnPhase::Preparing,
+                actual: txn.phase,
             });
         }
         txn.prepare_votes.insert(shard_id, prepared);
@@ -711,7 +907,9 @@ impl TransactionCoordinator {
             txn.phase = TxnPhase::Aborting;
             return Ok(Some(TxnPhase::Aborting));
         }
-        let all_yes = txn.shard_operations.keys()
+        let all_yes = txn
+            .shard_operations
+            .keys()
             .all(|s| txn.prepare_votes.get(s).copied() == Some(true));
         if all_yes {
             txn.phase = TxnPhase::Committing;
@@ -723,25 +921,37 @@ impl TransactionCoordinator {
 
     /// Complete: Committing -> Committed, or Aborting -> Aborted.
     pub fn complete(&mut self, txn_id: TxnId) -> Result<TxnPhase, DistributedError> {
-        let txn = self.active_txns.get_mut(&txn_id).ok_or(DistributedError::TxnNotFound(txn_id))?;
+        let txn = self
+            .active_txns
+            .get_mut(&txn_id)
+            .ok_or(DistributedError::TxnNotFound(txn_id))?;
         let final_phase = match txn.phase {
             TxnPhase::Committing => TxnPhase::Committed,
             TxnPhase::Aborting => TxnPhase::Aborted,
-            other => return Err(DistributedError::InvalidPhase {
-                txn_id, expected: TxnPhase::Committing, actual: other,
-            }),
+            other => {
+                return Err(DistributedError::InvalidPhase {
+                    txn_id,
+                    expected: TxnPhase::Committing,
+                    actual: other,
+                });
+            }
         };
         self.active_txns.remove(&txn_id);
         self.completed_txns.push((txn_id, final_phase));
         Ok(final_phase)
     }
 
-    pub fn get_txn(&self, txn_id: TxnId) -> Option<&DistributedTxn> { self.active_txns.get(&txn_id) }
-    pub fn active_count(&self) -> usize { self.active_txns.len() }
+    pub fn get_txn(&self, txn_id: TxnId) -> Option<&DistributedTxn> {
+        self.active_txns.get(&txn_id)
+    }
+    pub fn active_count(&self) -> usize {
+        self.active_txns.len()
+    }
 
     /// Return IDs of transactions that have exceeded the timeout.
     pub fn timed_out_txns(&self, now_ms: u64) -> Vec<TxnId> {
-        self.active_txns.values()
+        self.active_txns
+            .values()
             .filter(|txn| txn.created_at_ms > 0 && now_ms > txn.created_at_ms + self.timeout_ms)
             .map(|txn| txn.txn_id)
             .collect()
@@ -760,14 +970,17 @@ impl TransactionCoordinator {
                 _ => continue,
             };
             // Re-insert the txn in the recovery phase so complete() can finalize it.
-            self.active_txns.insert(entry.txn_id, DistributedTxn {
-                txn_id: entry.txn_id,
-                coordinator_node: self.local_node_id,
-                phase: recovery_phase,
-                shard_operations: entry.shard_ids.iter().map(|&s| (s, Vec::new())).collect(),
-                prepare_votes: HashMap::new(),
-                created_at_ms: entry.timestamp_ms,
-            });
+            self.active_txns.insert(
+                entry.txn_id,
+                DistributedTxn {
+                    txn_id: entry.txn_id,
+                    coordinator_node: self.local_node_id,
+                    phase: recovery_phase,
+                    shard_operations: entry.shard_ids.iter().map(|&s| (s, Vec::new())).collect(),
+                    prepare_votes: HashMap::new(),
+                    created_at_ms: entry.timestamp_ms,
+                },
+            );
             // Ensure next_txn_id stays ahead.
             if entry.txn_id >= self.next_txn_id {
                 self.next_txn_id = entry.txn_id + 1;
@@ -792,9 +1005,16 @@ impl TransactionCoordinator {
 /// Result of routing a query.
 #[derive(Debug, Clone)]
 pub enum RouteDecision {
-    Local { shard_id: ShardId },
-    Forward { shard_id: ShardId, target_node: NodeId },
-    ScatterGather { shards: Vec<(ShardId, NodeId)> },
+    Local {
+        shard_id: ShardId,
+    },
+    Forward {
+        shard_id: ShardId,
+        target_node: NodeId,
+    },
+    ScatterGather {
+        shards: Vec<(ShardId, NodeId)>,
+    },
     Standalone,
 }
 
@@ -818,9 +1038,13 @@ pub struct QueryRouter {
 impl QueryRouter {
     pub fn new(local_node_id: NodeId, mode: ClusterMode) -> Self {
         Self {
-            local_node_id, mode, shard_owners: HashMap::new(),
-            shard_ranges: Vec::new(), local_queries: 0,
-            forwarded_queries: 0, scatter_queries: 0,
+            local_node_id,
+            mode,
+            shard_owners: HashMap::new(),
+            shard_ranges: Vec::new(),
+            local_queries: 0,
+            forwarded_queries: 0,
+            scatter_queries: 0,
         }
     }
 
@@ -842,16 +1066,21 @@ impl QueryRouter {
             return RouteDecision::Standalone;
         }
         for &(shard_id, start, end) in &self.shard_ranges {
-            if key >= start && key < end
-                && let Some(&owner) = self.shard_owners.get(&shard_id) {
-                    if owner == self.local_node_id {
-                        self.local_queries += 1;
-                        return RouteDecision::Local { shard_id };
-                    } else {
-                        self.forwarded_queries += 1;
-                        return RouteDecision::Forward { shard_id, target_node: owner };
-                    }
+            if key >= start
+                && key < end
+                && let Some(&owner) = self.shard_owners.get(&shard_id)
+            {
+                if owner == self.local_node_id {
+                    self.local_queries += 1;
+                    return RouteDecision::Local { shard_id };
+                } else {
+                    self.forwarded_queries += 1;
+                    return RouteDecision::Forward {
+                        shard_id,
+                        target_node: owner,
+                    };
                 }
+            }
         }
         RouteDecision::Standalone
     }
@@ -864,10 +1093,12 @@ impl QueryRouter {
         }
         let mut matching: Vec<(ShardId, NodeId)> = Vec::new();
         for &(shard_id, s, e) in &self.shard_ranges {
-            if s < end_key && e > start_key
-                && let Some(&owner) = self.shard_owners.get(&shard_id) {
-                    matching.push((shard_id, owner));
-                }
+            if s < end_key
+                && e > start_key
+                && let Some(&owner) = self.shard_owners.get(&shard_id)
+            {
+                matching.push((shard_id, owner));
+            }
         }
         match matching.len() {
             0 => RouteDecision::Standalone,
@@ -878,10 +1109,16 @@ impl QueryRouter {
                     RouteDecision::Local { shard_id }
                 } else {
                     self.forwarded_queries += 1;
-                    RouteDecision::Forward { shard_id, target_node: owner }
+                    RouteDecision::Forward {
+                        shard_id,
+                        target_node: owner,
+                    }
                 }
             }
-            _ => { self.scatter_queries += 1; RouteDecision::ScatterGather { shards: matching } }
+            _ => {
+                self.scatter_queries += 1;
+                RouteDecision::ScatterGather { shards: matching }
+            }
         }
     }
 
@@ -891,12 +1128,18 @@ impl QueryRouter {
             self.local_queries += 1;
             return RouteDecision::Standalone;
         }
-        let all: Vec<(ShardId, NodeId)> = self.shard_ranges.iter()
+        let all: Vec<(ShardId, NodeId)> = self
+            .shard_ranges
+            .iter()
             .filter_map(|(shard_id, _, _)| {
-                self.shard_owners.get(shard_id).map(|&owner| (*shard_id, owner))
+                self.shard_owners
+                    .get(shard_id)
+                    .map(|&owner| (*shard_id, owner))
             })
             .collect();
-        if all.is_empty() { return RouteDecision::Standalone; }
+        if all.is_empty() {
+            return RouteDecision::Standalone;
+        }
         self.scatter_queries += 1;
         RouteDecision::ScatterGather { shards: all }
     }
@@ -939,10 +1182,13 @@ impl ClusterCoordinator {
         let mut nodes = HashMap::new();
         nodes.insert(node_id, "localhost".to_string());
         Self {
-            local_node_id: node_id, mode: ClusterMode::Standalone,
-            raft_manager: None, txn_coordinator: TransactionCoordinator::new(node_id),
+            local_node_id: node_id,
+            mode: ClusterMode::Standalone,
+            raft_manager: None,
+            txn_coordinator: TransactionCoordinator::new(node_id),
             router: QueryRouter::new(node_id, ClusterMode::Standalone),
-            cluster_nodes: nodes, epoch: 0,
+            cluster_nodes: nodes,
+            epoch: 0,
         }
     }
 
@@ -951,23 +1197,32 @@ impl ClusterCoordinator {
         nodes.insert(local_id, "localhost".to_string());
         nodes.insert(peer_id, peer_addr.to_string());
         Self {
-            local_node_id: local_id, mode: ClusterMode::PrimaryReplica,
-            raft_manager: None, txn_coordinator: TransactionCoordinator::new(local_id),
+            local_node_id: local_id,
+            mode: ClusterMode::PrimaryReplica,
+            raft_manager: None,
+            txn_coordinator: TransactionCoordinator::new(local_id),
             router: QueryRouter::new(local_id, ClusterMode::PrimaryReplica),
-            cluster_nodes: nodes, epoch: 0,
+            cluster_nodes: nodes,
+            epoch: 0,
         }
     }
 
     pub fn new_multi_raft(local_id: NodeId, initial_nodes: Vec<(NodeId, String)>) -> Self {
         let mut nodes = HashMap::new();
-        for (id, addr) in &initial_nodes { nodes.insert(*id, addr.clone()); }
-        nodes.entry(local_id).or_insert_with(|| "localhost".to_string());
+        for (id, addr) in &initial_nodes {
+            nodes.insert(*id, addr.clone());
+        }
+        nodes
+            .entry(local_id)
+            .or_insert_with(|| "localhost".to_string());
         Self {
-            local_node_id: local_id, mode: ClusterMode::MultiRaft,
+            local_node_id: local_id,
+            mode: ClusterMode::MultiRaft,
             raft_manager: Some(MultiRaftManager::new(local_id)),
             txn_coordinator: TransactionCoordinator::new(local_id),
             router: QueryRouter::new(local_id, ClusterMode::MultiRaft),
-            cluster_nodes: nodes, epoch: 0,
+            cluster_nodes: nodes,
+            epoch: 0,
         }
     }
 
@@ -981,15 +1236,23 @@ impl ClusterCoordinator {
         self.epoch += 1;
     }
 
-    pub fn mode(&self) -> ClusterMode { self.mode }
-    pub fn epoch(&self) -> u64 { self.epoch }
-    pub fn node_count(&self) -> usize { self.cluster_nodes.len() }
+    pub fn mode(&self) -> ClusterMode {
+        self.mode
+    }
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    pub fn node_count(&self) -> usize {
+        self.cluster_nodes.len()
+    }
 
     pub fn route_query(&mut self, key: i64) -> RouteDecision {
         self.router.route_by_key(key)
     }
 
-    pub fn begin_txn(&mut self) -> TxnId { self.txn_coordinator.begin() }
+    pub fn begin_txn(&mut self) -> TxnId {
+        self.txn_coordinator.begin()
+    }
 
     pub fn propose(&mut self, shard_id: ShardId, op: Operation) -> Result<u64, DistributedError> {
         match &mut self.raft_manager {
@@ -1000,18 +1263,30 @@ impl ClusterCoordinator {
 
     pub fn status(&self) -> ClusterStatus {
         let shard_count = self.raft_manager.as_ref().map_or(0, |m| m.group_count());
-        let shards_led = self.raft_manager.as_ref().map_or(0, |m| m.groups_led_by_self().len());
+        let shards_led = self
+            .raft_manager
+            .as_ref()
+            .map_or(0, |m| m.groups_led_by_self().len());
         ClusterStatus {
-            node_id: self.local_node_id, mode: self.mode,
-            node_count: self.cluster_nodes.len(), shard_count,
-            epoch: self.epoch, shards_led,
+            node_id: self.local_node_id,
+            mode: self.mode,
+            node_count: self.cluster_nodes.len(),
+            shard_count,
+            epoch: self.epoch,
+            shards_led,
             active_txns: self.txn_coordinator.active_count(),
         }
     }
 
-    pub fn raft_manager_mut(&mut self) -> Option<&mut MultiRaftManager> { self.raft_manager.as_mut() }
-    pub fn txn_coordinator_mut(&mut self) -> &mut TransactionCoordinator { &mut self.txn_coordinator }
-    pub fn router_mut(&mut self) -> &mut QueryRouter { &mut self.router }
+    pub fn raft_manager_mut(&mut self) -> Option<&mut MultiRaftManager> {
+        self.raft_manager.as_mut()
+    }
+    pub fn txn_coordinator_mut(&mut self) -> &mut TransactionCoordinator {
+        &mut self.txn_coordinator
+    }
+    pub fn router_mut(&mut self) -> &mut QueryRouter {
+        &mut self.router
+    }
 
     /// Returns true if this node is the leader of shard 0, or if running standalone.
     pub fn is_leader(&self) -> bool {
@@ -1030,7 +1305,8 @@ impl ClusterCoordinator {
 
     /// Return node IDs of all peers (excluding self).
     pub fn peer_node_ids(&self) -> Vec<NodeId> {
-        self.cluster_nodes.keys()
+        self.cluster_nodes
+            .keys()
             .filter(|&&id| id != self.local_node_id)
             .copied()
             .collect()
@@ -1041,7 +1317,6 @@ impl ClusterCoordinator {
         &self.cluster_nodes
     }
 }
-
 
 // =============================================================================
 // Hybrid Logical Clock (HLC)
@@ -1062,7 +1337,11 @@ pub struct HybridTimestamp {
 impl HybridTimestamp {
     /// Create a new hybrid timestamp.
     pub fn new(physical_ms: u64, logical: u32, node_id: u16) -> Self {
-        Self { physical_ms, logical, node_id }
+        Self {
+            physical_ms,
+            logical,
+            node_id,
+        }
     }
 
     /// Serialize to a 14-byte big-endian wire format:
@@ -1080,13 +1359,18 @@ impl HybridTimestamp {
         let physical_ms = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
         let logical = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
         let node_id = u16::from_be_bytes(bytes[12..14].try_into().unwrap());
-        Self { physical_ms, logical, node_id }
+        Self {
+            physical_ms,
+            logical,
+            node_id,
+        }
     }
 }
 
 impl Ord for HybridTimestamp {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.physical_ms.cmp(&other.physical_ms)
+        self.physical_ms
+            .cmp(&other.physical_ms)
             .then(self.logical.cmp(&other.logical))
             .then(self.node_id.cmp(&other.node_id))
     }
@@ -1156,9 +1440,7 @@ impl HybridLogicalClock {
         let pt = Self::physical_now();
         let max_pt = pt.max(received.physical_ms).max(self.latest.physical_ms);
 
-        let new_logical = if max_pt == self.latest.physical_ms
-            && max_pt == received.physical_ms
-        {
+        let new_logical = if max_pt == self.latest.physical_ms && max_pt == received.physical_ms {
             // All three times are equal: take max of both logical counters + 1.
             self.latest.logical.max(received.logical) + 1
         } else if max_pt == self.latest.physical_ms {
@@ -1181,7 +1463,6 @@ impl HybridLogicalClock {
         self.latest
     }
 }
-
 
 // ============================================================================
 // Gap 13: Follower Reads — serve consistent reads from replicas
@@ -1221,7 +1502,11 @@ pub struct FollowerReadManager {
 impl FollowerReadManager {
     pub fn new(leader_node: u64) -> Self {
         FollowerReadManager {
-            local_timestamp: HybridTimestamp { physical_ms: 0, logical: 0, node_id: 0 },
+            local_timestamp: HybridTimestamp {
+                physical_ms: 0,
+                logical: 0,
+                node_id: 0,
+            },
             leader_node,
             max_staleness_ms: 5000, // default 5 second staleness
         }
@@ -1390,7 +1675,10 @@ impl ParallelCommitCoordinator {
     }
 
     pub fn pending_intent_count(&self) -> usize {
-        self.intents.values().filter(|i| i.status == IntentStatus::Pending).count()
+        self.intents
+            .values()
+            .filter(|i| i.status == IntentStatus::Pending)
+            .count()
     }
 
     pub fn total_intent_count(&self) -> usize {
@@ -1506,7 +1794,10 @@ impl MultiRegionManager {
     }
 
     fn find_node_in_region(&self, region: &RegionId) -> Option<u64> {
-        self.nodes.iter().find(|n| n.region == *region).map(|n| n.node_id)
+        self.nodes
+            .iter()
+            .find(|n| n.region == *region)
+            .map(|n| n.node_id)
     }
 
     pub fn zone_config_count(&self) -> usize {
@@ -1545,7 +1836,7 @@ mod tests {
         assert_eq!(group.term, 1);
         // Need majority of 5 = 3 votes. Already have 1 (self).
         assert!(!group.receive_vote(20, true)); // 2 of 5
-        assert!(group.receive_vote(30, true));  // 3 of 5 -- majority
+        assert!(group.receive_vote(30, true)); // 3 of 5 -- majority
         assert_eq!(group.role, RaftRole::Leader);
         assert_eq!(group.leader_id, Some(10));
     }
@@ -1556,7 +1847,12 @@ mod tests {
         group.start_election(1);
         group.receive_vote(2, true);
         group.propose(Operation::Noop).unwrap();
-        group.propose(Operation::Put { key: b"k".to_vec(), value: b"v".to_vec() }).unwrap();
+        group
+            .propose(Operation::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            })
+            .unwrap();
         group.propose(Operation::Noop).unwrap();
         assert_eq!(group.log.len(), 3);
 
@@ -1611,7 +1907,10 @@ mod tests {
             g.receive_vote(2, true);
         }
         assert_eq!(mgr.propose_to_shard(10, Operation::Noop).unwrap(), 1);
-        assert!(matches!(mgr.propose_to_shard(99, Operation::Noop), Err(DistributedError::ShardNotFound(99))));
+        assert!(matches!(
+            mgr.propose_to_shard(99, Operation::Noop),
+            Err(DistributedError::ShardNotFound(99))
+        ));
     }
 
     #[test]
@@ -1641,7 +1940,10 @@ mod tests {
         let shards = coord.prepare(txn_id).unwrap();
         assert_eq!(shards.len(), 2);
         assert_eq!(coord.vote(txn_id, 10, true).unwrap(), None);
-        assert_eq!(coord.vote(txn_id, 20, true).unwrap(), Some(TxnPhase::Committing));
+        assert_eq!(
+            coord.vote(txn_id, 20, true).unwrap(),
+            Some(TxnPhase::Committing)
+        );
         assert_eq!(coord.complete(txn_id).unwrap(), TxnPhase::Committed);
         assert_eq!(coord.active_count(), 0);
     }
@@ -1654,7 +1956,10 @@ mod tests {
         coord.add_operation(txn_id, 20, Operation::Noop).unwrap();
         coord.prepare(txn_id).unwrap();
         coord.vote(txn_id, 10, true).unwrap();
-        assert_eq!(coord.vote(txn_id, 20, false).unwrap(), Some(TxnPhase::Aborting));
+        assert_eq!(
+            coord.vote(txn_id, 20, false).unwrap(),
+            Some(TxnPhase::Aborting)
+        );
         assert_eq!(coord.complete(txn_id).unwrap(), TxnPhase::Aborted);
     }
 
@@ -1671,14 +1976,16 @@ mod tests {
         assert!(!timed_out.contains(&txn2));
     }
 
-
     #[test]
     fn router_route_by_key_forward() {
         let mut router = QueryRouter::new(1, ClusterMode::MultiRaft);
         router.add_shard(10, 1, 0, 100);
         router.add_shard(20, 2, 100, 200);
         match router.route_by_key(150) {
-            RouteDecision::Forward { shard_id, target_node } => {
+            RouteDecision::Forward {
+                shard_id,
+                target_node,
+            } => {
                 assert_eq!(shard_id, 20);
                 assert_eq!(target_node, 2);
             }
@@ -1741,11 +2048,14 @@ mod tests {
 
     #[test]
     fn cluster_multi_raft_with_shard_groups() {
-        let mut coord = ClusterCoordinator::new_multi_raft(1, vec![
-            (1, "localhost:5432".to_string()),
-            (2, "peer1:5432".to_string()),
-            (3, "peer2:5432".to_string()),
-        ]);
+        let mut coord = ClusterCoordinator::new_multi_raft(
+            1,
+            vec![
+                (1, "localhost:5432".to_string()),
+                (2, "peer1:5432".to_string()),
+                (3, "peer2:5432".to_string()),
+            ],
+        );
         assert_eq!(coord.mode(), ClusterMode::MultiRaft);
         assert_eq!(coord.node_count(), 3);
         {
@@ -1767,14 +2077,18 @@ mod tests {
     #[test]
     fn cluster_standalone_propose_returns_error() {
         let mut coord = ClusterCoordinator::new_standalone(1);
-        assert!(matches!(coord.propose(10, Operation::Noop), Err(DistributedError::StandaloneMode)));
+        assert!(matches!(
+            coord.propose(10, Operation::Noop),
+            Err(DistributedError::StandaloneMode)
+        ));
     }
 
     #[test]
     fn cluster_begin_txn_and_route() {
-        let mut coord = ClusterCoordinator::new_multi_raft(1, vec![
-            (1, "localhost".to_string()), (2, "peer".to_string()),
-        ]);
+        let mut coord = ClusterCoordinator::new_multi_raft(
+            1,
+            vec![(1, "localhost".to_string()), (2, "peer".to_string())],
+        );
         let txn_id = coord.begin_txn();
         assert_eq!(txn_id, 1);
         assert_eq!(coord.status().active_txns, 1);
@@ -1912,7 +2226,11 @@ mod tests {
     #[test]
     fn raft_msg_request_vote_roundtrip() {
         let msg = RaftMessage::RequestVote {
-            shard_id: 10, term: 5, candidate_id: 3, last_log_index: 42, last_log_term: 4,
+            shard_id: 10,
+            term: 5,
+            candidate_id: 3,
+            last_log_index: 42,
+            last_log_term: 4,
         };
         let bytes = msg.to_bytes();
         let decoded = RaftMessage::from_bytes(&bytes).unwrap();
@@ -1924,7 +2242,10 @@ mod tests {
     #[test]
     fn raft_msg_vote_response_roundtrip() {
         let msg = RaftMessage::VoteResponse {
-            shard_id: 20, term: 3, voter_id: 7, granted: true,
+            shard_id: 20,
+            term: 3,
+            voter_id: 7,
+            granted: true,
         };
         let bytes = msg.to_bytes();
         let decoded = RaftMessage::from_bytes(&bytes).unwrap();
@@ -1934,16 +2255,32 @@ mod tests {
     #[test]
     fn raft_msg_append_entries_roundtrip() {
         let msg = RaftMessage::AppendEntries {
-            shard_id: 5, term: 10, leader_id: 1,
-            prev_log_index: 99, prev_log_term: 9,
+            shard_id: 5,
+            term: 10,
+            leader_id: 1,
+            prev_log_index: 99,
+            prev_log_term: 9,
             entries: vec![
-                LogEntry { index: 100, term: 10, operation: Operation::Noop },
-                LogEntry { index: 101, term: 10, operation: Operation::Put {
-                    key: b"hello".to_vec(), value: b"world".to_vec(),
-                }},
-                LogEntry { index: 102, term: 10, operation: Operation::Delete {
-                    key: b"old_key".to_vec(),
-                }},
+                LogEntry {
+                    index: 100,
+                    term: 10,
+                    operation: Operation::Noop,
+                },
+                LogEntry {
+                    index: 101,
+                    term: 10,
+                    operation: Operation::Put {
+                        key: b"hello".to_vec(),
+                        value: b"world".to_vec(),
+                    },
+                },
+                LogEntry {
+                    index: 102,
+                    term: 10,
+                    operation: Operation::Delete {
+                        key: b"old_key".to_vec(),
+                    },
+                },
             ],
             leader_commit: 98,
         };
@@ -1955,8 +2292,13 @@ mod tests {
     #[test]
     fn raft_msg_append_entries_empty() {
         let msg = RaftMessage::AppendEntries {
-            shard_id: 1, term: 1, leader_id: 1,
-            prev_log_index: 0, prev_log_term: 0, entries: vec![], leader_commit: 0,
+            shard_id: 1,
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
         };
         let bytes = msg.to_bytes();
         let decoded = RaftMessage::from_bytes(&bytes).unwrap();
@@ -1966,7 +2308,11 @@ mod tests {
     #[test]
     fn raft_msg_append_entries_response_roundtrip() {
         let msg = RaftMessage::AppendEntriesResponse {
-            shard_id: 10, term: 5, follower_id: 2, success: false, match_index: 50,
+            shard_id: 10,
+            term: 5,
+            follower_id: 2,
+            success: false,
+            match_index: 50,
         };
         let bytes = msg.to_bytes();
         let decoded = RaftMessage::from_bytes(&bytes).unwrap();
@@ -1975,7 +2321,11 @@ mod tests {
 
     #[test]
     fn raft_msg_heartbeat_roundtrip() {
-        let msg = RaftMessage::Heartbeat { shard_id: 30, term: 7, leader_id: 1 };
+        let msg = RaftMessage::Heartbeat {
+            shard_id: 30,
+            term: 7,
+            leader_id: 1,
+        };
         let bytes = msg.to_bytes();
         let decoded = RaftMessage::from_bytes(&bytes).unwrap();
         assert_eq!(msg, decoded);
@@ -1983,7 +2333,11 @@ mod tests {
 
     #[test]
     fn raft_msg_heartbeat_response_roundtrip() {
-        let msg = RaftMessage::HeartbeatResponse { shard_id: 30, term: 7, follower_id: 2 };
+        let msg = RaftMessage::HeartbeatResponse {
+            shard_id: 30,
+            term: 7,
+            follower_id: 2,
+        };
         let bytes = msg.to_bytes();
         let decoded = RaftMessage::from_bytes(&bytes).unwrap();
         assert_eq!(msg, decoded);
@@ -2046,11 +2400,7 @@ mod tests {
         let _t1 = clock.now();
 
         // Simulate receiving a timestamp far in the future.
-        let remote_ts = HybridTimestamp::new(
-            HybridLogicalClock::physical_now() + 500_000,
-            10,
-            2,
-        );
+        let remote_ts = HybridTimestamp::new(HybridLogicalClock::physical_now() + 500_000, 10, 2);
         let updated = clock.update(&remote_ts);
         // Updated timestamp must be greater than the received one.
         assert!(updated > remote_ts);
@@ -2206,9 +2556,15 @@ mod tests {
         mgr.advance_timestamp(HybridTimestamp::new(9500, 0, 2));
 
         // Current time 10000, local at 9500 → staleness 500ms → ok
-        assert_eq!(mgr.can_serve_bounded(10000), FollowerReadResult::ServeLocally);
+        assert_eq!(
+            mgr.can_serve_bounded(10000),
+            FollowerReadResult::ServeLocally
+        );
         // Current time 11000, local at 9500 → staleness 1500ms → too stale
-        assert_eq!(mgr.can_serve_bounded(11000), FollowerReadResult::RedirectToLeader);
+        assert_eq!(
+            mgr.can_serve_bounded(11000),
+            FollowerReadResult::RedirectToLeader
+        );
     }
 
     #[test]
@@ -2234,8 +2590,18 @@ mod tests {
         let mut coord = ParallelCommitCoordinator::new();
         let txn = coord.begin_txn();
 
-        coord.stage_intent(txn, "key1", b"val1".to_vec(), HybridTimestamp::new(100, 0, 1));
-        coord.stage_intent(txn, "key2", b"val2".to_vec(), HybridTimestamp::new(100, 1, 1));
+        coord.stage_intent(
+            txn,
+            "key1",
+            b"val1".to_vec(),
+            HybridTimestamp::new(100, 0, 1),
+        );
+        coord.stage_intent(
+            txn,
+            "key2",
+            b"val2".to_vec(),
+            HybridTimestamp::new(100, 1, 1),
+        );
 
         assert_eq!(coord.pending_intent_count(), 2);
         assert_eq!(coord.total_intent_count(), 2);
@@ -2249,7 +2615,12 @@ mod tests {
     fn parallel_commit_abort() {
         let mut coord = ParallelCommitCoordinator::new();
         let txn = coord.begin_txn();
-        coord.stage_intent(txn, "key1", b"val1".to_vec(), HybridTimestamp::new(100, 0, 1));
+        coord.stage_intent(
+            txn,
+            "key1",
+            b"val1".to_vec(),
+            HybridTimestamp::new(100, 0, 1),
+        );
 
         let aborted = coord.abort_txn(txn);
         assert_eq!(aborted, 1);
@@ -2259,7 +2630,12 @@ mod tests {
     fn parallel_commit_cleanup() {
         let mut coord = ParallelCommitCoordinator::new();
         let txn = coord.begin_txn();
-        coord.stage_intent(txn, "key1", b"val1".to_vec(), HybridTimestamp::new(100, 0, 1));
+        coord.stage_intent(
+            txn,
+            "key1",
+            b"val1".to_vec(),
+            HybridTimestamp::new(100, 0, 1),
+        );
         coord.commit_txn(txn);
 
         let cleaned = coord.cleanup_intents(txn);
@@ -2271,7 +2647,12 @@ mod tests {
     fn parallel_commit_read_intent() {
         let mut coord = ParallelCommitCoordinator::new();
         let txn = coord.begin_txn();
-        coord.stage_intent(txn, "key1", b"hello".to_vec(), HybridTimestamp::new(100, 0, 1));
+        coord.stage_intent(
+            txn,
+            "key1",
+            b"hello".to_vec(),
+            HybridTimestamp::new(100, 0, 1),
+        );
 
         // Read encounters a pending intent
         let (val, status) = coord.read_with_intent_resolution("key1").unwrap();

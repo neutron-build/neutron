@@ -17,9 +17,10 @@ use tokio::sync::RwLock;
 use crate::cache::CacheTier;
 use crate::catalog::{Catalog, TableDef};
 use crate::fault::{self, HealthRegistry, SubsystemError, SubsystemHealth};
-use crate::graph::{GraphStore, PropValue as GraphPropValue};
+use crate::fts;
 use crate::graph::cypher::parse_cypher;
 use crate::graph::cypher_executor::execute_cypher;
+use crate::graph::{GraphStore, PropValue as GraphPropValue};
 use crate::metrics::{MetricsRegistry, QueryType};
 use crate::planner;
 #[cfg(feature = "server")]
@@ -30,34 +31,33 @@ use crate::storage::STORAGE_SESSION_ID;
 use crate::storage::StorageEngine;
 use crate::types::{DataType, Row, Value};
 use crate::vector;
-use crate::fts;
 
-mod types;
-mod schema_types;
-mod helpers;
-mod session;
-mod scalar_fns;
-mod copy;
 mod admin;
-mod cache;
-mod expr;
-mod project;
-mod join;
 mod aggregate;
+mod cache;
+mod copy;
 mod ddl;
 mod dml;
-mod txn;
-mod query;
-pub mod param_subst;
+mod expr;
+mod helpers;
+mod join;
 mod meta_persistence;
+pub mod param_subst;
+mod project;
+mod query;
+mod scalar_fns;
+mod schema_types;
+mod session;
+mod txn;
+mod types;
 
-use types::*;
-use schema_types::*;
+pub use expr::FilterResult; // Phase 2C: Lazy materialization for WHERE clause filtering
 use helpers::*;
-pub use session::Session;
-pub use expr::FilterResult;  // Phase 2C: Lazy materialization for WHERE clause filtering
-pub use types::PreparedStmtHandle;
+use schema_types::*;
 use session::CURRENT_SESSION;
+pub use session::Session;
+pub use types::PreparedStmtHandle;
+use types::*;
 
 /// The result of executing a statement.
 #[derive(Debug)]
@@ -258,13 +258,16 @@ impl Executor {
     pub fn new(catalog: Arc<Catalog>, storage: Arc<dyn StorageEngine>) -> Self {
         // Create default superuser role
         let mut roles = HashMap::new();
-        roles.insert("nucleus".to_string(), RoleDef {
-            name: "nucleus".to_string(),
-            password_hash: None,
-            is_superuser: true,
-            can_login: true,
-            privileges: HashMap::new(),
-        });
+        roles.insert(
+            "nucleus".to_string(),
+            RoleDef {
+                name: "nucleus".to_string(),
+                password_hash: None,
+                is_superuser: true,
+                can_login: true,
+                privileges: HashMap::new(),
+            },
+        );
 
         let mut health = HealthRegistry::new();
         health.register("vector");
@@ -337,12 +340,12 @@ impl Executor {
             memory_allocator: parking_lot::Mutex::new({
                 use crate::memory::{MemoryAllocator, Priority};
                 let mut alloc = MemoryAllocator::new(1 << 30); // 1 GiB default budget
-                alloc.register("cache",  Priority::Low);
-                alloc.register("fts",    Priority::Normal);
+                alloc.register("cache", Priority::Low);
+                alloc.register("fts", Priority::Normal);
                 alloc.register("sparse", Priority::Normal);
-                alloc.register("kv",     Priority::Normal);
-                alloc.register("doc",      Priority::Normal);
-                alloc.register("graph",    Priority::High);
+                alloc.register("kv", Priority::Normal);
+                alloc.register("doc", Priority::Normal);
+                alloc.register("graph", Priority::High);
                 alloc.register("columnar", Priority::Normal);
                 alloc
             }),
@@ -353,7 +356,9 @@ impl Executor {
             datalog_wal: None,
             streams: parking_lot::RwLock::new(HashMap::new()),
             pubsub_sync: parking_lot::RwLock::new(crate::pubsub::PubSubHub::new(1024)),
-            dist_pubsub: parking_lot::RwLock::new(crate::pubsub::DistributedPubSubRouter::new(0, 1024)),
+            dist_pubsub: parking_lot::RwLock::new(crate::pubsub::DistributedPubSubRouter::new(
+                0, 1024,
+            )),
             model_registry: parking_lot::RwLock::new(crate::inference::ModelRegistry::new()),
             tensor_store: parking_lot::RwLock::new(crate::tensor::TensorStore::new()),
             branch_manager: parking_lot::RwLock::new(crate::branching::BranchManager::new()),
@@ -439,14 +444,16 @@ impl Executor {
 
                 // Restore recovered indexes
                 for (index_name, recovered) in state.indexes {
-                    let (table_name, column_name) = meta.get(&index_name)
-                        .cloned()
-                        .unwrap_or_default();
-                    exec.vector_indexes.write().insert(index_name, VectorIndexEntry {
-                        table_name,
-                        column_name,
-                        kind: VectorIndexKind::Hnsw(recovered.hnsw),
-                    });
+                    let (table_name, column_name) =
+                        meta.get(&index_name).cloned().unwrap_or_default();
+                    exec.vector_indexes.write().insert(
+                        index_name,
+                        VectorIndexEntry {
+                            table_name,
+                            column_name,
+                            kind: VectorIndexKind::Hnsw(recovered.hnsw),
+                        },
+                    );
                 }
                 exec.vector_wal = Some(wal);
             }
@@ -454,7 +461,10 @@ impl Executor {
             // TimeSeries store: WAL-backed crash-recovery
             let ts_dir = dir.join("timeseries");
             std::fs::create_dir_all(&ts_dir).ok();
-            if let Ok(ts) = crate::timeseries::TimeSeriesStore::open(&ts_dir, crate::timeseries::BucketSize::Hour) {
+            if let Ok(ts) = crate::timeseries::TimeSeriesStore::open(
+                &ts_dir,
+                crate::timeseries::BucketSize::Hour,
+            ) {
                 *exec.ts_store.write() = ts;
             }
 
@@ -513,10 +523,11 @@ impl Executor {
 
         // Set up stats persistence path and load any saved ANALYZE stats.
         if let Some(ref cp) = exec.catalog_path
-            && let Some(parent) = cp.parent() {
-                let sp = parent.join("stats.json");
-                exec.stats_path = Some(sp);
-            }
+            && let Some(parent) = cp.parent()
+        {
+            let sp = parent.join("stats.json");
+            exec.stats_path = Some(sp);
+        }
 
         exec.load_fts_index();
         exec
@@ -524,7 +535,10 @@ impl Executor {
 
     /// Return the path used for persisting the FTS index alongside the catalog.
     fn fts_persist_path(&self) -> Option<std::path::PathBuf> {
-        self.catalog_path.as_ref()?.parent().map(|d| d.join("fts_index.json"))
+        self.catalog_path
+            .as_ref()?
+            .parent()
+            .map(|d| d.join("fts_index.json"))
     }
 
     /// Save the FTS index to disk (called after each mutation).
@@ -545,20 +559,29 @@ impl Executor {
     }
 
     pub fn save_fts_index(&self) {
-        let Some(path) = self.fts_persist_path() else { return; };
+        let Some(path) = self.fts_persist_path() else {
+            return;
+        };
         if let Ok(json) = self.fts_index.read().to_json()
-            && let Err(e) = std::fs::write(&path, &json) {
-                eprintln!("executor: failed to save FTS index to {}: {e}", path.display());
-            }
+            && let Err(e) = std::fs::write(&path, &json)
+        {
+            eprintln!(
+                "executor: failed to save FTS index to {}: {e}",
+                path.display()
+            );
+        }
     }
 
     /// Load the FTS index from disk at startup (called by new_with_persistence).
     fn load_fts_index(&self) {
-        let Some(path) = self.fts_persist_path() else { return; };
+        let Some(path) = self.fts_persist_path() else {
+            return;
+        };
         if let Ok(data) = std::fs::read_to_string(&path)
-            && let Ok(idx) = fts::InvertedIndex::from_json(&data) {
-                *self.fts_index.write() = idx;
-            }
+            && let Ok(idx) = fts::InvertedIndex::from_json(&data)
+        {
+            *self.fts_index.write() = idx;
+        }
     }
 
     /// Synchronously persist only the sequence state to `sequences.json`.
@@ -566,7 +589,9 @@ impl Executor {
     /// Called after every `nextval`/`setval` to ensure sequence values survive restart.
     /// Uses a parking_lot (sync) lock snapshot so this can be called from non-async code.
     pub(crate) fn persist_sequences_sync(&self) {
-        let Some(ref cp) = self.catalog_path else { return };
+        let Some(ref cp) = self.catalog_path else {
+            return;
+        };
         let dir = match cp.parent() {
             Some(d) => d,
             None => return,
@@ -574,21 +599,27 @@ impl Executor {
         let path = dir.join("sequences.json");
 
         let sequences = self.sequences.read();
-        let data: Vec<serde_json::Value> = sequences.iter().map(|(name, mu)| {
-            let seq = mu.lock();
-            serde_json::json!({
-                "name": name,
-                "current": seq.current,
-                "increment": seq.increment,
-                "min_value": seq.min_value,
-                "max_value": seq.max_value,
+        let data: Vec<serde_json::Value> = sequences
+            .iter()
+            .map(|(name, mu)| {
+                let seq = mu.lock();
+                serde_json::json!({
+                    "name": name,
+                    "current": seq.current,
+                    "increment": seq.increment,
+                    "min_value": seq.min_value,
+                    "max_value": seq.max_value,
+                })
             })
-        }).collect();
+            .collect();
         drop(sequences);
 
         let json = match serde_json::to_string_pretty(&data) {
             Ok(j) => j,
-            Err(e) => { tracing::warn!("persist_sequences_sync serialize: {e}"); return; }
+            Err(e) => {
+                tracing::warn!("persist_sequences_sync serialize: {e}");
+                return;
+            }
         };
         let tmp = path.with_extension("json.tmp");
         if let Ok(mut f) = std::fs::File::create(&tmp) {
@@ -604,7 +635,9 @@ impl Executor {
     /// Must be called as `executor.load_meta().await` after `new_with_persistence`.
     /// In `main.rs` this is called once before accepting connections.
     pub async fn load_meta(&self) {
-        let Some(ref cp) = self.catalog_path else { return };
+        let Some(ref cp) = self.catalog_path else {
+            return;
+        };
         let loaded = meta_persistence::MetaPersistence::alongside_catalog(cp).load();
 
         // tokio::sync::RwLock — await the write locks
@@ -645,20 +678,29 @@ impl Executor {
             let seq_path = dir.join("sequences.json");
             if seq_path.exists()
                 && let Ok(json) = std::fs::read_to_string(&seq_path)
-                    && let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
-                        let mut seqs = self.sequences.write();
-                        for item in &arr {
-                            let name = item["name"].as_str().unwrap_or("").to_string();
-                            if name.is_empty() { continue; }
-                            let current = item["current"].as_i64().unwrap_or(0);
-                            let increment = item["increment"].as_i64().unwrap_or(1);
-                            let min_value = item["min_value"].as_i64().unwrap_or(i64::MIN);
-                            let max_value = item["max_value"].as_i64().unwrap_or(i64::MAX);
-                            seqs.insert(name, parking_lot::Mutex::new(SequenceDef {
-                                current, increment, min_value, max_value,
-                            }));
-                        }
+                && let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&json)
+            {
+                let mut seqs = self.sequences.write();
+                for item in &arr {
+                    let name = item["name"].as_str().unwrap_or("").to_string();
+                    if name.is_empty() {
+                        continue;
                     }
+                    let current = item["current"].as_i64().unwrap_or(0);
+                    let increment = item["increment"].as_i64().unwrap_or(1);
+                    let min_value = item["min_value"].as_i64().unwrap_or(i64::MIN);
+                    let max_value = item["max_value"].as_i64().unwrap_or(i64::MAX);
+                    seqs.insert(
+                        name,
+                        parking_lot::Mutex::new(SequenceDef {
+                            current,
+                            increment,
+                            min_value,
+                            max_value,
+                        }),
+                    );
+                }
+            }
         }
     }
 
@@ -702,10 +744,15 @@ impl Executor {
                         _ => continue,
                     };
                     let rows = self.storage.scan(&idx.table_name).await.unwrap_or_default();
-                    let vectors: Vec<Vec<f32>> = rows.iter()
+                    let vectors: Vec<Vec<f32>> = rows
+                        .iter()
                         .filter_map(|row| {
                             if col_pos < row.len() {
-                                if let Value::Vector(v) = &row[col_pos] { Some(v.clone()) } else { None }
+                                if let Value::Vector(v) = &row[col_pos] {
+                                    Some(v.clone())
+                                } else {
+                                    None
+                                }
                             } else {
                                 None
                             }
@@ -715,28 +762,36 @@ impl Executor {
                     let nlist = (vectors.len() as f64).sqrt().ceil() as usize;
                     let nlist = nlist.max(1);
                     let nprobe = (nlist / 4).max(1);
-                    let mut ivf = vector::IvfFlatIndex::new(dims, nlist, nprobe, vector::DistanceMetric::L2);
+                    let mut ivf =
+                        vector::IvfFlatIndex::new(dims, nlist, nprobe, vector::DistanceMetric::L2);
                     if !vectors.is_empty() {
                         ivf.train(&vectors);
                         for (row_id, row) in rows.iter().enumerate() {
                             if col_pos < row.len()
-                                && let Value::Vector(v) = &row[col_pos] {
-                                    ivf.add(row_id, v.clone());
-                                }
+                                && let Value::Vector(v) = &row[col_pos]
+                            {
+                                ivf.add(row_id, v.clone());
+                            }
                         }
                     }
-                    self.vector_indexes.write().insert(idx.name.clone(), VectorIndexEntry {
-                        table_name: idx.table_name.clone(),
-                        column_name: col_name,
-                        kind: VectorIndexKind::IvfFlat(ivf),
-                    });
-                    tracing::info!("Rebuilt IvfFlat index '{}' from {} rows", idx.name, rows.len());
+                    self.vector_indexes.write().insert(
+                        idx.name.clone(),
+                        VectorIndexEntry {
+                            table_name: idx.table_name.clone(),
+                            column_name: col_name,
+                            kind: VectorIndexKind::IvfFlat(ivf),
+                        },
+                    );
+                    tracing::info!(
+                        "Rebuilt IvfFlat index '{}' from {} rows",
+                        idx.name,
+                        rows.len()
+                    );
                 }
                 crate::catalog::IndexType::BTree if idx.options.contains_key("encryption_mode") => {
                     // Encrypted index: try to rebuild using env key.
-                    let key_bytes: Option<[u8; 32]> = std::env::var("NUCLEUS_ENCRYPTION_KEY")
-                        .ok()
-                        .and_then(|k| {
+                    let key_bytes: Option<[u8; 32]> =
+                        std::env::var("NUCLEUS_ENCRYPTION_KEY").ok().and_then(|k| {
                             let b = k.into_bytes();
                             if b.len() == 32 {
                                 let mut arr = [0u8; 32];
@@ -754,7 +809,11 @@ impl Executor {
                         continue;
                     };
 
-                    let mode_str = idx.options.get("encryption_mode").map(|s| s.as_str()).unwrap_or("");
+                    let mode_str = idx
+                        .options
+                        .get("encryption_mode")
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
                     let mode = if mode_str.contains("Order") || mode_str.contains("OPE") {
                         crate::storage::encrypted_index::EncryptionMode::OrderPreserving
                     } else if mode_str.contains("Random") {
@@ -773,7 +832,8 @@ impl Executor {
                     };
                     let col_idx = table_def.column_index(&col_name);
 
-                    let mut enc_idx = crate::storage::encrypted_index::EncryptedIndex::new(key, mode);
+                    let mut enc_idx =
+                        crate::storage::encrypted_index::EncryptedIndex::new(key, mode);
                     if let Some(ci) = col_idx {
                         let rows = self.storage.scan(&idx.table_name).await.unwrap_or_default();
                         for (row_id, row) in rows.iter().enumerate() {
@@ -782,14 +842,21 @@ impl Executor {
                                 enc_idx.insert(plaintext.as_bytes(), row_id as u64);
                             }
                         }
-                        tracing::info!("Rebuilt encrypted index '{}' from {} rows", idx.name, rows.len());
+                        tracing::info!(
+                            "Rebuilt encrypted index '{}' from {} rows",
+                            idx.name,
+                            rows.len()
+                        );
                     }
 
-                    self.encrypted_indexes.write().insert(idx.name.clone(), EncryptedIndexEntry {
-                        table_name: idx.table_name.clone(),
-                        column_name: col_name,
-                        index: enc_idx,
-                    });
+                    self.encrypted_indexes.write().insert(
+                        idx.name.clone(),
+                        EncryptedIndexEntry {
+                            table_name: idx.table_name.clone(),
+                            column_name: col_name,
+                            index: enc_idx,
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -860,7 +927,9 @@ impl Executor {
         let (proc_name, rest) = if let Some(paren_pos) = rest.find('(') {
             (rest[..paren_pos].trim().to_lowercase(), &rest[paren_pos..])
         } else {
-            return Err(ExecError::Unsupported("CREATE PROCEDURE: missing parameter list".into()));
+            return Err(ExecError::Unsupported(
+                "CREATE PROCEDURE: missing parameter list".into(),
+            ));
         };
 
         // Find the closing paren
@@ -882,7 +951,7 @@ impl Executor {
             after_params[pos + 4..].trim()
         } else {
             return Err(ExecError::Unsupported(
-                "CREATE PROCEDURE: expected LANGUAGE sql AS '<body>'".into()
+                "CREATE PROCEDURE: expected LANGUAGE sql AS '<body>'".into(),
             ));
         };
 
@@ -915,7 +984,11 @@ impl Executor {
 
         let trimmed = sql.trim().trim_end_matches(';');
         let upper_trimmed = trimmed.to_uppercase();
-        let rest = if upper_trimmed.starts_with("CALL ") { &trimmed[5..] } else { trimmed };
+        let rest = if upper_trimmed.starts_with("CALL ") {
+            &trimmed[5..]
+        } else {
+            trimmed
+        };
 
         // Parse: proc_name([args...])
         let (proc_name, rest) = if let Some(paren_pos) = rest.find('(') {
@@ -931,23 +1004,26 @@ impl Executor {
         let proc_args: Vec<ProcValue> = if args_str.is_empty() {
             Vec::new()
         } else {
-            args_str.split(',').map(|s| {
-                let s = s.trim();
-                if s == "NULL" || s == "null" {
-                    ProcValue::Null
-                } else if let Ok(i) = s.parse::<i64>() {
-                    ProcValue::Int(i)
-                } else if let Ok(f) = s.parse::<f64>() {
-                    ProcValue::Float(f)
-                } else if s == "true" || s == "TRUE" {
-                    ProcValue::Bool(true)
-                } else if s == "false" || s == "FALSE" {
-                    ProcValue::Bool(false)
-                } else {
-                    // Strip quotes for string literals
-                    ProcValue::Text(s.trim_matches('\'').trim_matches('"').to_string())
-                }
-            }).collect()
+            args_str
+                .split(',')
+                .map(|s| {
+                    let s = s.trim();
+                    if s == "NULL" || s == "null" {
+                        ProcValue::Null
+                    } else if let Ok(i) = s.parse::<i64>() {
+                        ProcValue::Int(i)
+                    } else if let Ok(f) = s.parse::<f64>() {
+                        ProcValue::Float(f)
+                    } else if s == "true" || s == "TRUE" {
+                        ProcValue::Bool(true)
+                    } else if s == "false" || s == "FALSE" {
+                        ProcValue::Bool(false)
+                    } else {
+                        // Strip quotes for string literals
+                        ProcValue::Text(s.trim_matches('\'').trim_matches('"').to_string())
+                    }
+                })
+                .collect()
         };
 
         let proc_result = {
@@ -962,9 +1038,12 @@ impl Executor {
                 // Distinguish them: only try to execute text that starts with a SQL keyword.
                 let is_sql = {
                     let u = sql_body.trim_start().to_ascii_uppercase();
-                    ["SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP",
-                     "ALTER", "WITH", "CALL", "EXPLAIN", "TRUNCATE"]
-                        .iter().any(|kw| u.starts_with(kw))
+                    [
+                        "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "WITH",
+                        "CALL", "EXPLAIN", "TRUNCATE",
+                    ]
+                    .iter()
+                    .any(|kw| u.starts_with(kw))
                 };
                 if is_sql {
                     let results = self.execute(&sql_body).await?;
@@ -997,23 +1076,31 @@ impl Executor {
                 })
             }
             ProcResult::Rows(rows) => {
-                let result_rows: Vec<Row> = rows.into_iter().map(|row| {
-                    row.into_iter().map(|v| match v {
-                        ProcValue::Null => Value::Null,
-                        ProcValue::Bool(b) => Value::Bool(b),
-                        ProcValue::Int(i) => Value::Int64(i),
-                        ProcValue::Float(f) => Value::Float64(f),
-                        ProcValue::Text(s) => Value::Text(s),
-                        ProcValue::Bytes(b) => Value::Bytea(b),
-                        ProcValue::Array(a) => Value::Text(format!("{a:?}")),
-                        ProcValue::Map(m) => Value::Text(format!("{m:?}")),
-                    }).collect()
-                }).collect();
+                let result_rows: Vec<Row> = rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|v| match v {
+                                ProcValue::Null => Value::Null,
+                                ProcValue::Bool(b) => Value::Bool(b),
+                                ProcValue::Int(i) => Value::Int64(i),
+                                ProcValue::Float(f) => Value::Float64(f),
+                                ProcValue::Text(s) => Value::Text(s),
+                                ProcValue::Bytes(b) => Value::Bytea(b),
+                                ProcValue::Array(a) => Value::Text(format!("{a:?}")),
+                                ProcValue::Map(m) => Value::Text(format!("{m:?}")),
+                            })
+                            .collect()
+                    })
+                    .collect();
                 let ncols = result_rows.first().map(|r| r.len()).unwrap_or(1);
                 let columns = (0..ncols)
                     .map(|i| (format!("col{i}"), DataType::Text))
                     .collect();
-                Ok(ExecResult::Select { columns, rows: result_rows })
+                Ok(ExecResult::Select {
+                    columns,
+                    rows: result_rows,
+                })
             }
             ProcResult::Error(e) if e.contains("not found") => {
                 // Built-in procedure engine doesn't know this name.
@@ -1021,15 +1108,18 @@ impl Executor {
                 let func_def = self.functions.read().get(&proc_name).cloned();
                 if let Some(func_def) = func_def {
                     // Re-evaluate args as Value from the already-parsed proc_args.
-                    let args: Vec<Value> = proc_args.iter().map(|v| match v {
-                        crate::procedures::ProcValue::Null => Value::Null,
-                        crate::procedures::ProcValue::Bool(b) => Value::Bool(*b),
-                        crate::procedures::ProcValue::Int(i) => Value::Int64(*i),
-                        crate::procedures::ProcValue::Float(f) => Value::Float64(*f),
-                        crate::procedures::ProcValue::Text(s) => Value::Text(s.clone()),
-                        crate::procedures::ProcValue::Bytes(b) => Value::Bytea(b.clone()),
-                        _ => Value::Null,
-                    }).collect();
+                    let args: Vec<Value> = proc_args
+                        .iter()
+                        .map(|v| match v {
+                            crate::procedures::ProcValue::Null => Value::Null,
+                            crate::procedures::ProcValue::Bool(b) => Value::Bool(*b),
+                            crate::procedures::ProcValue::Int(i) => Value::Int64(*i),
+                            crate::procedures::ProcValue::Float(f) => Value::Float64(*f),
+                            crate::procedures::ProcValue::Text(s) => Value::Text(s.clone()),
+                            crate::procedures::ProcValue::Bytes(b) => Value::Bytea(b.clone()),
+                            _ => Value::Null,
+                        })
+                        .collect();
                     let mut positional = Vec::with_capacity(func_def.params.len());
                     let mut named = HashMap::new();
                     for (i, (param_name, _)) in func_def.params.iter().enumerate() {
@@ -1043,9 +1133,7 @@ impl Executor {
                             named.insert(param_name.clone(), replacement);
                         }
                     }
-                    let body = substitute_sql_placeholders(
-                        &func_def.body, &positional, &named,
-                    );
+                    let body = substitute_sql_placeholders(&func_def.body, &positional, &named);
                     let results = self.execute(&body).await?;
                     Ok(results.into_iter().next().unwrap_or(ExecResult::Command {
                         tag: format!("CALL {proc_name}"),
@@ -1082,7 +1170,10 @@ impl Executor {
             bytes += match v {
                 Value::Null | Value::Bool(_) => 1,
                 Value::Int32(_) | Value::Date(_) => 4,
-                Value::Int64(_) | Value::Float64(_) | Value::Timestamp(_) | Value::TimestampTz(_) => 8,
+                Value::Int64(_)
+                | Value::Float64(_)
+                | Value::Timestamp(_)
+                | Value::TimestampTz(_) => 8,
                 Value::Text(s) => 24 + s.len() as u64,
                 Value::Numeric(s) => 24 + s.len() as u64,
                 Value::Uuid(_) => 16,
@@ -1111,20 +1202,29 @@ impl Executor {
 
     /// Set the replication manager for streaming replication.
     #[cfg(feature = "server")]
-    pub fn with_replication(mut self, repl: Arc<parking_lot::RwLock<crate::replication::ReplicationManager>>) -> Self {
+    pub fn with_replication(
+        mut self,
+        repl: Arc<parking_lot::RwLock<crate::replication::ReplicationManager>>,
+    ) -> Self {
         self.replication = Some(repl);
         self
     }
 
     /// Set the connection pool for live pool status reporting.
     #[cfg(feature = "server")]
-    pub fn with_conn_pool(mut self, pool: Arc<crate::pool::async_pool::AsyncConnectionPool>) -> Self {
+    pub fn with_conn_pool(
+        mut self,
+        pool: Arc<crate::pool::async_pool::AsyncConnectionPool>,
+    ) -> Self {
         self.conn_pool = Some(pool);
         self
     }
 
     #[cfg(feature = "server")]
-    pub fn with_cluster(mut self, cluster: Arc<parking_lot::RwLock<crate::distributed::ClusterCoordinator>>) -> Self {
+    pub fn with_cluster(
+        mut self,
+        cluster: Arc<parking_lot::RwLock<crate::distributed::ClusterCoordinator>>,
+    ) -> Self {
         self.cluster = Some(cluster);
         self
     }
@@ -1157,8 +1257,10 @@ impl Executor {
             None => return, // standalone mode — no cluster, nothing to wire
         };
 
-        let (deliver_tx, mut deliver_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
-        let (gossip_tx, mut gossip_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Vec<String>)>();
+        let (deliver_tx, mut deliver_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+        let (gossip_tx, mut gossip_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, Vec<String>)>();
         replicator.set_pubsub_channels(deliver_tx, gossip_tx).await;
 
         // Reinitialize the distributed router with the correct node ID.
@@ -1179,14 +1281,20 @@ impl Executor {
         let executor2 = Arc::clone(self);
         tokio::spawn(async move {
             while let Some((node_id, channels)) = gossip_rx.recv().await {
-                executor2.dist_pubsub.write().apply_gossip(node_id, channels);
+                executor2
+                    .dist_pubsub
+                    .write()
+                    .apply_gossip(node_id, channels);
             }
         });
     }
 
     /// Set the follower read manager for consistent follower reads.
     #[cfg(feature = "server")]
-    pub fn with_follower_reads(mut self, mgr: Arc<parking_lot::RwLock<crate::distributed::FollowerReadManager>>) -> Self {
+    pub fn with_follower_reads(
+        mut self,
+        mgr: Arc<parking_lot::RwLock<crate::distributed::FollowerReadManager>>,
+    ) -> Self {
         self.follower_read_mgr = Some(mgr);
         self
     }
@@ -1222,11 +1330,10 @@ impl Executor {
                     mgr.max_staleness_ms, mgr.leader_node
                 )))
             }
-            crate::distributed::FollowerReadResult::Unknown => {
-                Err(ExecError::Runtime(
-                    "follower has not yet received any data from leader; redirect to leader".to_string()
-                ))
-            }
+            crate::distributed::FollowerReadResult::Unknown => Err(ExecError::Runtime(
+                "follower has not yet received any data from leader; redirect to leader"
+                    .to_string(),
+            )),
         }
     }
 
@@ -1266,7 +1373,9 @@ impl Executor {
 
     /// Get the cluster coordinator (for query forwarding in the message handler).
     #[cfg(feature = "server")]
-    pub fn cluster_ref(&self) -> Option<&Arc<parking_lot::RwLock<crate::distributed::ClusterCoordinator>>> {
+    pub fn cluster_ref(
+        &self,
+    ) -> Option<&Arc<parking_lot::RwLock<crate::distributed::ClusterCoordinator>>> {
         self.cluster.as_ref()
     }
 
@@ -1307,11 +1416,14 @@ impl Executor {
         };
         if had_active_txn {
             if self.storage.supports_mvcc() {
-                let _ = CURRENT_SESSION.scope(session.clone(),
-                    STORAGE_SESSION_ID.scope(id, async {
-                        let _ = self.storage.abort_txn().await;
-                    })
-                ).await;
+                let _ = CURRENT_SESSION
+                    .scope(
+                        session.clone(),
+                        STORAGE_SESSION_ID.scope(id, async {
+                            let _ = self.storage.abort_txn().await;
+                        }),
+                    )
+                    .await;
             }
             actions.push("ROLLBACK active transaction".into());
             self.metrics.open_transactions.dec();
@@ -1334,7 +1446,10 @@ impl Executor {
 
     /// Get the session for the given ID, falling back to the default session.
     fn get_session(&self, id: u64) -> Arc<Session> {
-        self.sessions.read().get(&id).cloned()
+        self.sessions
+            .read()
+            .get(&id)
+            .cloned()
             .unwrap_or_else(|| self.default_session.clone())
     }
 
@@ -1344,10 +1459,26 @@ impl Executor {
         session.settings.read().get(key).cloned()
     }
 
+    /// Whether the given session is inside an active transaction (BEGIN issued,
+    /// not yet COMMIT/ROLLBACK). The wire handler uses this to disable its
+    /// autocommit fast paths inside a transaction: those paths bypass the
+    /// session's MVCC snapshot and write directly to storage, which would both
+    /// auto-commit writes the transaction must be able to ROLLBACK and break
+    /// read-your-own-writes for fast-path reads.
+    pub fn session_in_transaction(&self, session_id: u64) -> bool {
+        let session = self.get_session(session_id);
+        session
+            .txn_state
+            .try_read()
+            .map(|t| t.active)
+            .unwrap_or(false)
+    }
+
     /// Get the current session from the task-local, or the default session
     /// if no session has been set (e.g. embedded mode or tests).
     fn current_session(&self) -> Arc<Session> {
-        CURRENT_SESSION.try_with(|s| s.clone())
+        CURRENT_SESSION
+            .try_with(|s| s.clone())
             .unwrap_or_else(|_| self.default_session.clone())
     }
 
@@ -1374,12 +1505,13 @@ impl Executor {
         &'a self,
         session_id: u64,
         sql: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>,
+    > {
         let session = self.get_session(session_id);
-        Box::pin(CURRENT_SESSION.scope(session,
-            STORAGE_SESSION_ID.scope(session_id, async move {
-                self.execute(sql).await
-            })
+        Box::pin(CURRENT_SESSION.scope(
+            session,
+            STORAGE_SESSION_ID.scope(session_id, async move { self.execute(sql).await }),
         ))
     }
 
@@ -1390,16 +1522,19 @@ impl Executor {
         &'a self,
         session_id: u64,
         statements: Vec<Statement>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>,
+    > {
         let session = self.get_session(session_id);
-        Box::pin(CURRENT_SESSION.scope(session,
+        Box::pin(CURRENT_SESSION.scope(
+            session,
             STORAGE_SESSION_ID.scope(session_id, async move {
                 let mut results = Vec::new();
                 for stmt in statements {
                     results.push(self.execute_statement(stmt).await?);
                 }
                 Ok(results)
-            })
+            }),
         ))
     }
 
@@ -1414,7 +1549,9 @@ impl Executor {
     /// Called after DDL operations (CREATE TABLE, DROP TABLE, CREATE VIEW, etc.).
     #[cfg(feature = "server")]
     async fn persist_catalog(&self) {
-        let Some(ref path) = self.catalog_path else { return };
+        let Some(ref path) = self.catalog_path else {
+            return;
+        };
 
         // 1. Persist table/index catalog.
         let persistence = crate::storage::persistence::CatalogPersistence::new(path);
@@ -1427,10 +1564,13 @@ impl Executor {
         // parking_lot::Mutex<SequenceDef> is not Clone, so extract data manually.
         let sequences_snap: HashMap<String, parking_lot::Mutex<SequenceDef>> = {
             let guard = self.sequences.read();
-            guard.iter().map(|(k, mu)| {
-                let seq = mu.lock().clone();
-                (k.clone(), parking_lot::Mutex::new(seq))
-            }).collect()
+            guard
+                .iter()
+                .map(|(k, mu)| {
+                    let seq = mu.lock().clone();
+                    (k.clone(), parking_lot::Mutex::new(seq))
+                })
+                .collect()
         };
         let functions_snap: HashMap<String, FunctionDef> = self.functions.read().clone();
         // Now take async locks.
@@ -1636,7 +1776,10 @@ impl Executor {
         {
             let mut row_data = HashMap::new();
             row_data.insert("_rows".to_string(), row_count.to_string());
-            let seq = self.cdc_log.write().append(table, change_type.clone(), row_data.clone());
+            let seq = self
+                .cdc_log
+                .write()
+                .append(table, change_type.clone(), row_data.clone());
             // Log to CDC WAL after successful append
             if let Some(ref wal) = self.cdc_wal {
                 let entry = crate::reactive::CdcLogEntry {
@@ -1649,7 +1792,14 @@ impl Executor {
                         .unwrap_or_default()
                         .as_millis() as u64,
                 };
-                let _ = wal.log_append(&entry);
+                if let Err(e) = wal.log_append(&entry) {
+                    // CDC is advertised as durable change capture; a dropped WAL
+                    // append breaks that guarantee on crash. Surface it.
+                    tracing::error!(
+                        target: "nucleus::cdc",
+                        "CDC WAL append failed: {e}; change capture may lose this event on crash"
+                    );
+                }
             }
         }
 
@@ -1766,7 +1916,10 @@ impl Executor {
         // Append to CDC log
         let mut row_data = std::collections::HashMap::new();
         row_data.insert("_rows".to_string(), row_count.to_string());
-        let seq = self.cdc_log.write().append(table, change_type.clone(), row_data.clone());
+        let seq = self
+            .cdc_log
+            .write()
+            .append(table, change_type.clone(), row_data.clone());
         // Log to CDC WAL after successful append
         if let Some(ref wal) = self.cdc_wal {
             let entry = crate::reactive::CdcLogEntry {
@@ -1789,14 +1942,12 @@ impl Executor {
     /// converted to SQL-compatible types.
     pub fn execute_cypher_query(&self, cypher_text: &str) -> Result<ExecResult, ExecError> {
         self.check_subsystem("graph")?;
-        let parsed = parse_cypher(cypher_text).map_err(|e| {
-            ExecError::Unsupported(format!("Cypher parse error: {e:?}"))
-        })?;
+        let parsed = parse_cypher(cypher_text)
+            .map_err(|e| ExecError::Unsupported(format!("Cypher parse error: {e:?}")))?;
         let result = {
             let mut gs = self.graph_store.write();
-            execute_cypher(&mut gs, &parsed).map_err(|e| {
-                ExecError::Unsupported(format!("Cypher execution error: {e:?}"))
-            })?
+            execute_cypher(&mut gs, &parsed)
+                .map_err(|e| ExecError::Unsupported(format!("Cypher execution error: {e:?}")))?
         };
         // Convert CypherResult columns/rows to SQL types.
         let columns: Vec<(String, DataType)> = result
@@ -1843,8 +1994,7 @@ impl Executor {
     ///
     /// Only single-statement SQL is supported (multi-statement SQL will error).
     pub fn prepare(&self, sql: &str) -> Result<PreparedStmtHandle, ExecError> {
-        let stmts = crate::sql::parse(sql)
-            .map_err(ExecError::Parse)?;
+        let stmts = crate::sql::parse(sql).map_err(ExecError::Parse)?;
         if stmts.len() != 1 {
             return Err(ExecError::Unsupported(
                 "prepare() requires exactly one SQL statement".into(),
@@ -1900,7 +2050,9 @@ impl Executor {
                     i += 1;
                 }
                 if i > start
-                    && let Ok(n) = std::str::from_utf8(&bytes[start..i]).unwrap_or("0").parse::<usize>()
+                    && let Ok(n) = std::str::from_utf8(&bytes[start..i])
+                        .unwrap_or("0")
+                        .parse::<usize>()
                     && n > max_n
                 {
                     max_n = n;
@@ -1934,7 +2086,11 @@ impl Executor {
         use crate::wire::kv_fast_path::SqlFastPathCommand;
 
         match cmd {
-            SqlFastPathCommand::PointSelect { table, where_col, where_val } => {
+            SqlFastPathCommand::PointSelect {
+                table,
+                where_col,
+                where_val,
+            } => {
                 let table_def = self.catalog.get_table_cached(table)?;
                 let col_idx = table_def.column_index(where_col)?;
                 // Coerce the wire-parsed literal to the column's declared
@@ -1944,11 +2100,15 @@ impl Executor {
                 // Falls back to the original value if the cast fails — the
                 // storage scan then returns zero rows (Postgres-compatible
                 // "WHERE n = 'abc'" → no rows, no error).
-                let search_val = where_val.to_value()
+                let search_val = where_val
+                    .to_value()
                     .cast(&table_def.columns[col_idx].data_type)
                     .unwrap_or_else(|_| where_val.to_value());
                 let storage = self.storage_for(table);
-                let rows = match storage.scan_where_eq_positions(table, col_idx, &search_val).await {
+                let rows = match storage
+                    .scan_where_eq_positions(table, col_idx, &search_val)
+                    .await
+                {
                     Ok(matches) => matches.into_iter().map(|(_, row)| row).collect::<Vec<_>>(),
                     Err(e) => return Some(Err(ExecError::Storage(e))),
                 };
@@ -1971,22 +2131,34 @@ impl Executor {
                 // column's native representation. Fall back to the original
                 // value on cast failure — the storage layer will reject
                 // type-incompatible inserts with a clearer error than ours.
-                let row: Vec<Value> = values.iter().enumerate().map(|(i, v)| {
-                    v.to_value()
-                        .cast(&table_def.columns[i].data_type)
-                        .unwrap_or_else(|_| v.to_value())
-                }).collect();
+                let row: Vec<Value> = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        v.to_value()
+                            .cast(&table_def.columns[i].data_type)
+                            .unwrap_or_else(|_| v.to_value())
+                    })
+                    .collect();
                 let storage = self.storage_for(table);
                 match storage.insert(table, row).await {
+                    // Bare tag — the wire layer normalizes "INSERT" to "INSERT 0"
+                    // and appends rows_affected. Embedding the count here would
+                    // double it on the wire ("INSERT 0 1 1"). Matches general path.
                     Ok(()) => Some(Ok(ExecResult::Command {
-                        tag: "INSERT 0 1".into(),
+                        tag: "INSERT".into(),
                         rows_affected: 1,
                     })),
                     Err(e) => Some(Err(ExecError::Storage(e))),
                 }
             }
 
-            SqlFastPathCommand::PointUpdate { table, assignments, where_col, where_val } => {
+            SqlFastPathCommand::PointUpdate {
+                table,
+                assignments,
+                where_col,
+                where_val,
+            } => {
                 let table_def = self.catalog.get_table_cached(table)?;
                 let pk_idx = table_def.column_index(where_col)?;
                 // Resolve all assignment column indexes upfront. If any column
@@ -1997,24 +2169,29 @@ impl Executor {
                 let mut col_updates: Vec<(usize, Value)> = Vec::with_capacity(assignments.len());
                 for (col_name, lit) in assignments {
                     let idx = table_def.column_index(col_name)?;
-                    let v = lit.to_value()
+                    let v = lit
+                        .to_value()
                         .cast(&table_def.columns[idx].data_type)
                         .unwrap_or_else(|_| lit.to_value());
                     col_updates.push((idx, v));
                 }
                 // Coerce the WHERE search value too — same rationale as
                 // PointSelect (pgx SimpleProtocol text literals).
-                let search_val = where_val.to_value()
+                let search_val = where_val
+                    .to_value()
                     .cast(&table_def.columns[pk_idx].data_type)
                     .unwrap_or_else(|_| where_val.to_value());
                 let storage = self.storage_for(table);
-                let matches = match storage.scan_where_eq_positions(table, pk_idx, &search_val).await {
+                let matches = match storage
+                    .scan_where_eq_positions(table, pk_idx, &search_val)
+                    .await
+                {
                     Ok(m) => m,
                     Err(e) => return Some(Err(ExecError::Storage(e))),
                 };
                 if matches.is_empty() {
                     return Some(Ok(ExecResult::Command {
-                        tag: "UPDATE 0".into(),
+                        tag: "UPDATE".into(),
                         rows_affected: 0,
                     }));
                 }
@@ -2034,27 +2211,36 @@ impl Executor {
                     Err(e) => return Some(Err(ExecError::Storage(e))),
                 };
                 Some(Ok(ExecResult::Command {
-                    tag: format!("UPDATE {count}"),
+                    // Bare tag; wire appends rows_affected (see PointInsert).
+                    tag: "UPDATE".into(),
                     rows_affected: count,
                 }))
             }
 
-            SqlFastPathCommand::PointDelete { table, where_col, where_val } => {
+            SqlFastPathCommand::PointDelete {
+                table,
+                where_col,
+                where_val,
+            } => {
                 let table_def = self.catalog.get_table_cached(table)?;
                 let col_idx = table_def.column_index(where_col)?;
                 // Coerce text literal to the column's declared type — see
                 // PointSelect for the pgx SimpleProtocol rationale.
-                let search_val = where_val.to_value()
+                let search_val = where_val
+                    .to_value()
                     .cast(&table_def.columns[col_idx].data_type)
                     .unwrap_or_else(|_| where_val.to_value());
                 let storage = self.storage_for(table);
-                let matches = match storage.scan_where_eq_positions(table, col_idx, &search_val).await {
+                let matches = match storage
+                    .scan_where_eq_positions(table, col_idx, &search_val)
+                    .await
+                {
                     Ok(m) => m,
                     Err(e) => return Some(Err(ExecError::Storage(e))),
                 };
                 if matches.is_empty() {
                     return Some(Ok(ExecResult::Command {
-                        tag: "DELETE 0".into(),
+                        tag: "DELETE".into(),
                         rows_affected: 0,
                     }));
                 }
@@ -2064,14 +2250,20 @@ impl Executor {
                     Err(e) => return Some(Err(ExecError::Storage(e))),
                 };
                 Some(Ok(ExecResult::Command {
-                    tag: format!("DELETE {count}"),
+                    // Bare tag; wire appends rows_affected (see PointInsert).
+                    tag: "DELETE".into(),
                     rows_affected: count,
                 }))
             }
         }
     }
 
-    pub fn execute<'a>(&'a self, sql: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>> {
+    pub fn execute<'a>(
+        &'a self,
+        sql: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>,
+    > {
         // Box to allow recursion (triggers call execute)
         Box::pin(async move {
             // Clear the non-correlated subquery cache at the start of each top-level query
@@ -2085,7 +2277,12 @@ impl Executor {
             // EXECUTE/DEALLOCATE/COPY/TRUNCATE/VACUUM/ANALYZE/DECLARE/FETCH NEXT/CLOSE/
             // LISTEN/NOTIFY/UNLISTEN/DISCARD/DO/LOCK/VALUES/TABLE/MERGE) can skip all
             // extension prefix checks. Only non-standard Nucleus extensions need them.
-            let first = trimmed.as_bytes().first().copied().unwrap_or(0).to_ascii_uppercase();
+            let first = trimmed
+                .as_bytes()
+                .first()
+                .copied()
+                .unwrap_or(0)
+                .to_ascii_uppercase();
             let skip_extensions = match first {
                 // Standard SQL initials that never collide with Nucleus extensions.
                 // 'I' = INSERT, 'W' = WITH, 'B' = BEGIN, 'E' = EXPLAIN/EXECUTE,
@@ -2094,14 +2291,26 @@ impl Executor {
                 b'I' | b'W' | b'B' | b'E' | b'G' | b'T' | b'L' | b'N' | b'V' | b'P' => true,
                 // 'U' could be UNSUBSCRIBE or UPDATE/UNLISTEN — check
                 b'U' => {
-                    let second = trimmed.as_bytes().get(1).copied().unwrap_or(0).to_ascii_uppercase();
-                    second != b'N' || Self::starts_with_ci(trimmed, "UNLISTEN") || Self::starts_with_ci(trimmed, "UPDATE")
+                    let second = trimmed
+                        .as_bytes()
+                        .get(1)
+                        .copied()
+                        .unwrap_or(0)
+                        .to_ascii_uppercase();
+                    second != b'N'
+                        || Self::starts_with_ci(trimmed, "UNLISTEN")
+                        || Self::starts_with_ci(trimmed, "UPDATE")
                 }
                 // 'D' could be DELETE (standard) or DROP MODEL/PROCEDURE (extension)
                 b'D' => Self::starts_with_ci(trimmed, "DELETE"),
                 // 'S' could be SUBSCRIBE/SHOW (extension) or SELECT/SET (standard)
                 b'S' => {
-                    let second = trimmed.as_bytes().get(1).copied().unwrap_or(0).to_ascii_uppercase();
+                    let second = trimmed
+                        .as_bytes()
+                        .get(1)
+                        .copied()
+                        .unwrap_or(0)
+                        .to_ascii_uppercase();
                     second == b'E' // SELECT or SET
                 }
                 // 'R' could be REFRESH (extension) or ROLLBACK/RESET/REVOKE (standard)
@@ -2164,7 +2373,9 @@ impl Executor {
                 } else {
                     (false, rest.to_lowercase())
                 };
-                return Ok(vec![self.execute_drop_matview(&view_name, if_exists).await?]);
+                return Ok(vec![
+                    self.execute_drop_matview(&view_name, if_exists).await?,
+                ]);
             }
             // SHOW TABLE STATS <tablename> — display per-column statistics from ANALYZE.
             if upper.starts_with("SHOW TABLE STATS ") {
@@ -2189,14 +2400,17 @@ impl Executor {
             if upper.starts_with("SHOW MODELS") {
                 let registry = self.model_registry.read();
                 let models = registry.list_models();
-                let rows: Vec<Row> = models.iter().map(|m| {
-                    vec![
-                        Value::Text(m.name.clone()),
-                        Value::Text(format!("{:?}", m.format)),
-                        Value::Text(m.description.clone()),
-                        Value::Text(m.version.clone()),
-                    ]
-                }).collect();
+                let rows: Vec<Row> = models
+                    .iter()
+                    .map(|m| {
+                        vec![
+                            Value::Text(m.name.clone()),
+                            Value::Text(format!("{:?}", m.format)),
+                            Value::Text(m.description.clone()),
+                            Value::Text(m.version.clone()),
+                        ]
+                    })
+                    .collect();
                 return Ok(vec![ExecResult::Select {
                     columns: vec![
                         ("name".into(), DataType::Text),
@@ -2208,15 +2422,26 @@ impl Executor {
                 }]);
             }
             // CREATE PROCEDURE <name>([params]) LANGUAGE sql AS '<body>'
-            if upper.starts_with("CREATE PROCEDURE ") || upper.starts_with("CREATE OR REPLACE PROCEDURE ") {
+            if upper.starts_with("CREATE PROCEDURE ")
+                || upper.starts_with("CREATE OR REPLACE PROCEDURE ")
+            {
                 return Ok(vec![self.execute_create_procedure(trimmed)?]);
             }
             // DROP PROCEDURE <name>
             if upper.starts_with("DROP PROCEDURE ") {
-                let proc_name = trimmed[15..].trim().trim_end_matches(';').trim_matches('"').trim_matches('\'').to_lowercase();
+                let proc_name = trimmed[15..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_lowercase();
                 let removed = self.procedure_engine.write().unregister(&proc_name);
                 return Ok(vec![ExecResult::Command {
-                    tag: if removed { "DROP PROCEDURE".into() } else { "PROCEDURE NOT FOUND".into() },
+                    tag: if removed {
+                        "DROP PROCEDURE".into()
+                    } else {
+                        "PROCEDURE NOT FOUND".into()
+                    },
                     rows_affected: 0,
                 }]);
             }
@@ -2224,14 +2449,17 @@ impl Executor {
             if upper.starts_with("SHOW PROCEDURES") {
                 let eng = self.procedure_engine.read();
                 let procs = eng.list_procedures();
-                let rows: Vec<Row> = procs.iter().map(|m| {
-                    vec![
-                        Value::Text(m.name.clone()),
-                        Value::Text(format!("{:?}", m.language)),
-                        Value::Text(m.description.clone()),
-                        Value::Int64(m.param_names.len() as i64),
-                    ]
-                }).collect();
+                let rows: Vec<Row> = procs
+                    .iter()
+                    .map(|m| {
+                        vec![
+                            Value::Text(m.name.clone()),
+                            Value::Text(format!("{:?}", m.language)),
+                            Value::Text(m.description.clone()),
+                            Value::Int64(m.param_names.len() as i64),
+                        ]
+                    })
+                    .collect();
                 return Ok(vec![ExecResult::Select {
                     columns: vec![
                         ("name".into(), DataType::Text),
@@ -2250,13 +2478,16 @@ impl Executor {
             if upper.starts_with("SHOW BRANCHES") {
                 let mgr = self.branch_manager.read();
                 let branches = mgr.list_branches();
-                let rows: Vec<Row> = branches.iter().map(|b| {
-                    vec![
-                        Value::Int64(b.id as i64),
-                        Value::Text(b.name.clone()),
-                        Value::Bool(b.parent_id.is_none()),
-                    ]
-                }).collect();
+                let rows: Vec<Row> = branches
+                    .iter()
+                    .map(|b| {
+                        vec![
+                            Value::Int64(b.id as i64),
+                            Value::Text(b.name.clone()),
+                            Value::Bool(b.parent_id.is_none()),
+                        ]
+                    })
+                    .collect();
                 return Ok(vec![ExecResult::Select {
                     columns: vec![
                         ("id".into(), DataType::Int64),
@@ -2272,7 +2503,11 @@ impl Executor {
     }
 
     /// Execute pre-parsed statements with cluster routing and follower read checks.
-    async fn execute_statements_dispatch(&self, sql: &str, statements: Vec<Statement>) -> Result<Vec<ExecResult>, ExecError> {
+    async fn execute_statements_dispatch(
+        &self,
+        sql: &str,
+        statements: Vec<Statement>,
+    ) -> Result<Vec<ExecResult>, ExecError> {
         // Cluster-mode DML routing: followers forward to leader; leader appends to Raft log.
         // Skip entirely in standalone mode to avoid lock contention on the Raft mutex.
         #[cfg(feature = "server")]
@@ -2280,7 +2515,10 @@ impl Executor {
             let mode = { cluster_arc.read().mode() };
             if mode != crate::distributed::ClusterMode::Standalone {
                 let has_dml = statements.iter().any(|s| {
-                    matches!(s, Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_))
+                    matches!(
+                        s,
+                        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+                    )
                 });
                 if has_dml {
                     let (is_leader, leader_addr) = {
@@ -2330,7 +2568,11 @@ impl Executor {
     /// message over the cluster transport and awaits `ForwardDmlResponse`. Falls
     /// back to local execution when no replicator is configured (single-node mode).
     #[cfg(feature = "server")]
-    async fn forward_dml(&self, sql: &str, leader_addr: &str) -> Result<Vec<ExecResult>, ExecError> {
+    async fn forward_dml(
+        &self,
+        sql: &str,
+        leader_addr: &str,
+    ) -> Result<Vec<ExecResult>, ExecError> {
         let repl = self.raft_replicator.read().clone();
         if let Some(replicator) = repl {
             match replicator.forward_to_leader(sql, leader_addr).await {
@@ -2341,7 +2583,9 @@ impl Executor {
                     }]);
                 }
                 Err(e) => {
-                    return Err(ExecError::Runtime(format!("ForwardDml to leader failed: {e}")));
+                    return Err(ExecError::Runtime(format!(
+                        "ForwardDml to leader failed: {e}"
+                    )));
                 }
             }
         }
@@ -2391,7 +2635,10 @@ impl Executor {
         // Track whether this is a DML write operation that should invalidate query cache.
         let is_dml_write = matches!(
             &stmt,
-            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) | Statement::Truncate(_)
+            Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Delete(_)
+                | Statement::Truncate(_)
         );
 
         // Reject write operations when the memory watchdog has flagged critical pressure.
@@ -2407,7 +2654,9 @@ impl Executor {
         // change visibility boundaries).
         let is_txn_control = matches!(
             &stmt,
-            Statement::StartTransaction { .. } | Statement::Commit { .. } | Statement::Rollback { .. }
+            Statement::StartTransaction { .. }
+                | Statement::Commit { .. }
+                | Statement::Rollback { .. }
         );
 
         // Check if we're inside an active transaction. If so, skip query
@@ -2432,12 +2681,22 @@ impl Executor {
                     }
                     self.metrics.cache_misses.inc();
                 }
-                let result = self.execute_query(*query).await;
+                // Top-level statement: consume the plan-cache key hint set by
+                // parse_with_ast_cache()/execute_prepared() for THIS statement and
+                // pass it explicitly. Nested execute_query() calls never read the
+                // shared hint, so it cannot leak into a reentrant subquery.
+                let result = self
+                    .execute_query_planned(*query, self.take_plan_cache_key_hint())
+                    .await;
                 // Store successful SELECT results in the cache
                 if cacheable
-                    && let Ok(ExecResult::Select { ref columns, ref rows }) = result {
-                        self.query_cache_put(&sql_text, columns, rows);
-                    }
+                    && let Ok(ExecResult::Select {
+                        ref columns,
+                        ref rows,
+                    }) = result
+                {
+                    self.query_cache_put(&sql_text, columns, rows);
+                }
                 result
             }
             Statement::CreateTable(create) => self.execute_create_table(create).await,
@@ -2445,9 +2704,7 @@ impl Executor {
             Statement::Update(update) => self.execute_update(update).await,
             Statement::Delete(delete) => self.execute_delete(delete).await,
             Statement::Explain {
-                statement,
-                analyze,
-                ..
+                statement, analyze, ..
             } => self.execute_explain(*statement, analyze).await,
             Statement::Drop {
                 object_type,
@@ -2455,9 +2712,7 @@ impl Executor {
                 if_exists,
                 ..
             } => self.execute_drop(object_type, names, if_exists).await,
-            Statement::CreateIndex(create_index) => {
-                self.execute_create_index(create_index).await
-            }
+            Statement::CreateIndex(create_index) => self.execute_create_index(create_index).await,
             Statement::StartTransaction { ref modes, .. } => {
                 // Extract isolation level from BEGIN TRANSACTION ISOLATION LEVEL ...
                 for mode in modes {
@@ -2475,19 +2730,20 @@ impl Executor {
                 self.begin_transaction().await
             }
             Statement::Commit { .. } => self.commit_transaction().await,
-            Statement::Rollback { savepoint: Some(ref sp), .. } => {
-                self.execute_rollback_to_savepoint(&sp.value).await
-            }
+            Statement::Rollback {
+                savepoint: Some(ref sp),
+                ..
+            } => self.execute_rollback_to_savepoint(&sp.value).await,
             Statement::Rollback { .. } => self.rollback_transaction().await,
             Statement::Savepoint { name } => self.execute_savepoint(&name.value).await,
-            Statement::ReleaseSavepoint { name } => self.execute_release_savepoint(&name.value).await,
+            Statement::ReleaseSavepoint { name } => {
+                self.execute_release_savepoint(&name.value).await
+            }
             Statement::Set(set) => self.execute_set(set),
             Statement::ShowVariable { variable } => self.execute_show(variable),
             Statement::ShowTables { .. } => self.execute_show_tables().await,
             Statement::Truncate(truncate) => self.execute_truncate(truncate).await,
-            Statement::AlterTable(alter_table) => {
-                self.execute_alter_table(alter_table).await
-            }
+            Statement::AlterTable(alter_table) => self.execute_alter_table(alter_table).await,
             Statement::CreateView(create_view) if create_view.materialized => {
                 let view_name = create_view.name.to_string();
                 let sql = create_view.query.to_string();
@@ -2502,7 +2758,10 @@ impl Executor {
                         rows,
                         source_tables: source_tables.clone(),
                     };
-                    self.materialized_views.write().await.insert(view_name.clone(), mv);
+                    self.materialized_views
+                        .write()
+                        .await
+                        .insert(view_name.clone(), mv);
                     // Register write-time MV dependencies.
                     {
                         let mut deps = self.mv_deps.write().await;
@@ -2515,7 +2774,9 @@ impl Executor {
                         rows_affected: 0,
                     })
                 } else {
-                    Err(ExecError::Unsupported("materialized view query must return rows".into()))
+                    Err(ExecError::Unsupported(
+                        "materialized view query must return rows".into(),
+                    ))
                 }
             }
             Statement::CreateView(create_view) => {
@@ -2535,29 +2796,31 @@ impl Executor {
                     .await
             }
             Statement::Grant(grant) => {
-                self.execute_grant(grant.privileges, grant.objects, grant.grantees).await
+                self.execute_grant(grant.privileges, grant.objects, grant.grantees)
+                    .await
             }
             Statement::Revoke(revoke) => {
-                self.execute_revoke(revoke.privileges, revoke.objects, revoke.grantees).await
+                self.execute_revoke(revoke.privileges, revoke.objects, revoke.grantees)
+                    .await
             }
-            Statement::CreateRole(create_role) => {
-                self.execute_create_role(create_role).await
-            }
+            Statement::CreateRole(create_role) => self.execute_create_role(create_role).await,
             Statement::AlterRole { name, operation } => {
                 self.execute_alter_role(&name.to_string(), operation).await
             }
-            Statement::Copy { source, to, target, options, values, .. } => {
-                self.execute_copy(source, to, target, options, values).await
-            }
+            Statement::Copy {
+                source,
+                to,
+                target,
+                options,
+                values,
+                ..
+            } => self.execute_copy(source, to, target, options, values).await,
             Statement::NOTIFY { channel, payload } => {
-                self.execute_notify(&channel.value, payload.as_deref()).await
+                self.execute_notify(&channel.value, payload.as_deref())
+                    .await
             }
-            Statement::LISTEN { channel } => {
-                self.execute_listen(&channel.value).await
-            }
-            Statement::UNLISTEN { channel } => {
-                self.execute_unlisten(&channel.value).await
-            }
+            Statement::LISTEN { channel } => self.execute_listen(&channel.value).await,
+            Statement::UNLISTEN { channel } => self.execute_unlisten(&channel.value).await,
             Statement::Declare { stmts } => {
                 if let Some(stmt) = stmts.first() {
                     self.execute_declare_cursor(stmt).await
@@ -2565,32 +2828,32 @@ impl Executor {
                     Err(ExecError::Unsupported("empty DECLARE".into()))
                 }
             }
-            Statement::Fetch { name, direction, .. } => {
-                self.execute_fetch_cursor(&name.value, &direction).await
-            }
-            Statement::Close { cursor } => {
-                self.execute_close_cursor(cursor).await
-            }
-            Statement::CreateFunction(create_fn) => {
-                self.execute_create_function(create_fn).await
-            }
-            Statement::Analyze(analyze) => {
-                self.execute_analyze(&analyze).await
-            }
+            Statement::Fetch {
+                name, direction, ..
+            } => self.execute_fetch_cursor(&name.value, &direction).await,
+            Statement::Close { cursor } => self.execute_close_cursor(cursor).await,
+            Statement::CreateFunction(create_fn) => self.execute_create_function(create_fn).await,
+            Statement::Analyze(analyze) => self.execute_analyze(&analyze).await,
             Statement::DropFunction(drop_fn) => {
-                self.execute_drop_function(&drop_fn.func_desc, drop_fn.if_exists).await
+                self.execute_drop_function(&drop_fn.func_desc, drop_fn.if_exists)
+                    .await
             }
-            Statement::Prepare { name, statement, .. } => {
-                self.execute_prepare(&name.value, *statement).await
-            }
-            Statement::Execute { name, parameters, .. } => {
+            Statement::Prepare {
+                name, statement, ..
+            } => self.execute_prepare(&name.value, *statement).await,
+            Statement::Execute {
+                name, parameters, ..
+            } => {
                 let exec_name = name.map(|n| n.to_string()).unwrap_or_default();
                 self.execute_execute(&exec_name, &parameters).await
             }
             Statement::Deallocate { name, .. } => {
                 let sess = self.current_session();
                 sess.prepared_stmts.write().await.remove(&name.value);
-                Ok(ExecResult::Command { tag: "DEALLOCATE".into(), rows_affected: 0 })
+                Ok(ExecResult::Command {
+                    tag: "DEALLOCATE".into(),
+                    rows_affected: 0,
+                })
             }
             Statement::CreateSchema { schema_name, .. } => {
                 let name = schema_name.to_string();
@@ -2601,18 +2864,13 @@ impl Executor {
                 })
             }
             Statement::Call(func) => self.execute_call(func).await,
-            Statement::Vacuum(ref vacuum_stmt) => {
-                self.execute_vacuum(vacuum_stmt).await
-            }
-            Statement::Discard { object_type } => {
-                self.execute_discard(object_type).await
-            }
-            Statement::Reset(reset_stmt) => {
-                self.execute_reset(reset_stmt).await
-            }
-            Statement::CreateType { name, representation } => {
-                self.execute_create_type(name, representation).await
-            }
+            Statement::Vacuum(ref vacuum_stmt) => self.execute_vacuum(vacuum_stmt).await,
+            Statement::Discard { object_type } => self.execute_discard(object_type).await,
+            Statement::Reset(reset_stmt) => self.execute_reset(reset_stmt).await,
+            Statement::CreateType {
+                name,
+                representation,
+            } => self.execute_create_type(name, representation).await,
             Statement::CreateTrigger(ct) => {
                 let timing = match ct.period {
                     Some(ast::TriggerPeriod::Before) => TriggerTiming::Before,
@@ -2620,12 +2878,16 @@ impl Executor {
                     Some(ast::TriggerPeriod::InsteadOf) => TriggerTiming::InsteadOf,
                     Some(ast::TriggerPeriod::For) => TriggerTiming::After,
                 };
-                let events: Vec<TriggerEvent> = ct.events.iter().map(|e| match e {
-                    ast::TriggerEvent::Insert => TriggerEvent::Insert,
-                    ast::TriggerEvent::Update(_) => TriggerEvent::Update,
-                    ast::TriggerEvent::Delete => TriggerEvent::Delete,
-                    _ => TriggerEvent::Insert,
-                }).collect();
+                let events: Vec<TriggerEvent> = ct
+                    .events
+                    .iter()
+                    .map(|e| match e {
+                        ast::TriggerEvent::Insert => TriggerEvent::Insert,
+                        ast::TriggerEvent::Update(_) => TriggerEvent::Update,
+                        ast::TriggerEvent::Delete => TriggerEvent::Delete,
+                        _ => TriggerEvent::Insert,
+                    })
+                    .collect();
                 let for_each_row = matches!(
                     ct.trigger_object,
                     Some(ast::TriggerObjectKind::ForEach(ast::TriggerObject::Row))
@@ -2645,7 +2907,8 @@ impl Executor {
                     events,
                     for_each_row,
                     body,
-                ).await
+                )
+                .await
             }
             Statement::DropTrigger(dt) => {
                 let trigger_name = dt.trigger_name.to_string();
@@ -2653,16 +2916,18 @@ impl Executor {
                 let before = triggers.len();
                 triggers.retain(|t| t.name != trigger_name);
                 if triggers.len() == before && !dt.if_exists {
-                    return Err(ExecError::Unsupported(
-                        format!("trigger '{trigger_name}' does not exist"),
-                    ));
+                    return Err(ExecError::Unsupported(format!(
+                        "trigger '{trigger_name}' does not exist"
+                    )));
                 }
                 Ok(ExecResult::Command {
                     tag: "DROP TRIGGER".into(),
                     rows_affected: 0,
                 })
             }
-            _ => Err(ExecError::Unsupported("statement type not yet supported".into())),
+            _ => Err(ExecError::Unsupported(
+                "statement type not yet supported".into(),
+            )),
         };
 
         // Record metrics: query type, duration, and row counts.
@@ -2775,15 +3040,17 @@ impl Executor {
 
         // Check if role has privilege on this specific table
         if let Some(table_privs) = role.privileges.get(table_name)
-            && (table_privs.contains(&Privilege::All) || table_privs.contains(&required_priv)) {
-                return true;
-            }
+            && (table_privs.contains(&Privilege::All) || table_privs.contains(&required_priv))
+        {
+            return true;
+        }
 
         // Check if role has privilege on all tables (wildcard "*")
         if let Some(wildcard_privs) = role.privileges.get("*")
-            && (wildcard_privs.contains(&Privilege::All) || wildcard_privs.contains(&required_priv)) {
-                return true;
-            }
+            && (wildcard_privs.contains(&Privilege::All) || wildcard_privs.contains(&required_priv))
+        {
+            return true;
+        }
 
         false
     }
@@ -2812,7 +3079,9 @@ impl Executor {
             col_meta
                 .iter()
                 .position(|c| {
-                    c.table.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(tbl))
+                    c.table
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case(tbl))
                         && c.name == name
                 })
                 .ok_or_else(|| ExecError::ColumnNotFound(format!("{tbl}.{name}")))
@@ -2865,13 +3134,14 @@ impl Executor {
 
         // Must have a LIMIT
         let k = match limit_clause {
-            Some(ast::LimitClause::LimitOffset { limit: Some(limit_expr), .. }) => {
-                match self.eval_const_expr(limit_expr) {
-                    Ok(Value::Int32(n)) => n as usize,
-                    Ok(Value::Int64(n)) => n as usize,
-                    _ => return None,
-                }
-            }
+            Some(ast::LimitClause::LimitOffset {
+                limit: Some(limit_expr),
+                ..
+            }) => match self.eval_const_expr(limit_expr) {
+                Ok(Value::Int32(n)) => n as usize,
+                Ok(Value::Int64(n)) => n as usize,
+                _ => return None,
+            },
             _ => return None,
         };
 
@@ -2939,11 +3209,9 @@ impl Executor {
             VectorIndexKind::Hnsw(hnsw) => {
                 if valid_row_ids.len() < rows.len() || valid_row_ids.len() < hnsw.len() {
                     // Filtered search: only return IDs present in valid rows
-                    let results = hnsw.search_filtered(
-                        &vector::Vector::new(query_vec),
-                        k,
-                        |id| valid_row_ids.contains(&id),
-                    );
+                    let results = hnsw.search_filtered(&vector::Vector::new(query_vec), k, |id| {
+                        valid_row_ids.contains(&id)
+                    });
                     results.into_iter().map(|(id, _)| id).collect()
                 } else {
                     let results = hnsw.search(&vector::Vector::new(query_vec), k);
@@ -2952,11 +3220,8 @@ impl Executor {
             }
             VectorIndexKind::IvfFlat(ivf) => {
                 if valid_row_ids.len() < rows.len() || valid_row_ids.len() < ivf.len() {
-                    let results = ivf.search_filtered(
-                        &query_vec,
-                        k,
-                        |id| valid_row_ids.contains(&(id as u64)),
-                    );
+                    let results = ivf
+                        .search_filtered(&query_vec, k, |id| valid_row_ids.contains(&(id as u64)));
                     results.into_iter().map(|(id, _)| id as u64).collect()
                 } else {
                     let results = ivf.search(&query_vec, k);
@@ -2966,7 +3231,8 @@ impl Executor {
         };
 
         // Reorder rows: return indexed rows in order of proximity
-        let reordered: Vec<Row> = result_ids.iter()
+        let reordered: Vec<Row> = result_ids
+            .iter()
             .filter_map(|&id| rows.get(id as usize).cloned())
             .collect();
 
@@ -2984,21 +3250,22 @@ impl Executor {
             }
             if let Some(col_idx) = table_def.column_index(&entry.column_name)
                 && col_idx < row.len()
-                    && let Value::Vector(v) = &row[col_idx] {
-                        match &mut entry.kind {
-                            VectorIndexKind::Hnsw(hnsw) => {
-                                let row_id = hnsw.len() as u64;
-                                hnsw.insert(row_id, vector::Vector::new(v.clone()));
-                                wal_inserts.push((idx_name.clone(), row_id, v.clone()));
-                            }
-                            VectorIndexKind::IvfFlat(ivf) => {
-                                if ivf.is_trained() {
-                                    let row_id = ivf.len();
-                                    ivf.add(row_id, v.clone());
-                                }
-                            }
+                && let Value::Vector(v) = &row[col_idx]
+            {
+                match &mut entry.kind {
+                    VectorIndexKind::Hnsw(hnsw) => {
+                        let row_id = hnsw.len() as u64;
+                        hnsw.insert(row_id, vector::Vector::new(v.clone()));
+                        wal_inserts.push((idx_name.clone(), row_id, v.clone()));
+                    }
+                    VectorIndexKind::IvfFlat(ivf) => {
+                        if ivf.is_trained() {
+                            let row_id = ivf.len();
+                            ivf.add(row_id, v.clone());
                         }
                     }
+                }
+            }
         }
         drop(indexes);
         for (idx_name, row_id, v) in wal_inserts {
@@ -3008,35 +3275,49 @@ impl Executor {
 
     /// Save vector index name → (table, column) metadata sidecar for WAL recovery.
     fn save_vector_index_meta(&self) {
-        if self.vector_wal.is_none() { return; }
+        if self.vector_wal.is_none() {
+            return;
+        }
         let indexes = self.vector_indexes.read();
-        let meta: HashMap<&str, (&str, &str)> = indexes.iter()
-            .map(|(name, entry)| (name.as_str(), (entry.table_name.as_str(), entry.column_name.as_str())))
+        let meta: HashMap<&str, (&str, &str)> = indexes
+            .iter()
+            .map(|(name, entry)| {
+                (
+                    name.as_str(),
+                    (entry.table_name.as_str(), entry.column_name.as_str()),
+                )
+            })
             .collect();
         if let Some(ref wal) = self.vector_wal {
             // Write sidecar JSON next to the WAL
             let meta_path = wal.dir().join("index_meta.json");
             if let Ok(json) = serde_json::to_string(&meta)
-                && let Err(e) = std::fs::write(&meta_path, &json) {
-                    eprintln!("executor: failed to save vector index meta to {}: {e}", meta_path.display());
-                }
+                && let Err(e) = std::fs::write(&meta_path, &json)
+            {
+                eprintln!(
+                    "executor: failed to save vector index meta to {}: {e}",
+                    meta_path.display()
+                );
+            }
         }
     }
 
     /// Log a vector insert to WAL (no-op if WAL is not configured).
     fn wal_log_vector_insert(&self, index_name: &str, id: u64, vector: &[f32]) {
         if let Some(ref wal) = self.vector_wal
-            && let Err(e) = wal.log_insert(index_name, id, vector, "") {
-                eprintln!("vector WAL: failed to log insert {index_name}/{id}: {e}");
-            }
+            && let Err(e) = wal.log_insert(index_name, id, vector, "")
+        {
+            eprintln!("vector WAL: failed to log insert {index_name}/{id}: {e}");
+        }
     }
 
     /// Log a vector delete to WAL (no-op if WAL is not configured).
     fn wal_log_vector_delete(&self, index_name: &str, id: u64) {
         if let Some(ref wal) = self.vector_wal
-            && let Err(e) = wal.log_delete(index_name, id) {
-                eprintln!("vector WAL: failed to log delete {index_name}/{id}: {e}");
-            }
+            && let Err(e) = wal.log_delete(index_name, id)
+        {
+            eprintln!("vector WAL: failed to log delete {index_name}/{id}: {e}");
+        }
     }
 
     /// Mark a row as deleted in any live vector indexes on the table.
@@ -3064,33 +3345,46 @@ impl Executor {
     }
 
     /// Add a newly inserted row to any live encrypted indexes on the table.
-    fn update_encrypted_indexes_on_insert(&self, table_name: &str, row: &Row, table_def: &TableDef) {
+    fn update_encrypted_indexes_on_insert(
+        &self,
+        table_name: &str,
+        row: &Row,
+        table_def: &TableDef,
+    ) {
         let mut indexes = self.encrypted_indexes.write();
         for entry in indexes.values_mut() {
             if entry.table_name != table_name {
                 continue;
             }
             if let Some(col_idx) = table_def.column_index(&entry.column_name)
-                && col_idx < row.len() {
-                    let plaintext = self.value_to_text_string(&row[col_idx]);
-                    let row_id = entry.index.len() as u64;
-                    entry.index.insert(plaintext.as_bytes(), row_id);
-                }
+                && col_idx < row.len()
+            {
+                let plaintext = self.value_to_text_string(&row[col_idx]);
+                let row_id = entry.index.len() as u64;
+                entry.index.insert(plaintext.as_bytes(), row_id);
+            }
         }
     }
 
     /// Remove a row from any live encrypted indexes on the table.
-    fn remove_from_encrypted_indexes(&self, table_name: &str, row: &Row, row_pos: usize, table_def: &TableDef) {
+    fn remove_from_encrypted_indexes(
+        &self,
+        table_name: &str,
+        row: &Row,
+        row_pos: usize,
+        table_def: &TableDef,
+    ) {
         let mut indexes = self.encrypted_indexes.write();
         for entry in indexes.values_mut() {
             if entry.table_name != table_name {
                 continue;
             }
             if let Some(col_idx) = table_def.column_index(&entry.column_name)
-                && col_idx < row.len() {
-                    let plaintext = self.value_to_text_string(&row[col_idx]);
-                    entry.index.remove(plaintext.as_bytes(), row_pos as u64);
-                }
+                && col_idx < row.len()
+            {
+                let plaintext = self.value_to_text_string(&row[col_idx]);
+                entry.index.remove(plaintext.as_bytes(), row_pos as u64);
+            }
         }
     }
 
@@ -3164,9 +3458,7 @@ impl Executor {
             if let Err(e) = self.storage.insert("_old", row.clone()).await {
                 eprintln!("trigger: failed to insert into _old table: {e}");
             }
-            self.table_columns
-                .write()
-                .insert("_old".to_string(), cols);
+            self.table_columns.write().insert("_old".to_string(), cols);
         }
 
         for trigger in matching {
@@ -3216,13 +3508,14 @@ impl Executor {
             let mut names = Vec::new();
             for stmt in &stmts {
                 if let Statement::Query(q) = stmt
-                    && let SetExpr::Select(sel) = q.body.as_ref() {
-                        for from in &sel.from {
-                            if let TableFactor::Table { name, .. } = &from.relation {
-                                names.push(name.to_string());
-                            }
+                    && let SetExpr::Select(sel) = q.body.as_ref()
+                {
+                    for from in &sel.from {
+                        if let TableFactor::Table { name, .. } = &from.relation {
+                            names.push(name.to_string());
                         }
                     }
+                }
             }
             names
         } else {
@@ -3258,7 +3551,9 @@ impl Executor {
             ""
         };
         let id: u64 = id_str.parse().map_err(|_| {
-            ExecError::Unsupported(format!("UNSUBSCRIBE requires a numeric subscription ID, got '{id_str}'"))
+            ExecError::Unsupported(format!(
+                "UNSUBSCRIBE requires a numeric subscription ID, got '{id_str}'"
+            ))
         })?;
 
         let mut mgr = self.subscription_manager.write();
@@ -3281,10 +3576,12 @@ impl Executor {
     #[cfg(feature = "server")]
     fn execute_fetch_subscription(&self, sql: &str) -> Result<ExecResult, ExecError> {
         // Parse: FETCH SUBSCRIPTION <id> [LIMIT <n>]
-        let rest = sql.trim()
+        let rest = sql
+            .trim()
             .strip_prefix("FETCH SUBSCRIPTION")
             .or_else(|| sql.trim().strip_prefix("fetch subscription"))
-            .unwrap_or("").trim();
+            .unwrap_or("")
+            .trim();
 
         // Split off optional LIMIT clause
         let upper_rest = rest.to_uppercase();
@@ -3334,18 +3631,25 @@ impl Executor {
     /// SHOW MEMORY — return per-subsystem allocation table.
     fn execute_show_memory(&self) -> ExecResult {
         let alloc = self.memory_allocator.lock();
-        let mut rows: Vec<Row> = alloc.all_allocations().iter().map(|a| {
-            vec![
-                Value::Text(a.name.clone()),
-                Value::Int64(a.current_bytes as i64),
-                Value::Int64(a.peak_bytes as i64),
-                Value::Int64(a.allocation_count as i64),
-                Value::Text(format!("{:?}", a.priority)),
-            ]
-        }).collect();
+        let mut rows: Vec<Row> = alloc
+            .all_allocations()
+            .iter()
+            .map(|a| {
+                vec![
+                    Value::Text(a.name.clone()),
+                    Value::Int64(a.current_bytes as i64),
+                    Value::Int64(a.peak_bytes as i64),
+                    Value::Int64(a.allocation_count as i64),
+                    Value::Text(format!("{:?}", a.priority)),
+                ]
+            })
+            .collect();
         rows.sort_by(|a, b| {
-            if let (Value::Text(na), Value::Text(nb)) = (&a[0], &b[0]) { na.cmp(nb) }
-            else { std::cmp::Ordering::Equal }
+            if let (Value::Text(na), Value::Text(nb)) = (&a[0], &b[0]) {
+                na.cmp(nb)
+            } else {
+                std::cmp::Ordering::Equal
+            }
         });
         ExecResult::Select {
             columns: vec![
@@ -3403,7 +3707,10 @@ impl Executor {
             }
         }
 
-        ExecResult::Command { tag: "MEMORY PRESSURE".into(), rows_affected: 0 }
+        ExecResult::Command {
+            tag: "MEMORY PRESSURE".into(),
+            rows_affected: 0,
+        }
     }
 
     // ========================================================================
@@ -3419,31 +3726,88 @@ impl Executor {
             "information_schema.tables" => {
                 let tables = self.catalog.list_tables().await;
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "table_catalog".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "table_schema".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "table_name".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "table_type".into(), dtype: DataType::Text },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "table_catalog".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "table_schema".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "table_name".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "table_type".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
-                let rows: Vec<Row> = tables.iter().map(|t| vec![
-                    Value::Text("nucleus".into()),
-                    Value::Text("public".into()),
-                    Value::Text(t.name.clone()),
-                    Value::Text("BASE TABLE".into()),
-                ]).collect();
+                let rows: Vec<Row> = tables
+                    .iter()
+                    .map(|t| {
+                        vec![
+                            Value::Text("nucleus".into()),
+                            Value::Text("public".into()),
+                            Value::Text(t.name.clone()),
+                            Value::Text("BASE TABLE".into()),
+                        ]
+                    })
+                    .collect();
                 Ok(Some((cols, rows)))
             }
             "information_schema.columns" => {
                 let tables = self.catalog.list_tables().await;
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "table_catalog".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "table_schema".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "table_name".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "column_name".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "ordinal_position".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "column_default".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "is_nullable".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "data_type".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "udt_name".into(), dtype: DataType::Text },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "table_catalog".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "table_schema".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "table_name".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "column_name".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "ordinal_position".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "column_default".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "is_nullable".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "data_type".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "udt_name".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
                 let mut rows = Vec::new();
                 for t in &tables {
@@ -3454,7 +3818,9 @@ impl Executor {
                             Value::Text(t.name.clone()),
                             Value::Text(c.name.clone()),
                             Value::Int32((i + 1) as i32),
-                            c.default_expr.as_ref().map_or(Value::Null, |e| Value::Text(e.clone())),
+                            c.default_expr
+                                .as_ref()
+                                .map_or(Value::Null, |e| Value::Text(e.clone())),
                             Value::Text(if c.nullable { "YES" } else { "NO" }.into()),
                             Value::Text(c.data_type.to_string()),
                             Value::Text(datatype_to_udt_name(&c.data_type).into()),
@@ -3465,24 +3831,64 @@ impl Executor {
             }
             "information_schema.schemata" => {
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "catalog_name".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "schema_name".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "schema_owner".into(), dtype: DataType::Text },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "catalog_name".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "schema_name".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "schema_owner".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
                 let rows = vec![
-                    vec![Value::Text("nucleus".into()), Value::Text("public".into()), Value::Text("nucleus".into())],
-                    vec![Value::Text("nucleus".into()), Value::Text("information_schema".into()), Value::Text("nucleus".into())],
-                    vec![Value::Text("nucleus".into()), Value::Text("pg_catalog".into()), Value::Text("nucleus".into())],
+                    vec![
+                        Value::Text("nucleus".into()),
+                        Value::Text("public".into()),
+                        Value::Text("nucleus".into()),
+                    ],
+                    vec![
+                        Value::Text("nucleus".into()),
+                        Value::Text("information_schema".into()),
+                        Value::Text("nucleus".into()),
+                    ],
+                    vec![
+                        Value::Text("nucleus".into()),
+                        Value::Text("pg_catalog".into()),
+                        Value::Text("nucleus".into()),
+                    ],
                 ];
                 Ok(Some((cols, rows)))
             }
             "pg_catalog.pg_tables" | "pg_tables" => {
                 let tables = self.catalog.list_tables().await;
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "schemaname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "tablename".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "tableowner".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "hasindexes".into(), dtype: DataType::Bool },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "schemaname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "tablename".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "tableowner".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "hasindexes".into(),
+                        dtype: DataType::Bool,
+                    },
                 ];
                 let mut rows = Vec::new();
                 for t in &tables {
@@ -3499,31 +3905,74 @@ impl Executor {
             "pg_catalog.pg_indexes" | "pg_indexes" => {
                 let indexes = self.catalog.get_all_indexes().await;
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "schemaname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "tablename".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "indexname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "indexdef".into(), dtype: DataType::Text },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "schemaname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "tablename".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indexname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indexdef".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
-                let rows: Vec<Row> = indexes.iter().map(|idx| vec![
-                    Value::Text("public".into()),
-                    Value::Text(idx.table_name.clone()),
-                    Value::Text(idx.name.clone()),
-                    Value::Text(format!(
-                        "CREATE {}INDEX {} ON {} USING {} ({})",
-                        if idx.unique { "UNIQUE " } else { "" },
-                        idx.name, idx.table_name, idx.index_type,
-                        idx.columns.join(", ")
-                    )),
-                ]).collect();
+                let rows: Vec<Row> = indexes
+                    .iter()
+                    .map(|idx| {
+                        vec![
+                            Value::Text("public".into()),
+                            Value::Text(idx.table_name.clone()),
+                            Value::Text(idx.name.clone()),
+                            Value::Text(format!(
+                                "CREATE {}INDEX {} ON {} USING {} ({})",
+                                if idx.unique { "UNIQUE " } else { "" },
+                                idx.name,
+                                idx.table_name,
+                                idx.index_type,
+                                idx.columns.join(", ")
+                            )),
+                        ]
+                    })
+                    .collect();
                 Ok(Some((cols, rows)))
             }
             "pg_catalog.pg_database" | "pg_database" => {
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "oid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "datname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "datdba".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "encoding".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "datcollate".into(), dtype: DataType::Text },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "oid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "datname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "datdba".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "encoding".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "datcollate".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
                 let rows = vec![vec![
                     Value::Int32(1),
@@ -3537,12 +3986,36 @@ impl Executor {
             "pg_catalog.pg_type" | "pg_type" => {
                 let tables = self.catalog.list_tables().await;
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "oid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "typname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "typnamespace".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "typlen".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "typtype".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "typcategory".into(), dtype: DataType::Text },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "oid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typnamespace".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typlen".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typtype".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typcategory".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
                 let mut seen = std::collections::HashSet::new();
                 let mut rows = Vec::new();
@@ -3580,11 +4053,31 @@ impl Executor {
                 let tables = self.catalog.list_tables().await;
                 let indexes = self.catalog.get_all_indexes().await;
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "oid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "relname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "relnamespace".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "relkind".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "reltuples".into(), dtype: DataType::Float64 },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "oid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relnamespace".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relkind".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "reltuples".into(),
+                        dtype: DataType::Float64,
+                    },
                 ];
                 let mut rows = Vec::new();
                 for (i, t) in tables.iter().enumerate() {
@@ -3611,26 +4104,65 @@ impl Executor {
             }
             "pg_catalog.pg_namespace" | "pg_namespace" => {
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "oid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "nspname".into(), dtype: DataType::Text },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "oid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "nspname".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
                 let rows = vec![
                     vec![Value::Int32(11), Value::Text("pg_catalog".into())],
                     vec![Value::Int32(2200), Value::Text("public".into())],
-                    vec![Value::Int32(13100), Value::Text("information_schema".into())],
+                    vec![
+                        Value::Int32(13100),
+                        Value::Text("information_schema".into()),
+                    ],
                 ];
                 Ok(Some((cols, rows)))
             }
             "pg_catalog.pg_proc" | "pg_proc" => {
                 let functions = self.functions.read();
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "oid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "proname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "pronamespace".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "prorettype".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "pronargs".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "proargtypes".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "prosrc".into(), dtype: DataType::Text },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "oid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "proname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "pronamespace".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "prorettype".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "pronargs".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "proargtypes".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "prosrc".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
                 let mut rows = Vec::new();
                 for (i, (fname, fdef)) in functions.iter().enumerate() {
@@ -3643,7 +4175,9 @@ impl Executor {
                         0 // no return type (procedure)
                     };
                     let pronargs = fdef.params.len() as i32;
-                    let proargtypes = fdef.params.iter()
+                    let proargtypes = fdef
+                        .params
+                        .iter()
                         .map(|(_, dt)| {
                             let (oid, _, _, _) = pg_type_info(dt);
                             oid.to_string()
@@ -3665,33 +4199,87 @@ impl Executor {
             "pg_catalog.pg_roles" | "pg_roles" => {
                 let roles = self.roles.read().await;
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "oid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "rolname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "rolsuper".into(), dtype: DataType::Bool },
-                    ColMeta { table: Some(label.into()), name: "rolinherit".into(), dtype: DataType::Bool },
-                    ColMeta { table: Some(label.into()), name: "rolcreaterole".into(), dtype: DataType::Bool },
-                    ColMeta { table: Some(label.into()), name: "rolcreatedb".into(), dtype: DataType::Bool },
-                    ColMeta { table: Some(label.into()), name: "rolcanlogin".into(), dtype: DataType::Bool },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "oid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "rolname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "rolsuper".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "rolinherit".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "rolcreaterole".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "rolcreatedb".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "rolcanlogin".into(),
+                        dtype: DataType::Bool,
+                    },
                 ];
-                let rows: Vec<Row> = roles.values().enumerate().map(|(i, r)| vec![
-                    Value::Int32(10 + i as i32),
-                    Value::Text(r.name.clone()),
-                    Value::Bool(r.is_superuser),
-                    Value::Bool(true),
-                    Value::Bool(r.is_superuser),
-                    Value::Bool(r.is_superuser),
-                    Value::Bool(r.can_login),
-                ]).collect();
+                let rows: Vec<Row> = roles
+                    .values()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        vec![
+                            Value::Int32(10 + i as i32),
+                            Value::Text(r.name.clone()),
+                            Value::Bool(r.is_superuser),
+                            Value::Bool(true),
+                            Value::Bool(r.is_superuser),
+                            Value::Bool(r.is_superuser),
+                            Value::Bool(r.can_login),
+                        ]
+                    })
+                    .collect();
                 Ok(Some((cols, rows)))
             }
             "pg_catalog.pg_attribute" | "pg_attribute" => {
                 let tables = self.catalog.list_tables().await;
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "attrelid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "attname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "atttypid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "attnum".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "attnotnull".into(), dtype: DataType::Bool },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attrelid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "atttypid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attnum".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attnotnull".into(),
+                        dtype: DataType::Bool,
+                    },
                 ];
                 let mut rows = Vec::new();
                 for (ti, t) in tables.iter().enumerate() {
@@ -3713,29 +4301,59 @@ impl Executor {
                 let tables = self.catalog.list_tables().await;
                 let indexes = self.catalog.get_all_indexes().await;
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "indexrelid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "indrelid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "indisunique".into(), dtype: DataType::Bool },
-                    ColMeta { table: Some(label.into()), name: "indisprimary".into(), dtype: DataType::Bool },
-                    ColMeta { table: Some(label.into()), name: "indkey".into(), dtype: DataType::Text },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indexrelid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indrelid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indisunique".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indisprimary".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indkey".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
-                let table_oid_map: HashMap<String, i32> = tables.iter().enumerate()
+                let table_oid_map: HashMap<String, i32> = tables
+                    .iter()
+                    .enumerate()
                     .map(|(i, t)| (t.name.clone(), 16384 + i as i32))
                     .collect();
                 let mut rows = Vec::new();
                 for (i, idx) in indexes.iter().enumerate() {
                     let index_oid = 16384 + tables.len() as i32 + i as i32;
                     let table_oid = table_oid_map.get(&idx.table_name).copied().unwrap_or(0);
-                    let indkey = if let Some(tdef) = tables.iter().find(|t| t.name == idx.table_name) {
-                        idx.columns.iter().map(|col| {
-                            tdef.columns.iter().position(|c| c.name == *col)
-                                .map(|p| (p + 1).to_string())
-                                .unwrap_or_else(|| "0".into())
-                        }).collect::<Vec<_>>().join(" ")
-                    } else {
-                        "0".into()
-                    };
-                    let is_primary = tables.iter()
+                    let indkey =
+                        if let Some(tdef) = tables.iter().find(|t| t.name == idx.table_name) {
+                            idx.columns
+                                .iter()
+                                .map(|col| {
+                                    tdef.columns
+                                        .iter()
+                                        .position(|c| c.name == *col)
+                                        .map(|p| (p + 1).to_string())
+                                        .unwrap_or_else(|| "0".into())
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        } else {
+                            "0".into()
+                        };
+                    let is_primary = tables
+                        .iter()
                         .find(|t| t.name == idx.table_name)
                         .and_then(|t| t.primary_key_columns())
                         .is_some_and(|pk_cols| pk_cols == idx.columns.as_slice());
@@ -3753,22 +4371,45 @@ impl Executor {
                 let sess = self.current_session();
                 let settings = sess.settings.read();
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "name".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "setting".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "unit".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "category".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "short_desc".into(), dtype: DataType::Text },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "name".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "setting".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "unit".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "category".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "short_desc".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
-                let mut rows: Vec<Row> = settings.iter().map(|(k, v)| {
-                    let (unit, category, desc) = pg_setting_metadata(k);
-                    vec![
-                        Value::Text(k.clone()),
-                        Value::Text(v.clone()),
-                        Value::Text(unit.into()),
-                        Value::Text(category.into()),
-                        Value::Text(desc.into()),
-                    ]
-                }).collect();
+                let mut rows: Vec<Row> = settings
+                    .iter()
+                    .map(|(k, v)| {
+                        let (unit, category, desc) = pg_setting_metadata(k);
+                        vec![
+                            Value::Text(k.clone()),
+                            Value::Text(v.clone()),
+                            Value::Text(unit.into()),
+                            Value::Text(category.into()),
+                            Value::Text(desc.into()),
+                        ]
+                    })
+                    .collect();
                 rows.sort_by(|a, b| {
                     if let (Value::Text(an), Value::Text(bn)) = (&a[0], &b[0]) {
                         an.cmp(bn)
@@ -3781,17 +4422,48 @@ impl Executor {
             // ============================================================
             // pg_stat_* views — monitoring tool compatibility
             // ============================================================
-
             "pg_stat_activity" | "pg_catalog.pg_stat_activity" => {
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "datid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "datname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "pid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "usename".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "application_name".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "state".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "query".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "backend_start".into(), dtype: DataType::Text },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "datid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "datname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "pid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "usename".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "application_name".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "state".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "query".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "backend_start".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
                 // Return a single row representing the current session
                 let pid = std::process::id() as i32;
@@ -3811,18 +4483,66 @@ impl Executor {
             "pg_stat_user_tables" | "pg_catalog.pg_stat_user_tables" => {
                 let tables = self.catalog.list_tables().await;
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "relid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "schemaname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "relname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "seq_scan".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "seq_tup_read".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "idx_scan".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "idx_tup_fetch".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "n_tup_ins".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "n_tup_upd".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "n_tup_del".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "n_live_tup".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "n_dead_tup".into(), dtype: DataType::Int64 },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "schemaname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "seq_scan".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "seq_tup_read".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "idx_scan".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "idx_tup_fetch".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "n_tup_ins".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "n_tup_upd".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "n_tup_del".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "n_live_tup".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "n_dead_tup".into(),
+                        dtype: DataType::Int64,
+                    },
                 ];
                 let mut rows = Vec::new();
                 for (i, t) in tables.iter().enumerate() {
@@ -3847,14 +4567,46 @@ impl Executor {
             "pg_stat_user_indexes" | "pg_catalog.pg_stat_user_indexes" => {
                 let tables = self.catalog.list_tables().await;
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "relid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "indexrelid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "schemaname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "relname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "indexrelname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "idx_scan".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "idx_tup_read".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "idx_tup_fetch".into(), dtype: DataType::Int64 },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indexrelid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "schemaname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indexrelname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "idx_scan".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "idx_tup_read".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "idx_tup_fetch".into(),
+                        dtype: DataType::Int64,
+                    },
                 ];
                 let mut rows = Vec::new();
                 let mut idx_id = 1;
@@ -3880,32 +4632,80 @@ impl Executor {
             "pg_stat_database" | "pg_catalog.pg_stat_database" => {
                 let tables = self.catalog.list_tables().await;
                 let cols = vec![
-                    ColMeta { table: Some(label.into()), name: "datid".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "datname".into(), dtype: DataType::Text },
-                    ColMeta { table: Some(label.into()), name: "numbackends".into(), dtype: DataType::Int32 },
-                    ColMeta { table: Some(label.into()), name: "xact_commit".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "xact_rollback".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "blks_read".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "blks_hit".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "tup_returned".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "tup_fetched".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "tup_inserted".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "tup_updated".into(), dtype: DataType::Int64 },
-                    ColMeta { table: Some(label.into()), name: "tup_deleted".into(), dtype: DataType::Int64 },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "datid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "datname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "numbackends".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "xact_commit".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "xact_rollback".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "blks_read".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "blks_hit".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "tup_returned".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "tup_fetched".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "tup_inserted".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "tup_updated".into(),
+                        dtype: DataType::Int64,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "tup_deleted".into(),
+                        dtype: DataType::Int64,
+                    },
                 ];
                 let rows = vec![vec![
                     Value::Int32(1),
                     Value::Text("nucleus".into()),
-                    Value::Int32(1), // numbackends
-                    Value::Int64(0), // xact_commit
-                    Value::Int64(0), // xact_rollback
-                    Value::Int64(0), // blks_read
-                    Value::Int64(0), // blks_hit
-                    Value::Int64(0), // tup_returned
-                    Value::Int64(0), // tup_fetched
+                    Value::Int32(1),                   // numbackends
+                    Value::Int64(0),                   // xact_commit
+                    Value::Int64(0),                   // xact_rollback
+                    Value::Int64(0),                   // blks_read
+                    Value::Int64(0),                   // blks_hit
+                    Value::Int64(0),                   // tup_returned
+                    Value::Int64(0),                   // tup_fetched
                     Value::Int64(tables.len() as i64), // tup_inserted (placeholder)
-                    Value::Int64(0), // tup_updated
-                    Value::Int64(0), // tup_deleted
+                    Value::Int64(0),                   // tup_updated
+                    Value::Int64(0),                   // tup_deleted
                 ]];
                 Ok(Some((cols, rows)))
             }
@@ -3940,7 +4740,6 @@ pub enum ExecError {
     #[error("memory limit exceeded: {0}")]
     MemoryExceeded(String),
 }
-
 
 #[cfg(test)]
 mod tests;

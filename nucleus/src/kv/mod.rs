@@ -186,9 +186,20 @@ impl KvStore {
             }
             let shard = sharded.shard(&key);
             if let Some(exp) = expires_at {
-                shard.expiry_index.write().entry(exp).or_default().push(key.clone());
+                shard
+                    .expiry_index
+                    .write()
+                    .entry(exp)
+                    .or_default()
+                    .push(key.clone());
             }
-            shard.data.write().insert(key, KvEntry { value: Arc::new(value), expires_at });
+            shard.data.write().insert(
+                key,
+                KvEntry {
+                    value: Arc::new(value),
+                    expires_at,
+                },
+            );
         }
 
         // Open collections WAL and recover collection state
@@ -217,7 +228,8 @@ impl KvStore {
     /// Return the current global version counter. Used by WATCH to snapshot
     /// the version at WATCH time, then compare at EXEC time.
     pub fn version(&self) -> u64 {
-        self.global_version.load(std::sync::atomic::Ordering::Acquire)
+        self.global_version
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Return the version for a specific key. Currently uses the global
@@ -229,7 +241,8 @@ impl KvStore {
 
     /// Bump the global version counter. Called on every write operation.
     fn bump_version(&self) {
-        self.global_version.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.global_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// GET — retrieve a value by key. Returns None if key doesn't exist or is expired.
@@ -284,13 +297,17 @@ impl KvStore {
         {
             let data = shard.data.read();
             if let Some(old) = data.get(key)
-                && let Some(old_exp) = old.expires_at {
-                    shard.remove_expiry(key, old_exp);
-                }
+                && let Some(old_exp) = old.expires_at
+            {
+                shard.remove_expiry(key, old_exp);
+            }
         }
         shard.data.write().insert(
             key.to_string(),
-            KvEntry { value: Arc::new(value), expires_at },
+            KvEntry {
+                value: Arc::new(value),
+                expires_at,
+            },
         );
         if let Some(exp) = expires_at {
             shard.add_expiry(key, exp);
@@ -305,15 +322,17 @@ impl KvStore {
     pub fn del(&self, key: &str) -> bool {
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_delete(key) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_delete(key)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
         let shard = self.data.shard(key);
         let removed_entry = shard.data.write().remove(key);
         if let Some(ref entry) = removed_entry
-            && let Some(exp) = entry.expires_at {
-                shard.remove_expiry(key, exp);
-            }
+            && let Some(exp) = entry.expires_at
+        {
+            shard.remove_expiry(key, exp);
+        }
         let hot_removed = removed_entry.is_some();
         let cold_removed = if let Some(ref cold) = self.cold {
             let mut c = cold.lock();
@@ -358,14 +377,17 @@ impl KvStore {
             },
         };
 
-        let new_val = current + amount;
+        // checked_add: Redis returns an error rather than wrapping/panicking when
+        // an INCR/INCRBY would exceed i64 range.
+        let new_val = current.checked_add(amount).ok_or(KvError::Overflow)?;
         let ttl = entry.and_then(|e| e.expires_at);
 
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_set(key, &Value::Int64(new_val)) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_set(key, &Value::Int64(new_val))
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
 
         data.insert(
             key.to_string(),
@@ -473,7 +495,8 @@ impl KvStore {
         let mut count = 0;
         for shard in &self.data.shards {
             let data = shard.data.read();
-            count += data.values()
+            count += data
+                .values()
                 .filter(|entry| entry.expires_at.is_none_or(|t| now < t))
                 .count();
         }
@@ -528,10 +551,11 @@ impl KvStore {
                         // Double-check the entry is actually expired (could have been
                         // overwritten with a new TTL between index read and data write)
                         if let Some(entry) = data.get(&key)
-                            && entry.is_expired() {
-                                data.remove(&key);
-                                total_removed += 1;
-                            }
+                            && entry.is_expired()
+                        {
+                            data.remove(&key);
+                            total_removed += 1;
+                        }
                     }
                 }
             }
@@ -608,9 +632,10 @@ impl KvStore {
         }
         #[cfg(feature = "server")]
         if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_set(key, &value) {
-                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
-            }
+            && let Err(e) = wal.log_set(key, &value)
+        {
+            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        }
         data.insert(
             key.to_string(),
             KvEntry {
@@ -789,16 +814,21 @@ impl KvStore {
 
     /// Check if `key` exists as a plain string KV value. If so, return a
     /// WrongTypeError since collection operations cannot operate on string keys.
-    fn check_string_conflict(&self, key: &str, expected: &'static str) -> Result<(), collections::WrongTypeError> {
+    fn check_string_conflict(
+        &self,
+        key: &str,
+        expected: &'static str,
+    ) -> Result<(), collections::WrongTypeError> {
         let shard = self.data.shard(key);
         let data = shard.data.read();
         if let Some(entry) = data.get(key)
-            && !entry.is_expired() {
-                return Err(collections::WrongTypeError {
-                    expected,
-                    actual: "string",
-                });
-            }
+            && !entry.is_expired()
+        {
+            return Err(collections::WrongTypeError {
+                expected,
+                actual: "string",
+            });
+        }
         Ok(())
     }
 
@@ -820,7 +850,12 @@ impl KvStore {
         self.check_string_conflict(key, "list")?;
         self.collections.rpop(key)
     }
-    pub fn lrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<Value>, collections::WrongTypeError> {
+    pub fn lrange(
+        &self,
+        key: &str,
+        start: i64,
+        stop: i64,
+    ) -> Result<Vec<Value>, collections::WrongTypeError> {
         self.check_string_conflict(key, "list")?;
         self.collections.lrange(key, start, stop)
     }
@@ -828,18 +863,31 @@ impl KvStore {
         self.check_string_conflict(key, "list")?;
         self.collections.llen(key)
     }
-    pub fn lindex(&self, key: &str, index: i64) -> Result<Option<Value>, collections::WrongTypeError> {
+    pub fn lindex(
+        &self,
+        key: &str,
+        index: i64,
+    ) -> Result<Option<Value>, collections::WrongTypeError> {
         self.check_string_conflict(key, "list")?;
         self.collections.lindex(key, index)
     }
 
     // --- Hashes ---
 
-    pub fn hset(&self, key: &str, field: &str, value: Value) -> Result<bool, collections::WrongTypeError> {
+    pub fn hset(
+        &self,
+        key: &str,
+        field: &str,
+        value: Value,
+    ) -> Result<bool, collections::WrongTypeError> {
         self.check_string_conflict(key, "hash")?;
         self.collections.hset(key, field, value)
     }
-    pub fn hget(&self, key: &str, field: &str) -> Result<Option<Value>, collections::WrongTypeError> {
+    pub fn hget(
+        &self,
+        key: &str,
+        field: &str,
+    ) -> Result<Option<Value>, collections::WrongTypeError> {
         self.check_string_conflict(key, "hash")?;
         self.collections.hget(key, field)
     }
@@ -902,7 +950,12 @@ impl KvStore {
 
     // --- Sorted Sets ---
 
-    pub fn col_zadd(&self, key: &str, member: &str, score: f64) -> Result<bool, collections::WrongTypeError> {
+    pub fn col_zadd(
+        &self,
+        key: &str,
+        member: &str,
+        score: f64,
+    ) -> Result<bool, collections::WrongTypeError> {
         self.check_string_conflict(key, "zset")?;
         self.collections.zadd(key, member, score)
     }
@@ -910,23 +963,47 @@ impl KvStore {
         self.check_string_conflict(key, "zset")?;
         self.collections.zrem(key, member)
     }
-    pub fn col_zrange(&self, key: &str, start: usize, stop: usize) -> Result<Vec<SortedSetEntry>, collections::WrongTypeError> {
+    pub fn col_zrange(
+        &self,
+        key: &str,
+        start: usize,
+        stop: usize,
+    ) -> Result<Vec<SortedSetEntry>, collections::WrongTypeError> {
         self.check_string_conflict(key, "zset")?;
         self.collections.zrange(key, start, stop)
     }
-    pub fn col_zrevrange(&self, key: &str, start: usize, stop: usize) -> Result<Vec<SortedSetEntry>, collections::WrongTypeError> {
+    pub fn col_zrevrange(
+        &self,
+        key: &str,
+        start: usize,
+        stop: usize,
+    ) -> Result<Vec<SortedSetEntry>, collections::WrongTypeError> {
         self.check_string_conflict(key, "zset")?;
         self.collections.zrevrange(key, start, stop)
     }
-    pub fn col_zrangebyscore(&self, key: &str, min: f64, max: f64) -> Result<Vec<SortedSetEntry>, collections::WrongTypeError> {
+    pub fn col_zrangebyscore(
+        &self,
+        key: &str,
+        min: f64,
+        max: f64,
+    ) -> Result<Vec<SortedSetEntry>, collections::WrongTypeError> {
         self.check_string_conflict(key, "zset")?;
         self.collections.zrangebyscore(key, min, max)
     }
-    pub fn col_zrank(&self, key: &str, member: &str) -> Result<Option<usize>, collections::WrongTypeError> {
+    pub fn col_zrank(
+        &self,
+        key: &str,
+        member: &str,
+    ) -> Result<Option<usize>, collections::WrongTypeError> {
         self.check_string_conflict(key, "zset")?;
         self.collections.zrank(key, member)
     }
-    pub fn col_zincrby(&self, key: &str, member: &str, increment: f64) -> Result<f64, collections::WrongTypeError> {
+    pub fn col_zincrby(
+        &self,
+        key: &str,
+        member: &str,
+        increment: f64,
+    ) -> Result<f64, collections::WrongTypeError> {
         self.check_string_conflict(key, "zset")?;
         self.collections.zincrby(key, member, increment)
     }
@@ -934,7 +1011,12 @@ impl KvStore {
         self.check_string_conflict(key, "zset")?;
         self.collections.zcard(key)
     }
-    pub fn col_zcount(&self, key: &str, min: f64, max: f64) -> Result<usize, collections::WrongTypeError> {
+    pub fn col_zcount(
+        &self,
+        key: &str,
+        min: f64,
+        max: f64,
+    ) -> Result<usize, collections::WrongTypeError> {
         self.check_string_conflict(key, "zset")?;
         self.collections.zcount(key, min, max)
     }
@@ -949,7 +1031,11 @@ impl KvStore {
         self.check_string_conflict(key, "hyperloglog")?;
         self.collections.pfcount(key)
     }
-    pub fn col_pfmerge(&self, dest_key: &str, source_keys: &[&str]) -> Result<(), collections::WrongTypeError> {
+    pub fn col_pfmerge(
+        &self,
+        dest_key: &str,
+        source_keys: &[&str],
+    ) -> Result<(), collections::WrongTypeError> {
         self.check_string_conflict(dest_key, "hyperloglog")?;
         self.collections.pfmerge(dest_key, source_keys)
     }
@@ -958,40 +1044,87 @@ impl KvStore {
     // Stream operations (delegated to ShardedCollections)
     // ========================================================================
 
-    pub fn xadd(&self, key: &str, id_str: &str, fields: Vec<(String, String)>) -> Result<streams::StreamId, String> {
+    pub fn xadd(
+        &self,
+        key: &str,
+        id_str: &str,
+        fields: Vec<(String, String)>,
+    ) -> Result<streams::StreamId, String> {
         self.bump_version();
         self.collections.xadd(key, id_str, fields)
     }
     pub fn xlen(&self, key: &str) -> Result<usize, collections::WrongTypeError> {
         self.collections.xlen(key)
     }
-    pub fn xrange(&self, key: &str, start: &str, end: &str, count: Option<usize>) -> Result<Vec<streams::StreamEntry>, collections::WrongTypeError> {
+    pub fn xrange(
+        &self,
+        key: &str,
+        start: &str,
+        end: &str,
+        count: Option<usize>,
+    ) -> Result<Vec<streams::StreamEntry>, collections::WrongTypeError> {
         self.collections.xrange(key, start, end, count)
     }
-    pub fn xrevrange(&self, key: &str, end: &str, start: &str, count: Option<usize>) -> Result<Vec<streams::StreamEntry>, collections::WrongTypeError> {
+    pub fn xrevrange(
+        &self,
+        key: &str,
+        end: &str,
+        start: &str,
+        count: Option<usize>,
+    ) -> Result<Vec<streams::StreamEntry>, collections::WrongTypeError> {
         self.collections.xrevrange(key, end, start, count)
     }
-    pub fn xread(&self, key: &str, last_id: &str, count: Option<usize>) -> Result<Vec<streams::StreamEntry>, collections::WrongTypeError> {
+    pub fn xread(
+        &self,
+        key: &str,
+        last_id: &str,
+        count: Option<usize>,
+    ) -> Result<Vec<streams::StreamEntry>, collections::WrongTypeError> {
         self.collections.xread(key, last_id, count)
     }
-    pub fn xdel(&self, key: &str, ids: &[streams::StreamId]) -> Result<usize, collections::WrongTypeError> {
+    pub fn xdel(
+        &self,
+        key: &str,
+        ids: &[streams::StreamId],
+    ) -> Result<usize, collections::WrongTypeError> {
         self.bump_version();
         self.collections.xdel(key, ids)
     }
-    pub fn xtrim_maxlen(&self, key: &str, maxlen: usize) -> Result<usize, collections::WrongTypeError> {
+    pub fn xtrim_maxlen(
+        &self,
+        key: &str,
+        maxlen: usize,
+    ) -> Result<usize, collections::WrongTypeError> {
         self.bump_version();
         self.collections.xtrim_maxlen(key, maxlen)
     }
     pub fn xgroup_create(&self, key: &str, group_name: &str, start_id: &str) -> Result<(), String> {
         self.collections.xgroup_create(key, group_name, start_id)
     }
-    pub fn xgroup_destroy(&self, key: &str, group_name: &str) -> Result<bool, collections::WrongTypeError> {
+    pub fn xgroup_destroy(
+        &self,
+        key: &str,
+        group_name: &str,
+    ) -> Result<bool, collections::WrongTypeError> {
         self.collections.xgroup_destroy(key, group_name)
     }
-    pub fn xreadgroup(&self, key: &str, group_name: &str, consumer_name: &str, pending_id: &str, count: Option<usize>) -> Result<Vec<streams::StreamEntry>, String> {
-        self.collections.xreadgroup(key, group_name, consumer_name, pending_id, count)
+    pub fn xreadgroup(
+        &self,
+        key: &str,
+        group_name: &str,
+        consumer_name: &str,
+        pending_id: &str,
+        count: Option<usize>,
+    ) -> Result<Vec<streams::StreamEntry>, String> {
+        self.collections
+            .xreadgroup(key, group_name, consumer_name, pending_id, count)
     }
-    pub fn xack(&self, key: &str, group_name: &str, ids: &[streams::StreamId]) -> Result<usize, String> {
+    pub fn xack(
+        &self,
+        key: &str,
+        group_name: &str,
+        ids: &[streams::StreamId],
+    ) -> Result<usize, String> {
         self.collections.xack(key, group_name, ids)
     }
 
@@ -999,17 +1132,40 @@ impl KvStore {
     // Geo operations (delegated to ShardedCollections)
     // ========================================================================
 
-    pub fn geoadd(&self, key: &str, lon: f64, lat: f64, member: &str) -> Result<bool, collections::WrongTypeError> {
+    pub fn geoadd(
+        &self,
+        key: &str,
+        lon: f64,
+        lat: f64,
+        member: &str,
+    ) -> Result<bool, collections::WrongTypeError> {
         self.bump_version();
         self.collections.geoadd(key, lon, lat, member)
     }
-    pub fn geopos(&self, key: &str, member: &str) -> Result<Option<(f64, f64)>, collections::WrongTypeError> {
+    pub fn geopos(
+        &self,
+        key: &str,
+        member: &str,
+    ) -> Result<Option<(f64, f64)>, collections::WrongTypeError> {
         self.collections.geopos(key, member)
     }
-    pub fn geodist(&self, key: &str, member1: &str, member2: &str, unit: &str) -> Result<Option<f64>, collections::WrongTypeError> {
+    pub fn geodist(
+        &self,
+        key: &str,
+        member1: &str,
+        member2: &str,
+        unit: &str,
+    ) -> Result<Option<f64>, collections::WrongTypeError> {
         self.collections.geodist(key, member1, member2, unit)
     }
-    pub fn georadius(&self, key: &str, lon: f64, lat: f64, radius: f64, unit: &str) -> Result<Vec<(String, f64)>, collections::WrongTypeError> {
+    pub fn georadius(
+        &self,
+        key: &str,
+        lon: f64,
+        lat: f64,
+        radius: f64,
+        unit: &str,
+    ) -> Result<Vec<(String, f64)>, collections::WrongTypeError> {
         self.collections.georadius(key, lon, lat, radius, unit)
     }
     pub fn geolen(&self, key: &str) -> Result<usize, collections::WrongTypeError> {
@@ -1062,12 +1218,13 @@ impl KvStore {
                     let shard = self.data.shard(key);
                     let data = shard.data.read();
                     data.get(key.as_str()).map(|e| Arc::clone(&e.value))
-                } {
-                    let encoded = tiered::encode_value(&arc_value);
-                    cold.lock().put(key.as_bytes().to_vec(), encoded);
-                    self.data.shard(key).data.write().remove(key.as_str());
-                    evicted += 1;
                 }
+            {
+                let encoded = tiered::encode_value(&arc_value);
+                cold.lock().put(key.as_bytes().to_vec(), encoded);
+                self.data.shard(key).data.write().remove(key.as_str());
+                evicted += 1;
+            }
         }
     }
 
@@ -1083,7 +1240,8 @@ impl KvStore {
         let mut count = 0;
         for shard in &self.data.shards {
             let data = shard.data.read();
-            count += data.values()
+            count += data
+                .values()
                 .filter(|entry| entry.expires_at.is_none_or(|t| now < t))
                 .count();
         }
@@ -1093,7 +1251,9 @@ impl KvStore {
     /// Write a WAL checkpoint (snapshot + truncate). No-op if WAL is disabled.
     #[cfg(feature = "server")]
     pub fn checkpoint(&self) -> std::io::Result<()> {
-        let Some(ref wal) = self.wal else { return Ok(()) };
+        let Some(ref wal) = self.wal else {
+            return Ok(());
+        };
         let mut items = Vec::new();
         for shard in &self.data.shards {
             let data = shard.data.read();
@@ -1140,7 +1300,12 @@ impl KvStore {
         for (key, entry) in snapshot.entries {
             let shard = self.data.shard(&key);
             if let Some(exp) = entry.expires_at {
-                shard.expiry_index.write().entry(exp).or_default().push(key.clone());
+                shard
+                    .expiry_index
+                    .write()
+                    .entry(exp)
+                    .or_default()
+                    .push(key.clone());
             }
             shard.data.write().insert(key, entry);
         }
@@ -1229,6 +1394,8 @@ pub enum KvError {
     NotAnInteger,
     #[error("WRONGTYPE Operation against a key holding the wrong kind of value")]
     WrongType,
+    #[error("increment or decrement would overflow")]
+    Overflow,
 }
 
 // ============================================================================
@@ -1277,18 +1444,24 @@ impl Default for SortedSet {
 
 impl SortedSet {
     pub fn new() -> Self {
-        Self { tree: BTreeMap::new(), members: HashMap::new() }
+        Self {
+            tree: BTreeMap::new(),
+            members: HashMap::new(),
+        }
     }
 
     /// ZADD — insert or update a member. Returns true if new.
     pub fn zadd(&mut self, member: &str, score: f64) -> bool {
         if let Some(&old_score) = self.members.get(member) {
-            self.tree.remove(&(OrderedF64(old_score), member.to_string()));
-            self.tree.insert((OrderedF64(score), member.to_string()), ());
+            self.tree
+                .remove(&(OrderedF64(old_score), member.to_string()));
+            self.tree
+                .insert((OrderedF64(score), member.to_string()), ());
             self.members.insert(member.to_string(), score);
             false
         } else {
-            self.tree.insert((OrderedF64(score), member.to_string()), ());
+            self.tree
+                .insert((OrderedF64(score), member.to_string()), ());
             self.members.insert(member.to_string(), score);
             true
         }
@@ -1323,19 +1496,28 @@ impl SortedSet {
 
     /// ZRANGE — entries by rank ascending (inclusive start/stop).
     pub fn zrange(&self, start: usize, stop: usize) -> Vec<SortedSetEntry> {
-        self.tree.iter()
+        self.tree
+            .iter()
             .skip(start)
             .take(stop.saturating_sub(start) + 1)
-            .map(|((OrderedF64(s), m), _)| SortedSetEntry { member: m.clone(), score: *s })
+            .map(|((OrderedF64(s), m), _)| SortedSetEntry {
+                member: m.clone(),
+                score: *s,
+            })
             .collect()
     }
 
     /// ZREVRANGE — entries by rank descending.
     pub fn zrevrange(&self, start: usize, stop: usize) -> Vec<SortedSetEntry> {
-        self.tree.iter().rev()
+        self.tree
+            .iter()
+            .rev()
             .skip(start)
             .take(stop.saturating_sub(start) + 1)
-            .map(|((OrderedF64(s), m), _)| SortedSetEntry { member: m.clone(), score: *s })
+            .map(|((OrderedF64(s), m), _)| SortedSetEntry {
+                member: m.clone(),
+                score: *s,
+            })
             .collect()
     }
 
@@ -1343,17 +1525,26 @@ impl SortedSet {
     pub fn zrangebyscore(&self, min: f64, max: f64) -> Vec<SortedSetEntry> {
         use std::ops::Bound;
         let lo = (OrderedF64(min), String::new());
-        self.tree.range((Bound::Included(&lo), Bound::Unbounded))
+        self.tree
+            .range((Bound::Included(&lo), Bound::Unbounded))
             .take_while(|((OrderedF64(s), _), _)| *s <= max)
-            .map(|((OrderedF64(s), m), _)| SortedSetEntry { member: m.clone(), score: *s })
+            .map(|((OrderedF64(s), m), _)| SortedSetEntry {
+                member: m.clone(),
+                score: *s,
+            })
             .collect()
     }
 
-    pub fn zcard(&self) -> usize { self.members.len() }
+    pub fn zcard(&self) -> usize {
+        self.members.len()
+    }
 
     /// ZINCRBY — increment score. Creates member if missing.
     pub fn zincrby(&mut self, member: &str, increment: f64) -> f64 {
-        let new_score = self.members.get(member).map_or(increment, |&old| old + increment);
+        let new_score = self
+            .members
+            .get(member)
+            .map_or(increment, |&old| old + increment);
         self.zadd(member, new_score);
         new_score
     }
@@ -1390,12 +1581,17 @@ impl Default for HyperLogLog {
 }
 
 impl HyperLogLog {
-    pub fn new() -> Self { Self::with_precision(14) }
+    pub fn new() -> Self {
+        Self::with_precision(14)
+    }
 
     pub fn with_precision(p: u8) -> Self {
         assert!((4..=18).contains(&p), "precision p must be in 4..=18");
         let m = 1usize << p;
-        Self { registers: vec![0u8; m], p }
+        Self {
+            registers: vec![0u8; m],
+            p,
+        }
     }
 
     pub fn add(&mut self, item: &str) {
@@ -1415,7 +1611,9 @@ impl HyperLogLog {
         let mut zeros = 0u32;
         for &reg in &self.registers {
             sum += 2.0f64.powi(-(reg as i32));
-            if reg == 0 { zeros += 1; }
+            if reg == 0 {
+                zeros += 1;
+            }
         }
         let estimate = alpha_m * m * m / sum;
         // Small range correction (linear counting)
@@ -1431,18 +1629,29 @@ impl HyperLogLog {
     }
 
     pub fn merge(&mut self, other: &HyperLogLog) {
-        assert_eq!(self.p, other.p, "cannot merge HLLs with different precisions");
+        assert_eq!(
+            self.p, other.p,
+            "cannot merge HLLs with different precisions"
+        );
         for (a, &b) in self.registers.iter_mut().zip(other.registers.iter()) {
-            if b > *a { *a = b; }
+            if b > *a {
+                *a = b;
+            }
         }
     }
 
-    pub fn clear(&mut self) { self.registers.fill(0); }
+    pub fn clear(&mut self) {
+        self.registers.fill(0);
+    }
 
-    pub fn is_empty(&self) -> bool { self.registers.iter().all(|&r| r == 0) }
+    pub fn is_empty(&self) -> bool {
+        self.registers.iter().all(|&r| r == 0)
+    }
 
     /// Get a read-only view of the internal registers (for snapshotting in pfmerge).
-    pub fn registers(&self) -> &[u8] { &self.registers }
+    pub fn registers(&self) -> &[u8] {
+        &self.registers
+    }
 
     /// Overwrite internal registers from a snapshot (for pfmerge replay).
     pub fn set_registers(&mut self, regs: &[u8]) {
@@ -1513,6 +1722,20 @@ mod tests {
         let store = KvStore::new();
         store.set("text", Value::Text("hello".into()), None);
         assert!(store.incr("text").is_err());
+    }
+
+    // Regression: INCR/INCRBY used unchecked `current + amount`, which wraps
+    // (release) or panics (debug) at the i64 boundary. It must return an error.
+    #[test]
+    fn incr_overflow_errors() {
+        let store = KvStore::new();
+        store.set("c", Value::Int64(i64::MAX), None);
+        assert!(matches!(store.incr("c"), Err(KvError::Overflow)));
+        // Underflow at the other end too.
+        store.set("d", Value::Int64(i64::MIN), None);
+        assert!(matches!(store.incr_by("d", -1), Err(KvError::Overflow)));
+        // The stored value is unchanged after a rejected overflow.
+        assert_eq!(store.incr_by("c", 0).unwrap(), i64::MAX);
     }
 
     #[test]
@@ -1651,7 +1874,7 @@ mod tests {
             prop_assert!(!second, "setnx should fail when key exists");
             prop_assert_eq!(store.get(&key), Some(Value::Int32(1)));
         }
-    
+
     }
 
     proptest! {
@@ -1871,7 +2094,11 @@ mod tests {
             hll.add(&format!("item-{}", i));
         }
         let count = hll.count();
-        assert!(count > 95_000 && count < 105_000, "expected ~100000, got {}", count);
+        assert!(
+            count > 95_000 && count < 105_000,
+            "expected ~100000, got {}",
+            count
+        );
     }
 
     // ========================================================================
@@ -1952,7 +2179,10 @@ mod tests {
 
         // Append garbage
         let wal_path = dir.path().join("kv.wal");
-        let mut file = std::fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .unwrap();
         use std::io::Write;
         file.write_all(&[0xFF, 0xAB, 0xCD]).unwrap();
         file.flush().unwrap();
@@ -2030,10 +2260,7 @@ mod tests {
         let pairs: Vec<(String, Value)> = (0..500)
             .map(|i| (format!("key_{i}"), Value::Int64(i)))
             .collect();
-        let refs: Vec<(&str, Value)> = pairs
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.clone()))
-            .collect();
+        let refs: Vec<(&str, Value)> = pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         store.mset(&refs);
         drop(store);
 
@@ -2071,7 +2298,11 @@ mod tests {
         let store = KvStore::new();
         store.set("user:1:name", Value::Text("Alice".into()), None);
         store.set("user:2:name", Value::Text("Bob".into()), None);
-        store.set("user:1:email", Value::Text("alice@example.com".into()), None);
+        store.set(
+            "user:1:email",
+            Value::Text("alice@example.com".into()),
+            None,
+        );
         store.set("session:abc", Value::Int32(1), None);
 
         // Prefix glob
@@ -2108,11 +2339,7 @@ mod tests {
         let store_individual = KvStore::open(dir_individual.path()).unwrap();
         let start_individual = Instant::now();
         for i in 0..n {
-            store_individual.set(
-                &format!("k{i}"),
-                Value::Int64(i as i64),
-                None,
-            );
+            store_individual.set(&format!("k{i}"), Value::Int64(i as i64), None);
         }
         let elapsed_individual = start_individual.elapsed();
         drop(store_individual);
@@ -2123,10 +2350,7 @@ mod tests {
         let pairs: Vec<(String, Value)> = (0..n)
             .map(|i| (format!("k{i}"), Value::Int64(i as i64)))
             .collect();
-        let refs: Vec<(&str, Value)> = pairs
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.clone()))
-            .collect();
+        let refs: Vec<(&str, Value)> = pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         let start_batch = Instant::now();
         store_batch.mset(&refs);
         let elapsed_batch = start_batch.elapsed();
@@ -2136,7 +2360,10 @@ mod tests {
         let store_check = KvStore::open(dir_batch.path()).unwrap();
         assert_eq!(store_check.dbsize(), n);
         assert_eq!(store_check.get("k0"), Some(Value::Int64(0)));
-        assert_eq!(store_check.get(&format!("k{}", n - 1)), Some(Value::Int64((n - 1) as i64)));
+        assert_eq!(
+            store_check.get(&format!("k{}", n - 1)),
+            Some(Value::Int64((n - 1) as i64))
+        );
 
         // Print timing (visible with `cargo test -- --nocapture`)
         eprintln!(
@@ -2220,10 +2447,7 @@ mod tests {
         let pairs: Vec<(String, Value)> = (0..200)
             .map(|i| (format!("shard_key_{i}"), Value::Int64(i)))
             .collect();
-        let refs: Vec<(&str, Value)> = pairs
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.clone()))
-            .collect();
+        let refs: Vec<(&str, Value)> = pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
         store.mset(&refs);
 
         // Verify all keys exist and dbsize is correct
@@ -2250,7 +2474,7 @@ mod tests {
             }
         }
         // Remaining: all odd-indexed keys
-        let expected = (NUM_SHARDS * 3 + 1) / 2;
+        let expected = (NUM_SHARDS * 3).div_ceil(2);
         assert_eq!(store.dbsize(), expected);
     }
 
@@ -2402,7 +2626,10 @@ mod tests {
         // After promotion, key should be in hot tier
         let shard = store.data.shard("k0");
         let data = shard.data.read();
-        assert!(data.contains_key("k0"), "promoted key should be in hot tier");
+        assert!(
+            data.contains_key("k0"),
+            "promoted key should be in hot tier"
+        );
     }
 
     #[test]
@@ -2415,7 +2642,11 @@ mod tests {
         }
         // Delete a key — should be removed from both tiers
         assert!(store.del("k0"));
-        assert_eq!(store.get("k0"), None, "deleted key should be gone from both tiers");
+        assert_eq!(
+            store.get("k0"),
+            None,
+            "deleted key should be gone from both tiers"
+        );
         assert!(!store.del("k0"), "second delete should return false");
     }
 
@@ -2446,6 +2677,9 @@ mod tests {
     #[test]
     fn test_kv_memory_mode_no_cold() {
         let store = KvStore::new();
-        assert!(!store.has_cold_tier(), "memory mode should have no cold tier");
+        assert!(
+            !store.has_cold_tier(),
+            "memory mode should have no cold tier"
+        );
     }
 }

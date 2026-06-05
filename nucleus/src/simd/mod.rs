@@ -36,6 +36,7 @@ pub fn filter_i64_greater(column: &[i64], threshold: i64) -> Vec<usize> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     {
         if is_x86_feature_detected!("avx512f") {
+            // SAFETY: avx512f availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { avx512::filter_i64_greater(column, threshold) };
         }
     }
@@ -43,6 +44,7 @@ pub fn filter_i64_greater(column: &[i64], threshold: i64) -> Vec<usize> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { avx2::filter_i64_greater(column, threshold) };
         }
     }
@@ -55,6 +57,7 @@ pub fn filter_i64_equals(column: &[i64], target: i64) -> Vec<usize> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     {
         if is_x86_feature_detected!("avx512f") {
+            // SAFETY: avx512f availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { avx512::filter_i64_equals(column, target) };
         }
     }
@@ -62,6 +65,7 @@ pub fn filter_i64_equals(column: &[i64], target: i64) -> Vec<usize> {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { avx2::filter_i64_equals(column, target) };
         }
     }
@@ -95,6 +99,7 @@ pub fn sum_i64(column: &[i64]) -> i64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     {
         if is_x86_feature_detected!("avx512f") {
+            // SAFETY: avx512f availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { avx512::sum_i64(column) };
         }
     }
@@ -102,6 +107,7 @@ pub fn sum_i64(column: &[i64]) -> i64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 availability is confirmed by the is_x86_feature_detected! guard above.
             return unsafe { avx2::sum_i64(column) };
         }
     }

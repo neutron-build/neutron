@@ -175,11 +175,14 @@ impl RespHandler {
                         return vec![resp];
                     }
                     let mut responses = Vec::new();
+                    // unsubscribe_all already removed every channel, so the
+                    // registry count is now just the surviving patterns. Redis
+                    // reports a DECREMENTING count per message: surviving patterns
+                    // plus the channels still pending later in this batch.
+                    let surviving_patterns = self.pubsub.subscription_count(id);
                     for (i, ch) in channels.iter().enumerate() {
                         let remaining = channels.len() - i - 1;
-                        let pat_count = self.pubsub.subscription_count(id).saturating_sub(remaining);
-                        let _ = pat_count; // count from registry
-                        let count = self.pubsub.subscription_count(id);
+                        let count = surviving_patterns + remaining;
                         let mut resp = encoder::encode_array_header(3);
                         resp.extend(encoder::encode_bulk_string(b"unsubscribe"));
                         resp.extend(encoder::encode_bulk_string(ch.as_bytes()));
@@ -251,7 +254,7 @@ impl RespHandler {
                         resp.extend(encoder::encode_bulk_string(b"punsubscribe"));
                         resp.extend(encoder::encode_null_bulk());
                         resp.extend(encoder::encode_integer(
-                            self.pubsub.subscription_count(id) as i64,
+                            self.pubsub.subscription_count(id) as i64
                         ));
                         return vec![resp];
                     }
@@ -333,7 +336,9 @@ impl RespHandler {
                     return encoder::encode_error("ERR WATCH inside MULTI is not allowed");
                 }
                 if args.len() < 2 {
-                    return encoder::encode_error("ERR wrong number of arguments for 'watch' command");
+                    return encoder::encode_error(
+                        "ERR wrong number of arguments for 'watch' command",
+                    );
                 }
                 for arg in &args[1..] {
                     let key = String::from_utf8_lossy(arg).to_string();
@@ -368,7 +373,9 @@ impl RespHandler {
             }
             "AUTH" => {
                 if args.len() < 2 {
-                    return encoder::encode_error("ERR wrong number of arguments for 'auth' command");
+                    return encoder::encode_error(
+                        "ERR wrong number of arguments for 'auth' command",
+                    );
                 }
                 let provided = String::from_utf8_lossy(&args[1]).to_string();
                 match &self.password {
@@ -461,8 +468,7 @@ impl RespHandler {
             }
             "EXISTS" => {
                 let key = require_arg!(args, 1);
-                let exists =
-                    self.kv.exists(key) || self.kv.collections().exists(key);
+                let exists = self.kv.exists(key) || self.kv.collections().exists(key);
                 encoder::encode_integer(if exists { 1 } else { 0 })
             }
             "INCR" => {
@@ -565,8 +571,7 @@ impl RespHandler {
                 let mut i = 1;
                 while i + 1 < args.len() {
                     let key = std::str::from_utf8(&args[i]).unwrap_or("").to_string();
-                    let val_str =
-                        String::from_utf8_lossy(&args[i + 1]).to_string();
+                    let val_str = String::from_utf8_lossy(&args[i + 1]).to_string();
                     pairs.push((key, Value::Text(val_str)));
                     i += 2;
                 }
@@ -585,9 +590,7 @@ impl RespHandler {
                         s
                     }
                     Some(_) => {
-                        return encoder::encode_error(
-                            "ERR value is not a string",
-                        );
+                        return encoder::encode_error("ERR value is not a string");
                     }
                     None => String::from_utf8_lossy(val).to_string(),
                 };
@@ -609,10 +612,17 @@ impl RespHandler {
             // ================================================================
             "SETBIT" => {
                 let key = require_arg!(args, 1);
-                let offset: usize = match String::from_utf8_lossy(require_arg_bytes!(args, 2)).parse() {
-                    Ok(v) => v,
-                    Err(_) => return encoder::encode_error("ERR bit offset is not an integer or out of range"),
-                };
+                let offset: usize =
+                    match String::from_utf8_lossy(require_arg_bytes!(args, 2)).parse() {
+                        // Redis caps the bit offset at 2^32-1 (512 MB). Reject larger
+                        // values so one command can't trigger an unbounded allocation.
+                        Ok(v) if v < (1usize << 32) => v,
+                        _ => {
+                            return encoder::encode_error(
+                                "ERR bit offset is not an integer or out of range",
+                            );
+                        }
+                    };
                 let bit: u8 = match String::from_utf8_lossy(require_arg_bytes!(args, 3)).parse() {
                     Ok(v) if v <= 1 => v,
                     _ => return encoder::encode_error("ERR bit is not an integer or out of range"),
@@ -622,10 +632,15 @@ impl RespHandler {
             }
             "GETBIT" => {
                 let key = require_arg!(args, 1);
-                let offset: usize = match String::from_utf8_lossy(require_arg_bytes!(args, 2)).parse() {
-                    Ok(v) => v,
-                    Err(_) => return encoder::encode_error("ERR bit offset is not an integer or out of range"),
-                };
+                let offset: usize =
+                    match String::from_utf8_lossy(require_arg_bytes!(args, 2)).parse() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return encoder::encode_error(
+                                "ERR bit offset is not an integer or out of range",
+                            );
+                        }
+                    };
                 let bit = self.kv.getbit(key, offset);
                 encoder::encode_integer(bit as i64)
             }
@@ -634,11 +649,19 @@ impl RespHandler {
                 let (start, end) = if args.len() >= 4 {
                     let s: i64 = match String::from_utf8_lossy(&args[2]).parse() {
                         Ok(v) => v,
-                        Err(_) => return encoder::encode_error("ERR value is not an integer or out of range"),
+                        Err(_) => {
+                            return encoder::encode_error(
+                                "ERR value is not an integer or out of range",
+                            );
+                        }
                     };
                     let e: i64 = match String::from_utf8_lossy(&args[3]).parse() {
                         Ok(v) => v,
-                        Err(_) => return encoder::encode_error("ERR value is not an integer or out of range"),
+                        Err(_) => {
+                            return encoder::encode_error(
+                                "ERR value is not an integer or out of range",
+                            );
+                        }
                     };
                     (Some(s), Some(e))
                 } else {
@@ -649,14 +672,17 @@ impl RespHandler {
             }
             "BITOP" => {
                 if args.len() < 4 {
-                    return encoder::encode_error("ERR wrong number of arguments for 'bitop' command");
+                    return encoder::encode_error(
+                        "ERR wrong number of arguments for 'bitop' command",
+                    );
                 }
                 let op = String::from_utf8_lossy(&args[1]).to_uppercase();
                 let dest = String::from_utf8_lossy(&args[2]).to_string();
                 if op == "NOT" && args.len() != 4 {
                     return encoder::encode_error("ERR BITOP NOT requires one and only one key");
                 }
-                let src_keys: Vec<&str> = args[3..].iter()
+                let src_keys: Vec<&str> = args[3..]
+                    .iter()
                     .map(|a| std::str::from_utf8(a).unwrap_or(""))
                     .collect();
                 let len = self.kv.bitop(&op, &dest, &src_keys);
@@ -669,12 +695,20 @@ impl RespHandler {
                     _ => return encoder::encode_error("ERR bit is not an integer or out of range"),
                 };
                 let start = if args.len() >= 4 {
-                    Some(String::from_utf8_lossy(&args[3]).parse::<i64>().unwrap_or(0))
+                    Some(
+                        String::from_utf8_lossy(&args[3])
+                            .parse::<i64>()
+                            .unwrap_or(0),
+                    )
                 } else {
                     None
                 };
                 let end = if args.len() >= 5 {
-                    Some(String::from_utf8_lossy(&args[4]).parse::<i64>().unwrap_or(-1))
+                    Some(
+                        String::from_utf8_lossy(&args[4])
+                            .parse::<i64>()
+                            .unwrap_or(-1),
+                    )
                 } else {
                     None
                 };
@@ -750,7 +784,8 @@ impl RespHandler {
                 // Simplified: XREAD COUNT count STREAMS key id
                 let mut count: Option<usize> = None;
                 let mut idx = 1;
-                if args.len() > idx && String::from_utf8_lossy(&args[idx]).to_uppercase() == "COUNT" {
+                if args.len() > idx && String::from_utf8_lossy(&args[idx]).to_uppercase() == "COUNT"
+                {
                     idx += 1;
                     if idx < args.len() {
                         count = String::from_utf8_lossy(&args[idx]).parse::<usize>().ok();
@@ -758,7 +793,9 @@ impl RespHandler {
                     }
                 }
                 // Expect STREAMS keyword
-                if idx >= args.len() || String::from_utf8_lossy(&args[idx]).to_uppercase() != "STREAMS" {
+                if idx >= args.len()
+                    || String::from_utf8_lossy(&args[idx]).to_uppercase() != "STREAMS"
+                {
                     return encoder::encode_error("ERR syntax error");
                 }
                 idx += 1;
@@ -819,7 +856,11 @@ impl RespHandler {
                     return encoder::encode_error("ERR syntax error");
                 }
                 // Skip optional ~ (approximate trimming — we just do exact)
-                let count_idx = if args.len() >= 5 && &args[3] == b"~" { 4 } else { 3 };
+                let count_idx = if args.len() >= 5 && &args[3] == b"~" {
+                    4
+                } else {
+                    3
+                };
                 let maxlen: usize = match String::from_utf8_lossy(&args[count_idx]).parse() {
                     Ok(v) => v,
                     Err(_) => return encoder::encode_error("ERR value is not an integer"),
@@ -884,14 +925,17 @@ impl RespHandler {
 
                 let mut idx = 4;
                 let mut count: Option<usize> = None;
-                if idx < args.len() && String::from_utf8_lossy(&args[idx]).to_uppercase() == "COUNT" {
+                if idx < args.len() && String::from_utf8_lossy(&args[idx]).to_uppercase() == "COUNT"
+                {
                     idx += 1;
                     if idx < args.len() {
                         count = String::from_utf8_lossy(&args[idx]).parse::<usize>().ok();
                         idx += 1;
                     }
                 }
-                if idx >= args.len() || String::from_utf8_lossy(&args[idx]).to_uppercase() != "STREAMS" {
+                if idx >= args.len()
+                    || String::from_utf8_lossy(&args[idx]).to_uppercase() != "STREAMS"
+                {
                     return encoder::encode_error("ERR syntax error");
                 }
                 idx += 1;
@@ -1262,34 +1306,42 @@ impl RespHandler {
             }
             "ZRANGE" => {
                 let key = require_arg!(args, 1);
-                let start = require_i64!(args, 2) as usize;
-                let stop = require_i64!(args, 3) as usize;
+                let start_i = require_i64!(args, 2);
+                let stop_i = require_i64!(args, 3);
                 // Check for WITHSCORES flag.
                 let with_scores = args.len() > 4
-                    && String::from_utf8_lossy(&args[4])
-                        .to_uppercase()
-                        .as_str()
-                        == "WITHSCORES";
-                match self.kv.col_zrange(key, start, stop) {
-                    Ok(entries) => {
-                        if with_scores {
-                            let mut out = encoder::encode_array_header(entries.len() * 2);
-                            for e in &entries {
-                                out.extend(encoder::encode_bulk_string(e.member.as_bytes()));
-                                out.extend(encoder::encode_bulk_string(
-                                    e.score.to_string().as_bytes(),
-                                ));
-                            }
-                            out
-                        } else {
-                            let mut out = encoder::encode_array_header(entries.len());
-                            for e in &entries {
-                                out.extend(encoder::encode_bulk_string(e.member.as_bytes()));
-                            }
-                            out
-                        }
+                    && String::from_utf8_lossy(&args[4]).to_uppercase().as_str() == "WITHSCORES";
+                // Resolve Redis-style negative indices (-1 = last element)
+                // against the set's cardinality. A bare `as usize` turned -1
+                // into a huge index and returned nothing.
+                let card = match self.kv.col_zcard(key) {
+                    Ok(c) => c as i64,
+                    Err(e) => return encode_wrongtype(&e),
+                };
+                let resolve = |i: i64| if i < 0 { (card + i).max(0) } else { i };
+                let start = resolve(start_i);
+                let stop = resolve(stop_i).min(card - 1);
+                let entries = if card == 0 || start >= card || start > stop {
+                    Vec::new()
+                } else {
+                    match self.kv.col_zrange(key, start as usize, stop as usize) {
+                        Ok(e) => e,
+                        Err(e) => return encode_wrongtype(&e),
                     }
-                    Err(e) => encode_wrongtype(&e),
+                };
+                if with_scores {
+                    let mut out = encoder::encode_array_header(entries.len() * 2);
+                    for e in &entries {
+                        out.extend(encoder::encode_bulk_string(e.member.as_bytes()));
+                        out.extend(encoder::encode_bulk_string(e.score.to_string().as_bytes()));
+                    }
+                    out
+                } else {
+                    let mut out = encoder::encode_array_header(entries.len());
+                    for e in &entries {
+                        out.extend(encoder::encode_bulk_string(e.member.as_bytes()));
+                    }
+                    out
                 }
             }
             "ZRANGEBYSCORE" => {
@@ -1416,11 +1468,9 @@ impl RespHandler {
             // SUBSCRIBE/PSUBSCRIBE in non-pubsub mode are handled by the
             // server loop which calls handle_pubsub_command() directly.
             // If they somehow reach here, redirect.
-            "SUBSCRIBE" | "PSUBSCRIBE" | "UNSUBSCRIBE" | "PUNSUBSCRIBE" => {
-                encoder::encode_error(
-                    "ERR pub/sub commands must be handled by the server connection loop"
-                )
-            }
+            "SUBSCRIBE" | "PSUBSCRIBE" | "UNSUBSCRIBE" | "PUNSUBSCRIBE" => encoder::encode_error(
+                "ERR pub/sub commands must be handled by the server connection loop",
+            ),
 
             // ================================================================
             // Geo commands
@@ -1428,7 +1478,7 @@ impl RespHandler {
             "GEOADD" => {
                 // GEOADD key [NX|XX] [CH] longitude latitude member [longitude latitude member ...]
                 let key = require_arg!(args, 1);
-                if args.len() < 5 || (args.len() - 2) % 3 != 0 {
+                if args.len() < 5 || !(args.len() - 2).is_multiple_of(3) {
                     return encoder::encode_error(
                         "ERR wrong number of arguments for 'geoadd' command",
                     );
@@ -1468,9 +1518,9 @@ impl RespHandler {
                     "m"
                 };
                 match self.kv.geodist(key, member1, member2, unit) {
-                    Ok(Some(dist)) => encoder::encode_bulk_string(
-                        format!("{:.4}", dist).as_bytes(),
-                    ),
+                    Ok(Some(dist)) => {
+                        encoder::encode_bulk_string(format!("{:.4}", dist).as_bytes())
+                    }
                     Ok(None) => encoder::encode_null_bulk(),
                     Err(e) => encode_wrongtype(&e),
                 }
@@ -1515,7 +1565,8 @@ impl RespHandler {
                     Ok(v) => v,
                     Err(_) => return encoder::encode_error("ERR value is not a valid float"),
                 };
-                let radius: f64 = match String::from_utf8_lossy(require_arg_bytes!(args, 4)).parse() {
+                let radius: f64 = match String::from_utf8_lossy(require_arg_bytes!(args, 4)).parse()
+                {
                     Ok(v) => v,
                     Err(_) => return encoder::encode_error("ERR value is not a valid float"),
                 };
@@ -1558,8 +1609,12 @@ impl RespHandler {
                             let mut out = encoder::encode_array_header(results.len());
                             for (member, dist) in &results {
                                 let mut sub_count = 1; // member name
-                                if with_dist { sub_count += 1; }
-                                if with_coord { sub_count += 1; }
+                                if with_dist {
+                                    sub_count += 1;
+                                }
+                                if with_coord {
+                                    sub_count += 1;
+                                }
                                 out.extend(encoder::encode_array_header(sub_count));
                                 out.extend(encoder::encode_bulk_string(member.as_bytes()));
                                 if with_dist {
@@ -1597,7 +1652,8 @@ impl RespHandler {
                 // GEORADIUSBYMEMBER key member radius m|km|ft|mi
                 let key = require_arg!(args, 1);
                 let member = require_arg!(args, 2);
-                let radius: f64 = match String::from_utf8_lossy(require_arg_bytes!(args, 3)).parse() {
+                let radius: f64 = match String::from_utf8_lossy(require_arg_bytes!(args, 3)).parse()
+                {
                     Ok(v) => v,
                     Err(_) => return encoder::encode_error("ERR value is not a valid float"),
                 };
@@ -1605,18 +1661,16 @@ impl RespHandler {
 
                 // Look up the member's position
                 match self.kv.geopos(key, member) {
-                    Ok(Some((lon, lat))) => {
-                        match self.kv.georadius(key, lon, lat, radius, unit) {
-                            Ok(results) => {
-                                let mut out = encoder::encode_array_header(results.len());
-                                for (m, _) in &results {
-                                    out.extend(encoder::encode_bulk_string(m.as_bytes()));
-                                }
-                                out
+                    Ok(Some((lon, lat))) => match self.kv.georadius(key, lon, lat, radius, unit) {
+                        Ok(results) => {
+                            let mut out = encoder::encode_array_header(results.len());
+                            for (m, _) in &results {
+                                out.extend(encoder::encode_bulk_string(m.as_bytes()));
                             }
-                            Err(e) => encode_wrongtype(&e),
+                            out
                         }
-                    }
+                        Err(e) => encode_wrongtype(&e),
+                    },
                     Ok(None) => encoder::encode_error("ERR could not decode requested zset member"),
                     Err(e) => encode_wrongtype(&e),
                 }
@@ -1807,6 +1861,44 @@ mod tests {
     /// Check if response is a RESP error.
     fn is_error(data: &[u8]) -> bool {
         data.first() == Some(&b'-')
+    }
+
+    /// Decode the bulk-string members of a RESP array response.
+    fn decode_array_members(data: &[u8]) -> Vec<String> {
+        let s = String::from_utf8_lossy(data);
+        assert!(s.starts_with('*'), "expected array, got: {s}");
+        let mut members = Vec::new();
+        let mut rest = &s[s.find("\r\n").unwrap() + 2..];
+        while rest.starts_with('$') {
+            let after = &rest[1..];
+            let crlf = after.find("\r\n").unwrap();
+            let len: usize = after[..crlf].parse().unwrap();
+            let body_start = crlf + 2;
+            members.push(after[body_start..body_start + len].to_string());
+            rest = &after[body_start + len + 2..];
+        }
+        members
+    }
+
+    #[test]
+    fn test_zrange_negative_indices() {
+        let mut h = new_handler();
+        h.handle_command(args(&["ZADD", "z", "1", "a"]));
+        h.handle_command(args(&["ZADD", "z", "2", "b"]));
+        h.handle_command(args(&["ZADD", "z", "3", "c"]));
+
+        // 0..-1 → whole set in rank order.
+        let resp = h.handle_command(args(&["ZRANGE", "z", "0", "-1"]));
+        assert_eq!(decode_array_members(&resp), vec!["a", "b", "c"]);
+        // -2..-1 → last two.
+        let resp = h.handle_command(args(&["ZRANGE", "z", "-2", "-1"]));
+        assert_eq!(decode_array_members(&resp), vec!["b", "c"]);
+        // -1..-1 → last only.
+        let resp = h.handle_command(args(&["ZRANGE", "z", "-1", "-1"]));
+        assert_eq!(decode_array_members(&resp), vec!["c"]);
+        // start past end → empty.
+        let resp = h.handle_command(args(&["ZRANGE", "z", "5", "10"]));
+        assert!(decode_array_members(&resp).is_empty());
     }
 
     fn new_handler() -> RespHandler {
@@ -2004,7 +2096,10 @@ mod tests {
         let resp = h.handle_command(args(&["FOOBAR"]));
         assert!(is_error(&resp));
         let s = String::from_utf8_lossy(&resp);
-        assert!(s.contains("unknown command"), "expected unknown command error, got: {s}");
+        assert!(
+            s.contains("unknown command"),
+            "expected unknown command error, got: {s}"
+        );
     }
 
     // ====================================================================
@@ -2121,7 +2216,10 @@ mod tests {
         let resp = h.handle_command(args(&["EXEC"]));
         // Should return null bulk (transaction aborted)
         let s = String::from_utf8_lossy(&resp);
-        assert!(s.starts_with("$-1\r\n"), "expected null bulk for aborted tx, got: {s}");
+        assert!(
+            s.starts_with("$-1\r\n"),
+            "expected null bulk for aborted tx, got: {s}"
+        );
 
         // Value should be the conflicting write, not v2
         let resp = h.handle_command(args(&["GET", "wk"]));
@@ -2143,7 +2241,10 @@ mod tests {
         h.handle_command(args(&["SET", "uk", "v2"]));
         let resp = h.handle_command(args(&["EXEC"]));
         let s = String::from_utf8_lossy(&resp);
-        assert!(s.starts_with("*1\r\n"), "expected success after UNWATCH, got: {s}");
+        assert!(
+            s.starts_with("*1\r\n"),
+            "expected success after UNWATCH, got: {s}"
+        );
     }
 
     #[test]
@@ -2180,6 +2281,22 @@ mod tests {
         assert_eq!(decode_int(&resp), 1); // old was 1
 
         let resp = h.handle_command(args(&["GETBIT", "bm", "7"]));
+        assert_eq!(decode_int(&resp), 0);
+    }
+
+    // Regression: a huge SETBIT offset must be rejected (Redis caps at 2^32),
+    // not honored — otherwise one command triggers an unbounded allocation.
+    #[test]
+    fn test_setbit_offset_cap() {
+        let mut h = new_handler();
+        let resp = h.handle_command(args(&["SETBIT", "bm", "4294967296", "1"]));
+        assert!(
+            resp.starts_with(b"-ERR"),
+            "SETBIT with offset 2^32 must error, got {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+        // A reasonable offset still works.
+        let resp = h.handle_command(args(&["SETBIT", "bm", "100", "1"]));
         assert_eq!(decode_int(&resp), 0);
     }
 
@@ -2326,7 +2443,13 @@ mod tests {
 
         // Read for consumer alice
         let resp = h.handle_command(args(&[
-            "XREADGROUP", "GROUP", "g1", "alice", "STREAMS", "s", ">",
+            "XREADGROUP",
+            "GROUP",
+            "g1",
+            "alice",
+            "STREAMS",
+            "s",
+            ">",
         ]));
         let s = String::from_utf8_lossy(&resp);
         assert!(s.contains("hello"), "should contain hello: {s}");
@@ -2350,12 +2473,20 @@ mod tests {
         let mut h = new_handler();
         // Add two locations
         let resp = h.handle_command(args(&[
-            "GEOADD", "places", "13.361389", "38.115556", "Palermo",
+            "GEOADD",
+            "places",
+            "13.361389",
+            "38.115556",
+            "Palermo",
         ]));
         assert_eq!(decode_int(&resp), 1);
 
         let resp = h.handle_command(args(&[
-            "GEOADD", "places", "15.087269", "37.502669", "Catania",
+            "GEOADD",
+            "places",
+            "15.087269",
+            "37.502669",
+            "Catania",
         ]));
         assert_eq!(decode_int(&resp), 1);
 
@@ -2375,10 +2506,18 @@ mod tests {
     fn test_geodist() {
         let mut h = new_handler();
         h.handle_command(args(&[
-            "GEOADD", "geo", "13.361389", "38.115556", "Palermo",
+            "GEOADD",
+            "geo",
+            "13.361389",
+            "38.115556",
+            "Palermo",
         ]));
         h.handle_command(args(&[
-            "GEOADD", "geo", "15.087269", "37.502669", "Catania",
+            "GEOADD",
+            "geo",
+            "15.087269",
+            "37.502669",
+            "Catania",
         ]));
 
         // Distance in km
@@ -2397,19 +2536,23 @@ mod tests {
     fn test_georadius() {
         let mut h = new_handler();
         h.handle_command(args(&[
-            "GEOADD", "geo", "13.361389", "38.115556", "Palermo",
+            "GEOADD",
+            "geo",
+            "13.361389",
+            "38.115556",
+            "Palermo",
         ]));
         h.handle_command(args(&[
-            "GEOADD", "geo", "15.087269", "37.502669", "Catania",
+            "GEOADD",
+            "geo",
+            "15.087269",
+            "37.502669",
+            "Catania",
         ]));
-        h.handle_command(args(&[
-            "GEOADD", "geo", "2.349014", "48.864716", "Paris",
-        ]));
+        h.handle_command(args(&["GEOADD", "geo", "2.349014", "48.864716", "Paris"]));
 
         // Radius search from Palermo area — 200km should include Catania but not Paris
-        let resp = h.handle_command(args(&[
-            "GEORADIUS", "geo", "15.0", "37.5", "200", "km",
-        ]));
+        let resp = h.handle_command(args(&["GEORADIUS", "geo", "15.0", "37.5", "200", "km"]));
         let s = String::from_utf8_lossy(&resp);
         assert!(s.contains("Catania"), "should contain Catania: {s}");
         assert!(!s.contains("Paris"), "should not contain Paris: {s}");
@@ -2419,26 +2562,53 @@ mod tests {
     fn test_georadius_with_options() {
         let mut h = new_handler();
         h.handle_command(args(&[
-            "GEOADD", "geo", "13.361389", "38.115556", "Palermo",
+            "GEOADD",
+            "geo",
+            "13.361389",
+            "38.115556",
+            "Palermo",
         ]));
         h.handle_command(args(&[
-            "GEOADD", "geo", "15.087269", "37.502669", "Catania",
+            "GEOADD",
+            "geo",
+            "15.087269",
+            "37.502669",
+            "Catania",
         ]));
 
         // GEORADIUS WITHDIST
         let resp = h.handle_command(args(&[
-            "GEORADIUS", "geo", "15.0", "37.5", "200", "km", "WITHDIST",
+            "GEORADIUS",
+            "geo",
+            "15.0",
+            "37.5",
+            "200",
+            "km",
+            "WITHDIST",
         ]));
         let s = String::from_utf8_lossy(&resp);
         // Should be an array of arrays (each [member, dist])
-        assert!(s.contains("Catania") || s.contains("Palermo"), "should contain results: {s}");
+        assert!(
+            s.contains("Catania") || s.contains("Palermo"),
+            "should contain results: {s}"
+        );
 
         // GEORADIUS with COUNT
         let resp = h.handle_command(args(&[
-            "GEORADIUS", "geo", "15.0", "37.5", "500", "km", "COUNT", "1",
+            "GEORADIUS",
+            "geo",
+            "15.0",
+            "37.5",
+            "500",
+            "km",
+            "COUNT",
+            "1",
         ]));
         let s = String::from_utf8_lossy(&resp);
-        assert!(s.starts_with("*1\r\n"), "expected 1 result with COUNT 1: {s}");
+        assert!(
+            s.starts_with("*1\r\n"),
+            "expected 1 result with COUNT 1: {s}"
+        );
     }
 
     #[test]
@@ -2446,15 +2616,24 @@ mod tests {
         let mut h = new_handler();
         // Add multiple members at once
         let resp = h.handle_command(args(&[
-            "GEOADD", "geo",
-            "13.361389", "38.115556", "Palermo",
-            "15.087269", "37.502669", "Catania",
+            "GEOADD",
+            "geo",
+            "13.361389",
+            "38.115556",
+            "Palermo",
+            "15.087269",
+            "37.502669",
+            "Catania",
         ]));
         assert_eq!(decode_int(&resp), 2);
 
         // Update existing member — should return 0 (not new)
         let resp = h.handle_command(args(&[
-            "GEOADD", "geo", "13.361389", "38.115556", "Palermo",
+            "GEOADD",
+            "geo",
+            "13.361389",
+            "38.115556",
+            "Palermo",
         ]));
         assert_eq!(decode_int(&resp), 0);
     }
@@ -2481,7 +2660,10 @@ mod tests {
         let responses = subscriber.handle_pubsub_command(args(&["SUBSCRIBE", "news"]));
         assert_eq!(responses.len(), 1);
         let s = String::from_utf8_lossy(&responses[0]);
-        assert!(s.contains("subscribe"), "expected subscribe confirmation: {s}");
+        assert!(
+            s.contains("subscribe"),
+            "expected subscribe confirmation: {s}"
+        );
 
         // Publish
         let resp = publisher.handle_command(args(&["PUBLISH", "news", "breaking"]));

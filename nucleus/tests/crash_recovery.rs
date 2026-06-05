@@ -42,7 +42,11 @@ async fn crash_recovery_durable_mvcc() {
     {
         let db = Database::durable_mvcc(dir.path()).unwrap();
         let rows = db.query("SELECT * FROM users ORDER BY id").await.unwrap();
-        assert_eq!(rows.len(), 3, "all 3 committed rows should survive recovery");
+        assert_eq!(
+            rows.len(),
+            3,
+            "all 3 committed rows should survive recovery"
+        );
         assert_eq!(rows[0][1], Value::Text("Alice".into()));
         assert_eq!(rows[1][1], Value::Text("Bob".into()));
         assert_eq!(rows[2][1], Value::Text("Charlie".into()));
@@ -177,7 +181,11 @@ async fn crash_multi_cycle_recovery() {
     {
         let db = Database::durable_mvcc(dir.path()).unwrap();
         let rows = db.query("SELECT * FROM t ORDER BY id").await.unwrap();
-        assert_eq!(rows.len(), 2, "both rows should survive multi-cycle recovery");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both rows should survive multi-cycle recovery"
+        );
         assert_eq!(rows[0][1], Value::Text("first".into()));
         assert_eq!(rows[1][1], Value::Text("second".into()));
     }
@@ -199,11 +207,21 @@ async fn crash_multi_table_recovery() {
         db.execute("CREATE TABLE orders (id INT NOT NULL, user_id INT NOT NULL, total FLOAT)")
             .await
             .unwrap();
-        db.execute("INSERT INTO users VALUES (1, 'Alice')").await.unwrap();
-        db.execute("INSERT INTO users VALUES (2, 'Bob')").await.unwrap();
-        db.execute("INSERT INTO orders VALUES (100, 1, 29.99)").await.unwrap();
-        db.execute("INSERT INTO orders VALUES (101, 2, 49.99)").await.unwrap();
-        db.execute("INSERT INTO orders VALUES (102, 1, 9.99)").await.unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Alice')")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (100, 1, 29.99)")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (101, 2, 49.99)")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (102, 1, 9.99)")
+            .await
+            .unwrap();
         db.close();
     }
 
@@ -254,7 +272,10 @@ async fn crash_update_delete_recovery() {
         // - row 3 should remain as 'c'
         // WAL recovery may not replay UPDATE/DELETE the same way as in-memory,
         // so we verify the data is consistent (all rows have valid ids).
-        assert!(rows.len() >= 2, "should have at least 2 rows after recovery");
+        assert!(
+            rows.len() >= 2,
+            "should have at least 2 rows after recovery"
+        );
 
         // Verify no row with id=2 exists (it was deleted)
         let has_id_2 = rows.iter().any(|r| r[0] == Value::Int32(2));
@@ -314,13 +335,21 @@ async fn crash_mixed_committed_uncommitted() {
             .unwrap();
 
         // Committed rows (auto-commit)
-        db.execute("INSERT INTO t VALUES (1, 'committed')").await.unwrap();
-        db.execute("INSERT INTO t VALUES (2, 'committed')").await.unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'committed')")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'committed')")
+            .await
+            .unwrap();
 
         // Start explicit txn, insert but don't commit
         db.execute("BEGIN").await.unwrap();
-        db.execute("INSERT INTO t VALUES (3, 'uncommitted')").await.unwrap();
-        db.execute("INSERT INTO t VALUES (4, 'uncommitted')").await.unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'uncommitted')")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (4, 'uncommitted')")
+            .await
+            .unwrap();
         // Crash without commit
         db.close();
     }
@@ -364,7 +393,10 @@ async fn crash_truncated_wal() {
     // Recovery should handle truncated record gracefully
     {
         let result = Database::durable_mvcc(dir.path());
-        assert!(result.is_ok(), "recovery should handle truncated WAL without panic");
+        assert!(
+            result.is_ok(),
+            "recovery should handle truncated WAL without panic"
+        );
     }
 }
 
@@ -400,7 +432,10 @@ async fn crash_five_cycle_growing() {
             other => panic!("unexpected count type: {other:?}"),
         };
         let expected = ((cycle + 1) * 10) as i64;
-        assert_eq!(count, expected, "cycle {cycle}: expected {expected} rows, got {count}");
+        assert_eq!(
+            count, expected,
+            "cycle {cycle}: expected {expected} rows, got {count}"
+        );
 
         db.close();
     }
@@ -457,7 +492,10 @@ async fn crash_recovery_concurrent_writers() {
         }
 
         // Verify all rows landed before close
-        let rows = db.query("SELECT COUNT(*) FROM concurrent_wal").await.unwrap();
+        let rows = db
+            .query("SELECT COUNT(*) FROM concurrent_wal")
+            .await
+            .unwrap();
         let count = extract_count(&rows[0][0]);
         assert_eq!(
             count,
@@ -473,7 +511,10 @@ async fn crash_recovery_concurrent_writers() {
     // Phase 2: Reopen and verify all concurrent writes survived
     {
         let db = Database::durable_mvcc(dir.path()).unwrap();
-        let rows = db.query("SELECT COUNT(*) FROM concurrent_wal").await.unwrap();
+        let rows = db
+            .query("SELECT COUNT(*) FROM concurrent_wal")
+            .await
+            .unwrap();
         let count = extract_count(&rows[0][0]);
         assert_eq!(
             count, 400,
@@ -489,10 +530,7 @@ async fn crash_recovery_concurrent_writers() {
                 .await
                 .unwrap();
             let count = extract_count(&rows[0][0]);
-            assert_eq!(
-                count, 50,
-                "writer {w} should have 50 rows after recovery"
-            );
+            assert_eq!(count, 50, "writer {w} should have 50 rows after recovery");
         }
     }
 }
@@ -824,8 +862,8 @@ async fn crash_recovery_disk_concurrent_load() {
             let db = db.clone();
             let committed = committed_total.clone();
             handles.push(tokio::spawn(async move {
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(duration_secs);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(duration_secs);
                 let mut seq = 0u64;
                 while std::time::Instant::now() < deadline {
                     seq += 1;

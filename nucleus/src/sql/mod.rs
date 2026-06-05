@@ -54,50 +54,48 @@ pub fn convert_data_type(dt: &ast::DataType) -> Result<DataType, ParseError> {
         ast::DataType::Blob(_) => Ok(DataType::Bytea),
         ast::DataType::SmallInt(_) | ast::DataType::TinyInt(_) => Ok(DataType::Int32),
         ast::DataType::Real => Ok(DataType::Float64),
-        ast::DataType::Array(inner) => {
-            match inner {
-                ast::ArrayElemTypeDef::AngleBracket(dt) => {
-                    Ok(DataType::Array(Box::new(convert_data_type(dt)?)))
-                }
-                ast::ArrayElemTypeDef::SquareBracket(dt, _) => {
-                    Ok(DataType::Array(Box::new(convert_data_type(dt)?)))
-                }
-                ast::ArrayElemTypeDef::Parenthesis(dt) => {
-                    Ok(DataType::Array(Box::new(convert_data_type(dt)?)))
-                }
-                ast::ArrayElemTypeDef::None => {
-                    Ok(DataType::Array(Box::new(DataType::Text)))
-                }
+        ast::DataType::Array(inner) => match inner {
+            ast::ArrayElemTypeDef::AngleBracket(dt) => {
+                Ok(DataType::Array(Box::new(convert_data_type(dt)?)))
             }
-        }
+            ast::ArrayElemTypeDef::SquareBracket(dt, _) => {
+                Ok(DataType::Array(Box::new(convert_data_type(dt)?)))
+            }
+            ast::ArrayElemTypeDef::Parenthesis(dt) => {
+                Ok(DataType::Array(Box::new(convert_data_type(dt)?)))
+            }
+            ast::ArrayElemTypeDef::None => Ok(DataType::Array(Box::new(DataType::Text))),
+        },
         ast::DataType::Custom(name, args) => {
             // Handle VECTOR(n) custom type
             if let Some(part) = name.0.first()
-                && let Some(ident) = part.as_ident() {
-                    match ident.value.to_lowercase().as_str() {
-                        "vector" => {
-                            if args.is_empty() {
-                                // VECTOR without dimension defaults to 0 (unknown dimension)
-                                return Ok(DataType::Vector(0));
-                            }
-                            // Extract dimensionality from args (args are Strings in sqlparser 0.61)
-                            if args.len() == 1
-                                && let Ok(dim) = args[0].parse::<usize>() {
-                                    return Ok(DataType::Vector(dim));
-                                }
-                            return Err(ParseError::UnsupportedDataType(
-                                "VECTOR type requires a numeric dimension, e.g., VECTOR(384)".into()
-                            ));
+                && let Some(ident) = part.as_ident()
+            {
+                match ident.value.to_lowercase().as_str() {
+                    "vector" => {
+                        if args.is_empty() {
+                            // VECTOR without dimension defaults to 0 (unknown dimension)
+                            return Ok(DataType::Vector(0));
                         }
-                        // Serial types: stored as Int32/Int64; executor auto-creates sequences.
-                        "serial" | "serial4" => return Ok(DataType::Int32),
-                        "bigserial" | "serial8" => return Ok(DataType::Int64),
-                        "smallserial" | "serial2" => return Ok(DataType::Int32),
-                        _ => {}
+                        // Extract dimensionality from args (args are Strings in sqlparser 0.61)
+                        if args.len() == 1
+                            && let Ok(dim) = args[0].parse::<usize>()
+                        {
+                            return Ok(DataType::Vector(dim));
+                        }
+                        return Err(ParseError::UnsupportedDataType(
+                            "VECTOR type requires a numeric dimension, e.g., VECTOR(384)".into(),
+                        ));
                     }
-                    // Fall through: treat as a user-defined type (e.g. an enum).
-                    return Ok(DataType::UserDefined(ident.value.clone()));
+                    // Serial types: stored as Int32/Int64; executor auto-creates sequences.
+                    "serial" | "serial4" => return Ok(DataType::Int32),
+                    "bigserial" | "serial8" => return Ok(DataType::Int64),
+                    "smallserial" | "serial2" => return Ok(DataType::Int32),
+                    _ => {}
                 }
+                // Fall through: treat as a user-defined type (e.g. an enum).
+                return Ok(DataType::UserDefined(ident.value.clone()));
+            }
             Err(ParseError::UnsupportedDataType(format!("{name}")))
         }
         other => Err(ParseError::UnsupportedDataType(format!("{other}"))),
@@ -143,27 +141,40 @@ pub fn extract_serial_columns(columns: &[ast::ColumnDef]) -> Vec<(String, bool)>
                 if let Some(ident) = part.as_ident() {
                     matches!(
                         ident.value.to_lowercase().as_str(),
-                        "serial" | "serial4" | "serial2" | "smallserial"
-                        | "bigserial" | "serial8"
+                        "serial" | "serial4" | "serial2" | "smallserial" | "bigserial" | "serial8"
                     )
-                } else { false }
-            } else { false }
-        } else { false };
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         let is_bigserial = if let ast::DataType::Custom(name, _) = &col.data_type {
             if let Some(part) = name.0.first() {
                 if let Some(ident) = part.as_ident() {
                     matches!(ident.value.to_lowercase().as_str(), "bigserial" | "serial8")
-                } else { false }
-            } else { false }
-        } else { false };
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         // Also check for GENERATED ALWAYS/BY DEFAULT AS IDENTITY.
         let has_identity = col.options.iter().any(|opt| {
             matches!(
                 &opt.option,
-                ast::ColumnOption::Generated { generation_expr: None, .. }
-                | ast::ColumnOption::Identity(_)
+                ast::ColumnOption::Generated {
+                    generation_expr: None,
+                    ..
+                } | ast::ColumnOption::Identity(_)
             )
         });
 
@@ -187,7 +198,9 @@ pub fn extract_constraints(
         for opt in &col.options {
             match &opt.option {
                 ast::ColumnOption::PrimaryKey(_) => {
-                    let has_pk = constraints.iter().any(|c| matches!(c, TableConstraint::PrimaryKey { .. }));
+                    let has_pk = constraints
+                        .iter()
+                        .any(|c| matches!(c, TableConstraint::PrimaryKey { .. }));
                     if !has_pk {
                         constraints.push(TableConstraint::PrimaryKey {
                             columns: vec![col.name.value.clone()],
@@ -211,7 +224,11 @@ pub fn extract_constraints(
                         name: None,
                         columns: vec![col.name.value.clone()],
                         ref_table: fk.foreign_table.to_string(),
-                        ref_columns: fk.referred_columns.iter().map(|c| c.value.clone()).collect(),
+                        ref_columns: fk
+                            .referred_columns
+                            .iter()
+                            .map(|c| c.value.clone())
+                            .collect(),
                         on_delete: convert_fk_action(&fk.on_delete),
                         on_update: convert_fk_action(&fk.on_update),
                     });
@@ -227,13 +244,21 @@ pub fn extract_constraints(
             ast::TableConstraint::PrimaryKey(pk) => {
                 constraints.retain(|c| !matches!(c, TableConstraint::PrimaryKey { .. }));
                 constraints.push(TableConstraint::PrimaryKey {
-                    columns: pk.columns.iter().map(|c| c.column.expr.to_string()).collect(),
+                    columns: pk
+                        .columns
+                        .iter()
+                        .map(|c| c.column.expr.to_string())
+                        .collect(),
                 });
             }
             ast::TableConstraint::Unique(u) => {
                 constraints.push(TableConstraint::Unique {
                     name: u.name.as_ref().map(|n| n.to_string()),
-                    columns: u.columns.iter().map(|c| c.column.expr.to_string()).collect(),
+                    columns: u
+                        .columns
+                        .iter()
+                        .map(|c| c.column.expr.to_string())
+                        .collect(),
                 });
             }
             ast::TableConstraint::Check(ck) => {
@@ -247,7 +272,11 @@ pub fn extract_constraints(
                     name: fk.name.as_ref().map(|n| n.to_string()),
                     columns: fk.columns.iter().map(|c| c.value.clone()).collect(),
                     ref_table: fk.foreign_table.to_string(),
-                    ref_columns: fk.referred_columns.iter().map(|c| c.value.clone()).collect(),
+                    ref_columns: fk
+                        .referred_columns
+                        .iter()
+                        .map(|c| c.value.clone())
+                        .collect(),
                     on_delete: convert_fk_action(&fk.on_delete),
                     on_update: convert_fk_action(&fk.on_update),
                 });

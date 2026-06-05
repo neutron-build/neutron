@@ -66,11 +66,14 @@ impl ColumnarWal {
         } else {
             WalState { tables: Vec::new() }
         };
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        Ok((Self { path, writer: Mutex::new(BufWriter::new(file)) }, state))
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok((
+            Self {
+                path,
+                writer: Mutex::new(BufWriter::new(file)),
+            },
+            state,
+        ))
     }
 
     /// Log a CREATE TABLE operation.
@@ -116,7 +119,9 @@ impl ColumnarWal {
         }
 
         // Flush existing writer, then truncate file and rewrite as one entry.
-        { self.writer.lock().flush()?; }
+        {
+            self.writer.lock().flush()?;
+        }
 
         let file = OpenOptions::new()
             .write(true)
@@ -144,12 +149,7 @@ impl ColumnarWal {
 
 // ─── Binary encoding ──────────────────────────────────────────────────────────
 
-fn write_entry<W: Write>(
-    w: &mut W,
-    entry_type: u8,
-    name: &str,
-    payload: &[u8],
-) -> io::Result<()> {
+fn write_entry<W: Write>(w: &mut W, entry_type: u8, name: &str, payload: &[u8]) -> io::Result<()> {
     let nb = name.as_bytes();
     w.write_all(&[entry_type])?;
     w.write_all(&(nb.len() as u32).to_le_bytes())?;
@@ -168,19 +168,40 @@ fn encode_row(row: &Row, buf: &mut Vec<u8>) {
 fn encode_value(val: &Value, buf: &mut Vec<u8>) {
     match val {
         Value::Null => buf.push(0),
-        Value::Bool(b) => { buf.push(1); buf.push(*b as u8); }
-        Value::Int32(n) => { buf.push(2); buf.extend_from_slice(&n.to_le_bytes()); }
-        Value::Int64(n) => { buf.push(3); buf.extend_from_slice(&n.to_le_bytes()); }
-        Value::Float64(f) => { buf.push(4); buf.extend_from_slice(&f.to_le_bytes()); }
+        Value::Bool(b) => {
+            buf.push(1);
+            buf.push(*b as u8);
+        }
+        Value::Int32(n) => {
+            buf.push(2);
+            buf.extend_from_slice(&n.to_le_bytes());
+        }
+        Value::Int64(n) => {
+            buf.push(3);
+            buf.extend_from_slice(&n.to_le_bytes());
+        }
+        Value::Float64(f) => {
+            buf.push(4);
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
         Value::Text(s) => {
             buf.push(5);
             let b = s.as_bytes();
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
         }
-        Value::Date(d) => { buf.push(7); buf.extend_from_slice(&d.to_le_bytes()); }
-        Value::Timestamp(t) => { buf.push(8); buf.extend_from_slice(&t.to_le_bytes()); }
-        Value::TimestampTz(t) => { buf.push(9); buf.extend_from_slice(&t.to_le_bytes()); }
+        Value::Date(d) => {
+            buf.push(7);
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        Value::Timestamp(t) => {
+            buf.push(8);
+            buf.extend_from_slice(&t.to_le_bytes());
+        }
+        Value::TimestampTz(t) => {
+            buf.push(9);
+            buf.extend_from_slice(&t.to_le_bytes());
+        }
         other => {
             // Fallback: encode as Text (lossy for exotic types — sufficient for
             // columnar analytical workloads that don't use JSON/UUID/Array).
@@ -200,19 +221,24 @@ fn encode_value(val: &Value, buf: &mut Vec<u8>) {
 /// SNAPSHOT entries reset all state to their embedded snapshot, so only the
 /// *last* SNAPSHOT (and subsequent incremental entries) matter in practice.
 fn replay(data: &[u8]) -> WalState {
-    let mut tables: std::collections::HashMap<String, Vec<Row>> =
-        std::collections::HashMap::new();
+    let mut tables: std::collections::HashMap<String, Vec<Row>> = std::collections::HashMap::new();
     let mut pos = 0usize;
 
     while pos < data.len() {
         // entry_type
-        let Some(&entry_type) = data.get(pos) else { break };
+        let Some(&entry_type) = data.get(pos) else {
+            break;
+        };
         pos += 1;
 
         // name
-        let Some(name_len) = read_u32(data, &mut pos) else { break };
+        let Some(name_len) = read_u32(data, &mut pos) else {
+            break;
+        };
         let name_len = name_len as usize;
-        if pos + name_len > data.len() { break; }
+        if pos + name_len > data.len() {
+            break;
+        }
         let name = match std::str::from_utf8(&data[pos..pos + name_len]) {
             Ok(s) => s.to_string(),
             Err(_) => break,
@@ -220,9 +246,13 @@ fn replay(data: &[u8]) -> WalState {
         pos += name_len;
 
         // payload
-        let Some(payload_len) = read_u32(data, &mut pos) else { break };
+        let Some(payload_len) = read_u32(data, &mut pos) else {
+            break;
+        };
         let payload_len = payload_len as usize;
-        if pos + payload_len > data.len() { break; }
+        if pos + payload_len > data.len() {
+            break;
+        }
         let payload = &data[pos..pos + payload_len];
         pos += payload_len;
 
@@ -245,12 +275,17 @@ fn replay(data: &[u8]) -> WalState {
         }
     }
 
-    WalState { tables: tables.into_iter().collect() }
+    WalState {
+        tables: tables.into_iter().collect(),
+    }
 }
 
 fn decode_rows(data: &[u8]) -> Vec<Row> {
     let mut pos = 0;
-    let n = match read_u32(data, &mut pos) { Some(n) => n as usize, None => return vec![] };
+    let n = match read_u32(data, &mut pos) {
+        Some(n) => n as usize,
+        None => return vec![],
+    };
     let mut rows = Vec::with_capacity(n);
     for _ in 0..n {
         match decode_row(data, &mut pos) {
@@ -261,23 +296,31 @@ fn decode_rows(data: &[u8]) -> Vec<Row> {
     rows
 }
 
-fn decode_snapshot_into(
-    data: &[u8],
-    tables: &mut std::collections::HashMap<String, Vec<Row>>,
-) {
+fn decode_snapshot_into(data: &[u8], tables: &mut std::collections::HashMap<String, Vec<Row>>) {
     let mut pos = 0;
-    let n_tables = match read_u32(data, &mut pos) { Some(n) => n as usize, None => return };
+    let n_tables = match read_u32(data, &mut pos) {
+        Some(n) => n as usize,
+        None => return,
+    };
     for _ in 0..n_tables {
         // table name
-        let name_len = match read_u32(data, &mut pos) { Some(n) => n as usize, None => return };
-        if pos + name_len > data.len() { return; }
+        let name_len = match read_u32(data, &mut pos) {
+            Some(n) => n as usize,
+            None => return,
+        };
+        if pos + name_len > data.len() {
+            return;
+        }
         let name = match std::str::from_utf8(&data[pos..pos + name_len]) {
             Ok(s) => s.to_string(),
             Err(_) => return,
         };
         pos += name_len;
         // rows
-        let n_rows = match read_u32(data, &mut pos) { Some(n) => n as usize, None => return };
+        let n_rows = match read_u32(data, &mut pos) {
+            Some(n) => n as usize,
+            None => return,
+        };
         let mut rows = Vec::with_capacity(n_rows);
         for _ in 0..n_rows {
             match decode_row(data, &mut pos) {
@@ -303,14 +346,22 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Option<Value> {
     *pos += 1;
     match tag {
         0 => Some(Value::Null),
-        1 => { let b = *data.get(*pos)?; *pos += 1; Some(Value::Bool(b != 0)) }
+        1 => {
+            let b = *data.get(*pos)?;
+            *pos += 1;
+            Some(Value::Bool(b != 0))
+        }
         2 => Some(Value::Int32(read_i32(data, pos)?)),
         3 => Some(Value::Int64(read_i64(data, pos)?)),
         4 => Some(Value::Float64(read_f64(data, pos)?)),
         5 => {
             let len = read_u32(data, pos)? as usize;
-            if *pos + len > data.len() { return None; }
-            let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+            if *pos + len > data.len() {
+                return None;
+            }
+            let s = std::str::from_utf8(&data[*pos..*pos + len])
+                .ok()?
+                .to_string();
             *pos += len;
             Some(Value::Text(s))
         }
@@ -336,7 +387,9 @@ fn read_i32(data: &[u8], pos: &mut usize) -> Option<i32> {
 fn read_i64(data: &[u8], pos: &mut usize) -> Option<i64> {
     let b = data.get(*pos..*pos + 8)?;
     *pos += 8;
-    Some(i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    Some(i64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
 }
 
 fn read_f64(data: &[u8], pos: &mut usize) -> Option<f64> {
@@ -360,7 +413,8 @@ mod tests {
         assert!(state.tables.is_empty());
 
         wal.log_create_table("t").unwrap();
-        wal.log_insert_rows("t", &[int_row(1, 1.0), int_row(2, 2.0)]).unwrap();
+        wal.log_insert_rows("t", &[int_row(1, 1.0), int_row(2, 2.0)])
+            .unwrap();
         drop(wal);
 
         // Reopen — should see 2 rows.
@@ -394,7 +448,8 @@ mod tests {
         let rows: Vec<Row> = (1..=5).map(|i| int_row(i, i as f64)).collect();
         wal.checkpoint(&[("t", rows)]).unwrap();
         // Insert 2 more rows after checkpoint.
-        wal.log_insert_rows("t", &[int_row(6, 6.0), int_row(7, 7.0)]).unwrap();
+        wal.log_insert_rows("t", &[int_row(6, 6.0), int_row(7, 7.0)])
+            .unwrap();
         drop(wal);
 
         let (_wal2, state) = ColumnarWal::open(dir.path()).unwrap();
@@ -415,7 +470,8 @@ mod tests {
         let (wal, _) = ColumnarWal::open(dir.path()).unwrap();
         wal.log_create_table("a").unwrap();
         wal.log_create_table("b").unwrap();
-        wal.log_insert_rows("a", &[int_row(1, 1.0), int_row(2, 2.0)]).unwrap();
+        wal.log_insert_rows("a", &[int_row(1, 1.0), int_row(2, 2.0)])
+            .unwrap();
         wal.log_insert_rows("b", &[int_row(10, 10.0)]).unwrap();
         drop(wal);
 

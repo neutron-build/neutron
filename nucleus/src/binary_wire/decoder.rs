@@ -8,7 +8,7 @@
 //! [type:1byte][length:4bytes Big Endian][payload:N bytes]
 //! ```
 
-use bytes::{BytesMut, Buf};
+use bytes::{Buf, BytesMut};
 use std::fmt;
 
 pub use super::encoder::message_types;
@@ -223,9 +223,8 @@ impl Decoder {
 
         let affected_rows = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
         let message_bytes = &payload[4..];
-        let message = std::str::from_utf8(message_bytes).map_err(|_| {
-            DecodeError::InvalidPayload("Invalid UTF-8 in message".to_string())
-        })?;
+        let message = std::str::from_utf8(message_bytes)
+            .map_err(|_| DecodeError::InvalidPayload("Invalid UTF-8 in message".to_string()))?;
 
         Ok((affected_rows, message))
     }
@@ -318,17 +317,13 @@ impl Decoder {
         let column_id = u16::from_be_bytes([payload[0], payload[1]]);
 
         // Find null terminator
-        let name_end = payload[2..]
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or_else(|| {
-                DecodeError::InvalidPayload("No null terminator in column name".to_string())
-            })?;
+        let name_end = payload[2..].iter().position(|&b| b == 0).ok_or_else(|| {
+            DecodeError::InvalidPayload("No null terminator in column name".to_string())
+        })?;
 
         let name_bytes = &payload[2..2 + name_end];
-        let name = std::str::from_utf8(name_bytes).map_err(|_| {
-            DecodeError::InvalidPayload("Invalid UTF-8 in column name".to_string())
-        })?;
+        let name = std::str::from_utf8(name_bytes)
+            .map_err(|_| DecodeError::InvalidPayload("Invalid UTF-8 in column name".to_string()))?;
 
         let type_offset = 2 + name_end + 1;
         if payload.len() < type_offset + 2 {
@@ -353,10 +348,7 @@ impl Decoder {
         }
 
         Ok(u32::from_be_bytes([
-            payload[0],
-            payload[1],
-            payload[2],
-            payload[3],
+            payload[0], payload[1], payload[2], payload[3],
         ]))
     }
 

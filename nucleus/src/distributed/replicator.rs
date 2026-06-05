@@ -27,8 +27,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, oneshot};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{Mutex, oneshot};
 
 /// Shorthand for the deliver channel type used in distributed pub/sub.
 type PubSubDeliverTx = Arc<Mutex<Option<UnboundedSender<(String, String)>>>>;
@@ -36,12 +36,10 @@ type PubSubDeliverTx = Arc<Mutex<Option<UnboundedSender<(String, String)>>>>;
 type PubSubGossipTx = Arc<Mutex<Option<UnboundedSender<(NodeId, Vec<String>)>>>>;
 
 use crate::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, Command, LogEntry, RequestVoteRequest,
-    RequestVoteResponse, RaftNode, Role,
+    AppendEntriesRequest, AppendEntriesResponse, Command, LogEntry, RaftNode, RequestVoteRequest,
+    RequestVoteResponse, Role,
 };
-use crate::transport::{
-    Message, NodeId, RaftCommand, RaftEntry, TcpTransport,
-};
+use crate::transport::{Message, NodeId, RaftCommand, RaftEntry, TcpTransport};
 
 // ── RaftReplicator ────────────────────────────────────────────────────────────
 
@@ -300,14 +298,9 @@ impl RaftReplicator {
                     term: *term,
                     vote_granted: *vote_granted,
                 };
-                let became_leader =
-                    self.raft.lock().await.handle_vote_response(from, &resp);
+                let became_leader = self.raft.lock().await.handle_vote_response(from, &resp);
                 if became_leader {
-                    tracing::info!(
-                        "Node {} became Raft leader (term {})",
-                        self.node_id,
-                        term
-                    );
+                    tracing::info!("Node {} became Raft leader (term {})", self.node_id, term);
                     // Send an immediate heartbeat to establish leadership.
                     self.send_append_entries().await;
                 }
@@ -500,9 +493,7 @@ impl RaftReplicator {
             let applied = raft.apply_committed();
             applied
                 .into_iter()
-                .filter_map(|idx| {
-                    raft.log.get(idx as usize).map(|e| (idx, e.command.clone()))
-                })
+                .filter_map(|idx| raft.log.get(idx as usize).map(|e| (idx, e.command.clone())))
                 .collect()
         };
 
@@ -570,25 +561,13 @@ mod tests {
         assert_eq!(vote_reqs.len(), 2);
 
         // Nodes 2 and 3 respond.
-        let resp2 = rep2
-            .raft
-            .lock()
-            .await
-            .handle_request_vote(&vote_reqs[0].1);
-        let resp3 = rep3
-            .raft
-            .lock()
-            .await
-            .handle_request_vote(&vote_reqs[1].1);
+        let resp2 = rep2.raft.lock().await.handle_request_vote(&vote_reqs[0].1);
+        let resp3 = rep3.raft.lock().await.handle_request_vote(&vote_reqs[1].1);
         assert!(resp2.vote_granted);
         assert!(resp3.vote_granted);
 
         // Node 1 processes responses.
-        let became = rep1
-            .raft
-            .lock()
-            .await
-            .handle_vote_response(2, &resp2);
+        let became = rep1.raft.lock().await.handle_vote_response(2, &resp2);
         assert!(became); // Majority with self + node 2.
         assert!(rep1.is_leader().await);
     }

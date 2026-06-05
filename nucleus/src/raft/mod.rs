@@ -407,10 +407,11 @@ impl RaftNode {
             if (entry.index as usize) < self.log.len() {
                 // Existing entry — check for conflict
                 if let Some(existing) = self.log_at(entry.index)
-                    && existing.term != entry.term {
-                        self.log.truncate(entry.index as usize);
-                        self.log.push(entry.clone());
-                    }
+                    && existing.term != entry.term
+                {
+                    self.log.truncate(entry.index as usize);
+                    self.log.push(entry.clone());
+                }
             } else {
                 self.log.push(entry.clone());
             }
@@ -468,9 +469,10 @@ impl RaftNode {
         for n in (self.commit_index + 1)..=self.last_log_index() {
             // Only commit entries from current term
             if let Some(entry) = self.log_at(n)
-                && entry.term != self.current_term {
-                    continue;
-                }
+                && entry.term != self.current_term
+            {
+                continue;
+            }
 
             // Count replications (leader counts itself)
             let mut count = 1; // self
@@ -556,9 +558,14 @@ impl RaftNode {
     }
 
     /// Handle an InstallSnapshot RPC (as follower).
-    pub fn handle_install_snapshot(&mut self, req: &InstallSnapshotRequest) -> InstallSnapshotResponse {
+    pub fn handle_install_snapshot(
+        &mut self,
+        req: &InstallSnapshotRequest,
+    ) -> InstallSnapshotResponse {
         if req.term < self.current_term {
-            return InstallSnapshotResponse { term: self.current_term };
+            return InstallSnapshotResponse {
+                term: self.current_term,
+            };
         }
 
         if req.term > self.current_term {
@@ -590,7 +597,9 @@ impl RaftNode {
             self.last_applied = req.last_included_index;
         }
 
-        InstallSnapshotResponse { term: self.current_term }
+        InstallSnapshotResponse {
+            term: self.current_term,
+        }
     }
 
     /// Check if a follower needs a snapshot (their next_index is before our snapshot).
@@ -791,8 +800,16 @@ mod tests {
             prev_log_index: 0,
             prev_log_term: 0,
             entries: vec![
-                LogEntry { index: 1, term: 1, command: Command::Noop },
-                LogEntry { index: 2, term: 1, command: Command::Sql("CREATE TABLE t (id INT)".into()) },
+                LogEntry {
+                    index: 1,
+                    term: 1,
+                    command: Command::Noop,
+                },
+                LogEntry {
+                    index: 2,
+                    term: 1,
+                    command: Command::Sql("CREATE TABLE t (id INT)".into()),
+                },
             ],
             leader_commit: 2,
         };
@@ -835,11 +852,14 @@ mod tests {
         let votes2 = node2.start_election();
         assert_eq!(node1.role, Role::Candidate);
         assert_eq!(node2.role, Role::Candidate);
-        let r3_for_1 = node3.handle_request_vote(&votes1.iter().find(|(id, _)| *id == 3).unwrap().1);
+        let r3_for_1 =
+            node3.handle_request_vote(&votes1.iter().find(|(id, _)| *id == 3).unwrap().1);
         assert!(r3_for_1.vote_granted);
-        let r3_for_2 = node3.handle_request_vote(&votes2.iter().find(|(id, _)| *id == 3).unwrap().1);
+        let r3_for_2 =
+            node3.handle_request_vote(&votes2.iter().find(|(id, _)| *id == 3).unwrap().1);
         assert!(!r3_for_2.vote_granted);
-        let r5_for_1 = node5.handle_request_vote(&votes1.iter().find(|(id, _)| *id == 5).unwrap().1);
+        let r5_for_1 =
+            node5.handle_request_vote(&votes1.iter().find(|(id, _)| *id == 5).unwrap().1);
         assert!(r5_for_1.vote_granted);
         let became_leader_1a = node1.handle_vote_response(3, &r3_for_1);
         assert!(!became_leader_1a);
@@ -931,13 +951,17 @@ mod tests {
         let mut node4 = RaftNode::new(4, vec![1, 2, 3]);
         let votes1 = node1.start_election();
         let votes2 = node2.start_election();
-        let r3_for_1 = node3.handle_request_vote(&votes1.iter().find(|(id, _)| *id == 3).unwrap().1);
+        let r3_for_1 =
+            node3.handle_request_vote(&votes1.iter().find(|(id, _)| *id == 3).unwrap().1);
         assert!(r3_for_1.vote_granted);
-        let r3_for_2 = node3.handle_request_vote(&votes2.iter().find(|(id, _)| *id == 3).unwrap().1);
+        let r3_for_2 =
+            node3.handle_request_vote(&votes2.iter().find(|(id, _)| *id == 3).unwrap().1);
         assert!(!r3_for_2.vote_granted);
-        let r4_for_2 = node4.handle_request_vote(&votes2.iter().find(|(id, _)| *id == 4).unwrap().1);
+        let r4_for_2 =
+            node4.handle_request_vote(&votes2.iter().find(|(id, _)| *id == 4).unwrap().1);
         assert!(r4_for_2.vote_granted);
-        let r4_for_1 = node4.handle_request_vote(&votes1.iter().find(|(id, _)| *id == 4).unwrap().1);
+        let r4_for_1 =
+            node4.handle_request_vote(&votes1.iter().find(|(id, _)| *id == 4).unwrap().1);
         assert!(!r4_for_1.vote_granted);
         let became_leader_1 = node1.handle_vote_response(3, &r3_for_1);
         assert!(!became_leader_1);
@@ -951,23 +975,44 @@ mod tests {
     fn append_entries_consistency_check() {
         let mut follower = RaftNode::new(2, vec![1, 3]);
         let req1 = AppendEntriesRequest {
-            term: 1, leader_id: 1, prev_log_index: 0, prev_log_term: 0,
-            entries: vec![LogEntry { index: 1, term: 1, command: Command::Noop }],
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                index: 1,
+                term: 1,
+                command: Command::Noop,
+            }],
             leader_commit: 0,
         };
         let resp = follower.handle_append_entries(&req1);
         assert!(resp.success);
         assert_eq!(follower.last_log_index(), 1);
         let req_gap = AppendEntriesRequest {
-            term: 1, leader_id: 1, prev_log_index: 2, prev_log_term: 1,
-            entries: vec![LogEntry { index: 3, term: 1, command: Command::Sql("SELECT 1".into()) }],
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 2,
+            prev_log_term: 1,
+            entries: vec![LogEntry {
+                index: 3,
+                term: 1,
+                command: Command::Sql("SELECT 1".into()),
+            }],
             leader_commit: 0,
         };
         let resp = follower.handle_append_entries(&req_gap);
         assert!(!resp.success);
         let req_bad_term = AppendEntriesRequest {
-            term: 2, leader_id: 1, prev_log_index: 1, prev_log_term: 2,
-            entries: vec![LogEntry { index: 2, term: 2, command: Command::Sql("SELECT 2".into()) }],
+            term: 2,
+            leader_id: 1,
+            prev_log_index: 1,
+            prev_log_term: 2,
+            entries: vec![LogEntry {
+                index: 2,
+                term: 2,
+                command: Command::Sql("SELECT 2".into()),
+            }],
             leader_commit: 0,
         };
         let resp = follower.handle_append_entries(&req_bad_term);
@@ -981,7 +1026,10 @@ mod tests {
         leader.role = Role::Leader;
         leader.leader_id = Some(1);
         let req = RequestVoteRequest {
-            term: 5, candidate_id: 2, last_log_index: 0, last_log_term: 0,
+            term: 5,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
         };
         let resp = leader.handle_request_vote(&req);
         assert!(resp.vote_granted);
@@ -996,7 +1044,11 @@ mod tests {
         let mut leader = RaftNode::new(1, vec![2, 3]);
         leader.current_term = 2;
         leader.role = Role::Leader;
-        let resp = AppendEntriesResponse { term: 5, success: false, match_index: 0 };
+        let resp = AppendEntriesResponse {
+            term: 5,
+            success: false,
+            match_index: 0,
+        };
         leader.handle_append_response(2, &resp);
         assert_eq!(leader.role, Role::Follower);
         assert_eq!(leader.current_term, 5);
@@ -1005,9 +1057,21 @@ mod tests {
     #[test]
     fn apply_committed_entries() {
         let mut node = RaftNode::new(1, vec![2, 3]);
-        node.log.push(LogEntry { index: 1, term: 1, command: Command::Noop });
-        node.log.push(LogEntry { index: 2, term: 1, command: Command::Sql("INSERT 1".into()) });
-        node.log.push(LogEntry { index: 3, term: 1, command: Command::Sql("INSERT 2".into()) });
+        node.log.push(LogEntry {
+            index: 1,
+            term: 1,
+            command: Command::Noop,
+        });
+        node.log.push(LogEntry {
+            index: 2,
+            term: 1,
+            command: Command::Sql("INSERT 1".into()),
+        });
+        node.log.push(LogEntry {
+            index: 3,
+            term: 1,
+            command: Command::Sql("INSERT 2".into()),
+        });
         node.commit_index = 2;
         let applied = node.apply_committed();
         assert_eq!(applied, vec![1, 2]);
@@ -1019,5 +1083,4 @@ mod tests {
         assert_eq!(applied3, vec![3]);
         assert_eq!(node.last_applied, 3);
     }
-
 }

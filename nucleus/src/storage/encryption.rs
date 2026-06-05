@@ -13,7 +13,7 @@ use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Nonce};
 use argon2::Argon2;
 
-use super::page::{PageBuf, PAGE_SIZE};
+use super::page::{PAGE_SIZE, PageBuf};
 
 /// Size of AES-GCM nonce (96 bits).
 pub const NONCE_SIZE: usize = 12;
@@ -273,12 +273,12 @@ impl KeyManager {
 
     /// Retrieve the `PageEncryptor` for a tenant (if the key is active or rotating).
     pub fn get_encryptor(&self, tenant_id: &str) -> Option<&PageEncryptor> {
-        self.tenant_keys.get(tenant_id).and_then(|tk| {
-            match &tk.state {
+        self.tenant_keys
+            .get(tenant_id)
+            .and_then(|tk| match &tk.state {
                 TenantKeyState::Active | TenantKeyState::Rotating { .. } => Some(&tk.encryptor),
                 TenantKeyState::Revoked => None,
-            }
-        })
+            })
     }
 
     /// Begin key rotation for a tenant.
@@ -534,7 +534,9 @@ mod tests {
         let encrypted_bob = mgr.encrypt_page_for_tenant("bob", &page).unwrap();
 
         // Each tenant can decrypt their own data
-        let dec_alice = mgr.decrypt_page_for_tenant("alice", &encrypted_alice).unwrap();
+        let dec_alice = mgr
+            .decrypt_page_for_tenant("alice", &encrypted_alice)
+            .unwrap();
         let dec_bob = mgr.decrypt_page_for_tenant("bob", &encrypted_bob).unwrap();
         assert_eq!(&dec_alice[..], &page[..]);
         assert_eq!(&dec_bob[..], &page[..]);
@@ -559,12 +561,16 @@ mod tests {
 
         // During rotation the old encryptor is still active, so old data is
         // still decryptable.
-        let dec = mgr.decrypt_page_for_tenant("tenant-r", &encrypted_old).unwrap();
+        let dec = mgr
+            .decrypt_page_for_tenant("tenant-r", &encrypted_old)
+            .unwrap();
         assert_eq!(&dec[..], &page[..]);
 
         // We can still encrypt new pages during rotation (uses current key).
         let encrypted_mid = mgr.encrypt_page_for_tenant("tenant-r", &page).unwrap();
-        let dec_mid = mgr.decrypt_page_for_tenant("tenant-r", &encrypted_mid).unwrap();
+        let dec_mid = mgr
+            .decrypt_page_for_tenant("tenant-r", &encrypted_mid)
+            .unwrap();
         assert_eq!(&dec_mid[..], &page[..]);
 
         // Complete the rotation — now the new key is active.
@@ -572,7 +578,9 @@ mod tests {
 
         // Encrypt under the new key and verify roundtrip.
         let encrypted_new = mgr.encrypt_page_for_tenant("tenant-r", &page).unwrap();
-        let dec_new = mgr.decrypt_page_for_tenant("tenant-r", &encrypted_new).unwrap();
+        let dec_new = mgr
+            .decrypt_page_for_tenant("tenant-r", &encrypted_new)
+            .unwrap();
         assert_eq!(&dec_new[..], &page[..]);
 
         // Old ciphertext encrypted under the previous key should no longer
@@ -600,7 +608,9 @@ mod tests {
         assert!(matches!(enc_err, KeyError::KeyRevoked(_)));
 
         // Decrypt must fail
-        let dec_err = mgr.decrypt_page_for_tenant("tenant-x", &encrypted).unwrap_err();
+        let dec_err = mgr
+            .decrypt_page_for_tenant("tenant-x", &encrypted)
+            .unwrap_err();
         assert!(matches!(dec_err, KeyError::KeyRevoked(_)));
 
         // Double-revoke must fail

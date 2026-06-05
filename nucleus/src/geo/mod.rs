@@ -265,10 +265,7 @@ impl RTree {
         if let Some((left_bbox, left, right_bbox, right)) = split {
             // Root split — create new root
             self.root = RTreeNode::Internal {
-                children: vec![
-                    (left_bbox, Box::new(left)),
-                    (right_bbox, Box::new(right)),
-                ],
+                children: vec![(left_bbox, Box::new(left)), (right_bbox, Box::new(right))],
             };
         }
         self.count += 1;

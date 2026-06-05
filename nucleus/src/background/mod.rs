@@ -7,8 +7,8 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
@@ -151,12 +151,7 @@ impl BackgroundWorkerPool {
 
     /// Spawn a recurring task that is re-submitted every `interval` while the
     /// pool is running.
-    pub fn submit_recurring(
-        &self,
-        task: BackgroundTask,
-        priority: Priority,
-        interval: Duration,
-    ) {
+    pub fn submit_recurring(&self, task: BackgroundTask, priority: Priority, interval: Duration) {
         let queue = Arc::clone(&self.queue);
         let running = Arc::clone(&self.running);
 
@@ -406,9 +401,11 @@ impl CronExpr {
         let mut values = Vec::new();
         for part in field.split(',') {
             if part.contains('/') {
-                let (range_part, step_str) = part.split_once('/')
+                let (range_part, step_str) = part
+                    .split_once('/')
                     .ok_or_else(|| format!("invalid step syntax: {part}"))?;
-                let step: u8 = step_str.parse()
+                let step: u8 = step_str
+                    .parse()
                     .map_err(|_| format!("invalid step value: {step_str}"))?;
                 if step == 0 {
                     return Err("step value must be > 0".into());
@@ -418,7 +415,8 @@ impl CronExpr {
                 } else if range_part.contains('-') {
                     Self::parse_range(range_part, min, max)?
                 } else {
-                    let v: u8 = range_part.parse()
+                    let v: u8 = range_part
+                        .parse()
                         .map_err(|_| format!("invalid number: {range_part}"))?;
                     (v, max)
                 };
@@ -437,7 +435,8 @@ impl CronExpr {
                     values.push(v);
                 }
             } else {
-                let v: u8 = part.parse()
+                let v: u8 = part
+                    .parse()
                     .map_err(|_| format!("invalid number in cron field: {part}"))?;
                 if v < min || v > max {
                     return Err(format!("value {v} out of range {min}-{max}"));
@@ -451,10 +450,15 @@ impl CronExpr {
     }
 
     fn parse_range(s: &str, min: u8, max: u8) -> Result<(u8, u8), String> {
-        let (a_str, b_str) = s.split_once('-')
+        let (a_str, b_str) = s
+            .split_once('-')
             .ok_or_else(|| format!("invalid range: {s}"))?;
-        let a: u8 = a_str.parse().map_err(|_| format!("invalid range start: {a_str}"))?;
-        let b: u8 = b_str.parse().map_err(|_| format!("invalid range end: {b_str}"))?;
+        let a: u8 = a_str
+            .parse()
+            .map_err(|_| format!("invalid range start: {a_str}"))?;
+        let b: u8 = b_str
+            .parse()
+            .map_err(|_| format!("invalid range end: {b_str}"))?;
         if a < min || b > max || a > b {
             return Err(format!("range {a}-{b} out of bounds {min}-{max}"));
         }
@@ -485,14 +489,20 @@ impl Default for CronScheduler {
 }
 
 impl CronScheduler {
-    pub fn new() -> Self { Self { tasks: Vec::new() } }
+    pub fn new() -> Self {
+        Self { tasks: Vec::new() }
+    }
 
     /// Parse a cron expression and register a new enabled task.
     pub fn add_task(&mut self, name: &str, cron_expr: &str, sql: &str) -> Result<(), String> {
         let cron = CronExpr::parse(cron_expr)?;
         self.tasks.push(ScheduledTask {
-            name: name.to_string(), cron, sql: sql.to_string(),
-            enabled: true, last_run_ms: None, run_count: 0,
+            name: name.to_string(),
+            cron,
+            sql: sql.to_string(),
+            enabled: true,
+            last_run_ms: None,
+            run_count: 0,
         });
         Ok(())
     }
@@ -504,16 +514,36 @@ impl CronScheduler {
     }
 
     pub fn enable_task(&mut self, name: &str) -> bool {
-        self.tasks.iter_mut().find(|t| t.name == name).map(|t| { t.enabled = true; }).is_some()
+        self.tasks
+            .iter_mut()
+            .find(|t| t.name == name)
+            .map(|t| {
+                t.enabled = true;
+            })
+            .is_some()
     }
 
     pub fn disable_task(&mut self, name: &str) -> bool {
-        self.tasks.iter_mut().find(|t| t.name == name).map(|t| { t.enabled = false; }).is_some()
+        self.tasks
+            .iter_mut()
+            .find(|t| t.name == name)
+            .map(|t| {
+                t.enabled = false;
+            })
+            .is_some()
     }
 
     /// Return all enabled tasks whose cron matches the given time.
-    pub fn due_tasks(&self, minute: u8, hour: u8, day: u8, month: u8, weekday: u8) -> Vec<&ScheduledTask> {
-        self.tasks.iter()
+    pub fn due_tasks(
+        &self,
+        minute: u8,
+        hour: u8,
+        day: u8,
+        month: u8,
+        weekday: u8,
+    ) -> Vec<&ScheduledTask> {
+        self.tasks
+            .iter()
             .filter(|t| t.enabled && t.cron.matches(minute, hour, day, month, weekday))
             .collect()
     }
@@ -525,7 +555,9 @@ impl CronScheduler {
         }
     }
 
-    pub fn task_count(&self) -> usize { self.tasks.len() }
+    pub fn task_count(&self) -> usize {
+        self.tasks.len()
+    }
 
     pub fn get_task(&self, name: &str) -> Option<&ScheduledTask> {
         self.tasks.iter().find(|t| t.name == name)
@@ -636,10 +668,12 @@ mod tests {
         let pool = BackgroundWorkerPool::new(4);
         assert_eq!(pool.pending_count().await, 0);
 
-        pool.submit(BackgroundTask::WalCheckpoint, Priority::Normal).await;
+        pool.submit(BackgroundTask::WalCheckpoint, Priority::Normal)
+            .await;
         assert_eq!(pool.pending_count().await, 1);
 
-        pool.submit(BackgroundTask::BufferFlush, Priority::High).await;
+        pool.submit(BackgroundTask::BufferFlush, Priority::High)
+            .await;
         assert_eq!(pool.pending_count().await, 2);
 
         let _ = pool.drain_pending().await;
@@ -709,13 +743,7 @@ mod tests {
 
         // Submit 100 tasks.
         for i in 0..100u64 {
-            submit_with_ts(
-                &pool,
-                BackgroundTask::BufferFlush,
-                Priority::Normal,
-                i,
-            )
-            .await;
+            submit_with_ts(&pool, BackgroundTask::BufferFlush, Priority::Normal, i).await;
         }
 
         // Spawn several workers draining concurrently.
@@ -752,7 +780,13 @@ mod tests {
     async fn mixed_priorities_and_timestamps() {
         let pool = BackgroundWorkerPool::new(2);
         submit_with_ts(&pool, BackgroundTask::IndexRebuild, Priority::High, 500).await;
-        submit_with_ts(&pool, BackgroundTask::WalCheckpoint, Priority::Critical, 600).await;
+        submit_with_ts(
+            &pool,
+            BackgroundTask::WalCheckpoint,
+            Priority::Critical,
+            600,
+        )
+        .await;
         submit_with_ts(&pool, BackgroundTask::BufferFlush, Priority::High, 400).await;
         submit_with_ts(&pool, BackgroundTask::CacheCleanup, Priority::Low, 100).await;
 

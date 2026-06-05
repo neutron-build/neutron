@@ -113,11 +113,7 @@ async fn test_jsonb_containment_with_null() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE nullable (id INT, data JSONB)").await;
     exec(&ex, "INSERT INTO nullable VALUES (1, NULL)").await;
-    exec(
-        &ex,
-        r#"INSERT INTO nullable VALUES (2, '{"key": "val"}')"#,
-    )
-    .await;
+    exec(&ex, r#"INSERT INTO nullable VALUES (2, '{"key": "val"}')"#).await;
 
     // NULL @> anything should not match (NULL yields false in WHERE)
     let results = exec(
@@ -134,18 +130,10 @@ async fn test_jsonb_containment_with_null() {
 async fn test_jsonb_containment_empty_object() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE docs (id INT, data JSONB)").await;
-    exec(
-        &ex,
-        r#"INSERT INTO docs VALUES (1, '{"a": 1}')"#,
-    )
-    .await;
+    exec(&ex, r#"INSERT INTO docs VALUES (1, '{"a": 1}')"#).await;
 
     // Any object contains the empty object
-    let results = exec(
-        &ex,
-        r#"SELECT id FROM docs WHERE data @> '{}'"#,
-    )
-    .await;
+    let results = exec(&ex, r#"SELECT id FROM docs WHERE data @> '{}'"#).await;
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Int32(1));
@@ -159,16 +147,8 @@ async fn test_jsonb_containment_empty_object() {
 async fn test_jsonb_contained_by() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE items (id INT, data JSONB)").await;
-    exec(
-        &ex,
-        r#"INSERT INTO items VALUES (1, '{"a": 1}')"#,
-    )
-    .await;
-    exec(
-        &ex,
-        r#"INSERT INTO items VALUES (2, '{"a": 1, "b": 2}')"#,
-    )
-    .await;
+    exec(&ex, r#"INSERT INTO items VALUES (1, '{"a": 1}')"#).await;
+    exec(&ex, r#"INSERT INTO items VALUES (2, '{"a": 1, "b": 2}')"#).await;
 
     // data <@ '{"a": 1, "b": 2, "c": 3}' -- data is contained by the right side
     let results = exec(
@@ -232,11 +212,7 @@ async fn test_arrow_operators_still_work() {
 async fn test_path_arrow_operators_still_work() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE nested (id INT, data JSONB)").await;
-    exec(
-        &ex,
-        r#"INSERT INTO nested VALUES (1, '{"a": {"b": 42}}')"#,
-    )
-    .await;
+    exec(&ex, r#"INSERT INTO nested VALUES (1, '{"a": {"b": 42}}')"#).await;
 
     // #> returns JSONB at path
     let results = exec(&ex, r#"SELECT data #> '{a,b}' FROM nested"#).await;
@@ -304,8 +280,5 @@ async fn test_subscript_syntax() {
 
     // column['key'] should work like column -> 'key'
     let results = exec(&ex, r#"SELECT data['name'] FROM sub_test"#).await;
-    assert_eq!(
-        scalar(&results[0]),
-        &Value::Jsonb(serde_json::json!("Bob"))
-    );
+    assert_eq!(scalar(&results[0]), &Value::Jsonb(serde_json::json!("Bob")));
 }

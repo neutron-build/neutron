@@ -1,11 +1,11 @@
 //! Per-connection session state and transaction management.
 
+use super::schema_types::CursorDef;
+use super::types::{CteTableMap, PreparedStmt};
+use crate::types::Row;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use crate::types::Row;
-use super::types::{CteTableMap, PreparedStmt};
-use super::schema_types::CursorDef;
 
 #[cfg(feature = "server")]
 tokio::task_local! {
@@ -18,9 +18,9 @@ tokio::task_local! {
 /// method is only needed by server-gated methods, so we only expose `try_with`.
 #[cfg(not(feature = "server"))]
 pub(super) mod __current_session {
+    use super::Session;
     use std::cell::RefCell;
     use std::sync::Arc;
-    use super::Session;
 
     thread_local! {
         static INNER: RefCell<Option<Arc<Session>>> = const { RefCell::new(None) };
@@ -58,7 +58,8 @@ pub(super) mod __current_session {
 }
 
 #[cfg(not(feature = "server"))]
-pub(super) static CURRENT_SESSION: __current_session::SessionLocal = __current_session::SessionLocal;
+pub(super) static CURRENT_SESSION: __current_session::SessionLocal =
+    __current_session::SessionLocal;
 
 /// Run an async future from a synchronous context without deadlocking tokio.
 /// Uses `block_in_place` on multi-threaded runtimes (production) and falls
@@ -67,7 +68,9 @@ pub(super) static CURRENT_SESSION: __current_session::SessionLocal = __current_s
 /// Only available with the `server` feature (requires full tokio runtime).
 #[cfg(feature = "server")]
 pub(super) fn sync_block_on<F: std::future::Future + Send>(fut: F) -> F::Output
-where F::Output: Send {
+where
+    F::Output: Send,
+{
     let handle = tokio::runtime::Handle::current();
     if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
         tokio::task::block_in_place(|| handle.block_on(fut))
@@ -83,16 +86,21 @@ where F::Output: Send {
 pub(super) fn sync_block_on<F: std::future::Future>(fut: F) -> F::Output {
     // On WASM / embedded builds without a full tokio runtime, we use a simple
     // spin-poll executor. This is safe because there is no true parallelism.
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     use std::pin::pin;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     fn noop_raw_waker() -> RawWaker {
         fn no_op(_: *const ()) {}
-        fn clone(p: *const ()) -> RawWaker { RawWaker::new(p, &VTABLE) }
+        fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTABLE)
+        }
         const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
         RawWaker::new(std::ptr::null(), &VTABLE)
     }
 
+    // SAFETY: noop_raw_waker() returns a RawWaker whose vtable's clone/wake/
+    // wake_by_ref/drop are all no-ops over a null data pointer that is never
+    // dereferenced, so it upholds the RawWaker/Waker contract.
     let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
     let mut cx = Context::from_waker(&waker);
     let mut fut = pin!(fut);
@@ -189,9 +197,9 @@ impl Session {
             cursors: RwLock::new(HashMap::new()),
             settings: parking_lot::RwLock::new(default_settings),
             active_ctes: parking_lot::RwLock::new(HashMap::new()),
-            session_context: parking_lot::RwLock::new(
-                crate::security::SessionContext::new("nucleus"),
-            ),
+            session_context: parking_lot::RwLock::new(crate::security::SessionContext::new(
+                "nucleus",
+            )),
         }
     }
 

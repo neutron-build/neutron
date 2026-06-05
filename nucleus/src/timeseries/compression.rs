@@ -267,8 +267,7 @@ impl GorillaEncoder {
                 self.val_writer.write_bits(leading_capped as u64, 5);
                 // 6 bits for meaningful bits length (1..64, stored as 0..63)
                 let meaningful_bits = 64 - leading_capped - trailing;
-                self.val_writer
-                    .write_bits((meaningful_bits - 1) as u64, 6);
+                self.val_writer.write_bits((meaningful_bits - 1) as u64, 6);
                 // Write the meaningful bits
                 let meaningful = (xor >> trailing) & ((1u64 << meaningful_bits) - 1);
                 self.val_writer.write_bits(meaningful, meaningful_bits);

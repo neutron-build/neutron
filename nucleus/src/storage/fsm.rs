@@ -8,7 +8,6 @@
 //! The FSM is stored as a flat array in memory and can be persisted to
 //! dedicated FSM pages on disk.
 
-
 /// Bytes of free space represented by one FSM category unit.
 const BYTES_PER_CATEGORY: usize = 64;
 
@@ -166,8 +165,8 @@ impl std::fmt::Debug for FreeSpaceMap {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::page::PAGE_SIZE;
+    use super::*;
 
     #[test]
     fn new_fsm_is_empty() {
@@ -190,8 +189,8 @@ mod tests {
     fn update_and_get() {
         let mut fsm = FreeSpaceMap::new();
         fsm.update(0, PAGE_SIZE); // Full page of free space
-        fsm.update(1, 0);         // No free space
-        fsm.update(2, 1000);      // Some free space
+        fsm.update(1, 0); // No free space
+        fsm.update(2, 1000); // Some free space
 
         assert_eq!(fsm.get(0), 255); // PAGE_SIZE / 64 = 256, capped at 255
         assert_eq!(fsm.get(1), 0);
@@ -201,10 +200,10 @@ mod tests {
     #[test]
     fn find_page_with_enough_space() {
         let mut fsm = FreeSpaceMap::new();
-        fsm.update(0, 100);   // ~100 bytes free
-        fsm.update(1, 500);   // ~500 bytes free
-        fsm.update(2, 2000);  // ~2000 bytes free
-        fsm.update(3, 50);    // ~50 bytes free
+        fsm.update(0, 100); // ~100 bytes free
+        fsm.update(1, 500); // ~500 bytes free
+        fsm.update(2, 2000); // ~2000 bytes free
+        fsm.update(3, 50); // ~50 bytes free
 
         // Need 400 bytes → page 1 has 500
         assert_eq!(fsm.find_page(400), Some(1));
@@ -277,9 +276,9 @@ mod tests {
     #[test]
     fn stats_calculation() {
         let mut fsm = FreeSpaceMap::with_capacity(5);
-        fsm.update(0, 0);          // full
-        fsm.update(1, 0);          // full
-        fsm.update(2, PAGE_SIZE);  // empty
+        fsm.update(0, 0); // full
+        fsm.update(1, 0); // full
+        fsm.update(2, PAGE_SIZE); // empty
         // pages 3 and 4 are initially 255 (empty)
 
         let (total, full, empty, _avg) = fsm.stats();

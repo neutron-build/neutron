@@ -161,12 +161,20 @@ pub fn count_f64(column: &[f64]) -> usize {
 
 /// Scalar min of f64 column (ignoring NaN).
 pub fn min_f64(column: &[f64]) -> Option<f64> {
-    column.iter().copied().filter(|v| !v.is_nan()).reduce(f64::min)
+    column
+        .iter()
+        .copied()
+        .filter(|v| !v.is_nan())
+        .reduce(f64::min)
 }
 
 /// Scalar max of f64 column (ignoring NaN).
 pub fn max_f64(column: &[f64]) -> Option<f64> {
-    column.iter().copied().filter(|v| !v.is_nan()).reduce(f64::max)
+    column
+        .iter()
+        .copied()
+        .filter(|v| !v.is_nan())
+        .reduce(f64::max)
 }
 
 // ============================================================================

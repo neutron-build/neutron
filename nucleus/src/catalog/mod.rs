@@ -44,10 +44,7 @@ pub enum TableConstraint {
         columns: Vec<String>,
     },
     /// CHECK (expression) — stored as SQL text.
-    Check {
-        name: Option<String>,
-        expr: String,
-    },
+    Check { name: Option<String>, expr: String },
     /// FOREIGN KEY (columns) REFERENCES target_table (target_columns).
     ForeignKey {
         name: Option<String>,
@@ -222,7 +219,9 @@ impl Catalog {
                 self.catalog_epoch.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
-            Err(_) => Err(CatalogError::TableNotFound("catalog lock contention during recovery".into())),
+            Err(_) => Err(CatalogError::TableNotFound(
+                "catalog lock contention during recovery".into(),
+            )),
         }
     }
 
@@ -287,11 +286,12 @@ impl Catalog {
         let keys: Vec<String> = indexes.keys().cloned().collect();
         for key in keys {
             if let Some(idx) = indexes.get(&key)
-                && idx.table_name == old_name {
-                    let mut new_idx = (**idx).clone();
-                    new_idx.table_name = new_name.to_string();
-                    indexes.insert(key, Arc::new(new_idx));
-                }
+                && idx.table_name == old_name
+            {
+                let mut new_idx = (**idx).clone();
+                new_idx.table_name = new_name.to_string();
+                indexes.insert(key, Arc::new(new_idx));
+            }
         }
         // Invalidate sync caches for old and new names.
         {
@@ -342,7 +342,9 @@ impl Catalog {
         let guard = self.tables.try_read().ok()?;
         let def = guard.get(name)?.clone();
         // Populate cache for next time.
-        self.table_cache.write().insert(name.to_string(), Arc::clone(&def));
+        self.table_cache
+            .write()
+            .insert(name.to_string(), Arc::clone(&def));
         Some(def)
     }
 
@@ -364,7 +366,9 @@ impl Catalog {
             .cloned()
             .collect();
         // Populate cache for next time.
-        self.index_cache.write().insert(table_name.to_string(), result.clone());
+        self.index_cache
+            .write()
+            .insert(table_name.to_string(), result.clone());
         Some(result)
     }
 
@@ -429,7 +433,11 @@ impl Catalog {
     // ── Enum type operations ─────────────────────────────────────────
 
     /// Register a new enum type.
-    pub async fn create_enum_type(&self, name: &str, labels: Vec<String>) -> Result<(), CatalogError> {
+    pub async fn create_enum_type(
+        &self,
+        name: &str,
+        labels: Vec<String>,
+    ) -> Result<(), CatalogError> {
         let mut types = self.enum_types.write().await;
         if types.contains_key(name) {
             return Err(CatalogError::TypeExists(name.to_string()));

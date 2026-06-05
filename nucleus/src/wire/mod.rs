@@ -119,8 +119,7 @@ impl AuthSource for UserAuthenticator {
 }
 
 /// Password authentication method for the wire protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AuthMethod {
     /// PostgreSQL cleartext password exchange (only safe with TLS).
     Cleartext,
@@ -128,7 +127,6 @@ pub enum AuthMethod {
     #[default]
     ScramSha256,
 }
-
 
 // ============================================================================
 // Login Rate Limiter
@@ -159,9 +157,10 @@ impl LoginRateLimiter {
     fn is_locked_out(&self, ip: IpAddr) -> bool {
         let attempts = self.attempts.lock();
         if let Some(&(count, last)) = attempts.get(&ip)
-            && count >= Self::MAX_FAILED_ATTEMPTS {
-                return last.elapsed().as_secs() < Self::LOCKOUT_SECS;
-            }
+            && count >= Self::MAX_FAILED_ATTEMPTS
+        {
+            return last.elapsed().as_secs() < Self::LOCKOUT_SECS;
+        }
         false
     }
 
@@ -685,7 +684,9 @@ impl NucleusHandler {
                 } else {
                     tag.as_str()
                 };
-                Ok(Response::Execution(Tag::new(wire_tag).with_rows(rows_affected)))
+                Ok(Response::Execution(
+                    Tag::new(wire_tag).with_rows(rows_affected),
+                ))
             }
             ExecResult::CopyOut { row_count, .. } => {
                 Ok(Response::Execution(Tag::new("COPY").with_rows(row_count)))
@@ -724,31 +725,23 @@ impl NucleusHandler {
             ))));
         }
 
-        let fut = self
-            .executor
-            .execute_with_session(session_id, sql);
+        let fut = self.executor.execute_with_session(session_id, sql);
 
         // Per-session statement_timeout overrides the global default.
         // SET statement_timeout = N (seconds) to configure per-connection.
-        let timeout_secs = self.executor
+        let timeout_secs = self
+            .executor
             .get_session_setting(session_id, "statement_timeout")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(self.statement_timeout_secs);
 
         if timeout_secs > 0 {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                fut,
-            )
-            .await
-            {
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
                 Ok(result) => result.map_err(exec_error_to_pgwire),
                 Err(_elapsed) => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_owned(),
                     "57014".to_owned(), // query_canceled
-                    format!(
-                        "canceling statement due to statement timeout ({timeout_secs}s)",
-                    ),
+                    format!("canceling statement due to statement timeout ({timeout_secs}s)",),
                 )))),
             }
         } else {
@@ -840,10 +833,7 @@ impl NucleusHandler {
         );
 
         for i in 0..param_count {
-            let type_hint = inferred
-                .get(i)
-                .cloned()
-                .unwrap_or(Type::TEXT);
+            let type_hint = inferred.get(i).cloned().unwrap_or(Type::TEXT);
 
             let replacement = match decode_pg_param(portal, i, &type_hint) {
                 Some(DecodedParam::Null) | None => "NULL".to_owned(),
@@ -886,7 +876,12 @@ impl NucleusHandler {
         session_id: u64,
         cached_ast: &[sqlparser::ast::Statement],
         portal: &Portal<ParsedStatement>,
-    ) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>>, ()> {
+    ) -> Result<
+        std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>,
+        >,
+        (),
+    > {
         let param_count = portal.parameter_len();
         let mut param_values = Vec::with_capacity(param_count);
 
@@ -902,10 +897,7 @@ impl NucleusHandler {
         );
 
         for i in 0..param_count {
-            let type_hint = inferred
-                .get(i)
-                .cloned()
-                .unwrap_or(Type::TEXT);
+            let type_hint = inferred.get(i).cloned().unwrap_or(Type::TEXT);
 
             let value = match decode_pg_param(portal, i, &type_hint) {
                 Some(DecodedParam::Null) | None => Value::Null,
@@ -928,9 +920,18 @@ impl NucleusHandler {
     /// Convert a postgres text parameter to a Nucleus Value based on the type hint.
     fn pg_string_to_value(s: &str, type_hint: &Type) -> Value {
         match *type_hint {
-            Type::INT2 | Type::INT4 => s.parse::<i32>().map(Value::Int32).unwrap_or(Value::Text(s.to_owned())),
-            Type::INT8 => s.parse::<i64>().map(Value::Int64).unwrap_or(Value::Text(s.to_owned())),
-            Type::FLOAT4 | Type::FLOAT8 => s.parse::<f64>().map(Value::Float64).unwrap_or(Value::Text(s.to_owned())),
+            Type::INT2 | Type::INT4 => s
+                .parse::<i32>()
+                .map(Value::Int32)
+                .unwrap_or(Value::Text(s.to_owned())),
+            Type::INT8 => s
+                .parse::<i64>()
+                .map(Value::Int64)
+                .unwrap_or(Value::Text(s.to_owned())),
+            Type::FLOAT4 | Type::FLOAT8 => s
+                .parse::<f64>()
+                .map(Value::Float64)
+                .unwrap_or(Value::Text(s.to_owned())),
             Type::BOOL => match s {
                 "t" | "true" | "TRUE" | "1" => Value::Bool(true),
                 "f" | "false" | "FALSE" | "0" => Value::Bool(false),
@@ -1194,9 +1195,17 @@ impl SimpleQueryHandler for NucleusHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let peer_addr_str = client.socket_addr().to_string();
+        let session_id = self.session_id_from_client(client);
+
+        // Inside an active transaction, all autocommit fast paths are disabled:
+        // they bypass the session's MVCC snapshot and write straight to storage,
+        // which would auto-commit writes the transaction must be able to
+        // ROLLBACK and break read-your-own-writes. Route everything through the
+        // session-scoped executor until COMMIT/ROLLBACK.
+        let in_txn = self.executor.session_in_transaction(session_id);
 
         // ── Large Objects fast path: intercept lo_* function calls ───────
-        if let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, query) {
+        if !in_txn && let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, query) {
             let resp = Self::build_response(lo_result, true)?;
             self.flush_pending_notifications(client).await?;
             return Ok(vec![resp]);
@@ -1231,35 +1240,41 @@ impl SimpleQueryHandler for NucleusHandler {
         }
 
         // ── KV fast path: intercept common KV queries before SQL parsing ──
-        if let Some(kv_cmd) = kv_fast_path::try_parse_kv(query) {
+        if !in_txn && let Some(kv_cmd) = kv_fast_path::try_parse_kv(query) {
             let result = kv_fast_path::execute_kv_command(&kv_cmd, self.executor.kv_store());
             self.flush_pending_notifications(client).await?;
             return Ok(vec![Self::build_response(result, true)?]);
         }
 
         // ── SQL OLTP fast path: intercept simple point queries/mutations ──
-        if let Some(sql_cmd) = kv_fast_path::try_parse_sql_fast_path(query)
-            && let Some(result) = self.executor.execute_sql_fast_path(&sql_cmd).await {
-                self.flush_pending_notifications(client).await?;
-                return Ok(vec![Self::build_response(result.map_err(exec_error_to_pgwire)?, true)?]);
-            }
-            // Fall through to normal path if fast-path couldn't handle it
-            // (e.g. table not found in cache, column mismatch, etc.)
-
-        let session_id = self.session_id_from_client(client);
+        if !in_txn
+            && let Some(sql_cmd) = kv_fast_path::try_parse_sql_fast_path(query)
+            && let Some(result) = self.executor.execute_sql_fast_path(&sql_cmd).await
+        {
+            self.flush_pending_notifications(client).await?;
+            return Ok(vec![Self::build_response(
+                result.map_err(exec_error_to_pgwire)?,
+                true,
+            )?]);
+        }
+        // Fall through to normal path if fast-path couldn't handle it
+        // (e.g. table not found in cache, column mismatch, etc.)
 
         // Detect COPY ... FROM STDIN and enter copy-in mode.
         if let Some(copy_info) = detect_copy_from_stdin(query) {
             let peer_addr = client.socket_addr();
-            self.copy_state.lock().insert(peer_addr, CopyInProgress {
-                table: copy_info.table,
-                columns: copy_info.columns,
-                delimiter: copy_info.delimiter,
-                is_csv: copy_info.is_csv,
-                has_header: copy_info.has_header,
-                data: Vec::new(),
-                session_id,
-            });
+            self.copy_state.lock().insert(
+                peer_addr,
+                CopyInProgress {
+                    table: copy_info.table,
+                    columns: copy_info.columns,
+                    delimiter: copy_info.delimiter,
+                    is_csv: copy_info.is_csv,
+                    has_header: copy_info.has_header,
+                    data: Vec::new(),
+                    session_id,
+                },
+            );
             return Ok(vec![Response::CopyIn(CopyResponse::new(0, 0, vec![]))]);
         }
 
@@ -1286,7 +1301,9 @@ impl SimpleQueryHandler for NucleusHandler {
                             .await?;
                     }
                 }
-                client.send(PgWireBackendMessage::CopyDone(CopyDone::new())).await?;
+                client
+                    .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
+                    .await?;
                 client
                     .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
                         format!("COPY {row_count}"),
@@ -1378,9 +1395,8 @@ impl ExtendedQueryHandler for NucleusHandler {
         let fields = if is_select_query(sql) {
             // With bound parameters available, we can try to determine columns
             // more accurately by substituting and executing.
-            let substituted = Self::substitute_parameters_with_executor(
-                sql, portal, Some(&self.executor),
-            )?;
+            let substituted =
+                Self::substitute_parameters_with_executor(sql, portal, Some(&self.executor))?;
             match self.describe_select_columns(&substituted).await {
                 Ok(cols) => cols,
                 Err(e) => {
@@ -1421,13 +1437,22 @@ impl ExtendedQueryHandler for NucleusHandler {
         {
             let trimmed_upper = parsed_stmt.sql.trim().to_uppercase();
             if trimmed_upper.starts_with("LISTEN ") {
-                let channel = parsed_stmt.sql.trim()[7..].trim().trim_end_matches(';').trim();
+                let channel = parsed_stmt.sql.trim()[7..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim();
                 self.handle_listen(&peer_addr_str, channel);
             } else if trimmed_upper.starts_with("UNLISTEN ") {
-                let channel = parsed_stmt.sql.trim()[9..].trim().trim_end_matches(';').trim();
+                let channel = parsed_stmt.sql.trim()[9..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim();
                 self.handle_unlisten(&peer_addr_str, channel);
             } else if trimmed_upper.starts_with("NOTIFY ") {
-                let rest = parsed_stmt.sql.trim()[7..].trim().trim_end_matches(';').trim();
+                let rest = parsed_stmt.sql.trim()[7..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim();
                 let (channel, payload) = if let Some(comma) = rest.find(',') {
                     let ch = rest[..comma].trim();
                     let pl = rest[comma + 1..].trim().trim_matches('\'');
@@ -1459,7 +1484,9 @@ impl ExtendedQueryHandler for NucleusHandler {
         } else {
             // No cached AST — use string path
             let resolved_sql = Self::substitute_parameters_with_executor(
-                &parsed_stmt.sql, portal, Some(&self.executor),
+                &parsed_stmt.sql,
+                portal,
+                Some(&self.executor),
             )?;
             self.execute_sql_session(session_id, &resolved_sql).await
         }?;
@@ -1471,9 +1498,10 @@ impl ExtendedQueryHandler for NucleusHandler {
             // the client only wants that many rows. (Full cursor/PortalSuspended
             // support would require pgwire to expose that response variant.)
             if max_rows > 0
-                && let ExecResult::Select { ref mut rows, .. } = result {
-                    rows.truncate(max_rows);
-                }
+                && let ExecResult::Select { ref mut rows, .. } = result
+            {
+                rows.truncate(max_rows);
+            }
             let bytes_est = Self::estimate_result_bytes(&result);
             if bytes_est > 0 {
                 self.executor.metrics().bytes_sent.inc_by(bytes_est);
@@ -1530,8 +1558,18 @@ impl CopyHandler for NucleusHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // Cap the accumulated COPY buffer so a client streaming CopyData forever
+        // can't drive unbounded memory growth (DoS).
+        const MAX_COPY_BUFFER: usize = 512 * 1024 * 1024; // 512 MB
         let peer_addr = client.socket_addr();
         if let Some(state) = self.copy_state.lock().get_mut(&peer_addr) {
+            if state.data.len().saturating_add(copy_data.data.len()) > MAX_COPY_BUFFER {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "54000".to_owned(), // program_limit_exceeded
+                    format!("COPY data exceeds the {MAX_COPY_BUFFER}-byte buffer limit"),
+                ))));
+            }
             state.data.extend_from_slice(&copy_data.data);
         }
         Ok(())
@@ -1545,7 +1583,9 @@ impl CopyHandler for NucleusHandler {
     {
         let peer_addr = client.socket_addr();
         let state = self.copy_state.lock().remove(&peer_addr);
-        let Some(state) = state else { return Ok(()); };
+        let Some(state) = state else {
+            return Ok(());
+        };
 
         let rows = parse_copy_rows(&state.data, state.delimiter, state.is_csv, state.has_header);
         let row_count = rows.len();
@@ -1553,22 +1593,31 @@ impl CopyHandler for NucleusHandler {
         // Insert in batches of 500 rows.
         const BATCH: usize = 500;
         for chunk in rows.chunks(BATCH) {
-            if chunk.is_empty() { continue; }
+            if chunk.is_empty() {
+                continue;
+            }
             let col_clause = match &state.columns {
                 Some(cols) => format!(
                     " ({})",
-                    cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ")
+                    cols.iter()
+                        .map(|c| format!("\"{c}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
                 None => String::new(),
             };
             let mut sql = format!("INSERT INTO {}{} VALUES ", state.table, col_clause);
             let mut first_row = true;
             for row_fields in chunk {
-                if !first_row { sql.push_str(", "); }
+                if !first_row {
+                    sql.push_str(", ");
+                }
                 first_row = false;
                 sql.push('(');
                 for (i, val) in row_fields.iter().enumerate() {
-                    if i > 0 { sql.push_str(", "); }
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
                     match val {
                         None => sql.push_str("NULL"),
                         Some(s) => {
@@ -1647,7 +1696,9 @@ impl NucleusHandler {
             return pid;
         }
         let pid = self.notification_registry.allocate_pid();
-        self.connection_pids.write().insert(peer_addr.to_string(), pid);
+        self.connection_pids
+            .write()
+            .insert(peer_addr.to_string(), pid);
         pid
     }
 
@@ -1780,7 +1831,10 @@ impl NucleusHandler {
             let args: Vec<&str> = if args_str.is_empty() {
                 vec![]
             } else {
-                args_str.split(',').map(|a| a.trim().trim_matches('\'')).collect()
+                args_str
+                    .split(',')
+                    .map(|a| a.trim().trim_matches('\''))
+                    .collect()
             };
 
             match func_name.as_str() {
@@ -1850,7 +1904,9 @@ impl NucleusHandler {
             };
         }
         let mut map = self.lo_state.lock();
-        let state = map.entry(peer_addr.to_string()).or_insert_with(LargeObjectState::new);
+        let state = map
+            .entry(peer_addr.to_string())
+            .or_insert_with(LargeObjectState::new);
         let fd = state.allocate_fd();
         state.descriptors.insert(
             fd,
@@ -1959,8 +2015,7 @@ impl NucleusHandler {
             existing.resize(end, 0);
         }
         existing[offset..end].copy_from_slice(data);
-        self.executor
-            .blob_store_put(&desc.key, &existing, None);
+        self.executor.blob_store_put(&desc.key, &existing, None);
         let written = data.len() as i32;
         desc.offset += data.len() as u64;
         ExecResult::Select {
@@ -2229,8 +2284,7 @@ fn decode_pg_param(
         20 => {
             if is_binary && bytes.len() == 8 {
                 let n = i64::from_be_bytes([
-                    bytes[0], bytes[1], bytes[2], bytes[3],
-                    bytes[4], bytes[5], bytes[6], bytes[7],
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
                 ]);
                 Some(DecodedParam::Numeric(n.to_string()))
             } else {
@@ -2258,8 +2312,7 @@ fn decode_pg_param(
         701 => {
             if is_binary && bytes.len() == 8 {
                 let n = f64::from_be_bytes([
-                    bytes[0], bytes[1], bytes[2], bytes[3],
-                    bytes[4], bytes[5], bytes[6], bytes[7],
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
                 ]);
                 Some(DecodedParam::Numeric(n.to_string()))
             } else {
@@ -2287,14 +2340,56 @@ fn decode_pg_param(
         16 => {
             if is_binary {
                 let b = matches!(bytes.first(), Some(&n) if n != 0);
-                Some(DecodedParam::Bool(if b { "true".into() } else { "false".into() }))
+                Some(DecodedParam::Bool(if b {
+                    "true".into()
+                } else {
+                    "false".into()
+                }))
             } else {
                 let s = String::from_utf8_lossy(bytes);
-                let b = matches!(s.trim().to_ascii_lowercase().as_str(), "t" | "true" | "1" | "y" | "yes");
-                Some(DecodedParam::Bool(if b { "true".into() } else { "false".into() }))
+                let b = matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "t" | "true" | "1" | "y" | "yes"
+                );
+                Some(DecodedParam::Bool(if b {
+                    "true".into()
+                } else {
+                    "false".into()
+                }))
             }
         }
-        _ => Some(DecodedParam::Text(String::from_utf8_lossy(bytes).into_owned())),
+        _ => {
+            // Unknown OID. A text-format value is UTF-8 and decodes losslessly.
+            // A binary-format value is NOT UTF-8 — from_utf8_lossy would mangle
+            // it. Undeclared binary params are overwhelmingly fixed-width
+            // integers (drivers send float/date/timestamp with their OID), so
+            // decode the standard int widths; fall back to text otherwise.
+            if is_binary {
+                match bytes.len() {
+                    2 => Some(DecodedParam::Numeric(
+                        (i16::from_be_bytes([bytes[0], bytes[1]]) as i64).to_string(),
+                    )),
+                    4 => Some(DecodedParam::Numeric(
+                        (i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64)
+                            .to_string(),
+                    )),
+                    8 => Some(DecodedParam::Numeric(
+                        i64::from_be_bytes([
+                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                            bytes[7],
+                        ])
+                        .to_string(),
+                    )),
+                    _ => Some(DecodedParam::Text(
+                        String::from_utf8_lossy(bytes).into_owned(),
+                    )),
+                }
+            } else {
+                Some(DecodedParam::Text(
+                    String::from_utf8_lossy(bytes).into_owned(),
+                ))
+            }
+        }
     }
 }
 
@@ -2511,7 +2606,11 @@ fn walk_expr_for_params(
     use sqlparser::ast::{BinaryOperator, Expr};
 
     match expr {
-        Expr::Cast { expr: inner, data_type, .. } => {
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => {
             if let Ok(dt) = crate::sql::convert_data_type(data_type) {
                 mark_param(inner, data_type_to_pg(&dt), out);
             }
@@ -2546,7 +2645,9 @@ fn walk_expr_for_params(
         | Expr::Nested(expr)
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr) => walk_expr_for_params(expr, tables, out),
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             if let Some(t) = expr_pg_type(expr, tables) {
                 mark_param(low, t.clone(), out);
                 mark_param(high, t, out);
@@ -2727,11 +2828,23 @@ fn detect_copy_from_stdin(sql: &str) -> Option<CopyInfo> {
     let stmts = Parser::parse_sql(&PostgreSqlDialect {}, &sql_with_semi).ok()?;
     let stmt = stmts.into_iter().next()?;
 
-    let Statement::Copy { source, to: false, target: CopyTarget::Stdin, options, .. } = stmt
+    let Statement::Copy {
+        source,
+        to: false,
+        target: CopyTarget::Stdin,
+        options,
+        ..
+    } = stmt
     else {
         return None;
     };
-    let CopySource::Table { table_name, columns } = source else { return None; };
+    let CopySource::Table {
+        table_name,
+        columns,
+    } = source
+    else {
+        return None;
+    };
 
     // Reconstruct the (possibly qualified) table name from parts.
     let table = table_name
@@ -2766,11 +2879,22 @@ fn detect_copy_from_stdin(sql: &str) -> Option<CopyInfo> {
         }
     }
 
-    Some(CopyInfo { table, columns: col_names, delimiter, is_csv, has_header })
+    Some(CopyInfo {
+        table,
+        columns: col_names,
+        delimiter,
+        is_csv,
+        has_header,
+    })
 }
 
 /// Parse accumulated COPY data bytes into rows of optional string fields.
-fn parse_copy_rows(data: &[u8], delimiter: u8, is_csv: bool, has_header: bool) -> Vec<Vec<Option<String>>> {
+fn parse_copy_rows(
+    data: &[u8],
+    delimiter: u8,
+    is_csv: bool,
+    has_header: bool,
+) -> Vec<Vec<Option<String>>> {
     let text = match std::str::from_utf8(data) {
         Ok(s) => s,
         Err(_) => return vec![],
@@ -2800,7 +2924,11 @@ fn split_copy_line(line: &str, delimiter: u8, is_csv: bool) -> Vec<Option<String
         loop {
             match chars.next() {
                 None => {
-                    result.push(if current.is_empty() { None } else { Some(current) });
+                    result.push(if current.is_empty() {
+                        None
+                    } else {
+                        Some(current)
+                    });
                     break;
                 }
                 Some('"') => {
@@ -2822,12 +2950,20 @@ fn split_copy_line(line: &str, delimiter: u8, is_csv: bool) -> Vec<Option<String
                     // Skip optional delimiter after closing quote.
                     if chars.peek() == Some(&delim) {
                         chars.next();
-                        result.push(if current.is_empty() { None } else { Some(current.clone()) });
+                        result.push(if current.is_empty() {
+                            None
+                        } else {
+                            Some(current.clone())
+                        });
                         current.clear();
                     }
                 }
                 Some(c) if c == delim => {
-                    result.push(if current.is_empty() { None } else { Some(current.clone()) });
+                    result.push(if current.is_empty() {
+                        None
+                    } else {
+                        Some(current.clone())
+                    });
                     current.clear();
                 }
                 Some(c) => current.push(c),
@@ -2859,7 +2995,10 @@ fn unescape_copy_text(s: &str) -> String {
                 Some('n') => result.push('\n'),
                 Some('r') => result.push('\r'),
                 Some('\\') => result.push('\\'),
-                Some(ch) => { result.push('\\'); result.push(ch); }
+                Some(ch) => {
+                    result.push('\\');
+                    result.push(ch);
+                }
                 None => result.push('\\'),
             }
         } else {
@@ -2875,6 +3014,8 @@ fn unescape_copy_text(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
 
     // ── UserAuthenticator unit tests ───────────────────────────────────
@@ -3515,10 +3656,14 @@ mod security_tests {
     #[test]
     fn detect_copy_from_stdin_csv_format() {
         let info = detect_copy_from_stdin(
-            "COPY orders (id, amount) FROM STDIN WITH (FORMAT CSV, DELIMITER ',')"
-        ).unwrap();
+            "COPY orders (id, amount) FROM STDIN WITH (FORMAT CSV, DELIMITER ',')",
+        )
+        .unwrap();
         assert_eq!(info.table, "orders");
-        assert_eq!(info.columns.as_deref(), Some(&["id".to_owned(), "amount".to_owned()][..]));
+        assert_eq!(
+            info.columns.as_deref(),
+            Some(&["id".to_owned(), "amount".to_owned()][..])
+        );
         assert_eq!(info.delimiter, b',');
         assert!(info.is_csv);
     }
@@ -3599,7 +3744,10 @@ mod security_tests {
         for _ in 0..LoginRateLimiter::MAX_FAILED_ATTEMPTS {
             limiter.record_failure(ip);
         }
-        assert!(limiter.is_locked_out(ip), "should be locked out after max failures");
+        assert!(
+            limiter.is_locked_out(ip),
+            "should be locked out after max failures"
+        );
     }
 
     #[test]
@@ -3609,7 +3757,10 @@ mod security_tests {
         for _ in 0..(LoginRateLimiter::MAX_FAILED_ATTEMPTS - 1) {
             limiter.record_failure(ip);
         }
-        assert!(!limiter.is_locked_out(ip), "should not lock out below threshold");
+        assert!(
+            !limiter.is_locked_out(ip),
+            "should not lock out below threshold"
+        );
     }
 
     #[test]
@@ -3621,7 +3772,10 @@ mod security_tests {
         }
         assert!(limiter.is_locked_out(ip));
         limiter.clear(ip);
-        assert!(!limiter.is_locked_out(ip), "should not be locked out after clear");
+        assert!(
+            !limiter.is_locked_out(ip),
+            "should not be locked out after clear"
+        );
     }
 
     #[test]
@@ -3633,7 +3787,10 @@ mod security_tests {
             limiter.record_failure(ip_a);
         }
         assert!(limiter.is_locked_out(ip_a));
-        assert!(!limiter.is_locked_out(ip_b), "unrelated IP should not be locked out");
+        assert!(
+            !limiter.is_locked_out(ip_b),
+            "unrelated IP should not be locked out"
+        );
     }
 
     // ── Notification Registry tests ─────────────────────────────────
@@ -3953,9 +4110,21 @@ mod security_tests {
     #[test]
     fn try_handle_lo_non_matching() {
         let handler = NucleusHandler::new(make_executor());
-        assert!(handler.try_handle_large_object("peer1", "SELECT 1").is_none());
-        assert!(handler.try_handle_large_object("peer1", "INSERT INTO t VALUES (1)").is_none());
-        assert!(handler.try_handle_large_object("peer1", "SELECT lower('X')").is_none());
+        assert!(
+            handler
+                .try_handle_large_object("peer1", "SELECT 1")
+                .is_none()
+        );
+        assert!(
+            handler
+                .try_handle_large_object("peer1", "INSERT INTO t VALUES (1)")
+                .is_none()
+        );
+        assert!(
+            handler
+                .try_handle_large_object("peer1", "SELECT lower('X')")
+                .is_none()
+        );
     }
 
     #[test]

@@ -58,7 +58,12 @@ fn send_signal(pid: u32, sig: i32) {
     // SAFETY: kill is async-signal-safe and pid is a valid child pid we
     // just spawned and have not yet reaped.
     let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
-    assert_eq!(rc, 0, "kill({pid}, {sig}) failed: {}", std::io::Error::last_os_error());
+    assert_eq!(
+        rc,
+        0,
+        "kill({pid}, {sig}) failed: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 struct ServerHandle {
@@ -79,12 +84,17 @@ impl ServerHandle {
         let child = Command::new(nucleus_binary())
             .args([
                 "start",
-                "--port", &port.to_string(),
-                "--cluster-port", &cluster_port.to_string(),
-                "--replication-port", &repl_port.to_string(),
-                "--resp-port", "0",
+                "--port",
+                &port.to_string(),
+                "--cluster-port",
+                &cluster_port.to_string(),
+                "--replication-port",
+                &repl_port.to_string(),
+                "--resp-port",
+                "0",
                 "--no-tls",
-                "--data", data_dir.path().to_str().unwrap(),
+                "--data",
+                data_dir.path().to_str().unwrap(),
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -93,16 +103,28 @@ impl ServerHandle {
 
         if !wait_for_port(port) {
             // Surface server output to make CI failures debuggable.
-            let mut handle = ServerHandle { child, data_dir, port };
+            let mut handle = ServerHandle {
+                child,
+                data_dir,
+                port,
+            };
             let logs = handle.drain_output();
             handle.kill();
-            panic!("nucleus did not bind port {port} within {STARTUP_TIMEOUT:?}\n--- logs ---\n{logs}");
+            panic!(
+                "nucleus did not bind port {port} within {STARTUP_TIMEOUT:?}\n--- logs ---\n{logs}"
+            );
         }
 
-        ServerHandle { child, data_dir, port }
+        ServerHandle {
+            child,
+            data_dir,
+            port,
+        }
     }
 
-    fn pid(&self) -> u32 { self.child.id() }
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
 
     /// Best-effort SIGKILL + reap. Used on test failure paths.
     fn kill(&mut self) {
@@ -217,12 +239,20 @@ fn sigterm_with_active_connections_exits_within_deadline() {
     send_signal(pid, libc::SIGTERM);
 
     let elapsed = wait_for_exit(&mut server, EXIT_DEADLINE).unwrap_or_else(|| {
-        for c in &conns { let _ = c.shutdown(std::net::Shutdown::Both); }
+        for c in &conns {
+            let _ = c.shutdown(std::net::Shutdown::Both);
+        }
         server.kill();
-        panic!("nucleus did not exit within {EXIT_DEADLINE:?} of SIGTERM with {} active conns", conns.len());
+        panic!(
+            "nucleus did not exit within {EXIT_DEADLINE:?} of SIGTERM with {} active conns",
+            conns.len()
+        );
     });
 
-    println!("nucleus exited {elapsed:?} with {} active connections", conns.len());
+    println!(
+        "nucleus exited {elapsed:?} with {} active connections",
+        conns.len()
+    );
     assert!(elapsed < EXIT_DEADLINE);
 
     // Drop after the assertion so the connections are alive during shutdown.

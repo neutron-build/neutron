@@ -58,11 +58,14 @@ impl DocWal {
         } else {
             DocWalState { docs: Vec::new() }
         };
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        Ok((Self { path, writer: Mutex::new(file) }, state))
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok((
+            Self {
+                path,
+                writer: Mutex::new(file),
+            },
+            state,
+        ))
     }
 
     /// Log an INSERT operation (insert or replace).
@@ -90,7 +93,9 @@ impl DocWal {
     /// that the store currently holds.
     pub fn checkpoint(&self, docs: &[(u64, Vec<u8>)]) -> io::Result<()> {
         // Flush existing writer before truncating.
-        { self.writer.lock().flush()?; }
+        {
+            self.writer.lock().flush()?;
+        }
 
         // Build snapshot into a temporary buffer, then write atomically.
         let mut buf: Vec<u8> = Vec::new();
@@ -125,42 +130,64 @@ impl DocWal {
 /// SNAPSHOT entries reset all state. Only the *last* SNAPSHOT (and subsequent
 /// incremental entries) matter in practice.
 fn replay(data: &[u8]) -> DocWalState {
-    let mut docs: std::collections::HashMap<u64, Vec<u8>> =
-        std::collections::HashMap::new();
+    let mut docs: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
     let mut pos = 0usize;
 
     while pos < data.len() {
-        let Some(&entry_type) = data.get(pos) else { break };
+        let Some(&entry_type) = data.get(pos) else {
+            break;
+        };
         pos += 1;
 
         match entry_type {
             ENTRY_INSERT => {
-                let Some(doc_id) = read_u64(data, &mut pos) else { break };
-                let Some(jsonb_len) = read_u32(data, &mut pos) else { break };
+                let Some(doc_id) = read_u64(data, &mut pos) else {
+                    break;
+                };
+                let Some(jsonb_len) = read_u32(data, &mut pos) else {
+                    break;
+                };
                 let jsonb_len = jsonb_len as usize;
-                if pos + jsonb_len > data.len() { break; }
+                if pos + jsonb_len > data.len() {
+                    break;
+                }
                 let jsonb = data[pos..pos + jsonb_len].to_vec();
                 pos += jsonb_len;
                 docs.insert(doc_id, jsonb);
             }
             ENTRY_DELETE => {
-                let Some(doc_id) = read_u64(data, &mut pos) else { break };
+                let Some(doc_id) = read_u64(data, &mut pos) else {
+                    break;
+                };
                 docs.remove(&doc_id);
             }
             ENTRY_SNAPSHOT => {
                 docs.clear();
-                let Some(n_docs) = read_u32(data, &mut pos) else { break };
+                let Some(n_docs) = read_u32(data, &mut pos) else {
+                    break;
+                };
                 let mut ok = true;
                 for _ in 0..n_docs {
-                    let Some(doc_id) = read_u64(data, &mut pos) else { ok = false; break };
-                    let Some(jsonb_len) = read_u32(data, &mut pos) else { ok = false; break };
+                    let Some(doc_id) = read_u64(data, &mut pos) else {
+                        ok = false;
+                        break;
+                    };
+                    let Some(jsonb_len) = read_u32(data, &mut pos) else {
+                        ok = false;
+                        break;
+                    };
                     let jsonb_len = jsonb_len as usize;
-                    if pos + jsonb_len > data.len() { ok = false; break; }
+                    if pos + jsonb_len > data.len() {
+                        ok = false;
+                        break;
+                    }
                     let jsonb = data[pos..pos + jsonb_len].to_vec();
                     pos += jsonb_len;
                     docs.insert(doc_id, jsonb);
                 }
-                if !ok { break; }
+                if !ok {
+                    break;
+                }
             }
             _ => {
                 // Unknown entry type — stop replay (corrupt data).
@@ -169,7 +196,9 @@ fn replay(data: &[u8]) -> DocWalState {
         }
     }
 
-    DocWalState { docs: docs.into_iter().collect() }
+    DocWalState {
+        docs: docs.into_iter().collect(),
+    }
 }
 
 // ─── Primitive readers ──────────────────────────────────────────────────────
@@ -206,8 +235,7 @@ mod tests {
 
         let (_wal2, state2) = DocWal::open(dir.path()).unwrap();
         assert_eq!(state2.docs.len(), 2);
-        let map: std::collections::HashMap<u64, Vec<u8>> =
-            state2.docs.into_iter().collect();
+        let map: std::collections::HashMap<u64, Vec<u8>> = state2.docs.into_iter().collect();
         assert_eq!(map[&1], b"hello");
         assert_eq!(map[&2], b"world");
     }
@@ -241,8 +269,7 @@ mod tests {
 
         let (_wal2, state) = DocWal::open(dir.path()).unwrap();
         assert_eq!(state.docs.len(), 2);
-        let map: std::collections::HashMap<u64, Vec<u8>> =
-            state.docs.into_iter().collect();
+        let map: std::collections::HashMap<u64, Vec<u8>> = state.docs.into_iter().collect();
         assert!(map.contains_key(&2));
         assert!(map.contains_key(&3));
         assert!(!map.contains_key(&1)); // removed by snapshot

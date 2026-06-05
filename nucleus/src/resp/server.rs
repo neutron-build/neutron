@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
-use crate::kv::KvStore;
 use super::pubsub_registry::PubSubRegistry;
+use crate::kv::KvStore;
 
 /// Configuration for the RESP server.
 pub struct RespServerConfig {
@@ -42,7 +42,14 @@ pub async fn start_resp_server(
     password: Option<String>,
     shutdown: Arc<tokio::sync::Notify>,
 ) -> std::io::Result<()> {
-    start_resp_server_with_config(bind_addr, kv, password, shutdown, RespServerConfig::default()).await
+    start_resp_server_with_config(
+        bind_addr,
+        kv,
+        password,
+        shutdown,
+        RespServerConfig::default(),
+    )
+    .await
 }
 
 /// Start the RESP2 server with full configuration (TLS, connection limits, idle timeout).
@@ -59,9 +66,9 @@ pub async fn start_resp_server_with_config(
     let idle_timeout = std::time::Duration::from_secs(config.idle_timeout_secs);
     let pubsub = Arc::new(PubSubRegistry::new());
 
-    let tls_acceptor = config.tls_config.map(|cfg| {
-        pgwire::tokio::tokio_rustls::TlsAcceptor::from(cfg)
-    });
+    let tls_acceptor = config
+        .tls_config
+        .map(pgwire::tokio::tokio_rustls::TlsAcceptor::from);
 
     if tls_acceptor.is_some() {
         tracing::info!("RESP server listening on {} (TLS enabled)", bind_addr);
@@ -183,7 +190,12 @@ async fn handle_connection_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
             }
         } else {
             // Normal (non-pub/sub) mode
-            let value = match tokio::time::timeout(idle_timeout, super::parser::read_value(&mut buf_reader)).await {
+            let value = match tokio::time::timeout(
+                idle_timeout,
+                super::parser::read_value(&mut buf_reader),
+            )
+            .await
+            {
                 Ok(result) => result?,
                 Err(_) => {
                     tracing::debug!("RESP connection idle timeout, closing");
@@ -194,7 +206,9 @@ async fn handle_connection_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
             let args = match super::parser::parse_command(value) {
                 Some(args) => args,
                 None => {
-                    writer.write_all(&super::encoder::encode_error("ERR invalid command format")).await?;
+                    writer
+                        .write_all(&super::encoder::encode_error("ERR invalid command format"))
+                        .await?;
                     continue;
                 }
             };
@@ -203,7 +217,9 @@ async fn handle_connection_with_timeout<S: AsyncRead + AsyncWrite + Unpin>(
             if !args.is_empty() {
                 let cmd = String::from_utf8_lossy(&args[0]).to_uppercase();
                 if cmd == "QUIT" {
-                    writer.write_all(&super::encoder::encode_simple_string("OK")).await?;
+                    writer
+                        .write_all(&super::encoder::encode_simple_string("OK"))
+                        .await?;
                     break;
                 }
             }

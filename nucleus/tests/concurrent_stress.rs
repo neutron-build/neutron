@@ -7,8 +7,8 @@
 
 use nucleus::embedded::Database;
 use nucleus::types::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
 // Helper: create a shared executor for concurrent tests
@@ -108,7 +108,9 @@ async fn stress_ddl_dml_interleave() {
                     .await;
                 if i % 10 == 9 {
                     let _ = db
-                        .execute(&format!("CREATE INDEX IF NOT EXISTS idx_{table} ON {table} (id)"))
+                        .execute(&format!(
+                            "CREATE INDEX IF NOT EXISTS idx_{table} ON {table} (id)"
+                        ))
                         .await;
                 }
                 tokio::task::yield_now().await;
@@ -192,10 +194,7 @@ async fn stress_snapshot_isolation() {
     }
 
     // Invariant: total balance must remain constant
-    let rows = db
-        .query("SELECT SUM(balance) FROM accounts")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT SUM(balance) FROM accounts").await.unwrap();
     let total = match &rows[0][0] {
         Value::Int64(n) => *n,
         Value::Int32(n) => *n as i64,
@@ -267,9 +266,7 @@ async fn stress_mixed_workload() {
             while tokio::time::Instant::now() < deadline {
                 let target = i % 100;
                 let _ = db
-                    .execute(&format!(
-                        "UPDATE mixed SET val = 'upd' WHERE id = {target}"
-                    ))
+                    .execute(&format!("UPDATE mixed SET val = 'upd' WHERE id = {target}"))
                     .await;
                 i += 1;
                 tokio::task::yield_now().await;
@@ -335,9 +332,7 @@ async fn stress_connection_pool() {
                     .execute(&format!("INSERT INTO pool_test VALUES ({id}, {worker})"))
                     .await;
                 let _ = db
-                    .query(&format!(
-                        "SELECT * FROM pool_test WHERE worker = {worker}"
-                    ))
+                    .query(&format!("SELECT * FROM pool_test WHERE worker = {worker}"))
                     .await;
             }
         }));
@@ -399,7 +394,10 @@ async fn stress_single_row_contention() {
 
     // The final value depends on conflict resolution, but it should be positive
     // and the table should remain queryable.
-    let rows = db.query("SELECT val FROM counter WHERE id = 1").await.unwrap();
+    let rows = db
+        .query("SELECT val FROM counter WHERE id = 1")
+        .await
+        .unwrap();
     let val = match &rows[0][0] {
         Value::Int64(n) => *n,
         Value::Int32(n) => *n as i64,
@@ -425,7 +423,9 @@ async fn stress_multi_model_concurrent() {
         handles.push(tokio::spawn(async move {
             let table = format!("mm_sql_{t}");
             let _ = db
-                .execute(&format!("CREATE TABLE IF NOT EXISTS {table} (id INT NOT NULL, v TEXT)"))
+                .execute(&format!(
+                    "CREATE TABLE IF NOT EXISTS {table} (id INT NOT NULL, v TEXT)"
+                ))
                 .await;
             for i in 0..50u32 {
                 let _ = db
@@ -441,9 +441,7 @@ async fn stress_multi_model_concurrent() {
         handles.push(tokio::spawn(async move {
             for i in 0..50u32 {
                 let key = format!("stress:{t}:{i}");
-                let _ = db
-                    .execute(&format!("KV_SET '{key}', 'value_{i}'"))
-                    .await;
+                let _ = db.execute(&format!("KV_SET '{key}', 'value_{i}'")).await;
             }
         }));
     }
@@ -718,10 +716,7 @@ async fn stress_mvcc_heavy_contention() {
     );
 
     // Row count must remain at 10
-    let rows = db
-        .query("SELECT COUNT(*) FROM contention")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM contention").await.unwrap();
     assert_eq!(extract_i64(&rows[0][0]), 10);
 }
 
@@ -750,7 +745,7 @@ async fn stress_sustained_load_iterations() {
             let db = db.clone();
             handles.push(tokio::spawn(async move {
                 for i in 0..ops_per_task {
-                    let id = iter * 10000 + t as i32 * 1000 + i;
+                    let id = iter * 10000 + t * 1000 + i;
                     let _ = db
                         .execute(&format!(
                             "INSERT INTO sustained VALUES ({id}, {iter}, 'iter_{iter}_task_{t}')"
@@ -792,10 +787,7 @@ async fn stress_sustained_load_iterations() {
         }
 
         // Verify consistency after each iteration
-        let rows = db
-            .query("SELECT COUNT(*) FROM sustained")
-            .await
-            .unwrap();
+        let rows = db.query("SELECT COUNT(*) FROM sustained").await.unwrap();
         let count = extract_i64(&rows[0][0]);
         assert!(
             count > 0,
@@ -804,10 +796,7 @@ async fn stress_sustained_load_iterations() {
     }
 
     // Final consistency check
-    let rows = db
-        .query("SELECT COUNT(*) FROM sustained")
-        .await
-        .unwrap();
+    let rows = db.query("SELECT COUNT(*) FROM sustained").await.unwrap();
     let final_count = extract_i64(&rows[0][0]);
     let expected_min = (iterations * tasks_per_iteration / 2 * ops_per_task) as i64;
     assert!(
@@ -861,9 +850,7 @@ async fn stress_fifty_plus_clients_mixed() {
                 // 15 readers
                 1 => {
                     for _ in 0..ops_per_client {
-                        let _ = db
-                            .query("SELECT COUNT(*) FROM fifty_clients")
-                            .await;
+                        let _ = db.query("SELECT COUNT(*) FROM fifty_clients").await;
                         let _ = db
                             .query(&format!(
                                 "SELECT * FROM fifty_clients WHERE client = {c} LIMIT 10"
@@ -894,9 +881,7 @@ async fn stress_fifty_plus_clients_mixed() {
                             ))
                             .await;
                         let _ = db
-                            .execute(&format!(
-                                "DELETE FROM fifty_clients WHERE id = {id}"
-                            ))
+                            .execute(&format!("DELETE FROM fifty_clients WHERE id = {id}"))
                             .await;
                     }
                 }
@@ -911,10 +896,7 @@ async fn stress_fifty_plus_clients_mixed() {
         }
     })
     .await;
-    assert!(
-        timeout.is_ok(),
-        "all 60 clients should complete within 60s"
-    );
+    assert!(timeout.is_ok(), "all 60 clients should complete within 60s");
 
     // Table should remain queryable
     let rows = db

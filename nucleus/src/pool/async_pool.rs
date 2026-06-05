@@ -46,10 +46,11 @@ impl AsyncConnectionPool {
     /// if the timeout expires before a slot is available.
     pub async fn acquire(&self, client_addr: &str) -> Result<ConnectionId, PoolError> {
         // Wait for a semaphore permit (async backpressure)
-        let permit = tokio::time::timeout(self.acquire_timeout, self.semaphore.clone().acquire_owned())
-            .await
-            .map_err(|_| PoolError::AcquireTimeout)?
-            .map_err(|_| PoolError::PoolExhausted)?;
+        let permit =
+            tokio::time::timeout(self.acquire_timeout, self.semaphore.clone().acquire_owned())
+                .await
+                .map_err(|_| PoolError::AcquireTimeout)?
+                .map_err(|_| PoolError::PoolExhausted)?;
 
         let id = {
             let mut pool = self.inner.lock().await;

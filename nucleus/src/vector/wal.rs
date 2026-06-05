@@ -77,10 +77,7 @@ impl VectorWal {
                 indexes: HashMap::new(),
             }
         };
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok((
             Self {
                 path,
@@ -447,7 +444,9 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
     if *pos + len > data.len() {
         return None;
     }
-    let s = std::str::from_utf8(&data[*pos..*pos + len]).ok()?.to_string();
+    let s = std::str::from_utf8(&data[*pos..*pos + len])
+        .ok()?
+        .to_string();
     *pos += len;
     Some(s)
 }
@@ -507,7 +506,7 @@ mod tests {
 
         // Search should find vector 0 nearest to itself.
         let q: Vec<f32> = (0..dim)
-            .map(|d| ((0 * 73 + d * 37) % 1000) as f32 / 1000.0)
+            .map(|d| ((d * 37) % 1000) as f32 / 1000.0)
             .collect();
         let results = recovered.hnsw.search(&Vector::new(q), 5);
         assert!(!results.is_empty());
@@ -652,7 +651,8 @@ mod tests {
                 .unwrap();
             wal.log_insert("idx1", 2, &[0.0, 1.0, 0.0, 0.0], r#"{"color":"blue"}"#)
                 .unwrap();
-            wal.log_insert("idx1", 3, &[0.0, 0.0, 1.0, 0.0], "").unwrap();
+            wal.log_insert("idx1", 3, &[0.0, 0.0, 1.0, 0.0], "")
+                .unwrap();
             drop(wal);
         }
 
@@ -757,7 +757,7 @@ mod tests {
 
         // Search produces valid results.
         let q_data: Vec<f32> = (0..dim)
-            .map(|d| ((0 * 73 + d * 37) % 1000) as f32 / 1000.0)
+            .map(|d| ((d * 37) % 1000) as f32 / 1000.0)
             .collect();
         let results = recovered.hnsw.search(&Vector::new(q_data), 5);
         assert!(!results.is_empty());

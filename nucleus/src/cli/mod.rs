@@ -7,8 +7,8 @@
 
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 // ============================================================================
 // Error type
@@ -351,8 +351,7 @@ impl PgClient {
                             "authentication message too short".into(),
                         ));
                     }
-                    let auth_type =
-                        i32::from_be_bytes(payload[0..4].try_into().unwrap());
+                    let auth_type = i32::from_be_bytes(payload[0..4].try_into().unwrap());
                     match auth_type {
                         0 => { /* AuthenticationOk — continue */ }
                         3 => {
@@ -465,9 +464,7 @@ impl PgClient {
         } else if let Some(tag) = command_tag {
             Ok(QueryResult::Command { tag })
         } else {
-            Ok(QueryResult::Command {
-                tag: String::new(),
-            })
+            Ok(QueryResult::Command { tag: String::new() })
         }
     }
 
@@ -519,12 +516,9 @@ impl PgClient {
     /// ```
     fn parse_row_description(payload: &[u8]) -> Result<Vec<String>, CliError> {
         if payload.len() < 2 {
-            return Err(CliError::ProtocolError(
-                "RowDescription too short".into(),
-            ));
+            return Err(CliError::ProtocolError("RowDescription too short".into()));
         }
-        let field_count =
-            i16::from_be_bytes(payload[0..2].try_into().unwrap()) as usize;
+        let field_count = i16::from_be_bytes(payload[0..2].try_into().unwrap()) as usize;
         let mut columns = Vec::with_capacity(field_count);
         let mut pos = 2;
 
@@ -560,19 +554,15 @@ impl PgClient {
         if payload.len() < 2 {
             return Err(CliError::ProtocolError("DataRow too short".into()));
         }
-        let col_count =
-            i16::from_be_bytes(payload[0..2].try_into().unwrap()) as usize;
+        let col_count = i16::from_be_bytes(payload[0..2].try_into().unwrap()) as usize;
         let mut values = Vec::with_capacity(col_count);
         let mut pos = 2;
 
         for _ in 0..col_count {
             if pos + 4 > payload.len() {
-                return Err(CliError::ProtocolError(
-                    "DataRow truncated".into(),
-                ));
+                return Err(CliError::ProtocolError("DataRow truncated".into()));
             }
-            let val_len =
-                i32::from_be_bytes(payload[pos..pos + 4].try_into().unwrap());
+            let val_len = i32::from_be_bytes(payload[pos..pos + 4].try_into().unwrap());
             pos += 4;
 
             if val_len < 0 {
@@ -676,10 +666,7 @@ mod tests {
 
     #[test]
     fn test_table_display_empty() {
-        let display = TableDisplay::new(
-            vec!["id".into(), "name".into()],
-            vec![],
-        );
+        let display = TableDisplay::new(vec!["id".into(), "name".into()], vec![]);
         let output = display.format_empty();
         assert!(output.contains("id"));
         assert!(output.contains("name"));
@@ -691,10 +678,7 @@ mod tests {
 
     #[test]
     fn test_table_display_single_column() {
-        let display = TableDisplay::new(
-            vec!["count".into()],
-            vec![vec!["42".into()]],
-        );
+        let display = TableDisplay::new(vec!["count".into()], vec![vec!["42".into()]]);
         let output = display.format();
         assert!(output.contains("count"));
         assert!(output.contains("42"));
@@ -706,10 +690,7 @@ mod tests {
         let display = TableDisplay::new(
             vec!["id".into(), "description".into()],
             vec![
-                vec![
-                    "1".into(),
-                    "This is a very long description value".into(),
-                ],
+                vec!["1".into(), "This is a very long description value".into()],
                 vec!["2".into(), "Short".into()],
             ],
         );
@@ -725,10 +706,7 @@ mod tests {
 
     #[test]
     fn test_table_display_format_calls_format_empty_when_no_rows() {
-        let display = TableDisplay::new(
-            vec!["x".into()],
-            vec![],
-        );
+        let display = TableDisplay::new(vec!["x".into()], vec![]);
         // format() should delegate to format_empty() when rows is empty
         let f = display.format();
         let e = display.format_empty();

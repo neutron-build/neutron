@@ -22,9 +22,6 @@
 //! - Data types preserved
 //! - NULL handling
 
-use super::test_server::{TestClient, TestServer};
-use crate::types::Value;
-
 // ============================================================================
 // SQL Model Tests
 // ============================================================================

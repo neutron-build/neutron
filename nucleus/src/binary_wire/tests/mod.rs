@@ -9,12 +9,12 @@
 //! - isolation_tests.rs: transaction isolation levels
 //! - error_tests.rs: error codec and recovery paths
 
-mod test_server;
 mod binary_tests;
-mod cross_protocol;
 mod concurrency_tests;
-mod property_tests;
-mod isolation_tests;
+mod cross_protocol;
 mod error_tests;
+mod isolation_tests;
+mod property_tests;
+mod test_server;
 
-pub use test_server::{spawn_binary_server, TestClient, TestServer};
+pub use test_server::{TestClient, TestServer, spawn_binary_server};

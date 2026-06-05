@@ -226,8 +226,7 @@ impl TieredKvStore {
         let hot_keys = self.hot.keys("*");
         let cold_keys = self.cold_keys();
 
-        let mut all: std::collections::HashSet<String> =
-            hot_keys.into_iter().collect();
+        let mut all: std::collections::HashSet<String> = hot_keys.into_iter().collect();
         for k in cold_keys {
             all.insert(k);
         }
@@ -247,10 +246,11 @@ impl TieredKvStore {
     pub fn incr(&self, key: &str) -> i64 {
         // If key is in cold, promote it first
         if self.hot.get(key).is_none()
-            && let Some(v) = self.cold_get(key) {
-                self.hot.set(key, v, None);
-                self.cold_del(key);
-            }
+            && let Some(v) = self.cold_get(key)
+        {
+            self.hot.set(key, v, None);
+            self.cold_del(key);
+        }
         self.hot.incr(key).unwrap_or(0)
     }
 
@@ -355,6 +355,8 @@ impl TieredKvStore {
 
 #[cfg(test)]
 mod tests {
+    // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
+    #![allow(clippy::approx_constant)]
     use super::*;
 
     #[test]
@@ -393,10 +395,7 @@ mod tests {
         // All entries should still be accessible (via hot or cold)
         for i in 0..20 {
             let val = store.get(&format!("key{i}"));
-            assert!(
-                val.is_some(),
-                "key{i} should be accessible but got None"
-            );
+            assert!(val.is_some(), "key{i} should be accessible but got None");
         }
     }
 
@@ -415,7 +414,10 @@ mod tests {
         }
 
         // Verify it's not in hot
-        assert!(store.hot.get("target").is_none(), "target should not be in hot");
+        assert!(
+            store.hot.get("target").is_none(),
+            "target should not be in hot"
+        );
 
         // Access it — should promote from cold to hot
         let val = store.get("target");
@@ -446,7 +448,11 @@ mod tests {
         let cold_keys = store.cold_keys();
         if let Some(cold_key) = cold_keys.first().cloned() {
             assert!(store.del(&cold_key), "should delete cold key");
-            assert_eq!(store.get(&cold_key), None, "deleted cold key should be gone");
+            assert_eq!(
+                store.get(&cold_key),
+                None,
+                "deleted cold key should be gone"
+            );
         }
     }
 
@@ -459,7 +465,12 @@ mod tests {
 
         let all_keys = store.keys();
         // All 15 keys should appear (some hot, some cold)
-        assert_eq!(all_keys.len(), 15, "expected 15 keys, got {}", all_keys.len());
+        assert_eq!(
+            all_keys.len(),
+            15,
+            "expected 15 keys, got {}",
+            all_keys.len()
+        );
     }
 
     #[test]
@@ -479,10 +490,7 @@ mod tests {
 
         // All keys should exist (some in hot, some in cold)
         for i in 0..15 {
-            assert!(
-                store.exists(&format!("k{i}")),
-                "k{i} should exist"
-            );
+            assert!(store.exists(&format!("k{i}")), "k{i} should exist");
         }
     }
 
@@ -663,7 +671,10 @@ mod tests {
     #[test]
     fn test_tiered_del_nonexistent() {
         let store = TieredKvStore::new(100);
-        assert!(!store.del("ghost"), "deleting nonexistent key should return false");
+        assert!(
+            !store.del("ghost"),
+            "deleting nonexistent key should return false"
+        );
     }
 
     #[test]

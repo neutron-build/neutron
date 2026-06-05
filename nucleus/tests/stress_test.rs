@@ -37,7 +37,11 @@ async fn stress_test_large_insert() {
     println!("\n=== Stress Test: Large Insert (100K rows) ===");
     let ex = setup().await;
 
-    exec(&ex, "CREATE TABLE stress_test (id INT PRIMARY KEY, value INT, name TEXT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE stress_test (id INT PRIMARY KEY, value INT, name TEXT)",
+    )
+    .await;
 
     let start = Instant::now();
     let batch_size = 1000;
@@ -60,10 +64,16 @@ async fn stress_test_large_insert() {
 
     let elapsed = start.elapsed();
     println!("✓ Inserted {} rows in {:?}", total_rows, elapsed);
-    println!("  Throughput: {:.0} rows/sec", total_rows as f64 / elapsed.as_secs_f64());
+    println!(
+        "  Throughput: {:.0} rows/sec",
+        total_rows as f64 / elapsed.as_secs_f64()
+    );
 
     // Verify count
-    let _result = ex.execute("SELECT COUNT(*) FROM stress_test").await.unwrap();
+    let _result = ex
+        .execute("SELECT COUNT(*) FROM stress_test")
+        .await
+        .unwrap();
     println!("✓ Verified row count");
 }
 
@@ -81,7 +91,11 @@ async fn stress_test_large_scan() {
         for i in 0..1000 {
             values.push(format!("({}, {})", base + i, (base + i) * 2));
         }
-        exec(&ex, &format!("INSERT INTO scan_test VALUES {}", values.join(", "))).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO scan_test VALUES {}", values.join(", ")),
+        )
+        .await;
     }
 
     // Full table scan
@@ -90,7 +104,10 @@ async fn stress_test_large_scan() {
     let elapsed = start.elapsed();
 
     println!("✓ Scanned 100K rows in {:?}", elapsed);
-    println!("  Throughput: {:.0} rows/sec", 100_000.0 / elapsed.as_secs_f64());
+    println!(
+        "  Throughput: {:.0} rows/sec",
+        100_000.0 / elapsed.as_secs_f64()
+    );
 }
 
 #[tokio::test]
@@ -101,7 +118,11 @@ async fn stress_test_complex_join() {
 
     // Create two tables
     exec(&ex, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)").await;
-    exec(&ex, "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount FLOAT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount FLOAT)",
+    )
+    .await;
 
     // Insert data
     println!("  Inserting 10K users...");
@@ -111,7 +132,11 @@ async fn stress_test_complex_join() {
             let id = batch * 1000 + i;
             values.push(format!("({}, 'User{}')", id, id));
         }
-        exec(&ex, &format!("INSERT INTO users VALUES {}", values.join(", "))).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO users VALUES {}", values.join(", ")),
+        )
+        .await;
     }
 
     println!("  Inserting 10K orders...");
@@ -122,18 +147,25 @@ async fn stress_test_complex_join() {
             let user_id = id % 10_000;
             values.push(format!("({}, {}, {})", id, user_id, id as f64 * 1.5));
         }
-        exec(&ex, &format!("INSERT INTO orders VALUES {}", values.join(", "))).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO orders VALUES {}", values.join(", ")),
+        )
+        .await;
     }
 
     // Execute join
     println!("  Executing hash join...");
     let start = Instant::now();
-    let _result = ex.execute(
-        "SELECT u.name, COUNT(o.id), SUM(o.amount)
+    let _result = ex
+        .execute(
+            "SELECT u.name, COUNT(o.id), SUM(o.amount)
          FROM users u
          JOIN orders o ON u.id = o.user_id
-         GROUP BY u.name"
-    ).await.unwrap();
+         GROUP BY u.name",
+        )
+        .await
+        .unwrap();
     let elapsed = start.elapsed();
 
     println!("✓ Joined 10K × 10K rows in {:?}", elapsed);
@@ -154,21 +186,31 @@ async fn stress_test_aggregation() {
             let category = i % 100;
             values.push(format!("({}, {})", category, i));
         }
-        exec(&ex, &format!("INSERT INTO agg_test VALUES {}", values.join(", "))).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO agg_test VALUES {}", values.join(", ")),
+        )
+        .await;
     }
 
     // Complex aggregation
     let start = Instant::now();
-    let _result = ex.execute(
-        "SELECT category, COUNT(*), SUM(value), AVG(value), MIN(value), MAX(value)
+    let _result = ex
+        .execute(
+            "SELECT category, COUNT(*), SUM(value), AVG(value), MIN(value), MAX(value)
          FROM agg_test
          GROUP BY category
-         ORDER BY category"
-    ).await.unwrap();
+         ORDER BY category",
+        )
+        .await
+        .unwrap();
     let elapsed = start.elapsed();
 
     println!("✓ Aggregated 50K rows into 100 groups in {:?}", elapsed);
-    println!("  Throughput: {:.0} rows/sec", 50_000.0 / elapsed.as_secs_f64());
+    println!(
+        "  Throughput: {:.0} rows/sec",
+        50_000.0 / elapsed.as_secs_f64()
+    );
 }
 
 // ============================================================================
@@ -181,7 +223,11 @@ async fn stress_test_concurrent_inserts() {
     println!("\n=== Stress Test: Concurrent Inserts (10 threads × 1K rows) ===");
     let ex = setup().await;
 
-    exec(&ex, "CREATE TABLE concurrent_test (id INT PRIMARY KEY, thread_id INT, value INT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE concurrent_test (id INT PRIMARY KEY, thread_id INT, value INT)",
+    )
+    .await;
 
     let start = Instant::now();
     let mut handles = Vec::new();
@@ -191,7 +237,10 @@ async fn stress_test_concurrent_inserts() {
         let handle = tokio::spawn(async move {
             for i in 0..1000 {
                 let id = thread_id * 1000 + i;
-                let sql = format!("INSERT INTO concurrent_test VALUES ({}, {}, {})", id, thread_id, i);
+                let sql = format!(
+                    "INSERT INTO concurrent_test VALUES ({}, {}, {})",
+                    id, thread_id, i
+                );
                 ex_clone.execute(&sql).await.unwrap();
             }
         });
@@ -205,10 +254,16 @@ async fn stress_test_concurrent_inserts() {
 
     let elapsed = start.elapsed();
     println!("✓ 10 threads inserted 10K rows total in {:?}", elapsed);
-    println!("  Throughput: {:.0} rows/sec", 10_000.0 / elapsed.as_secs_f64());
+    println!(
+        "  Throughput: {:.0} rows/sec",
+        10_000.0 / elapsed.as_secs_f64()
+    );
 
     // Verify count
-    let _result = ex.execute("SELECT COUNT(*) FROM concurrent_test").await.unwrap();
+    let _result = ex
+        .execute("SELECT COUNT(*) FROM concurrent_test")
+        .await
+        .unwrap();
     println!("✓ Verified all rows inserted");
 }
 
@@ -218,14 +273,22 @@ async fn stress_test_transaction_rollback() {
     println!("\n=== Stress Test: Transaction Rollback (1K transactions) ===");
     let ex = setup().await;
 
-    exec(&ex, "CREATE TABLE rollback_test (id INT PRIMARY KEY, value INT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE rollback_test (id INT PRIMARY KEY, value INT)",
+    )
+    .await;
     exec(&ex, "INSERT INTO rollback_test VALUES (1, 100)").await;
 
     let start = Instant::now();
 
     for i in 0..1000 {
         exec(&ex, "BEGIN").await;
-        exec(&ex, &format!("UPDATE rollback_test SET value = {} WHERE id = 1", i)).await;
+        exec(
+            &ex,
+            &format!("UPDATE rollback_test SET value = {} WHERE id = 1", i),
+        )
+        .await;
         exec(&ex, "ROLLBACK").await;
     }
 
@@ -233,7 +296,10 @@ async fn stress_test_transaction_rollback() {
     println!("✓ Rolled back 1K transactions in {:?}", elapsed);
 
     // Verify original value unchanged
-    let _result = ex.execute("SELECT value FROM rollback_test WHERE id = 1").await.unwrap();
+    let _result = ex
+        .execute("SELECT value FROM rollback_test WHERE id = 1")
+        .await
+        .unwrap();
     println!("✓ Verified rollback correctness");
 }
 
@@ -249,7 +315,11 @@ async fn stress_test_deep_subquery() {
 
     exec(&ex, "CREATE TABLE subquery_test (id INT, value INT)").await;
     for i in 0..1000 {
-        exec(&ex, &format!("INSERT INTO subquery_test VALUES ({}, {})", i, i * 2)).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO subquery_test VALUES ({}, {})", i, i * 2),
+        )
+        .await;
     }
 
     let sql = "
@@ -282,7 +352,11 @@ async fn stress_test_window_functions() {
     exec(&ex, "CREATE TABLE window_test (category INT, value INT)").await;
     for i in 0..10_000 {
         let category = i % 10;
-        exec(&ex, &format!("INSERT INTO window_test VALUES ({}, {})", category, i)).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO window_test VALUES ({}, {})", category, i),
+        )
+        .await;
     }
 
     let sql = "
@@ -302,7 +376,10 @@ async fn stress_test_window_functions() {
     let _result = ex.execute(sql).await.unwrap();
     let elapsed = start.elapsed();
 
-    println!("✓ Applied 4 window functions over 10K rows in {:?}", elapsed);
+    println!(
+        "✓ Applied 4 window functions over 10K rows in {:?}",
+        elapsed
+    );
 }
 
 // ============================================================================
@@ -324,7 +401,11 @@ async fn stress_test_large_result_set() {
             let id = batch * 1000 + i;
             values.push(format!("({}, 'Data string for row {}')", id, id));
         }
-        exec(&ex, &format!("INSERT INTO large_result VALUES {}", values.join(", "))).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO large_result VALUES {}", values.join(", ")),
+        )
+        .await;
     }
 
     // Select all rows
@@ -347,7 +428,11 @@ async fn stress_test_many_columns() {
     for i in 1..100 {
         cols.push(format!("col{} INT", i));
     }
-    exec(&ex, &format!("CREATE TABLE wide_table ({})", cols.join(", "))).await;
+    exec(
+        &ex,
+        &format!("CREATE TABLE wide_table ({})", cols.join(", ")),
+    )
+    .await;
 
     // Insert 1000 rows
     let start = Instant::now();
@@ -356,7 +441,11 @@ async fn stress_test_many_columns() {
         for j in 1..100 {
             vals.push((i * j).to_string());
         }
-        exec(&ex, &format!("INSERT INTO wide_table VALUES ({})", vals.join(", "))).await;
+        exec(
+            &ex,
+            &format!("INSERT INTO wide_table VALUES ({})", vals.join(", ")),
+        )
+        .await;
     }
     let elapsed = start.elapsed();
 

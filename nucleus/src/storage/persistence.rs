@@ -13,7 +13,9 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{Catalog, ColumnDef, FkAction, IndexDef, IndexType, TableConstraint, TableDef};
+use crate::catalog::{
+    Catalog, ColumnDef, FkAction, IndexDef, IndexType, TableConstraint, TableDef,
+};
 use crate::types::DataType;
 
 /// Default FK action string for serde deserialization (backward compatibility).
@@ -43,11 +45,9 @@ fn string_to_fk_action(s: &str) -> FkAction {
     }
 }
 
-use super::txn::{IsolationLevel, RowVersion, Transaction, TransactionManager};
-use super::wal::{
-    self, Wal, RECORD_ABORT, RECORD_CHECKPOINT, RECORD_COMMIT, RECORD_PAGE_WRITE,
-};
 use super::page::PageBuf;
+use super::txn::{IsolationLevel, RowVersion, Transaction, TransactionManager};
+use super::wal::{self, RECORD_ABORT, RECORD_CHECKPOINT, RECORD_COMMIT, RECORD_PAGE_WRITE, Wal};
 
 // ============================================================================
 // Catalog persistence — JSON serialization
@@ -67,9 +67,17 @@ struct ColumnDefSer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum TableConstraintSer {
-    PrimaryKey { columns: Vec<String> },
-    Unique { name: Option<String>, columns: Vec<String> },
-    Check { name: Option<String>, expr: String },
+    PrimaryKey {
+        columns: Vec<String>,
+    },
+    Unique {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    Check {
+        name: Option<String>,
+        expr: String,
+    },
     ForeignKey {
         name: Option<String>,
         columns: Vec<String>,
@@ -297,11 +305,7 @@ impl CatalogPersistence {
                             default_expr: c.default_expr.clone(),
                         })
                         .collect(),
-                    constraints: t
-                        .constraints
-                        .iter()
-                        .map(constraint_to_ser)
-                        .collect(),
+                    constraints: t.constraints.iter().map(constraint_to_ser).collect(),
                     append_only: t.append_only,
                 })
                 .collect(),
@@ -313,7 +317,11 @@ impl CatalogPersistence {
                     columns: i.columns.clone(),
                     unique: i.unique,
                     index_type: index_type_to_string(&i.index_type),
-                    options: if i.options.is_empty() { None } else { Some(i.options.clone()) },
+                    options: if i.options.is_empty() {
+                        None
+                    } else {
+                        Some(i.options.clone())
+                    },
                 })
                 .collect(),
         };
@@ -358,11 +366,8 @@ impl CatalogPersistence {
                 })
                 .collect();
 
-            let constraints: Vec<TableConstraint> = t
-                .constraints
-                .iter()
-                .map(ser_to_constraint)
-                .collect();
+            let constraints: Vec<TableConstraint> =
+                t.constraints.iter().map(ser_to_constraint).collect();
 
             let table_def = TableDef {
                 name: t.name.clone(),
@@ -499,10 +504,7 @@ impl WalStorageEngine {
         // In a full implementation, we would flush all dirty pages to the data
         // file here. For our in-memory page store, all pages are already "flushed".
         self.wal.sync().map_err(PersistenceError::Io)?;
-        let lsn = self
-            .wal
-            .log_checkpoint()
-            .map_err(PersistenceError::Io)?;
+        let lsn = self.wal.log_checkpoint().map_err(PersistenceError::Io)?;
         self.wal.sync().map_err(PersistenceError::Io)?;
         Ok(lsn)
     }
@@ -559,7 +561,12 @@ impl MvccRowStore {
     }
 
     /// Insert a row within a transaction.
-    pub fn insert(&self, table: &str, txn: &Transaction, data: Vec<u8>) -> Result<(), PersistenceError> {
+    pub fn insert(
+        &self,
+        table: &str,
+        txn: &Transaction,
+        data: Vec<u8>,
+    ) -> Result<(), PersistenceError> {
         let mut tables = self.tables.write();
         let rows = tables
             .get_mut(table)
@@ -590,7 +597,9 @@ impl MvccRowStore {
         for row in rows.iter_mut() {
             if row.version.is_visible(&txn.snapshot, &self.txn_manager) {
                 if visible_count == row_index {
-                    row.version.deleted_by.store(txn.id, std::sync::atomic::Ordering::Release);
+                    row.version
+                        .deleted_by
+                        .store(txn.id, std::sync::atomic::Ordering::Release);
                     return Ok(());
                 }
                 visible_count += 1;
@@ -653,8 +662,7 @@ impl RecoveryManager {
             });
         }
 
-        let records =
-            wal::read_wal_records(&self.wal_path).map_err(PersistenceError::Io)?;
+        let records = wal::read_wal_records(&self.wal_path).map_err(PersistenceError::Io)?;
 
         if records.is_empty() {
             return Ok(RecoveryResult {
@@ -710,11 +718,13 @@ impl RecoveryManager {
                 continue;
             }
 
-            if record.record_type == RECORD_PAGE_WRITE && committed.contains(&record.txn_id)
-                && let Some(ref page_image) = record.page_image {
-                    pages.insert(record.page_id, page_image.clone());
-                    records_replayed += 1;
-                }
+            if record.record_type == RECORD_PAGE_WRITE
+                && committed.contains(&record.txn_id)
+                && let Some(ref page_image) = record.page_image
+            {
+                pages.insert(record.page_id, page_image.clone());
+                records_replayed += 1;
+            }
         }
 
         let max_lsn = wal::max_lsn(&records);
@@ -788,8 +798,8 @@ pub enum PersistenceError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::page::PAGE_SIZE;
+    use super::*;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -825,11 +835,9 @@ mod tests {
                         default_expr: Some("true".into()),
                     },
                 ],
-                constraints: vec![
-                    TableConstraint::PrimaryKey {
-                        columns: vec!["id".into()],
-                    },
-                ],
+                constraints: vec![TableConstraint::PrimaryKey {
+                    columns: vec!["id".into()],
+                }],
                 append_only: false,
             })
             .await
@@ -913,7 +921,10 @@ mod tests {
 
         // Verify orders table with Array type
         let orders = catalog2.get_table("orders").await.unwrap();
-        assert_eq!(orders.columns[2].data_type, DataType::Array(Box::new(DataType::Text)));
+        assert_eq!(
+            orders.columns[2].data_type,
+            DataType::Array(Box::new(DataType::Text))
+        );
 
         // Verify indexes
         let user_indexes = catalog2.get_indexes("users").await;
@@ -1164,7 +1175,9 @@ mod tests {
 
         // T1 inserts and commits
         let mut t1 = store.begin_transaction(IsolationLevel::Snapshot);
-        store.insert("test", &t1, b"committed_row".to_vec()).unwrap();
+        store
+            .insert("test", &t1, b"committed_row".to_vec())
+            .unwrap();
         store.commit_transaction(&mut t1);
 
         // T2 starts after T1 committed — should see the row

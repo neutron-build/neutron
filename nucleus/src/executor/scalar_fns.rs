@@ -3,24 +3,23 @@
 //! Contains the massive `eval_scalar_fn` dispatch function and `extract_fn_args`
 //! helper. These implement all 208+ built-in SQL functions.
 
-use std::collections::{HashMap, HashSet};
-use sqlparser::ast;
-use crate::types::{Row, Value};
-use crate::vector;
+use super::helpers::*;
+use super::session::sync_block_on;
+use super::types::ColMeta;
+use super::{ExecError, ExecResult, Executor};
 use crate::fts;
-use crate::timeseries;
 use crate::graph::PropValue as GraphPropValue;
 use crate::graph::cypher::parse_cypher;
 use crate::graph::cypher_executor::execute_cypher;
 #[cfg(feature = "server")]
 use crate::reactive::ChangeType;
-use super::types::ColMeta;
-use super::{ExecError, ExecResult, Executor};
-use super::helpers::*;
-use super::session::sync_block_on;
+use crate::timeseries;
+use crate::types::{Row, Value};
+use crate::vector;
+use sqlparser::ast;
+use std::collections::{HashMap, HashSet};
 
 impl Executor {
-
     /// Evaluate a scalar (non-aggregate) function call.
     pub(super) fn eval_scalar_fn(
         &self,
@@ -94,7 +93,9 @@ impl Executor {
             }
             "CONCAT_WS" => {
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("CONCAT_WS requires at least 1 arg".into()));
+                    return Err(ExecError::Unsupported(
+                        "CONCAT_WS requires at least 1 arg".into(),
+                    ));
                 }
                 let sep = match &args[0] {
                     Value::Text(s) => s.clone(),
@@ -113,9 +114,9 @@ impl Executor {
             }
             "SUBSTRING" | "SUBSTR" => {
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported(
-                        format!("{fname} requires at least 2 args"),
-                    ));
+                    return Err(ExecError::Unsupported(format!(
+                        "{fname} requires at least 2 args"
+                    )));
                 }
                 let s = match &args[0] {
                     Value::Text(s) => s.clone(),
@@ -206,7 +207,9 @@ impl Executor {
                     (Value::Text(s), Value::Text(delim)) => {
                         let part_num = value_to_i64(&args[2])? as usize;
                         if part_num == 0 {
-                            return Err(ExecError::Unsupported("SPLIT_PART field position must be > 0".into()));
+                            return Err(ExecError::Unsupported(
+                                "SPLIT_PART field position must be > 0".into(),
+                            ));
                         }
                         let parts: Vec<&str> = s.split(delim.as_str()).collect();
                         Ok(Value::Text(
@@ -214,7 +217,9 @@ impl Executor {
                         ))
                     }
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("SPLIT_PART requires text args".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "SPLIT_PART requires text args".into(),
+                    )),
                 }
             }
             "TRANSLATE" => {
@@ -236,13 +241,17 @@ impl Executor {
                         Ok(Value::Text(result))
                     }
                     (Value::Null, _, _) => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("TRANSLATE requires text args".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "TRANSLATE requires text args".into(),
+                    )),
                 }
             }
             "ASCII" => {
                 require_args(fname, &args, 1)?;
                 match &args[0] {
-                    Value::Text(s) => Ok(Value::Int32(s.chars().next().map(|c| c as i32).unwrap_or(0))),
+                    Value::Text(s) => Ok(Value::Int32(
+                        s.chars().next().map(|c| c as i32).unwrap_or(0),
+                    )),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("ASCII requires text".into())),
                 }
@@ -252,12 +261,16 @@ impl Executor {
                 let n = value_to_i64(&args[0])? as u32;
                 match char::from_u32(n) {
                     Some(c) => Ok(Value::Text(c.to_string())),
-                    None => Err(ExecError::Unsupported(format!("invalid character code: {n}"))),
+                    None => Err(ExecError::Unsupported(format!(
+                        "invalid character code: {n}"
+                    ))),
                 }
             }
             "REGEXP_REPLACE" => {
                 if args.len() < 3 {
-                    return Err(ExecError::Unsupported("REGEXP_REPLACE requires at least 3 args".into()));
+                    return Err(ExecError::Unsupported(
+                        "REGEXP_REPLACE requires at least 3 args".into(),
+                    ));
                 }
                 match (&args[0], &args[1], &args[2]) {
                     (Value::Text(s), Value::Text(pattern), Value::Text(replacement)) => {
@@ -266,11 +279,21 @@ impl Executor {
                         if pattern.len() > MAX_REGEX_PATTERN_LEN {
                             return Err(ExecError::Runtime(format!(
                                 "regex pattern too long ({} chars, max {})",
-                                pattern.len(), MAX_REGEX_PATTERN_LEN
+                                pattern.len(),
+                                MAX_REGEX_PATTERN_LEN
                             )));
                         }
                         // Optional 4th arg: flags ('g' = global replace)
-                        let flags = args.get(3).and_then(|v| if let Value::Text(f) = v { Some(f.as_str()) } else { None }).unwrap_or("");
+                        let flags = args
+                            .get(3)
+                            .and_then(|v| {
+                                if let Value::Text(f) = v {
+                                    Some(f.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or("");
                         let re = regex::Regex::new(pattern).map_err(|e| {
                             ExecError::Runtime(format!("invalid regex pattern: {e}"))
                         })?;
@@ -282,12 +305,16 @@ impl Executor {
                         Ok(Value::Text(result))
                     }
                     (Value::Null, _, _) => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("REGEXP_REPLACE requires text args".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "REGEXP_REPLACE requires text args".into(),
+                    )),
                 }
             }
             "REGEXP_MATCH" | "REGEXP_MATCHES" => {
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("REGEXP_MATCH requires at least 2 args".into()));
+                    return Err(ExecError::Unsupported(
+                        "REGEXP_MATCH requires at least 2 args".into(),
+                    ));
                 }
                 match (&args[0], &args[1]) {
                     (Value::Text(s), Value::Text(pattern)) => {
@@ -296,7 +323,8 @@ impl Executor {
                         if pattern.len() > MAX_REGEX_PATTERN_LEN {
                             return Err(ExecError::Runtime(format!(
                                 "regex pattern too long ({} chars, max {})",
-                                pattern.len(), MAX_REGEX_PATTERN_LEN
+                                pattern.len(),
+                                MAX_REGEX_PATTERN_LEN
                             )));
                         }
                         let re = regex::Regex::new(pattern).map_err(|e| {
@@ -305,7 +333,8 @@ impl Executor {
                         match re.captures(s) {
                             Some(caps) => {
                                 // Return array of captured groups (group 0 = full match)
-                                let groups: Vec<Value> = caps.iter()
+                                let groups: Vec<Value> = caps
+                                    .iter()
                                     .map(|m| match m {
                                         Some(m) => Value::Text(m.as_str().to_string()),
                                         None => Value::Null,
@@ -317,23 +346,33 @@ impl Executor {
                         }
                     }
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("REGEXP_MATCH requires text args".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "REGEXP_MATCH requires text args".into(),
+                    )),
                 }
             }
             "STARTS_WITH" => {
                 require_args(fname, &args, 2)?;
                 match (&args[0], &args[1]) {
-                    (Value::Text(s), Value::Text(prefix)) => Ok(Value::Bool(s.starts_with(prefix.as_str()))),
+                    (Value::Text(s), Value::Text(prefix)) => {
+                        Ok(Value::Bool(s.starts_with(prefix.as_str())))
+                    }
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("STARTS_WITH requires text args".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "STARTS_WITH requires text args".into(),
+                    )),
                 }
             }
             "ENDS_WITH" => {
                 require_args(fname, &args, 2)?;
                 match (&args[0], &args[1]) {
-                    (Value::Text(s), Value::Text(suffix)) => Ok(Value::Bool(s.ends_with(suffix.as_str()))),
+                    (Value::Text(s), Value::Text(suffix)) => {
+                        Ok(Value::Bool(s.ends_with(suffix.as_str())))
+                    }
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("ENDS_WITH requires text args".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "ENDS_WITH requires text args".into(),
+                    )),
                 }
             }
             "OCTET_LENGTH" | "BIT_LENGTH" => {
@@ -356,7 +395,9 @@ impl Executor {
                         }
                     }
                     Value::Null => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported(format!("{fname} requires text or bytea"))),
+                    _ => Err(ExecError::Unsupported(format!(
+                        "{fname} requires text or bytea"
+                    ))),
                 }
             }
             "INITCAP" => {
@@ -386,7 +427,9 @@ impl Executor {
             }
             "LPAD" => {
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("LPAD requires at least 2 args".into()));
+                    return Err(ExecError::Unsupported(
+                        "LPAD requires at least 2 args".into(),
+                    ));
                 }
                 match &args[0] {
                     Value::Text(s) => {
@@ -399,10 +442,13 @@ impl Executor {
                         } else {
                             " ".to_string()
                         };
-                        if s.len() >= target_len {
-                            Ok(Value::Text(s[..target_len].to_string()))
+                        // Operate on characters, not bytes: byte slicing breaks
+                        // Unicode (and panics on a non-char-boundary cut).
+                        let char_count = s.chars().count();
+                        if char_count >= target_len {
+                            Ok(Value::Text(s.chars().take(target_len).collect()))
                         } else {
-                            let pad_len = target_len - s.len();
+                            let pad_len = target_len - char_count;
                             let padding: String = fill.chars().cycle().take(pad_len).collect();
                             Ok(Value::Text(format!("{padding}{s}")))
                         }
@@ -413,7 +459,9 @@ impl Executor {
             }
             "RPAD" => {
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("RPAD requires at least 2 args".into()));
+                    return Err(ExecError::Unsupported(
+                        "RPAD requires at least 2 args".into(),
+                    ));
                 }
                 match &args[0] {
                     Value::Text(s) => {
@@ -426,10 +474,12 @@ impl Executor {
                         } else {
                             " ".to_string()
                         };
-                        if s.len() >= target_len {
-                            Ok(Value::Text(s[..target_len].to_string()))
+                        // Operate on characters, not bytes (see LPAD).
+                        let char_count = s.chars().count();
+                        if char_count >= target_len {
+                            Ok(Value::Text(s.chars().take(target_len).collect()))
                         } else {
-                            let pad_len = target_len - s.len();
+                            let pad_len = target_len - char_count;
                             let padding: String = fill.chars().cycle().take(pad_len).collect();
                             Ok(Value::Text(format!("{s}{padding}")))
                         }
@@ -443,8 +493,16 @@ impl Executor {
             "ABS" => {
                 require_args(fname, &args, 1)?;
                 match &args[0] {
-                    Value::Int32(n) => Ok(Value::Int32(n.abs())),
-                    Value::Int64(n) => Ok(Value::Int64(n.abs())),
+                    // checked_abs: i32::MIN/i64::MIN have no positive representation
+                    // and would panic on .abs(); surface as a Postgres-style range error.
+                    Value::Int32(n) => n
+                        .checked_abs()
+                        .map(Value::Int32)
+                        .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
+                    Value::Int64(n) => n
+                        .checked_abs()
+                        .map(Value::Int64)
+                        .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
                     Value::Float64(n) => Ok(Value::Float64(n.abs())),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("ABS requires numeric".into())),
@@ -452,7 +510,9 @@ impl Executor {
             }
             "ROUND" => {
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("ROUND requires at least 1 arg".into()));
+                    return Err(ExecError::Unsupported(
+                        "ROUND requires at least 1 arg".into(),
+                    ));
                 }
                 let decimals = if args.len() > 1 {
                     value_to_i64(&args[1])? as i32
@@ -503,9 +563,13 @@ impl Executor {
                 match &args[0] {
                     Value::Int32(n) => Ok(Value::Int32(n.signum())),
                     Value::Int64(n) => Ok(Value::Int64(n.signum())),
-                    Value::Float64(n) => {
-                        Ok(Value::Int32(if *n > 0.0 { 1 } else if *n < 0.0 { -1 } else { 0 }))
-                    }
+                    Value::Float64(n) => Ok(Value::Int32(if *n > 0.0 {
+                        1
+                    } else if *n < 0.0 {
+                        -1
+                    } else {
+                        0
+                    })),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("SIGN requires numeric".into())),
                 }
@@ -541,23 +605,37 @@ impl Executor {
             "MOD" => {
                 require_args(fname, &args, 2)?;
                 match (&args[0], &args[1]) {
-                    (Value::Int32(a), Value::Int32(b)) if *b != 0 => Ok(Value::Int32(a % b)),
-                    (Value::Int64(a), Value::Int64(b)) if *b != 0 => Ok(Value::Int64(a % b)),
+                    // Postgres errors (not NULL) on mod-by-zero; give the right message.
+                    (Value::Int32(_), Value::Int32(0)) | (Value::Int64(_), Value::Int64(0)) => {
+                        Err(ExecError::Runtime("division by zero".into()))
+                    }
+                    (Value::Float64(_), Value::Float64(b)) if *b == 0.0 => {
+                        Err(ExecError::Runtime("division by zero".into()))
+                    }
+                    // checked_rem avoids the i32::MIN % -1 / i64::MIN % -1 panic (result is 0).
+                    (Value::Int32(a), Value::Int32(b)) => {
+                        Ok(Value::Int32(a.checked_rem(*b).unwrap_or(0)))
+                    }
+                    (Value::Int64(a), Value::Int64(b)) => {
+                        Ok(Value::Int64(a.checked_rem(*b).unwrap_or(0)))
+                    }
                     (Value::Float64(a), Value::Float64(b)) => Ok(Value::Float64(a % b)),
                     _ => Err(ExecError::Unsupported("MOD requires numeric".into())),
                 }
             }
-            "RANDOM" => {
-                Ok(Value::Float64(rand::random::<f64>()))
-            }
-            "PI" => {
-                Ok(Value::Float64(std::f64::consts::PI))
-            }
+            "RANDOM" => Ok(Value::Float64(rand::random::<f64>())),
+            "PI" => Ok(Value::Float64(std::f64::consts::PI)),
             "TRUNC" | "TRUNCATE" => {
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("TRUNC requires at least 1 arg".into()));
+                    return Err(ExecError::Unsupported(
+                        "TRUNC requires at least 1 arg".into(),
+                    ));
                 }
-                let decimals = if args.len() > 1 { value_to_i64(&args[1])? as i32 } else { 0 };
+                let decimals = if args.len() > 1 {
+                    value_to_i64(&args[1])? as i32
+                } else {
+                    0
+                };
                 match &args[0] {
                     Value::Float64(n) => {
                         let factor = 10f64.powi(decimals);
@@ -610,8 +688,13 @@ impl Executor {
             }
             "GCD" => {
                 require_args(fname, &args, 2)?;
-                let mut a = value_to_i64(&args[0])?.abs();
-                let mut b = value_to_i64(&args[1])?.abs();
+                // checked_abs: i64::MIN has no positive representation (would panic).
+                let mut a = value_to_i64(&args[0])?
+                    .checked_abs()
+                    .ok_or_else(|| ExecError::Runtime("bigint out of range".into()))?;
+                let mut b = value_to_i64(&args[1])?
+                    .checked_abs()
+                    .ok_or_else(|| ExecError::Runtime("bigint out of range".into()))?;
                 while b != 0 {
                     let t = b;
                     b = a % b;
@@ -621,8 +704,12 @@ impl Executor {
             }
             "LCM" => {
                 require_args(fname, &args, 2)?;
-                let a = value_to_i64(&args[0])?.abs();
-                let b = value_to_i64(&args[1])?.abs();
+                let a = value_to_i64(&args[0])?
+                    .checked_abs()
+                    .ok_or_else(|| ExecError::Runtime("bigint out of range".into()))?;
+                let b = value_to_i64(&args[1])?
+                    .checked_abs()
+                    .ok_or_else(|| ExecError::Runtime("bigint out of range".into()))?;
                 if a == 0 || b == 0 {
                     Ok(Value::Int64(0))
                 } else {
@@ -633,30 +720,50 @@ impl Executor {
                         gb = ga % gb;
                         ga = t;
                     }
-                    Ok(Value::Int64(a / ga * b))
+                    // a/ga is exact (ga | a); the multiply by b can overflow i64.
+                    (a / ga)
+                        .checked_mul(b)
+                        .map(Value::Int64)
+                        .ok_or_else(|| ExecError::Runtime("bigint out of range".into()))
                 }
             }
             "GENERATE_SERIES" => {
                 if args.len() < 2 || args.len() > 3 {
-                    return Err(ExecError::Unsupported("GENERATE_SERIES requires 2 or 3 args".into()));
+                    return Err(ExecError::Unsupported(
+                        "GENERATE_SERIES requires 2 or 3 args".into(),
+                    ));
                 }
                 let start = value_to_i64(&args[0])?;
                 let stop = value_to_i64(&args[1])?;
-                let step = if args.len() == 3 { value_to_i64(&args[2])? } else { 1 };
+                let step = if args.len() == 3 {
+                    value_to_i64(&args[2])?
+                } else {
+                    1
+                };
                 if step == 0 {
-                    return Err(ExecError::Unsupported("GENERATE_SERIES step cannot be 0".into()));
+                    return Err(ExecError::Unsupported(
+                        "GENERATE_SERIES step cannot be 0".into(),
+                    ));
                 }
                 let mut vals = Vec::new();
                 let mut current = start;
+                // checked_add: stepping past i64::MAX/MIN must stop the series, not
+                // panic (debug) or wrap into an infinite loop (release).
                 if step > 0 {
                     while current <= stop {
                         vals.push(Value::Int64(current));
-                        current += step;
+                        match current.checked_add(step) {
+                            Some(next) => current = next,
+                            None => break,
+                        }
                     }
                 } else {
                     while current >= stop {
                         vals.push(Value::Int64(current));
-                        current += step;
+                        match current.checked_add(step) {
+                            Some(next) => current = next,
+                            None => break,
+                        }
                     }
                 }
                 Ok(Value::Array(vals))
@@ -743,18 +850,12 @@ impl Executor {
                 };
                 Ok(Value::Text(type_name.to_string()))
             }
-            "VERSION" => {
-                Ok(Value::Text(format!(
-                    "PostgreSQL 16.0 (Nucleus {} — The Definitive Database)",
-                    env!("CARGO_PKG_VERSION")
-                )))
-            }
-            "CURRENT_DATABASE" => {
-                Ok(Value::Text("nucleus".to_string()))
-            }
-            "CURRENT_SCHEMA" => {
-                Ok(Value::Text("public".to_string()))
-            }
+            "VERSION" => Ok(Value::Text(format!(
+                "PostgreSQL 16.0 (Nucleus {} — The Definitive Database)",
+                env!("CARGO_PKG_VERSION")
+            ))),
+            "CURRENT_DATABASE" => Ok(Value::Text("nucleus".to_string())),
+            "CURRENT_SCHEMA" => Ok(Value::Text("public".to_string())),
             "CURRENT_USER" | "CURRENT_ROLE" | "SESSION_USER" => {
                 Ok(Value::Text("nucleus".to_string()))
             }
@@ -820,7 +921,9 @@ impl Executor {
                                 Ok(Value::Int32(*d - jan1 + 1))
                             }
                             "epoch" => Ok(Value::Int64(*d as i64 * 86400)),
-                            _ => Err(ExecError::Unsupported(format!("EXTRACT({field}) from date"))),
+                            _ => Err(ExecError::Unsupported(format!(
+                                "EXTRACT({field}) from date"
+                            ))),
                         }
                     }
                     Value::Timestamp(ts) => {
@@ -840,7 +943,9 @@ impl Executor {
                                 let jdn = days + 2451545;
                                 Ok(Value::Int32(jdn.rem_euclid(7)))
                             }
-                            _ => Err(ExecError::Unsupported(format!("EXTRACT({field}) from timestamp"))),
+                            _ => Err(ExecError::Unsupported(format!(
+                                "EXTRACT({field}) from timestamp"
+                            ))),
                         }
                     }
                     Value::Int64(v) => {
@@ -857,7 +962,9 @@ impl Executor {
                             "minute" => Ok(Value::Int32(((time_secs % 3600) / 60) as i32)),
                             "second" => Ok(Value::Int32((time_secs % 60) as i32)),
                             "epoch" => Ok(Value::Int64(total_secs)),
-                            _ => Err(ExecError::Unsupported(format!("EXTRACT({field}) from integer"))),
+                            _ => Err(ExecError::Unsupported(format!(
+                                "EXTRACT({field}) from integer"
+                            ))),
                         }
                     }
                     Value::Text(s) => {
@@ -869,21 +976,31 @@ impl Executor {
                                 "month" => Ok(Value::Int32(m as i32)),
                                 "day" => Ok(Value::Int32(day as i32)),
                                 "epoch" => Ok(Value::Int64(d as i64 * 86400)),
-                                _ => Err(ExecError::Unsupported(format!("EXTRACT({field}) from text"))),
+                                _ => Err(ExecError::Unsupported(format!(
+                                    "EXTRACT({field}) from text"
+                                ))),
                             }
                         } else {
-                            Err(ExecError::Unsupported("cannot parse date/time from text".into()))
+                            Err(ExecError::Unsupported(
+                                "cannot parse date/time from text".into(),
+                            ))
                         }
                     }
                     Value::Null => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("EXTRACT requires date/timestamp".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "EXTRACT requires date/timestamp".into(),
+                    )),
                 }
             }
             "DATE_TRUNC" => {
                 require_args(fname, &args, 2)?;
                 let field = match &args[0] {
                     Value::Text(s) => s.to_lowercase(),
-                    _ => return Err(ExecError::Unsupported("DATE_TRUNC field must be text".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "DATE_TRUNC field must be text".into(),
+                        ));
+                    }
                 };
                 match &args[1] {
                     Value::Timestamp(ts) => {
@@ -893,11 +1010,20 @@ impl Executor {
                         let (y, m, _d) = crate::types::days_to_ymd(days);
                         let truncated_us = match field.as_str() {
                             "year" => crate::types::ymd_to_days(y, 1, 1) as i64 * 86400 * 1_000_000,
-                            "month" => crate::types::ymd_to_days(y, m, 1) as i64 * 86400 * 1_000_000,
+                            "month" => {
+                                crate::types::ymd_to_days(y, m, 1) as i64 * 86400 * 1_000_000
+                            }
                             "day" => days as i64 * 86400 * 1_000_000,
-                            "hour" => days as i64 * 86400 * 1_000_000 + (time_secs / 3600) * 3600 * 1_000_000,
-                            "minute" => days as i64 * 86400 * 1_000_000 + (time_secs / 60) * 60 * 1_000_000,
-                            _ => return Err(ExecError::Unsupported(format!("DATE_TRUNC({field})"))),
+                            "hour" => {
+                                days as i64 * 86400 * 1_000_000
+                                    + (time_secs / 3600) * 3600 * 1_000_000
+                            }
+                            "minute" => {
+                                days as i64 * 86400 * 1_000_000 + (time_secs / 60) * 60 * 1_000_000
+                            }
+                            _ => {
+                                return Err(ExecError::Unsupported(format!("DATE_TRUNC({field})")));
+                            }
                         };
                         Ok(Value::Timestamp(truncated_us))
                     }
@@ -907,7 +1033,9 @@ impl Executor {
                             "year" => crate::types::ymd_to_days(y, 1, 1),
                             "month" => crate::types::ymd_to_days(y, m, 1),
                             "day" => *d,
-                            _ => return Err(ExecError::Unsupported(format!("DATE_TRUNC({field})"))),
+                            _ => {
+                                return Err(ExecError::Unsupported(format!("DATE_TRUNC({field})")));
+                            }
                         };
                         Ok(Value::Date(truncated))
                     }
@@ -918,16 +1046,26 @@ impl Executor {
                                 "month" => format!("{y:04}-{m:02}-01 00:00:00"),
                                 "day" => format!("{y:04}-{m:02}-{d:02} 00:00:00"),
                                 "hour" => format!("{y:04}-{m:02}-{d:02} {hour:02}:00:00"),
-                                "minute" => format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}:00"),
-                                _ => return Err(ExecError::Unsupported(format!("DATE_TRUNC({field})"))),
+                                "minute" => {
+                                    format!("{y:04}-{m:02}-{d:02} {hour:02}:{minute:02}:00")
+                                }
+                                _ => {
+                                    return Err(ExecError::Unsupported(format!(
+                                        "DATE_TRUNC({field})"
+                                    )));
+                                }
                             };
                             Ok(Value::Text(result))
                         } else {
-                            Err(ExecError::Unsupported(format!("cannot parse date/time: {s}")))
+                            Err(ExecError::Unsupported(format!(
+                                "cannot parse date/time: {s}"
+                            )))
                         }
                     }
                     Value::Null => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("DATE_TRUNC requires timestamp/date".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "DATE_TRUNC requires timestamp/date".into(),
+                    )),
                 }
             }
             "AGE" => {
@@ -937,15 +1075,22 @@ impl Executor {
                 let d1 = match &args[0] {
                     Value::Date(d) => *d,
                     Value::Timestamp(ts) => (*ts / 1_000_000 / 86400) as i32,
-                    Value::Text(s) => parse_date_string(s).ok_or_else(|| ExecError::Unsupported(format!("AGE cannot parse: {s}")))?,
+                    Value::Text(s) => parse_date_string(s)
+                        .ok_or_else(|| ExecError::Unsupported(format!("AGE cannot parse: {s}")))?,
                     _ => return Err(ExecError::Unsupported("AGE requires date/timestamp".into())),
                 };
                 let d2 = if args.len() == 2 {
                     match &args[1] {
                         Value::Date(d) => *d,
                         Value::Timestamp(ts) => (*ts / 1_000_000 / 86400) as i32,
-                        Value::Text(s) => parse_date_string(s).ok_or_else(|| ExecError::Unsupported(format!("AGE cannot parse: {s}")))?,
-                        _ => return Err(ExecError::Unsupported("AGE requires date/timestamp".into())),
+                        Value::Text(s) => parse_date_string(s).ok_or_else(|| {
+                            ExecError::Unsupported(format!("AGE cannot parse: {s}"))
+                        })?,
+                        _ => {
+                            return Err(ExecError::Unsupported(
+                                "AGE requires date/timestamp".into(),
+                            ));
+                        }
                     }
                 } else {
                     // age(date) = age from now
@@ -959,7 +1104,9 @@ impl Executor {
                 let years = diff / 365;
                 let months = (diff % 365) / 30;
                 let days = diff % 30;
-                Ok(Value::Text(format!("{years} years {months} mons {days} days")))
+                Ok(Value::Text(format!(
+                    "{years} years {months} mons {days} days"
+                )))
             }
             "TO_CHAR" => {
                 require_args(fname, &args, 2)?;
@@ -1006,27 +1153,38 @@ impl Executor {
                             // Try parsing as timestamp string (with time part)
                             if let Some((y, m, d, h, min, sec)) = parse_timestamp_parts(s) {
                                 let days = crate::types::ymd_to_days(y, m, d) as i64;
-                                let time_us = (h as i64 * 3600 + min as i64 * 60 + sec as i64) * 1_000_000;
+                                let time_us =
+                                    (h as i64 * 3600 + min as i64 * 60 + sec as i64) * 1_000_000;
                                 Ok(Value::Timestamp(days * 86400 * 1_000_000 + time_us))
                             } else {
-                                Err(ExecError::Unsupported(format!("cannot parse timestamp: {s}")))
+                                Err(ExecError::Unsupported(format!(
+                                    "cannot parse timestamp: {s}"
+                                )))
                             }
                         }
                         Value::Null => Ok(Value::Null),
-                        _ => Err(ExecError::Unsupported("TO_TIMESTAMP requires numeric or text".into())),
+                        _ => Err(ExecError::Unsupported(
+                            "TO_TIMESTAMP requires numeric or text".into(),
+                        )),
                     }
                 } else {
                     require_args(fname, &args, 2)?;
                     let s = match &args[0] {
                         Value::Text(s) => s.clone(),
-                        _ => return Err(ExecError::Unsupported("TO_TIMESTAMP requires text".into())),
+                        _ => {
+                            return Err(ExecError::Unsupported(
+                                "TO_TIMESTAMP requires text".into(),
+                            ));
+                        }
                     };
                     if let Some((y, m, d, h, min, sec)) = parse_timestamp_parts(&s) {
                         let days = crate::types::ymd_to_days(y, m, d) as i64;
                         let time_us = (h as i64 * 3600 + min as i64 * 60 + sec as i64) * 1_000_000;
                         Ok(Value::Timestamp(days * 86400 * 1_000_000 + time_us))
                     } else {
-                        Err(ExecError::Unsupported(format!("cannot parse timestamp: {s}")))
+                        Err(ExecError::Unsupported(format!(
+                            "cannot parse timestamp: {s}"
+                        )))
                     }
                 }
             }
@@ -1094,16 +1252,21 @@ impl Executor {
             }
             "JSONB_SET" | "JSON_SET" => {
                 if args.len() < 3 {
-                    return Err(ExecError::Unsupported("jsonb_set requires at least 3 args".into()));
+                    return Err(ExecError::Unsupported(
+                        "jsonb_set requires at least 3 args".into(),
+                    ));
                 }
                 let new_val = value_to_json(&args[2]);
                 match (&args[0], &args[1]) {
                     (Value::Jsonb(target_json), Value::Jsonb(serde_json::Value::Array(path))) => {
                         let mut target = target_json.clone();
-                        let path_strs: Vec<String> = path.iter().map(|p| match p {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        }).collect();
+                        let path_strs: Vec<String> = path
+                            .iter()
+                            .map(|p| match p {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            })
+                            .collect();
                         jsonb_set_path(&mut target, &path_strs, new_val);
                         Ok(Value::Jsonb(target))
                     }
@@ -1115,13 +1278,17 @@ impl Executor {
                         Ok(Value::Jsonb(target))
                     }
                     (Value::Null, _) => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("jsonb_set requires jsonb target".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "jsonb_set requires jsonb target".into(),
+                    )),
                 }
             }
             "JSONB_PRETTY" | "JSON_PRETTY" => {
                 require_args(fname, &args, 1)?;
                 match &args[0] {
-                    Value::Jsonb(v) => Ok(Value::Text(serde_json::to_string_pretty(v).unwrap_or_default())),
+                    Value::Jsonb(v) => Ok(Value::Text(
+                        serde_json::to_string_pretty(v).unwrap_or_default(),
+                    )),
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("jsonb_pretty requires jsonb".into())),
                 }
@@ -1130,13 +1297,16 @@ impl Executor {
                 require_args(fname, &args, 1)?;
                 match &args[0] {
                     Value::Jsonb(serde_json::Value::Object(map)) => {
-                        let keys: Vec<serde_json::Value> = map.keys()
+                        let keys: Vec<serde_json::Value> = map
+                            .keys()
                             .map(|k| serde_json::Value::String(k.clone()))
                             .collect();
                         Ok(Value::Jsonb(serde_json::Value::Array(keys)))
                     }
                     Value::Null => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("jsonb_object_keys requires jsonb object".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "jsonb_object_keys requires jsonb object".into(),
+                    )),
                 }
             }
             "JSONB_STRIP_NULLS" | "JSON_STRIP_NULLS" => {
@@ -1144,17 +1314,25 @@ impl Executor {
                 match &args[0] {
                     Value::Jsonb(v) => Ok(Value::Jsonb(strip_json_nulls(v))),
                     Value::Null => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("jsonb_strip_nulls requires jsonb".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "jsonb_strip_nulls requires jsonb".into(),
+                    )),
                 }
             }
             "JSONB_EXTRACT_PATH" | "JSON_EXTRACT_PATH" => {
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("jsonb_extract_path requires at least 1 arg".into()));
+                    return Err(ExecError::Unsupported(
+                        "jsonb_extract_path requires at least 1 arg".into(),
+                    ));
                 }
                 let mut current = match &args[0] {
                     Value::Jsonb(v) => v.clone(),
                     Value::Null => return Ok(Value::Null),
-                    _ => return Err(ExecError::Unsupported("jsonb_extract_path requires jsonb".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "jsonb_extract_path requires jsonb".into(),
+                        ));
+                    }
                 };
                 for arg in &args[1..] {
                     let key = match arg {
@@ -1162,7 +1340,9 @@ impl Executor {
                         other => other.to_string(),
                     };
                     current = match current {
-                        serde_json::Value::Object(ref map) => map.get(&key).cloned().unwrap_or(serde_json::Value::Null),
+                        serde_json::Value::Object(ref map) => {
+                            map.get(&key).cloned().unwrap_or(serde_json::Value::Null)
+                        }
                         serde_json::Value::Array(ref arr) => {
                             if let Ok(idx) = key.parse::<usize>() {
                                 arr.get(idx).cloned().unwrap_or(serde_json::Value::Null)
@@ -1177,12 +1357,18 @@ impl Executor {
             }
             "JSONB_EXTRACT_PATH_TEXT" | "JSON_EXTRACT_PATH_TEXT" => {
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("jsonb_extract_path_text requires at least 1 arg".into()));
+                    return Err(ExecError::Unsupported(
+                        "jsonb_extract_path_text requires at least 1 arg".into(),
+                    ));
                 }
                 let mut current = match &args[0] {
                     Value::Jsonb(v) => v.clone(),
                     Value::Null => return Ok(Value::Null),
-                    _ => return Err(ExecError::Unsupported("jsonb_extract_path_text requires jsonb".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "jsonb_extract_path_text requires jsonb".into(),
+                        ));
+                    }
                 };
                 for arg in &args[1..] {
                     let key = match arg {
@@ -1190,7 +1376,9 @@ impl Executor {
                         other => other.to_string(),
                     };
                     current = match current {
-                        serde_json::Value::Object(ref map) => map.get(&key).cloned().unwrap_or(serde_json::Value::Null),
+                        serde_json::Value::Object(ref map) => {
+                            map.get(&key).cloned().unwrap_or(serde_json::Value::Null)
+                        }
                         serde_json::Value::Array(ref arr) => {
                             if let Ok(idx) = key.parse::<usize>() {
                                 arr.get(idx).cloned().unwrap_or(serde_json::Value::Null)
@@ -1277,18 +1465,22 @@ impl Executor {
                 require_args(fname, &args, 2)?;
                 let a = json_to_vector(&args[0])?;
                 let b = json_to_vector(&args[1])?;
-                Ok(Value::Float64(
-                    crate::vector::distance(&a, &b, crate::vector::DistanceMetric::Cosine) as f64,
-                ))
+                Ok(Value::Float64(crate::vector::distance(
+                    &a,
+                    &b,
+                    crate::vector::DistanceMetric::Cosine,
+                ) as f64))
             }
             "VECTOR_INNER_PRODUCT" | "INNER_PRODUCT" => {
                 require_args(fname, &args, 2)?;
                 let a = json_to_vector(&args[0])?;
                 let b = json_to_vector(&args[1])?;
                 // Return positive inner product (not negated)
-                Ok(Value::Float64(
-                    -crate::vector::distance(&a, &b, crate::vector::DistanceMetric::InnerProduct) as f64,
-                ))
+                Ok(Value::Float64(-crate::vector::distance(
+                    &a,
+                    &b,
+                    crate::vector::DistanceMetric::InnerProduct,
+                ) as f64))
             }
 
             // -- Full-text search functions --
@@ -1340,7 +1532,9 @@ impl Executor {
                     (Value::Text(a), Value::Text(b)) => {
                         Ok(Value::Int32(crate::fts::levenshtein(a, b) as i32))
                     }
-                    _ => Err(ExecError::Unsupported("LEVENSHTEIN requires text args".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "LEVENSHTEIN requires text args".into(),
+                    )),
                 }
             }
 
@@ -1351,7 +1545,9 @@ impl Executor {
                 let bucket_millis = value_to_i64(&args[0])? as u64;
                 let ts = value_to_i64(&args[1])? as u64;
                 if bucket_millis == 0 {
-                    return Err(ExecError::Unsupported("TIME_BUCKET size must be positive".into()));
+                    return Err(ExecError::Unsupported(
+                        "TIME_BUCKET size must be positive".into(),
+                    ));
                 }
                 // Direct bucket calculation (same as timeseries::time_bucket but with raw millis)
                 let bucket = (ts / bucket_millis) * bucket_millis;
@@ -1373,21 +1569,27 @@ impl Executor {
                 // json_vector: JSON object {"dim_index": weight, ...}
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("SPARSE_INSERT requires (doc_id, json_vector)".into()));
+                    return Err(ExecError::Unsupported(
+                        "SPARSE_INSERT requires (doc_id, json_vector)".into(),
+                    ));
                 }
                 let doc_id = val_to_u64(&args[0], "SPARSE_INSERT doc_id")?;
                 let vec = json_to_sparse_vec(&args[1])?;
                 let nnz = vec.nnz();
                 self.sparse_index.write().insert(doc_id, vec);
                 // Each posting: doc_id(8) + weight(4) + index(4) = ~16 bytes.
-                self.memory_allocator.lock().request("sparse", nnz * 16 + 32);
+                self.memory_allocator
+                    .lock()
+                    .request("sparse", nnz * 16 + 32);
                 Ok(Value::Bool(true))
             }
             "SPARSE_REMOVE" => {
                 // sparse_remove(doc_id) → true/false
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("SPARSE_REMOVE requires (doc_id)".into()));
+                    return Err(ExecError::Unsupported(
+                        "SPARSE_REMOVE requires (doc_id)".into(),
+                    ));
                 }
                 let doc_id = val_to_u64(&args[0], "SPARSE_REMOVE doc_id")?;
                 let removed = self.sparse_index.write().remove(doc_id);
@@ -1405,12 +1607,15 @@ impl Executor {
                 // Exact brute-force search.
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("SPARSE_SEARCH requires (json_query, top_k)".into()));
+                    return Err(ExecError::Unsupported(
+                        "SPARSE_SEARCH requires (json_query, top_k)".into(),
+                    ));
                 }
                 let query = json_to_sparse_vec(&args[0])?;
                 let top_k = (val_to_u64(&args[1], "SPARSE_SEARCH top_k")? as usize).min(10_000);
                 let results = self.sparse_index.read().search_exact(&query, top_k);
-                let json = results.iter()
+                let json = results
+                    .iter()
                     .map(|(id, score)| format!(r#"{{"doc_id":{id},"score":{score:.6}}}"#))
                     .collect::<Vec<_>>()
                     .join(",");
@@ -1422,12 +1627,15 @@ impl Executor {
                 // Faster than SPARSE_SEARCH for high-selectivity queries on large indexes.
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("SPARSE_WAND requires (json_query, top_k)".into()));
+                    return Err(ExecError::Unsupported(
+                        "SPARSE_WAND requires (json_query, top_k)".into(),
+                    ));
                 }
                 let query = json_to_sparse_vec(&args[0])?;
                 let top_k = (val_to_u64(&args[1], "SPARSE_WAND top_k")? as usize).min(10_000);
                 let results = self.sparse_index.read().search_wand_pruned(&query, top_k);
-                let json = results.iter()
+                let json = results
+                    .iter()
                     .map(|(id, score)| format!(r#"{{"doc_id":{id},"score":{score:.6}}}"#))
                     .collect::<Vec<_>>()
                     .join(",");
@@ -1437,11 +1645,15 @@ impl Executor {
             // -- Memory allocator query functions (Principle 2) --
             "MEM_USAGE" => {
                 // mem_usage() → bytes currently tracked across all subsystems
-                Ok(Value::Int64(self.memory_allocator.lock().total_allocated() as i64))
+                Ok(Value::Int64(
+                    self.memory_allocator.lock().total_allocated() as i64
+                ))
             }
             "MEM_BUDGET" => {
                 // mem_budget() → total memory budget in bytes
-                Ok(Value::Int64(self.memory_allocator.lock().total_budget() as i64))
+                Ok(Value::Int64(
+                    self.memory_allocator.lock().total_budget() as i64
+                ))
             }
             "MEM_AVAILABLE" => {
                 // mem_available() → budget - usage
@@ -1453,11 +1665,15 @@ impl Executor {
             }
             "MEM_PRESSURE_EVENTS" => {
                 // mem_pressure_events() → number of times pressure was applied
-                Ok(Value::Int64(self.memory_allocator.lock().pressure_events() as i64))
+                Ok(Value::Int64(
+                    self.memory_allocator.lock().pressure_events() as i64
+                ))
             }
             "MEM_PEAK" => {
                 // mem_peak() → high-water mark in bytes
-                Ok(Value::Int64(self.memory_allocator.lock().peak_allocated() as i64))
+                Ok(Value::Int64(
+                    self.memory_allocator.lock().peak_allocated() as i64
+                ))
             }
             "MEM_STATS" => {
                 // mem_stats() → JSON object of all subsystem allocations
@@ -1512,9 +1728,13 @@ impl Executor {
                     }
                     "base64" => {
                         use base64::Engine;
-                        Ok(Value::Text(base64::engine::general_purpose::STANDARD.encode(&data)))
+                        Ok(Value::Text(
+                            base64::engine::general_purpose::STANDARD.encode(&data),
+                        ))
                     }
-                    _ => Err(ExecError::Unsupported(format!("unknown encoding: {format}"))),
+                    _ => Err(ExecError::Unsupported(format!(
+                        "unknown encoding: {format}"
+                    ))),
                 }
             }
             "DECODE" => {
@@ -1529,20 +1749,46 @@ impl Executor {
                 };
                 match format.as_str() {
                     "hex" => {
-                        let bytes: Vec<u8> = (0..encoded.len())
-                            .step_by(2)
-                            .filter_map(|i| u8::from_str_radix(&encoded[i..i + 2], 16).ok())
-                            .collect();
+                        // Operate on bytes and validate: the old code sliced
+                        // `encoded[i..i+2]`, which panicked on odd-length input,
+                        // and silently dropped invalid digit pairs.
+                        let h = encoded.as_bytes();
+                        if h.len() % 2 != 0 {
+                            return Err(ExecError::Runtime(
+                                "invalid hexadecimal data: odd number of digits".into(),
+                            ));
+                        }
+                        let mut bytes = Vec::with_capacity(h.len() / 2);
+                        let mut i = 0;
+                        while i < h.len() {
+                            let hi = (h[i] as char).to_digit(16);
+                            let lo = (h[i + 1] as char).to_digit(16);
+                            match (hi, lo) {
+                                (Some(hi), Some(lo)) => bytes.push((hi * 16 + lo) as u8),
+                                _ => {
+                                    return Err(ExecError::Runtime(
+                                        "invalid hexadecimal digit".into(),
+                                    ));
+                                }
+                            }
+                            i += 2;
+                        }
                         Ok(Value::Text(String::from_utf8_lossy(&bytes).to_string()))
                     }
                     "base64" => {
                         use base64::Engine;
                         match base64::engine::general_purpose::STANDARD.decode(&encoded) {
-                            Ok(bytes) => Ok(Value::Text(String::from_utf8_lossy(&bytes).to_string())),
-                            Err(e) => Err(ExecError::Unsupported(format!("base64 decode error: {e}"))),
+                            Ok(bytes) => {
+                                Ok(Value::Text(String::from_utf8_lossy(&bytes).to_string()))
+                            }
+                            Err(e) => {
+                                Err(ExecError::Unsupported(format!("base64 decode error: {e}")))
+                            }
                         }
                     }
-                    _ => Err(ExecError::Unsupported(format!("unknown encoding: {format}"))),
+                    _ => Err(ExecError::Unsupported(format!(
+                        "unknown encoding: {format}"
+                    ))),
                 }
             }
 
@@ -1569,7 +1815,9 @@ impl Executor {
                     self.persist_sequences_sync();
                     Ok(Value::Int64(val))
                 } else {
-                    Err(ExecError::Unsupported(format!("sequence {seq_name} does not exist")))
+                    Err(ExecError::Unsupported(format!(
+                        "sequence {seq_name} does not exist"
+                    )))
                 }
             }
             "CURRVAL" => {
@@ -1583,7 +1831,9 @@ impl Executor {
                     let seq = seq_mutex.lock();
                     Ok(Value::Int64(seq.current))
                 } else {
-                    Err(ExecError::Unsupported(format!("sequence {seq_name} does not exist")))
+                    Err(ExecError::Unsupported(format!(
+                        "sequence {seq_name} does not exist"
+                    )))
                 }
             }
             "SETVAL" => {
@@ -1602,17 +1852,15 @@ impl Executor {
                     self.persist_sequences_sync();
                     Ok(Value::Int64(new_val))
                 } else {
-                    Err(ExecError::Unsupported(format!("sequence {seq_name} does not exist")))
+                    Err(ExecError::Unsupported(format!(
+                        "sequence {seq_name} does not exist"
+                    )))
                 }
             }
 
             // -- PostgreSQL system/catalog functions --
-            "PG_BACKEND_PID" => {
-                Ok(Value::Int32(std::process::id() as i32))
-            }
-            "TXID_CURRENT" => {
-                Ok(Value::Int64(1))
-            }
+            "PG_BACKEND_PID" => Ok(Value::Int32(std::process::id() as i32)),
+            "TXID_CURRENT" => Ok(Value::Int64(1)),
             "OBJ_DESCRIPTION" => {
                 // Stub: always returns NULL
                 Ok(Value::Null)
@@ -1624,7 +1872,9 @@ impl Executor {
             "FORMAT_TYPE" => {
                 // Map common PostgreSQL type OIDs to type names
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("FORMAT_TYPE requires at least 1 arg".into()));
+                    return Err(ExecError::Unsupported(
+                        "FORMAT_TYPE requires at least 1 arg".into(),
+                    ));
                 }
                 let oid = value_to_i64(&args[0])?;
                 let type_name = match oid {
@@ -1696,13 +1946,23 @@ impl Executor {
                 };
                 // Extract just the schema name (first arg if 3 args, else first arg if 2 args)
                 let schema_name = if args.len() >= 3 {
-                    match &args[1] { Value::Text(s) => s.as_str(), _ => &schema }
+                    match &args[1] {
+                        Value::Text(s) => s.as_str(),
+                        _ => &schema,
+                    }
                 } else if args.len() == 2 {
-                    match &args[0] { Value::Text(s) => s.as_str(), _ => &schema }
+                    match &args[0] {
+                        Value::Text(s) => s.as_str(),
+                        _ => &schema,
+                    }
                 } else {
                     &schema
                 };
-                Ok(Value::Bool(schema_name == "public" || schema_name == "pg_catalog" || schema_name == "information_schema"))
+                Ok(Value::Bool(
+                    schema_name == "public"
+                        || schema_name == "pg_catalog"
+                        || schema_name == "information_schema",
+                ))
             }
             "PG_ENCODING_TO_CHAR" => {
                 // Always return UTF8 regardless of encoding OID
@@ -1733,7 +1993,10 @@ impl Executor {
                         }
                     }
                     Value::Null => Ok(Value::Null),
-                    other => Ok(Value::Text(format!("\"{}\"", other.to_string().replace('"', "\"\"")))),
+                    other => Ok(Value::Text(format!(
+                        "\"{}\"",
+                        other.to_string().replace('"', "\"\"")
+                    ))),
                 }
             }
             "PG_GET_USERBYID" => {
@@ -1756,7 +2019,9 @@ impl Executor {
                 match &args[0] {
                     Value::Array(vals) => Ok(Value::Int32(vals.len() as i32)),
                     Value::Null => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("ARRAY_LENGTH requires an array argument".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "ARRAY_LENGTH requires an array argument".into(),
+                    )),
                 }
             }
             "ARRAY_UPPER" => {
@@ -1771,7 +2036,9 @@ impl Executor {
                         }
                     }
                     Value::Null => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("ARRAY_UPPER requires an array argument".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "ARRAY_UPPER requires an array argument".into(),
+                    )),
                 }
             }
             "ARRAY_LOWER" => {
@@ -1786,7 +2053,9 @@ impl Executor {
                         }
                     }
                     Value::Null => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("ARRAY_LOWER requires an array argument".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "ARRAY_LOWER requires an array argument".into(),
+                    )),
                 }
             }
             "ARRAY_APPEND" => {
@@ -1802,7 +2071,9 @@ impl Executor {
                         // NULL array + element = single-element array
                         Ok(Value::Array(vec![args[1].clone()]))
                     }
-                    _ => Err(ExecError::Unsupported("ARRAY_APPEND requires an array as first argument".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "ARRAY_APPEND requires an array as first argument".into(),
+                    )),
                 }
             }
             "ARRAY_CAT" => {
@@ -1811,12 +2082,20 @@ impl Executor {
                 let arr1 = match &args[0] {
                     Value::Array(v) => v.clone(),
                     Value::Null => Vec::new(),
-                    _ => return Err(ExecError::Unsupported("ARRAY_CAT requires array arguments".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "ARRAY_CAT requires array arguments".into(),
+                        ));
+                    }
                 };
                 let arr2 = match &args[1] {
                     Value::Array(v) => v.clone(),
                     Value::Null => Vec::new(),
-                    _ => return Err(ExecError::Unsupported("ARRAY_CAT requires array arguments".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "ARRAY_CAT requires array arguments".into(),
+                        ));
+                    }
                 };
                 let mut result = arr1;
                 result.extend(arr2);
@@ -1826,11 +2105,11 @@ impl Executor {
                 // unnest(array) — set-returning function; for scalar context return first element
                 require_args(fname, &args, 1)?;
                 match &args[0] {
-                    Value::Array(vals) => {
-                        Ok(vals.first().cloned().unwrap_or(Value::Null))
-                    }
+                    Value::Array(vals) => Ok(vals.first().cloned().unwrap_or(Value::Null)),
                     Value::Null => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("UNNEST requires an array argument".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "UNNEST requires an array argument".into(),
+                    )),
                 }
             }
             "CARDINALITY" => {
@@ -1839,7 +2118,9 @@ impl Executor {
                 match &args[0] {
                     Value::Array(vals) => Ok(Value::Int32(vals.len() as i32)),
                     Value::Null => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("CARDINALITY requires an array argument".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "CARDINALITY requires an array argument".into(),
+                    )),
                 }
             }
 
@@ -1852,54 +2133,78 @@ impl Executor {
                         // Parse "[1.0,2.0,3.0]" format
                         let s = s.trim();
                         if !s.starts_with('[') || !s.ends_with(']') {
-                            return Err(ExecError::Unsupported("vector literal must be [...]".into()));
+                            return Err(ExecError::Unsupported(
+                                "vector literal must be [...]".into(),
+                            ));
                         }
-                        let inner = &s[1..s.len()-1];
+                        let inner = &s[1..s.len() - 1];
                         if inner.is_empty() {
                             return Ok(Value::Vector(Vec::new()));
                         }
-                        let floats: Result<Vec<f32>, _> = inner.split(',')
-                            .map(|v| v.trim().parse::<f32>())
-                            .collect();
+                        let floats: Result<Vec<f32>, _> =
+                            inner.split(',').map(|v| v.trim().parse::<f32>()).collect();
                         match floats {
                             Ok(vec) => Ok(Value::Vector(vec)),
-                            Err(e) => Err(ExecError::Unsupported(format!("invalid vector literal: {e}")))
+                            Err(e) => Err(ExecError::Unsupported(format!(
+                                "invalid vector literal: {e}"
+                            ))),
                         }
                     }
                     Value::Array(vals) => {
                         // Convert array of numbers to vector
-                        let floats: Result<Vec<f32>, _> = vals.iter().map(|v| match v {
-                            Value::Int32(n) => Ok(*n as f32),
-                            Value::Int64(n) => Ok(*n as f32),
-                            Value::Float64(n) => Ok(*n as f32),
-                            Value::Null => Err(ExecError::Unsupported("vector elements cannot be null".into())),
-                            _ => Err(ExecError::Unsupported("vector elements must be numeric".into()))
-                        }).collect();
+                        let floats: Result<Vec<f32>, _> = vals
+                            .iter()
+                            .map(|v| match v {
+                                Value::Int32(n) => Ok(*n as f32),
+                                Value::Int64(n) => Ok(*n as f32),
+                                Value::Float64(n) => Ok(*n as f32),
+                                Value::Null => Err(ExecError::Unsupported(
+                                    "vector elements cannot be null".into(),
+                                )),
+                                _ => Err(ExecError::Unsupported(
+                                    "vector elements must be numeric".into(),
+                                )),
+                            })
+                            .collect();
                         Ok(Value::Vector(floats?))
                     }
                     Value::Null => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("vector() requires text or array".into()))
+                    _ => Err(ExecError::Unsupported(
+                        "vector() requires text or array".into(),
+                    )),
                 }
             }
             "VECTOR_DISTANCE" => {
                 self.check_subsystem("vector")?;
                 // vector_distance(vec1, vec2, 'l2'|'cosine'|'inner') — compute distance between vectors
                 if args.len() < 2 || args.len() > 3 {
-                    return Err(ExecError::Unsupported("VECTOR_DISTANCE requires 2 or 3 args".into()));
+                    return Err(ExecError::Unsupported(
+                        "VECTOR_DISTANCE requires 2 or 3 args".into(),
+                    ));
                 }
                 let vec1 = match &args[0] {
                     Value::Vector(v) => v,
                     Value::Null => return Ok(Value::Null),
-                    _ => return Err(ExecError::Unsupported("VECTOR_DISTANCE arg 1 must be vector".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "VECTOR_DISTANCE arg 1 must be vector".into(),
+                        ));
+                    }
                 };
                 let vec2 = match &args[1] {
                     Value::Vector(v) => v,
                     Value::Null => return Ok(Value::Null),
-                    _ => return Err(ExecError::Unsupported("VECTOR_DISTANCE arg 2 must be vector".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "VECTOR_DISTANCE arg 2 must be vector".into(),
+                        ));
+                    }
                 };
                 if vec1.len() != vec2.len() {
                     return Err(ExecError::Unsupported(format!(
-                        "vector dimensions must match: {} vs {}", vec1.len(), vec2.len()
+                        "vector dimensions must match: {} vs {}",
+                        vec1.len(),
+                        vec2.len()
                     )));
                 }
                 let metric = if args.len() == 3 {
@@ -1908,8 +2213,12 @@ impl Executor {
                             "l2" | "euclidean" => vector::DistanceMetric::L2,
                             "cosine" => vector::DistanceMetric::Cosine,
                             "inner" | "ip" | "dot" => vector::DistanceMetric::InnerProduct,
-                            _ => return Err(ExecError::Unsupported(format!("unknown distance metric: {s}"))),
-                        }
+                            _ => {
+                                return Err(ExecError::Unsupported(format!(
+                                    "unknown distance metric: {s}"
+                                )));
+                            }
+                        },
                         Value::Null => return Ok(Value::Null),
                         _ => return Err(ExecError::Unsupported("metric must be text".into())),
                     }
@@ -1947,7 +2256,6 @@ impl Executor {
             // ================================================================
             // Additional FTS functions
             // ================================================================
-
             "TS_MATCH" => {
                 // ts_match(text_content, query_text) → boolean: does text match query?
                 require_args(fname, &args, 2)?;
@@ -1959,7 +2267,9 @@ impl Executor {
                         Ok(Value::Bool(!results.is_empty()))
                     }
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("TS_MATCH requires (text, query_text)".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "TS_MATCH requires (text, query_text)".into(),
+                    )),
                 }
             }
             "PLAINTO_TSQUERY" => {
@@ -1972,7 +2282,9 @@ impl Executor {
                         Ok(Value::Text(terms.join(" & ")))
                     }
                     Value::Null => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("PLAINTO_TSQUERY requires text".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "PLAINTO_TSQUERY requires text".into(),
+                    )),
                 }
             }
             "TS_HEADLINE" => {
@@ -1981,10 +2293,13 @@ impl Executor {
                 match (&args[0], &args[1]) {
                     (Value::Text(content), Value::Text(query)) => {
                         let query_tokens = fts::tokenize(query);
-                        let query_terms: std::collections::HashSet<String> = query_tokens.iter().map(|t| t.term.clone()).collect();
+                        let query_terms: std::collections::HashSet<String> =
+                            query_tokens.iter().map(|t| t.term.clone()).collect();
                         let mut result = String::new();
                         for word in content.split_whitespace() {
-                            if !result.is_empty() { result.push(' '); }
+                            if !result.is_empty() {
+                                result.push(' ');
+                            }
                             let stemmed = fts::stem(&word.to_lowercase());
                             if query_terms.contains(&stemmed) {
                                 result.push_str(&format!("<b>{word}</b>"));
@@ -1995,14 +2310,15 @@ impl Executor {
                         Ok(Value::Text(result))
                     }
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("TS_HEADLINE requires (text, query_text)".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "TS_HEADLINE requires (text, query_text)".into(),
+                    )),
                 }
             }
 
             // ================================================================
             // Additional PostGIS-compatible geospatial functions
             // ================================================================
-
             "ST_MAKEPOINT" => {
                 // st_makepoint(x, y) → 'POINT(x y)' text
                 require_args(fname, &args, 2)?;
@@ -2015,7 +2331,9 @@ impl Executor {
                 require_args(fname, &args, 1)?;
                 match &args[0] {
                     Value::Text(s) => {
-                        let p = parse_point_wkt(s).ok_or_else(|| ExecError::Unsupported("ST_X: invalid point WKT".into()))?;
+                        let p = parse_point_wkt(s).ok_or_else(|| {
+                            ExecError::Unsupported("ST_X: invalid point WKT".into())
+                        })?;
                         Ok(Value::Float64(p.x))
                     }
                     Value::Null => Ok(Value::Null),
@@ -2027,7 +2345,9 @@ impl Executor {
                 require_args(fname, &args, 1)?;
                 match &args[0] {
                     Value::Text(s) => {
-                        let p = parse_point_wkt(s).ok_or_else(|| ExecError::Unsupported("ST_Y: invalid point WKT".into()))?;
+                        let p = parse_point_wkt(s).ok_or_else(|| {
+                            ExecError::Unsupported("ST_Y: invalid point WKT".into())
+                        })?;
                         Ok(Value::Float64(p.y))
                     }
                     Value::Null => Ok(Value::Null),
@@ -2039,37 +2359,47 @@ impl Executor {
                 require_args(fname, &args, 2)?;
                 match (&args[0], &args[1]) {
                     (Value::Text(poly_wkt), Value::Text(pt_wkt)) => {
-                        let poly = parse_polygon_wkt(poly_wkt).ok_or_else(|| ExecError::Unsupported("ST_CONTAINS: invalid polygon WKT".into()))?;
-                        let pt = parse_point_wkt(pt_wkt).ok_or_else(|| ExecError::Unsupported("ST_CONTAINS: invalid point WKT".into()))?;
+                        let poly = parse_polygon_wkt(poly_wkt).ok_or_else(|| {
+                            ExecError::Unsupported("ST_CONTAINS: invalid polygon WKT".into())
+                        })?;
+                        let pt = parse_point_wkt(pt_wkt).ok_or_else(|| {
+                            ExecError::Unsupported("ST_CONTAINS: invalid point WKT".into())
+                        })?;
                         Ok(Value::Bool(poly.contains(&pt)))
                     }
                     (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("ST_CONTAINS requires (polygon_wkt, point_wkt)".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "ST_CONTAINS requires (polygon_wkt, point_wkt)".into(),
+                    )),
                 }
             }
 
             // ================================================================
             // Additional time-series functions
             // ================================================================
-
             "DATE_BIN" => {
                 // date_bin(interval_text, timestamp_ms) → truncated timestamp
                 require_args(fname, &args, 2)?;
                 match &args[0] {
                     Value::Text(bucket_str) => {
-                        let bucket = parse_bucket_size(bucket_str).ok_or_else(|| ExecError::Unsupported(format!("DATE_BIN: unknown interval '{bucket_str}'")))?;
+                        let bucket = parse_bucket_size(bucket_str).ok_or_else(|| {
+                            ExecError::Unsupported(format!(
+                                "DATE_BIN: unknown interval '{bucket_str}'"
+                            ))
+                        })?;
                         let ts = value_to_i64(&args[1])? as u64;
                         Ok(Value::Int64(timeseries::time_bucket(ts, bucket) as i64))
                     }
                     Value::Null => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("DATE_BIN requires (text, timestamp)".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "DATE_BIN requires (text, timestamp)".into(),
+                    )),
                 }
             }
 
             // ================================================================
             // Graph utility functions
             // ================================================================
-
             "GRAPH_SHORTEST_PATH_LENGTH" => {
                 // graph_shortest_path_length(edges_json, from_id, to_id) → path length or NULL
                 // edges_json: '[{"from":1,"to":2},{"from":2,"to":3}]'
@@ -2080,33 +2410,54 @@ impl Executor {
                         let to_id = value_to_i64(&args[2])? as u64;
                         let mut gs = crate::graph::GraphStore::new();
                         // Parse edges and build graph
-                        if let Ok(edges) = serde_json::from_str::<Vec<serde_json::Value>>(edges_json) {
+                        if let Ok(edges) =
+                            serde_json::from_str::<Vec<serde_json::Value>>(edges_json)
+                        {
                             // Collect all unique node IDs
                             let mut node_ids = std::collections::HashSet::new();
                             for edge in &edges {
-                                if let (Some(f), Some(t)) = (edge.get("from").and_then(|v| v.as_u64()), edge.get("to").and_then(|v| v.as_u64())) {
+                                if let (Some(f), Some(t)) = (
+                                    edge.get("from").and_then(|v| v.as_u64()),
+                                    edge.get("to").and_then(|v| v.as_u64()),
+                                ) {
                                     node_ids.insert(f);
                                     node_ids.insert(t);
                                 }
                             }
                             // Create nodes (IDs are assigned sequentially, so we need a mapping)
-                            let mut id_map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+                            let mut id_map: std::collections::HashMap<u64, u64> =
+                                std::collections::HashMap::new();
                             for &nid in &node_ids {
-                                let internal_id = gs.create_node(vec![], std::collections::BTreeMap::new());
+                                let internal_id =
+                                    gs.create_node(vec![], std::collections::BTreeMap::new());
                                 id_map.insert(nid, internal_id);
                             }
                             // Create edges
                             for edge in &edges {
-                                if let (Some(f), Some(t)) = (edge.get("from").and_then(|v| v.as_u64()), edge.get("to").and_then(|v| v.as_u64()))
-                                    && let (Some(&fi), Some(&ti)) = (id_map.get(&f), id_map.get(&t)) {
-                                        gs.create_edge(fi, ti, "EDGE".to_string(), std::collections::BTreeMap::new());
-                                    }
+                                if let (Some(f), Some(t)) = (
+                                    edge.get("from").and_then(|v| v.as_u64()),
+                                    edge.get("to").and_then(|v| v.as_u64()),
+                                ) && let (Some(&fi), Some(&ti)) =
+                                    (id_map.get(&f), id_map.get(&t))
+                                {
+                                    gs.create_edge(
+                                        fi,
+                                        ti,
+                                        "EDGE".to_string(),
+                                        std::collections::BTreeMap::new(),
+                                    );
+                                }
                             }
                             // Find shortest path
                             let mapped_from = id_map.get(&from_id).copied();
                             let mapped_to = id_map.get(&to_id).copied();
                             if let (Some(mf), Some(mt)) = (mapped_from, mapped_to) {
-                                match gs.shortest_path(mf, mt, crate::graph::Direction::Outgoing, None) {
+                                match gs.shortest_path(
+                                    mf,
+                                    mt,
+                                    crate::graph::Direction::Outgoing,
+                                    None,
+                                ) {
                                     Some(path) => Ok(Value::Int32((path.len() as i32) - 1)),
                                     None => Ok(Value::Null),
                                 }
@@ -2114,11 +2465,15 @@ impl Executor {
                                 Ok(Value::Null)
                             }
                         } else {
-                            Err(ExecError::Unsupported("GRAPH_SHORTEST_PATH_LENGTH: invalid edges JSON".into()))
+                            Err(ExecError::Unsupported(
+                                "GRAPH_SHORTEST_PATH_LENGTH: invalid edges JSON".into(),
+                            ))
                         }
                     }
                     Value::Null => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("GRAPH_SHORTEST_PATH_LENGTH requires (edges_json, from_id, to_id)".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "GRAPH_SHORTEST_PATH_LENGTH requires (edges_json, from_id, to_id)".into(),
+                    )),
                 }
             }
             "GRAPH_NODE_DEGREE" => {
@@ -2127,19 +2482,28 @@ impl Executor {
                 match &args[0] {
                     Value::Text(edges_json) => {
                         let node_id = value_to_i64(&args[1])? as u64;
-                        if let Ok(edges) = serde_json::from_str::<Vec<serde_json::Value>>(edges_json) {
-                            let degree: usize = edges.iter().filter(|e| {
-                                let f = e.get("from").and_then(|v| v.as_u64());
-                                let t = e.get("to").and_then(|v| v.as_u64());
-                                f == Some(node_id) || t == Some(node_id)
-                            }).count();
+                        if let Ok(edges) =
+                            serde_json::from_str::<Vec<serde_json::Value>>(edges_json)
+                        {
+                            let degree: usize = edges
+                                .iter()
+                                .filter(|e| {
+                                    let f = e.get("from").and_then(|v| v.as_u64());
+                                    let t = e.get("to").and_then(|v| v.as_u64());
+                                    f == Some(node_id) || t == Some(node_id)
+                                })
+                                .count();
                             Ok(Value::Int32(degree as i32))
                         } else {
-                            Err(ExecError::Unsupported("GRAPH_NODE_DEGREE: invalid edges JSON".into()))
+                            Err(ExecError::Unsupported(
+                                "GRAPH_NODE_DEGREE: invalid edges JSON".into(),
+                            ))
                         }
                     }
                     Value::Null => Ok(Value::Null),
-                    _ => Err(ExecError::Unsupported("GRAPH_NODE_DEGREE requires (edges_json, node_id)".into())),
+                    _ => Err(ExecError::Unsupported(
+                        "GRAPH_NODE_DEGREE requires (edges_json, node_id)".into(),
+                    )),
                 }
             }
 
@@ -2147,15 +2511,20 @@ impl Executor {
                 // CYPHER(query_text) — execute a Cypher query against the persistent graph store.
                 self.check_subsystem("graph")?;
                 if args.is_empty() || args.len() > 1 {
-                    return Err(ExecError::Unsupported("CYPHER requires exactly 1 argument (query string)".into()));
+                    return Err(ExecError::Unsupported(
+                        "CYPHER requires exactly 1 argument (query string)".into(),
+                    ));
                 }
                 let cypher_text = match &args[0] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("CYPHER argument must be a text string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "CYPHER argument must be a text string".into(),
+                        ));
+                    }
                 };
-                let parsed = parse_cypher(&cypher_text).map_err(|e| {
-                    ExecError::Unsupported(format!("Cypher parse error: {e:?}"))
-                })?;
+                let parsed = parse_cypher(&cypher_text)
+                    .map_err(|e| ExecError::Unsupported(format!("Cypher parse error: {e:?}")))?;
                 let result = {
                     let mut gs = self.graph_store.write();
                     execute_cypher(&mut gs, &parsed).map_err(|e| {
@@ -2167,13 +2536,16 @@ impl Executor {
                 let mut lines = Vec::new();
                 lines.push(result.columns.join(","));
                 for row in &result.rows {
-                    let cells: Vec<String> = row.iter().map(|v| match v {
-                        GraphPropValue::Null => "null".to_string(),
-                        GraphPropValue::Bool(b) => b.to_string(),
-                        GraphPropValue::Int(n) => n.to_string(),
-                        GraphPropValue::Float(f) => f.to_string(),
-                        GraphPropValue::Text(s) => s.clone(),
-                    }).collect();
+                    let cells: Vec<String> = row
+                        .iter()
+                        .map(|v| match v {
+                            GraphPropValue::Null => "null".to_string(),
+                            GraphPropValue::Bool(b) => b.to_string(),
+                            GraphPropValue::Int(n) => n.to_string(),
+                            GraphPropValue::Float(f) => f.to_string(),
+                            GraphPropValue::Text(s) => s.clone(),
+                        })
+                        .collect();
                     lines.push(cells.join(","));
                 }
                 Ok(Value::Text(lines.join("\n")))
@@ -2184,7 +2556,11 @@ impl Executor {
                 require_args(fname, &args, 2)?;
                 let idx_name = match &args[0] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("ENCRYPTED_LOOKUP arg 1 must be index name text".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "ENCRYPTED_LOOKUP arg 1 must be index name text".into(),
+                        ));
+                    }
                 };
                 let lookup_val = match &args[1] {
                     Value::Text(s) => s.as_bytes().to_vec(),
@@ -2199,14 +2575,15 @@ impl Executor {
                         let id_strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
                         Ok(Value::Text(id_strs.join(",")))
                     }
-                    None => Err(ExecError::Unsupported(format!("encrypted index '{idx_name}' not found"))),
+                    None => Err(ExecError::Unsupported(format!(
+                        "encrypted index '{idx_name}' not found"
+                    ))),
                 }
             }
 
             // ================================================================
             // KV store functions (Redis-compatible via SQL)
             // ================================================================
-
             "KV_GET" => {
                 // kv_get(key) → value or NULL
                 require_args(fname, &args, 1)?;
@@ -2220,7 +2597,9 @@ impl Executor {
             "KV_SET" => {
                 // kv_set(key, value) or kv_set(key, value, ttl_secs) → 'OK'
                 if args.len() < 2 || args.len() > 3 {
-                    return Err(ExecError::Unsupported("KV_SET requires 2 or 3 arguments".into()));
+                    return Err(ExecError::Unsupported(
+                        "KV_SET requires 2 or 3 arguments".into(),
+                    ));
                 }
                 let key = match &args[0] {
                     Value::Text(s) => s.clone(),
@@ -2272,7 +2651,9 @@ impl Executor {
             "KV_INCR" => {
                 // kv_incr(key) or kv_incr(key, amount) → new value
                 if args.is_empty() || args.len() > 2 {
-                    return Err(ExecError::Unsupported("KV_INCR requires 1 or 2 arguments".into()));
+                    return Err(ExecError::Unsupported(
+                        "KV_INCR requires 1 or 2 arguments".into(),
+                    ));
                 }
                 let key = match &args[0] {
                     Value::Text(s) => s.clone(),
@@ -2282,7 +2663,11 @@ impl Executor {
                     match &args[1] {
                         Value::Int32(n) => *n as i64,
                         Value::Int64(n) => *n,
-                        _ => return Err(ExecError::Unsupported("KV_INCR amount must be integer".into())),
+                        _ => {
+                            return Err(ExecError::Unsupported(
+                                "KV_INCR amount must be integer".into(),
+                            ));
+                        }
                     }
                 } else {
                     1
@@ -2321,7 +2706,8 @@ impl Executor {
                 let estimated = key.len() + Self::estimate_value_bytes(&args[1]) + 64;
                 if !self.memory_allocator.lock().request("kv", estimated) {
                     return Err(ExecError::Unsupported(format!(
-                        "KV_SETNX: memory budget exceeded (need {} bytes)", estimated
+                        "KV_SETNX: memory budget exceeded (need {} bytes)",
+                        estimated
                     )));
                 }
                 let was_set = self.kv_store.setnx(&key, args[1].clone());
@@ -2344,7 +2730,6 @@ impl Executor {
             // ================================================================
             // KV Collection functions: Lists
             // ================================================================
-
             "KV_LPUSH" => {
                 // kv_lpush(key, value) → list length after push
                 require_args(fname, &args, 2)?;
@@ -2407,12 +2792,20 @@ impl Executor {
                 let start = match &args[1] {
                     Value::Int32(n) => *n as i64,
                     Value::Int64(n) => *n,
-                    _ => return Err(ExecError::Unsupported("KV_LRANGE start must be integer".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "KV_LRANGE start must be integer".into(),
+                        ));
+                    }
                 };
                 let stop = match &args[2] {
                     Value::Int32(n) => *n as i64,
                     Value::Int64(n) => *n,
-                    _ => return Err(ExecError::Unsupported("KV_LRANGE stop must be integer".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "KV_LRANGE stop must be integer".into(),
+                        ));
+                    }
                 };
                 match self.kv_store.lrange(&key, start, stop) {
                     Ok(vals) => {
@@ -2444,7 +2837,11 @@ impl Executor {
                 let index = match &args[1] {
                     Value::Int32(n) => *n as i64,
                     Value::Int64(n) => *n,
-                    _ => return Err(ExecError::Unsupported("KV_LINDEX index must be integer".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "KV_LINDEX index must be integer".into(),
+                        ));
+                    }
                 };
                 match self.kv_store.lindex(&key, index) {
                     Ok(Some(v)) => Ok(v),
@@ -2456,7 +2853,6 @@ impl Executor {
             // ================================================================
             // KV Collection functions: Hashes
             // ================================================================
-
             "KV_HSET" => {
                 // kv_hset(key, field, value) → boolean (true if new field)
                 require_args(fname, &args, 3)?;
@@ -2516,9 +2912,8 @@ impl Executor {
                 };
                 match self.kv_store.hgetall(&key) {
                     Ok(pairs) => {
-                        let s: Vec<String> = pairs.iter()
-                            .map(|(f, v)| format!("{}={}", f, v))
-                            .collect();
+                        let s: Vec<String> =
+                            pairs.iter().map(|(f, v)| format!("{}={}", f, v)).collect();
                         Ok(Value::Text(s.join(",")))
                     }
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
@@ -2556,7 +2951,6 @@ impl Executor {
             // ================================================================
             // KV Collection functions: Sets
             // ================================================================
-
             "KV_SADD" => {
                 // kv_sadd(key, member) → boolean (true if new)
                 require_args(fname, &args, 2)?;
@@ -2633,7 +3027,6 @@ impl Executor {
             // ================================================================
             // KV Collection functions: Sorted Sets
             // ================================================================
-
             "KV_ZADD" => {
                 // kv_zadd(key, score, member) → boolean
                 require_args(fname, &args, 3)?;
@@ -2645,7 +3038,11 @@ impl Executor {
                     Value::Float64(f) => *f,
                     Value::Int32(n) => *n as f64,
                     Value::Int64(n) => *n as f64,
-                    _ => return Err(ExecError::Unsupported("KV_ZADD score must be numeric".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "KV_ZADD score must be numeric".into(),
+                        ));
+                    }
                 };
                 let member = match &args[2] {
                     Value::Text(s) => s.clone(),
@@ -2682,16 +3079,25 @@ impl Executor {
                 let start = match &args[1] {
                     Value::Int32(n) => *n as usize,
                     Value::Int64(n) => *n as usize,
-                    _ => return Err(ExecError::Unsupported("KV_ZRANGE start must be integer".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "KV_ZRANGE start must be integer".into(),
+                        ));
+                    }
                 };
                 let stop = match &args[2] {
                     Value::Int32(n) => *n as usize,
                     Value::Int64(n) => *n as usize,
-                    _ => return Err(ExecError::Unsupported("KV_ZRANGE stop must be integer".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "KV_ZRANGE stop must be integer".into(),
+                        ));
+                    }
                 };
                 match self.kv_store.col_zrange(&key, start, stop) {
                     Ok(entries) => {
-                        let s: Vec<String> = entries.iter()
+                        let s: Vec<String> = entries
+                            .iter()
                             .map(|e| format!("{}:{}", e.member, e.score))
                             .collect();
                         Ok(Value::Text(s.join(",")))
@@ -2710,17 +3116,26 @@ impl Executor {
                     Value::Float64(f) => *f,
                     Value::Int32(n) => *n as f64,
                     Value::Int64(n) => *n as f64,
-                    _ => return Err(ExecError::Unsupported("KV_ZRANGEBYSCORE min must be numeric".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "KV_ZRANGEBYSCORE min must be numeric".into(),
+                        ));
+                    }
                 };
                 let max_score = match &args[2] {
                     Value::Float64(f) => *f,
                     Value::Int32(n) => *n as f64,
                     Value::Int64(n) => *n as f64,
-                    _ => return Err(ExecError::Unsupported("KV_ZRANGEBYSCORE max must be numeric".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "KV_ZRANGEBYSCORE max must be numeric".into(),
+                        ));
+                    }
                 };
                 match self.kv_store.col_zrangebyscore(&key, min_score, max_score) {
                     Ok(entries) => {
-                        let s: Vec<String> = entries.iter()
+                        let s: Vec<String> = entries
+                            .iter()
                             .map(|e| format!("{}:{}", e.member, e.score))
                             .collect();
                         Ok(Value::Text(s.join(",")))
@@ -2744,7 +3159,6 @@ impl Executor {
             // ================================================================
             // KV Collection functions: HyperLogLog
             // ================================================================
-
             "KV_PFADD" => {
                 // kv_pfadd(key, element) → boolean
                 require_args(fname, &args, 2)?;
@@ -2759,7 +3173,7 @@ impl Executor {
                 // HLL is fixed 16 bytes per key; account for key creation overhead
                 if !self.memory_allocator.lock().request("kv", 64) {
                     return Err(ExecError::Unsupported(
-                        "KV_PFADD: memory budget exceeded".into()
+                        "KV_PFADD: memory budget exceeded".into(),
                     ));
                 }
                 match self.kv_store.col_pfadd(&key, &element) {
@@ -2783,7 +3197,6 @@ impl Executor {
             // ================================================================
             // Stream functions (Redis-style append-only logs)
             // ================================================================
-
             "STREAM_XADD" => {
                 // stream_xadd(stream, field1, value1, ...) → stream entry ID
                 if args.len() < 3 || args.len() % 2 == 0 {
@@ -2826,9 +3239,7 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let streams = self.streams.read();
-                let len = streams.get(&stream_name)
-                    .map(|s| s.xlen())
-                    .unwrap_or(0);
+                let len = streams.get(&stream_name).map(|s| s.xlen()).unwrap_or(0);
                 Ok(Value::Int64(len as i64))
             }
             "STREAM_XRANGE" => {
@@ -2847,12 +3258,14 @@ impl Executor {
                         let start_id = crate::pubsub::StreamEntryId::new(start_ms, 0);
                         let end_id = crate::pubsub::StreamEntryId::new(end_ms, u64::MAX);
                         let entries = stream.xrange(&start_id, &end_id, Some(count));
-                        let parts: Vec<String> = entries.iter().map(|e| {
-                            let fields: Vec<String> = e.fields.iter()
-                                .map(|(k, v)| format!("{k}={v}"))
-                                .collect();
-                            format!("{}:{}", e.id, fields.join(";"))
-                        }).collect();
+                        let parts: Vec<String> = entries
+                            .iter()
+                            .map(|e| {
+                                let fields: Vec<String> =
+                                    e.fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                                format!("{}:{}", e.id, fields.join(";"))
+                            })
+                            .collect();
                         Ok(Value::Text(parts.join(",")))
                     }
                     None => Ok(Value::Text(String::new())),
@@ -2872,12 +3285,14 @@ impl Executor {
                     Some(stream) => {
                         let last_id = crate::pubsub::StreamEntryId::new(last_id_ms, u64::MAX);
                         let entries = stream.xread(&last_id, count);
-                        let parts: Vec<String> = entries.iter().map(|e| {
-                            let fields: Vec<String> = e.fields.iter()
-                                .map(|(k, v)| format!("{k}={v}"))
-                                .collect();
-                            format!("{}:{}", e.id, fields.join(";"))
-                        }).collect();
+                        let parts: Vec<String> = entries
+                            .iter()
+                            .map(|e| {
+                                let fields: Vec<String> =
+                                    e.fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                                format!("{}:{}", e.id, fields.join(";"))
+                            })
+                            .collect();
                         Ok(Value::Text(parts.join(",")))
                     }
                     None => Ok(Value::Text(String::new())),
@@ -2920,12 +3335,14 @@ impl Executor {
                 match streams.get_mut(&stream_name) {
                     Some(stream) => {
                         let entries = stream.xreadgroup(&group, &consumer, count);
-                        let parts: Vec<String> = entries.iter().map(|e| {
-                            let fields: Vec<String> = e.fields.iter()
-                                .map(|(k, v)| format!("{k}={v}"))
-                                .collect();
-                            format!("{}:{}", e.id, fields.join(";"))
-                        }).collect();
+                        let parts: Vec<String> = entries
+                            .iter()
+                            .map(|e| {
+                                let fields: Vec<String> =
+                                    e.fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                                format!("{}:{}", e.id, fields.join(";"))
+                            })
+                            .collect();
                         Ok(Value::Text(parts.join(",")))
                     }
                     None => Ok(Value::Text(String::new())),
@@ -2947,7 +3364,8 @@ impl Executor {
                 let mut streams = self.streams.write();
                 match streams.get_mut(&stream_name) {
                     Some(stream) => {
-                        let acked = stream.xack(&group, &[crate::pubsub::StreamEntryId::new(id_ms, id_seq)]);
+                        let acked = stream
+                            .xack(&group, &[crate::pubsub::StreamEntryId::new(id_ms, id_seq)]);
                         Ok(Value::Int64(acked as i64))
                     }
                     None => Ok(Value::Int64(0)),
@@ -2957,7 +3375,6 @@ impl Executor {
             // ================================================================
             // Pub/Sub functions (publish/subscribe via SQL)
             // ================================================================
-
             "PUBSUB_PUBLISH" => {
                 // pubsub_publish(channel, message) → integer subscriber count
                 require_args(fname, &args, 2)?;
@@ -2994,7 +3411,6 @@ impl Executor {
             // ================================================================
             // Columnar storage functions (analytics via SQL)
             // ================================================================
-
             "COLUMNAR_INSERT" => {
                 // columnar_insert(table, col1, val1, col2, val2, ...) → 'OK'
                 // Inserts a single row into the columnar store as key-value pairs.
@@ -3154,7 +3570,6 @@ impl Executor {
             // ================================================================
             // Time-series functions
             // ================================================================
-
             "TS_INSERT" => {
                 // ts_insert(series, timestamp_ms, value) → 'OK'
                 require_args(fname, &args, 3)?;
@@ -3167,11 +3582,19 @@ impl Executor {
                     Value::Int32(n) => *n as f64,
                     Value::Int64(n) => *n as f64,
                     Value::Float64(f) => *f,
-                    _ => return Err(ExecError::Unsupported("TS_INSERT value must be numeric".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "TS_INSERT value must be numeric".into(),
+                        ));
+                    }
                 };
                 self.ts_store.write().insert(
                     &series,
-                    crate::timeseries::DataPoint { timestamp: ts, tags: vec![], value: val },
+                    crate::timeseries::DataPoint {
+                        timestamp: ts,
+                        tags: vec![],
+                        value: val,
+                    },
                 );
                 Ok(Value::Text("OK".into()))
             }
@@ -3234,16 +3657,17 @@ impl Executor {
                 // ts_retention(max_age_ms) → 'OK' — sets global retention policy
                 require_args(fname, &args, 1)?;
                 let max_age = val_to_u64(&args[0], "TS_RETENTION max_age_ms")?;
-                self.ts_store.write().set_retention(
-                    crate::timeseries::RetentionPolicy { max_age_ms: max_age },
-                );
+                self.ts_store
+                    .write()
+                    .set_retention(crate::timeseries::RetentionPolicy {
+                        max_age_ms: max_age,
+                    });
                 Ok(Value::Text("OK".into()))
             }
 
             // ================================================================
             // Document store functions (JSONB + GIN index via SQL)
             // ================================================================
-
             "DOC_INSERT" => {
                 // doc_insert(json_text) → document ID
                 require_args(fname, &args, 1)?;
@@ -3286,13 +3710,18 @@ impl Executor {
             "DOC_PATH" => {
                 // doc_path(id, path_key1, path_key2, ...) → JSON value at path, or NULL
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("DOC_PATH requires (id, key1, key2, ...)".into()));
+                    return Err(ExecError::Unsupported(
+                        "DOC_PATH requires (id, key1, key2, ...)".into(),
+                    ));
                 }
                 let id = val_to_u64(&args[0], "DOC_PATH id")?;
-                let path: Vec<String> = args[1..].iter().map(|a| match a {
-                    Value::Text(s) => s.clone(),
-                    other => other.to_string(),
-                }).collect();
+                let path: Vec<String> = args[1..]
+                    .iter()
+                    .map(|a| match a {
+                        Value::Text(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect();
                 let path_refs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
                 let store = self.doc_store.read();
                 match store.get(id) {
@@ -3314,12 +3743,18 @@ impl Executor {
                 // fts_index(doc_id, text) → true
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("FTS_INDEX requires (doc_id, text)".into()));
+                    return Err(ExecError::Unsupported(
+                        "FTS_INDEX requires (doc_id, text)".into(),
+                    ));
                 }
                 let doc_id = val_to_u64(&args[0], "FTS_INDEX doc_id")?;
                 let text = match &args[1] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("FTS_INDEX: text must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "FTS_INDEX: text must be a string".into(),
+                        ));
+                    }
                 };
                 let text_len = text.len();
                 let estimated = text_len + 64;
@@ -3332,14 +3767,12 @@ impl Executor {
                 self.fts_index.write().add_document(doc_id, &text);
                 self.save_fts_index();
                 // Record mutation for potential rollback
-                if let Ok(mut txn) = self.current_session().txn_state.try_write() {
-                    if txn.active {
-                        if let Some(ref mut cm) = txn.cross_model {
-                            if let Some(ref mut fts_log) = cm.fts {
-                                fts_log.ops.push(crate::fts::FtsUndoOp::AddedDoc { doc_id });
-                            }
-                        }
-                    }
+                if let Ok(mut txn) = self.current_session().txn_state.try_write()
+                    && txn.active
+                    && let Some(ref mut cm) = txn.cross_model
+                    && let Some(ref mut fts_log) = cm.fts
+                {
+                    fts_log.ops.push(crate::fts::FtsUndoOp::AddedDoc { doc_id });
                 }
                 Ok(Value::Bool(true))
             }
@@ -3347,18 +3780,18 @@ impl Executor {
                 // fts_remove(doc_id) → true
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("FTS_REMOVE requires (doc_id)".into()));
+                    return Err(ExecError::Unsupported(
+                        "FTS_REMOVE requires (doc_id)".into(),
+                    ));
                 }
                 let doc_id = val_to_u64(&args[0], "FTS_REMOVE doc_id")?;
                 // Capture state before removal for potential rollback
-                if let Ok(mut txn) = self.current_session().txn_state.try_write() {
-                    if txn.active {
-                        if let Some(ref mut cm) = txn.cross_model {
-                            if let Some(ref mut fts_log) = cm.fts {
-                                self.fts_index.read().record_remove(fts_log, doc_id);
-                            }
-                        }
-                    }
+                if let Ok(mut txn) = self.current_session().txn_state.try_write()
+                    && txn.active
+                    && let Some(ref mut cm) = txn.cross_model
+                    && let Some(ref mut fts_log) = cm.fts
+                {
+                    self.fts_index.read().record_remove(fts_log, doc_id);
                 }
                 self.fts_index.write().remove_document(doc_id);
                 self.save_fts_index();
@@ -3369,15 +3802,22 @@ impl Executor {
                 // fts_search(query, limit) → JSON array of [{doc_id, score}]
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("FTS_SEARCH requires (query, limit)".into()));
+                    return Err(ExecError::Unsupported(
+                        "FTS_SEARCH requires (query, limit)".into(),
+                    ));
                 }
                 let query = match &args[0] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("FTS_SEARCH: query must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "FTS_SEARCH: query must be a string".into(),
+                        ));
+                    }
                 };
                 let limit = (val_to_u64(&args[1], "FTS_SEARCH limit")? as usize).min(10_000);
                 let results = self.fts_index.read().search(&query, limit);
-                let json = results.iter()
+                let json = results
+                    .iter()
                     .map(|(id, score)| format!(r#"{{"doc_id":{id},"score":{score:.6}}}"#))
                     .collect::<Vec<_>>()
                     .join(",");
@@ -3394,7 +3834,11 @@ impl Executor {
                 }
                 let query = match &args[0] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("FTS_FUZZY_SEARCH: query must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "FTS_FUZZY_SEARCH: query must be a string".into(),
+                        ));
+                    }
                 };
                 let max_dist_raw = val_to_u64(&args[1], "FTS_FUZZY_SEARCH max_distance")? as usize;
                 let max_dist = max_dist_raw.min(3); // Cap at 3 to prevent combinatorial explosion
@@ -3402,7 +3846,8 @@ impl Executor {
                 let idx = self.fts_index.read();
                 // Tokenize query, expand each term via fuzzy matching, collect all matching doc scores
                 let query_tokens = fts::tokenize(&query);
-                let mut scores: std::collections::HashMap<u64, f64> = std::collections::HashMap::new();
+                let mut scores: std::collections::HashMap<u64, f64> =
+                    std::collections::HashMap::new();
                 for token in &query_tokens {
                     // Get fuzzy-expanded terms (includes exact if distance=0)
                     let expanded = fts::fuzzy_terms(&idx, &token.term, max_dist);
@@ -3423,7 +3868,8 @@ impl Executor {
                 let mut results: Vec<(u64, f64)> = scores.into_iter().collect();
                 results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 results.truncate(limit);
-                let json = results.iter()
+                let json = results
+                    .iter()
                     .map(|(id, score)| format!(r#"{{"doc_id":{id},"score":{score:.6}}}"#))
                     .collect::<Vec<_>>()
                     .join(",");
@@ -3445,12 +3891,18 @@ impl Executor {
                 //   SELECT * FROM docs WHERE fts_match(id, 'machine learning')
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("FTS_MATCH requires (doc_id, query)".into()));
+                    return Err(ExecError::Unsupported(
+                        "FTS_MATCH requires (doc_id, query)".into(),
+                    ));
                 }
                 let doc_id = val_to_u64(&args[0], "FTS_MATCH doc_id")?;
                 let query = match &args[1] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("FTS_MATCH: query must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "FTS_MATCH: query must be a string".into(),
+                        ));
+                    }
                 };
                 // Use posting-list membership check (O(terms × P), early exit)
                 // rather than full BM25 search (O(N·P)) to check a single doc.
@@ -3463,22 +3915,35 @@ impl Executor {
                 // blob_store(key, data_hex, content_type?) → blob_count
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("BLOB_STORE requires (key, data_hex [, content_type])".into()));
+                    return Err(ExecError::Unsupported(
+                        "BLOB_STORE requires (key, data_hex [, content_type])".into(),
+                    ));
                 }
                 let key = match &args[0] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("BLOB_STORE: key must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "BLOB_STORE: key must be a string".into(),
+                        ));
+                    }
                 };
                 let data_hex = match &args[1] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("BLOB_STORE: data must be a hex string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "BLOB_STORE: data must be a hex string".into(),
+                        ));
+                    }
                 };
                 // Validate size (100 MB max via SQL function; direct API has no limit)
                 if data_hex.len() > 200_000_000 {
-                    return Err(ExecError::Unsupported("BLOB_STORE: data exceeds 100 MB limit".into()));
+                    return Err(ExecError::Unsupported(
+                        "BLOB_STORE: data exceeds 100 MB limit".into(),
+                    ));
                 }
                 // Decode hex → bytes
-                let data = hex_decode(&data_hex).map_err(|e| ExecError::Unsupported(format!("BLOB_STORE: {e}")))?;
+                let data = hex_decode(&data_hex)
+                    .map_err(|e| ExecError::Unsupported(format!("BLOB_STORE: {e}")))?;
                 let content_type = if args.len() > 2 {
                     match &args[2] {
                         Value::Text(s) => Some(s.clone()),
@@ -3487,7 +3952,9 @@ impl Executor {
                 } else {
                     None
                 };
-                self.blob_store.write().put(&key, &data, content_type.as_deref());
+                self.blob_store
+                    .write()
+                    .put(&key, &data, content_type.as_deref());
                 Ok(Value::Bool(true))
             }
             "BLOB_GET" => {
@@ -3498,7 +3965,11 @@ impl Executor {
                 }
                 let key = match &args[0] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("BLOB_GET: key must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "BLOB_GET: key must be a string".into(),
+                        ));
+                    }
                 };
                 match self.blob_store.read().get(&key) {
                     Some(data) => Ok(Value::Text(hex_encode(&data))),
@@ -3513,7 +3984,11 @@ impl Executor {
                 }
                 let key = match &args[0] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("BLOB_DELETE: key must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "BLOB_DELETE: key must be a string".into(),
+                        ));
+                    }
                 };
                 let removed = self.blob_store.write().delete(&key);
                 Ok(Value::Bool(removed))
@@ -3526,7 +4001,11 @@ impl Executor {
                 }
                 let key = match &args[0] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("BLOB_META: key must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "BLOB_META: key must be a string".into(),
+                        ));
+                    }
                 };
                 let store = self.blob_store.read();
                 match store.metadata(&key) {
@@ -3547,19 +4026,33 @@ impl Executor {
                 // blob_tag(key, tag_key, tag_value) → true/false
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 3 {
-                    return Err(ExecError::Unsupported("BLOB_TAG requires (key, tag_key, tag_value)".into()));
+                    return Err(ExecError::Unsupported(
+                        "BLOB_TAG requires (key, tag_key, tag_value)".into(),
+                    ));
                 }
                 let key = match &args[0] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("BLOB_TAG: key must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "BLOB_TAG: key must be a string".into(),
+                        ));
+                    }
                 };
                 let tag_key = match &args[1] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("BLOB_TAG: tag_key must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "BLOB_TAG: tag_key must be a string".into(),
+                        ));
+                    }
                 };
                 let tag_val = match &args[2] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("BLOB_TAG: tag_value must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "BLOB_TAG: tag_value must be a string".into(),
+                        ));
+                    }
                 };
                 let ok = self.blob_store.write().set_tag(&key, &tag_key, &tag_val);
                 Ok(Value::Bool(ok))
@@ -3581,7 +4074,8 @@ impl Executor {
                 } else {
                     store.list_prefix(&prefix)
                 };
-                let json = keys.iter()
+                let json = keys
+                    .iter()
                     .map(|k| format!(r#""{}""#, json_escape(k)))
                     .collect::<Vec<_>>()
                     .join(",");
@@ -3601,24 +4095,37 @@ impl Executor {
                 // graph_query(cypher_text) → JSON result {columns, rows}
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("GRAPH_QUERY requires (cypher_text)".into()));
+                    return Err(ExecError::Unsupported(
+                        "GRAPH_QUERY requires (cypher_text)".into(),
+                    ));
                 }
                 let cypher = match &args[0] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("GRAPH_QUERY: cypher must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "GRAPH_QUERY: cypher must be a string".into(),
+                        ));
+                    }
                 };
-                let stmt = parse_cypher(&cypher)
-                    .map_err(|e| ExecError::Unsupported(format!("GRAPH_QUERY parse error: {e:?}")))?;
-                let result = execute_cypher(&mut self.graph_store.write(), &stmt)
-                    .map_err(|e| ExecError::Unsupported(format!("GRAPH_QUERY exec error: {e:?}")))?;
+                let stmt = parse_cypher(&cypher).map_err(|e| {
+                    ExecError::Unsupported(format!("GRAPH_QUERY parse error: {e:?}"))
+                })?;
+                let result = execute_cypher(&mut self.graph_store.write(), &stmt).map_err(|e| {
+                    ExecError::Unsupported(format!("GRAPH_QUERY exec error: {e:?}"))
+                })?;
                 // Serialize result to JSON
-                let cols_json = result.columns.iter()
+                let cols_json = result
+                    .columns
+                    .iter()
                     .map(|c| format!(r#""{}""#, json_escape(c)))
                     .collect::<Vec<_>>()
                     .join(",");
-                let rows_json = result.rows.iter()
+                let rows_json = result
+                    .rows
+                    .iter()
                     .map(|row_vals| {
-                        let vals = row_vals.iter()
+                        let vals = row_vals
+                            .iter()
                             .map(prop_value_to_json)
                             .collect::<Vec<_>>()
                             .join(",");
@@ -3626,17 +4133,25 @@ impl Executor {
                     })
                     .collect::<Vec<_>>()
                     .join(",");
-                Ok(Value::Text(format!(r#"{{"columns":[{cols_json}],"rows":[{rows_json}]}}"#)))
+                Ok(Value::Text(format!(
+                    r#"{{"columns":[{cols_json}],"rows":[{rows_json}]}}"#
+                )))
             }
             "GRAPH_ADD_NODE" => {
                 // graph_add_node(label, properties_json?) → node_id
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("GRAPH_ADD_NODE requires (label [, properties_json])".into()));
+                    return Err(ExecError::Unsupported(
+                        "GRAPH_ADD_NODE requires (label [, properties_json])".into(),
+                    ));
                 }
                 let label = match &args[0] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("GRAPH_ADD_NODE: label must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "GRAPH_ADD_NODE: label must be a string".into(),
+                        ));
+                    }
                 };
                 let props = if args.len() > 1 {
                     match &args[1] {
@@ -3654,14 +4169,19 @@ impl Executor {
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 3 {
                     return Err(ExecError::Unsupported(
-                        "GRAPH_ADD_EDGE requires (from_id, to_id, edge_type [, properties_json])".into(),
+                        "GRAPH_ADD_EDGE requires (from_id, to_id, edge_type [, properties_json])"
+                            .into(),
                     ));
                 }
                 let from = val_to_u64(&args[0], "GRAPH_ADD_EDGE from_id")?;
                 let to = val_to_u64(&args[1], "GRAPH_ADD_EDGE to_id")?;
                 let edge_type = match &args[2] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("GRAPH_ADD_EDGE: edge_type must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "GRAPH_ADD_EDGE: edge_type must be a string".into(),
+                        ));
+                    }
                 };
                 let props = if args.len() > 3 {
                     match &args[3] {
@@ -3671,7 +4191,11 @@ impl Executor {
                 } else {
                     std::collections::BTreeMap::new()
                 };
-                match self.graph_store.write().create_edge(from, to, edge_type, props) {
+                match self
+                    .graph_store
+                    .write()
+                    .create_edge(from, to, edge_type, props)
+                {
                     Some(eid) => Ok(Value::Int64(eid as i64)),
                     None => Ok(Value::Null),
                 }
@@ -3680,7 +4204,9 @@ impl Executor {
                 // graph_delete_node(node_id) → true/false
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("GRAPH_DELETE_NODE requires (node_id)".into()));
+                    return Err(ExecError::Unsupported(
+                        "GRAPH_DELETE_NODE requires (node_id)".into(),
+                    ));
                 }
                 let id = val_to_u64(&args[0], "GRAPH_DELETE_NODE")?;
                 Ok(Value::Bool(self.graph_store.write().delete_node(id)))
@@ -3689,7 +4215,9 @@ impl Executor {
                 // graph_delete_edge(edge_id) → true/false
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("GRAPH_DELETE_EDGE requires (edge_id)".into()));
+                    return Err(ExecError::Unsupported(
+                        "GRAPH_DELETE_EDGE requires (edge_id)".into(),
+                    ));
                 }
                 let id = val_to_u64(&args[0], "GRAPH_DELETE_EDGE")?;
                 Ok(Value::Bool(self.graph_store.write().delete_edge(id)))
@@ -3699,7 +4227,9 @@ impl Executor {
                 // direction: 'out' (default), 'in', 'both'
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("GRAPH_NEIGHBORS requires (node_id [, direction])".into()));
+                    return Err(ExecError::Unsupported(
+                        "GRAPH_NEIGHBORS requires (node_id [, direction])".into(),
+                    ));
                 }
                 let node_id = val_to_u64(&args[0], "GRAPH_NEIGHBORS node_id")?;
                 let dir = if args.len() > 1 {
@@ -3716,9 +4246,15 @@ impl Executor {
                 };
                 let store = self.graph_store.read();
                 let neighbors = store.neighbors(node_id, dir, None);
-                let json = neighbors.iter()
+                let json = neighbors
+                    .iter()
                     .map(|(nid, edge)| {
-                        format!(r#"{{"neighbor_id":{},"edge_id":{},"edge_type":"{}"}}"#, nid, edge.id, json_escape(&edge.edge_type))
+                        format!(
+                            r#"{{"neighbor_id":{},"edge_id":{},"edge_type":"{}"}}"#,
+                            nid,
+                            edge.id,
+                            json_escape(&edge.edge_type)
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(",");
@@ -3728,14 +4264,17 @@ impl Executor {
                 // graph_shortest_path(from_id, to_id) → JSON array of node IDs or NULL
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("GRAPH_SHORTEST_PATH requires (from_id, to_id)".into()));
+                    return Err(ExecError::Unsupported(
+                        "GRAPH_SHORTEST_PATH requires (from_id, to_id)".into(),
+                    ));
                 }
                 let from = val_to_u64(&args[0], "GRAPH_SHORTEST_PATH from_id")?;
                 let to = val_to_u64(&args[1], "GRAPH_SHORTEST_PATH to_id")?;
                 let store = self.graph_store.read();
                 match store.shortest_path(from, to, crate::graph::Direction::Outgoing, None) {
                     Some(path) => {
-                        let json = path.iter()
+                        let json = path
+                            .iter()
                             .map(|id| id.to_string())
                             .collect::<Vec<_>>()
                             .join(",");
@@ -3744,12 +4283,8 @@ impl Executor {
                     None => Ok(Value::Null),
                 }
             }
-            "GRAPH_NODE_COUNT" => {
-                Ok(Value::Int64(self.graph_store.read().node_count() as i64))
-            }
-            "GRAPH_EDGE_COUNT" => {
-                Ok(Value::Int64(self.graph_store.read().edge_count() as i64))
-            }
+            "GRAPH_NODE_COUNT" => Ok(Value::Int64(self.graph_store.read().node_count() as i64)),
+            "GRAPH_EDGE_COUNT" => Ok(Value::Int64(self.graph_store.read().edge_count() as i64)),
 
             // ── Reactive / CDC functions ─────────────────────────────
             #[cfg(feature = "server")]
@@ -3757,16 +4292,29 @@ impl Executor {
                 // subscribe(query_text, table1 [, table2, ...]) → subscription_id
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("SUBSCRIBE requires (query_text, table1, ...)".into()));
+                    return Err(ExecError::Unsupported(
+                        "SUBSCRIBE requires (query_text, table1, ...)".into(),
+                    ));
                 }
                 let query_text = match &args[0] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("SUBSCRIBE: query_text must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "SUBSCRIBE: query_text must be a string".into(),
+                        ));
+                    }
                 };
-                let tables: Vec<String> = args[1..].iter().filter_map(|v| {
-                    match v { Value::Text(s) => Some(s.clone()), _ => None }
-                }).collect();
-                let (sub_id, _rx) = self.subscription_manager.write().subscribe(&query_text, tables);
+                let tables: Vec<String> = args[1..]
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Text(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let (sub_id, _rx) = self
+                    .subscription_manager
+                    .write()
+                    .subscribe(&query_text, tables);
                 Ok(Value::Int64(sub_id as i64))
             }
             #[cfg(feature = "server")]
@@ -3774,27 +4322,34 @@ impl Executor {
                 // unsubscribe(subscription_id) → true/false
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("UNSUBSCRIBE requires (subscription_id)".into()));
+                    return Err(ExecError::Unsupported(
+                        "UNSUBSCRIBE requires (subscription_id)".into(),
+                    ));
                 }
                 let id = val_to_u64(&args[0], "UNSUBSCRIBE")?;
-                Ok(Value::Bool(self.subscription_manager.write().unsubscribe(id)))
+                Ok(Value::Bool(
+                    self.subscription_manager.write().unsubscribe(id),
+                ))
             }
             #[cfg(feature = "server")]
-            "SUBSCRIPTION_COUNT" => {
-                Ok(Value::Int64(self.subscription_manager.read().active_count() as i64))
-            }
+            "SUBSCRIPTION_COUNT" => Ok(Value::Int64(
+                self.subscription_manager.read().active_count() as i64,
+            )),
             #[cfg(feature = "server")]
             "CDC_READ" => {
                 // cdc_read(after_sequence, limit) → JSON array of log entries
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("CDC_READ requires (after_sequence, limit)".into()));
+                    return Err(ExecError::Unsupported(
+                        "CDC_READ requires (after_sequence, limit)".into(),
+                    ));
                 }
                 let after_seq = val_to_u64(&args[0], "CDC_READ after_sequence")?;
                 let limit = (val_to_u64(&args[1], "CDC_READ limit")? as usize).min(100_000);
                 let log = self.cdc_log.read();
                 let entries = log.read_from(after_seq, limit);
-                let json = entries.iter()
+                let json = entries
+                    .iter()
                     .map(|e| {
                         let change = match e.change_type {
                             ChangeType::Insert => "INSERT",
@@ -3803,7 +4358,10 @@ impl Executor {
                         };
                         format!(
                             r#"{{"seq":{},"table":"{}","change":"{}","ts":{}}}"#,
-                            e.sequence, json_escape(&e.table), change, e.timestamp
+                            e.sequence,
+                            json_escape(&e.table),
+                            change,
+                            e.timestamp
                         )
                     })
                     .collect::<Vec<_>>()
@@ -3815,17 +4373,24 @@ impl Executor {
                 // cdc_table_read(table, after_sequence, limit) → JSON array of log entries for a table
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 3 {
-                    return Err(ExecError::Unsupported("CDC_TABLE_READ requires (table, after_sequence, limit)".into()));
+                    return Err(ExecError::Unsupported(
+                        "CDC_TABLE_READ requires (table, after_sequence, limit)".into(),
+                    ));
                 }
                 let table = match &args[0] {
                     Value::Text(s) => s.clone(),
-                    _ => return Err(ExecError::Unsupported("CDC_TABLE_READ: table must be a string".into())),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "CDC_TABLE_READ: table must be a string".into(),
+                        ));
+                    }
                 };
                 let after_seq = val_to_u64(&args[1], "CDC_TABLE_READ after_sequence")?;
                 let limit = (val_to_u64(&args[2], "CDC_TABLE_READ limit")? as usize).min(100_000);
                 let log = self.cdc_log.read();
                 let entries = log.read_table_from(&table, after_seq, limit);
-                let json = entries.iter()
+                let json = entries
+                    .iter()
                     .map(|e| {
                         let change = match e.change_type {
                             ChangeType::Insert => "INSERT",
@@ -3834,7 +4399,10 @@ impl Executor {
                         };
                         format!(
                             r#"{{"seq":{},"table":"{}","change":"{}","ts":{}}}"#,
-                            e.sequence, json_escape(&e.table), change, e.timestamp
+                            e.sequence,
+                            json_escape(&e.table),
+                            change,
+                            e.timestamp
                         )
                     })
                     .collect::<Vec<_>>()
@@ -3842,9 +4410,7 @@ impl Executor {
                 Ok(Value::Text(format!("[{json}]")))
             }
             #[cfg(feature = "server")]
-            "CDC_COUNT" => {
-                Ok(Value::Int64(self.cdc_log.read().len() as i64))
-            }
+            "CDC_COUNT" => Ok(Value::Int64(self.cdc_log.read().len() as i64)),
 
             // ── Datalog functions ──────────────────────────────────────
             "DATALOG_ASSERT" => {
@@ -3925,15 +4491,23 @@ impl Executor {
                 let rows = sync_block_on(self.storage_for(&table_name).scan(&table_name))?;
                 let string_rows: Vec<Vec<String>> = rows
                     .into_iter()
-                    .map(|row| row.into_iter().map(|v| match v {
-                        Value::Null => "null".to_string(),
-                        Value::Text(s) => s,
-                        other => other.to_string(),
-                    }).collect())
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|v| match v {
+                                Value::Null => "null".to_string(),
+                                Value::Text(s) => s,
+                                other => other.to_string(),
+                            })
+                            .collect()
+                    })
                     .collect();
                 let count = string_rows.len();
-                self.datalog_store.write().import_rows(&predicate, string_rows);
-                Ok(Value::Text(format!("IMPORTED {count} rows into {predicate}")))
+                self.datalog_store
+                    .write()
+                    .import_rows(&predicate, string_rows);
+                Ok(Value::Text(format!(
+                    "IMPORTED {count} rows into {predicate}"
+                )))
             }
             "DATALOG_IMPORT_GRAPH" => {
                 // DATALOG_IMPORT_GRAPH(predicate)
@@ -3945,18 +4519,19 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let gs = self.graph_store.read();
-                let edge_rows: Vec<Vec<String>> = gs.all_edges()
+                let edge_rows: Vec<Vec<String>> = gs
+                    .all_edges()
                     .iter()
-                    .map(|e| vec![
-                        e.from.to_string(),
-                        e.edge_type.clone(),
-                        e.to.to_string(),
-                    ])
+                    .map(|e| vec![e.from.to_string(), e.edge_type.clone(), e.to.to_string()])
                     .collect();
                 drop(gs);
                 let count = edge_rows.len();
-                self.datalog_store.write().import_rows(&predicate, edge_rows);
-                Ok(Value::Text(format!("IMPORTED {count} edges into {predicate}")))
+                self.datalog_store
+                    .write()
+                    .import_rows(&predicate, edge_rows);
+                Ok(Value::Text(format!(
+                    "IMPORTED {count} edges into {predicate}"
+                )))
             }
             "DATALOG_IMPORT_NODES" => {
                 // DATALOG_IMPORT_NODES(predicate)
@@ -3968,20 +4543,28 @@ impl Executor {
                     other => other.to_string(),
                 };
                 let gs = self.graph_store.read();
-                let node_rows: Vec<Vec<String>> = gs.all_nodes()
+                let node_rows: Vec<Vec<String>> = gs
+                    .all_nodes()
                     .iter()
                     .flat_map(|n| {
                         if n.labels.is_empty() {
                             vec![vec![n.id.to_string(), String::new()]]
                         } else {
-                            n.labels.iter().map(|l| vec![n.id.to_string(), l.clone()]).collect()
+                            n.labels
+                                .iter()
+                                .map(|l| vec![n.id.to_string(), l.clone()])
+                                .collect()
                         }
                     })
                     .collect();
                 drop(gs);
                 let count = node_rows.len();
-                self.datalog_store.write().import_rows(&predicate, node_rows);
-                Ok(Value::Text(format!("IMPORTED {count} node-label pairs into {predicate}")))
+                self.datalog_store
+                    .write()
+                    .import_rows(&predicate, node_rows);
+                Ok(Value::Text(format!(
+                    "IMPORTED {count} node-label pairs into {predicate}"
+                )))
             }
 
             // ================================================================
@@ -3993,7 +4576,9 @@ impl Executor {
                 // real transformer inference. Otherwise falls back to the
                 // built-in bag-of-words EmbeddingGenerator.
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("embed() requires 2 arguments: embed(model, text)".into()));
+                    return Err(ExecError::Unsupported(
+                        "embed() requires 2 arguments: embed(model, text)".into(),
+                    ));
                 }
                 let _model_name = args[0].to_string().replace('\'', "");
                 let text = match &args[1] {
@@ -4013,10 +4598,21 @@ impl Executor {
                         let input: Vec<f32> = text.bytes().map(|b| b as f32 / 255.0).collect();
                         match registry.predict(&_model_name, &input) {
                             Ok(output) => {
-                                let vec_str = format!("[{}]", output.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(","));
+                                let vec_str = format!(
+                                    "[{}]",
+                                    output
+                                        .iter()
+                                        .map(|v| format!("{v:.6}"))
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                );
                                 return Ok(Value::Text(vec_str));
                             }
-                            Err(e) => return Err(ExecError::Unsupported(format!("embed ONNX error: {e}"))),
+                            Err(e) => {
+                                return Err(ExecError::Unsupported(format!(
+                                    "embed ONNX error: {e}"
+                                )));
+                            }
                         }
                     }
                 }
@@ -4025,28 +4621,43 @@ impl Executor {
                 let mut emb_gen = crate::inference::EmbeddingGenerator::new();
                 emb_gen.build_vocabulary(&[&text]);
                 let vec = emb_gen.embed(&text);
-                let vec_str = format!("[{}]", vec.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(","));
+                let vec_str = format!(
+                    "[{}]",
+                    vec.iter()
+                        .map(|v| format!("{v:.6}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
                 Ok(Value::Text(vec_str))
             }
             "CLASSIFY" => {
                 // classify(model_name, input_values...) → TEXT (class label)
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("classify() requires at least 2 arguments: classify(model, input...)".into()));
+                    return Err(ExecError::Unsupported(
+                        "classify() requires at least 2 arguments: classify(model, input...)"
+                            .into(),
+                    ));
                 }
                 let model_name = args[0].to_string().replace('\'', "");
-                let input: Vec<f32> = args[1..].iter().filter_map(|v| match v {
-                    Value::Float64(f) => Some(*f as f32),
-                    Value::Int32(i) => Some(*i as f32),
-                    Value::Int64(i) => Some(*i as f32),
-                    _ => v.to_string().parse::<f32>().ok(),
-                }).collect();
+                let input: Vec<f32> = args[1..]
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Float64(f) => Some(*f as f32),
+                        Value::Int32(i) => Some(*i as f32),
+                        Value::Int64(i) => Some(*i as f32),
+                        _ => v.to_string().parse::<f32>().ok(),
+                    })
+                    .collect();
                 let registry = self.model_registry.read();
                 match registry.predict(&model_name, &input) {
                     Ok(probs) => {
                         // Return the index of the highest probability as the class
-                        let class_idx = probs.iter()
+                        let class_idx = probs
+                            .iter()
                             .enumerate()
-                            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                            .max_by(|(_, a), (_, b)| {
+                                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                            })
                             .map(|(i, _)| i)
                             .unwrap_or(0);
                         Ok(Value::Text(format!("class_{class_idx}")))
@@ -4057,19 +4668,31 @@ impl Executor {
             "PREDICT" => {
                 // predict(model_name, input_values...) → FLOAT8[] (output vector)
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("predict() requires at least 2 arguments: predict(model, input...)".into()));
+                    return Err(ExecError::Unsupported(
+                        "predict() requires at least 2 arguments: predict(model, input...)".into(),
+                    ));
                 }
                 let model_name = args[0].to_string().replace('\'', "");
-                let input: Vec<f32> = args[1..].iter().filter_map(|v| match v {
-                    Value::Float64(f) => Some(*f as f32),
-                    Value::Int32(i) => Some(*i as f32),
-                    Value::Int64(i) => Some(*i as f32),
-                    _ => v.to_string().parse::<f32>().ok(),
-                }).collect();
+                let input: Vec<f32> = args[1..]
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Float64(f) => Some(*f as f32),
+                        Value::Int32(i) => Some(*i as f32),
+                        Value::Int64(i) => Some(*i as f32),
+                        _ => v.to_string().parse::<f32>().ok(),
+                    })
+                    .collect();
                 let registry = self.model_registry.read();
                 match registry.predict(&model_name, &input) {
                     Ok(output) => {
-                        let vec_str = format!("[{}]", output.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(","));
+                        let vec_str = format!(
+                            "[{}]",
+                            output
+                                .iter()
+                                .map(|v| format!("{v:.6}"))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        );
                         Ok(Value::Text(vec_str))
                     }
                     Err(e) => Err(ExecError::Unsupported(format!("predict error: {e}"))),
@@ -4079,35 +4702,42 @@ impl Executor {
             // ================================================================
             // Tensor functions — tensor_* SQL API
             // ================================================================
-
             "TENSOR_STORE" => {
                 // tensor_store(name, version, shape_json[, dtype[, hex_data]]) → 'OK'
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 3 {
-                    return Err(ExecError::Unsupported("tensor_store requires (name, version, shape_json[, dtype[, hex_data]])".into()));
+                    return Err(ExecError::Unsupported(
+                        "tensor_store requires (name, version, shape_json[, dtype[, hex_data]])"
+                            .into(),
+                    ));
                 }
                 let name = args[0].to_string().replace('\'', "");
                 let version = args[1].to_string().replace('\'', "");
                 let shape_json = args[2].to_string().replace('\'', "");
-                let shape: Vec<usize> = serde_json::from_str::<Vec<usize>>(&shape_json)
-                    .map_err(|e| ExecError::Unsupported(format!("tensor_store: invalid shape JSON: {e}")))?;
-                let dtype_str = args.get(3).map(|v| v.to_string().replace('\'', "").to_lowercase())
+                let shape: Vec<usize> =
+                    serde_json::from_str::<Vec<usize>>(&shape_json).map_err(|e| {
+                        ExecError::Unsupported(format!("tensor_store: invalid shape JSON: {e}"))
+                    })?;
+                let dtype_str = args
+                    .get(3)
+                    .map(|v| v.to_string().replace('\'', "").to_lowercase())
                     .unwrap_or_else(|| "float32".to_string());
                 let dtype = match dtype_str.as_str() {
-                    "float16"  => crate::tensor::DType::Float16,
-                    "float64"  => crate::tensor::DType::Float64,
-                    "int8"     => crate::tensor::DType::Int8,
-                    "int16"    => crate::tensor::DType::Int16,
-                    "int32"    => crate::tensor::DType::Int32,
-                    "int64"    => crate::tensor::DType::Int64,
+                    "float16" => crate::tensor::DType::Float16,
+                    "float64" => crate::tensor::DType::Float64,
+                    "int8" => crate::tensor::DType::Int8,
+                    "int16" => crate::tensor::DType::Int16,
+                    "int32" => crate::tensor::DType::Int32,
+                    "int64" => crate::tensor::DType::Int64,
                     "bfloat16" => crate::tensor::DType::BFloat16,
-                    "bool"     => crate::tensor::DType::Bool,
-                    _          => crate::tensor::DType::Float32,
+                    "bool" => crate::tensor::DType::Bool,
+                    _ => crate::tensor::DType::Float32,
                 };
                 let data = if let Some(hex_val) = args.get(4) {
                     let hex_str = hex_val.to_string().replace('\'', "");
-                    (0..hex_str.len()).step_by(2)
-                        .filter_map(|i| u8::from_str_radix(&hex_str[i..i+2], 16).ok())
+                    (0..hex_str.len())
+                        .step_by(2)
+                        .filter_map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16).ok())
                         .collect::<Vec<u8>>()
                 } else {
                     let num_elements: usize = shape.iter().product();
@@ -4115,7 +4745,8 @@ impl Executor {
                 };
                 let tensor = crate::tensor::Tensor::new(shape, dtype, data)
                     .map_err(|e| ExecError::Unsupported(format!("tensor_store: {e:?}")))?;
-                self.tensor_store.write()
+                self.tensor_store
+                    .write()
                     .put(&name, &version, tensor, std::collections::HashMap::new())
                     .map_err(|e| ExecError::Unsupported(format!("tensor_store: {e:?}")))?;
                 Ok(Value::Text("OK".into()))
@@ -4124,24 +4755,40 @@ impl Executor {
                 // tensor_shape(name[, version]) → JSON shape e.g. '[3,4]'
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("tensor_shape requires (name)".into()));
+                    return Err(ExecError::Unsupported(
+                        "tensor_shape requires (name)".into(),
+                    ));
                 }
                 let name = args[0].to_string().replace('\'', "");
                 let store = self.tensor_store.read();
                 let tensor = if let Some(ver) = args.get(1) {
                     let v = ver.to_string().replace('\'', "");
-                    store.get(&name, &v).map_err(|e| ExecError::Unsupported(format!("tensor_shape: {e:?}")))?
+                    store
+                        .get(&name, &v)
+                        .map_err(|e| ExecError::Unsupported(format!("tensor_shape: {e:?}")))?
                 } else {
-                    store.get_latest(&name).map_err(|e| ExecError::Unsupported(format!("tensor_shape: {e:?}")))?
+                    store
+                        .get_latest(&name)
+                        .map_err(|e| ExecError::Unsupported(format!("tensor_shape: {e:?}")))?
                 };
-                let shape_json = format!("[{}]", tensor.shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(","));
+                let shape_json = format!(
+                    "[{}]",
+                    tensor
+                        .shape
+                        .iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
                 Ok(Value::Text(shape_json))
             }
             "TENSOR_VERSIONS" => {
                 // tensor_versions(name) → Int64 count of stored versions
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("tensor_versions requires (name)".into()));
+                    return Err(ExecError::Unsupported(
+                        "tensor_versions requires (name)".into(),
+                    ));
                 }
                 let name = args[0].to_string().replace('\'', "");
                 let store = self.tensor_store.read();
@@ -4152,12 +4799,21 @@ impl Executor {
                 // tensor_list_versions(name) → TEXT JSON array of version strings
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("tensor_list_versions requires (name)".into()));
+                    return Err(ExecError::Unsupported(
+                        "tensor_list_versions requires (name)".into(),
+                    ));
                 }
                 let name = args[0].to_string().replace('\'', "");
                 let store = self.tensor_store.read();
                 let versions = store.list_versions(&name);
-                let json = format!("[{}]", versions.iter().map(|v| format!("\"{v}\"")).collect::<Vec<_>>().join(","));
+                let json = format!(
+                    "[{}]",
+                    versions
+                        .iter()
+                        .map(|v| format!("\"{v}\""))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
                 Ok(Value::Text(json))
             }
             "TENSOR_COUNT" => {
@@ -4169,15 +4825,21 @@ impl Executor {
                 // tensor_size_bytes(name[, version]) → Int64 raw byte count
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("tensor_size_bytes requires (name)".into()));
+                    return Err(ExecError::Unsupported(
+                        "tensor_size_bytes requires (name)".into(),
+                    ));
                 }
                 let name = args[0].to_string().replace('\'', "");
                 let store = self.tensor_store.read();
                 let tensor = if let Some(ver) = args.get(1) {
                     let v = ver.to_string().replace('\'', "");
-                    store.get(&name, &v).map_err(|e| ExecError::Unsupported(format!("tensor_size_bytes: {e:?}")))?
+                    store
+                        .get(&name, &v)
+                        .map_err(|e| ExecError::Unsupported(format!("tensor_size_bytes: {e:?}")))?
                 } else {
-                    store.get_latest(&name).map_err(|e| ExecError::Unsupported(format!("tensor_size_bytes: {e:?}")))?
+                    store
+                        .get_latest(&name)
+                        .map_err(|e| ExecError::Unsupported(format!("tensor_size_bytes: {e:?}")))?
                 };
                 Ok(Value::Int64(tensor.size_bytes() as i64))
             }
@@ -4185,19 +4847,24 @@ impl Executor {
             // ================================================================
             // Compliance functions — pii_*, retention_*, gdpr_*
             // ================================================================
-
             "PII_DETECT" => {
                 // pii_detect(column_name, sample1[, sample2, ...]) → TEXT JSON matches
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("pii_detect requires (column_name, sample...)".into()));
+                    return Err(ExecError::Unsupported(
+                        "pii_detect requires (column_name, sample...)".into(),
+                    ));
                 }
                 let col_name = args[0].to_string().replace('\'', "");
-                let samples: Vec<String> = args[1..].iter().map(|v| v.to_string().replace('\'', "")).collect();
+                let samples: Vec<String> = args[1..]
+                    .iter()
+                    .map(|v| v.to_string().replace('\'', ""))
+                    .collect();
                 let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
                 let detector = crate::compliance::PiiDetector::new();
                 let matches = detector.detect(&col_name, &sample_refs);
-                let json = format!("[{}]", matches.iter().map(|m| {
+                let json =
+                    format!("[{}]", matches.iter().map(|m| {
                     format!("{{\"column\":\"{}\",\"category\":\"{:?}\",\"confidence\":{:.2}}}",
                         m.column_name, m.category, m.confidence)
                 }).collect::<Vec<_>>().join(","));
@@ -4207,13 +4874,16 @@ impl Executor {
                 // pii_detect_category(column_name, sample) → TEXT category or 'NONE'
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("pii_detect_category requires (column_name, sample)".into()));
+                    return Err(ExecError::Unsupported(
+                        "pii_detect_category requires (column_name, sample)".into(),
+                    ));
                 }
                 let col_name = args[0].to_string().replace('\'', "");
                 let sample = args[1].to_string().replace('\'', "");
                 let detector = crate::compliance::PiiDetector::new();
                 let matches = detector.detect(&col_name, &[sample.as_str()]);
-                let category = matches.first()
+                let category = matches
+                    .first()
                     .map(|m| format!("{:?}", m.category))
                     .unwrap_or_else(|| "NONE".to_string());
                 Ok(Value::Text(category))
@@ -4222,7 +4892,9 @@ impl Executor {
                 // retention_set(table, days, ts_column) → 'OK'
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 3 {
-                    return Err(ExecError::Unsupported("retention_set requires (table, days, ts_col)".into()));
+                    return Err(ExecError::Unsupported(
+                        "retention_set requires (table, days, ts_col)".into(),
+                    ));
                 }
                 let table_name = args[0].to_string().replace('\'', "");
                 let days = match &args[1] {
@@ -4235,12 +4907,14 @@ impl Executor {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
-                self.retention_engine.write().register(crate::compliance::RetentionPolicy {
-                    table_name,
-                    retention_days: days,
-                    timestamp_column: ts_col,
-                    created_at: now_ts,
-                });
+                self.retention_engine
+                    .write()
+                    .register(crate::compliance::RetentionPolicy {
+                        table_name,
+                        retention_days: days,
+                        timestamp_column: ts_col,
+                        created_at: now_ts,
+                    });
                 Ok(Value::Text("OK".into()))
             }
             "RETENTION_CHECK" => {
@@ -4250,7 +4924,8 @@ impl Executor {
                     .unwrap_or_default()
                     .as_millis() as u64;
                 let actions = self.retention_engine.read().find_all_expired(now_ts, |_| 0);
-                let json = format!("[{}]", actions.iter().map(|a| {
+                let json =
+                    format!("[{}]", actions.iter().map(|a| {
                     format!("{{\"table\":\"{}\",\"condition\":\"{}\",\"estimated_rows\":{}}}",
                         a.table, a.condition.replace('"', "\\\""), a.estimated_rows)
                 }).collect::<Vec<_>>().join(","));
@@ -4260,33 +4935,48 @@ impl Executor {
                 // gdpr_delete_plan(table, id_col, id_val) → TEXT JSON deletion plan
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 3 {
-                    return Err(ExecError::Unsupported("gdpr_delete_plan requires (table, id_col, id_val)".into()));
+                    return Err(ExecError::Unsupported(
+                        "gdpr_delete_plan requires (table, id_col, id_val)".into(),
+                    ));
                 }
                 let table = args[0].to_string().replace('\'', "");
                 let id_col = args[1].to_string().replace('\'', "");
                 let id_val = args[2].to_string().replace('\'', "");
                 let cascade = crate::compliance::DeletionCascade::new();
                 let plan = cascade.plan_deletion(&table, &id_col, &id_val);
-                let json = format!("[{}]", plan.steps.iter().map(|s| {
-                    format!("{{\"table\":\"{}\",\"condition\":\"{}\"}}",
-                        s.table, s.condition.replace('"', "\\\""))
-                }).collect::<Vec<_>>().join(","));
+                let json = format!(
+                    "[{}]",
+                    plan.steps
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "{{\"table\":\"{}\",\"condition\":\"{}\"}}",
+                                s.table,
+                                s.condition.replace('"', "\\\"")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
                 Ok(Value::Text(json))
             }
 
             // ================================================================
             // Row-level versioning functions — version_* SQL API
             // ================================================================
-
             "VERSION_BRANCH" => {
                 // version_branch(new_name, from_branch) → 'OK'
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("version_branch requires (new_name, from_branch)".into()));
+                    return Err(ExecError::Unsupported(
+                        "version_branch requires (new_name, from_branch)".into(),
+                    ));
                 }
                 let new_name = args[0].to_string().replace('\'', "");
                 let from = args[1].to_string().replace('\'', "");
-                self.version_store.write().create_branch(&new_name, &from)
+                self.version_store
+                    .write()
+                    .create_branch(&new_name, &from)
                     .map_err(|e| ExecError::Unsupported(format!("version_branch: {e:?}")))?;
                 Ok(Value::Text("OK".into()))
             }
@@ -4294,11 +4984,15 @@ impl Executor {
                 // version_commit(branch, message) → Int64 commit ID
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("version_commit requires (branch, message)".into()));
+                    return Err(ExecError::Unsupported(
+                        "version_commit requires (branch, message)".into(),
+                    ));
                 }
                 let branch = args[0].to_string().replace('\'', "");
                 let msg = args[1].to_string().replace('\'', "");
-                let commit_id = self.version_store.write()
+                let commit_id = self
+                    .version_store
+                    .write()
                     .commit(&branch, &msg, std::collections::HashMap::new())
                     .map_err(|e| ExecError::Unsupported(format!("version_commit: {e:?}")))?;
                 Ok(Value::Int64(commit_id as i64))
@@ -4307,42 +5001,68 @@ impl Executor {
                 // version_log(branch) → TEXT JSON array of commits
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("version_log requires (branch)".into()));
+                    return Err(ExecError::Unsupported(
+                        "version_log requires (branch)".into(),
+                    ));
                 }
                 let branch = args[0].to_string().replace('\'', "");
                 let store = self.version_store.read();
-                let commits = store.log(&branch)
+                let commits = store
+                    .log(&branch)
                     .map_err(|e| ExecError::Unsupported(format!("version_log: {e:?}")))?;
-                let json = format!("[{}]", commits.iter().map(|c| {
-                    format!("{{\"id\":{},\"message\":\"{}\",\"branch\":\"{}\",\"ts\":{}}}",
-                        c.id, c.message.replace('"', "\\\""), c.branch, c.timestamp)
-                }).collect::<Vec<_>>().join(","));
+                let json = format!(
+                    "[{}]",
+                    commits
+                        .iter()
+                        .map(|c| {
+                            format!(
+                                "{{\"id\":{},\"message\":\"{}\",\"branch\":\"{}\",\"ts\":{}}}",
+                                c.id,
+                                c.message.replace('"', "\\\""),
+                                c.branch,
+                                c.timestamp
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
                 Ok(Value::Text(json))
             }
             "VERSION_BRANCHES" => {
                 // version_branches() → TEXT JSON array of branch names
                 let store = self.version_store.read();
                 let branches = store.list_branches();
-                let json = format!("[{}]", branches.iter().map(|b| format!("\"{b}\"")).collect::<Vec<_>>().join(","));
+                let json = format!(
+                    "[{}]",
+                    branches
+                        .iter()
+                        .map(|b| format!("\"{b}\""))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
                 Ok(Value::Text(json))
             }
 
             // ================================================================
             // Database branching functions — db_branch_* SQL API
             // ================================================================
-
             "DB_BRANCH_CREATE" => {
                 // db_branch_create(name[, parent_name]) → Int64 branch ID
                 // parent_name defaults to 'main' if not provided
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("db_branch_create requires (name[, parent_name])".into()));
+                    return Err(ExecError::Unsupported(
+                        "db_branch_create requires (name[, parent_name])".into(),
+                    ));
                 }
                 let name = args[0].to_string().replace('\'', "");
-                let parent = args.get(1)
+                let parent = args
+                    .get(1)
                     .map(|v| v.to_string().replace('\'', ""))
                     .unwrap_or_else(|| "main".to_string());
-                let branch_id = self.branch_manager.write()
+                let branch_id = self
+                    .branch_manager
+                    .write()
                     .create_branch(&name, &parent)
                     .map_err(|e| ExecError::Unsupported(format!("db_branch_create: {e:?}")))?;
                 Ok(Value::Int64(branch_id as i64))
@@ -4351,14 +5071,23 @@ impl Executor {
                 // db_branch_list() → TEXT JSON array of branch names
                 let mgr = self.branch_manager.read();
                 let branches = mgr.list_branches();
-                let json = format!("[{}]", branches.iter().map(|b| format!("\"{}\"", b.name)).collect::<Vec<_>>().join(","));
+                let json = format!(
+                    "[{}]",
+                    branches
+                        .iter()
+                        .map(|b| format!("\"{}\"", b.name))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
                 Ok(Value::Text(json))
             }
             "DB_BRANCH_DELETE" => {
                 // db_branch_delete(name) → Bool
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.is_empty() {
-                    return Err(ExecError::Unsupported("db_branch_delete requires (name)".into()));
+                    return Err(ExecError::Unsupported(
+                        "db_branch_delete requires (name)".into(),
+                    ));
                 }
                 let name = args[0].to_string().replace('\'', "");
                 let ok = self.branch_manager.write().delete_branch(&name).is_ok();
@@ -4368,11 +5097,15 @@ impl Executor {
                 // db_branch_merge(source, target) → 'OK'
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("db_branch_merge requires (source, target)".into()));
+                    return Err(ExecError::Unsupported(
+                        "db_branch_merge requires (source, target)".into(),
+                    ));
                 }
                 let source = args[0].to_string().replace('\'', "");
                 let target = args[1].to_string().replace('\'', "");
-                self.branch_manager.write().merge(&source, &target)
+                self.branch_manager
+                    .write()
+                    .merge(&source, &target)
                     .map_err(|e| ExecError::Unsupported(format!("db_branch_merge: {e:?}")))?;
                 Ok(Value::Text("OK".into()))
             }
@@ -4380,30 +5113,42 @@ impl Executor {
                 // db_branch_diff(branch_a, branch_b) → TEXT JSON diff summary
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("db_branch_diff requires (branch_a, branch_b)".into()));
+                    return Err(ExecError::Unsupported(
+                        "db_branch_diff requires (branch_a, branch_b)".into(),
+                    ));
                 }
                 let a = args[0].to_string().replace('\'', "");
                 let b_arg = args[1].to_string().replace('\'', "");
-                let diff = self.branch_manager.read().diff(&a, &b_arg)
+                let diff = self
+                    .branch_manager
+                    .read()
+                    .diff(&a, &b_arg)
                     .map_err(|e| ExecError::Unsupported(format!("db_branch_diff: {e:?}")))?;
-                let json = format!("{{\"added\":{},\"modified\":{},\"deleted\":{}}}",
-                    diff.added_pages.len(), diff.modified_pages.len(), diff.deleted_pages.len());
+                let json = format!(
+                    "{{\"added\":{},\"modified\":{},\"deleted\":{}}}",
+                    diff.added_pages.len(),
+                    diff.modified_pages.len(),
+                    diff.deleted_pages.len()
+                );
                 Ok(Value::Text(json))
             }
 
             // ================================================================
             // Procedure scalar functions — proc_* SQL API
             // ================================================================
-
             "PROC_REGISTER" => {
                 // proc_register(name, body) or proc_register(name, params_csv, body) → 'OK'
                 let args = self.extract_fn_args(func, row, col_meta)?;
                 if args.len() < 2 {
-                    return Err(ExecError::Unsupported("proc_register requires (name, body) or (name, params_csv, body)".into()));
+                    return Err(ExecError::Unsupported(
+                        "proc_register requires (name, body) or (name, params_csv, body)".into(),
+                    ));
                 }
                 let name = args[0].to_string().replace('\'', "").to_lowercase();
                 let (param_names, body) = if args.len() >= 3 {
-                    let params: Vec<String> = args[1].to_string().replace('\'', "")
+                    let params: Vec<String> = args[1]
+                        .to_string()
+                        .replace('\'', "")
                         .split(',')
                         .map(|p| p.trim().to_string())
                         .filter(|p| !p.is_empty())
@@ -4412,7 +5157,12 @@ impl Executor {
                 } else {
                     (Vec::new(), args[1].to_string().replace('\'', ""))
                 };
-                self.procedure_engine.write().register_sql(&name, "registered via SQL", param_names, &body);
+                self.procedure_engine.write().register_sql(
+                    &name,
+                    "registered via SQL",
+                    param_names,
+                    &body,
+                );
                 Ok(Value::Text("OK".into()))
             }
             "PROC_DROP" => {
@@ -4429,7 +5179,14 @@ impl Executor {
                 // proc_list() → TEXT JSON array of procedure names
                 let eng = self.procedure_engine.read();
                 let procs = eng.list_procedures();
-                let json = format!("[{}]", procs.iter().map(|m| format!("\"{}\"", m.name)).collect::<Vec<_>>().join(","));
+                let json = format!(
+                    "[{}]",
+                    procs
+                        .iter()
+                        .map(|m| format!("\"{}\"", m.name))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
                 Ok(Value::Text(json))
             }
 
@@ -4472,7 +5229,7 @@ impl Executor {
                 } else {
                     Err(ExecError::Unsupported(format!("unknown function: {fname}")))
                 }
-            },
+            }
         }
     }
 

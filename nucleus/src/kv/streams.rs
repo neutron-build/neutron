@@ -164,22 +164,26 @@ impl Stream {
     ///
     /// If `id_str` is "*", auto-generates an ID. Otherwise parses the explicit ID.
     /// Returns an error if the explicit ID is not greater than the last ID.
-    pub fn xadd(&mut self, id_str: &str, fields: Vec<(String, String)>) -> Result<StreamId, String> {
+    pub fn xadd(
+        &mut self,
+        id_str: &str,
+        fields: Vec<(String, String)>,
+    ) -> Result<StreamId, String> {
         let id = if id_str == "*" {
             self.next_auto_id()
         } else {
-            let parsed = StreamId::parse(id_str)
-                .ok_or_else(|| format!("Invalid stream ID: {id_str}"))?;
+            let parsed =
+                StreamId::parse(id_str).ok_or_else(|| format!("Invalid stream ID: {id_str}"))?;
             if parsed <= self.last_id {
-                return Err("The ID specified in XADD is equal or smaller than the target stream top item".to_string());
+                return Err(
+                    "The ID specified in XADD is equal or smaller than the target stream top item"
+                        .to_string(),
+                );
             }
             parsed
         };
 
-        let entry = StreamEntry {
-            id,
-            fields,
-        };
+        let entry = StreamEntry { id, fields };
         self.entries.insert(id, entry);
         self.last_id = id;
         Ok(id)
@@ -291,12 +295,7 @@ impl Stream {
             return 0;
         }
         let to_remove = current - maxlen;
-        let ids_to_remove: Vec<StreamId> = self
-            .entries
-            .keys()
-            .take(to_remove)
-            .copied()
-            .collect();
+        let ids_to_remove: Vec<StreamId> = self.entries.keys().take(to_remove).copied().collect();
         for id in &ids_to_remove {
             self.entries.remove(id);
         }
@@ -315,11 +314,12 @@ impl Stream {
         } else if start_id == "0" || start_id == "0-0" {
             StreamId::min()
         } else {
-            StreamId::parse(start_id)
-                .ok_or_else(|| format!("Invalid stream ID: {start_id}"))?
+            StreamId::parse(start_id).ok_or_else(|| format!("Invalid stream ID: {start_id}"))?
         };
-        self.groups
-            .insert(group_name.to_string(), ConsumerGroup::new(group_name.to_string(), id));
+        self.groups.insert(
+            group_name.to_string(),
+            ConsumerGroup::new(group_name.to_string(), id),
+        );
         Ok(())
     }
 
@@ -362,9 +362,7 @@ impl Stream {
             // Update last_delivered_id and add to PEL
             for entry in &limited {
                 group.last_delivered_id = entry.id;
-                group
-                    .pel
-                    .insert(entry.id, consumer_name.to_string());
+                group.pel.insert(entry.id, consumer_name.to_string());
                 group
                     .consumers
                     .entry(consumer_name.to_string())

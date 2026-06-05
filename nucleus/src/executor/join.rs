@@ -10,9 +10,9 @@ use sqlparser::ast::{self, Expr, SelectItem};
 use crate::planner;
 use crate::types::{Row, Value};
 
+use super::helpers::value_type;
 use super::types::{ColMeta, JoinType};
 use super::{ExecError, ExecResult, Executor};
-use super::helpers::value_type;
 
 impl Executor {
     // ========================================================================
@@ -54,11 +54,8 @@ impl Executor {
         right_rows: &[Row],
         operator: &ast::JoinOperator,
     ) -> Result<(Vec<ColMeta>, Vec<Row>), ExecError> {
-        let combined_meta: Vec<ColMeta> = left_meta
-            .iter()
-            .chain(right_meta.iter())
-            .cloned()
-            .collect();
+        let combined_meta: Vec<ColMeta> =
+            left_meta.iter().chain(right_meta.iter()).cloned().collect();
         let right_nulls: Row = right_meta.iter().map(|_| Value::Null).collect();
         let left_nulls: Row = left_meta.iter().map(|_| Value::Null).collect();
 
@@ -80,8 +77,14 @@ impl Executor {
             ast::JoinConstraint::On(expr) => expr.clone(),
             ast::JoinConstraint::Using(columns) => {
                 // Convert USING(col1, col2) to ON left.col1 = right.col1 AND left.col2 = right.col2
-                let left_table = left_meta.first().and_then(|c| c.table.as_deref()).unwrap_or("left");
-                let right_table = right_meta.first().and_then(|c| c.table.as_deref()).unwrap_or("right");
+                let left_table = left_meta
+                    .first()
+                    .and_then(|c| c.table.as_deref())
+                    .unwrap_or("left");
+                let right_table = right_meta
+                    .first()
+                    .and_then(|c| c.table.as_deref())
+                    .unwrap_or("right");
                 let mut expr: Option<Expr> = None;
                 for col in columns {
                     let col_name = col.to_string();
@@ -154,9 +157,15 @@ impl Executor {
             Self::extract_equijoin_keys(on_expr, left_meta, right_meta)
         {
             let result_rows = self.execute_hash_join(
-                left_meta, left_rows, right_meta, right_rows,
-                &left_keys, &right_keys, join_type,
-                residual.as_ref(), &combined_meta,
+                left_meta,
+                left_rows,
+                right_meta,
+                right_rows,
+                &left_keys,
+                &right_keys,
+                join_type,
+                residual.as_ref(),
+                &combined_meta,
             )?;
             return Ok((combined_meta, result_rows));
         }
@@ -265,7 +274,12 @@ impl Executor {
         let left_len = left_meta.len();
 
         for conj in conjuncts {
-            if let Expr::BinaryOp { left, op: ast::BinaryOperator::Eq, right } = conj {
+            if let Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::Eq,
+                right,
+            } = conj
+            {
                 // Try to resolve each side to a column index in left or right metadata
                 let l_idx = Self::resolve_col_idx_in_meta(left, left_meta, 0);
                 let r_idx = Self::resolve_col_idx_in_meta(right, right_meta, left_len);
@@ -346,7 +360,7 @@ impl Executor {
         residual: Option<&Expr>,
         combined_meta: &[ColMeta],
     ) -> Result<Vec<Row>, ExecError> {
-        use std::hash::{Hash, Hasher, DefaultHasher};
+        use std::hash::{DefaultHasher, Hash, Hasher};
 
         // Hash function for a vector of Values — uses Value's Hash impl directly
         fn hash_key(vals: &[Value]) -> u64 {
@@ -358,12 +372,13 @@ impl Executor {
         }
 
         fn vals_eq(a: &[Value], b: &[Value]) -> bool {
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| {
-                match (x, y) {
-                    (Value::Null, _) | (_, Value::Null) => false, // NULL != anything
-                    _ => x == y,
-                }
-            })
+            a.len() == b.len()
+                && a.iter().zip(b.iter()).all(|(x, y)| {
+                    match (x, y) {
+                        (Value::Null, _) | (_, Value::Null) => false, // NULL != anything
+                        _ => x == y,
+                    }
+                })
         }
 
         let right_nulls: Row = right_meta.iter().map(|_| Value::Null).collect();
@@ -395,7 +410,10 @@ impl Executor {
                                 let rr = &right_rows[*ri];
                                 let combined: Row = lr.iter().chain(rr.iter()).cloned().collect();
                                 if let Some(res) = residual {
-                                    if self.eval_where(res, &combined, combined_meta).unwrap_or(false) {
+                                    if self
+                                        .eval_where(res, &combined, combined_meta)
+                                        .unwrap_or(false)
+                                    {
                                         result_rows.push(combined);
                                         matched = true;
                                     }
@@ -433,7 +451,10 @@ impl Executor {
                                 let lr = &left_rows[*li];
                                 let combined: Row = lr.iter().chain(rr.iter()).cloned().collect();
                                 if let Some(res) = residual {
-                                    if self.eval_where(res, &combined, combined_meta).unwrap_or(false) {
+                                    if self
+                                        .eval_where(res, &combined, combined_meta)
+                                        .unwrap_or(false)
+                                    {
                                         result_rows.push(combined);
                                         matched = true;
                                     }
@@ -473,7 +494,10 @@ impl Executor {
                                 let rr = &right_rows[*ri];
                                 let combined: Row = lr.iter().chain(rr.iter()).cloned().collect();
                                 if let Some(res) = residual {
-                                    if self.eval_where(res, &combined, combined_meta).unwrap_or(false) {
+                                    if self
+                                        .eval_where(res, &combined, combined_meta)
+                                        .unwrap_or(false)
+                                    {
                                         result_rows.push(combined);
                                         left_matched = true;
                                         right_matched[*ri] = true;
@@ -510,12 +534,14 @@ impl Executor {
         // concurrent-query gate, not a long-lived reservation.
         if !result_rows.is_empty() {
             let accounted_bytes: u64 = result_rows.iter().map(Self::estimate_row_bytes).sum();
-            self.query_memory.try_allocate(accounted_bytes).map_err(|_| {
-                ExecError::Unsupported(format!(
-                    "hash join result exceeded memory limit ({} MB)",
-                    self.query_memory.limit() / (1024 * 1024)
-                ))
-            })?;
+            self.query_memory
+                .try_allocate(accounted_bytes)
+                .map_err(|_| {
+                    ExecError::Unsupported(format!(
+                        "hash join result exceeded memory limit ({} MB)",
+                        self.query_memory.limit() / (1024 * 1024)
+                    ))
+                })?;
             self.query_memory.deallocate(accounted_bytes);
         }
 
@@ -537,14 +563,12 @@ impl Executor {
         if product > Self::MAX_CROSS_JOIN_ROWS {
             return Err(ExecError::Runtime(format!(
                 "cross join would produce {} rows, exceeding limit of {}",
-                product, Self::MAX_CROSS_JOIN_ROWS
+                product,
+                Self::MAX_CROSS_JOIN_ROWS
             )));
         }
-        let combined_meta: Vec<ColMeta> = left_meta
-            .iter()
-            .chain(right_meta.iter())
-            .cloned()
-            .collect();
+        let combined_meta: Vec<ColMeta> =
+            left_meta.iter().chain(right_meta.iter()).cloned().collect();
         let mut rows = Vec::with_capacity(product);
         for lr in left_rows {
             for rr in right_rows {
