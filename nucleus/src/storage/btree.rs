@@ -785,11 +785,22 @@ fn find_child(pg: &PageBuf, key: &[u8]) -> u32 {
 fn insert_internal_entry(pg: &mut PageBuf, key: &[u8], child_page_id: u32) {
     let count = page::read_u16(pg, IDX_ENTRY_COUNT) as usize;
 
-    // Collect existing entries
+    // Collect existing entries. Guard against a corrupt key_len / entry_count
+    // that would slice past the page (mirrors find_child's defense, F-032).
     let mut entries: Vec<(Vec<u8>, u32)> = Vec::new();
     let mut pos = INTERNAL_ENTRIES_START;
     for _ in 0..count {
+        if pos + 2 > PAGE_SIZE {
+            break;
+        }
         let key_len = page::read_u16(pg, pos) as usize;
+        if pos + 2 + key_len + 4 > PAGE_SIZE {
+            tracing::error!(
+                target: "nucleus::btree",
+                "corrupt internal page in insert_internal_entry: entry at {pos} (key_len {key_len}) exceeds page"
+            );
+            break;
+        }
         let ek = pg[pos + 2..pos + 2 + key_len].to_vec();
         let child = page::read_u32(pg, pos + 2 + key_len);
         entries.push((ek, child));

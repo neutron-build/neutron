@@ -382,8 +382,14 @@ impl GinIndex {
     pub fn remove(&mut self, doc_id: u64, doc: &JsonValue) {
         for (path, leaf) in doc.gin_extract() {
             let key_bytes = jsonb_encode(&leaf);
-            if let Some(set) = self.entries.get_mut(&(path, key_bytes)) {
+            let key = (path, key_bytes);
+            if let Some(set) = self.entries.get_mut(&key) {
                 set.remove(&doc_id);
+                // Drop the posting list entirely once empty — otherwise deleted
+                // keys accumulate empty sets and leak memory over a churning index.
+                if set.is_empty() {
+                    self.entries.remove(&key);
+                }
             }
         }
     }
@@ -2229,6 +2235,25 @@ mod tests {
         assert!(
             !store.has_cold_tier(),
             "memory mode should have no cold tier"
+        );
+    }
+
+    #[test]
+    fn gin_remove_drops_empty_posting_lists() {
+        let mut idx = GinIndex::new();
+        let doc = json_obj(vec![
+            ("type", JsonValue::Str("user".to_string())),
+            ("name", JsonValue::Str("Bob".to_string())),
+        ]);
+        idx.insert(1, &doc);
+        assert!(
+            !idx.entries.is_empty(),
+            "insert must populate posting lists"
+        );
+        idx.remove(1, &doc);
+        assert!(
+            idx.entries.is_empty(),
+            "removing the only document must drop empty posting lists, not leak them"
         );
     }
 }

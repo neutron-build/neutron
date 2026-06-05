@@ -175,12 +175,14 @@ impl RespHandler {
                         return vec![resp];
                     }
                     let mut responses = Vec::new();
+                    // unsubscribe_all already removed every channel, so the
+                    // registry count is now just the surviving patterns. Redis
+                    // reports a DECREMENTING count per message: surviving patterns
+                    // plus the channels still pending later in this batch.
+                    let surviving_patterns = self.pubsub.subscription_count(id);
                     for (i, ch) in channels.iter().enumerate() {
                         let remaining = channels.len() - i - 1;
-                        let pat_count =
-                            self.pubsub.subscription_count(id).saturating_sub(remaining);
-                        let _ = pat_count; // count from registry
-                        let count = self.pubsub.subscription_count(id);
+                        let count = surviving_patterns + remaining;
                         let mut resp = encoder::encode_array_header(3);
                         resp.extend(encoder::encode_bulk_string(b"unsubscribe"));
                         resp.extend(encoder::encode_bulk_string(ch.as_bytes()));

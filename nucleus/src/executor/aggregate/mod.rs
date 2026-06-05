@@ -1474,16 +1474,20 @@ impl Executor {
                         Value::Int64(rank)
                     }
                     "NTILE" => {
-                        let n = arg_expr
+                        let n_raw = arg_expr
                             .and_then(|e| self.eval_row_expr(e, row, col_meta).ok())
                             .and_then(|v| value_to_i64(&v).ok())
-                            .unwrap_or(1) as usize;
-                        let bucket = if n == 0 {
+                            .unwrap_or(1);
+                        // NTILE requires a positive bucket count. A negative arg
+                        // previously wrapped via `as usize` to a huge value; clamp
+                        // to >= 1 and compute in u128 to avoid the rank*n overflow.
+                        let n = n_raw.max(1) as u128;
+                        let bucket = if partition_size == 0 {
                             1
                         } else {
-                            (rank_in_partition * n / partition_size) + 1
+                            ((rank_in_partition as u128 * n) / partition_size as u128) as i64 + 1
                         };
-                        Value::Int64(bucket as i64)
+                        Value::Int64(bucket)
                     }
                     "LAG" => {
                         let offset = 1usize;

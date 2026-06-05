@@ -266,6 +266,34 @@ tracked below and in the Phase C/D batches.
   (2) multi-process topologies (per-process storage/cache, unsupported for shared state). Relay to observe.
 
 **All 10 teploy-observe D-cluster items are now resolved (fixed or verdict-given).**
+
+## Phase C — FIXED (10 still-real med/low from the Phase A sweep)
+
+All verified against current code; the 8 already-fixed and 14 false-positives from Phase A were
+correctly excluded (notably the columnar `i.to_string()` "bug" — a misread of the columnar naming
+convention where columns *are* named by stringified index).
+
+- **btree `insert_internal_entry` corrupt-page bounds** (`storage/btree.rs`) — added the same
+  `pos+2`/`pos+2+key_len+4 > PAGE_SIZE` guards as `find_child` (F-032). No more slice-past-page panic.
+- **zone-map granule u32 overflow** (`executor/dml.rs`) — cumulative `base_row_offset` accumulated in
+  u64 (was u32, wrapped past ~4.29B rows and mis-assigned rows to granule 0).
+- **fast-path `rows_scanned` undercount** (`executor/dml.rs`, UPDATE+DELETE) — `inc_by(matches.len())`
+  instead of a literal 1.
+- **NTILE negative/overflow** (`executor/aggregate/mod.rs`) — clamp the bucket count to ≥1 (a negative
+  arg previously wrapped via `as usize`) and compute `rank*n` in u128.
+- **GIN `remove` empty-set leak** (`document/mod.rs`) — drop the posting list once its set is empty.
+  Test.
+- **datalog checkpoint 4 GiB truncation** (`datalog/mod.rs`) — `u32::try_from` guard on the payload
+  length prefix; fails loudly instead of silently truncating + corrupting the snapshot.
+- **stream `xadd_with_id` ordering** (`pubsub/mod.rs`) — enforce the strictly-increasing invariant
+  `xrange`/`xread` rely on; an out-of-order explicit id is bumped, not stored out of order. Test.
+- **RESP UNSUBSCRIBE-all counts** (`resp/handler.rs`) — report Redis's decrementing per-message count
+  (surviving patterns + pending channels) instead of a constant; removed dead `pat_count` code.
+- **columnar sort missing-key** (`columnar/mod.rs`) — `debug_assert` that every sort key resolves to a
+  real column (a missing one would fall through to `Equal` and silently mis-sort). The `i.to_string()`
+  half of the finding was a false positive.
+- **wire binary unknown-OID param** (`wire/mod.rs`) — a binary-format param with an unknown OID was
+  UTF-8-mangled; decode the standard fixed-width integer widths (2/4/8) instead; text path unchanged.
 **Deferred to Phase G:** one-time `metrics.sh` doc-header sync (STATUS/AUDIT-REPORT/ROADMAP/etc.) —
 pre-existing drift across the whole branch; sync once when test counts stabilize.
 
