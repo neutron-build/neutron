@@ -7,6 +7,17 @@ const SERVER_EXPORT_NAMES = new Set([
   "middleware",
   "headers",
   "getStaticPaths",
+  // HTTP-method handlers for API routes (e.g. rss.xml.ts) are server-only.
+  // Without stripping these from the client route module, their server-side
+  // imports (e.g. getCollection, which reads the filesystem) leak into the
+  // browser bundle and break the build.
+  "GET",
+  "POST",
+  "PUT",
+  "PATCH",
+  "DELETE",
+  "HEAD",
+  "OPTIONS",
 ]);
 
 const SERVER_FILE_RE = /\.server(?:\.[^/\\?#]+)?(?:[?#].*)?$/i;
