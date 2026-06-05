@@ -62,6 +62,84 @@ impl ColumnData {
             ColumnData::Text(_) => "Text",
         }
     }
+
+    /// Read this column as `Option<i64>` values, NULL-preserving. Returns `None`
+    /// if any non-null value cannot be represented losslessly as an integer
+    /// (a fractional float, or text that doesn't parse as an integer). Used to
+    /// unify a mixed-variant column to a numeric common type without panicking.
+    fn as_i64_opt(&self) -> Option<Vec<Option<i64>>> {
+        match self {
+            ColumnData::Bool(v) => Some(v.iter().map(|o| o.map(|b| b as i64)).collect()),
+            ColumnData::Int32(v) => Some(v.iter().map(|o| o.map(|n| n as i64)).collect()),
+            ColumnData::Int64(v) => Some(v.clone()),
+            ColumnData::Float64(v) => v
+                .iter()
+                .map(|o| match o {
+                    None => Some(None),
+                    Some(f) if f.fract() == 0.0 && f.is_finite() => Some(Some(*f as i64)),
+                    Some(_) => None,
+                })
+                .collect(),
+            ColumnData::Text(v) => v
+                .iter()
+                .map(|o| match o {
+                    None => Some(None),
+                    Some(s) => s.trim().parse::<i64>().ok().map(Some),
+                })
+                .collect(),
+        }
+    }
+
+    /// Read this column as `Option<f64>` values, NULL-preserving. Returns `None`
+    /// if any non-null value cannot be parsed as a float.
+    fn as_f64_opt(&self) -> Option<Vec<Option<f64>>> {
+        match self {
+            ColumnData::Bool(v) => Some(v.iter().map(|o| o.map(|b| b as i64 as f64)).collect()),
+            ColumnData::Int32(v) => Some(v.iter().map(|o| o.map(|n| n as f64)).collect()),
+            ColumnData::Int64(v) => Some(v.iter().map(|o| o.map(|n| n as f64)).collect()),
+            ColumnData::Float64(v) => Some(v.clone()),
+            ColumnData::Text(v) => v
+                .iter()
+                .map(|o| match o {
+                    None => Some(None),
+                    Some(s) => s.trim().parse::<f64>().ok().map(Some),
+                })
+                .collect(),
+        }
+    }
+
+    /// Render this column as `Option<String>` values, NULL-preserving. Always
+    /// succeeds — Text is the universal fallback when types can't be unified
+    /// numerically.
+    fn as_text_opt(&self) -> Vec<Option<String>> {
+        match self {
+            ColumnData::Bool(v) => v.iter().map(|o| o.map(|b| b.to_string())).collect(),
+            ColumnData::Int32(v) => v.iter().map(|o| o.map(|n| n.to_string())).collect(),
+            ColumnData::Int64(v) => v.iter().map(|o| o.map(|n| n.to_string())).collect(),
+            ColumnData::Float64(v) => v.iter().map(|o| o.map(|n| n.to_string())).collect(),
+            ColumnData::Text(v) => v.clone(),
+        }
+    }
+}
+
+/// Coerce two columns of differing physical type to a single common variant so
+/// they can be concatenated without panicking. Prefers a numeric common type
+/// (Int64, else Float64) when every value is numeric-representable — so a column
+/// that went mixed-variant from legacy text-bound inserts still orders
+/// numerically (argMax/MAX) — and falls back to Text only when a value can't be
+/// parsed numerically. Defense-in-depth: write-time coercion in `execute_insert`
+/// prevents new mixed batches, but pre-existing data may already be mixed.
+fn unify_columns(a: &ColumnData, b: &ColumnData) -> (ColumnData, ColumnData) {
+    if let (Some(ia), Some(ib)) = (a.as_i64_opt(), b.as_i64_opt()) {
+        return (ColumnData::Int64(ia), ColumnData::Int64(ib));
+    }
+    if let (Some(fa), Some(fb)) = (a.as_f64_opt(), b.as_f64_opt()) {
+        return (ColumnData::Float64(fa), ColumnData::Float64(fb));
+    }
+    (
+        ColumnData::Text(a.as_text_opt()),
+        ColumnData::Text(b.as_text_opt()),
+    )
 }
 
 /// A batch of columns representing a chunk of a table.
@@ -3268,15 +3346,17 @@ fn concat_columns(a: &ColumnData, b: &ColumnData) -> ColumnData {
             result.extend_from_slice(vb);
             ColumnData::Bool(result)
         }
-        // All batches for a table must share column types. A mismatch here would
-        // silently drop `b`'s rows and leave this column shorter than its
-        // siblings (ragged, misaligned batch) — far worse than failing. Treat it
-        // as the schema-corruption invariant violation it is and fail loudly.
-        (a, b) => panic!(
-            "concat_columns: column type mismatch ({} vs {}) — batches for a table must share column types",
-            a.type_name(),
-            b.type_name()
-        ),
+        // Pre-existing mixed-variant batches (e.g. legacy data written before
+        // write-time coercion, where a BIGINT column holds both Text and Int).
+        // A panic here would let one bad writer take down reads for the whole
+        // table; silently dropping `b` would leave a ragged, misaligned column.
+        // Instead unify both sides to a common type (numeric when possible so
+        // version ordering stays correct, else Text) and concatenate — reads
+        // always succeed and the column stays aligned.
+        (a, b) => {
+            let (ca, cb) = unify_columns(a, b);
+            concat_columns(&ca, &cb)
+        }
     }
 }
 
@@ -3865,15 +3945,37 @@ impl ColumnarStore {
 mod tests {
     use super::*;
 
-    // Regression: concat_columns used to `_ => a.clone()` on a type mismatch,
-    // silently dropping b's rows and leaving this column shorter than its
-    // siblings (ragged batch). It must fail loudly instead.
+    // Regression: concat_columns must never panic or drop rows on a mixed-variant
+    // batch (legacy data written before write-time coercion). It used to `_ =>
+    // a.clone()` (ragged), then `panic!` (one bad writer kills reads). Now it
+    // unifies to a common type — numeric when possible so version ordering stays
+    // correct — and keeps every row.
     #[test]
-    #[should_panic(expected = "column type mismatch")]
-    fn concat_columns_type_mismatch_panics() {
-        let a = ColumnData::Int32(vec![Some(1)]);
-        let b = ColumnData::Int64(vec![Some(2)]);
-        let _ = concat_columns(&a, &b);
+    fn concat_columns_unifies_mixed_types_without_panic() {
+        // Int32 + Int64 -> Int64, both rows kept.
+        match concat_columns(
+            &ColumnData::Int32(vec![Some(1)]),
+            &ColumnData::Int64(vec![Some(2)]),
+        ) {
+            ColumnData::Int64(v) => assert_eq!(v, vec![Some(1), Some(2)]),
+            other => panic!("expected Int64, got {}", other.type_name()),
+        }
+        // The BUG-1 case: numeric Text + Int -> Int64 (numeric ordering), no panic.
+        match concat_columns(
+            &ColumnData::Text(vec![Some("5".into())]),
+            &ColumnData::Int32(vec![Some(7)]),
+        ) {
+            ColumnData::Int64(v) => assert_eq!(v, vec![Some(5), Some(7)]),
+            other => panic!("expected Int64, got {}", other.type_name()),
+        }
+        // Non-numeric text + Int -> Text fallback, both rows kept (no panic).
+        match concat_columns(
+            &ColumnData::Text(vec![Some("abc".into())]),
+            &ColumnData::Int32(vec![Some(7)]),
+        ) {
+            ColumnData::Text(v) => assert_eq!(v, vec![Some("abc".into()), Some("7".into())]),
+            other => panic!("expected Text, got {}", other.type_name()),
+        }
     }
 
     fn sample_batch() -> ColumnBatch {

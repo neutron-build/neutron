@@ -287,7 +287,31 @@ impl Executor {
         let mut returned_rows = Vec::new();
         let mut inserted_rows: Vec<Row> = Vec::new();
 
-        for row in source_rows {
+        for mut row in source_rows {
+            // Coerce a text-bound value landing in a numeric/bool column to the
+            // column's declared physical type at write time. A pgwire client (or
+            // a literal like `'5'`) can bind a number as text; without this the
+            // raw `Value::Text` is stored in a typed column, so a later int-bound
+            // insert leaves the column mixed-variant (Text + Int) — which breaks
+            // numeric ordering (argMax/MAX compare lexically) and trips the
+            // columnar concat invariant. The extended-protocol and fast-insert
+            // paths already coerce; this closes the gap for the general INSERT
+            // path. Unparseable text is left as-is for the type/constraint checks
+            // (and the columnar concat fallback) to handle — fail open here, not
+            // by silently zeroing.
+            for (i, col) in table_def.columns.iter().enumerate() {
+                if let Some(v) = row.get_mut(i)
+                    && matches!(v, Value::Text(_))
+                    && matches!(
+                        col.data_type,
+                        DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Bool
+                    )
+                    && let Ok(coerced) = v.cast(&col.data_type)
+                {
+                    *v = coerced;
+                }
+            }
+
             // Fire BEFORE INSERT row-level triggers (only if triggers exist)
             if has_triggers {
                 self.fire_triggers(
