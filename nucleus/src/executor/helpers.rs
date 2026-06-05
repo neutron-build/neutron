@@ -427,11 +427,11 @@ pub(super) fn cmp_with_nulls(
 pub(super) fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Function(func) => {
-            let name = func.name.to_string().to_uppercase();
             if func.over.is_some() {
                 return false; // Window functions are NOT aggregates
             }
-            matches!(
+            let name = func.name.to_string().to_uppercase();
+            if matches!(
                 name.as_str(),
                 "COUNT"
                     | "SUM"
@@ -446,7 +446,23 @@ pub(super) fn contains_aggregate(expr: &Expr) -> bool {
                     | "EVERY"
                     | "BIT_AND"
                     | "BIT_OR"
-            )
+            ) {
+                return true;
+            }
+            // A non-aggregate scalar function may still wrap an aggregate in its
+            // arguments, e.g. COALESCE(MAX(id), 0). Recurse so the query is
+            // routed to the aggregate path instead of per-row evaluation.
+            if let ast::FunctionArguments::List(arg_list) = &func.args {
+                return arg_list.args.iter().any(|arg| match arg {
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(inner))
+                    | ast::FunctionArg::Named {
+                        arg: ast::FunctionArgExpr::Expr(inner),
+                        ..
+                    } => contains_aggregate(inner),
+                    _ => false,
+                });
+            }
+            false
         }
         Expr::BinaryOp { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
         Expr::UnaryOp { expr, .. } => contains_aggregate(expr),

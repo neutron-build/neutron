@@ -1789,3 +1789,70 @@ async fn test_nullif_null_edge_cases() {
         "NULLIF(5, 6) should not be NULL"
     );
 }
+
+// ── D-10 (teploy-observe): aggregate-detection / evaluation bugs ──
+
+#[tokio::test]
+async fn test_cast_over_aggregate_returns_one_row() {
+    // CAST(COUNT(*) AS TEXT) previously returned 3 NULL rows (aggregate not
+    // detected under the cast → per-row projection). Must return one row "3".
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t (id INT)").await;
+    exec(&ex, "INSERT INTO t VALUES (1)").await;
+    exec(&ex, "INSERT INTO t VALUES (2)").await;
+    exec(&ex, "INSERT INTO t VALUES (3)").await;
+
+    let r = exec(&ex, "SELECT CAST(COUNT(*) AS TEXT) FROM t").await;
+    assert_eq!(scalar(&r[0]), &Value::Text("3".into()));
+    // PG-style :: cast spelling routes the same way.
+    let r2 = exec(&ex, "SELECT COUNT(*)::text FROM t").await;
+    assert_eq!(scalar(&r2[0]), &Value::Text("3".into()));
+}
+
+#[tokio::test]
+async fn test_scalar_fn_wrapping_aggregate() {
+    // COALESCE(MAX(id), 0) previously errored ("aggregate outside context").
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t (id INT)").await;
+    exec(&ex, "INSERT INTO t VALUES (1)").await;
+    exec(&ex, "INSERT INTO t VALUES (3)").await;
+    exec(&ex, "INSERT INTO t VALUES (2)").await;
+
+    let r = exec(&ex, "SELECT COALESCE(MAX(id), 0) FROM t").await;
+    assert_eq!(scalar(&r[0]), &Value::Int32(3));
+
+    // Empty table: MAX→NULL, COALESCE→0, still one row.
+    exec(&ex, "CREATE TABLE e (id INT)").await;
+    let re = exec(&ex, "SELECT COALESCE(MAX(id), 0) FROM e").await;
+    assert_eq!(scalar(&re[0]), &Value::Int32(0));
+}
+
+#[tokio::test]
+async fn test_having_aggregate_not_in_projection() {
+    // HAVING COUNT(*) >= N where COUNT(*) is NOT in the SELECT list previously
+    // dropped every group (the aggregate was only collected from the
+    // projection, so the HAVING filter had nothing to evaluate).
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE g (name TEXT)").await;
+    exec(&ex, "INSERT INTO g VALUES ('a')").await;
+    exec(&ex, "INSERT INTO g VALUES ('a')").await;
+    exec(&ex, "INSERT INTO g VALUES ('b')").await;
+
+    // Count NOT in projection.
+    let r = exec(&ex, "SELECT name FROM g GROUP BY name HAVING COUNT(*) >= 2").await;
+    let rs = rows(&r[0]);
+    assert_eq!(rs.len(), 1, "only 'a' has count >= 2");
+    assert_eq!(rs[0][0], Value::Text("a".into()));
+
+    // Count IN projection still works (regression guard for the symmetric case).
+    let r2 = exec(
+        &ex,
+        "SELECT name, COUNT(*) FROM g GROUP BY name HAVING COUNT(*) >= 2",
+    )
+    .await;
+    assert_eq!(rows(&r2[0]).len(), 1);
+
+    // Lower threshold returns all groups.
+    let r3 = exec(&ex, "SELECT name FROM g GROUP BY name HAVING COUNT(*) >= 1").await;
+    assert_eq!(rows(&r3[0]).len(), 2);
+}

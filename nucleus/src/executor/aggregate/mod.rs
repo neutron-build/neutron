@@ -18,8 +18,8 @@ use crate::simd;
 use crate::types::{DataType, Row, Value};
 
 use super::helpers::{
-    compare_values, compute_window_frame_bounds, infer_expr_type, value_to_f64, value_to_i64,
-    value_type,
+    compare_values, compute_window_frame_bounds, contains_aggregate, infer_expr_type,
+    value_to_ast_expr, value_to_f64, value_to_i64, value_type,
 };
 use super::types::ColMeta;
 use super::{ExecError, ExecResult, Executor};
@@ -529,45 +529,145 @@ impl Executor {
         match expr {
             Expr::Function(func) => {
                 let fname = func.name.to_string().to_uppercase();
-                if matches!(
-                    fname.as_str(),
-                    "COUNT"
-                        | "SUM"
-                        | "AVG"
-                        | "MIN"
-                        | "MAX"
-                        | "STRING_AGG"
-                        | "ARRAY_AGG"
-                        | "JSON_AGG"
-                        | "BOOL_AND"
-                        | "BOOL_OR"
-                        | "EVERY"
-                        | "BIT_AND"
-                        | "BIT_OR"
-                ) {
+                if Self::is_aggregate_fn_name(&fname) && func.over.is_none() {
                     return self.eval_aggregate_fn(&fname, func, all_rows, indices, col_meta);
                 }
-                // Non-aggregate function — evaluate per first row
-                if let Some(&first_idx) = indices.first() {
-                    self.eval_row_expr(expr, &all_rows[first_idx], col_meta)
-                } else {
-                    Ok(Value::Null)
-                }
+                // Non-aggregate function (e.g. COALESCE, ROUND) that may still
+                // wrap an aggregate in its arguments — e.g. COALESCE(MAX(id), 0).
+                self.eval_scalar_over_aggregates(expr, all_rows, indices, col_meta)
             }
             Expr::BinaryOp { left, op, right } => {
                 let l = self.eval_aggregate_expr(left, all_rows, indices, col_meta)?;
                 let r = self.eval_aggregate_expr(right, all_rows, indices, col_meta)?;
                 self.eval_binary_op(&l, op, &r)
             }
-            // For non-aggregate expressions, use the first row's value
-            _ => {
-                if let Some(&first_idx) = indices.first() {
-                    self.eval_row_expr(expr, &all_rows[first_idx], col_meta)
-                } else {
-                    Ok(Value::Null)
-                }
+            // Casts, CASE, etc. wrapping an aggregate — e.g. CAST(COUNT(*) AS TEXT).
+            _ => self.eval_scalar_over_aggregates(expr, all_rows, indices, col_meta),
+        }
+    }
+
+    /// True for the aggregate function names this executor recognizes.
+    fn is_aggregate_fn_name(name: &str) -> bool {
+        matches!(
+            name,
+            "COUNT"
+                | "SUM"
+                | "AVG"
+                | "MIN"
+                | "MAX"
+                | "STRING_AGG"
+                | "ARRAY_AGG"
+                | "JSON_AGG"
+                | "BOOL_AND"
+                | "BOOL_OR"
+                | "EVERY"
+                | "BIT_AND"
+                | "BIT_OR"
+        )
+    }
+
+    /// Evaluate a scalar expression (cast, CASE, COALESCE/ROUND/…) that may wrap
+    /// aggregate calls in its sub-expressions. Aggregate sub-expressions are
+    /// computed over the group and substituted with their literal values, then
+    /// the resulting pure-scalar expression is evaluated with the full row
+    /// evaluator against the group's first row (which also resolves any GROUP BY
+    /// key column references in the projection).
+    fn eval_scalar_over_aggregates(
+        &self,
+        expr: &Expr,
+        all_rows: &[Row],
+        indices: &[usize],
+        col_meta: &[ColMeta],
+    ) -> Result<Value, ExecError> {
+        let empty: Row = Vec::new();
+        let row: &Row = indices.first().map(|&i| &all_rows[i]).unwrap_or(&empty);
+        if !contains_aggregate(expr) {
+            // Pure scalar / group-key expression.
+            return self.eval_row_expr(expr, row, col_meta);
+        }
+        let mut rewritten = expr.clone();
+        self.substitute_aggregates_inplace(&mut rewritten, all_rows, indices, col_meta)?;
+        // After substitution the expression has no aggregate calls left.
+        self.eval_row_expr(&rewritten, row, col_meta)
+    }
+
+    /// Recursively replace aggregate function calls in `expr` with the literal
+    /// value they evaluate to over the group. Non-aggregate nodes are left in
+    /// place (their children are still visited, so nested aggregates inside a
+    /// scalar function's arguments are substituted too).
+    fn substitute_aggregates_inplace(
+        &self,
+        expr: &mut Expr,
+        all_rows: &[Row],
+        indices: &[usize],
+        col_meta: &[ColMeta],
+    ) -> Result<(), ExecError> {
+        if let Expr::Function(func) = expr {
+            let fname = func.name.to_string().to_uppercase();
+            if func.over.is_none() && Self::is_aggregate_fn_name(&fname) {
+                let v = self.eval_aggregate_fn(&fname, func, all_rows, indices, col_meta)?;
+                *expr = value_to_ast_expr(&v);
+                return Ok(());
             }
         }
+        match expr {
+            Expr::BinaryOp { left, right, .. } => {
+                self.substitute_aggregates_inplace(left, all_rows, indices, col_meta)?;
+                self.substitute_aggregates_inplace(right, all_rows, indices, col_meta)?;
+            }
+            Expr::UnaryOp { expr: inner, .. }
+            | Expr::Nested(inner)
+            | Expr::Cast { expr: inner, .. } => {
+                self.substitute_aggregates_inplace(inner, all_rows, indices, col_meta)?;
+            }
+            Expr::Function(func) => {
+                if let ast::FunctionArguments::List(list) = &mut func.args {
+                    for arg in &mut list.args {
+                        match arg {
+                            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(inner))
+                            | ast::FunctionArg::Named {
+                                arg: ast::FunctionArgExpr::Expr(inner),
+                                ..
+                            } => {
+                                self.substitute_aggregates_inplace(
+                                    inner, all_rows, indices, col_meta,
+                                )?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                if let Some(op) = operand {
+                    self.substitute_aggregates_inplace(op, all_rows, indices, col_meta)?;
+                }
+                for cw in conditions.iter_mut() {
+                    self.substitute_aggregates_inplace(
+                        &mut cw.condition,
+                        all_rows,
+                        indices,
+                        col_meta,
+                    )?;
+                    self.substitute_aggregates_inplace(
+                        &mut cw.result,
+                        all_rows,
+                        indices,
+                        col_meta,
+                    )?;
+                }
+                if let Some(e) = else_result {
+                    self.substitute_aggregates_inplace(e, all_rows, indices, col_meta)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Build a trivial index array `[0, 1, 2, ..., n-1]` for callers that already

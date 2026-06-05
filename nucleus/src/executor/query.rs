@@ -235,8 +235,21 @@ impl Executor {
             };
         }
 
-        // Detect aggregate functions in the projection
-        let agg_funcs = Self::extract_aggregate_names(&select.projection);
+        // Detect aggregate functions in the projection.
+        let mut agg_funcs = Self::extract_aggregate_names(&select.projection);
+        // Aggregates referenced ONLY in HAVING (e.g. `SELECT name ... HAVING
+        // COUNT(*) >= 2` with COUNT not in the SELECT list) must still be
+        // computed by the aggregate node — otherwise the HAVING filter has no
+        // aggregate column to evaluate against and silently drops every group.
+        if let Some(having_expr) = &select.having {
+            let mut having_aggs = Vec::new();
+            Self::collect_aggregates_from_expr(having_expr, &mut having_aggs);
+            for a in having_aggs {
+                if !agg_funcs.contains(&a) {
+                    agg_funcs.push(a);
+                }
+            }
+        }
 
         // GROUP BY
         let has_group_by = if let ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
@@ -609,7 +622,13 @@ impl Executor {
                 Self::collect_aggregates_from_expr(left, out);
                 Self::collect_aggregates_from_expr(right, out);
             }
-            Expr::Nested(inner) => {
+            Expr::UnaryOp { expr: inner, .. } => {
+                Self::collect_aggregates_from_expr(inner, out);
+            }
+            Expr::Nested(inner) | Expr::Cast { expr: inner, .. } => {
+                // e.g. CAST(COUNT(*) AS TEXT) — the aggregate is nested under
+                // the cast and must still be collected so an Aggregate node is
+                // built (otherwise the projection runs per source row).
                 Self::collect_aggregates_from_expr(inner, out);
             }
             _ => {}
@@ -743,8 +762,12 @@ impl Executor {
                         .as_ref()
                         .is_some_and(|e| Self::expr_has_unsupported(e))
             }
-            // CAST is now supported
-            Expr::Cast { expr, .. } => Self::expr_has_unsupported(expr),
+            // CAST is now supported — EXCEPT when it wraps an aggregate
+            // (e.g. CAST(COUNT(*) AS TEXT)). The plan path's Project node can't
+            // evaluate a cast over an aggregated value (it derives the column by
+            // string-parsing the expr), so route such casts to the AST aggregate
+            // path, which substitutes the aggregate then casts.
+            Expr::Cast { expr, .. } => contains_aggregate(expr) || Self::expr_has_unsupported(expr),
             // BETWEEN is supported (including negated)
             Expr::Between {
                 expr, low, high, ..
