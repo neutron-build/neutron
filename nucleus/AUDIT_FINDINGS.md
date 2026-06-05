@@ -236,9 +236,20 @@ tracked below and in the Phase C/D batches.
   from the projection only, so a HAVING-only aggregate was never computed. → also collect
   aggregates from the HAVING clause. Test (count in/out of projection + threshold).
 
-**Still open (Phase B3):** D-7 ALTER COLUMN TYPE divergence; D-4/D-8 missing features
-(argMax/percentile/SummingMergeTree) — fix the safe ALTER guard, implement the high-value standard
-features (percentile_cont/disc, argMax), give observe a clear verdict on the rest. D-9 doc-only.
+### Phase B3a — FIXED (ALTER COLUMN TYPE)
+
+- **D-7 ALTER COLUMN TYPE silent divergence** — `SetDataType` mutated only the catalog; physical
+  storage keeps the value's original variant, so a columnar/MergeTree table read back the stale
+  type while the catalog claimed the new one. → on a type change, rewrite the stored column by
+  casting each value (`scan_physical` + `Value::cast` + `update`); a value that can't cast aborts
+  the ALTER with a clear error (catalog untouched — verified). `TEXT '10' → BIGINT` now reads back
+  `Int64(10)` and `SUM` works. Tests: successful rewrite + atomic rejection on an uncastable value.
+
+**Still open (Phase B3b — features, not bugs):** D-4/D-8 — `argMax`/`argMin`, `percentile_cont/disc`
+(p50/p95/p99), `SummingMergeTree`, and read-time collapse for `AggregatingMergeTree`. Blessed path
+per the brief is "implement or tell observe to use pattern Y". Plan: implement the high-value
+standard-SQL ones (percentile_cont/disc, argMax/argMin); for SummingMergeTree + aggregating
+read-time collapse, decide implement-vs-document. D-9 is doc-only (visibility caveats to observe).
 **Deferred to Phase G:** one-time `metrics.sh` doc-header sync (STATUS/AUDIT-REPORT/ROADMAP/etc.) —
 pre-existing drift across the whole branch; sync once when test counts stabilize.
 
