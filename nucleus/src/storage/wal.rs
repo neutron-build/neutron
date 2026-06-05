@@ -69,6 +69,19 @@ const PAGE_WRITE_RECORD_SIZE: usize = RECORD_HEADER_SIZE + PAGE_SIZE + RECORD_CR
 /// Record size for control records (commit, abort, checkpoint) — no page data.
 const CONTROL_RECORD_SIZE: usize = RECORD_HEADER_SIZE + RECORD_CRC_SIZE;
 
+/// CRC over a page-write record's authenticated bytes: the header
+/// (lsn, txn_id, record_type, page_id) followed by the page image. Covering the
+/// header — not just the page — means a corrupt page_id or txn_id is detected on
+/// replay instead of being silently applied to the wrong page / attributed to the
+/// wrong transaction. (Control records already CRC their header fields.)
+fn page_write_crc(lsn: u64, txn_id: u64, page_id: u32, page_image: &[u8]) -> u32 {
+    let mut crc = crc32c::crc32c(&lsn.to_le_bytes());
+    crc = crc32c::crc32c_append(crc, &txn_id.to_le_bytes());
+    crc = crc32c::crc32c_append(crc, &[RECORD_PAGE_WRITE]);
+    crc = crc32c::crc32c_append(crc, &page_id.to_le_bytes());
+    crc32c::crc32c_append(crc, page_image)
+}
+
 // ============================================================================
 // WAL record (in-memory representation)
 // ============================================================================
@@ -206,8 +219,8 @@ impl Wal {
         writer.write_all(&page_id.to_le_bytes())?;
         writer.write_all(page_image)?;
 
-        // CRC over the entire record (excluding the record_len prefix and crc itself)
-        let crc = crc32c::crc32c(page_image);
+        // CRC over header (lsn/txn_id/type/page_id) + page image — see page_write_crc.
+        let crc = page_write_crc(lsn, txn_id, page_id, page_image);
         writer.write_all(&crc.to_le_bytes())?;
 
         self.writes.fetch_add(1, Ordering::Relaxed);
@@ -392,9 +405,10 @@ pub fn read_wal_records(path: &Path) -> std::io::Result<Vec<WalRecord>> {
         let stored_crc = u32::from_le_bytes(crc_buf);
 
         if record_type == RECORD_PAGE_WRITE {
-            // For page writes, CRC is over the page image
+            // For page writes, CRC is over the header (lsn/txn_id/type/page_id)
+            // plus the page image — see page_write_crc.
             if let Some(ref img) = page_image {
-                let computed = crc32c::crc32c(img.as_ref());
+                let computed = page_write_crc(lsn, txn_id, page_id, img.as_ref());
                 if computed != stored_crc {
                     tracing::error!(
                         "WAL CORRUPTION: CRC mismatch at LSN {lsn} (page write): stored={stored_crc:#x}, computed={computed:#x}. \
@@ -587,7 +601,7 @@ impl SegmentedWal {
         active.writer.write_all(&[RECORD_PAGE_WRITE])?;
         active.writer.write_all(&page_id.to_le_bytes())?;
         active.writer.write_all(page_image)?;
-        let crc = crc32c::crc32c(page_image);
+        let crc = page_write_crc(lsn, txn_id, page_id, page_image);
         active.writer.write_all(&crc.to_le_bytes())?;
 
         active.bytes_written += record_len as u64;
@@ -1003,6 +1017,41 @@ mod tests {
         assert!(records.iter().all(|r| r.record_type == RECORD_COMMIT));
         assert_eq!(records[0].txn_id, 2);
         assert_eq!(records[1].txn_id, 3);
+    }
+
+    #[test]
+    fn wal_page_write_detects_header_corruption() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("hdr.wal");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            let page = Box::new([0u8; PAGE_SIZE]);
+            wal.log_page_write(42, 7, &page).unwrap(); // txn_id=42, page_id=7
+            wal.sync().unwrap();
+        }
+        // Sanity: the record reads back.
+        assert_eq!(read_wal_records(&wal_path).unwrap().len(), 1);
+
+        // Corrupt the page_id field in the HEADER (not the page body). Before the
+        // header-CRC fix the CRC covered only the page image, so this corruption
+        // went undetected and the page would be applied to the wrong page_id.
+        let page_id_off = (RECORD_HEADER_SIZE - 4) as u64; // 25 - 4 = 21
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(page_id_off)).unwrap();
+            f.write_all(&[0xAB]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let records = read_wal_records(&wal_path).unwrap();
+        assert!(
+            records.is_empty(),
+            "page-write header corruption must now be caught by the CRC"
+        );
     }
 
     #[test]
