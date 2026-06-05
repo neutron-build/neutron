@@ -51,4 +51,24 @@ describe("server-only module handling", () => {
     expect(transformed.includes("export const config")).toBe(true);
     expect(transformed.includes("export default function Page")).toBe(true);
   });
+
+  it("strips HTTP-method handler exports from API routes (e.g. rss.xml.ts)", () => {
+    // Regression: a GET handler that reads content must not survive into the
+    // client bundle, or its server-side import (getCollection -> node:fs) leaks
+    // and breaks the build. After stripping GET, the now-unused import is
+    // tree-shaken by the bundler (core is sideEffects:false).
+    const code = `
+      import { getCollection } from "@neutron-build/core";
+      export async function GET() {
+        const posts = await getCollection("blog");
+        return new Response("<rss/>");
+      }
+      export const POST = async () => new Response("ok");
+    `;
+
+    const transformed = stripServerOnlyRouteModule(code);
+
+    expect(transformed.includes("export async function GET")).toBe(false);
+    expect(transformed.includes("export const POST")).toBe(false);
+  });
 });
