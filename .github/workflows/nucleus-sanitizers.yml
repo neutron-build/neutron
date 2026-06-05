@@ -1,0 +1,33 @@
+name: Nucleus Sanitizers (Linux)
+
+# AddressSanitizer + LeakSanitizer run for Nucleus — the memory-safety / leak
+# check that can't run on macOS. Slow (instrumented), so it runs weekly and on
+# demand rather than on every push.
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  sanitizers:
+    name: ASan + LSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly + std target
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+
+      - name: ASan + LSan leak check
+        run: bash scripts/linux-leak-check.sh
+        working-directory: nucleus
