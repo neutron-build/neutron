@@ -1076,27 +1076,68 @@ impl Executor {
                 }
                 ast::AlterTableOperation::AlterColumn { column_name, op } => {
                     let mut updated = (*table_def).clone();
-                    let col = updated
+                    let col_idx = updated
                         .columns
-                        .iter_mut()
-                        .find(|c| c.name == column_name.value)
+                        .iter()
+                        .position(|c| c.name == column_name.value)
                         .ok_or_else(|| ExecError::ColumnNotFound(column_name.value.clone()))?;
-                    match op {
-                        ast::AlterColumnOperation::SetNotNull => col.nullable = false,
-                        ast::AlterColumnOperation::DropNotNull => col.nullable = true,
-                        ast::AlterColumnOperation::SetDefault { value } => {
-                            col.default_expr = Some(value.to_string());
+                    // Set when SetDataType changes the type: triggers a physical rewrite below.
+                    let mut retype: Option<DataType> = None;
+                    {
+                        let col = &mut updated.columns[col_idx];
+                        match op {
+                            ast::AlterColumnOperation::SetNotNull => col.nullable = false,
+                            ast::AlterColumnOperation::DropNotNull => col.nullable = true,
+                            ast::AlterColumnOperation::SetDefault { value } => {
+                                col.default_expr = Some(value.to_string());
+                            }
+                            ast::AlterColumnOperation::DropDefault => {
+                                col.default_expr = None;
+                            }
+                            ast::AlterColumnOperation::SetDataType { data_type, .. } => {
+                                let new_type = sql::convert_data_type(data_type)?;
+                                if col.data_type != new_type {
+                                    retype = Some(new_type.clone());
+                                }
+                                col.data_type = new_type;
+                            }
+                            _ => {
+                                return Err(ExecError::Unsupported(format!(
+                                    "ALTER COLUMN operation not yet supported: {op}"
+                                )));
+                            }
                         }
-                        ast::AlterColumnOperation::DropDefault => {
-                            col.default_expr = None;
+                    }
+                    // ALTER COLUMN … TYPE: rewrite stored values so the physical
+                    // representation matches the new declared type. Without this the
+                    // catalog claims the new type while storage still holds the old
+                    // physical representation — columnar/MergeTree tables reconstruct
+                    // values from the physical ColumnData variant and would read back
+                    // the stale type (silent catalog/storage divergence). A value that
+                    // can't be cast to the new type aborts the ALTER with a clear error.
+                    if let Some(new_type) = retype {
+                        let storage = self.storage_for(&table_name);
+                        let rows = storage.scan_physical(&table_name).await?;
+                        let mut rewrites = Vec::new();
+                        for (pos, mut row) in rows {
+                            if let Some(v) = row.get(col_idx)
+                                && !matches!(v, Value::Null)
+                            {
+                                let cast = v.cast(&new_type).map_err(|_| {
+                                    ExecError::Unsupported(format!(
+                                        "ALTER COLUMN {} TYPE {new_type}: existing value \
+                                         {v:?} cannot be cast to the new type",
+                                        column_name.value
+                                    ))
+                                })?;
+                                if &cast != v {
+                                    row[col_idx] = cast;
+                                    rewrites.push((pos, row));
+                                }
+                            }
                         }
-                        ast::AlterColumnOperation::SetDataType { data_type, .. } => {
-                            col.data_type = sql::convert_data_type(data_type)?;
-                        }
-                        _ => {
-                            return Err(ExecError::Unsupported(format!(
-                                "ALTER COLUMN operation not yet supported: {op}"
-                            )));
+                        if !rewrites.is_empty() {
+                            storage.update(&table_name, &rewrites).await?;
                         }
                     }
                     self.catalog.update_table(updated).await?;
