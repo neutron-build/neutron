@@ -4323,19 +4323,19 @@ impl Executor {
                 .position(|(c, _)| c.eq_ignore_ascii_case(name))
         };
 
-        // WHERE: attempt to extract a single equality predicate
-        // If WHERE is present but isn't `col = literal`, bail out.
-        // Returns None to fall through to normal scan for unsupported predicates.
-        let eq_filter: Option<(usize, Value)> = match &select.selection {
+        // WHERE: attempt to extract a single `col OP literal` predicate (=, !=,
+        // <, <=, >, >=). If WHERE is present but isn't that shape, bail out and
+        // let the normal scan path handle it.
+        let cmp_filter: Option<(usize, crate::storage::FilterOp, Value)> = match &select.selection {
             None => None,
             Some(expr) => {
-                match Self::extract_fast_eq_filter(expr, &resolve_col) {
-                    Some((col_idx, val)) => {
+                match Self::extract_fast_cmp_filter(expr, &resolve_col) {
+                    Some((col_idx, op, val)) => {
                         // Coerce the literal to match the column's declared type.
                         // SQL parser always produces Int64 for integer literals, but
                         // columns declared as INT store Int32 values.
                         let coerced = Self::coerce_to_column_type(&val, &col_info[col_idx].1);
-                        Some((col_idx, coerced))
+                        Some((col_idx, op, coerced))
                     }
                     None => return Ok(None), // WHERE too complex
                 }
@@ -4345,7 +4345,7 @@ impl Executor {
         // GROUP BY + WHERE is not fast-pathed yet (would need filtered group-by)
         let group_by_col: Option<usize> = match &select.group_by {
             ast::GroupByExpr::Expressions(exprs, _) if exprs.len() == 1 => {
-                if eq_filter.is_some() {
+                if cmp_filter.is_some() {
                     return Ok(None); // GROUP BY + WHERE: fall through
                 }
                 match &exprs[0] {
@@ -4545,10 +4545,20 @@ impl Executor {
         let mut result_row: Row = Vec::new();
         let mut col_defs: Vec<(String, DataType)> = Vec::new();
 
+        // Filtered MIN/MAX is not fast-pathed (fast_min_f64/fast_max_f64 ignore
+        // the predicate), so a WHERE + MIN/MAX must fall back to the general path.
+        if cmp_filter.is_some()
+            && items
+                .iter()
+                .any(|(_, a)| matches!(a, FastAgg::Min(_) | FastAgg::Max(_)))
+        {
+            return Ok(None);
+        }
+
         // Helper: call the right sum variant based on whether a filter is active.
         let sum_or_filtered = |ci: usize| -> Option<(f64, usize)> {
-            match &eq_filter {
-                Some((fc, fv)) => tbl_storage.fast_sum_f64_filtered(&table_name, ci, *fc, fv),
+            match &cmp_filter {
+                Some((fc, op, fv)) => tbl_storage.fast_sum_f64_cmp(&table_name, ci, *fc, *op, fv),
                 None => tbl_storage.fast_sum_f64(&table_name, ci),
             }
         };
@@ -4556,9 +4566,9 @@ impl Executor {
         for (col_label, agg) in &items {
             match agg {
                 FastAgg::Count => {
-                    let n = match &eq_filter {
-                        Some((fc, fv)) => {
-                            match tbl_storage.fast_count_filtered(&table_name, *fc, fv) {
+                    let n = match &cmp_filter {
+                        Some((fc, op, fv)) => {
+                            match tbl_storage.fast_count_cmp(&table_name, *fc, *op, fv) {
                                 Some(c) => c as i64,
                                 None => return Ok(None),
                             }
@@ -4694,6 +4704,53 @@ impl Executor {
             }
             _ => None,
         }
+    }
+
+    /// Extract a single `col OP literal` predicate (=, !=, <, <=, >, >=) for the
+    /// columnar filtered-aggregate fast path. Returns the column index, the
+    /// operator (flipped if the column is on the right), and the literal.
+    pub(super) fn extract_fast_cmp_filter(
+        expr: &Expr,
+        resolve_col: &dyn Fn(&str) -> Option<usize>,
+    ) -> Option<(usize, crate::storage::FilterOp, Value)> {
+        use crate::storage::FilterOp;
+        let Expr::BinaryOp { left, op, right } = expr else {
+            return None;
+        };
+        let fop = match op {
+            ast::BinaryOperator::Eq => FilterOp::Eq,
+            ast::BinaryOperator::NotEq => FilterOp::Ne,
+            ast::BinaryOperator::Lt => FilterOp::Lt,
+            ast::BinaryOperator::LtEq => FilterOp::Le,
+            ast::BinaryOperator::Gt => FilterOp::Gt,
+            ast::BinaryOperator::GtEq => FilterOp::Ge,
+            _ => return None,
+        };
+        let left_is_col = matches!(
+            left.as_ref(),
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_)
+        );
+        let right_is_col = matches!(
+            right.as_ref(),
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_)
+        );
+        // If the column is on the right (`40 < age`), flip the operator so it
+        // reads as `col OP literal` (`age > 40`).
+        let (col_expr, lit_expr, fop) = if left_is_col && !right_is_col {
+            (left.as_ref(), right.as_ref(), fop)
+        } else if right_is_col && !left_is_col {
+            (right.as_ref(), left.as_ref(), fop.flip())
+        } else {
+            return None;
+        };
+        let col_name = match col_expr {
+            Expr::Identifier(id) => id.value.as_str(),
+            Expr::CompoundIdentifier(ids) => ids.last()?.value.as_str(),
+            _ => return None,
+        };
+        let col_idx = resolve_col(col_name)?;
+        let val = Self::ast_expr_to_literal(lit_expr)?;
+        Some((col_idx, fop, val))
     }
 
     /// Coerce a value to match the storage format used by eval_value.
