@@ -4249,24 +4249,35 @@ impl Executor {
         }
 
         let mut rows = Vec::new();
+        // Track whether the engine's point-index is actually usable. An engine
+        // that does not maintain a B-tree index (e.g. the LSM engine) returns
+        // `Ok(None)` from `index_lookup_sync` for every probe. If we never see a
+        // single `Ok(Some(_))`, this per-key fallback cannot service the range
+        // and would otherwise return `Some(vec![])` — which the caller treats as
+        // an authoritative (empty) index result, silently dropping all rows
+        // instead of falling back to the full scan + filter path. Returning
+        // `None` here forces that correct fallback.
+        let mut index_usable = false;
         for k in lo..=hi {
             // Probe both integer encodings to tolerate Int32/Int64 schema storage.
             let candidates = [Value::Int32(k as i32), Value::Int64(k)];
-            let mut matched = false;
             for candidate in &candidates {
                 if let Ok(Some(mut found)) = self
                     .storage_for(table_name)
                     .index_lookup_sync(table_name, index_name, candidate)
-                    && !found.is_empty()
                 {
-                    rows.append(&mut found);
-                    matched = true;
-                    break;
+                    // The engine answered the lookup — its index is usable, even
+                    // if this particular key has no matching row.
+                    index_usable = true;
+                    if !found.is_empty() {
+                        rows.append(&mut found);
+                        break;
+                    }
                 }
             }
-            if matched {
-                continue;
-            }
+        }
+        if !index_usable {
+            return None;
         }
         Some(rows)
     }
@@ -4591,11 +4602,25 @@ impl Executor {
                 None => return Ok(None),
             };
 
+            // The group key keeps its native column type (the columnar engine now
+            // returns integer keys as Int*, not Text), so the GroupKey output
+            // column dtype is derived from the actual key value rather than
+            // hardcoded to Text — otherwise ORDER BY would sort it lexically.
+            let group_key_dtype = groups
+                .first()
+                .map(|(key, _, _)| match key {
+                    Value::Int32(_) => DataType::Int32,
+                    Value::Int64(_) => DataType::Int64,
+                    Value::Float64(_) => DataType::Float64,
+                    Value::Bool(_) => DataType::Bool,
+                    _ => DataType::Text,
+                })
+                .unwrap_or(DataType::Text);
             let col_defs: Vec<(String, DataType)> = items
                 .iter()
                 .map(|(name, t)| {
                     let dtype = match t {
-                        FastAgg::GroupKey => DataType::Text,
+                        FastAgg::GroupKey => group_key_dtype.clone(),
                         FastAgg::Count => DataType::Int64,
                         FastAgg::Sum(_) | FastAgg::Avg(_) | FastAgg::Min(_) | FastAgg::Max(_) => {
                             DataType::Float64

@@ -128,6 +128,13 @@ name = "fuzz"
 path = "src/bin/fuzz.rs"
 required-features = ["server", "rusqlite"]
 
+# Extended SQL differential fuzzer (also vs SQLite) — needs rusqlite, so it must
+# be gated like `fuzz` or a plain `cargo build` fails to resolve the dep.
+[[bin]]
+name = "probe_sqlext"
+path = "src/bin/probe_sqlext.rs"
+required-features = ["server", "rusqlite"]
+
 [[bench]]
 name = "query_bench"
 harness = false
