@@ -954,6 +954,27 @@ class TestPubSub:
         with pytest.raises(AppError):
             await ps.subscriber_count("ch")
 
+    @pytest.mark.asyncio
+    async def test_publish_plain_postgres_uses_pg_notify(self, plain_features):
+        # P0.1: the NOTIFY *statement* rejects bind params; publish must use the
+        # pg_notify() function so it works on plain Postgres.
+        from unittest.mock import AsyncMock, MagicMock
+
+        conn = AsyncMock()
+        conn.execute = AsyncMock(return_value="SELECT 1")
+        acquire_ctx = AsyncMock()
+        acquire_ctx.__aenter__.return_value = conn
+        acquire_ctx.__aexit__.return_value = None
+        pool = MagicMock()
+        pool.acquire.return_value = acquire_ctx
+
+        ps = PubSubModel(pool, _make_exec(conn), plain_features)
+        n = await ps.publish("events", "hello")
+        assert n == 0
+        conn.execute.assert_awaited_once_with(
+            "SELECT pg_notify($1, $2)", "events", "hello"
+        )
+
 
 # ============================================================
 # SQL Model
