@@ -4662,50 +4662,6 @@ impl Executor {
         }))
     }
 
-    /// Extract a simple `col = literal` equality predicate from a WHERE expression.
-    /// Returns `(col_idx, value)` if the WHERE is exactly one equality comparison
-    /// against a literal. Returns None for anything more complex.
-    pub(super) fn extract_fast_eq_filter(
-        expr: &Expr,
-        resolve_col: &dyn Fn(&str) -> Option<usize>,
-    ) -> Option<(usize, Value)> {
-        match expr {
-            Expr::BinaryOp {
-                left,
-                op: ast::BinaryOperator::Eq,
-                right,
-            } => {
-                // Determine which side is the column and which is the literal
-                let (col_expr, lit_expr) = {
-                    let left_is_col = matches!(
-                        left.as_ref(),
-                        Expr::Identifier(_) | Expr::CompoundIdentifier(_)
-                    );
-                    let right_is_col = matches!(
-                        right.as_ref(),
-                        Expr::Identifier(_) | Expr::CompoundIdentifier(_)
-                    );
-                    if left_is_col && !right_is_col {
-                        (left.as_ref(), right.as_ref())
-                    } else if right_is_col && !left_is_col {
-                        (right.as_ref(), left.as_ref())
-                    } else {
-                        return None;
-                    }
-                };
-                let col_name = match col_expr {
-                    Expr::Identifier(id) => id.value.as_str(),
-                    Expr::CompoundIdentifier(ids) => ids.last()?.value.as_str(),
-                    _ => return None,
-                };
-                let col_idx = resolve_col(col_name)?;
-                let val = Self::ast_expr_to_literal(lit_expr)?;
-                Some((col_idx, val))
-            }
-            _ => None,
-        }
-    }
-
     /// Extract a single `col OP literal` predicate (=, !=, <, <=, >, >=) for the
     /// columnar filtered-aggregate fast path. Returns the column index, the
     /// operator (flipped if the column is on the right), and the literal.

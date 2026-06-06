@@ -662,6 +662,15 @@ impl Executor {
     ) -> Result<(), ExecError> {
         use crate::catalog::TableConstraint;
 
+        // ReplacingMergeTree (and friends) intentionally keep multiple physical
+        // rows per PK and collapse them to one at read time by version column.
+        // Enforcing PK/UNIQUE on insert would reject every version after the
+        // first, so the constraint does not apply to these tables. (Plain
+        // columnar tables still enforce uniqueness.)
+        if crate::columnar::replacing_config(table_name).is_some() {
+            return Ok(());
+        }
+
         let mut unique_col_sets: Vec<Vec<usize>> = Vec::new();
 
         for constraint in &table_def.constraints {
