@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import functools
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from starlette.requests import Request
 
@@ -90,7 +90,7 @@ def _find_request(args: tuple, kwargs: dict) -> Request:
     for arg in args:
         if isinstance(arg, Request):
             return arg
-    if "request" in kwargs:
+    if "request" in kwargs and isinstance(kwargs["request"], Request):
         return kwargs["request"]
     # In Neutron handlers, request is injected by the framework
     # Check kwargs for any Request-like objects
@@ -115,7 +115,7 @@ def _get_user(request: Request) -> dict[str, Any]:
             title="Unauthorized",
             detail="Authentication required",
         )
-    return user
+    return cast("dict[str, Any]", user)
 
 
 def _extract_roles(user: dict[str, Any]) -> set[str]:

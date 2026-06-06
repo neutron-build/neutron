@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel
 
@@ -186,7 +186,7 @@ class _HandoffTool:
             # The first arg is typically the prompt/topic
             prompt = " ".join(str(v) for v in kwargs.values())
             result = await target.run(prompt)
-            return result.content
+            return cast(str, result.content)
 
         t = Tool(handoff_fn, name=self.name)
         t.description = self.description or f"Hand off to {self.target_cls.__name__}"

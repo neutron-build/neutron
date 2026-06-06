@@ -11,7 +11,7 @@ import hashlib
 import hmac
 import json
 import time
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -154,7 +154,7 @@ def decode_token(
 
     # HS256 — stdlib verification
     try:
-        payload = json.loads(_b64url_decode(parts[1]))
+        payload: dict[str, Any] = json.loads(_b64url_decode(parts[1]))
         signature = _b64url_decode(parts[2])
     except Exception:
         raise AppError(
@@ -265,4 +265,4 @@ def get_current_user(request: Request) -> dict[str, Any]:
             title="Unauthorized",
             detail="Authentication required",
         )
-    return user
+    return cast("dict[str, Any]", user)
