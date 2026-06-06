@@ -83,8 +83,9 @@ mod tests {
     async fn handler_executes_schema_and_returns_json() {
         let handler = graphql_handler(EchoSchema);
 
+        let mut raw = post_json_req(r#"{"query":"{ users { id } }"}"#);
         let req = ok_or_panic(
-            GraphQlRequest::from_request(&post_json_req(r#"{"query":"{ users { id } }"}"#)),
+            GraphQlRequest::from_request(&mut raw).await,
             "GraphQL parse failed",
         );
 

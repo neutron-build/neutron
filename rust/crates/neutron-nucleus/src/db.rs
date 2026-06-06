@@ -29,7 +29,7 @@ pub struct Db {
 }
 
 impl FromRequestParts for Db {
-    fn from_parts(req: &Request) -> Result<Self, Response> {
+    async fn from_parts(req: &Request) -> Result<Self, Response> {
         req.get_state::<NucleusPool>()
             .cloned()
             .map(|pool| Db { pool })
