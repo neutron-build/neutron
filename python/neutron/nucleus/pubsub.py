@@ -53,9 +53,12 @@ class PubSubModel:
             )
             return int(result) if result else 0
         else:
-            # Plain PostgreSQL: use NOTIFY
+            # Plain PostgreSQL: the NOTIFY *statement* does not accept bind
+            # parameters, so `NOTIFY chan, $1` errors at runtime. Use the
+            # pg_notify() *function*, which is parameterizable (and keeps the
+            # channel a bind param — injection-safe regardless of validation).
             async with self._pool.acquire() as conn:
-                await conn.execute(f"NOTIFY {channel}, $1", message)
+                await conn.execute("SELECT pg_notify($1, $2)", channel, message)
             return 0
 
     async def channels(self, pattern: str | None = None) -> list[str]:
