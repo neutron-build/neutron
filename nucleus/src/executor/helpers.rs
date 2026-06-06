@@ -1383,6 +1383,27 @@ pub(super) fn value_to_i64(val: &Value) -> Result<i64, ExecError> {
     }
 }
 
+/// Maximum output length (in characters) for string-building functions. Caps
+/// user-controlled allocations so an extreme length/count argument errors
+/// gracefully instead of attempting an `i64::MAX`-byte allocation that aborts
+/// the process. ~128M chars is far above any legitimate use.
+pub(super) const MAX_STR_OUTPUT: usize = 1 << 27;
+
+/// Convert a length/count argument to a bounded `usize`. A non-positive value
+/// yields 0 (Postgres LPAD/RPAD/REPEAT treat negative length as empty); a value
+/// above `MAX_STR_OUTPUT` is an error rather than an unbounded allocation.
+pub(super) fn bounded_len(n: i64, what: &str) -> Result<usize, ExecError> {
+    if n <= 0 {
+        Ok(0)
+    } else if n as u64 > MAX_STR_OUTPUT as u64 {
+        Err(ExecError::Unsupported(format!(
+            "{what}: requested length {n} exceeds maximum {MAX_STR_OUTPUT}"
+        )))
+    } else {
+        Ok(n as usize)
+    }
+}
+
 /// Convert a Value to f64.
 pub(super) fn value_to_f64(val: &Value) -> Result<f64, ExecError> {
     match val {
