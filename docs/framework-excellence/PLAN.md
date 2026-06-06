@@ -103,6 +103,21 @@ Each scaffold is a standalone phased engineering plan (P0 correctness → P1 fun
 - **Wire-layer fix** for the KV/Document comma-corruption (don't string-split per SDK) + a **testcontainers integration tier against real Postgres AND real Nucleus** with a comma-value regression test (all four).
 - These roll up into **Phase 3** (cross-SDK conformance suite).
 
+## Phase 2 — Implementation (IN PROGRESS — Rust first, branch `framework/rust-excellence`)
+
+### Rust P0 status
+- ✅ **P0.1** remove dead `unsafe impl Send/Sync` (handler.rs) + compile-time assert
+- ✅ **P0.2** `Router::resolve()` returns `RouteError::NotBuilt` instead of panicking
+- ✅ **P0.3** 405 carries RFC 7231 `Allow` header (`MethodNotAllowed { allow }`)
+- ✅ **P0.4** `HealthCheck::contract()` — `GET /health` = `{status, nucleus, version}`
+- ✅ **P0.6** example middleware order fixed (RequestID before Logging)
+- ⏳ **P0.0** TLS-capable Nucleus connections (rustls + `sslmode`) — next
+- ⏳ **P0.5** KV collection decode (jsonb, no comma-split) — coupled to engine N-1 (jsonb emit); assess/defer
+- Tests: 651 neutron tests green; clippy `--lib` clean (pre-existing extract.rs lints noted for the quality-gates sweep).
+
+> ⚠️ **Critical repo finding (fixed):** the entire Rust framework (`rust/`, 18 crates) was **gitignored and untracked** — `/rust/` in `.gitignore`, added under the stale belief the source lived in `rs/` (renamed to `rust/` in 6079213). The flagship framework existed only on local disk. Fixed: `.gitignore` now ignores only `rust/target/`; framework brought under version control (commit `cb67b4f`, 185 files). The audit/scaffold/P0 work had all been on untracked code.
+
 ## Working Log
+- **2026-06-05** — Phase 2 begun (Rust). Discovered + fixed the Rust framework being untracked/gitignored (commit `cb67b4f`). Implemented & tested P0.1–P0.4 + P0.6 (651 tests green, clippy `--lib` clean). Remaining P0: **P0.0 TLS** (adds rustls client deps — crypto-backend decision; planned defaults: `tokio-postgres-rustls` + rustls `ring` provider + `rustls-native-certs` OS trust store, `tls` feature default-on) and **P0.5 KV decode** (client jsonb decode is coupled to engine item N-1 emitting jsonb — do them together or sequence N-1 first). Then P1 (Router→Service, async extractors, Router<S> — the invasive keystone the scaffold says to land as its own PR).
 - **2026-06-05** — Phase 0 audits complete: Go 6.5, Python 6.5, Rust 7.5, TS 6.5. Cross-cutting systemic findings captured (now confirmed 4/4 SDKs). Plan note created.
 - **2026-06-05** — Phase 1 COMPLETE. Orchestrated mini-team per framework (research → scaffold → adversarial review → finalize) via background workflow (13 agents, ~824k tokens). All four scaffolds written to `docs/framework-excellence/`. New finding beyond the audits: Rust DB uses `NoTls` (plaintext) → P0.0. Next: choose first framework to implement, or start Phase 3 conformance harness which several P1 items feed into.
