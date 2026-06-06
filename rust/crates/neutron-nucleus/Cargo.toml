@@ -1,0 +1,38 @@
+[package]
+name = "neutron-nucleus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Nucleus multi-model database integration for the Neutron web framework"
+readme = "../../README.md"
+
+[features]
+default = ["tls"]
+# TLS-capable Nucleus/Postgres connections via rustls (ring provider, OS trust
+# store). Required to reach any `sslmode=require` server (Neon/Supabase/RDS/etc.).
+tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
+
+[dependencies]
+neutron        = { path = "../neutron", default-features = false }
+tokio-postgres = { workspace = true }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+http           = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+regex          = "1"
+
+# TLS (optional, enabled by default via the `tls` feature).
+# rustls default features provide the aws-lc-rs crypto provider (already in the
+# workspace); we pin the provider explicitly in code to avoid ambiguity.
+rustls                = { workspace = true, optional = true }
+tokio-postgres-rustls = { version = "0.13", optional = true }
+rustls-native-certs   = { version = "0.8", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

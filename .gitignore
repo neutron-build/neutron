@@ -41,6 +41,8 @@ archive/
 **/PLAN.md
 **/STATUS.md
 **/TODO-NEXT.md
+# Exception: the framework-excellence program's master plan is a tracked deliverable.
+!docs/framework-excellence/PLAN.md
 **/EXECUTION.md
 **/CHECKLIST.md
 **/NEUTRON_FINISH_CHECKLIST.md
@@ -112,10 +114,11 @@ mojo/specs/
 **/coord_lines.py
 **/coord_methods.rs
 
-# Old location remnant at repo root (build artifacts only; source is in rs/ and
-# nucleus/). Anchored to root so it does NOT swallow nested `rust/` dirs like the
-# site's Rust docs (apps/site/.../docs/rust/) or the CLI scaffold template.
-/rust/
+# Rust framework (rust/) — the SOURCE is tracked. Only the cargo build output is
+# ignored. (Earlier this was `/rust/` under the mistaken belief the source lived
+# in `rs/`; `rs/` was renamed to `rust/` in 6079213, so `/rust/` was silently
+# excluding the entire framework from version control. Fixed to ignore only target/.)
+/rust/target/
 
 # Site build output (source is tracked, dist is not)
 typescript/apps/site/dist/
@@ -131,9 +134,11 @@ __pycache__/
 .venv/
 venv/
 
-# Rust
+# Rust — track the framework + engine lockfiles for reproducible builds.
+# (The `!rs/Cargo.lock` exception was stale: `rs/` was renamed to `rust/` in
+# 6079213, so the framework lockfile silently went untracked.)
 Cargo.lock
-!rs/Cargo.lock
+!rust/Cargo.lock
 !nucleus/Cargo.lock
 # Database files
 *.db

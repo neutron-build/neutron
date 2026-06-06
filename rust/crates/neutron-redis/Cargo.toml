@@ -1,0 +1,27 @@
+[package]
+name        = "neutron-redis"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+keywords.workspace   = true
+categories.workspace = true
+description = "Redis-backed session, rate-limit, and cache backends for the Neutron web framework"
+readme = "../../README.md"
+
+[dependencies]
+# The redis crate with async (tokio) support, auto-reconnect manager, and Lua scripts.
+redis   = { workspace = true }
+neutron = { path = "../neutron", default-features = false, features = ["cookie", "rate-limit", "cache"] }
+tokio   = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tracing    = { workspace = true }
+bytes          = { workspace = true }
+http           = { workspace = true }
+http-body-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

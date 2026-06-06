@@ -1,0 +1,18 @@
+[package]
+name        = "neutron-smtp"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+authors.workspace     = true
+repository.workspace  = true
+homepage.workspace    = true
+keywords.workspace    = true
+categories.workspace  = true
+description = "SMTP and transactional email integration for the Neutron web framework"
+readme = "../../README.md"
+
+[dependencies]
+lettre  = { workspace = true }
+tokio   = { workspace = true }
+tracing = { workspace = true }
+serde   = { workspace = true }
