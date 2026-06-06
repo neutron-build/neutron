@@ -195,8 +195,12 @@ func (q *Queue) Process(ctx context.Context, jobType string, handler func(ctx co
 func (q *Queue) executeJob(ctx context.Context, id string, payload []byte, attempts, maxRetry int, backoffMs int64, handler func(context.Context, []byte) error) {
 	err := handler(ctx, payload)
 	if err == nil {
-		q.client.SQL().Exec(ctx,
-			"UPDATE _neutron_jobs SET status = 'completed', updated_at = NOW() WHERE id = $1", id)
+		if _, uerr := q.client.SQL().Exec(ctx,
+			"UPDATE _neutron_jobs SET status = 'completed', updated_at = NOW() WHERE id = $1", id); uerr != nil {
+			// A lost completion write leaves the job stuck in 'running' until the
+			// reaper requeues it — surface it rather than dropping it silently.
+			q.logger.Error("job status update failed", "id", id, "target", "completed", "error", uerr)
+		}
 		return
 	}
 
@@ -205,13 +209,17 @@ func (q *Queue) executeJob(ctx context.Context, id string, payload []byte, attem
 	if attempts < maxRetry {
 		// Schedule retry with backoff
 		retryAt := time.Now().Add(time.Duration(backoffMs*int64(attempts)) * time.Millisecond)
-		q.client.SQL().Exec(ctx,
+		if _, uerr := q.client.SQL().Exec(ctx,
 			"UPDATE _neutron_jobs SET status = 'pending', run_at = $1, error = $2, updated_at = NOW() WHERE id = $3",
-			retryAt, err.Error(), id)
+			retryAt, err.Error(), id); uerr != nil {
+			q.logger.Error("job status update failed", "id", id, "target", "retry", "error", uerr)
+		}
 	} else {
-		q.client.SQL().Exec(ctx,
+		if _, uerr := q.client.SQL().Exec(ctx,
 			"UPDATE _neutron_jobs SET status = 'failed', error = $1, updated_at = NOW() WHERE id = $2",
-			err.Error(), id)
+			err.Error(), id); uerr != nil {
+			q.logger.Error("job status update failed", "id", id, "target", "failed", "error", uerr)
+		}
 	}
 }
 

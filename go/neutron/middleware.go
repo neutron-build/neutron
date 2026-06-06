@@ -1,6 +1,7 @@
 package neutron
 
 import (
+	"bufio"
 	"compress/gzip"
 	"context"
 	"crypto/rand"
@@ -9,12 +10,75 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 )
+
+// RateLimitConfig configures the rate-limit layer of DefaultStack.
+type RateLimitConfig struct {
+	RPS   float64
+	Burst int
+}
+
+// DefaultStackConfig configures the standard middleware stack. The order is
+// fixed (see DefaultStack); these fields only toggle/configure layers. Nil/zero
+// optional fields skip that layer.
+type DefaultStackConfig struct {
+	Logger    *slog.Logger     // nil → slog.Default()
+	CORS      *CORSOptions     // nil → no CORS layer
+	Compress  bool             // true → gzip at default level
+	RateLimit *RateLimitConfig // nil → no rate limit
+	Auth      Middleware       // nil → no auth layer (app-specific)
+	Timeout   time.Duration    // 0 → no timeout layer
+	OTel      *OTelOptions     // nil → no OpenTelemetry layer
+}
+
+// DefaultStack returns the standard middleware in the exact order mandated by
+// FRAMEWORK_CONTRACT.md:
+//
+//	RequestID → Logging → Recovery → CORS → Compression → RateLimit → Auth → Timeout → OpenTelemetry
+//
+// The order is hard-coded and cannot be reordered — callers configure layers,
+// they do not arrange them. RequestID strictly precedes Logging so every log
+// line carries the request id. Use it as:
+//
+//	app := neutron.New(neutron.WithMiddleware(neutron.DefaultStack(cfg)...))
+func DefaultStack(cfg DefaultStackConfig) []Middleware {
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	// Always-on first three, in contract order.
+	mw := []Middleware{
+		RequestID(),
+		Logger(logger),
+		Recover(),
+	}
+	if cfg.CORS != nil {
+		mw = append(mw, CORS(*cfg.CORS))
+	}
+	if cfg.Compress {
+		mw = append(mw, Compress(gzip.DefaultCompression))
+	}
+	if cfg.RateLimit != nil {
+		mw = append(mw, RateLimit(cfg.RateLimit.RPS, cfg.RateLimit.Burst))
+	}
+	if cfg.Auth != nil {
+		mw = append(mw, cfg.Auth)
+	}
+	if cfg.Timeout > 0 {
+		mw = append(mw, Timeout(cfg.Timeout))
+	}
+	if cfg.OTel != nil {
+		mw = append(mw, OTel(*cfg.OTel))
+	}
+	return mw
+}
 
 // Middleware is the standard Go middleware signature.
 type Middleware = func(next http.Handler) http.Handler
@@ -212,6 +276,9 @@ func Timeout(d time.Duration) Middleware {
 func Compress(level int) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// The response varies on Accept-Encoding whether or not we compress,
+			// so caches must key on it (RFC 7231 §7.1.4). Set on both paths.
+			w.Header().Add("Vary", "Accept-Encoding")
 			if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 				next.ServeHTTP(w, r)
 				return
@@ -262,6 +329,28 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap exposes the underlying writer to http.ResponseController and to
+// interface probes that walk Unwrap chains.
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// Flush forwards to the underlying writer so SSE / streaming responses are not
+// silently buffered when this middleware is in the chain.
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack forwards to the underlying writer so WebSocket upgrades work behind
+// this middleware. Embedding the ResponseWriter interface does not promote
+// Hijack (it is not part of http.ResponseWriter), so it must be forwarded.
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("neutron: underlying ResponseWriter does not support Hijack")
+}
+
 // gzipWriter wraps http.ResponseWriter with a gzip writer.
 type gzipWriter struct {
 	http.ResponseWriter
@@ -270,6 +359,28 @@ type gzipWriter struct {
 
 func (w *gzipWriter) Write(b []byte) (int, error) {
 	return w.Writer.Write(b)
+}
+
+func (w *gzipWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// Flush flushes the gzip writer (to push buffered compressed bytes) and then
+// the underlying writer, so SSE works through compression.
+func (w *gzipWriter) Flush() {
+	if f, ok := w.Writer.(interface{ Flush() error }); ok {
+		_ = f.Flush()
+	}
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack forwards to the underlying writer (the hijacked connection bypasses
+// gzip, which is correct for WebSocket upgrades).
+func (w *gzipWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("neutron: underlying ResponseWriter does not support Hijack")
 }
 
 func generateID() string {
