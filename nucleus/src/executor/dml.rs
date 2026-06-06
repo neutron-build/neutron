@@ -1271,6 +1271,45 @@ impl Executor {
         Ok(())
     }
 
+    /// Rebuild a table's zone map from its current rows after a mutation that
+    /// can invalidate granule stats (DELETE/UPDATE). A plain clear is unsafe:
+    /// the next INSERT only adds its own rows, so surviving rows would be left
+    /// unrepresented and `can_skip_granule` could wrongly prune them. Recompute
+    /// granules in scan order so they align with `apply_zone_map_pruning`'s
+    /// chunking. On any failure, clear the map (pruning then safely no-ops).
+    async fn rebuild_zone_map(&self, table_name: &str) {
+        let zm_table_id = table_name_to_id(table_name);
+        let col_count = match self.get_table(table_name).await {
+            Ok(def) => def.columns.len(),
+            Err(_) => {
+                self.zone_map_index.clear_table(zm_table_id);
+                return;
+            }
+        };
+        let rows = match self.storage_for(table_name).scan(table_name).await {
+            Ok(r) => r,
+            Err(_) => {
+                self.zone_map_index.clear_table(zm_table_id);
+                return;
+            }
+        };
+        self.zone_map_index.clear_table(zm_table_id);
+        if rows.is_empty() {
+            return;
+        }
+        let column_ids: Vec<u32> = (0..col_count as u32).collect();
+        for (granule_id, chunk) in rows.chunks(GRANULE_SIZE as usize).enumerate() {
+            let stats = crate::storage::granule_stats::compute_granule_stats(
+                chunk,
+                &column_ids,
+                zm_table_id,
+                granule_id as u32,
+            );
+            self.zone_map_index
+                .update_granule(zm_table_id, granule_id as u32, stats);
+        }
+    }
+
     pub(super) async fn execute_update(
         &self,
         update: ast::Update,
@@ -1520,11 +1559,11 @@ impl Executor {
             .update(&table_name, &updates)
             .await?;
 
-        // Invalidate zone map stats — column values may have changed,
-        // making min/max bounds stale.
+        // Rebuild zone map stats — column values may have changed, making
+        // min/max bounds stale. A bare clear would leave the map to be
+        // partially repopulated by later INSERTs, under-representing survivors.
         if count > 0 {
-            let zm_table_id = table_name_to_id(&table_name);
-            self.zone_map_index.clear_table(zm_table_id);
+            self.rebuild_zone_map(&table_name).await;
         }
 
         // Fire AFTER UPDATE statement-level triggers
@@ -1741,12 +1780,12 @@ impl Executor {
             .delete(&table_name, &positions)
             .await?;
 
-        // Invalidate zone map stats — row positions have shifted after delete,
-        // so granule boundaries no longer align. Clear and let the next INSERT
-        // repopulate.
+        // Rebuild zone map stats — row positions have shifted after delete, so
+        // granule boundaries no longer align. A bare clear would leave the map
+        // to be partially repopulated by later INSERTs, under-representing
+        // surviving rows and causing valid rows to be wrongly pruned.
         if count > 0 {
-            let zm_table_id = table_name_to_id(&table_name);
-            self.zone_map_index.clear_table(zm_table_id);
+            self.rebuild_zone_map(&table_name).await;
         }
 
         // Fire AFTER DELETE row-level triggers for each deleted row

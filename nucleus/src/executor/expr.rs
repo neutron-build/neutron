@@ -348,13 +348,50 @@ impl Executor {
         Ok(Value::Bool(json_contains(&left_json, &right_json)))
     }
 
+    /// SQL 3-valued `x [NOT] IN (candidates)`, shared by `IN (list)` and
+    /// `IN (subquery)`:
+    /// - FALSE (TRUE for NOT IN) when the candidate set is empty — even for a
+    ///   NULL `val`: `x IN ()` is unconditionally FALSE in SQL because there is
+    ///   nothing to be equal to (this is the empty-subquery case);
+    /// - NULL if `val` is NULL, or `val` matches nothing but a candidate is NULL;
+    /// - otherwise TRUE on a definite match / FALSE on a match-free non-NULL set,
+    ///   with `negated` flipping the definite TRUE/FALSE (NULL stays NULL).
+    ///
+    /// This is what makes `WHERE x NOT IN (..)` correctly exclude NULL-involved
+    /// rows instead of including them.
+    pub(super) fn in_three_valued(val: &Value, candidates: &[Value], negated: bool) -> Value {
+        // Empty set is decisive regardless of `val` (including NULL): IN → FALSE,
+        // NOT IN → TRUE. Must precede the NULL-val check below.
+        if candidates.is_empty() {
+            return Value::Bool(negated);
+        }
+        if matches!(val, Value::Null) {
+            return Value::Null;
+        }
+        let mut has_null = false;
+        for v in candidates {
+            if matches!(v, Value::Null) {
+                has_null = true;
+            } else if compare_values(val, v) == Some(Ordering::Equal) {
+                return Value::Bool(!negated);
+            }
+        }
+        if has_null {
+            Value::Null
+        } else {
+            Value::Bool(negated)
+        }
+    }
+
     pub(super) fn eval_binary_op(
         &self,
         left: &Value,
         op: &ast::BinaryOperator,
         right: &Value,
     ) -> Result<Value, ExecError> {
-        // SQL 3-valued logic: comparisons with NULL yield NULL
+        // SQL 3-valued logic: comparisons AND arithmetic/concat with a NULL
+        // operand yield NULL (not an error). AND/OR are excluded here — they
+        // have their own 3-valued rules below (e.g. FALSE AND NULL = FALSE).
         if matches!(left, Value::Null) || matches!(right, Value::Null) {
             match op {
                 ast::BinaryOperator::Eq
@@ -362,7 +399,13 @@ impl Executor {
                 | ast::BinaryOperator::Lt
                 | ast::BinaryOperator::Gt
                 | ast::BinaryOperator::LtEq
-                | ast::BinaryOperator::GtEq => return Ok(Value::Null),
+                | ast::BinaryOperator::GtEq
+                | ast::BinaryOperator::Plus
+                | ast::BinaryOperator::Minus
+                | ast::BinaryOperator::Multiply
+                | ast::BinaryOperator::Divide
+                | ast::BinaryOperator::Modulo
+                | ast::BinaryOperator::StringConcat => return Ok(Value::Null),
                 _ => {}
             }
         }
@@ -815,33 +858,11 @@ impl Executor {
                 negated,
             } => {
                 let val = self.eval_row_expr(expr, row, col_meta)?;
-                // SQL 3-valued logic: NULL IN (...) is unknown (NULL), and so is
-                // `x IN (...)` when x matches nothing but the list contains a NULL.
-                // Only a definite match yields TRUE; only a match-free list with no
-                // NULLs yields FALSE. NOT IN negates the definite TRUE/FALSE; NULL
-                // stays NULL (so WHERE NOT (x IN (...)) excludes NULL-valued rows).
-                if matches!(val, Value::Null) {
-                    return Ok(Value::Null);
-                }
-                let mut found = false;
-                let mut list_has_null = false;
+                let mut items = Vec::with_capacity(list.len());
                 for item in list {
-                    match self.eval_row_expr(item, row, col_meta)? {
-                        Value::Null => list_has_null = true,
-                        v if v == val => {
-                            found = true;
-                            break;
-                        }
-                        _ => {}
-                    }
+                    items.push(self.eval_row_expr(item, row, col_meta)?);
                 }
-                if found {
-                    Ok(Value::Bool(!negated))
-                } else if list_has_null {
-                    Ok(Value::Null)
-                } else {
-                    Ok(Value::Bool(*negated))
-                }
+                Ok(Self::in_three_valued(&val, &items, *negated))
             }
             Expr::Function(func) => {
                 let fname = func.name.to_string().to_uppercase();
@@ -1231,10 +1252,7 @@ impl Executor {
                     .get(&cache_key)
                     .cloned()
                 {
-                    let found = cached
-                        .iter()
-                        .any(|v| compare_values(&val, v) == Some(Ordering::Equal));
-                    return Ok(Value::Bool(if *negated { !found } else { found }));
+                    return Ok(Self::in_three_valued(&val, &cached, *negated));
                 }
                 self.check_subquery_depth()?;
                 let resolved = substitute_outer_refs_in_query(subquery, row, col_meta);
@@ -1254,10 +1272,7 @@ impl Executor {
                         .write()
                         .insert(cache_key, values.clone());
                 }
-                let found = values
-                    .iter()
-                    .any(|v| compare_values(&val, v) == Some(Ordering::Equal));
-                Ok(Value::Bool(if *negated { !found } else { found }))
+                Ok(Self::in_three_valued(&val, &values, *negated))
             }
             Expr::Subquery(subquery) => {
                 // Scalar subquery -- must return exactly one row, one column

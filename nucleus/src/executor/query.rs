@@ -5023,7 +5023,21 @@ impl Executor {
                 let threshold = match &literal_val {
                     Value::Int32(n) => *n as i64,
                     Value::Int64(n) => *n,
-                    Value::Float64(f) => *f as i64,
+                    // A non-integral (or out-of-range) float bound on an integer
+                    // column must NOT be truncated to i64 — `c1 > -2.333` would
+                    // become `c1 > -2` and wrongly drop c1 = -2, and `c1 = 2.5`
+                    // would wrongly match c1 = 2. Bail to the exact filter, which
+                    // compares via int↔float promotion. Integral in-range floats
+                    // (e.g. 5.0) coerce losslessly and keep the SIMD fast path.
+                    Value::Float64(f) => {
+                        if f.fract() != 0.0
+                            || *f < i64::MIN as f64
+                            || *f > i64::MAX as f64
+                        {
+                            return None;
+                        }
+                        *f as i64
+                    }
                     _ => return None,
                 };
 
@@ -8143,6 +8157,17 @@ impl Executor {
         let zm_table_id = table_name_to_id(table_name);
         let granules = self.zone_map_index.get_table_granules(zm_table_id);
         if granules.is_empty() {
+            return rows;
+        }
+
+        // Safety net: the zone map is a pure optimization, so it is only safe to
+        // prune when its stats describe exactly the rows being scanned. If the
+        // granule row counts don't sum to the scanned row count, the map is
+        // stale or incomplete (e.g. a DELETE cleared it and only later INSERTs
+        // repopulated it, leaving surviving rows unrepresented) — skip pruning
+        // entirely and let the row-level WHERE filter produce the correct result.
+        let zm_row_total: usize = granules.iter().map(|g| g.row_count as usize).sum();
+        if zm_row_total != rows.len() {
             return rows;
         }
 

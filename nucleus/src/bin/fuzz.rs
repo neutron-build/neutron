@@ -1,28 +1,38 @@
 //! Differential fuzzer: Nucleus vs SQLite.
 //!
-//! Generates random schemas, data, and SQL queries, runs each query against
+//! Generates random schemas, data, queries, AND mutations, runs each against
 //! both Nucleus (embedded executor) and SQLite (a battle-tested oracle), and
-//! reports any result divergence with a fully reproducible seed. SQLite is the
+//! reports any divergence with a fully reproducible seed. SQLite is the
 //! reference because it is correct and rigorous; any disagreement is a Nucleus
-//! bug (or a documented dialect difference).
+//! bug (or a documented dialect difference we deliberately avoid generating).
 //!
-//! This is how the bugs found by hand this cycle (comma-join row loss, ORDER BY
-//! by a non-projected column, etc.) get found automatically — and how future
-//! regressions get caught before a consumer hits them.
+//! Coverage (each axis is a place bugs hide):
+//!   - Random schemas: varied column count, types (INT/REAL/TEXT), nullability.
+//!   - Reads: aggregates (incl COUNT(DISTINCT)), GROUP BY + HAVING, INNER/LEFT
+//!     self-joins, projection w/ CASE/COALESCE/ABS/arithmetic, LIKE, IS NULL,
+//!     nested AND/OR/NOT, DISTINCT, ORDER BY, LIMIT/OFFSET, UNION/INTERSECT/
+//!     EXCEPT, IN/NOT IN/EXISTS/scalar subqueries.
+//!   - Mutations: INSERT/UPDATE/DELETE interleaved with reads; after every
+//!     mutation the FULL table state must match SQLite (catches visibility /
+//!     MVCC / index-maintenance bugs).
+//!   - Robustness: every execution runs under catch_unwind — any panic on any
+//!     input is a bug, reported and fatal.
 //!
 //! Usage:
 //!   cargo run --release --features "server rusqlite" --bin fuzz
-//!   cargo run --release --features "server rusqlite" --bin fuzz -- --seed 42 --iterations 5000 --max-report 20
-//!   cargo run --release --features "server rusqlite" --bin fuzz -- --seed 123   # reproduce one iteration
+//!   cargo run --release --features "server rusqlite" --bin fuzz -- --seed 42 --iterations 5000
 //!
-//! Methodology notes (to avoid false positives):
-//!   - ORDER BY uses only NOT NULL columns and always ends with the unique `id`
-//!     tiebreaker, so the output order is deterministic and comparable.
-//!   - LIMIT is only emitted with an ORDER BY (otherwise which rows survive is
-//!     undefined and the two engines may legally differ).
-//!   - Numbers are compared semantically (5 == 5.0); floats rounded to 6 dp.
-//!   - GROUP BY keys are NOT NULL (NULL-group + NULL-order conventions differ).
+//! Methodology notes (to avoid false positives — dialect differences, not bugs):
+//!   - ORDER BY uses only NOT NULL columns + the unique `id` tiebreaker, so row
+//!     order is deterministic (SQLite/Nucleus differ on NULL ordering default).
+//!   - LIMIT/OFFSET only with an ORDER BY (else surviving rows are undefined).
+//!   - SUM/AVG only over INTEGER columns (float accumulation order differs).
+//!   - No `/` or `%` (SQLite returns NULL on div-by-zero; Nucleus errors).
+//!   - LIKE patterns and text data are lowercase (SQLite LIKE is ASCII-case-
+//!     insensitive; equal case keeps it moot).
+//!   - Set operations compared unordered (set semantics, no ORDER BY needed).
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use nucleus::catalog::Catalog;
@@ -43,11 +53,7 @@ impl Rng {
         z ^ (z >> 31)
     }
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 {
-            0
-        } else {
-            (self.next() % n as u64) as usize
-        }
+        if n == 0 { 0 } else { (self.next() % n as u64) as usize }
     }
     fn chance(&mut self, pct: u64) -> bool {
         self.next() % 100 < pct
@@ -60,200 +66,392 @@ impl Rng {
     }
 }
 
-// ─── Fixed schema (varied data per seed) ──────────────────────────────────────
-// id: unique NOT NULL (tiebreaker). d,e: NOT NULL ints (safe to ORDER BY).
-// a,b: nullable ints (aggregates / WHERE). g: NOT NULL category text (GROUP BY).
-// s: nullable text.
-const SCHEMA: &str = "CREATE TABLE t (\
-    id INTEGER PRIMARY KEY, \
-    d INTEGER NOT NULL, \
-    e INTEGER NOT NULL, \
-    a INTEGER, \
-    b INTEGER, \
-    g TEXT NOT NULL, \
-    s TEXT)";
+// ─── Random schema ────────────────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ty {
+    Int,
+    Real,
+    Text,
+}
 
-const ORDER_COLS: &[&str] = &["d", "e", "g", "id"];
-const NUM_COLS: &[&str] = &["id", "d", "e", "a", "b"];
-const ALL_COLS: &[&str] = &["id", "d", "e", "a", "b", "g", "s"];
-const CATS: &[&str] = &["red", "green", "blue", "amber"];
+#[derive(Clone)]
+struct Col {
+    name: &'static str,
+    ty: Ty,
+    nn: bool, // NOT NULL
+}
 
-fn gen_inserts(rng: &mut Rng, rows: usize) -> String {
+struct Schema {
+    cols: Vec<Col>, // cols[0] is always `id INTEGER PRIMARY KEY`
+}
+
+const NAMES: &[&str] = &["c1", "c2", "c3", "c4", "c5", "c6", "c7"];
+const CATS: &[&str] = &[
+    "red", "green", "blue", "amber", "str0", "str1", "str2", "str3",
+];
+
+impl Schema {
+    fn random(rng: &mut Rng) -> Schema {
+        let mut cols = vec![Col { name: "id", ty: Ty::Int, nn: true }];
+        // Guarantee a NOT NULL int and a NOT NULL text so ORDER BY / GROUP BY
+        // always have safe (non-NULL) targets besides id.
+        cols.push(Col { name: NAMES[0], ty: Ty::Int, nn: true });
+        cols.push(Col { name: NAMES[1], ty: Ty::Text, nn: true });
+        let extra = 2 + rng.below(4); // total non-id cols: 4..7
+        for k in 0..extra {
+            let ty = *rng.pick(&[Ty::Int, Ty::Int, Ty::Real, Ty::Text]);
+            cols.push(Col { name: NAMES[2 + k], ty, nn: rng.chance(35) });
+        }
+        Schema { cols }
+    }
+
+    fn ddl(&self) -> String {
+        let mut parts = Vec::new();
+        for (i, c) in self.cols.iter().enumerate() {
+            if i == 0 {
+                parts.push("id INTEGER PRIMARY KEY".to_string());
+                continue;
+            }
+            let ty = match c.ty {
+                Ty::Int => "INTEGER",
+                Ty::Real => "REAL",
+                Ty::Text => "TEXT",
+            };
+            let nn = if c.nn { " NOT NULL" } else { "" };
+            parts.push(format!("{} {ty}{nn}", c.name));
+        }
+        format!("CREATE TABLE t ({})", parts.join(", "))
+    }
+
+    fn of<F: Fn(&Col) -> bool>(&self, f: F) -> Vec<&Col> {
+        self.cols.iter().filter(|c| f(c)).collect()
+    }
+    fn nn_cols(&self) -> Vec<&Col> {
+        self.of(|c| c.nn)
+    }
+    fn int_cols(&self) -> Vec<&Col> {
+        self.of(|c| c.ty == Ty::Int)
+    }
+    fn nullable(&self) -> Vec<&Col> {
+        self.of(|c| !c.nn)
+    }
+    fn pick<'a>(&'a self, rng: &mut Rng) -> &'a Col {
+        let i = rng.below(self.cols.len());
+        &self.cols[i]
+    }
+}
+
+// ─── Value / literal generation ───────────────────────────────────────────────
+fn gen_value(rng: &mut Rng, c: &Col) -> String {
+    let null_pct = if c.ty == Ty::Text { 25 } else { 20 };
+    if !c.nn && rng.chance(null_pct) {
+        return "NULL".into();
+    }
+    match c.ty {
+        Ty::Int => rng.int(-5, 20).to_string(),
+        // One-decimal reals keep f64 sums/compares exact for small row counts.
+        Ty::Real => format!("{:.1}", rng.int(-50, 50) as f64 / 10.0),
+        Ty::Text => format!("'{}'", rng.pick(CATS)),
+    }
+}
+
+fn gen_literal(rng: &mut Rng, c: &Col) -> String {
+    match c.ty {
+        Ty::Int => rng.int(-5, 20).to_string(),
+        Ty::Real => format!("{:.1}", rng.int(-50, 50) as f64 / 10.0),
+        Ty::Text => format!("'{}'", rng.pick(CATS)),
+    }
+}
+
+fn gen_inserts(schema: &Schema, rng: &mut Rng, rows: usize) -> String {
+    let names: Vec<&str> = schema.cols.iter().map(|c| c.name).collect();
     let mut vals = Vec::with_capacity(rows);
     for id in 1..=rows {
-        let d = rng.int(0, 9);
-        let e = rng.int(0, 4);
-        let a = if rng.chance(20) {
-            "NULL".to_string()
-        } else {
-            rng.int(-5, 20).to_string()
-        };
-        let b = if rng.chance(20) {
-            "NULL".to_string()
-        } else {
-            rng.int(0, 100).to_string()
-        };
-        let g = rng.pick(CATS);
-        let s = if rng.chance(25) {
-            "NULL".to_string()
-        } else {
-            format!("'str{}'", rng.int(0, 5))
-        };
-        vals.push(format!("({id},{d},{e},{a},{b},'{g}',{s})"));
+        let mut cells = Vec::with_capacity(schema.cols.len());
+        for (i, c) in schema.cols.iter().enumerate() {
+            cells.push(if i == 0 { id.to_string() } else { gen_value(rng, c) });
+        }
+        vals.push(format!("({})", cells.join(",")));
     }
-    format!("INSERT INTO t (id,d,e,a,b,g,s) VALUES {}", vals.join(","))
+    format!("INSERT INTO t ({}) VALUES {}", names.join(","), vals.join(","))
 }
 
-// ─── Predicate / query generation ─────────────────────────────────────────────
-fn gen_literal(rng: &mut Rng, col: &str) -> String {
-    match col {
-        "g" => format!("'{}'", rng.pick(CATS)),
-        "s" => format!("'str{}'", rng.int(0, 5)),
-        "a" => rng.int(-5, 20).to_string(),
-        "b" => rng.int(0, 100).to_string(),
-        _ => rng.int(0, 9).to_string(),
-    }
-}
-
-fn gen_predicate(rng: &mut Rng, depth: u32) -> String {
-    if depth > 0 && rng.chance(45) {
-        let l = gen_predicate(rng, depth - 1);
-        let r = gen_predicate(rng, depth - 1);
+// ─── Predicates ───────────────────────────────────────────────────────────────
+fn gen_predicate(schema: &Schema, rng: &mut Rng, depth: u32) -> String {
+    if depth > 0 && rng.chance(42) {
+        let l = gen_predicate(schema, rng, depth - 1);
+        let r = gen_predicate(schema, rng, depth - 1);
         let op = rng.pick(&["AND", "OR"]);
         return format!("({l} {op} {r})");
     }
     if rng.chance(12) {
-        return format!("NOT ({})", gen_predicate(rng, 0));
+        return format!("NOT ({})", gen_predicate(schema, rng, 0));
     }
-    let col = *rng.pick(ALL_COLS);
-    match rng.below(6) {
-        0 if col == "a" || col == "b" || col == "s" => {
+    let c = schema.pick(rng);
+    match rng.below(7) {
+        0 if !c.nn => {
             let n = if rng.chance(50) { "NOT " } else { "" };
-            format!("{col} IS {n}NULL")
+            format!("{} IS {n}NULL", c.name)
         }
-        1 if NUM_COLS.contains(&col) => {
-            let lo = rng.int(-5, 10);
-            let hi = lo + rng.int(0, 15);
-            format!("{col} BETWEEN {lo} AND {hi}")
+        1 if c.ty == Ty::Int => {
+            let lo = rng.int(-5, 12);
+            let hi = lo + rng.int(0, 14);
+            format!("{} BETWEEN {lo} AND {hi}", c.name)
         }
         2 => {
             let n = 1 + rng.below(3);
-            let items: Vec<String> = (0..n).map(|_| gen_literal(rng, col)).collect();
-            format!("{col} IN ({})", items.join(","))
+            let items: Vec<String> = (0..n).map(|_| gen_literal(rng, c)).collect();
+            let neg = if rng.chance(40) { "NOT " } else { "" };
+            format!("{} {neg}IN ({})", c.name, items.join(","))
+        }
+        3 if c.ty == Ty::Text => {
+            // Lowercase patterns over lowercase data → LIKE case-folding moot.
+            let pat = match rng.below(4) {
+                0 => format!("'{}'", rng.pick(CATS)),
+                1 => format!("'{}%'", &rng.pick(CATS)[..2]),
+                2 => "'%r%'".to_string(),
+                _ => "'str_'".to_string(),
+            };
+            let neg = if rng.chance(35) { "NOT " } else { "" };
+            format!("{} {neg}LIKE {pat}", c.name)
         }
         _ => {
             let op = *rng.pick(&["=", "<>", "<", "<=", ">", ">="]);
-            format!("{col} {op} {}", gen_literal(rng, col))
+            format!("{} {op} {}", c.name, gen_literal(rng, c))
         }
     }
 }
 
-fn gen_orderby(rng: &mut Rng) -> String {
-    // 1-2 NOT NULL keys, then `id` as a unique tiebreaker → fully deterministic.
-    let n = 1 + rng.below(2);
+// ─── Scalar projection expressions ────────────────────────────────────────────
+fn gen_scalar(schema: &Schema, rng: &mut Rng) -> String {
+    match rng.below(6) {
+        0 => {
+            // CASE WHEN <pred> THEN <int> ELSE <int> END
+            let p = gen_predicate(schema, rng, 1);
+            format!("CASE WHEN {p} THEN {} ELSE {} END", rng.int(0, 9), rng.int(0, 9))
+        }
+        1 if !schema.nullable().is_empty() => {
+            let c = *rng.pick(&schema.nullable());
+            format!("COALESCE({}, {})", c.name, gen_literal(rng, c))
+        }
+        2 if !schema.int_cols().is_empty() => {
+            let c = *rng.pick(&schema.int_cols());
+            format!("ABS({})", c.name)
+        }
+        3 if !schema.int_cols().is_empty() => {
+            // Bounded arithmetic (operands tiny → no overflow; no '/' or '%').
+            let c = *rng.pick(&schema.int_cols());
+            let op = *rng.pick(&["+", "-", "*"]);
+            let k = if op == "*" { rng.int(0, 3) } else { rng.int(0, 10) };
+            format!("({} {op} {k})", c.name)
+        }
+        4 => {
+            // Boolean expression → 0/1 in both engines.
+            format!("({})", gen_predicate(schema, rng, 0))
+        }
+        _ => schema.pick(rng).name.to_string(),
+    }
+}
+
+// ─── ORDER BY (NOT NULL keys + id tiebreaker = deterministic) ─────────────────
+fn gen_orderby(schema: &Schema, rng: &mut Rng) -> String {
+    let nn: Vec<&Col> = schema.nn_cols().into_iter().filter(|c| c.name != "id").collect();
     let mut keys = Vec::new();
-    for _ in 0..n {
-        let c = *rng.pick(&ORDER_COLS[..3]); // d,e,g (exclude id; appended below)
-        let dir = if rng.chance(50) { "ASC" } else { "DESC" };
-        keys.push(format!("{c} {dir}"));
+    if !nn.is_empty() {
+        let n = 1 + rng.below(2.min(nn.len()));
+        for _ in 0..n {
+            let c = *rng.pick(&nn);
+            let dir = if rng.chance(50) { "ASC" } else { "DESC" };
+            keys.push(format!("{} {dir}", c.name));
+        }
     }
     keys.push("id ASC".to_string());
     format!("ORDER BY {}", keys.join(", "))
 }
 
-fn gen_agg(rng: &mut Rng) -> String {
-    let aggs = [
-        "COUNT(*)", "COUNT(a)", "SUM(a)", "AVG(a)", "MIN(a)", "MAX(a)", "SUM(b)", "AVG(b)",
-        "MIN(d)", "MAX(e)", "MIN(g)", "MAX(g)",
-    ];
-    rng.pick(&aggs).to_string()
+// ─── Aggregates ───────────────────────────────────────────────────────────────
+fn gen_agg(schema: &Schema, rng: &mut Rng) -> String {
+    let any = schema.pick(rng).name;
+    let ints = schema.int_cols();
+    match rng.below(7) {
+        0 => "COUNT(*)".into(),
+        1 => format!("COUNT({any})"),
+        2 => format!("COUNT(DISTINCT {any})"),
+        3 if !ints.is_empty() => format!("SUM({})", rng.pick(&ints).name),
+        4 if !ints.is_empty() => format!("AVG({})", rng.pick(&ints).name),
+        5 => format!("MIN({any})"),
+        _ => format!("MAX({any})"),
+    }
 }
 
-/// Returns (sql, ordered) — `ordered` true means compare rows in order.
-fn gen_query(rng: &mut Rng, rows: usize) -> (String, bool) {
-    match rng.below(5) {
+// ─── Query generation. Returns (sql, ordered). ────────────────────────────────
+fn gen_query(schema: &Schema, rng: &mut Rng, rows: usize) -> (String, bool) {
+    match rng.below(8) {
         // Aggregate, no GROUP BY → single row.
         0 => {
             let n = 1 + rng.below(3);
-            let aggs: Vec<String> = (0..n).map(|_| gen_agg(rng)).collect();
-            let where_c = if rng.chance(55) {
-                format!(" WHERE {}", gen_predicate(rng, 2))
+            let aggs: Vec<String> = (0..n).map(|_| gen_agg(schema, rng)).collect();
+            let w = if rng.chance(55) {
+                format!(" WHERE {}", gen_predicate(schema, rng, 2))
             } else {
                 String::new()
             };
-            (format!("SELECT {} FROM t{where_c}", aggs.join(", ")), true)
+            (format!("SELECT {} FROM t{w}", aggs.join(", ")), true)
         }
-        // GROUP BY.
+        // GROUP BY [HAVING].
         1 => {
-            let gcol = *rng.pick(&["d", "e", "g"]);
+            // Group by a NOT NULL column (NULL-group conventions differ).
+            let gcols: Vec<&Col> =
+                schema.nn_cols().into_iter().filter(|c| c.ty != Ty::Real).collect();
+            let g = if gcols.is_empty() { "id" } else { rng.pick(&gcols).name };
             let n = 1 + rng.below(2);
-            let aggs: Vec<String> = (0..n).map(|_| gen_agg(rng)).collect();
-            let where_c = if rng.chance(45) {
-                format!(" WHERE {}", gen_predicate(rng, 1))
+            let aggs: Vec<String> = (0..n).map(|_| gen_agg(schema, rng)).collect();
+            let w = if rng.chance(45) {
+                format!(" WHERE {}", gen_predicate(schema, rng, 1))
+            } else {
+                String::new()
+            };
+            let having = if rng.chance(30) {
+                let op = *rng.pick(&[">", ">=", "<", "<=", "="]);
+                format!(" HAVING COUNT(*) {op} {}", rng.int(0, 3))
             } else {
                 String::new()
             };
             (
+                format!("SELECT {g}, {} FROM t{w} GROUP BY {g}{having} ORDER BY {g} ASC", aggs.join(", ")),
+                true,
+            )
+        }
+        // Self-join: INNER or LEFT.
+        2 | 3 => {
+            let jcols = schema.of(|c| c.ty == Ty::Int || c.ty == Ty::Text);
+            let jcol = rng.pick(&jcols).name;
+            let kind = if rng.chance(50) { "JOIN" } else { "LEFT JOIN" };
+            let extra = if rng.chance(50) {
+                format!(" AND x1.id < {}", rng.int(2, rows as i64))
+            } else {
+                String::new()
+            };
+            // x2.id is NULL only for unmatched LEFT singletons (unique per x1.id),
+            // so ORDER BY x1.id, x2.id stays deterministic across both engines.
+            (
                 format!(
-                    "SELECT {gcol}, {} FROM t{where_c} GROUP BY {gcol} ORDER BY {gcol} ASC",
-                    aggs.join(", ")
+                    "SELECT x1.id, x2.id, x1.{jcol} FROM t x1 {kind} t x2 ON x1.{jcol} = x2.{jcol}{extra} ORDER BY x1.id ASC, x2.id ASC"
                 ),
                 true,
             )
         }
-        // Comma self-join (the class that hid the row-loss bug).
-        2 | 3 => {
-            let jcol = *rng.pick(&["d", "e", "a", "g"]);
-            let explicit = rng.chance(50);
-            let from = if explicit {
-                format!("t x1 JOIN t x2 ON x1.{jcol} = x2.{jcol}")
-            } else {
-                format!("t x1, t x2 WHERE x1.{jcol} = x2.{jcol}")
-            };
-            let extra = if rng.chance(50) {
-                let conj = if explicit { "WHERE" } else { "AND" };
-                format!(" {conj} x1.id < {}", rng.int(2, rows as i64))
-            } else {
-                String::new()
-            };
-            let proj = *rng.pick(&["x1.id, x2.id", "x1.g, x2.d, x1.id, x2.id", "x1.id, x2.g"]);
-            // Deterministic order across both engines.
+        // Set operation (compared unordered).
+        4 => {
+            let op = *rng.pick(&["UNION", "UNION ALL", "INTERSECT", "EXCEPT"]);
+            let c1 = schema.cols[1].name; // guaranteed NN int
+            let c2 = schema.cols[2].name; // guaranteed NN text
+            let p1 = gen_predicate(schema, rng, 1);
+            let p2 = gen_predicate(schema, rng, 1);
             (
-                format!("SELECT {proj} FROM {from}{extra} ORDER BY x1.id ASC, x2.id ASC"),
-                true,
+                format!(
+                    "SELECT id, {c1}, {c2} FROM t WHERE {p1} {op} SELECT id, {c1}, {c2} FROM t WHERE {p2}"
+                ),
+                false,
             )
         }
-        // Projection with WHERE / ORDER BY / LIMIT.
+        // Subquery: IN / NOT IN / EXISTS / scalar.
+        5 => {
+            let pred = match rng.below(4) {
+                0 => {
+                    let c = schema.pick(rng).name;
+                    let neg = if rng.chance(50) { "NOT " } else { "" };
+                    format!(
+                        "{c} {neg}IN (SELECT {c} FROM t WHERE {})",
+                        gen_predicate(schema, rng, 1)
+                    )
+                }
+                1 => {
+                    let neg = if rng.chance(50) { "NOT " } else { "" };
+                    let c = schema.cols[1].name;
+                    format!(
+                        "{neg}EXISTS (SELECT 1 FROM t x2 WHERE x2.{c} = t.{c} AND {})",
+                        gen_predicate(schema, rng, 0)
+                    )
+                }
+                2 => {
+                    let c = schema.cols[1].name; // NN int
+                    let op = *rng.pick(&["=", "<", ">", "<=", ">="]);
+                    format!("{c} {op} (SELECT MAX({c}) FROM t)")
+                }
+                _ => {
+                    let c = schema.cols[1].name;
+                    format!("{c} > (SELECT AVG({c}) FROM t)")
+                }
+            };
+            (format!("SELECT id FROM t WHERE {pred} ORDER BY id ASC"), true)
+        }
+        // Projection (+ DISTINCT) with WHERE / ORDER BY / LIMIT / OFFSET.
         _ => {
-            let proj = if rng.chance(30) {
+            let distinct = rng.chance(25);
+            let proj = if rng.chance(25) && !distinct {
                 "*".to_string()
             } else {
                 let n = 1 + rng.below(3);
-                let cols: Vec<&str> = (0..n).map(|_| *rng.pick(ALL_COLS)).collect();
-                cols.join(", ")
+                let items: Vec<String> = (0..n).map(|_| gen_scalar(schema, rng)).collect();
+                items.join(", ")
             };
-            let where_c = if rng.chance(55) {
-                format!(" WHERE {}", gen_predicate(rng, 2))
+            let w = if rng.chance(55) {
+                format!(" WHERE {}", gen_predicate(schema, rng, 2))
             } else {
                 String::new()
             };
-            let has_order = rng.chance(65);
+            // DISTINCT rows are a set → compare unordered, skip ORDER BY/LIMIT
+            // (ORDER BY a computed/della column is not always deterministic).
+            if distinct {
+                return (format!("SELECT DISTINCT {proj} FROM t{w}"), false);
+            }
+            let has_order = rng.chance(70);
             let order = if has_order {
-                format!(" {}", gen_orderby(rng))
+                format!(" {}", gen_orderby(schema, rng))
             } else {
                 String::new()
             };
-            // LIMIT only with ORDER BY (else which rows survive is undefined).
-            let limit = if has_order && rng.chance(40) {
-                format!(" LIMIT {}", rng.int(1, rows as i64))
+            let limit = if has_order && rng.chance(45) {
+                let off = if rng.chance(40) {
+                    format!(" OFFSET {}", rng.int(0, rows as i64))
+                } else {
+                    String::new()
+                };
+                format!(" LIMIT {}{off}", rng.int(1, rows as i64))
             } else {
                 String::new()
             };
-            (
-                format!("SELECT {proj} FROM t{where_c}{order}{limit}"),
-                has_order,
+            (format!("SELECT {proj} FROM t{w}{order}{limit}"), has_order)
+        }
+    }
+}
+
+// ─── Mutations ────────────────────────────────────────────────────────────────
+fn gen_mutation(schema: &Schema, rng: &mut Rng, next_id: &mut i64) -> String {
+    match rng.below(3) {
+        0 => {
+            // INSERT a fresh row (unique id, NOT NULL respected by gen_value).
+            let names: Vec<&str> = schema.cols.iter().map(|c| c.name).collect();
+            let mut cells = Vec::with_capacity(schema.cols.len());
+            for (i, c) in schema.cols.iter().enumerate() {
+                cells.push(if i == 0 { next_id.to_string() } else { gen_value(rng, c) });
+            }
+            *next_id += 1;
+            format!("INSERT INTO t ({}) VALUES ({})", names.join(","), cells.join(","))
+        }
+        1 => {
+            // UPDATE a non-id column (respecting NOT NULL) on a predicate subset.
+            let targets: Vec<&Col> = schema.cols.iter().skip(1).collect();
+            let c = *rng.pick(&targets);
+            format!(
+                "UPDATE t SET {} = {} WHERE {}",
+                c.name,
+                gen_value(rng, c),
+                gen_predicate(schema, rng, 1)
             )
         }
+        _ => format!("DELETE FROM t WHERE {}", gen_predicate(schema, rng, 1)),
     }
 }
 
@@ -287,20 +485,46 @@ fn canon_sqlite(v: &rusqlite::types::Value) -> String {
     }
 }
 
+// ─── Execution wrappers (panic-safe) ──────────────────────────────────────────
+/// Run a SELECT on Nucleus. Errors are returned as `Err`; panics are returned as
+/// `Err("PANIC: ..")` so the caller can treat them as always-fatal bugs.
 fn run_nucleus(ex: &Executor, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let rt = tokio::runtime::Handle::current();
-    let res = tokio::task::block_in_place(|| rt.block_on(ex.execute(sql)));
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        tokio::task::block_in_place(|| rt.block_on(ex.execute(sql)))
+    }));
     match res {
-        Ok(mut results) => match results.pop() {
-            Some(ExecResult::Select { rows, .. }) => Ok(rows
-                .iter()
-                .map(|r| r.iter().map(canon_nucleus).collect())
-                .collect()),
+        Ok(Ok(mut results)) => match results.pop() {
+            Some(ExecResult::Select { rows, .. }) => {
+                Ok(rows.iter().map(|r| r.iter().map(canon_nucleus).collect()).collect())
+            }
             _ => Err("non-select result".into()),
         },
-        Err(e) => Err(format!("{e:?}")),
+        Ok(Err(e)) => Err(format!("{e:?}")),
+        Err(p) => Err(format!("PANIC: {}", panic_msg(&p))),
     }
 }
+
+/// Run a non-SELECT (DML/DDL) on Nucleus. `Ok(())` on any success.
+fn exec_nucleus(ex: &Executor, sql: &str) -> Result<(), String> {
+    let rt = tokio::runtime::Handle::current();
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        tokio::task::block_in_place(|| rt.block_on(ex.execute(sql)))
+    }));
+    match res {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(format!("{e:?}")),
+        Err(p) => Err(format!("PANIC: {}", panic_msg(&p))),
+    }
+}
+
+fn panic_msg(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 fn run_sqlite(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     let ncol = stmt.column_count();
@@ -329,8 +553,88 @@ fn compare(mut nuc: Vec<Vec<String>>, mut sql: Vec<Vec<String>>, ordered: bool) 
     nuc == sql
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() {
+/// Full table snapshot, ordered by id — the post-mutation invariant.
+fn snapshot(schema: &Schema) -> String {
+    let cols: Vec<&str> = schema.cols.iter().map(|c| c.name).collect();
+    format!("SELECT {} FROM t ORDER BY id ASC", cols.join(", "))
+}
+
+/// Reconstruct a replayable INSERT from a full-table snapshot (canon cells in
+/// schema column order, ordered by id). The original `inserts` no longer
+/// describes the live table once mutations have run, so a faithful repro must
+/// dump the *current* rows. canon text cells are already valid `'..'` literals
+/// and numbers are bare; only NULL (`∅`) needs translating.
+fn dump_inserts(schema: &Schema, rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        return "-- (table empty after mutations)".into();
+    }
+    let names: Vec<&str> = schema.cols.iter().map(|c| c.name).collect();
+    let tuples: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            let cells: Vec<String> = r
+                .iter()
+                .map(|c| if c == "∅" { "NULL".to_string() } else { c.clone() })
+                .collect();
+            format!("({})", cells.join(","))
+        })
+        .collect();
+    format!("INSERT INTO t ({}) VALUES {}", names.join(","), tuples.join(","))
+}
+
+/// Replay an op sequence on a fresh Nucleus + fresh SQLite, run `q` on both,
+/// and report whether they diverge. `None` if the candidate is structurally
+/// invalid (some op errors on either engine) — such a candidate is unusable for
+/// minimization. SELECTs in `ops` are run for side effects (cache priming).
+fn replay_diverges(ops: &[String], q: &str, ordered: bool) -> Option<bool> {
+    let cat = Arc::new(Catalog::new());
+    let st: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
+    let ex = Arc::new(Executor::new(cat, st));
+    let sqlite = Connection::open_in_memory().ok()?;
+    for op in ops {
+        let is_select = op.trim_start().to_uppercase().starts_with("SELECT");
+        let nr = if is_select { run_nucleus(&ex, op).map(|_| ()) } else { exec_nucleus(&ex, op) };
+        if nr.is_err() {
+            return None;
+        }
+        if sqlite.execute_batch(op).is_err() {
+            // SELECTs aren't valid for execute_batch on some shapes; ignore
+            // read failures, but a failed DDL/DML invalidates the candidate.
+            if !is_select {
+                return None;
+            }
+        }
+    }
+    match (run_nucleus(&ex, q), run_sqlite(&sqlite, q)) {
+        (Ok(x), Ok(y)) => Some(!compare(x, y, ordered)),
+        _ => None,
+    }
+}
+
+/// Delta-debug an op sequence down to a minimal subsequence that still makes
+/// `q` diverge. Op 0 (CREATE TABLE) is always kept. Greedy single-op removal to
+/// a fixpoint — small op counts make this cheap and the result is a drop-in repro.
+fn minimize(ops: &[String], q: &str, ordered: bool) -> Vec<String> {
+    let mut cur: Vec<String> = ops.to_vec();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut i = 1;
+        while i < cur.len() {
+            let mut cand = cur.clone();
+            cand.remove(i);
+            if replay_diverges(&cand, q, ordered) == Some(true) {
+                cur = cand;
+                changed = true;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    cur
+}
+
+fn main_impl() {
     let mut seed: u64 = 0x1234_5678;
     let mut iterations: usize = 2000;
     let mut max_report: usize = 15;
@@ -339,72 +643,185 @@ async fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed" => {
-                i += 1;
-                seed = args[i].parse().unwrap();
-            }
-            "--iterations" => {
-                i += 1;
-                iterations = args[i].parse().unwrap();
-            }
-            "--max-report" => {
-                i += 1;
-                max_report = args[i].parse().unwrap();
-            }
-            "--queries" => {
-                i += 1;
-                queries_per = args[i].parse().unwrap();
-            }
+            "--seed" => { i += 1; seed = args[i].parse().unwrap(); }
+            "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
+            "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
+            "--queries" => { i += 1; queries_per = args[i].parse().unwrap(); }
             _ => {}
         }
         i += 1;
     }
 
-    println!("Nucleus ⇄ SQLite differential fuzzer");
+    // Silence the default panic printer; catch_unwind captures the message.
+    std::panic::set_hook(Box::new(|_| {}));
+
+    println!("Nucleus ⇄ SQLite differential fuzzer (schema+DML+expr coverage)");
     println!("seed={seed} iterations={iterations} queries/iter={queries_per}\n");
 
-    let mut total_queries = 0usize;
+    let mut total = 0usize;
     let mut divergences = 0usize;
-    let mut nuc_errors = 0usize; // Nucleus errored where SQLite succeeded (possible gap)
+    let mut panics = 0usize;
+    let mut nuc_errors = 0usize;
 
     'outer: for iter in 0..iterations {
         let mut rng = Rng(seed.wrapping_add(iter as u64).wrapping_mul(0x100000001B3));
+        let schema = Schema::random(&mut rng);
         let rows = 8 + rng.below(40);
+        let ddl = schema.ddl();
+        let inserts = gen_inserts(&schema, &mut rng, rows);
+        let mut next_id = rows as i64 + 1;
 
-        // Fresh Nucleus + SQLite with identical schema + data.
         let catalog = Arc::new(Catalog::new());
         let storage: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
         let ex = Arc::new(Executor::new(catalog, storage));
         let sqlite = Connection::open_in_memory().unwrap();
 
-        let inserts = gen_inserts(&mut rng, rows);
-        for ddl in [SCHEMA, &inserts] {
-            if let Err(e) = run_nucleus(&ex, ddl) {
-                // DDL/INSERT must succeed on both; if Nucleus can't, that's notable.
-                if !e.contains("non-select") {
-                    eprintln!("[setup] nucleus failed: {e}\n  {ddl}");
-                    continue 'outer;
+        // Replayable op-log for faithful repros. WHERE-filtered scans can go
+        // wrong only after a *sequence* of mutations (the bug lives in
+        // incrementally-maintained MVCC/index state, not the final rows), so a
+        // dump of final state alone does not reproduce — we must replay every
+        // applied mutation in order.
+        let mut ops: Vec<String> = vec![ddl.clone(), inserts.clone()];
+
+        // Setup must succeed on both.
+        for stmt in [&ddl, &inserts] {
+            if let Err(e) = exec_nucleus(&ex, stmt) {
+                if e.starts_with("PANIC:") {
+                    report_panic(&mut panics, max_report, iter, stmt, &e, &ddl, &inserts);
                 }
+                eprintln!("[setup] nucleus failed: {e}\n  {stmt}");
+                continue 'outer;
             }
-            sqlite.execute_batch(ddl).unwrap();
+            if sqlite.execute_batch(stmt).is_err() {
+                continue 'outer;
+            }
         }
 
         for _ in 0..queries_per {
-            let (q, ordered) = gen_query(&mut rng, rows);
-            total_queries += 1;
+            total += 1;
+
+            // ~30% of steps mutate, then assert full state matches.
+            if rng.chance(30) {
+                let m = gen_mutation(&schema, &mut rng, &mut next_id);
+                let nr = exec_nucleus(&ex, &m);
+                if let Err(e) = &nr
+                    && e.starts_with("PANIC:")
+                {
+                    report_panic(&mut panics, max_report, iter, &m, e, &ddl, &inserts);
+                    if panics > max_report {
+                        std::process::exit(1);
+                    }
+                    continue 'outer;
+                }
+                let sr = sqlite.execute_batch(&m);
+                match (nr, sr) {
+                    (Ok(()), Ok(())) => {
+                        // Both applied — record it so a later read divergence
+                        // can be replayed exactly, then assert state matches.
+                        ops.push(m.clone());
+                        let snap = snapshot(&schema);
+                        let ns = run_nucleus(&ex, &snap);
+                        let ss = run_sqlite(&sqlite, &snap);
+                        if let (Ok(a), Ok(b)) = (ns, ss)
+                            && !compare(a.clone(), b.clone(), true)
+                        {
+                            divergences += 1;
+                            if divergences <= max_report {
+                                println!("─── STATE DIVERGENCE after mutation #{divergences} (iter {iter}, seed {seed}) ───");
+                                println!("  schema : {ddl}");
+                                println!("  data   : {inserts}");
+                                println!("  mutation: {m}");
+                                println!("  nucleus({} rows): {}", a.len(), preview(&a));
+                                println!("  sqlite ({} rows): {}", b.len(), preview(&b));
+                                println!();
+                            }
+                        }
+                    }
+                    (Err(_), Err(_)) => { /* both rejected — state unchanged */ }
+                    (Err(_e), Ok(())) => {
+                        // SQLite applied, Nucleus didn't → state now divergent. Stop.
+                        nuc_errors += 1;
+                        continue 'outer;
+                    }
+                    (Ok(()), Err(_)) => continue 'outer,
+                }
+                continue;
+            }
+
+            let (q, ordered) = gen_query(&schema, &mut rng, rows);
             let n = run_nucleus(&ex, &q);
             let s = run_sqlite(&sqlite, &q);
+            // A read can leave behind cache state that a later mutation fails to
+            // invalidate, so intervening queries are part of a faithful repro,
+            // not just mutations. Record every query that ran cleanly on nucleus.
+            let n_ok = n.is_ok();
             match (n, s) {
                 (Ok(nr), Ok(sr)) => {
                     if !compare(nr.clone(), sr.clone(), ordered) {
                         divergences += 1;
                         if divergences <= max_report {
-                            println!(
-                                "─── DIVERGENCE #{divergences} (iter {iter}, seed {seed}) ───"
-                            );
-                            println!("  query : {q}");
-                            println!("  setup : {SCHEMA}");
-                            println!("          {inserts}");
+                            // Is the LIVE table identical at query time? If yes, the
+                            // divergence is a read-path bug, not a desynced mutation.
+                            let snap = snapshot(&schema);
+                            let (live_n, live_s) = (run_nucleus(&ex, &snap), run_sqlite(&sqlite, &snap));
+                            let live_match = matches!((&live_n, &live_s), (Ok(x), Ok(y)) if compare(x.clone(), y.clone(), true));
+                            let live_data = match (&live_s, &live_n) {
+                                (Ok(rows), _) => dump_inserts(&schema, rows),
+                                (_, Ok(rows)) => dump_inserts(&schema, rows),
+                                _ => inserts.clone(),
+                            };
+                            // Re-run the exact query: does it still diverge (persistent)
+                            // or was it transient (cache)?
+                            let rerun_match = match (run_nucleus(&ex, &q), run_sqlite(&sqlite, &q)) {
+                                (Ok(x), Ok(y)) => compare(x, y, ordered),
+                                _ => false,
+                            };
+                            // Path-dependence probe: rebuild a fresh table from the
+                            // *final* rows and run q. If that matches sqlite, the
+                            // bug needs the mutation history (MVCC/index state),
+                            // not just the rows — so the op-log below is the repro.
+                            let fresh_match = {
+                                let cat = Arc::new(Catalog::new());
+                                let st: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
+                                let fx = Arc::new(Executor::new(cat, st));
+                                let ok = exec_nucleus(&fx, &ddl).is_ok()
+                                    && exec_nucleus(&fx, &live_data).is_ok();
+                                if ok {
+                                    match (run_nucleus(&fx, &q), run_sqlite(&sqlite, &q)) {
+                                        (Ok(x), Ok(y)) => Some(compare(x, y, ordered)),
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                }
+                            };
+                            // Op-log replay: a fresh executor fed the exact recorded
+                            // op sequence, then q. If this MATCHES sqlite while the
+                            // live executor does not, the trigger is something the
+                            // op-log omits (e.g. the post-mutation snapshot probes).
+                            let oplog_match = {
+                                let cat = Arc::new(Catalog::new());
+                                let st: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
+                                let rx = Arc::new(Executor::new(cat, st));
+                                let mut ok = true;
+                                for op in &ops {
+                                    let is_select = op.trim_start().to_uppercase().starts_with("SELECT");
+                                    let r = if is_select { run_nucleus(&rx, op).map(|_| ()) } else { exec_nucleus(&rx, op) };
+                                    if r.is_err() { ok = false; break; }
+                                }
+                                if ok {
+                                    match (run_nucleus(&rx, &q), run_sqlite(&sqlite, &q)) {
+                                        (Ok(x), Ok(y)) => Some(compare(x, y, ordered)),
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                }
+                            };
+                            println!("─── DIVERGENCE #{divergences} (iter {iter}, seed {seed}) ───");
+                            println!("  query  : {q}");
+                            println!("  schema : {ddl}");
+                            println!("  data   : {live_data}");
                             let (mut a, mut b) = (nr, sr);
                             if !ordered {
                                 a.sort();
@@ -412,44 +829,92 @@ async fn main() {
                             }
                             println!("  nucleus({} rows): {}", a.len(), preview(&a));
                             println!("  sqlite ({} rows): {}", b.len(), preview(&b));
+                            println!(
+                                "  live-state match: {live_match} | rerun match: {rerun_match} | fresh-rebuild: {} | oplog-replay: {}",
+                                match fresh_match { Some(true) => "match", Some(false) => "diverge", None => "n/a" },
+                                match oplog_match { Some(true) => "MATCH (op-log INSUFFICIENT)", Some(false) => "diverge (op-log reproduces)", None => "n/a" }
+                            );
+                            // Minimal replayable sequence — delta-debugged when the
+                            // op-log reproduces, else the full sequence.
+                            let repro = if oplog_match == Some(false) {
+                                minimize(&ops, &q, ordered)
+                            } else {
+                                ops.clone()
+                            };
+                            println!("  ── repro ({} ops, minimized from {}) ──", repro.len(), ops.len());
+                            for op in &repro {
+                                println!("    {op};");
+                            }
+                            println!("    {q};");
                             println!();
                         }
                     }
                 }
                 (Err(ne), Ok(_)) => {
-                    // SQLite accepts it, Nucleus errors — possible missing feature/bug.
-                    nuc_errors += 1;
-                    if nuc_errors <= max_report {
-                        println!("─── NUCLEUS-ERROR (iter {iter}) ─── {q}\n    err: {ne}\n");
+                    if ne.starts_with("PANIC:") {
+                        report_panic(&mut panics, max_report, iter, &q, &ne, &ddl, &inserts);
+                        if panics > max_report {
+                            std::process::exit(1);
+                        }
+                    } else {
+                        nuc_errors += 1;
+                        if nuc_errors <= max_report {
+                            println!("─── NUCLEUS-ERROR (iter {iter}) ─── {q}\n    err: {ne}\n");
+                        }
                     }
                 }
-                _ => {} // both error, or Nucleus-only success (rare) → ignore
+                _ => {}
+            }
+            if n_ok {
+                ops.push(q.clone());
             }
         }
     }
 
     println!("\n════ SUMMARY ════");
-    println!("queries run        : {total_queries}");
+    println!("queries/mutations  : {total}");
     println!("RESULT divergences : {divergences}");
+    println!("PANICS             : {panics}");
     println!("nucleus-only errors: {nuc_errors} (SQLite accepted; may be unsupported features)");
-    if divergences == 0 {
-        println!("\nNo result divergences vs SQLite. 🎯");
+    if divergences == 0 && panics == 0 {
+        println!("\nNo divergences, no panics vs SQLite. 🎯");
     } else {
-        println!("\nReproduce a divergence with: --seed {seed} --iterations <iter+1>");
+        println!("\nReproduce with: --seed {seed} --iterations <iter+1>");
         std::process::exit(1);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn report_panic(
+    panics: &mut usize,
+    max_report: usize,
+    iter: usize,
+    sql: &str,
+    err: &str,
+    ddl: &str,
+    inserts: &str,
+) {
+    *panics += 1;
+    if *panics <= max_report {
+        println!("─── PANIC #{panics} (iter {iter}) ───");
+        println!("  sql    : {sql}");
+        println!("  schema : {ddl}");
+        println!("  data   : {inserts}");
+        println!("  {err}\n");
+    }
+}
+
 fn preview(rows: &[Vec<String>]) -> String {
-    let shown: Vec<String> = rows
-        .iter()
-        .take(8)
-        .map(|r| format!("[{}]", r.join(",")))
-        .collect();
+    let shown: Vec<String> = rows.iter().take(8).map(|r| format!("[{}]", r.join(","))).collect();
     let more = if rows.len() > 8 {
         format!(" …(+{})", rows.len() - 8)
     } else {
         String::new()
     };
     format!("{}{more}", shown.join(" "))
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+async fn main() {
+    main_impl();
 }
