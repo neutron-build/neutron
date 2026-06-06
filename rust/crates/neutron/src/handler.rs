@@ -454,6 +454,37 @@ impl<T: IntoResponse, E: IntoResponse> IntoResponse for Result<T, E> {
     }
 }
 
+// Terse header arrays (Axum parity): return headers inline without building a
+// `HeaderMap`. `append` is used so repeated names (e.g. `Set-Cookie`) are kept.
+impl<T: IntoResponse, const N: usize> IntoResponse
+    for ([(http::HeaderName, http::HeaderValue); N], T)
+{
+    fn into_response(self) -> Response {
+        let (headers, body) = self;
+        let mut resp = body.into_response();
+        let h = resp.headers_mut();
+        for (name, value) in headers {
+            h.append(name, value);
+        }
+        resp
+    }
+}
+
+impl<T: IntoResponse, const N: usize> IntoResponse
+    for (StatusCode, [(http::HeaderName, http::HeaderValue); N], T)
+{
+    fn into_response(self) -> Response {
+        let (status, headers, body) = self;
+        let mut resp = body.into_response();
+        *resp.status_mut() = status;
+        let h = resp.headers_mut();
+        for (name, value) in headers {
+            h.append(name, value);
+        }
+        resp
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Redirect
 // ---------------------------------------------------------------------------
@@ -638,6 +669,28 @@ mod tests {
             "text/plain; charset=utf-8"
         );
         assert_eq!(body_bytes(resp).await, b"hello");
+    }
+
+    // P1.8: terse (StatusCode, [header pairs], body) — headers appended so
+    // repeated names (Set-Cookie) are preserved.
+    #[tokio::test]
+    async fn status_header_array_into_response() {
+        let resp = (
+            StatusCode::CREATED,
+            [
+                (http::header::LOCATION, http::HeaderValue::from_static("/items/1")),
+                (http::header::SET_COOKIE, http::HeaderValue::from_static("a=1")),
+                (http::header::SET_COOKIE, http::HeaderValue::from_static("b=2")),
+            ],
+            "made",
+        )
+            .into_response();
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(resp.headers().get(http::header::LOCATION).unwrap(), "/items/1");
+        let cookies = resp.headers().get_all(http::header::SET_COOKIE).iter().count();
+        assert_eq!(cookies, 2, "both Set-Cookie values should be appended");
+        assert_eq!(body_bytes(resp).await, b"made");
     }
 
     #[tokio::test]
