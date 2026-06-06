@@ -28,6 +28,7 @@ use smallvec::SmallVec;
 #[cfg(feature = "json")]
 use serde::Serialize;
 
+use crate::error::AppError;
 use crate::extract::FromRequest;
 
 // ---------------------------------------------------------------------------
@@ -132,6 +133,54 @@ impl From<Vec<u8>> for Body {
 /// HTTP response type used throughout Neutron.
 pub type Response = http::Response<Body>;
 
+/// Boxed streaming **request** body.
+///
+/// Unlike the response [`Body`] (whose error is `Infallible`), a request body
+/// can fail mid-stream (connection reset during upload), so it carries a real
+/// boxed error. Kept separate from `Body` to preserve the response-body
+/// `Infallible` invariant relied on by `IntoResponse`.
+pub type ReqBody = Pin<
+    Box<dyn HttpBody<Data = Bytes, Error = Box<dyn std::error::Error + Send + Sync>> + Send>,
+>;
+
+/// Collect a streaming request body with a hard byte ceiling enforced
+/// **during** streaming — the limit is checked per-frame as bytes arrive, so a
+/// body exceeding `limit` is rejected after `limit + 1` bytes, never buffered
+/// whole.
+async fn collect_limited(mut body: ReqBody, limit: usize) -> Result<Bytes, Response> {
+    use http_body_util::BodyExt;
+    let mut acc = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| {
+            AppError::bad_request("The request body could not be read.").into_response()
+        })?;
+        if let Ok(data) = frame.into_data() {
+            if acc.len() + data.len() > limit {
+                return Err(AppError::payload_too_large(
+                    "The request body exceeds the configured limit.",
+                )
+                .into_response());
+            }
+            acc.extend_from_slice(&data);
+        }
+    }
+    Ok(acc.freeze())
+}
+
+/// Box a `Bytes` buffer as a single-frame [`ReqBody`] (for synthetic/buffered requests).
+#[allow(dead_code)]
+pub(crate) fn full_frame(body: Bytes) -> ReqBody {
+    use http_body_util::BodyExt;
+    Box::pin(http_body_util::Full::new(body).map_err(|never: Infallible| match never {}))
+}
+
+/// An empty [`ReqBody`] (used when the body has already been consumed).
+#[allow(dead_code)]
+pub(crate) fn empty_req_body() -> ReqBody {
+    use http_body_util::BodyExt;
+    Box::pin(http_body_util::Empty::<Bytes>::new().map_err(|never: Infallible| match never {}))
+}
+
 // ---------------------------------------------------------------------------
 // Type-erased state storage
 // ---------------------------------------------------------------------------
@@ -200,6 +249,13 @@ pub struct Request {
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
+    /// Streaming request body. `Some(..)` once a production server path mounts a
+    /// real `ReqBody`; `None` for synthetic/buffered requests (falls back to `body`).
+    ///
+    /// Wrapped in a `Mutex` so `Request` stays `Sync` — `ReqBody` (`dyn Body + Send`)
+    /// is not `Sync`, and parts extractors take `&Request` across an `.await`, which
+    /// the trait's `+ Send` bound turns into a `Request: Sync` obligation.
+    body_stream: std::sync::Mutex<Option<ReqBody>>,
     params: SmallVec<[(String, String); 4]>,
     state: Arc<StateMap>,
     on_upgrade: std::sync::Mutex<Option<hyper::upgrade::OnUpgrade>>,
@@ -214,6 +270,7 @@ impl Request {
             uri,
             headers,
             body,
+            body_stream: std::sync::Mutex::new(None),
             params: SmallVec::new(),
             state: Arc::new(HashMap::new()),
             on_upgrade: std::sync::Mutex::new(None),
@@ -237,12 +294,31 @@ impl Request {
             uri,
             headers,
             body,
+            body_stream: std::sync::Mutex::new(None),
             params: SmallVec::new(),
             state,
             on_upgrade: std::sync::Mutex::new(None),
             extensions: SmallVec::new(),
             remote_addr: None,
         }
+    }
+
+    /// Collect the request body with a hard byte ceiling, enforced *during*
+    /// streaming. Returns 413 (as a `Response`) the instant the running total
+    /// exceeds `limit`.
+    pub async fn collect_body(&mut self, limit: usize) -> Result<Bytes, Response> {
+        // A.2: body_stream is always None -> fall back to the buffered Bytes.
+        let taken = self.body_stream.get_mut().unwrap().take();
+        if let Some(stream) = taken {
+            collect_limited(stream, limit).await
+        } else {
+            Ok(self.body.clone())
+        }
+    }
+
+    /// Take the streaming body for frame-level consumption (`BodyStream` extractor).
+    pub fn take_body(&mut self) -> Option<ReqBody> {
+        self.body_stream.get_mut().unwrap().take()
     }
 
     pub fn method(&self) -> &Method {
@@ -661,6 +737,21 @@ mod tests {
 
     async fn body_bytes(resp: Response) -> Vec<u8> {
         resp.into_body().collect().await.unwrap().to_bytes().to_vec()
+    }
+
+    #[tokio::test]
+    async fn collect_body_transitional_returns_buffered() {
+        let mut req = Request::new(
+            Method::POST,
+            "/".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::from("hello"),
+        );
+        let collected = match req.collect_body(1024).await {
+            Ok(b) => b,
+            Err(_) => panic!("expected Ok"),
+        };
+        assert_eq!(collected, Bytes::from("hello"));
     }
 
     #[tokio::test]
