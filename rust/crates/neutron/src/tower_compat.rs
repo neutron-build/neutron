@@ -179,6 +179,10 @@ where
                 });
 
             // Convert Neutron request → http::Request, call the Tower service.
+            // Buffer the (possibly streaming) body first so the conversion sees
+            // the bytes; Tower layers expect a materialized body.
+            let mut req = req;
+            let _ = req.buffer_body(crate::app::DEFAULT_MAX_BODY_SIZE).await;
             let http_req = neutron_to_http_request(req);
 
             match tower_svc.call(http_req).await {

@@ -15,8 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
-use http_body_util::{BodyExt, Limited};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -44,11 +43,6 @@ use crate::tls::TlsConfig;
 #[inline]
 fn resp_payload_too_large() -> Response {
     AppError::payload_too_large("The request body exceeds the configured limit.").into_response()
-}
-
-#[inline]
-fn resp_bad_request() -> Response {
-    AppError::bad_request("The request body could not be read.").into_response()
 }
 
 #[inline]
@@ -80,26 +74,6 @@ fn resp_internal_error(path: &str) -> Response {
     AppError::internal("The server was not ready to handle the request.")
         .with_instance(path)
         .into_response()
-}
-
-/// Returns `true` if the request carries a body.
-///
-/// Checks for `Content-Length` (non-zero) or `Transfer-Encoding` headers.
-/// Requests without either header have no body — skipping collection saves
-/// one async await cycle (~30-50 µs) on every GET/HEAD/DELETE request.
-#[inline]
-fn request_has_body(headers: &http::HeaderMap) -> bool {
-    if let Some(cl) = headers.get(http::header::CONTENT_LENGTH) {
-        // Content-Length: 0 means no body
-        cl.to_str()
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|n| n > 0)
-            .unwrap_or(true) // unknown value → assume body present
-    } else {
-        // Transfer-Encoding (chunked etc.) always implies a body
-        headers.contains_key(http::header::TRANSFER_ENCODING)
-    }
 }
 
 /// Apply HTTP/2 configuration to a hyper-util auto builder.
@@ -316,29 +290,18 @@ async fn worker_accept_loop(
                     let on_upgrade = needs_upgrade.then(|| hyper::upgrade::on(&mut req));
 
                     let (parts, body) = req.into_parts();
-                    let body_bytes = if request_has_body(&parts.headers) {
-                        match Limited::new(body, body_limit).collect().await {
-                            Ok(collected) => collected.to_bytes(),
-                            Err(e) => {
-                                let msg = e.to_string();
-                                if msg.contains("length limit exceeded") {
-                                    return Ok::<_, std::convert::Infallible>(
-                                        resp_payload_too_large(),
-                                    );
-                                }
-                                tracing::error!("Failed to read request body: {msg}");
-                                return Ok::<_, std::convert::Infallible>(resp_bad_request());
-                            }
-                        }
-                    } else {
-                        Bytes::new()
-                    };
+                    // P1.2: pass the body through as a lazy stream — no pre-collect.
+                    // The Content-Length early-413 above is kept; the per-frame
+                    // ceiling in collect_body enforces the limit for chunked bodies.
+                    let boxed: crate::handler::ReqBody = Box::pin(body.map_err(|e| {
+                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                    }));
 
-                    let mut neutron_req = crate::handler::Request::with_state(
+                    let mut neutron_req = crate::handler::Request::with_streaming_state(
                         parts.method,
                         parts.uri,
                         parts.headers,
-                        body_bytes,
+                        boxed,
                         state,
                     );
                     if let Some(upgrade) = on_upgrade {
@@ -676,35 +639,21 @@ impl Neutron {
 
                                 let (parts, body) = req.into_parts();
 
-                                // Skip body collection for requests that carry no body
-                                // (no Content-Length / Transfer-Encoding header).  For GET,
-                                // HEAD, DELETE, OPTIONS this eliminates an entire async await
-                                // cycle — roughly 30-50 µs on a loopback benchmark.
-                                let body_bytes = if request_has_body(&parts.headers) {
-                                    match Limited::new(body, body_limit).collect().await {
-                                        Ok(collected) => collected.to_bytes(),
-                                        Err(e) => {
-                                            let msg = e.to_string();
-                                            if msg.contains("length limit exceeded") {
-                                                return Ok::<_, std::convert::Infallible>(
-                                                    resp_payload_too_large(),
-                                                );
-                                            }
-                                            tracing::error!("Failed to read request body: {msg}");
-                                            return Ok::<_, std::convert::Infallible>(
-                                                resp_bad_request(),
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    Bytes::new()
-                                };
+                                // P1.2: pass the body through as a lazy stream — no
+                                // pre-collect. The Content-Length early-413 above is
+                                // kept; the per-frame ceiling in collect_body enforces
+                                // the limit for chunked bodies.
+                                let boxed: crate::handler::ReqBody =
+                                    Box::pin(body.map_err(|e| {
+                                        Box::new(e)
+                                            as Box<dyn std::error::Error + Send + Sync>
+                                    }));
 
-                                let mut neutron_req = NeutronRequest::with_state(
+                                let mut neutron_req = NeutronRequest::with_streaming_state(
                                     parts.method,
                                     parts.uri,
                                     parts.headers,
-                                    body_bytes,
+                                    boxed,
                                     state,
                                 );
                                 if let Some(upgrade) = on_upgrade {
@@ -1009,31 +958,18 @@ impl Neutron {
 
                                 let (parts, body) = req.into_parts();
 
-                                let body_bytes = if request_has_body(&parts.headers) {
-                                    match Limited::new(body, body_limit).collect().await {
-                                        Ok(collected) => collected.to_bytes(),
-                                        Err(e) => {
-                                            let msg = e.to_string();
-                                            if msg.contains("length limit exceeded") {
-                                                return Ok::<_, std::convert::Infallible>(
-                                                    resp_payload_too_large(),
-                                                );
-                                            }
-                                            tracing::error!("Failed to read request body: {msg}");
-                                            return Ok::<_, std::convert::Infallible>(
-                                                resp_bad_request(),
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    Bytes::new()
-                                };
+                                // P1.2: lazy streaming body, no pre-collect (TLS path).
+                                let boxed: crate::handler::ReqBody =
+                                    Box::pin(body.map_err(|e| {
+                                        Box::new(e)
+                                            as Box<dyn std::error::Error + Send + Sync>
+                                    }));
 
-                                let mut neutron_req = NeutronRequest::with_state(
+                                let mut neutron_req = NeutronRequest::with_streaming_state(
                                     parts.method,
                                     parts.uri,
                                     parts.headers,
-                                    body_bytes,
+                                    boxed,
                                     state,
                                 );
                                 if let Some(upgrade) = on_upgrade {

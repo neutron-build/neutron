@@ -207,12 +207,20 @@ async fn handle_request(
     }
 
     // Convert to a NeutronRequest.
+    //
+    // P1.2 (deferred true h3 streaming, see P1.9): the h3 recv loop above already
+    // accumulates the body with its own per-chunk 413 ceiling. To reach the new
+    // streaming dispatch surface without rewriting h3's chunk API, wrap the
+    // collected bytes as a single-frame ReqBody and mount it via
+    // with_streaming_state. The handler still streams the type; true frame-level
+    // h3 backpressure lands with P1.9.
     let (parts, _) = req.into_parts();
-    let mut neutron_req = NeutronRequest::with_state(
+    let boxed = crate::handler::full_frame(Bytes::from(body_bytes));
+    let mut neutron_req = NeutronRequest::with_streaming_state(
         parts.method,
         parts.uri,
         parts.headers,
-        Bytes::from(body_bytes),
+        boxed,
         state_map,
     );
     neutron_req.set_remote_addr(remote);
