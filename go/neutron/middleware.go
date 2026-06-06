@@ -276,6 +276,9 @@ func Timeout(d time.Duration) Middleware {
 func Compress(level int) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// The response varies on Accept-Encoding whether or not we compress,
+			// so caches must key on it (RFC 7231 §7.1.4). Set on both paths.
+			w.Header().Add("Vary", "Accept-Encoding")
 			if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 				next.ServeHTTP(w, r)
 				return
