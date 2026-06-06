@@ -502,3 +502,47 @@ class TrailingSlashMiddleware(_NeutronMiddleware):
 
     def as_starlette_middleware(self) -> Middleware:
         return Middleware(_TrailingSlashASGI, action=self._action)
+
+
+def default_stack(
+    *,
+    logging: LoggingMiddleware | None = None,
+    cors: CORSMiddleware | None = None,
+    compression: CompressionMiddleware | None = None,
+    rate_limit: RateLimitMiddleware | None = None,
+    auth: Any | None = None,
+    timeout: TimeoutMiddleware | None = None,
+    otel: OTelMiddleware | None = None,
+) -> list[Any]:
+    """Return the standard middleware in the exact FRAMEWORK_CONTRACT.md order:
+
+        RequestID → Logging → Recovery → CORS → Compression → RateLimit → Auth
+        → Timeout → OpenTelemetry
+
+    The order is fixed — callers pass *configured* layers (or ``None`` to skip an
+    optional one), they do not arrange them. RequestID and Logging are always on,
+    with RequestID first so every log line carries the request id. Recovery is
+    Starlette's built-in ``ServerErrorMiddleware`` (always outermost), so it is
+    not listed here.
+
+    Usage::
+
+        app = App(middleware=default_stack(
+            cors=CORSMiddleware(allow_origins=["*"]),
+            compression=CompressionMiddleware(),
+        ))
+    """
+    stack: list[Any] = [RequestIDMiddleware(), logging or LoggingMiddleware()]
+    if cors is not None:
+        stack.append(cors)
+    if compression is not None:
+        stack.append(compression)
+    if rate_limit is not None:
+        stack.append(rate_limit)
+    if auth is not None:
+        stack.append(auth)
+    if timeout is not None:
+        stack.append(timeout)
+    if otel is not None:
+        stack.append(otel)
+    return stack
