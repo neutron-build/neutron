@@ -737,6 +737,44 @@ impl Executor {
                     return false;
                 }
             }
+            // ORDER BY a column not in a non-`*` projection: the plan path applies
+            // Project before Sort, so the sort key is already dropped and the
+            // ORDER BY is silently ignored. The AST path sorts the source rows
+            // before projecting, so route there for correct results.
+            let has_wildcard = select.projection.iter().any(|i| {
+                matches!(
+                    i,
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+                )
+            });
+            if !has_wildcard {
+                let proj_names: std::collections::HashSet<String> = select
+                    .projection
+                    .iter()
+                    .filter_map(|item| match item {
+                        SelectItem::UnnamedExpr(Expr::Identifier(id)) => {
+                            Some(id.value.to_lowercase())
+                        }
+                        SelectItem::UnnamedExpr(Expr::CompoundIdentifier(ids)) => {
+                            ids.last().map(|i| i.value.to_lowercase())
+                        }
+                        SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.to_lowercase()),
+                        _ => None,
+                    })
+                    .collect();
+                for ob in exprs {
+                    let ob_col = match &ob.expr {
+                        Expr::Identifier(id) => Some(id.value.to_lowercase()),
+                        Expr::CompoundIdentifier(ids) => ids.last().map(|i| i.value.to_lowercase()),
+                        _ => None,
+                    };
+                    if let Some(c) = ob_col
+                        && !proj_names.contains(&c)
+                    {
+                        return false;
+                    }
+                }
+            }
         }
         true
     }
