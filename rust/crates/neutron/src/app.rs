@@ -191,7 +191,7 @@ impl Default for TcpConfig {
 }
 
 /// Default global body size limit: 2 MiB.
-const DEFAULT_MAX_BODY_SIZE: usize = 2 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_BODY_SIZE: usize = 2 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Thread-per-core helpers
