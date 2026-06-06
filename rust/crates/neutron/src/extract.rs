@@ -308,14 +308,15 @@ impl<T: Clone + Send + Sync + 'static> FromRequestParts for Extension<T> {
 /// Raw request body as bytes.
 impl FromRequest for Bytes {
     async fn from_request(req: &mut Request) -> Result<Self, Response> {
-        Ok(req.body().clone())
+        req.collect_body(crate::app::DEFAULT_MAX_BODY_SIZE).await
     }
 }
 
 /// Request body decoded as UTF-8 text.
 impl FromRequest for String {
     async fn from_request(req: &mut Request) -> Result<Self, Response> {
-        String::from_utf8(req.body().to_vec())
+        let bytes = req.collect_body(crate::app::DEFAULT_MAX_BODY_SIZE).await?;
+        String::from_utf8(bytes.to_vec())
             .map_err(|_| reject(StatusCode::BAD_REQUEST, "Request body is not valid UTF-8"))
     }
 }
@@ -331,7 +332,8 @@ impl<T: DeserializeOwned + Send + 'static> FromRequest for Json<T> {
             .headers()
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_owned();
 
         if !content_type.starts_with("application/json") {
             return Err(reject(
@@ -340,7 +342,8 @@ impl<T: DeserializeOwned + Send + 'static> FromRequest for Json<T> {
             ));
         }
 
-        json_from_slice(req.body())
+        let bytes = req.collect_body(crate::app::DEFAULT_MAX_BODY_SIZE).await?;
+        json_from_slice(&bytes)
             .map(Json)
             .map_err(|e| reject(StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")))
     }
@@ -384,7 +387,8 @@ impl<T: DeserializeOwned + Send + 'static> FromRequest for Form<T> {
             .headers()
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_owned();
 
         if !content_type.starts_with("application/x-www-form-urlencoded") {
             return Err(reject(
@@ -393,7 +397,8 @@ impl<T: DeserializeOwned + Send + 'static> FromRequest for Form<T> {
             ));
         }
 
-        serde_urlencoded::from_bytes(req.body())
+        let bytes = req.collect_body(crate::app::DEFAULT_MAX_BODY_SIZE).await?;
+        serde_urlencoded::from_bytes(&bytes)
             .map(Form)
             .map_err(|e| reject(StatusCode::BAD_REQUEST, format!("Invalid form data: {e}")))
     }

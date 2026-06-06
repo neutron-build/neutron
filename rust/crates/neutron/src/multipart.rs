@@ -63,7 +63,8 @@ impl FromRequest for Multipart {
             .headers()
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_owned();
 
         let boundary = multer::parse_boundary(content_type).map_err(|_| {
             (
@@ -73,7 +74,7 @@ impl FromRequest for Multipart {
                 .into_response()
         })?;
 
-        let body = req.body().clone();
+        let body = req.collect_body(2 * 1024 * 1024).await?;
         let stream = tokio_stream::once(Ok::<Bytes, std::convert::Infallible>(body));
         let size_limit = multer::SizeLimit::new()
             .whole_stream(2 * 1024 * 1024) // 2 MB total
