@@ -41,9 +41,18 @@ use http::{HeaderMap, Method, StatusCode, Uri};
 #[cfg(any(feature = "json", feature = "form"))]
 use serde::de::DeserializeOwned;
 
+use crate::error::AppError;
 use crate::handler::{IntoResponse, Request, Response};
 #[cfg(feature = "json")]
 use crate::handler::Json;
+
+/// Build an extractor rejection as RFC 7807 `application/problem+json` (P1.5a).
+/// Every extractor failure renders identically — the framework honors its own
+/// error contract instead of emitting plain text.
+#[inline]
+fn reject(status: StatusCode, detail: impl Into<String>) -> Response {
+    AppError::from_status(status, detail).into_response()
+}
 
 // ---------------------------------------------------------------------------
 // Core extractor traits
@@ -180,7 +189,7 @@ impl<T: PathParam + Send + 'static> FromRequestParts for Path<T> {
     fn from_parts(req: &Request) -> Result<Self, Response> {
         T::from_params(req.params())
             .map(Path)
-            .map_err(|msg| (StatusCode::BAD_REQUEST, msg).into_response())
+            .map_err(|msg| reject(StatusCode::BAD_REQUEST, msg))
     }
 }
 
@@ -200,9 +209,7 @@ impl<T: DeserializeOwned + Send + 'static> FromRequestParts for Query<T> {
         let query = req.uri().query().unwrap_or("");
         serde_urlencoded::from_str(query)
             .map(Query)
-            .map_err(|e| {
-                (StatusCode::BAD_REQUEST, format!("Invalid query: {e}")).into_response()
-            })
+            .map_err(|e| reject(StatusCode::BAD_REQUEST, format!("Invalid query: {e}")))
     }
 }
 
@@ -232,11 +239,7 @@ impl<T: Clone + Send + Sync + 'static> FromRequestParts for State<T> {
                     "State<{}> not found — did you call Router::state()?",
                     std::any::type_name::<T>()
                 );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal Server Error",
-                )
-                    .into_response()
+                reject(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
             })
     }
 }
@@ -281,11 +284,7 @@ impl FromRequestParts for ConnectInfo {
         req.remote_addr()
             .map(ConnectInfo)
             .ok_or_else(|| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Remote address not available",
-                )
-                    .into_response()
+                reject(StatusCode::INTERNAL_SERVER_ERROR, "Remote address not available")
             })
     }
 }
@@ -317,11 +316,7 @@ impl<T: Clone + Send + Sync + 'static> FromRequestParts for Extension<T> {
                     "Extension<{}> not found — did middleware set it?",
                     std::any::type_name::<T>()
                 );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal Server Error",
-                )
-                    .into_response()
+                reject(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
             })
     }
 }
@@ -340,9 +335,8 @@ impl FromRequest for Bytes {
 /// Request body decoded as UTF-8 text.
 impl FromRequest for String {
     fn from_request(req: &Request) -> Result<Self, Response> {
-        String::from_utf8(req.body().to_vec()).map_err(|_| {
-            (StatusCode::BAD_REQUEST, "Request body is not valid UTF-8").into_response()
-        })
+        String::from_utf8(req.body().to_vec())
+            .map_err(|_| reject(StatusCode::BAD_REQUEST, "Request body is not valid UTF-8"))
     }
 }
 
@@ -360,14 +354,15 @@ impl<T: DeserializeOwned + Send + 'static> FromRequest for Json<T> {
             .unwrap_or("");
 
         if !content_type.starts_with("application/json") {
-            return Err(
-                (StatusCode::UNSUPPORTED_MEDIA_TYPE, "Expected application/json").into_response(),
-            );
+            return Err(reject(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Expected application/json",
+            ));
         }
 
         json_from_slice(req.body())
             .map(Json)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")).into_response())
+            .map_err(|e| reject(StatusCode::BAD_REQUEST, format!("Invalid JSON: {e}")))
     }
 }
 
@@ -412,18 +407,15 @@ impl<T: DeserializeOwned + Send + 'static> FromRequest for Form<T> {
             .unwrap_or("");
 
         if !content_type.starts_with("application/x-www-form-urlencoded") {
-            return Err((
+            return Err(reject(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "Expected application/x-www-form-urlencoded",
-            )
-                .into_response());
+            ));
         }
 
         serde_urlencoded::from_bytes(req.body())
             .map(Form)
-            .map_err(|e| {
-                (StatusCode::BAD_REQUEST, format!("Invalid form data: {e}")).into_response()
-            })
+            .map_err(|e| reject(StatusCode::BAD_REQUEST, format!("Invalid form data: {e}")))
     }
 }
 
@@ -509,21 +501,19 @@ impl<T: TypedHeaderValue + 'static> FromRequestParts for TypedHeader<T> {
             .headers()
             .get(T::HEADER_NAME)
             .ok_or_else(|| {
-                (
+                reject(
                     StatusCode::BAD_REQUEST,
                     format!("Missing required header: {}", T::HEADER_NAME),
                 )
-                    .into_response()
             })?;
 
         T::decode(value)
             .map(TypedHeader)
             .map_err(|msg| {
-                (
+                reject(
                     StatusCode::BAD_REQUEST,
                     format!("Invalid header {}: {}", T::HEADER_NAME, msg),
                 )
-                    .into_response()
             })
     }
 }
@@ -1075,6 +1065,40 @@ mod tests {
         let req = Request::new(Method::POST, "/test".parse().unwrap(), headers, body);
         let err = err_or_panic(Json::<User>::from_request(&req));
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // P1.5a: extractor rejections render as RFC 7807 application/problem+json.
+    #[cfg(feature = "json")]
+    #[tokio::test]
+    async fn json_rejection_is_problem_json() {
+        use http_body_util::BodyExt;
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct User {
+            #[allow(dead_code)]
+            name: String,
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let req = Request::new(
+            Method::POST,
+            "/test".parse().unwrap(),
+            headers,
+            Bytes::from("not json"),
+        );
+        let err = err_or_panic(Json::<User>::from_request(&req));
+
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.headers().get("content-type").unwrap(),
+            "application/problem+json"
+        );
+        let body = err.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], 400);
+        assert!(v["title"].is_string());
     }
 
     #[cfg(feature = "json")]
