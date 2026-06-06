@@ -728,7 +728,15 @@ pub(super) fn parse_agg_spec(spec: &str) -> (String, String) {
 /// Compute an aggregate function over rows.
 pub(super) fn compute_aggregate(func: &str, col_idx: Option<usize>, rows: &[Row]) -> Value {
     match func {
-        "COUNT" => Value::Int64(rows.len() as i64),
+        // COUNT(*) counts rows; COUNT(col) counts non-NULL values of col.
+        "COUNT" => match col_idx {
+            None => Value::Int64(rows.len() as i64),
+            Some(col) => Value::Int64(
+                rows.iter()
+                    .filter(|r| r.get(col).is_some_and(|v| *v != Value::Null))
+                    .count() as i64,
+            ),
+        },
         "SUM" => {
             let col = col_idx.unwrap_or(0);
             let mut int_sum = 0i64;
@@ -839,7 +847,15 @@ pub(super) fn compute_aggregate(func: &str, col_idx: Option<usize>, rows: &[Row]
 /// Same logic as `compute_aggregate` but avoids requiring owned rows.
 pub(super) fn compute_aggregate_refs(func: &str, col_idx: Option<usize>, rows: &[&Row]) -> Value {
     match func {
-        "COUNT" => Value::Int64(rows.len() as i64),
+        // COUNT(*) counts rows; COUNT(col) counts non-NULL values of col.
+        "COUNT" => match col_idx {
+            None => Value::Int64(rows.len() as i64),
+            Some(col) => Value::Int64(
+                rows.iter()
+                    .filter(|r| r.get(col).is_some_and(|v| *v != Value::Null))
+                    .count() as i64,
+            ),
+        },
         "SUM" => {
             let col = col_idx.unwrap_or(0);
             let mut int_sum = 0i64;

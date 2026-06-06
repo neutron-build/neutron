@@ -123,6 +123,11 @@ name = "stress"
 path = "src/bin/stress.rs"
 required-features = ["server"]
 
+[[bin]]
+name = "fuzz"
+path = "src/bin/fuzz.rs"
+required-features = ["server", "rusqlite"]
+
 [[bench]]
 name = "query_bench"
 harness = false

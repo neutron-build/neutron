@@ -2620,7 +2620,28 @@ impl Executor {
                                     None
                                 }
                             });
-                            if let Some(ki) = key_idx {
+                            // fast_group_by only yields (key, count, avg-of-val_idx).
+                            // It cannot do MIN/MAX, COUNT(col) (NULL-excluding), or a
+                            // SUM/AVG of any column other than val_idx — those must use
+                            // the general grouped path below, or they'd return NULL /
+                            // wrong values. Only take the fast path when every aggregate
+                            // is COUNT(*) or SUM/AVG of that single value column.
+                            let fast_ok = aggregates.iter().all(|a| {
+                                let (f, col) = parse_agg_spec(a);
+                                match f.as_str() {
+                                    "COUNT" => col == "*",
+                                    // AVG is the engine's non-NULL mean directly.
+                                    // SUM is reconstructed as avg*count, which over-
+                                    // counts when the column has NULLs (count is the
+                                    // total group size, avg excludes NULLs) — so SUM
+                                    // must use the exact general path below.
+                                    "AVG" => col != "*" && resolve(&col) == val_idx,
+                                    _ => false,
+                                }
+                            });
+                            if let Some(ki) = key_idx
+                                && fast_ok
+                            {
                                 let tbl_storage = self.storage_for(table);
                                 if let Some(groups) = tbl_storage.fast_group_by(table, ki, val_idx)
                                 {
@@ -3588,7 +3609,31 @@ impl Executor {
                 None
             };
 
-            let result = self.execute_set_expr(*query.body, &cte_tables).await?;
+            // Column names referenced by ORDER BY (lowercased). A non-column
+            // ORDER BY expression becomes a sentinel that matches no real column,
+            // so any column-dropping fast path (e.g. index-only scan) bails rather
+            // than silently returning rows in the wrong order.
+            let order_by_cols: Vec<String> = match order_by {
+                Some(ref ob) => match &ob.kind {
+                    ast::OrderByKind::Expressions(exprs) => exprs
+                        .iter()
+                        .map(|e| match &e.expr {
+                            Expr::Identifier(id) => id.value.to_lowercase(),
+                            Expr::CompoundIdentifier(ids) => ids
+                                .last()
+                                .map(|i| i.value.to_lowercase())
+                                .unwrap_or_else(|| "\u{0}".into()),
+                            _ => "\u{0}".into(),
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                },
+                None => Vec::new(),
+            };
+
+            let result = self
+                .execute_set_expr(*query.body, &cte_tables, &order_by_cols)
+                .await?;
 
             let mut exec_result = match result {
                 // Aggregate queries are already fully projected -- ORDER BY works on output columns
@@ -3759,13 +3804,14 @@ impl Executor {
         &'a self,
         body: SetExpr,
         cte_tables: &'a CteTableMap,
+        order_by_cols: &'a [String],
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<SelectResult, ExecError>> + Send + 'a>,
     > {
         Box::pin(async move {
             match body {
                 SetExpr::Select(select) => {
-                    self.execute_select_inner_with_ctes(&select, cte_tables)
+                    self.execute_select_inner_with_ctes(&select, cte_tables, order_by_cols)
                         .await
                 }
                 SetExpr::SetOperation {
@@ -3774,8 +3820,10 @@ impl Executor {
                     left,
                     right,
                 } => {
-                    let left_result = self.execute_set_expr(*left, cte_tables).await?;
-                    let right_result = self.execute_set_expr(*right, cte_tables).await?;
+                    // An outer ORDER BY does not apply to individual set-operation
+                    // branches, so sub-branches receive no order-by constraint.
+                    let left_result = self.execute_set_expr(*left, cte_tables, &[]).await?;
+                    let right_result = self.execute_set_expr(*right, cte_tables, &[]).await?;
 
                     let (left_cols, left_rows) = self.select_result_to_rows(left_result)?;
                     let (_right_cols, right_rows) = self.select_result_to_rows(right_result)?;
@@ -3946,7 +3994,9 @@ impl Executor {
                     );
                     if is_all {
                         // Execute base case (left side of UNION ALL)
-                        let base_result = self.execute_set_expr(*left.clone(), &cte_tables).await?;
+                        let base_result = self
+                            .execute_set_expr(*left.clone(), &cte_tables, &[])
+                            .await?;
                         let (base_cols, base_rows) = self.select_result_to_rows(base_result)?;
                         // Apply CTE alias column names if provided
                         let cte_col_names: Vec<String> = cte
@@ -3974,8 +4024,9 @@ impl Executor {
                             // Make current working set available as the CTE
                             cte_tables.insert(cte_name.clone(), (col_meta.clone(), working_rows));
                             // Execute recursive part (right side of UNION ALL)
-                            let rec_result =
-                                self.execute_set_expr(*right.clone(), &cte_tables).await?;
+                            let rec_result = self
+                                .execute_set_expr(*right.clone(), &cte_tables, &[])
+                                .await?;
                             let (_rec_cols, new_rows) = self.select_result_to_rows(rec_result)?;
                             if new_rows.is_empty() {
                                 break; // fixpoint reached
@@ -5390,6 +5441,7 @@ impl Executor {
         table_name: &str,
         label: &str,
         cte_tables: &CteTableMap,
+        order_by_cols: &[String],
     ) -> Option<ExecResult> {
         // Only single-table, no-join queries
         if select.from.len() != 1 || !select.from[0].joins.is_empty() {
@@ -5468,6 +5520,13 @@ impl Executor {
             return None;
         }
         let covered_col = &all_columns[0];
+
+        // The index-only scan returns rows in covered-column order and projects
+        // only that column, so any ORDER BY referencing a different column can no
+        // longer be satisfied downstream. Bail to the full path in that case.
+        if order_by_cols.iter().any(|c| c != covered_col) {
+            return None;
+        }
 
         // Look up whether this column has a B-tree index
         let idx_key = (table_name.to_string(), covered_col.clone());
@@ -5592,7 +5651,7 @@ impl Executor {
         label: &str,
         where_expr: &Expr,
     ) -> IndexScanResult {
-        let (eq_preds, range_preds, remaining) = self.extract_index_predicates(where_expr);
+        let (eq_preds, range_preds, _remaining) = self.extract_index_predicates(where_expr);
         if eq_preds.is_empty() && range_preds.is_empty() {
             return None;
         }
@@ -5612,31 +5671,13 @@ impl Executor {
                         self.metrics.rows_scanned.inc_by(rows.len() as u64);
                         let col_meta = self.build_col_meta_from_cache(table_name, label)?;
 
-                        // Build remaining filter: other eq preds + remaining expr
-                        let mut other_preds: Vec<Expr> = Vec::new();
-                        for (other_col, other_val) in &eq_preds {
-                            if other_col == col_name {
-                                continue;
-                            }
-                            other_preds.push(Expr::BinaryOp {
-                                left: Box::new(Expr::Identifier(ast::Ident::new(
-                                    other_col.clone(),
-                                ))),
-                                op: ast::BinaryOperator::Eq,
-                                right: Box::new(self.value_to_expr(other_val)),
-                            });
-                        }
-                        if let Some(rest) = &remaining {
-                            other_preds.push(rest.clone());
-                        }
-                        let final_remaining =
-                            other_preds.into_iter().reduce(|a, b| Expr::BinaryOp {
-                                left: Box::new(a),
-                                op: ast::BinaryOperator::And,
-                                right: Box::new(b),
-                            });
-
-                        return Some((col_meta, rows, final_remaining, None));
+                        // Reapply the FULL original predicate after the point
+                        // lookup. The index fetch only narrows candidate rows by
+                        // this one equality; every other predicate must still be
+                        // enforced — including range/comparison preds that were
+                        // folded into sentinel bounds (and so are absent from
+                        // `remaining`). Matches the range-fallback path below.
+                        return Some((col_meta, rows, Some(where_expr.clone()), None));
                     }
                     Ok(None) => continue,
                     Err(_) => continue,
@@ -5667,28 +5708,12 @@ impl Executor {
         None
     }
 
-    /// Convert a Value to an AST Expr for re-creating filter expressions.
-    pub(super) fn value_to_expr(&self, val: &Value) -> Expr {
-        let v = match val {
-            Value::Int32(n) => ast::Value::Number(n.to_string(), false),
-            Value::Int64(n) => ast::Value::Number(n.to_string(), false),
-            Value::Float64(f) => ast::Value::Number(f.to_string(), false),
-            Value::Text(s) => ast::Value::SingleQuotedString(s.clone()),
-            Value::Bool(b) => ast::Value::Boolean(*b),
-            Value::Null => ast::Value::Null,
-            _ => ast::Value::SingleQuotedString(val.to_string()),
-        };
-        Expr::Value(ast::ValueWithSpan {
-            value: v,
-            span: sqlparser::tokenizer::Span::empty(),
-        })
-    }
-
     /// SELECT execution that is CTE-aware -- delegates to load_table_factor_with_ctes.
     pub(super) async fn execute_select_inner_with_ctes(
         &self,
         select: &ast::Select,
         cte_tables: &CteTableMap,
+        order_by_cols: &[String],
     ) -> Result<SelectResult, ExecError> {
         // Expression-only query: SELECT 1, SELECT 'hello', SELECT 1+1
         if select.from.is_empty() {
@@ -5722,7 +5747,8 @@ impl Executor {
                 .as_ref()
                 .map(|a| a.name.value.clone())
                 .unwrap_or_else(|| table_name.clone());
-            if let Some(result) = self.try_index_only_scan(select, &table_name, &label, cte_tables)
+            if let Some(result) =
+                self.try_index_only_scan(select, &table_name, &label, cte_tables, order_by_cols)
             {
                 return Ok(SelectResult::Projected(result));
             }
@@ -7273,7 +7299,26 @@ impl Executor {
                     continue;
                 }
 
+                // Keep LIMIT/OFFSET operands literal in the plan-cache key. The
+                // plan bakes the limit/offset value in (and may even fuse it into
+                // a scan), so a cached plan must NOT be reused across different
+                // LIMIT/OFFSET values. WHERE-clause literals stay parameterized —
+                // those are safely re-bound when a cached plan is reused.
+                let after_limit_or_offset = {
+                    let t = out.trim_end();
+                    let ends_with_kw = |kw: &str| {
+                        t.len() >= kw.len()
+                            && t[t.len() - kw.len()..].eq_ignore_ascii_case(kw)
+                            && t[..t.len() - kw.len()]
+                                .chars()
+                                .last()
+                                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+                    };
+                    ends_with_kw("limit") || ends_with_kw("offset")
+                };
+
                 // Consume the full number (digits, optional dot, more digits)
+                let num_start = i;
                 i += 1;
                 let mut saw_dot = false;
                 while i < len {
@@ -7291,7 +7336,11 @@ impl Executor {
                         break;
                     }
                 }
-                out.push_str("$N");
+                if after_limit_or_offset {
+                    out.push_str(&sql[num_start..i]);
+                } else {
+                    out.push_str("$N");
+                }
                 continue;
             }
 
@@ -7395,6 +7444,23 @@ impl Executor {
                     continue;
                 }
 
+                // Keep LIMIT/OFFSET operands literal in the cache KEY so a plan is
+                // never reused across different limit/offset values (the limit is
+                // baked into the plan and may be fused into a scan). The literal is
+                // still extracted into `literals` so AST substitution counts match.
+                let after_limit_or_offset = {
+                    let t = out.trim_end();
+                    let ends_with_kw = |kw: &str| {
+                        t.len() >= kw.len()
+                            && t[t.len() - kw.len()..].eq_ignore_ascii_case(kw)
+                            && t[..t.len() - kw.len()]
+                                .chars()
+                                .last()
+                                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+                    };
+                    ends_with_kw("limit") || ends_with_kw("offset")
+                };
+
                 let start = i;
                 i += 1;
                 let mut saw_dot = false;
@@ -7415,8 +7481,12 @@ impl Executor {
                 let num_str = std::str::from_utf8(&bytes[start..i])
                     .unwrap_or("0")
                     .to_string();
-                literals.push(CacheLiteral::Number(num_str));
-                out.push_str("$N");
+                literals.push(CacheLiteral::Number(num_str.clone()));
+                if after_limit_or_offset {
+                    out.push_str(&num_str);
+                } else {
+                    out.push_str("$N");
+                }
                 continue;
             }
 
@@ -8207,9 +8277,13 @@ mod normalize_tests {
 
     #[test]
     fn test_normalize_limit_offset() {
-        let sql = "SELECT * FROM t LIMIT 10 OFFSET 20";
+        // LIMIT/OFFSET operands stay literal in the cache key: the plan bakes
+        // them in (and may fuse the limit into a scan), so plans must not be
+        // shared across different limit/offset values. WHERE literals still
+        // parameterize.
+        let sql = "SELECT * FROM t WHERE x = 5 LIMIT 10 OFFSET 20";
         let norm = Executor::normalize_sql_for_cache(sql);
-        assert_eq!(norm, "SELECT * FROM t LIMIT $N OFFSET $N");
+        assert_eq!(norm, "SELECT * FROM t WHERE x = $N LIMIT 10 OFFSET 20");
     }
 
     #[test]
