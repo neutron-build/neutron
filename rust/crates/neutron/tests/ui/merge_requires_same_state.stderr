@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/merge_requires_same_state.rs:11:38
+   |
+11 |     let _ = Router::<A>::new().merge(Router::<B>::new());
+   |                                ----- ^^^^^^^^^^^^^^^^^^ expected `Router<A>`, found `Router<B>`
+   |                                |
+   |                                arguments to this method are incorrect
+   |
+   = note: expected struct `Router<A>`
+              found struct `Router<B>`
+note: method defined here
+  --> src/router.rs
+   |
+   |     pub fn merge(mut self, other: Router<S>) -> Self {
+   |            ^^^^^
