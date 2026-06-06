@@ -454,28 +454,38 @@ pub trait StorageEngine: Send + Sync {
     }
 
     /// Count rows where `filter_col OP filter_val`, vectorized over columns.
-    /// Generalizes equality-filtered count to any comparison. None = unsupported.
+    /// Generalizes equality-filtered count to any comparison. The default
+    /// delegates the `=` case to `fast_count_filtered`, so an engine that only
+    /// implements equality (e.g. the MVCC row engine) keeps its fast path for
+    /// `col = val`; only ordered comparisons need an override. None = unsupported.
     fn fast_count_cmp(
         &self,
-        _table: &str,
-        _filter_col: usize,
-        _op: FilterOp,
-        _filter_val: &Value,
+        table: &str,
+        filter_col: usize,
+        op: FilterOp,
+        filter_val: &Value,
     ) -> Option<usize> {
-        None
+        match op {
+            FilterOp::Eq => self.fast_count_filtered(table, filter_col, filter_val),
+            _ => None,
+        }
     }
 
     /// Sum of `val_col` (and a non-null count) over rows where
-    /// `filter_col OP filter_val`, vectorized. None = unsupported.
+    /// `filter_col OP filter_val`, vectorized. Default delegates `=` to
+    /// `fast_sum_f64_filtered` (see `fast_count_cmp`). None = unsupported.
     fn fast_sum_f64_cmp(
         &self,
-        _table: &str,
-        _val_col: usize,
-        _filter_col: usize,
-        _op: FilterOp,
-        _filter_val: &Value,
+        table: &str,
+        val_col: usize,
+        filter_col: usize,
+        op: FilterOp,
+        filter_val: &Value,
     ) -> Option<(f64, usize)> {
-        None
+        match op {
+            FilterOp::Eq => self.fast_sum_f64_filtered(table, val_col, filter_col, filter_val),
+            _ => None,
+        }
     }
 
     // ── Per-connection session lifecycle (default: no-op) ──────
