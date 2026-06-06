@@ -112,3 +112,26 @@ class TestRealtimeExports:
         assert WebSocketHub is not None
         assert sse_response is not None
         assert SSEStream is not None
+
+
+@pytest.mark.asyncio
+async def test_broadcast_iterates_snapshot_not_live_set():
+    """P0.2: broadcast must iterate a snapshot of the room. If a member's
+    send_json mutates the live room mid-iteration, all original members still
+    receive (no 'Set changed size during iteration')."""
+    hub = WebSocketHub()
+    received: list[int] = []
+
+    class FakeWS:
+        async def send_json(self, data: Any) -> None:
+            received.append(id(self))
+            # Mutate the live room set mid-broadcast.
+            hub._rooms.get("r", set()).clear()
+
+    members = [FakeWS(), FakeWS(), FakeWS()]
+    for ws in members:
+        hub._join_room(ws, "r")  # type: ignore[arg-type]
+
+    sent = await hub.broadcast("r", {"x": 1})
+    assert sent == 3
+    assert len(received) == 3
