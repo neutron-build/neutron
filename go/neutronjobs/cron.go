@@ -3,31 +3,43 @@ package neutronjobs
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
+
+	cron "github.com/robfig/cron/v3"
 )
 
-// Schedule registers a recurring job. The cron expression supports:
+// Schedule registers a recurring job. The expression is a standard cron spec
+// parsed by robfig/cron, supporting:
 //
-//	"@every 5m"   - interval-based
-//	"0 * * * *"   - standard 5-field cron (min hour dom month dow)
-func (q *Queue) Schedule(ctx context.Context, cron string, jobType string, payload any) error {
-	interval, err := parseCron(cron)
+//	"*/5 * * * *"  - every 5 minutes
+//	"30 9 * * 1"   - 09:30 every Monday (real field semantics, not an interval)
+//	"@every 5m"    - interval-based
+//	"@daily", "@hourly", "@weekly", "@monthly" - descriptors
+//
+// Unlike the previous implementation (which mapped every expression to a fixed
+// interval and could only handle a few patterns), this fires at the correct
+// next activation time computed from the schedule.
+func (q *Queue) Schedule(ctx context.Context, spec string, jobType string, payload any) error {
+	schedule, err := cron.ParseStandard(spec)
 	if err != nil {
-		return fmt.Errorf("neutronjobs: parse cron %q: %w", cron, err)
+		return fmt.Errorf("neutronjobs: parse cron %q: %w", spec, err)
 	}
 
 	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
 		for {
+			now := time.Now()
+			next := schedule.Next(now)
+			if next.IsZero() {
+				// No future activation (shouldn't happen for valid specs).
+				return
+			}
+			timer := time.NewTimer(next.Sub(now))
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return
-			case <-ticker.C:
-				_, err := Enqueue(ctx, q, jobType, payload)
-				if err != nil {
+			case <-timer.C:
+				if _, err := Enqueue(ctx, q, jobType, payload); err != nil {
 					q.logger.Error("schedule enqueue failed", "job_type", jobType, "error", err)
 				}
 			}
@@ -35,37 +47,4 @@ func (q *Queue) Schedule(ctx context.Context, cron string, jobType string, paylo
 	}()
 
 	return nil
-}
-
-// parseCron handles simple cron-like expressions.
-func parseCron(expr string) (time.Duration, error) {
-	expr = strings.TrimSpace(expr)
-
-	// @every syntax
-	if strings.HasPrefix(expr, "@every ") {
-		durStr := strings.TrimPrefix(expr, "@every ")
-		return time.ParseDuration(durStr)
-	}
-
-	// Simple 5-field cron — only support "*/N" for minutes
-	fields := strings.Fields(expr)
-	if len(fields) == 5 {
-		// Check for "*/N * * * *" (every N minutes)
-		if strings.HasPrefix(fields[0], "*/") {
-			n, err := strconv.Atoi(strings.TrimPrefix(fields[0], "*/"))
-			if err == nil {
-				return time.Duration(n) * time.Minute, nil
-			}
-		}
-		// "0 * * * *" = every hour
-		if fields[0] == "0" && fields[1] == "*" {
-			return time.Hour, nil
-		}
-		// "0 0 * * *" = every day
-		if fields[0] == "0" && fields[1] == "0" && fields[2] == "*" {
-			return 24 * time.Hour, nil
-		}
-	}
-
-	return 0, fmt.Errorf("unsupported cron expression: %s", expr)
 }
