@@ -1,0 +1,24 @@
+[package]
+name = "neutron-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "PostgreSQL connection pool and query helpers for the Neutron web framework"
+readme = "../../README.md"
+
+[dependencies]
+neutron        = { path = "../neutron", default-features = false }
+tokio-postgres = { workspace = true }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+http           = { workspace = true }
+futures-util   = { workspace = true }
+bytes          = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

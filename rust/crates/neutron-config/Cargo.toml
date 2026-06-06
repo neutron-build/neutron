@@ -1,0 +1,26 @@
+[package]
+name        = "neutron-config"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+homepage.workspace   = true
+keywords.workspace   = true
+categories.workspace = true
+description = "Typed environment-based configuration for the Neutron web framework"
+readme = "../../README.md"
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tracing    = { workspace = true }
+envy       = { workspace = true }
+dotenvy    = { workspace = true, optional = true }
+
+[features]
+# Load a .env file before reading environment variables.
+dotenv = ["dep:dotenvy"]
+
+[dev-dependencies]
+tokio = { workspace = true }
