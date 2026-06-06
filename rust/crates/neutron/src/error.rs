@@ -122,6 +122,16 @@ impl AppError {
         self
     }
 
+    /// Build from any status code, deriving a sensible `type` slug and `title`
+    /// from the status's canonical reason (e.g. `415` → `unsupported-media-type`
+    /// / "Unsupported Media Type"). Used by extractor rejections so every
+    /// built-in failure is RFC 7807 without a bespoke constructor per status.
+    pub fn from_status(status: StatusCode, detail: impl Into<String>) -> Self {
+        let title = status.canonical_reason().unwrap_or("Error");
+        let slug = title.to_ascii_lowercase().replace(' ', "-");
+        Self::new(status, slug, title, detail)
+    }
+
     // --- Convenience constructors (per FRAMEWORK_CONTRACT.md) ---
 
     /// 400 Bad Request
@@ -166,6 +176,16 @@ impl AppError {
             StatusCode::PAYLOAD_TOO_LARGE,
             "payload-too-large",
             "Payload Too Large",
+            detail,
+        )
+    }
+
+    /// 415 Unsupported Media Type
+    pub fn unsupported_media_type(detail: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported-media-type",
+            "Unsupported Media Type",
             detail,
         )
     }
