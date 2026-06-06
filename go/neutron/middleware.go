@@ -18,6 +18,68 @@ import (
 	"time"
 )
 
+// RateLimitConfig configures the rate-limit layer of DefaultStack.
+type RateLimitConfig struct {
+	RPS   float64
+	Burst int
+}
+
+// DefaultStackConfig configures the standard middleware stack. The order is
+// fixed (see DefaultStack); these fields only toggle/configure layers. Nil/zero
+// optional fields skip that layer.
+type DefaultStackConfig struct {
+	Logger    *slog.Logger     // nil → slog.Default()
+	CORS      *CORSOptions     // nil → no CORS layer
+	Compress  bool             // true → gzip at default level
+	RateLimit *RateLimitConfig // nil → no rate limit
+	Auth      Middleware       // nil → no auth layer (app-specific)
+	Timeout   time.Duration    // 0 → no timeout layer
+	OTel      *OTelOptions     // nil → no OpenTelemetry layer
+}
+
+// DefaultStack returns the standard middleware in the exact order mandated by
+// FRAMEWORK_CONTRACT.md:
+//
+//	RequestID → Logging → Recovery → CORS → Compression → RateLimit → Auth → Timeout → OpenTelemetry
+//
+// The order is hard-coded and cannot be reordered — callers configure layers,
+// they do not arrange them. RequestID strictly precedes Logging so every log
+// line carries the request id. Use it as:
+//
+//	app := neutron.New(neutron.WithMiddleware(neutron.DefaultStack(cfg)...))
+func DefaultStack(cfg DefaultStackConfig) []Middleware {
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	// Always-on first three, in contract order.
+	mw := []Middleware{
+		RequestID(),
+		Logger(logger),
+		Recover(),
+	}
+	if cfg.CORS != nil {
+		mw = append(mw, CORS(*cfg.CORS))
+	}
+	if cfg.Compress {
+		mw = append(mw, Compress(gzip.DefaultCompression))
+	}
+	if cfg.RateLimit != nil {
+		mw = append(mw, RateLimit(cfg.RateLimit.RPS, cfg.RateLimit.Burst))
+	}
+	if cfg.Auth != nil {
+		mw = append(mw, cfg.Auth)
+	}
+	if cfg.Timeout > 0 {
+		mw = append(mw, Timeout(cfg.Timeout))
+	}
+	if cfg.OTel != nil {
+		mw = append(mw, OTel(*cfg.OTel))
+	}
+	return mw
+}
+
 // Middleware is the standard Go middleware signature.
 type Middleware = func(next http.Handler) http.Handler
 

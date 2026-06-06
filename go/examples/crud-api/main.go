@@ -65,12 +65,12 @@ func main() {
 		neutron.WithLogger(logger),
 		neutron.WithLifecycle(db.LifecycleHook()),
 		neutron.WithOpenAPIInfo("Todo API", "1.0.0"),
-		neutron.WithMiddleware(
-			neutron.Logger(logger),
-			neutron.Recover(),
-			neutron.RequestID(),
-			neutron.CORS(neutron.CORSOptions{AllowOrigins: []string{"*"}}),
-		),
+		// DefaultStack applies the FRAMEWORK_CONTRACT.md middleware order
+		// (RequestID → Logging → Recovery → CORS → …) so it cannot be miswired.
+		neutron.WithMiddleware(neutron.DefaultStack(neutron.DefaultStackConfig{
+			Logger: logger,
+			CORS:   &neutron.CORSOptions{AllowOrigins: []string{"*"}},
+		})...),
 	)
 
 	api := app.Router().Group("/api")
