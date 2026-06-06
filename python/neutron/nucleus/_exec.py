@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 
 import asyncpg
 
@@ -33,7 +34,7 @@ class Executor:
         self._is_pool = isinstance(target, asyncpg.Pool)
 
     @asynccontextmanager
-    async def acquire(self):
+    async def acquire(self) -> AsyncIterator[asyncpg.Connection]:
         if self._is_pool:
             async with self._target.acquire() as conn:
                 yield conn
@@ -44,9 +45,9 @@ class Executor:
         async with self.acquire() as conn:
             return await conn.fetchval(sql, *args)
 
-    async def fetch(self, sql: str, *args: Any) -> list:
+    async def fetch(self, sql: str, *args: Any) -> list[Any]:
         async with self.acquire() as conn:
-            return await conn.fetch(sql, *args)
+            return cast("list[Any]", await conn.fetch(sql, *args))
 
     async def fetchrow(self, sql: str, *args: Any) -> Any:
         async with self.acquire() as conn:
@@ -54,4 +55,4 @@ class Executor:
 
     async def execute(self, sql: str, *args: Any) -> str:
         async with self.acquire() as conn:
-            return await conn.execute(sql, *args)
+            return cast(str, await conn.execute(sql, *args))
