@@ -73,7 +73,7 @@ def _parse_cdc_events(raw: str | None) -> list[CDCEvent]:
                     CDCEvent(
                         offset=item.get("offset", i),
                         table=item.get("table", ""),
-                        operation=item.get("operation", item.get("op", "")),
+                        operation=str(item.get("operation") or item.get("op") or ""),
                         data=item.get("data", {}),
                     )
                 )

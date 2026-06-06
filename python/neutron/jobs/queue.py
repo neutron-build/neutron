@@ -330,10 +330,10 @@ def _field_matches(field: str, value: int) -> bool:
     if "-" in field:
         parts = field.split("-", 1)
         try:
-            lo, hi = int(parts[0]), int(parts[1])
+            lo_n, hi_n = int(parts[0]), int(parts[1])
         except ValueError:
             return False
-        return lo <= value <= hi
+        return lo_n <= value <= hi_n
 
     # Exact value
     try:
