@@ -65,6 +65,7 @@ class Transaction:
         exc_val: BaseException | None,
         exc_tb: object,
     ) -> None:
+        assert self._tx is not None
         try:
             if exc_type is not None:
                 await self._tx.rollback()
@@ -84,7 +85,7 @@ class _TransactionSQL:
         rows = await self._conn.fetch(sql, *args)
         return [model.model_validate(dict(row)) for row in rows]
 
-    async def query_one(self, model: type[Any], sql: str, *args: object):
+    async def query_one(self, model: type[Any], sql: str, *args: object) -> Any:
         from neutron.error import not_found
 
         row = await self._conn.fetchrow(sql, *args)
