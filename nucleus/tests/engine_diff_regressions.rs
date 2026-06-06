@@ -43,7 +43,6 @@ async fn groupby_int_key_baseline_mvcc_memory() {
 /// BUG (columnar): the columnar fast group-by returns an INTEGER group key as
 /// Text and orders it lexicographically (e.g. 1, 11, 2 instead of 1, 2, 11).
 #[tokio::test]
-#[ignore = "BUG: columnar fast_group_by returns integer key as Text + lexicographic order"]
 async fn columnar_groupby_int_key_type() {
     let e = ex(Arc::new(ColumnarStorageEngine::new()));
     e.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER NOT NULL)").await.unwrap();
@@ -81,7 +80,6 @@ async fn pk_range_baseline_mvcc_memory() {
 /// even on freshly-inserted data — silent data loss. A non-PK BETWEEN works,
 /// so the defect is in the LSM primary-key range path.
 #[tokio::test]
-#[ignore = "BUG: LSM primary-key range scan (id BETWEEN) returns empty"]
 async fn lsm_pk_range_returns_rows() {
     let e = ex(Arc::new(LsmStorageEngine::new()));
     e.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER NOT NULL)").await.unwrap();
@@ -93,4 +91,20 @@ async fn lsm_pk_range_returns_rows() {
         ref v => panic!("{v:?}"),
     }).collect();
     assert_eq!(ids, vec![2, 3, 4]);
+}
+
+/// BUG (columnar, residual — found while fixing the GROUP BY key-type bug): the
+/// columnar AVG/SUM group-by path drops a group whose aggregated column is
+/// entirely NULL, instead of emitting it with a NULL aggregate (which Mvcc does).
+/// `probe_engines --engine columnar` still shows ~19 divergences from this.
+#[tokio::test]
+#[ignore = "BUG: columnar group-by drops all-NULL aggregate groups"]
+async fn columnar_all_null_group_kept() {
+    let e = ex(Arc::new(ColumnarStorageEngine::new()));
+    e.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER NOT NULL, c2 INTEGER)").await.unwrap();
+    // group c1=5 has only NULL c2; group c1=6 has a value.
+    e.execute("INSERT INTO t VALUES (1,5,NULL),(2,5,NULL),(3,6,10)").await.unwrap();
+    let r = rows(&e, "SELECT c1, AVG(c2) FROM t GROUP BY c1 ORDER BY c1 ASC").await;
+    // Mvcc returns both groups: (5, NULL) and (6, 10). Columnar drops the first.
+    assert_eq!(r.len(), 2, "expected 2 groups (incl. the all-NULL one), got {r:?}");
 }

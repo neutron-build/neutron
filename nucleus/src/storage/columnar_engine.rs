@@ -129,6 +129,44 @@ impl std::fmt::Debug for ColumnarStorageEngine {
 
 // ─── Value ↔ ColumnData helpers ──────────────────────────────────────────────
 
+/// The underlying type of a GROUP BY key column. `fast_group_by` hashes keys as
+/// strings, then uses this to reconstruct the native `Value` so an integer key
+/// is returned (and later ordered) numerically rather than lexicographically.
+#[derive(Clone, Copy)]
+enum ColumnarKeyKind {
+    Text,
+    Int32,
+    Int64,
+    Float64,
+    Bool,
+}
+
+impl ColumnarKeyKind {
+    fn to_value(self, key: String) -> Value {
+        match self {
+            // Parse back to the native type; fall back to Text if parsing fails
+            // (the string came from `to_string()` of that type, so it won't).
+            ColumnarKeyKind::Int32 => key
+                .parse::<i32>()
+                .map(Value::Int32)
+                .unwrap_or(Value::Text(key)),
+            ColumnarKeyKind::Int64 => key
+                .parse::<i64>()
+                .map(Value::Int64)
+                .unwrap_or(Value::Text(key)),
+            ColumnarKeyKind::Float64 => key
+                .parse::<f64>()
+                .map(Value::Float64)
+                .unwrap_or(Value::Text(key)),
+            ColumnarKeyKind::Bool => key
+                .parse::<bool>()
+                .map(Value::Bool)
+                .unwrap_or(Value::Text(key)),
+            ColumnarKeyKind::Text => Value::Text(key),
+        }
+    }
+}
+
 #[allow(dead_code)]
 fn val_to_coldata(v: Value) -> ColumnData {
     match v {
@@ -1031,24 +1069,33 @@ impl StorageEngine for ColumnarStorageEngine {
         let batches = batches_for_read(&store, table);
 
         // Collect the key and value columns across all batches.
+        // Keys are accumulated as strings for hashing/grouping, but we remember
+        // the underlying column kind so the native Value type is preserved on the
+        // way out (e.g. an INTEGER group key must come back as Int*, ordered
+        // numerically — not as Text, which would order lexicographically).
         let mut key_vec: Vec<Option<String>> = Vec::new();
         let mut val_vec: Vec<Option<f64>> = Vec::new();
+        let mut key_kind = ColumnarKeyKind::Text;
 
         for batch in batches.iter() {
             let n = batch.row_count;
-            // Key column — always text-converted.
+            // Key column — text-converted for grouping; kind tracked for output.
             match batch.column(&key_col_name) {
                 Some(ColumnData::Text(v)) => key_vec.extend(v.iter().cloned()),
                 Some(ColumnData::Int32(v)) => {
+                    key_kind = ColumnarKeyKind::Int32;
                     key_vec.extend(v.iter().map(|o| o.map(|n| n.to_string())))
                 }
                 Some(ColumnData::Int64(v)) => {
+                    key_kind = ColumnarKeyKind::Int64;
                     key_vec.extend(v.iter().map(|o| o.map(|n| n.to_string())))
                 }
                 Some(ColumnData::Float64(v)) => {
+                    key_kind = ColumnarKeyKind::Float64;
                     key_vec.extend(v.iter().map(|o| o.map(|n| n.to_string())))
                 }
                 Some(ColumnData::Bool(v)) => {
+                    key_kind = ColumnarKeyKind::Bool;
                     key_vec.extend(v.iter().map(|o| o.map(|b| b.to_string())))
                 }
                 None => key_vec.extend(std::iter::repeat_n(None, n)),
@@ -1077,7 +1124,7 @@ impl StorageEngine for ColumnarStorageEngine {
                 result
                     .groups
                     .into_iter()
-                    .map(|g| (Value::Text(g.key), g.count as i64, g.avg))
+                    .map(|g| (key_kind.to_value(g.key), g.count as i64, g.avg))
                     .collect(),
             )
         } else {
@@ -1090,7 +1137,7 @@ impl StorageEngine for ColumnarStorageEngine {
             Some(
                 counts
                     .into_iter()
-                    .map(|(k, cnt)| (Value::Text(k), cnt, None))
+                    .map(|(k, cnt)| (key_kind.to_value(k), cnt, None))
                     .collect(),
             )
         }
