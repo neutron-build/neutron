@@ -10,7 +10,7 @@ from typing import Any, Callable, cast
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware as _StarletteCORS
 from starlette.middleware.gzip import GZipMiddleware as _StarletteGZip
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 
 class _NeutronMiddleware:
@@ -38,7 +38,7 @@ class _RequestIDASGI:
             scope["state"] = {}
         scope["state"]["request_id"] = request_id
 
-        async def send_with_id(message: dict) -> None:
+        async def send_with_id(message: Message) -> None:
             if message["type"] == "http.response.start":
                 headers = list(message.get("headers", []))
                 headers.append((b"x-request-id", request_id.encode()))
@@ -73,7 +73,7 @@ class _LoggingASGI:
         start = time.perf_counter()
         status_code = 500
 
-        async def send_wrapper(message: dict) -> None:
+        async def send_wrapper(message: Message) -> None:
             nonlocal status_code
             if message["type"] == "http.response.start":
                 status_code = message["status"]
@@ -377,7 +377,7 @@ class _OTelASGI:
         start = time.perf_counter()
         status_code = 500
 
-        async def send_with_trace(message: dict) -> None:
+        async def send_with_trace(message: Message) -> None:
             nonlocal status_code
             if message["type"] == "http.response.start":
                 status_code = message["status"]
