@@ -12,11 +12,10 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::StatusCode;
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -27,7 +26,8 @@ use tokio::sync::watch;
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
 
-use crate::handler::{Body, Request as NeutronRequest, Response, StateMap};
+use crate::error::AppError;
+use crate::handler::{Body, IntoResponse, Request as NeutronRequest, Response, StateMap};
 use crate::http2::Http2Config;
 use crate::middleware;
 use crate::router::{RouteError, Router};
@@ -38,63 +38,48 @@ use crate::tls::TlsConfig;
 // Pre-computed static response bodies — zero-copy, no allocation per request.
 // ---------------------------------------------------------------------------
 
-#[inline(always)]
-fn static_bytes(b: &'static [u8]) -> Bytes {
-    static CELLS: OnceLock<()> = OnceLock::new();
-    let _ = CELLS; // just to avoid unused warning
-    Bytes::from_static(b)
-}
+// P2.1: every built-in failure is RFC 7807 `application/problem+json` via
+// `AppError`, so the framework honors its own error contract (not plain text).
 
 #[inline]
 fn resp_payload_too_large() -> Response {
-    http::Response::builder()
-        .status(StatusCode::PAYLOAD_TOO_LARGE)
-        .header("content-type", "text/plain; charset=utf-8")
-        .body(Body::full(static_bytes(b"Payload Too Large")))
-        .unwrap()
+    AppError::payload_too_large("The request body exceeds the configured limit.").into_response()
 }
 
 #[inline]
 fn resp_bad_request() -> Response {
-    http::Response::builder()
-        .status(StatusCode::BAD_REQUEST)
-        .body(Body::full(static_bytes(b"Failed to read body")))
-        .unwrap()
+    AppError::bad_request("The request body could not be read.").into_response()
 }
 
 #[inline]
-fn resp_not_found() -> Response {
-    http::Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .header("content-type", "text/plain; charset=utf-8")
-        .body(Body::full(static_bytes(b"Not Found")))
-        .unwrap()
+fn resp_not_found(path: &str) -> Response {
+    AppError::not_found("No route matches the requested path.")
+        .with_instance(path)
+        .into_response()
 }
 
 #[inline]
-fn resp_method_not_allowed(allow: &[http::Method]) -> Response {
-    // RFC 7231 §6.5.5: a 405 response MUST generate an `Allow` header listing
-    // the methods supported by the target resource.
+fn resp_method_not_allowed(allow: &[http::Method], path: &str) -> Response {
+    let mut resp = AppError::method_not_allowed("The request method is not supported for this resource.")
+        .with_instance(path)
+        .into_response();
+    // RFC 7231 §6.5.5: a 405 response MUST carry an `Allow` header.
     let allow_value = allow
         .iter()
         .map(|m| m.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    http::Response::builder()
-        .status(StatusCode::METHOD_NOT_ALLOWED)
-        .header("content-type", "text/plain; charset=utf-8")
-        .header(http::header::ALLOW, allow_value)
-        .body(Body::full(static_bytes(b"Method Not Allowed")))
-        .unwrap()
+    if let Ok(hv) = http::HeaderValue::from_str(&allow_value) {
+        resp.headers_mut().insert(http::header::ALLOW, hv);
+    }
+    resp
 }
 
 #[inline]
-fn resp_internal_error() -> Response {
-    http::Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .header("content-type", "text/plain; charset=utf-8")
-        .body(Body::full(static_bytes(b"Internal Server Error")))
-        .unwrap()
+fn resp_internal_error(path: &str) -> Response {
+    AppError::internal("The server was not ready to handle the request.")
+        .with_instance(path)
+        .into_response()
 }
 
 /// Returns `true` if the request carries a body.
@@ -165,15 +150,15 @@ pub(crate) fn build_dispatch(router: Arc<Router>) -> DispatchChain {
                             if let Some(ref fallback) = router.fallback {
                                 fallback.call(req).await
                             } else {
-                                resp_not_found()
+                                resp_not_found(req.uri().path())
                             }
                         }
                         Err(RouteError::MethodNotAllowed { allow }) => {
-                            resp_method_not_allowed(&allow)
+                            resp_method_not_allowed(&allow, req.uri().path())
                         }
                         // Unreachable on the request path (server force-builds
                         // before serving); handled for exhaustiveness.
-                        Err(RouteError::NotBuilt) => resp_internal_error(),
+                        Err(RouteError::NotBuilt) => resp_internal_error(req.uri().path()),
                     }
                 })
             },

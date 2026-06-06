@@ -144,9 +144,30 @@ impl AppError {
         Self::new(StatusCode::NOT_FOUND, "not-found", "Not Found", detail)
     }
 
+    /// 405 Method Not Allowed. The caller should also set the `Allow` header
+    /// (RFC 7231 §6.5.5) on the resulting response.
+    pub fn method_not_allowed(detail: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method-not-allowed",
+            "Method Not Allowed",
+            detail,
+        )
+    }
+
     /// 409 Conflict
     pub fn conflict(detail: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "conflict", "Conflict", detail)
+    }
+
+    /// 413 Payload Too Large
+    pub fn payload_too_large(detail: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload-too-large",
+            "Payload Too Large",
+            detail,
+        )
     }
 
     /// 422 Validation Failed — with field-level errors.

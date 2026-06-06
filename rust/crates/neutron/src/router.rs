@@ -1051,6 +1051,53 @@ mod tests {
         assert!(allow.contains("GET"), "Allow header was {allow:?}");
     }
 
+    // P2.1: built-in 404/405 are RFC 7807 problem+json with `instance` set.
+    #[tokio::test]
+    async fn not_found_is_problem_json() {
+        use tower::ServiceExt;
+
+        let svc = Router::new().get("/x", || async { "x" }).into_service();
+        let req = http::Request::builder()
+            .method(Method::GET)
+            .uri("/nope")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/problem+json"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], 404);
+        assert_eq!(v["instance"], "/nope");
+    }
+
+    #[tokio::test]
+    async fn method_not_allowed_is_problem_json_with_allow() {
+        use tower::ServiceExt;
+
+        let svc = Router::new().get("/x", || async { "x" }).into_service();
+        let req = http::Request::builder()
+            .method(Method::DELETE)
+            .uri("/x")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/problem+json"
+        );
+        assert!(resp.headers().get(http::header::ALLOW).is_some());
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], 405);
+    }
+
     #[tokio::test]
     async fn head_falls_back_to_get() {
         let r = build(Router::new().get("/", || async { "hello" }));
