@@ -508,12 +508,24 @@ impl Executor {
             ast::ObjectType::Index => {
                 for name in &names {
                     let index_name = name.to_string();
+                    // Resolve the index's table BEFORE removing the mapping so we
+                    // can drop it from that table's engine (columnar/lsm tables
+                    // have a per-table engine, not the base one).
+                    let index_table = self
+                        .btree_indexes
+                        .iter()
+                        .find(|e| e.value() == &index_name)
+                        .map(|e| e.key().0.clone());
                     // Remove from sync btree_indexes and hash_indexes maps
                     self.btree_indexes.retain(|_, v| v != &index_name);
                     // Also clean up hash_indexes if this was a hash index
                     // (hash_indexes is keyed by (table, col), so we just leave it; catalog drop handles it)
                     // Drop the storage engine index (log errors if not present)
-                    if let Err(e) = self.storage.drop_index(&index_name).await {
+                    let drop_storage = match &index_table {
+                        Some(t) => self.storage_for(t),
+                        None => self.storage.clone(),
+                    };
+                    if let Err(e) = drop_storage.drop_index(&index_name).await {
                         eprintln!("DDL: failed to drop storage index '{index_name}': {e}");
                     }
                     match self.catalog.drop_index(&index_name).await {
@@ -824,7 +836,7 @@ impl Executor {
                 && let Some(col_idx) = table_def.column_index(col_name)
             {
                 if let Err(e) = self
-                    .storage
+                    .storage_for(&table_name)
                     .create_index(&table_name, &index_name, col_idx)
                     .await
                 {

@@ -1042,7 +1042,7 @@ impl Executor {
                 continue;
             };
 
-            self.storage
+            self.storage_for(&table_def.name)
                 .create_index(&table_def.name, &index_name, col_idx)
                 .await?;
             self.btree_indexes.insert(
@@ -1272,8 +1272,11 @@ impl Executor {
             .find(|v| !matches!(v, Value::Null));
         if let Some(probe_val) = first_probe_val
             && matches!(
-                self.storage
-                    .index_lookup_sync(&table_name, &right_index_name, probe_val),
+                self.storage_for(&table_name).index_lookup_sync(
+                    &table_name,
+                    &right_index_name,
+                    probe_val
+                ),
                 Ok(None)
             )
         {
@@ -1300,14 +1303,14 @@ impl Executor {
             }
 
             let mut matched = false;
-            let probed_rows =
-                match self
-                    .storage
-                    .index_lookup_sync(&table_name, &right_index_name, lookup_val)
-                {
-                    Ok(Some(rows)) => rows,
-                    _ => Vec::new(),
-                };
+            let probed_rows = match self.storage_for(&table_name).index_lookup_sync(
+                &table_name,
+                &right_index_name,
+                lookup_val,
+            ) {
+                Ok(Some(rows)) => rows,
+                _ => Vec::new(),
+            };
             self.metrics.rows_scanned.inc_by(probed_rows.len() as u64);
 
             for right_row in probed_rows {
@@ -1633,7 +1636,7 @@ impl Executor {
                             &self.catalog,
                         );
                         if let Ok(Some(mut rows)) = self
-                            .storage
+                            .storage_for(table)
                             .index_lookup_range(table, index_name, &lo_val, &hi_val)
                             .await
                         {
@@ -1700,8 +1703,10 @@ impl Executor {
                                 &table_def,
                                 &self.catalog,
                             );
-                            if let Ok(Some(rows)) =
-                                self.storage.index_lookup(table, index_name, &coerced).await
+                            if let Ok(Some(rows)) = self
+                                .storage_for(table)
+                                .index_lookup(table, index_name, &coerced)
+                                .await
                             {
                                 self.metrics.rows_scanned.inc_by(rows.len() as u64);
                                 return Ok((meta, rows));
@@ -3389,7 +3394,7 @@ impl Executor {
                         });
                         if let Some(idx) = pk_idx
                             && let Ok(Some(rows)) = self
-                                .storage
+                                .storage_for(&table_name)
                                 .index_lookup(&table_name, &idx.name, &coerced)
                                 .await
                         {
@@ -4080,7 +4085,7 @@ impl Executor {
         high: &Value,
     ) -> Option<Vec<Row>> {
         if let Ok(Some(rows)) = self
-            .storage
+            .storage_for(table_name)
             .index_lookup_range_sync(table_name, index_name, low, high)
         {
             return Some(rows);
@@ -4104,7 +4109,7 @@ impl Executor {
             let mut matched = false;
             for candidate in &candidates {
                 if let Ok(Some(mut found)) = self
-                    .storage
+                    .storage_for(table_name)
                     .index_lookup_sync(table_name, index_name, candidate)
                     && !found.is_empty()
                 {
@@ -5492,7 +5497,7 @@ impl Executor {
                 drop(index_name_ref);
                 // Try synchronous index lookup via storage engine
                 match self
-                    .storage
+                    .storage_for(table_name)
                     .index_lookup_sync(table_name, &index_name, value)
                 {
                     Ok(Some(rows)) => {
@@ -5834,9 +5839,9 @@ impl Executor {
                             }
                             let mut left_rows = Vec::new();
                             for key_val in &key_set {
-                                if let Ok(Some(mut found)) =
-                                    self.storage
-                                        .index_lookup_sync(lt_name, &index_name, key_val)
+                                if let Ok(Some(mut found)) = self
+                                    .storage_for(lt_name)
+                                    .index_lookup_sync(lt_name, &index_name, key_val)
                                 {
                                     left_rows.append(&mut found);
                                 }
@@ -5996,11 +6001,10 @@ impl Executor {
                         if let Some(index_name) = idx_name {
                             let mut left_rows = Vec::new();
                             for key_val in &key_set {
-                                if let Ok(Some(mut found)) = self.storage.index_lookup_sync(
-                                    &left_table,
-                                    &index_name,
-                                    key_val,
-                                ) {
+                                if let Ok(Some(mut found)) = self
+                                    .storage_for(&left_table)
+                                    .index_lookup_sync(&left_table, &index_name, key_val)
+                                {
                                     left_rows.append(&mut found);
                                 }
                             }
