@@ -19,7 +19,7 @@ use crate::columnar::{
     ColumnBatch, ColumnData, ColumnarStore, aggregate_count, aggregate_sum, group_by_text_agg_f64,
 };
 use crate::storage::columnar_wal::ColumnarWal;
-use crate::storage::{StorageEngine, StorageError};
+use crate::storage::{FilterOp, StorageEngine, StorageError};
 use crate::types::{Row, Value};
 
 // ─── Write buffer ─────────────────────────────────────────────────────────────
@@ -401,6 +401,63 @@ fn eq_mask(col: &ColumnData, val: &Value) -> Vec<bool> {
         (ColumnData::Bool(v), Value::Bool(b)) => v.iter().map(|o| o == &Some(*b)).collect(),
         _ => vec![false; col.len()],
     }
+}
+
+/// Read a predicate literal as f64 for numeric comparison, if it is numeric.
+fn value_as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int32(n) => Some(*n as f64),
+        Value::Int64(n) => Some(*n as f64),
+        Value::Float64(f) => Some(*f),
+        Value::Bool(b) => Some(*b as i64 as f64),
+        _ => None,
+    }
+}
+
+/// Does `ord` (the result of comparing a value to the predicate) satisfy `op`?
+fn apply_ord(ord: std::cmp::Ordering, op: FilterOp) -> bool {
+    use std::cmp::Ordering::*;
+    match op {
+        FilterOp::Eq => ord == Equal,
+        FilterOp::Ne => ord != Equal,
+        FilterOp::Lt => ord == Less,
+        FilterOp::Le => ord != Greater,
+        FilterOp::Gt => ord == Greater,
+        FilterOp::Ge => ord != Less,
+    }
+}
+
+/// Build a boolean mask for `col OP val`. NULLs are always false (a NULL
+/// comparison is SQL-unknown, excluded from filtered COUNT/SUM). Eq delegates
+/// to `eq_mask` (exact, cross-int-width aware); ordered ops compare numerics as
+/// f64 and text lexically.
+fn cmp_mask(col: &ColumnData, op: FilterOp, val: &Value) -> Vec<bool> {
+    if op == FilterOp::Eq {
+        return eq_mask(col, val);
+    }
+    if let Some(pred) = value_as_f64(val) {
+        let test = |o: Option<f64>| match o {
+            Some(x) => apply_ord(x.total_cmp(&pred), op),
+            None => false,
+        };
+        return match col {
+            ColumnData::Int32(v) => v.iter().map(|o| test(o.map(|x| x as f64))).collect(),
+            ColumnData::Int64(v) => v.iter().map(|o| test(o.map(|x| x as f64))).collect(),
+            ColumnData::Float64(v) => v.iter().map(|o| test(*o)).collect(),
+            ColumnData::Bool(v) => v.iter().map(|o| test(o.map(|b| b as i64 as f64))).collect(),
+            ColumnData::Text(_) => vec![false; col.len()],
+        };
+    }
+    if let (ColumnData::Text(v), Value::Text(s)) = (col, val) {
+        return v
+            .iter()
+            .map(|o| match o.as_deref() {
+                Some(x) => apply_ord(x.cmp(s.as_str()), op),
+                None => false,
+            })
+            .collect();
+    }
+    vec![false; col.len()]
 }
 
 /// Sum the numeric values in `col` at positions where `mask[i]` is true.
@@ -1076,6 +1133,62 @@ impl StorageEngine for ColumnarStorageEngine {
                 None => return (s, c),
             };
             let mask = eq_mask(filter_data, filter_val);
+            let val_data = match batch.column(&val_col_name) {
+                Some(d) => d,
+                None => return (s, c),
+            };
+            let (bs, bc) = sum_masked(val_data, &mask);
+            (s + bs, c + bc)
+        });
+        Some((sum, count))
+    }
+
+    fn fast_count_cmp(
+        &self,
+        table: &str,
+        filter_col: usize,
+        op: FilterOp,
+        filter_val: &Value,
+    ) -> Option<usize> {
+        self.flush_write_buffer(table);
+        let store = self.store.read();
+        if !store.table_exists(table) {
+            return None;
+        }
+        let batches = batches_for_read(&store, table);
+        let filter_col_name = filter_col.to_string();
+        let count = batches
+            .iter()
+            .map(|batch| match batch.column(&filter_col_name) {
+                Some(col) => cmp_mask(col, op, filter_val).iter().filter(|&&b| b).count(),
+                None => 0,
+            })
+            .sum();
+        Some(count)
+    }
+
+    fn fast_sum_f64_cmp(
+        &self,
+        table: &str,
+        val_col: usize,
+        filter_col: usize,
+        op: FilterOp,
+        filter_val: &Value,
+    ) -> Option<(f64, usize)> {
+        self.flush_write_buffer(table);
+        let val_col_name = val_col.to_string();
+        let filter_col_name = filter_col.to_string();
+        let store = self.store.read();
+        if !store.table_exists(table) {
+            return None;
+        }
+        let batches = batches_for_read(&store, table);
+        let (sum, count) = batches.iter().fold((0.0f64, 0usize), |(s, c), batch| {
+            let filter_data = match batch.column(&filter_col_name) {
+                Some(d) => d,
+                None => return (s, c),
+            };
+            let mask = cmp_mask(filter_data, op, filter_val);
             let val_data = match batch.column(&val_col_name) {
                 Some(d) => d,
                 None => return (s, c),

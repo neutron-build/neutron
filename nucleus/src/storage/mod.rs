@@ -74,6 +74,30 @@ pub fn get_storage_session_id() -> u64 {
     STORAGE_SESSION_ID_CELL.with(|c| c.get())
 }
 
+/// Comparison operator for predicate-filtered fast aggregates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl FilterOp {
+    /// Flip operand order: `lit OP col` is equivalent to `col OP.flip() lit`.
+    pub fn flip(self) -> Self {
+        match self {
+            FilterOp::Lt => FilterOp::Gt,
+            FilterOp::Le => FilterOp::Ge,
+            FilterOp::Gt => FilterOp::Lt,
+            FilterOp::Ge => FilterOp::Le,
+            other => other,
+        }
+    }
+}
+
 /// The storage engine trait. All storage backends implement this.
 /// Principle 1: subsystems interact through clean abstractions.
 #[async_trait::async_trait]
@@ -426,6 +450,31 @@ pub trait StorageEngine: Send + Sync {
         _desc: bool,
         _k: usize,
     ) -> Option<Vec<Row>> {
+        None
+    }
+
+    /// Count rows where `filter_col OP filter_val`, vectorized over columns.
+    /// Generalizes equality-filtered count to any comparison. None = unsupported.
+    fn fast_count_cmp(
+        &self,
+        _table: &str,
+        _filter_col: usize,
+        _op: FilterOp,
+        _filter_val: &Value,
+    ) -> Option<usize> {
+        None
+    }
+
+    /// Sum of `val_col` (and a non-null count) over rows where
+    /// `filter_col OP filter_val`, vectorized. None = unsupported.
+    fn fast_sum_f64_cmp(
+        &self,
+        _table: &str,
+        _val_col: usize,
+        _filter_col: usize,
+        _op: FilterOp,
+        _filter_val: &Value,
+    ) -> Option<(f64, usize)> {
         None
     }
 
