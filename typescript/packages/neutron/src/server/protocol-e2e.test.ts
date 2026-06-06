@@ -179,6 +179,15 @@ describe("protocol e2e", () => {
     ]);
   });
 
+  it("GET /health returns the contract shape { status, nucleus, version }", async () => {
+    const res = await fetch(`${baseUrl}/health`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(["nucleus", "status", "version"]);
+    expect(body.status).toBe("ok");
+  });
+
   it("serves static and app responses with correct etag/head/304 semantics", async () => {
     const staticGet = await fetch(`${baseUrl}/`);
     expect(staticGet.status).toBe(200);

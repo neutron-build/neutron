@@ -119,6 +119,8 @@ export interface NeutronServerOptions {
   routesDir?: string;
   compress?: boolean;
   runtime?: NeutronRuntime;
+  /** Version reported by GET /health (FRAMEWORK_CONTRACT.md). Defaults to "0.1.0". */
+  version?: string;
   cors?: false | CorsOptions;
   securityHeaders?: false | { headers?: Record<string, string> };
   /**
@@ -260,6 +262,7 @@ export async function createServer(options: NeutronServerOptions = {}) {
     cache,
     routes: routeRules,
     hooks,
+    version: serverVersion = "0.1.0",
   } = options;
 
   const resolvedRootDir = path.resolve(rootDir);
@@ -312,10 +315,8 @@ export async function createServer(options: NeutronServerOptions = {}) {
     });
   }
 
-  if (enableCompress) {
-    app.use("*", compress());
-  }
-
+  // FRAMEWORK_CONTRACT.md middleware order: CORS precedes Compression. (CORS
+  // preflight short-circuits before the body is ever compressed.)
   if (corsOptions || securityHeadersConfig) {
     app.use("*", async (c, next) => {
       if (corsOptions) {
@@ -336,6 +337,21 @@ export async function createServer(options: NeutronServerOptions = {}) {
       }
     });
   }
+
+  if (enableCompress) {
+    app.use("*", compress());
+  }
+
+  // GET /health — contract shape { status, nucleus, version }. Registered before
+  // the static/SSR routes so it always answers. The SSR server holds no Nucleus
+  // pool (loaders connect per-request), so nucleus is "unconfigured" here.
+  app.get("/health", (c) =>
+    c.json({
+      status: "ok",
+      nucleus: "unconfigured",
+      version: serverVersion,
+    }),
+  );
 
   app.use(
     "/assets/*",
