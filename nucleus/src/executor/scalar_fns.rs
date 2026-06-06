@@ -186,8 +186,18 @@ impl Executor {
                 require_args(fname, &args, 2)?;
                 match &args[0] {
                     Value::Text(s) => {
-                        let n = value_to_i64(&args[1])? as usize;
-                        Ok(Value::Text(s.repeat(n)))
+                        let n = bounded_len(value_to_i64(&args[1])?, "REPEAT")?;
+                        // Bound the *total* output (count * width), not just the
+                        // count, so REPEAT of a long string errors rather than
+                        // OOM-aborting the process.
+                        match s.len().checked_mul(n) {
+                            Some(total) if total <= MAX_STR_OUTPUT => {
+                                Ok(Value::Text(s.repeat(n)))
+                            }
+                            _ => Err(ExecError::Unsupported(
+                                "REPEAT: result exceeds maximum length".into(),
+                            )),
+                        }
                     }
                     Value::Null => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("REPEAT requires text".into())),
@@ -433,7 +443,7 @@ impl Executor {
                 }
                 match &args[0] {
                     Value::Text(s) => {
-                        let target_len = value_to_i64(&args[1])? as usize;
+                        let target_len = bounded_len(value_to_i64(&args[1])?, "LPAD")?;
                         let fill = if args.len() > 2 {
                             match &args[2] {
                                 Value::Text(f) => f.clone(),
@@ -465,7 +475,7 @@ impl Executor {
                 }
                 match &args[0] {
                     Value::Text(s) => {
-                        let target_len = value_to_i64(&args[1])? as usize;
+                        let target_len = bounded_len(value_to_i64(&args[1])?, "RPAD")?;
                         let fill = if args.len() > 2 {
                             match &args[2] {
                                 Value::Text(f) => f.clone(),
@@ -744,6 +754,15 @@ impl Executor {
                     return Err(ExecError::Unsupported(
                         "GENERATE_SERIES step cannot be 0".into(),
                     ));
+                }
+                // Bound the series cardinality so an enormous range can't build a
+                // multi-billion-element vector and OOM-abort the process.
+                let span = (stop as i128 - start as i128).abs();
+                let count = (span / (step as i128).abs()) + 1;
+                if count > MAX_STR_OUTPUT as i128 {
+                    return Err(ExecError::Unsupported(format!(
+                        "GENERATE_SERIES: {count} elements exceeds maximum {MAX_STR_OUTPUT}"
+                    )));
                 }
                 let mut vals = Vec::new();
                 let mut current = start;
@@ -4858,6 +4877,10 @@ impl Executor {
                     let hex_str = hex_val.to_string().replace('\'', "");
                     (0..hex_str.len())
                         .step_by(2)
+                        // Guard the 2-byte window: an odd-length input would slice
+                        // past the end and panic. Drop the trailing half-byte,
+                        // consistent with the lenient filter_map below.
+                        .filter(|&i| i + 2 <= hex_str.len())
                         .filter_map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16).ok())
                         .collect::<Vec<u8>>()
                 } else {
