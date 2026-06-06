@@ -1408,6 +1408,17 @@ impl RespHandler {
                     Err(e) => encode_wrongtype(&e),
                 }
             }
+            "PFMERGE" => {
+                let dest = require_arg!(args, 1);
+                let sources: Vec<&str> = args[2..]
+                    .iter()
+                    .map(|a| std::str::from_utf8(a).unwrap_or(""))
+                    .collect();
+                match self.kv.col_pfmerge(dest, &sources) {
+                    Ok(()) => encoder::encode_simple_string("OK"),
+                    Err(e) => encode_wrongtype(&e),
+                }
+            }
 
             // ================================================================
             // Info / Meta

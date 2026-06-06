@@ -506,6 +506,28 @@ func (kv *KVModel) PFCount(ctx context.Context, key string) (int64, error) {
 	return n, wrapErr("kv pfcount", err)
 }
 
+// PFMerge merges the source HyperLogLogs into dest (their set union). Use this
+// for a unique count across buckets — summing per-bucket PFCounts over-counts
+// elements seen in more than one bucket.
+func (kv *KVModel) PFMerge(ctx context.Context, dest string, sources ...string) error {
+	if err := kv.client.requireNucleus("KV.PFMerge"); err != nil {
+		return err
+	}
+	if len(sources) == 0 {
+		return nil
+	}
+	args := make([]any, 0, len(sources)+1)
+	args = append(args, dest)
+	placeholders := make([]string, 0, len(sources)+1)
+	placeholders = append(placeholders, "$1")
+	for i, s := range sources {
+		args = append(args, s)
+		placeholders = append(placeholders, fmt.Sprintf("$%d", i+2))
+	}
+	_, err := kv.pool.Exec(ctx, "SELECT KV_PFMERGE("+strings.Join(placeholders, ", ")+")", args...)
+	return wrapErr("kv pfmerge", err)
+}
+
 // --- helpers ---
 
 func wrapErr(op string, err error) error {
