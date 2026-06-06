@@ -305,6 +305,23 @@ impl<T: Clone + Send + Sync + 'static> FromRequestParts for Extension<T> {
 // Body extractors: Bytes, String
 // ---------------------------------------------------------------------------
 
+/// Stream the raw request body frame-by-frame, without buffering it whole.
+///
+/// Only one body-consuming extractor can run per request — `BodyStream` takes
+/// the streaming body, so a second body extractor sees an empty stream. Use
+/// this for large uploads or proxying where you want backpressure instead of a
+/// full in-memory buffer.
+pub struct BodyStream(pub crate::handler::ReqBody);
+
+impl FromRequest for BodyStream {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
+        match req.take_body() {
+            Some(b) => Ok(BodyStream(b)),
+            None => Ok(BodyStream(crate::handler::empty_req_body())),
+        }
+    }
+}
+
 /// Raw request body as bytes.
 impl FromRequest for Bytes {
     async fn from_request(req: &mut Request) -> Result<Self, Response> {
@@ -624,6 +641,21 @@ mod tests {
     use bytes::Bytes;
     use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use smallvec::SmallVec;
+
+    // A.4: with no streaming body mounted, BodyStream yields an empty stream.
+    #[tokio::test]
+    async fn body_stream_extractor_yields_empty_when_buffered() {
+        use http_body_util::BodyExt;
+        let mut req = Request::new(
+            Method::POST,
+            "/".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::from("ignored-buffered-body"),
+        );
+        let BodyStream(body) = ok_or_panic(BodyStream::from_request(&mut req).await);
+        let collected = body.collect().await.unwrap_or_else(|_| panic!("stream errored")).to_bytes();
+        assert!(collected.is_empty());
+    }
 
     // Proves every extractor future is `Send` (required to box into the handler's
     // `Pin<Box<dyn Future + Send>>`). If any extractor's future were !Send this

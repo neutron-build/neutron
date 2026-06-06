@@ -13,7 +13,7 @@ pub use crate::router::Router;
 pub use crate::extract::{FromRequest, FromRequestParts};
 
 // Core extractors (no feature required)
-pub use crate::extract::{ConnectInfo, Extension, Optional, Path, State};
+pub use crate::extract::{BodyStream, ConnectInfo, Extension, Optional, Path, State};
 
 // Typed header extractor and trait
 pub use crate::extract::{TypedHeader, TypedHeaderValue};
