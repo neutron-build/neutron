@@ -1,12 +1,53 @@
 package neutron
 
 import (
+	"bytes"
+	"compress/gzip"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
+
+// P0.1: response-writer wrappers must forward Flush/Hijack so SSE and WebSocket
+// upgrades work behind the framework's own Logger/Compress middleware. Embedding
+// the http.ResponseWriter interface does NOT promote those methods.
+func TestStreamingWorksBehindMiddleware(t *testing.T) {
+	var _ http.Flusher = (*statusWriter)(nil)
+	var _ http.Hijacker = (*statusWriter)(nil)
+	var _ http.Flusher = (*gzipWriter)(nil)
+	var _ http.Hijacker = (*gzipWriter)(nil)
+
+	streaming := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("http.Flusher not available to handler behind middleware")
+			return
+		}
+		_, _ = w.Write([]byte("data: hi\n\n"))
+		f.Flush()
+	})
+
+	t.Run("behind Logger", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		Logger(slog.Default())(streaming).ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+		if !rec.Flushed {
+			t.Error("response not flushed behind Logger middleware")
+		}
+	})
+
+	t.Run("behind Compress", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		Compress(gzip.DefaultCompression)(streaming).ServeHTTP(rec, req)
+		if !rec.Flushed {
+			t.Error("response not flushed behind Compress middleware")
+		}
+	})
+}
 
 func TestRequestIDMiddleware(t *testing.T) {
 	handler := RequestID()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -200,5 +241,48 @@ func TestRateLimitMiddleware(t *testing.T) {
 	handler.ServeHTTP(w, r)
 	if w.Code != http.StatusTooManyRequests {
 		t.Errorf("second request: status = %d, want 429", w.Code)
+	}
+}
+
+// P1: DefaultStack applies the contract middleware order. The key invariant —
+// RequestID strictly before Logging — is verified by checking the log line
+// carries a non-empty request_id (Logger ran after RequestID set it).
+func TestDefaultStackEnforcesContractOrder(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	stack := DefaultStack(DefaultStackConfig{
+		Logger:   logger,
+		Compress: true,
+		Timeout:  time.Second,
+	})
+	// First three are always-on in contract order.
+	if len(stack) < 3 {
+		t.Fatalf("stack has %d layers, want >= 3", len(stack))
+	}
+
+	sawID := false
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if RequestIDFromContext(r.Context()) != "" {
+			sawID = true
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	var wrapped http.Handler = h
+	for i := len(stack) - 1; i >= 0; i-- {
+		wrapped = stack[i](wrapped)
+	}
+	rec := httptest.NewRecorder()
+	wrapped.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+
+	if !sawID {
+		t.Error("RequestID did not run before the handler")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "request_id=") {
+		t.Errorf("Logger did not run; log = %q", out)
+	}
+	if strings.Contains(out, `request_id=""`) {
+		t.Error("request_id empty in log — RequestID must precede Logging")
 	}
 }

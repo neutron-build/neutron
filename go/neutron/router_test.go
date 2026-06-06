@@ -245,3 +245,45 @@ func TestRouterInvalidJSON(t *testing.T) {
 		t.Errorf("status = %d, want 400", w.Code)
 	}
 }
+
+// P0.3: unmatched routes (404) and method mismatches (405) render as RFC 7807
+// application/problem+json, not the std plain-text replies; 405 carries Allow.
+func TestNotFoundAndMethodNotAllowedAreProblemJSON(t *testing.T) {
+	r := newRouter()
+	Get[Empty, map[string]string](r, "/users", func(ctx context.Context, _ Empty) (map[string]string, error) {
+		return map[string]string{"ok": "yes"}, nil
+	})
+
+	t.Run("404", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest("GET", "/nope", nil))
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", w.Code)
+		}
+		if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/problem+json") {
+			t.Errorf("content-type = %q, want problem+json", ct)
+		}
+		var pd map[string]any
+		_ = json.NewDecoder(w.Body).Decode(&pd)
+		if pd["status"] != float64(404) {
+			t.Errorf("body status = %v, want 404", pd["status"])
+		}
+		if pd["instance"] != "/nope" {
+			t.Errorf("instance = %v, want /nope", pd["instance"])
+		}
+	})
+
+	t.Run("405", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest("DELETE", "/users", nil))
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("status = %d, want 405", w.Code)
+		}
+		if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/problem+json") {
+			t.Errorf("content-type = %q, want problem+json", ct)
+		}
+		if allow := w.Header().Get("Allow"); !strings.Contains(allow, "GET") {
+			t.Errorf("Allow = %q, want GET", allow)
+		}
+	})
+}

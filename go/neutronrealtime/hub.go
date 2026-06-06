@@ -10,6 +10,23 @@ type Conn struct {
 	Send   chan []byte
 	rooms  map[string]bool
 	mu     sync.Mutex
+	closed bool
+}
+
+// trySend delivers msg without blocking. It is safe against a concurrent
+// Unregister: the `closed` flag and the send are both guarded by c.mu, so a
+// broadcast can never send on a closed channel (which would panic). Messages
+// are dropped if the buffer is full or the connection is closed.
+func (c *Conn) trySend(msg []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	select {
+	case c.Send <- msg:
+	default:
+	}
 }
 
 // NewConn creates a new connection.
@@ -57,10 +74,15 @@ func (h *Hub) Unregister(conn *Conn) {
 			}
 		}
 	}
+	// Set closed + close under conn.mu so a concurrent trySend cannot send on
+	// the closed channel. Guard makes Unregister idempotent (no double-close).
+	if !conn.closed {
+		conn.closed = true
+		close(conn.Send)
+	}
 	conn.mu.Unlock()
 
 	delete(h.connections, conn.ID)
-	close(conn.Send)
 }
 
 // Subscribe adds a connection to a room.
@@ -111,11 +133,7 @@ func (h *Hub) Broadcast(room string, msg []byte) {
 	h.mu.RUnlock()
 
 	for _, c := range conns {
-		select {
-		case c.Send <- msg:
-		default:
-			// Drop message if buffer full
-		}
+		c.trySend(msg)
 	}
 }
 
@@ -129,10 +147,7 @@ func (h *Hub) BroadcastAll(msg []byte) {
 	h.mu.RUnlock()
 
 	for _, c := range conns {
-		select {
-		case c.Send <- msg:
-		default:
-		}
+		c.trySend(msg)
 	}
 }
 

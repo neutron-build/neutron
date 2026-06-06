@@ -1,8 +1,52 @@
 package neutronrealtime
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 )
+
+// P0.2: concurrent Broadcast + Unregister must not panic (send on closed
+// channel) nor race. Run with -race. Before the fix this panicked.
+func TestHubConcurrentBroadcastUnregisterNoPanic(t *testing.T) {
+	h := NewHub()
+	const n = 40
+	conns := make([]*Conn, n)
+	for i := 0; i < n; i++ {
+		c := NewConn(fmt.Sprintf("c%d", i), 1)
+		conns[i] = c
+		h.Register(c)
+		h.Subscribe("room", c)
+		// Drain so a full buffer doesn't matter.
+		go func(c *Conn) {
+			for range c.Send {
+			}
+		}(c)
+	}
+
+	var wg sync.WaitGroup
+	for b := 0; b < 4; b++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 500; i++ {
+				h.Broadcast("room", []byte("x"))
+				h.BroadcastAll([]byte("y"))
+			}
+		}()
+	}
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(c *Conn) {
+			defer wg.Done()
+			h.Unregister(c)
+		}(conns[i])
+	}
+	wg.Wait()
+
+	// Double-unregister must be safe (idempotent, no double-close panic).
+	h.Unregister(conns[0])
+}
 
 func TestHubRegisterUnregister(t *testing.T) {
 	hub := NewHub()
