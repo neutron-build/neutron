@@ -111,9 +111,15 @@ Each scaffold is a standalone phased engineering plan (P0 correctness → P1 fun
 - ✅ **P0.3** 405 carries RFC 7231 `Allow` header (`MethodNotAllowed { allow }`)
 - ✅ **P0.4** `HealthCheck::contract()` — `GET /health` = `{status, nucleus, version}`
 - ✅ **P0.6** example middleware order fixed (RequestID before Logging)
-- ⏳ **P0.0** TLS-capable Nucleus connections (rustls + `sslmode`) — next
-- ⏳ **P0.5** KV collection decode (jsonb, no comma-split) — coupled to engine N-1 (jsonb emit); assess/defer
-- Tests: 651 neutron tests green; clippy `--lib` clean (pre-existing extract.rs lints noted for the quality-gates sweep).
+- ✅ **P0.0** TLS-capable Nucleus connections — rustls (aws-lc-rs) + OS trust store + `sslmode` (disable/prefer/require/verify-full), default-on `tls` feature, cached connector, `NucleusError::Tls`. 85 nucleus tests green; builds tls-on/off/all-features. (commit `928021c`)
+- ⏸️ **P0.5** KV collection decode (jsonb, no comma-split) — **DEFERRED (sound reason).** The engine emits comma-joined TEXT from `KV_LRANGE`/`KV_SMEMBERS`/`KV_HGETALL`/`KV_ZRANGE` (`nucleus/src/executor/scalar_fns.rs:2785+`). A client-only change can't fix the corruption (it'd still split); the real fix needs engine item **N-1** to emit `jsonb`, then the client decodes `jsonb`. The engine is under **heavy active concurrent development** (ebad523/4bfc536/af78d19…), so changing its hot-path scalar fns from this stale framework branch would conflict and risk breaking the DB. → Land P0.5 + N-1 together on the nucleus mainline (engine emits jsonb for the 5 collection fns; client `decode_collection`/`decode_hash` helpers parse jsonb, no `split`), verified by the P2.5 testcontainers comma/`=`/newline/unicode round-trip tests.
+- Tests: 651 neutron + 85 neutron-nucleus tests green; clippy `--lib` clean. Pre-existing lints noted for the quality-gates sweep: `extract.rs` (approx_constant PI + dead fields), `handler.rs:23` unused `BufMut`/`BytesMut` under `--no-default-features` (feature-gating gap).
+
+**P0 status: 6/7 implemented & committed; P0.5 deferred to the nucleus mainline (engine-coupled). The framework P0 surface is shippable.**
+
+### Repo-hygiene fixes made along the way (both stale-rename artifacts from rs→rust)
+- `/rust/` ignore → `/rust/target/` — brought the whole framework under version control (`cb67b4f`).
+- `!rs/Cargo.lock` exception → `!rust/Cargo.lock` — the framework lockfile was silently untracked; now tracked for reproducible builds (folded into `928021c`).
 
 > ⚠️ **Critical repo finding (fixed):** the entire Rust framework (`rust/`, 18 crates) was **gitignored and untracked** — `/rust/` in `.gitignore`, added under the stale belief the source lived in `rs/` (renamed to `rust/` in 6079213). The flagship framework existed only on local disk. Fixed: `.gitignore` now ignores only `rust/target/`; framework brought under version control (commit `cb67b4f`, 185 files). The audit/scaffold/P0 work had all been on untracked code.
 
