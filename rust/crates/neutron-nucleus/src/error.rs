@@ -25,6 +25,10 @@ pub enum NucleusError {
     InvalidIdentifier(String),
     /// A Nucleus-specific feature was called against plain PostgreSQL.
     NucleusRequired { feature: String },
+    /// TLS setup failed (root store, crypto provider, or handshake config).
+    /// Distinct from `Connect` (which wraps the postgres-level handshake error)
+    /// so callers can tell a TLS misconfiguration from a network/auth failure.
+    Tls(String),
 }
 
 impl fmt::Display for NucleusError {
@@ -41,6 +45,7 @@ impl fmt::Display for NucleusError {
                 f,
                 "{feature} requires Nucleus database, but connected to plain PostgreSQL"
             ),
+            Self::Tls(msg) => write!(f, "Nucleus TLS: {msg}"),
         }
     }
 }
@@ -56,6 +61,7 @@ impl std::error::Error for NucleusError {
             Self::Serde(_) => None,
             Self::InvalidIdentifier(_) => None,
             Self::NucleusRequired { .. } => None,
+            Self::Tls(_) => None,
         }
     }
 }

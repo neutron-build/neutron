@@ -134,9 +134,11 @@ __pycache__/
 .venv/
 venv/
 
-# Rust
+# Rust — track the framework + engine lockfiles for reproducible builds.
+# (The `!rs/Cargo.lock` exception was stale: `rs/` was renamed to `rust/` in
+# 6079213, so the framework lockfile silently went untracked.)
 Cargo.lock
-!rs/Cargo.lock
+!rust/Cargo.lock
 !nucleus/Cargo.lock
 # Database files
 *.db
