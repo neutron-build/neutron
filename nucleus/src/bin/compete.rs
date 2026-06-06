@@ -2505,22 +2505,47 @@ fn setup_sqlite_schema(sqlite_path: &str, rows: usize) -> Result<(), rusqlite::E
 
 #[cfg(feature = "rusqlite")]
 fn bench_sqlite_query(conn: &Connection, sql: &str, warmup: usize, n: usize) -> Stats {
-    // Warm-up
-    for _ in 0..warmup {
-        let _ = conn.prepare(sql).and_then(|mut stmt| {
-            stmt.query(params![])?;
-            Ok(())
-        });
-    }
+    // Prepare ONCE (matches Nucleus's bench_query_prepared), then fully
+    // materialize every result row each iteration. SQLite is lazy — without
+    // stepping the row iterator and touching a column, the engine does almost
+    // no work (the old code never iterated, so GROUP BY/filter/sort looked
+    // ~1000x faster than reality). Stepping forces the real scan/aggregate/sort.
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(_) => return Stats::new(),
+    };
+    let ncols = stmt.column_count();
 
-    // Timed iterations
+    let drain = |stmt: &mut rusqlite::Statement| -> u64 {
+        let mut sink = 0u64;
+        if let Ok(mut rows) = stmt.query(params![]) {
+            while let Ok(Some(row)) = rows.next() {
+                // Touch the first column of every row to force materialization.
+                if ncols > 0 {
+                    if let Ok(v) = row.get::<usize, rusqlite::types::Value>(0) {
+                        sink = sink.wrapping_add(match v {
+                            rusqlite::types::Value::Integer(i) => i as u64,
+                            rusqlite::types::Value::Real(f) => f as u64,
+                            rusqlite::types::Value::Text(t) => t.len() as u64,
+                            rusqlite::types::Value::Blob(b) => b.len() as u64,
+                            rusqlite::types::Value::Null => 0,
+                        });
+                    }
+                }
+            }
+        }
+        sink
+    };
+
+    for _ in 0..warmup {
+        std::hint::black_box(drain(&mut stmt));
+    }
     let mut stats = Stats::new();
     for _ in 0..n {
         let t = Instant::now();
-        if let Ok(mut stmt) = conn.prepare(sql) {
-            let _ = stmt.query(params![]);
-        }
+        let s = drain(&mut stmt);
         stats.record(t.elapsed());
+        std::hint::black_box(s);
     }
     stats
 }
@@ -3817,24 +3842,45 @@ async fn bench_vs_clickhouse(
 ) -> Vec<CompeteResult> {
     let mut results = Vec::new();
 
+    // Apples-to-apples OLAP: ClickHouse uses its columnar MergeTree engine, so
+    // the Nucleus side must use its COLUMNAR engine too (not the default row
+    // store). Build a columnar copy of bench_users once and query that.
+    let _ = nc
+        .simple_query("DROP TABLE IF EXISTS bench_users_col")
+        .await;
+    nc.simple_query(
+        "CREATE TABLE bench_users_col (id INT PRIMARY KEY, name TEXT, email TEXT, age INT NOT NULL) \
+         WITH (engine='columnar')",
+    )
+    .await
+    .expect("create columnar table");
+    nc.simple_query("INSERT INTO bench_users_col SELECT * FROM bench_users")
+        .await
+        .expect("populate columnar table");
+    // Build the PK index AFTER load so point/range lookups don't full-scan
+    // (the columnar index is materialized from current rows at creation).
+    let _ = nc
+        .simple_query("CREATE INDEX idx_users_col_id ON bench_users_col(id)")
+        .await;
+
     let workloads = [
-        ("COUNT(*)", "SELECT COUNT(*) FROM bench_users"),
+        ("COUNT(*)", "SELECT COUNT(*) FROM bench_users_col"),
         (
             "Point Query (PK)",
-            "SELECT * FROM bench_users WHERE id = 5000",
+            "SELECT * FROM bench_users_col WHERE id = 5000",
         ),
         (
             "Range Scan",
-            "SELECT * FROM bench_users WHERE id BETWEEN 1000 AND 1099",
+            "SELECT * FROM bench_users_col WHERE id BETWEEN 1000 AND 1099",
         ),
-        ("Aggregation (AVG)", "SELECT AVG(age) FROM bench_users"),
+        ("Aggregation (AVG)", "SELECT AVG(age) FROM bench_users_col"),
         (
             "Filtering (WHERE)",
-            "SELECT COUNT(*) FROM bench_users WHERE age > 40",
+            "SELECT COUNT(*) FROM bench_users_col WHERE age > 40",
         ),
         (
             "Ordering (ORDER BY)",
-            "SELECT * FROM bench_users ORDER BY age DESC LIMIT 10",
+            "SELECT * FROM bench_users_col ORDER BY age DESC LIMIT 10",
         ),
     ];
 

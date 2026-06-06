@@ -776,6 +776,29 @@ impl StorageEngine for ColumnarStorageEngine {
         Ok(())
     }
 
+    // The executor's point/range fast paths call the async index_lookup; without
+    // these overrides they hit the trait default (Ok(None)) and fall back to a
+    // full table scan, so a columnar table's PK lookups were O(n). Delegate to
+    // the (synchronous, in-memory) index implementations.
+    async fn index_lookup(
+        &self,
+        table: &str,
+        index_name: &str,
+        value: &Value,
+    ) -> Result<Option<Vec<Row>>, StorageError> {
+        self.index_lookup_sync(table, index_name, value)
+    }
+
+    async fn index_lookup_range(
+        &self,
+        table: &str,
+        index_name: &str,
+        low: &Value,
+        high: &Value,
+    ) -> Result<Option<Vec<Row>>, StorageError> {
+        self.index_lookup_range_sync(table, index_name, low, high)
+    }
+
     fn index_lookup_sync(
         &self,
         table: &str,
@@ -793,9 +816,11 @@ impl StorageEngine for ColumnarStorageEngine {
         };
         let store = self.store.read();
         // Index points at physical positions; fetch by those, then dedup so
-        // SELECT via the index sees one row per logical PK.
-        let batches = store.batches_all(table);
-        let rows = fetch_rows_by_positions(&batches, &positions);
+        // SELECT via the index sees one row per logical PK. Borrow batches for
+        // raw tables — cloning the whole table to fetch a handful of rows by
+        // position defeats the point of the index.
+        let batches = batches_for_read(&store, table);
+        let rows = fetch_rows_by_positions(batches.as_ref(), &positions);
         let out = match crate::columnar::replacing_config(table) {
             Some(c) => crate::columnar::dedup_replacing_rows(rows, &c),
             None => rows,
@@ -826,8 +851,8 @@ impl StorageEngine for ColumnarStorageEngine {
             }
         };
         let store = self.store.read();
-        let batches = store.batches_all(table);
-        let rows = fetch_rows_by_positions(&batches, &positions);
+        let batches = batches_for_read(&store, table);
+        let rows = fetch_rows_by_positions(batches.as_ref(), &positions);
         let out = match crate::columnar::replacing_config(table) {
             Some(c) => crate::columnar::dedup_replacing_rows(rows, &c),
             None => rows,
