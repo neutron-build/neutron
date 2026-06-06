@@ -58,7 +58,7 @@ impl Multipart {
 }
 
 impl FromRequest for Multipart {
-    fn from_request(req: &Request) -> Result<Self, Response> {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
         let content_type = req
             .headers()
             .get(http::header::CONTENT_TYPE)

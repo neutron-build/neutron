@@ -61,7 +61,7 @@ use crate::middleware::{MiddlewareTrait, Next};
 pub struct CsrfToken(pub String);
 
 impl FromRequest for CsrfToken {
-    fn from_request(req: &Request) -> Result<Self, Response> {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
         req.get_extension::<CsrfToken>()
             .cloned()
             .ok_or_else(|| {
