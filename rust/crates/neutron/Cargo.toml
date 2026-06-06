@@ -143,6 +143,7 @@ tower-compat    = ["dep:tower", "dep:tower-layer", "dep:futures-util"]
 [dependencies]
 
 # ── Always required — the engine ────────────────────────────────────────────
+neutron-macros = { path = "../neutron-macros" }
 tokio          = { workspace = true }
 hyper          = { workspace = true }
 hyper-util     = { workspace = true }
