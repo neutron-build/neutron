@@ -117,6 +117,16 @@ Each scaffold is a standalone phased engineering plan (P0 correctness → P1 fun
 
 **P0 status: 6/7 implemented & committed; P0.5 deferred to the nucleus mainline (engine-coupled). The framework P0 surface is shippable.**
 
+### Rust P1 status (in progress)
+- ✅ **P1.1** `Router` implements `tower::Service` (the keystone) — `Router::into_service()` → cloneable `RouterService: tower_service::Service<http::Request<Body>, Error = Infallible>`, carries the full middleware chain/route table/state/fallback, supports `ServiceExt::oneshot`. `tower-service` promoted to a core dep. (commit `465773a`)
+- ✅ **P1.8** terse header-array `IntoResponse` (`(StatusCode, [(HeaderName, HeaderValue); N], T)` etc.) — the other tuple/`Result` forms were already present. (commit `5520356`)
+- ⏳ **Remaining P1 (the heavy interdependent architecture surgery — best as focused PRs):**
+  - **P1.M** reconcile `MiddlewareTrait` → one Tower model (`from_fn` sugar) — *next in dependency order*
+  - **P1.5** async extractors + typed RFC 7807 rejections (rewrites `extract.rs`)
+  - **P1.6** `Router<S>` + `FromRef` + `#[derive(FromRef)]` — the scaffold says land this as its own PR
+  - **P1.2** streaming request bodies (after P1.5) · **P1.3** lossless Tower bridge + server dispatch through `RouterService` on HTTP/1/2/3 + `nest_service` · **P1.4** `default_stack()` order-enforcing · **P1.7** `#[debug_handler]` · **P1.9** WS/SSE regression guard
+- Tests: **655 neutron** + 85 neutron-nucleus green; clippy `--lib` clean.
+
 ### Repo-hygiene fixes made along the way (both stale-rename artifacts from rs→rust)
 - `/rust/` ignore → `/rust/target/` — brought the whole framework under version control (`cb67b4f`).
 - `!rs/Cargo.lock` exception → `!rust/Cargo.lock` — the framework lockfile was silently untracked; now tracked for reproducible builds (folded into `928021c`).
