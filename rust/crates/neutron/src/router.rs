@@ -1125,6 +1125,47 @@ mod tests {
         assert!(allow.contains("GET"), "Allow header was {allow:?}");
     }
 
+    // P1.6/B.4: typed state binds via with_state and extracts at dispatch time.
+    // The whole composite state extracts as State<AppState>; sub-states are
+    // reachable through the derived FromRef impls.
+    #[tokio::test]
+    async fn typed_state_extracts() {
+        use crate::extract::State;
+        use crate::from_ref::FromRef;
+        use tower::ServiceExt;
+
+        #[derive(Clone, Debug, PartialEq)]
+        struct Db(u32);
+
+        #[derive(Clone, crate::FromRef)]
+        struct AppState {
+            db: Db,
+        }
+
+        // Compile-time: the derive produced FromRef<AppState> for Db.
+        let app = AppState { db: Db(99) };
+        assert_eq!(<Db as FromRef<AppState>>::from_ref(&app), Db(99));
+
+        // Runtime: Router::<AppState>::new(...).with_state(app) -> Router<()>,
+        // and State<AppState> resolves from the bound state map.
+        let svc = Router::<AppState>::new()
+            .get("/db", |State(s): State<AppState>| async move {
+                s.db.0.to_string()
+            })
+            .with_state(app)
+            .into_service();
+
+        let req = http::Request::builder()
+            .method(Method::GET)
+            .uri("/db")
+            .body(Body::empty())
+            .unwrap();
+        let resp = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"99");
+    }
+
     // P2.1: built-in 404/405 are RFC 7807 problem+json with `instance` set.
     #[tokio::test]
     async fn not_found_is_problem_json() {
