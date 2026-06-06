@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel
 
@@ -44,7 +44,7 @@ class CDCModel:
     async def count(self) -> int:
         """Return the total number of CDC events."""
         self._require()
-        return await self._exec.fetchval("SELECT CDC_COUNT()")
+        return cast("int", await self._exec.fetchval("SELECT CDC_COUNT()"))
 
     async def table_read(self, table: str, offset: int = 0) -> list[CDCEvent]:
         """Read CDC events for a specific table from the given offset."""

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel
 
@@ -94,7 +94,7 @@ class BlobModel:
         """Delete a blob."""
         self._require()
         full_key = f"{bucket}/{key}"
-        return await self._exec.fetchval("SELECT BLOB_DELETE($1)", full_key)
+        return cast("bool", await self._exec.fetchval("SELECT BLOB_DELETE($1)", full_key))
 
     async def exists(self, bucket: str, key: str) -> bool:
         """Check if a blob exists."""
@@ -130,12 +130,12 @@ class BlobModel:
     async def count(self) -> int:
         """Count all blobs."""
         self._require()
-        return await self._exec.fetchval("SELECT BLOB_COUNT()")
+        return cast("int", await self._exec.fetchval("SELECT BLOB_COUNT()"))
 
     async def dedup_ratio(self) -> float:
         """Get deduplication ratio."""
         self._require()
-        return await self._exec.fetchval("SELECT BLOB_DEDUP_RATIO()")
+        return cast("float", await self._exec.fetchval("SELECT BLOB_DEDUP_RATIO()"))
 
     async def copy(
         self,

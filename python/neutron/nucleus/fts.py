@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel
 
@@ -101,9 +101,9 @@ class FTSModel:
     async def doc_count(self) -> int:
         """Count indexed documents."""
         self._require()
-        return await self._exec.fetchval("SELECT FTS_DOC_COUNT()")
+        return cast("int", await self._exec.fetchval("SELECT FTS_DOC_COUNT()"))
 
     async def term_count(self) -> int:
         """Count unique indexed terms."""
         self._require()
-        return await self._exec.fetchval("SELECT FTS_TERM_COUNT()")
+        return cast("int", await self._exec.fetchval("SELECT FTS_TERM_COUNT()"))

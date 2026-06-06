@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 import asyncpg
 
@@ -78,8 +78,11 @@ class PubSubModel:
         """Count subscribers on a channel (Nucleus only)."""
         _validate_channel(channel)
         require_nucleus(self._features, "PubSub.subscriber_count")
-        return await self._exec.fetchval(
-            "SELECT PUBSUB_SUBSCRIBERS($1)", channel
+        return cast(
+            "int",
+            await self._exec.fetchval(
+                "SELECT PUBSUB_SUBSCRIBERS($1)", channel
+            )
         )
 
     async def listen(self, channel: str) -> AsyncIterator[str]:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel
 
@@ -148,8 +148,11 @@ class VectorModel:
     async def count(self, collection: str) -> int:
         """Count vectors in a collection."""
         self._require()
-        return await self._exec.fetchval(
-            f"SELECT COUNT(*) FROM {_safe(collection)}"
+        return cast(
+            "int",
+            await self._exec.fetchval(
+                f"SELECT COUNT(*) FROM {_safe(collection)}"
+            )
         )
 
 
