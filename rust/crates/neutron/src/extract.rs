@@ -642,19 +642,72 @@ mod tests {
     use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use smallvec::SmallVec;
 
-    // A.4: with no streaming body mounted, BodyStream yields an empty stream.
+    // A.6: BodyStream yields the request body as a real stream (Request::new now
+    // wraps the bytes as a single-frame stream).
     #[tokio::test]
-    async fn body_stream_extractor_yields_empty_when_buffered() {
+    async fn body_stream_extractor_yields_body() {
         use http_body_util::BodyExt;
         let mut req = Request::new(
             Method::POST,
             "/".parse().unwrap(),
             HeaderMap::new(),
-            Bytes::from("ignored-buffered-body"),
+            Bytes::from("streamed-body"),
         );
         let BodyStream(body) = ok_or_panic(BodyStream::from_request(&mut req).await);
         let collected = body.collect().await.unwrap_or_else(|_| panic!("stream errored")).to_bytes();
+        assert_eq!(collected, Bytes::from("streamed-body"));
+    }
+
+    // After the body is taken once, a second body extractor sees an empty stream.
+    #[tokio::test]
+    async fn body_stream_empty_after_consumed() {
+        use http_body_util::BodyExt;
+        let mut req = Request::new(
+            Method::POST,
+            "/".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::from("once"),
+        );
+        let _ = req.take_body();
+        let BodyStream(body) = ok_or_panic(BodyStream::from_request(&mut req).await);
+        let collected = body.collect().await.unwrap_or_else(|_| panic!("stream errored")).to_bytes();
         assert!(collected.is_empty());
+    }
+
+    // A.6: the per-frame ceiling rejects an over-limit body with 413 without
+    // requiring the whole body to fit — collect_body streams and stops early.
+    #[tokio::test]
+    async fn body_limit_enforced_during_stream() {
+        let mut req = Request::new(
+            Method::POST,
+            "/".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::from(vec![b'x'; 4096]),
+        );
+        let err = err_or_panic(req.collect_body(1024).await.map(|_| ()));
+        assert_eq!(err.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // A.6: JSON deserialization works over the streamed body.
+    #[cfg(feature = "json")]
+    #[tokio::test]
+    async fn json_extractor_still_works_over_stream() {
+        use serde::Deserialize;
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct User {
+            name: String,
+            age: u32,
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        let mut req = Request::new(
+            Method::POST,
+            "/".parse().unwrap(),
+            headers,
+            Bytes::from(r#"{"name":"Alice","age":30}"#),
+        );
+        let Json(u) = ok_or_panic(Json::<User>::from_request(&mut req).await);
+        assert_eq!(u, User { name: "Alice".into(), age: 30 });
     }
 
     // Proves every extractor future is `Send` (required to box into the handler's

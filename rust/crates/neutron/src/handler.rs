@@ -248,14 +248,17 @@ pub struct Request {
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
-    /// Streaming request body. `Some(..)` once a production server path mounts a
-    /// real `ReqBody`; `None` for synthetic/buffered requests (falls back to `body`).
+    /// Streaming request body. `Some(..)` until consumed by `collect_body`,
+    /// `buffer_body`, or `take_body`; `None` once drained (or for a request that
+    /// never carried a body).
     ///
     /// Wrapped in a `Mutex` so `Request` stays `Sync` — `ReqBody` (`dyn Body + Send`)
     /// is not `Sync`, and parts extractors take `&Request` across an `.await`, which
     /// the trait's `+ Send` bound turns into a `Request: Sync` obligation.
     body_stream: std::sync::Mutex<Option<ReqBody>>,
+    /// Materialized body, populated once `buffer_body` runs so that middleware
+    /// and the handler can both read it. Empty until then.
+    buffered: Bytes,
     params: SmallVec<[(String, String); 4]>,
     state: Arc<StateMap>,
     on_upgrade: std::sync::Mutex<Option<hyper::upgrade::OnUpgrade>>,
@@ -264,40 +267,18 @@ pub struct Request {
 }
 
 impl Request {
+    /// Construct a request from a buffered `Bytes` body. Source-compatible with
+    /// the pre-streaming API: the bytes are wrapped as a single-frame stream so
+    /// extractors exercise the same streaming path as production.
     pub fn new(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Self {
         Self {
             method,
             uri,
             headers,
-            body,
-            body_stream: std::sync::Mutex::new(None),
+            body_stream: std::sync::Mutex::new(Some(full_frame(body))),
+            buffered: Bytes::new(),
             params: SmallVec::new(),
             state: Arc::new(HashMap::new()),
-            on_upgrade: std::sync::Mutex::new(None),
-            extensions: SmallVec::new(),
-            remote_addr: None,
-        }
-    }
-
-    /// Create a new request with pre-built state and a buffered `Bytes` body.
-    /// Retained for synthetic/buffered construction; production paths use
-    /// [`with_streaming_state`](Self::with_streaming_state).
-    #[allow(dead_code)]
-    pub(crate) fn with_state(
-        method: Method,
-        uri: Uri,
-        headers: HeaderMap,
-        body: Bytes,
-        state: Arc<StateMap>,
-    ) -> Self {
-        Self {
-            method,
-            uri,
-            headers,
-            body,
-            body_stream: std::sync::Mutex::new(None),
-            params: SmallVec::new(),
-            state,
             on_upgrade: std::sync::Mutex::new(None),
             extensions: SmallVec::new(),
             remote_addr: None,
@@ -318,8 +299,8 @@ impl Request {
             method,
             uri,
             headers,
-            body: Bytes::new(),
             body_stream: std::sync::Mutex::new(Some(body)),
+            buffered: Bytes::new(),
             params: SmallVec::new(),
             state,
             on_upgrade: std::sync::Mutex::new(None),
@@ -330,14 +311,12 @@ impl Request {
 
     /// Collect the request body with a hard byte ceiling, enforced *during*
     /// streaming. Returns 413 (as a `Response`) the instant the running total
-    /// exceeds `limit`.
+    /// exceeds `limit`. After a prior `buffer_body`, returns the buffered bytes.
     pub async fn collect_body(&mut self, limit: usize) -> Result<Bytes, Response> {
-        // A.2: body_stream is always None -> fall back to the buffered Bytes.
         let taken = self.body_stream.get_mut().unwrap().take();
-        if let Some(stream) = taken {
-            collect_limited(stream, limit).await
-        } else {
-            Ok(self.body.clone())
+        match taken {
+            Some(stream) => collect_limited(stream, limit).await,
+            None => Ok(self.buffered.clone()),
         }
     }
 
@@ -356,9 +335,9 @@ impl Request {
     pub async fn buffer_body(&mut self, limit: usize) -> Result<&Bytes, Response> {
         let taken = self.body_stream.get_mut().unwrap().take();
         if let Some(stream) = taken {
-            self.body = collect_limited(stream, limit).await?;
+            self.buffered = collect_limited(stream, limit).await?;
         }
-        Ok(&self.body)
+        Ok(&self.buffered)
     }
 
     pub fn method(&self) -> &Method {
@@ -373,8 +352,11 @@ impl Request {
         &self.headers
     }
 
+    /// The buffered request body. Only populated after a prior call to
+    /// [`buffer_body`](Self::buffer_body) (or `collect_body` via a re-buffering
+    /// path); empty otherwise. Streaming consumers should use `collect_body`.
     pub fn body(&self) -> &Bytes {
-        &self.body
+        &self.buffered
     }
 
     pub fn params(&self) -> &[(String, String)] {
