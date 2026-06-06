@@ -1933,6 +1933,63 @@ impl Executor {
                         }
                     }
 
+                    // ── Unfiltered columnar top-k ────────────────────────
+                    // Limit → Sort(single key) → SeqScan(no filter/projection):
+                    // ask the engine for the top-k by the sort column directly.
+                    // fast_topk scans only that column and materializes just k
+                    // rows, instead of materializing the whole table to sort it.
+                    if let planner::PlanNode::Sort {
+                        input: sort_input,
+                        keys,
+                        ..
+                    } = input.as_ref()
+                        && let (Some(lim), None | Some(0)) = (limit, offset.as_ref())
+                        && keys.len() == 1
+                        && *lim > 0
+                        && let planner::PlanNode::SeqScan {
+                            table,
+                            filter_expr: None,
+                            projection: None,
+                            ..
+                        } = sort_input.as_ref()
+                    {
+                        let raw = keys[0].trim();
+                        let up = raw.to_uppercase();
+                        let without_nulls = if up.ends_with("NULLS FIRST") {
+                            raw[..raw.len() - "NULLS FIRST".len()].trim_end()
+                        } else if up.ends_with("NULLS LAST") {
+                            raw[..raw.len() - "NULLS LAST".len()].trim_end()
+                        } else {
+                            raw
+                        };
+                        let (sort_col_name, desc) = match without_nulls.rsplit_once(' ') {
+                            Some((c, dir)) if dir.eq_ignore_ascii_case("DESC") => (c.trim(), true),
+                            Some((c, dir)) if dir.eq_ignore_ascii_case("ASC") => (c.trim(), false),
+                            _ => (without_nulls, false),
+                        };
+                        if let Ok(table_def) = self.get_table(table).await
+                            && let Some(sort_col_idx) = table_def
+                                .columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(sort_col_name))
+                            && let Some(rows) =
+                                self.storage_for(table)
+                                    .fast_topk(table, sort_col_idx, desc, *lim)
+                        {
+                            let meta: Vec<ColMeta> = table_def
+                                .columns
+                                .iter()
+                                .map(|c| ColMeta {
+                                    table: Some(table.clone()),
+                                    name: c.name.clone(),
+                                    dtype: c.data_type.clone(),
+                                })
+                                .collect();
+                            self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                            return Ok((meta, rows));
+                        }
+                    }
+
                     // ── Top-K sort fusion ────────────────────────────────
 
                     // When Limit wraps Sort, avoid sorting all N rows.

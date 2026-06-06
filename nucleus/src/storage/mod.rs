@@ -413,6 +413,22 @@ pub trait StorageEngine: Send + Sync {
         None
     }
 
+    /// Top-k rows ordered by a single numeric `sort_col` (no filter). Scans only
+    /// the sort column, partitions for the k largest (`desc`) / smallest values,
+    /// and materializes just those k rows in sort order — avoiding a full
+    /// materialize-and-sort of the whole table for `ORDER BY col LIMIT k`.
+    /// Returns `None` when unsupported (non-numeric column, NULLs present, etc.),
+    /// so the caller falls back to the general sort.
+    fn fast_topk(
+        &self,
+        _table: &str,
+        _sort_col: usize,
+        _desc: bool,
+        _k: usize,
+    ) -> Option<Vec<Row>> {
+        None
+    }
+
     // ── Per-connection session lifecycle (default: no-op) ──────
 
     /// Create per-connection storage state for a new session.

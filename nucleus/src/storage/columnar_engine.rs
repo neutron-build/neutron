@@ -878,6 +878,61 @@ impl StorageEngine for ColumnarStorageEngine {
         Some(store.row_count(table))
     }
 
+    fn fast_topk(&self, table: &str, sort_col: usize, desc: bool, k: usize) -> Option<Vec<Row>> {
+        if k == 0 {
+            return Some(Vec::new());
+        }
+        self.flush_write_buffer(table);
+        let store = self.store.read();
+        if !store.table_exists(table) {
+            return None;
+        }
+        let batches = batches_for_read(&store, table);
+        let sort_name = sort_col.to_string();
+        // Collect (numeric key, global position). Bail to the general sort on a
+        // NULL or non-numeric column so their SQL ordering stays correct.
+        let mut keyed: Vec<(f64, usize)> = Vec::with_capacity(store.row_count(table));
+        let mut pos = 0usize;
+        for batch in batches.iter() {
+            macro_rules! push_keys {
+                ($v:expr, $conv:expr) => {{
+                    for o in $v {
+                        match o {
+                            Some(x) => {
+                                keyed.push(($conv(*x), pos));
+                                pos += 1;
+                            }
+                            None => return None,
+                        }
+                    }
+                }};
+            }
+            match batch.column(&sort_name) {
+                Some(ColumnData::Int32(v)) => push_keys!(v, |x: i32| x as f64),
+                Some(ColumnData::Int64(v)) => push_keys!(v, |x: i64| x as f64),
+                Some(ColumnData::Float64(v)) => push_keys!(v, |x: f64| x),
+                Some(ColumnData::Bool(v)) => push_keys!(v, |x: bool| x as i64 as f64),
+                _ => return None,
+            }
+        }
+        let n = keyed.len();
+        let cmp = |a: &(f64, usize), b: &(f64, usize)| {
+            if desc {
+                b.0.total_cmp(&a.0)
+            } else {
+                a.0.total_cmp(&b.0)
+            }
+        };
+        // O(n) partition for the top-k, then O(k log k) sort of just those k.
+        if k < n {
+            keyed.select_nth_unstable_by(k - 1, cmp);
+            keyed.truncate(k);
+        }
+        keyed.sort_unstable_by(cmp);
+        let positions: Vec<usize> = keyed.iter().map(|(_, p)| *p).collect();
+        Some(fetch_rows_by_positions(batches.as_ref(), &positions))
+    }
+
     fn fast_sum_f64(&self, table: &str, col_idx: usize) -> Option<(f64, usize)> {
         self.flush_write_buffer(table);
         let col_name = col_idx.to_string();
