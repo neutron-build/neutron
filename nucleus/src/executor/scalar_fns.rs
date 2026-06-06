@@ -3193,6 +3193,38 @@ impl Executor {
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
                 }
             }
+            "KV_PFMERGE" => {
+                // kv_pfmerge(dest, src1 [, src2, ...]) → bool
+                // Merge the union of the source HyperLogLogs into dest. A unique
+                // count across buckets must use this, not a sum of per-bucket
+                // PFCOUNTs (which over-counts elements seen in multiple buckets).
+                if args.len() < 2 {
+                    return Err(ExecError::Unsupported(
+                        "KV_PFMERGE requires a destination and at least one source key".into(),
+                    ));
+                }
+                let dest = match &args[0] {
+                    Value::Text(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let sources: Vec<String> = args[1..]
+                    .iter()
+                    .map(|a| match a {
+                        Value::Text(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect();
+                let source_refs: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
+                if !self.memory_allocator.lock().request("kv", 64) {
+                    return Err(ExecError::Unsupported(
+                        "KV_PFMERGE: memory budget exceeded".into(),
+                    ));
+                }
+                match self.kv_store.col_pfmerge(&dest, &source_refs) {
+                    Ok(()) => Ok(Value::Bool(true)),
+                    Err(e) => Err(ExecError::Unsupported(e.to_string())),
+                }
+            }
 
             // ================================================================
             // Stream functions (Redis-style append-only logs)
