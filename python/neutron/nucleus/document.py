@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from pydantic import BaseModel
 
@@ -132,7 +132,7 @@ class DocumentModel:
         raw = await self._exec.fetchval("SELECT DOC_GET($1)", doc_id)
         if raw is None:
             return None
-        return json.loads(raw)
+        return cast("dict[str, Any] | None", json.loads(raw))
 
     async def get_path(self, doc_id: int, *keys: str) -> Any:
         """Extract a value at a nested path from a document."""
@@ -145,7 +145,7 @@ class DocumentModel:
     async def count(self) -> int:
         """Count all documents."""
         self._require()
-        return await self._exec.fetchval("SELECT DOC_COUNT()")
+        return cast("int", await self._exec.fetchval("SELECT DOC_COUNT()"))
 
     async def update(
         self, collection: str, filter: dict[str, Any], update: dict[str, Any]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from neutron.nucleus._exec import Executor, require_nucleus
 from neutron.nucleus.client import Features
 
@@ -26,18 +28,21 @@ class DatalogModel:
     async def assert_fact(self, fact: str) -> bool:
         """Assert a Datalog fact."""
         self._require()
-        return await self._exec.fetchval("SELECT DATALOG_ASSERT($1)", fact)
+        return cast("bool", await self._exec.fetchval("SELECT DATALOG_ASSERT($1)", fact))
 
     async def retract(self, fact: str) -> bool:
         """Retract (remove) a previously asserted fact."""
         self._require()
-        return await self._exec.fetchval("SELECT DATALOG_RETRACT($1)", fact)
+        return cast("bool", await self._exec.fetchval("SELECT DATALOG_RETRACT($1)", fact))
 
     async def rule(self, head: str, body: str) -> bool:
         """Add a Datalog inference rule: ``head :- body``."""
         self._require()
-        return await self._exec.fetchval(
-            "SELECT DATALOG_RULE($1, $2)", head, body
+        return cast(
+            "bool",
+            await self._exec.fetchval(
+                "SELECT DATALOG_RULE($1, $2)", head, body
+            )
         )
 
     async def query(self, query: str) -> list[list[str]]:
@@ -56,9 +61,9 @@ class DatalogModel:
     async def clear(self) -> bool:
         """Clear all facts and rules."""
         self._require()
-        return await self._exec.fetchval("SELECT DATALOG_CLEAR()")
+        return cast("bool", await self._exec.fetchval("SELECT DATALOG_CLEAR()"))
 
     async def import_graph(self) -> int:
         """Import the current graph data as Datalog facts. Returns fact count."""
         self._require()
-        return await self._exec.fetchval("SELECT DATALOG_IMPORT_GRAPH()")
+        return cast("int", await self._exec.fetchval("SELECT DATALOG_IMPORT_GRAPH()"))

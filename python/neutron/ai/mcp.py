@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import httpx
 from starlette.requests import Request
@@ -248,14 +248,14 @@ class MCPClient:
         client = self._ensure_client()
         resp = await client.get(f"{self.url}/")
         resp.raise_for_status()
-        return resp.json()
+        return cast("dict[str, Any]", resp.json())
 
     async def list_tools(self) -> list[dict[str, Any]]:
         """List available tools on the server."""
         client = self._ensure_client()
         resp = await client.get(f"{self.url}/tools")
         resp.raise_for_status()
-        return resp.json().get("tools", [])
+        return cast("list[dict[str, Any]]", resp.json().get("tools", []))
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any] | None = None
@@ -277,7 +277,7 @@ class MCPClient:
         client = self._ensure_client()
         resp = await client.get(f"{self.url}/resources")
         resp.raise_for_status()
-        return resp.json().get("resources", [])
+        return cast("list[dict[str, Any]]", resp.json().get("resources", []))
 
     async def read_resource(self, uri: str) -> Any:
         """Read a resource by URI."""

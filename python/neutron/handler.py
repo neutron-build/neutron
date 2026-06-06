@@ -5,7 +5,16 @@ from __future__ import annotations
 import inspect
 import re
 from types import UnionType
-from typing import Annotated, Any, Callable, Union, get_args, get_origin, get_type_hints
+from typing import (
+    Annotated,
+    Any,
+    Callable,
+    Union,
+    cast,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
@@ -47,7 +56,7 @@ class Query:
     """
 
     def __class_getitem__(cls, model: type[Any]) -> type[Any]:
-        return Annotated[model, _QueryMarker()]
+        return cast("type[Any]", Annotated[model, _QueryMarker()])
 
 
 class Header:
@@ -63,7 +72,7 @@ class Header:
     """
 
     def __class_getitem__(cls, model: type[Any]) -> type[Any]:
-        return Annotated[model, _HeaderMarker()]
+        return cast("type[Any]", Annotated[model, _HeaderMarker()])
 
 
 class Form:
@@ -80,7 +89,7 @@ class Form:
     """
 
     def __class_getitem__(cls, model: type[Any]) -> type[Any]:
-        return Annotated[model, _FormMarker()]
+        return cast("type[Any]", Annotated[model, _FormMarker()])
 
 
 class UploadFile:
@@ -169,11 +178,11 @@ def _unwrap_scalar_type(annotation: type[Any]) -> type[Any]:
     if origin is Union:
         args = [a for a in get_args(annotation) if a is not type(None)]
         if args:
-            return args[0]
+            return cast("type[Any]", args[0])
     if isinstance(annotation, UnionType):
         args = [a for a in get_args(annotation) if a is not type(None)]
         if args:
-            return args[0]
+            return cast("type[Any]", args[0])
     return annotation
 
 
@@ -379,7 +388,7 @@ async def resolve_handler_params(
                 raise validation_error("Form validation failed", errors)
 
         elif param.kind == ParamKind.FILE:
-            form_data = await request.form()
+            form_data = dict(await request.form())
             upload = form_data.get(param.name)
             if upload is None:
                 if param.default is not inspect.Parameter.empty:

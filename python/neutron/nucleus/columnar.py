@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
 from neutron.nucleus._exec import Executor, require_nucleus
 from neutron.nucleus.client import Features
@@ -29,27 +29,36 @@ class ColumnarModel:
     async def insert(self, table: str, values: dict[str, Any]) -> bool:
         """Insert a row into a columnar table."""
         self._require()
-        return await self._exec.fetchval(
-            "SELECT COLUMNAR_INSERT($1, $2)", table, json.dumps(values)
+        return cast(
+            "bool",
+            await self._exec.fetchval(
+                "SELECT COLUMNAR_INSERT($1, $2)", table, json.dumps(values)
+            )
         )
 
     async def count(self, table: str) -> int:
         """Return the row count of a columnar table."""
         self._require()
-        return await self._exec.fetchval("SELECT COLUMNAR_COUNT($1)", table)
+        return cast("int", await self._exec.fetchval("SELECT COLUMNAR_COUNT($1)", table))
 
     async def sum(self, table: str, column: str) -> float:
         """Return the sum of a column."""
         self._require()
-        return await self._exec.fetchval(
-            "SELECT COLUMNAR_SUM($1, $2)", table, column
+        return cast(
+            "float",
+            await self._exec.fetchval(
+                "SELECT COLUMNAR_SUM($1, $2)", table, column
+            )
         )
 
     async def avg(self, table: str, column: str) -> float | None:
         """Return the average of a column."""
         self._require()
-        return await self._exec.fetchval(
-            "SELECT COLUMNAR_AVG($1, $2)", table, column
+        return cast(
+            "float | None",
+            await self._exec.fetchval(
+                "SELECT COLUMNAR_AVG($1, $2)", table, column
+            )
         )
 
     async def min(self, table: str, column: str) -> Any:

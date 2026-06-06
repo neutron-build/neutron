@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel
 
@@ -97,15 +97,21 @@ class GraphModel:
     async def delete_node(self, node_id: str) -> bool:
         """Delete a node by ID."""
         self._require()
-        return await self._exec.fetchval(
-            "SELECT GRAPH_DELETE_NODE($1)", int(node_id)
+        return cast(
+            "bool",
+            await self._exec.fetchval(
+                "SELECT GRAPH_DELETE_NODE($1)", int(node_id)
+            )
         )
 
     async def delete_edge(self, edge_id: str) -> bool:
         """Delete an edge by ID."""
         self._require()
-        return await self._exec.fetchval(
-            "SELECT GRAPH_DELETE_EDGE($1)", int(edge_id)
+        return cast(
+            "bool",
+            await self._exec.fetchval(
+                "SELECT GRAPH_DELETE_EDGE($1)", int(edge_id)
+            )
         )
 
     async def query(
@@ -191,9 +197,9 @@ class GraphModel:
     async def node_count(self) -> int:
         """Count all nodes."""
         self._require()
-        return await self._exec.fetchval("SELECT GRAPH_NODE_COUNT()")
+        return cast("int", await self._exec.fetchval("SELECT GRAPH_NODE_COUNT()"))
 
     async def edge_count(self) -> int:
         """Count all edges."""
         self._require()
-        return await self._exec.fetchval("SELECT GRAPH_EDGE_COUNT()")
+        return cast("int", await self._exec.fetchval("SELECT GRAPH_EDGE_COUNT()"))

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from pydantic import BaseModel
 
@@ -36,7 +36,7 @@ class KVModel:
 
     async def get(self, key: str) -> str | None:
         self._require()
-        return await self._exec.fetchval("SELECT KV_GET($1)", key)
+        return cast("str | None", await self._exec.fetchval("SELECT KV_GET($1)", key))
 
     async def get_typed(self, key: str, model: type[T]) -> T | None:
         raw = await self.get(key)
@@ -60,31 +60,31 @@ class KVModel:
 
     async def setnx(self, key: str, value: str) -> bool:
         self._require()
-        return await self._exec.fetchval("SELECT KV_SETNX($1, $2)", key, value)
+        return cast("bool", await self._exec.fetchval("SELECT KV_SETNX($1, $2)", key, value))
 
     async def delete(self, key: str) -> bool:
         self._require()
-        return await self._exec.fetchval("SELECT KV_DEL($1)", key)
+        return cast("bool", await self._exec.fetchval("SELECT KV_DEL($1)", key))
 
     async def exists(self, key: str) -> bool:
         self._require()
-        return await self._exec.fetchval("SELECT KV_EXISTS($1)", key)
+        return cast("bool", await self._exec.fetchval("SELECT KV_EXISTS($1)", key))
 
     async def incr(self, key: str, delta: int = 1) -> int:
         self._require()
-        return await self._exec.fetchval("SELECT KV_INCR($1, $2)", key, delta)
+        return cast("int", await self._exec.fetchval("SELECT KV_INCR($1, $2)", key, delta))
 
     async def ttl(self, key: str) -> int:
         self._require()
-        return await self._exec.fetchval("SELECT KV_TTL($1)", key)
+        return cast("int", await self._exec.fetchval("SELECT KV_TTL($1)", key))
 
     async def expire(self, key: str, ttl: int) -> bool:
         self._require()
-        return await self._exec.fetchval("SELECT KV_EXPIRE($1, $2)", key, ttl)
+        return cast("bool", await self._exec.fetchval("SELECT KV_EXPIRE($1, $2)", key, ttl))
 
     async def dbsize(self) -> int:
         self._require()
-        return await self._exec.fetchval("SELECT KV_DBSIZE()")
+        return cast("int", await self._exec.fetchval("SELECT KV_DBSIZE()"))
 
     async def flushdb(self) -> None:
         self._require()
@@ -94,19 +94,19 @@ class KVModel:
 
     async def lpush(self, key: str, value: str) -> int:
         self._require()
-        return await self._exec.fetchval("SELECT KV_LPUSH($1, $2)", key, value)
+        return cast("int", await self._exec.fetchval("SELECT KV_LPUSH($1, $2)", key, value))
 
     async def rpush(self, key: str, value: str) -> int:
         self._require()
-        return await self._exec.fetchval("SELECT KV_RPUSH($1, $2)", key, value)
+        return cast("int", await self._exec.fetchval("SELECT KV_RPUSH($1, $2)", key, value))
 
     async def lpop(self, key: str) -> str | None:
         self._require()
-        return await self._exec.fetchval("SELECT KV_LPOP($1)", key)
+        return cast("str | None", await self._exec.fetchval("SELECT KV_LPOP($1)", key))
 
     async def rpop(self, key: str) -> str | None:
         self._require()
-        return await self._exec.fetchval("SELECT KV_RPOP($1)", key)
+        return cast("str | None", await self._exec.fetchval("SELECT KV_RPOP($1)", key))
 
     async def lrange(self, key: str, start: int, stop: int) -> list[str]:
         self._require()
@@ -115,35 +115,38 @@ class KVModel:
         )
         if not raw:
             return []
-        return raw.split(",")
+        return cast("list[str]", raw.split(","))
 
     async def llen(self, key: str) -> int:
         self._require()
-        return await self._exec.fetchval("SELECT KV_LLEN($1)", key)
+        return cast("int", await self._exec.fetchval("SELECT KV_LLEN($1)", key))
 
     async def lindex(self, key: str, index: int) -> str | None:
         self._require()
-        return await self._exec.fetchval("SELECT KV_LINDEX($1, $2)", key, index)
+        return cast("str | None", await self._exec.fetchval("SELECT KV_LINDEX($1, $2)", key, index))
 
     # --- Hash operations ---
 
     async def hset(self, key: str, field: str, value: str) -> bool:
         self._require()
-        return await self._exec.fetchval(
-            "SELECT KV_HSET($1, $2, $3)", key, field, value
+        return cast(
+            "bool",
+            await self._exec.fetchval(
+                "SELECT KV_HSET($1, $2, $3)", key, field, value
+            ),
         )
 
     async def hget(self, key: str, field: str) -> str | None:
         self._require()
-        return await self._exec.fetchval("SELECT KV_HGET($1, $2)", key, field)
+        return cast("str | None", await self._exec.fetchval("SELECT KV_HGET($1, $2)", key, field))
 
     async def hdel(self, key: str, field: str) -> bool:
         self._require()
-        return await self._exec.fetchval("SELECT KV_HDEL($1, $2)", key, field)
+        return cast("bool", await self._exec.fetchval("SELECT KV_HDEL($1, $2)", key, field))
 
     async def hexists(self, key: str, field: str) -> bool:
         self._require()
-        return await self._exec.fetchval("SELECT KV_HEXISTS($1, $2)", key, field)
+        return cast("bool", await self._exec.fetchval("SELECT KV_HEXISTS($1, $2)", key, field))
 
     async def hgetall(self, key: str) -> dict[str, str]:
         self._require()
@@ -159,41 +162,47 @@ class KVModel:
 
     async def hlen(self, key: str) -> int:
         self._require()
-        return await self._exec.fetchval("SELECT KV_HLEN($1)", key)
+        return cast("int", await self._exec.fetchval("SELECT KV_HLEN($1)", key))
 
     # --- Set operations ---
 
     async def sadd(self, key: str, member: str) -> bool:
         self._require()
-        return await self._exec.fetchval("SELECT KV_SADD($1, $2)", key, member)
+        return cast("bool", await self._exec.fetchval("SELECT KV_SADD($1, $2)", key, member))
 
     async def srem(self, key: str, member: str) -> bool:
         self._require()
-        return await self._exec.fetchval("SELECT KV_SREM($1, $2)", key, member)
+        return cast("bool", await self._exec.fetchval("SELECT KV_SREM($1, $2)", key, member))
 
     async def smembers(self, key: str) -> list[str]:
         self._require()
         raw = await self._exec.fetchval("SELECT KV_SMEMBERS($1)", key)
         if not raw:
             return []
-        return raw.split(",")
+        return cast("list[str]", raw.split(","))
 
     async def sismember(self, key: str, member: str) -> bool:
         self._require()
-        return await self._exec.fetchval(
-            "SELECT KV_SISMEMBER($1, $2)", key, member
+        return cast(
+            "bool",
+            await self._exec.fetchval(
+                "SELECT KV_SISMEMBER($1, $2)", key, member
+            ),
         )
 
     async def scard(self, key: str) -> int:
         self._require()
-        return await self._exec.fetchval("SELECT KV_SCARD($1)", key)
+        return cast("int", await self._exec.fetchval("SELECT KV_SCARD($1)", key))
 
     # --- Sorted set operations ---
 
     async def zadd(self, key: str, score: float, member: str) -> bool:
         self._require()
-        return await self._exec.fetchval(
-            "SELECT KV_ZADD($1, $2, $3)", key, score, member
+        return cast(
+            "bool",
+            await self._exec.fetchval(
+                "SELECT KV_ZADD($1, $2, $3)", key, score, member
+            ),
         )
 
     async def zrange(self, key: str, start: int, stop: int) -> list[str]:
@@ -203,7 +212,7 @@ class KVModel:
         )
         if not raw:
             return []
-        return raw.split(",")
+        return cast("list[str]", raw.split(","))
 
     async def zrangebyscore(
         self, key: str, min_score: float, max_score: float
@@ -214,25 +223,25 @@ class KVModel:
         )
         if not raw:
             return []
-        return raw.split(",")
+        return cast("list[str]", raw.split(","))
 
     async def zrem(self, key: str, member: str) -> bool:
         self._require()
-        return await self._exec.fetchval("SELECT KV_ZREM($1, $2)", key, member)
+        return cast("bool", await self._exec.fetchval("SELECT KV_ZREM($1, $2)", key, member))
 
     async def zcard(self, key: str) -> int:
         self._require()
-        return await self._exec.fetchval("SELECT KV_ZCARD($1)", key)
+        return cast("int", await self._exec.fetchval("SELECT KV_ZCARD($1)", key))
 
     # --- HyperLogLog ---
 
     async def pfadd(self, key: str, element: str) -> bool:
         self._require()
-        return await self._exec.fetchval("SELECT KV_PFADD($1, $2)", key, element)
+        return cast("bool", await self._exec.fetchval("SELECT KV_PFADD($1, $2)", key, element))
 
     async def pfcount(self, key: str) -> int:
         self._require()
-        return await self._exec.fetchval("SELECT KV_PFCOUNT($1)", key)
+        return cast("int", await self._exec.fetchval("SELECT KV_PFCOUNT($1)", key))
 
     # --- Prefix scan ---
 

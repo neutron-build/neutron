@@ -35,7 +35,7 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, cast
 from urllib.parse import urlencode
 
 logger = logging.getLogger("neutron.auth")
@@ -530,7 +530,7 @@ async def _exchange_code(
     # Some providers (GitHub) may return form-encoded instead of JSON.
     body = resp.text
     if body.startswith("{"):
-        return resp.json()
+        return cast("dict[str, Any]", resp.json())
 
     # Parse form-encoded response
     from urllib.parse import parse_qs
@@ -565,4 +565,4 @@ async def _fetch_userinfo(
             detail="OAuth authentication failed",
         )
 
-    return resp.json()
+    return cast("dict[str, Any]", resp.json())

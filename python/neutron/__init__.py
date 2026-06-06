@@ -25,6 +25,7 @@ from neutron.middleware import (
     RequestIDMiddleware,
     TimeoutMiddleware,
     TrailingSlashMiddleware,
+    default_stack,
 )
 from neutron.openapi import (
     SecurityScheme,
@@ -63,6 +64,7 @@ __all__ = [
     "RequestIDMiddleware",
     "TimeoutMiddleware",
     "TrailingSlashMiddleware",
+    "default_stack",
     "SecurityScheme",
     "bearer_auth_scheme",
     "api_key_scheme",
