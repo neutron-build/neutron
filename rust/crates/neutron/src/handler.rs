@@ -28,6 +28,7 @@ use smallvec::SmallVec;
 #[cfg(feature = "json")]
 use serde::Serialize;
 
+use crate::error::AppError;
 use crate::extract::FromRequest;
 
 // ---------------------------------------------------------------------------
@@ -132,6 +133,54 @@ impl From<Vec<u8>> for Body {
 /// HTTP response type used throughout Neutron.
 pub type Response = http::Response<Body>;
 
+/// Boxed streaming **request** body.
+///
+/// Unlike the response [`Body`] (whose error is `Infallible`), a request body
+/// can fail mid-stream (connection reset during upload), so it carries a real
+/// boxed error. Kept separate from `Body` to preserve the response-body
+/// `Infallible` invariant relied on by `IntoResponse`.
+pub type ReqBody = Pin<
+    Box<dyn HttpBody<Data = Bytes, Error = Box<dyn std::error::Error + Send + Sync>> + Send>,
+>;
+
+/// Collect a streaming request body with a hard byte ceiling enforced
+/// **during** streaming — the limit is checked per-frame as bytes arrive, so a
+/// body exceeding `limit` is rejected after `limit + 1` bytes, never buffered
+/// whole.
+async fn collect_limited(mut body: ReqBody, limit: usize) -> Result<Bytes, Response> {
+    use http_body_util::BodyExt;
+    let mut acc = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| {
+            AppError::bad_request("The request body could not be read.").into_response()
+        })?;
+        if let Ok(data) = frame.into_data() {
+            if acc.len() + data.len() > limit {
+                return Err(AppError::payload_too_large(
+                    "The request body exceeds the configured limit.",
+                )
+                .into_response());
+            }
+            acc.extend_from_slice(&data);
+        }
+    }
+    Ok(acc.freeze())
+}
+
+/// Box a `Bytes` buffer as a single-frame [`ReqBody`] (for synthetic/buffered requests).
+#[allow(dead_code)]
+pub(crate) fn full_frame(body: Bytes) -> ReqBody {
+    use http_body_util::BodyExt;
+    Box::pin(http_body_util::Full::new(body).map_err(|never: Infallible| match never {}))
+}
+
+/// An empty [`ReqBody`] (used when the body has already been consumed).
+#[allow(dead_code)]
+pub(crate) fn empty_req_body() -> ReqBody {
+    use http_body_util::BodyExt;
+    Box::pin(http_body_util::Empty::<Bytes>::new().map_err(|never: Infallible| match never {}))
+}
+
 // ---------------------------------------------------------------------------
 // Type-erased state storage
 // ---------------------------------------------------------------------------
@@ -199,7 +248,17 @@ pub struct Request {
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    /// Streaming request body. `Some(..)` until consumed by `collect_body`,
+    /// `buffer_body`, or `take_body`; `None` once drained (or for a request that
+    /// never carried a body).
+    ///
+    /// Wrapped in a `Mutex` so `Request` stays `Sync` — `ReqBody` (`dyn Body + Send`)
+    /// is not `Sync`, and parts extractors take `&Request` across an `.await`, which
+    /// the trait's `+ Send` bound turns into a `Request: Sync` obligation.
+    body_stream: std::sync::Mutex<Option<ReqBody>>,
+    /// Materialized body, populated once `buffer_body` runs so that middleware
+    /// and the handler can both read it. Empty until then.
+    buffered: Bytes,
     params: SmallVec<[(String, String); 4]>,
     state: Arc<StateMap>,
     on_upgrade: std::sync::Mutex<Option<hyper::upgrade::OnUpgrade>>,
@@ -208,12 +267,16 @@ pub struct Request {
 }
 
 impl Request {
+    /// Construct a request from a buffered `Bytes` body. Source-compatible with
+    /// the pre-streaming API: the bytes are wrapped as a single-frame stream so
+    /// extractors exercise the same streaming path as production.
     pub fn new(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Self {
         Self {
             method,
             uri,
             headers,
-            body,
+            body_stream: std::sync::Mutex::new(Some(full_frame(body))),
+            buffered: Bytes::new(),
             params: SmallVec::new(),
             state: Arc::new(HashMap::new()),
             on_upgrade: std::sync::Mutex::new(None),
@@ -222,27 +285,59 @@ impl Request {
         }
     }
 
-    /// Create a new request with pre-built state — avoids allocating a temporary
-    /// empty `Arc<StateMap>` that would immediately be overwritten.  Used by all
-    /// production server paths; `new()` is kept for `TestClient` and user code.
-    pub(crate) fn with_state(
+    /// Create a request with a **streaming** body (the production dispatch path).
+    /// The body is consumed lazily — nothing is buffered until an extractor calls
+    /// [`collect_body`](Self::collect_body) or [`take_body`](Self::take_body).
+    pub(crate) fn with_streaming_state(
         method: Method,
         uri: Uri,
         headers: HeaderMap,
-        body: Bytes,
+        body: ReqBody,
         state: Arc<StateMap>,
     ) -> Self {
         Self {
             method,
             uri,
             headers,
-            body,
+            body_stream: std::sync::Mutex::new(Some(body)),
+            buffered: Bytes::new(),
             params: SmallVec::new(),
             state,
             on_upgrade: std::sync::Mutex::new(None),
             extensions: SmallVec::new(),
             remote_addr: None,
         }
+    }
+
+    /// Collect the request body with a hard byte ceiling, enforced *during*
+    /// streaming. Returns 413 (as a `Response`) the instant the running total
+    /// exceeds `limit`. After a prior `buffer_body`, returns the buffered bytes.
+    pub async fn collect_body(&mut self, limit: usize) -> Result<Bytes, Response> {
+        let taken = self.body_stream.get_mut().unwrap().take();
+        match taken {
+            Some(stream) => collect_limited(stream, limit).await,
+            None => Ok(self.buffered.clone()),
+        }
+    }
+
+    /// Take the streaming body for frame-level consumption (`BodyStream` extractor).
+    pub fn take_body(&mut self) -> Option<ReqBody> {
+        self.body_stream.get_mut().unwrap().take()
+    }
+
+    /// Buffer the streaming body into memory (with a per-frame `limit` ceiling)
+    /// and store it so that subsequent reads — including downstream extractors
+    /// calling [`collect_body`](Self::collect_body) — see the same bytes.
+    ///
+    /// Middleware that must inspect the body (size limits, CSRF form fields,
+    /// signature verification) calls this once; the body is then buffered and
+    /// available to the handler. Returns 413 if the body exceeds `limit`.
+    pub async fn buffer_body(&mut self, limit: usize) -> Result<&Bytes, Response> {
+        let taken = self.body_stream.get_mut().unwrap().take();
+        if let Some(stream) = taken {
+            self.buffered = collect_limited(stream, limit).await?;
+        }
+        Ok(&self.buffered)
     }
 
     pub fn method(&self) -> &Method {
@@ -257,8 +352,11 @@ impl Request {
         &self.headers
     }
 
+    /// The buffered request body. Only populated after a prior call to
+    /// [`buffer_body`](Self::buffer_body) (or `collect_body` via a re-buffering
+    /// path); empty otherwise. Streaming consumers should use `collect_body`.
     pub fn body(&self) -> &Bytes {
-        &self.body
+        &self.buffered
     }
 
     pub fn params(&self) -> &[(String, String)] {
@@ -599,13 +697,13 @@ where
 // Zero extractors: async fn() -> impl IntoResponse
 impl<F, Fut, Res> Handler<()> for F
 where
-    F: Fn() -> Fut + Send + Sync + 'static,
+    F: Fn() -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Res> + Send + 'static,
     Res: IntoResponse,
 {
     fn call(&self, _req: Request) -> Pin<Box<dyn Future<Output = Response> + Send>> {
-        let fut = (self)();
-        Box::pin(async move { fut.await.into_response() })
+        let this = self.clone();
+        Box::pin(async move { (this)().await.into_response() })
     }
 }
 
@@ -615,20 +713,23 @@ macro_rules! impl_handler {
         #[allow(non_snake_case)]
         impl<F, Fut, Res, $($T,)+> Handler<($($T,)+)> for F
         where
-            F: Fn($($T,)+) -> Fut + Send + Sync + 'static,
+            F: Fn($($T,)+) -> Fut + Clone + Send + Sync + 'static,
             Fut: Future<Output = Res> + Send + 'static,
             Res: IntoResponse,
             $($T: FromRequest + 'static,)+
         {
             fn call(&self, req: Request) -> Pin<Box<dyn Future<Output = Response> + Send>> {
-                $(
-                    let $T = match $T::from_request(&req) {
-                        Ok(v) => v,
-                        Err(e) => return Box::pin(async move { e }),
-                    };
-                )+
-                let fut = (self)($($T,)+);
-                Box::pin(async move { fut.await.into_response() })
+                let this = self.clone();
+                Box::pin(async move {
+                    let mut req = req;
+                    $(
+                        let $T = match $T::from_request(&mut req).await {
+                            Ok(v) => v,
+                            Err(e) => return e,
+                        };
+                    )+
+                    (this)($($T,)+).await.into_response()
+                })
             }
         }
     };
@@ -658,6 +759,21 @@ mod tests {
 
     async fn body_bytes(resp: Response) -> Vec<u8> {
         resp.into_body().collect().await.unwrap().to_bytes().to_vec()
+    }
+
+    #[tokio::test]
+    async fn collect_body_transitional_returns_buffered() {
+        let mut req = Request::new(
+            Method::POST,
+            "/".parse().unwrap(),
+            HeaderMap::new(),
+            Bytes::from("hello"),
+        );
+        let collected = match req.collect_body(1024).await {
+            Ok(b) => b,
+            Err(_) => panic!("expected Ok"),
+        };
+        assert_eq!(collected, Bytes::from("hello"));
     }
 
     #[tokio::test]

@@ -61,7 +61,7 @@ use crate::middleware::{MiddlewareTrait, Next};
 pub struct CsrfToken(pub String);
 
 impl FromRequest for CsrfToken {
-    fn from_request(req: &Request) -> Result<Self, Response> {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
         req.get_extension::<CsrfToken>()
             .cloned()
             .ok_or_else(|| {
@@ -215,6 +215,15 @@ impl MiddlewareTrait for CsrfLayer {
 
             // For non-safe methods, verify the token
             if !is_safe_method(req.method()) {
+                // The form-field fallback needs the body; buffer it (keeping it
+                // available to downstream extractors) before reading.
+                if req.buffer_body(crate::app::DEFAULT_MAX_BODY_SIZE).await.is_err() {
+                    return http::Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header("content-type", "text/plain; charset=utf-8")
+                        .body(Body::full("CSRF token missing or invalid"))
+                        .unwrap();
+                }
                 // Get the submitted token from header or form field
                 let submitted = req
                     .headers()

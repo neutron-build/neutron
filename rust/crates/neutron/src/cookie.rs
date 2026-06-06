@@ -234,7 +234,7 @@ impl CookieJar {
 }
 
 impl FromRequest for CookieJar {
-    fn from_request(req: &Request) -> Result<Self, Response> {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
         Ok(CookieJar {
             cookies: parse_cookies_from_headers(req.headers()),
         })
@@ -493,7 +493,7 @@ impl SignedCookieJar {
 }
 
 impl FromRequest for SignedCookieJar {
-    fn from_request(req: &Request) -> Result<Self, Response> {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
         let key = req.get_state::<Key>().ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -571,7 +571,7 @@ impl PrivateCookieJar {
 }
 
 impl FromRequest for PrivateCookieJar {
-    fn from_request(req: &Request) -> Result<Self, Response> {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
         let key = req.get_state::<Key>().ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

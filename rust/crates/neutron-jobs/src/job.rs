@@ -28,8 +28,9 @@ use serde::de::DeserializeOwned;
 pub struct Job<T>(pub T);
 
 impl<T: DeserializeOwned + Send + 'static> FromRequest for Job<T> {
-    fn from_request(req: &Request) -> Result<Self, Response> {
-        serde_json::from_slice(req.body())
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
+        let body = req.collect_body(2 * 1024 * 1024).await?;
+        serde_json::from_slice(&body)
             .map(Job)
             .map_err(|e| {
                 (StatusCode::BAD_REQUEST, format!("Invalid job payload: {e}")).into_response()
@@ -61,7 +62,7 @@ pub struct JobContext {
 }
 
 impl FromRequestParts for JobContext {
-    fn from_parts(req: &Request) -> Result<Self, Response> {
+    async fn from_parts(req: &Request) -> Result<Self, Response> {
         req.get_extension::<JobContext>()
             .cloned()
             .ok_or_else(|| {
@@ -246,35 +247,35 @@ mod tests {
 
     // -- Job<T> extractor --------------------------------------------------
 
-    #[test]
-    fn job_extractor_deserializes_json_body() {
+    #[tokio::test]
+    async fn job_extractor_deserializes_json_body() {
         #[derive(serde::Deserialize, Debug, PartialEq)]
         struct Payload { id: u64, name: String }
 
         let body = serde_json::to_vec(&serde_json::json!({"id": 1, "name": "alice"})).unwrap();
-        let req = Request::new(
+        let mut req = Request::new(
             Method::POST, "/".parse().unwrap(), HeaderMap::new(), Bytes::from(body),
         );
 
-        let Job(p) = ok_or_panic(Job::<Payload>::from_request(&req), "Job extractor failed");
+        let Job(p) = ok_or_panic(Job::<Payload>::from_request(&mut req).await, "Job extractor failed");
         assert_eq!(p, Payload { id: 1, name: "alice".to_string() });
     }
 
-    #[test]
-    fn job_extractor_fails_on_bad_json() {
-        let req = Request::new(
+    #[tokio::test]
+    async fn job_extractor_fails_on_bad_json() {
+        let mut req = Request::new(
             Method::POST,
             "/".parse().unwrap(),
             HeaderMap::new(),
             Bytes::from_static(b"not json"),
         );
-        assert!(Job::<serde_json::Value>::from_request(&req).is_err());
+        assert!(Job::<serde_json::Value>::from_request(&mut req).await.is_err());
     }
 
     // -- JobContext extractor ----------------------------------------------
 
-    #[test]
-    fn job_context_extracted_from_extension() {
+    #[tokio::test]
+    async fn job_context_extracted_from_extension() {
         let ctx = JobContext {
             job_id:       "abc-123".to_string(),
             job_type:     "email".to_string(),
@@ -289,16 +290,16 @@ mod tests {
         );
         req.set_extension(ctx.clone());
 
-        let extracted = ok_or_panic(JobContext::from_parts(&req), "JobContext extraction failed");
+        let extracted = ok_or_panic(JobContext::from_parts(&req).await, "JobContext extraction failed");
         assert_eq!(extracted.job_id, "abc-123");
         assert_eq!(extracted.attempt, 2);
     }
 
-    #[test]
-    fn job_context_fails_without_extension() {
+    #[tokio::test]
+    async fn job_context_fails_without_extension() {
         let req = Request::new(
             Method::POST, "/".parse().unwrap(), HeaderMap::new(), Bytes::new(),
         );
-        assert!(JobContext::from_parts(&req).is_err());
+        assert!(JobContext::from_parts(&req).await.is_err());
     }
 }

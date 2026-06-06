@@ -525,3 +525,14 @@ async fn head_request_returns_headers_no_body() {
 
     shutdown.send(()).ok();
 }
+
+// A.7: HTTP/3 streaming upload parity. Requires a QUIC client harness, so this
+// is marked #[ignore] to keep default `cargo test` hermetic. The h3 dispatch
+// path itself is exercised by the unit build under --features http3.
+#[cfg(feature = "http3")]
+#[tokio::test]
+#[ignore = "needs a QUIC client harness"]
+async fn h3_streaming_upload() {
+    // Placeholder: wire a quinn/h3 client, POST a body, assert it round-trips
+    // through the streaming dispatch path. Tracked with P1.9.
+}

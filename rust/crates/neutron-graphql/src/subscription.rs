@@ -161,8 +161,9 @@ where
     move |req: Request| {
         let schema = Arc::clone(&schema);
         Box::pin(async move {
+            let mut req = req;
             // Extract the WebSocket upgrade from the request.
-            let ws = match WebSocketUpgrade::from_request(&req) {
+            let ws = match WebSocketUpgrade::from_request(&mut req).await {
                 Ok(ws)   => ws,
                 Err(err) => return err,
             };
