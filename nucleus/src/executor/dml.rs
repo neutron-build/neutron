@@ -708,10 +708,11 @@ impl Executor {
                         .get(&(table_name.to_string(), col_name.clone()))
                         .map(|r| r.clone());
                     if let Some(index_name) = index_name_opt {
-                        match self
-                            .storage
-                            .index_lookup_sync(table_name, &index_name, new_val)
-                        {
+                        match self.storage_for(table_name).index_lookup_sync(
+                            table_name,
+                            &index_name,
+                            new_val,
+                        ) {
                             Ok(Some(rows)) if !rows.is_empty() => {
                                 return Err(ExecError::ConstraintViolation(format!(
                                     "duplicate key value violates unique constraint on ({col_name})"
