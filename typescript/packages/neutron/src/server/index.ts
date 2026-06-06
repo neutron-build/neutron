@@ -119,6 +119,8 @@ export interface NeutronServerOptions {
   routesDir?: string;
   compress?: boolean;
   runtime?: NeutronRuntime;
+  /** Version reported by GET /health (FRAMEWORK_CONTRACT.md). Defaults to "0.1.0". */
+  version?: string;
   cors?: false | CorsOptions;
   securityHeaders?: false | { headers?: Record<string, string> };
   /**
@@ -260,6 +262,7 @@ export async function createServer(options: NeutronServerOptions = {}) {
     cache,
     routes: routeRules,
     hooks,
+    version: serverVersion = "0.1.0",
   } = options;
 
   const resolvedRootDir = path.resolve(rootDir);
@@ -312,10 +315,8 @@ export async function createServer(options: NeutronServerOptions = {}) {
     });
   }
 
-  if (enableCompress) {
-    app.use("*", compress());
-  }
-
+  // FRAMEWORK_CONTRACT.md middleware order: CORS precedes Compression. (CORS
+  // preflight short-circuits before the body is ever compressed.)
   if (corsOptions || securityHeadersConfig) {
     app.use("*", async (c, next) => {
       if (corsOptions) {
@@ -336,6 +337,21 @@ export async function createServer(options: NeutronServerOptions = {}) {
       }
     });
   }
+
+  if (enableCompress) {
+    app.use("*", compress());
+  }
+
+  // GET /health — contract shape { status, nucleus, version }. Registered before
+  // the static/SSR routes so it always answers. The SSR server holds no Nucleus
+  // pool (loaders connect per-request), so nucleus is "unconfigured" here.
+  app.get("/health", (c) =>
+    c.json({
+      status: "ok",
+      nucleus: "unconfigured",
+      version: serverVersion,
+    }),
+  );
 
   app.use(
     "/assets/*",
@@ -649,7 +665,13 @@ export async function createServer(options: NeutronServerOptions = {}) {
     server,
     close: async () => {
       await ssrServer?.close();
-      server.close();
+      // Await server.close's callback so in-flight requests actually drain
+      // (the previous fire-and-forget resolved before any draining). Close idle
+      // keep-alive sockets so they don't hold the drain open indefinitely.
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+        (server as { closeIdleConnections?: () => void }).closeIdleConnections?.();
+      });
     },
     url: `http://${host}:${port}`,
   };
@@ -2067,17 +2089,37 @@ export async function startServer(options: NeutronServerOptions = {}) {
   console.log(`  Local:   ${url}\n`);
   console.log(`  Press Ctrl+C to stop\n`);
 
+  // Graceful shutdown with a bounded drain (FRAMEWORK_CONTRACT.md: 30s).
+  const SHUTDOWN_TIMEOUT_MS = 30_000;
   let shuttingDown = false;
-  const shutdown = () => {
+  const shutdown = (signal: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
 
-    console.log("\nShutting down...");
-    void close().finally(() => {
-      process.exit(0);
-    });
+    console.log(
+      `\nReceived ${signal}, draining in-flight requests (up to ${
+        SHUTDOWN_TIMEOUT_MS / 1000
+      }s)...`,
+    );
+    const forceExit = setTimeout(() => {
+      console.error("Drain timed out; forcing exit.");
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS);
+
+    void close().then(
+      () => {
+        clearTimeout(forceExit);
+        console.log("Drained cleanly.");
+        process.exit(0);
+      },
+      (err) => {
+        clearTimeout(forceExit);
+        console.error("Shutdown error:", err);
+        process.exit(1);
+      },
+    );
   };
 
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
