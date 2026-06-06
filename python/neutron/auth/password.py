@@ -10,6 +10,8 @@ Usage::
 
 from __future__ import annotations
 
+from typing import cast
+
 
 def hash_password(password: str) -> str:
     """Hash a password using argon2id (preferred) or bcrypt (fallback).
@@ -29,7 +31,7 @@ def hash_password(password: str) -> str:
         import bcrypt
 
         salt = bcrypt.gensalt()
-        return bcrypt.hashpw(password.encode(), salt).decode()
+        return cast(str, bcrypt.hashpw(password.encode(), salt).decode())
     except ImportError:
         pass
 
@@ -68,7 +70,7 @@ def verify_password(password: str, hashed: str) -> bool:
         try:
             import bcrypt
 
-            return bcrypt.checkpw(password.encode(), hashed.encode())
+            return cast(bool, bcrypt.checkpw(password.encode(), hashed.encode()))
         except ImportError:
             raise ImportError(
                 "bcrypt is required to verify bcrypt hashes: "

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel
 
@@ -39,8 +39,11 @@ class GeoModel:
     ) -> float:
         """Calculate distance in meters between two points (haversine)."""
         self._require()
-        return await self._exec.fetchval(
-            "SELECT GEO_DISTANCE($1, $2, $3, $4)", lat1, lon1, lat2, lon2
+        return cast(
+            "float",
+            await self._exec.fetchval(
+                "SELECT GEO_DISTANCE($1, $2, $3, $4)", lat1, lon1, lat2, lon2
+            )
         )
 
     async def distance_euclidean(
@@ -48,9 +51,12 @@ class GeoModel:
     ) -> float:
         """Calculate Euclidean distance between two points."""
         self._require()
-        return await self._exec.fetchval(
-            "SELECT GEO_DISTANCE_EUCLIDEAN($1, $2, $3, $4)",
-            lat1, lon1, lat2, lon2,
+        return cast(
+            "float",
+            await self._exec.fetchval(
+                "SELECT GEO_DISTANCE_EUCLIDEAN($1, $2, $3, $4)",
+                lat1, lon1, lat2, lon2,
+            )
         )
 
     async def within(
@@ -63,36 +69,42 @@ class GeoModel:
     ) -> bool:
         """Check if two points are within a radius."""
         self._require()
-        return await self._exec.fetchval(
-            "SELECT GEO_WITHIN($1, $2, $3, $4, $5)",
-            lat1,
-            lon1,
-            lat2,
-            lon2,
-            radius_m,
+        return cast(
+            "bool",
+            await self._exec.fetchval(
+                "SELECT GEO_WITHIN($1, $2, $3, $4, $5)",
+                lat1,
+                lon1,
+                lat2,
+                lon2,
+                radius_m,
+            )
         )
 
     async def area(self, geometry: str) -> float:
         """Calculate the area of a geometry in square meters."""
         self._require()
-        return await self._exec.fetchval("SELECT GEO_AREA($1)", geometry)
+        return cast("float", await self._exec.fetchval("SELECT GEO_AREA($1)", geometry))
 
     async def make_point(self, lon: float, lat: float) -> str:
         """Create a point geometry from lon/lat coordinates."""
         self._require()
-        return await self._exec.fetchval(
-            "SELECT ST_MAKEPOINT($1, $2)", lon, lat
+        return cast(
+            "str",
+            await self._exec.fetchval(
+                "SELECT ST_MAKEPOINT($1, $2)", lon, lat
+            )
         )
 
     async def point_x(self, point: str) -> float:
         """Extract the X (longitude) coordinate from a point."""
         self._require()
-        return await self._exec.fetchval("SELECT ST_X($1)", point)
+        return cast("float", await self._exec.fetchval("SELECT ST_X($1)", point))
 
     async def point_y(self, point: str) -> float:
         """Extract the Y (latitude) coordinate from a point."""
         self._require()
-        return await self._exec.fetchval("SELECT ST_Y($1)", point)
+        return cast("float", await self._exec.fetchval("SELECT ST_Y($1)", point))
 
     async def insert(self, layer: str, feature: GeoFeature) -> None:
         """Insert a geo feature into a layer."""

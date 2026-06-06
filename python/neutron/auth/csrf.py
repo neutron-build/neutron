@@ -25,7 +25,7 @@ from typing import Any, Callable
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from neutron.middleware import _NeutronMiddleware
 
@@ -92,7 +92,7 @@ class _CSRFASGI:
 
             needs_cookie = cookie_token is None
 
-            async def send_with_csrf(message: dict) -> None:
+            async def send_with_csrf(message: Message) -> None:
                 if message["type"] == "http.response.start" and needs_cookie:
                     headers = list(message.get("headers", []))
                     cookie_parts = [
@@ -139,7 +139,10 @@ class _CSRFASGI:
                "multipart/form-data" in content_type:
                 try:
                     form = await request.form()
-                    submitted_token = form.get(self.form_field)
+                    field_value = form.get(self.form_field)
+                    submitted_token = (
+                        field_value if isinstance(field_value, str) else None
+                    )
                 except Exception:
                     submitted_token = None
 

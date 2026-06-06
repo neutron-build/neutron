@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from datetime import datetime, timedelta, timezone
 
 from pydantic import BaseModel
@@ -48,12 +50,12 @@ class TimeSeriesModel:
     async def last(self, measurement: str) -> float | None:
         """Get the latest value for a series."""
         self._require()
-        return await self._exec.fetchval("SELECT TS_LAST($1)", measurement)
+        return cast("float | None", await self._exec.fetchval("SELECT TS_LAST($1)", measurement))
 
     async def count(self, measurement: str) -> int:
         """Count data points in a series."""
         self._require()
-        return await self._exec.fetchval("SELECT TS_COUNT($1)", measurement)
+        return cast("int", await self._exec.fetchval("SELECT TS_COUNT($1)", measurement))
 
     async def query(
         self,
@@ -195,6 +197,9 @@ class TimeSeriesModel:
     async def retention(self, measurement: str, days: int) -> bool:
         """Set retention policy for a series."""
         self._require()
-        return await self._exec.fetchval(
-            "SELECT TS_RETENTION($1, $2)", measurement, days
+        return cast(
+            "bool",
+            await self._exec.fetchval(
+                "SELECT TS_RETENTION($1, $2)", measurement, days
+            )
         )

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel
 
@@ -49,7 +49,7 @@ class StreamsModel:
     async def xlen(self, stream: str) -> int:
         """Return the number of entries in a stream."""
         self._require()
-        return await self._exec.fetchval("SELECT STREAM_XLEN($1)", stream)
+        return cast("int", await self._exec.fetchval("SELECT STREAM_XLEN($1)", stream))
 
     async def xrange(
         self,
@@ -83,8 +83,11 @@ class StreamsModel:
     ) -> bool:
         """Create a consumer group on the stream."""
         self._require()
-        return await self._exec.fetchval(
-            "SELECT STREAM_XGROUP_CREATE($1, $2, $3)", stream, group, start_id
+        return cast(
+            "bool",
+            await self._exec.fetchval(
+                "SELECT STREAM_XGROUP_CREATE($1, $2, $3)", stream, group, start_id
+            )
         )
 
     async def xreadgroup(
@@ -106,8 +109,11 @@ class StreamsModel:
     ) -> bool:
         """Acknowledge a processed entry."""
         self._require()
-        return await self._exec.fetchval(
-            "SELECT STREAM_XACK($1, $2, $3, $4)", stream, group, id_ms, id_seq
+        return cast(
+            "bool",
+            await self._exec.fetchval(
+                "SELECT STREAM_XACK($1, $2, $3, $4)", stream, group, id_ms, id_seq
+            )
         )
 
 

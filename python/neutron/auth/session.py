@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import secrets
 import time
-from typing import Any
+from typing import Any, cast
 
 from starlette.requests import Request
 
@@ -55,7 +55,7 @@ class NucleusSessionStore:
         if raw is None:
             return None
         try:
-            return json.loads(raw)
+            return cast("dict[str, Any]", json.loads(raw))
         except (json.JSONDecodeError, TypeError):
             return None
 

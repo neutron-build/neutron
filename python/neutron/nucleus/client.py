@@ -4,10 +4,27 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import asyncpg
 
 from neutron.nucleus.sql import SQLModel
+
+if TYPE_CHECKING:
+    from neutron.nucleus.blob import BlobModel
+    from neutron.nucleus.cdc import CDCModel
+    from neutron.nucleus.columnar import ColumnarModel
+    from neutron.nucleus.datalog import DatalogModel
+    from neutron.nucleus.document import DocumentModel
+    from neutron.nucleus.fts import FTSModel
+    from neutron.nucleus.geo import GeoModel
+    from neutron.nucleus.graph import GraphModel
+    from neutron.nucleus.kv import KVModel
+    from neutron.nucleus.pubsub import PubSubModel
+    from neutron.nucleus.streams import StreamsModel
+    from neutron.nucleus.timeseries import TimeSeriesModel
+    from neutron.nucleus.tx import Transaction
+    from neutron.nucleus.vector import VectorModel
 
 
 @dataclass

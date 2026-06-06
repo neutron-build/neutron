@@ -5,12 +5,12 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware as _StarletteCORS
 from starlette.middleware.gzip import GZipMiddleware as _StarletteGZip
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 
 class _NeutronMiddleware:
@@ -38,7 +38,7 @@ class _RequestIDASGI:
             scope["state"] = {}
         scope["state"]["request_id"] = request_id
 
-        async def send_with_id(message: dict) -> None:
+        async def send_with_id(message: Message) -> None:
             if message["type"] == "http.response.start":
                 headers = list(message.get("headers", []))
                 headers.append((b"x-request-id", request_id.encode()))
@@ -73,7 +73,7 @@ class _LoggingASGI:
         start = time.perf_counter()
         status_code = 500
 
-        async def send_wrapper(message: dict) -> None:
+        async def send_wrapper(message: Message) -> None:
             nonlocal status_code
             if message["type"] == "http.response.start":
                 status_code = message["status"]
@@ -174,7 +174,7 @@ def _get_client_ip(scope: Scope, trust_proxy: bool = False) -> str:
     # Default: use actual connection IP
     client = scope.get("client")
     if client:
-        return client[0]
+        return cast(str, client[0])
 
     return "unknown"
 
@@ -377,7 +377,7 @@ class _OTelASGI:
         start = time.perf_counter()
         status_code = 500
 
-        async def send_with_trace(message: dict) -> None:
+        async def send_with_trace(message: Message) -> None:
             nonlocal status_code
             if message["type"] == "http.response.start":
                 status_code = message["status"]
@@ -502,3 +502,47 @@ class TrailingSlashMiddleware(_NeutronMiddleware):
 
     def as_starlette_middleware(self) -> Middleware:
         return Middleware(_TrailingSlashASGI, action=self._action)
+
+
+def default_stack(
+    *,
+    logging: LoggingMiddleware | None = None,
+    cors: CORSMiddleware | None = None,
+    compression: CompressionMiddleware | None = None,
+    rate_limit: RateLimitMiddleware | None = None,
+    auth: Any | None = None,
+    timeout: TimeoutMiddleware | None = None,
+    otel: OTelMiddleware | None = None,
+) -> list[Any]:
+    """Return the standard middleware in the exact FRAMEWORK_CONTRACT.md order:
+
+        RequestID → Logging → Recovery → CORS → Compression → RateLimit → Auth
+        → Timeout → OpenTelemetry
+
+    The order is fixed — callers pass *configured* layers (or ``None`` to skip an
+    optional one), they do not arrange them. RequestID and Logging are always on,
+    with RequestID first so every log line carries the request id. Recovery is
+    Starlette's built-in ``ServerErrorMiddleware`` (always outermost), so it is
+    not listed here.
+
+    Usage::
+
+        app = App(middleware=default_stack(
+            cors=CORSMiddleware(allow_origins=["*"]),
+            compression=CompressionMiddleware(),
+        ))
+    """
+    stack: list[Any] = [RequestIDMiddleware(), logging or LoggingMiddleware()]
+    if cors is not None:
+        stack.append(cors)
+    if compression is not None:
+        stack.append(compression)
+    if rate_limit is not None:
+        stack.append(rate_limit)
+    if auth is not None:
+        stack.append(auth)
+    if timeout is not None:
+        stack.append(timeout)
+    if otel is not None:
+        stack.append(otel)
+    return stack

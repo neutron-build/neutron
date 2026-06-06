@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 
 import asyncpg
 
@@ -53,9 +53,12 @@ class PubSubModel:
             )
             return int(result) if result else 0
         else:
-            # Plain PostgreSQL: use NOTIFY
+            # Plain PostgreSQL: the NOTIFY *statement* does not accept bind
+            # parameters, so `NOTIFY chan, $1` errors at runtime. Use the
+            # pg_notify() *function*, which is parameterizable (and keeps the
+            # channel a bind param — injection-safe regardless of validation).
             async with self._pool.acquire() as conn:
-                await conn.execute(f"NOTIFY {channel}, $1", message)
+                await conn.execute("SELECT pg_notify($1, $2)", channel, message)
             return 0
 
     async def channels(self, pattern: str | None = None) -> list[str]:
@@ -75,8 +78,11 @@ class PubSubModel:
         """Count subscribers on a channel (Nucleus only)."""
         _validate_channel(channel)
         require_nucleus(self._features, "PubSub.subscriber_count")
-        return await self._exec.fetchval(
-            "SELECT PUBSUB_SUBSCRIBERS($1)", channel
+        return cast(
+            "int",
+            await self._exec.fetchval(
+                "SELECT PUBSUB_SUBSCRIBERS($1)", channel
+            )
         )
 
     async def listen(self, channel: str) -> AsyncIterator[str]:

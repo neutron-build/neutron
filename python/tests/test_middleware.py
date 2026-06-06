@@ -568,3 +568,32 @@ class TestGracefulShutdown:
         assert my_hook is not None
         assert callable(my_hook)
         assert app._on_stop_hooks[-1] is my_hook
+
+
+def test_default_stack_enforces_contract_order():
+    """P1: default_stack returns layers in the fixed FRAMEWORK_CONTRACT.md order,
+    RequestID first (so logs carry the request id), regardless of which optional
+    layers are enabled."""
+    from neutron.middleware import (
+        default_stack,
+        RequestIDMiddleware,
+        LoggingMiddleware,
+        CompressionMiddleware,
+        TimeoutMiddleware,
+        CORSMiddleware,
+    )
+
+    stack = default_stack(
+        timeout=TimeoutMiddleware(timeout=5.0),
+        cors=CORSMiddleware(allow_origins=["*"]),
+        compression=CompressionMiddleware(),
+    )
+    names = [type(m).__name__ for m in stack]
+
+    # RequestID and Logging are always first two, in order.
+    assert names[0] == "RequestIDMiddleware"
+    assert names[1] == "LoggingMiddleware"
+    # CORS precedes Compression precedes Timeout per the contract, even though we
+    # passed them timeout-first.
+    assert names.index("CORSMiddleware") < names.index("CompressionMiddleware")
+    assert names.index("CompressionMiddleware") < names.index("TimeoutMiddleware")
