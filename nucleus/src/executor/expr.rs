@@ -763,6 +763,9 @@ impl Executor {
                         .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
                     (ast::UnaryOperator::Minus, Value::Float64(n)) => Ok(Value::Float64(-n)),
                     (ast::UnaryOperator::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
+                    // SQL 3-valued logic: NOT NULL = NULL (unknown), not an error.
+                    (ast::UnaryOperator::Not, Value::Null)
+                    | (ast::UnaryOperator::Minus, Value::Null) => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("unsupported unary op".into())),
                 }
             }
@@ -812,11 +815,33 @@ impl Executor {
                 negated,
             } => {
                 let val = self.eval_row_expr(expr, row, col_meta)?;
-                // Compare by reference — avoids cloning val for every list item
-                let found = list.iter().any(|item| {
-                    self.eval_row_expr(item, row, col_meta).ok().as_ref() == Some(&val)
-                });
-                Ok(Value::Bool(if *negated { !found } else { found }))
+                // SQL 3-valued logic: NULL IN (...) is unknown (NULL), and so is
+                // `x IN (...)` when x matches nothing but the list contains a NULL.
+                // Only a definite match yields TRUE; only a match-free list with no
+                // NULLs yields FALSE. NOT IN negates the definite TRUE/FALSE; NULL
+                // stays NULL (so WHERE NOT (x IN (...)) excludes NULL-valued rows).
+                if matches!(val, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let mut found = false;
+                let mut list_has_null = false;
+                for item in list {
+                    match self.eval_row_expr(item, row, col_meta)? {
+                        Value::Null => list_has_null = true,
+                        v if v == val => {
+                            found = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if found {
+                    Ok(Value::Bool(!negated))
+                } else if list_has_null {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Bool(*negated))
+                }
             }
             Expr::Function(func) => {
                 let fname = func.name.to_string().to_uppercase();
