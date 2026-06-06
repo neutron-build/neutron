@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware as _StarletteCORS
@@ -174,7 +174,7 @@ def _get_client_ip(scope: Scope, trust_proxy: bool = False) -> str:
     # Default: use actual connection IP
     client = scope.get("client")
     if client:
-        return client[0]
+        return cast(str, client[0])
 
     return "unknown"
 
