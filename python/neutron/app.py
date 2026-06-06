@@ -14,6 +14,7 @@ from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
+from starlette.types import Receive, Scope, Send
 
 from neutron.error import AppError, handle_app_error, internal_error
 from neutron.middleware import TrailingSlashMiddleware, _NeutronMiddleware
@@ -290,7 +291,7 @@ class App:
         return self._starlette
 
     async def __call__(
-        self, scope: dict, receive: Callable, send: Callable
+        self, scope: Scope, receive: Receive, send: Send
     ) -> None:
         """ASGI interface with in-flight request tracking."""
         app = self._build_app()

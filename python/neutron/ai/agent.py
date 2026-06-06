@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 from pydantic import BaseModel
 
@@ -83,7 +83,7 @@ class Agent:
         if self.llm is None:
             raise ValueError("Agent requires an LLM. Set llm class attribute or pass to __init__.")
 
-        all_tools = list(self._tools)
+        all_tools: list[Tool | Callable[..., Any]] = list(self._tools)
         if tools:
             all_tools.extend(tools)
 
