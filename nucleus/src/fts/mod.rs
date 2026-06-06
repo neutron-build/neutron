@@ -845,6 +845,56 @@ impl InvertedIndex {
         }
     }
 
+    /// Search, keeping only documents whose facet `field` contains `value`.
+    /// Scopes BM25 ranking to a partition (e.g. `site_id`) so a busy partition's
+    /// hits don't crowd out others. Returns (doc_id, score) sorted by score DESC.
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        field: &str,
+        value: &str,
+    ) -> Vec<(u64, f64)> {
+        let query_tokens = tokenize(query);
+        if query_tokens.is_empty() {
+            return vec![];
+        }
+        let mut term_postings: Vec<(&str, &Vec<Posting>)> = query_tokens
+            .iter()
+            .filter_map(|token| {
+                self.postings
+                    .get(&token.term)
+                    .map(|p| (token.term.as_str(), p))
+            })
+            .collect();
+        term_postings.sort_by_key(|(_, postings)| postings.len());
+
+        let mut scores: HashMap<u64, f64> = HashMap::new();
+        for (_, postings) in &term_postings {
+            let idf = self.idf(postings.len());
+            for posting in *postings {
+                let in_partition = self
+                    .doc_facets
+                    .get(&posting.doc_id)
+                    .and_then(|m| m.get(field))
+                    .is_some_and(|vals| vals.iter().any(|v| v == value));
+                if !in_partition {
+                    continue;
+                }
+                *scores.entry(posting.doc_id).or_default() += self.bm25_term_score(posting, idf);
+            }
+        }
+
+        let mut results: Vec<(u64, f64)> = scores.into_iter().collect();
+        results.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
+        results.truncate(limit);
+        results
+    }
+
     /// Search for documents matching a query. Returns (doc_id, score) pairs sorted by score DESC.
     ///
     /// Uses shortest-first posting list processing: query terms are sorted by

@@ -3808,6 +3808,55 @@ impl Executor {
                 }
                 Ok(Value::Bool(true))
             }
+            "FTS_INDEX_FACETED" => {
+                // fts_index_faceted(doc_id, text, facet_field, facet_value) → true
+                // Index a document tagged with a single facet (e.g. site_id) so
+                // FTS_SEARCH_FILTER can scope BM25 ranking to that partition.
+                let args = self.extract_fn_args(func, row, col_meta)?;
+                if args.len() < 4 {
+                    return Err(ExecError::Unsupported(
+                        "FTS_INDEX_FACETED requires (doc_id, text, facet_field, facet_value)"
+                            .into(),
+                    ));
+                }
+                let doc_id = val_to_u64(&args[0], "FTS_INDEX_FACETED doc_id")?;
+                let text = match &args[1] {
+                    Value::Text(s) => s.clone(),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "FTS_INDEX_FACETED: text must be a string".into(),
+                        ));
+                    }
+                };
+                let field = match &args[2] {
+                    Value::Text(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let value = match &args[3] {
+                    Value::Text(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let estimated = text.len() + field.len() + value.len() + 96;
+                if !self.memory_allocator.lock().request("fts", estimated) {
+                    return Err(ExecError::Unsupported(format!(
+                        "FTS_INDEX_FACETED: memory budget exceeded (need {estimated} bytes for doc {doc_id})"
+                    )));
+                }
+                let mut facets = std::collections::HashMap::new();
+                facets.insert(field, vec![value]);
+                self.fts_index
+                    .write()
+                    .add_document_with_facets(doc_id, &text, facets);
+                self.save_fts_index();
+                if let Ok(mut txn) = self.current_session().txn_state.try_write()
+                    && txn.active
+                    && let Some(ref mut cm) = txn.cross_model
+                    && let Some(ref mut fts_log) = cm.fts
+                {
+                    fts_log.ops.push(crate::fts::FtsUndoOp::AddedDoc { doc_id });
+                }
+                Ok(Value::Bool(true))
+            }
             "FTS_REMOVE" => {
                 // fts_remove(doc_id) → true
                 let args = self.extract_fn_args(func, row, col_meta)?;
@@ -3848,6 +3897,46 @@ impl Executor {
                 };
                 let limit = (val_to_u64(&args[1], "FTS_SEARCH limit")? as usize).min(10_000);
                 let results = self.fts_index.read().search(&query, limit);
+                let json = results
+                    .iter()
+                    .map(|(id, score)| format!(r#"{{"doc_id":{id},"score":{score:.6}}}"#))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                Ok(Value::Text(format!("[{json}]")))
+            }
+            "FTS_SEARCH_FILTER" => {
+                // fts_search_filter(query, limit, facet_field, facet_value)
+                //   → JSON array of [{doc_id, score}], scoped to documents whose
+                //   facet `field` contains `value` (e.g. site_id), so one busy
+                //   partition's hits don't crowd out the rest.
+                let args = self.extract_fn_args(func, row, col_meta)?;
+                if args.len() < 4 {
+                    return Err(ExecError::Unsupported(
+                        "FTS_SEARCH_FILTER requires (query, limit, facet_field, facet_value)"
+                            .into(),
+                    ));
+                }
+                let query = match &args[0] {
+                    Value::Text(s) => s.clone(),
+                    _ => {
+                        return Err(ExecError::Unsupported(
+                            "FTS_SEARCH_FILTER: query must be a string".into(),
+                        ));
+                    }
+                };
+                let limit = (val_to_u64(&args[1], "FTS_SEARCH_FILTER limit")? as usize).min(10_000);
+                let field = match &args[2] {
+                    Value::Text(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let value = match &args[3] {
+                    Value::Text(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let results = self
+                    .fts_index
+                    .read()
+                    .search_filtered(&query, limit, &field, &value);
                 let json = results
                     .iter()
                     .map(|(id, score)| format!(r#"{{"doc_id":{id},"score":{score:.6}}}"#))
