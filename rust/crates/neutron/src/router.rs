@@ -5,7 +5,7 @@
 //! zero-allocation path matching.
 //!
 //! ```rust,ignore
-//! let router = Router::new()
+//! let router = Router::<()>::new()
 //!     .get("/", || async { "index" })
 //!     .get("/users/:id", get_user)
 //!     .nest("/api", api_router);
@@ -13,6 +13,7 @@
 
 use std::any::TypeId;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 #[cfg(feature = "openapi")]
 use std::collections::HashSet;
 use std::future::Future;
@@ -275,7 +276,7 @@ struct PendingRoute {
 /// Routes are registered with a builder API, then compiled into a matchit
 /// router when the server starts. Method dispatch uses an array-indexed
 /// MethodMap for O(1) lookup.
-pub struct Router {
+pub struct Router<S = ()> {
     /// Routes pending compilation, keyed by matchit path.
     pending: HashMap<String, Vec<PendingRoute>>,
     /// Compiled matchit router (built lazily on first resolve or on `build()`).
@@ -283,17 +284,21 @@ pub struct Router {
     pub(crate) middlewares: Vec<Arc<dyn MiddlewareTrait>>,
     pub(crate) state_map: StateMap,
     pub(crate) fallback: Option<BoxedHandler>,
-    /// Sub-routers waiting to be nested (prefix, sub-router).
-    pending_nests: Vec<(String, Router)>,
+    /// Sub-routers waiting to be nested (prefix, sub-router). Nests carry the
+    /// same `S` until the state is bound with [`with_state`](Router::with_state).
+    pending_nests: Vec<(String, Router<S>)>,
     /// All registered (lowercase_method, original_path) pairs — for OpenAPI discovery.
     #[cfg(feature = "openapi")]
     registered_routes: Vec<(String, String)>,
     /// Explicitly documented [`ApiRoute`]s attached via [`.doc()`].
     #[cfg(feature = "openapi")]
     api_docs: Vec<crate::openapi::ApiRoute>,
+    /// Compile-time tag for the application state this router still expects.
+    /// Erased to `()` once [`with_state`](Router::with_state) binds the state.
+    _state: PhantomData<fn() -> S>,
 }
 
-impl Router {
+impl<S> Router<S> {
     pub fn new() -> Self {
         Self {
             pending: HashMap::new(),
@@ -306,7 +311,70 @@ impl Router {
             registered_routes: Vec::new(),
             #[cfg(feature = "openapi")]
             api_docs: Vec::new(),
+            _state: PhantomData,
         }
+    }
+
+    /// Move every field into a `Router<S2>` — the data is `S`-independent; only
+    /// the compile-time `PhantomData` tag changes. Used by `with_state` to erase
+    /// the state obligation to `()`, and to re-tag nests during `merge`.
+    fn retag<S2>(self) -> Router<S2> {
+        Router {
+            pending: self.pending,
+            inner: self.inner,
+            middlewares: self.middlewares,
+            state_map: self.state_map,
+            fallback: self.fallback,
+            // Sub-routers carried the same `S`; re-tag each to `S2`.
+            pending_nests: self
+                .pending_nests
+                .into_iter()
+                .map(|(p, sub)| (p, sub.retag::<S2>()))
+                .collect(),
+            #[cfg(feature = "openapi")]
+            registered_routes: self.registered_routes,
+            #[cfg(feature = "openapi")]
+            api_docs: self.api_docs,
+            _state: PhantomData,
+        }
+    }
+
+    /// Bind the application state, erasing the `S` obligation to `()`.
+    ///
+    /// After this the router is `Router<()>` and `State<T>` extraction reads `T`
+    /// from the dynamic state map exactly as before — the state is materialized
+    /// into the map here so the runtime lookup always succeeds.
+    pub fn with_state(self, state: S) -> Router<()>
+    where
+        S: Send + Sync + 'static,
+    {
+        let mut r: Router<()> = self.retag();
+        r.state_map
+            .insert(TypeId::of::<S>(), Arc::new(state) as Arc<dyn AnyState>);
+        r
+    }
+
+    /// Merge another router with the **same** state type `S` into this one.
+    /// Routes, nests, middleware, state, and (when enabled) OpenAPI metadata are
+    /// folded in; on a state-key conflict, `self` wins.
+    pub fn merge(mut self, other: Router<S>) -> Self {
+        for (path, routes) in other.pending {
+            self.pending.entry(path).or_default().extend(routes);
+        }
+        self.pending_nests.extend(other.pending_nests);
+        self.middlewares.extend(other.middlewares);
+        for (k, v) in other.state_map {
+            self.state_map.entry(k).or_insert(v);
+        }
+        if self.fallback.is_none() {
+            self.fallback = other.fallback;
+        }
+        #[cfg(feature = "openapi")]
+        {
+            self.registered_routes.extend(other.registered_routes);
+            self.api_docs.extend(other.api_docs);
+        }
+        self
     }
 
     // -- Route registration helpers -----------------------------------------
@@ -387,7 +455,7 @@ impl Router {
     /// Register a handler for multiple HTTP methods on the same path.
     ///
     /// ```rust,ignore
-    /// Router::new()
+    /// Router::<()>::new()
     ///     .on("/resource", &[Method::GET, Method::HEAD], handler)
     /// ```
     pub fn on<H, T>(mut self, path: &str, methods: &[Method], handler: H) -> Self
@@ -416,7 +484,7 @@ impl Router {
     /// Register a handler that matches any HTTP method.
     ///
     /// ```rust,ignore
-    /// Router::new()
+    /// Router::<()>::new()
     ///     .any("/health", || async { "ok" })
     /// ```
     pub fn any<H, T>(self, path: &str, handler: H) -> Self
@@ -456,7 +524,7 @@ impl Router {
     /// If the sub-router has its own middleware, each of its handlers is
     /// wrapped with that middleware chain (scoped, not applied globally).
     /// State from the sub-router is merged (parent takes precedence on conflict).
-    pub fn nest(mut self, prefix: &str, sub: Router) -> Self {
+    pub fn nest(mut self, prefix: &str, sub: Router<S>) -> Self {
         self.pending_nests.push((prefix.to_string(), sub));
         self
     }
@@ -475,7 +543,7 @@ impl Router {
     /// Without a fallback, unmatched routes return a plain-text "Not Found" response.
     ///
     /// ```rust,ignore
-    /// Router::new()
+    /// Router::<()>::new()
     ///     .get("/", index)
     ///     .fallback(|| async { (StatusCode::NOT_FOUND, "custom 404 page") })
     /// ```
@@ -499,7 +567,7 @@ impl Router {
     /// ```rust,ignore
     /// use neutron::openapi::{ApiRoute, Schema};
     ///
-    /// let router = Router::new()
+    /// let router = Router::<()>::new()
     ///     .get("/users", list_users)
     ///     .doc(
     ///         ApiRoute::get("/users")
@@ -521,7 +589,7 @@ impl Router {
     /// Nested sub-routers (added with [`.nest()`]) are traversed recursively.
     ///
     /// ```rust,ignore
-    /// let spec = Router::new()
+    /// let spec = Router::<()>::new()
     ///     .get("/users", list_users)
     ///     .doc(ApiRoute::get("/users").summary("List users"))
     ///     .post("/users", create_user)      // auto-stub
@@ -752,7 +820,7 @@ impl Router {
     }
 }
 
-impl Default for Router {
+impl<S> Default for Router<S> {
     fn default() -> Self {
         Self::new()
     }
@@ -868,27 +936,27 @@ mod tests {
 
     #[test]
     fn root_path() {
-        let r = build(Router::new().get("/", || async { "root" }));
+        let r = build(Router::<()>::new().get("/", || async { "root" }));
         let m = r.resolve(&Method::GET, "/").unwrap();
         assert!(m.params.is_empty());
     }
 
     #[test]
     fn single_static_segment() {
-        let r = build(Router::new().get("/users", || async { "users" }));
+        let r = build(Router::<()>::new().get("/users", || async { "users" }));
         assert!(r.resolve(&Method::GET, "/users").is_ok());
     }
 
     #[test]
     fn multi_segment_static_path() {
-        let r = build(Router::new().get("/api/v1/users", || async { "v1" }));
+        let r = build(Router::<()>::new().get("/api/v1/users", || async { "v1" }));
         let m = r.resolve(&Method::GET, "/api/v1/users").unwrap();
         assert!(m.params.is_empty());
     }
 
     #[test]
     fn trailing_slash_normalized() {
-        let r = build(Router::new().get("/users", || async { "u" }));
+        let r = build(Router::<()>::new().get("/users", || async { "u" }));
         assert!(r.resolve(&Method::GET, "/users").is_ok());
         assert!(r.resolve(&Method::GET, "/users/").is_ok());
     }
@@ -896,14 +964,14 @@ mod tests {
     #[test]
     fn trailing_slash_added_when_route_has_it() {
         // Route registered as /users/ — request to /users should still match
-        let r = build(Router::new().get("/users/", || async { "u" }));
+        let r = build(Router::<()>::new().get("/users/", || async { "u" }));
         assert!(r.resolve(&Method::GET, "/users/").is_ok());
         assert!(r.resolve(&Method::GET, "/users").is_ok());
     }
 
     #[test]
     fn root_with_and_without_slash() {
-        let r = build(Router::new().get("/", || async { "root" }));
+        let r = build(Router::<()>::new().get("/", || async { "root" }));
         // "/" produces a match
         assert!(r.resolve(&Method::GET, "/").is_ok());
         // "" is normalized to "/" by resolve
@@ -917,7 +985,7 @@ mod tests {
     #[test]
     fn each_method_resolves() {
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/g", || async { "g" })
                 .post("/p", || async { "p" })
                 .put("/u", || async { "u" })
@@ -935,7 +1003,7 @@ mod tests {
     #[tokio::test]
     async fn same_path_different_methods_dispatch_correctly() {
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/res", || async { "GET" })
                 .post("/res", || async { "POST" })
                 .put("/res", || async { "PUT" })
@@ -953,7 +1021,7 @@ mod tests {
     #[test]
     fn method_not_allowed_on_existing_path() {
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/users", || async { "g" })
                 .post("/users", || async { "p" }),
         );
@@ -968,7 +1036,7 @@ mod tests {
     #[test]
     fn method_not_allowed_includes_allow_set() {
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/users", || async { "g" })
                 .post("/users", || async { "p" }),
         );
@@ -989,7 +1057,7 @@ mod tests {
     // P0.2: resolve() before build() returns an error and never unwinds.
     #[test]
     fn resolve_before_build_returns_not_built() {
-        let r = Router::new().get("/", || async { "x" }); // NOT built
+        let r = Router::<()>::new().get("/", || async { "x" }); // NOT built
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             matches!(r.resolve(&Method::GET, "/"), Err(RouteError::NotBuilt))
         }));
@@ -1021,7 +1089,7 @@ mod tests {
     async fn router_oneshot_dispatch() {
         use tower::ServiceExt;
 
-        let svc = Router::new()
+        let svc = Router::<()>::new()
             .get("/hi", || async { "hello" })
             .into_service();
 
@@ -1042,7 +1110,7 @@ mod tests {
     async fn router_service_405_has_allow() {
         use tower::ServiceExt;
 
-        let svc = Router::new()
+        let svc = Router::<()>::new()
             .get("/x", || async { "g" })
             .into_service();
         let req = http::Request::builder()
@@ -1062,7 +1130,7 @@ mod tests {
     async fn not_found_is_problem_json() {
         use tower::ServiceExt;
 
-        let svc = Router::new().get("/x", || async { "x" }).into_service();
+        let svc = Router::<()>::new().get("/x", || async { "x" }).into_service();
         let req = http::Request::builder()
             .method(Method::GET)
             .uri("/nope")
@@ -1085,7 +1153,7 @@ mod tests {
     async fn method_not_allowed_is_problem_json_with_allow() {
         use tower::ServiceExt;
 
-        let svc = Router::new().get("/x", || async { "x" }).into_service();
+        let svc = Router::<()>::new().get("/x", || async { "x" }).into_service();
         let req = http::Request::builder()
             .method(Method::DELETE)
             .uri("/x")
@@ -1111,7 +1179,7 @@ mod tests {
         use crate::middleware::Next;
         use tower::ServiceExt;
 
-        let svc = Router::new()
+        let svc = Router::<()>::new()
             .middleware(|req: Request, next: Next| async move {
                 let mut resp = next.run(req).await;
                 resp.headers_mut()
@@ -1132,7 +1200,7 @@ mod tests {
     async fn router_service_composes_with_tower_layer() {
         use tower::{ServiceBuilder, ServiceExt};
 
-        let router = Router::new().get("/", || async { "ok" }).into_service();
+        let router = Router::<()>::new().get("/", || async { "ok" }).into_service();
         let svc = ServiceBuilder::new()
             .map_response(|mut resp: Response| {
                 resp.headers_mut()
@@ -1149,7 +1217,7 @@ mod tests {
 
     #[tokio::test]
     async fn head_falls_back_to_get() {
-        let r = build(Router::new().get("/", || async { "hello" }));
+        let r = build(Router::<()>::new().get("/", || async { "hello" }));
         // HEAD should resolve to the GET handler
         let m = r.resolve(&Method::HEAD, "/").unwrap();
         assert_eq!(body_of(m.handler).await, "hello");
@@ -1157,7 +1225,7 @@ mod tests {
 
     #[test]
     fn head_returns_method_not_allowed_without_get() {
-        let r = build(Router::new().post("/", || async { "p" }));
+        let r = build(Router::<()>::new().post("/", || async { "p" }));
         assert!(matches!(
             r.resolve(&Method::HEAD, "/"),
             Err(RouteError::MethodNotAllowed { .. })
@@ -1170,14 +1238,14 @@ mod tests {
 
     #[test]
     fn single_param_extracted() {
-        let r = build(Router::new().get("/users/:id", || async { "u" }));
+        let r = build(Router::<()>::new().get("/users/:id", || async { "u" }));
         let m = r.resolve(&Method::GET, "/users/42").unwrap();
         assert_eq!(&*m.params, &[("id".into(), "42".into())]);
     }
 
     #[test]
     fn multiple_params_extracted_in_order() {
-        let r = build(Router::new().get("/users/:uid/posts/:pid", || async { "p" }));
+        let r = build(Router::<()>::new().get("/users/:uid/posts/:pid", || async { "p" }));
         let m = r.resolve(&Method::GET, "/users/5/posts/99").unwrap();
         assert_eq!(
             &*m.params,
@@ -1187,7 +1255,7 @@ mod tests {
 
     #[test]
     fn param_preserves_names() {
-        let r = build(Router::new().get("/teams/:team_id/members/:member_id", || async { "m" }));
+        let r = build(Router::<()>::new().get("/teams/:team_id/members/:member_id", || async { "m" }));
         let m = r.resolve(&Method::GET, "/teams/alpha/members/42").unwrap();
         assert_eq!(m.params[0], ("team_id".into(), "alpha".into()));
         assert_eq!(m.params[1], ("member_id".into(), "42".into()));
@@ -1195,7 +1263,7 @@ mod tests {
 
     #[test]
     fn param_captures_any_string() {
-        let r = build(Router::new().get("/search/:q", || async { "s" }));
+        let r = build(Router::<()>::new().get("/search/:q", || async { "s" }));
         // Percent-encoded values pass through as-is (matchit does not decode)
         let m = r.resolve(&Method::GET, "/search/hello%20world").unwrap();
         assert_eq!(m.params[0].1, "hello%20world");
@@ -1206,7 +1274,7 @@ mod tests {
 
     #[test]
     fn param_at_root_level() {
-        let r = build(Router::new().get("/:org/repos", || async { "repos" }));
+        let r = build(Router::<()>::new().get("/:org/repos", || async { "repos" }));
         let m = r.resolve(&Method::GET, "/github/repos").unwrap();
         assert_eq!(&*m.params, &[("org".into(), "github".into())]);
     }
@@ -1218,7 +1286,7 @@ mod tests {
     #[tokio::test]
     async fn static_wins_over_param() {
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/users/me", || async { "STATIC" })
                 .get("/users/:id", || async { "PARAM" }),
         );
@@ -1236,7 +1304,7 @@ mod tests {
     async fn static_wins_over_param_regardless_of_registration_order() {
         // Register param first, static second — priority must still hold.
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/users/:id", || async { "PARAM" })
                 .get("/users/me", || async { "STATIC" }),
         );
@@ -1252,7 +1320,7 @@ mod tests {
     #[tokio::test]
     async fn static_wins_over_wildcard() {
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/files/readme", || async { "STATIC" })
                 .get("/files/*", || async { "WILD" }),
         );
@@ -1268,7 +1336,7 @@ mod tests {
     #[tokio::test]
     async fn static_and_param_priorities() {
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/x/known", || async { "STATIC" })
                 .get("/x/:id", || async { "PARAM" }),
         );
@@ -1283,13 +1351,13 @@ mod tests {
 
     #[test]
     fn wildcard_catches_single_segment() {
-        let r = build(Router::new().get("/files/*", || async { "w" }));
+        let r = build(Router::<()>::new().get("/files/*", || async { "w" }));
         assert!(r.resolve(&Method::GET, "/files/a").is_ok());
     }
 
     #[test]
     fn wildcard_catches_deep_path() {
-        let r = build(Router::new().get("/files/*", || async { "w" }));
+        let r = build(Router::<()>::new().get("/files/*", || async { "w" }));
         // Wildcard should catch any remaining depth.
         assert!(r.resolve(&Method::GET, "/files/a/b/c").is_ok());
     }
@@ -1300,7 +1368,7 @@ mod tests {
 
     #[test]
     fn not_found_empty_router() {
-        let r = build(Router::new());
+        let r = build(Router::<()>::new());
         assert!(matches!(
             r.resolve(&Method::GET, "/anything"),
             Err(RouteError::NotFound)
@@ -1309,7 +1377,7 @@ mod tests {
 
     #[test]
     fn not_found_root_when_empty() {
-        let r = build(Router::new());
+        let r = build(Router::<()>::new());
         assert!(matches!(
             r.resolve(&Method::GET, "/"),
             Err(RouteError::NotFound)
@@ -1318,7 +1386,7 @@ mod tests {
 
     #[test]
     fn not_found_unmatched_path() {
-        let r = build(Router::new().get("/users", || async { "u" }));
+        let r = build(Router::<()>::new().get("/users", || async { "u" }));
         assert!(matches!(
             r.resolve(&Method::GET, "/posts"),
             Err(RouteError::NotFound)
@@ -1328,7 +1396,7 @@ mod tests {
     #[test]
     fn not_found_partial_prefix() {
         // Intermediate nodes without handlers must not match.
-        let r = build(Router::new().get("/api/v1/users", || async { "u" }));
+        let r = build(Router::<()>::new().get("/api/v1/users", || async { "u" }));
         assert!(matches!(
             r.resolve(&Method::GET, "/api/v1"),
             Err(RouteError::NotFound)
@@ -1341,7 +1409,7 @@ mod tests {
 
     #[test]
     fn not_found_deeper_than_registered() {
-        let r = build(Router::new().get("/users", || async { "u" }));
+        let r = build(Router::<()>::new().get("/users", || async { "u" }));
         assert!(matches!(
             r.resolve(&Method::GET, "/users/1/posts/2"),
             Err(RouteError::NotFound)
@@ -1350,7 +1418,7 @@ mod tests {
 
     #[test]
     fn method_not_allowed_vs_not_found() {
-        let r = build(Router::new().get("/items", || async { "i" }));
+        let r = build(Router::<()>::new().get("/items", || async { "i" }));
         // Wrong method on existing path → 405
         assert!(matches!(
             r.resolve(&Method::POST, "/items"),
@@ -1369,7 +1437,7 @@ mod tests {
 
     #[test]
     fn deeply_nested_static() {
-        let r = build(Router::new().get("/a/b/c/d/e/f/g", || async { "deep" }));
+        let r = build(Router::<()>::new().get("/a/b/c/d/e/f/g", || async { "deep" }));
         assert!(r.resolve(&Method::GET, "/a/b/c/d/e/f/g").is_ok());
         assert!(matches!(
             r.resolve(&Method::GET, "/a/b/c/d/e/f"),
@@ -1380,7 +1448,7 @@ mod tests {
     #[tokio::test]
     async fn many_static_siblings() {
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/a", || async { "a" })
                 .get("/b", || async { "b" })
                 .get("/c", || async { "c" })
@@ -1397,7 +1465,7 @@ mod tests {
     #[tokio::test]
     async fn multiple_static_children_under_same_parent() {
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/api/users", || async { "users" })
                 .get("/api/posts", || async { "posts" })
                 .get("/api/health", || async { "health" }),
@@ -1411,7 +1479,7 @@ mod tests {
     #[test]
     fn root_and_deeper_coexist() {
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/", || async { "root" })
                 .get("/users", || async { "users" }),
         );
@@ -1423,7 +1491,7 @@ mod tests {
     #[test]
     fn param_and_its_child_both_have_handlers() {
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/users/:id", || async { "user" })
                 .get("/users/:id/posts", || async { "posts" }),
         );
@@ -1437,7 +1505,7 @@ mod tests {
 
     #[test]
     fn param_value_with_dots_and_dashes() {
-        let r = build(Router::new().get("/files/:name", || async { "f" }));
+        let r = build(Router::<()>::new().get("/files/:name", || async { "f" }));
 
         let m = r.resolve(&Method::GET, "/files/my-file.tar.gz").unwrap();
         assert_eq!(m.params[0].1, "my-file.tar.gz");
@@ -1450,7 +1518,7 @@ mod tests {
     fn shared_param_node_across_methods() {
         // GET and DELETE on same param path share the trie node.
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/users/:id", || async { "get" })
                 .delete("/users/:id", || async { "del" }),
         );
@@ -1473,7 +1541,7 @@ mod tests {
 
     #[test]
     fn state_stored_and_retrievable() {
-        let r = Router::new().state(TestConfig {
+        let r = Router::<()>::new().state(TestConfig {
             name: "test".into(),
         });
         assert!(r.state_map.contains_key(&TypeId::of::<TestConfig>()));
@@ -1481,7 +1549,7 @@ mod tests {
 
     #[test]
     fn multiple_state_types() {
-        let r = Router::new()
+        let r = Router::<()>::new()
             .state(TestConfig {
                 name: "app".into(),
             })
@@ -1534,7 +1602,7 @@ mod tests {
             name: "neutron".into(),
         };
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .state(cfg)
                 .get("/", |State(c): State<TestConfig>| async move { c.name }),
         );
@@ -1563,7 +1631,7 @@ mod tests {
         use http::StatusCode;
 
         // No state registered — extraction should fail with 500.
-        let r = build(Router::new().get("/", |State(_c): State<TestConfig>| async { "nope" }));
+        let r = build(Router::<()>::new().get("/", |State(_c): State<TestConfig>| async { "nope" }));
 
         let m = r.resolve(&Method::GET, "/").unwrap();
         let req = test_req(); // no state injected
@@ -1580,7 +1648,7 @@ mod tests {
         });
 
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .state(shared)
                 .get("/", |State(c): State<Arc<TestConfig>>| async move {
                     c.name.clone()
@@ -1610,12 +1678,12 @@ mod tests {
 
     #[tokio::test]
     async fn nest_basic_routes() {
-        let api = Router::new()
+        let api = Router::<()>::new()
             .get("/users", || async { "list_users" })
             .post("/users", || async { "create_user" });
 
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/", || async { "root" })
                 .nest("/api", api),
         );
@@ -1627,11 +1695,11 @@ mod tests {
 
     #[tokio::test]
     async fn nest_with_params() {
-        let sub = Router::new()
+        let sub = Router::<()>::new()
             .get("/:id", || async { "get_item" })
             .delete("/:id", || async { "delete_item" });
 
-        let r = build(Router::new().nest("/items", sub));
+        let r = build(Router::<()>::new().nest("/items", sub));
 
         let m = r.resolve(&Method::GET, "/items/42").unwrap();
         assert_eq!(&*m.params, &[("id".into(), "42".into())]);
@@ -1644,9 +1712,9 @@ mod tests {
 
     #[test]
     fn nest_prefix_with_param() {
-        let sub = Router::new().get("/posts", || async { "posts" });
+        let sub = Router::<()>::new().get("/posts", || async { "posts" });
 
-        let r = build(Router::new().nest("/users/:uid", sub));
+        let r = build(Router::<()>::new().nest("/users/:uid", sub));
 
         let m = r.resolve(&Method::GET, "/users/5/posts").unwrap();
         assert_eq!(&*m.params, &[("uid".into(), "5".into())]);
@@ -1654,9 +1722,9 @@ mod tests {
 
     #[tokio::test]
     async fn nest_deep_prefix() {
-        let sub = Router::new().get("/health", || async { "ok" });
+        let sub = Router::<()>::new().get("/health", || async { "ok" });
 
-        let r = build(Router::new().nest("/api/v1", sub));
+        let r = build(Router::<()>::new().nest("/api/v1", sub));
 
         assert_eq!(
             body_of(r.resolve(&Method::GET, "/api/v1/health").unwrap().handler).await,
@@ -1668,10 +1736,10 @@ mod tests {
     async fn nest_overlapping_routes() {
         // Parent has /api/status, sub has /status under /api prefix.
         // Sub-router's handler should win (last write wins in merge).
-        let sub = Router::new().get("/status", || async { "from_sub" });
+        let sub = Router::<()>::new().get("/status", || async { "from_sub" });
 
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/api/status", || async { "from_parent" })
                 .nest("/api", sub),
         );
@@ -1684,16 +1752,16 @@ mod tests {
 
     #[tokio::test]
     async fn nest_multiple_sub_routers() {
-        let users = Router::new()
+        let users = Router::<()>::new()
             .get("/", || async { "list_users" })
             .get("/:id", || async { "get_user" });
 
-        let posts = Router::new()
+        let posts = Router::<()>::new()
             .get("/", || async { "list_posts" })
             .post("/", || async { "create_post" });
 
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .nest("/users", users)
                 .nest("/posts", posts),
         );
@@ -1706,10 +1774,10 @@ mod tests {
 
     #[tokio::test]
     async fn nest_preserves_parent_routes() {
-        let sub = Router::new().get("/items", || async { "items" });
+        let sub = Router::<()>::new().get("/items", || async { "items" });
 
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/", || async { "root" })
                 .get("/health", || async { "ok" })
                 .nest("/api", sub),
@@ -1722,8 +1790,8 @@ mod tests {
 
     #[test]
     fn nest_sub_not_found() {
-        let sub = Router::new().get("/items", || async { "items" });
-        let r = build(Router::new().nest("/api", sub));
+        let sub = Router::<()>::new().get("/items", || async { "items" });
+        let r = build(Router::<()>::new().nest("/api", sub));
 
         assert!(matches!(
             r.resolve(&Method::GET, "/api/nope"),
@@ -1733,8 +1801,8 @@ mod tests {
 
     #[test]
     fn nest_sub_method_not_allowed() {
-        let sub = Router::new().get("/items", || async { "items" });
-        let r = build(Router::new().nest("/api", sub));
+        let sub = Router::<()>::new().get("/items", || async { "items" });
+        let r = build(Router::<()>::new().nest("/api", sub));
 
         assert!(matches!(
             r.resolve(&Method::POST, "/api/items"),
@@ -1744,10 +1812,10 @@ mod tests {
 
     #[test]
     fn nest_merges_state() {
-        let sub = Router::new().state(42u64);
+        let sub = Router::<()>::new().state(42u64);
 
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .state(TestConfig { name: "app".into() })
                 .nest("/api", sub),
         );
@@ -1758,9 +1826,9 @@ mod tests {
 
     #[test]
     fn nest_parent_state_wins_on_conflict() {
-        let sub = Router::new().state(99u64);
+        let sub = Router::<()>::new().state(99u64);
 
-        let r = build(Router::new().state(42u64).nest("/api", sub));
+        let r = build(Router::<()>::new().state(42u64).nest("/api", sub));
 
         let arc = r.state_map.get(&TypeId::of::<u64>()).unwrap();
         let val = (**arc).as_any().downcast_ref::<u64>().unwrap();
@@ -1778,12 +1846,12 @@ mod tests {
             resp
         }
 
-        let sub = Router::new()
+        let sub = Router::<()>::new()
             .middleware(add_header)
             .get("/items", || async { "items" });
 
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/", || async { "root" })
                 .nest("/api", sub),
         );
@@ -1807,9 +1875,9 @@ mod tests {
     #[tokio::test]
     async fn nest_root_handler_in_sub() {
         // Sub-router has a handler at "/" which should mount at the prefix itself
-        let sub = Router::new().get("/", || async { "sub_root" });
+        let sub = Router::<()>::new().get("/", || async { "sub_root" });
 
-        let r = build(Router::new().nest("/api", sub));
+        let r = build(Router::<()>::new().nest("/api", sub));
 
         assert_eq!(
             body_of(r.resolve(&Method::GET, "/api").unwrap().handler).await,
@@ -1819,8 +1887,8 @@ mod tests {
 
     #[tokio::test]
     async fn nest_wildcard_in_sub() {
-        let sub = Router::new().get("/*", || async { "catch_all" });
-        let r = build(Router::new().nest("/files", sub));
+        let sub = Router::<()>::new().get("/*", || async { "catch_all" });
+        let r = build(Router::<()>::new().nest("/files", sub));
 
         assert!(r.resolve(&Method::GET, "/files/a/b/c").is_ok());
         assert_eq!(
@@ -1835,7 +1903,7 @@ mod tests {
 
     #[test]
     fn fallback_is_stored() {
-        let r = Router::new()
+        let r = Router::<()>::new()
             .get("/", || async { "root" })
             .fallback(|| async { "custom 404" });
 
@@ -1845,7 +1913,7 @@ mod tests {
     #[tokio::test]
     async fn fallback_handler_is_callable() {
         let r = build(
-            Router::new()
+            Router::<()>::new()
                 .get("/", || async { "root" })
                 .fallback(|| async { "custom 404" }),
         );
@@ -1871,7 +1939,7 @@ mod tests {
 
     #[test]
     fn fallback_not_set_by_default() {
-        let r = Router::new().get("/", || async { "root" });
+        let r = Router::<()>::new().get("/", || async { "root" });
         assert!(r.fallback.is_none());
     }
 }
