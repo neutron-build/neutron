@@ -252,3 +252,24 @@ Override via env vars:
 - `BENCH_GATE_FRAMEWORK` (default `neutron`)
 - `BENCH_GATE_FAIL_RPS_DROP_PCT` (default `20`)
 - `BENCH_GATE_FAIL_P95_INCREASE_PCT` (default `35`)
+
+## Client weight (the axis RPS does not measure)
+
+The RPS harness measures the *server* HTML response only — it never fetches the
+client JS, so it cannot see what a browser downloads before interactive. That is
+the axis where islands frameworks (Astro) compete. `client-weight.mjs` measures
+it: for each route it fetches the HTML, extracts the entry module scripts, and
+sums the bytes of everything they STATICALLY import (transitively). Dynamic
+`import()` chunks are excluded — that is the payoff of code-splitting.
+
+```bash
+pnpm run client-weight http://127.0.0.1:3000 "/,/about,/dashboard,/todos"
+```
+
+Measured against the built playground (2026-06-06): static routes (`/`, `/about`,
+`/blog/*`) ship **0 KB JS** (pure HTML, Astro-parity); interactive routes
+(`/dashboard`, `/todos`, `/islands`, `/users/1`) ship **~35 KB** (~13 KB gzip) —
+the lean SPA runtime. Neutron's model is therefore *0 KB static / lean-SPA
+interactive*. The only remaining client-weight gap vs Astro is the "interactive
+widget on an otherwise-static page" case (35 KB vs ~5 KB), addressable by
+decoupling the islands bootstrap from the SPA runtime — tracked, lower priority.

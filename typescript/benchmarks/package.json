@@ -16,6 +16,7 @@
     "compare:publish-grade": "node ./publish-grade.mjs",
     "compare:publish:preflight": "node ./publish-preflight.mjs",
     "compare:publish:official": "node ./publish-official.mjs",
+    "client-weight": "node ./client-weight.mjs",
     "results:diff": "node ./compare-results.mjs",
     "compare:gate:smoke": "node ./smoke-gate.mjs",
     "baseline:pin": "node ./pin-baseline.mjs",
