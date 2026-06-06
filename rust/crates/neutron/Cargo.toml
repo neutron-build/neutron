@@ -143,6 +143,7 @@ tower-compat    = ["dep:tower", "dep:tower-layer", "dep:futures-util"]
 [dependencies]
 
 # ── Always required — the engine ────────────────────────────────────────────
+neutron-macros = { path = "../neutron-macros" }
 tokio          = { workspace = true }
 hyper          = { workspace = true }
 hyper-util     = { workspace = true }
@@ -204,6 +205,8 @@ criterion    = { workspace = true }
 rcgen        = { workspace = true }
 # `oneshot` for testing the RouterService (P1.1).
 tower        = { version = "0.5", features = ["util"] }
+# UI / compile-fail tests for the Router<S> + FromRef surface (P1.6).
+trybuild     = "1"
 
 [[bench]]
 name = "router"

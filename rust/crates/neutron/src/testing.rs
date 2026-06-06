@@ -163,11 +163,11 @@ impl<'a> TestRequest<'a> {
 
     /// Execute the request and return the response.
     pub async fn send(self) -> TestResponse {
-        let req = NeutronRequest::with_state(
+        let req = NeutronRequest::with_streaming_state(
             self.method,
             self.uri.parse().expect("invalid URI"),
             self.headers,
-            self.body,
+            crate::handler::full_frame(self.body),
             Arc::clone(&self.client.state_map),
         );
         let resp = (self.client.chain)(req).await;
@@ -334,23 +334,16 @@ async fn serve_test_conn(
         async move {
             let on_upgrade  = hyper::upgrade::on(&mut req);
             let (parts, body) = req.into_parts();
-            let body_bytes  = match body.collect().await {
-                Ok(c)  => c.to_bytes(),
-                Err(_) => {
-                    return Ok::<_, std::convert::Infallible>(
-                        http::Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
-                            .body(Body::full("Failed to read body"))
-                            .unwrap(),
-                    );
-                }
-            };
+            // P1.2: pass the hyper body through as a lazy stream (real HTTP/1+2 path).
+            let boxed: crate::handler::ReqBody = Box::pin(
+                body.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+            );
 
-            let mut neutron_req = NeutronRequest::with_state(
+            let mut neutron_req = NeutronRequest::with_streaming_state(
                 parts.method,
                 parts.uri,
                 parts.headers,
-                body_bytes,
+                boxed,
                 state,
             );
             neutron_req.set_on_upgrade(on_upgrade);

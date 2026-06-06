@@ -423,16 +423,16 @@ pub fn is_url(value: &str) -> bool {
 pub struct Validated<T>(pub T);
 
 impl<T: DeserializeOwned + Validate + Send + 'static> FromRequest for Validated<Json<T>> {
-    fn from_request(req: &Request) -> Result<Self, Response> {
-        let Json(inner) = Json::<T>::from_request(req)?;
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
+        let Json(inner) = Json::<T>::from_request(req).await?;
         inner.validate().map_err(|e| e.into_response())?;
         Ok(Validated(Json(inner)))
     }
 }
 
 impl<T: DeserializeOwned + Validate + Send + 'static> FromRequest for Validated<Query<T>> {
-    fn from_request(req: &Request) -> Result<Self, Response> {
-        let Query(inner) = Query::<T>::from_request(req)?;
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
+        let Query(inner) = Query::<T>::from_request(req).await?;
         inner.validate().map_err(|e| e.into_response())?;
         Ok(Validated(Query(inner)))
     }

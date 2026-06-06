@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/neutron",
+    "crates/neutron-macros",
     "crates/neutron-cli",
     "crates/neutron-grpc",
     "crates/neutron-graphql",

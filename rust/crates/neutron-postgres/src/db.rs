@@ -29,7 +29,7 @@ pub struct Db {
 }
 
 impl FromRequestParts for Db {
-    fn from_parts(req: &Request) -> Result<Self, Response> {
+    async fn from_parts(req: &Request) -> Result<Self, Response> {
         req.get_state::<PgPool>()
             .cloned()
             .map(|pool| Db { pool })
@@ -190,8 +190,8 @@ mod tests {
     use super::*;
     use crate::pool::PgConfig;
 
-    #[test]
-    fn db_requires_pool_in_state() {
+    #[tokio::test]
+    async fn db_requires_pool_in_state() {
         // Verify that FromRequestParts returns an error response when the pool
         // is absent — we can test this without a real DB connection.
         use neutron::handler::Request as NeutronRequest;
@@ -204,7 +204,7 @@ mod tests {
             http::HeaderMap::new(),
             Bytes::new(),
         );
-        let result = Db::from_parts(&req);
+        let result = Db::from_parts(&req).await;
         assert!(result.is_err());
         // unwrap_err() requires Debug on Ok variant; match instead
         match result {
