@@ -641,6 +641,22 @@ class TestWorkflow:
         assert result.trace[2].output == "Result: 20"
         assert result.total_duration_ms > 0
 
+    async def test_workflow_reraises_base_exception(self):
+        """P0.2: a step raising a BaseException (e.g. CancelledError) must
+        propagate, not crash with a TypeError from unpacking it as a result."""
+
+        class CustomBase(BaseException):
+            pass
+
+        class Boom(Workflow):
+            @step
+            async def explode(self, value: int) -> int:
+                raise CustomBase("boom")
+
+        wf = Boom()
+        with pytest.raises(CustomBase):
+            await wf.run(value=1)
+
     async def test_workflow_parallel_steps(self):
         """Steps without dependencies on each other run concurrently."""
 

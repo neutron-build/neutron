@@ -131,7 +131,12 @@ class Workflow:
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for name, result in zip(ready, results):
-                if isinstance(result, Exception):
+                # gather(return_exceptions=True) can yield a BaseException such as
+                # asyncio.CancelledError (not an Exception since 3.8). Checking
+                # only Exception let those fall through to the unpack below and
+                # raise TypeError. BaseException covers both and re-raises (so
+                # cancellation still propagates).
+                if isinstance(result, BaseException):
                     step_result = StepResult(
                         name=name, error=str(result), duration_ms=0.0
                     )

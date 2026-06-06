@@ -98,7 +98,10 @@ class WebSocketHub:
 
         Returns the number of clients that received the message.
         """
-        members = self._rooms.get(room, set())
+        # Snapshot the room set: `await ws.send_json` below yields control, and a
+        # concurrent join/leave mutating the live set would otherwise raise
+        # "Set changed size during iteration".
+        members = list(self._rooms.get(room, set()))
         sent = 0
         disconnected: list[WebSocket] = []
 
