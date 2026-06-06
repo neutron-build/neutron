@@ -32,6 +32,10 @@
 // is large by design — these are standard patterns in Rust web frameworks.
 #![allow(clippy::type_complexity, clippy::result_large_err)]
 
+// Lets `#[derive(FromRef)]` resolve `::neutron::FromRef` from inside this crate
+// (the derive output uses the absolute path so downstream crates work too).
+extern crate self as neutron;
+
 // ---------------------------------------------------------------------------
 // Phase 5: opt-in global allocators
 //
@@ -199,6 +203,9 @@ pub mod tower_compat;
 // ---------------------------------------------------------------------------
 pub mod from_ref;
 pub use from_ref::FromRef;
+
+/// Derive `FromRef<S>` for each field of a composite application-state struct.
+pub use neutron_macros::FromRef;
 
 // ---------------------------------------------------------------------------
 // Prelude — convenience re-exports, respects all feature gates above

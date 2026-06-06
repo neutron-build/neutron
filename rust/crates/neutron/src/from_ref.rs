@@ -41,4 +41,28 @@ mod tests {
         let cloned = <AppState as FromRef<AppState>>::from_ref(&state);
         assert_eq!(cloned, state);
     }
+
+    #[test]
+    fn derive_from_ref_extracts_substate() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct Db(u32);
+        #[derive(Clone, Debug, PartialEq)]
+        struct Cache(String);
+
+        #[derive(Clone, crate::FromRef)]
+        struct AppState {
+            db: Db,
+            cache: Cache,
+        }
+
+        let state = AppState {
+            db: Db(7),
+            cache: Cache("hot".into()),
+        };
+        assert_eq!(<Db as FromRef<AppState>>::from_ref(&state), Db(7));
+        assert_eq!(
+            <Cache as FromRef<AppState>>::from_ref(&state),
+            Cache("hot".into())
+        );
+    }
 }
