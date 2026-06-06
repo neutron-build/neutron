@@ -279,9 +279,10 @@ impl Request {
         }
     }
 
-    /// Create a new request with pre-built state — avoids allocating a temporary
-    /// empty `Arc<StateMap>` that would immediately be overwritten.  Used by all
-    /// production server paths; `new()` is kept for `TestClient` and user code.
+    /// Create a new request with pre-built state and a buffered `Bytes` body.
+    /// Retained for synthetic/buffered construction; production paths use
+    /// [`with_streaming_state`](Self::with_streaming_state).
+    #[allow(dead_code)]
     pub(crate) fn with_state(
         method: Method,
         uri: Uri,
@@ -295,6 +296,30 @@ impl Request {
             headers,
             body,
             body_stream: std::sync::Mutex::new(None),
+            params: SmallVec::new(),
+            state,
+            on_upgrade: std::sync::Mutex::new(None),
+            extensions: SmallVec::new(),
+            remote_addr: None,
+        }
+    }
+
+    /// Create a request with a **streaming** body (the production dispatch path).
+    /// The body is consumed lazily — nothing is buffered until an extractor calls
+    /// [`collect_body`](Self::collect_body) or [`take_body`](Self::take_body).
+    pub(crate) fn with_streaming_state(
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: ReqBody,
+        state: Arc<StateMap>,
+    ) -> Self {
+        Self {
+            method,
+            uri,
+            headers,
+            body: Bytes::new(),
+            body_stream: std::sync::Mutex::new(Some(body)),
             params: SmallVec::new(),
             state,
             on_upgrade: std::sync::Mutex::new(None),
@@ -319,6 +344,21 @@ impl Request {
     /// Take the streaming body for frame-level consumption (`BodyStream` extractor).
     pub fn take_body(&mut self) -> Option<ReqBody> {
         self.body_stream.get_mut().unwrap().take()
+    }
+
+    /// Buffer the streaming body into memory (with a per-frame `limit` ceiling)
+    /// and store it so that subsequent reads — including downstream extractors
+    /// calling [`collect_body`](Self::collect_body) — see the same bytes.
+    ///
+    /// Middleware that must inspect the body (size limits, CSRF form fields,
+    /// signature verification) calls this once; the body is then buffered and
+    /// available to the handler. Returns 413 if the body exceeds `limit`.
+    pub async fn buffer_body(&mut self, limit: usize) -> Result<&Bytes, Response> {
+        let taken = self.body_stream.get_mut().unwrap().take();
+        if let Some(stream) = taken {
+            self.body = collect_limited(stream, limit).await?;
+        }
+        Ok(&self.body)
     }
 
     pub fn method(&self) -> &Method {

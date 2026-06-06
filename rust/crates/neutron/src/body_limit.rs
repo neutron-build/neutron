@@ -16,9 +16,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use http::StatusCode;
-
-use crate::handler::{Body, Request, Response};
+use crate::handler::{Request, Response};
 use crate::middleware::{MiddlewareTrait, Next};
 
 /// Middleware that rejects requests with a body larger than the configured limit.
@@ -51,12 +49,13 @@ impl MiddlewareTrait for BodyLimit {
         let max = self.max_bytes;
 
         Box::pin(async move {
-            if req.body().len() > max {
-                return http::Response::builder()
-                    .status(StatusCode::PAYLOAD_TOO_LARGE)
-                    .header("content-type", "text/plain; charset=utf-8")
-                    .body(Body::full("Payload Too Large"))
-                    .unwrap();
+            let mut req = req;
+            // Buffer the (possibly streaming) body with the limit enforced per
+            // frame. `buffer_body` returns 413 the instant the running total
+            // exceeds `max`, and leaves the bytes available to downstream
+            // extractors.
+            if let Err(rejection) = req.buffer_body(max).await {
+                return rejection;
             }
             next.run(req).await
         })
@@ -72,6 +71,7 @@ mod tests {
     use super::*;
     use crate::router::Router;
     use crate::testing::TestClient;
+    use http::StatusCode;
 
     #[tokio::test]
     async fn allows_body_under_limit() {

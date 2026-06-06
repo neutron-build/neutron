@@ -25,7 +25,8 @@ use http_body_util::BodyExt;
 use smallvec::SmallVec;
 
 use crate::handler::{
-    into_boxed, AnyState, Body, BoxedHandler, ErasedHandler, Handler, Request, Response, StateMap,
+    into_boxed, AnyState, Body, BoxedHandler, ErasedHandler, Handler, ReqBody, Request, Response,
+    StateMap,
 };
 use crate::middleware::{self, MiddlewareTrait};
 
@@ -808,14 +809,19 @@ impl tower_service::Service<http::Request<Body>> for RouterService {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
             let (parts, body) = req.into_parts();
-            // `Body`'s error type is `Infallible`, so collection cannot fail.
-            let bytes = body
-                .collect()
-                .await
-                .map(|c| c.to_bytes())
-                .unwrap_or_default();
-            let neutron_req =
-                Request::with_state(parts.method, parts.uri, parts.headers, bytes, state);
+            // P1.2: pass the body through as a lazy stream. The response `Body`'s
+            // error type is `Infallible`, so the boxed `ReqBody` error is the
+            // never type (the map closure is never invoked).
+            let boxed: ReqBody = Box::pin(
+                body.map_err(|e: std::convert::Infallible| match e {}),
+            );
+            let neutron_req = Request::with_streaming_state(
+                parts.method,
+                parts.uri,
+                parts.headers,
+                boxed,
+                state,
+            );
             Ok(dispatch(neutron_req).await)
         })
     }
