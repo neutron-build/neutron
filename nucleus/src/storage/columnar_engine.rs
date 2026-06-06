@@ -314,14 +314,6 @@ fn batches_to_rows_where_eq(
 /// (so superseded versions don't inflate SUM/AVG/MIN/MAX/GROUP BY), else return
 /// physical batches. Mirrors the guard in `fast_count_all`.
 /// NOTE: read paths only — mutations must use `batches_all` directly.
-fn select_batches(store: &ColumnarStore, table: &str) -> Vec<ColumnBatch> {
-    if crate::columnar::replacing_config(table).is_some() {
-        store.batches_all_for_select(table)
-    } else {
-        store.batches_all(table)
-    }
-}
-
 /// Batches for a read-only aggregate, borrowing the stored column data when
 /// possible. Aggregate fast-paths (sum/count/group-by) only read columns, so
 /// for a raw (non-MergeTree) table we hand back a borrow of `tables` instead of
@@ -335,6 +327,23 @@ fn batches_for_read<'a>(
     if crate::columnar::replacing_config(table).is_some() {
         Cow::Owned(store.batches_all_for_select(table))
     } else if store.is_merge_tree(table) {
+        Cow::Owned(store.batches_all(table))
+    } else {
+        Cow::Borrowed(store.batches(table))
+    }
+}
+
+/// Like `batches_for_read` but returns *physical* batches with no read-time
+/// dedup — for index lookups, whose stored positions index physical rows. Using
+/// the deduped/reordered `batches_for_read` here would fetch the wrong rows on a
+/// replacing table (positions wouldn't line up). Borrows raw tables (no clone),
+/// materializes MergeTree parts.
+fn physical_batches_for_read<'a>(
+    store: &'a ColumnarStore,
+    table: &str,
+) -> std::borrow::Cow<'a, [ColumnBatch]> {
+    use std::borrow::Cow;
+    if store.is_merge_tree(table) {
         Cow::Owned(store.batches_all(table))
     } else {
         Cow::Borrowed(store.batches(table))
@@ -876,7 +885,7 @@ impl StorageEngine for ColumnarStorageEngine {
         // SELECT via the index sees one row per logical PK. Borrow batches for
         // raw tables — cloning the whole table to fetch a handful of rows by
         // position defeats the point of the index.
-        let batches = batches_for_read(&store, table);
+        let batches = physical_batches_for_read(&store, table);
         let rows = fetch_rows_by_positions(batches.as_ref(), &positions);
         let out = match crate::columnar::replacing_config(table) {
             Some(c) => crate::columnar::dedup_replacing_rows(rows, &c),
@@ -908,7 +917,7 @@ impl StorageEngine for ColumnarStorageEngine {
             }
         };
         let store = self.store.read();
-        let batches = batches_for_read(&store, table);
+        let batches = physical_batches_for_read(&store, table);
         let rows = fetch_rows_by_positions(batches.as_ref(), &positions);
         let out = match crate::columnar::replacing_config(table) {
             Some(c) => crate::columnar::dedup_replacing_rows(rows, &c),
