@@ -427,12 +427,14 @@ impl ShardedCollections {
         match data.get(key) {
             Some(KvCollection::List(list)) => {
                 let len = list.len() as i64;
+                // start underflow clamps to 0 (Redis); stop underflowing past the
+                // front yields an empty range, NOT a clamp to element 0.
                 let s = normalize_index(start, len);
-                let e = normalize_index(stop, len);
-                if s > e || s >= len as usize {
+                let e_signed = if stop < 0 { len + stop } else { stop };
+                if e_signed < 0 || s >= len as usize || s as i64 > e_signed {
                     return Ok(vec![]);
                 }
-                let end = e.min(len as usize - 1);
+                let end = (e_signed as usize).min(len as usize - 1);
                 Ok(list.iter().skip(s).take(end - s + 1).cloned().collect())
             }
             Some(other) => Err(WrongTypeError {
@@ -465,11 +467,14 @@ impl ShardedCollections {
         match data.get(key) {
             Some(KvCollection::List(list)) => {
                 let len = list.len() as i64;
-                let idx = normalize_index(index, len);
-                if idx >= list.len() {
+                // A negative index that underflows past the front is out of
+                // range → NULL (Redis), NOT clamped to element 0. normalize_index
+                // clamps (correct for LRANGE start, wrong here), so adjust inline.
+                let idx = if index < 0 { len + index } else { index };
+                if idx < 0 || idx >= len {
                     Ok(None)
                 } else {
-                    Ok(list.get(idx).cloned())
+                    Ok(list.get(idx as usize).cloned())
                 }
             }
             Some(other) => Err(WrongTypeError {
