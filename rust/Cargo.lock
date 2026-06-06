@@ -1783,6 +1783,7 @@ dependencies = [
  "tower-service",
  "tracing",
  "tracing-subscriber",
+ "trybuild",
 ]
 
 [[package]]
