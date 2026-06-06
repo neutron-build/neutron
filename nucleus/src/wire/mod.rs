@@ -649,6 +649,10 @@ impl NucleusHandler {
                     })
                     .collect();
                 let schema = Arc::new(schema);
+                // Declared column types, so binary encoding matches the advertised
+                // RowDescription width (see encode_value_typed).
+                let col_types: Arc<Vec<DataType>> =
+                    Arc::new(columns.iter().map(|(_, dt)| dt.clone()).collect());
 
                 // Fast path for small result sets (≤10 rows): pre-encode all
                 // rows into a Vec, avoiding per-row Arc::clone and lazy stream
@@ -657,8 +661,11 @@ impl NucleusHandler {
                     let mut encoded = Vec::with_capacity(rows.len());
                     for row in &rows {
                         let mut encoder = DataRowEncoder::new(Arc::clone(&schema));
-                        for value in row {
-                            encode_value(&mut encoder, value)?;
+                        for (i, value) in row.iter().enumerate() {
+                            match col_types.get(i) {
+                                Some(dt) => encode_value_typed(&mut encoder, value, dt)?,
+                                None => encode_value(&mut encoder, value)?,
+                            }
                         }
                         encoded.push(encoder.finish()?);
                     }
@@ -666,10 +673,14 @@ impl NucleusHandler {
                     Ok(Response::Query(QueryResponse::new(schema, data_row_stream)))
                 } else {
                     let schema_ref = Arc::clone(&schema);
+                    let col_types_ref = Arc::clone(&col_types);
                     let data_row_stream = stream::iter(rows).map(move |row| {
                         let mut encoder = DataRowEncoder::new(Arc::clone(&schema_ref));
-                        for value in &row {
-                            encode_value(&mut encoder, value)?;
+                        for (i, value) in row.iter().enumerate() {
+                            match col_types_ref.get(i) {
+                                Some(dt) => encode_value_typed(&mut encoder, value, dt)?,
+                                None => encode_value(&mut encoder, value)?,
+                            }
                         }
                         encoder.finish()
                     });
@@ -2762,6 +2773,32 @@ fn data_type_field_format(dt: &DataType) -> FieldFormat {
         DataType::Int32 | DataType::Int64 | DataType::Float64 => FieldFormat::Binary,
         _ => FieldFormat::Text,
     }
+}
+
+/// Encode a value to match the column's *declared* type width. Nucleus stores
+/// small integers as `Int32` even in `BIGINT` columns (and a literal can be
+/// `Int64` in an `INT` column), but the RowDescription advertises the declared
+/// type. With binary result format the client decodes by that advertised type,
+/// so a width mismatch (e.g. a 4-byte int4 payload under an int8 column) makes
+/// pgx/any binary consumer fail with "error deserializing column". Coerce the
+/// integer/float to the declared width before encoding.
+fn encode_value_typed(
+    encoder: &mut DataRowEncoder,
+    value: &Value,
+    target: &DataType,
+) -> PgWireResult<()> {
+    match (value, target) {
+        (Value::Int32(n), DataType::Int64) => return encoder.encode_field(&Some(*n as i64)),
+        (Value::Int64(n), DataType::Int32) => {
+            if let Ok(n32) = i32::try_from(*n) {
+                return encoder.encode_field(&Some(n32));
+            }
+        }
+        (Value::Int32(n), DataType::Float64) => return encoder.encode_field(&Some(*n as f64)),
+        (Value::Int64(n), DataType::Float64) => return encoder.encode_field(&Some(*n as f64)),
+        _ => {}
+    }
+    encode_value(encoder, value)
 }
 
 /// Encode a Nucleus Value into a pgwire DataRowEncoder field.
