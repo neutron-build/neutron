@@ -21,21 +21,26 @@ use crate::status::GrpcStatus;
 pub struct GrpcRequest(pub Bytes);
 
 impl FromRequest for GrpcRequest {
-    fn from_request(req: &Request) -> Result<Self, Response> {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
         // Validate Content-Type
         let ct = req
             .headers()
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_owned();
 
         if !ct.starts_with("application/grpc") {
             return Err(GrpcStatus::InvalidArgument
                 .error_response("Expected Content-Type: application/grpc"));
         }
 
-        let body = req.body();
-        let (msg_bytes, _compressed) = unframe_message(body)
+        // gRPC messages are length-prefixed and bounded; buffer with a 4 MiB cap.
+        let body = req
+            .collect_body(4 * 1024 * 1024)
+            .await
+            .map_err(|_| GrpcStatus::ResourceExhausted.error_response("gRPC body too large"))?;
+        let (msg_bytes, _compressed) = unframe_message(&body)
             .ok_or_else(|| GrpcStatus::InvalidArgument.error_response("malformed gRPC frame"))?;
 
         Ok(GrpcRequest(Bytes::copy_from_slice(msg_bytes)))
@@ -66,36 +71,39 @@ mod tests {
         match r { Ok(v) => v, Err(resp) => panic!("{msg}: HTTP {}", resp.status()) }
     }
 
-    #[test]
-    fn extracts_payload() {
-        let req = grpc_request(b"hello grpc");
-        let GrpcRequest(payload) = ok_or_panic(GrpcRequest::from_request(&req), "extract failed");
+    #[tokio::test]
+    async fn extracts_payload() {
+        let mut req = grpc_request(b"hello grpc");
+        let GrpcRequest(payload) =
+            ok_or_panic(GrpcRequest::from_request(&mut req).await, "extract failed");
         assert_eq!(payload.as_ref(), b"hello grpc");
     }
 
-    #[test]
-    fn rejects_wrong_content_type() {
+    #[tokio::test]
+    async fn rejects_wrong_content_type() {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/json".parse().unwrap());
-        let req = Request::new(Method::POST, "/".parse().unwrap(), headers, Bytes::new());
-        let result = GrpcRequest::from_request(&req);
+        let mut req = Request::new(Method::POST, "/".parse().unwrap(), headers, Bytes::new());
+        let result = GrpcRequest::from_request(&mut req).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn rejects_malformed_frame() {
+    #[tokio::test]
+    async fn rejects_malformed_frame() {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/grpc".parse().unwrap());
         // Only 3 bytes — too short for the 5-byte header
-        let req = Request::new(Method::POST, "/".parse().unwrap(), headers, Bytes::from_static(b"ab"));
-        let result = GrpcRequest::from_request(&req);
+        let mut req =
+            Request::new(Method::POST, "/".parse().unwrap(), headers, Bytes::from_static(b"ab"));
+        let result = GrpcRequest::from_request(&mut req).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn extracts_empty_payload() {
-        let req = grpc_request(b"");
-        let GrpcRequest(payload) = ok_or_panic(GrpcRequest::from_request(&req), "empty extract failed");
+    #[tokio::test]
+    async fn extracts_empty_payload() {
+        let mut req = grpc_request(b"");
+        let GrpcRequest(payload) =
+            ok_or_panic(GrpcRequest::from_request(&mut req).await, "empty extract failed");
         assert!(payload.is_empty());
     }
 }

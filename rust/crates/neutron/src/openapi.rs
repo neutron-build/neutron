@@ -21,7 +21,7 @@
 //!         .property("name", Schema::string())
 //!     );
 //!
-//! let router = Router::new()
+//! let router = Router::<()>::new()
 //!     .get("/docs", spec.swagger_ui())
 //!     .get("/openapi.json", spec.json_handler())
 //!     .get("/users", list_users);
@@ -1101,7 +1101,7 @@ mod tests {
     async fn json_endpoint_returns_spec() {
         let spec = sample_spec();
         let client = TestClient::new(
-            Router::new().get("/openapi.json", spec.json_handler()),
+            Router::<()>::new().get("/openapi.json", spec.json_handler()),
         );
 
         let resp = client.get("/openapi.json").send().await;
@@ -1117,7 +1117,7 @@ mod tests {
     async fn swagger_ui_returns_html() {
         let spec = sample_spec();
         let client = TestClient::new(
-            Router::new().get("/docs", spec.swagger_ui()),
+            Router::<()>::new().get("/docs", spec.swagger_ui()),
         );
 
         let resp = client.get("/docs").send().await;
@@ -1136,7 +1136,7 @@ mod tests {
     async fn swagger_ui_custom_url() {
         let spec = sample_spec();
         let client = TestClient::new(
-            Router::new().get("/docs", spec.swagger_ui_at("/api/spec.json")),
+            Router::<()>::new().get("/docs", spec.swagger_ui_at("/api/spec.json")),
         );
 
         let resp = client.get("/docs").send().await;
@@ -1165,7 +1165,7 @@ mod tests {
     fn router_openapi_all_stubbed() {
         use crate::router::Router;
 
-        let spec = Router::new()
+        let spec = Router::<()>::new()
             .get("/users", || async { "ok" })
             .post("/users", || async { "ok" })
             .delete("/users/:id", || async { "ok" })
@@ -1182,7 +1182,7 @@ mod tests {
     fn router_openapi_documented_route_uses_metadata() {
         use crate::router::Router;
 
-        let spec = Router::new()
+        let spec = Router::<()>::new()
             .get("/users", || async { "ok" })
             .doc(
                 ApiRoute::get("/users")
@@ -1204,7 +1204,7 @@ mod tests {
     fn router_openapi_mixed_documented_and_stub() {
         use crate::router::Router;
 
-        let spec = Router::new()
+        let spec = Router::<()>::new()
             .get("/users", || async { "ok" })
             .doc(ApiRoute::get("/users").summary("Documented"))
             .post("/users", || async { "ok" })     // no doc → auto-stub
@@ -1225,11 +1225,11 @@ mod tests {
     fn router_openapi_nested_routes_included() {
         use crate::router::Router;
 
-        let api = Router::new()
+        let api = Router::<()>::new()
             .get("/users", || async { "ok" })
             .doc(ApiRoute::get("/users").summary("List users"));
 
-        let root = Router::new()
+        let root = Router::<()>::new()
             .get("/health", || async { "ok" })
             .nest("/api", api)
             .openapi("Nested API", "1.0.0")
@@ -1244,7 +1244,7 @@ mod tests {
     fn router_openapi_on_method_tracked() {
         use crate::router::Router;
 
-        let spec = Router::new()
+        let spec = Router::<()>::new()
             .on("/resource", &[http::Method::GET, http::Method::HEAD], || async { "ok" })
             .openapi("On API", "1.0.0")
             .to_json();
