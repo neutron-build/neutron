@@ -1,6 +1,7 @@
 package neutron
 
 import (
+	"bufio"
 	"compress/gzip"
 	"context"
 	"crypto/rand"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"runtime/debug"
 	"strings"
@@ -262,6 +264,28 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap exposes the underlying writer to http.ResponseController and to
+// interface probes that walk Unwrap chains.
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// Flush forwards to the underlying writer so SSE / streaming responses are not
+// silently buffered when this middleware is in the chain.
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack forwards to the underlying writer so WebSocket upgrades work behind
+// this middleware. Embedding the ResponseWriter interface does not promote
+// Hijack (it is not part of http.ResponseWriter), so it must be forwarded.
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("neutron: underlying ResponseWriter does not support Hijack")
+}
+
 // gzipWriter wraps http.ResponseWriter with a gzip writer.
 type gzipWriter struct {
 	http.ResponseWriter
@@ -270,6 +294,28 @@ type gzipWriter struct {
 
 func (w *gzipWriter) Write(b []byte) (int, error) {
 	return w.Writer.Write(b)
+}
+
+func (w *gzipWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// Flush flushes the gzip writer (to push buffered compressed bytes) and then
+// the underlying writer, so SSE works through compression.
+func (w *gzipWriter) Flush() {
+	if f, ok := w.Writer.(interface{ Flush() error }); ok {
+		_ = f.Flush()
+	}
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack forwards to the underlying writer (the hijacked connection bypasses
+// gzip, which is correct for WebSocket upgrades).
+func (w *gzipWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("neutron: underlying ResponseWriter does not support Hijack")
 }
 
 func generateID() string {

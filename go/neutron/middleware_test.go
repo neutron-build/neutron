@@ -1,12 +1,51 @@
 package neutron
 
 import (
+	"compress/gzip"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 )
+
+// P0.1: response-writer wrappers must forward Flush/Hijack so SSE and WebSocket
+// upgrades work behind the framework's own Logger/Compress middleware. Embedding
+// the http.ResponseWriter interface does NOT promote those methods.
+func TestStreamingWorksBehindMiddleware(t *testing.T) {
+	var _ http.Flusher = (*statusWriter)(nil)
+	var _ http.Hijacker = (*statusWriter)(nil)
+	var _ http.Flusher = (*gzipWriter)(nil)
+	var _ http.Hijacker = (*gzipWriter)(nil)
+
+	streaming := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("http.Flusher not available to handler behind middleware")
+			return
+		}
+		_, _ = w.Write([]byte("data: hi\n\n"))
+		f.Flush()
+	})
+
+	t.Run("behind Logger", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		Logger(slog.Default())(streaming).ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+		if !rec.Flushed {
+			t.Error("response not flushed behind Logger middleware")
+		}
+	})
+
+	t.Run("behind Compress", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		Compress(gzip.DefaultCompression)(streaming).ServeHTTP(rec, req)
+		if !rec.Flushed {
+			t.Error("response not flushed behind Compress middleware")
+		}
+	})
+}
 
 func TestRequestIDMiddleware(t *testing.T) {
 	handler := RequestID()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
