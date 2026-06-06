@@ -134,7 +134,8 @@ mimalloc        = ["dep:mimalloc"]
 http3           = ["dep:quinn", "dep:h3", "dep:h3-quinn", "tls"]
 
 # Tower middleware compatibility — use tower-http layers alongside Neutron middleware.
-tower-compat    = ["dep:tower", "dep:tower-service", "dep:tower-layer", "dep:futures-util"]
+# (tower-service is now a core dep — Router implements tower::Service unconditionally.)
+tower-compat    = ["dep:tower", "dep:tower-layer", "dep:futures-util"]
 
 # ---------------------------------------------------------------------------
 # Dependencies
@@ -189,9 +190,10 @@ quinn    = { workspace = true, optional = true }
 h3       = { workspace = true, optional = true }
 h3-quinn = { workspace = true, optional = true }
 
-# ── Tower compatibility ──────────────────────────────────────────────────────
+# ── Tower ────────────────────────────────────────────────────────────────────
+# tower-service is core: `Router::into_service()` yields a `tower::Service` (P1.1).
+tower-service = { version = "0.3" }
 tower         = { version = "0.5", optional = true, default-features = false }
-tower-service = { version = "0.3", optional = true }
 tower-layer   = { version = "0.3", optional = true }
 futures-util  = { workspace = true, optional = true }
 
@@ -200,6 +202,8 @@ async-stream = { workspace = true }
 tempfile     = { workspace = true }
 criterion    = { workspace = true }
 rcgen        = { workspace = true }
+# `oneshot` for testing the RouterService (P1.1).
+tower        = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "router"
