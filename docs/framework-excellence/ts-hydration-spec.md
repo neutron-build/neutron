@@ -1,9 +1,46 @@
 # Neutron TS — Hydration-Model Rewrite (zero-JS default + true islands)
 
-Surgical, file-level spec for the **one confirmed structural gap** in the TS
-framework: it ships a full SPA hydration runtime on every page.
+Surgical, file-level spec for the TS framework's client-side hydration model.
 
 Status: 2026-06-06. Companion to `ts.md` (render-core audit). Green-after-each-step.
+
+---
+
+## CORRECTION (2026-06-06, empirical) — read this first
+
+The original premise below ("ships a full SPA runtime on every page") was based on
+reading the **dev-server** path (`server/index.ts`). Inspecting the actual
+**production build output** of the playground overturns it:
+
+- **Pure static content already ships ZERO JS.** Prerendered pages
+  (`dist/index.html` 1063B, `about` 776B, all `blog/*`) contain **no `<script>`,
+  no `__NEUTRON_DATA_SERIALIZED__`, no island markers** — pure HTML. `build.ts:703`
+  already gates the client script on `content.includes("<neutron-island")`. This
+  is **already Astro-parity** for the marketing/docs/blog sweet spot.
+- **Code-splitting already exists:** `index-*.js` (34KB SPA runtime), a separate
+  `islands-*.js` (5.4KB) chunk, and per-route/per-component chunks
+  (`todos`/`admin`/`dashboard`/`_slug_`…).
+- **The real, narrow remaining gap:** the `islands-*.js` bootstrap is **not
+  standalone** — it `import`s `index-*.js`, so any page needing *one* island pulls
+  the full 34KB SPA runtime (router + fetcher + nav) it doesn't need. And dynamic
+  `mode:app` routes always ship the runtime + serialized data via the server path.
+
+So the giant "invert the default + MPA-nav rewrite" below is **mostly
+unnecessary and NOT recommended** (it would risk the 4 live sites for a problem
+prod already solves). The justified, bounded work is:
+
+1. **Decouple the islands bootstrap from the SPA runtime** so an islands page
+   ships only a tiny scheduler + the per-island component chunks (break
+   `island-runtime.ts`/`island.tsx`'s import edge into `hydrate.ts`/router/fetcher).
+2. **Client-weight measurement** in the harness (JS bytes shipped per route) so
+   this is provable and regressions are caught — this is the genuinely missing piece.
+3. (optional) Let dynamic `mode:app` routes opt out of the runtime when they have
+   no islands; align the dev path with the prod island-gating.
+
+The MPA-nav default flip and full-tree-hydration removal (S5 below) are **shelved**
+unless a future need appears. The sections below are retained for context only.
+
+---
 
 ---
 
