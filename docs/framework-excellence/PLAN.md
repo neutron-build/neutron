@@ -122,8 +122,9 @@ Each scaffold is a standalone phased engineering plan (P0 correctness → P1 fun
 - ✅ **P1.8** terse header-array `IntoResponse` (`(StatusCode, [(HeaderName, HeaderValue); N], T)` etc.) — the other tuple/`Result` forms were already present. (commit `5520356`)
 - ✅ **P1.M (user-facing slice)** closure middleware (blanket `MiddlewareTrait for Fn(Request,Next)` = Axum `from_fn` ergonomics) + `RouterService` composes under tower layers — both locked in with tests. Internal `build_chain`→Tower-`ServiceBuilder` unification deferred with the core rewrite. (commit in the P1.M test commit)
 - ✅ **P2.1** built-in dispatch failures (404/405/413/400/500) are RFC 7807 `problem+json` with `instance`; 405 keeps `Allow`. (commit `ad098d8`) — extractor-rejection + timeout/panic problem+json land with P1.5.
+- ✅ **P1.5a** extractor rejections are RFC 7807 `problem+json` (added `AppError::from_status`/`unsupported_media_type` + a `reject()` helper; all of Path/Query/State/Json/Form/TypedHeader/etc. converted). (commit `f8864a8`)
 - ⏳ **Remaining = the coupled core-rewrite cluster (a focused multi-session effort, in dependency order):**
-  - **P1.5** async extractors + typed RFC 7807 rejections (rewrites `extract.rs`) → unblocks **P1.2** streaming request bodies
+  - **P1.5b + P1.2 are ONE coupled breaking change** (traced): making extractors async (RPITIT `impl Future + Send`) only pays off with streaming bodies, and both require rewriting the `Handler` macro (handler.rs:613) to extract *inside* the async block + add a `Clone` bound on handlers + change `Request` to hold `Body` not `Bytes`. High-risk Handler-core surgery — its own PR. (serde-Path arbitrary-arity is a splittable lower-risk sub-part.) Design captured in task #53.
   - **P1.6** `Router<S>` + `FromRef` + `#[derive(FromRef)]` (own PR per the scaffold)
   - **P1.3** route the server's per-connection `service_fn` through `RouterService` on HTTP/1/2/3 + `nest_service` + collapse `tower_compat` + P1.M internal unification
   - **P1.4** `default_stack()` order-enforcing · **P1.7** `#[debug_handler]` · **P1.9** WS/SSE regression guard (after P1.3)
