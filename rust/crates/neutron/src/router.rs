@@ -1098,6 +1098,49 @@ mod tests {
         assert_eq!(v["status"], 405);
     }
 
+    // P1.M: closure middleware (the blanket `MiddlewareTrait for Fn(Request, Next)`)
+    // runs as part of the chain — Axum `from_fn` ergonomics with no boilerplate.
+    #[tokio::test]
+    async fn closure_middleware_runs_in_chain() {
+        use crate::middleware::Next;
+        use tower::ServiceExt;
+
+        let svc = Router::new()
+            .middleware(|req: Request, next: Next| async move {
+                let mut resp = next.run(req).await;
+                resp.headers_mut()
+                    .insert("x-mw", http::HeaderValue::from_static("1"));
+                resp
+            })
+            .get("/", || async { "ok" })
+            .into_service();
+
+        let req = http::Request::builder().uri("/").body(Body::empty()).unwrap();
+        let resp = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.headers().get("x-mw").unwrap(), "1");
+    }
+
+    // P1.M: RouterService composes under a real `tower` layer stack — the basis
+    // for inheriting the tower-http ecosystem (enabled by P1.1).
+    #[tokio::test]
+    async fn router_service_composes_with_tower_layer() {
+        use tower::{ServiceBuilder, ServiceExt};
+
+        let router = Router::new().get("/", || async { "ok" }).into_service();
+        let svc = ServiceBuilder::new()
+            .map_response(|mut resp: Response| {
+                resp.headers_mut()
+                    .insert("x-wrapped", http::HeaderValue::from_static("1"));
+                resp
+            })
+            .service(router);
+
+        let req = http::Request::builder().uri("/").body(Body::empty()).unwrap();
+        let resp = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(resp.headers().get("x-wrapped").unwrap(), "1");
+    }
+
     #[tokio::test]
     async fn head_falls_back_to_get() {
         let r = build(Router::new().get("/", || async { "hello" }));
