@@ -18,11 +18,15 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use http::Method;
+use http_body_util::BodyExt;
 use smallvec::SmallVec;
 
-use crate::handler::{into_boxed, AnyState, BoxedHandler, ErasedHandler, Handler, Request, Response, StateMap};
+use crate::handler::{
+    into_boxed, AnyState, Body, BoxedHandler, ErasedHandler, Handler, Request, Response, StateMap,
+};
 use crate::middleware::{self, MiddlewareTrait};
 
 // ---------------------------------------------------------------------------
@@ -753,6 +757,70 @@ impl Default for Router {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RouterService — Router as a `tower::Service` (P1.1, the keystone)
+// ---------------------------------------------------------------------------
+
+/// A compiled, cloneable [`tower::Service`] produced by [`Router::into_service`].
+///
+/// This is the composable, testable form of a [`Router`]: it implements
+/// `tower_service::Service<http::Request<Body>>` with `Error = Infallible`
+/// (like Axum), so it composes with `tower` / `tower-http` layers and supports
+/// `ServiceExt::oneshot` testing.
+///
+/// The request body is buffered at the boundary today; streaming request bodies
+/// land in P1.2 (the boundary type is already `http::Request<Body>` so that
+/// change is internal).
+#[derive(Clone)]
+pub struct RouterService {
+    dispatch: crate::app::DispatchChain,
+    state: Arc<StateMap>,
+}
+
+impl Router {
+    /// Freeze this router into a [`RouterService`] — a `tower::Service` carrying
+    /// the full middleware chain, route table, state, and fallback.
+    pub fn into_service(mut self) -> RouterService {
+        self.ensure_built();
+        // State is injected into each request at the boundary (handlers extract
+        // it from the request's state map); `build_dispatch` itself does not read
+        // `state_map`, so moving it out here is sound.
+        let state = Arc::new(std::mem::take(&mut self.state_map));
+        let dispatch = crate::app::build_dispatch(Arc::new(self));
+        RouterService { dispatch, state }
+    }
+}
+
+impl tower_service::Service<http::Request<Body>> for RouterService {
+    type Response = Response;
+    type Error = std::convert::Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // The router leaf is always ready. Backpressure-capable layers
+        // (rate-limit, load-shed, buffer) propagate readiness above it once the
+        // middleware chain is Tower-native (P1.M).
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<Body>) -> Self::Future {
+        let dispatch = Arc::clone(&self.dispatch);
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let (parts, body) = req.into_parts();
+            // `Body`'s error type is `Infallible`, so collection cannot fail.
+            let bytes = body
+                .collect()
+                .await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            let neutron_req =
+                Request::with_state(parts.method, parts.uri, parts.headers, bytes, state);
+            Ok(dispatch(neutron_req).await)
+        })
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -924,6 +992,63 @@ mod tests {
             Some(true),
             "resolve() before build() must return Err(NotBuilt) without panicking"
         );
+    }
+
+    // P1.1: RouterService is a tower::Service with the contract associated types.
+    #[test]
+    fn router_is_tower_service() {
+        fn assert_service<S>()
+        where
+            S: tower_service::Service<
+                http::Request<Body>,
+                Response = Response,
+                Error = std::convert::Infallible,
+            >,
+        {
+        }
+        assert_service::<RouterService>();
+    }
+
+    // P1.1: dispatch through into_service() + ServiceExt::oneshot runs the real
+    // route table + middleware chain and returns the handler's response.
+    #[tokio::test]
+    async fn router_oneshot_dispatch() {
+        use tower::ServiceExt;
+
+        let svc = Router::new()
+            .get("/hi", || async { "hello" })
+            .into_service();
+
+        let req = http::Request::builder()
+            .method(Method::GET)
+            .uri("/hi")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"hello");
+    }
+
+    // P1.1: a 405 routed through the service still carries the Allow header.
+    #[tokio::test]
+    async fn router_service_405_has_allow() {
+        use tower::ServiceExt;
+
+        let svc = Router::new()
+            .get("/x", || async { "g" })
+            .into_service();
+        let req = http::Request::builder()
+            .method(Method::DELETE)
+            .uri("/x")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::METHOD_NOT_ALLOWED);
+        let allow = resp.headers().get(http::header::ALLOW).unwrap().to_str().unwrap();
+        assert!(allow.contains("GET"), "Allow header was {allow:?}");
     }
 
     #[tokio::test]
