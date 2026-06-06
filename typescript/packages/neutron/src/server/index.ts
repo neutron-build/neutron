@@ -649,7 +649,13 @@ export async function createServer(options: NeutronServerOptions = {}) {
     server,
     close: async () => {
       await ssrServer?.close();
-      server.close();
+      // Await server.close's callback so in-flight requests actually drain
+      // (the previous fire-and-forget resolved before any draining). Close idle
+      // keep-alive sockets so they don't hold the drain open indefinitely.
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+        (server as { closeIdleConnections?: () => void }).closeIdleConnections?.();
+      });
     },
     url: `http://${host}:${port}`,
   };
@@ -2067,17 +2073,37 @@ export async function startServer(options: NeutronServerOptions = {}) {
   console.log(`  Local:   ${url}\n`);
   console.log(`  Press Ctrl+C to stop\n`);
 
+  // Graceful shutdown with a bounded drain (FRAMEWORK_CONTRACT.md: 30s).
+  const SHUTDOWN_TIMEOUT_MS = 30_000;
   let shuttingDown = false;
-  const shutdown = () => {
+  const shutdown = (signal: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
 
-    console.log("\nShutting down...");
-    void close().finally(() => {
-      process.exit(0);
-    });
+    console.log(
+      `\nReceived ${signal}, draining in-flight requests (up to ${
+        SHUTDOWN_TIMEOUT_MS / 1000
+      }s)...`,
+    );
+    const forceExit = setTimeout(() => {
+      console.error("Drain timed out; forcing exit.");
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS);
+
+    void close().then(
+      () => {
+        clearTimeout(forceExit);
+        console.log("Drained cleanly.");
+        process.exit(0);
+      },
+      (err) => {
+        clearTimeout(forceExit);
+        console.error("Shutdown error:", err);
+        process.exit(1);
+      },
+    );
   };
 
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }

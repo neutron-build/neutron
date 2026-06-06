@@ -155,6 +155,30 @@ describe("protocol e2e", () => {
     }
   });
 
+  it("close() drains and resolves without hanging on idle keep-alive sockets", async () => {
+    const port = await getFreePort();
+    const srv = await createServer({
+      host: "127.0.0.1",
+      port,
+      rootDir: fixtureRoot,
+      distDir: "dist",
+      routesDir: "src/routes",
+      compress: false,
+    });
+    const url = `http://127.0.0.1:${port}`;
+    const res = await fetch(`${url}/`); // leaves an idle keep-alive socket
+    await res.text();
+
+    // close() must await the drain AND close idle sockets, so it resolves
+    // rather than hanging on the keep-alive connection.
+    await Promise.race([
+      srv.close(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("close() hung on idle socket")), 5000),
+      ),
+    ]);
+  });
+
   it("serves static and app responses with correct etag/head/304 semantics", async () => {
     const staticGet = await fetch(`${baseUrl}/`);
     expect(staticGet.status).toBe(200);
