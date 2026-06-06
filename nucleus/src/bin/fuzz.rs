@@ -639,6 +639,9 @@ fn main_impl() {
     let mut iterations: usize = 2000;
     let mut max_report: usize = 15;
     let mut queries_per: usize = 25;
+    // 0 = default random (8..47 rows). Set high (e.g. 9000) to cross the
+    // 8192-row zone-map granule boundary and exercise multi-granule pruning.
+    let mut fixed_rows: usize = 0;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -647,6 +650,7 @@ fn main_impl() {
             "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
             "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
             "--queries" => { i += 1; queries_per = args[i].parse().unwrap(); }
+            "--rows" => { i += 1; fixed_rows = args[i].parse().unwrap(); }
             _ => {}
         }
         i += 1;
@@ -666,7 +670,7 @@ fn main_impl() {
     'outer: for iter in 0..iterations {
         let mut rng = Rng(seed.wrapping_add(iter as u64).wrapping_mul(0x100000001B3));
         let schema = Schema::random(&mut rng);
-        let rows = 8 + rng.below(40);
+        let rows = if fixed_rows > 0 { fixed_rows } else { 8 + rng.below(40) };
         let ddl = schema.ddl();
         let inserts = gen_inserts(&schema, &mut rng, rows);
         let mut next_id = rows as i64 + 1;

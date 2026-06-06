@@ -373,6 +373,10 @@ impl KvStore {
             Some(e) => match e.value.as_ref() {
                 Value::Int32(n) => *n as i64,
                 Value::Int64(n) => *n,
+                // Redis stores all string values as strings, so `SET k 5; INCR k`
+                // must parse the integer-formatted string. Non-integer strings
+                // (and other types) are an error, matching Redis.
+                Value::Text(s) => s.parse::<i64>().map_err(|_| KvError::NotAnInteger)?,
                 _ => return Err(KvError::NotAnInteger),
             },
         };
