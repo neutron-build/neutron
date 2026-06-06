@@ -13,6 +13,38 @@ use crate::error::NucleusError;
 // NucleusConfig
 // ---------------------------------------------------------------------------
 
+/// TLS negotiation policy for Nucleus/Postgres connections (libpq `sslmode`).
+///
+/// With the `tls` feature (default-on), TLS uses rustls with the OS trust store
+/// and full certificate-chain + hostname verification. We deliberately do not
+/// offer an "encrypt but don't verify" mode: `Require` also verifies, so there
+/// is no silent downgrade to unauthenticated TLS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SslMode {
+    /// Never use TLS — plaintext only.
+    Disable,
+    /// Use TLS if the server offers it, otherwise plaintext. **Default.**
+    #[default]
+    Prefer,
+    /// Require TLS (and verify the certificate); fail if unavailable.
+    Require,
+    /// Require TLS with full chain + hostname verification.
+    VerifyFull,
+}
+
+impl SslMode {
+    /// The libpq `sslmode` token tokio-postgres understands. tokio-postgres only
+    /// knows `disable`/`prefer`/`require`; `VerifyFull`'s extra strictness is
+    /// enforced by the rustls verifier (chain + SNI hostname), not the token.
+    fn as_pg(self) -> &'static str {
+        match self {
+            SslMode::Disable => "disable",
+            SslMode::Prefer => "prefer",
+            SslMode::Require | SslMode::VerifyFull => "require",
+        }
+    }
+}
+
 /// Connection parameters for a Nucleus (or any pgwire-compatible) server.
 #[derive(Debug, Clone)]
 pub struct NucleusConfig {
@@ -23,6 +55,8 @@ pub struct NucleusConfig {
     pub password: String,
     /// Maximum concurrent connections (default: 16).
     pub max_size: usize,
+    /// TLS policy (default: [`SslMode::Prefer`]).
+    pub sslmode: SslMode,
 }
 
 impl Default for NucleusConfig {
@@ -34,6 +68,7 @@ impl Default for NucleusConfig {
             user: "postgres".to_string(),
             password: String::new(),
             max_size: 16,
+            sslmode: SslMode::default(),
         }
     }
 }
@@ -63,10 +98,21 @@ impl NucleusConfig {
         self
     }
 
+    /// Set the TLS policy (default: [`SslMode::Prefer`]).
+    pub fn sslmode(mut self, mode: SslMode) -> Self {
+        self.sslmode = mode;
+        self
+    }
+
     pub(crate) fn connect_string(&self) -> String {
         format!(
-            "host={} port={} dbname={} user={} password={}",
-            self.host, self.port, self.dbname, self.user, self.password,
+            "host={} port={} dbname={} user={} password={} sslmode={}",
+            self.host,
+            self.port,
+            self.dbname,
+            self.user,
+            self.password,
+            self.sslmode.as_pg(),
         )
     }
 }
@@ -116,6 +162,54 @@ pub(crate) struct PoolInner {
     pub(crate) config: NucleusConfig,
     pub(crate) semaphore: Arc<Semaphore>,
     pub(crate) idle: Mutex<VecDeque<ClientWithDriver>>,
+    /// Lazily-built, cached TLS connector (native roots loaded once, not per
+    /// connection). `Err` if TLS setup failed; surfaced at connect time.
+    #[cfg(feature = "tls")]
+    tls: std::sync::OnceLock<Result<tokio_postgres_rustls::MakeRustlsConnect, String>>,
+}
+
+#[cfg(feature = "tls")]
+fn build_rustls_connector() -> Result<tokio_postgres_rustls::MakeRustlsConnect, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    let loaded = rustls_native_certs::load_native_certs();
+    for cert in loaded.certs {
+        // Skip individual malformed certs rather than failing the whole store.
+        let _ = roots.add(cert);
+    }
+    if roots.is_empty() {
+        return Err("no usable native root certificates were found".to_string());
+    }
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("rustls protocol versions: {e}"))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(config))
+}
+
+#[cfg(feature = "tls")]
+impl PoolInner {
+    /// The shared TLS connector, built once on first use.
+    fn tls_connector(&self) -> Result<tokio_postgres_rustls::MakeRustlsConnect, NucleusError> {
+        self.tls
+            .get_or_init(build_rustls_connector)
+            .clone()
+            .map_err(NucleusError::Tls)
+    }
+}
+
+/// Spawn the background driver that pumps a tokio-postgres connection. The
+/// returned `JoinHandle` is tracked by [`ClientWithDriver`] and aborted on drop.
+fn spawn_driver<C>(conn: C) -> JoinHandle<()>
+where
+    C: std::future::Future<Output = Result<(), tokio_postgres::Error>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            tracing::error!("Nucleus connection driver exited: {e}");
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +243,8 @@ impl NucleusPool {
             semaphore: sem,
             idle: Mutex::new(VecDeque::new()),
             config,
+            #[cfg(feature = "tls")]
+            tls: std::sync::OnceLock::new(),
         }))
     }
 
@@ -179,20 +275,40 @@ impl NucleusPool {
 
     async fn new_client(&self) -> Result<ClientWithDriver, NucleusError> {
         let cs = self.0.config.connect_string();
+        let sslmode = self.0.config.sslmode;
+
+        // TLS path: anything other than `disable` negotiates TLS via rustls
+        // (the server makes the final call for `prefer`). The connector verifies
+        // the certificate chain + hostname against the OS trust store.
+        #[cfg(feature = "tls")]
+        if sslmode != SslMode::Disable {
+            let connector = self.0.tls_connector()?;
+            let (client, conn) = tokio_postgres::connect(&cs, connector)
+                .await
+                .map_err(NucleusError::Connect)?;
+            return Ok(ClientWithDriver {
+                client,
+                driver: spawn_driver(conn),
+            });
+        }
+
+        // Without the `tls` feature, a strict mode is unsatisfiable — fail loudly
+        // rather than silently sending credentials in cleartext.
+        #[cfg(not(feature = "tls"))]
+        if matches!(sslmode, SslMode::Require | SslMode::VerifyFull) {
+            return Err(NucleusError::Tls(
+                "sslmode=require/verify-full requested but the `tls` feature is disabled".to_string(),
+            ));
+        }
+
+        // Plaintext: `sslmode=disable`, or `prefer` with the `tls` feature off.
         let (client, conn) = tokio_postgres::connect(&cs, NoTls)
             .await
             .map_err(NucleusError::Connect)?;
-
-        // Drive the connection in the background; track its JoinHandle so we
-        // can abort it on Client drop / pool teardown rather than relying on
-        // the runtime to clean up orphaned tasks.
-        let driver = tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                tracing::error!("Nucleus connection driver exited: {e}");
-            }
-        });
-
-        Ok(ClientWithDriver { client, driver })
+        Ok(ClientWithDriver {
+            client,
+            driver: spawn_driver(conn),
+        })
     }
 }
 
@@ -253,6 +369,24 @@ mod tests {
         assert!(cs.contains("dbname=mydb"));
         assert!(cs.contains("user=alice"));
         assert!(cs.contains("password=secret"));
+    }
+
+    // P0.0: sslmode is threaded into the connection string and defaults to prefer.
+    #[test]
+    fn sslmode_defaults_to_prefer() {
+        assert_eq!(NucleusConfig::default().sslmode, SslMode::Prefer);
+        assert!(NucleusConfig::default().connect_string().contains("sslmode=prefer"));
+    }
+
+    #[test]
+    fn sslmode_maps_to_pg_token() {
+        let cs = |m: SslMode| NucleusConfig::default().sslmode(m).connect_string();
+        assert!(cs(SslMode::Disable).contains("sslmode=disable"));
+        assert!(cs(SslMode::Prefer).contains("sslmode=prefer"));
+        assert!(cs(SslMode::Require).contains("sslmode=require"));
+        // verify-full's extra strictness is enforced by the rustls verifier, so
+        // it shares the `require` libpq token.
+        assert!(cs(SslMode::VerifyFull).contains("sslmode=require"));
     }
 
     #[test]

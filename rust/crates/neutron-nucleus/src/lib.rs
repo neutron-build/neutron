@@ -79,4 +79,4 @@ pub use client::{Features, NucleusClient};
 pub use db::{Db, NucleusTransaction};
 pub use error::NucleusError;
 pub use migrate::migrate;
-pub use pool::{NucleusConfig, NucleusPool, PooledConn};
+pub use pool::{NucleusConfig, NucleusPool, PooledConn, SslMode};
