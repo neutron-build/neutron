@@ -1,10 +1,12 @@
 package neutron
 
 import (
+	"bytes"
 	"compress/gzip"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -239,5 +241,48 @@ func TestRateLimitMiddleware(t *testing.T) {
 	handler.ServeHTTP(w, r)
 	if w.Code != http.StatusTooManyRequests {
 		t.Errorf("second request: status = %d, want 429", w.Code)
+	}
+}
+
+// P1: DefaultStack applies the contract middleware order. The key invariant —
+// RequestID strictly before Logging — is verified by checking the log line
+// carries a non-empty request_id (Logger ran after RequestID set it).
+func TestDefaultStackEnforcesContractOrder(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	stack := DefaultStack(DefaultStackConfig{
+		Logger:   logger,
+		Compress: true,
+		Timeout:  time.Second,
+	})
+	// First three are always-on in contract order.
+	if len(stack) < 3 {
+		t.Fatalf("stack has %d layers, want >= 3", len(stack))
+	}
+
+	sawID := false
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if RequestIDFromContext(r.Context()) != "" {
+			sawID = true
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	var wrapped http.Handler = h
+	for i := len(stack) - 1; i >= 0; i-- {
+		wrapped = stack[i](wrapped)
+	}
+	rec := httptest.NewRecorder()
+	wrapped.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+
+	if !sawID {
+		t.Error("RequestID did not run before the handler")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "request_id=") {
+		t.Errorf("Logger did not run; log = %q", out)
+	}
+	if strings.Contains(out, `request_id=""`) {
+		t.Error("request_id empty in log — RequestID must precede Logging")
 	}
 }
