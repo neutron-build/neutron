@@ -63,6 +63,12 @@ func ErrNotFound(detail string) *AppError {
 	return newAppError(http.StatusNotFound, "not-found", "Not Found", detail)
 }
 
+// ErrMethodNotAllowed builds a 405. The caller should also set the Allow header
+// (RFC 7231 §6.5.5) on the response.
+func ErrMethodNotAllowed(detail string) *AppError {
+	return newAppError(http.StatusMethodNotAllowed, "method-not-allowed", "Method Not Allowed", detail)
+}
+
 func ErrConflict(detail string) *AppError {
 	return newAppError(http.StatusConflict, "conflict", "Conflict", detail)
 }

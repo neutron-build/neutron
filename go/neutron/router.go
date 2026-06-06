@@ -1,7 +1,9 @@
 package neutron
 
 import (
+	"bufio"
 	"fmt"
+	"net"
 	"net/http"
 	"reflect"
 	"strings"
@@ -119,8 +121,70 @@ func (r *Router) register(method, pattern string, handler http.Handler, inType, 
 }
 
 // ServeHTTP implements http.Handler.
+//
+// P0.3: the std ServeMux replies to unmatched routes with plain text, violating
+// the framework's own RFC 7807 contract. We render 404 and 405 as
+// application/problem+json instead. Go 1.22's mux returns an empty pattern when
+// no route matches the path (genuine 404) and a non-empty pattern when the path
+// matches but the method does not (405) — so we distinguish them via Handler().
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	r.mux.ServeHTTP(w, req)
+	// Serve via the mux (it populates req.PathValue) wrapped in an interceptor
+	// that rewrites the mux's built-in plain-text 404/405 as problem+json. The
+	// interceptor forwards Flush/Hijack/Unwrap so SSE/WebSocket are unaffected.
+	r.mux.ServeHTTP(&errInterceptor{ResponseWriter: w, req: req}, req)
+}
+
+// errInterceptor rewrites the std ServeMux's built-in plain-text 404/405 replies
+// as RFC 7807 problem+json. It only rewrites when the response content-type is
+// not already problem+json — so handlers that produce their own errors (via
+// WriteError) pass through untouched. Go 1.22's mux returns an empty pattern for
+// both genuine 404s and method-mismatch 405s, so the status code + the mux-set
+// Allow header are the reliable signals, not the pattern.
+type errInterceptor struct {
+	http.ResponseWriter
+	req       *http.Request
+	rewritten bool
+}
+
+func (w *errInterceptor) WriteHeader(code int) {
+	if (code == http.StatusNotFound || code == http.StatusMethodNotAllowed) && !w.rewritten {
+		ct := w.ResponseWriter.Header().Get("Content-Type")
+		if !strings.Contains(ct, "application/problem+json") {
+			w.rewritten = true
+			// The mux sets the Allow header before WriteHeader; WriteError keeps it.
+			if code == http.StatusMethodNotAllowed {
+				WriteError(w.ResponseWriter, w.req,
+					ErrMethodNotAllowed("The request method is not supported for this resource."))
+			} else {
+				WriteError(w.ResponseWriter, w.req,
+					ErrNotFound("No route matches the requested path."))
+			}
+			return
+		}
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *errInterceptor) Write(b []byte) (int, error) {
+	if w.rewritten {
+		return len(b), nil // swallow the std plain-text body
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *errInterceptor) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *errInterceptor) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *errInterceptor) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("neutron: underlying ResponseWriter does not support Hijack")
 }
 
 func applyMiddleware(h http.Handler, mw []Middleware) http.Handler {
