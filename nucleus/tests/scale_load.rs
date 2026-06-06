@@ -58,7 +58,13 @@ async fn scale_one_million_rows() {
 
     // COUNT(*) — correctness + timing
     let t = Instant::now();
-    let cnt = match ex.execute("SELECT COUNT(*) FROM big").await.unwrap().pop().unwrap() {
+    let cnt = match ex
+        .execute("SELECT COUNT(*) FROM big")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+    {
         ExecResult::Select { rows, .. } => i64v(&rows[0][0]),
         o => panic!("{o:?}"),
     };
@@ -67,7 +73,13 @@ async fn scale_one_million_rows() {
 
     // SUM(amt) — correctness vs computed expectation
     let t = Instant::now();
-    let sum = match ex.execute("SELECT SUM(amt) FROM big").await.unwrap().pop().unwrap() {
+    let sum = match ex
+        .execute("SELECT SUM(amt) FROM big")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+    {
         ExecResult::Select { rows, .. } => i64v(&rows[0][0]),
         o => panic!("{o:?}"),
     };
@@ -86,7 +98,10 @@ async fn scale_one_million_rows() {
         ExecResult::Select { rows, .. } => i64v(&rows[0][0]),
         o => panic!("{o:?}"),
     };
-    eprintln!("COUNT WHERE bucket=3 = {gc} in {:.3}s", t.elapsed().as_secs_f64());
+    eprintln!(
+        "COUNT WHERE bucket=3 = {gc} in {:.3}s",
+        t.elapsed().as_secs_f64()
+    );
     assert_eq!(gc, N / 10, "1/10 of rows have bucket=3");
 
     // Point lookup
@@ -101,7 +116,10 @@ async fn scale_one_million_rows() {
         ExecResult::Select { rows, .. } => i64v(&rows[0][0]),
         o => panic!("{o:?}"),
     };
-    eprintln!("point lookup id=987654 -> amt={pt} in {:.3}s", t.elapsed().as_secs_f64());
+    eprintln!(
+        "point lookup id=987654 -> amt={pt} in {:.3}s",
+        t.elapsed().as_secs_f64()
+    );
     assert_eq!(pt, (987654 % 1000) + 1);
 
     // GROUP BY
@@ -116,7 +134,10 @@ async fn scale_one_million_rows() {
         ExecResult::Select { rows, .. } => rows.len(),
         o => panic!("{o:?}"),
     };
-    eprintln!("GROUP BY bucket -> {groups} groups in {:.3}s", t.elapsed().as_secs_f64());
+    eprintln!(
+        "GROUP BY bucket -> {groups} groups in {:.3}s",
+        t.elapsed().as_secs_f64()
+    );
     assert_eq!(groups, 10, "10 distinct buckets");
 
     eprintln!("SCALE TEST PASSED — 1M rows, all aggregates exact.");
