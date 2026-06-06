@@ -599,13 +599,13 @@ where
 // Zero extractors: async fn() -> impl IntoResponse
 impl<F, Fut, Res> Handler<()> for F
 where
-    F: Fn() -> Fut + Send + Sync + 'static,
+    F: Fn() -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Res> + Send + 'static,
     Res: IntoResponse,
 {
     fn call(&self, _req: Request) -> Pin<Box<dyn Future<Output = Response> + Send>> {
-        let fut = (self)();
-        Box::pin(async move { fut.await.into_response() })
+        let this = self.clone();
+        Box::pin(async move { (this)().await.into_response() })
     }
 }
 
@@ -615,20 +615,23 @@ macro_rules! impl_handler {
         #[allow(non_snake_case)]
         impl<F, Fut, Res, $($T,)+> Handler<($($T,)+)> for F
         where
-            F: Fn($($T,)+) -> Fut + Send + Sync + 'static,
+            F: Fn($($T,)+) -> Fut + Clone + Send + Sync + 'static,
             Fut: Future<Output = Res> + Send + 'static,
             Res: IntoResponse,
             $($T: FromRequest + 'static,)+
         {
             fn call(&self, req: Request) -> Pin<Box<dyn Future<Output = Response> + Send>> {
-                $(
-                    let $T = match $T::from_request(&req) {
-                        Ok(v) => v,
-                        Err(e) => return Box::pin(async move { e }),
-                    };
-                )+
-                let fut = (self)($($T,)+);
-                Box::pin(async move { fut.await.into_response() })
+                let this = self.clone();
+                Box::pin(async move {
+                    let mut req = req;
+                    $(
+                        let $T = match $T::from_request(&mut req).await {
+                            Ok(v) => v,
+                            Err(e) => return e,
+                        };
+                    )+
+                    (this)($($T,)+).await.into_response()
+                })
             }
         }
     };

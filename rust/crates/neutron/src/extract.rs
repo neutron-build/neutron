@@ -66,16 +66,21 @@ fn reject(status: StatusCode, detail: impl Into<String>) -> Response {
 /// A blanket impl automatically satisfies [`FromRequest`] for all
 /// `FromRequestParts` types — no extra code required.
 pub trait FromRequestParts: Sized + Send {
-    fn from_parts(req: &Request) -> Result<Self, Response>;
+    fn from_parts(
+        req: &Request,
+    ) -> impl std::future::Future<Output = Result<Self, Response>> + Send;
 }
 
 /// Extractor trait for types that may consume the request body.
 ///
 /// All [`FromRequestParts`] types automatically implement this trait via the
 /// blanket impl below. Only implement `FromRequest` directly when you need
-/// access to the buffered body bytes (`Bytes`, `String`, `Json<T>`, etc.).
+/// access to the request body (`Bytes`, `String`, `Json<T>`, etc.).
 pub trait FromRequest: Sized + Send {
-    fn from_request(req: &Request) -> Result<Self, Response>;
+    // `&mut Request` — body extractors need to mutate (take/stream) the body.
+    fn from_request(
+        req: &mut Request,
+    ) -> impl std::future::Future<Output = Result<Self, Response>> + Send;
 }
 
 /// Blanket impl: every body-free extractor is also a full extractor.
@@ -84,9 +89,9 @@ pub trait FromRequest: Sized + Send {
 /// can freely mix `Path`, `State`, `Extension`, `Json`, `Form`, etc. without
 /// any special casing.
 impl<T: FromRequestParts> FromRequest for T {
-    #[inline]
-    fn from_request(req: &Request) -> Result<Self, Response> {
-        T::from_parts(req)
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
+        // parts extractors don't touch the body; immutable reborrow is fine.
+        T::from_parts(req).await
     }
 }
 
@@ -161,7 +166,7 @@ impl_path_param_tuple!(7; A 0, B 1, C 2, D 3, E 4, F 5, G 6);
 impl_path_param_tuple!(8; A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7);
 
 impl<T: PathParam + Send + 'static> FromRequestParts for Path<T> {
-    fn from_parts(req: &Request) -> Result<Self, Response> {
+    async fn from_parts(req: &Request) -> Result<Self, Response> {
         T::from_params(req.params())
             .map(Path)
             .map_err(|msg| reject(StatusCode::BAD_REQUEST, msg))
@@ -180,7 +185,7 @@ pub struct Query<T>(pub T);
 
 #[cfg(feature = "form")]
 impl<T: DeserializeOwned + Send + 'static> FromRequestParts for Query<T> {
-    fn from_parts(req: &Request) -> Result<Self, Response> {
+    async fn from_parts(req: &Request) -> Result<Self, Response> {
         let query = req.uri().query().unwrap_or("");
         serde_urlencoded::from_str(query)
             .map(Query)
@@ -205,7 +210,7 @@ impl<T: DeserializeOwned + Send + 'static> FromRequestParts for Query<T> {
 pub struct State<T>(pub T);
 
 impl<T: Clone + Send + Sync + 'static> FromRequestParts for State<T> {
-    fn from_parts(req: &Request) -> Result<Self, Response> {
+    async fn from_parts(req: &Request) -> Result<Self, Response> {
         req.get_state::<T>()
             .cloned()
             .map(State)
@@ -224,19 +229,19 @@ impl<T: Clone + Send + Sync + 'static> FromRequestParts for State<T> {
 // ---------------------------------------------------------------------------
 
 impl FromRequestParts for Method {
-    fn from_parts(req: &Request) -> Result<Self, Response> {
+    async fn from_parts(req: &Request) -> Result<Self, Response> {
         Ok(req.method().clone())
     }
 }
 
 impl FromRequestParts for Uri {
-    fn from_parts(req: &Request) -> Result<Self, Response> {
+    async fn from_parts(req: &Request) -> Result<Self, Response> {
         Ok(req.uri().clone())
     }
 }
 
 impl FromRequestParts for HeaderMap {
-    fn from_parts(req: &Request) -> Result<Self, Response> {
+    async fn from_parts(req: &Request) -> Result<Self, Response> {
         Ok(req.headers().clone())
     }
 }
@@ -255,7 +260,7 @@ impl FromRequestParts for HeaderMap {
 pub struct ConnectInfo(pub SocketAddr);
 
 impl FromRequestParts for ConnectInfo {
-    fn from_parts(req: &Request) -> Result<Self, Response> {
+    async fn from_parts(req: &Request) -> Result<Self, Response> {
         req.remote_addr()
             .map(ConnectInfo)
             .ok_or_else(|| {
@@ -282,7 +287,7 @@ impl FromRequestParts for ConnectInfo {
 pub struct Extension<T>(pub T);
 
 impl<T: Clone + Send + Sync + 'static> FromRequestParts for Extension<T> {
-    fn from_parts(req: &Request) -> Result<Self, Response> {
+    async fn from_parts(req: &Request) -> Result<Self, Response> {
         req.get_extension::<T>()
             .cloned()
             .map(Extension)
@@ -302,14 +307,14 @@ impl<T: Clone + Send + Sync + 'static> FromRequestParts for Extension<T> {
 
 /// Raw request body as bytes.
 impl FromRequest for Bytes {
-    fn from_request(req: &Request) -> Result<Self, Response> {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
         Ok(req.body().clone())
     }
 }
 
 /// Request body decoded as UTF-8 text.
 impl FromRequest for String {
-    fn from_request(req: &Request) -> Result<Self, Response> {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
         String::from_utf8(req.body().to_vec())
             .map_err(|_| reject(StatusCode::BAD_REQUEST, "Request body is not valid UTF-8"))
     }
@@ -321,7 +326,7 @@ impl FromRequest for String {
 
 #[cfg(feature = "json")]
 impl<T: DeserializeOwned + Send + 'static> FromRequest for Json<T> {
-    fn from_request(req: &Request) -> Result<Self, Response> {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
         let content_type = req
             .headers()
             .get(http::header::CONTENT_TYPE)
@@ -374,7 +379,7 @@ pub struct Form<T>(pub T);
 
 #[cfg(feature = "form")]
 impl<T: DeserializeOwned + Send + 'static> FromRequest for Form<T> {
-    fn from_request(req: &Request) -> Result<Self, Response> {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
         let content_type = req
             .headers()
             .get(http::header::CONTENT_TYPE)
@@ -417,8 +422,8 @@ impl<T: DeserializeOwned + Send + 'static> FromRequest for Form<T> {
 pub struct Optional<T>(pub Option<T>);
 
 impl<T: FromRequestParts> FromRequestParts for Optional<T> {
-    fn from_parts(req: &Request) -> Result<Self, Response> {
-        match T::from_parts(req) {
+    async fn from_parts(req: &Request) -> Result<Self, Response> {
+        match T::from_parts(req).await {
             Ok(value) => Ok(Optional(Some(value))),
             Err(_) => Ok(Optional(None)),
         }
@@ -471,7 +476,7 @@ pub trait TypedHeaderValue: Sized + Send + Sync {
 pub struct TypedHeader<T: TypedHeaderValue>(pub T);
 
 impl<T: TypedHeaderValue + 'static> FromRequestParts for TypedHeader<T> {
-    fn from_parts(req: &Request) -> Result<Self, Response> {
+    async fn from_parts(req: &Request) -> Result<Self, Response> {
         let value = req
             .headers()
             .get(T::HEADER_NAME)
@@ -614,6 +619,19 @@ mod tests {
     use bytes::Bytes;
     use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use smallvec::SmallVec;
+
+    // Proves every extractor future is `Send` (required to box into the handler's
+    // `Pin<Box<dyn Future + Send>>`). If any extractor's future were !Send this
+    // would not compile.
+    #[test]
+    fn extractor_futures_are_send() {
+        fn assert_send<F: Send>(_: F) {}
+        let req = Request::new(Method::GET, "/".parse().unwrap(), HeaderMap::new(), Bytes::new());
+        assert_send(async move {
+            let mut r = req;
+            let _ = String::from_request(&mut r).await;
+        });
+    }
 
     /// Helper: build a minimal GET request.
     fn get_request(uri: &str) -> Request {
@@ -761,23 +779,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn path_extractor_success() {
+    #[tokio::test]
+    async fn path_extractor_success() {
         let req = request_with_params(vec![("id".into(), "99".into())]);
-        let Path(id) = ok_or_panic(Path::<u64>::from_parts(&req));
+        let Path(id) = ok_or_panic(Path::<u64>::from_parts(&req).await);
         assert_eq!(id, 99);
     }
 
-    #[test]
-    fn path_extractor_invalid_returns_400() {
+    #[tokio::test]
+    async fn path_extractor_invalid_returns_400() {
         let req = request_with_params(vec![("id".into(), "abc".into())]);
-        let err = err_or_panic(Path::<u64>::from_parts(&req));
+        let err = err_or_panic(Path::<u64>::from_parts(&req).await);
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     // P1.5: Path tuples beyond arity 3 (macro-generated up to 8).
-    #[test]
-    fn path_extractor_five_tuple() {
+    #[tokio::test]
+    async fn path_extractor_five_tuple() {
         let req = request_with_params(vec![
             ("a".into(), "1".into()),
             ("b".into(), "2".into()),
@@ -786,22 +804,22 @@ mod tests {
             ("e".into(), "5".into()),
         ]);
         let Path((a, b, c, d, e)) =
-            ok_or_panic(Path::<(u32, u32, u32, u8, i64)>::from_parts(&req));
+            ok_or_panic(Path::<(u32, u32, u32, u8, i64)>::from_parts(&req).await);
         assert_eq!((a, b, c, d, e), (1, 2, 3, 4, 5));
     }
 
-    #[test]
-    fn path_extractor_missing_returns_400() {
+    #[tokio::test]
+    async fn path_extractor_missing_returns_400() {
         let req = get_request("/test");
-        let err = err_or_panic(Path::<u64>::from_parts(&req));
+        let err = err_or_panic(Path::<u64>::from_parts(&req).await);
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     // --- Query extractor ---
 
     #[cfg(feature = "form")]
-    #[test]
-    fn query_extractor_success() {
+    #[tokio::test]
+    async fn query_extractor_success() {
         use serde::Deserialize;
 
         #[derive(Deserialize)]
@@ -811,14 +829,14 @@ mod tests {
         }
 
         let req = get_request("/items?page=2&limit=10");
-        let Query(params) = ok_or_panic(Query::<Params>::from_parts(&req));
+        let Query(params) = ok_or_panic(Query::<Params>::from_parts(&req).await);
         assert_eq!(params.page, 2);
         assert_eq!(params.limit, 10);
     }
 
     #[cfg(feature = "form")]
-    #[test]
-    fn query_extractor_empty_query_string() {
+    #[tokio::test]
+    async fn query_extractor_empty_query_string() {
         use serde::Deserialize;
 
         #[derive(Deserialize)]
@@ -828,13 +846,13 @@ mod tests {
         }
 
         let req = get_request("/items");
-        let Query(params) = ok_or_panic(Query::<Params>::from_parts(&req));
+        let Query(params) = ok_or_panic(Query::<Params>::from_parts(&req).await);
         assert!(params.page.is_none());
     }
 
     #[cfg(feature = "form")]
-    #[test]
-    fn query_extractor_bad_query_returns_400() {
+    #[tokio::test]
+    async fn query_extractor_bad_query_returns_400() {
         use serde::Deserialize;
 
         #[derive(Deserialize)]
@@ -843,14 +861,14 @@ mod tests {
         }
 
         let req = get_request("/items?page=notanumber");
-        let err = err_or_panic(Query::<Params>::from_parts(&req));
+        let err = err_or_panic(Query::<Params>::from_parts(&req).await);
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     // --- State extractor ---
 
-    #[test]
-    fn state_extractor_success() {
+    #[tokio::test]
+    async fn state_extractor_success() {
         #[derive(Clone, Debug, PartialEq)]
         struct AppConfig {
             name: String,
@@ -862,45 +880,45 @@ mod tests {
         let mut req = get_request("/test");
         req.set_state(state);
 
-        let State(extracted) = ok_or_panic(State::<AppConfig>::from_parts(&req));
+        let State(extracted) = ok_or_panic(State::<AppConfig>::from_parts(&req).await);
         assert_eq!(extracted, cfg);
     }
 
-    #[test]
-    fn state_extractor_missing_returns_500() {
+    #[tokio::test]
+    async fn state_extractor_missing_returns_500() {
         let req = get_request("/test");
-        let err = err_or_panic(State::<String>::from_parts(&req));
+        let err = err_or_panic(State::<String>::from_parts(&req).await);
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     // --- Method extractor ---
 
-    #[test]
-    fn method_extractor() {
+    #[tokio::test]
+    async fn method_extractor() {
         let req = Request::new(
             Method::POST,
             "/test".parse().unwrap(),
             HeaderMap::new(),
             Bytes::new(),
         );
-        let method = ok_or_panic(Method::from_parts(&req));
+        let method = ok_or_panic(Method::from_parts(&req).await);
         assert_eq!(method, Method::POST);
     }
 
     // --- Uri extractor ---
 
-    #[test]
-    fn uri_extractor() {
+    #[tokio::test]
+    async fn uri_extractor() {
         let req = get_request("/api/v1/users?page=1");
-        let uri = ok_or_panic(<Uri as FromRequestParts>::from_parts(&req));
+        let uri = ok_or_panic(<Uri as FromRequestParts>::from_parts(&req).await);
         assert_eq!(uri.path(), "/api/v1/users");
         assert_eq!(uri.query(), Some("page=1"));
     }
 
     // --- HeaderMap extractor ---
 
-    #[test]
-    fn headermap_extractor() {
+    #[tokio::test]
+    async fn headermap_extractor() {
         let mut headers = HeaderMap::new();
         headers.insert("x-custom", HeaderValue::from_static("hello"));
         let req = Request::new(
@@ -909,97 +927,97 @@ mod tests {
             headers,
             Bytes::new(),
         );
-        let extracted = ok_or_panic(HeaderMap::from_parts(&req));
+        let extracted = ok_or_panic(HeaderMap::from_parts(&req).await);
         assert_eq!(extracted.get("x-custom").unwrap(), "hello");
     }
 
     // --- Extension extractor ---
 
-    #[test]
-    fn extension_extractor_success() {
+    #[tokio::test]
+    async fn extension_extractor_success() {
         #[derive(Clone, Debug, PartialEq)]
         struct UserId(u64);
 
         let mut req = get_request("/test");
         req.set_extension(UserId(42));
 
-        let Extension(user_id) = ok_or_panic(Extension::<UserId>::from_parts(&req));
+        let Extension(user_id) = ok_or_panic(Extension::<UserId>::from_parts(&req).await);
         assert_eq!(user_id, UserId(42));
     }
 
-    #[test]
-    fn extension_extractor_missing_returns_500() {
+    #[tokio::test]
+    async fn extension_extractor_missing_returns_500() {
         #[derive(Clone)]
         struct MissingType;
 
         let req = get_request("/test");
-        let err = err_or_panic(Extension::<MissingType>::from_parts(&req));
+        let err = err_or_panic(Extension::<MissingType>::from_parts(&req).await);
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     // --- ConnectInfo extractor ---
 
-    #[test]
-    fn connect_info_extractor_success() {
+    #[tokio::test]
+    async fn connect_info_extractor_success() {
         let mut req = get_request("/test");
         let addr: SocketAddr = "192.168.1.1:12345".parse().unwrap();
         req.set_remote_addr(addr);
 
-        let ConnectInfo(extracted) = ok_or_panic(ConnectInfo::from_parts(&req));
+        let ConnectInfo(extracted) = ok_or_panic(ConnectInfo::from_parts(&req).await);
         assert_eq!(extracted, addr);
     }
 
-    #[test]
-    fn connect_info_extractor_missing_returns_500() {
+    #[tokio::test]
+    async fn connect_info_extractor_missing_returns_500() {
         let req = get_request("/test");
-        let err = err_or_panic(ConnectInfo::from_parts(&req));
+        let err = err_or_panic(ConnectInfo::from_parts(&req).await);
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     // --- Body extractors: Bytes, String ---
 
-    #[test]
-    fn bytes_extractor() {
+    #[tokio::test]
+    async fn bytes_extractor() {
         let body_data = Bytes::from("hello world");
-        let req = Request::new(
+        let mut req = Request::new(
             Method::POST,
             "/test".parse().unwrap(),
             HeaderMap::new(),
             body_data.clone(),
         );
-        let extracted = ok_or_panic(Bytes::from_request(&req));
+        let extracted = ok_or_panic(Bytes::from_request(&mut req).await);
         assert_eq!(extracted, body_data);
     }
 
-    #[test]
-    fn string_extractor_valid_utf8() {
-        let req = Request::new(
+    #[tokio::test]
+    async fn string_extractor_valid_utf8() {
+        let mut req = Request::new(
             Method::POST,
             "/test".parse().unwrap(),
             HeaderMap::new(),
             Bytes::from("hello"),
         );
-        let extracted = ok_or_panic(String::from_request(&req));
+        let extracted = ok_or_panic(String::from_request(&mut req).await);
         assert_eq!(extracted, "hello");
     }
 
-    #[test]
-    fn string_extractor_invalid_utf8_returns_400() {
-        let req = Request::new(
+    #[tokio::test]
+    async fn string_extractor_invalid_utf8_returns_400() {
+        let mut req = Request::new(
             Method::POST,
             "/test".parse().unwrap(),
             HeaderMap::new(),
             Bytes::from_static(&[0xFF, 0xFE]),
         );
-        let err = err_or_panic(String::from_request(&req));
+        let err = err_or_panic(String::from_request(&mut req).await);
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     // --- Json extractor ---
 
     #[cfg(feature = "json")]
-    #[test]
-    fn json_extractor_success() {
+    #[tokio::test]
+    async fn json_extractor_success() {
         use serde::Deserialize;
 
         #[derive(Deserialize, Debug, PartialEq)]
@@ -1012,14 +1030,14 @@ mod tests {
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         let body = Bytes::from(r#"{"name":"Alice","age":30}"#);
 
-        let req = Request::new(Method::POST, "/test".parse().unwrap(), headers, body);
-        let Json(user) = ok_or_panic(Json::<User>::from_request(&req));
+        let mut req = Request::new(Method::POST, "/test".parse().unwrap(), headers, body);
+        let Json(user) = ok_or_panic(Json::<User>::from_request(&mut req).await);
         assert_eq!(user, User { name: "Alice".into(), age: 30 });
     }
 
     #[cfg(feature = "json")]
-    #[test]
-    fn json_extractor_wrong_content_type_returns_415() {
+    #[tokio::test]
+    async fn json_extractor_wrong_content_type_returns_415() {
         use serde::Deserialize;
 
         #[derive(Deserialize)]
@@ -1032,14 +1050,14 @@ mod tests {
         headers.insert("content-type", HeaderValue::from_static("text/plain"));
         let body = Bytes::from(r#"{"name":"Alice"}"#);
 
-        let req = Request::new(Method::POST, "/test".parse().unwrap(), headers, body);
-        let err = err_or_panic(Json::<User>::from_request(&req));
+        let mut req = Request::new(Method::POST, "/test".parse().unwrap(), headers, body);
+        let err = err_or_panic(Json::<User>::from_request(&mut req).await);
         assert_eq!(err.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[cfg(feature = "json")]
-    #[test]
-    fn json_extractor_invalid_json_returns_400() {
+    #[tokio::test]
+    async fn json_extractor_invalid_json_returns_400() {
         use serde::Deserialize;
 
         #[derive(Deserialize)]
@@ -1052,8 +1070,8 @@ mod tests {
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         let body = Bytes::from("not json");
 
-        let req = Request::new(Method::POST, "/test".parse().unwrap(), headers, body);
-        let err = err_or_panic(Json::<User>::from_request(&req));
+        let mut req = Request::new(Method::POST, "/test".parse().unwrap(), headers, body);
+        let err = err_or_panic(Json::<User>::from_request(&mut req).await);
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -1072,13 +1090,13 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("application/json"));
-        let req = Request::new(
+        let mut req = Request::new(
             Method::POST,
             "/test".parse().unwrap(),
             headers,
             Bytes::from("not json"),
         );
-        let err = err_or_panic(Json::<User>::from_request(&req));
+        let err = err_or_panic(Json::<User>::from_request(&mut req).await);
 
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
@@ -1092,8 +1110,8 @@ mod tests {
     }
 
     #[cfg(feature = "json")]
-    #[test]
-    fn json_extractor_no_content_type_returns_415() {
+    #[tokio::test]
+    async fn json_extractor_no_content_type_returns_415() {
         use serde::Deserialize;
 
         #[derive(Deserialize)]
@@ -1103,16 +1121,16 @@ mod tests {
         }
 
         let body = Bytes::from(r#"{"name":"Alice"}"#);
-        let req = Request::new(Method::POST, "/test".parse().unwrap(), HeaderMap::new(), body);
-        let err = err_or_panic(Json::<User>::from_request(&req));
+        let mut req = Request::new(Method::POST, "/test".parse().unwrap(), HeaderMap::new(), body);
+        let err = err_or_panic(Json::<User>::from_request(&mut req).await);
         assert_eq!(err.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     // --- Form extractor ---
 
     #[cfg(feature = "form")]
-    #[test]
-    fn form_extractor_success() {
+    #[tokio::test]
+    async fn form_extractor_success() {
         use serde::Deserialize;
 
         #[derive(Deserialize, Debug, PartialEq)]
@@ -1128,14 +1146,14 @@ mod tests {
         );
         let body = Bytes::from("username=alice&password=secret");
 
-        let req = Request::new(Method::POST, "/login".parse().unwrap(), headers, body);
-        let Form(login) = ok_or_panic(Form::<Login>::from_request(&req));
+        let mut req = Request::new(Method::POST, "/login".parse().unwrap(), headers, body);
+        let Form(login) = ok_or_panic(Form::<Login>::from_request(&mut req).await);
         assert_eq!(login, Login { username: "alice".into(), password: "secret".into() });
     }
 
     #[cfg(feature = "form")]
-    #[test]
-    fn form_extractor_wrong_content_type_returns_415() {
+    #[tokio::test]
+    async fn form_extractor_wrong_content_type_returns_415() {
         use serde::Deserialize;
 
         #[derive(Deserialize)]
@@ -1148,14 +1166,14 @@ mod tests {
         headers.insert("content-type", HeaderValue::from_static("text/plain"));
         let body = Bytes::from("username=alice");
 
-        let req = Request::new(Method::POST, "/login".parse().unwrap(), headers, body);
-        let err = err_or_panic(Form::<Login>::from_request(&req));
+        let mut req = Request::new(Method::POST, "/login".parse().unwrap(), headers, body);
+        let err = err_or_panic(Form::<Login>::from_request(&mut req).await);
         assert_eq!(err.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[cfg(feature = "form")]
-    #[test]
-    fn form_extractor_invalid_data_returns_400() {
+    #[tokio::test]
+    async fn form_extractor_invalid_data_returns_400() {
         use serde::Deserialize;
 
         #[derive(Deserialize)]
@@ -1173,109 +1191,109 @@ mod tests {
         );
         let body = Bytes::from("username=alice&age=notanumber");
 
-        let req = Request::new(Method::POST, "/login".parse().unwrap(), headers, body);
-        let err = err_or_panic(Form::<Login>::from_request(&req));
+        let mut req = Request::new(Method::POST, "/login".parse().unwrap(), headers, body);
+        let err = err_or_panic(Form::<Login>::from_request(&mut req).await);
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     // --- Optional extractor ---
 
-    #[test]
-    fn optional_extractor_present() {
+    #[tokio::test]
+    async fn optional_extractor_present() {
         #[derive(Clone, Debug, PartialEq)]
         struct UserId(u64);
 
         let mut req = get_request("/test");
         req.set_extension(UserId(42));
 
-        let result = ok_or_panic(Optional::<Extension<UserId>>::from_parts(&req));
+        let result = ok_or_panic(Optional::<Extension<UserId>>::from_parts(&req).await);
         assert!(result.0.is_some());
         assert_eq!(result.0.unwrap().0, UserId(42));
     }
 
-    #[test]
-    fn optional_extractor_absent() {
+    #[tokio::test]
+    async fn optional_extractor_absent() {
         #[derive(Clone)]
         struct UserId(u64);
 
         let req = get_request("/test");
-        let result = ok_or_panic(Optional::<Extension<UserId>>::from_parts(&req));
+        let result = ok_or_panic(Optional::<Extension<UserId>>::from_parts(&req).await);
         assert!(result.0.is_none());
     }
 
     // --- TypedHeader extractor ---
 
-    #[test]
-    fn typed_header_content_type() {
+    #[tokio::test]
+    async fn typed_header_content_type() {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
 
-        let TypedHeader(ct) = ok_or_panic(TypedHeader::<ContentType>::from_parts(&req));
+        let TypedHeader(ct) = ok_or_panic(TypedHeader::<ContentType>::from_parts(&req).await);
         assert_eq!(ct.0, "application/json");
     }
 
-    #[test]
-    fn typed_header_missing_returns_400() {
+    #[tokio::test]
+    async fn typed_header_missing_returns_400() {
         let req = get_request("/test");
-        let err = err_or_panic(TypedHeader::<ContentType>::from_parts(&req));
+        let err = err_or_panic(TypedHeader::<ContentType>::from_parts(&req).await);
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn typed_header_authorization() {
+    #[tokio::test]
+    async fn typed_header_authorization() {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", HeaderValue::from_static("Basic abc123"));
         let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
 
-        let TypedHeader(auth) = ok_or_panic(TypedHeader::<Authorization>::from_parts(&req));
+        let TypedHeader(auth) = ok_or_panic(TypedHeader::<Authorization>::from_parts(&req).await);
         assert_eq!(auth.0, "Basic abc123");
     }
 
-    #[test]
-    fn typed_header_accept() {
+    #[tokio::test]
+    async fn typed_header_accept() {
         let mut headers = HeaderMap::new();
         headers.insert("accept", HeaderValue::from_static("text/html"));
         let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
 
-        let TypedHeader(accept) = ok_or_panic(TypedHeader::<Accept>::from_parts(&req));
+        let TypedHeader(accept) = ok_or_panic(TypedHeader::<Accept>::from_parts(&req).await);
         assert_eq!(accept.0, "text/html");
     }
 
-    #[test]
-    fn typed_header_user_agent() {
+    #[tokio::test]
+    async fn typed_header_user_agent() {
         let mut headers = HeaderMap::new();
         headers.insert("user-agent", HeaderValue::from_static("Neutron/1.0"));
         let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
 
-        let TypedHeader(ua) = ok_or_panic(TypedHeader::<UserAgent>::from_parts(&req));
+        let TypedHeader(ua) = ok_or_panic(TypedHeader::<UserAgent>::from_parts(&req).await);
         assert_eq!(ua.0, "Neutron/1.0");
     }
 
-    #[test]
-    fn typed_header_host() {
+    #[tokio::test]
+    async fn typed_header_host() {
         let mut headers = HeaderMap::new();
         headers.insert("host", HeaderValue::from_static("example.com"));
         let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
 
-        let TypedHeader(host) = ok_or_panic(TypedHeader::<Host>::from_parts(&req));
+        let TypedHeader(host) = ok_or_panic(TypedHeader::<Host>::from_parts(&req).await);
         assert_eq!(host.0, "example.com");
     }
 
-    #[test]
-    fn typed_header_origin() {
+    #[tokio::test]
+    async fn typed_header_origin() {
         let mut headers = HeaderMap::new();
         headers.insert("origin", HeaderValue::from_static("https://example.com"));
         let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
 
-        let TypedHeader(origin) = ok_or_panic(TypedHeader::<Origin>::from_parts(&req));
+        let TypedHeader(origin) = ok_or_panic(TypedHeader::<Origin>::from_parts(&req).await);
         assert_eq!(origin.0, "https://example.com");
     }
 
     // --- BearerToken ---
 
-    #[test]
-    fn bearer_token_success() {
+    #[tokio::test]
+    async fn bearer_token_success() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "authorization",
@@ -1284,12 +1302,12 @@ mod tests {
         let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
 
         let TypedHeader(BearerToken(token)) =
-            ok_or_panic(TypedHeader::<BearerToken>::from_parts(&req));
+            ok_or_panic(TypedHeader::<BearerToken>::from_parts(&req).await);
         assert_eq!(token, "my-secret-token");
     }
 
-    #[test]
-    fn bearer_token_wrong_scheme_returns_400() {
+    #[tokio::test]
+    async fn bearer_token_wrong_scheme_returns_400() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "authorization",
@@ -1297,29 +1315,30 @@ mod tests {
         );
         let req = Request::new(Method::GET, "/test".parse().unwrap(), headers, Bytes::new());
 
-        let err = err_or_panic(TypedHeader::<BearerToken>::from_parts(&req));
+        let err = err_or_panic(TypedHeader::<BearerToken>::from_parts(&req).await);
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
-    #[test]
-    fn bearer_token_missing_header_returns_400() {
+    #[tokio::test]
+    async fn bearer_token_missing_header_returns_400() {
         let req = get_request("/test");
-        let err = err_or_panic(TypedHeader::<BearerToken>::from_parts(&req));
+        let err = err_or_panic(TypedHeader::<BearerToken>::from_parts(&req).await);
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     // --- Blanket FromRequest impl for FromRequestParts types ---
 
-    #[test]
-    fn from_request_parts_blanket_impl() {
+    #[tokio::test]
+    async fn from_request_parts_blanket_impl() {
         // Method implements FromRequestParts; via blanket, it also implements FromRequest.
-        let req = Request::new(
+        let mut req = Request::new(
             Method::DELETE,
             "/test".parse().unwrap(),
             HeaderMap::new(),
             Bytes::new(),
         );
-        let method = ok_or_panic(<Method as FromRequest>::from_request(&req));
+        let method = ok_or_panic(<Method as FromRequest>::from_request(&mut req).await);
         assert_eq!(method, Method::DELETE);
     }
 }
+

@@ -286,7 +286,7 @@ impl Negotiate {
 }
 
 impl FromRequest for Negotiate {
-    fn from_request(req: &Request) -> Result<Self, Response> {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
         Negotiate::with_offered(req, DEFAULT_OFFERED)
     }
 }
@@ -398,10 +398,10 @@ mod tests {
     // 6. Missing Accept header defaults to */*
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn missing_accept_defaults_to_wildcard() {
-        let req = request_without_accept();
-        let negotiate_result = Negotiate::from_request(&req);
+    #[tokio::test]
+    async fn missing_accept_defaults_to_wildcard() {
+        let mut req = request_without_accept();
+        let negotiate_result = Negotiate::from_request(&mut req).await;
         assert!(negotiate_result.is_ok(), "should succeed when Accept is missing");
         // The first default offered type should be chosen (application/json)
         let Negotiate(ct) = negotiate_result.unwrap_or_else(|_| panic!("expected Ok"));
@@ -493,19 +493,19 @@ mod tests {
         assert!(!header.accepts("application/json")); // q=0 means excluded
     }
 
-    #[test]
-    fn negotiate_extractor_with_accept_header() {
-        let req = request_with_accept("application/json");
-        let result = Negotiate::from_request(&req);
+    #[tokio::test]
+    async fn negotiate_extractor_with_accept_header() {
+        let mut req = request_with_accept("application/json");
+        let result = Negotiate::from_request(&mut req).await;
         assert!(result.is_ok());
         let Negotiate(ct) = result.unwrap_or_else(|_| panic!("expected Ok"));
         assert_eq!(ct, ContentType::Json);
     }
 
-    #[test]
-    fn negotiate_extractor_not_acceptable() {
-        let req = request_with_accept("image/png");
-        let result = Negotiate::from_request(&req);
+    #[tokio::test]
+    async fn negotiate_extractor_not_acceptable() {
+        let mut req = request_with_accept("image/png");
+        let result = Negotiate::from_request(&mut req).await;
         assert!(result.is_err());
         let resp = match result {
             Err(r) => r,

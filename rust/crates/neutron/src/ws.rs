@@ -223,7 +223,7 @@ impl WebSocketUpgrade {
 }
 
 impl FromRequest for WebSocketUpgrade {
-    fn from_request(req: &Request) -> Result<Self, Response> {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
         // Connection: upgrade
         let connection = req
             .headers()

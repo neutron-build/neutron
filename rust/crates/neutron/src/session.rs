@@ -266,7 +266,7 @@ impl Session {
 }
 
 impl FromRequest for Session {
-    fn from_request(req: &Request) -> Result<Self, Response> {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
         req.get_extension::<Session>()
             .cloned()
             .ok_or_else(|| {
