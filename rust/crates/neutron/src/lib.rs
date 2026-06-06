@@ -195,6 +195,12 @@ pub mod http3_server;
 pub mod tower_compat;
 
 // ---------------------------------------------------------------------------
+// Typed application-state composition
+// ---------------------------------------------------------------------------
+pub mod from_ref;
+pub use from_ref::FromRef;
+
+// ---------------------------------------------------------------------------
 // Prelude — convenience re-exports, respects all feature gates above
 // ---------------------------------------------------------------------------
 pub mod prelude;
