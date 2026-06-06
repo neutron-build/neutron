@@ -2120,12 +2120,29 @@ impl Executor {
                     .cast(&table_def.columns[col_idx].data_type)
                     .unwrap_or_else(|_| where_val.to_value());
                 let storage = self.storage_for(table);
-                let rows = match storage
-                    .scan_where_eq_positions(table, col_idx, &search_val)
-                    .await
-                {
-                    Ok(matches) => matches.into_iter().map(|(_, row)| row).collect::<Vec<_>>(),
-                    Err(e) => return Some(Err(ExecError::Storage(e))),
+                // Prefer an index on the predicate column. scan_where_eq_positions
+                // is a full scan (and on the columnar engine materializes the whole
+                // table), so using it here would make an indexed point lookup
+                // O(n) — defeating the fast path. Fall back to the scan only when
+                // there's no usable index.
+                let idx_name = self
+                    .btree_indexes
+                    .get(&(table.clone(), where_col.clone()))
+                    .map(|r| r.clone());
+                let rows = match idx_name.and_then(|n| {
+                    storage
+                        .index_lookup_sync(table, &n, &search_val)
+                        .ok()
+                        .flatten()
+                }) {
+                    Some(rows) => rows,
+                    None => match storage
+                        .scan_where_eq_positions(table, col_idx, &search_val)
+                        .await
+                    {
+                        Ok(matches) => matches.into_iter().map(|(_, row)| row).collect::<Vec<_>>(),
+                        Err(e) => return Some(Err(ExecError::Storage(e))),
+                    },
                 };
                 let columns: Vec<(String, DataType)> = table_def
                     .columns
