@@ -52,12 +52,11 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use http::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::extract::{FromRequest, Query};
-use crate::handler::{Body, IntoResponse, Json, Request, Response};
+use crate::handler::{IntoResponse, Json, Request, Response};
 
 // ---------------------------------------------------------------------------
 // Validate trait
@@ -320,25 +319,24 @@ impl std::error::Error for ValidationErrors {}
 
 impl IntoResponse for ValidationErrors {
     fn into_response(self) -> Response {
-        #[derive(Serialize)]
-        struct ErrorBody<'a> {
-            error: &'a str,
-            fields: &'a HashMap<String, Vec<FieldError>>,
-        }
+        // P2.1/P2.3: emit RFC 7807 `application/problem+json` with a populated
+        // `errors[]` array via `AppError`, so validation failures honor the same
+        // error contract as every other built-in failure (not ad-hoc JSON).
+        let field_errors: Vec<crate::error::ValidationFieldError> = self
+            .fields
+            .into_iter()
+            .flat_map(|(field, errs)| {
+                errs.into_iter().map(move |e| {
+                    crate::error::ValidationFieldError::new(field.clone(), e.message)
+                })
+            })
+            .collect();
 
-        let body = ErrorBody {
-            error: "Validation failed",
-            fields: &self.fields,
-        };
-
-        let json = serde_json::to_vec(&body)
-            .unwrap_or_else(|_| br#"{"error":"Validation failed"}"#.to_vec());
-
-        http::Response::builder()
-            .status(StatusCode::UNPROCESSABLE_ENTITY)
-            .header("content-type", "application/json")
-            .body(Body::full(json))
-            .unwrap()
+        crate::error::AppError::validation_error(
+            "One or more fields failed validation.",
+            field_errors,
+        )
+        .into_response()
     }
 }
 
@@ -438,6 +436,30 @@ impl<T: DeserializeOwned + Validate + Send + 'static> FromRequest for Validated<
     }
 }
 
+/// Ergonomic JSON-body extractor that deserializes **and** validates `T` in one
+/// step (P2.3). Equivalent to `Validated<Json<T>>` but destructures straight to
+/// `T`, so handlers read cleanly:
+///
+/// ```rust,ignore
+/// async fn create(ValidatedJson(data): ValidatedJson<CreateUser>) -> String {
+///     // `data` is a fully-validated `CreateUser`
+///     format!("Created {}", data.name)
+/// }
+/// ```
+///
+/// On deserialization failure it returns `400`; on validation failure it returns
+/// `422 Unprocessable Entity` as RFC 7807 `application/problem+json` with a
+/// populated `errors[]` array (one entry per field error).
+pub struct ValidatedJson<T>(pub T);
+
+impl<T: DeserializeOwned + Validate + Send + 'static> FromRequest for ValidatedJson<T> {
+    async fn from_request(req: &mut Request) -> Result<Self, Response> {
+        let Json(inner) = Json::<T>::from_request(req).await?;
+        inner.validate().map_err(|e| e.into_response())?;
+        Ok(ValidatedJson(inner))
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -447,6 +469,7 @@ mod tests {
     use super::*;
     use crate::router::Router;
     use crate::testing::TestClient;
+    use http::StatusCode;
     use serde::Deserialize;
 
     // -----------------------------------------------------------------------
@@ -534,13 +557,23 @@ mod tests {
             .send()
             .await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // P2.3: RFC 7807 problem+json with a populated errors[] array.
+        assert_eq!(
+            resp.header("content-type").unwrap(),
+            "application/problem+json"
+        );
 
         let body = resp.text().await;
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["error"], "Validation failed");
-        assert!(parsed["fields"]["name"].is_array());
-        assert!(parsed["fields"]["email"].is_array());
-        assert!(parsed["fields"]["age"].is_array());
+        assert_eq!(parsed["status"], 422);
+        let errors = parsed["errors"].as_array().expect("errors array");
+        let fields: std::collections::HashSet<&str> = errors
+            .iter()
+            .filter_map(|e| e["field"].as_str())
+            .collect();
+        assert!(fields.contains("name"));
+        assert!(fields.contains("email"));
+        assert!(fields.contains("age"));
     }
 
     #[tokio::test]
@@ -556,10 +589,15 @@ mod tests {
 
         let body = resp.text().await;
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        // Only email should fail
-        assert!(parsed["fields"]["email"].is_array());
-        assert!(parsed["fields"].get("name").is_none());
-        assert!(parsed["fields"].get("age").is_none());
+        // Only email should fail.
+        let errors = parsed["errors"].as_array().expect("errors array");
+        let fields: std::collections::HashSet<&str> = errors
+            .iter()
+            .filter_map(|e| e["field"].as_str())
+            .collect();
+        assert!(fields.contains("email"));
+        assert!(!fields.contains("name"));
+        assert!(!fields.contains("age"));
     }
 
     #[tokio::test]
@@ -595,9 +633,13 @@ mod tests {
 
         let body = resp.text().await;
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["error"], "Validation failed");
-        assert!(parsed["fields"]["q"].is_array());
-        assert!(parsed["fields"]["page"].is_array());
+        let errors = parsed["errors"].as_array().expect("errors array");
+        let fields: std::collections::HashSet<&str> = errors
+            .iter()
+            .filter_map(|e| e["field"].as_str())
+            .collect();
+        assert!(fields.contains("q"));
+        assert!(fields.contains("page"));
     }
 
     // -----------------------------------------------------------------------
@@ -932,14 +974,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn error_response_is_json() {
+    async fn error_response_is_problem_json() {
         let mut e = ValidationErrors::new();
         e.add("name", "required", "name is required");
         let resp = e.into_response();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // P2.1/P2.3: RFC 7807 problem+json, not ad-hoc application/json.
         assert_eq!(
             resp.headers().get("content-type").unwrap(),
-            "application/json"
+            "application/problem+json"
         );
     }
 
@@ -947,5 +990,50 @@ mod tests {
     fn field_errors_returns_none_for_missing() {
         let e = ValidationErrors::new();
         assert!(e.field_errors("nonexistent").is_none());
+    }
+
+    // P2.3: the ValidatedJson<T> ergonomic extractor.
+    #[tokio::test]
+    async fn validated_json_accepts_valid() {
+        let client = TestClient::new(Router::new().post(
+            "/users",
+            |ValidatedJson(user): ValidatedJson<CreateUser>| async move {
+                format!("Hello, {}!", user.name)
+            },
+        ));
+        let resp = client
+            .post("/users")
+            .header("content-type", "application/json")
+            .body(r#"{"name":"Bob","email":"bob@example.com","age":25}"#)
+            .send()
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.text().await, "Hello, Bob!");
+    }
+
+    #[tokio::test]
+    async fn validated_json_rejects_with_422_and_field_errors() {
+        let client = TestClient::new(Router::new().post(
+            "/users",
+            |ValidatedJson(user): ValidatedJson<CreateUser>| async move {
+                format!("Hello, {}!", user.name)
+            },
+        ));
+        let resp = client
+            .post("/users")
+            .header("content-type", "application/json")
+            .body(r#"{"name":"","email":"bad","age":5}"#)
+            .send()
+            .await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            resp.header("content-type").unwrap(),
+            "application/problem+json"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&resp.text().await).unwrap();
+        assert!(
+            !parsed["errors"].as_array().unwrap().is_empty(),
+            "expected populated errors[]"
+        );
     }
 }

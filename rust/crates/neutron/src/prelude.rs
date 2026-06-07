@@ -103,7 +103,7 @@ pub use crate::health::HealthCheck;
 pub use crate::negotiate::{AcceptHeader, ContentType, Negotiate};
 
 #[cfg(feature = "validate")]
-pub use crate::validate::{Validate, Validated};
+pub use crate::validate::{Validate, Validated, ValidatedJson};
 
 // ---------------------------------------------------------------------------
 // Real-time
