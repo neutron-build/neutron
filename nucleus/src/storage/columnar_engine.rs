@@ -316,16 +316,21 @@ fn batches_to_rows(batches: &[ColumnBatch]) -> Vec<Row> {
 
 /// Reconstruct only rows where `batches[*][filter_col] == filter_val`.
 /// Avoids allocating Value objects for non-matching rows.
+/// Returns `(matched_rows, rows_examined)`. `rows_examined` is the total number of
+/// rows the scan inspected across all batches — the sequential-scan size the caller
+/// reports to the `rows_scanned` metric (matching Postgres Seq Scan semantics).
 fn batches_to_rows_where_eq(
     batches: &[ColumnBatch],
     filter_col: usize,
     filter_val: &Value,
-) -> Vec<Row> {
+) -> (Vec<Row>, usize) {
     let mut rows = Vec::new();
+    let mut examined = 0usize;
     for batch in batches {
         let Some((_, filter_data)) = batch.columns.get(filter_col) else {
             continue;
         };
+        examined += batch.row_count;
         let mask = eq_mask(filter_data, filter_val);
         let n_cols = batch.columns.len();
         for row_i in 0..batch.row_count {
@@ -341,7 +346,7 @@ fn batches_to_rows_where_eq(
             rows.push(row);
         }
     }
-    rows
+    (rows, examined)
 }
 
 /// Fetch rows from a slice of ColumnBatches by their global (scan-order) positions.
@@ -1328,7 +1333,7 @@ impl StorageEngine for ColumnarStorageEngine {
         table: &str,
         filter_col: usize,
         filter_val: &Value,
-    ) -> Option<Vec<Row>> {
+    ) -> Option<(Vec<Row>, usize)> {
         self.flush_write_buffer(table);
         let store = self.store.read();
         if !store.table_exists(table) {

@@ -1573,8 +1573,12 @@ impl Executor {
                         // back to Int32 so storage row-format matches.
                         let typed = Self::coerce_to_column_type(&val, &meta[col_idx].dtype);
                         let coerced = Self::coerce_to_storage_type(&typed);
-                        if let Some(rows) = storage.fast_scan_where_eq(table, col_idx, &coerced) {
-                            self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                        if let Some((rows, examined)) =
+                            storage.fast_scan_where_eq(table, col_idx, &coerced)
+                        {
+                            // Report rows EXAMINED by the seq scan, not the (typically
+                            // tiny) match count — `rows_scanned` is a scan-cost metric.
+                            self.metrics.rows_scanned.inc_by(examined as u64);
                             return Ok((meta, rows));
                         }
                     }
@@ -1725,10 +1729,12 @@ impl Executor {
                             {
                                 let coerced_scan = Self::coerce_to_storage_type(&val);
                                 let storage = self.storage_for(table);
-                                if let Some(rows) =
+                                if let Some((rows, examined)) =
                                     storage.fast_scan_where_eq(table, col_idx, &coerced_scan)
                                 {
-                                    self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                                    // Report rows EXAMINED by the seq scan, not the
+                                    // match count — `rows_scanned` is a scan-cost metric.
+                                    self.metrics.rows_scanned.inc_by(examined as u64);
                                     return Ok((meta, rows));
                                 }
                             }
@@ -2369,7 +2375,15 @@ impl Executor {
                     {
                         let tbl_storage = self.storage_for(table);
                         let col_info = self.table_columns.read().get(table.as_str()).cloned();
+                        // On an MVCC engine inside an explicit transaction, the
+                        // O(1) fast_count_all is snapshot-unaware (see
+                        // try_columnar_fast_aggregate Guard 6b). Skip the fast
+                        // branch so the snapshot-aware row scan below runs,
+                        // keeping COUNT(*)/SUM(...) consistent with SELECT *.
+                        let snapshot_unsafe =
+                            tbl_storage.supports_mvcc() && self.fast_count_in_txn();
                         if let Some(ci) = &col_info
+                            && !snapshot_unsafe
                             && tbl_storage.fast_count_all(table).is_some()
                         {
                             let mut result_meta = Vec::new();
@@ -4039,8 +4053,28 @@ impl Executor {
                     }
                 }
 
-                // Non-recursive CTE
-                let cte_result = self.execute_query(*cte.query.clone()).await?;
+                // Non-recursive CTE.
+                // Per the SQL standard / PostgreSQL, every CTE in a single WITH
+                // list may reference any CTE defined earlier in that same list.
+                // execute_query -> execute_query_planned only discovers sibling
+                // CTEs from the body's own WITH clause or from session
+                // `active_ctes`. We therefore expose the in-progress local
+                // `cte_tables` via `active_ctes` for the duration of this inner
+                // execution so an earlier CTE (e.g. `first`) resolves when a
+                // later CTE (e.g. `totals`) references it.
+                //
+                // We save/restore (rather than clear) the previous value to stay
+                // nesting-safe: this preserves any outer WITH+DML scope and any
+                // enclosing resolve_ctes context, and restores even on the error
+                // path so a failing inner CTE never leaves stale state behind.
+                let cte_result = {
+                    let sess = self.current_session();
+                    let saved =
+                        std::mem::replace(&mut *sess.active_ctes.write(), cte_tables.clone());
+                    let cte_result = self.execute_query(*cte.query.clone()).await;
+                    *sess.active_ctes.write() = saved;
+                    cte_result?
+                };
                 if let ExecResult::Select { columns, rows } = cte_result {
                     let cte_col_names: Vec<String> = cte
                         .alias
@@ -4373,6 +4407,22 @@ impl Executor {
         }
     }
 
+    /// Whether the current session is inside an explicit transaction, for the
+    /// purpose of gating the snapshot-unaware O(1) aggregate fast paths.
+    ///
+    /// The session is single-threaded for its own statements, so no other thread
+    /// writes this session's `txn_state` while this read runs. To stay safe even
+    /// if the lock is momentarily contended, a failed `try_read` defaults to
+    /// `true` — that conservatively forces the snapshot-correct slow path rather
+    /// than risking a wrong (snapshot-unaware) fast-path answer.
+    pub(super) fn fast_count_in_txn(&self) -> bool {
+        self.current_session()
+            .txn_state
+            .try_read()
+            .map(|t| t.active)
+            .unwrap_or(true)
+    }
+
     /// Attempt to answer aggregate queries using the storage engine's columnar
     /// fast paths before any row scan. Returns `Ok(Some(result))` if handled,
     /// `Ok(None)` if the fast path is inapplicable (fall through to normal scan).
@@ -4415,6 +4465,17 @@ impl Executor {
         // (fast_count_all returns None for non-columnar engines by default)
         let tbl_storage = self.storage_for(&table_name);
         if tbl_storage.fast_count_all(&table_name).is_none() {
+            return Ok(None);
+        }
+        // Guard 6b: snapshot correctness inside an explicit transaction.
+        // The MVCC engine's fast_count_all returns a process-global committed
+        // counter that ignores the session's transaction snapshot — it neither
+        // reflects this txn's own uncommitted DML (read-your-own-writes) nor is
+        // isolated from another session's concurrent COMMIT (repeatable read).
+        // So when this session is inside an explicit txn on an MVCC engine, bail
+        // out and let the snapshot-aware SeqScan+Aggregate path compute the
+        // result. Autocommit and non-MVCC engines keep the O(1) fast path.
+        if tbl_storage.supports_mvcc() && self.fast_count_in_txn() {
             return Ok(None);
         }
         let resolve_col = |name: &str| -> Option<usize> {
@@ -5278,7 +5339,9 @@ impl Executor {
                 // would otherwise miss every row.
                 let coerced =
                     Self::coerce_literal_to_column_type(filter_val, &col_meta[col_idx].dtype)?;
-                let rows = storage.fast_scan_where_eq(&table_name, col_idx, &coerced)?;
+                // This path does not feed the rows_scanned metric, so the examined
+                // count is intentionally discarded here.
+                let (rows, _examined) = storage.fast_scan_where_eq(&table_name, col_idx, &coerced)?;
                 Some((col_meta, rows))
             }
             FilterKind::Range(col_name, lo, hi) => {
@@ -5400,7 +5463,11 @@ impl Executor {
         table_name: &str,
         where_expr: &Expr,
         col_meta: &[ColMeta],
-    ) -> Option<Vec<Row>> {
+    ) -> Option<(Vec<Row>, usize)> {
+        // Returns `(matched_rows, rows_examined)`. `rows_examined` is the seq-scan
+        // size the caller reports to the `rows_scanned` metric. For equality the
+        // engine reports the true examined count; for range scans (which do not yet
+        // surface an examined count) we fall back to the matched length.
         let storage = self.storage_for(table_name);
 
         match where_expr {
@@ -5425,7 +5492,9 @@ impl Executor {
                 let dtype = &col_meta[col_idx].dtype;
                 let lo = Self::coerce_to_column_type(&lo, dtype);
                 let hi = Self::coerce_to_column_type(&hi, dtype);
-                storage.fast_scan_where_range(table_name, col_idx, &lo, &hi)
+                let rows = storage.fast_scan_where_range(table_name, col_idx, &lo, &hi)?;
+                let examined = rows.len();
+                Some((rows, examined))
             }
             // Single range comparison: col < val, col > val, col <= val, col >= val
             // Use a wide sentinel bound on the open end
@@ -5450,7 +5519,9 @@ impl Executor {
                 // engine and rely on the post-scan filter from apply_pushdown_for_factor
                 // to enforce strict semantics. This is safe because the pushdown filter
                 // is always applied after load_table_factor_with_ctes returns.
-                storage.fast_scan_where_range(table_name, col_idx, &lo, &hi)
+                let rows = storage.fast_scan_where_range(table_name, col_idx, &lo, &hi)?;
+                let examined = rows.len();
+                Some((rows, examined))
             }
             Expr::BinaryOp {
                 left,
@@ -5462,7 +5533,9 @@ impl Executor {
                 let dtype = &col_meta[col_idx].dtype;
                 let lo = Self::coerce_to_column_type(&lo, dtype);
                 let hi = Self::coerce_to_column_type(&hi, dtype);
-                storage.fast_scan_where_range(table_name, col_idx, &lo, &hi)
+                let rows = storage.fast_scan_where_range(table_name, col_idx, &lo, &hi)?;
+                let examined = rows.len();
+                Some((rows, examined))
             }
             _ => None,
         }
@@ -6401,10 +6474,11 @@ impl Executor {
 
                 // Try storage-level filtered scan for pushed-down predicates
                 if let Some(where_expr) = pushdown_expr
-                    && let Some(rows) =
+                    && let Some((rows, examined)) =
                         self.try_storage_fast_scan(&table_name, where_expr, &col_meta)
                 {
-                    self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                    // Report rows EXAMINED by the scan, not the match count.
+                    self.metrics.rows_scanned.inc_by(examined as u64);
                     return Ok((col_meta, rows));
                 }
 

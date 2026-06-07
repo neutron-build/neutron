@@ -15,6 +15,7 @@
 //!
 //! Build: `cargo run --release --features server --bin probe_fts`
 #![cfg(feature = "server")]
+#![allow(clippy::all)] // internal fuzz harness
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

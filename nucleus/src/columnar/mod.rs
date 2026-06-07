@@ -398,30 +398,41 @@ pub struct GroupByRow {
 
 /// Group-by on a text column with aggregation on a numeric column.
 pub fn group_by_text_agg_f64(key_col: &[Option<String>], val_col: &[Option<f64>]) -> GroupByResult {
-    let mut groups: HashMap<String, (usize, f64, f64, f64)> = HashMap::new();
-    // (count, sum, min, max)
+    // Per group: (count_all, count_non_null, sum, min, max). A row counts toward
+    // its group as soon as the KEY is present — even if the aggregated value is
+    // NULL — so a group whose value column is entirely NULL is still emitted
+    // (with NULL aggregates), matching the row engine / SQL standard. `count` is
+    // COUNT(*) (total group size); sum/avg/min/max are over the non-NULL values
+    // only (NULL when the group has none), so AVG = sum / count_non_null.
+    let mut groups: HashMap<String, (usize, usize, f64, f64, f64)> = HashMap::new();
 
     for (key, val) in key_col.iter().zip(val_col.iter()) {
-        if let (Some(k), Some(v)) = (key, val) {
+        if let Some(k) = key {
             let entry = groups
                 .entry(k.clone())
-                .or_insert((0, 0.0, f64::MAX, f64::MIN));
+                .or_insert((0, 0, 0.0, f64::MAX, f64::MIN));
             entry.0 += 1;
-            entry.1 += v;
-            entry.2 = entry.2.min(*v);
-            entry.3 = entry.3.max(*v);
+            if let Some(v) = val {
+                entry.1 += 1;
+                entry.2 += v;
+                entry.3 = entry.3.min(*v);
+                entry.4 = entry.4.max(*v);
+            }
         }
     }
 
     let rows = groups
         .into_iter()
-        .map(|(key, (count, sum, min, max))| GroupByRow {
-            key,
-            count,
-            sum: Some(sum),
-            avg: Some(sum / count as f64),
-            min: Some(min),
-            max: Some(max),
+        .map(|(key, (count_all, count_nn, sum, min, max))| {
+            let has = count_nn > 0;
+            GroupByRow {
+                key,
+                count: count_all,
+                sum: if has { Some(sum) } else { None },
+                avg: if has { Some(sum / count_nn as f64) } else { None },
+                min: if has { Some(min) } else { None },
+                max: if has { Some(max) } else { None },
+            }
         })
         .collect();
 
@@ -4310,7 +4321,10 @@ mod tests {
         assert_eq!(x.count, 2);
         assert!((x.sum.unwrap() - 40.0).abs() < 1e-10);
         let y = result.groups.iter().find(|g| g.key == "Y").unwrap();
-        assert_eq!(y.count, 1);
+        // Y has two rows — (20.0) and (NULL) — so COUNT(*) is 2 (the total group
+        // size), while sum/avg cover only the single non-NULL value. (Previously
+        // `count` wrongly excluded the NULL-valued row.)
+        assert_eq!(y.count, 2);
         assert!((y.sum.unwrap() - 20.0).abs() < 1e-10);
     }
 

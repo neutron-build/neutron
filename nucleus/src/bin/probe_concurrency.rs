@@ -27,6 +27,7 @@
 //!   cargo run  --release --features server --bin probe_concurrency -- --seed 42 --iterations 2000
 
 #![cfg(feature = "server")]
+#![allow(clippy::all)] // internal fuzz harness
 #![allow(dead_code)] // harness scaffolding
 
 use std::sync::Arc;

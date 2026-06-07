@@ -446,17 +446,21 @@ impl TimeIndex {
         }
     }
 
-    /// Find all partitions whose time window overlaps [start_ts, end_ts).
+    /// Find all partitions whose time window overlaps the inclusive
+    /// interval [start_ts, end_ts].
     fn range(&self, start_ts: u64, end_ts: u64) -> Vec<(u64, &PartitionMeta)> {
-        // A partition with boundary B overlaps [start, end) if:
-        //   partition.min_ts < end_ts AND partition.max_ts >= start_ts
+        // A partition with boundary B overlaps [start, end] if:
+        //   partition.min_ts <= end_ts AND partition.max_ts >= start_ts
         // We use the B-tree to skip partitions that are entirely after end_ts.
         // Start from the beginning and iterate; due to sorted order, we can
-        // stop once boundary > end_ts (all subsequent partitions start later).
+        // stop once a partition's min_ts > end_ts (all subsequent partitions
+        // start even later). The break uses `>` (not `>=`) so that a partition
+        // whose min_ts == end_ts — which can contain a sample sitting exactly
+        // on the inclusive upper bound — is still scanned.
         let mut result = Vec::new();
         for (&boundary, meta) in &self.boundaries {
             // Skip partitions entirely after our range
-            if meta.min_ts >= end_ts {
+            if meta.min_ts > end_ts {
                 // Since boundaries are sorted and min_ts >= boundary,
                 // all remaining partitions are also after end_ts
                 break;
@@ -641,8 +645,14 @@ impl Series {
         }
     }
 
-    /// Range query — returns indices into the columns that match [start, end).
-    /// Uses the partition index for O(log P + K) performance.
+    /// Range query — returns indices into the columns that match the inclusive
+    /// interval [start, end]. Uses the partition index for O(log P + K)
+    /// performance. The interval is inclusive on both ends so that a point whose
+    /// timestamp equals `end` is returned (point-interval semantics matching the
+    /// Prometheus range query and the TS_RANGE_* scalar functions). Bucketed
+    /// aggregation deliberately uses half-open intervals elsewhere to avoid
+    /// double-counting at adjacent bucket edges; this single-interval path does
+    /// not.
     fn query_range_indices(&self, start: u64, end: u64) -> Vec<usize> {
         let partitions = self.partition_index.range(start, end);
         let mut indices = Vec::new();
@@ -652,7 +662,7 @@ impl Series {
             for i in meta.start_offset..slice_end {
                 if i < self.timestamps.len() {
                     let ts = self.timestamps[i];
-                    if ts >= start && ts < end {
+                    if ts >= start && ts <= end {
                         indices.push(i);
                     }
                 }
@@ -1416,7 +1426,8 @@ impl TimeSeriesStore {
         }
     }
 
-    /// Query data points in a time range [start, end).
+    /// Query data points in the inclusive time range [start, end].
+    /// A point whose timestamp equals `end` is included.
     /// Returns references to reconstructed DataPoints.
     pub fn query(&self, series_name: &str, start: u64, end: u64) -> Vec<DataPoint> {
         if let Some(series) = self.series.get(series_name) {
@@ -2101,8 +2112,10 @@ mod tests {
 
         assert_eq!(store.total_points(), 100);
 
+        // Inclusive [start, end]: points at i = 0..=30 (i.e. base_ts ..=
+        // base_ts + 30*60_000), so 31 points including the one exactly on `end`.
         let results = store.query("cpu.usage", base_ts, base_ts + 30 * 60_000);
-        assert_eq!(results.len(), 30);
+        assert_eq!(results.len(), 31);
     }
 
     #[test]
@@ -2602,14 +2615,20 @@ mod tests {
         let series = store.get_series("pquery").unwrap();
         assert_eq!(series.partition_index.len(), 10);
 
-        // Query just hours 3-5 (should not touch partitions 0-2 or 6-9)
+        // Query hours 3-5 plus the inclusive upper bound at hour 6's boundary.
+        // Partitions 3,4,5 overlap the range; partition 6 also overlaps because
+        // its min_ts == end and the upper bound is inclusive — 4 partitions.
+        // Partitions 0-2 and 7-9 are still pruned.
         let start = base_ts + 3 * 3_600_000;
         let end = base_ts + 6 * 3_600_000;
         let overlapping = series.partition_index.range(start, end);
-        assert_eq!(overlapping.len(), 3, "should hit exactly 3 partitions");
+        assert_eq!(overlapping.len(), 4, "should hit exactly 4 partitions");
 
+        // Inclusive [start, end]: hours 3,4,5 contribute 10 points each (30),
+        // plus the point at exactly `end` (hour 6, minute 0) since the upper
+        // bound is inclusive — 31 total.
         let results = store.query("pquery", start, end);
-        assert_eq!(results.len(), 30, "3 hours * 10 points = 30");
+        assert_eq!(results.len(), 31, "3 hours * 10 points + end boundary = 31");
     }
 
     #[test]
@@ -2769,11 +2788,12 @@ mod tests {
         // Stats
         assert_eq!(series.stats.count, n as usize);
 
-        // Range query subset
+        // Range query subset — inclusive [start, end] spans i = 50_000..=50_010,
+        // which is 11 points (the point at exactly `end` is included).
         let start = base_ts + 50_000 * 100;
         let end = base_ts + 50_010 * 100;
         let results = store.query("large", start, end);
-        assert_eq!(results.len(), 10);
+        assert_eq!(results.len(), 11);
     }
 
     #[test]

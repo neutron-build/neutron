@@ -98,7 +98,6 @@ async fn lsm_pk_range_returns_rows() {
 /// entirely NULL, instead of emitting it with a NULL aggregate (which Mvcc does).
 /// `probe_engines --engine columnar` still shows ~19 divergences from this.
 #[tokio::test]
-#[ignore = "BUG: columnar group-by drops all-NULL aggregate groups"]
 async fn columnar_all_null_group_kept() {
     let e = ex(Arc::new(ColumnarStorageEngine::new()));
     e.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER NOT NULL, c2 INTEGER)").await.unwrap();

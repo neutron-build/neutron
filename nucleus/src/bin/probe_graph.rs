@@ -18,6 +18,7 @@
 //! Run:
 //!   cargo run  --release --features server --bin probe_graph -- --seed 1234 --iterations 3000
 #![cfg(feature = "server")]
+#![allow(clippy::all)] // internal fuzz harness
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;

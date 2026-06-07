@@ -8,6 +8,7 @@
 //!   cargo run  --release --features server --bin probe_kv_coll
 //!   cargo run  --release --features server --bin probe_kv_coll -- --seed 42 --iterations 2000
 #![cfg(feature = "server")]
+#![allow(clippy::all)] // internal fuzz harness
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -243,7 +244,10 @@ impl RefOracle {
     }
 
     fn pfmerge(&mut self, dest: &str, srcs: &[&str]) {
-        let mut union = BTreeSet::new();
+        // Redis PFMERGE treats the DESTINATION as one of the source sets too: its
+        // prior cardinality is included in the merged result (it is NOT replaced).
+        // Seed the union with dest's existing content before adding the sources.
+        let mut union: BTreeSet<String> = self.hlls.get(dest).cloned().unwrap_or_default();
         for &src in srcs {
             if let Some(s) = self.hlls.get(src) {
                 for m in s {

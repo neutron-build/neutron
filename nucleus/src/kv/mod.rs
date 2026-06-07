@@ -1500,6 +1500,12 @@ impl SortedSet {
 
     /// ZRANGE — entries by rank ascending (inclusive start/stop).
     pub fn zrange(&self, start: usize, stop: usize) -> Vec<SortedSetEntry> {
+        // Inverted rank range (start past stop) yields no elements, matching
+        // Redis ZRANGE semantics. Without this guard, `stop.saturating_sub(start)`
+        // floors at 0 and `.take(0 + 1)` would emit one spurious element.
+        if start > stop {
+            return Vec::new();
+        }
         self.tree
             .iter()
             .skip(start)
@@ -1513,6 +1519,11 @@ impl SortedSet {
 
     /// ZREVRANGE — entries by rank descending.
     pub fn zrevrange(&self, start: usize, stop: usize) -> Vec<SortedSetEntry> {
+        // Inverted rank range (start past stop) yields no elements, matching
+        // Redis ZREVRANGE semantics (mirror of the zrange guard above).
+        if start > stop {
+            return Vec::new();
+        }
         self.tree
             .iter()
             .rev()

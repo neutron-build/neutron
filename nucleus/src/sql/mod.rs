@@ -21,8 +21,216 @@ pub fn convert_fk_action(action: &Option<ast::ReferentialAction>) -> FkAction {
     }
 }
 
+/// Maximum allowed parenthesis-nesting depth in a SQL statement before we reject
+/// it outright as too complex.
+///
+/// This is a DoS guard, NOT a semantic limit. It backstops absurd parenthesis
+/// nesting (plain `(((...)))`, arithmetic, etc.). Plain paren nesting does NOT
+/// exponentially backtrack in sqlparser — it hits the parser's own recursion
+/// limit cleanly — so this cap can be generous. Real-world SQL nests only a
+/// handful of parens deep, so 100 rejects no legitimate query.
+const MAX_PARSE_NESTING_DEPTH: usize = 100;
+
+/// Maximum allowed nesting depth of `CAST` / `TRY_CAST` / `SAFE_CAST` / `CONVERT`
+/// expressions before we reject the statement.
+///
+/// This is the load-bearing part of the DoS guard. sqlparser's recursive-descent
+/// expression parser backtracks EXPONENTIALLY on deeply-nested CAST grammar: a
+/// depth-48 chain explores on the order of 2^48 alternative parse paths and pins
+/// a CPU core for minutes. Empirically the cliff is sharp — depth 47 parses in
+/// ~1.5 ms, depth 48 never completes — and it sits UNDER sqlparser's own
+/// `RecursionCounter` (DEFAULT_REMAINING_DEPTH = 50), so the built-in guard never
+/// fires. We must therefore reject deep CAST nesting BEFORE handing the input to
+/// the parser.
+///
+/// 32 is far below the ~48 cliff (so the exponential never gets going) yet far
+/// above any realistic query (real queries nest at most a couple of casts).
+/// Postgres behaves analogously: beyond `max_stack_depth` it returns
+/// `54001 statement too complex` immediately rather than spinning. Note this caps
+/// the *simultaneously-open* CAST depth, not the total CAST count — a query with
+/// thousands of non-nested casts (`SELECT CAST(a AS INT), CAST(b AS INT), ...`)
+/// parses in linear time and is unaffected.
+const MAX_CAST_NESTING_DEPTH: usize = 32;
+
+/// Returns true if the keyword token ending just before `paren_idx` (skipping
+/// whitespace) is a CAST-family keyword — i.e. this `(` opens a cast expression.
+/// `bytes[..paren_idx]` is the SQL up to (not including) the `(`.
+fn paren_is_cast(bytes: &[u8], paren_idx: usize) -> bool {
+    // Walk back over whitespace between the keyword and the '('.
+    let mut end = paren_idx;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    // Walk back over the identifier characters of the preceding token.
+    let mut start = end;
+    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        start -= 1;
+    }
+    if start == end {
+        return false;
+    }
+    // The token must not be the tail of a longer identifier (e.g. `mycast(`):
+    // the char before `start` must not be an identifier char.
+    if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        return false;
+    }
+    let word = &bytes[start..end];
+    word.eq_ignore_ascii_case(b"CAST")
+        || word.eq_ignore_ascii_case(b"TRY_CAST")
+        || word.eq_ignore_ascii_case(b"SAFE_CAST")
+        || word.eq_ignore_ascii_case(b"CONVERT")
+}
+
+/// Cheap O(n) pre-parse complexity guard.
+///
+/// Scans the raw SQL once, tracking (a) running parenthesis-nesting depth and
+/// (b) running CAST-expression nesting depth, and returns an error if either
+/// exceeds its cap. This MUST run before `Parser::parse_sql` so the
+/// exponential-backtracking inputs never reach the recursive-descent parser.
+///
+/// String literals (`'...'`), quoted/escaped identifiers (`"..."`,
+/// `` `...` ``), dollar-quoted strings (`$tag$...$tag$`), and SQL comments
+/// (`-- ...`, `/* ... */`) are skipped so that parentheses appearing inside
+/// string data or comments are not miscounted — e.g. `WHERE note = '(((('`
+/// must not be rejected.
+fn check_nesting_depth(sql: &str) -> Result<(), ParseError> {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let len = bytes.len();
+    let mut depth: usize = 0;
+    // Per-open-paren stack of "did this paren open a CAST expression?" plus a
+    // running count of currently-open CAST parens.
+    let mut cast_stack: Vec<bool> = Vec::new();
+    let mut cast_depth: usize = 0;
+
+    while i < len {
+        let b = bytes[i];
+        match b {
+            // ── Single-quoted string literal: '...' with '' escaping ──────────
+            b'\'' => {
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\'' {
+                        // Doubled '' is an escaped quote inside the literal.
+                        if i + 1 < len && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        break; // closing quote
+                    }
+                    i += 1;
+                }
+            }
+            // ── Double-quoted identifier: "..." with "" escaping ──────────────
+            b'"' => {
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'"' {
+                        if i + 1 < len && bytes[i + 1] == b'"' {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // ── Backtick-quoted identifier: `...` ─────────────────────────────
+            b'`' => {
+                i += 1;
+                while i < len && bytes[i] != b'`' {
+                    i += 1;
+                }
+            }
+            // ── Line comment: -- to end of line ───────────────────────────────
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            // ── Block comment: /* ... */ (non-nested, matching sqlparser) ──────
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 1; // skip the closing '/'
+            }
+            // ── Dollar-quoted string: $tag$ ... $tag$ (Postgres) ──────────────
+            b'$' => {
+                // Find the closing '$' of the opening tag. A valid tag contains
+                // only letters/digits/underscore; anything else means this '$'
+                // is not a dollar-quote opener (e.g. a positional param $1).
+                let tag_start = i;
+                let mut j = i + 1;
+                while j < len && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                if j < len && bytes[j] == b'$' {
+                    // tag = sql[tag_start..=j]  (includes both '$' delimiters)
+                    let tag = &bytes[tag_start..=j];
+                    i = j + 1;
+                    // Scan for the closing tag.
+                    while i < len {
+                        if bytes[i] == b'$' && i + tag.len() <= len && &bytes[i..i + tag.len()] == tag
+                        {
+                            i += tag.len();
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue; // i already advanced past the closing tag
+                }
+                // Not a dollar-quote; fall through and treat '$' as an ordinary
+                // character (i is advanced by the tail increment below).
+                i += 1;
+                continue;
+            }
+            b'(' => {
+                depth += 1;
+                if depth > MAX_PARSE_NESTING_DEPTH {
+                    return Err(ParseError::StatementTooComplex(MAX_PARSE_NESTING_DEPTH));
+                }
+                let is_cast = paren_is_cast(bytes, i);
+                cast_stack.push(is_cast);
+                if is_cast {
+                    cast_depth += 1;
+                    if cast_depth > MAX_CAST_NESTING_DEPTH {
+                        return Err(ParseError::StatementTooComplex(MAX_CAST_NESTING_DEPTH));
+                    }
+                }
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if cast_stack.pop() == Some(true) {
+                    cast_depth = cast_depth.saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    Ok(())
+}
+
 /// Parse a SQL string into sqlparser AST statements.
 pub fn parse(sql: &str) -> Result<Vec<ast::Statement>, ParseError> {
+    // DoS guard: reject pathologically deep nesting BEFORE handing the input to
+    // sqlparser, whose recursive-descent parser backtracks exponentially on deep
+    // nested-CAST grammars (see `MAX_PARSE_NESTING_DEPTH`). This is the
+    // load-bearing fix; it runs on every parse path (raw parse, the AST-cache
+    // miss branch, and the wire fallback all funnel through here).
+    check_nesting_depth(sql)?;
+
+    // NOTE: we deliberately keep sqlparser's DEFAULT recursion limit (50). It is
+    // well-tuned: deep single-path constructs (e.g. nested scalar subqueries
+    // `SELECT (SELECT (...))`) error cleanly at 50 in well under a millisecond.
+    // RAISING the limit re-introduces exponential blow-up for those forms, so the
+    // pre-parse `check_nesting_depth` caps above (parens 100, CAST nesting 32) are
+    // the load-bearing defense — the CAST cap sits below sqlparser's ~48 cliff,
+    // which itself is below the default-50 recursion guard.
     let dialect = PostgreSqlDialect {};
     let stmts = Parser::parse_sql(&dialect, sql)?;
     Ok(stmts)
@@ -296,6 +504,8 @@ pub enum ParseError {
     UnsupportedDataType(String),
     #[error("unexpected statement: expected {0}")]
     UnexpectedStatement(String),
+    #[error("statement too complex: parenthesis nesting exceeds maximum of {0}")]
+    StatementTooComplex(usize),
 }
 
 // ============================================================================

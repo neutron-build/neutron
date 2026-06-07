@@ -21,6 +21,7 @@
 //! Build: `cargo build --release --features server --bin probe_streams`
 //! Run:   `cargo run  --release --features server --bin probe_streams`
 #![cfg(feature = "server")]
+#![allow(clippy::all)] // internal fuzz harness
 #![allow(dead_code)] // harness scaffolding
 
 use std::panic::AssertUnwindSafe;

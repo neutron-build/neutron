@@ -16,6 +16,7 @@
 //! Build: `cargo build --release --features server --bin probe_security`
 //! Run:   `cargo run  --release --features server --bin probe_security`
 #![cfg(feature = "server")]
+#![allow(clippy::all)] // internal fuzz harness
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -319,21 +320,21 @@ fn main_impl() {
         let expr = gen_nested_arith_linear(depth);
         probe!(format!("SELECT {expr}"));
     }
-    // CAST chains: sqlparser (the parser used by Nucleus) has confirmed exponential
-    // backtracking at depth ~47. Testing above that depth would hang THIS harness,
-    // not just Nucleus — so we stay well below the blowup point (45 is safe).
-    // The finding is documented as a suspected hang in the FINDINGS list.
-    {
+    // CAST chains: sqlparser (the parser used by Nucleus) exhibits exponential
+    // backtracking starting at depth ~48 (depth 47 parses in ~1.5 ms, depth 48
+    // never completes).  Nucleus now guards this with a pre-parse CAST-nesting cap
+    // (MAX_CAST_NESTING_DEPTH = 32) in crate::sql::parse, so deeply-nested CAST
+    // chains are rejected in O(n) BEFORE reaching the parser.  We therefore test
+    // depths well ABOVE the former blow-up point: the guard must reject them fast,
+    // not hang.
+    for depth in [10, 45, 48, 60, 100, 300] {
         let mut expr = "1".to_string();
-        for d in 0..45 {
+        for d in 0..depth {
             let t = if d % 3 == 0 { "INTEGER" } else if d % 3 == 1 { "REAL" } else { "TEXT" };
             expr = format!("CAST({expr} AS {t})");
         }
         probe!(format!("SELECT {expr}"));
     }
-    // NOTE: CAST depth >=47 was verified to hang sqlparser (exponential parse time).
-    // This is a real pre-executor DoS: any client can send ~50 nested CASTs and
-    // freeze the Nucleus parser thread.  Documented as finding; not run here.
 
     // ────────────────────────────────────────────────────────────────────────
     // CATEGORY 2: long IN lists

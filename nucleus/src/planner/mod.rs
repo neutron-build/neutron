@@ -1225,13 +1225,130 @@ impl QueryPlanner {
 
         let mut best_plan: Option<PlanNode> = None;
         let mut best_total = seq_cost.total();
-        let mut best_pred_idx: Option<usize> = None; // which predicate the index covers
+        // Which predicate(s) the chosen index scan consumes — these are excluded
+        // from the residual Filter. A point lookup / single-bound scan covers one
+        // predicate; a two-sided range covers both contributing bound predicates.
+        let mut best_covered: Vec<usize> = Vec::new();
+        // Predicate indices consumed by a two-sided range plan (set below). The
+        // per-predicate loop must NOT re-cost these individual bounds: doing so
+        // would let one bound, mis-costed with equality selectivity, override the
+        // (correct) two-sided range plan with a single-bound scan that demotes the
+        // other bound to a non-indexable Filter.
+        let mut range_pred_indices: Vec<usize> = Vec::new();
+
+        // ── Two-sided range index scan ────────────────────────────────────────
+        // The per-predicate loop below classifies `id >= lo` and `id <= hi` as
+        // two *independent* Range predicates and only special-cases a single
+        // sqlparser `BETWEEN` node for a true range scan. A `>=`/`<=` (or
+        // `>`/`<`) pair on the same indexed column would otherwise emit an
+        // IndexScan carrying only the lower bound as a `lookup_key`, demoting the
+        // upper bound to a residual Filter — which the executor cannot drive
+        // through the index, forcing an O(N - lo) tail scan.
+        //
+        // Detect a two-sided range on a BTree-indexed column up front (the same
+        // `find_range_scan_opportunity` helper + range-IndexScan shape that
+        // `plan_scan` already uses) and emit an IndexScan with BOTH bounds set so
+        // the executor's range branch + storage `index_lookup_range`
+        // (BTreeMap::range, O(log N + k)) can serve it. Both contributing bound
+        // predicates are marked covered so neither becomes a redundant Filter.
+        // Strict `>`/`<` bounds stay correct because the executor post-filters
+        // with the inclusive `range_predicate`.
+        if self.catalog.get_table_cached(table).is_some() {
+            let indexes = self.catalog.get_indexes_cached(table).unwrap_or_default();
+            let btree_indexed_cols: Vec<String> = indexes
+                .iter()
+                .filter(|i| matches!(i.index_type, IndexType::BTree))
+                .filter_map(|i| i.columns.first().cloned())
+                .collect();
+
+            if !btree_indexed_cols.is_empty()
+                && let Some((col, lo_val, hi_val, range_pred_str)) =
+                    find_range_scan_opportunity(predicates, &btree_indexed_cols)
+                && let Some(idx) = indexes.iter().find(|i| {
+                    matches!(i.index_type, IndexType::BTree)
+                        && i.columns
+                            .first()
+                            .map(|c| c.eq_ignore_ascii_case(&col))
+                            .unwrap_or(false)
+                })
+            {
+                // Cost the range scan with the SAME unified cost model as the
+                // per-predicate loop below so the two are directly comparable.
+                // A flat 20% selectivity is a conservative range estimate (real
+                // histograms would tighten it); even so it beats a seq scan for
+                // selective ranges and matches plan_scan's heuristic.
+                let range_sel = 0.20_f64;
+                let btree = cost::BTreeAccess::new(200.0);
+                let idx_cost = btree.estimate_cost(row_count, range_sel);
+                let est = btree.estimate_rows(row_count, range_sel);
+                let estimated_matches = est.rows as usize;
+
+                if idx_cost.total() < best_total {
+                    best_total = idx_cost.total();
+                    // Predicates carrying a bound on this column — used ONLY to skip
+                    // re-costing the same bounds in the per-predicate loop below,
+                    // NOT to exclude them from the residual Filter.
+                    range_pred_indices = predicates
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| {
+                            if let sqlparser::ast::Expr::Between { expr, negated, .. } = p {
+                                !negated
+                                    && extract_column_name(expr)
+                                        .map(|c| c.eq_ignore_ascii_case(&col))
+                                        .unwrap_or(false)
+                            } else {
+                                extract_range_bound(p)
+                                    .map(|(c, _)| c.eq_ignore_ascii_case(&col))
+                                    .unwrap_or(false)
+                            }
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    // CRITICAL: a two-sided range scan only NARROWS candidates to
+                    // [lo, hi]. find_range_scan_opportunity folds only one lo and
+                    // one hi into the index bounds, but the column may carry extra
+                    // predicates (e.g. `id BETWEEN 7 AND 13 AND id <= -4`). Mark
+                    // NOTHING covered so the residual Filter reapplies the FULL
+                    // WHERE over the narrowed rows — re-checking the bounds is cheap
+                    // and idempotent; dropping a predicate is a correctness bug.
+                    best_covered = Vec::new();
+
+                    let lo_expr = parse_expr_safe(&lo_val);
+                    let hi_expr = parse_expr_safe(&hi_val);
+                    let (rp_str, rp_expr) = if range_pred_str.is_empty() {
+                        (None, None)
+                    } else {
+                        let expr = parse_expr_safe(&range_pred_str);
+                        (Some(range_pred_str), expr)
+                    };
+                    best_plan = Some(PlanNode::IndexScan {
+                        table: table.to_string(),
+                        index_name: idx.name.clone(),
+                        estimated_rows: estimated_matches.max(1),
+                        estimated_cost: Cost(idx_cost.total()),
+                        lookup_key: None,
+                        lookup_key_expr: None,
+                        range_lo: Some(lo_val),
+                        range_lo_expr: lo_expr,
+                        range_hi: Some(hi_val),
+                        range_hi_expr: hi_expr,
+                        range_predicate: rp_str,
+                        range_predicate_expr: rp_expr,
+                    });
+                }
+            }
+        }
 
         // Check each predicate against available indexes.
         // Use sync cached lookups to avoid async RwLock overhead.
         if self.catalog.get_table_cached(table).is_some() {
             let indexes = self.catalog.get_indexes_cached(table).unwrap_or_default();
             for (pred_i, pred) in predicates.iter().enumerate() {
+                // Skip bounds already consumed by the two-sided range plan above.
+                if range_pred_indices.contains(&pred_i) {
+                    continue;
+                }
                 let pred_type = Self::classify_predicate(pred);
                 if pred_type.is_none() {
                     continue;
@@ -1271,7 +1388,10 @@ impl QueryPlanner {
 
                         if idx_cost.total() < best_total {
                             best_total = idx_cost.total();
-                            best_pred_idx = Some(pred_i);
+                            // This single-predicate plan replaces any prior choice
+                            // (incl. the two-sided range above); it covers exactly
+                            // this one predicate.
+                            best_covered = vec![pred_i];
                             // BETWEEN predicates → range scan; equality → point lookup
                             let plan = if let sqlparser::ast::Expr::Between { low, high, .. } = pred
                             {
@@ -1318,7 +1438,7 @@ impl QueryPlanner {
             let remaining: Vec<&sqlparser::ast::Expr> = predicates
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| Some(*i) != best_pred_idx)
+                .filter(|(i, _)| !best_covered.contains(i))
                 .map(|(_, p)| *p)
                 .collect();
             if remaining.is_empty() {
