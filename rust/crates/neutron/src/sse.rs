@@ -392,4 +392,45 @@ mod tests {
         assert!(resp.header("content-encoding").is_none());
         assert_eq!(resp.header("content-type").unwrap(), "text/event-stream");
     }
+
+    // P1.9 regression guard: an SSE streaming response survives the
+    // RouterService (tower::Service) + streaming-body boundary intact — the
+    // event frames arrive, not a buffered/collapsed body.
+    #[tokio::test]
+    async fn sse_streams_through_router_service() {
+        use crate::handler::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let svc = Router::<()>::new()
+            .get("/events", || async {
+                let stream = tokio_stream::iter(vec![
+                    SseEvent::new().data("one"),
+                    SseEvent::new().event("tick").data("two"),
+                ]);
+                Sse::new(stream)
+            })
+            .into_service();
+
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("/events")
+            .body(Body::empty())
+            .unwrap();
+        let resp = svc.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+        // The body is a real stream; drain it and confirm both events landed.
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("data:one"), "missing first event: {text:?}");
+        assert!(
+            text.contains("event:tick") && text.contains("data:two"),
+            "missing second event: {text:?}"
+        );
+    }
 }
