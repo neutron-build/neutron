@@ -5510,10 +5510,15 @@ impl Executor {
                 let (col_name, val, is_lower) = self.try_extract_col_bound(where_expr)?;
                 let col_idx = col_meta.iter().position(|c| c.name == col_name)?;
                 let val = Self::coerce_to_column_type(&val, &col_meta[col_idx].dtype);
+                // The open end must be a sentinel of the SAME type as `val`
+                // (a hard-coded Int64 sentinel makes the storage comparator
+                // return None for TEXT/DATE/etc. columns, dropping every row).
                 let (lo, hi) = if is_lower {
-                    (val, Value::Int64(i64::MAX))
+                    let hi = Self::sentinel_max(&val);
+                    (val, hi)
                 } else {
-                    (Value::Int64(i64::MIN), val)
+                    let lo = Self::sentinel_min(&val);
+                    (lo, val)
                 };
                 // For strict comparisons (< / >), we pass inclusive bounds to the storage
                 // engine and rely on the post-scan filter from apply_pushdown_for_factor

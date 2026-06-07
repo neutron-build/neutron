@@ -912,9 +912,12 @@ async fn test_query_cache_put_get() {
         assert_eq!(r[1][1], Value::Text("bob".into()));
     }
 
-    // Case-insensitive key: same SQL lowercased should hit
+    // The cache key is intentionally case-SENSITIVE: lower-casing the SQL would
+    // collapse string literals that differ only by case (e.g. ENCODE('A') vs
+    // ENCODE('a')) onto one key and return a wrong cached result. A different
+    // keyword spelling is therefore a (harmless) miss, not a hit.
     let cached2 = ex.query_cache_get("select * from users");
-    assert!(cached2.is_some());
+    assert!(cached2.is_none());
 }
 
 #[tokio::test]
