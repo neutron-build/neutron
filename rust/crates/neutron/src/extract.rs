@@ -199,14 +199,31 @@ impl<T: DeserializeOwned + Send + 'static> FromRequestParts for Query<T> {
 
 /// Extract shared application state.
 ///
-/// Register state on the router with [`Router::state()`], then extract it in
-/// any handler:
+/// Two ways to provide state:
+///
+/// 1. **Typed (compile-time checked) — recommended.** Build a `Router<S>` and
+///    call [`with_state`](crate::router::Router::with_state) with a concrete
+///    `S`. Sub-states are reached through `#[derive(FromRef)]`. Because
+///    `with_state` consumes the exact `S` the router was typed with, forgetting
+///    to provide the state is a compile error at the `with_state` call.
+///
+/// 2. **Dynamic (escape hatch).** Register individual values with
+///    [`Router::state()`](crate::router::Router::state). Extraction looks the
+///    value up by `TypeId` at request time; a missing value yields a `500`
+///    (logged) rather than a compile error. Prefer the typed path for app state.
 ///
 /// ```ignore
 /// async fn handler(State(cfg): State<AppConfig>) -> String {
 ///     format!("app = {}", cfg.name)
 /// }
 /// ```
+///
+/// > **Scope note (P1.6/B.4):** per-handler `State<U>: FromRef<S>` enforcement
+/// > would require threading the state type `S` through the entire `Handler<T>`
+/// > trait, every route method, and `RouterService` (Axum's `Handler<T, S>`).
+/// > That is the framework's most invasive single change and is deliberately
+/// > deferred; the typed `with_state` path above is the sanctioned compile-time
+/// > guarantee in the meantime.
 pub struct State<T>(pub T);
 
 impl<T: Clone + Send + Sync + 'static> FromRequestParts for State<T> {
@@ -772,6 +789,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 here is the parsed input, not π
     fn path_param_f64() {
         let params = vec![("val".into(), "3.14".into())];
         let result = f64::from_params(&params);
@@ -946,6 +964,7 @@ mod tests {
         use serde::Deserialize;
 
         #[derive(Deserialize)]
+        #[allow(dead_code)] // deserialized into, not read directly
         struct Params {
             page: u32,
         }
@@ -1304,6 +1323,7 @@ mod tests {
     #[tokio::test]
     async fn optional_extractor_absent() {
         #[derive(Clone)]
+        #[allow(dead_code)] // the inner value is never read in the absent case
         struct UserId(u64);
 
         let req = get_request("/test");

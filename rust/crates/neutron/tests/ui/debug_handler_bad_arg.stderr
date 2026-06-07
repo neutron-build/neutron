@@ -1,0 +1,27 @@
+error[E0277]: the trait bound `NotAnExtractor: FromRequest` is not satisfied
+ --> tests/ui/debug_handler_bad_arg.rs:8:27
+  |
+8 | async fn create(_payload: NotAnExtractor) -> &'static str {
+  |                           ^^^^^^^^^^^^^^ unsatisfied trait bound
+  |
+help: the trait `FromRequestParts` is not implemented for `NotAnExtractor`
+ --> tests/ui/debug_handler_bad_arg.rs:5:1
+  |
+5 | struct NotAnExtractor;
+  | ^^^^^^^^^^^^^^^^^^^^^
+  = help: the following other types implement trait `FromRequestParts`:
+            ConnectInfo
+            Extension<T>
+            HeaderMap
+            Method
+            Optional<T>
+            Query<T>
+            TypedHeader<T>
+            http::uri::Uri
+          and $N others
+  = note: required for `NotAnExtractor` to implement `FromRequest`
+note: required by a bound in `__neutron_assert_arg_0`
+ --> tests/ui/debug_handler_bad_arg.rs:8:27
+  |
+8 | async fn create(_payload: NotAnExtractor) -> &'static str {
+  |                           ^^^^^^^^^^^^^^ required by this bound in `__neutron_assert_arg_0`

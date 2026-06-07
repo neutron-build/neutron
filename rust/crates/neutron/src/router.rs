@@ -26,8 +26,8 @@ use http_body_util::BodyExt;
 use smallvec::SmallVec;
 
 use crate::handler::{
-    into_boxed, AnyState, Body, BoxedHandler, ErasedHandler, Handler, ReqBody, Request, Response,
-    StateMap,
+    into_boxed, AnyState, Body, BoxedHandler, ErasedHandler, Handler, IntoResponse, ReqBody,
+    Request, Response, StateMap,
 };
 use crate::middleware::{self, MiddlewareTrait};
 
@@ -529,10 +529,143 @@ impl<S> Router<S> {
         self
     }
 
+    /// Register a pre-boxed, type-erased handler for every HTTP method at `path`.
+    fn route_all_boxed(mut self, path: &str, boxed: Arc<BoxedHandler>) -> Self {
+        let matchit_path = to_matchit_path(path);
+        for kind in MethodKind::ALL {
+            let forwarding: BoxedHandler =
+                Box::new(ForwardingHandler { inner: Arc::clone(&boxed) });
+            self.pending
+                .entry(matchit_path.clone())
+                .or_default()
+                .push(PendingRoute { method: kind, handler: forwarding });
+            #[cfg(feature = "openapi")]
+            self.registered_routes
+                .push((method_kind_to_str(kind).to_string(), path.to_string()));
+        }
+        self
+    }
+
+    /// Mount an arbitrary `tower::Service` under a path prefix.
+    ///
+    /// Unlike [`nest`](Self::nest) (which merges another [`Router`]'s route
+    /// table into this one), `nest_service` mounts an opaque
+    /// `tower::Service<http::Request<Body>, Response = Response, Error = Infallible>`
+    /// — another [`RouterService`], a `tower-http` `ServeDir`, a gRPC handler, etc.
+    /// All requests under `prefix` (and `prefix` itself) are forwarded to the
+    /// service. The request body is buffered before hand-off.
+    ///
+    /// ```rust,ignore
+    /// let assets = ServeDir::new("./public"); // any tower::Service
+    /// let api = Router::<()>::new().get("/users", list).into_service();
+    /// let app = Router::<()>::new()
+    ///     .nest_service("/assets", assets)
+    ///     .nest_service("/api", api);
+    /// ```
+    pub fn nest_service<Svc>(self, prefix: &str, service: Svc) -> Self
+    where
+        Svc: tower_service::Service<
+                http::Request<Body>,
+                Response = Response,
+                Error = std::convert::Infallible,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        Svc::Future: Send,
+    {
+        let prefix = prefix.trim_end_matches('/');
+        let boxed: Arc<BoxedHandler> = Arc::new(Box::new(ServiceHandler {
+            service,
+            body_limit: crate::app::DEFAULT_MAX_BODY_SIZE,
+            prefix: prefix.to_string(),
+        }));
+        // Mount at both the bare prefix and the catch-all below it.
+        let wildcard = if prefix.is_empty() {
+            "/*".to_string()
+        } else {
+            format!("{prefix}/*")
+        };
+        let bare = if prefix.is_empty() { "/" } else { prefix };
+        self.route_all_boxed(bare, Arc::clone(&boxed))
+            .route_all_boxed(&wildcard, boxed)
+    }
+
     // -- Middleware ----------------------------------------------------------
 
     pub fn middleware<M: MiddlewareTrait + 'static>(mut self, mw: M) -> Self {
         self.middlewares.push(Arc::new(mw));
+        self
+    }
+
+    /// Install the standard Neutron middleware stack in the contract-mandated
+    /// order, matching the cross-language `FRAMEWORK_CONTRACT.md` spec:
+    ///
+    /// ```text
+    /// RequestID → Logging → Recovery → CORS → Compression
+    ///   → RateLimit → Auth → Timeout → OpenTelemetry
+    /// ```
+    ///
+    /// Each layer is gated on its feature flag, so the stack only includes the
+    /// middleware your build actually compiled in. `Auth` is application-defined
+    /// (no universal default exists) and is intentionally omitted — add it with
+    /// `.middleware(..)` after `default_stack()` at the Auth position if needed.
+    /// `OpenTelemetry` is represented by the `tracing-mw` [`TracingLayer`].
+    ///
+    /// Middleware added *before* `default_stack()` runs outermost; middleware
+    /// added *after* runs innermost (closest to the handler). For the canonical
+    /// ordering, call `default_stack()` first.
+    ///
+    /// ```rust,ignore
+    /// let router = Router::<()>::new()
+    ///     .default_stack(std::time::Duration::from_secs(30))
+    ///     .get("/", || async { "ok" });
+    /// ```
+    pub fn default_stack(mut self, request_timeout: std::time::Duration) -> Self {
+        // 1. Request ID — first so every downstream layer can log/propagate it.
+        #[cfg(feature = "request-id")]
+        self.middlewares
+            .push(Arc::new(crate::request_id::RequestId::new()));
+
+        // 2. Logging.
+        #[cfg(feature = "logging")]
+        self.middlewares.push(Arc::new(crate::logger::Logger::new()));
+
+        // 3. Recovery — catch panics and convert to a 500 problem+json.
+        #[cfg(feature = "catch-panic")]
+        self.middlewares
+            .push(Arc::new(crate::catch_panic::CatchPanic::new()));
+
+        // 4. CORS — permissive defaults; tighten via `.middleware(Cors::new()..)`.
+        #[cfg(feature = "cors")]
+        self.middlewares.push(Arc::new(crate::cors::Cors::new()));
+
+        // 5. Compression.
+        #[cfg(feature = "compress")]
+        self.middlewares
+            .push(Arc::new(crate::compress::Compress::new()));
+
+        // 6. Rate limit — conservative default (1000 req / 60s per client).
+        #[cfg(feature = "rate-limit")]
+        self.middlewares
+            .push(Arc::new(crate::rate_limit::RateLimiter::new(
+                1000,
+                std::time::Duration::from_secs(60),
+            )));
+
+        // 7. Auth — application-defined; intentionally not installed here.
+
+        // 8. Timeout.
+        #[cfg(feature = "timeout")]
+        self.middlewares
+            .push(Arc::new(crate::timeout::Timeout::new(request_timeout)));
+
+        // 9. OpenTelemetry — tracing span per request.
+        #[cfg(feature = "tracing-mw")]
+        self.middlewares
+            .push(Arc::new(crate::tracing_mw::TracingLayer));
+
+        let _ = request_timeout; // silence unused warning when timeout feature is off
         self
     }
 
@@ -827,6 +960,102 @@ impl<S> Default for Router<S> {
 }
 
 // ---------------------------------------------------------------------------
+// ServiceHandler — mount an arbitrary `tower::Service` at a path (P1.3)
+// ---------------------------------------------------------------------------
+
+/// Type-erased handler that forwards a [`Request`] to an inner `tower::Service`.
+///
+/// Used by [`Router::nest_service`] to mount any
+/// `tower::Service<http::Request<Body>, Response = Response, Error = Infallible>`
+/// (e.g. another [`RouterService`], a `tower-http` `ServeDir`, a gRPC service)
+/// under a path prefix. The request body is buffered (bounded by `body_limit`)
+/// before hand-off so the inner service receives a complete `http::Request<Body>`.
+struct ServiceHandler<S> {
+    service: S,
+    body_limit: usize,
+    /// The mount prefix (e.g. `/api`), stripped from the request path before the
+    /// inner service sees it — so a service mounted at `/api` receives `/users`
+    /// for a request to `/api/users`, matching Axum's `nest_service` semantics.
+    prefix: String,
+}
+
+impl<S> ServiceHandler<S> {
+    /// Strip the mount prefix from `path`, always returning a leading-slash path.
+    fn strip_prefix<'a>(&self, path: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.prefix.is_empty() {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        match path.strip_prefix(&self.prefix) {
+            // Exact prefix match (e.g. "/api" -> "/").
+            Some("") => std::borrow::Cow::Borrowed("/"),
+            // "/api/users" -> "/users".
+            Some(rest) if rest.starts_with('/') => std::borrow::Cow::Borrowed(rest),
+            // "/apixyz" — prefix matched as a substring, not a path boundary;
+            // forward unchanged.
+            _ => std::borrow::Cow::Borrowed(path),
+        }
+    }
+}
+
+impl<S> ErasedHandler for ServiceHandler<S>
+where
+    S: tower_service::Service<
+            http::Request<Body>,
+            Response = Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send,
+{
+    fn call(&self, mut req: Request) -> Pin<Box<dyn Future<Output = Response> + Send>> {
+        let mut service = self.service.clone();
+        let body_limit = self.body_limit;
+
+        // Rewrite the path to strip the mount prefix, preserving any query.
+        // Computed here (while `self` is borrowed) so the `'static` future below
+        // doesn't capture `self`.
+        let original = req.uri().clone();
+        let stripped_path = self.strip_prefix(original.path());
+        let new_path_and_query = match original.query() {
+            Some(q) => format!("{stripped_path}?{q}"),
+            None => stripped_path.into_owned(),
+        };
+        let mut uri_parts = original.clone().into_parts();
+        uri_parts.path_and_query = new_path_and_query.parse().ok();
+        let uri = http::Uri::from_parts(uri_parts).unwrap_or(original);
+
+        Box::pin(async move {
+            // Buffer the streaming body so the inner service gets a complete,
+            // Infallible-bodied `http::Request<Body>`.
+            let body = match req.collect_body(body_limit).await {
+                Ok(b) => b,
+                Err(resp) => return resp,
+            };
+            let mut builder = http::Request::builder()
+                .method(req.method().clone())
+                .uri(uri);
+            if let Some(headers) = builder.headers_mut() {
+                *headers = req.headers().clone();
+            }
+            let http_req = match builder.body(Body::full(body)) {
+                Ok(r) => r,
+                Err(_) => return crate::error::AppError::internal(
+                    "Failed to reconstruct request for nested service.",
+                )
+                .into_response(),
+            };
+            // poll_ready then call; Error is Infallible so unwrap is total.
+            std::future::poll_fn(|cx| service.poll_ready(cx))
+                .await
+                .unwrap_or_else(|e| match e {});
+            service.call(http_req).await.unwrap_or_else(|e| match e {})
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RouterService — Router as a `tower::Service` (P1.1, the keystone)
 // ---------------------------------------------------------------------------
 
@@ -837,9 +1066,8 @@ impl<S> Default for Router<S> {
 /// (like Axum), so it composes with `tower` / `tower-http` layers and supports
 /// `ServiceExt::oneshot` testing.
 ///
-/// The request body is buffered at the boundary today; streaming request bodies
-/// land in P1.2 (the boundary type is already `http::Request<Body>` so that
-/// change is internal).
+/// The request body is passed through as a lazy stream (P1.2) — nothing is
+/// buffered at the boundary; body extractors enforce per-frame size limits.
 #[derive(Clone)]
 pub struct RouterService {
     dispatch: crate::app::DispatchChain,
@@ -857,6 +1085,20 @@ impl Router {
         let state = Arc::new(std::mem::take(&mut self.state_map));
         let dispatch = crate::app::build_dispatch(Arc::new(self));
         RouterService { dispatch, state }
+    }
+}
+
+impl RouterService {
+    /// The compiled dispatch chain (middleware → routing → handler). The
+    /// production server (`Neutron::listen`) drives requests through this exact
+    /// chain so the server and the `tower::Service` share one dispatch path.
+    pub(crate) fn dispatch_chain(&self) -> crate::app::DispatchChain {
+        Arc::clone(&self.dispatch)
+    }
+
+    /// The application state map injected into every request at the boundary.
+    pub(crate) fn state(&self) -> Arc<StateMap> {
+        Arc::clone(&self.state)
     }
 }
 
@@ -1123,6 +1365,109 @@ mod tests {
         assert_eq!(resp.status(), http::StatusCode::METHOD_NOT_ALLOWED);
         let allow = resp.headers().get(http::header::ALLOW).unwrap().to_str().unwrap();
         assert!(allow.contains("GET"), "Allow header was {allow:?}");
+    }
+
+    // P1.3: nest_service mounts another RouterService under a prefix and
+    // forwards every request below it to that inner service.
+    #[tokio::test]
+    async fn nest_service_forwards_to_inner_router() {
+        use tower::ServiceExt;
+
+        let inner = Router::<()>::new()
+            .get("/users", || async { "inner-users" })
+            .get("/", || async { "inner-root" })
+            .into_service();
+
+        let app = Router::<()>::new()
+            .get("/", || async { "outer-root" })
+            .nest_service("/api", inner)
+            .into_service();
+
+        // Request under the prefix hits the inner service's deep route.
+        let req = http::Request::builder()
+            .method(Method::GET)
+            .uri("/api/users")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"inner-users");
+
+        // The outer route is unaffected.
+        let req = http::Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"outer-root");
+    }
+
+    // P1.3: a nested service's POST body is buffered and handed through intact.
+    #[tokio::test]
+    async fn nest_service_passes_body_through() {
+        use tower::ServiceExt;
+
+        let inner = Router::<()>::new()
+            .post("/echo", |body: String| async move { body })
+            .into_service();
+        let app = Router::<()>::new().nest_service("/svc", inner).into_service();
+
+        let req = http::Request::builder()
+            .method(Method::POST)
+            .uri("/svc/echo")
+            .body(Body::full("payload-123"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"payload-123");
+    }
+
+    // P1.4: default_stack installs the contract middleware and dispatch works.
+    #[tokio::test]
+    async fn default_stack_dispatches() {
+        use tower::ServiceExt;
+
+        let svc = Router::<()>::new()
+            .default_stack(std::time::Duration::from_secs(5))
+            .get("/ok", || async { "stacked" })
+            .into_service();
+
+        let req = http::Request::builder()
+            .method(Method::GET)
+            .uri("/ok")
+            .body(Body::empty())
+            .unwrap();
+        let resp = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"stacked");
+    }
+
+    // P1.4: default_stack installs middleware in the contract order. When the
+    // relevant features are on, request-id is outermost (its header is present).
+    #[cfg(feature = "request-id")]
+    #[tokio::test]
+    async fn default_stack_sets_request_id() {
+        use tower::ServiceExt;
+
+        let svc = Router::<()>::new()
+            .default_stack(std::time::Duration::from_secs(5))
+            .get("/", || async { "ok" })
+            .into_service();
+        let req = http::Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = svc.oneshot(req).await.unwrap();
+        assert!(
+            resp.headers().contains_key("x-request-id"),
+            "default_stack should install the RequestId layer"
+        );
     }
 
     // P1.6/B.4: typed state binds via with_state and extracts at dispatch time.
