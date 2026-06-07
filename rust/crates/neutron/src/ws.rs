@@ -30,7 +30,7 @@ use http::{HeaderValue, StatusCode};
 use hyper_util::rt::TokioIo;
 use sha1::{Digest, Sha1};
 
-use crate::extract::FromRequest;
+use crate::extract::FromRequestParts;
 use crate::handler::{Body, IntoResponse, Request, Response};
 
 /// The WebSocket GUID from RFC 6455.
@@ -222,8 +222,13 @@ impl WebSocketUpgrade {
     }
 }
 
-impl FromRequest for WebSocketUpgrade {
-    async fn from_request(req: &mut Request) -> Result<Self, Response> {
+// P1.9: WebSocketUpgrade is a *parts* extractor — it only reads headers and
+// takes the upgrade future (via interior mutability), never the body. Modeling
+// it as `FromRequestParts` (Axum parity) means it composes with a body extractor
+// in the same handler and survives the streaming-body + RouterService boundary
+// untouched (the body is never consumed by the handshake).
+impl FromRequestParts for WebSocketUpgrade {
+    async fn from_parts(req: &Request) -> Result<Self, Response> {
         // Connection: upgrade
         let connection = req
             .headers()
@@ -675,6 +680,68 @@ mod tests {
             .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(resp.text().await.contains("does not support upgrade"));
+    }
+
+    // P1.9 regression guard: a WebSocket handler routed through the
+    // RouterService (tower::Service) + streaming-body boundary reaches the
+    // upgrade-extraction path. A synthetic request carries no real upgrade
+    // handle, so extraction fails at the "does not support upgrade" point —
+    // proving the handshake validation ran through the service stack without
+    // the streaming-body rework swallowing or panicking on the request.
+    #[tokio::test]
+    async fn ws_upgrade_roundtrip_through_router_service() {
+        use crate::router::Router;
+        use tower::ServiceExt;
+
+        let svc = Router::<()>::new()
+            .get("/ws", |ws: WebSocketUpgrade| async move {
+                ws.on_upgrade(|_| async {})
+            })
+            .into_service();
+
+        let req = http::Request::builder()
+            .method(http::Method::GET)
+            .uri("/ws")
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = svc.oneshot(req).await.unwrap();
+        // Header validation passed through the full service stack; only the
+        // (absent) upgrade handle is missing on a synthetic request.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("does not support upgrade"),
+            "expected upgrade-unavailable error, got: {text:?}"
+        );
+    }
+
+    // P1.9: WebSocketUpgrade is a parts extractor, so it composes with a body
+    // extractor in the same handler — the body is never consumed by the
+    // handshake. This wouldn't compile (or would steal the body) if the upgrade
+    // were a FromRequest body extractor.
+    #[tokio::test]
+    async fn ws_upgrade_composes_with_body_extractor() {
+        use crate::router::Router;
+        use crate::testing::TestClient;
+
+        let client = TestClient::new(Router::new().post(
+            "/ws",
+            |_ws: WebSocketUpgrade, body: String| async move { body },
+        ));
+
+        // Missing upgrade headers -> the WS parts extractor rejects first (400),
+        // but the handler signature itself proves parts + body coexist.
+        let resp = client.post("/ws").body("payload").send().await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     // -----------------------------------------------------------------------
