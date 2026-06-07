@@ -227,6 +227,55 @@ impl TestResponse {
     pub fn into_response(self) -> Response {
         self.inner
     }
+
+    // -- Ergonomic assertions (P2.7) ----------------------------------------
+
+    /// Assert the response status equals `expected`. Returns `self` for chaining.
+    ///
+    /// ```rust,ignore
+    /// client.get("/").send().await.assert_status(StatusCode::OK);
+    /// ```
+    #[track_caller]
+    pub fn assert_status(self, expected: StatusCode) -> Self {
+        assert_eq!(
+            self.status(),
+            expected,
+            "expected status {expected}, got {}",
+            self.status()
+        );
+        self
+    }
+
+    /// Assert the response status is `200 OK`. Returns `self` for chaining.
+    #[track_caller]
+    pub fn assert_status_ok(self) -> Self {
+        self.assert_status(StatusCode::OK)
+    }
+
+    /// Assert a header is present and equals `value`. Returns `self` for chaining.
+    #[track_caller]
+    pub fn assert_header(self, name: &str, value: &str) -> Self {
+        match self.header(name) {
+            Some(actual) => assert_eq!(
+                actual, value,
+                "header `{name}`: expected `{value}`, got `{actual}`"
+            ),
+            None => panic!("expected header `{name}` to be present, but it was missing"),
+        }
+        self
+    }
+
+    /// Assert the `content-type` header starts with `expected` (ignores params
+    /// like `; charset=utf-8`). Returns `self` for chaining.
+    #[track_caller]
+    pub fn assert_content_type(self, expected: &str) -> Self {
+        let ct = self.header("content-type").unwrap_or("");
+        assert!(
+            ct.starts_with(expected),
+            "expected content-type starting with `{expected}`, got `{ct}`"
+        );
+        self
+    }
 }
 
 // ===========================================================================
@@ -535,6 +584,33 @@ mod tests {
         let resp = client.post("/items").send().await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.text().await, "created");
+    }
+
+    // P2.7: ergonomic chainable response assertions.
+    #[tokio::test]
+    async fn test_response_assert_helpers() {
+        let client = TestClient::new(Router::new().get("/", || async { "hi" }));
+
+        let text = client
+            .get("/")
+            .send()
+            .await
+            .assert_status_ok()
+            .assert_status(StatusCode::OK)
+            .text()
+            .await;
+        assert_eq!(text, "hi");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "expected status")]
+    async fn assert_status_panics_on_mismatch() {
+        let client = TestClient::new(Router::new().get("/", || async { "hi" }));
+        client
+            .get("/missing")
+            .send()
+            .await
+            .assert_status(StatusCode::OK);
     }
 
     #[tokio::test]

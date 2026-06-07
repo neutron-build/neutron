@@ -379,7 +379,7 @@ impl<S> Router<S> {
 
     // -- Route registration helpers -----------------------------------------
 
-    fn route<H, T>(mut self, method: MethodKind, path: &str, handler: H) -> Self
+    fn add_route<H, T>(mut self, method: MethodKind, path: &str, handler: H) -> Self
     where
         H: Handler<T>,
         T: 'static,
@@ -401,7 +401,7 @@ impl<S> Router<S> {
         H: Handler<T>,
         T: 'static,
     {
-        self.route(MethodKind::Get, path, handler)
+        self.add_route(MethodKind::Get, path, handler)
     }
 
     pub fn post<H, T>(self, path: &str, handler: H) -> Self
@@ -409,7 +409,7 @@ impl<S> Router<S> {
         H: Handler<T>,
         T: 'static,
     {
-        self.route(MethodKind::Post, path, handler)
+        self.add_route(MethodKind::Post, path, handler)
     }
 
     pub fn put<H, T>(self, path: &str, handler: H) -> Self
@@ -417,7 +417,7 @@ impl<S> Router<S> {
         H: Handler<T>,
         T: 'static,
     {
-        self.route(MethodKind::Put, path, handler)
+        self.add_route(MethodKind::Put, path, handler)
     }
 
     pub fn delete<H, T>(self, path: &str, handler: H) -> Self
@@ -425,7 +425,7 @@ impl<S> Router<S> {
         H: Handler<T>,
         T: 'static,
     {
-        self.route(MethodKind::Delete, path, handler)
+        self.add_route(MethodKind::Delete, path, handler)
     }
 
     pub fn patch<H, T>(self, path: &str, handler: H) -> Self
@@ -433,7 +433,7 @@ impl<S> Router<S> {
         H: Handler<T>,
         T: 'static,
     {
-        self.route(MethodKind::Patch, path, handler)
+        self.add_route(MethodKind::Patch, path, handler)
     }
 
     pub fn head<H, T>(self, path: &str, handler: H) -> Self
@@ -441,7 +441,7 @@ impl<S> Router<S> {
         H: Handler<T>,
         T: 'static,
     {
-        self.route(MethodKind::Head, path, handler)
+        self.add_route(MethodKind::Head, path, handler)
     }
 
     pub fn options<H, T>(self, path: &str, handler: H) -> Self
@@ -449,7 +449,7 @@ impl<S> Router<S> {
         H: Handler<T>,
         T: 'static,
     {
-        self.route(MethodKind::Options, path, handler)
+        self.add_route(MethodKind::Options, path, handler)
     }
 
     /// Register a handler for multiple HTTP methods on the same path.
@@ -505,6 +505,30 @@ impl<S> Router<S> {
             ],
             handler,
         )
+    }
+
+    /// Register a composable [`MethodRouter`] value at `path` (P2.7).
+    ///
+    /// ```rust,ignore
+    /// use neutron::router::{get, post};
+    /// Router::<()>::new()
+    ///     .route("/users", get(list).post(create));
+    /// ```
+    ///
+    /// A 405 with a correct `Allow` header falls out automatically for any
+    /// method the `MethodRouter` doesn't handle.
+    pub fn route(mut self, path: &str, method_router: MethodRouter) -> Self {
+        let matchit_path = to_matchit_path(path);
+        for (kind, handler) in method_router.handlers {
+            self.pending
+                .entry(matchit_path.clone())
+                .or_default()
+                .push(PendingRoute { method: kind, handler });
+            #[cfg(feature = "openapi")]
+            self.registered_routes
+                .push((method_kind_to_str(kind).to_string(), path.to_string()));
+        }
+        self
     }
 
     // -- State --------------------------------------------------------------
@@ -957,6 +981,156 @@ impl<S> Default for Router<S> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// MethodRouter — composable per-method handler value (P2.7, Axum parity)
+// ---------------------------------------------------------------------------
+
+/// A composable bundle of per-method handlers for a single path.
+///
+/// Build one with the free functions [`get`], [`post`], etc., chain more
+/// methods onto it, then mount it with [`Router::route`]:
+///
+/// ```rust,ignore
+/// use neutron::router::{get, post, Router};
+///
+/// Router::<()>::new()
+///     .route("/users", get(list_users).post(create_user))
+///     .route("/users/:id", get(show_user).delete(delete_user));
+/// ```
+///
+/// A correct `405 Method Not Allowed` (with the `Allow` header) is produced
+/// automatically for any method the bundle doesn't define.
+#[derive(Default)]
+pub struct MethodRouter {
+    handlers: Vec<(MethodKind, BoxedHandler)>,
+}
+
+impl MethodRouter {
+    /// Create an empty `MethodRouter`. Prefer the [`get`]/[`post`]/… free fns.
+    pub fn new() -> Self {
+        Self { handlers: Vec::new() }
+    }
+
+    fn with<H, T>(mut self, method: MethodKind, handler: H) -> Self
+    where
+        H: Handler<T>,
+        T: 'static,
+    {
+        // Last registration for a method wins (matches builder-method behavior).
+        self.handlers.retain(|(m, _)| *m != method);
+        self.handlers.push((method, into_boxed(handler)));
+        self
+    }
+
+    /// Add a `GET` handler.
+    pub fn get<H, T>(self, handler: H) -> Self
+    where
+        H: Handler<T>,
+        T: 'static,
+    {
+        self.with(MethodKind::Get, handler)
+    }
+
+    /// Add a `POST` handler.
+    pub fn post<H, T>(self, handler: H) -> Self
+    where
+        H: Handler<T>,
+        T: 'static,
+    {
+        self.with(MethodKind::Post, handler)
+    }
+
+    /// Add a `PUT` handler.
+    pub fn put<H, T>(self, handler: H) -> Self
+    where
+        H: Handler<T>,
+        T: 'static,
+    {
+        self.with(MethodKind::Put, handler)
+    }
+
+    /// Add a `DELETE` handler.
+    pub fn delete<H, T>(self, handler: H) -> Self
+    where
+        H: Handler<T>,
+        T: 'static,
+    {
+        self.with(MethodKind::Delete, handler)
+    }
+
+    /// Add a `PATCH` handler.
+    pub fn patch<H, T>(self, handler: H) -> Self
+    where
+        H: Handler<T>,
+        T: 'static,
+    {
+        self.with(MethodKind::Patch, handler)
+    }
+
+    /// Add a `HEAD` handler.
+    pub fn head<H, T>(self, handler: H) -> Self
+    where
+        H: Handler<T>,
+        T: 'static,
+    {
+        self.with(MethodKind::Head, handler)
+    }
+
+    /// Add an `OPTIONS` handler.
+    pub fn options<H, T>(self, handler: H) -> Self
+    where
+        H: Handler<T>,
+        T: 'static,
+    {
+        self.with(MethodKind::Options, handler)
+    }
+}
+
+/// Start a [`MethodRouter`] with a `GET` handler.
+pub fn get<H, T>(handler: H) -> MethodRouter
+where
+    H: Handler<T>,
+    T: 'static,
+{
+    MethodRouter::new().get(handler)
+}
+
+/// Start a [`MethodRouter`] with a `POST` handler.
+pub fn post<H, T>(handler: H) -> MethodRouter
+where
+    H: Handler<T>,
+    T: 'static,
+{
+    MethodRouter::new().post(handler)
+}
+
+/// Start a [`MethodRouter`] with a `PUT` handler.
+pub fn put<H, T>(handler: H) -> MethodRouter
+where
+    H: Handler<T>,
+    T: 'static,
+{
+    MethodRouter::new().put(handler)
+}
+
+/// Start a [`MethodRouter`] with a `DELETE` handler.
+pub fn delete<H, T>(handler: H) -> MethodRouter
+where
+    H: Handler<T>,
+    T: 'static,
+{
+    MethodRouter::new().delete(handler)
+}
+
+/// Start a [`MethodRouter`] with a `PATCH` handler.
+pub fn patch<H, T>(handler: H) -> MethodRouter
+where
+    H: Handler<T>,
+    T: 'static,
+{
+    MethodRouter::new().patch(handler)
 }
 
 // ---------------------------------------------------------------------------
@@ -1424,6 +1598,54 @@ mod tests {
         assert_eq!(resp.status(), http::StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"payload-123");
+    }
+
+    // P2.7: MethodRouter composes as a value via get(..).post(..) and a 405
+    // with Allow falls out for unhandled methods.
+    #[tokio::test]
+    async fn method_router_composes() {
+        use tower::ServiceExt;
+
+        let app = Router::<()>::new()
+            .route(
+                "/users",
+                super::get(|| async { "list" }).post(|| async { "create" }),
+            )
+            .into_service();
+
+        let get_req = http::Request::builder()
+            .method(Method::GET)
+            .uri("/users")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(get_req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"list");
+
+        let post_req = http::Request::builder()
+            .method(Method::POST)
+            .uri("/users")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(post_req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"create");
+
+        // Unhandled method -> 405 with Allow.
+        let del_req = http::Request::builder()
+            .method(Method::DELETE)
+            .uri("/users")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(del_req).await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::METHOD_NOT_ALLOWED);
+        let allow = resp
+            .headers()
+            .get(http::header::ALLOW)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(allow.contains("GET") && allow.contains("POST"), "Allow: {allow}");
     }
 
     // P1.4: default_stack installs the contract middleware and dispatch works.
