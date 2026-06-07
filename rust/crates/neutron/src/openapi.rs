@@ -41,9 +41,58 @@ use crate::handler::{Body, Response};
 // Schema
 // ---------------------------------------------------------------------------
 
+/// Types that can describe themselves as an OpenAPI [`Schema`] (P2.2).
+///
+/// Implement this by hand, or derive it with `#[derive(ApiSchema)]` on a struct
+/// of `serde`-friendly fields — the derive maps each field's Rust type to the
+/// corresponding JSON Schema primitive and marks non-`Option` fields required.
+///
+/// ```rust,ignore
+/// use neutron::openapi::ApiSchema;
+///
+/// #[derive(serde::Serialize, ApiSchema)]
+/// struct User { id: u64, name: String, nickname: Option<String> }
+///
+/// let schema = User::schema(); // { type: object, properties: {...}, required: [id, name] }
+/// ```
+pub trait ApiSchema {
+    /// The JSON Schema describing `Self`.
+    fn schema() -> Schema;
+}
+
 /// JSON Schema builder for OpenAPI type definitions.
 #[derive(Debug, Clone)]
 pub struct Schema(pub Value);
+
+// Primitive `ApiSchema` impls so `#[derive(ApiSchema)]` can recurse on field
+// types generically (`<#ty as ApiSchema>::schema()`).
+macro_rules! impl_api_schema_primitive {
+    ($($t:ty => $ctor:expr),* $(,)?) => {
+        $(impl ApiSchema for $t { fn schema() -> Schema { $ctor } })*
+    };
+}
+
+impl_api_schema_primitive! {
+    bool => Schema::boolean(),
+    i8 => Schema::integer(), i16 => Schema::integer(), i32 => Schema::integer(),
+    u8 => Schema::integer(), u16 => Schema::integer(), u32 => Schema::integer(),
+    i64 => Schema::int64(), u64 => Schema::int64(),
+    isize => Schema::int64(), usize => Schema::int64(),
+    f32 => Schema::number(), f64 => Schema::number(),
+    String => Schema::string(),
+}
+
+impl<T: ApiSchema> ApiSchema for Option<T> {
+    fn schema() -> Schema {
+        Schema::nullable(T::schema())
+    }
+}
+
+impl<T: ApiSchema> ApiSchema for Vec<T> {
+    fn schema() -> Schema {
+        Schema::array(T::schema())
+    }
+}
 
 impl Schema {
     /// String type.
@@ -908,6 +957,64 @@ mod tests {
     use super::*;
     use crate::router::Router;
     use crate::testing::TestClient;
+
+    // P2.2: #[derive(ApiSchema)] builds a JSON Schema from a serde struct.
+    #[test]
+    fn derived_schema_matches_serde_type() {
+        #[allow(dead_code)]
+        #[derive(serde::Serialize, crate::ApiSchema)]
+        struct User {
+            id: u64,
+            name: String,
+            nickname: Option<String>,
+            tags: Vec<String>,
+        }
+
+        let schema = User::schema().0;
+        assert_eq!(schema["type"], "object");
+
+        let props = &schema["properties"];
+        assert_eq!(props["id"]["type"], "integer");
+        assert_eq!(props["id"]["format"], "int64");
+        assert_eq!(props["name"]["type"], "string");
+        // Option<String> -> nullable string.
+        assert_eq!(props["nickname"]["type"], "string");
+        assert_eq!(props["nickname"]["nullable"], true);
+        // Vec<String> -> array of string.
+        assert_eq!(props["tags"]["type"], "array");
+        assert_eq!(props["tags"]["items"]["type"], "string");
+
+        // Non-Option fields are required; Option fields are not.
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&"id"));
+        assert!(required.contains(&"name"));
+        assert!(required.contains(&"tags"));
+        assert!(!required.contains(&"nickname"));
+    }
+
+    // P2.2: the manual ApiRoute builder remains the escape hatch alongside the
+    // derive (they compose — a derived Schema feeds a manual route).
+    #[test]
+    fn manual_apiroute_still_works() {
+        #[allow(dead_code)]
+        #[derive(serde::Serialize, crate::ApiSchema)]
+        struct Item {
+            id: u64,
+        }
+
+        let route = ApiRoute::post("/items")
+            .summary("Create item")
+            .body("application/json", Item::schema())
+            .response(201, "application/json", Schema::ref_to("Item"));
+        let spec = OpenApi::new("API", "1.0.0").route(route);
+        let json = spec.to_json();
+        assert!(json["paths"]["/items"]["post"].is_object());
+    }
 
     fn sample_spec() -> OpenApi {
         OpenApi::new("Test API", "1.0.0")

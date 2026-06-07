@@ -84,6 +84,102 @@ pub fn derive_from_ref(input: TokenStream) -> TokenStream {
     quote! { #(#impls)* }.into()
 }
 
+/// Derive `neutron::openapi::ApiSchema` for a struct of `serde`-friendly fields.
+///
+/// Generates `fn schema() -> Schema` that builds a JSON Schema `object`: each
+/// field becomes a property whose schema is `<FieldType as ApiSchema>::schema()`,
+/// and every non-`Option` field is marked `required`. Field names follow the
+/// Rust identifiers (matching `serde`'s default).
+///
+/// ```ignore
+/// #[derive(ApiSchema)]
+/// struct User { id: u64, name: String, nickname: Option<String> }
+/// // => object { id: integer(int64), name: string, nickname: string|nullable }
+/// //    required: ["id", "name"]
+/// ```
+///
+/// Only named-field structs are supported; tuple/unit structs, enums, and
+/// generic targets emit a `compile_error!`.
+#[proc_macro_derive(ApiSchema)]
+pub fn derive_api_schema(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+
+    if !input.generics.params.is_empty() {
+        return syn::Error::new_spanned(
+            &input.generics,
+            "#[derive(ApiSchema)] does not support generic types",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let fields = match &input.data {
+        Data::Struct(data) => match &data.fields {
+            Fields::Named(named) => &named.named,
+            _ => {
+                return syn::Error::new_spanned(
+                    name,
+                    "#[derive(ApiSchema)] requires a struct with named fields",
+                )
+                .to_compile_error()
+                .into();
+            }
+        },
+        _ => {
+            return syn::Error::new_spanned(
+                name,
+                "#[derive(ApiSchema)] can only be applied to structs",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+
+    let mut properties = Vec::new();
+    let mut required = Vec::new();
+    for field in fields {
+        let Some(ident) = field.ident.as_ref() else {
+            continue;
+        };
+        let field_name = ident.to_string();
+        let ty = &field.ty;
+        properties.push(quote! {
+            .property(
+                #field_name,
+                <#ty as ::neutron::openapi::ApiSchema>::schema(),
+            )
+        });
+        // A field is required unless its type is `Option<...>`.
+        if !is_option(ty) {
+            required.push(field_name);
+        }
+    }
+
+    let required_lit = &required;
+    quote! {
+        impl ::neutron::openapi::ApiSchema for #name {
+            fn schema() -> ::neutron::openapi::Schema {
+                ::neutron::openapi::Schema::object()
+                    #(#properties)*
+                    .required(&[#(#required_lit),*])
+                    .build()
+            }
+        }
+    }
+    .into()
+}
+
+/// Returns `true` if `ty` is syntactically `Option<...>`.
+fn is_option(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(tp) = ty {
+        if let Some(seg) = tp.path.segments.last() {
+            return seg.ident == "Option";
+        }
+    }
+    false
+}
+
 /// Improve the compile errors for a Neutron handler `async fn`.
 ///
 /// Neutron handlers are plain `async fn`s; whether one is a valid handler is
@@ -112,7 +208,7 @@ pub fn debug_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // The function must be async — handlers return a future.
     if func.sig.asyncness.is_none() {
         return syn::Error::new_spanned(
-            &func.sig.fn_token,
+            func.sig.fn_token,
             "#[debug_handler] expects an `async fn` — Neutron handlers return a future",
         )
         .to_compile_error()

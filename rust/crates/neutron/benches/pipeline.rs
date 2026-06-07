@@ -449,6 +449,29 @@ fn bench_extractors(c: &mut Criterion) {
         })
     });
 
+    // P2.6 / P1.2 regression guard: a sub-1KB JSON body extract must not regress
+    // now that request bodies stream by default. A single small frame should be
+    // collected with negligible overhead vs the old pre-buffered path.
+    let small_user = User {
+        id: 7,
+        name: "Small".into(),
+        email: "s@x.io".into(),
+    };
+    assert!(
+        serde_json::to_vec(&small_user).unwrap().len() < 1024,
+        "small_json_extract fixture must be < 1KB"
+    );
+    let client_small = TestClient::new(
+        Router::new().post("/u", |Json(_u): Json<User>| async { "ok" }),
+    );
+    group.bench_function("small_json_extract (<1KB, streaming)", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                black_box(client_small.post("/u").json(&small_user).send().await);
+            })
+        })
+    });
+
     group.finish();
 }
 
