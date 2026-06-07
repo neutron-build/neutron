@@ -20,7 +20,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
+// `BufMut::writer()` is only used by the JSON `IntoResponse` impl below.
+#[cfg(feature = "json")]
+use bytes::BufMut;
 use http::{HeaderMap, Method, StatusCode, Uri};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::Full;
