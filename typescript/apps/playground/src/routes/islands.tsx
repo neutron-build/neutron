@@ -3,7 +3,7 @@ import Counter from "../components/Counter.js";
 import Toggle from "../components/Toggle.js";
 import Stopwatch from "../components/Stopwatch.js";
 
-export const config = { mode: "app" };
+export const config = { mode: "static" };
 
 export default function IslandsDemo() {
   return (
@@ -11,7 +11,8 @@ export default function IslandsDemo() {
       <h1>Islands Demo</h1>
       <p style="margin-bottom: 2rem; color: #888;">
         This page demonstrates islands: interactive components that hydrate progressively.
-        The page uses app mode so components are available for hydration.
+        The page is prerendered static and ships only the tiny islands runtime plus
+        each island's own code-split chunk — never the full SPA runtime.
       </p>
 
       <h2>client:load</h2>

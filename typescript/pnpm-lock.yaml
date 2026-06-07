@@ -107,6 +107,9 @@ importers:
       preact:
         specifier: ^10.25.4
         version: 10.28.3
+      preact-render-to-string:
+        specifier: ^6.6.5
+        version: 6.6.5(preact@10.28.3)
     devDependencies:
       '@preact/preset-vite':
         specifier: ^2.9.4
@@ -164,28 +167,6 @@ importers:
       typescript:
         specifier: ^5.7.2
         version: 5.7.2
-      vite:
-        specifier: ^6.0.7
-        version: 6.4.1(@types/node@25.9.1)(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.2)
-
-  apps/tebian-os:
-    dependencies:
-      '@neutron-build/cli':
-        specifier: workspace:*
-        version: link:../../packages/neutron-cli
-      '@neutron-build/core':
-        specifier: workspace:*
-        version: link:../../packages/neutron
-      preact:
-        specifier: ^10.25.4
-        version: 10.28.3
-    devDependencies:
-      '@preact/preset-vite':
-        specifier: ^2.9.4
-        version: 2.10.3(@babel/core@7.29.0)(preact@10.28.3)(rollup@4.57.1)(vite@6.4.1(@types/node@25.9.1)(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.2))
-      typescript:
-        specifier: ^5.7.2
-        version: 5.9.3
       vite:
         specifier: ^6.0.7
         version: 6.4.1(@types/node@25.9.1)(jiti@2.6.1)(tsx@4.21.0)(yaml@2.8.2)
@@ -360,7 +341,7 @@ importers:
   packages/neutron-auth:
     dependencies:
       '@neutron-build/core':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../neutron
       better-auth:
         specifier: '*'
@@ -379,7 +360,7 @@ importers:
   packages/neutron-cache-redis:
     dependencies:
       '@neutron-build/core':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../neutron
       ioredis:
         specifier: ^5.8.1
@@ -395,7 +376,7 @@ importers:
   packages/neutron-cli:
     dependencies:
       '@neutron-build/core':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../neutron
       preact:
         specifier: ^10.25.4
@@ -423,7 +404,7 @@ importers:
         specifier: ^0.17.0
         version: 0.17.0
       '@neutron-build/nucleus':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../neutron-nucleus
       bullmq:
         specifier: ^5.58.0
@@ -457,7 +438,7 @@ importers:
   packages/neutron-ops:
     dependencies:
       '@neutron-build/core':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../neutron
     devDependencies:
       '@types/node':
@@ -470,7 +451,7 @@ importers:
   packages/neutron-otel:
     dependencies:
       '@neutron-build/core':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../neutron
       '@opentelemetry/api':
         specifier: ^1.9.0
@@ -486,7 +467,7 @@ importers:
   packages/neutron-security:
     dependencies:
       '@neutron-build/core':
-        specifier: workspace:*
+        specifier: workspace:^
         version: link:../neutron
     devDependencies:
       '@types/node':

@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import MagicString from "magic-string";
 import type { Plugin, ViteDevServer } from "vite";
 import { escapeHtml } from "../core/escape.js";
 import { discoverRoutes } from "../core/manifest.js";
@@ -46,7 +47,19 @@ const DEV_TOOLBAR_RESOLVED_ID = "\0virtual:neutron/dev-toolbar";
 interface RouterState {
   routes: Route[];
   router: ReturnType<typeof createRouter>;
+  /**
+   * Resolved root-relative module ids (e.g. "/src/components/Counter.tsx") for
+   * every component referenced by an `<Island component={X}>` tag anywhere in
+   * the app's source. Populated by an eager source scan in refreshRoutes so the
+   * `virtual:neutron-islands` manifest is complete at build time (the per-module
+   * `transform` runs lazily and cannot, on its own, enumerate every island).
+   */
+  islandIds: Set<string>;
 }
+
+const ISLAND_VIRTUAL_ID = "virtual:neutron-islands";
+const ISLAND_VIRTUAL_RESOLVED_ID = "\0virtual:neutron-islands";
+const ISLAND_SCRIPT_EXTENSIONS = [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs"];
 
 interface LoaderResult {
   routeId: string;
@@ -115,7 +128,9 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
   const state: RouterState = {
     routes: [],
     router: createRouter(),
+    islandIds: new Set<string>(),
   };
+  const srcDir = path.resolve(rootDir, "src");
   const compiledRouteRules = compileRouteRules(options.routeRules);
   const clientEntry = resolveClientEntryPath(rootDir);
   let isBuild = false;
@@ -126,6 +141,8 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
     for (const route of state.routes) {
       state.router.insert(route);
     }
+
+    state.islandIds = scanIslandIds(srcDir, rootDir);
 
     if (writeRouteTypes) {
       await prepareRouteTypes({
@@ -138,6 +155,10 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
 
   return {
     name: "neutron:core",
+    // Run before @preact/preset-vite's babel transform so the island JSX
+    // injection operates on raw `<Island component={X}>` source, not the
+    // already-lowered `h(Island, { component: X })` form.
+    enforce: "pre",
 
     async configResolved(config) {
       isBuild = config.command === "build";
@@ -414,6 +435,9 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
       if (id === "virtual:neutron/manifest") {
         return "\0virtual:neutron/manifest";
       }
+      if (id === ISLAND_VIRTUAL_ID) {
+        return ISLAND_VIRTUAL_RESOLVED_ID;
+      }
       if (id === DEV_TOOLBAR_MODULE_ID) {
         return DEV_TOOLBAR_RESOLVED_ID;
       }
@@ -439,6 +463,9 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
         return result;
       }
 
+      if (id === ISLAND_VIRTUAL_RESOLVED_ID) {
+        return generateIslandsModule(state.islandIds);
+      }
       if (id === "\0virtual:neutron/routes") {
         return generateRoutesModule(state.routes);
       }
@@ -467,10 +494,6 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
     },
 
     transform(code, id, options) {
-      if (options?.ssr) {
-        return null;
-      }
-
       if (id.startsWith("\0")) {
         return null;
       }
@@ -479,28 +502,53 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
       if (!isScriptModuleId(cleanId)) {
         return null;
       }
+
+      // Inject a stable `__src="<resolved module id>"` prop into every
+      // `<Island component={X}>` tag so the marker carries the island module's
+      // root-relative path (minification-safe; component *names* get mangled).
+      // This runs for BOTH route files and component files (islands can be
+      // wrapped anywhere), and for BOTH SSR and client transforms: SSR needs it
+      // so the prerendered HTML stamps `data-src` on the marker; the client
+      // build needs it so the standalone runtime can dynamic-import the chunk.
+      // It must run before the JSX is lowered by preset-vite.
+      let result: { code: string; map: ReturnType<MagicString["generateMap"]> } | null = null;
+      if (!isPathOutsideSrc(cleanId, srcDir) && code.includes("<Island")) {
+        const injected = injectIslandSources(code, cleanId, rootDir);
+        if (injected) {
+          for (const islandId of injected.ids) state.islandIds.add(islandId);
+          result = injected.result;
+          code = injected.result.code;
+        }
+      }
+
+      // The remaining checks (.server import guard) only apply to client
+      // transforms; SSR modules legitimately import server-only code.
+      if (options?.ssr) {
+        return result;
+      }
+
       const isRouteModule =
         cleanId === normalizedRoutesDir || cleanId.startsWith(normalizedRoutesDir + "/");
       if (isRouteModule) {
-        return null;
+        return result;
       }
 
       // Skip files already transformed by prefresh — their HMR preamble makes
       // them unparseable by our Babel config, and client files with HMR wrappers
       // can't meaningfully import .server modules anyway.
       if (code.includes("$RefreshReg$") || code.includes("__PREFRESH__")) {
-        return null;
+        return result;
       }
 
       if (!hasServerOnlyImport(code)) {
-        return null;
+        return result;
       }
 
       this.error(
         `Client module "${id}" imports a .server module. ` +
           `.server modules can only be imported by route server exports (loader/action/etc) or other .server files.`
       );
-      return null;
+      return result;
     },
   };
 }
@@ -1083,6 +1131,187 @@ function generateManifestModule(routes: Route[]): string {
 }
 
 export default neutronPlugin;
+
+// ---------------------------------------------------------------------------
+// Standalone islands: module-path ids + virtual manifest
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate the `virtual:neutron-islands` module: maps each island's
+ * root-relative module id to a static `import()` thunk. Rollup auto-code-splits
+ * each import into its own chunk and rewrites the URL in dev AND prod, so the
+ * standalone islands entry can lazy-load exactly the island code a page needs.
+ */
+function generateIslandsModule(ids: Set<string>): string {
+  const entries = [...ids]
+    .sort()
+    .map((id) => `  ${JSON.stringify(id)}: () => import(${JSON.stringify(id)})`)
+    .join(",\n");
+  return `export const islands = {\n${entries}\n};\n`;
+}
+
+function isPathOutsideSrc(cleanId: string, srcDir: string): boolean {
+  const normalizedSrc = normalizePathForComparison(srcDir);
+  return !(cleanId === normalizedSrc || cleanId.startsWith(normalizedSrc + "/"));
+}
+
+const ISLAND_TAG_RE = /<Island\b([^>]*?)\bcomponent=\{\s*([A-Za-z_$][\w$]*)\s*\}/g;
+
+/**
+ * Find every `<Island ... component={X}>` tag, resolve X's import source to a
+ * root-relative module id, and inject `__src="<id>"` into the tag. Returns the
+ * magic-string result plus the set of resolved island ids (for the manifest).
+ */
+function injectIslandSources(
+  code: string,
+  cleanId: string,
+  rootDir: string
+): { result: { code: string; map: ReturnType<MagicString["generateMap"]> }; ids: string[] } | null {
+  ISLAND_TAG_RE.lastIndex = 0;
+  const s = new MagicString(code);
+  const ids: string[] = [];
+  let changed = false;
+  let match: RegExpExecArray | null;
+
+  while ((match = ISLAND_TAG_RE.exec(code)) !== null) {
+    const componentName = match[2];
+    // Skip if this tag already has an __src (idempotent re-transform).
+    const tagStart = match.index;
+    const tagSlice = code.slice(tagStart, tagStart + match[0].length + 1);
+    if (/\b__src=/.test(tagSlice)) continue;
+
+    const id = resolveImportSourceId(code, componentName, cleanId, rootDir);
+    if (!id) continue;
+
+    // Insert the prop immediately after `<Island` so it survives whatever
+    // attribute layout follows.
+    const insertAt = tagStart + "<Island".length;
+    s.appendLeft(insertAt, ` __src=${JSON.stringify(id)}`);
+    ids.push(id);
+    changed = true;
+  }
+
+  if (!changed) return null;
+  return {
+    result: { code: s.toString(), map: s.generateMap({ hires: true }) },
+    ids,
+  };
+}
+
+/**
+ * Given a component identifier used in JSX, find its import statement and
+ * resolve the specifier to a root-relative module id (e.g.
+ * "/src/components/Counter.tsx"). Returns null for bare/package imports — those
+ * can't be code-split into a per-island chunk by path id.
+ */
+function resolveImportSourceId(
+  code: string,
+  componentName: string,
+  importerCleanId: string,
+  rootDir: string
+): string | null {
+  const escaped = componentName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // default import:  import Counter from "..."
+  // named import:    import { Counter } from "..."  /  import { X as Counter } from "..."
+  const importRe = new RegExp(
+    `import\\s+(?:${escaped}\\b|(?:[\\w$]+\\s*,\\s*)?\\{[^}]*\\b${escaped}\\b[^}]*\\})\\s*from\\s*["']([^"']+)["']`
+  );
+  const m = code.match(importRe);
+  if (!m) return null;
+  const specifier = m[1];
+
+  // Only relative specifiers map to a project module id.
+  if (!specifier.startsWith(".") && !specifier.startsWith("/")) {
+    return null;
+  }
+
+  const importerAbs = importerCleanId; // already absolute, forward-slashed
+  const importerDir = path.posix.dirname(importerAbs.replace(/\\/g, "/"));
+  let resolvedAbs: string;
+  if (specifier.startsWith("/")) {
+    resolvedAbs = path.posix.join(normalizePathForComparison(rootDir), specifier.slice(1));
+  } else {
+    resolvedAbs = path.posix.normalize(path.posix.join(importerDir, specifier));
+  }
+
+  const onDisk = resolveModuleFileOnDisk(resolvedAbs);
+  if (!onDisk) return null;
+
+  const rootFwd = normalizePathForComparison(rootDir);
+  if (!onDisk.startsWith(rootFwd + "/")) return null;
+  return onDisk.slice(rootFwd.length); // leading slash retained, e.g. /src/...
+}
+
+/**
+ * Resolve a module specifier (which may carry a `.js` extension that actually
+ * refers to a `.tsx` source, or no extension at all) to the real file on disk.
+ */
+function resolveModuleFileOnDisk(resolvedAbs: string): string | null {
+  const tryFiles: string[] = [];
+  const extMatch = resolvedAbs.match(/\.(js|jsx|mjs|cjs|ts|tsx)$/);
+  if (extMatch) {
+    // Exact file, then ".js" → ".tsx"/".ts"/... rewrites.
+    tryFiles.push(resolvedAbs);
+    const base = resolvedAbs.slice(0, resolvedAbs.length - extMatch[0].length);
+    for (const ext of ISLAND_SCRIPT_EXTENSIONS) tryFiles.push(base + ext);
+  } else {
+    for (const ext of ISLAND_SCRIPT_EXTENSIONS) tryFiles.push(resolvedAbs + ext);
+    for (const ext of ISLAND_SCRIPT_EXTENSIONS) {
+      tryFiles.push(path.posix.join(resolvedAbs, "index" + ext));
+    }
+  }
+  for (const candidate of tryFiles) {
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+/**
+ * Eager full-source scan: walk every script file under `src/` looking for
+ * `<Island component={X}>` tags and resolve each X to a root-relative module
+ * id. Used to populate the `virtual:neutron-islands` manifest at build time,
+ * since the lazy per-module `transform` only sees modules Vite happens to load.
+ */
+function scanIslandIds(srcDir: string, rootDir: string): Set<string> {
+  const ids = new Set<string>();
+  if (!fs.existsSync(srcDir)) return ids;
+
+  const walk = (dir: string) => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (/\.(tsx|ts|jsx|js|mjs|cjs)$/.test(entry.name)) {
+        let src: string;
+        try {
+          src = fs.readFileSync(full, "utf-8");
+        } catch {
+          continue;
+        }
+        if (!src.includes("<Island")) continue;
+        const cleanId = normalizePathForComparison(full);
+        ISLAND_TAG_RE.lastIndex = 0;
+        let match: RegExpExecArray | null;
+        while ((match = ISLAND_TAG_RE.exec(src)) !== null) {
+          const id = resolveImportSourceId(src, match[2], cleanId, rootDir);
+          if (id) ids.add(id);
+        }
+      }
+    }
+  };
+
+  walk(srcDir);
+  return ids;
+}
 
 function normalizePathForComparison(filePath: string): string {
   return filePath.replace(/\\/g, "/").replace(/\/+$/, "");

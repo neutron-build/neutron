@@ -234,6 +234,43 @@ export async function build(): Promise<void> {
     writeClientEntryMetadata(outputDir, clientEntryScriptSrc);
   }
 
+  // Standalone islands entry: a SEPARATE Rollup build (so the SPA/app client
+  // bundle stays byte-identical). It imports only the island runtime + the
+  // virtual islands manifest — never the SPA runtime — so Rollup code-splits
+  // each island into its own chunk. Prerendered static pages with islands
+  // reference THIS entry instead of the 34KB index-*.js.
+  if (hasIslands) {
+    await viteBuild(
+      mergeConfig(userConfig, {
+        configFile: false,
+        root: cwd,
+        plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
+        css: cssConfig,
+        resolve: {
+          ...(runtimeAliases ? { alias: runtimeAliases } : {}),
+          dedupe: ["preact", "preact/hooks", "preact/compat", "preact/jsx-runtime"],
+        },
+        build: {
+          outDir: outputDir,
+          // Do NOT empty the output — the SPA/app client bundle is already there.
+          emptyOutDir: false,
+          rollupOptions: {
+            input: { "neutron-islands": "@neutron-build/core/client/islands-entry" },
+            output: {
+              entryFileNames: "assets/[name]-[hash].js",
+              chunkFileNames: "assets/[name]-[hash].js",
+              assetFileNames: "assets/[name]-[hash][extname]",
+            },
+          },
+        },
+      })
+    );
+  }
+
+  // Standalone islands entry chunk (tiny runtime + per-island code-split chunks).
+  // Prerendered static pages with islands reference this instead of the SPA runtime.
+  const islandsEntryScriptSrc = hasIslands ? extractIslandsEntryScriptSrc(outputDir) : null;
+
   // Collect CSS files produced by the client build for injection into static HTML
   const clientCssFiles = extractClientCssFiles(outputDir);
 
@@ -530,7 +567,8 @@ export async function build(): Promise<void> {
             loaderData,
             clientEntryScriptSrc,
             headHtml,
-            clientCssFiles
+            clientCssFiles,
+            islandsEntryScriptSrc
           );
 
           const outPath = getOutputPath(outputDir, resolvedPath);
@@ -606,7 +644,8 @@ export async function build(): Promise<void> {
         loaderData,
         clientEntryScriptSrc,
         headHtml,
-        clientCssFiles
+        clientCssFiles,
+        islandsEntryScriptSrc
       );
 
       const outPath = getOutputPath(outputDir, route.path);
@@ -698,12 +737,17 @@ function wrapHtml(
   _loaderData?: unknown,
   clientEntryScriptSrc: string | null = null,
   headHtml: string = renderDocumentHead(routePath, null),
-  cssFiles: string[] = []
+  cssFiles: string[] = [],
+  islandsEntryScriptSrc: string | null = null
 ): string {
   // Detect islands in content — only load client runtime if interactive islands exist
   const hasIslands = content.includes("<neutron-island");
-  const clientScript = hasIslands && clientEntryScriptSrc
-    ? `<script type="module" src="${escapeHtml(clientEntryScriptSrc)}"></script>`
+  // Prefer the standalone islands entry (tiny runtime + per-island code-split
+  // chunks) over the full 34KB SPA runtime. Fall back to the SPA runtime only
+  // if no islands entry was emitted.
+  const islandScriptSrc = islandsEntryScriptSrc || clientEntryScriptSrc;
+  const clientScript = hasIslands && islandScriptSrc
+    ? `<script type="module" src="${escapeHtml(islandScriptSrc)}"></script>`
     : "";
 
   const cssLinks = cssFiles
@@ -748,6 +792,21 @@ function extractClientCssFiles(outputDir: string): string[] {
     .readdirSync(assetsDir)
     .filter((name) => name.endsWith(".css"))
     .map((name) => `/assets/${name}`);
+}
+
+/**
+ * Find the standalone islands entry chunk emitted by the client build. Named
+ * input "neutron-islands" → Rollup emits `assets/neutron-islands-[hash].js`.
+ */
+function extractIslandsEntryScriptSrc(outputDir: string): string | null {
+  const assetsDir = path.join(outputDir, "assets");
+  if (!fs.existsSync(assetsDir)) return null;
+  const candidates = fs
+    .readdirSync(assetsDir)
+    .filter((name) => name.startsWith("neutron-islands-") && name.endsWith(".js"))
+    .sort();
+  if (candidates.length === 0) return null;
+  return `/assets/${candidates[candidates.length - 1]}`;
 }
 
 function extractClientEntryScriptSrc(outputDir: string): string | null {

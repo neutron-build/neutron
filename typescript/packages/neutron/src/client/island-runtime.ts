@@ -10,6 +10,12 @@ interface IslandElement extends HTMLElement {
   __neutronHydrationAttempts?: number;
 }
 
+type IslandManifest = Record<string, () => Promise<any>>;
+
+// Manifest set by initIslands() for standalone (non-SPA) hydration. Maps an
+// island module id (data-src) to a dynamic import() of its code-split chunk.
+let islandManifest: IslandManifest | undefined;
+
 async function hydrateIsland(island: IslandElement) {
   if (island.__neutronHydrated) return;
 
@@ -17,9 +23,24 @@ async function hydrateIsland(island: IslandElement) {
   const propsJson = island.getAttribute("data-props");
   const props = safeParseProps(propsJson);
 
-  // Get component from registry
+  // Resolve the component. In SPA mode the full-tree client render populates
+  // window.__ISLAND_COMPONENTS__, so use that first. Otherwise (standalone
+  // islands on a static page) dynamic-import the component's own chunk via the
+  // manifest keyed by the marker's data-src module id.
   const registry = (window as any).__ISLAND_COMPONENTS__ || {};
-  const Component = registry[componentId || ""];
+  let Component = registry[componentId || ""];
+
+  if (!Component) {
+    const src = island.dataset.src;
+    if (src && islandManifest && Object.prototype.hasOwnProperty.call(islandManifest, src)) {
+      try {
+        const mod = await islandManifest[src]();
+        Component = mod?.default ?? mod;
+      } catch (error) {
+        console.error(`[Neutron] Failed to load island chunk ${src}:`, error);
+      }
+    }
+  }
 
   if (!Component) {
     scheduleHydrationRetry(island, componentId);
@@ -85,7 +106,10 @@ function onMedia(island: IslandElement, query: string) {
   mql.addEventListener("change", handler);
 }
 
-export function initIslands() {
+export function initIslands(manifest?: IslandManifest) {
+  if (manifest) {
+    islandManifest = manifest;
+  }
   const islands = document.querySelectorAll<IslandElement>("neutron-island");
   
   islands.forEach((island) => {
