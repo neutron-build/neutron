@@ -17,7 +17,7 @@ help: the trait `FromRequestParts` is not implemented for `NotAnExtractor`
             Optional<T>
             Query<T>
             TypedHeader<T>
-            http::uri::Uri
+            WebSocketUpgrade
           and $N others
   = note: required for `NotAnExtractor` to implement `FromRequest`
 note: required by a bound in `__neutron_assert_arg_0`

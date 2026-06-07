@@ -215,6 +215,10 @@ pub use neutron_macros::FromRef;
 /// registration site. It is a no-op on the emitted code.
 pub use neutron_macros::debug_handler;
 
+/// Derive `openapi::ApiSchema` — a JSON Schema describing a serde struct (P2.2).
+#[cfg(feature = "openapi")]
+pub use neutron_macros::ApiSchema;
+
 // ---------------------------------------------------------------------------
 // Prelude — convenience re-exports, respects all feature gates above
 // ---------------------------------------------------------------------------
