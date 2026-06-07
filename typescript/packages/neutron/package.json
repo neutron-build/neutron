@@ -44,6 +44,10 @@
       "types": "./dist/client/index.d.ts",
       "import": "./dist/client/index.js"
     },
+    "./client/islands-entry": {
+      "types": "./dist/client/islands-entry.d.ts",
+      "import": "./dist/client/islands-entry.js"
+    },
     "./content": {
       "types": "./dist/content/index.d.ts",
       "import": "./dist/content/index.js"

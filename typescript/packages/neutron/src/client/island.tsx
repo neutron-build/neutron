@@ -7,6 +7,14 @@ interface IslandProps {
   client: ClientDirective;
   id?: string;
   media?: string;
+  /**
+   * Resolved root-relative module id of the island component, injected by the
+   * neutron Vite plugin (e.g. "/src/components/Counter.tsx"). Used by the
+   * standalone islands runtime to dynamic-import the component's code-split
+   * chunk via the `virtual:neutron-islands` manifest. Never rendered as a DOM
+   * attribute under its prop name.
+   */
+  __src?: string;
   [key: string]: unknown;
 }
 
@@ -24,12 +32,13 @@ const componentNameCounts = new Map<string, number>();
  * <Island component={Counter} client="load" count={0} />
  * ```
  */
-export function Island({ 
-  component: Component, 
-  client, 
+export function Island({
+  component: Component,
+  client,
   id,
   media,
-  ...props 
+  __src,
+  ...props
 }: IslandProps) {
   const islandId = `island-${islandCounter++}`;
   const componentId = resolveComponentId(Component, id);
@@ -55,6 +64,7 @@ export function Island({
       "data-client": client,
       "data-props": safeSerializeProps(props),
       ...(media ? { "data-media": media } : {}),
+      ...(__src ? { "data-src": __src } : {}),
     },
     h(Component, props)
   );
