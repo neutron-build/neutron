@@ -572,6 +572,14 @@ impl MvccStorageAdapter {
             committed_counts.insert(name.clone(), table.rows.len() as i64);
         }
 
+        // Compact the WAL to a clean baseline matching the just-reconstructed
+        // state. The engine assigned version indices 0..n per table above (in
+        // `table.rows` order); compact() writes Insert records with the SAME
+        // indices, so subsequent writes get non-colliding higher indices and a
+        // later recovery cannot resurrect/lose rows via cross-run vidx reuse.
+        wal.compact(&state)
+            .map_err(|e| StorageError::Io(format!("WAL compact: {e}")))?;
+
         Ok((
             Self {
                 engine,
@@ -1089,6 +1097,7 @@ impl StorageEngine for MvccStorageAdapter {
             MvccWalRecord::Insert {
                 table: table.to_string(),
                 txn_id: if auto { 0 } else { txn_id },
+                version_idx: version_idx as u32,
                 row: row.clone(),
             }
         )?;
@@ -1135,6 +1144,7 @@ impl StorageEngine for MvccStorageAdapter {
                 MvccWalRecord::Insert {
                     table: table.to_string(),
                     txn_id: wal_txn_id,
+                    version_idx: vidx as u32,
                     row: row.clone(),
                 }
             )?;
@@ -1642,7 +1652,7 @@ impl StorageEngine for MvccStorageAdapter {
                     MvccWalRecord::Delete {
                         table: table.to_string(),
                         txn_id: wal_txn_id,
-                        row_idx: pos as u32,
+                        version_idx: *version_idx as u32,
                     }
                 )?;
                 count += 1;
@@ -1715,7 +1725,8 @@ impl StorageEngine for MvccStorageAdapter {
                     MvccWalRecord::Update {
                         table: table.to_string(),
                         txn_id: wal_txn_id,
-                        row_idx: *pos as u32,
+                        old_version_idx: *version_idx as u32,
+                        new_version_idx: new_vidx as u32,
                         new_row: new_row.clone(),
                     }
                 )?;
@@ -2085,6 +2096,12 @@ impl StorageEngine for MvccStorageAdapter {
         let indexes = self.indexes.read();
         match indexes.get(index_name) {
             Some(idx) => {
+                // BTreeMap::range panics if the start bound is greater than the
+                // end bound; a reversed/contradictory range (e.g. `id >= 20 AND
+                // id <= -5`) is simply empty.
+                if value_cmp_coerced(low, high) == Some(std::cmp::Ordering::Greater) {
+                    return Ok(Some(Vec::new()));
+                }
                 // Use BTreeMap::range for O(log N + k) instead of O(N) linear scan.
                 // BTreeMap iterates in key order, so no sort needed.
                 let rows: Vec<Row> = idx
@@ -2117,6 +2134,10 @@ impl StorageEngine for MvccStorageAdapter {
             let entries = idx.map.get(val)?;
             Some(entries.values().map(|_| vec![val.clone()]).collect())
         } else if let Some((low, high)) = range {
+            // Empty/reversed range — BTreeMap::range would panic.
+            if value_cmp_coerced(low, high) == Some(std::cmp::Ordering::Greater) {
+                return Some(Vec::new());
+            }
             let mut rows = Vec::new();
             for (key, entries) in idx.map.range(low..=high) {
                 for _ in entries.values() {
