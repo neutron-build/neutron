@@ -45,17 +45,25 @@ pub enum MvccWalRecord {
     Insert {
         table: String,
         txn_id: u64,
+        /// Engine version index assigned to this row (stable identity for the
+        /// life of the table). Replay keys rows by this so DELETE/UPDATE address
+        /// the exact row regardless of scan order.
+        version_idx: u32,
         row: Vec<Value>,
     },
     Delete {
         table: String,
         txn_id: u64,
-        row_idx: u32,
+        /// Version index of the deleted row (NOT a scan position).
+        version_idx: u32,
     },
     Update {
         table: String,
         txn_id: u64,
-        row_idx: u32,
+        /// Version index of the superseded row.
+        old_version_idx: u32,
+        /// Version index of the new row version the engine appended.
+        new_version_idx: u32,
         new_row: Vec<Value>,
     },
     Begin {
@@ -155,6 +163,33 @@ impl MvccWal {
         *self.writer.lock() = BufWriter::new(file);
         Ok(())
     }
+
+    /// Rewrite the WAL as a clean baseline for a recovered state: one
+    /// `CreateTable` plus sequential auto-committed `Insert`s (version_idx 0..n)
+    /// per table. Called on open right after replay so that (a) version indices
+    /// restart from 0 each run — otherwise a fresh run's new vidx would collide
+    /// with a survivor's old vidx in the accumulated WAL and corrupt the NEXT
+    /// recovery — and (b) the WAL stays compact. The caller reconstructs the
+    /// engine from the SAME `state` in the same per-table row order, so the
+    /// engine's assigned version indices match these baseline records exactly.
+    pub fn compact(&self, state: &MvccWalState) -> io::Result<()> {
+        self.truncate()?;
+        for (name, tbl) in &state.tables {
+            self.log(&MvccWalRecord::CreateTable {
+                name: name.clone(),
+                columns: tbl.columns.clone(),
+            })?;
+            for (i, row) in tbl.rows.iter().enumerate() {
+                self.log(&MvccWalRecord::Insert {
+                    table: name.clone(),
+                    txn_id: 0,
+                    version_idx: i as u32,
+                    row: row.clone(),
+                })?;
+            }
+        }
+        self.sync()
+    }
 }
 
 // ── Encoding ─────────────────────────────────────────────────────────────────
@@ -175,32 +210,35 @@ fn encode_record(rec: &MvccWalRecord) -> Vec<u8> {
             buf.push(TAG_DROP_TABLE);
             write_str(&mut buf, name);
         }
-        MvccWalRecord::Insert { table, txn_id, row } => {
+        MvccWalRecord::Insert { table, txn_id, version_idx, row } => {
             buf.push(TAG_INSERT);
             write_str(&mut buf, table);
             write_u64(&mut buf, *txn_id);
+            write_u32(&mut buf, *version_idx);
             write_row(&mut buf, row);
         }
         MvccWalRecord::Delete {
             table,
             txn_id,
-            row_idx,
+            version_idx,
         } => {
             buf.push(TAG_DELETE);
             write_str(&mut buf, table);
             write_u64(&mut buf, *txn_id);
-            write_u32(&mut buf, *row_idx);
+            write_u32(&mut buf, *version_idx);
         }
         MvccWalRecord::Update {
             table,
             txn_id,
-            row_idx,
+            old_version_idx,
+            new_version_idx,
             new_row,
         } => {
             buf.push(TAG_UPDATE);
             write_str(&mut buf, table);
             write_u64(&mut buf, *txn_id);
-            write_u32(&mut buf, *row_idx);
+            write_u32(&mut buf, *old_version_idx);
+            write_u32(&mut buf, *new_version_idx);
             write_row(&mut buf, new_row);
         }
         MvccWalRecord::Begin { txn_id } => {
@@ -605,61 +643,47 @@ fn replay(data: &[u8]) -> MvccWalState {
         }
     }
 
-    // Phase 3: Replay committed operations (and auto-commits where txn_id=0)
-    let mut tables: HashMap<String, RecoveredTable> = HashMap::new();
+    // Phase 3: Replay committed operations (and auto-commits where txn_id=0).
+    // Rows are keyed by the engine's stable per-row VERSION INDEX, so DELETE and
+    // UPDATE address the exact row by identity — no fragile scan-position
+    // arithmetic. A BTreeMap keeps rows in version order (the scan order); the
+    // final ordering is irrelevant to callers, which re-sort, but it is
+    // deterministic. An uncommitted transaction's records are simply never
+    // applied, so its writes are rolled back on recovery.
+    let mut columns: HashMap<String, Vec<(String, DataType)>> = HashMap::new();
+    let mut rowmaps: HashMap<String, std::collections::BTreeMap<u32, Vec<Value>>> = HashMap::new();
 
     for rec in &records {
+        let committed_rec = |txn_id: &u64| *txn_id == 0 || committed.contains(txn_id);
         match rec {
-            MvccWalRecord::CreateTable { name, columns } => {
-                tables.insert(
-                    name.clone(),
-                    RecoveredTable {
-                        columns: columns.clone(),
-                        rows: Vec::new(),
-                    },
-                );
+            MvccWalRecord::CreateTable { name, columns: cols } => {
+                columns.insert(name.clone(), cols.clone());
+                rowmaps.insert(name.clone(), std::collections::BTreeMap::new());
             }
             MvccWalRecord::DropTable { name } => {
-                tables.remove(name);
+                columns.remove(name);
+                rowmaps.remove(name);
             }
-            MvccWalRecord::Insert { table, txn_id, row } => {
-                // Auto-commit txns (id 0) or explicitly committed txns
-                if (*txn_id == 0 || committed.contains(txn_id))
-                    && let Some(tbl) = tables.get_mut(table)
+            MvccWalRecord::Insert { table, txn_id, version_idx, row } => {
+                if committed_rec(txn_id)
+                    && let Some(m) = rowmaps.get_mut(table)
                 {
-                    tbl.rows.push(row.clone());
+                    m.insert(*version_idx, row.clone());
                 }
             }
-            MvccWalRecord::Delete {
-                table,
-                txn_id,
-                row_idx,
-            } => {
-                if (*txn_id == 0 || committed.contains(txn_id))
-                    && let Some(tbl) = tables.get_mut(table)
+            MvccWalRecord::Delete { table, txn_id, version_idx } => {
+                if committed_rec(txn_id)
+                    && let Some(m) = rowmaps.get_mut(table)
                 {
-                    let idx = *row_idx as usize;
-                    if idx < tbl.rows.len() {
-                        // Mark deleted with tombstone (empty row) instead
-                        // of Vec::remove() to avoid shifting indices that
-                        // subsequent WAL records reference.
-                        tbl.rows[idx] = Vec::new();
-                    }
+                    m.remove(version_idx);
                 }
             }
-            MvccWalRecord::Update {
-                table,
-                txn_id,
-                row_idx,
-                new_row,
-            } => {
-                if (*txn_id == 0 || committed.contains(txn_id))
-                    && let Some(tbl) = tables.get_mut(table)
+            MvccWalRecord::Update { table, txn_id, old_version_idx, new_version_idx, new_row } => {
+                if committed_rec(txn_id)
+                    && let Some(m) = rowmaps.get_mut(table)
                 {
-                    let idx = *row_idx as usize;
-                    if idx < tbl.rows.len() {
-                        tbl.rows[idx] = new_row.clone();
-                    }
+                    m.remove(old_version_idx);
+                    m.insert(*new_version_idx, new_row.clone());
                 }
             }
             MvccWalRecord::Checkpoint => {
@@ -670,10 +694,16 @@ fn replay(data: &[u8]) -> MvccWalState {
         }
     }
 
-    // Remove tombstone rows (empty Vec) left by DELETE replay.
-    for tbl in tables.values_mut() {
-        tbl.rows.retain(|row| !row.is_empty());
-    }
+    let tables: HashMap<String, RecoveredTable> = columns
+        .into_iter()
+        .map(|(name, cols)| {
+            let rows = rowmaps
+                .remove(&name)
+                .map(|m| m.into_values().collect())
+                .unwrap_or_default();
+            (name, RecoveredTable { columns: cols, rows })
+        })
+        .collect();
 
     MvccWalState { tables }
 }
@@ -702,28 +732,31 @@ fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
         TAG_INSERT => {
             let table = read_str(data, &mut pos)?;
             let txn_id = read_u64_val(data, &mut pos)?;
+            let version_idx = read_u32_val(data, &mut pos)?;
             let row = read_row(data, &mut pos)?;
-            Some(MvccWalRecord::Insert { table, txn_id, row })
+            Some(MvccWalRecord::Insert { table, txn_id, version_idx, row })
         }
         TAG_DELETE => {
             let table = read_str(data, &mut pos)?;
             let txn_id = read_u64_val(data, &mut pos)?;
-            let row_idx = read_u32_val(data, &mut pos)?;
+            let version_idx = read_u32_val(data, &mut pos)?;
             Some(MvccWalRecord::Delete {
                 table,
                 txn_id,
-                row_idx,
+                version_idx,
             })
         }
         TAG_UPDATE => {
             let table = read_str(data, &mut pos)?;
             let txn_id = read_u64_val(data, &mut pos)?;
-            let row_idx = read_u32_val(data, &mut pos)?;
+            let old_version_idx = read_u32_val(data, &mut pos)?;
+            let new_version_idx = read_u32_val(data, &mut pos)?;
             let new_row = read_row(data, &mut pos)?;
             Some(MvccWalRecord::Update {
                 table,
                 txn_id,
-                row_idx,
+                old_version_idx,
+                new_version_idx,
                 new_row,
             })
         }
@@ -771,12 +804,14 @@ mod tests {
             wal.log(&MvccWalRecord::Insert {
                 table: "users".into(),
                 txn_id: 1,
+                version_idx: 0,
                 row: vec![Value::Int64(1), Value::Text("Alice".into())],
             })
             .unwrap();
             wal.log(&MvccWalRecord::Insert {
                 table: "users".into(),
                 txn_id: 1,
+                version_idx: 1,
                 row: vec![Value::Int64(2), Value::Text("Bob".into())],
             })
             .unwrap();
@@ -807,6 +842,7 @@ mod tests {
             wal.log(&MvccWalRecord::Insert {
                 table: "t".into(),
                 txn_id: 1,
+                version_idx: 0,
                 row: vec![Value::Int32(10)],
             })
             .unwrap();
@@ -835,6 +871,7 @@ mod tests {
             wal.log(&MvccWalRecord::Insert {
                 table: "t".into(),
                 txn_id: 1,
+                version_idx: 0,
                 row: vec![Value::Int32(42)],
             })
             .unwrap();
@@ -861,6 +898,7 @@ mod tests {
             wal.log(&MvccWalRecord::Insert {
                 table: "t".into(),
                 txn_id: 1,
+                version_idx: 0,
                 row: vec![Value::Int32(99)],
             })
             .unwrap();
@@ -899,6 +937,7 @@ mod tests {
             wal.log(&MvccWalRecord::Insert {
                 table: "temp".into(),
                 txn_id: 0,
+                version_idx: 0,
                 row: vec![Value::Int32(1)],
             })
             .unwrap();

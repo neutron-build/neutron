@@ -1,0 +1,59 @@
+name: Nucleus Probe Suite
+
+# Differential / metamorphic / invariant / crash / recovery / concurrency /
+# efficiency / security fuzz harnesses for the Nucleus engine. Each harness
+# (src/bin/probe_*.rs + the SQL differential `fuzz`) exits non-zero on a finding;
+# scripts/probe.sh runs them all.
+#
+#   - PRs / pushes touching nucleus: a short ("ci") pass as a gate.
+#   - Nightly: a thorough ("full") pass with many more iterations/seeds.
+#   - Manually dispatchable with a chosen scale.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "nucleus/**"
+      - ".github/workflows/nucleus-probe.yml"
+  pull_request:
+    paths:
+      - "nucleus/**"
+      - ".github/workflows/nucleus-probe.yml"
+  schedule:
+    - cron: "0 7 * * *" # 07:00 UTC nightly
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: "Probe scale (ci | full)"
+        required: false
+        default: "full"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  probe:
+    name: Probe suite
+    runs-on: ubuntu-latest
+    # The nightly/full run can take a while; cap it generously.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nucleus
+      - name: Select scale
+        id: scale
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "scale=full" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.inputs.scale }}" ]; then
+            echo "scale=${{ github.event.inputs.scale }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "scale=ci" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run probe suite (${{ steps.scale.outputs.scale }})
+        run: PROBE_SCALE=${{ steps.scale.outputs.scale }} bash scripts/probe.sh
+        working-directory: nucleus
