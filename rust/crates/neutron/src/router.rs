@@ -645,6 +645,9 @@ impl<S> Router<S> {
     ///     .default_stack(std::time::Duration::from_secs(30))
     ///     .get("/", || async { "ok" });
     /// ```
+    // `mut self` and `request_timeout` are unused when no middleware feature is
+    // enabled (e.g. `--no-default-features`); the cfg-gated pushes consume them.
+    #[allow(unused_mut, unused_variables)]
     pub fn default_stack(mut self, request_timeout: std::time::Duration) -> Self {
         // 1. Request ID — first so every downstream layer can log/propagate it.
         #[cfg(feature = "request-id")]
@@ -689,7 +692,6 @@ impl<S> Router<S> {
         self.middlewares
             .push(Arc::new(crate::tracing_mw::TracingLayer));
 
-        let _ = request_timeout; // silence unused warning when timeout feature is off
         self
     }
 
