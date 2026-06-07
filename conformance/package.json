@@ -1,0 +1,13 @@
+{
+  "name": "@neutron/conformance",
+  "private": true,
+  "type": "module",
+  "description": "Cross-SDK contract conformance suite for the Neutron framework (FRAMEWORK_CONTRACT.md).",
+  "scripts": {
+    "test": "node runner/run.mjs",
+    "test:no-build": "node runner/run.mjs --no-build"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

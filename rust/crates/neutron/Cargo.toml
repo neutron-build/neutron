@@ -231,3 +231,7 @@ path = "examples/rest_api.rs"
 [[example]]
 name = "realtime"
 path = "examples/realtime.rs"
+
+[[example]]
+name = "conformance_app"
+path = "examples/conformance_app.rs"
