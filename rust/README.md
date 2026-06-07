@@ -321,6 +321,42 @@ crates/
   neutron-cli/       # CLI for scaffolding and dev server
 ```
 
+## Parity and deliberate non-goals
+
+Neutron tracks Axum/Actix/Rocket ergonomics closely. A few parity points are
+deliberate, stated decisions rather than oversights:
+
+- **Per-route body limit — supported.** The global cap is set with
+  `Neutron::max_body_size` (default 2 MiB) and enforced per-frame at the
+  streaming boundary. For a stricter, scoped limit, apply the `BodyLimit(n)`
+  middleware to a sub-router or `nest`ed scope:
+  `Router::new().middleware(BodyLimit::new(512 * 1024)).post("/upload", ...)`.
+  The limit is enforced during streaming (413 the instant the running total
+  exceeds the cap), so an oversized chunked body is never fully buffered.
+
+- **Rocket `Outcome::Forward` — won't do (intentional).** Neutron uses
+  single-match routing: a path+method resolves to exactly one handler. There is
+  no "guard fails → fall through to the next matching route" semantics. Guard
+  logic belongs in middleware or in the handler (return the appropriate status),
+  which keeps routing predictable and the 405/404 contract unambiguous.
+
+- **Actix per-route extractor config — partially supported, by design.**
+  Per-route body limits are available (above). Per-route error handlers are not
+  a separate mechanism: every built-in failure already renders as RFC 7807
+  `application/problem+json` via `AppError`, and a handler that wants a custom
+  error shape returns it directly (handlers own their responses). This keeps one
+  error contract across the whole app rather than a patchwork of per-route
+  formatters.
+
+- **Composable `MethodRouter` — supported.** `route("/x", get(h).post(h2))`
+  composes per-method handlers as a value (`neutron::router::{get, post, ...}`),
+  with a correct `405 + Allow` for unhandled methods falling out automatically.
+
+- **Handler diagnostics — `#[neutron::debug_handler]`.** Annotate a handler to
+  get span-targeted errors when an argument isn't a valid extractor or the
+  return type isn't a response, instead of an opaque `Handler` error at the
+  route site.
+
 ## License
 
 MIT
