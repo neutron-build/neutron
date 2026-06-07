@@ -44,6 +44,20 @@ PROBES=(
   "probe_security|"
   "probe_recover|--iterations $((300 * M))"
   "probe_engines|--iterations $((1200 * M))"
+  # ── Tier 1/2 harnesses (deeper coverage) ──
+  "probe_types|--iterations $((500 * M))"
+  "probe_joins|--iterations $((2000 * M))"
+  "probe_graph_algo|--iterations $((2000 * M))"
+  "probe_datalog_rich|--iterations $((2000 * M))"
+  "probe_pgwire|--iterations $((20000 * M))"
+  "probe_crash_subprocess|--cycles $((30 * M))"
+  "probe_distributed|--iterations $((300 * M))"
+  "probe_durability_torn|--iterations $((300 * M))"
+  # NOTE: probe_fts_rank, probe_recover_engines, probe_concurrency_threads are
+  # built and runnable but NOT yet in this gating list — each found an OPEN bug
+  # (FTS_RANK TF-vs-BM25; disk-mode catalog-not-restored; SSI serializable
+  # lost-update cluster). They are pinned as #[ignore]'d regressions in
+  # tests/tier_findings_open.rs; add them here as each bug is fixed.
 )
 
 echo "==> Building probe suite (features: $FEATURES, scale: ${PROBE_SCALE:-ci})"

@@ -310,9 +310,15 @@ impl Executor {
         self.query_cache.read().len()
     }
 
-    /// Compute a cache key from normalized SQL.
+    /// Compute a cache key from the (trimmed) SQL.
+    ///
+    /// MUST be case-SENSITIVE: string literals carry meaning by case
+    /// (`ENCODE('A','hex')` = 41 vs `ENCODE('a','hex')` = 61), so lower-casing
+    /// the whole statement collapses distinct queries onto one key and returns a
+    /// stale result for the other. Keywords being case-insensitive only means
+    /// `SELECT`/`select` get separate (correct) cache entries — a harmless miss.
     fn query_cache_key(sql: &str) -> String {
-        let normalized = sql.trim().to_lowercase();
+        let normalized = sql.trim();
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         normalized.hash(&mut hasher);

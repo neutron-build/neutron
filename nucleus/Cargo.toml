@@ -135,6 +135,54 @@ name = "probe_sqlext"
 path = "src/bin/probe_sqlext.rs"
 required-features = ["server", "rusqlite"]
 
+# Tier 1/2 probe harnesses that link rusqlite (SQLite oracle / shared helpers) —
+# gated like the others so a plain `cargo build`/`cargo test --features server`
+# (no rusqlite) skips them rather than failing to resolve the dep.
+[[bin]]
+name = "probe_types"
+path = "src/bin/probe_types.rs"
+required-features = ["server", "rusqlite"]
+
+[[bin]]
+name = "probe_joins"
+path = "src/bin/probe_joins.rs"
+required-features = ["server", "rusqlite"]
+
+[[bin]]
+name = "probe_fts_rank"
+path = "src/bin/probe_fts_rank.rs"
+required-features = ["server", "rusqlite"]
+
+[[bin]]
+name = "probe_recover_engines"
+path = "src/bin/probe_recover_engines.rs"
+required-features = ["server", "rusqlite"]
+
+[[bin]]
+name = "probe_pgwire"
+path = "src/bin/probe_pgwire.rs"
+required-features = ["server", "rusqlite"]
+
+[[bin]]
+name = "probe_concurrency_threads"
+path = "src/bin/probe_concurrency_threads.rs"
+required-features = ["server", "rusqlite"]
+
+[[bin]]
+name = "probe_crash_subprocess"
+path = "src/bin/probe_crash_subprocess.rs"
+required-features = ["server", "rusqlite"]
+
+[[bin]]
+name = "probe_distributed"
+path = "src/bin/probe_distributed.rs"
+required-features = ["server", "rusqlite"]
+
+[[bin]]
+name = "probe_durability_torn"
+path = "src/bin/probe_durability_torn.rs"
+required-features = ["server", "rusqlite"]
+
 [[bench]]
 name = "query_bench"
 harness = false

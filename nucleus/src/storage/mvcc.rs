@@ -980,13 +980,25 @@ fn value_cmp_coerced(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
             _ => None,
         }
     }
+    if a == b {
+        return Some(std::cmp::Ordering::Equal);
+    }
+    // Numeric cross-type comparison (Int32/Int64/Float64).
+    if let (Some(af), Some(bf)) = (to_f64(a), to_f64(b)) {
+        return af.partial_cmp(&bf);
+    }
+    // Same-type ordered comparison for non-numeric types. Without this, a range
+    // scan over a TEXT/DATE/etc. column compared every row to its bound as None
+    // ("out of range") and silently returned zero rows.
     match (a, b) {
-        _ if a == b => Some(std::cmp::Ordering::Equal),
-        _ => {
-            let af = to_f64(a)?;
-            let bf = to_f64(b)?;
-            af.partial_cmp(&bf)
-        }
+        (Value::Text(x), Value::Text(y)) => Some(x.cmp(y)),
+        (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+        (Value::Date(x), Value::Date(y)) => Some(x.cmp(y)),
+        (Value::Timestamp(x), Value::Timestamp(y)) => Some(x.cmp(y)),
+        (Value::TimestampTz(x), Value::TimestampTz(y)) => Some(x.cmp(y)),
+        // Incomparable (cross-type non-numeric, NULL, etc.) — "not in range";
+        // the post-scan WHERE filter applies exact 3-valued semantics.
+        _ => None,
     }
 }
 
