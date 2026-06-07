@@ -207,6 +207,14 @@ pub use from_ref::FromRef;
 /// Derive `FromRef<S>` for each field of a composite application-state struct.
 pub use neutron_macros::FromRef;
 
+/// Attribute that improves compile errors for a handler `async fn` (P1.7).
+///
+/// Annotate a handler with `#[neutron::debug_handler]` to get span-targeted
+/// errors when an argument isn't a valid extractor or the return type isn't a
+/// response, instead of an opaque "`Handler` is not implemented" at the route
+/// registration site. It is a no-op on the emitted code.
+pub use neutron_macros::debug_handler;
+
 // ---------------------------------------------------------------------------
 // Prelude — convenience re-exports, respects all feature gates above
 // ---------------------------------------------------------------------------

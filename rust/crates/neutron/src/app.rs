@@ -534,18 +534,11 @@ impl Neutron {
 
         tracing::info!("Neutron listening on http://{addr}");
 
-        let state_map = Arc::new(
-            self.router
-                .state_map
-                .iter()
-                .map(|(k, v)| (*k, Arc::clone(v)))
-                .collect::<StateMap>(),
-        );
-
-        let mut router = self.router;
-        router.ensure_built();
-        let router = Arc::new(router);
-        let chain = build_dispatch(router);
+        // P1.3: dispatch through the same `RouterService` artifacts the
+        // `tower::Service` impl uses — one compiled chain, one state map.
+        let service = self.router.into_service();
+        let chain = service.dispatch_chain();
+        let state_map = service.state();
 
         // Connection limit semaphore
         let conn_semaphore = self
@@ -748,17 +741,10 @@ impl Neutron {
         let n = self.worker_threads;
         tracing::info!("Neutron listening on http://{addr} ({n} worker threads)");
 
-        let state_map = Arc::new(
-            self.router
-                .state_map
-                .iter()
-                .map(|(k, v)| (*k, Arc::clone(v)))
-                .collect::<StateMap>(),
-        );
-        let mut router = self.router;
-        router.ensure_built();
-        let router = Arc::new(router);
-        let chain = build_dispatch(router);
+        // P1.3: single dispatch path shared with the `tower::Service` impl.
+        let service = self.router.into_service();
+        let chain = service.dispatch_chain();
+        let state_map = service.state();
 
         let http2_config = self.http2_config;
         let tcp_config = self.tcp_config;
@@ -854,18 +840,10 @@ impl Neutron {
 
         tracing::info!("Neutron listening on https://{addr}");
 
-        let state_map = Arc::new(
-            self.router
-                .state_map
-                .iter()
-                .map(|(k, v)| (*k, Arc::clone(v)))
-                .collect::<StateMap>(),
-        );
-
-        let mut router = self.router;
-        router.ensure_built();
-        let router = Arc::new(router);
-        let chain = build_dispatch(router);
+        // P1.3: single dispatch path shared with the `tower::Service` impl.
+        let service = self.router.into_service();
+        let chain = service.dispatch_chain();
+        let state_map = service.state();
 
         let conn_semaphore = self
             .max_connections
@@ -1082,18 +1060,10 @@ impl Neutron {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use crate::http3_server::{Http3Config, serve_h3};
 
-        let state_map = Arc::new(
-            self.router
-                .state_map
-                .iter()
-                .map(|(k, v)| (*k, Arc::clone(v)))
-                .collect::<StateMap>(),
-        );
-
-        let mut router = self.router;
-        router.ensure_built();
-        let router = Arc::new(router);
-        let chain  = build_dispatch(router);
+        // P1.3: single dispatch path shared with the `tower::Service` impl.
+        let service = self.router.into_service();
+        let chain = service.dispatch_chain();
+        let state_map = service.state();
 
         let h3_cfg = Http3Config {
             max_body_size: self.max_body_size,

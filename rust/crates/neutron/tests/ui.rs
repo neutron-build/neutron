@@ -12,4 +12,8 @@ fn ui() {
     let t = trybuild::TestCases::new();
     t.pass("tests/ui/derive_from_ref_ok.rs");
     t.compile_fail("tests/ui/merge_requires_same_state.rs");
+    // P1.7: #[debug_handler] passes on a valid handler and produces a
+    // targeted FromRequest error on a non-extractor argument.
+    t.pass("tests/ui/debug_handler_ok.rs");
+    t.compile_fail("tests/ui/debug_handler_bad_arg.rs");
 }
