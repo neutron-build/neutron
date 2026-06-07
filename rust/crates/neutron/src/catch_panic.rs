@@ -10,9 +10,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use http::StatusCode;
-
-use crate::handler::{Body, Request, Response};
+use crate::error::AppError;
+use crate::handler::{IntoResponse, Request, Response};
 use crate::middleware::{MiddlewareTrait, Next};
 
 /// Middleware that catches panics and returns 500 Internal Server Error.
@@ -73,26 +72,16 @@ impl MiddlewareTrait for CatchPanic {
 
                         tracing::error!(panic = %msg, "handler panicked");
 
-                        http::Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .header("content-type", "application/json; charset=utf-8")
-                            .body(Body::full(
-                                serde_json::json!({ "error": "Internal Server Error" })
-                                    .to_string(),
-                            ))
-                            .unwrap()
+                        // P2.1: RFC 7807 problem+json, not ad-hoc JSON. The
+                        // panic message is logged, never leaked to the client.
+                        AppError::internal("The server encountered an internal error.")
+                            .into_response()
                     } else {
                         // Task was cancelled (unlikely in practice)
                         tracing::error!("handler task cancelled");
 
-                        http::Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .header("content-type", "application/json; charset=utf-8")
-                            .body(Body::full(
-                                serde_json::json!({ "error": "Internal Server Error" })
-                                    .to_string(),
-                            ))
-                            .unwrap()
+                        AppError::internal("The server encountered an internal error.")
+                            .into_response()
                     }
                 }
             }
@@ -109,6 +98,7 @@ mod tests {
     use super::*;
     use crate::router::Router;
     use crate::testing::TestClient;
+    use http::StatusCode;
 
     #[tokio::test]
     async fn normal_request_unaffected() {
@@ -137,9 +127,17 @@ mod tests {
 
         let resp = client.get("/boom").send().await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // P2.1: panic recovery is RFC 7807 problem+json, not ad-hoc JSON.
+        assert_eq!(
+            resp.header("content-type").unwrap(),
+            "application/problem+json"
+        );
 
         let body: serde_json::Value = resp.json().await;
-        assert_eq!(body["error"], "Internal Server Error");
+        assert_eq!(body["status"], 500);
+        assert!(body["title"].is_string());
+        // The panic message must never leak to the client.
+        assert!(!body.to_string().contains("handler exploded"));
     }
 
     #[tokio::test]
