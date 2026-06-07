@@ -1,7 +1,9 @@
 //! Neutron -- a lightweight, async-first Rust web framework built on hyper.
 //!
 //! Provides trie-based routing, type-safe extractors, composable middleware,
-//! and optional features for TLS, WebSockets, compression, sessions, and more.
+//! a composable [`router::MethodRouter`], `nest_service` mounting, the
+//! contract [`router::Router::default_stack`], and optional features for TLS,
+//! WebSockets, compression, sessions, and more.
 //!
 //! # Feature Tiers
 //!
