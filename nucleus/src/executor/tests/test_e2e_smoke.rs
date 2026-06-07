@@ -1021,14 +1021,16 @@ async fn test_e2e_timeseries() {
     let res = exec(&ex, "SELECT ts_last('cpu_usage')").await;
     assert_eq!(scalar(&res[0]), &Value::Float64(55.0));
 
-    // Range count: [2000, 4000) should contain timestamps 2000 and 3000
+    // Range count: inclusive [2000, 4000] contains timestamps 2000, 3000, 4000
+    // (the point at the upper bound is included — point-interval semantics).
     let res = exec(&ex, "SELECT ts_range_count('cpu_usage', 2000, 4000)").await;
-    assert_eq!(scalar(&res[0]), &Value::Int64(2));
+    assert_eq!(scalar(&res[0]), &Value::Int64(3));
 
-    // Range avg: [1000, 5000) should avg 45+62+38+71 = 216 / 4 = 54.0
+    // Range avg: inclusive [1000, 5000] averages all five points:
+    // 45+62+38+71+55 = 271 / 5 = 54.2
     let res = exec(&ex, "SELECT ts_range_avg('cpu_usage', 1000, 5000)").await;
     match scalar(&res[0]) {
-        Value::Float64(v) => assert!((*v - 54.0).abs() < 0.01, "avg should be 54.0, got {v}"),
+        Value::Float64(v) => assert!((*v - 54.2).abs() < 0.01, "avg should be 54.2, got {v}"),
         other => panic!("expected Float64, got {other:?}"),
     }
 

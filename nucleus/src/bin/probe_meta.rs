@@ -16,6 +16,7 @@
 //!
 //! Build: `cargo run --release --features server --bin probe_meta`
 #![cfg(feature = "server")]
+#![allow(clippy::all)] // internal fuzz harness
 
 use std::sync::Arc;
 

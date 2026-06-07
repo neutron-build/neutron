@@ -750,12 +750,13 @@ async fn test_ts_range_count_and_avg() {
     exec(&ex, "SELECT ts_insert('temp', 2000, 25.0)").await;
     exec(&ex, "SELECT ts_insert('temp', 3000, 30.0)").await;
     exec(&ex, "SELECT ts_insert('temp', 4000, 35.0)").await;
-    // Range count: [2000, 4000) should contain 2000 and 3000
+    // Range count: inclusive [2000, 4000] contains 2000, 3000, 4000 (the upper
+    // bound is inclusive — point-interval semantics).
     let res = exec(&ex, "SELECT ts_range_count('temp', 2000, 4000)").await;
-    assert_eq!(scalar(&res[0]), &Value::Int64(2));
-    // Range avg: [1000, 4000) should avg 20+25+30 = 75/3 = 25.0
+    assert_eq!(scalar(&res[0]), &Value::Int64(3));
+    // Range avg: inclusive [1000, 4000] averages 20+25+30+35 = 110/4 = 27.5
     let res = exec(&ex, "SELECT ts_range_avg('temp', 1000, 4000)").await;
-    assert_eq!(scalar(&res[0]), &Value::Float64(25.0));
+    assert_eq!(scalar(&res[0]), &Value::Float64(27.5));
     // Empty range
     let res = exec(&ex, "SELECT ts_range_avg('temp', 9000, 10000)").await;
     assert_eq!(scalar(&res[0]), &Value::Null);

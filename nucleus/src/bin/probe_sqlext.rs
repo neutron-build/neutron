@@ -27,6 +27,7 @@
 //!   cargo run --release --features "server rusqlite" --bin probe_sqlext
 //!   cargo run --release --features "server rusqlite" --bin probe_sqlext -- --seed 42 --iterations 2000
 #![cfg(feature = "server")]
+#![allow(clippy::all)] // internal fuzz harness
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;

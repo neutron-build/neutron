@@ -1620,14 +1620,29 @@ impl Executor {
                     }
                     // Aggregate window functions: SUM, AVG, COUNT, MIN, MAX OVER()
                     "SUM" => {
+                        // SQL-standard SUM is NULL-ignoring: skip NULL argument
+                        // values and return NULL when the frame contains no
+                        // non-NULL value at all (mirrors the non-window SUM's
+                        // has_value logic above). Returning 0 for an all-NULL
+                        // frame would diverge from Postgres/SQLite and from
+                        // Nucleus's own plain-aggregate SUM.
                         let mut sum = 0.0f64;
+                        let mut has_value = false;
                         for &(_, r) in &members[frame_start..=frame_end] {
                             if let Some(e) = arg_expr {
                                 let v = self.eval_row_expr(e, r, col_meta)?;
+                                if v == Value::Null {
+                                    continue;
+                                }
                                 sum += value_to_f64(&v).unwrap_or(0.0);
+                                has_value = true;
                             }
                         }
-                        Value::Float64(sum)
+                        if has_value {
+                            Value::Float64(sum)
+                        } else {
+                            Value::Null
+                        }
                     }
                     "AVG" => {
                         let mut sum = 0.0f64;

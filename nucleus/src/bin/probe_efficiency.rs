@@ -14,6 +14,7 @@
 //!     --seed 42 --n 2000 --seeds 3
 
 #![cfg(feature = "server")]
+#![allow(clippy::all)] // internal fuzz harness
 
 use std::sync::Arc;
 

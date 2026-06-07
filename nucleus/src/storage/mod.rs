@@ -401,12 +401,19 @@ pub trait StorageEngine: Send + Sync {
     /// Scan rows matching a single equality predicate, avoiding full materialization.
     /// Returns `None` if the engine does not support this optimisation (caller falls
     /// back to full scan + filter). The returned rows always include ALL columns.
+    ///
+    /// On success returns `(matched_rows, rows_examined)` where `rows_examined` is the
+    /// number of visible rows the engine had to inspect to evaluate the predicate —
+    /// i.e. the size of the sequential scan. Callers must report `rows_examined` (not
+    /// `matched_rows.len()`) to the `rows_scanned` metric so it reflects rows EXAMINED,
+    /// matching Postgres `EXPLAIN ANALYZE` Seq Scan semantics and the cost-based index
+    /// advisor's selectivity model.
     fn fast_scan_where_eq(
         &self,
         _table: &str,
         _filter_col: usize,
         _filter_val: &Value,
-    ) -> Option<Vec<Row>> {
+    ) -> Option<(Vec<Row>, usize)> {
         None
     }
 
@@ -1021,15 +1028,18 @@ impl StorageEngine for MemoryEngine {
         table: &str,
         filter_col: usize,
         filter_val: &Value,
-    ) -> Option<Vec<Row>> {
+    ) -> Option<(Vec<Row>, usize)> {
         let guard = self.tables.try_read().ok()?;
         let rows = guard.get(table)?;
-        Some(
-            rows.iter()
-                .filter(|row| row.get(filter_col) == Some(filter_val))
-                .cloned()
-                .collect(),
-        )
+        // Every row in the table is examined by the scan; the returned vec holds
+        // only those that matched. Report `rows.len()` as the examined count.
+        let examined = rows.len();
+        let matched = rows
+            .iter()
+            .filter(|row| row.get(filter_col) == Some(filter_val))
+            .cloned()
+            .collect();
+        Some((matched, examined))
     }
 
     fn fast_scan_where_range(

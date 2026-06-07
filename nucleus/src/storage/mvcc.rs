@@ -1421,7 +1421,7 @@ impl StorageEngine for MvccStorageAdapter {
         table: &str,
         filter_col: usize,
         filter_val: &Value,
-    ) -> Option<Vec<Row>> {
+    ) -> Option<(Vec<Row>, usize)> {
         let (_txn_id, snap, auto) = self.current_or_auto();
         let tbl = {
             let tables = self.engine.tables.read();
@@ -1431,12 +1431,18 @@ impl StorageEngine for MvccStorageAdapter {
         let no_aborts = self.engine.txn_mgr.has_no_aborts();
         let xmin = snap.xmin;
         let mut result = Vec::new();
+        // Count every visible row the scan touches, independent of whether it
+        // matches the equality predicate. This is the true sequential-scan size
+        // (Postgres Seq Scan "rows" = matched + "rows removed by filter"). The
+        // caller reports this — not `result.len()` — to the `rows_scanned` metric.
+        let mut examined = 0usize;
         for r in rows.iter() {
             if !(r.version.is_visible_fast(xmin, no_aborts)
                 || r.version.is_visible(&snap, &self.engine.txn_mgr))
             {
                 continue;
             }
+            examined += 1;
             if let Some(val) = r.data.get(filter_col)
                 && value_eq_coerced(val, filter_val)
             {
@@ -1446,7 +1452,7 @@ impl StorageEngine for MvccStorageAdapter {
         if auto {
             self.auto_commit(_txn_id);
         }
-        Some(result)
+        Some((result, examined))
     }
 
     fn fast_scan_where_eq_topk(
