@@ -58,7 +58,6 @@ fn select_rows(ex: &Executor, r: &tokio::runtime::Runtime, sid: u64, sql: &str) 
 }
 
 #[test]
-#[ignore = "OPEN BUG it found: PK/UNIQUE not enforced under concurrent inserts (see tier_findings_open.rs + concurrent_unique_constraint_regression.rs). Un-ignore once enforced."]
 fn schema_and_constraints_hold_under_concurrency() {
     let panics = Arc::new(AtomicUsize::new(0));
     for round in 0..20u64 {

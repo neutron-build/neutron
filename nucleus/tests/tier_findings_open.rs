@@ -47,19 +47,17 @@
 //!   6.  [MEDIUM] FTS_RANK was TF-only and could rank inversely to FTS_SEARCH's
 //!       BM25 — now uses BM25 tf-saturation. See fts_rank_regression.rs.
 //!
-//! ── NEW (Tier 3 adversarial harness, 2026-06-07) ──────────────────────────
-//!   7.  [HIGH/OPEN] PRIMARY KEY / UNIQUE constraints are NOT enforced under
-//!       concurrency. Concurrent transactions inserting the same key all succeed
-//!       (observed up to 4 duplicate rows for one PK). check_unique_constraints
-//!       does a snapshot scan then inserts — not atomic across txns, and each
-//!       inserter's snapshot hides the others' uncommitted rows. Needs atomic,
-//!       MVCC-aware unique enforcement in the engine (a unique index that
-//!       conflicts on a committed OR concurrently-uncommitted entry, reclaims keys
-//!       on abort, tracks key changes on update/delete). Found by
-//!       concurrency_schema_constraints_probe; pinned (#[ignore]) in
-//!       concurrent_unique_constraint_regression.rs. A real concurrency feature —
-//!       do carefully, do NOT rush. (CHECK and basic schema-under-concurrency
-//!       invariants in the same harness held; only PK/UNIQUE atomicity failed.)
+//! ── Tier 3 (adversarial DML+DDL+constraint concurrency harness) ───────────
+//!   7.  [HIGH] FIXED. PRIMARY KEY / UNIQUE were not enforced under concurrency —
+//!       concurrent transactions inserting (or updating to) the same key all
+//!       succeeded (up to 4 duplicate rows for one PK). check_unique_constraints
+//!       did a snapshot scan then inserted, not atomic across txns. Fixed with
+//!       atomic MVCC-aware enforcement in the engine: insert_unique/update_unique
+//!       check a committed-live chain AND an in-flight reservation map (keys held
+//!       by uncommitted inserts, released on commit/abort) under one lock, so two
+//!       racing transactions cannot both take the same key; NULL keys are distinct
+//!       (SQL). See concurrency_schema_constraints_probe (now passing) +
+//!       concurrent_unique_constraint_regression.rs.
 //!
 //! ── Tier 1/2 (all fixed and gated) ────────────────────────────────────────
 //! ALL Tier 1/2 findings are fixed and gated. SERIALIZABLE SIREAD is now

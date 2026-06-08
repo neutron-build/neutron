@@ -23,6 +23,8 @@ use crate::types::{Row, Value};
 
 /// `(version_index, row)` pairs from a scan, each owning its row.
 type VersionedRows = Vec<(usize, Row)>;
+/// A reserved UNIQUE/PK key: (table, constraint-index, key column values).
+type UniqueKey = (String, usize, Vec<Value>);
 
 // ---------------------------------------------------------------------------
 // MvccRow — a single logical row with multiple versions
@@ -243,6 +245,10 @@ pub enum MvccError {
     TableNotFound(String),
     WriteConflict { table: String, row_idx: usize },
     NoActiveTransaction,
+    /// A PRIMARY KEY / UNIQUE constraint would be violated — atomically detected
+    /// at insert time against committed-live rows AND concurrent uncommitted
+    /// inserts (so two racing transactions can't both insert the same key).
+    UniqueViolation { table: String, key: String },
 }
 
 impl std::fmt::Display for MvccError {
@@ -260,6 +266,9 @@ impl std::fmt::Display for MvccError {
                 }
             }
             Self::NoActiveTransaction => write!(f, "no active transaction"),
+            Self::UniqueViolation { table, key } => {
+                write!(f, "duplicate key value violates unique constraint on {table} ({key})")
+            }
         }
     }
 }
@@ -302,6 +311,16 @@ struct MvccIdx {
 pub struct MvccMemoryEngine {
     tables: RwLock<HashMap<String, Arc<MvccTable>>>,
     txn_mgr: Arc<TransactionManager>,
+    /// Atomic PRIMARY KEY / UNIQUE enforcement. Maps a reserved key
+    /// (table, constraint-index, key-values) → the txn that currently holds it via
+    /// an in-flight (uncommitted) insert. Combined with a committed-live chain
+    /// check, this makes "is this key taken?" atomic with the insert, so two
+    /// concurrent transactions cannot both insert the same key. Entries are
+    /// released when the owning txn ends (commit OR abort) — once committed, the
+    /// row itself (caught by the chain check) keeps the key taken.
+    unique_reservations: parking_lot::Mutex<HashMap<UniqueKey, u64>>,
+    /// Reverse index: txn → its reserved keys, for O(reserved) release on txn end.
+    txn_unique_keys: parking_lot::Mutex<HashMap<u64, Vec<UniqueKey>>>,
 }
 
 impl MvccMemoryEngine {
@@ -309,6 +328,214 @@ impl MvccMemoryEngine {
         Self {
             tables: RwLock::new(HashMap::new()),
             txn_mgr,
+            unique_reservations: parking_lot::Mutex::new(HashMap::new()),
+            txn_unique_keys: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Atomically insert `row` enforcing the given UNIQUE/PK column sets. Returns
+    /// the new version index, or `UniqueViolation` if any key set collides with a
+    /// committed-live row or a concurrent uncommitted insert. NULL key columns are
+    /// treated as distinct (SQL semantics: NULLs never conflict).
+    pub fn insert_unique(
+        &self,
+        table: &str,
+        txn_id: u64,
+        row: Row,
+        unique_col_sets: &[Vec<usize>],
+    ) -> Result<usize, MvccError> {
+        let tbl = self.get_table(table)?;
+
+        // Build the candidate keys (skip any set with a NULL column).
+        let mut keys: Vec<(usize, Vec<Value>)> = Vec::new();
+        for (cid, cols) in unique_col_sets.iter().enumerate() {
+            let mut key = Vec::with_capacity(cols.len());
+            let mut has_null = false;
+            for &c in cols {
+                match row.get(c) {
+                    Some(Value::Null) | None => {
+                        has_null = true;
+                        break;
+                    }
+                    Some(v) => key.push(v.clone()),
+                }
+            }
+            if !has_null {
+                keys.push((cid, key));
+            }
+        }
+
+        if keys.is_empty() {
+            // No enforceable keys — plain insert.
+            return Ok(tbl.insert(txn_id, row));
+        }
+
+        // Hold the reservation lock across check + reserve + push so the whole
+        // operation is atomic with respect to other unique inserts.
+        let mut reservations = self.unique_reservations.lock();
+
+        // Phase 1: check every key before reserving any (avoid partial reservation).
+        for (cid, key) in &keys {
+            // (a) concurrent uncommitted insert holding this key?
+            if let Some(&owner) = reservations.get(&(table.to_string(), *cid, key.clone()))
+                && owner != txn_id
+                && self.txn_mgr.get_status(owner) != TxnStatus::Aborted
+            {
+                return Err(MvccError::UniqueViolation {
+                    table: table.to_string(),
+                    key: format!("{key:?}"),
+                });
+            }
+            // (b) committed-live row with this key?
+            if self.has_committed_live_key(&tbl, &unique_col_sets[*cid], key, None) {
+                return Err(MvccError::UniqueViolation {
+                    table: table.to_string(),
+                    key: format!("{key:?}"),
+                });
+            }
+        }
+
+        // Phase 2: reserve all keys, then insert.
+        let mut owned = self.txn_unique_keys.lock();
+        let owned_entry = owned.entry(txn_id).or_default();
+        for (cid, key) in keys {
+            reservations.insert((table.to_string(), cid, key.clone()), txn_id);
+            owned_entry.push((table.to_string(), cid, key));
+        }
+        drop(owned);
+        let vidx = tbl.insert(txn_id, row);
+        drop(reservations);
+        Ok(vidx)
+    }
+
+    /// Is there a committed-live row (created by a committed txn, not deleted by a
+    /// committed txn) whose `cols` equal `key`? Snapshot-independent: reflects the
+    /// latest committed state, which is what uniqueness must be enforced against.
+    fn has_committed_live_key(
+        &self,
+        tbl: &MvccTable,
+        cols: &[usize],
+        key: &[Value],
+        exclude_vidx: Option<usize>,
+    ) -> bool {
+        let rows = tbl.rows.read();
+        for (vidx, r) in rows.iter().enumerate() {
+            // Skip the row being updated in-place (its own version must not
+            // conflict with its replacement).
+            if Some(vidx) == exclude_vidx {
+                continue;
+            }
+            // created by a committed txn?
+            if self.txn_mgr.get_status(r.version.created_by) != TxnStatus::Committed {
+                continue;
+            }
+            // deleted by a committed txn? then not live.
+            let del = r.version.deleted_by.load(Ordering::Acquire);
+            if del != TXN_INVALID && self.txn_mgr.get_status(del) == TxnStatus::Committed {
+                continue;
+            }
+            // key match?
+            let matches = cols.iter().enumerate().all(|(i, &c)| {
+                r.data.get(c).is_some_and(|v| value_eq_coerced(v, &key[i]))
+            });
+            if matches {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Atomic UPDATE enforcing UNIQUE/PK on the NEW row. For each unique set whose
+    /// value actually CHANGES, checks the new key against committed-live rows
+    /// (excluding the row being updated) and concurrent reservations before
+    /// replacing the version. Unchanged keys are skipped (the row already holds
+    /// them). Returns the new version index or `UniqueViolation`.
+    pub fn update_unique(
+        &self,
+        table: &str,
+        txn_id: u64,
+        old_version_idx: usize,
+        new_row: Row,
+        unique_col_sets: &[Vec<usize>],
+    ) -> Result<usize, MvccError> {
+        let tbl = self.get_table(table)?;
+        let old_row = self.row_at(table, old_version_idx);
+
+        // Keys that actually change and are enforceable (no NULL).
+        let mut changed: Vec<(usize, Vec<Value>)> = Vec::new();
+        for (cid, cols) in unique_col_sets.iter().enumerate() {
+            let mut key = Vec::with_capacity(cols.len());
+            let mut has_null = false;
+            for &c in cols {
+                match new_row.get(c) {
+                    Some(Value::Null) | None => {
+                        has_null = true;
+                        break;
+                    }
+                    Some(v) => key.push(v.clone()),
+                }
+            }
+            if has_null {
+                continue;
+            }
+            // Unchanged key for this row → no conflict possible (self).
+            let unchanged = old_row.as_ref().is_some_and(|orow| {
+                cols.iter()
+                    .enumerate()
+                    .all(|(i, &c)| orow.get(c).is_some_and(|v| value_eq_coerced(v, &key[i])))
+            });
+            if !unchanged {
+                changed.push((cid, key));
+            }
+        }
+
+        if changed.is_empty() {
+            return tbl.update_version(old_version_idx, txn_id, new_row, &self.txn_mgr);
+        }
+
+        let mut reservations = self.unique_reservations.lock();
+        for (cid, key) in &changed {
+            if let Some(&owner) = reservations.get(&(table.to_string(), *cid, key.clone()))
+                && owner != txn_id
+                && self.txn_mgr.get_status(owner) != TxnStatus::Aborted
+            {
+                return Err(MvccError::UniqueViolation {
+                    table: table.to_string(),
+                    key: format!("{key:?}"),
+                });
+            }
+            if self.has_committed_live_key(&tbl, &unique_col_sets[*cid], key, Some(old_version_idx)) {
+                return Err(MvccError::UniqueViolation {
+                    table: table.to_string(),
+                    key: format!("{key:?}"),
+                });
+            }
+        }
+        let mut owned = self.txn_unique_keys.lock();
+        let owned_entry = owned.entry(txn_id).or_default();
+        for (cid, key) in changed {
+            reservations.insert((table.to_string(), cid, key.clone()), txn_id);
+            owned_entry.push((table.to_string(), cid, key));
+        }
+        drop(owned);
+        let new_vidx = tbl.update_version(old_version_idx, txn_id, new_row, &self.txn_mgr)?;
+        drop(reservations);
+        Ok(new_vidx)
+    }
+
+    /// Release a transaction's in-flight unique reservations (on commit or abort).
+    /// After commit the committed row keeps the key taken via the chain check;
+    /// after abort the row is invisible so the key is genuinely free.
+    pub fn release_unique(&self, txn_id: u64) {
+        let removed = self.txn_unique_keys.lock().remove(&txn_id);
+        if let Some(keys) = removed {
+            let mut reservations = self.unique_reservations.lock();
+            for k in keys {
+                // Only remove if still owned by this txn (a reclaim may have moved it).
+                if reservations.get(&k) == Some(&txn_id) {
+                    reservations.remove(&k);
+                }
+            }
         }
     }
 
@@ -825,7 +1052,11 @@ impl MvccStorageAdapter {
                 active: std::collections::HashSet::new(),
             },
         };
+        // Order: mark committed BEFORE releasing unique reservations, so the now-
+        // committed row is caught by the committed-live key check the instant the
+        // reservation is dropped (no window where the key looks free).
         self.engine.txn_mgr().commit(&mut txn);
+        self.engine.release_unique(txn_id);
     }
 
     /// Log a WAL record (no-op if WAL is disabled or server feature is off).
@@ -1118,6 +1349,9 @@ impl StorageEngine for MvccStorageAdapter {
                     StorageError::WriteConflict(format!("{table} row {row_idx}"))
                 }
                 MvccError::NoActiveTransaction => StorageError::NoActiveTransaction,
+                MvccError::UniqueViolation { table, key } => {
+                    StorageError::UniqueViolation(format!("{table} {key}"))
+                }
             })?;
         // SSI: record table-level write (INSERTs create phantoms for scanners)
         if !auto {
@@ -1133,6 +1367,57 @@ impl StorageEngine for MvccStorageAdapter {
             }
         )?;
         if auto {
+            self.auto_commit(txn_id);
+            self.update_indexes_for_new_rows(table, &[(&row, version_idx)]);
+            *self
+                .committed_counts
+                .write()
+                .entry(table.to_string())
+                .or_insert(0) += 1;
+        } else {
+            self.mvcc_session()
+                .dirty_tables
+                .write()
+                .insert(table.to_string());
+        }
+        Ok(())
+    }
+
+    async fn insert_unique(
+        &self,
+        table: &str,
+        row: Row,
+        unique_col_sets: &[Vec<usize>],
+    ) -> Result<(), StorageError> {
+        let (txn_id, _snap, auto) = self.current_or_auto();
+        let version_idx = self
+            .engine
+            .insert_unique(table, txn_id, row.clone(), unique_col_sets)
+            .map_err(|e| match e {
+                MvccError::TableNotFound(t) => StorageError::TableNotFound(t),
+                MvccError::WriteConflict { table, row_idx } => {
+                    StorageError::WriteConflict(format!("{table} row {row_idx}"))
+                }
+                MvccError::NoActiveTransaction => StorageError::NoActiveTransaction,
+                MvccError::UniqueViolation { table, key } => {
+                    StorageError::UniqueViolation(format!("{table} {key}"))
+                }
+            })?;
+        if !auto {
+            self.maybe_record_table_write(txn_id, table);
+        }
+        wal_log!(
+            self,
+            MvccWalRecord::Insert {
+                table: table.to_string(),
+                txn_id: if auto { 0 } else { txn_id },
+                version_idx: version_idx as u32,
+                row: row.clone(),
+            }
+        )?;
+        if auto {
+            // auto_commit releases this txn's unique reservations (the now-committed
+            // row keeps the key taken via the committed-live chain check).
             self.auto_commit(txn_id);
             self.update_indexes_for_new_rows(table, &[(&row, version_idx)]);
             *self
@@ -1168,6 +1453,9 @@ impl StorageEngine for MvccStorageAdapter {
                         StorageError::WriteConflict(format!("{table} row {row_idx}"))
                     }
                     MvccError::NoActiveTransaction => StorageError::NoActiveTransaction,
+                    MvccError::UniqueViolation { table, key } => {
+                        StorageError::UniqueViolation(format!("{table} {key}"))
+                    }
                 })?;
             version_indices.push(vidx);
             wal_log!(
@@ -1767,73 +2055,17 @@ impl StorageEngine for MvccStorageAdapter {
     }
 
     async fn update(&self, table: &str, updates: &[(usize, Row)]) -> Result<usize, StorageError> {
-        let (txn_id, _snap, auto) = self.current_or_auto();
-
-        // `updates` keys are stable MVCC version indices (from
-        // scan_where_eq_positions / scan_physical), NOT scan-order positions —
-        // mutate each version directly so the write always lands on the row that
-        // row-finding matched, never a re-scan position that could be the wrong row.
-        let mut count = 0;
-        let wal_txn_id = if auto { 0 } else { txn_id };
-        let mut written_indices = Vec::new();
-        // (old_vidx, new_vidx, old_row, new_row) of each applied update, for
-        // auto-commit incremental index maintenance.
-        let mut applied: Vec<(usize, usize, Arc<Row>, Row)> = Vec::new();
-        for (version_idx, new_row) in updates {
-            // Skip stale/out-of-range version indices (matches the old pos<len guard).
-            let Some(old_row) = self.engine.row_at(table, *version_idx) else {
-                continue;
-            };
-            let new_vidx = self
-                .engine
-                .update(table, *version_idx, txn_id, new_row.clone())
-                .map_err(|e| match e {
-                    MvccError::WriteConflict { table, row_idx } => {
-                        StorageError::WriteConflict(format!("{table} row {row_idx}"))
-                    }
-                    e => StorageError::Io(e.to_string()),
-                })?;
-            written_indices.push(*version_idx);
-            wal_log!(
-                self,
-                MvccWalRecord::Update {
-                    table: table.to_string(),
-                    txn_id: wal_txn_id,
-                    old_version_idx: *version_idx as u32,
-                    new_version_idx: new_vidx as u32,
-                    new_row: new_row.clone(),
-                }
-            )?;
-            applied.push((*version_idx, new_vidx, old_row, new_row.clone()));
-            count += 1;
-        }
-
-        // SSI: record row-level writes for UPDATE
-        if !auto && !written_indices.is_empty() {
-            self.maybe_record_write(txn_id, table, &written_indices);
-        }
-
-        if auto {
-            self.auto_commit(txn_id);
-            // Incremental index update: only touch changed rows, not entire table.
-            let index_updates: Vec<(usize, usize, &Row, &Row)> = applied
-                .iter()
-                .map(|(old_vidx, new_vidx, old_row, new_row)| {
-                    (*old_vidx, *new_vidx, old_row.as_ref(), new_row)
-                })
-                .collect();
-            if !index_updates.is_empty() {
-                self.update_indexes_incremental(table, &index_updates);
-            }
-        } else {
-            self.mvcc_session()
-                .dirty_tables
-                .write()
-                .insert(table.to_string());
-        }
-        Ok(count)
+        self.update_impl(table, updates, None).await
     }
 
+    async fn update_unique(
+        &self,
+        table: &str,
+        updates: &[(usize, Row)],
+        unique_col_sets: &[Vec<usize>],
+    ) -> Result<usize, StorageError> {
+        self.update_impl(table, updates, Some(unique_col_sets)).await
+    }
     // -- Transaction lifecycle --
 
     fn set_next_isolation_level(&self, level: &str) {
@@ -1903,6 +2135,7 @@ impl StorageEngine for MvccStorageAdapter {
         if let Some(e) = ser_err {
             // Txn already aborted (abort() ran cleanup_ssi). Discard the session's
             // uncommitted side state so the next BEGIN starts from a clean slate.
+            self.engine.release_unique(commit_txn_id);
             sess.savepoints.write().clear();
             sess.dirty_tables.write().clear();
             return Err(StorageError::SerializationFailure(e));
@@ -1911,6 +2144,9 @@ impl StorageEngine for MvccStorageAdapter {
             self.engine.txn_mgr().cleanup_ssi(commit_txn_id);
         }
         if commit_txn_id != 0 {
+            // Committed: release in-flight unique reservations (the committed rows
+            // now hold their keys via the committed-live check).
+            self.engine.release_unique(commit_txn_id);
             wal_log_commit!(self, commit_txn_id)?;
         }
         sess.savepoints.write().clear();
@@ -1935,6 +2171,9 @@ impl StorageEngine for MvccStorageAdapter {
         let mut lock = sess.session_txn.write();
         if let Some(ref mut txn) = *lock {
             wal_log!(self, MvccWalRecord::Abort { txn_id: txn.id })?;
+            // Release in-flight unique reservations — the aborted inserts are gone,
+            // so their keys are genuinely free again.
+            self.engine.release_unique(txn.id);
             self.engine.txn_mgr().abort(txn);
         }
         *lock = None;
@@ -4103,5 +4342,89 @@ mod arc_row_tests {
         // Scan order: unmodified row (2) first, then new version (99).
         assert_eq!(rows[0][0], Value::Int32(2));
         assert_eq!(rows[1][0], Value::Int32(99));
+    }
+}
+
+impl MvccStorageAdapter {
+    /// Shared UPDATE implementation. When `unique` is Some, the new key of each
+    /// row is enforced atomically (engine.update_unique) so concurrent updates
+    /// can't both move two rows to the same UNIQUE/PK value.
+    async fn update_impl(
+        &self,
+        table: &str,
+        updates: &[(usize, Row)],
+        unique: Option<&[Vec<usize>]>,
+    ) -> Result<usize, StorageError> {
+        let (txn_id, _snap, auto) = self.current_or_auto();
+
+        // `updates` keys are stable MVCC version indices (from
+        // scan_where_eq_positions / scan_physical), NOT scan-order positions —
+        // mutate each version directly so the write always lands on the row that
+        // row-finding matched, never a re-scan position that could be the wrong row.
+        let mut count = 0;
+        let wal_txn_id = if auto { 0 } else { txn_id };
+        let mut written_indices = Vec::new();
+        // (old_vidx, new_vidx, old_row, new_row) of each applied update, for
+        // auto-commit incremental index maintenance.
+        let mut applied: Vec<(usize, usize, Arc<Row>, Row)> = Vec::new();
+        for (version_idx, new_row) in updates {
+            // Skip stale/out-of-range version indices (matches the old pos<len guard).
+            let Some(old_row) = self.engine.row_at(table, *version_idx) else {
+                continue;
+            };
+            let new_vidx = match unique {
+                Some(sets) => self
+                    .engine
+                    .update_unique(table, txn_id, *version_idx, new_row.clone(), sets),
+                None => self.engine.update(table, *version_idx, txn_id, new_row.clone()),
+            }
+            .map_err(|e| match e {
+                MvccError::WriteConflict { table, row_idx } => {
+                    StorageError::WriteConflict(format!("{table} row {row_idx}"))
+                }
+                MvccError::UniqueViolation { table, key } => {
+                    StorageError::UniqueViolation(format!("{table} {key}"))
+                }
+                e => StorageError::Io(e.to_string()),
+            })?;
+            written_indices.push(*version_idx);
+            wal_log!(
+                self,
+                MvccWalRecord::Update {
+                    table: table.to_string(),
+                    txn_id: wal_txn_id,
+                    old_version_idx: *version_idx as u32,
+                    new_version_idx: new_vidx as u32,
+                    new_row: new_row.clone(),
+                }
+            )?;
+            applied.push((*version_idx, new_vidx, old_row, new_row.clone()));
+            count += 1;
+        }
+
+        // SSI: record row-level writes for UPDATE
+        if !auto && !written_indices.is_empty() {
+            self.maybe_record_write(txn_id, table, &written_indices);
+        }
+
+        if auto {
+            self.auto_commit(txn_id);
+            // Incremental index update: only touch changed rows, not entire table.
+            let index_updates: Vec<(usize, usize, &Row, &Row)> = applied
+                .iter()
+                .map(|(old_vidx, new_vidx, old_row, new_row)| {
+                    (*old_vidx, *new_vidx, old_row.as_ref(), new_row)
+                })
+                .collect();
+            if !index_updates.is_empty() {
+                self.update_indexes_incremental(table, &index_updates);
+            }
+        } else {
+            self.mvcc_session()
+                .dirty_tables
+                .write()
+                .insert(table.to_string());
+        }
+        Ok(count)
     }
 }

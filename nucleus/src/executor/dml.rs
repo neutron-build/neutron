@@ -502,9 +502,51 @@ impl Executor {
                 }
             }
 
-            self.storage_for(&table_name)
-                .insert_batch(&table_name, inserted_rows)
-                .await?;
+            // Compute UNIQUE/PRIMARY KEY column sets. If any exist, insert each row
+            // through the atomic insert_unique() so concurrent transactions can't
+            // both insert the same key (the snapshot check_unique_constraints above
+            // can't see another txn's uncommitted row); otherwise use the fast
+            // batch path. ReplacingMergeTree-style tables keep multiple versions per
+            // key, so they opt out of unique enforcement (see check_unique_constraints).
+            let unique_col_sets: Vec<Vec<usize>> =
+                if crate::columnar::replacing_config(&table_name).is_some() {
+                    Vec::new()
+                } else {
+                    use crate::catalog::TableConstraint;
+                    table_def
+                        .constraints
+                        .iter()
+                        .filter_map(|c| match c {
+                            TableConstraint::PrimaryKey { columns }
+                            | TableConstraint::Unique { columns, .. } => {
+                                let idxs: Vec<usize> = columns
+                                    .iter()
+                                    .filter_map(|n| table_def.column_index(n))
+                                    .collect();
+                                (idxs.len() == columns.len()).then_some(idxs)
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                };
+            let storage = self.storage_for(&table_name);
+            if unique_col_sets.is_empty() {
+                storage.insert_batch(&table_name, inserted_rows).await?;
+            } else {
+                for row in inserted_rows {
+                    storage
+                        .insert_unique(&table_name, row, &unique_col_sets)
+                        .await
+                        .map_err(|e| match e {
+                            crate::storage::StorageError::UniqueViolation(m) => {
+                                ExecError::ConstraintViolation(format!(
+                                    "duplicate key value violates unique constraint: {m}"
+                                ))
+                            }
+                            other => ExecError::Storage(other),
+                        })?;
+                }
+            }
         }
 
         // Fire AFTER INSERT statement-level triggers
@@ -1561,10 +1603,44 @@ impl Executor {
             }
         }
 
-        let count = self
-            .storage_for(&table_name)
-            .update(&table_name, &updates)
-            .await?;
+        // When a UNIQUE/PK column is being updated, enforce uniqueness atomically
+        // on the new values (the snapshot enforce_constraints above can't see a
+        // concurrent txn's uncommitted row), so two concurrent updates can't move
+        // two rows to the same key. Otherwise use the plain update path.
+        let storage = self.storage_for(&table_name);
+        let count = if check_unique && !updates.is_empty() {
+            let unique_col_sets: Vec<Vec<usize>> = {
+                use crate::catalog::TableConstraint;
+                table_def
+                    .constraints
+                    .iter()
+                    .filter_map(|c| match c {
+                        TableConstraint::PrimaryKey { columns }
+                        | TableConstraint::Unique { columns, .. } => {
+                            let idxs: Vec<usize> = columns
+                                .iter()
+                                .filter_map(|n| table_def.column_index(n))
+                                .collect();
+                            (idxs.len() == columns.len()).then_some(idxs)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            storage
+                .update_unique(&table_name, &updates, &unique_col_sets)
+                .await
+                .map_err(|e| match e {
+                    crate::storage::StorageError::UniqueViolation(m) => {
+                        ExecError::ConstraintViolation(format!(
+                            "duplicate key value violates unique constraint: {m}"
+                        ))
+                    }
+                    other => ExecError::Storage(other),
+                })?
+        } else {
+            storage.update(&table_name, &updates).await?
+        };
 
         // Rebuild zone map stats — column values may have changed, making
         // min/max bounds stale. A bare clear would leave the map to be
