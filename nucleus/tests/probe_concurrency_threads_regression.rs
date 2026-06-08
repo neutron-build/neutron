@@ -27,7 +27,7 @@ fn run(ex: &Executor, rt: &tokio::runtime::Runtime, sid: u64, sql: &str) -> Resu
 fn read1(ex: &Executor, rt: &tokio::runtime::Runtime, sid: u64, sql: &str) -> Option<i64> {
     let mut r = run(ex, rt, sid, sql).ok()?;
     if let Some(ExecResult::Select { rows, .. }) = r.pop() {
-        match rows.get(0).and_then(|row| row.get(0)) {
+        match rows.first().and_then(|row| row.first()) {
             Some(Value::Int64(n)) => return Some(*n),
             Some(Value::Int32(n)) => return Some(*n as i64),
             _ => {}

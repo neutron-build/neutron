@@ -23,8 +23,8 @@ fn rt() -> tokio::runtime::Runtime {
 fn rows(db: &Database, rt: &tokio::runtime::Runtime) -> Vec<(i64, String)> {
     let res = rt.block_on(db.execute("SELECT id, c1 FROM t ORDER BY id ASC"));
     let mut out = Vec::new();
-    if let Ok(mut r) = res {
-        if let Some(ExecResult::Select { rows, .. }) = r.pop() {
+    if let Ok(mut r) = res
+        && let Some(ExecResult::Select { rows, .. }) = r.pop() {
             for row in &rows {
                 let id = match row.first() {
                     Some(nucleus::types::Value::Int32(n)) => *n as i64,
@@ -35,7 +35,6 @@ fn rows(db: &Database, rt: &tokio::runtime::Runtime) -> Vec<(i64, String)> {
                 out.push((id, c1));
             }
         }
-    }
     out
 }
 
@@ -115,9 +114,8 @@ fn full_truncation_to_zero_yields_empty_or_missing_no_panic() {
     let db = Database::durable_mvcc(dir.path()).expect("reopen must not panic on empty WAL");
     let rt = rt();
     // Either the table is gone (Err) or it is present with no rows; never corrupt.
-    if let Ok(mut r) = rt.block_on(db.execute("SELECT id FROM t")) {
-        if let Some(ExecResult::Select { rows, .. }) = r.pop() {
+    if let Ok(mut r) = rt.block_on(db.execute("SELECT id FROM t"))
+        && let Some(ExecResult::Select { rows, .. }) = r.pop() {
             assert!(rows.is_empty(), "rows survived a fully-erased WAL");
         }
-    }
 }

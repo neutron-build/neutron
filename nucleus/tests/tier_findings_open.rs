@@ -67,3 +67,7 @@
 //! are SIREAD-free — so disjoint SERIALIZABLE access no longer over-aborts. See
 //! ssi_write_skew_regression.rs (serializable_disjoint_both_commit).
 #![cfg(feature = "server")]
+// The module doc above is a human-readable findings log using custom
+// enumerators (1b/2., 1c., 5b.) that aren't valid Markdown list markers, which
+// trips clippy's lazy-continuation heuristic. Cosmetic; keep the log as written.
+#![allow(clippy::doc_lazy_continuation)]
