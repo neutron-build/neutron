@@ -252,6 +252,12 @@ pub struct Executor {
     /// TRUNCATE) are rejected while this flag is set. Cleared when RSS drops
     /// below the pressure threshold.
     memory_critical: Arc<AtomicBool>,
+    /// Monotonically increasing write generation counter.
+    /// Incremented on every successful DML/DDL. `query_cache_put` snapshots
+    /// this before the query executes; if it has changed by the time the result
+    /// is ready to store, the store is skipped — preventing a concurrent DML
+    /// from being obscured by a stale cache entry written after invalidation.
+    cache_write_gen: AtomicU64,
 }
 
 impl Executor {
@@ -366,6 +372,7 @@ impl Executor {
             procedure_engine: parking_lot::RwLock::new(crate::procedures::ProcedureEngine::new()),
             retention_engine: parking_lot::RwLock::new(crate::compliance::RetentionEngine::new()),
             query_cache: parking_lot::RwLock::new(HashMap::new()),
+            cache_write_gen: AtomicU64::new(0),
             view_deps: parking_lot::RwLock::new(HashMap::new()),
             mv_deps: RwLock::new(HashMap::new()),
             stats_path: None,
@@ -2716,13 +2723,19 @@ impl Executor {
                 let cacheable = !in_txn
                     && !Self::query_cache_disabled()
                     && Self::query_result_is_cacheable(&sql_text);
-                if cacheable {
+                // Snapshot the write generation at the point of the cache check.
+                // If a DML increments it before we store the result, query_cache_put
+                // will detect the race and refuse to insert the stale entry.
+                let gen_at_miss = if cacheable {
                     if let Some(cached) = self.query_cache_get(&sql_text) {
                         self.metrics.cache_hits.inc();
                         return Ok(cached);
                     }
                     self.metrics.cache_misses.inc();
-                }
+                    self.cache_write_gen.load(Ordering::Acquire)
+                } else {
+                    0
+                };
                 // Top-level statement: consume the plan-cache key hint set by
                 // parse_with_ast_cache()/execute_prepared() for THIS statement and
                 // pass it explicitly. Nested execute_query() calls never read the
@@ -2737,7 +2750,7 @@ impl Executor {
                         ref rows,
                     }) = result
                 {
-                    self.query_cache_put(&sql_text, columns, rows);
+                    self.query_cache_put(&sql_text, columns, rows, gen_at_miss);
                 }
                 result
             }
