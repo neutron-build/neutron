@@ -299,8 +299,14 @@ pub struct TransactionManager {
     /// RW-conflict edges: (reader_txn, writer_txn).
     /// Meaning: reader_txn read data that writer_txn wrote (or will write).
     ssi_rw_conflicts: Mutex<HashSet<(u64, u64)>>,
-    /// Which transaction IDs are SERIALIZABLE.
+    /// Which transaction IDs are SERIALIZABLE and still tracked (active OR
+    /// committed/aborted but not yet purged — see `cleanup_ssi`).
     ssi_txns: Mutex<HashSet<u64>>,
+    /// For each tracked SERIALIZABLE txn, the set of SERIALIZABLE txns CONCURRENT
+    /// with it (overlapping lifetimes). Used to (a) only create rw-conflict edges
+    /// between concurrent txns, and (b) decide when a committed txn's SSI data can
+    /// be purged (only once every concurrent peer has also finished).
+    ssi_concurrent: Mutex<HashMap<u64, HashSet<u64>>>,
 }
 
 impl Default for TransactionManager {
@@ -322,6 +328,7 @@ impl TransactionManager {
             ssi_write_sets: Mutex::new(HashMap::new()),
             ssi_rw_conflicts: Mutex::new(HashSet::new()),
             ssi_txns: Mutex::new(HashSet::new()),
+            ssi_concurrent: Mutex::new(HashMap::new()),
         }
     }
 
@@ -346,14 +353,26 @@ impl TransactionManager {
             active: active.clone(),
         };
         active.insert(id);
-        drop(active); // release before SSI locks (lock order: active → ssi_*)
 
-        // Register SERIALIZABLE transactions for SSI tracking
+        // Register SERIALIZABLE transactions for SSI tracking. Done while holding
+        // `active` so the concurrent-peer set is captured atomically with the
+        // snapshot (lock order: active → ssi_txns → read_locks → write_sets →
+        // ssi_concurrent, consistent with cleanup_ssi/record_*).
         if isolation == IsolationLevel::Serializable {
-            self.ssi_txns.lock().insert(id);
+            let mut ssi = self.ssi_txns.lock();
+            // Concurrent peers = SERIALIZABLE txns currently active (committed/
+            // aborted-but-retained ones in ssi_txns are excluded via active).
+            let peers: HashSet<u64> = ssi.iter().copied().filter(|t| active.contains(t)).collect();
+            ssi.insert(id);
             self.ssi_read_locks.lock().insert(id, HashMap::new());
             self.ssi_write_sets.lock().insert(id, HashMap::new());
+            let mut concurrent = self.ssi_concurrent.lock();
+            for &p in &peers {
+                concurrent.entry(p).or_default().insert(id);
+            }
+            concurrent.insert(id, peers);
         }
+        drop(active);
 
         Transaction {
             id,
@@ -393,7 +412,10 @@ impl TransactionManager {
         self.active.lock().remove(&txn.id);
         self.maybe_gc();
         if txn.isolation == IsolationLevel::Serializable {
-            self.cleanup_ssi(txn.id);
+            // An aborted txn's effects are rolled back, so purge its SSI data
+            // immediately (retaining it would only create bogus rw-conflict edges
+            // against a txn that never committed).
+            self.abort_ssi(txn.id);
         }
     }
 
@@ -554,8 +576,9 @@ impl TransactionManager {
         // Check if any other SERIALIZABLE txn has written to these rows
         let writes = self.ssi_write_sets.lock();
         let mut conflicts = self.ssi_rw_conflicts.lock();
+        let concurrent = self.ssi_concurrent.lock();
         for &other_txn in ssi.iter() {
-            if other_txn == txn_id {
+            if other_txn == txn_id || !Self::are_concurrent(&concurrent, txn_id, other_txn) {
                 continue;
             }
             if let Some(other_writes) = writes.get(&other_txn)
@@ -570,6 +593,15 @@ impl TransactionManager {
                 }
             }
         }
+    }
+
+    /// Whether two SERIALIZABLE transactions had overlapping lifetimes. Only
+    /// concurrent txns can form a meaningful rw-antidependency; a txn that began
+    /// after another committed sees its writes (a wr-dependency), not an rw one,
+    /// so an edge between them would be a spurious serialization failure.
+    fn are_concurrent(concurrent: &HashMap<u64, HashSet<u64>>, a: u64, b: u64) -> bool {
+        concurrent.get(&a).is_some_and(|s| s.contains(&b))
+            || concurrent.get(&b).is_some_and(|s| s.contains(&a))
     }
 
     /// Record that a SERIALIZABLE transaction wrote rows in a table.
@@ -591,8 +623,9 @@ impl TransactionManager {
         }
         // Check if any other SERIALIZABLE txn has read these rows
         let mut conflicts = self.ssi_rw_conflicts.lock();
+        let concurrent = self.ssi_concurrent.lock();
         for &other_txn in ssi.iter() {
-            if other_txn == txn_id {
+            if other_txn == txn_id || !Self::are_concurrent(&concurrent, txn_id, other_txn) {
                 continue;
             }
             if let Some(other_reads) = reads.get(&other_txn)
@@ -617,11 +650,12 @@ impl TransactionManager {
         if !ssi.contains(&txn_id) {
             return;
         }
-        // Any SERIALIZABLE txn that scanned this table has a conflict
+        // Any concurrent SERIALIZABLE txn that scanned this table has a conflict
         let reads = self.ssi_read_locks.lock();
         let mut conflicts = self.ssi_rw_conflicts.lock();
+        let concurrent = self.ssi_concurrent.lock();
         for &other_txn in ssi.iter() {
-            if other_txn == txn_id {
+            if other_txn == txn_id || !Self::are_concurrent(&concurrent, txn_id, other_txn) {
                 continue;
             }
             if let Some(other_reads) = reads.get(&other_txn)
@@ -703,27 +737,64 @@ impl TransactionManager {
         Ok(())
     }
 
-    /// Clean up SSI tracking data for a finished transaction.
-    /// Read/write sets are removed immediately. Conflict edges are only
-    /// removed if the OTHER party is also no longer active (so they won't
-    /// need the edge for their own commit check).
-    pub fn cleanup_ssi(&self, txn_id: u64) {
-        // Canonical lock order: active → ssi_txns → ssi_read_locks → ssi_write_sets → ssi_rw_conflicts
-        // Hold all locks together to avoid reacquiring ssi_txns (prevents deadlock).
+    /// Clean up SSI tracking after a SERIALIZABLE transaction COMMITS.
+    ///
+    /// This is DEFERRED, not immediate: a committed txn's SIREAD/write sets and
+    /// conflict edges must survive until every SERIALIZABLE txn that was
+    /// CONCURRENT with it has also finished. Otherwise a concurrent txn that does
+    /// its conflicting read/write AFTER this commit would find no set to form the
+    /// rw-antidependency edge and write-skew would slip through. We therefore
+    /// sweep and purge only the tracked txns that are (a) no longer active and
+    /// (b) have no still-active concurrent peer. `txn_id` is already out of
+    /// `active` (commit()/abort() removed it) — it is purged here only if its own
+    /// peers are all done.
+    pub fn cleanup_ssi(&self, _txn_id: u64) {
+        self.sweep_ssi(None);
+    }
+
+    /// Purge an ABORTED SERIALIZABLE transaction's SSI data immediately (its
+    /// effects are rolled back, so retaining its sets would only create bogus
+    /// edges), then sweep any other now-purgeable txns.
+    fn abort_ssi(&self, txn_id: u64) {
+        self.sweep_ssi(Some(txn_id));
+    }
+
+    /// Purge `force` (if any) plus every tracked SERIALIZABLE txn that is no
+    /// longer active and whose concurrent peers have all finished. Canonical lock
+    /// order: active → ssi_txns → ssi_read_locks → ssi_write_sets →
+    /// ssi_rw_conflicts → ssi_concurrent.
+    fn sweep_ssi(&self, force: Option<u64>) {
         let active = self.active.lock();
         let mut ssi = self.ssi_txns.lock();
-        ssi.remove(&txn_id);
-        self.ssi_read_locks.lock().remove(&txn_id);
-        self.ssi_write_sets.lock().remove(&txn_id);
-        self.ssi_rw_conflicts.lock().retain(|&(r, w)| {
-            if r == txn_id || w == txn_id {
-                let other = if r == txn_id { w } else { r };
-                // Keep edge if the other party is still active or tracked
-                active.contains(&other) || ssi.contains(&other)
-            } else {
-                true
+        let mut reads = self.ssi_read_locks.lock();
+        let mut writes = self.ssi_write_sets.lock();
+        let mut conflicts = self.ssi_rw_conflicts.lock();
+        let mut concurrent = self.ssi_concurrent.lock();
+
+        let mut purge: Vec<u64> = ssi
+            .iter()
+            .copied()
+            .filter(|t| {
+                Some(*t) == force
+                    || (!active.contains(t)
+                        && concurrent
+                            .get(t)
+                            .is_none_or(|peers| peers.iter().all(|p| !active.contains(p))))
+            })
+            .collect();
+        purge.sort_unstable();
+        purge.dedup();
+
+        for t in purge {
+            ssi.remove(&t);
+            reads.remove(&t);
+            writes.remove(&t);
+            concurrent.remove(&t);
+            for peers in concurrent.values_mut() {
+                peers.remove(&t);
             }
-        });
+            conflicts.retain(|&(r, w)| r != t && w != t);
+        }
     }
 }
 

@@ -1251,14 +1251,21 @@ impl StorageEngine for MvccStorageAdapter {
         col_idx: usize,
         value: &Value,
     ) -> Result<Vec<(usize, Row)>, StorageError> {
-        let (_txn_id, snap, auto) = self.current_or_auto();
+        let (txn_id, snap, auto) = self.current_or_auto();
 
         // --- Try index-based O(1) lookup first ---
         // If there is a BTreeMap index on this column with version tracking,
         // we can skip the full version chain iteration entirely.
         if let Some(matches) = self.index_version_lookup(table, col_idx, value, &snap) {
+            // Record SIREAD locks for SERIALIZABLE — point/eq reads must be
+            // tracked too (not only full scans), or SSI misses write-skew where
+            // a txn reads a single row by key and another writes it.
+            if !auto {
+                let indices: Vec<usize> = matches.iter().map(|(idx, _)| *idx).collect();
+                self.maybe_record_siread(txn_id, table, &indices);
+            }
             if auto {
-                self.auto_commit(_txn_id);
+                self.auto_commit(txn_id);
             }
             return Ok(matches);
         }
@@ -1292,8 +1299,12 @@ impl StorageEngine for MvccStorageAdapter {
         }
         drop(rows_guard);
 
+        if !auto {
+            let indices: Vec<usize> = matches.iter().map(|(idx, _)| *idx).collect();
+            self.maybe_record_siread(txn_id, table, &indices);
+        }
         if auto {
-            self.auto_commit(_txn_id);
+            self.auto_commit(txn_id);
         }
         Ok(matches)
     }
