@@ -178,7 +178,14 @@ impl KvStore {
                     return None;
                 }
                 let remaining_ms = abs_ms - now_epoch_ms;
-                Some(Instant::now() + Duration::from_millis(remaining_ms))
+                // checked_add; an absurd persisted TTL would overflow Instant +
+                // Duration. Fall back to ~10 years out (effectively never) so the
+                // key is still RESTORED (Some), not dropped as "already expired".
+                Instant::now()
+                    .checked_add(Duration::from_millis(remaining_ms))
+                    .or_else(|| {
+                        Instant::now().checked_add(Duration::from_secs(3_600 * 24 * 365 * 10))
+                    })
             });
             // If the TTL was set but already expired, skip the key
             if ttl_abs_ms.is_some() && expires_at.is_none() {
@@ -291,7 +298,10 @@ impl KvStore {
                 }
             }
         }
-        let expires_at = ttl_secs.map(|s| Instant::now() + Duration::from_secs(s));
+        // checked_add: a huge TTL (e.g. i64::MAX seconds) would overflow
+        // Instant + Duration and panic. Treat an overflowing TTL as "never
+        // expires" (None) — it is effectively infinite anyway.
+        let expires_at = ttl_secs.and_then(|s| Instant::now().checked_add(Duration::from_secs(s)));
         let shard = self.data.shard(key);
         // Remove old expiry index entry if replacing a key with TTL
         {
@@ -422,14 +432,21 @@ impl KvStore {
             if let Some(old_exp) = entry.expires_at {
                 shard.remove_expiry(key, old_exp);
             }
+            // checked_add: a huge TTL overflows Instant + Duration and panics.
+            // Treat an overflowing TTL as "never expires".
+            let Some(new_exp) = Instant::now().checked_add(Duration::from_secs(ttl_secs)) else {
+                entry.expires_at = None;
+                self.bump_version();
+                return true;
+            };
             #[cfg(feature = "server")]
             if let Some(ref wal) = self.wal {
-                let abs_ms = epoch_ms_now() + ttl_secs * 1000;
+                // saturating: ttl_secs * 1000 (u64) would also overflow.
+                let abs_ms = epoch_ms_now().saturating_add(ttl_secs.saturating_mul(1000));
                 if let Err(e) = wal.log_expire(key, abs_ms) {
                     tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
                 }
             }
-            let new_exp = Instant::now() + Duration::from_secs(ttl_secs);
             entry.expires_at = Some(new_exp);
             shard.add_expiry(key, new_exp);
             self.bump_version();

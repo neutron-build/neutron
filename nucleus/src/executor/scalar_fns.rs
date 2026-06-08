@@ -123,19 +123,24 @@ impl Executor {
                     Value::Null => return Ok(Value::Null),
                     other => other.to_string(),
                 };
-                let start = value_to_i64(&args[1])? as usize;
-                let start = if start > 0 { start - 1 } else { 0 }; // SQL is 1-indexed
-                let len = if args.len() > 2 {
-                    Some(value_to_i64(&args[2])? as usize)
-                } else {
-                    None
-                };
+                // Compute indices in SIGNED space, then clamp to [0, len] and
+                // ensure start <= end. A negative/garbage start (e.g. -3.14) cast
+                // straight to usize wraps to a huge value and slicing panics with
+                // "start > end"; signed math avoids that and matches SQL semantics
+                // (1-indexed start; positions before 1 are clipped but still count
+                // toward the length window).
                 let chars: Vec<char> = s.chars().collect();
-                let end = match len {
-                    Some(l) => (start + l).min(chars.len()),
-                    None => chars.len(),
+                let n = chars.len() as i64;
+                let start0 = value_to_i64(&args[1])?.saturating_sub(1); // 0-indexed, may be < 0
+                let end0 = if args.len() > 2 {
+                    start0.saturating_add(value_to_i64(&args[2])?) // exclusive end
+                } else {
+                    n
                 };
-                let result: String = chars[start.min(chars.len())..end].iter().collect();
+                let start = start0.clamp(0, n) as usize;
+                let end = end0.clamp(0, n) as usize;
+                let end = end.max(start);
+                let result: String = chars[start..end].iter().collect();
                 Ok(Value::Text(result))
             }
             "REPLACE" => {
@@ -4885,13 +4890,19 @@ impl Executor {
                 };
                 let data = if let Some(hex_val) = args.get(4) {
                     let hex_str = hex_val.to_string().replace('\'', "");
-                    (0..hex_str.len())
+                    // Slice over BYTES, not chars: indexing a &str by byte offset
+                    // panics if the offset lands inside a multi-byte UTF-8 char
+                    // (e.g. "日本語🎉"). Hex is ASCII, so a window that isn't valid
+                    // ASCII/UTF-8 (or isn't valid hex) is simply dropped.
+                    let bytes = hex_str.as_bytes();
+                    (0..bytes.len())
                         .step_by(2)
-                        // Guard the 2-byte window: an odd-length input would slice
-                        // past the end and panic. Drop the trailing half-byte,
-                        // consistent with the lenient filter_map below.
-                        .filter(|&i| i + 2 <= hex_str.len())
-                        .filter_map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16).ok())
+                        .filter(|&i| i + 2 <= bytes.len())
+                        .filter_map(|i| {
+                            std::str::from_utf8(&bytes[i..i + 2])
+                                .ok()
+                                .and_then(|s| u8::from_str_radix(s, 16).ok())
+                        })
                         .collect::<Vec<u8>>()
                 } else {
                     let num_elements: usize = shape.iter().product();
