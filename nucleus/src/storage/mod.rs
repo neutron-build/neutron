@@ -181,7 +181,10 @@ pub trait StorageEngine: Send + Sync {
         Ok(rows
             .into_iter()
             .enumerate()
-            .filter(|(_, row)| row.get(col_idx).is_some_and(|v| v == value))
+            // Coercing eq (loose_eq), matching the slow WHERE path and Postgres:
+            // a text-bound BIGINT PK (Int64) must still match an Int32/text
+            // literal, else UPDATE/DELETE by PK silently no-ops.
+            .filter(|(_, row)| row.get(col_idx).is_some_and(|v| v.loose_eq(value)))
             .collect())
     }
 

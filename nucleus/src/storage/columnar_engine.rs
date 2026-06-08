@@ -739,7 +739,9 @@ impl StorageEngine for ColumnarStorageEngine {
         Ok(rows
             .into_iter()
             .enumerate()
-            .filter(|(_, row)| row.get(col_idx).is_some_and(|v| v == value))
+            // Coercing eq (loose_eq): a text-bound BIGINT PK (Int64) must match an
+            // Int32/text WHERE literal, else UPDATE/DELETE by PK silently no-ops.
+            .filter(|(_, row)| row.get(col_idx).is_some_and(|v| v.loose_eq(value)))
             .collect())
     }
 
