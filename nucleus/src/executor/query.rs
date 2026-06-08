@@ -1113,6 +1113,21 @@ impl Executor {
     ) -> (HashMap<String, Vec<Expr>>, Option<Expr>) {
         let relation_names = Self::collect_from_relation_names(from);
         let has_outer_join = Self::from_has_outer_join(from);
+        // For a single-table FROM (no joins / outer joins) an UNQUALIFIED column
+        // predicate (e.g. `WHERE id = 1`) belongs unambiguously to that table, so
+        // push it down too. This lets `SELECT … WHERE pk = v` use the storage
+        // index/fast scan, which records precise tuple-level SIREAD under
+        // SERIALIZABLE (instead of a full scan's table-wide predicate lock). The
+        // pushed predicate is re-applied by apply_pushdown_for_factor, so results
+        // are unaffected even when the storage layer can't accelerate the shape.
+        let single_table_key: Option<String> = if from.len() == 1
+            && from[0].joins.is_empty()
+            && !has_outer_join
+        {
+            Self::table_factor_names(&from[0].relation).into_iter().next()
+        } else {
+            None
+        };
         let mut by_relation: HashMap<String, Vec<Expr>> = HashMap::new();
         let mut remaining: Vec<Expr> = Vec::new();
         for pred in planner::split_conjunction(where_expr).into_iter().cloned() {
@@ -1132,6 +1147,13 @@ impl Executor {
                 if has_outer_join {
                     remaining.push(pred);
                 }
+                continue;
+            }
+            // Unqualified predicate over the single FROM table → push it there.
+            if refs.is_empty()
+                && let Some(ref key) = single_table_key
+            {
+                by_relation.entry(key.clone()).or_default().push(pred);
                 continue;
             }
             remaining.push(pred);

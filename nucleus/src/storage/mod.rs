@@ -106,6 +106,13 @@ pub trait StorageEngine: Send + Sync {
     async fn drop_table(&self, table: &str) -> Result<(), StorageError>;
     async fn insert(&self, table: &str, row: Row) -> Result<(), StorageError>;
     async fn scan(&self, table: &str) -> Result<Vec<Row>, StorageError>;
+    /// Scan all visible rows WITHOUT recording SIREAD locks. For INTERNAL
+    /// maintenance reads (zone-map rebuild, stats refresh) that are not part of
+    /// the transaction's logical read set and so must not create SSI
+    /// rw-conflicts. Default: same as `scan()`.
+    async fn scan_for_maintenance(&self, table: &str) -> Result<Vec<Row>, StorageError> {
+        self.scan(table).await
+    }
     /// Scan with an early-exit limit. Returns at most `limit` rows.
     /// Default: delegates to scan() + truncate.
     async fn scan_limit(&self, table: &str, limit: usize) -> Result<Vec<Row>, StorageError> {

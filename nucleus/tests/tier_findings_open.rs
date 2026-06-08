@@ -47,6 +47,10 @@
 //!   6.  [MEDIUM] FTS_RANK was TF-only and could rank inversely to FTS_SEARCH's
 //!       BM25 — now uses BM25 tf-saturation. See fts_rank_regression.rs.
 //!
-//! ALL Tier 1/2 findings are fixed and gated. (A precision note remains, not a
-//! correctness bug: SERIALIZABLE SIREAD granularity — see ssi_write_skew_regression.rs.)
+//! ALL Tier 1/2 findings are fixed and gated. SERIALIZABLE SIREAD is now
+//! tuple-granular for point access too: point reads/writes record SIREAD on only
+//! the matched row, single-table unqualified predicates push down so point
+//! SELECTs use the fast scan, and internal maintenance scans (zone-map rebuild)
+//! are SIREAD-free — so disjoint SERIALIZABLE access no longer over-aborts. See
+//! ssi_write_skew_regression.rs (serializable_disjoint_both_commit).
 #![cfg(feature = "server")]
