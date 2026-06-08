@@ -1517,11 +1517,21 @@ impl Executor {
                 };
                 let tokens = crate::fts::tokenize(&doc);
                 let query_tokens = crate::fts::tokenize(&query);
-                // Simple TF score
+                // BM25 term-frequency saturation (Okapi BM25, k1=1.2) — the same
+                // ranking shape FTS_SEARCH uses. FTS_RANK scores a single
+                // (doc, query) pair, so there is no corpus: idf is a constant
+                // (omitted; it doesn't affect relative order) and the length term
+                // is neutral (avgdl == this document's length, so dl/avgdl == 1).
+                // The previous raw tf/len score could rank documents INVERSELY to
+                // FTS_SEARCH because linear tf divided by length disagrees with
+                // BM25's saturated tf when both tf and length vary.
+                const K1: f64 = 1.2;
                 let mut score = 0.0f64;
                 for qt in &query_tokens {
                     let tf = tokens.iter().filter(|t| t.term == qt.term).count() as f64;
-                    score += tf / tokens.len().max(1) as f64;
+                    if tf > 0.0 {
+                        score += tf * (K1 + 1.0) / (tf + K1);
+                    }
                 }
                 Ok(Value::Float64(score))
             }

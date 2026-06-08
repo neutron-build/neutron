@@ -53,11 +53,13 @@ PROBES=(
   "probe_crash_subprocess|--cycles $((30 * M))"
   "probe_distributed|--iterations $((300 * M))"
   "probe_durability_torn|--iterations $((300 * M))"
-  # NOTE: probe_fts_rank, probe_recover_engines, probe_concurrency_threads are
-  # built and runnable but NOT yet in this gating list — each found an OPEN bug
-  # (FTS_RANK TF-vs-BM25; disk-mode catalog-not-restored; SSI serializable
-  # lost-update cluster). They are pinned as #[ignore]'d regressions in
-  # tests/tier_findings_open.rs; add them here as each bug is fixed.
+  "probe_fts_rank|--iterations $((2000 * M))"
+  "probe_concurrency_threads|--seed 1 --rounds $((200 * M))"
+  # NOTE: probe_recover_engines is built and runnable but NOT yet in this gating
+  # list — it found an OPEN bug (disk-mode catalog not repopulated on reopen).
+  # The multi-row WHERE-eq mutation + SSI write-skew findings are pinned as
+  # #[ignore]'d regressions in tests/{txn_multirow_mutation,tier_findings_open}.rs.
+  # Add probe_recover_engines here once disk-mode recovery is fixed.
 )
 
 echo "==> Building probe suite (features: $FEATURES, scale: ${PROBE_SCALE:-ci})"
