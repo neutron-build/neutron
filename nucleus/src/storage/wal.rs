@@ -912,6 +912,14 @@ impl GroupCommitter {
         self.state.lock().sync_count
     }
 
+    /// Number of callers currently queued as followers behind the in-flight
+    /// leader. Lets a test deterministically wait until every peer has batched
+    /// before the leader completes, instead of relying on thread-scheduling
+    /// timing (which is what made the batching tests flaky under CPU contention).
+    pub fn waiters(&self) -> u64 {
+        self.state.lock().waiters
+    }
+
     pub fn epoch(&self) -> u64 {
         self.state.lock().epoch
     }
@@ -1553,12 +1561,21 @@ mod group_commit_tests {
         let mut handles = vec![];
         for _ in 0..10 {
             let gc = gc.clone();
+            let gc_inner = gc.clone();
             let sc = sync_count.clone();
             let b = barrier.clone();
             handles.push(std::thread::spawn(move || {
                 b.wait();
                 gc.group_sync(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    // The leader holds the sync open until the other 9 callers
+                    // are queued as followers, so they are GUARANTEED to batch
+                    // behind this one sync — deterministic regardless of OS
+                    // scheduling. (The old `sleep(10ms)` + `total < 10` assertion
+                    // flaked under CPU contention: if threads ran serially each
+                    // became its own leader and `total == 10`.)
+                    while gc_inner.waiters() < 9 {
+                        std::thread::yield_now();
+                    }
                     sc.fetch_add(1, Ordering::SeqCst);
                 });
             }));
@@ -1566,12 +1583,13 @@ mod group_commit_tests {
         for h in handles {
             h.join().unwrap();
         }
-        let total = sync_count.load(Ordering::SeqCst);
-        assert!(
-            total < 10,
-            "Expected batching: got {total} syncs for 10 callers"
+        // Exactly one leader synced; the other 9 batched behind it.
+        assert_eq!(
+            sync_count.load(Ordering::SeqCst),
+            1,
+            "all 10 concurrent callers must batch into one sync"
         );
-        assert!(total >= 1);
+        assert_eq!(gc.sync_count(), 1);
     }
 
     #[test]
@@ -1622,12 +1640,17 @@ mod group_commit_tests {
         let mut handles = vec![];
         for _ in 0..100 {
             let gc = gc.clone();
+            let gc_inner = gc.clone();
             let sc = sync_count.clone();
             let b = barrier.clone();
             handles.push(std::thread::spawn(move || {
                 b.wait();
                 gc.group_sync(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    // Leader waits until the other 99 are queued as followers →
+                    // deterministic single batch (see group_commit_concurrent_batching).
+                    while gc_inner.waiters() < 99 {
+                        std::thread::yield_now();
+                    }
                     sc.fetch_add(1, Ordering::SeqCst);
                 });
             }));
@@ -1635,12 +1658,12 @@ mod group_commit_tests {
         for h in handles {
             h.join().unwrap();
         }
-        let total = sync_count.load(Ordering::SeqCst);
-        assert!(
-            total < 100,
-            "Expected batching: got {total} syncs for 100 callers"
+        // All 100 concurrent callers batch behind a single leader sync.
+        assert_eq!(
+            sync_count.load(Ordering::SeqCst),
+            1,
+            "all 100 concurrent callers must batch into one sync"
         );
-        assert!(total >= 1);
     }
 
     #[test]
