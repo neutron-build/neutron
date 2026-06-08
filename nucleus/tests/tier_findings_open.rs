@@ -32,20 +32,21 @@
 //!   5.  [HIGH] Disk-mode tables vanished from SQL after reopen — the on-disk
 //!       directory now persists column names and the embedded builder repopulates
 //!       the catalog from DiskEngine::recovered_schemas(). See
-//!       disk_recovery_regression.rs. (Catalog-visibility part of #5; the disk WAL
-//!       data-correctness part is tracked as 5b below.)
+//!       disk_recovery_regression.rs.
+//!   5b. [HIGH] Disk-mode recovery persisted an ABANDONED transaction's writes
+//!       (BEGIN + writes, dropped with no COMMIT) — they survived a reopen. The
+//!       engine applied txn writes to its in-memory directory immediately and
+//!       flushed that uncommitted directory on Drop. Fixed: Drop rolls back any
+//!       open txn's in-memory state before flushing
+//!       (DiskEngine::rollback_open_txn_in_memory). probe_recover_engines now
+//!       clean (gated); see disk_recovery_dml_regression.rs.
 //!   6.  [MEDIUM] FTS_RANK was TF-only and could rank inversely to FTS_SEARCH's
 //!       BM25 — now uses BM25 tf-saturation. See fts_rank_regression.rs.
 //!
 //! STILL OPEN:
 //!   4.  [LOW] READ COMMITTED doesn't take a fresh per-statement snapshot, so it
 //!       behaves as Snapshot/Repeatable Read (stricter than spec — safe, not a
-//!       correctness hazard, but not standards-compliant).
-//!   5b. [HIGH] Disk-mode WAL recovery is not data-correct under update/delete:
-//!       probe_recover_engines shows the recovered row set diverging from the
-//!       pre-shutdown set (extra rows — likely WAL replay / page-chain handling
-//!       re-materializing deleted/updated rows). Distinct from #5 (catalog
-//!       visibility, fixed). Disk mode is opt-in; the default MvccStorageAdapter
-//!       is unaffected. Keep probe_recover_engines out of the gating list until
-//!       fixed.
+//!       correctness hazard, but not standards-compliant). The only remaining
+//!       finding; no dedicated probe (would need cross-statement visibility
+//!       checks). Left intentionally: stricter isolation is safe.
 #![cfg(feature = "server")]
