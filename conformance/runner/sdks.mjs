@@ -29,6 +29,8 @@ const GO_APP = path.join(CONF, "adapters/go/conformance-app");
 const GO_BIN = path.join(CONF, ".build/conf-go-app");
 const RUST_BIN = path.join(REPO, "rust/target/release/examples/conformance_app");
 const PY_APP = path.join(CONF, "adapters/python/conformance_app.py");
+const TS_APP = path.join(CONF, "adapters/typescript/conformance_app.mjs");
+const TS_DIST = path.join(REPO, "typescript/packages/neutron/dist/server/index.js");
 
 function pythonBin() {
   for (const c of ["python3", "python"]) {
@@ -97,6 +99,25 @@ export const SDKS = [
       const py = pythonBin();
       if (!py) return "python interpreter not found";
       if (!pythonDepsOk(py)) return "python deps missing (pip install starlette pydantic uvicorn)";
+      return null;
+    },
+  },
+  {
+    // Web/SSR meta-framework (Hono): implements the cross-cutting contract
+    // surfaces (health, request-id, CORS, compression). API-only dimensions
+    // (forced errors, validation, OpenAPI) are skip-by-design — see
+    // adapters/typescript/README.md.
+    name: "ts",
+    portEnv: "PORT",
+    hostEnv: "HOST",
+    build() {},
+    cmd() {
+      return { command: process.execPath, args: [TS_APP] };
+    },
+    available() {
+      if (!fs.existsSync(TS_DIST)) {
+        return "TS package not built (run: pnpm --filter @neutron-build/core build)";
+      }
       return null;
     },
   },

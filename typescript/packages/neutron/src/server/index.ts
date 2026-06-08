@@ -300,7 +300,19 @@ export async function createServer(options: NeutronServerOptions = {}) {
     );
   }
 
-  const app = new Hono();
+  const app = new Hono<{ Variables: { requestId: string } }>();
+
+  // FRAMEWORK_CONTRACT.md §5: Request ID is middleware step 1 (outermost). Reuse an
+  // inbound x-request-id for trace propagation, otherwise generate one. It is shared
+  // with the per-request trace context and surfaced as the x-request-id response
+  // header on every response, including /health.
+  app.use("*", async (c, next) => {
+    const incoming = c.req.header("x-request-id");
+    const requestId = incoming && incoming.length > 0 ? incoming : createRequestId();
+    c.set("requestId", requestId);
+    await next();
+    c.res.headers.set("x-request-id", requestId);
+  });
 
   // Reject untrusted Host headers first, before any other processing, so a
   // spoofed Host can't reach URL/link construction or cache keying.
@@ -409,7 +421,7 @@ export async function createServer(options: NeutronServerOptions = {}) {
 
   app.all("*", async (c) => {
     const requestTrace: RequestTraceContext = {
-      requestId: createRequestId(),
+      requestId: c.get("requestId") ?? createRequestId(),
       method: c.req.method.toUpperCase(),
       url: c.req.raw.url,
       pathname: c.req.path,
