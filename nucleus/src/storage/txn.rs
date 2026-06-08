@@ -327,9 +327,18 @@ impl TransactionManager {
 
     /// Begin a new transaction with the given isolation level.
     pub fn begin(&self, isolation: IsolationLevel) -> Transaction {
-        let id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
-
+        // Assign the id and capture the snapshot ATOMICALLY under the active
+        // lock. If the id assignment (`fetch_add`) and the active-set capture are
+        // separate, a transaction can receive id N but observe an active set that
+        // is inconsistent with N: a concurrent transaction that grabbed a higher
+        // id but inserted into `active` first will be MISSING from N's snapshot
+        // (and N's set can even contain ids > N). N then treats that concurrent
+        // transaction as non-concurrent, sees its commit mid-transaction, and a
+        // read-modify-write loses an update. Holding `active` across both steps
+        // guarantees: snapshot.active holds exactly the still-running txns with
+        // ids < N, and xmax = N excludes everything from N onward.
         let mut active = self.active.lock();
+        let id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
         let snapshot = Snapshot {
             txn_id: id,
             xmin: *active.iter().min().unwrap_or(&id),
@@ -337,6 +346,7 @@ impl TransactionManager {
             active: active.clone(),
         };
         active.insert(id);
+        drop(active); // release before SSI locks (lock order: active → ssi_*)
 
         // Register SERIALIZABLE transactions for SSI tracking
         if isolation == IsolationLevel::Serializable {
@@ -356,8 +366,16 @@ impl TransactionManager {
     /// Commit a transaction.
     pub fn commit(&self, txn: &mut Transaction) {
         txn.status = TxnStatus::Committed;
-        self.active.lock().remove(&txn.id);
+        // Order matters: publish to `committed` BEFORE removing from `active`, so
+        // the txn is never absent from both sets. Otherwise there is a window in
+        // which get_status() falls through to its "unknown → Aborted" default and
+        // briefly reports a committing txn as aborted — which flips the visibility
+        // of its just-written rows for a concurrent snapshot mid-transaction and
+        // produces a lost update. (The commit linearization point is the active
+        // removal; the committed insert is bookkeeping that keeps get_status
+        // consistent across the window.)
         self.committed.lock().insert(txn.id);
+        self.active.lock().remove(&txn.id);
         self.maybe_gc();
         // Note: SSI cleanup is NOT done here because commit_serializable()
         // needs the data for its check. Callers using commit_serializable()
@@ -368,9 +386,11 @@ impl TransactionManager {
     /// Abort (rollback) a transaction.
     pub fn abort(&self, txn: &mut Transaction) {
         txn.status = TxnStatus::Aborted;
-        self.active.lock().remove(&txn.id);
+        // Publish to `aborted` (and bump the counter) BEFORE removing from
+        // `active`, mirroring commit(): never leave the txn absent from both sets.
         self.aborted.lock().insert(txn.id);
         self.aborted_count.fetch_add(1, Ordering::Release);
+        self.active.lock().remove(&txn.id);
         self.maybe_gc();
         if txn.isolation == IsolationLevel::Serializable {
             self.cleanup_ssi(txn.id);
