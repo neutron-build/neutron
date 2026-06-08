@@ -71,7 +71,7 @@ async def test_health_check():
         data = resp.json()
         assert data["status"] == "ok"
         assert data["version"] == "1.0.0"
-        assert data["nucleus"] is False
+        assert data["nucleus"] == "unconfigured"
 
 
 @pytest.mark.asyncio

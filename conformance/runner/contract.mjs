@@ -93,17 +93,19 @@ async function checkHealth(base, results, ctx) {
     );
   }
 
-  // Types: status string, version string, nucleus boolean per §7 ("true|false").
+  // Types: status string, version string, nucleus tri-state string per §7
+  // ("connected" | "disconnected" | "unconfigured").
+  const NUCLEUS_STATES = ["connected", "disconnected", "unconfigured"];
   const typeProblems = [];
   if (typeof body.status !== "string") typeProblems.push(`status is ${typeof body.status}, want string`);
   if (typeof body.version !== "string") typeProblems.push(`version is ${typeof body.version}, want string`);
-  if (typeof body.nucleus !== "boolean") {
+  if (typeof body.nucleus !== "string" || !NUCLEUS_STATES.includes(body.nucleus)) {
     typeProblems.push(
-      `nucleus is ${typeof body.nucleus} (${JSON.stringify(body.nucleus)}), contract §7 wants boolean true|false`,
+      `nucleus is ${JSON.stringify(body.nucleus)}, contract §7 wants one of ${JSON.stringify(NUCLEUS_STATES)}`,
     );
   }
   if (typeProblems.length === 0) {
-    results.push(result("health.types", "pass", `status:string version:string nucleus:boolean`));
+    results.push(result("health.types", "pass", `status:string version:string nucleus:${JSON.stringify(body.nucleus)}`));
   } else {
     results.push(result("health.types", "fail", typeProblems.join("; ")));
   }
@@ -121,8 +123,7 @@ function checkFeatureDetection(results, ctx) {
   }
   const v = ctx.nucleusField;
   const known =
-    typeof v === "boolean" ||
-    (typeof v === "string" && ["connected", "disconnected", "unconfigured"].includes(v));
+    typeof v === "string" && ["connected", "disconnected", "unconfigured"].includes(v);
   if (known) {
     results.push(
       result("feature.detection", "pass", `nucleus=${JSON.stringify(v)} (detection state exposed via /health)`),

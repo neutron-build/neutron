@@ -325,8 +325,15 @@ Connection URL format: `postgres://user:password@host:port/database`
 All frameworks SHOULD register a default health check:
 
 ```
-GET /health → 200 { "status": "ok", "nucleus": true|false, "version": "X.Y.Z" }
+GET /health → 200 { "status": "ok", "nucleus": "connected" | "disconnected" | "unconfigured", "version": "X.Y.Z" }
 ```
+
+`nucleus` reflects the HEALTH of the nucleus dependency:
+- `"connected"` — configured and reachable/healthy
+- `"disconnected"` — configured but unreachable/unhealthy (`status` → `"degraded"`; MAY return `503`)
+- `"unconfigured"` — no nucleus configured for this service (not an error)
+
+Feature detection (is the connected DB a Nucleus instance vs plain Postgres) is §1, not `/health`.
 
 ## 8. Graceful Shutdown
 
