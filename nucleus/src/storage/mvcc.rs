@@ -1476,7 +1476,7 @@ impl StorageEngine for MvccStorageAdapter {
         filter_col: usize,
         filter_val: &Value,
     ) -> Option<(Vec<Row>, usize)> {
-        let (_txn_id, snap, auto) = self.current_or_auto();
+        let (txn_id, snap, auto) = self.current_or_auto();
         let tbl = {
             let tables = self.engine.tables.read();
             tables.get(table)?.clone()
@@ -1485,12 +1485,19 @@ impl StorageEngine for MvccStorageAdapter {
         let no_aborts = self.engine.txn_mgr.has_no_aborts();
         let xmin = snap.xmin;
         let mut result = Vec::new();
+        // SIREAD on the MATCHED rows (tuple-level): this predicate-pushdown path
+        // must record reads under SERIALIZABLE too, or write-skew via a `WHERE
+        // col=v` read would be missed. Recording the matched version indices keeps
+        // it precise (only the rows the predicate selects); phantom protection is
+        // preserved because record_table_write checks whether the reader touched
+        // the table at all.
+        let mut matched_vidx: Vec<usize> = Vec::new();
         // Count every visible row the scan touches, independent of whether it
         // matches the equality predicate. This is the true sequential-scan size
         // (Postgres Seq Scan "rows" = matched + "rows removed by filter"). The
         // caller reports this — not `result.len()` — to the `rows_scanned` metric.
         let mut examined = 0usize;
-        for r in rows.iter() {
+        for (vidx, r) in rows.iter().enumerate() {
             if !(r.version.is_visible_fast(xmin, no_aborts)
                 || r.version.is_visible(&snap, &self.engine.txn_mgr))
             {
@@ -1501,10 +1508,15 @@ impl StorageEngine for MvccStorageAdapter {
                 && value_eq_coerced(val, filter_val)
             {
                 result.push((*r.data).clone());
+                matched_vidx.push(vidx);
             }
         }
+        drop(rows);
+        if !auto && !matched_vidx.is_empty() {
+            self.maybe_record_siread(txn_id, table, &matched_vidx);
+        }
         if auto {
-            self.auto_commit(_txn_id);
+            self.auto_commit(txn_id);
         }
         Some((result, examined))
     }
@@ -1631,7 +1643,7 @@ impl StorageEngine for MvccStorageAdapter {
         low: &Value,
         high: &Value,
     ) -> Option<Vec<Row>> {
-        let (_txn_id, snap, auto) = self.current_or_auto();
+        let (txn_id, snap, auto) = self.current_or_auto();
         let tbl = {
             let tables = self.engine.tables.read();
             tables.get(table)?.clone()
@@ -1640,7 +1652,10 @@ impl StorageEngine for MvccStorageAdapter {
         let no_aborts = self.engine.txn_mgr.has_no_aborts();
         let xmin = snap.xmin;
         let mut result = Vec::new();
-        for r in rows.iter() {
+        // SIREAD on matched rows (see fast_scan_where_eq) so SERIALIZABLE range
+        // reads via this pushdown path are tracked rather than silently skipped.
+        let mut matched_vidx: Vec<usize> = Vec::new();
+        for (vidx, r) in rows.iter().enumerate() {
             if !(r.version.is_visible_fast(xmin, no_aborts)
                 || r.version.is_visible(&snap, &self.engine.txn_mgr))
             {
@@ -1653,10 +1668,15 @@ impl StorageEngine for MvccStorageAdapter {
                 && hi_cmp != std::cmp::Ordering::Greater
             {
                 result.push((*r.data).clone());
+                matched_vidx.push(vidx);
             }
         }
+        drop(rows);
+        if !auto && !matched_vidx.is_empty() {
+            self.maybe_record_siread(txn_id, table, &matched_vidx);
+        }
         if auto {
-            self.auto_commit(_txn_id);
+            self.auto_commit(txn_id);
         }
         Some(result)
     }

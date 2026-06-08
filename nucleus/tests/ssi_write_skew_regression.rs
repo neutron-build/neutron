@@ -8,12 +8,17 @@
 //!      (retain until concurrent peers finish) + record_siread on the eq read
 //!      path + a concurrency guard on edge creation.
 //!  (2) Disjoint SERIALIZABLE txns must converge correctly under the standard
-//!      retry-on-serialization-failure contract. NOTE: a point SELECT currently
-//!      executes as a full scan, so its SIREAD covers the whole table (coarse
-//!      "predicate lock", as in PostgreSQL seq scans) — disjoint access may abort
-//!      one txn on the first try. That is SAFE (no anomaly) and resolved by retry;
-//!      tuple-granular SIREAD (index-point reads) is a future precision
-//!      optimization, not a correctness issue.
+//!      retry-on-serialization-failure contract. NOTE on precision: the
+//!      predicate-pushdown fast-scan paths (fast_scan_where_eq /
+//!      fast_scan_where_range) now record tuple-level SIREAD on the matched rows
+//!      (closing a coverage gap and giving precise conflict detection when used).
+//!      But a plain point SELECT like `SELECT v FROM t WHERE id=1` is not pushed
+//!      down by the planner — it runs as a full scan, so its SIREAD covers the
+//!      whole table (coarse "predicate lock", as PostgreSQL does for seq scans),
+//!      and disjoint access can abort one txn on the first try. That is SAFE (no
+//!      anomaly) and resolved by retry; routing point SELECTs through the index
+//!      (so their SIREAD is tuple-granular) is a planner-pushdown optimization,
+//!      not a correctness issue.
 #![cfg(feature = "server")]
 use std::sync::Arc;
 
