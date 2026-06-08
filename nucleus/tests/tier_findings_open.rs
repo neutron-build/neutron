@@ -4,10 +4,20 @@
 //! Un-ignore (and add the harness to scripts/probe.sh) as each is fixed.
 //!
 //! Open findings:
-//!   1. [CRITICAL] SERIALIZABLE misses a rw-conflict against an already-committed
-//!      concurrent txn → silent lost update / write skew. (probe_concurrency_threads)
-//!      Root: txn.rs cleanup_ssi removes a committing txn's SIREAD/write sets
-//!      immediately, so a concurrent txn finds no conflict edge.
+//!   1. [CRITICAL] Concurrent read-modify-write lost updates under RR AND
+//!      SERIALIZABLE (probe_concurrency_threads).
+//!      PARTIALLY FIXED: the dominant mechanism — a PK/eq UPDATE/DELETE matching
+//!      zero rows (and so skipping its CAS write-conflict check) because the index
+//!      was rebuilt to the latest snapshot and dropped the version a concurrent
+//!      snapshot still needs — is fixed (index_version_lookup now defers to the
+//!      chain scan; see concurrent_lost_update_regression.rs). Loss magnitude
+//!      dropped from ~50% to a few %. A RESIDUAL timing race remains (both RR and
+//!      SERIALIZABLE still lose a small number under true OS-thread contention);
+//!      root cause not yet isolated — needs runtime instrumentation, not static
+//!      analysis. Plus the SSI-specific gap below.
+//!   1b.[CRITICAL] SERIALIZABLE misses a rw-conflict against an already-committed
+//!      concurrent txn → write skew. Root: txn.rs cleanup_ssi removes a committing
+//!      txn's SIREAD/write sets immediately, so a concurrent txn finds no edge.
 //!   2. [HIGH] SIREAD locks not recorded on point/equality read paths
 //!      (fast_scan_where_eq / scan_where_eq_positions / fast_scan_where_eq_topk).
 //!   3. [MEDIUM] Executor txn_state desync when a SERIALIZABLE COMMIT fails SSI

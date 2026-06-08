@@ -921,7 +921,9 @@ impl MvccStorageAdapter {
             // Look up version indices from the version_map
             let version_indices = idx.version_map.get(value)?;
             if version_indices.is_empty() {
-                return Some((Vec::new(), Vec::new()));
+                // Value tracked but with no live versions — defer to the chain
+                // scan (see the matches-empty case below for the rationale).
+                return None;
             }
 
             // Verify each version is still visible in the MVCC chain
@@ -948,6 +950,19 @@ impl MvccStorageAdapter {
                         break;
                     }
                 }
+            }
+            if matches.is_empty() {
+                // The value exists in the index but no version is visible to this
+                // snapshot. That can mean the row is genuinely gone, OR that the
+                // index was rebuilt to the latest committed snapshot (see
+                // `rebuild_indexes_for_table`) and dropped an older version that
+                // a concurrent transaction's snapshot still needs. We cannot tell
+                // the two apart here, so we must NOT assert "no rows" — doing so
+                // makes a concurrent UPDATE/DELETE match zero rows, skipping the
+                // per-row write-conflict (CAS) check and silently losing the
+                // write. Return None to fall back to the authoritative MVCC chain
+                // scan, which sees every physical version with correct visibility.
+                return None;
             }
             return Some((matches, cache_entries));
         }
