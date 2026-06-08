@@ -105,6 +105,30 @@ pub trait StorageEngine: Send + Sync {
     async fn create_table(&self, table: &str) -> Result<(), StorageError>;
     async fn drop_table(&self, table: &str) -> Result<(), StorageError>;
     async fn insert(&self, table: &str, row: Row) -> Result<(), StorageError>;
+    /// Insert a row, atomically enforcing the given UNIQUE/PRIMARY KEY column sets
+    /// (each is a list of column indices) so that two concurrent transactions
+    /// cannot both insert the same key. Returns `StorageError::UniqueViolation` on
+    /// conflict. Default: plain `insert()` — engines without atomic unique support
+    /// rely on the executor's snapshot check (correct single-threaded, but racy).
+    async fn insert_unique(
+        &self,
+        table: &str,
+        row: Row,
+        _unique_col_sets: &[Vec<usize>],
+    ) -> Result<(), StorageError> {
+        self.insert(table, row).await
+    }
+    /// Update rows enforcing the given UNIQUE/PK column sets atomically on the new
+    /// values (so concurrent updates can't move two rows to the same key).
+    /// `updates` are `(position, new_row)`. Default: plain `update()`.
+    async fn update_unique(
+        &self,
+        table: &str,
+        updates: &[(usize, Row)],
+        _unique_col_sets: &[Vec<usize>],
+    ) -> Result<usize, StorageError> {
+        self.update(table, updates).await
+    }
     async fn scan(&self, table: &str) -> Result<Vec<Row>, StorageError>;
     /// Scan all visible rows WITHOUT recording SIREAD locks. For INTERNAL
     /// maintenance reads (zone-map rebuild, stats refresh) that are not part of
@@ -1119,6 +1143,8 @@ pub enum StorageError {
     NoActiveTransaction,
     #[error("ERROR: {0}")]
     SerializationFailure(String),
+    #[error("duplicate key value violates unique constraint: {0}")]
+    UniqueViolation(String),
 }
 
 pub use mvcc::MvccStorageAdapter;

@@ -1,18 +1,11 @@
-//! OPEN BUG (pinned, #[ignore]'d): PRIMARY KEY / UNIQUE constraints are NOT
-//! enforced under concurrency. N transactions that concurrently INSERT the same
-//! key all succeed, leaving duplicate rows — found by
-//! concurrency_schema_constraints_probe.
-//!
-//! Root cause: uniqueness is checked in the executor (check_unique_constraints)
-//! via a snapshot scan, then the row is inserted — the check and the insert are
-//! not atomic across transactions, and each concurrent inserter's snapshot shows
-//! no duplicate (the others are uncommitted), so they all pass and all insert.
-//!
-//! A correct fix needs atomic, MVCC-aware unique enforcement in the storage
-//! engine (a unique index that detects a conflicting committed OR concurrently-
-//! uncommitted entry at insert time, reclaims keys on abort, and tracks key
-//! changes on update/delete) — a real concurrency feature, not a quick patch.
-//! Tracked in tier_findings_open.rs.
+//! Regression for finding #7 (FIXED): PRIMARY KEY / UNIQUE constraints must be
+//! enforced under concurrency. Previously N transactions concurrently INSERTing
+//! the same key all succeeded (snapshot-based check_unique_constraints + insert
+//! is not atomic across txns). Fixed with atomic, MVCC-aware unique enforcement
+//! in the engine: insert_unique/update_unique check a committed-live chain AND an
+//! in-flight reservation map (released on commit/abort) under one lock, so two
+//! racing transactions can't both take the same key. See
+//! src/storage/mvcc.rs (insert_unique / update_unique / release_unique).
 #![cfg(feature = "server")]
 use std::sync::{Arc, Barrier};
 
@@ -25,7 +18,6 @@ fn rt() -> tokio::runtime::Runtime {
 }
 
 #[test]
-#[ignore = "OPEN BUG: PK/UNIQUE not enforced under concurrent inserts (see tier_findings_open.rs)"]
 fn concurrent_same_pk_insert_only_one_wins() {
     let mut dup_rounds = 0;
     for _round in 0..40u64 {
