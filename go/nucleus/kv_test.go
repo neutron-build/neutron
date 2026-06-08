@@ -414,6 +414,132 @@ func TestKVTTL(t *testing.T) {
 	}
 }
 
+// rawStringQuerier returns a querier whose QueryRow scans the given string into
+// the first *string destination, simulating the single-TEXT-column result the
+// KV collection SQL functions emit.
+func rawStringQuerier(raw string) *mockCDCQuerier {
+	return &mockCDCQuerier{
+		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			return &mockCDCRow{scanFn: func(dest ...any) error {
+				*(dest[0].(*string)) = raw
+				return nil
+			}}
+		},
+	}
+}
+
+func TestKVLRangeJSON(t *testing.T) {
+	// Includes an element with an embedded comma to prove JSON, not comma-split.
+	kv := &KVModel{pool: rawStringQuerier(`["a","b,c"]`), client: nucleusClient()}
+	got, err := kv.LRange(context.Background(), "k", 0, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"a", "b,c"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestKVLRangeEmpty(t *testing.T) {
+	kv := &KVModel{pool: rawStringQuerier(`[]`), client: nucleusClient()}
+	got, err := kv.LRange(context.Background(), "k", 0, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %v, want empty", got)
+	}
+}
+
+func TestKVSMembersJSON(t *testing.T) {
+	kv := &KVModel{pool: rawStringQuerier(`["x","y"]`), client: nucleusClient()}
+	got, err := kv.SMembers(context.Background(), "k")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"x", "y"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestKVSMembersEmpty(t *testing.T) {
+	kv := &KVModel{pool: rawStringQuerier(`[]`), client: nucleusClient()}
+	got, err := kv.SMembers(context.Background(), "k")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %v, want empty", got)
+	}
+}
+
+func TestKVHGetAllJSON(t *testing.T) {
+	// Value "v=2" carries an embedded '=' to prove JSON pairs, not '=' split.
+	kv := &KVModel{pool: rawStringQuerier(`[["f1","v1"],["f2","v=2"]]`), client: nucleusClient()}
+	got, err := kv.HGetAll(context.Background(), "k")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got["f1"] != "v1" {
+		t.Errorf("f1 = %q, want v1", got["f1"])
+	}
+	if got["f2"] != "v=2" {
+		t.Errorf("f2 = %q, want v=2", got["f2"])
+	}
+	if len(got) != 2 {
+		t.Errorf("len = %d, want 2", len(got))
+	}
+}
+
+func TestKVHGetAllEmpty(t *testing.T) {
+	kv := &KVModel{pool: rawStringQuerier(`[]`), client: nucleusClient()}
+	got, err := kv.HGetAll(context.Background(), "k")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Errorf("got %v, want empty non-nil map", got)
+	}
+}
+
+func TestKVZRangeJSON(t *testing.T) {
+	// "bob,x" carries an embedded comma; scores are JSON numbers.
+	kv := &KVModel{pool: rawStringQuerier(`[["alice",1.0],["bob,x",2.5]]`), client: nucleusClient()}
+	got, err := kv.ZRange(context.Background(), "k", 0, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"alice:1", "bob,x:2.5"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestKVZRangeByScoreJSON(t *testing.T) {
+	kv := &KVModel{pool: rawStringQuerier(`[["a",10],["b",20.25]]`), client: nucleusClient()}
+	got, err := kv.ZRangeByScore(context.Background(), "k", 0, 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"a:10", "b:20.25"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestKVZRangeEmpty(t *testing.T) {
+	kv := &KVModel{pool: rawStringQuerier(`[]`), client: nucleusClient()}
+	got, err := kv.ZRange(context.Background(), "k", 0, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %v, want empty", got)
+	}
+}
+
 func TestKVExpire(t *testing.T) {
 	q := &mockCDCQuerier{
 		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {

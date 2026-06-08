@@ -271,7 +271,7 @@ class KVModelImpl implements KVModel {
     this.require();
     const raw = await this.transport.fetchval<string>('SELECT KV_LRANGE($1, $2, $3)', [key, start, stop]);
     if (!raw) return [];
-    return raw.split(',');
+    return JSON.parse(raw) as string[];
   }
 
   async llen(key: string): Promise<number> {
@@ -311,11 +311,8 @@ class KVModelImpl implements KVModel {
     const raw = await this.transport.fetchval<string>('SELECT KV_HGETALL($1)', [key]);
     if (!raw) return {};
     const result: Record<string, string> = {};
-    for (const pair of raw.split(',')) {
-      const eqIdx = pair.indexOf('=');
-      if (eqIdx !== -1) {
-        result[pair.slice(0, eqIdx)] = pair.slice(eqIdx + 1);
-      }
+    for (const [field, value] of JSON.parse(raw) as Array<[string, string]>) {
+      result[field] = value;
     }
     return result;
   }
@@ -341,7 +338,7 @@ class KVModelImpl implements KVModel {
     this.require();
     const raw = await this.transport.fetchval<string>('SELECT KV_SMEMBERS($1)', [key]);
     if (!raw) return [];
-    return raw.split(',');
+    return JSON.parse(raw) as string[];
   }
 
   async sismember(key: string, member: string): Promise<boolean> {
@@ -365,14 +362,14 @@ class KVModelImpl implements KVModel {
     this.require();
     const raw = await this.transport.fetchval<string>('SELECT KV_ZRANGE($1, $2, $3)', [key, start, stop]);
     if (!raw) return [];
-    return raw.split(',');
+    return (JSON.parse(raw) as Array<[string, number]>).map(([member, score]) => `${member}:${score}`);
   }
 
   async zrangeByScore(key: string, min: number, max: number): Promise<string[]> {
     this.require();
     const raw = await this.transport.fetchval<string>('SELECT KV_ZRANGEBYSCORE($1, $2, $3)', [key, min, max]);
     if (!raw) return [];
-    return raw.split(',');
+    return (JSON.parse(raw) as Array<[string, number]>).map(([member, score]) => `${member}:${score}`);
   }
 
   async zrem(key: string, member: string): Promise<boolean> {

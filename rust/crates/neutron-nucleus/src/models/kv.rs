@@ -209,10 +209,7 @@ impl KvModel {
             .await
             .map_err(NucleusError::Query)?;
         let raw: String = row.get(0);
-        if raw.is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(raw.split(',').map(|s| s.to_string()).collect())
+        serde_json::from_str(&raw).map_err(|e| NucleusError::Serde(e.to_string()))
     }
 
     /// Return the length of a list.
@@ -292,14 +289,11 @@ impl KvModel {
             .await
             .map_err(NucleusError::Query)?;
         let raw: String = row.get(0);
+        let pairs: Vec<[String; 2]> =
+            serde_json::from_str(&raw).map_err(|e| NucleusError::Serde(e.to_string()))?;
         let mut result = HashMap::new();
-        if raw.is_empty() {
-            return Ok(result);
-        }
-        for pair in raw.split(',') {
-            if let Some((k, v)) = pair.split_once('=') {
-                result.insert(k.to_string(), v.to_string());
-            }
+        for [field, value] in pairs {
+            result.insert(field, value);
         }
         Ok(result)
     }
@@ -348,10 +342,7 @@ impl KvModel {
             .await
             .map_err(NucleusError::Query)?;
         let raw: String = row.get(0);
-        if raw.is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(raw.split(',').map(|s| s.to_string()).collect())
+        serde_json::from_str(&raw).map_err(|e| NucleusError::Serde(e.to_string()))
     }
 
     /// Check if a member exists in a set.
@@ -403,10 +394,9 @@ impl KvModel {
             .await
             .map_err(NucleusError::Query)?;
         let raw: String = row.get(0);
-        if raw.is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(raw.split(',').map(|s| s.to_string()).collect())
+        let pairs: Vec<(String, f64)> =
+            serde_json::from_str(&raw).map_err(|e| NucleusError::Serde(e.to_string()))?;
+        Ok(pairs.into_iter().map(|(member, _score)| member).collect())
     }
 
     /// Return members with scores between min and max.
@@ -423,10 +413,9 @@ impl KvModel {
             .await
             .map_err(NucleusError::Query)?;
         let raw: String = row.get(0);
-        if raw.is_empty() {
-            return Ok(Vec::new());
-        }
-        Ok(raw.split(',').map(|s| s.to_string()).collect())
+        let pairs: Vec<(String, f64)> =
+            serde_json::from_str(&raw).map_err(|e| NucleusError::Serde(e.to_string()))?;
+        Ok(pairs.into_iter().map(|(member, _score)| member).collect())
     }
 
     /// Remove a member from a sorted set.

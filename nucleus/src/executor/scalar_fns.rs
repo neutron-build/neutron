@@ -2843,8 +2843,12 @@ impl Executor {
                 };
                 match self.kv_store.lrange(&key, start, stop) {
                     Ok(vals) => {
+                        // JSON array so list values containing ',' are not corrupted
+                        // on the client (SDKs JSON-parse this, they don't split on ',').
                         let s: Vec<String> = vals.iter().map(|v| v.to_string()).collect();
-                        Ok(Value::Text(s.join(",")))
+                        Ok(Value::Text(
+                            serde_json::to_string(&s).unwrap_or_else(|_| "[]".into()),
+                        ))
                     }
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
                 }
@@ -2946,9 +2950,15 @@ impl Executor {
                 };
                 match self.kv_store.hgetall(&key) {
                     Ok(pairs) => {
-                        let s: Vec<String> =
-                            pairs.iter().map(|(f, v)| format!("{}={}", f, v)).collect();
-                        Ok(Value::Text(s.join(",")))
+                        // JSON array of [field, value] pairs: preserves order and never
+                        // corrupts fields/values containing ',' or '=' (was "f=v,f=v").
+                        let s: Vec<[String; 2]> = pairs
+                            .iter()
+                            .map(|(f, v)| [f.clone(), v.to_string()])
+                            .collect();
+                        Ok(Value::Text(
+                            serde_json::to_string(&s).unwrap_or_else(|_| "[]".into()),
+                        ))
                     }
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
                 }
@@ -3025,7 +3035,10 @@ impl Executor {
                     other => other.to_string(),
                 };
                 match self.kv_store.smembers(&key) {
-                    Ok(members) => Ok(Value::Text(members.join(","))),
+                    // JSON array so members containing ',' survive the round-trip.
+                    Ok(members) => Ok(Value::Text(
+                        serde_json::to_string(&members).unwrap_or_else(|_| "[]".into()),
+                    )),
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
                 }
             }
@@ -3130,11 +3143,15 @@ impl Executor {
                 };
                 match self.kv_store.col_zrange(&key, start, stop) {
                     Ok(entries) => {
-                        let s: Vec<String> = entries
+                        // JSON array of [member, score] — never corrupts members
+                        // containing ',' or ':' (was "member:score,member:score").
+                        let s: Vec<(String, f64)> = entries
                             .iter()
-                            .map(|e| format!("{}:{}", e.member, e.score))
+                            .map(|e| (e.member.clone(), e.score))
                             .collect();
-                        Ok(Value::Text(s.join(",")))
+                        Ok(Value::Text(
+                            serde_json::to_string(&s).unwrap_or_else(|_| "[]".into()),
+                        ))
                     }
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
                 }
@@ -3168,11 +3185,14 @@ impl Executor {
                 };
                 match self.kv_store.col_zrangebyscore(&key, min_score, max_score) {
                     Ok(entries) => {
-                        let s: Vec<String> = entries
+                        // JSON array of [member, score] — see KV_ZRANGE.
+                        let s: Vec<(String, f64)> = entries
                             .iter()
-                            .map(|e| format!("{}:{}", e.member, e.score))
+                            .map(|e| (e.member.clone(), e.score))
                             .collect();
-                        Ok(Value::Text(s.join(",")))
+                        Ok(Value::Text(
+                            serde_json::to_string(&s).unwrap_or_else(|_| "[]".into()),
+                        ))
                     }
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
                 }

@@ -115,7 +115,7 @@ class KVModel:
         )
         if not raw:
             return []
-        return cast("list[str]", raw.split(","))
+        return cast("list[str]", json.loads(raw))
 
     async def llen(self, key: str) -> int:
         self._require()
@@ -154,10 +154,8 @@ class KVModel:
         if not raw:
             return {}
         result: dict[str, str] = {}
-        for pair in raw.split(","):
-            if "=" in pair:
-                k, v = pair.split("=", 1)
-                result[k] = v
+        for field, value in json.loads(raw):
+            result[field] = value
         return result
 
     async def hlen(self, key: str) -> int:
@@ -179,7 +177,7 @@ class KVModel:
         raw = await self._exec.fetchval("SELECT KV_SMEMBERS($1)", key)
         if not raw:
             return []
-        return cast("list[str]", raw.split(","))
+        return cast("list[str]", json.loads(raw))
 
     async def sismember(self, key: str, member: str) -> bool:
         self._require()
@@ -212,7 +210,7 @@ class KVModel:
         )
         if not raw:
             return []
-        return cast("list[str]", raw.split(","))
+        return [f"{member}:{score}" for member, score in json.loads(raw)]
 
     async def zrangebyscore(
         self, key: str, min_score: float, max_score: float
@@ -223,7 +221,7 @@ class KVModel:
         )
         if not raw:
             return []
-        return cast("list[str]", raw.split(","))
+        return [f"{member}:{score}" for member, score in json.loads(raw)]
 
     async def zrem(self, key: str, member: str) -> bool:
         self._require()
