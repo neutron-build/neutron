@@ -39,11 +39,11 @@ cargo test --features "$FEATURES" \
 
 # ── Phase 3: probe suite (scale by RAM) ─────────────────────────────────────
 if [ "$mem_mb" -ge 8000 ]; then
-  echo "==> [3/4] PROBE_SCALE=full sh scripts/probe.sh  (>=8GB: full scale)"
-  PROBE_SCALE=full sh scripts/probe.sh 2>&1 | tail -40
+  echo "==> [3/4] PROBE_SCALE=full bash scripts/probe.sh  (>=8GB: full scale)"
+  PROBE_SCALE=full bash scripts/probe.sh 2>&1 | tail -40
 else
-  echo "==> [3/4] sh scripts/probe.sh  (ci scale; <8GB RAM — full scale would OOM)"
-  sh scripts/probe.sh 2>&1 | tail -40
+  echo "==> [3/4] bash scripts/probe.sh  (ci scale; <8GB RAM — full scale would OOM)"
+  bash scripts/probe.sh 2>&1 | tail -40
 fi
 
 # ── Phase 4: ThreadSanitizer on the concurrency tests (Linux + nightly only) ─
