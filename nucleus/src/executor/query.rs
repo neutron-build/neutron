@@ -681,6 +681,19 @@ impl Executor {
         {
             return false;
         }
+        // ORDER BY: the plan path's Sort resolves keys by output-column NAME only
+        // (resolve_plan_col_idx). A positional ordinal (`ORDER BY 1`) or a computed
+        // expression (`ORDER BY a + b`) doesn't resolve to a column name and would
+        // silently NOT sort. Route those to the AST execution path, which evaluates
+        // ORDER BY positions and expressions correctly.
+        if let Some(ref order_by) = query.order_by
+            && let ast::OrderByKind::Expressions(exprs) = &order_by.kind
+            && !exprs
+                .iter()
+                .all(|o| matches!(o.expr, ast::Expr::Identifier(_)))
+        {
+            return false;
+        }
         if let Some(from) = select.from.first() {
             for join in &from.joins {
                 match &join.join_operator {
@@ -7225,7 +7238,7 @@ impl Executor {
         }
         // GROUP BY: bare columns only.
         if let ast::GroupByExpr::Expressions(exprs, _) = &select.group_by
-            && !exprs.iter().all(|e| is_col(e))
+            && !exprs.iter().all(&is_col)
         {
             return false;
         }
