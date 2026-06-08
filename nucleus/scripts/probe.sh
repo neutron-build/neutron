@@ -55,11 +55,10 @@ PROBES=(
   "probe_durability_torn|--iterations $((300 * M))"
   "probe_fts_rank|--iterations $((2000 * M))"
   "probe_concurrency_threads|--seed 1 --rounds $((200 * M))"
-  # NOTE: probe_recover_engines is built and runnable but NOT yet in this gating
-  # list — it found an OPEN bug (disk-mode catalog not repopulated on reopen).
-  # The multi-row WHERE-eq mutation + SSI write-skew findings are pinned as
-  # #[ignore]'d regressions in tests/{txn_multirow_mutation,tier_findings_open}.rs.
-  # Add probe_recover_engines here once disk-mode recovery is fixed.
+  "probe_recover_engines|--iterations $((300 * M))"
+  # All Tier 1/2 findings are fixed and gated. Remaining open items (tracked in
+  # tests/tier_findings_open.rs) are #4 (READ COMMITTED per-statement snapshot —
+  # LOW, currently stricter-than-spec/safe), which has no dedicated probe.
 )
 
 echo "==> Building probe suite (features: $FEATURES, scale: ${PROBE_SCALE:-ci})"

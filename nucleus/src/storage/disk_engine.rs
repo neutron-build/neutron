@@ -203,6 +203,10 @@ fn set_next_page(pg: &mut PageBuf, next: u32) {
 impl Drop for DiskEngine {
     /// Flush all dirty pages and save the table directory on drop (clean shutdown).
     fn drop(&mut self) {
+        // Roll back any transaction left open (abandoned without COMMIT/ROLLBACK)
+        // BEFORE flushing, so its uncommitted directory changes are not persisted
+        // — otherwise its rows would incorrectly survive a reopen (atomicity).
+        self.rollback_open_txn_in_memory();
         let _ = self.flush();
     }
 }
@@ -544,6 +548,33 @@ impl DiskEngine {
         self.pool
             .flush_all()
             .map_err(|e| StorageError::Io(e.to_string()))
+    }
+
+    /// Discard the in-memory effects of an open transaction (restore the
+    /// committed directory / free-list snapshot and reload dirtied pages). Used
+    /// on Drop to ensure an abandoned transaction's uncommitted writes are not
+    /// flushed into the persisted directory. Synchronous counterpart of the
+    /// metadata-restore portion of `abort_txn`.
+    fn rollback_open_txn_in_memory(&self) {
+        let ts = self.txn_state.lock().take();
+        if let Some(ts) = ts {
+            // Reload pre-existing pages dirtied by the txn so their in-memory
+            // (uncommitted) mutations are dropped before flush.
+            let existing: Vec<u32> = ts.dirty_existing.iter().copied().collect();
+            if !existing.is_empty() {
+                let _ = self.pool.reload_pages_from_disk(&existing);
+            }
+            // New pages become orphans (the restored directory won't reference
+            // them); blank them so a flush doesn't write uncommitted tuples into a
+            // referenced chain.
+            let new_pages: Vec<u32> = ts.new_pages.iter().copied().collect();
+            if !new_pages.is_empty() {
+                let _ = self.pool.reload_pages_from_disk(&new_pages);
+            }
+            *self.tables.write() = ts.tables_snapshot;
+            *self.free_list_head.lock() = ts.free_list_head;
+            *self.free_page_count.lock() = ts.free_page_count;
+        }
     }
 
     /// Record a page as dirtied during an active MVCC transaction.
