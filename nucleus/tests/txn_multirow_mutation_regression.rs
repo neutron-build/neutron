@@ -1,22 +1,16 @@
-//! OPEN BUG (pinned, #[ignore]'d): inside an explicit transaction,
-//! `UPDATE/DELETE ... WHERE indexed_col = X` on a MULTI-ROW table can hit the
-//! wrong row. The MVCC PK/eq fast path (scan_where_eq_positions) returns
-//! positions relative to the MATCH list (virtual), but the adapter's
-//! update()/delete() map them against the full `engine.scan(snap)`; they only
-//! agree when the per-session scan cache holds the matches, which is populated
-//! for auto-commit but NOT inside a transaction. So a single match at virtual
-//! position 0 lands on physical row 0.
+//! Regression: inside an explicit transaction, `UPDATE/DELETE ... WHERE
+//! indexed_col = X` on a MULTI-ROW table must hit the row matching X, not the
+//! first physical row.
 //!
-//! The obvious fix — cache the matches for transactions too — was tried and
-//! REVERTED: it exposed a deeper latent issue under concurrency. The index path
-//! (index_version_lookup, newest-visible) and the chain path (engine.scan) can
-//! disagree on which version of a PK is visible to the same snapshot (observed
-//! cached_vidx != fresh_vidx), so consuming the cached (index) version in
-//! update() followed the conflict-unsafe version and reintroduced concurrent
-//! lost updates. Fixing this correctly needs reconciling index vs chain MVCC
-//! visibility (only one version per key per snapshot) before the position fix is
-//! safe — careful work, not a quick patch. Tracked in task #24.
-#![allow(dead_code)]
+//! Root cause (fixed): the MVCC scan methods returned scan-order positions and
+//! the adapter's update()/delete() re-mapped them against a fresh scan, which
+//! could disagree with what row-finding matched (and a per-session scan cache
+//! that would reconcile them was populated only for auto-commit). The fix makes
+//! the MVCC engine's positions BE stable version indices end-to-end:
+//! scan_where_eq_positions / scan_physical / index_version_lookup return
+//! (version_idx, row), and update()/delete() mutate exactly that version (no
+//! re-scan, no scan cache). This also removes the index-vs-chain visibility
+//! divergence that the earlier cache attempt hit.
 #![cfg(feature = "server")]
 use std::sync::Arc;
 
@@ -44,7 +38,6 @@ async fn rows(ex: &Executor, sid: u64, sql: &str) -> Vec<(i64, i64)> {
 }
 
 #[tokio::test]
-#[ignore = "OPEN BUG: multi-row UPDATE/DELETE WHERE indexed_col=X in a txn can hit the wrong row (see file header, task #24)"]
 async fn txn_update_where_eq_hits_correct_row() {
     let ex = Arc::new(Executor::new(
         Arc::new(Catalog::new()),
