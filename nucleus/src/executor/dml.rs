@@ -1286,7 +1286,14 @@ impl Executor {
                 return;
             }
         };
-        let rows = match self.storage_for(table_name).scan(table_name).await {
+        // Maintenance scan: rebuilding zone-map stats is not a logical read, so it
+        // must not record SIREAD (that would pollute a SERIALIZABLE txn's read set
+        // with the whole table and cause spurious serialization failures).
+        let rows = match self
+            .storage_for(table_name)
+            .scan_for_maintenance(table_name)
+            .await
+        {
             Ok(r) => r,
             Err(_) => {
                 self.zone_map_index.clear_table(zm_table_id);

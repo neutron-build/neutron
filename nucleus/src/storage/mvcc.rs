@@ -1217,6 +1217,22 @@ impl StorageEngine for MvccStorageAdapter {
         Ok(rows)
     }
 
+    async fn scan_for_maintenance(&self, table: &str) -> Result<Vec<Row>, StorageError> {
+        // Same as scan() but does NOT record SIREAD — used by internal stat/zone-map
+        // rebuilds, which are not part of the transaction's logical read set and
+        // must not introduce spurious SSI rw-conflicts.
+        let (txn_id, snap, auto) = self.current_or_auto();
+        let results = self
+            .engine
+            .scan(table, &snap)
+            .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+        let rows: Vec<Row> = results.into_iter().map(|(_, r)| (*r).clone()).collect();
+        if auto {
+            self.auto_commit(txn_id);
+        }
+        Ok(rows)
+    }
+
     /// Physical scan returning each visible row paired with its stable MVCC
     /// version index. UPDATE/DELETE feed these indices back to update()/delete(),
     /// which mutate the exact version (no scan-order remapping). Overrides the
