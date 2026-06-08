@@ -98,7 +98,7 @@ fn schema_and_constraints_hold_under_concurrency() {
                         _ => {
                             // Concurrent DDL interleaved with the DML storm.
                             match rng.below(3) {
-                                0 => run(&ex, &r, sid, &format!("CREATE INDEX IF NOT EXISTS ix_v ON t (v)")),
+                                0 => run(&ex, &r, sid, "CREATE INDEX IF NOT EXISTS ix_v ON t (v)"),
                                 1 => run(&ex, &r, sid, "DROP INDEX IF EXISTS ix_v"),
                                 _ => run(&ex, &r, sid, &format!("ALTER TABLE t ADD COLUMN c{} INTEGER", rng.below(3))),
                             }
