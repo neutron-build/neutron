@@ -131,6 +131,9 @@ struct TableMeta {
     last_page: u32,
     /// Column types needed for tuple serialization.
     col_types: Vec<DataType>,
+    /// Column names, persisted so the catalog can be repopulated after a reopen
+    /// (otherwise restored tables exist physically but are invisible to SQL).
+    col_names: Vec<String>,
 }
 
 /// Metadata for an active index.
@@ -602,6 +605,15 @@ impl DiskEngine {
             for ct in &meta.col_types {
                 serialize_data_type(ct, &mut dir_buf);
             }
+            // Column names block (after the types) so the catalog can be rebuilt
+            // on reopen. Written for all col_count columns; falls back to
+            // synthetic names on load if an older directory lacks this block.
+            for i in 0..meta.col_types.len() {
+                let nm = meta.col_names.get(i).map(|s| s.as_str()).unwrap_or("");
+                let nb = nm.as_bytes();
+                dir_buf.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+                dir_buf.extend_from_slice(nb);
+            }
         }
         drop(tables);
 
@@ -825,6 +837,27 @@ impl DiskEngine {
                 }
             }
 
+            // Read the column-names block (written after the types). Older
+            // directories lack it — fall back to synthetic names so the table is
+            // still loadable (it just won't be queryable by its real column names).
+            let mut col_names = Vec::with_capacity(col_count);
+            for i in 0..col_count {
+                if offset + 2 > dir_data.len() {
+                    col_names.push(format!("col{i}"));
+                    continue;
+                }
+                let nlen =
+                    u16::from_le_bytes([dir_data[offset], dir_data[offset + 1]]) as usize;
+                offset += 2;
+                if nlen == 0 || offset + nlen > dir_data.len() {
+                    col_names.push(format!("col{i}"));
+                    continue;
+                }
+                col_names
+                    .push(String::from_utf8_lossy(&dir_data[offset..offset + nlen]).to_string());
+                offset += nlen;
+            }
+
             // Walk chain to find last page for fast appends
             let mut last = first_page;
             if last != INVALID_PAGE_ID {
@@ -844,6 +877,7 @@ impl DiskEngine {
                     first_page,
                     last_page: last,
                     col_types,
+                    col_names,
                 },
             );
         }
@@ -860,6 +894,26 @@ impl DiskEngine {
     /// Get a reference to the buffer pool.
     pub fn buffer_pool(&self) -> &Arc<BufferPool> {
         &self.pool
+    }
+
+    /// Schemas (name → [(col_name, type)]) of all tables restored from the
+    /// on-disk directory. The embedded builder uses this to repopulate the
+    /// catalog after a reopen — without it the tables exist physically but are
+    /// invisible to SQL (the catalog starts empty on each open).
+    pub fn recovered_schemas(&self) -> Vec<(String, Vec<(String, DataType)>)> {
+        self.tables
+            .read()
+            .iter()
+            .map(|(name, meta)| {
+                let cols = meta
+                    .col_names
+                    .iter()
+                    .cloned()
+                    .zip(meta.col_types.iter().cloned())
+                    .collect();
+                (name.clone(), cols)
+            })
+            .collect()
     }
 
     // ========================================================================
@@ -1136,9 +1190,12 @@ impl StorageEngine for DiskEngine {
                     .iter()
                     .map(|c| c.data_type.clone())
                     .collect();
+                let col_names: Vec<String> =
+                    table_def.columns.iter().map(|c| c.name.clone()).collect();
                 let mut tables = self.tables.write();
                 if let Some(meta) = tables.get_mut(table) {
                     meta.col_types = col_types;
+                    meta.col_names = col_names;
                 }
             }
             return Ok(());
@@ -1155,6 +1212,8 @@ impl StorageEngine for DiskEngine {
             .iter()
             .map(|c| c.data_type.clone())
             .collect();
+        let col_names: Vec<String> =
+            table_def.columns.iter().map(|c| c.name.clone()).collect();
 
         let mut tables = self.tables.write();
         tables.insert(
@@ -1163,6 +1222,7 @@ impl StorageEngine for DiskEngine {
                 first_page: INVALID_PAGE_ID,
                 last_page: INVALID_PAGE_ID,
                 col_types,
+                col_names,
             },
         );
         Ok(())
