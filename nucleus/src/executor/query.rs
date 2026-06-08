@@ -3594,10 +3594,18 @@ impl Executor {
                     // This skips plan_query() entirely (~500-1000ns savings).
                     // Falls back to re-planning if transplanting fails.
                     let plan = if let Some(cached) = cached_plan {
-                        if let Some(reused) = Self::try_reuse_plan(cached, select) {
+                        // try_reuse_plan only re-binds the WHERE clause. Reusing a
+                        // cached plan is sound only when no re-bindable literal lives
+                        // outside the WHERE (projection / GROUP BY / HAVING / ORDER BY);
+                        // otherwise the cached plan would keep the previously-planned
+                        // query's literals there. Re-plan from the current AST when not.
+                        if Self::plan_reuse_is_literal_safe(&query, select)
+                            && let Some(reused) = Self::try_reuse_plan(cached, select)
+                        {
                             Some(reused)
                         } else {
-                            // Transplant failed — re-plan with current AST
+                            // Not literal-safe to transplant, or transplant failed —
+                            // re-plan with the current (correctly-substituted) AST.
                             self.plan_query(&query).await.ok()
                         }
                     } else {
@@ -7185,6 +7193,57 @@ impl Executor {
         } else {
             None
         }
+    }
+
+    /// Whether a cached plan can be reused for `select` by only transplanting the
+    /// WHERE clause (see [`Self::try_reuse_plan`]).
+    ///
+    /// The plan-cache key strips every literal except LIMIT/OFFSET, so two queries
+    /// that differ only in literal values share a cache entry. But the transplant
+    /// re-binds *only* the WHERE clause — every other clause keeps the literals of
+    /// whichever query first populated the entry. Reuse is therefore sound only
+    /// when no re-bindable literal (a number or `'string'`) can appear outside the
+    /// WHERE. We approve conservatively: projection, GROUP BY, and ORDER BY must be
+    /// plain column references (or `*`), with no HAVING and no `DISTINCT ON`.
+    /// Anything richer re-plans from the current AST.
+    ///
+    /// Without this, `SELECT (c6 BETWEEN 6 AND 6) FROM t` followed by
+    /// `SELECT (c6 BETWEEN 8 AND 13) FROM t` returns the first query's answer for
+    /// the second (full-scale differential-fuzzer finding, seed 305419896).
+    fn plan_reuse_is_literal_safe(query: &ast::Query, select: &ast::Select) -> bool {
+        use ast::Expr;
+        let is_col = |e: &Expr| matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_));
+        // Projection: bare columns or wildcards only.
+        let proj_ok = select.projection.iter().all(|item| match item {
+            ast::SelectItem::UnnamedExpr(e) => is_col(e),
+            ast::SelectItem::ExprWithAlias { expr, .. } => is_col(expr),
+            // Wildcard / QualifiedWildcard carry no literals.
+            _ => true,
+        });
+        if !proj_ok {
+            return false;
+        }
+        // GROUP BY: bare columns only.
+        if let ast::GroupByExpr::Expressions(exprs, _) = &select.group_by
+            && !exprs.iter().all(|e| is_col(e))
+        {
+            return false;
+        }
+        // HAVING and DISTINCT ON can both carry literals.
+        if select.having.is_some() {
+            return false;
+        }
+        if matches!(&select.distinct, Some(d) if !matches!(d, ast::Distinct::Distinct)) {
+            return false;
+        }
+        // ORDER BY: bare columns only (ordinals are numeric literals → stripped).
+        if let Some(ob) = &query.order_by
+            && let ast::OrderByKind::Expressions(exprs) = &ob.kind
+            && !exprs.iter().all(|x| is_col(&x.expr))
+        {
+            return false;
+        }
+        true
     }
 
     /// Recursively traverse the plan tree to find the leaf scan node and
