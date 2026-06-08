@@ -156,9 +156,15 @@ func (c *Client) MigrationStatus(ctx context.Context) ([]MigrationRecord, error)
 	var records []MigrationRecord
 	for rows.Next() {
 		var r MigrationRecord
-		if err := rows.Scan(&r.Version, &r.Name, &r.AppliedAt); err != nil {
+		var rawVer []byte
+		if err := rows.Scan(&rawVer, &r.Name, &r.AppliedAt); err != nil {
 			return nil, err
 		}
+		v, err := scanInt(rawVer)
+		if err != nil {
+			return nil, fmt.Errorf("nucleus: parse migration version: %w", err)
+		}
+		r.Version = v
 		records = append(records, r)
 	}
 	return records, rows.Err()
@@ -173,13 +179,49 @@ func (c *Client) appliedVersions(ctx context.Context) (map[int]bool, error) {
 
 	applied := make(map[int]bool)
 	for rows.Next() {
-		var v int
-		if err := rows.Scan(&v); err != nil {
+		var rawVer []byte
+		if err := rows.Scan(&rawVer); err != nil {
 			return nil, err
+		}
+		v, err := scanInt(rawVer)
+		if err != nil {
+			return nil, fmt.Errorf("nucleus: parse migration version: %w", err)
 		}
 		applied[v] = true
 	}
 	return applied, rows.Err()
+}
+
+// scanInt decodes an integer value from raw pgwire bytes. Nucleus declares text
+// format (code 0) in RowDescription but sends big-endian binary bytes for
+// INTEGER columns — pgx's text decoder then fails. We inspect the bytes: if all
+// are ASCII digits, treat as text; otherwise decode as big-endian int32/int64.
+// Track as Nucleus finding #35.
+func scanInt(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, fmt.Errorf("empty value")
+	}
+	allDigits := true
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if allDigits {
+		n, err := strconv.ParseInt(string(b), 10, 64)
+		return int(n), err
+	}
+	switch len(b) {
+	case 4:
+		return int(int32(b[0])<<24 | int32(b[1])<<16 | int32(b[2])<<8 | int32(b[3])), nil
+	case 8:
+		v := int64(b[0])<<56 | int64(b[1])<<48 | int64(b[2])<<40 | int64(b[3])<<32 |
+			int64(b[4])<<24 | int64(b[5])<<16 | int64(b[6])<<8 | int64(b[7])
+		return int(v), nil
+	default:
+		return 0, fmt.Errorf("unexpected %d-byte integer", len(b))
+	}
 }
 
 // LoadMigrations reads migration files from an embedded filesystem.
