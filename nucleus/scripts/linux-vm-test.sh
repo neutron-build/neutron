@@ -38,7 +38,7 @@ cargo test --features "$FEATURES" \
   2>&1 | grep -E "test result|FAILED|error\[" || true
 
 # ── Phase 3: probe suite (scale by RAM) ─────────────────────────────────────
-if [ "$mem_mb" -ge 8000 ]; then
+if [ "$mem_mb" -ge 7500 ]; then
   echo "==> [3/4] PROBE_SCALE=full bash scripts/probe.sh  (>=8GB: full scale)"
   PROBE_SCALE=full bash scripts/probe.sh 2>&1 | tail -40
 else
@@ -50,7 +50,7 @@ fi
 # TSan directly detects data races in the MVCC engine — the strongest check for
 # the begin/commit/SIREAD/unique-reservation concurrency code. Needs nightly and
 # the rust-src component; very memory-hungry, so gated on RAM.
-if [ "$mem_mb" -lt 8000 ]; then
+if [ "$mem_mb" -lt 7500 ]; then
   echo "==> [4/4] SKIP ThreadSanitizer (needs >=8GB RAM; this host has ${mem_mb}MB)"
 elif ! rustup toolchain list 2>/dev/null | grep -q nightly; then
   echo "==> [4/4] SKIP ThreadSanitizer (no nightly toolchain: 'rustup toolchain install nightly')"
