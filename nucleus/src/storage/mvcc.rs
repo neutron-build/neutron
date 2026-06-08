@@ -1827,21 +1827,28 @@ impl StorageEngine for MvccStorageAdapter {
         let sess = self.mvcc_session();
         let commit_txn_id;
         let is_serializable;
+        let mut ser_err: Option<String> = None;
         {
             let mut lock = sess.session_txn.write();
             if let Some(ref mut txn) = *lock {
                 commit_txn_id = txn.id;
                 is_serializable = txn.isolation == IsolationLevel::Serializable;
                 if is_serializable {
-                    // SSI check: detect rw-antidependency cycles before committing
-                    self.engine
-                        .txn_mgr()
-                        .commit_serializable(txn)
-                        .map_err(|e| {
-                            // Abort the transaction on serialization failure
+                    // SSI check: detect rw-antidependency cycles before committing.
+                    match self.engine.txn_mgr().commit_serializable(txn) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            // Serialization failure: abort and surface the error.
+                            // Crucially we STILL clear the session transaction
+                            // (`*lock = None` below) — otherwise the session keeps
+                            // an aborted txn with a stale snapshot that a retry's
+                            // BEGIN would silently reuse (BEGIN no-ops when a txn is
+                            // already present), causing read-modify-writes against a
+                            // dead snapshot → lost update.
                             self.engine.txn_mgr().abort(txn);
-                            StorageError::SerializationFailure(e)
-                        })?;
+                            ser_err = Some(e);
+                        }
+                    }
                 } else {
                     self.engine.txn_mgr().commit(txn);
                 }
@@ -1850,6 +1857,13 @@ impl StorageEngine for MvccStorageAdapter {
                 is_serializable = false;
             }
             *lock = None;
+        }
+        if let Some(e) = ser_err {
+            // Txn already aborted (abort() ran cleanup_ssi). Discard the session's
+            // uncommitted side state so the next BEGIN starts from a clean slate.
+            sess.savepoints.write().clear();
+            sess.dirty_tables.write().clear();
+            return Err(StorageError::SerializationFailure(e));
         }
         if is_serializable {
             self.engine.txn_mgr().cleanup_ssi(commit_txn_id);
@@ -2085,15 +2099,19 @@ impl StorageEngine for MvccStorageAdapter {
 
     fn index_lookup_sync(
         &self,
-        table: &str,
+        _table: &str,
         index_name: &str,
         value: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
-        // If inside an explicit transaction that has modified this table,
-        // the index may be stale (indexes are rebuilt at COMMIT). Fall back
-        // to SeqScan which has proper MVCC snapshot visibility filtering.
+        // Inside ANY explicit transaction, the cached `idx.map` rows are unsafe:
+        // they hold snapshot-independent COPIES that lag `tbl.rows` in the window
+        // between a concurrent commit() and its index rebuild, and they carry no
+        // MVCC visibility. A read that returns such a stale/wrong-visibility row
+        // and is then used in a read-modify-write produces a lost update. Fall
+        // back to the snapshot-correct chain-resolved path (scan_where_eq_positions
+        // → index_version_lookup), which is still index-accelerated.
         let sess = self.mvcc_session();
-        if sess.session_txn.read().is_some() && sess.dirty_tables.read().contains(table) {
+        if sess.session_txn.read().is_some() {
             return Ok(None);
         }
         let indexes = self.indexes.read();
@@ -2110,14 +2128,15 @@ impl StorageEngine for MvccStorageAdapter {
 
     fn index_lookup_range_sync(
         &self,
-        table: &str,
+        _table: &str,
         index_name: &str,
         low: &Value,
         high: &Value,
     ) -> Result<Option<Vec<Row>>, StorageError> {
-        // Same stale-index guard as index_lookup_sync.
+        // Same stale-index guard as index_lookup_sync: any explicit txn must use
+        // the snapshot-correct chain path, not the cached idx.map row copies.
         let sess = self.mvcc_session();
-        if sess.session_txn.read().is_some() && sess.dirty_tables.read().contains(table) {
+        if sess.session_txn.read().is_some() {
             return Ok(None);
         }
         let indexes = self.indexes.read();
@@ -2144,15 +2163,16 @@ impl StorageEngine for MvccStorageAdapter {
 
     fn index_only_scan(
         &self,
-        table: &str,
+        _table: &str,
         index_name: &str,
         eq_value: Option<&Value>,
         range: Option<(&Value, &Value)>,
     ) -> Option<Vec<Row>> {
-        // If inside an explicit transaction that has modified this table,
-        // the index may be stale — fall back to None (caller does full scan).
+        // Inside any explicit transaction, fall back to the snapshot-correct
+        // path — the cached index covers no MVCC visibility and can be stale
+        // between a concurrent commit and its rebuild.
         let sess = self.mvcc_session();
-        if sess.session_txn.read().is_some() && sess.dirty_tables.read().contains(table) {
+        if sess.session_txn.read().is_some() {
             return None;
         }
         let indexes = self.indexes.read();
