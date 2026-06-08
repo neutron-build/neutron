@@ -144,10 +144,23 @@ async function checkErrors(base, results) {
   const codeDetails = [];
   let any = false;
 
+  // Probe every forced-error endpoint up front. The forced-error surface is
+  // "wired" if any endpoint OTHER than not-found returns its forced (non-404)
+  // status. /errors/not-found is ambiguous in isolation (404 also means "not
+  // wired"), so we only assert on it when the rest of the surface is present —
+  // otherwise a bare 404 is just the framework's normal not-found handling (e.g.
+  // an SSR framework serving an HTML page), not an RFC 7807 violation.
+  const probes = [];
   for (const e of STANDARD_ERRORS) {
-    const res = await fetchSafe(base + e.path);
+    probes.push({ e, res: await fetchSafe(base + e.path) });
+  }
+  const surfaceWired = probes.some(
+    ({ e, res }) => !res.networkError && e.suffix !== "not-found" && res.status !== 404,
+  );
+
+  for (const { e, res } of probes) {
     if (res.networkError) continue;
-    if (res.status === 404 && e.suffix !== "not-found") {
+    if (res.status === 404 && (e.suffix !== "not-found" || !surfaceWired)) {
       // Endpoint not wired in this app — skip silently for this code.
       continue;
     }
@@ -260,7 +273,16 @@ async function checkValidation(base, results) {
 
 async function checkOpenAPI(base, results) {
   const res = await fetchSafe(base + "/openapi.json");
+  if (!res.networkError && res.status === 404) {
+    // The route is not registered: this SDK does not expose an OpenAPI surface
+    // (e.g. a web/SSR framework whose routes are pages, not API endpoints).
+    // Documented skip, consistent with how errors/validation treat a 404.
+    results.push(result("openapi.present", "skip", "no /openapi.json endpoint exposed"));
+    results.push(result("openapi.31", "skip", "no /openapi.json endpoint exposed"));
+    return;
+  }
   if (res.networkError || res.status !== 200) {
+    // Present but broken (5xx, non-JSON, wrong status) is a real drift, not a skip.
     results.push(result("openapi.present", "fail", `GET /openapi.json → ${res.status || res.networkError}`));
     results.push(result("openapi.31", "fail", "no spec"));
     return;
