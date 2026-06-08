@@ -278,6 +278,45 @@ pub fn parse_uuid(s: &str) -> Result<[u8; 16], String> {
 // ============================================================================
 
 impl Value {
+    /// Coercing equality for single-column PK / eq predicates.
+    ///
+    /// Mirrors the executor's `compare_values` (the slow `WHERE` path) and
+    /// PostgreSQL: numeric variants compare by value across `Int32`/`Int64`/
+    /// `Float64`, and a text operand is coerced to the other side's numeric
+    /// type (pgwire simple-protocol clients interpolate bound params as text).
+    /// Everything else falls back to strict equality.
+    ///
+    /// Used by the UPDATE/DELETE PK fast path (`scan_where_eq_positions`) so a
+    /// `BIGINT` PK stored as `Int64` still matches a `WHERE id = 5` literal
+    /// (`Int32`) or a `WHERE id = '5'` text literal. Without it the mutation
+    /// silently matches zero rows and no-ops — e.g. `UPDATE api_keys SET
+    /// revoked = ... WHERE id = $1` never persists and revoked keys keep
+    /// authenticating (teploy-observe finding #3).
+    pub fn loose_eq(&self, other: &Value) -> bool {
+        use core::cmp::Ordering::Equal;
+        match (self, other) {
+            // Numeric cross-variant.
+            (Value::Int32(a), Value::Int64(b)) => i64::from(*a) == *b,
+            (Value::Int64(a), Value::Int32(b)) => *a == i64::from(*b),
+            (Value::Int32(a), Value::Float64(b)) => f64::from(*a).partial_cmp(b) == Some(Equal),
+            (Value::Float64(a), Value::Int32(b)) => a.partial_cmp(&f64::from(*b)) == Some(Equal),
+            (Value::Int64(a), Value::Float64(b)) => (*a as f64).partial_cmp(b) == Some(Equal),
+            (Value::Float64(a), Value::Int64(b)) => a.partial_cmp(&(*b as f64)) == Some(Equal),
+            // Text ↔ numeric (simple-protocol text params). Unparseable → not equal.
+            (Value::Text(s), Value::Int32(n)) | (Value::Int32(n), Value::Text(s)) => {
+                s.trim().parse::<i32>().map(|v| v == *n).unwrap_or(false)
+            }
+            (Value::Text(s), Value::Int64(n)) | (Value::Int64(n), Value::Text(s)) => {
+                s.trim().parse::<i64>().map(|v| v == *n).unwrap_or(false)
+            }
+            (Value::Text(s), Value::Float64(f)) | (Value::Float64(f), Value::Text(s)) => {
+                s.trim().parse::<f64>().ok().and_then(|v| v.partial_cmp(f)) == Some(Equal)
+            }
+            // Same-variant and every other combination: strict equality.
+            _ => self == other,
+        }
+    }
+
     /// Cast this value to the target data type.
     pub fn cast(&self, target: &DataType) -> Result<Value, String> {
         if *self == Value::Null {
