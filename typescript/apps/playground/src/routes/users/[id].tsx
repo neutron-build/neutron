@@ -1,10 +1,14 @@
 import type { LoaderArgs } from "@neutron-build/core";
 
-export const config = { mode: "app", cache: { maxAge: 30 } };
+// Dynamic SSR benchmark route: renders fresh per request (no server cache, no
+// cacheable response) so the harness's "dynamic" scenario is a like-for-like
+// SSR comparison against Next getServerSideProps / Astro SSR. (Caching is
+// demoed on the dedicated /api/cache and /api/revalidate routes.)
+export const config = { mode: "app" };
 
 export function headers() {
   return {
-    "Cache-Control": "public, max-age=30",
+    "Cache-Control": "no-store",
     Vary: "Accept",
   };
 }
