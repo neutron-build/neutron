@@ -190,10 +190,15 @@ func (a *App) registerHealthCheck() {
 			"status":  "ok",
 			"version": a.oaInfo.Version,
 		}
-		if a.nucleusChecker != nil {
-			resp["nucleus"] = a.nucleusChecker.IsNucleus()
+		// Contract §7: nucleus reflects the HEALTH of the nucleus dependency.
+		// No checker → "unconfigured"; checker present → "connected" when the
+		// nucleus connection is detected, else "disconnected".
+		if a.nucleusChecker == nil {
+			resp["nucleus"] = "unconfigured"
+		} else if a.nucleusChecker.IsNucleus() {
+			resp["nucleus"] = "connected"
 		} else {
-			resp["nucleus"] = false
+			resp["nucleus"] = "disconnected"
 		}
 		JSON(w, http.StatusOK, resp)
 	}))

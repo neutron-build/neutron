@@ -143,16 +143,20 @@ class App:
         neutron_app = self
 
         async def health_endpoint(request: Request) -> JSONResponse:
-            is_nucleus = False
             db = neutron_app.db
             if db is None and hasattr(neutron_app.state, "db"):
                 db = neutron_app.state.db
-            if db is not None and hasattr(db, "features"):
-                is_nucleus = db.features.is_nucleus
+            # Contract §7: nucleus reflects the HEALTH of the nucleus dependency.
+            if db is None:
+                nucleus = "unconfigured"
+            elif getattr(getattr(db, "features", None), "is_nucleus", False):
+                nucleus = "connected"
+            else:
+                nucleus = "disconnected"
             return JSONResponse(
                 {
                     "status": "ok",
-                    "nucleus": is_nucleus,
+                    "nucleus": nucleus,
                     "version": neutron_app._version,
                 }
             )

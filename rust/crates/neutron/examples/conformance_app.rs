@@ -10,10 +10,10 @@
 //!   POST /api/items                    422 validation error (RFC 7807 + errors[])
 //!   GET  /errors/{bad-request,…}       forced standard §2 errors
 //!
-//! Listen address comes from PORT/HOST (Config::from_env), so the runner pins an
-//! ephemeral port. The middleware stack follows the contract order.
+//! Listen address comes from NEUTRON_HOST/NEUTRON_PORT (Config::from_env, contract
+//! §6), so the runner pins an ephemeral port. Middleware follows the contract order.
 //!
-//! Run: `PORT=8082 cargo run --release --example conformance_app`
+//! Run: `NEUTRON_PORT=8082 cargo run --release --example conformance_app`
 
 use neutron::health::HealthCheck;
 use neutron::openapi::{ApiRoute, OpenApi, Schema};

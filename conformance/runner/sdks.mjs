@@ -67,8 +67,8 @@ export const SDKS = [
   },
   {
     name: "rust",
-    portEnv: "PORT",
-    hostEnv: "HOST",
+    portEnv: "NEUTRON_PORT",
+    hostEnv: "NEUTRON_HOST",
     build() {
       const r = spawnSync(
         "cargo",

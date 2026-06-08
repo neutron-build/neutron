@@ -128,8 +128,8 @@ func TestHealthCheckWithNucleus(t *testing.T) {
 	if body["status"] != "ok" {
 		t.Errorf("status = %v", body["status"])
 	}
-	if body["nucleus"] != true {
-		t.Errorf("nucleus = %v", body["nucleus"])
+	if body["nucleus"] != "connected" {
+		t.Errorf("nucleus = %v, want \"connected\"", body["nucleus"])
 	}
 }
 
@@ -149,8 +149,8 @@ func TestHealthCheckWithoutNucleus(t *testing.T) {
 	var body map[string]any
 	json.NewDecoder(resp.Body).Decode(&body)
 
-	if body["nucleus"] != false {
-		t.Errorf("nucleus should be false, got %v", body["nucleus"])
+	if body["nucleus"] != "unconfigured" {
+		t.Errorf("nucleus should be \"unconfigured\", got %v", body["nucleus"])
 	}
 }
 
