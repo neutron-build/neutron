@@ -15,9 +15,21 @@
 //!      SERIALIZABLE still lose a small number under true OS-thread contention);
 //!      root cause not yet isolated — needs runtime instrumentation, not static
 //!      analysis. Plus the SSI-specific gap below.
-//!   1b.[CRITICAL] SERIALIZABLE misses a rw-conflict against an already-committed
-//!      concurrent txn → write skew. Root: txn.rs cleanup_ssi removes a committing
-//!      txn's SIREAD/write sets immediately, so a concurrent txn finds no edge.
+//!   1b.[HIGH] SERIALIZABLE misses write-skew when the second txn does its
+//!      read/write AFTER the first commits: cleanup_ssi purges the committing
+//!      txn's SIREAD/write sets immediately, so no rw-conflict edge forms; also
+//!      SIREAD is not recorded on the eq/point read path. Needs deferred SSI
+//!      cleanup (retain until concurrent peers finish) + record_siread on eq
+//!      reads + a concurrency guard on edge creation. (Entangled with 1c.)
+//!   1c.[HIGH] Multi-row UPDATE/DELETE WHERE indexed_col=X inside a transaction
+//!      can hit the WRONG row — scan_where_eq_positions returns virtual match
+//!      positions but update()/delete() map them against the full scan, and the
+//!      txn scan cache that would reconcile them is populated only for
+//!      auto-commit. The obvious fix (cache for txns) exposed a deeper issue:
+//!      index_version_lookup (newest-visible) and engine.scan disagree on the
+//!      visible PK version under concurrency (>1 version visible to one
+//!      snapshot). Must reconcile index vs chain MVCC visibility first. Pinned in
+//!      txn_multirow_mutation_regression.rs (#[ignore]). (task #24)
 //!   2. [HIGH] SIREAD locks not recorded on point/equality read paths
 //!      (fast_scan_where_eq / scan_where_eq_positions / fast_scan_where_eq_topk).
 //!   3. [MEDIUM] Executor txn_state desync when a SERIALIZABLE COMMIT fails SSI
