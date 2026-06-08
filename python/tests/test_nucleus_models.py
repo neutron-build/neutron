@@ -177,27 +177,27 @@ class TestKV:
 
     @pytest.mark.asyncio
     async def test_hgetall_parsing(self, mock_conn, nucleus_features):
-        mock_conn.fetchval.return_value = "name=Alice,age=30"
+        mock_conn.fetchval.return_value = '[["name","Alice"],["age","30"]]'
         kv = KVModel(_make_exec(mock_conn), nucleus_features)
         result = await kv.hgetall("user:1")
         assert result == {"name": "Alice", "age": "30"}
 
     @pytest.mark.asyncio
     async def test_hgetall_empty(self, mock_conn, nucleus_features):
-        mock_conn.fetchval.return_value = ""
+        mock_conn.fetchval.return_value = "[]"
         kv = KVModel(_make_exec(mock_conn), nucleus_features)
         assert await kv.hgetall("empty") == {}
 
     @pytest.mark.asyncio
     async def test_lrange_parsing(self, mock_conn, nucleus_features):
-        mock_conn.fetchval.return_value = "a,b,c"
+        mock_conn.fetchval.return_value = '["a","b","c"]'
         kv = KVModel(_make_exec(mock_conn), nucleus_features)
         result = await kv.lrange("list", 0, -1)
         assert result == ["a", "b", "c"]
 
     @pytest.mark.asyncio
     async def test_smembers_parsing(self, mock_conn, nucleus_features):
-        mock_conn.fetchval.return_value = "x,y,z"
+        mock_conn.fetchval.return_value = '["x","y","z"]'
         kv = KVModel(_make_exec(mock_conn), nucleus_features)
         result = await kv.smembers("myset")
         assert result == ["x", "y", "z"]

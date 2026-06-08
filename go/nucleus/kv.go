@@ -264,7 +264,11 @@ func (kv *KVModel) LRange(ctx context.Context, key string, start, stop int64) ([
 	if raw == "" {
 		return nil, nil
 	}
-	return strings.Split(raw, ","), nil
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, wrapErr("kv lrange decode", err)
+	}
+	return out, nil
 }
 
 // LLen returns the length of a list.
@@ -343,10 +347,13 @@ func (kv *KVModel) HGetAll(ctx context.Context, key string) (map[string]string, 
 	if raw == "" {
 		return result, nil
 	}
-	for _, pair := range strings.Split(raw, ",") {
-		parts := strings.SplitN(pair, "=", 2)
-		if len(parts) == 2 {
-			result[parts[0]] = parts[1]
+	var pairs [][]string
+	if err := json.Unmarshal([]byte(raw), &pairs); err != nil {
+		return nil, wrapErr("kv hgetall decode", err)
+	}
+	for _, pair := range pairs {
+		if len(pair) == 2 {
+			result[pair[0]] = pair[1]
 		}
 	}
 	return result, nil
@@ -397,7 +404,11 @@ func (kv *KVModel) SMembers(ctx context.Context, key string) ([]string, error) {
 	if raw == "" {
 		return nil, nil
 	}
-	return strings.Split(raw, ","), nil
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, wrapErr("kv smembers decode", err)
+	}
+	return out, nil
 }
 
 // SIsMember checks if a member exists in a set.
@@ -442,10 +453,7 @@ func (kv *KVModel) ZRange(ctx context.Context, key string, start, stop int64) ([
 	if err != nil {
 		return nil, wrapErr("kv zrange", err)
 	}
-	if raw == "" {
-		return nil, nil
-	}
-	return strings.Split(raw, ","), nil
+	return decodeZMembers("kv zrange", raw)
 }
 
 // ZRangeByScore returns members with scores between min and max.
@@ -458,10 +466,47 @@ func (kv *KVModel) ZRangeByScore(ctx context.Context, key string, min, max float
 	if err != nil {
 		return nil, wrapErr("kv zrangebyscore", err)
 	}
+	return decodeZMembers("kv zrangebyscore", raw)
+}
+
+// decodeZMembers parses the engine's JSON [member, score] pair array into the
+// "member:score" string slice shape the sorted-set methods expose. An empty
+// collection ("" or "[]") yields a nil slice. Scores are rendered with the
+// minimum digits needed to represent them (strconv 'g'), matching the prior
+// integer-style "member:1" output for whole numbers.
+func decodeZMembers(op, raw string) ([]string, error) {
 	if raw == "" {
 		return nil, nil
 	}
-	return strings.Split(raw, ","), nil
+	var pairs []struct {
+		Member string
+		Score  float64
+	}
+	tuples := make([][2]json.RawMessage, 0)
+	if err := json.Unmarshal([]byte(raw), &tuples); err != nil {
+		return nil, wrapErr(op+" decode", err)
+	}
+	for _, t := range tuples {
+		var p struct {
+			Member string
+			Score  float64
+		}
+		if err := json.Unmarshal(t[0], &p.Member); err != nil {
+			return nil, wrapErr(op+" decode member", err)
+		}
+		if err := json.Unmarshal(t[1], &p.Score); err != nil {
+			return nil, wrapErr(op+" decode score", err)
+		}
+		pairs = append(pairs, p)
+	}
+	if len(pairs) == 0 {
+		return nil, nil
+	}
+	out := make([]string, len(pairs))
+	for i, p := range pairs {
+		out[i] = p.Member + ":" + strconv.FormatFloat(p.Score, 'g', -1, 64)
+	}
+	return out, nil
 }
 
 // ZRem removes a member from a sorted set.

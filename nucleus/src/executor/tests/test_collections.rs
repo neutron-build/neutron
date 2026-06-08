@@ -46,9 +46,49 @@ async fn test_kv_lrange() {
     exec(&ex, "SELECT kv_rpush('rng', 'c')").await;
     exec(&ex, "SELECT kv_rpush('rng', 'd')").await;
     let r = exec(&ex, "SELECT kv_lrange('rng', 0, 2)").await;
-    assert_eq!(scalar(&r[0]), &Value::Text("a,b,c".into()));
+    assert_eq!(scalar(&r[0]), &Value::Text(r#"["a","b","c"]"#.into()));
     let r = exec(&ex, "SELECT kv_lrange('rng', 1, -1)").await;
-    assert_eq!(scalar(&r[0]), &Value::Text("b,c,d".into()));
+    assert_eq!(scalar(&r[0]), &Value::Text(r#"["b","c","d"]"#.into()));
+}
+
+/// Regression: KV collection values containing the old delimiters (',', '=',
+/// ':') must survive the round-trip. The SQL functions emit JSON arrays, so SDK
+/// clients JSON-parse the result instead of splitting on ',' (which silently
+/// corrupted any value containing a comma).
+#[tokio::test]
+async fn test_kv_collection_values_with_delimiters_roundtrip() {
+    let ex = test_executor();
+    let text_of = |rows: &[ExecResult]| -> String {
+        match scalar(&rows[0]) {
+            Value::Text(s) => s.clone(),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    };
+
+    // List value containing a comma must not split into two values.
+    exec(&ex, "SELECT kv_rpush('cl', 'a,b')").await;
+    exec(&ex, "SELECT kv_rpush('cl', 'plain')").await;
+    let list: Vec<String> =
+        serde_json::from_str(&text_of(&exec(&ex, "SELECT kv_lrange('cl', 0, -1)").await)).unwrap();
+    assert_eq!(list, vec!["a,b".to_string(), "plain".to_string()]);
+
+    // Set member containing a comma.
+    exec(&ex, "SELECT kv_sadd('cs', 'x,y')").await;
+    let set: Vec<String> =
+        serde_json::from_str(&text_of(&exec(&ex, "SELECT kv_smembers('cs')").await)).unwrap();
+    assert_eq!(set, vec!["x,y".to_string()]);
+
+    // Hash field/value containing '=' and ','.
+    exec(&ex, "SELECT kv_hset('ch', 'f,1', 'v=2')").await;
+    let hash: Vec<[String; 2]> =
+        serde_json::from_str(&text_of(&exec(&ex, "SELECT kv_hgetall('ch')").await)).unwrap();
+    assert_eq!(hash, vec![["f,1".to_string(), "v=2".to_string()]]);
+
+    // Sorted-set member containing ':' and ','.
+    exec(&ex, "SELECT kv_zadd('cz', 1.5, 'm:1,2')").await;
+    let zset: Vec<(String, f64)> =
+        serde_json::from_str(&text_of(&exec(&ex, "SELECT kv_zrange('cz', 0, 5)").await)).unwrap();
+    assert_eq!(zset, vec![("m:1,2".to_string(), 1.5)]);
 }
 
 #[tokio::test]
@@ -107,15 +147,15 @@ async fn test_kv_hgetall_hlen_hexists() {
     assert_eq!(scalar(&r[0]), &Value::Bool(true));
     let r = exec(&ex, "SELECT kv_hexists('h', 'c')").await;
     assert_eq!(scalar(&r[0]), &Value::Bool(false));
-    // hgetall — returns comma-separated "field=value" pairs
+    // hgetall — JSON array of [field, value] pairs
     let r = exec(&ex, "SELECT kv_hgetall('h')").await;
     let text = match scalar(&r[0]) {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
     };
     // Order may vary, check both pairs are present
-    assert!(text.contains("a=1"));
-    assert!(text.contains("b=2"));
+    assert!(text.contains(r#"["a","1"]"#));
+    assert!(text.contains(r#"["b","2"]"#));
 }
 
 // ======================================================================
@@ -185,9 +225,9 @@ async fn test_kv_zadd_zcard_zrange() {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
     };
-    assert!(text.starts_with("alice:1"));
-    assert!(text.contains("bob:2"));
-    assert!(text.contains("charlie:3"));
+    assert!(text.starts_with(r#"[["alice",1.0]"#));
+    assert!(text.contains(r#"["bob",2.0]"#));
+    assert!(text.contains(r#"["charlie",3.0]"#));
 }
 
 #[tokio::test]
@@ -202,9 +242,9 @@ async fn test_kv_zrem_zrangebyscore() {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
     };
-    assert!(text.contains("b:20"));
-    assert!(!text.contains("a:10"));
-    assert!(!text.contains("c:30"));
+    assert!(text.contains(r#"["b",20.0]"#));
+    assert!(!text.contains(r#"["a",10.0]"#));
+    assert!(!text.contains(r#"["c",30.0]"#));
     // zrem
     let r = exec(&ex, "SELECT kv_zrem('zs2', 'b')").await;
     assert_eq!(scalar(&r[0]), &Value::Bool(true));
@@ -432,21 +472,21 @@ async fn test_kv_pfcount_empty_hll() {
 async fn test_kv_smembers_empty_set() {
     let ex = test_executor();
     let r = exec(&ex, "SELECT kv_smembers('nope')").await;
-    assert_eq!(scalar(&r[0]), &Value::Text("".into()));
+    assert_eq!(scalar(&r[0]), &Value::Text("[]".into()));
 }
 
 #[tokio::test]
 async fn test_kv_hgetall_empty_hash() {
     let ex = test_executor();
     let r = exec(&ex, "SELECT kv_hgetall('nope')").await;
-    assert_eq!(scalar(&r[0]), &Value::Text("".into()));
+    assert_eq!(scalar(&r[0]), &Value::Text("[]".into()));
 }
 
 #[tokio::test]
 async fn test_kv_zrange_empty_sorted_set() {
     let ex = test_executor();
     let r = exec(&ex, "SELECT kv_zrange('nope', 0, 10)").await;
-    assert_eq!(scalar(&r[0]), &Value::Text("".into()));
+    assert_eq!(scalar(&r[0]), &Value::Text("[]".into()));
 }
 
 // ======================================================================
