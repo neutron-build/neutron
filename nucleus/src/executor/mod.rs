@@ -2664,6 +2664,14 @@ impl Executor {
         };
         let start = std::time::Instant::now();
 
+        // READ COMMITTED: re-take the transaction's read snapshot at the start of
+        // each data statement so it observes rows committed by other transactions
+        // since the previous statement (per-statement snapshot — SQL-standard RC).
+        // No-op for SNAPSHOT/SERIALIZABLE (snapshot fixed at BEGIN) and non-MVCC.
+        if !matches!(query_type, QueryType::Other) && self.storage.supports_mvcc() {
+            self.storage.refresh_statement_snapshot();
+        }
+
         // Track whether this is a DML write operation that should invalidate query cache.
         let is_dml_write = matches!(
             &stmt,

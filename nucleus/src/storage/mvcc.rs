@@ -2213,6 +2213,16 @@ impl StorageEngine for MvccStorageAdapter {
         true
     }
 
+    fn refresh_statement_snapshot(&self) {
+        let sess = self.mvcc_session();
+        let mut lock = sess.session_txn.write();
+        if let Some(ref mut txn) = *lock
+            && txn.isolation == IsolationLevel::ReadCommitted
+        {
+            self.engine.txn_mgr().refresh_snapshot(txn);
+        }
+    }
+
     fn create_storage_session(&self, id: u64) {
         self.mvcc_sessions
             .write()

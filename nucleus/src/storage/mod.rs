@@ -320,6 +320,12 @@ pub trait StorageEngine: Send + Sync {
     fn supports_mvcc(&self) -> bool {
         false
     }
+    /// Refresh the current transaction's read snapshot for a new statement.
+    /// Under READ COMMITTED each statement must see data committed since the
+    /// previous statement, so the snapshot is re-taken at statement start. A
+    /// no-op for SNAPSHOT/SERIALIZABLE (snapshot is fixed at BEGIN) and for
+    /// engines without MVCC. Default: no-op.
+    fn refresh_statement_snapshot(&self) {}
     /// Flush all dirty data to stable storage. Engines that don't persist
     /// can no-op (the default).
     async fn flush_all_dirty(&self) -> Result<(), StorageError> {

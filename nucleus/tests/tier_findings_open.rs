@@ -40,13 +40,13 @@
 //!       open txn's in-memory state before flushing
 //!       (DiskEngine::rollback_open_txn_in_memory). probe_recover_engines now
 //!       clean (gated); see disk_recovery_dml_regression.rs.
+//!   4.  [LOW] READ COMMITTED now takes a fresh snapshot per statement
+//!       (execute_statement → refresh_statement_snapshot), so a statement sees
+//!       rows committed by other transactions since the previous statement, while
+//!       SNAPSHOT/SERIALIZABLE keep a fixed snapshot. See read_committed_regression.rs.
 //!   6.  [MEDIUM] FTS_RANK was TF-only and could rank inversely to FTS_SEARCH's
 //!       BM25 — now uses BM25 tf-saturation. See fts_rank_regression.rs.
 //!
-//! STILL OPEN:
-//!   4.  [LOW] READ COMMITTED doesn't take a fresh per-statement snapshot, so it
-//!       behaves as Snapshot/Repeatable Read (stricter than spec — safe, not a
-//!       correctness hazard, but not standards-compliant). The only remaining
-//!       finding; no dedicated probe (would need cross-statement visibility
-//!       checks). Left intentionally: stricter isolation is safe.
+//! ALL Tier 1/2 findings are fixed and gated. (A precision note remains, not a
+//! correctness bug: SERIALIZABLE SIREAD granularity — see ssi_write_skew_regression.rs.)
 #![cfg(feature = "server")]
