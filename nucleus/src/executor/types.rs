@@ -96,6 +96,10 @@ pub(crate) struct QueryCacheEntry {
     pub columns: Vec<(String, DataType)>,
     pub rows: Vec<Row>,
     pub inserted_at: std::time::Instant,
+    /// Write generation at the time this entry was inserted.
+    /// If the executor's `cache_write_gen` has advanced past this value,
+    /// the entry is stale and must not be returned.
+    pub generation: u64,
 }
 
 /// A prepared statement with its parsed AST.

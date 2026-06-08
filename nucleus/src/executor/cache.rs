@@ -2,6 +2,8 @@
 // Cache SQL functions (Tier 3.6) + Query Result Cache
 // ========================================================================
 
+use std::sync::atomic::Ordering;
+
 use crate::types::{DataType, Row, Value};
 
 use super::types::QueryCacheEntry;
@@ -256,9 +258,14 @@ impl Executor {
     /// Returns `Some(ExecResult)` on cache hit, `None` on miss.
     /// Entries expire after `QUERY_CACHE_TTL_SECS` seconds (default 30).
     pub fn query_cache_get(&self, sql: &str) -> Option<ExecResult> {
+        let current_gen = self.cache_write_gen.load(Ordering::Acquire);
         let key = Self::query_cache_key(sql);
         let cache = self.query_cache.read();
         let entry = cache.get(&key)?;
+        // Stale generation: a DML ran after this entry was inserted.
+        if entry.generation != current_gen {
+            return None;
+        }
         // Check TTL
         if entry.inserted_at.elapsed().as_secs() > Self::QUERY_CACHE_TTL_SECS {
             return None;
@@ -272,13 +279,36 @@ impl Executor {
     /// Store a SELECT result in the query cache.
     /// Bounded to `QUERY_CACHE_MAX_ENTRIES` entries (evicts oldest on overflow).
     /// Skips results larger than `QUERY_CACHE_MAX_RESULT_BYTES` (1 MB).
-    pub fn query_cache_put(&self, sql: &str, columns: &[(String, DataType)], rows: &[Row]) {
+    ///
+    /// `gen_at_miss` must be the generation snapshot taken at the time of the
+    /// cache miss (before query execution). If the write generation has advanced
+    /// since then, a concurrent DML ran and the result we computed may reflect
+    /// pre-DML state — we skip the store rather than cache stale data.
+    pub fn query_cache_put(
+        &self,
+        sql: &str,
+        columns: &[(String, DataType)],
+        rows: &[Row],
+        gen_at_miss: u64,
+    ) {
         // Don't cache result sets larger than 1 MB
         if Self::estimate_result_size(columns, rows) > Self::QUERY_CACHE_MAX_RESULT_BYTES {
             return;
         }
+        // If a write happened while this query was executing, skip the store.
+        let current_gen = self.cache_write_gen.load(Ordering::Acquire);
+        if current_gen != gen_at_miss {
+            return;
+        }
         let key = Self::query_cache_key(sql);
         let mut cache = self.query_cache.write();
+        // Re-check after acquiring the write lock — a DML may have just cleared
+        // the cache and bumped the generation between our Acquire load above and
+        // the lock acquisition here.
+        let now_gen = self.cache_write_gen.load(Ordering::Relaxed);
+        if now_gen != gen_at_miss {
+            return;
+        }
         // Evict oldest entries if at capacity
         if cache.len() >= Self::QUERY_CACHE_MAX_ENTRIES {
             let oldest_key = cache
@@ -295,12 +325,18 @@ impl Executor {
                 columns: columns.to_vec(),
                 rows: rows.to_vec(),
                 inserted_at: std::time::Instant::now(),
+                generation: gen_at_miss,
             },
         );
     }
 
     /// Invalidate all cached queries (called after any write operation).
+    /// Increments the write generation first so any in-flight SELECT that
+    /// already computed its result cannot race-insert it back.
     pub fn query_cache_invalidate_all(&self) {
+        // Bump generation before clearing: any SELECT that captured gen=N will
+        // see gen=N+1 when it tries to store and abort the insert.
+        self.cache_write_gen.fetch_add(1, Ordering::Release);
         let mut cache = self.query_cache.write();
         cache.clear();
     }

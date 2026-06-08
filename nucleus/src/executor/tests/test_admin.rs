@@ -896,7 +896,7 @@ async fn test_query_cache_put_get() {
         vec![Value::Int32(1), Value::Text("alice".into())],
         vec![Value::Int32(2), Value::Text("bob".into())],
     ];
-    ex.query_cache_put("SELECT * FROM users", &columns, &rows_data);
+    ex.query_cache_put("SELECT * FROM users", &columns, &rows_data, 0);
 
     // Should hit
     let cached = ex.query_cache_get("SELECT * FROM users");
@@ -925,7 +925,7 @@ async fn test_query_cache_invalidate() {
     let ex = test_executor();
     let columns = vec![("x".to_string(), DataType::Int32)];
     let rows_data = vec![vec![Value::Int32(42)]];
-    ex.query_cache_put("SELECT x FROM t", &columns, &rows_data);
+    ex.query_cache_put("SELECT x FROM t", &columns, &rows_data, 0);
     assert!(ex.query_cache_get("SELECT x FROM t").is_some());
 
     ex.query_cache_invalidate_all();
