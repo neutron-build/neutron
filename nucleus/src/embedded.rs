@@ -119,10 +119,12 @@ impl DatabaseBuilder {
             #[cfg(feature = "server")]
             StorageMode::Disk(ref path) => {
                 data_dir = Some(path.clone());
-                Arc::new(
-                    DiskEngine::open(path, catalog.clone())
-                        .map_err(|e| DatabaseError::Storage(e.to_string()))?,
-                )
+                let engine = DiskEngine::open(path, catalog.clone())
+                    .map_err(|e| DatabaseError::Storage(e.to_string()))?;
+                // Repopulate the catalog from the restored on-disk table directory
+                // so reopened tables are visible to SQL (the catalog starts empty).
+                recovered_schemas = engine.recovered_schemas();
+                Arc::new(engine)
             }
         };
 
