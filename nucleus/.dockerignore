@@ -1,0 +1,7 @@
+target/
+debug/
+fuzz/
+proptest-regressions/
+*.md
+*.json
+*.txt
