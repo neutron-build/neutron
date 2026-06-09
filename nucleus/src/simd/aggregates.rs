@@ -256,8 +256,9 @@ unsafe fn min_i64_avx2(data: &[i64]) -> Option<i64> {
 
     for chunk in chunks {
         let values = _mm256_loadu_si256(chunk.as_ptr() as *const __m256i);
-        // AVX2 has _mm256_min_epi64 (added in AVX2 instructions)
-        min_vec = _mm256_min_epi64(min_vec, values);
+        // _mm256_min_epi64 requires AVX512VL, not plain AVX2; emulate with cmpgt+blendv
+        let gt = _mm256_cmpgt_epi64(min_vec, values);
+        min_vec = _mm256_blendv_epi8(min_vec, values, gt);
     }
 
     // Horizontal minimum of 4 lanes
@@ -291,7 +292,9 @@ unsafe fn max_i64_avx2(data: &[i64]) -> Option<i64> {
 
     for chunk in chunks {
         let values = _mm256_loadu_si256(chunk.as_ptr() as *const __m256i);
-        max_vec = _mm256_max_epi64(max_vec, values);
+        // _mm256_max_epi64 requires AVX512VL; emulate with cmpgt+blendv
+        let gt = _mm256_cmpgt_epi64(values, max_vec);
+        max_vec = _mm256_blendv_epi8(max_vec, values, gt);
     }
 
     // Horizontal maximum of 4 lanes
