@@ -2098,7 +2098,7 @@ impl NucleusHandler {
                             None,
                             None,
                             data_type_to_pg(dt),
-                            FieldFormat::Text,
+                            data_type_field_format(dt),
                         )
                     })
                     .collect());
