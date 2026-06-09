@@ -10,6 +10,12 @@
 //!
 //! All SIMD functions are marked `unsafe` and require CPU feature detection.
 
+// Rust 2024 edition requires explicit `unsafe {}` blocks even inside `unsafe fn`
+// (unsafe_op_in_unsafe_fn). All functions here are already `unsafe fn` with
+// documented safety requirements; allow the implicit form to keep the SIMD
+// code readable.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 

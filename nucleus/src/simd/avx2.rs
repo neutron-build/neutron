@@ -6,6 +6,9 @@
 //!
 //! All functions in this module are `unsafe` and require AVX2 CPU support.
 
+// Rust 2024: allow implicit unsafe in unsafe fn bodies for SIMD code.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
