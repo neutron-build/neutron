@@ -190,7 +190,7 @@ impl IndexAdvisor {
             }
         }
 
-        recommendations.sort_by(|a, b| b.priority.cmp(&a.priority));
+        recommendations.sort_by_key(|b| std::cmp::Reverse(b.priority));
         recommendations
     }
 
@@ -202,7 +202,7 @@ impl IndexAdvisor {
     /// Get the top N most frequent patterns.
     pub fn top_patterns(&self, n: usize) -> Vec<&PatternStats> {
         let mut patterns: Vec<&PatternStats> = self.patterns.values().collect();
-        patterns.sort_by(|a, b| b.execution_count.cmp(&a.execution_count));
+        patterns.sort_by_key(|b| std::cmp::Reverse(b.execution_count));
         patterns.truncate(n);
         patterns
     }

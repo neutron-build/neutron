@@ -146,9 +146,8 @@ impl IoUringDiskOps {
             .truncate(false)
             .open(path.as_ref())?;
 
-        let ring = io_uring::IoUring::new(queue_depth).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("io_uring init failed: {e}"))
-        })?;
+        let ring = io_uring::IoUring::new(queue_depth)
+            .map_err(|e| io::Error::other(format!("io_uring init failed: {e}")))?;
 
         Ok(Self {
             ring: std::sync::Arc::new(std::sync::Mutex::new(ring)),
@@ -181,7 +180,7 @@ impl AsyncDiskOps for IoUringDiskOps {
                     .user_data(0x42);
 
             let mut ring_guard = ring.lock().map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("ring lock poisoned: {e}"))
+                io::Error::other(format!("ring lock poisoned: {e}"))
             })?;
 
             // SAFETY: the SQE references read_buf, which is owned by this closure
@@ -192,7 +191,7 @@ impl AsyncDiskOps for IoUringDiskOps {
                 ring_guard
                     .submission()
                     .push(&read_e)
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring SQ full"))?;
+                    .map_err(|_| io::Error::other("io_uring SQ full"))?;
             }
 
             ring_guard.submit_and_wait(1)?;
@@ -211,7 +210,7 @@ impl AsyncDiskOps for IoUringDiskOps {
             Ok(read_buf)
         })
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn_blocking join: {e}")))??;
+        .map_err(|e| io::Error::other(format!("spawn_blocking join: {e}")))??;
 
         let copy_len = buf.len().min(data.len());
         buf[..copy_len].copy_from_slice(&data[..copy_len]);
@@ -240,7 +239,7 @@ impl AsyncDiskOps for IoUringDiskOps {
             .user_data(0x43);
 
             let mut ring_guard = ring.lock().map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("ring lock poisoned: {e}"))
+                io::Error::other(format!("ring lock poisoned: {e}"))
             })?;
 
             // SAFETY: the SQE references write_buf, owned by this closure and
@@ -250,7 +249,7 @@ impl AsyncDiskOps for IoUringDiskOps {
                 ring_guard
                     .submission()
                     .push(&write_e)
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring SQ full"))?;
+                    .map_err(|_| io::Error::other("io_uring SQ full"))?;
             }
 
             ring_guard.submit_and_wait(1)?;
@@ -265,7 +264,7 @@ impl AsyncDiskOps for IoUringDiskOps {
             Ok(())
         })
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn_blocking join: {e}")))?
+        .map_err(|e| io::Error::other(format!("spawn_blocking join: {e}")))?
     }
 
     async fn sync(&self) -> io::Result<()> {
@@ -280,7 +279,7 @@ impl AsyncDiskOps for IoUringDiskOps {
             let fsync_e = io_uring::opcode::Fsync::new(fd).build().user_data(0x44);
 
             let mut ring_guard = ring.lock().map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("ring lock poisoned: {e}"))
+                io::Error::other(format!("ring lock poisoned: {e}"))
             })?;
 
             // SAFETY: the fsync SQE references only the file descriptor (no data
@@ -290,7 +289,7 @@ impl AsyncDiskOps for IoUringDiskOps {
                 ring_guard
                     .submission()
                     .push(&fsync_e)
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring SQ full"))?;
+                    .map_err(|_| io::Error::other("io_uring SQ full"))?;
             }
 
             ring_guard.submit_and_wait(1)?;
@@ -305,7 +304,7 @@ impl AsyncDiskOps for IoUringDiskOps {
             Ok(())
         })
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn_blocking join: {e}")))?
+        .map_err(|e| io::Error::other(format!("spawn_blocking join: {e}")))?
     }
 
     fn page_size(&self) -> usize {

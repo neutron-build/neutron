@@ -385,35 +385,34 @@ impl Parser {
         if let Some(Token::Atom(a)) = self.peek() {
             let agg_name = a.clone();
             match agg_name.as_str() {
-                "count" | "sum" | "min" | "max" => {
-                    // Peek ahead to see if next token is '(' — if so, parse as aggregate
-                    if self.tokens.get(self.pos + 1) == Some(&Token::LParen) {
-                        self.advance(); // consume the atom
-                        self.advance(); // consume '('
-                        let agg = match agg_name.as_str() {
-                            "count" => {
-                                self.expect(&Token::RParen)?;
-                                AggFunc::Count
-                            }
-                            "sum" => {
-                                let var = self.parse_agg_var_arg()?;
-                                self.expect(&Token::RParen)?;
-                                AggFunc::Sum(var)
-                            }
-                            "min" => {
-                                let var = self.parse_agg_var_arg()?;
-                                self.expect(&Token::RParen)?;
-                                AggFunc::Min(var)
-                            }
-                            "max" => {
-                                let var = self.parse_agg_var_arg()?;
-                                self.expect(&Token::RParen)?;
-                                AggFunc::Max(var)
-                            }
-                            _ => unreachable!(),
-                        };
-                        return Ok(Term::Agg(agg));
-                    }
+                "count" | "sum" | "min" | "max"
+                    if self.tokens.get(self.pos + 1) == Some(&Token::LParen) =>
+                {
+                    self.advance(); // consume the atom
+                    self.advance(); // consume '('
+                    let agg = match agg_name.as_str() {
+                        "count" => {
+                            self.expect(&Token::RParen)?;
+                            AggFunc::Count
+                        }
+                        "sum" => {
+                            let var = self.parse_agg_var_arg()?;
+                            self.expect(&Token::RParen)?;
+                            AggFunc::Sum(var)
+                        }
+                        "min" => {
+                            let var = self.parse_agg_var_arg()?;
+                            self.expect(&Token::RParen)?;
+                            AggFunc::Min(var)
+                        }
+                        "max" => {
+                            let var = self.parse_agg_var_arg()?;
+                            self.expect(&Token::RParen)?;
+                            AggFunc::Max(var)
+                        }
+                        _ => unreachable!(),
+                    };
+                    return Ok(Term::Agg(agg));
                 }
                 _ => {}
             }
