@@ -219,7 +219,7 @@ export async function prepareContentCollections(
   });
 
   if (writeManifest) {
-    const serializableCollections = toSerializableCollections(store.collections);
+    const serializableCollections = await toSerializableCollections(store.collections);
     await fsp.mkdir(path.dirname(manifestPath), { recursive: true });
     await fsp.writeFile(
       manifestPath,
@@ -543,7 +543,33 @@ async function readCollectionEntries(
       const parsed = matter(raw);
       const data = definition.schema.parse(parsed.data);
       const sourceType = ext === ".mdx" ? "mdx" : "markdown";
-      const rendered = await renderMarkup(parsed.content, sourceType, relativeFilePath, markdownConfig);
+
+      // Lazy rendering. Rendering every entry's body through KaTeX/Shiki/MDX at
+      // load time and pinning the resulting HTML in the content-store cache for
+      // the whole build is what pushed large content sets (thousands of entries)
+      // past the V8 heap limit — the rendered HTML for the entire collection sat
+      // in memory even though listing pages only read frontmatter and each page
+      // renders its own body exactly once. Defer rendering into render() so the
+      // HTML is produced on demand and collected by GC after each page is
+      // written. The closure captures the already-retained body string, so it
+      // adds no per-entry memory.
+      //
+      // Frontmatter parsing and schema validation stay eager (above), so malformed
+      // frontmatter still fails fast at load. Only body *rendering* defers — its
+      // errors (e.g. MDX compile failures) now surface when render() is called,
+      // wrapped in the same collection context as before so messages are identical.
+      const lazyMarkup = async () => {
+        try {
+          return await renderMarkup(parsed.content, sourceType, relativeFilePath, markdownConfig);
+        } catch (error) {
+          throw withCollectionContext(
+            collectionName,
+            relativeFilePath,
+            `Failed to render content entry`,
+            error
+          );
+        }
+      };
 
       entries.push(createEntry({
         id,
@@ -551,11 +577,11 @@ async function readCollectionEntries(
         collection: collectionName,
         filePath,
         body: parsed.content,
-        html: rendered.html,
+        html: "",
         data,
         sourceType,
         sanitize: definition.sanitize,
-        renderFactory: rendered.renderFactory,
+        lazyMarkup,
       }));
     } catch (error) {
       throw withCollectionContext(
@@ -607,6 +633,13 @@ function createEntry(input: {
   sourceType: "markdown" | "mdx" | "html" | "data";
   sanitize?: boolean;
   renderFactory?: () => Promise<{ Content: preact.FunctionComponent<any> }>;
+  // Defers body rendering (markdown/MDX) until render() is first called, so the
+  // rendered HTML is not held in the content-store cache for every entry. See
+  // readCollectionEntries.
+  lazyMarkup?: () => Promise<{
+    html: string;
+    renderFactory?: () => Promise<{ Content: preact.FunctionComponent<any> }>;
+  }>;
 }): CollectionEntry<unknown> {
   const fallbackRender = async () => {
     // Local content files are trusted authored content and rendered faithfully.
@@ -619,10 +652,37 @@ function createEntry(input: {
     };
   };
 
-  const { renderFactory, ...rest } = input;
+  // Render the body on demand. The result is intentionally NOT memoized onto the
+  // (long-lived, cached) entry: a static build renders each page once, so caching
+  // would simply re-accumulate the whole collection's HTML in memory — the exact
+  // problem lazy rendering exists to avoid.
+  const lazyRender = input.lazyMarkup
+    ? async () => {
+        const rendered = await input.lazyMarkup!();
+        if (rendered.renderFactory) {
+          return rendered.renderFactory();
+        }
+        const html = input.sanitize ? await sanitizeHtml(rendered.html) : rendered.html;
+        return {
+          Content: () => h("div", { dangerouslySetInnerHTML: { __html: html } }),
+        };
+      }
+    : undefined;
+
+  const { renderFactory, lazyMarkup, ...rest } = input;
   const entry = rest as CollectionEntry<unknown>;
+  // Expose the lazy renderer non-enumerably so serialization (manifest writes)
+  // can materialize the HTML for entries that were never rendered during build.
+  if (lazyMarkup) {
+    Object.defineProperty(entry, '__lazyMarkup', {
+      value: lazyMarkup,
+      writable: false,
+      enumerable: false,
+      configurable: false,
+    });
+  }
   Object.defineProperty(entry, 'render', {
-    value: renderFactory || fallbackRender,
+    value: renderFactory || lazyRender || fallbackRender,
     writable: false,
     enumerable: false,
     configurable: false,
@@ -821,22 +881,33 @@ function generateCollectionTypes(config: CollectionConfigMap): string {
   return lines.join("\n");
 }
 
-function toSerializableCollections(
+async function toSerializableCollections(
   collections: Record<string, Array<CollectionEntry<unknown>>>
-): Record<string, Array<SerializedCollectionEntry>> {
+): Promise<Record<string, Array<SerializedCollectionEntry>>> {
   const result: Record<string, Array<SerializedCollectionEntry>> = {};
   for (const [name, entries] of Object.entries(collections)) {
-    result[name] = entries.map((entry) => ({
-      id: entry.id,
-      slug: entry.slug,
-      collection: entry.collection,
-      body: entry.body,
-      html: entry.html,
-      data: entry.data,
-      filePath: entry.filePath,
-      sourceType: entry.sourceType,
-      sanitize: entry.sanitize,
-    }));
+    const serialized: SerializedCollectionEntry[] = [];
+    for (const entry of entries) {
+      // Lazily-rendered entries carry an empty html field until first render.
+      // Materialize it here so a written manifest is self-contained.
+      let html = entry.html;
+      const lazyMarkup = (entry as { __lazyMarkup?: () => Promise<{ html: string }> }).__lazyMarkup;
+      if (!html && typeof lazyMarkup === "function") {
+        html = (await lazyMarkup()).html;
+      }
+      serialized.push({
+        id: entry.id,
+        slug: entry.slug,
+        collection: entry.collection,
+        body: entry.body,
+        html,
+        data: entry.data,
+        filePath: entry.filePath,
+        sourceType: entry.sourceType,
+        sanitize: entry.sanitize,
+      });
+    }
+    result[name] = serialized;
   }
   return result;
 }

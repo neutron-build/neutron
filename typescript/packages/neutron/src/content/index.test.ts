@@ -33,7 +33,11 @@ describe("content collections", () => {
     const hello = posts.find((post) => post.slug === "hello-world");
     expect(hello).toBeTruthy();
     expect(hello?.data).toMatchObject({ title: "Hello World", draft: false });
-    expect(hello?.html).toContain("<h1>Hello world");
+    // Bodies render lazily via render(): the eager `html` field is empty until
+    // first render, so the rendered HTML for an entire collection is not pinned
+    // in memory for the whole build. The raw body is always available.
+    expect(hello?.html).toBe("");
+    expect(hello?.body).toContain("# Hello world");
 
     const rendered = await hello!.render();
     const html = renderToString(h(rendered.Content, {}));
@@ -45,7 +49,9 @@ describe("content collections", () => {
 
     const nested = await getEntry("blog", "guides/intro");
     expect(nested?.data).toMatchObject({ title: "Guides Intro", draft: false });
-    expect(nested?.html).toContain("Nested guide");
+    const nestedRendered = await nested!.render();
+    const nestedHtml = renderToString(h(nestedRendered.Content, {}));
+    expect(nestedHtml).toContain("Nested guide");
   });
 
   it("writes manifest and type declarations during prepare", async () => {
@@ -66,12 +72,19 @@ describe("content collections", () => {
     expect(types).toContain('"summary"?: string;');
   });
 
-  it("surfaces contextual MDX compile errors", async () => {
+  it("surfaces contextual MDX compile errors on render", async () => {
     const root = await makeBrokenMdxFixtureProject();
     process.chdir(root);
 
-    await expect(getCollection("blog")).rejects.toThrow(
-      '[content:blog] Failed to parse, validate, or render content entry for "broken.mdx": MDX compilation failed in "broken.mdx"'
+    // Body rendering is lazy, so a broken MDX file loads successfully (its
+    // frontmatter is valid) and the compile error surfaces when render() runs —
+    // wrapped in the same collection context as the old eager path.
+    const posts = await getCollection("blog");
+    const broken = posts.find((post) => post.slug === "broken");
+    expect(broken).toBeTruthy();
+
+    await expect(broken!.render()).rejects.toThrow(
+      '[content:blog] Failed to render content entry for "broken.mdx": MDX compilation failed in "broken.mdx"'
     );
   });
 
