@@ -655,6 +655,14 @@ async function readCollectionEntries(
       // errors (e.g. MDX compile failures) now surface when render() is called,
       // wrapped in the same collection context as before so messages are identical.
       const cacheKey = renderCacheKey(sourceType, parsed.content);
+      // Known, deliberate limitation: no in-flight de-duplication. If several
+      // requests for the same uncached body arrive concurrently (SSR cold
+      // cache), each misses and compiles before the first populates the cache —
+      // a brief double-compile, not a correctness issue (the output is
+      // identical), self-healing once the entry lands. A static build renders
+      // sequentially and never hits this. De-duping would require tracking an
+      // in-flight Promise per key; left out as not worth the extra state for a
+      // transient cold-start cost.
       const lazyMarkup = async (): Promise<RenderedMarkup> => {
         const cached = getCachedMarkup(cacheKey);
         if (cached) return cached;
