@@ -94,6 +94,17 @@ export interface NeutronMarkdownConfig {
    */
   markedExtensions?: unknown[];
   syntaxHighlight?: { theme?: string } | false;
+  /**
+   * Maximum number of rendered content bodies to keep in the in-memory,
+   * content-addressed render cache. The cache lets a long-running SSR server
+   * serve repeated markdown/MDX content without re-compiling it per request,
+   * and bounds memory to a working set rather than the whole collection.
+   * Static builds render each page once, so the cache is near-inert there; the
+   * bound keeps it from accumulating the entire collection's HTML. Set to `0`
+   * to disable caching entirely.
+   * @default 256
+   */
+  renderCacheSize?: number;
 }
 
 export interface NeutronConfig {

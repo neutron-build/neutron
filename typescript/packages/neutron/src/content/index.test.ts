@@ -9,6 +9,8 @@ import {
   getEntry,
   prepareContentCollections,
   setActiveMarkdownConfig,
+  __renderCacheStatsForTest,
+  __resetRenderCacheForTest,
 } from "./index.js";
 
 const tempRoots: string[] = [];
@@ -117,6 +119,61 @@ describe("content collections", () => {
     expect(posts[0]?.data).toMatchObject({ title: "Typed Config" });
   });
 
+  it("renders identical content once and serves repeats from the render cache", async () => {
+    const root = await makeDuplicateContentFixtureProject();
+    process.chdir(root);
+    // Fresh config reference resets both the store and render caches.
+    setActiveMarkdownConfig({});
+    __resetRenderCacheForTest();
+
+    const posts = await getCollection("blog");
+    expect(posts.length).toBe(2);
+
+    // First render compiles the body exactly once.
+    await posts[0]!.render();
+    expect(__renderCacheStatsForTest()).toMatchObject({ misses: 1, size: 1 });
+
+    // The second entry has byte-identical content → content-addressed cache
+    // hit, no recompile (the dedup that also serves SSR hot paths).
+    await posts[1]!.render();
+    expect(__renderCacheStatsForTest()).toMatchObject({ misses: 1, size: 1 });
+
+    // Re-rendering the same entry (the per-request SSR path) reuses the cache
+    // rather than recompiling — the regression guard for the lazy-render change.
+    await posts[0]!.render();
+    expect(__renderCacheStatsForTest().misses).toBe(1);
+  });
+
+  it("drops the render cache when the markdown config changes", async () => {
+    const root = await makeFixtureProject();
+    process.chdir(root);
+    setActiveMarkdownConfig({});
+    __resetRenderCacheForTest();
+
+    const posts = await getCollection("blog");
+    await posts[0]!.render();
+    expect(__renderCacheStatsForTest().size).toBe(1);
+
+    // A new config reference can change rendered output (themes/plugins), so the
+    // content-addressed cache — whose key omits the config — must be dropped.
+    setActiveMarkdownConfig({});
+    expect(__renderCacheStatsForTest().size).toBe(0);
+  });
+
+  it("renderCacheSize: 0 disables the render cache", async () => {
+    const root = await makeDuplicateContentFixtureProject();
+    process.chdir(root);
+    setActiveMarkdownConfig({ renderCacheSize: 0 });
+    __resetRenderCacheForTest();
+
+    const posts = await getCollection("blog");
+    await posts[0]!.render();
+    await posts[0]!.render();
+
+    // No caching: every render recompiles, nothing retained.
+    expect(__renderCacheStatsForTest()).toMatchObject({ misses: 2, size: 0 });
+  });
+
   it("setActiveMarkdownConfig is idempotent for reference-identical config", async () => {
     // Regression: layouts and SSR-bootstrap files call this at module-load
     // time. Every HMR pass was wiping the content cache, forcing a full
@@ -207,6 +264,45 @@ title: Guides Intro
 name: Jane Doe
 bio: Writes docs
 `,
+    "utf-8"
+  );
+
+  return root;
+}
+
+async function makeDuplicateContentFixtureProject(): Promise<string> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "neutron-content-dup-"));
+  tempRoots.push(root);
+
+  await fs.mkdir(path.join(root, "src", "content", "blog"), { recursive: true });
+  await fs.writeFile(
+    path.join(root, "src", "content", "config.js"),
+    `
+import { z } from "zod";
+export const collections = {
+  blog: {
+    schema: z.object({ title: z.string() }),
+  },
+};
+`,
+    "utf-8"
+  );
+
+  // Two entries whose rendered BODY is byte-identical (only frontmatter
+  // differs) — the content-addressed key must treat them as one render.
+  const body = `
+# Shared body
+
+The same prose in both posts.
+`;
+  await fs.writeFile(
+    path.join(root, "src", "content", "blog", "first.md"),
+    `---\ntitle: First\n---\n${body}`,
+    "utf-8"
+  );
+  await fs.writeFile(
+    path.join(root, "src", "content", "blog", "second.md"),
+    `---\ntitle: Second\n---\n${body}`,
     "utf-8"
   );
 

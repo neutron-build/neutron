@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { evaluate } from "@mdx-js/mdx";
 import matter from "gray-matter";
@@ -152,6 +153,96 @@ const CONTENT_MANIFEST_DIST_NAME = ".neutron-content.json";
 const COLLECTION_FILE_EXTENSIONS = new Set([".md", ".mdx", ".html", ".htm", ".json", ".yaml", ".yml"]);
 const cacheByRoot = new Map<string, CacheRecord>();
 
+// In-memory, content-addressed render cache. Body rendering (KaTeX/Shiki/MDX)
+// is the expensive part of serving a markdown/MDX entry; caching it lets a
+// long-running SSR server reuse the result for repeated content instead of
+// recompiling per request, and bounds memory to a working set rather than the
+// whole collection (an unbounded cache is what caused the original build OOM).
+//
+// The key is content-addressed — hash(sourceType + body + renderer version) —
+// so identical bodies across files share one entry, and changed bodies miss.
+// The markdown config (themes, plugins, extensions) is deliberately NOT part of
+// the key: a config change produces a new object reference, and
+// setActiveMarkdownConfig clears this cache alongside the store cache, so the
+// config is invariant for any single cache lifetime. RENDER_CACHE_VERSION
+// guards against rendering-logic changes for the future on-disk cache layer
+// (an in-memory cache already dies with the process); bump it whenever
+// renderMarkup/compileMdx/syntax-highlight output changes.
+const RENDER_CACHE_VERSION = "1";
+const DEFAULT_RENDER_CACHE_SIZE = 256;
+
+interface RenderedMarkup {
+  html: string;
+  renderFactory?: () => Promise<{ Content: preact.FunctionComponent<any> }>;
+}
+
+// Insertion-ordered Map used as an LRU: a cache hit re-inserts the key to move
+// it to the most-recently-used end; inserts past the cap evict the oldest key.
+const renderCache = new Map<string, RenderedMarkup>();
+let renderCacheLimit = DEFAULT_RENDER_CACHE_SIZE;
+// Count of actual body renders (cache misses). Exposed only for tests, to prove
+// repeated rendering of identical content compiles once.
+let renderCacheMisses = 0;
+
+/** Test-only view of the render cache. Not part of the public API. */
+export function __renderCacheStatsForTest(): {
+  size: number;
+  limit: number;
+  misses: number;
+} {
+  return { size: renderCache.size, limit: renderCacheLimit, misses: renderCacheMisses };
+}
+
+/** Test-only reset of the render cache and its counters. */
+export function __resetRenderCacheForTest(): void {
+  clearRenderCache();
+  renderCacheMisses = 0;
+}
+
+function setRenderCacheLimit(size: number | undefined): void {
+  const next = typeof size === "number" && Number.isFinite(size) && size >= 0
+    ? Math.floor(size)
+    : DEFAULT_RENDER_CACHE_SIZE;
+  if (next === renderCacheLimit) return;
+  renderCacheLimit = next;
+  if (renderCache.size > renderCacheLimit) clearRenderCache();
+}
+
+function clearRenderCache(): void {
+  renderCache.clear();
+}
+
+function renderCacheKey(sourceType: "markdown" | "mdx", body: string): string {
+  return createHash("sha256")
+    .update(RENDER_CACHE_VERSION)
+    .update("\0")
+    .update(sourceType)
+    .update("\0")
+    .update(body)
+    .digest("hex");
+}
+
+function getCachedMarkup(key: string): RenderedMarkup | undefined {
+  if (renderCacheLimit === 0) return undefined;
+  const hit = renderCache.get(key);
+  if (hit === undefined) return undefined;
+  // Move to MRU position.
+  renderCache.delete(key);
+  renderCache.set(key, hit);
+  return hit;
+}
+
+function setCachedMarkup(key: string, value: RenderedMarkup): void {
+  if (renderCacheLimit === 0) return;
+  if (renderCache.has(key)) {
+    renderCache.delete(key);
+  } else if (renderCache.size >= renderCacheLimit) {
+    const oldest = renderCache.keys().next().value;
+    if (oldest !== undefined) renderCache.delete(oldest);
+  }
+  renderCache.set(key, value);
+}
+
 export function defineCollection<TData>(
   options: DefineCollectionOptions<TData>
 ): CollectionDefinition<TData> {
@@ -254,6 +345,11 @@ export function setActiveMarkdownConfig(config: NeutronMarkdownConfig | undefine
   if (activeMarkdownConfig === config) return;
   activeMarkdownConfig = config;
   cacheByRoot.clear();
+  // A config change can alter rendered output (themes, plugins, extensions), so
+  // the content-addressed render cache — whose key intentionally omits the
+  // config — must be dropped in lockstep with the store cache.
+  clearRenderCache();
+  setRenderCacheLimit(config?.renderCacheSize);
 }
 
 export function getActiveMarkdownConfig(): NeutronMarkdownConfig | undefined {
@@ -558,9 +654,20 @@ async function readCollectionEntries(
       // frontmatter still fails fast at load. Only body *rendering* defers — its
       // errors (e.g. MDX compile failures) now surface when render() is called,
       // wrapped in the same collection context as before so messages are identical.
-      const lazyMarkup = async () => {
+      const cacheKey = renderCacheKey(sourceType, parsed.content);
+      const lazyMarkup = async (): Promise<RenderedMarkup> => {
+        const cached = getCachedMarkup(cacheKey);
+        if (cached) return cached;
         try {
-          return await renderMarkup(parsed.content, sourceType, relativeFilePath, markdownConfig);
+          renderCacheMisses++;
+          const rendered = await renderMarkup(
+            parsed.content,
+            sourceType,
+            relativeFilePath,
+            markdownConfig
+          );
+          setCachedMarkup(cacheKey, rendered);
+          return rendered;
         } catch (error) {
           throw withCollectionContext(
             collectionName,
