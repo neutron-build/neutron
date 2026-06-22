@@ -18,11 +18,12 @@ High-performance HTTP/1.1, HTTP/2, HTTP/3 web framework in Rust. Hyper 1.x + tok
 - Tests: `cargo test` in `rs/`
 - Key types: `App`, `Router`, `Request`, `Response`, `Middleware`, `Handler`
 
-### ts/ — Neutron TypeScript (UI Framework)
-SSR-first TypeScript framework with Preact components, file-based routing, signals, server actions, streaming. Monorepo: pnpm + Turbo. Packages include auth, cache-redis, otel, security, ops.
-- Entry: `ts/packages/neutron/src/`
-- Tests: `pnpm test` in `ts/`
-- Key APIs: `defineRoute`, `useSignal`, `cache()`, `revalidateTag()`, `ServerIsland`
+### typescript/ — Neutron TypeScript (UI Framework)
+SSR-first TypeScript UI framework on Preact: file-based routing, per-route loaders/actions, static + server (`app`) render modes, islands, signals, streaming. Published as `@neutron-build/core`. Monorepo: pnpm + Turbo. Packages include auth, data, nucleus, otel, security; scaffolding via `create-neutron`.
+- Entry: `typescript/packages/neutron/src/` (package name: `@neutron-build/core`, v0.1.4)
+- Tests: `pnpm test` in `typescript/`
+- App authoring: routes in `src/routes/` (`index.tsx`→`/`, `[id].tsx`→dynamic, `_layout.tsx`→layout, `api/*`→API); per-route `export const config = { mode: "static" | "app", cache? }`; `export async function loader({ params, request }: LoaderArgs)` → `props.data`; `export async function action({ request }: ActionArgs)` → `props.actionData`. Client entry (`src/main.tsx`) is fixed glue: `registerRoutes(routes)` + `init()` from `@neutron-build/core/client` with `virtual:neutron/routes`. Preact, not React; no `App.tsx`.
+- Key exports: `@neutron-build/core` → `defineConfig`, `cache`, `revalidateTag`, `signal`/`computed`/`effect`, `Island`, `LoaderArgs`/`ActionArgs`, `useLoaderData`, `Link`, `Form`, `useNavigate`, `useParams`; `@neutron-build/core/client` → `init`, `registerRoutes`; `@neutron-build/core/vite` → `neutronPlugin`. See AGENTS.md in any scaffolded app for full authoring rules.
 
 ### go/ — Neutron Go (Full Backend Framework)
 Full backend framework built on `net/http`. Generic typed handlers, composable middleware, OpenAPI 3.1, RFC 7807 errors, OAuth2, WebAuthn, JWT, sessions, RBAC, API keys. Background jobs, cron, tiered cache, WebSocket hub, SSE.
