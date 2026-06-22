@@ -1,0 +1,137 @@
+# Neutron
+
+Neutron is a full-stack framework ecosystem. One mental model across web, mobile, desktop, and AI — backed by Nucleus, a multi-model database engine built in Rust.
+
+## Projects
+
+### nucleus/ — Nucleus Database Engine
+Multi-model database in Rust. One engine for 14 data models: SQL, Key-Value, Vector, Graph, TimeSeries, Document, Full-Text Search, Geo, Blob, Streams, Columnar, Datalog, CDC, and PubSub. PostgreSQL wire protocol compatible. MVCC isolation, WAL crash recovery, production-grade persistence.
+- Entry: `nucleus/src/`
+- Tests: `cargo test --lib` in `nucleus/`
+- Key SQL functions: `kv_get/set`, `ts_insert/range`, `doc_insert/query`, `columnar_insert`, `VECTOR_DISTANCE()`
+- Vector syntax: `VECTOR('[1,0,0]')` not bare string
+- Port: 5432 (pgwire)
+
+### rs/ — Neutron Rust (Web Framework)
+High-performance HTTP/1.1, HTTP/2, HTTP/3 web framework in Rust. Hyper 1.x + tokio, middleware pipeline, file-based routing, WebSockets, SSE, multipart, TLS, gRPC, GraphQL. 19 crates including OAuth, WebAuthn, Stripe, SMTP, Redis, OpenTelemetry.
+- Entry: `rs/crates/neutron/src/lib.rs`
+- Tests: `cargo test` in `rs/`
+- Key types: `App`, `Router`, `Request`, `Response`, `Middleware`, `Handler`
+
+### typescript/ — Neutron TypeScript (UI Framework)
+SSR-first TypeScript UI framework on Preact: file-based routing, per-route loaders/actions, static + server (`app`) render modes, islands, signals, streaming. Published as `@neutron-build/core`. Monorepo: pnpm + Turbo. Packages include auth, data, nucleus, otel, security; scaffolding via `create-neutron`.
+- Entry: `typescript/packages/neutron/src/` (package name: `@neutron-build/core`, v0.1.4)
+- Tests: `pnpm test` in `typescript/`
+- App authoring: routes in `src/routes/` (`index.tsx`→`/`, `[id].tsx`→dynamic, `_layout.tsx`→layout, `api/*`→API); per-route `export const config = { mode: "static" | "app", cache? }`; `export async function loader({ params, request }: LoaderArgs)` → `props.data`; `export async function action({ request }: ActionArgs)` → `props.actionData`. Client entry (`src/main.tsx`) is fixed glue: `registerRoutes(routes)` + `init()` from `@neutron-build/core/client` with `virtual:neutron/routes`. Preact, not React; no `App.tsx`.
+- Key exports: `@neutron-build/core` → `defineConfig`, `cache`, `revalidateTag`, `signal`/`computed`/`effect`, `Island`, `LoaderArgs`/`ActionArgs`, `useLoaderData`, `Link`, `Form`, `useNavigate`, `useParams`; `@neutron-build/core/client` → `init`, `registerRoutes`; `@neutron-build/core/vite` → `neutronPlugin`. See AGENTS.md in any scaffolded app for full authoring rules.
+
+### go/ — Neutron Go (Full Backend Framework)
+Full backend framework built on `net/http`. Generic typed handlers, composable middleware, OpenAPI 3.1, RFC 7807 errors, OAuth2, WebAuthn, JWT, sessions, RBAC, API keys. Background jobs, cron, tiered cache, WebSocket hub, SSE.
+- Entry: `go/`
+- Tests: `go test ./...` in `go/`
+- Key packages: `neutron`, `nucleus`, `neutronauth`, `neutroncache`, `neutronjobs`, `neutronrealtime`
+
+### python/ — Neutron Python (AI Framework)
+AI application framework: agents, RAG pipelines, MCP integration, structured output. Built on Starlette + Pydantic v2 + asyncpg. 22 modules covering middleware, CSRF, graceful shutdown (30s drain), OpenAPI 3.1.
+- Entry: `python/`
+- Tests: `pytest` in `python/`
+- Key modules: `agents`, `rag`, `mcp`, `structured_output`, `middleware`, `nucleus_client`
+
+### elixir/ — Neutron Elixir (Fault-Tolerant Backend)
+OTP-based backend framework using Plug + Bandit. Fault-tolerant supervisors, all 14 Nucleus models, real-time channels with presence tracking. Idiomatic Elixir with GenServer-backed connection pools.
+- Entry: `elixir/lib/`
+- Tests: `mix test` in `elixir/`
+- Key modules: `Neutron.Router`, `Neutron.Nucleus`, `Neutron.Channels`, `Neutron.Presence`
+
+### mojo/ — Neutron Mojo (ML Library)
+Tensor operations, quantization (Q8/Q4/NF4/FP8), inference pipeline, training stack in Mojo. Runs on CPU with SIMD kernels (337x vs scalar).
+- Entry: `mojo/neutron-mojo/src/`
+- Tests: `pixi run mojo build -I src test/test_*.mojo`
+- Key types: `Tensor`, `Model`, `QuantizedModel`, `pipeline_generate`
+
+### julia/ — Neutron Julia (ML/Scientific Computing)
+ML and scientific computing library. Typed Nucleus client for all 14 models. Extensions for DifferentialEquations.jl, Flux.jl, Graphs.jl, CUDA.jl, and Makie.jl. Connection pooling via LibPQ.jl.
+- Entry: `julia/`
+- Tests: `julia --project=. -e 'using Pkg; Pkg.test()'`
+- Key types: `NeutronJulia.connect`, `sql()`, `kv()`, `vector()`, `timeseries()`
+
+### zig/ — Neutron Zig (Systems Library)
+4-layer systems library (wire -> HAL -> protocols -> app). Nucleus client for all 14 models. JWT auth, compression, SSE, cache. Zero heap allocations, comptime SQL validation. Targets ARM, RISC-V, AVR, ESP32.
+- Entry: `zig/`
+- Tests: `zig build test` in `zig/` (295 tests)
+
+### modelica/ — Neutron Modelica (Physics Simulation)
+Physics simulation framework. FMI 2.0/3.0 model exchange, Kirchhoff's law solver (MNA), Julia bridge via DifferentialEquations.jl. Python-based tooling.
+- Entry: `modelica/`
+- CI: `.github/workflows/modelica.yml`
+
+### native/ — Neutron Native (Mobile Framework)
+React Native Fabric (iOS/Android) + Preact (web). Expo Go for on-device preview. Web device APIs, NeutronWind styling with 700+ design tokens. Components, router, navigation, device modules, animation, gestures, accessibility.
+- Entry: `native/`
+- Key APIs: Components, `NeutronRouter`, `useDevice`, `NeutronWind`
+
+### desktop/ — Neutron Desktop
+Cross-platform desktop apps using Tauri 2.0 + Preact + Neutron Rust backend. 12 Rust plugins, `neutron://` protocol bridge, Nucleus embedded mode. Dev mode TCP server for hot reload. ~10MB bundles vs Electron's 100MB+.
+- Entry: `desktop/`
+- CLI: `neutron desktop dev/build/preview`
+
+### studio/ — Nucleus Studio
+Visual database management GUI. Browse all 14 data models in one UI with toggles. Schema designer, code generator, database browser, MCP server with 17 tools.
+- Stack: Preact SPA + Go embedded server
+- Backend: `cli/internal/studio/`, Frontend: `studio/src/`
+
+### cli/ — Neutron CLI
+Universal CLI in Go + Cobra. 17 commands including `dev`, `build`, `deploy`, `desktop`, `native`, `studio`. ~21MB binary.
+- Build: `go build` in `cli/`
+
+## Transport Layer
+
+Auto-detecting transport adapts to the runtime environment:
+- **Http** — Standard HTTP client for server-to-server
+- **Mobile** — Retry, cache, offline queue for React Native
+- **Embedded** — Direct IPC for Tauri desktop (no network hop)
+
+## Nucleus ORM — Per Language
+
+Each language has an idiomatic ORM for Nucleus covering all 14 data models:
+
+- **TypeScript**: Drizzle-style — schema in code, no codegen, fully typed
+- **Rust**: Proc macros — `nucleus::schema!{}`, compile-time checked
+- **Go**: Struct tags (idiomatic Go)
+- **Python**: Pydantic-style class definitions
+- **Elixir**: Ecto-style schemas with changesets
+- **Julia**: Typed structs with `@nucleus` macro
+- **Zig**: Comptime — zero overhead, SQL validated at compile time
+
+Single schema covers SQL tables, KV stores, vector collections, timeseries metrics, document collections, graph nodes, and more — unlike Drizzle/Prisma which only cover SQL.
+
+## Verification Suite
+
+Formal verification across three tools:
+
+- **Lean4** (`lean4/`): 26 files, algorithm proofs, 100% proven (Aeneas Rust-to-Lean translation)
+- **Quint** (`quint/`): 27 protocol specification files, 12 test files, nucleus + framework + realtime specs
+- **Verus** (`verus/`): 12 files, Rust verification for nucleus (MVCC, page, buffer) and framework (JWT, session, rate limit)
+
+## Key Design Decisions
+
+- Neutron TS uses Preact (3KB) not React (42KB)
+- Nucleus uses PostgreSQL wire protocol — works with any Postgres client
+- Nucleus MVCC + WAL crash recovery — production-grade persistence
+- Neutron Rust uses hyper 1.x + tokio, no framework overhead
+- Mojo uses SIMD kernels for tensor ops
+- Elixir uses OTP supervisors for fault tolerance
+- License: MIT (frameworks) | BSL 1.1 → MIT 2046 (Nucleus)
+
+## File Conventions
+
+- `rs/crates/neutron/src/app.rs` — main App builder
+- `rs/crates/neutron/src/handler.rs` — Request/Response types
+- `rs/crates/neutron/src/router.rs` — routing
+- `nucleus/src/` — all database engine modules
+- `ts/packages/neutron/src/` — TypeScript framework source
+- `mojo/neutron-mojo/src/` — Mojo tensor library source
+- `go/` — Go framework packages
+- `elixir/lib/` — Elixir framework modules
+- `julia/` — Julia ML library
+- `zig/` — Zig systems library
