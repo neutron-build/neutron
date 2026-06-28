@@ -1,8 +1,9 @@
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
-import { serve } from "@hono/node-server";
+import { serve, type ServerType } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
+import type { WebSocketServer } from "ws";
 import { compress } from "hono/compress";
 import { Hono } from "hono";
 import { h } from "preact";
@@ -132,6 +133,49 @@ export interface NeutronServerOptions {
   cache?: NeutronCacheStores;
   routes?: NeutronRoutesConfig;
   hooks?: NeutronServerHooks;
+  /**
+   * Rendering mode (default `"ssr"`). Controls the HTTP-response machinery:
+   * - `"ssr"` — full Neutron: route discovery, Vite SSR runtime, asset/image/island
+   *   routes, and the HTML catch-all. The canonical, unchanged behavior.
+   * - `"api"` — JSON backend. No route discovery, no SSR, no asset serving. Keeps the
+   *   shared batteries (request-id, /health, CORS/security, compression) and answers a
+   *   clean JSON 404 for unmatched paths. Mount your own routes on the returned `app`.
+   * - `"raw"` — bare Hono with only the shared batteries. No catch-all; unmatched paths
+   *   get Hono's default 404. Full control.
+   *
+   * Orthogonal to {@link websocket}: any mode can also carry a WebSocket server.
+   */
+  mode?: NeutronServerMode;
+  /**
+   * Attach a WebSocket server to the returned HTTP server (default off). Works with any
+   * {@link mode} — e.g. an `"ssr"` dashboard that also streams logs, or an `"api"`/`"raw"`
+   * relay. `true` accepts WS upgrades on every path; pass `{ path }` to restrict to one.
+   * The returned object gains a `wss` ({@link https://github.com/websockets/ws | ws}
+   * `WebSocketServer`); attach `.on("connection", ...)` to handle sockets.
+   */
+  websocket?: boolean | NeutronWebSocketOptions;
+}
+
+/** Rendering mode for {@link createServer}. The transport axis is {@link NeutronServerOptions.websocket}. */
+export type NeutronServerMode = "ssr" | "api" | "raw";
+
+export interface NeutronWebSocketOptions {
+  /**
+   * Only accept WebSocket upgrades whose request pathname equals this value; other
+   * upgrade attempts get the socket destroyed. Unset = accept upgrades on any path
+   * (route inside your `wss.on("connection", (ws, req) => ...)` via `req.url`).
+   */
+  path?: string;
+}
+
+/** Resolved handle returned by {@link createServer}. */
+export interface NeutronServer {
+  app: Hono<{ Variables: { requestId: string } }>;
+  server: ServerType;
+  /** Present only when {@link NeutronServerOptions.websocket} is set. */
+  wss?: WebSocketServer;
+  close: () => Promise<void>;
+  url: string;
 }
 
 export interface NeutronRequestStartEvent {
@@ -247,7 +291,9 @@ type StreamRenderFn = (element: preact.VNode) => ReadableStream<Uint8Array> & {
 
 let cachedStreamRenderFn: StreamRenderFn | null | undefined;
 
-export async function createServer(options: NeutronServerOptions = {}) {
+export async function createServer(
+  options: NeutronServerOptions = {}
+): Promise<NeutronServer> {
   const {
     port = 3000,
     host = "0.0.0.0",
@@ -256,6 +302,8 @@ export async function createServer(options: NeutronServerOptions = {}) {
     routesDir = "src/routes",
     compress: enableCompress = true,
     runtime = "preact",
+    mode = "ssr",
+    websocket,
     cors,
     securityHeaders,
     trustedHosts,
@@ -275,7 +323,12 @@ export async function createServer(options: NeutronServerOptions = {}) {
   const securityHeadersConfig = resolveSecurityHeadersConfig(securityHeaders);
   const compiledRouteRules = compileRouteRules(routeRules);
 
-  const routes = discoverRoutes({ routesDir: resolvedRoutesDir });
+  // Rendering mode gates the SSR machinery. Only "ssr" walks the routes dir, spins up
+  // the Vite SSR runtime, serves assets, and registers the HTML catch-all. "api"/"raw"
+  // skip all of it (no fs walk, no hard-fail on a missing routes dir).
+  const isSsr = mode === "ssr";
+
+  const routes = isSsr ? discoverRoutes({ routesDir: resolvedRoutesDir }) : [];
   const router = createRouter();
   for (const route of routes) {
     router.insert(route);
@@ -365,6 +418,9 @@ export async function createServer(options: NeutronServerOptions = {}) {
     }),
   );
 
+  // SSR-only routes: static assets, image optimization, server islands, and the HTML
+  // catch-all. "api"/"raw" modes skip these entirely.
+  if (isSsr) {
   app.use(
     "/assets/*",
     serveStatic({
@@ -665,6 +721,15 @@ export async function createServer(options: NeutronServerOptions = {}) {
       return finalize(new Response("Internal Server Error", { status: 500 }));
     }
   });
+  } // end if (isSsr)
+
+  // "api" mode answers a clean JSON 404 for anything the user didn't mount. Use
+  // app.notFound (not an app.all("*") route) so it fires only when nothing matched —
+  // an "*" route would shadow routes the caller mounts later on the returned `app`.
+  // "raw" mode intentionally adds nothing — unmatched paths get Hono's default 404.
+  if (mode === "api") {
+    app.notFound((c) => c.json({ error: "Not Found", path: c.req.path }, 404));
+  }
 
   const server = serve({
     fetch: app.fetch,
@@ -672,11 +737,45 @@ export async function createServer(options: NeutronServerOptions = {}) {
     hostname: host,
   });
 
+  // Transport axis: attach a WebSocket server to the live HTTP server, independent of
+  // rendering mode. Raw `ws` in noServer mode so the framework owns the upgrade handshake
+  // and the caller just attaches `wss.on("connection", ...)`.
+  let wss: WebSocketServer | undefined;
+  if (websocket) {
+    const { WebSocketServer: WSServer } = await import("ws");
+    const wsOptions = websocket === true ? {} : websocket;
+    wss = new WSServer({ noServer: true });
+    const httpServer = server as unknown as import("node:http").Server;
+    httpServer.on("upgrade", (req, socket, head) => {
+      if (wsOptions.path) {
+        const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+        if (pathname !== wsOptions.path) {
+          socket.destroy();
+          return;
+        }
+      }
+      wss!.handleUpgrade(req, socket, head, (ws) => {
+        wss!.emit("connection", ws, req);
+      });
+    });
+  }
+
   return {
     app,
     server,
+    wss,
     close: async () => {
       await ssrServer?.close();
+      // Tear down WebSockets before draining HTTP. An upgraded WS socket is NOT an idle
+      // HTTP keep-alive, so server.close()/closeIdleConnections() won't reap it — a live
+      // client would otherwise hold the drain open until the caller's shutdown timeout.
+      // Forcibly terminate each live socket, then await the WS server's own close.
+      if (wss) {
+        for (const client of wss.clients) {
+          client.terminate();
+        }
+        await new Promise<void>((resolve) => wss!.close(() => resolve()));
+      }
       // Await server.close's callback so in-flight requests actually drain
       // (the previous fire-and-forget resolved before any draining). Close idle
       // keep-alive sockets so they don't hold the drain open indefinitely.
@@ -2094,8 +2193,11 @@ async function getFreePort(): Promise<number> {
   });
 }
 
-export async function startServer(options: NeutronServerOptions = {}) {
-  const { url, close } = await createServer(options);
+export async function startServer(
+  options: NeutronServerOptions = {}
+): Promise<NeutronServer> {
+  const running = await createServer(options);
+  const { url, close } = running;
 
   console.log(`\n  Neutron production server running:\n`);
   console.log(`  Local:   ${url}\n`);
@@ -2134,4 +2236,8 @@ export async function startServer(options: NeutronServerOptions = {}) {
 
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
+
+  // Return the handle so realtime callers can attach `wss.on("connection", ...)` while
+  // still getting startServer's signal-driven graceful shutdown.
+  return running;
 }
