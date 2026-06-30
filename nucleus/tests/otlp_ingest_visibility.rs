@@ -304,3 +304,58 @@ async fn otlp_style_concurrent_inserts_all_visible() {
 
     server.abort();
 }
+
+// ---------------------------------------------------------------------------
+// 4. Finding #25, real root cause: an empty string (invalid JSON) bound to a
+//    JSONB column used to ack the INSERT but vanish on read — the storage
+//    layer kept the raw Text and the JSONB decode silently dropped the whole
+//    row. The fix rejects invalid JSON at insert (like Postgres) and the
+//    decode no longer drops rows. This is the case the original #25
+//    investigation never tried (it only used valid `'{}'` payloads).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn empty_string_jsonb_is_rejected_not_silently_dropped() {
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+    client
+        .simple_query(SPANS_SCHEMA)
+        .await
+        .expect("CREATE TABLE spans");
+
+    // Empty string is not valid JSON — Postgres errors, and so must Nucleus,
+    // instead of acking the INSERT and then dropping the row on every read.
+    let bad = client
+        .simple_query(
+            "INSERT INTO spans (trace_id, span_id, site_id, start_time, end_time, attributes)
+             VALUES ('t_bad','s_bad','site_x', 1, 2, '')",
+        )
+        .await;
+    assert!(
+        bad.is_err(),
+        "empty-string into a JSONB column must error, not silently drop the row"
+    );
+
+    // A valid row inserts and is visible from a separate connection — the
+    // table is not poisoned and the read path does not drop rows.
+    client
+        .simple_query(
+            "INSERT INTO spans (trace_id, span_id, site_id, start_time, end_time, attributes)
+             VALUES ('t_ok','s_ok','site_x', 1, 2, '{\"http.method\":\"GET\"}')",
+        )
+        .await
+        .expect("valid JSONB INSERT");
+
+    let reader = connect(port).await;
+    let rows = reader
+        .simple_query("SELECT trace_id FROM spans WHERE site_id = 'site_x'")
+        .await
+        .expect("SELECT");
+    assert_eq!(
+        count_data_rows(&rows),
+        1,
+        "exactly the valid row should be present (bad INSERT rejected, not stored)"
+    );
+
+    server.abort();
+}

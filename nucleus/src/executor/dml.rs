@@ -312,6 +312,27 @@ impl Executor {
                 }
             }
 
+            // JSONB columns: parse text into a real JSON value and reject
+            // invalid JSON the way Postgres does. Without this, an unparseable
+            // value (e.g. an empty string) is stored as raw Text in a JSONB
+            // slot and then silently dropped on read because the decode path
+            // can't parse it back — data loss by default. Valid JSON text is
+            // normalized to Value::Jsonb so writes and reads stay consistent.
+            for (i, col) in table_def.columns.iter().enumerate() {
+                if matches!(col.data_type, DataType::Jsonb)
+                    && let Some(v) = row.get_mut(i)
+                    && let Value::Text(s) = v
+                {
+                    let parsed = serde_json::from_str::<serde_json::Value>(s.as_str())
+                        .map_err(|e| {
+                            ExecError::Runtime(format!(
+                                "invalid input syntax for type json: {e}"
+                            ))
+                        })?;
+                    *v = Value::Jsonb(parsed);
+                }
+            }
+
             // Fire BEFORE INSERT row-level triggers (only if triggers exist)
             if has_triggers {
                 self.fire_triggers(

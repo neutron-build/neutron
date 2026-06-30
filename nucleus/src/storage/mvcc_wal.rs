@@ -432,7 +432,11 @@ fn read_value(data: &[u8], pos: &mut usize) -> Option<Value> {
         }
         VAL_JSONB => {
             let s = read_str(data, pos)?;
-            let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+            // A malformed stored JSONB value must not drop the whole row
+            // (data loss). Fall back to JSON null; the insert path now rejects
+            // invalid JSON up front, so this only guards legacy/foreign rows.
+            let v: serde_json::Value =
+                serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
             Some(Value::Jsonb(v))
         }
         VAL_VECTOR => {

@@ -241,7 +241,9 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Option<Value> {
         5 => Some(Value::Text(read_string(data, pos)?)),
         6 => {
             let s = read_string(data, pos)?;
-            let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+            // Malformed stored JSONB must not drop the row; fall back to null.
+            let v: serde_json::Value =
+                serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
             Some(Value::Jsonb(v))
         }
         7 => Some(Value::Date(read_i32(data, pos)?)),
