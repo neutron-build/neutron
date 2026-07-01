@@ -166,6 +166,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: nucleus-*
           merge-multiple: true
 
       - name: Generate checksums
