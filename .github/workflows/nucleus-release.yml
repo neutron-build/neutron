@@ -93,7 +93,7 @@ jobs:
             arch: arm64
             cross: false
 
-          - runner: macos-13
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
             os: darwin
             arch: amd64
