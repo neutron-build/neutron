@@ -199,57 +199,91 @@ impl LruKReplacer {
 
     /// Find the best eviction candidate across all shards.
     /// Locks one shard at a time (never holds two shard locks simultaneously).
+    ///
+    /// The scan-then-remove sequence below is racy by construction: two
+    /// concurrent callers (e.g. `BufferPool::prefetch_pages`'s parallel rayon
+    /// fetches) can each independently scan the shards and converge on the
+    /// same `best_frame`, since nothing is locked for the full scan. The
+    /// `remove()` call is what arbitrates the race — only one caller's
+    /// `remove()` actually finds-and-deletes the entry; the other's is a
+    /// silent no-op on an already-missing key. We must check that outcome:
+    /// a caller whose removal lost the race must NOT return that frame_id as
+    /// if it owned it, or two callers end up believing they exclusively own
+    /// the same frame and concurrently overwrite its buffer with two
+    /// different pages' disk content — corrupting whichever page's bytes
+    /// happen to land second (this was reproduced empirically: it silently
+    /// corrupted an on-disk page-chain "next" pointer into a self-loop,
+    /// hanging any table scan holding the buffer pool under eviction
+    /// pressure). Retry against a fresh scan when the race is lost.
     fn evict(&self) -> Option<u32> {
-        let current_ts = self.current_ts.load(Ordering::Relaxed);
+        loop {
+            let current_ts = self.current_ts.load(Ordering::Relaxed);
 
-        let mut best_frame: Option<u32> = None;
-        let mut best_k_dist: u64 = 0;
-        let mut best_earliest: u64 = u64::MAX;
-        let mut best_has_k = true;
-        let mut best_shard: usize = 0;
+            let mut best_frame: Option<u32> = None;
+            let mut best_k_dist: u64 = 0;
+            let mut best_earliest: u64 = u64::MAX;
+            let mut best_has_k = true;
+            let mut best_shard: usize = 0;
 
-        for (si, shard_lock) in self.shards.iter().enumerate() {
-            let shard = shard_lock.lock();
-            for (&frame_id, history) in shard.iter() {
-                if !history.is_evictable {
-                    continue;
-                }
-
-                let has_k = history.access_history.len() >= self.k;
-                let k_dist = if has_k {
-                    current_ts.saturating_sub(history.access_history[0])
-                } else {
-                    u64::MAX
-                };
-                let earliest = history.access_history.front().copied().unwrap_or(0);
-
-                let is_better = if best_frame.is_none() {
-                    true
-                } else {
-                    match (best_has_k, has_k) {
-                        (true, false) => true,
-                        (false, true) => false,
-                        (false, false) => earliest < best_earliest,
-                        (true, true) => k_dist > best_k_dist,
+            for (si, shard_lock) in self.shards.iter().enumerate() {
+                let shard = shard_lock.lock();
+                for (&frame_id, history) in shard.iter() {
+                    if !history.is_evictable {
+                        continue;
                     }
-                };
 
-                if is_better {
-                    best_frame = Some(frame_id);
-                    best_k_dist = k_dist;
-                    best_earliest = earliest;
-                    best_has_k = has_k;
-                    best_shard = si;
+                    let has_k = history.access_history.len() >= self.k;
+                    let k_dist = if has_k {
+                        current_ts.saturating_sub(history.access_history[0])
+                    } else {
+                        u64::MAX
+                    };
+                    let earliest = history.access_history.front().copied().unwrap_or(0);
+
+                    let is_better = if best_frame.is_none() {
+                        true
+                    } else {
+                        match (best_has_k, has_k) {
+                            (true, false) => true,
+                            (false, true) => false,
+                            (false, false) => earliest < best_earliest,
+                            (true, true) => k_dist > best_k_dist,
+                        }
+                    };
+
+                    if is_better {
+                        best_frame = Some(frame_id);
+                        best_k_dist = k_dist;
+                        best_earliest = earliest;
+                        best_has_k = has_k;
+                        best_shard = si;
+                    }
                 }
+                // Drop the shard lock before moving to the next shard.
             }
-            // Drop the shard lock before moving to the next shard.
-        }
 
-        if let Some(frame_id) = best_frame {
-            // Re-lock only the winning shard to remove the evicted frame.
-            self.shards[best_shard].lock().remove(&frame_id);
+            let frame_id = best_frame?;
+
+            // Re-lock only the winning shard and re-validate before removing.
+            // Two things can have happened since the scan observed this
+            // frame as evictable: (a) a concurrent evict() already claimed
+            // and removed it — `get` finds nothing, or (b) a concurrent
+            // `fetch_page` cache hit just re-pinned it via
+            // `set_evictable(frame_id, false)` — the entry is still present
+            // but no longer evictable. `set_evictable` mutates the entry in
+            // place rather than removing it, so a plain `remove()` here
+            // would blindly hand out a frame that's actively in use again,
+            // racing its content against whatever the new pinner reads.
+            // Only claim it if it's both present AND still evictable.
+            let mut shard = self.shards[best_shard].lock();
+            let should_claim = matches!(shard.get(&frame_id), Some(entry) if entry.is_evictable);
+            if should_claim {
+                shard.remove(&frame_id);
+                return Some(frame_id);
+            }
+            drop(shard);
+            // Lost the race for this candidate — rescan for another one.
         }
-        best_frame
     }
 
     fn remove(&self, frame_id: u32) {
@@ -282,6 +316,24 @@ pub struct BufferPool {
     stats: BufferPoolStats,
     /// Tracked set of dirty frame indices for efficient batch flushing.
     dirty_set: Mutex<HashSet<u32>>,
+    /// Serializes "pin an existing resident page" against "evict a frame to
+    /// make room". These are two different operations over two different
+    /// data structures (`page_table` and the replacer's per-frame
+    /// `is_evictable` state) that both need to agree on which frame a given
+    /// page_id currently owns. Without a lock spanning both, a pinner's
+    /// `page_table` lookup and an evictor's replacer-side claim can
+    /// interleave: the pinner sees page_id still mapped to frame F (correct,
+    /// at that instant) and increments F's pin count, while — in the same
+    /// window — an evictor (which doesn't consult `page_table` at all, only
+    /// `is_evictable`) claims F as free, flushes it, repurposes it for a
+    /// different page_id, and removes page_id's `page_table` entry. Both
+    /// operations individually "succeed"; the pinner ends up holding a
+    /// pinned reference to a frame that's already been overwritten with a
+    /// different page's disk content. This was reproduced empirically as a
+    /// production hang: a table's on-disk page-chain "next" pointer got
+    /// corrupted into pointing at itself, spinning a query at ~100% CPU
+    /// forever. See `pin_if_present` and `get_free_frame`.
+    eviction_lock: Mutex<()>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -324,74 +376,119 @@ impl BufferPool {
             pool_size,
             stats: BufferPoolStats::new(),
             dirty_set: Mutex::new(HashSet::new()),
+            eviction_lock: Mutex::new(()),
         }
+    }
+
+    /// If `page_id` is currently resident, pin it and return its frame.
+    /// Returns `None` if it isn't resident (a genuine cache miss).
+    ///
+    /// Holds `eviction_lock` for the lookup-then-pin sequence so this can't
+    /// interleave with `get_free_frame`'s evict-then-repurpose sequence for
+    /// the same frame — see the comment on `eviction_lock` for why that gap
+    /// matters.
+    fn pin_if_present(&self, page_id: u32) -> Option<u32> {
+        let _guard = self.eviction_lock.lock();
+        let frame_id = self.page_table.lookup(page_id)?;
+        let desc = &self.descriptors[frame_id as usize];
+        desc.pin_count.fetch_add(1, Ordering::AcqRel);
+        self.replacer.record_access(frame_id);
+        self.replacer.set_evictable(frame_id, false);
+        Some(frame_id)
     }
 
     /// Fetch a page into the buffer pool and pin it. Returns the frame ID.
     /// The caller must call `unpin` when done.
+    ///
+    /// Loops rather than recursing on the (rare) lost-race retry paths — see
+    /// the comment above the final race check below.
     pub fn fetch_page(&self, page_id: u32) -> Result<u32, BufferError> {
-        // Check if already in pool
-        if let Some(frame_id) = self.page_table.lookup(page_id) {
-            let desc = &self.descriptors[frame_id as usize];
-            desc.pin_count.fetch_add(1, Ordering::AcqRel);
-            self.replacer.record_access(frame_id);
-            self.replacer.set_evictable(frame_id, false);
-            self.stats.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(frame_id);
-        }
+        loop {
+            // Check if already in pool
+            if let Some(frame_id) = self.pin_if_present(page_id) {
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(frame_id);
+            }
 
-        // Cache miss — must load from disk
-        self.stats.misses.fetch_add(1, Ordering::Relaxed);
+            // Cache miss — must load from disk
+            self.stats.misses.fetch_add(1, Ordering::Relaxed);
 
-        // Get a free frame
-        let frame_id = self.get_free_frame()?;
+            // Get a free frame
+            let frame_id = self.get_free_frame()?;
 
-        // Double-check: another thread may have loaded this page while we
-        // were allocating a frame. Re-check under the partition lock.
-        {
-            let part_idx = self.page_table.partition_for(page_id);
-            let part = self.page_table.partitions[part_idx].lock();
-            if let Some(&existing_frame) = part.get(&page_id) {
-                // Another thread won the race — return the free frame and use theirs
-                drop(part);
+            // Double-check: another thread may have loaded this page while we
+            // were allocating a frame.
+            if let Some(existing_frame) = self.pin_if_present(page_id) {
                 self.free_list.lock().push(frame_id);
-                let desc = &self.descriptors[existing_frame as usize];
-                desc.pin_count.fetch_add(1, Ordering::AcqRel);
-                self.replacer.record_access(existing_frame);
-                self.replacer.set_evictable(existing_frame, false);
                 self.stats.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(existing_frame);
             }
-            // Still absent — drop lock, proceed with disk read
+
+            // Read from disk
+            self.disk
+                .read_page(page_id, self.frame_data_mut(frame_id))?;
+
+            // Verify checksum (skip for freshly allocated pages with all zeros)
+            let page_data = self.frame_data(frame_id);
+            if (page::get_page_type(page_data) != page::PAGE_TYPE_FREE
+                || page::read_u32(page_data, page::HEADER_CHECKSUM) != 0)
+                && !page::verify_checksum(page_data)
+            {
+                return Err(BufferError::ChecksumMismatch(page_id));
+            }
+
+            // Second race check: the earlier double-check only guarded the gap
+            // before this disk read. Two threads can both miss on the same
+            // page_id, both pass that check (neither has registered yet), and
+            // both independently read the same page from disk into two
+            // different frames. Without re-checking here, both would then
+            // insert into page_table and whichever insert lands last would
+            // silently win — orphaning the other thread's frame: it would sit
+            // pinned forever (never reachable to unpin via a page_table lookup,
+            // since callers look pages up by page_id) while still consuming a
+            // pool slot, permanently shrinking the effective pool size by one
+            // frame per lost race. This check doesn't need `eviction_lock` (our
+            // own `frame_id` is exclusively ours and not yet visible to any
+            // evictor — it has no page_table or replacer entry until we
+            // register it below) — just the plain partition lock `insert()`
+            // uses, so only the winner registers.
+            let part_idx = self.page_table.partition_for(page_id);
+            let mut part = self.page_table.partitions[part_idx].lock();
+            if part.get(&page_id).is_some() {
+                // Lost the second race — someone else's load already won.
+                // Our own frame never had its descriptor set up (page_id/
+                // pin_count/is_dirty untouched), so it's safe to return
+                // straight to the free list without resetting anything.
+                drop(part);
+                self.free_list.lock().push(frame_id);
+                // Re-resolve via pin_if_present rather than trusting the
+                // frame_id observed above — in the (astronomically rare)
+                // case that it was evicted again in between, retry the
+                // whole fetch from the top rather than fall back to a
+                // frame_id we never actually pinned.
+                match self.pin_if_present(page_id) {
+                    Some(existing_frame) => {
+                        self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                        return Ok(existing_frame);
+                    }
+                    None => continue,
+                }
+            }
+            part.insert(page_id, frame_id);
+            drop(part);
+
+            // Setup descriptor
+            let desc = &self.descriptors[frame_id as usize];
+            desc.page_id.store(page_id, Ordering::Release);
+            desc.pin_count.store(1, Ordering::Release);
+            desc.is_dirty.store(false, Ordering::Release);
+
+            // Track in replacer
+            self.replacer.record_access(frame_id);
+            self.replacer.set_evictable(frame_id, false);
+
+            return Ok(frame_id);
         }
-
-        // Read from disk
-        self.disk
-            .read_page(page_id, self.frame_data_mut(frame_id))?;
-
-        // Verify checksum (skip for freshly allocated pages with all zeros)
-        let page_data = self.frame_data(frame_id);
-        if (page::get_page_type(page_data) != page::PAGE_TYPE_FREE
-            || page::read_u32(page_data, page::HEADER_CHECKSUM) != 0)
-            && !page::verify_checksum(page_data)
-        {
-            return Err(BufferError::ChecksumMismatch(page_id));
-        }
-
-        // Setup descriptor
-        let desc = &self.descriptors[frame_id as usize];
-        desc.page_id.store(page_id, Ordering::Release);
-        desc.pin_count.store(1, Ordering::Release);
-        desc.is_dirty.store(false, Ordering::Release);
-
-        // Register in page table
-        self.page_table.insert(page_id, frame_id);
-
-        // Track in replacer
-        self.replacer.record_access(frame_id);
-        self.replacer.set_evictable(frame_id, false);
-
-        Ok(frame_id)
     }
 
     /// Prefetch pages into the buffer pool for sequential scan read-ahead.
@@ -762,6 +859,12 @@ impl BufferPool {
             return Ok(frame_id);
         }
 
+        // Held for the rest of this function: see the comment on
+        // `eviction_lock` for why eviction (which repurposes a resident
+        // frame for a different page) must be mutually exclusive with
+        // `pin_if_present` (which pins a resident frame in place).
+        let _guard = self.eviction_lock.lock();
+
         // Evict
         let frame_id = self.replacer.evict().ok_or(BufferError::PoolFull)?;
         self.stats.evictions.fetch_add(1, Ordering::Relaxed);
@@ -990,6 +1093,76 @@ mod tests {
         let (pool, _dir) = make_pool(32);
         assert_eq!(pool.pool_size(), 32);
     }
+
+    /// Regression test for a data race in `LruKReplacer::evict()`: under
+    /// concurrent eviction pressure (pool smaller than the working set),
+    /// two threads could each independently scan the shards, converge on the
+    /// same "best" frame, and both receive it from `evict()` — because the
+    /// old code returned the scanned candidate unconditionally instead of
+    /// checking whether *this* caller's removal actually won the race. Both
+    /// callers would then believe they exclusively owned the frame and
+    /// concurrently overwrite its buffer with two different pages' disk
+    /// content, corrupting one of them.
+    ///
+    /// This was found by reproducing a real production hang: a `DELETE`
+    /// against a large table drove `BufferPool::prefetch_pages`'s parallel
+    /// rayon fetches, which raced on eviction and corrupted a page's
+    /// on-disk "next page" pointer into pointing at itself — the table's
+    /// page-chain walk then spun at ~100% CPU forever. Disabling eviction
+    /// (a pool big enough to hold the whole table) made the corruption
+    /// disappear, isolating the bug to eviction under contention.
+    ///
+    /// Here we stamp every page with its own ID (far from the page header,
+    /// so we're not relying on any higher-layer page-format internals) and
+    /// hammer the tiny pool from many threads. If a frame is ever handed to
+    /// two callers at once, one thread's stamp will clobber another's and a
+    /// reader will observe a stamp that doesn't match the page it fetched.
+    #[test]
+    fn concurrent_eviction_never_hands_out_the_same_frame_twice() {
+        use std::sync::Arc;
+        use std::thread;
+
+        const STAMP_OFFSET: usize = PAGE_SIZE - 4;
+
+        // Deliberately tiny relative to the working set so essentially every
+        // fetch on a miss forces an eviction.
+        let (pool, _dir) = make_pool(8);
+        let pool = Arc::new(pool);
+
+        let mut page_ids = Vec::new();
+        for _ in 0..64 {
+            let (page_id, frame_id) = pool.new_page().unwrap();
+            let data = pool.frame_data_mut(frame_id);
+            data[STAMP_OFFSET..STAMP_OFFSET + 4].copy_from_slice(&page_id.to_le_bytes());
+            pool.mark_dirty(frame_id);
+            pool.unpin(frame_id);
+            page_ids.push(page_id);
+        }
+
+        let mut handles = Vec::new();
+        for t in 0..8usize {
+            let pool = Arc::clone(&pool);
+            let page_ids = page_ids.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..500usize {
+                    let page_id = page_ids[(t * 37 + i) % page_ids.len()];
+                    let frame_id = pool.fetch_page(page_id).unwrap();
+                    let data = pool.frame_data(frame_id);
+                    let stamp =
+                        u32::from_le_bytes(data[STAMP_OFFSET..STAMP_OFFSET + 4].try_into().unwrap());
+                    assert_eq!(
+                        stamp, page_id,
+                        "buffer pool handed out a frame for page {page_id} whose content is \
+                         stamped {stamp} — two callers were given the same frame concurrently"
+                    );
+                    pool.unpin(frame_id);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1154,5 +1327,46 @@ mod dirty_tracking_tests {
         // Should NOT have flushed — 2 < 16
         assert_eq!(pool.dirty_page_count(), 2);
         handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod eviction_content_integrity_tests {
+    use super::*;
+
+    /// Single-threaded control for
+    /// `tests::concurrent_eviction_never_hands_out_the_same_frame_twice`:
+    /// confirms heavy eviction pressure alone (no concurrency at all) never
+    /// corrupts frame content, isolating the earlier bug to the concurrent
+    /// path specifically rather than eviction/reuse in general.
+    #[test]
+    fn sequential_heavy_eviction_preserves_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let disk = DiskManager::open(&db_path).unwrap();
+        let pool = BufferPool::new(disk, None, 4, 0);
+
+        const STAMP_OFFSET: usize = PAGE_SIZE - 4;
+        let mut page_ids = Vec::new();
+        for _ in 0..64 {
+            let (page_id, frame_id) = pool.new_page().unwrap();
+            let data = pool.frame_data_mut(frame_id);
+            data[STAMP_OFFSET..STAMP_OFFSET + 4].copy_from_slice(&page_id.to_le_bytes());
+            pool.mark_dirty(frame_id);
+            pool.unpin(frame_id);
+            page_ids.push(page_id);
+        }
+
+        let mut bad = Vec::new();
+        for &page_id in &page_ids {
+            let frame_id = pool.fetch_page(page_id).unwrap();
+            let data = pool.frame_data(frame_id);
+            let stamp = u32::from_le_bytes(data[STAMP_OFFSET..STAMP_OFFSET + 4].try_into().unwrap());
+            pool.unpin(frame_id);
+            if stamp != page_id {
+                bad.push((page_id, stamp));
+            }
+        }
+        assert!(bad.is_empty(), "sequential (single-threaded) corruption found: {bad:?}");
     }
 }
