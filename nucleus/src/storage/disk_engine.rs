@@ -1028,9 +1028,27 @@ impl DiskEngine {
             .get(table)
             .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
 
+        // Defensive cycle detection: a page chain should never revisit a page
+        // (see the fix to LruKReplacer::evict() above for why one could
+        // previously get corrupted into a self-loop). Detecting a cycle here
+        // turns "hang forever burning CPU/memory" into a clean, actionable
+        // error instead — a chain should never legitimately cycle, so any
+        // repeat is itself a bug worth surfacing regardless of cause.
+        let mut seen: HashSet<u32> = HashSet::new();
         let mut pages = Vec::new();
         let mut page_id = meta.first_page;
         while page_id != INVALID_PAGE_ID {
+            if !seen.insert(page_id) {
+                tracing::error!(
+                    table,
+                    page_id,
+                    pages_walked = pages.len(),
+                    "table_pages: cyclic page chain detected — the same page was visited twice"
+                );
+                return Err(StorageError::Io(format!(
+                    "table_pages({table}): cyclic page chain detected at page {page_id}"
+                )));
+            }
             pages.push(page_id);
             let frame_id = self
                 .pool
