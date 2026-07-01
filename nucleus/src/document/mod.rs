@@ -916,6 +916,29 @@ impl DocumentStore {
         self.next_id = snap.next_id;
     }
 
+    /// Checkpoint the WAL: write the current hot-tier state as a single
+    /// snapshot entry and truncate the log to just that entry. No-op if no
+    /// WAL is attached.
+    ///
+    /// Only hot-tier (`self.docs`) documents need to be in the snapshot.
+    /// Documents evicted to the cold LsmTree tier (see `maybe_evict`)
+    /// persist independently of this WAL — `cold.put()` is durable on its
+    /// own, so truncating away a since-evicted document's original
+    /// `log_insert` entry here does not lose data (`test_reopen_...`-style
+    /// coverage for this invariant already exists for the KV store, whose
+    /// hot/cold split works the same way).
+    pub fn checkpoint(&self) -> std::io::Result<()> {
+        if let Some(ref wal) = self.wal {
+            let docs: Vec<(u64, Vec<u8>)> = self
+                .docs
+                .iter()
+                .map(|(id, doc)| (*id, jsonb_encode(doc)))
+                .collect();
+            wal.checkpoint(&docs)?;
+        }
+        Ok(())
+    }
+
     // ========================================================================
     // Cold tier helpers
     // ========================================================================
@@ -1834,6 +1857,35 @@ mod tests {
             doc2.get_path(&["name"]),
             Some(&JsonValue::Str("Bob".to_string()))
         );
+    }
+
+    /// `checkpoint()` must truncate the WAL file (bounding its on-disk
+    /// growth — see the 2026-06-30 CdcLog OOM this mirrors) and documents
+    /// must still survive a reopen afterward.
+    #[test]
+    fn test_wal_checkpoint_truncates_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("doc.wal");
+        {
+            let mut store = DocumentStore::open(dir.path()).unwrap();
+            for i in 0..100 {
+                store.insert(json_obj(vec![("n", JsonValue::Number(i as f64))]));
+            }
+            let size_before = std::fs::metadata(&wal_path).unwrap().len();
+            for id in 4..=100 {
+                store.delete(id);
+            }
+            store.checkpoint().unwrap();
+            let size_after = std::fs::metadata(&wal_path).unwrap().len();
+            assert!(
+                size_after < size_before,
+                "checkpoint should shrink the WAL: before={size_before} after={size_after}"
+            );
+        }
+        let store2 = DocumentStore::open(dir.path()).unwrap();
+        assert_eq!(store2.len(), 3);
+        assert!(store2.get(1).is_some());
+        assert!(store2.get(100).is_none());
     }
 
     #[test]

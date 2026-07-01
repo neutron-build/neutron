@@ -1110,12 +1110,55 @@ async fn cmd_start(cfg: StartConfig) {
                     task.priority
                 );
                 match &task.task {
-                    nucleus::background::BackgroundTask::BufferFlush
-                    | nucleus::background::BackgroundTask::WalCheckpoint => {
+                    nucleus::background::BackgroundTask::BufferFlush => {
                         if let Some(ref engine) = disk_for_workers
                             && let Err(e) = engine.flush()
                         {
                             tracing::warn!("Background flush failed: {e}");
+                        }
+                    }
+                    nucleus::background::BackgroundTask::WalCheckpoint => {
+                        if let Some(ref engine) = disk_for_workers
+                            && let Err(e) = engine.flush()
+                        {
+                            tracing::warn!("Background flush failed: {e}");
+                        }
+                        // Truncate the specialty-store WALs (CDC, KV,
+                        // collections, blob, graph, document, streams, FTS)
+                        // to their current in-memory snapshot. Each of these
+                        // logs every write unconditionally with no consumer
+                        // or reader required — without periodic
+                        // checkpointing they grow one record per write
+                        // forever, on disk, regardless of activity. This is
+                        // what caused the 2026-06-30 observe-nucleus OOM
+                        // (CDC log in memory) and was already visibly
+                        // inflating kv.wal (493MB from a ~1.2GB dataset) on
+                        // that same host. Vector-index WAL checkpointing is
+                        // deliberately not wired here yet — building a
+                        // correct index snapshot needs new accessors on
+                        // HnswIndex and doesn't cover IvfFlat; see
+                        // vector/wal.rs::IndexSnapshot.
+                        if let Err(e) = executor_for_workers.checkpoint_cdc_wal() {
+                            tracing::warn!("CDC WAL checkpoint failed: {e}");
+                        }
+                        if let Err(e) = executor_for_workers.checkpoint_streams_wal() {
+                            tracing::warn!("Streams WAL checkpoint failed: {e}");
+                        }
+                        if let Err(e) = executor_for_workers.kv_store().checkpoint() {
+                            tracing::warn!("KV WAL checkpoint failed: {e}");
+                        }
+                        if let Err(e) = executor_for_workers.blob_store().read().checkpoint() {
+                            tracing::warn!("Blob WAL checkpoint failed: {e}");
+                        }
+                        if let Err(e) = executor_for_workers.graph_store().read().checkpoint_wal()
+                        {
+                            tracing::warn!("Graph WAL checkpoint failed: {e}");
+                        }
+                        if let Err(e) = executor_for_workers.doc_store().read().checkpoint() {
+                            tracing::warn!("Document WAL checkpoint failed: {e}");
+                        }
+                        if let Err(e) = executor_for_workers.fts_index().read().checkpoint_wal() {
+                            tracing::warn!("FTS WAL checkpoint failed: {e}");
                         }
                     }
                     nucleus::background::BackgroundTask::ReplicationSync => {
