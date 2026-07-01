@@ -1753,10 +1753,43 @@ impl Executor {
         &self.streams
     }
 
+    /// Checkpoint the streams WAL: writes a snapshot of the current stream
+    /// state and truncates the WAL file to just that snapshot.
+    ///
+    /// `STREAM_XADD` logs to this WAL unconditionally on every call (see
+    /// `scalar_fns.rs`) with no consumer required — same unbounded-growth
+    /// shape as the CDC WAL this mirrors (`checkpoint_cdc_wal`). Called from
+    /// the recurring `WalCheckpoint` background task.
+    pub fn checkpoint_streams_wal(&self) -> std::io::Result<()> {
+        if let Some(ref wal) = self.streams_wal {
+            let streams = self.streams.read();
+            wal.checkpoint(&streams)?;
+        }
+        Ok(())
+    }
+
     /// Get a reference to the CDC log.
     #[cfg(feature = "server")]
     pub fn cdc_log(&self) -> &parking_lot::RwLock<crate::reactive::CdcLog> {
         &self.cdc_log
+    }
+
+    /// Checkpoint the on-disk CDC WAL: writes a snapshot of the current
+    /// in-memory log and truncates the WAL file to just that snapshot.
+    ///
+    /// `notify_change_rows` appends to the CDC WAL unconditionally on every
+    /// row-level write, with no consumer required — without periodic
+    /// checkpointing the WAL file grows by one record per write forever,
+    /// the on-disk counterpart of the in-memory `CdcLog::MAX_EVENTS` cap.
+    /// Called from the recurring `WalCheckpoint` background task
+    /// (`main.rs`) on the same cadence as the primary storage WAL.
+    #[cfg(feature = "server")]
+    pub fn checkpoint_cdc_wal(&self) -> std::io::Result<()> {
+        if let Some(ref wal) = self.cdc_wal {
+            let log = self.cdc_log.read();
+            wal.checkpoint(&log)?;
+        }
+        Ok(())
     }
 
     /// Get a reference to the distributed pub/sub router.

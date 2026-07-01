@@ -388,7 +388,7 @@ pub struct CdcLogEntry {
 
 /// CDC log — ordered log of changes with consumer tracking.
 pub struct CdcLog {
-    events: Vec<CdcLogEntry>,
+    events: VecDeque<CdcLogEntry>,
     /// consumer_name → last consumed sequence
     consumers: HashMap<String, u64>,
     next_sequence: u64,
@@ -401,11 +401,31 @@ impl Default for CdcLog {
 }
 
 impl CdcLog {
+    /// Hard cap on retained events. Every write to any table appends here
+    /// unconditionally (see `Executor::notify_change_rows`), regardless of
+    /// whether anything is reading — so without a cap this is an unbounded
+    /// in-memory log that grows one entry per statement for the life of the
+    /// process. A sustained burst of single-row writes (e.g. a tracing/log
+    /// ingest path doing one INSERT per event) turns that into tens of GB of
+    /// RSS in minutes despite a tiny on-disk footprint. Bounding it trades
+    /// unlimited backlog for a fixed ~tens-of-MB ceiling; a consumer that
+    /// falls more than this many events behind loses entries, same tradeoff
+    /// every bounded change log (Kafka retention, replication slots) makes.
+    const MAX_EVENTS: usize = 100_000;
+
     pub fn new() -> Self {
         Self {
-            events: Vec::new(),
+            events: VecDeque::new(),
             consumers: HashMap::new(),
             next_sequence: 1,
+        }
+    }
+
+    /// Drop the oldest events past `MAX_EVENTS` so the log can't grow
+    /// without bound. Called after every append and recovered-append.
+    fn enforce_cap(&mut self) {
+        while self.events.len() > Self::MAX_EVENTS {
+            self.events.pop_front();
         }
     }
 
@@ -424,13 +444,14 @@ impl CdcLog {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        self.events.push(CdcLogEntry {
+        self.events.push_back(CdcLogEntry {
             sequence: seq,
             table: table.to_string(),
             change_type,
             row_data,
             timestamp: ts,
         });
+        self.enforce_cap();
 
         seq
     }
@@ -500,13 +521,14 @@ impl CdcLog {
         row_data: HashMap<String, String>,
         timestamp: u64,
     ) {
-        self.events.push(CdcLogEntry {
+        self.events.push_back(CdcLogEntry {
             sequence,
             table: table.to_string(),
             change_type,
             row_data,
             timestamp,
         });
+        self.enforce_cap();
         if sequence >= self.next_sequence {
             self.next_sequence = sequence + 1;
         }
@@ -553,9 +575,15 @@ impl CdcEvent {
 pub struct CdcStream {
     pub name: String,
     pub tables: HashSet<String>,
-    pub events: Vec<CdcEvent>,
+    pub events: VecDeque<CdcEvent>,
     pub cursor: u64,
     pub created_at_ms: u64,
+    /// Count of events evicted from the front once `events` exceeded
+    /// `CdcManager::MAX_EVENTS_PER_STREAM`. `poll`'s cursor is expressed in
+    /// "total events ever emitted" space (`dropped + events.len()`), not raw
+    /// `events` indices, so eviction can't shift a live consumer's cursor
+    /// onto the wrong event the way a naive capped `Vec` would.
+    dropped: u64,
 }
 
 /// Manager for multiple CDC streams.
@@ -570,6 +598,15 @@ impl Default for CdcManager {
 }
 
 impl CdcManager {
+    /// Hard cap on retained events per stream. `emit()` appends to every
+    /// stream matching the changed table unconditionally, with no consumer
+    /// required — the same unbounded-growth shape that caused the CdcLog OOM
+    /// (see `CdcLog::MAX_EVENTS`). This type isn't wired into any SQL path
+    /// today (`CREATE STREAM`/CDC streams are not yet exposed), but it's
+    /// public API and the bug is latent until someone wires it up, so it
+    /// gets the same bound now rather than waiting for a repeat incident.
+    const MAX_EVENTS_PER_STREAM: usize = 100_000;
+
     /// Create an empty CDC manager.
     pub fn new() -> Self {
         Self {
@@ -589,9 +626,10 @@ impl CdcManager {
             CdcStream {
                 name: name.to_string(),
                 tables,
-                events: Vec::new(),
+                events: VecDeque::new(),
                 cursor: 0,
                 created_at_ms: now,
+                dropped: 0,
             },
         );
     }
@@ -606,23 +644,31 @@ impl CdcManager {
         let table = event.table().to_string();
         for stream in self.streams.values_mut() {
             if stream.tables.contains(&table) {
-                stream.events.push(event.clone());
+                stream.events.push_back(event.clone());
+                while stream.events.len() > Self::MAX_EVENTS_PER_STREAM {
+                    stream.events.pop_front();
+                    stream.dropped += 1;
+                }
             }
         }
     }
 
     /// Poll a stream for events starting at the given cursor position.
-    /// Returns the matching events and the new cursor value.
+    /// Returns the matching events and the new cursor value. `cursor` is in
+    /// "total events ever emitted" space, so it stays meaningful even after
+    /// older events have been evicted by the retention cap — a consumer that
+    /// fell more than `MAX_EVENTS_PER_STREAM` behind silently skips forward
+    /// to the oldest still-retained event, the same tradeoff `CdcLog` makes.
     pub fn poll(&self, stream_name: &str, cursor: u64) -> (Vec<CdcEvent>, u64) {
         match self.streams.get(stream_name) {
             Some(stream) => {
-                let start = cursor as usize;
-                if start >= stream.events.len() {
+                let total = stream.dropped + stream.events.len() as u64;
+                if cursor >= total {
                     return (Vec::new(), cursor);
                 }
-                let events: Vec<CdcEvent> = stream.events[start..].to_vec();
-                let new_cursor = stream.events.len() as u64;
-                (events, new_cursor)
+                let start = cursor.saturating_sub(stream.dropped) as usize;
+                let events: Vec<CdcEvent> = stream.events.iter().skip(start).cloned().collect();
+                (events, total)
             }
             None => (Vec::new(), cursor),
         }
@@ -787,6 +833,32 @@ mod tests {
         let pending = cdc.read_from(cdc.consumer_position("app1"), 100);
         assert_eq!(pending.len(), 1); // Only s3
         assert_eq!(pending[0].table, "users");
+    }
+
+    /// A sustained burst of writes (e.g. one INSERT per event on a tracing
+    /// ingest path) must not grow the in-memory CDC log without bound —
+    /// this reproduces the 2026-06-30 observe-nucleus OOM (29.9GB RSS from
+    /// ~1.2GB on disk after a burst of single-row autocommit inserts).
+    #[test]
+    fn cdc_log_bounded_under_sustained_append() {
+        let mut cdc = CdcLog::new();
+
+        for i in 0..(CdcLog::MAX_EVENTS * 3) {
+            cdc.append(
+                "spans",
+                ChangeType::Insert,
+                make_row(&[("id", &i.to_string())]),
+            );
+        }
+
+        assert_eq!(
+            cdc.len(),
+            CdcLog::MAX_EVENTS,
+            "CDC log must stay capped at MAX_EVENTS regardless of append volume"
+        );
+        // The oldest entries were evicted; the newest sequence is preserved.
+        let newest = cdc.read_from(0, usize::MAX);
+        assert_eq!(newest.last().unwrap().sequence, (CdcLog::MAX_EVENTS * 3) as u64);
     }
 
     #[test]
@@ -1120,6 +1192,61 @@ mod tests {
         let (events_none, cursor_none) = mgr.poll("nonexistent", 0);
         assert!(events_none.is_empty());
         assert_eq!(cursor_none, 0);
+    }
+
+    /// A CDC stream must not grow without bound under sustained emit volume
+    /// (same failure shape as the 2026-06-30 CdcLog OOM), and — unlike a
+    /// naive capped `Vec` — eviction must not corrupt a live consumer's
+    /// cursor: a caught-up consumer should see only the newly emitted tail,
+    /// not a re-shuffled slice of already-seen events.
+    #[test]
+    fn cdc_stream_bounded_under_sustained_emit_with_correct_cursor() {
+        let mut mgr = CdcManager::new();
+        mgr.create_stream("s1", tables(&["orders"]));
+
+        let total_emitted = CdcManager::MAX_EVENTS_PER_STREAM * 3;
+        for i in 0..total_emitted {
+            mgr.emit(CdcEvent::Insert {
+                table: "orders".into(),
+                row_id: i as u64,
+                data: make_row(&[("id", &i.to_string())]),
+            });
+        }
+
+        assert_eq!(
+            mgr.get_stream("s1").unwrap().events.len(),
+            CdcManager::MAX_EVENTS_PER_STREAM,
+            "stream must stay capped regardless of emit volume"
+        );
+
+        // A consumer polling from 0 must land exactly on the oldest
+        // retained event, with a cursor in "total emitted" space — not a
+        // stale index into the pre-eviction vector.
+        let (events, cursor) = mgr.poll("s1", 0);
+        assert_eq!(events.len(), CdcManager::MAX_EVENTS_PER_STREAM);
+        assert_eq!(cursor, total_emitted as u64);
+        match &events[0] {
+            CdcEvent::Insert { row_id, .. } => {
+                assert_eq!(*row_id, (total_emitted - CdcManager::MAX_EVENTS_PER_STREAM) as u64);
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+
+        // A caught-up consumer emitting one more event sees exactly that
+        // one event, not a re-shuffled batch — proves eviction didn't shift
+        // the cursor's meaning.
+        mgr.emit(CdcEvent::Insert {
+            table: "orders".into(),
+            row_id: 999_999,
+            data: make_row(&[("id", "999999")]),
+        });
+        let (events2, cursor2) = mgr.poll("s1", cursor);
+        assert_eq!(events2.len(), 1);
+        assert_eq!(cursor2, total_emitted as u64 + 1);
+        match &events2[0] {
+            CdcEvent::Insert { row_id, .. } => assert_eq!(*row_id, 999_999),
+            other => panic!("expected Insert, got {other:?}"),
+        }
     }
 
     #[test]
