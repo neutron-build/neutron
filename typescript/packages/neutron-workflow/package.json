@@ -1,0 +1,66 @@
+{
+  "name": "@neutron-build/workflow",
+  "version": "0.1.0",
+  "description": "Durable workflow engine for Neutron. Event-sourced replay on Nucleus: workflows that suspend, survive restarts, and resume days later.",
+  "author": "Tyler",
+  "license": "MIT",
+  "homepage": "https://neutron.build",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/neutron-build/neutron",
+    "directory": "typescript/packages/neutron-workflow"
+  },
+  "keywords": [
+    "neutron",
+    "workflow",
+    "durable-execution",
+    "event-sourcing",
+    "replay",
+    "nucleus"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./ai": {
+      "types": "./dist/ai/index.d.ts",
+      "import": "./dist/ai/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "tsc --noEmit --pretty false",
+    "typecheck": "tsc --noEmit",
+    "test": "pnpm run build && node --test --experimental-test-isolation=none \"dist/**/*.test.js\""
+  },
+  "peerDependencies": {
+    "@neutron-build/ai": "^0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@neutron-build/ai": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@neutron-build/ai": "workspace:^",
+    "@neutron-build/nucleus": "workspace:^",
+    "@types/node": "^22.10.7",
+    "typescript": "^5.7.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

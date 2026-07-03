@@ -1,0 +1,129 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+import { createEventsHandler } from "./events-http.js";
+import { LeaseManager, type KVLike } from "./lease.js";
+import { executeRun } from "./run.js";
+import { RunIndex, Scheduler, type DocumentLike } from "./scheduler.js";
+import { MemoryEventStore } from "./store.js";
+import { workflow } from "./workflow.js";
+
+function fakeDocs(): DocumentLike {
+  const docs: Array<Record<string, unknown>> = [];
+  const matches = (doc: Record<string, unknown>, filter: Record<string, unknown>) =>
+    Object.entries(filter).every(([key, value]) => doc[key] === value);
+  return {
+    async insert(_collection, doc) {
+      docs.push({ ...doc });
+      return docs.length;
+    },
+    async find(_collection, filter) {
+      return docs.filter((doc) => matches(doc, filter)).map((doc) => ({ ...doc }));
+    },
+    async update(_collection, filter, update) {
+      let count = 0;
+      for (const doc of docs) {
+        if (matches(doc, filter)) {
+          Object.assign(doc, update);
+          count += 1;
+        }
+      }
+      return count;
+    },
+  };
+}
+
+function simpleKV(): KVLike {
+  const map = new Map<string, string>();
+  return {
+    async setNX(key, value) {
+      if (map.has(key)) return false;
+      map.set(key, value);
+      return true;
+    },
+    async cdel(key, expected) {
+      if (map.get(key) !== expected) return false;
+      map.delete(key);
+      return true;
+    },
+    async cexpire(key, expected) {
+      return map.get(key) === expected;
+    },
+  };
+}
+
+function harness() {
+  const store = new MemoryEventStore();
+  const index = new RunIndex(fakeDocs());
+  const leases = new LeaseManager(simpleKV(), { ttlSeconds: 30 });
+  return { store, index, leases };
+}
+
+test("scheduler wakes due sleepers and completes them", async () => {
+  const { store, index, leases } = harness();
+  const wf = workflow("nightly", async (ctx) => {
+    await ctx.step("work", () => "did work");
+    await ctx.sleep("1h");
+    return "done";
+  });
+
+  const outcome = await executeRun({ workflow: wf, runId: "run-1", store, input: null });
+  await index.record("run-1", wf.name, outcome);
+  const scheduler = new Scheduler({ workflows: [wf], store, leases, index, owner: "worker-1" });
+
+  // before the wake time: nothing happens
+  await scheduler.tick(new Date(Date.now() + 60_000));
+  assert.equal((await store.load("run-1")).some((e) => e.type === "run-completed"), false);
+
+  // past the wake time: the run resumes and completes
+  await scheduler.tick(new Date(Date.now() + 2 * 3_600_000));
+  const events = await store.load("run-1");
+  assert.equal(events.some((e) => e.type === "run-completed"), true);
+
+  // and the index reflects it — a further tick finds nothing due
+  await scheduler.tick(new Date(Date.now() + 3 * 3_600_000));
+  assert.deepEqual(await index.due(new Date(Date.now() + 4 * 3_600_000)), []);
+});
+
+test("the events handler delivers, flags the run, and the next tick resumes it", async () => {
+  const { store, index, leases } = harness();
+  const wf = workflow("approval", async (ctx) => {
+    const decision = await ctx.waitForEvent<{ ok: boolean }>("decision");
+    return decision.ok ? "approved" : "rejected";
+  });
+
+  const outcome = await executeRun({ workflow: wf, runId: "run-1", store, input: null });
+  await index.record("run-1", wf.name, outcome);
+  assert.equal(outcome.status, "waiting");
+
+  const handler = createEventsHandler({ store, index });
+  const response = await handler(
+    new Request("http://x/events", {
+      method: "POST",
+      body: JSON.stringify({ runId: "run-1", name: "decision", payload: { ok: true } }),
+    }),
+  );
+  assert.equal(response.status, 202);
+
+  const scheduler = new Scheduler({ workflows: [wf], store, leases, index, owner: "worker-1" });
+  await scheduler.tick();
+  const events = await store.load("run-1");
+  assert.equal(events.some((e) => e.type === "run-completed"), true);
+});
+
+test("the events handler maps errors to problem details", async () => {
+  const { store, index } = harness();
+  const handler = createEventsHandler({ store, index });
+
+  const missing = await handler(
+    new Request("http://x/events", { method: "POST", body: JSON.stringify({ runId: "ghost", name: "x" }) }),
+  );
+  assert.equal(missing.status, 404);
+  assert.equal(missing.headers.get("content-type"), "application/problem+json");
+
+  const badBody = await handler(new Request("http://x/events", { method: "POST", body: "not json" }));
+  assert.equal(badBody.status, 400);
+
+  const wrongMethod = await handler(new Request("http://x/events", { method: "GET" }));
+  assert.equal(wrongMethod.status, 400);
+});
