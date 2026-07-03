@@ -215,7 +215,7 @@ impl LruKReplacer {
     /// corrupted an on-disk page-chain "next" pointer into a self-loop,
     /// hanging any table scan holding the buffer pool under eviction
     /// pressure). Retry against a fresh scan when the race is lost.
-    fn evict(&self) -> Option<u32> {
+    fn evict_where<F: Fn(u32) -> bool>(&self, claimable: F) -> Option<u32> {
         loop {
             let current_ts = self.current_ts.load(Ordering::Relaxed);
 
@@ -228,7 +228,7 @@ impl LruKReplacer {
             for (si, shard_lock) in self.shards.iter().enumerate() {
                 let shard = shard_lock.lock();
                 for (&frame_id, history) in shard.iter() {
-                    if !history.is_evictable {
+                    if !history.is_evictable || !claimable(frame_id) {
                         continue;
                     }
 
@@ -274,15 +274,24 @@ impl LruKReplacer {
             // place rather than removing it, so a plain `remove()` here
             // would blindly hand out a frame that's actively in use again,
             // racing its content against whatever the new pinner reads.
-            // Only claim it if it's both present AND still evictable.
+            // Only claim it if it's present, still evictable, AND the
+            // caller's predicate approves. The predicate is how the buffer
+            // pool vetoes frames whose pin_count is nonzero: `unpin` sets
+            // evictable=true outside the eviction lock, so a stale
+            // set_evictable(true) can land AFTER a concurrent pinner
+            // re-pinned the frame — the flag alone cannot be trusted.
             let mut shard = self.shards[best_shard].lock();
-            let should_claim = matches!(shard.get(&frame_id), Some(entry) if entry.is_evictable);
+            let should_claim = matches!(shard.get(&frame_id), Some(entry) if entry.is_evictable)
+                && claimable(frame_id);
             if should_claim {
                 shard.remove(&frame_id);
                 return Some(frame_id);
             }
             drop(shard);
-            // Lost the race for this candidate — rescan for another one.
+            // Lost the race for this candidate — rescan. The scan itself
+            // also applies the predicate, so a still-pinned frame won't be
+            // re-selected; if every flagged frame is vetoed the scan
+            // returns None (PoolFull), which is the correct semantics.
         }
     }
 
@@ -452,14 +461,26 @@ impl BufferPool {
             // evictor — it has no page_table or replacer entry until we
             // register it below) — just the plain partition lock `insert()`
             // uses, so only the winner registers.
+            // Set up the descriptor BEFORE publishing the page_table mapping
+            // (same order new_page uses). The moment the insert below lands,
+            // a concurrent pin_if_present can find this frame and fetch_add
+            // its pin_count — a store(1) issued after that would erase that
+            // caller's pin, letting the frame be evicted and repurposed while
+            // they are still reading it.
+            let desc = &self.descriptors[frame_id as usize];
+            desc.page_id.store(page_id, Ordering::Release);
+            desc.pin_count.store(1, Ordering::Release);
+            desc.is_dirty.store(false, Ordering::Release);
+
             let part_idx = self.page_table.partition_for(page_id);
             let mut part = self.page_table.partitions[part_idx].lock();
             if part.get(&page_id).is_some() {
                 // Lost the second race — someone else's load already won.
-                // Our own frame never had its descriptor set up (page_id/
-                // pin_count/is_dirty untouched), so it's safe to return
-                // straight to the free list without resetting anything.
+                // The frame was never published, so the descriptor is still
+                // exclusively ours: reset it before freeing.
                 drop(part);
+                desc.pin_count.store(0, Ordering::Release);
+                desc.page_id.store(INVALID_PAGE_ID, Ordering::Release);
                 self.free_list.lock().push(frame_id);
                 // Re-resolve via pin_if_present rather than trusting the
                 // frame_id observed above — in the (astronomically rare)
@@ -476,12 +497,6 @@ impl BufferPool {
             }
             part.insert(page_id, frame_id);
             drop(part);
-
-            // Setup descriptor
-            let desc = &self.descriptors[frame_id as usize];
-            desc.page_id.store(page_id, Ordering::Release);
-            desc.pin_count.store(1, Ordering::Release);
-            desc.is_dirty.store(false, Ordering::Release);
 
             // Track in replacer
             self.replacer.record_access(frame_id);
@@ -866,7 +881,20 @@ impl BufferPool {
         let _guard = self.eviction_lock.lock();
 
         // Evict
-        let frame_id = self.replacer.evict().ok_or(BufferError::PoolFull)?;
+        // The predicate vetoes frames still pinned: `unpin`'s
+        // set_evictable(true) runs outside `eviction_lock`, so a stale flag
+        // can mark a re-pinned frame evictable. We hold `eviction_lock` here
+        // and every pin path (pin_if_present) also takes it, so a frame
+        // observed unpinned in this check cannot gain a pin until we're done.
+        let frame_id = self
+            .replacer
+            .evict_where(|fid| {
+                self.descriptors[fid as usize]
+                    .pin_count
+                    .load(Ordering::Acquire)
+                    == 0
+            })
+            .ok_or(BufferError::PoolFull)?;
         self.stats.evictions.fetch_add(1, Ordering::Relaxed);
 
         let desc = &self.descriptors[frame_id as usize];
