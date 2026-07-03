@@ -170,16 +170,29 @@ impl Wal {
             .truncate(false)
             .open(path)?;
 
-        // Determine next LSN by scanning existing WAL records.
+        // Determine next LSN by scanning existing WAL records, and position
+        // the writer AFTER the last valid record. The old code left the
+        // write cursor at byte 0, so every reopen+append overwrote the head
+        // of the existing log — shredding old records and producing CRC
+        // "corruption" at fixed LSNs on every subsequent startup replay.
+        let mut file = file;
         let file_len = file.metadata()?.len();
         let next_lsn = if file_len == 0 {
             1
         } else {
-            // Scan the WAL to find the max LSN and continue from there.
-            let records = read_wal_records(path).unwrap_or_default();
-            let max = max_lsn(&records);
-            max + 1
+            let (records, last_good_end) = read_wal_records_with_end(path).unwrap_or_default();
+            if last_good_end < file_len {
+                // Torn tail from a crash (or trailing garbage): repair it
+                // now so appends never land after invalid bytes.
+                tracing::warn!(
+                    "WAL: truncating {} bytes of invalid tail after last valid record (offset {last_good_end})",
+                    file_len - last_good_end
+                );
+                file.set_len(last_good_end)?;
+            }
+            max_lsn(&records) + 1
         };
+        file.seek(SeekFrom::End(0))?;
 
         Ok(Self {
             writer: Mutex::new(BufWriter::new(file)),
@@ -356,9 +369,18 @@ impl Wal {
 
 /// Read all WAL records from a file for crash recovery.
 pub fn read_wal_records(path: &Path) -> std::io::Result<Vec<WalRecord>> {
+    Ok(read_wal_records_with_end(path)?.0)
+}
+
+/// Read all WAL records plus the byte offset just past the last VALID
+/// record. `Wal::open` truncates the file to that offset and appends from
+/// there — repairing a torn tail from a crash instead of leaving garbage
+/// that later replays report as corruption.
+pub fn read_wal_records_with_end(path: &Path) -> std::io::Result<(Vec<WalRecord>, u64)> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut records = Vec::new();
+    let mut last_good_end: u64 = 0;
     let mut pos: u64 = 0;
 
     while pos + 4 <= file_len {
@@ -448,9 +470,10 @@ pub fn read_wal_records(path: &Path) -> std::io::Result<Vec<WalRecord>> {
         });
 
         pos += record_len as u64;
+        last_good_end = pos;
     }
 
-    Ok(records)
+    Ok((records, last_good_end))
 }
 
 /// Determine the maximum LSN in a set of WAL records.
@@ -989,6 +1012,62 @@ mod tests {
     // Regression: a corrupt control record must be skipped by exactly its own
     // length so the records AFTER it still recover. The skip used to advance by
     // `4 + record_len`, over-shooting by 4 and silently losing the rest of the WAL.
+    #[test]
+    fn wal_open_repairs_torn_tail_and_appends_cleanly() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("torn.wal");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_commit(1).unwrap();
+            wal.log_commit(2).unwrap();
+            wal.sync().unwrap();
+        }
+        // Simulate a crash mid-append: valid length prefix, torn payload.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
+            f.write_all(&(CONTROL_RECORD_SIZE as u32).to_le_bytes()).unwrap();
+            f.write_all(&[0xAB; 7]).unwrap(); // partial header, then crash
+            f.sync_all().unwrap();
+        }
+        // Reopen: the torn tail is truncated, the next append lands cleanly,
+        // and replay recovers every record with no CRC corruption.
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_commit(3).unwrap();
+            wal.sync().unwrap();
+        }
+        let records = read_wal_records(&wal_path).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records.iter().map(|r| r.txn_id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        // And it stays clean across further restarts (the fixed-LSN symptom).
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_commit(4).unwrap();
+            wal.sync().unwrap();
+        }
+        assert_eq!(read_wal_records(&wal_path).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn wal_reopen_append_must_not_overwrite_existing_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("reopen.wal");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_commit(1).unwrap();
+            wal.log_commit(2).unwrap();
+            wal.sync().unwrap();
+        }
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log_commit(3).unwrap();
+            wal.sync().unwrap();
+        }
+        let records = read_wal_records(&wal_path).unwrap();
+        assert_eq!(records.len(), 3, "reopen+append clobbered earlier records: got {:?}", records.iter().map(|r| r.txn_id).collect::<Vec<_>>());
+    }
+
     #[test]
     fn wal_replay_continues_past_corrupt_control_record() {
         use std::io::{Seek, SeekFrom, Write};
