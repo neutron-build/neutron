@@ -344,6 +344,39 @@ importers:
         specifier: ^2.1.8
         version: 2.1.9(@types/node@22.19.11)(happy-dom@17.6.3)
 
+  packages/neutron-agents:
+    devDependencies:
+      '@neutron-build/ai':
+        specifier: workspace:^
+        version: link:../neutron-ai
+      '@neutron-build/workflow':
+        specifier: workspace:^
+        version: link:../neutron-workflow
+      '@types/node':
+        specifier: ^22.10.7
+        version: 22.19.11
+      typescript:
+        specifier: ^5.7.2
+        version: 5.7.2
+      zod:
+        specifier: ^3.25.76
+        version: 3.25.76
+
+  packages/neutron-ai:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.7
+        version: 22.19.11
+      preact:
+        specifier: ^10.25.4
+        version: 10.25.4
+      typescript:
+        specifier: ^5.7.2
+        version: 5.7.2
+      zod:
+        specifier: ^3.25.76
+        version: 3.25.76
+
   packages/neutron-auth:
     dependencies:
       '@neutron-build/core':
@@ -482,6 +515,21 @@ importers:
       typescript:
         specifier: ^5.7.2
         version: 5.9.3
+
+  packages/neutron-workflow:
+    devDependencies:
+      '@neutron-build/ai':
+        specifier: workspace:^
+        version: link:../neutron-ai
+      '@neutron-build/nucleus':
+        specifier: workspace:^
+        version: link:../neutron-nucleus
+      '@types/node':
+        specifier: ^22.10.7
+        version: 22.19.11
+      typescript:
+        specifier: ^5.7.2
+        version: 5.7.2
 
 packages:
 

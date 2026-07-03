@@ -1,8 +1,16 @@
 {
   "packageManager": "pnpm9",
   "packages": {
-    "count": 20,
+    "count": 22,
     "items": [
+      {
+        "name": "@neutron-build/agents",
+        "path": "packages/neutron-agents"
+      },
+      {
+        "name": "@neutron-build/ai",
+        "path": "packages/neutron-ai"
+      },
       {
         "name": "@neutron-build/auth",
         "path": "packages/neutron-auth"
@@ -40,6 +48,10 @@
         "path": "packages/neutron-security"
       },
       {
+        "name": "@neutron-build/workflow",
+        "path": "packages/neutron-workflow"
+      },
+      {
         "name": "@neutron/example-marketing-reference",
         "path": "examples/marketing-reference"
       },
@@ -54,10 +66,6 @@
       {
         "name": "@neutron/playground-react-compat",
         "path": "apps/playground-react-compat"
-      },
-      {
-        "name": "@neutron/tebian-os",
-        "path": "apps/tebian-os"
       },
       {
         "name": "codex",
