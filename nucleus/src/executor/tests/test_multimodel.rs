@@ -545,6 +545,65 @@ async fn test_kv_incr() {
 }
 
 #[tokio::test]
+async fn test_kv_setnx_with_ttl_atomic_acquire() {
+    let ex = test_executor();
+    // acquire with TTL in one call
+    let res = exec(&ex, "SELECT kv_setnx('lease', 'owner1', 3600)").await;
+    assert_eq!(scalar(&res[0]), &Value::Bool(true));
+    let res = exec(&ex, "SELECT kv_ttl('lease')").await;
+    match scalar(&res[0]) {
+        Value::Int64(ttl) => assert!(*ttl > 3500 && *ttl <= 3600, "expected ~3600, got {ttl}"),
+        other => panic!("expected Int64 ttl, got {other:?}"),
+    }
+    // contender fails and must not disturb value or TTL
+    let res = exec(&ex, "SELECT kv_setnx('lease', 'owner2', 10)").await;
+    assert_eq!(scalar(&res[0]), &Value::Bool(false));
+    let res = exec(&ex, "SELECT kv_get('lease')").await;
+    assert_eq!(scalar(&res[0]), &Value::Text("owner1".into()));
+    // NULL ttl means no expiry (backward-compatible 3-arg form)
+    let res = exec(&ex, "SELECT kv_setnx('plain', 'v', NULL)").await;
+    assert_eq!(scalar(&res[0]), &Value::Bool(true));
+    let res = exec(&ex, "SELECT kv_ttl('plain')").await;
+    assert_eq!(scalar(&res[0]), &Value::Int64(-1));
+}
+
+#[tokio::test]
+async fn test_kv_cdel_conditional_release() {
+    let ex = test_executor();
+    exec(&ex, "SELECT kv_setnx('lease', 'owner1', 3600)").await;
+    // wrong holder cannot release
+    let res = exec(&ex, "SELECT kv_cdel('lease', 'owner2')").await;
+    assert_eq!(scalar(&res[0]), &Value::Bool(false));
+    let res = exec(&ex, "SELECT kv_exists('lease')").await;
+    assert_eq!(scalar(&res[0]), &Value::Bool(true));
+    // right holder releases
+    let res = exec(&ex, "SELECT kv_cdel('lease', 'owner1')").await;
+    assert_eq!(scalar(&res[0]), &Value::Bool(true));
+    let res = exec(&ex, "SELECT kv_exists('lease')").await;
+    assert_eq!(scalar(&res[0]), &Value::Bool(false));
+    // missing key
+    let res = exec(&ex, "SELECT kv_cdel('lease', 'owner1')").await;
+    assert_eq!(scalar(&res[0]), &Value::Bool(false));
+}
+
+#[tokio::test]
+async fn test_kv_cexpire_conditional_renewal() {
+    let ex = test_executor();
+    exec(&ex, "SELECT kv_setnx('lease', 'owner1', 10)").await;
+    // wrong holder cannot renew
+    let res = exec(&ex, "SELECT kv_cexpire('lease', 'owner2', 3600)").await;
+    assert_eq!(scalar(&res[0]), &Value::Bool(false));
+    // right holder renews
+    let res = exec(&ex, "SELECT kv_cexpire('lease', 'owner1', 3600)").await;
+    assert_eq!(scalar(&res[0]), &Value::Bool(true));
+    let res = exec(&ex, "SELECT kv_ttl('lease')").await;
+    match scalar(&res[0]) {
+        Value::Int64(ttl) => assert!(*ttl > 3500 && *ttl <= 3600, "expected ~3600, got {ttl}"),
+        other => panic!("expected Int64 ttl, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_kv_setnx_and_dbsize() {
     let ex = test_executor();
     // SETNX on missing key

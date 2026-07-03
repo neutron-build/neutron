@@ -561,6 +561,18 @@ impl KvHandle<'_> {
     pub fn setnx(&self, key: &str, value: Value) -> bool {
         self.store.setnx(key, value)
     }
+    /// Atomic set-if-absent with TTL — the crash-safe lock acquire.
+    pub fn setnx_ttl(&self, key: &str, value: Value, ttl_secs: Option<u64>) -> bool {
+        self.store.setnx_ttl(key, value, ttl_secs)
+    }
+    /// Delete only if the current value equals `expected` — the safe lock release.
+    pub fn cdel(&self, key: &str, expected: &Value) -> bool {
+        self.store.cdel(key, expected)
+    }
+    /// Set TTL only if the current value equals `expected` — the lease renewal heartbeat.
+    pub fn cexpire(&self, key: &str, expected: &Value, ttl_secs: u64) -> bool {
+        self.store.cexpire(key, expected, ttl_secs)
+    }
 
     // ========================================================================
     // Collection operations (Lists, Hashes, Sets, Sorted Sets, HyperLogLog)

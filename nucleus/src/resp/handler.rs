@@ -410,8 +410,9 @@ impl RespHandler {
                 let key = require_arg!(args, 1);
                 let val = require_arg_bytes!(args, 2);
 
-                // Parse optional EX/PX/EXAT/PXAT modifiers.
+                // Parse optional NX/EX/PX/EXAT/PXAT modifiers.
                 let mut ttl_secs: Option<u64> = None;
+                let mut nx = false;
                 let mut i = 3;
                 while i < args.len() {
                     let modifier = String::from_utf8_lossy(&args[i]).to_uppercase();
@@ -435,7 +436,10 @@ impl RespHandler {
                                 ttl_secs = Some(ms.div_ceil(1000));
                             }
                         }
-                        "NX" | "XX" | "KEEPTTL" | "GET" | "EXAT" | "PXAT" => {
+                        "NX" => {
+                            nx = true;
+                        }
+                        "XX" | "KEEPTTL" | "GET" | "EXAT" | "PXAT" => {
                             // Accepted but not fully implemented -- skip.
                         }
                         _ => {}
@@ -444,8 +448,18 @@ impl RespHandler {
                 }
 
                 let value = Value::Text(String::from_utf8_lossy(val).to_string());
-                self.kv.set(key, value, ttl_secs);
-                encoder::encode_simple_string("OK")
+                if nx {
+                    // SET key val NX [EX ttl] — atomic set-if-absent; Redis
+                    // replies nil when the key already exists.
+                    if self.kv.setnx_ttl(key, value, ttl_secs) {
+                        encoder::encode_simple_string("OK")
+                    } else {
+                        encoder::encode_null_bulk()
+                    }
+                } else {
+                    self.kv.set(key, value, ttl_secs);
+                    encoder::encode_simple_string("OK")
+                }
             }
             "DEL" => {
                 if args.len() < 2 {
@@ -1995,6 +2009,29 @@ mod tests {
         assert_eq!(decode_int(&resp), 1);
         let resp = h.handle_command(args(&["SETNX", "lock", "2"]));
         assert_eq!(decode_int(&resp), 0);
+    }
+
+    #[test]
+    fn test_set_nx_ex() {
+        let mut h = new_handler();
+        // SET ... NX acquires atomically with its TTL
+        let resp = h.handle_command(args(&["SET", "lock", "owner1", "NX", "EX", "3600"]));
+        assert_eq!(decode_simple(&resp), "OK");
+        // second NX set replies nil and must not overwrite (this used to
+        // silently overwrite when NX was accepted-but-ignored)
+        let resp = h.handle_command(args(&["SET", "lock", "owner2", "NX"]));
+        assert_eq!(decode_bulk(&resp), None);
+        let resp = h.handle_command(args(&["GET", "lock"]));
+        assert_eq!(decode_bulk(&resp), Some("owner1".to_string()));
+        // TTL survived the failed contender
+        let resp = h.handle_command(args(&["TTL", "lock"]));
+        let ttl = decode_int(&resp);
+        assert!(ttl > 3500 && ttl <= 3600, "expected ~3600, got {ttl}");
+        // plain SET without NX still overwrites
+        let resp = h.handle_command(args(&["SET", "lock", "owner3"]));
+        assert_eq!(decode_simple(&resp), "OK");
+        let resp = h.handle_command(args(&["GET", "lock"]));
+        assert_eq!(decode_bulk(&resp), Some("owner3".to_string()));
     }
 
     #[test]

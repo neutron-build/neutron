@@ -640,6 +640,15 @@ impl KvStore {
 
     /// SETNX — set only if key doesn't exist. Returns true if set, false if already exists.
     pub fn setnx(&self, key: &str, value: Value) -> bool {
+        self.setnx_ttl(key, value, None)
+    }
+
+    /// SETNX with optional TTL — atomic set-if-absent-with-expiry under one
+    /// shard write lock (Redis `SET key val NX EX ttl`; the crash-safe lock
+    /// acquire). The value and its expiry are decided and WAL-logged inside
+    /// the same critical section, so a crash can never leave a lock without
+    /// its TTL.
+    pub fn setnx_ttl(&self, key: &str, value: Value, ttl_secs: Option<u64>) -> bool {
         let shard = self.data.shard(key);
         let mut data = shard.data.write();
         if let Some(entry) = data.get(key) {
@@ -652,20 +661,148 @@ impl KvStore {
             }
         }
         #[cfg(feature = "server")]
-        if let Some(ref wal) = self.wal
-            && let Err(e) = wal.log_set(key, &value)
-        {
-            tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+        if let Some(ref wal) = self.wal {
+            if let Err(e) = wal.log_set(key, &value) {
+                tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+            }
+            if let Some(secs) = ttl_secs {
+                let abs_ms = epoch_ms_now().saturating_add(secs.saturating_mul(1000));
+                if let Err(e) = wal.log_expire(key, abs_ms) {
+                    tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+                }
+            }
         }
+        // checked_add: a huge TTL would overflow Instant + Duration and
+        // panic; treat it as "never expires" (same rule as `set`).
+        let expires_at = ttl_secs.and_then(|s| Instant::now().checked_add(Duration::from_secs(s)));
         data.insert(
             key.to_string(),
             KvEntry {
                 value: Arc::new(value),
-                expires_at: None,
+                expires_at,
             },
         );
+        if let Some(exp) = expires_at {
+            shard.add_expiry(key, exp);
+        }
         self.bump_version();
         true
+    }
+
+    /// CDEL — delete `key` only if its current value equals `expected`; the
+    /// safe lock release (a holder whose lease already expired cannot delete
+    /// the next holder's lock). Expired entries count as absent. Compares
+    /// with the stored value's type — write lock values as text.
+    ///
+    /// Mirrors `del`'s cold-tier behavior: a hot miss promotes any cold copy
+    /// first (via the `get_arc` path), and a successful delete purges the
+    /// cold tier so a stale copy cannot resurrect. TTL'd keys (locks) never
+    /// evict to cold, so lock usage always takes the atomic hot path.
+    pub fn cdel(&self, key: &str, expected: &Value) -> bool {
+        enum Gate {
+            Missing,
+            Expired(Option<Instant>),
+            Mismatch,
+            Match(Option<Instant>),
+        }
+        for attempt in 0..2 {
+            let shard = self.data.shard(key);
+            let mut data = shard.data.write();
+            let gate = match data.get(key) {
+                None => Gate::Missing,
+                Some(entry) if entry.is_expired() => Gate::Expired(entry.expires_at),
+                Some(entry) if *entry.value != *expected => Gate::Mismatch,
+                Some(entry) => Gate::Match(entry.expires_at),
+            };
+            match gate {
+                Gate::Mismatch => return false,
+                Gate::Expired(old_exp) => {
+                    data.remove(key);
+                    if let Some(exp) = old_exp {
+                        shard.remove_expiry(key, exp);
+                    }
+                    return false;
+                }
+                Gate::Match(old_exp) => {
+                    #[cfg(feature = "server")]
+                    if let Some(ref wal) = self.wal
+                        && let Err(e) = wal.log_delete(key)
+                    {
+                        tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+                    }
+                    data.remove(key);
+                    if let Some(exp) = old_exp {
+                        shard.remove_expiry(key, exp);
+                    }
+                    drop(data);
+                    if let Some(ref cold) = self.cold {
+                        let mut c = cold.lock();
+                        if c.get(key.as_bytes()).is_some() {
+                            c.delete(key.as_bytes().to_vec());
+                        }
+                    }
+                    self.bump_version();
+                    return true;
+                }
+                Gate::Missing => {
+                    drop(data);
+                    // Hot miss: promote a possible cold-tier copy, then retry
+                    // the atomic hot path once.
+                    if attempt == 0 && self.cold.is_some() {
+                        if self.get_arc(key).is_none() {
+                            return false;
+                        }
+                        continue;
+                    }
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
+    /// CEXPIRE — set the TTL only if the current value equals `expected`;
+    /// the lease-renewal heartbeat (a holder whose lease was taken over
+    /// cannot extend the new holder's lock). Mirrors `expire`'s hot-tier
+    /// semantics; TTL'd keys never evict to cold.
+    pub fn cexpire(&self, key: &str, expected: &Value, ttl_secs: u64) -> bool {
+        let shard = self.data.shard(key);
+        let mut data = shard.data.write();
+        if let Some(entry) = data.get_mut(key) {
+            if entry.is_expired() {
+                if let Some(old_exp) = entry.expires_at {
+                    shard.remove_expiry(key, old_exp);
+                }
+                data.remove(key);
+                return false;
+            }
+            if *entry.value != *expected {
+                return false;
+            }
+            if let Some(old_exp) = entry.expires_at {
+                shard.remove_expiry(key, old_exp);
+            }
+            // checked_add: a huge TTL overflows Instant + Duration and panics.
+            // Treat an overflowing TTL as "never expires" (same rule as `expire`).
+            let Some(new_exp) = Instant::now().checked_add(Duration::from_secs(ttl_secs)) else {
+                entry.expires_at = None;
+                self.bump_version();
+                return true;
+            };
+            #[cfg(feature = "server")]
+            if let Some(ref wal) = self.wal {
+                let abs_ms = epoch_ms_now().saturating_add(ttl_secs.saturating_mul(1000));
+                if let Err(e) = wal.log_expire(key, abs_ms) {
+                    tracing::error!(target: "nucleus::kv::wal", "WAL write failed: {e}");
+                }
+            }
+            entry.expires_at = Some(new_exp);
+            shard.add_expiry(key, new_exp);
+            self.bump_version();
+            true
+        } else {
+            false
+        }
     }
 
     // ========================================================================
@@ -2136,6 +2273,101 @@ mod tests {
     // ========================================================================
     // WAL-backed KV store tests
     // ========================================================================
+
+    #[test]
+    fn setnx_ttl_atomic_acquire() {
+        let store = KvStore::new();
+        // acquire with TTL succeeds and carries the expiry
+        assert!(store.setnx_ttl("lock", Value::Text("owner-1".into()), Some(3600)));
+        let ttl = store.ttl("lock");
+        assert!(ttl > 3500 && ttl <= 3600, "expected ~3600, got {}", ttl);
+        // second acquire fails and does not disturb the TTL
+        assert!(!store.setnx_ttl("lock", Value::Text("owner-2".into()), Some(10)));
+        assert_eq!(store.get("lock"), Some(Value::Text("owner-1".into())));
+        let ttl = store.ttl("lock");
+        assert!(ttl > 3500, "owner-2's failed acquire must not shorten the TTL");
+        // no-TTL variant still behaves like plain setnx
+        assert!(store.setnx_ttl("plain", Value::Int64(1), None));
+        assert_eq!(store.ttl("plain"), -1);
+    }
+
+    #[test]
+    fn setnx_ttl_reacquires_expired_lock() {
+        let store = KvStore::new();
+        assert!(store.setnx_ttl("lock", Value::Text("owner-1".into()), Some(0)));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(store.setnx_ttl("lock", Value::Text("owner-2".into()), Some(3600)));
+        assert_eq!(store.get("lock"), Some(Value::Text("owner-2".into())));
+    }
+
+    #[test]
+    fn cdel_releases_only_matching_value() {
+        let store = KvStore::new();
+        store.set("lock", Value::Text("owner-1".into()), Some(3600));
+        // wrong holder cannot release
+        assert!(!store.cdel("lock", &Value::Text("owner-2".into())));
+        assert!(store.exists("lock"));
+        // wrong type does not match either
+        assert!(!store.cdel("lock", &Value::Int64(1)));
+        // right holder releases
+        assert!(store.cdel("lock", &Value::Text("owner-1".into())));
+        assert!(!store.exists("lock"));
+        // releasing a missing key is false
+        assert!(!store.cdel("lock", &Value::Text("owner-1".into())));
+    }
+
+    #[test]
+    fn cdel_treats_expired_as_absent() {
+        let store = KvStore::new();
+        store.set("lock", Value::Text("owner-1".into()), Some(0));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!store.cdel("lock", &Value::Text("owner-1".into())));
+    }
+
+    #[test]
+    fn cexpire_renews_only_matching_value() {
+        let store = KvStore::new();
+        store.set("lock", Value::Text("owner-1".into()), Some(10));
+        // wrong holder cannot renew
+        assert!(!store.cexpire("lock", &Value::Text("owner-2".into()), 3600));
+        let ttl = store.ttl("lock");
+        assert!(ttl <= 10, "failed renewal must not extend the TTL, got {}", ttl);
+        // right holder renews
+        assert!(store.cexpire("lock", &Value::Text("owner-1".into()), 3600));
+        let ttl = store.ttl("lock");
+        assert!(ttl > 3500 && ttl <= 3600, "expected ~3600, got {}", ttl);
+        // missing key is false
+        assert!(!store.cexpire("missing", &Value::Text("x".into()), 60));
+    }
+
+    #[test]
+    fn wal_setnx_ttl_reopen_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KvStore::open(dir.path()).unwrap();
+        assert!(store.setnx_ttl("lock", Value::Text("owner-1".into()), Some(3600)));
+        drop(store);
+
+        let store2 = KvStore::open(dir.path()).unwrap();
+        assert_eq!(store2.get("lock"), Some(Value::Text("owner-1".into())));
+        let ttl = store2.ttl("lock");
+        assert!(ttl > 3500 && ttl <= 3600, "TTL must survive recovery, got {}", ttl);
+    }
+
+    #[test]
+    fn wal_cdel_reopen_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KvStore::open(dir.path()).unwrap();
+        store.set("lock", Value::Text("owner-1".into()), Some(3600));
+        store.set("other", Value::Text("keep".into()), None);
+        // failed conditional delete must not be logged; successful one must be
+        assert!(!store.cdel("lock", &Value::Text("owner-2".into())));
+        assert!(store.cdel("lock", &Value::Text("owner-1".into())));
+        drop(store);
+
+        let store2 = KvStore::open(dir.path()).unwrap();
+        assert_eq!(store2.get("lock"), None);
+        assert_eq!(store2.get("other"), Some(Value::Text("keep".into())));
+    }
 
     #[test]
     fn wal_insert_reopen_verify() {
