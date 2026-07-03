@@ -346,3 +346,63 @@ All frameworks MUST:
 4. Run OnStop lifecycle hooks in reverse registration order
 5. Close database connections
 6. Exit cleanly
+
+## 9. Workflow Event-Log Wire Format (v1)
+
+Durable workflows (`@neutron-build/workflow` and future language SDKs)
+share one event-sourced log format so a run started by one SDK can be
+resumed by another. The log is the only state; replay is deterministic.
+
+**Storage:** one Nucleus stream per run — `wf:{runId}` — one entry per
+event: `STREAM_XADD('wf:{runId}', 'event', '<json>')`. Full-log reads use
+XRANGE from 0. Run metadata (queryable) lives in Document collection
+`wf_runs`; executor leases in KV under `wf:lease:{runId}` using
+`KV_SETNX(key, token, ttl)` / `KV_CEXPIRE` / `KV_CDEL`.
+
+**Event envelope (JSON):**
+
+```json
+{ "v": 1, "seq": 3, "type": "step-completed", "at": "2026-07-03T12:00:00Z",
+  "name": "charge", "data": { "result": { "ok": true } } }
+```
+
+- `v` — format version (this document describes v1).
+- `seq` — per-run, strictly increasing, assigned at append. Readers MUST
+  dedupe by seq keeping the FIRST entry in stream order (executor lease
+  races may append duplicates; effects are at-least-once).
+- `at` — ISO-8601 append time. Informational only: replay MUST NOT
+  branch on it.
+- `name` — step name, event name, or absent.
+
+**Event types.** CURSOR events record the workflow's own operations in
+execution order; replay walks them one-by-one and any type/name mismatch
+with the code is nondeterminism (fail the execution pass, NEVER the run):
+
+| type | name | data |
+|------|------|------|
+| `step-completed` | step | `{ result: any }` (JSON-normalized) |
+| `step-failed` | step | `{ error: { message }, attempt: n }` — attempts ≤ the step's retry budget replay as consumed retries; beyond it, as the terminal error |
+| `now` | — | `{ value: epoch_ms }` |
+| `random` | — | `{ value: float }` |
+| `sleep-started` | — | `{ until: ISO-8601 }` |
+| `event-waiting` | event | — |
+
+EXTERNAL events are appended from outside a suspended run and are
+rebuilt into FIFO buffers on replay (per name for `event-received`), so
+early signals buffer until consumed:
+
+| type | name | data |
+|------|------|------|
+| `sleep-completed` | — | — (wakes the oldest pending sleep) |
+| `event-received` | event | `{ payload: any }` |
+
+ENVELOPE events: `run-started` (`{ workflow, input }` — seq 0; input on
+resume comes from here, never the caller), `run-completed`
+(`{ output }`), `run-failed` (`{ error: { message } }`). Terminal events
+short-circuit idempotently, after validating the workflow name.
+
+**Determinism rules for SDK authors:** code between context calls must
+be deterministic; all I/O inside steps; step results and event payloads
+are observed post-JSON on first execution (never hand code a value JSON
+cannot round-trip); v1 workflows are sequential — no concurrent context
+operations within one run.
