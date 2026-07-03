@@ -756,8 +756,16 @@ impl HnswIndex {
                 .map(|c| (c.id, c.dist))
                 .collect();
 
-            if results.len() >= k || ef >= self.nodes.len() {
+            if results.len() >= k {
                 return results;
+            }
+            if ef >= self.nodes.len() {
+                // A graph traversal cannot reach disconnected layer-0
+                // components no matter how large ef gets — returning short
+                // results here skipped the guaranteed-recall fallback below
+                // (silently dropping filter-passing matches). Stop
+                // oversampling and use the fallbacks instead.
+                break;
             }
         }
 
