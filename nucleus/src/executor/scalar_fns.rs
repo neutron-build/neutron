@@ -2731,11 +2731,26 @@ impl Executor {
                 Ok(Value::Bool(self.kv_store.expire(&key, ttl)))
             }
             "KV_SETNX" => {
-                // kv_setnx(key, value) → true if set, false if already exists
-                require_args(fname, &args, 2)?;
+                // kv_setnx(key, value) or kv_setnx(key, value, ttl_secs)
+                // → true if set, false if already exists. With a TTL this is
+                // the atomic lock acquire (Redis SET NX EX): value and expiry
+                // commit in one critical section.
+                if args.len() < 2 || args.len() > 3 {
+                    return Err(ExecError::Unsupported(
+                        "KV_SETNX requires 2 or 3 arguments".into(),
+                    ));
+                }
                 let key = match &args[0] {
                     Value::Text(s) => s.clone(),
                     other => other.to_string(),
+                };
+                let ttl = if args.len() == 3 {
+                    match &args[2] {
+                        Value::Null => None,
+                        v => Some(val_to_u64(v, "KV_SETNX ttl")?),
+                    }
+                } else {
+                    None
                 };
                 let estimated = key.len() + Self::estimate_value_bytes(&args[1]) + 64;
                 if !self.memory_allocator.lock().request("kv", estimated) {
@@ -2744,12 +2759,40 @@ impl Executor {
                         estimated
                     )));
                 }
-                let was_set = self.kv_store.setnx(&key, args[1].clone());
+                let was_set = self.kv_store.setnx_ttl(&key, args[1].clone(), ttl);
                 if !was_set {
                     // Key already existed, release the reservation
                     self.memory_allocator.lock().release("kv", estimated);
                 }
                 Ok(Value::Bool(was_set))
+            }
+            "KV_CDEL" => {
+                // kv_cdel(key, expected) → true if the key held exactly
+                // `expected` and was deleted. The safe lock release.
+                require_args(fname, &args, 2)?;
+                let key = match &args[0] {
+                    Value::Text(s) => s.clone(),
+                    Value::Null => return Ok(Value::Bool(false)),
+                    other => other.to_string(),
+                };
+                let deleted = self.kv_store.cdel(&key, &args[1]);
+                if deleted {
+                    self.memory_allocator.lock().release("kv", key.len() + 96);
+                }
+                Ok(Value::Bool(deleted))
+            }
+            "KV_CEXPIRE" => {
+                // kv_cexpire(key, expected, ttl_secs) → true if the key held
+                // exactly `expected` and its TTL was updated. The lease
+                // renewal heartbeat.
+                require_args(fname, &args, 3)?;
+                let key = match &args[0] {
+                    Value::Text(s) => s.clone(),
+                    Value::Null => return Ok(Value::Bool(false)),
+                    other => other.to_string(),
+                };
+                let ttl = val_to_u64(&args[2], "KV_CEXPIRE ttl")?;
+                Ok(Value::Bool(self.kv_store.cexpire(&key, &args[1], ttl)))
             }
             "KV_DBSIZE" => {
                 // kv_dbsize() → count of non-expired keys

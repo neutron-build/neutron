@@ -35,11 +35,28 @@ export interface KVModel {
   /** JSON-stringify `value` and store it. */
   setTyped<T>(key: string, value: T, opts?: KVSetOptions): Promise<void>;
 
-  /** Set the key only if it does not already exist. Returns `true` if set. */
-  setNX(key: string, value: string): Promise<boolean>;
+  /**
+   * Set the key only if it does not already exist. Returns `true` if set.
+   * With `ttl`, value and expiry commit atomically (Redis `SET NX EX`) —
+   * the crash-safe lock acquire.
+   */
+  setNX(key: string, value: string, opts?: { ttl?: number }): Promise<boolean>;
 
   /** Delete a key. Returns `true` if it existed. */
   delete(key: string): Promise<boolean>;
+
+  /**
+   * Delete the key only if its current value equals `expected` — the safe
+   * lock release (a holder whose lease expired cannot delete the next
+   * holder's lock). Returns `true` if deleted.
+   */
+  cdel(key: string, expected: string): Promise<boolean>;
+
+  /**
+   * Set the TTL only if the current value equals `expected` — the lease
+   * renewal heartbeat. Returns `true` if renewed.
+   */
+  cexpire(key: string, expected: string, seconds: number): Promise<boolean>;
 
   /** Check whether a key exists. */
   exists(key: string): Promise<boolean>;
@@ -193,14 +210,31 @@ class KVModelImpl implements KVModel {
     await this.set(key, JSON.stringify(value), opts);
   }
 
-  async setNX(key: string, value: string): Promise<boolean> {
+  async setNX(key: string, value: string, opts?: { ttl?: number }): Promise<boolean> {
     this.require();
+    if (opts?.ttl !== undefined) {
+      return (
+        (await this.transport.fetchval<boolean>('SELECT KV_SETNX($1, $2, $3)', [key, value, opts.ttl])) ?? false
+      );
+    }
     return (await this.transport.fetchval<boolean>('SELECT KV_SETNX($1, $2)', [key, value])) ?? false;
   }
 
   async delete(key: string): Promise<boolean> {
     this.require();
     return (await this.transport.fetchval<boolean>('SELECT KV_DEL($1)', [key])) ?? false;
+  }
+
+  async cdel(key: string, expected: string): Promise<boolean> {
+    this.require();
+    return (await this.transport.fetchval<boolean>('SELECT KV_CDEL($1, $2)', [key, expected])) ?? false;
+  }
+
+  async cexpire(key: string, expected: string, seconds: number): Promise<boolean> {
+    this.require();
+    return (
+      (await this.transport.fetchval<boolean>('SELECT KV_CEXPIRE($1, $2, $3)', [key, expected, seconds])) ?? false
+    );
   }
 
   async exists(key: string): Promise<boolean> {

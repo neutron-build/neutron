@@ -70,8 +70,10 @@ These are the ACTUAL SQL functions Nucleus exposes. All frameworks call these ov
 |-------------|-----------|---------|
 | `KV_GET` | `KV_GET(key TEXT)` | value or NULL |
 | `KV_SET` | `KV_SET(key TEXT, value ANY [, ttl_secs BIGINT])` | `'OK'` |
-| `KV_SETNX` | `KV_SETNX(key TEXT, value ANY)` | BOOLEAN (true if set) |
+| `KV_SETNX` | `KV_SETNX(key TEXT, value ANY [, ttl_secs BIGINT])` | BOOLEAN (true if set; with TTL = atomic lock acquire) |
 | `KV_DEL` | `KV_DEL(key TEXT)` | BOOLEAN |
+| `KV_CDEL` | `KV_CDEL(key TEXT, expected ANY)` | BOOLEAN (delete only if value matches — safe lock release) |
+| `KV_CEXPIRE` | `KV_CEXPIRE(key TEXT, expected ANY, ttl_secs BIGINT)` | BOOLEAN (set TTL only if value matches — lease renewal) |
 | `KV_EXISTS` | `KV_EXISTS(key TEXT)` | BOOLEAN |
 | `KV_INCR` | `KV_INCR(key TEXT [, amount BIGINT])` | BIGINT (new value) |
 | `KV_TTL` | `KV_TTL(key TEXT)` | BIGINT (-1=no TTL, -2=missing) |
