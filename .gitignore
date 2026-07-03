@@ -76,6 +76,10 @@ archive/
 **/SVELTEKIT-SOLIDJS-FEATURES.md
 **/REMIX-FEATURES-TO-ADOPT.md
 
+# Vercel parity / product strategy research (local only)
+/docs/VERCEL_PARITY_BACKLOG.md
+/docs/design/
+
 # Planning & audit docs
 **/NUCLEUS-AUDIT.md
 **/NUCLEUS-ROADMAP.md
