@@ -1,0 +1,78 @@
+{
+  "name": "@neutron-build/ai",
+  "version": "0.1.0",
+  "description": "AI SDK for Neutron. Model calls, streaming, structured output, and tool-calling over pluggable provider adapters.",
+  "author": "Tyler",
+  "license": "MIT",
+  "homepage": "https://neutron.build",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/neutron-build/neutron",
+    "directory": "typescript/packages/neutron-ai"
+  },
+  "keywords": [
+    "neutron",
+    "ai",
+    "llm",
+    "anthropic",
+    "streaming",
+    "tool-calling"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./anthropic": {
+      "types": "./dist/anthropic/index.d.ts",
+      "import": "./dist/anthropic/index.js"
+    },
+    "./openai": {
+      "types": "./dist/openai/index.d.ts",
+      "import": "./dist/openai/index.js"
+    },
+    "./preact": {
+      "types": "./dist/preact/index.d.ts",
+      "import": "./dist/preact/index.js"
+    },
+    "./harness": {
+      "types": "./dist/harness/index.d.ts",
+      "import": "./dist/harness/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "tsc --noEmit --pretty false",
+    "typecheck": "tsc --noEmit",
+    "test": "pnpm run build && node --test --experimental-test-isolation=none \"dist/**/*.test.js\""
+  },
+  "peerDependencies": {
+    "preact": "^10.0.0"
+  },
+  "peerDependenciesMeta": {
+    "preact": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "preact": "^10.25.4",
+    "typescript": "^5.7.2",
+    "zod": "^3.25.76"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
