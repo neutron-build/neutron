@@ -14,6 +14,7 @@ import type {
   ToolChoice,
   ToolDefinition,
   ToolResultPart,
+  Usage,
   UserMessage,
 } from "../types.js";
 
@@ -55,6 +56,15 @@ export function createOpenAI(settings: OpenAISettings = {}): OpenAIProvider {
 /** Default instance, configured via OPENAI_API_KEY. */
 export const openai = createOpenAI();
 
+interface OpenAIUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  // OpenAI automatic caching reports the cached portion here...
+  prompt_tokens_details?: { cached_tokens?: number };
+  // ...while DeepSeek's automatic disk cache uses its own field.
+  prompt_cache_hit_tokens?: number;
+}
+
 interface OpenAIToolCall {
   id?: string;
   function?: { name?: string; arguments?: string };
@@ -65,7 +75,7 @@ interface OpenAIResponse {
     message?: { content?: string | null; tool_calls?: OpenAIToolCall[] };
     finish_reason?: string | null;
   }>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number };
+  usage?: OpenAIUsage;
 }
 
 interface OpenAIStreamChunk {
@@ -76,7 +86,7 @@ interface OpenAIStreamChunk {
     };
     finish_reason?: string | null;
   }>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number } | null;
+  usage?: OpenAIUsage | null;
 }
 
 class OpenAIAdapter implements ModelAdapter {
@@ -392,12 +402,17 @@ function mapFinishReason(finishReason: string | null | undefined): FinishReason 
   }
 }
 
-function mapUsage(usage: { prompt_tokens?: number; completion_tokens?: number } | undefined): {
-  inputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
-} {
+function mapUsage(usage: OpenAIUsage | undefined): Usage {
   const inputTokens = usage?.prompt_tokens ?? 0;
   const outputTokens = usage?.completion_tokens ?? 0;
-  return { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens };
+  // Caching is automatic on this wire (OpenAI >=1024-token prompts;
+  // DeepSeek disk cache); cached tokens are INCLUDED in prompt_tokens,
+  // so totals need no adjustment — we just surface the cached portion.
+  const cacheRead = usage?.prompt_tokens_details?.cached_tokens ?? usage?.prompt_cache_hit_tokens ?? 0;
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+    ...(cacheRead > 0 ? { cacheReadTokens: cacheRead } : {}),
+  };
 }

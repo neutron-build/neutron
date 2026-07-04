@@ -14,6 +14,7 @@ import type {
   ToolChoice,
   ToolDefinition,
   ToolResultPart,
+  Usage,
   UserMessage,
 } from "../types.js";
 
@@ -35,6 +36,14 @@ export interface AnthropicSettings {
 export interface AnthropicModelOptions {
   /** Enable extended thinking with this token budget (must be below maxOutputTokens). */
   thinking?: { budgetTokens: number };
+  /**
+   * Prompt caching (top-level automatic cache_control; GA, no beta
+   * header). `true` = 5-minute TTL; `{ ttl: "1h" }` for the hour cache.
+   * Reads bill at 0.1x input price — the shape of an agent loop (a
+   * growing prefix resent every turn) is the ideal case. Prompts below
+   * the model's cacheable minimum are silently processed uncached.
+   */
+  cache?: boolean | { ttl: "5m" | "1h" };
 }
 
 export function createAnthropic(
@@ -49,6 +58,8 @@ export const anthropic = createAnthropic();
 interface AnthropicUsage {
   input_tokens?: number;
   output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
 }
 
 interface AnthropicContentBlock {
@@ -131,6 +142,8 @@ class AnthropicAdapter implements ModelAdapter {
 
     let inputTokens = 0;
     let outputTokens = 0;
+    let cacheRead = 0;
+    let cacheWrite = 0;
     let finishReason: FinishReason = "other";
     const pendingTools = new Map<number, { id: string; name: string; inputJson: string }>();
     const pendingReasoning = new Map<number, { text: string; signature: string; redactedData?: string }>();
@@ -148,6 +161,9 @@ class AnthropicAdapter implements ModelAdapter {
         case "message_start":
           inputTokens = payload.message?.usage?.input_tokens ?? 0;
           outputTokens = payload.message?.usage?.output_tokens ?? 0;
+          // Cache accounting arrives with message_start when caching is on.
+          cacheRead = payload.message?.usage?.cache_read_input_tokens ?? 0;
+          cacheWrite = payload.message?.usage?.cache_creation_input_tokens ?? 0;
           break;
         case "content_block_start":
           if (payload.index === undefined) break;
@@ -221,13 +237,17 @@ class AnthropicAdapter implements ModelAdapter {
             outputTokens = payload.usage.output_tokens;
           }
           break;
-        case "message_stop":
-          yield {
-            type: "finish",
-            finishReason,
-            usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+        case "message_stop": {
+          const usage: Usage = {
+            inputTokens,
+            outputTokens,
+            totalTokens: inputTokens + outputTokens + cacheRead + cacheWrite,
+            ...(cacheRead > 0 ? { cacheReadTokens: cacheRead } : {}),
+            ...(cacheWrite > 0 ? { cacheWriteTokens: cacheWrite } : {}),
           };
+          yield { type: "finish", finishReason, usage };
           break;
+        }
         case "error": {
           const status = SSE_ERROR_STATUS[payload.error?.type ?? ""] ?? 500;
           throw new AIError(
@@ -317,6 +337,10 @@ class AnthropicAdapter implements ModelAdapter {
       messages,
     };
     if (system.length > 0) body.system = system.join("\n\n");
+    if (this.#modelOptions.cache !== undefined && this.#modelOptions.cache !== false) {
+      const ttl = typeof this.#modelOptions.cache === "object" ? this.#modelOptions.cache.ttl : "5m";
+      body.cache_control = ttl === "1h" ? { type: "ephemeral", ttl: "1h" } : { type: "ephemeral" };
+    }
     if (this.#modelOptions.thinking !== undefined) {
       body.thinking = { type: "enabled", budget_tokens: this.#modelOptions.thinking.budgetTokens };
     }
@@ -443,10 +467,20 @@ function mapStopReason(stopReason: string | null | undefined): FinishReason {
   }
 }
 
-function mapUsage(usage: AnthropicUsage | undefined): { inputTokens: number; outputTokens: number; totalTokens: number } {
+function mapUsage(usage: AnthropicUsage | undefined): Usage {
   const inputTokens = usage?.input_tokens ?? 0;
   const outputTokens = usage?.output_tokens ?? 0;
-  return { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens };
+  const cacheRead = usage?.cache_read_input_tokens;
+  const cacheWrite = usage?.cache_creation_input_tokens;
+  // Anthropic reports cached tokens SEPARATELY from input_tokens, so the
+  // real total is the sum of all four.
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens + (cacheRead ?? 0) + (cacheWrite ?? 0),
+    ...(cacheRead !== undefined && cacheRead > 0 ? { cacheReadTokens: cacheRead } : {}),
+    ...(cacheWrite !== undefined && cacheWrite > 0 ? { cacheWriteTokens: cacheWrite } : {}),
+  };
 }
 
 function parseToolInput(inputJson: string): unknown {

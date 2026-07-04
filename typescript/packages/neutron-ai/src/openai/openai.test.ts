@@ -179,6 +179,25 @@ test("HTTP errors map to problem details with the provider message", async () =>
   );
 });
 
+test("automatic caching surfaces cached tokens (OpenAI details field and DeepSeek's)", async () => {
+  const withDetails = {
+    ...GENERATE_FIXTURE,
+    usage: { prompt_tokens: 2000, completion_tokens: 10, prompt_tokens_details: { cached_tokens: 1792 } },
+  };
+  const first = mockFetch(() => jsonResponse(withDetails));
+  const openaiP = createOpenAI({ apiKey: "k", fetch: first.impl });
+  const a = await generateText({ model: openaiP("gpt-4o"), prompt: "hi" });
+  assert.equal(a.usage.cacheReadTokens, 1792);
+  // cached tokens are INCLUDED in prompt_tokens on this wire — total unchanged
+  assert.equal(a.usage.totalTokens, 2010);
+
+  const deepseekUsage = { ...GENERATE_FIXTURE, usage: { prompt_tokens: 500, completion_tokens: 5, prompt_cache_hit_tokens: 400 } };
+  const second = mockFetch(() => jsonResponse(deepseekUsage));
+  const deepseek = createOpenAI({ apiKey: "k", baseURL: "https://api.deepseek.com", provider: "deepseek", fetch: second.impl });
+  const b = await generateText({ model: deepseek("deepseek-chat"), prompt: "hi" });
+  assert.equal(b.usage.cacheReadTokens, 400);
+});
+
 test("a custom baseURL and provider label serve OpenAI-compatible servers", async () => {
   const { impl, calls } = mockFetch(() => jsonResponse(GENERATE_FIXTURE));
   const groq = createOpenAI({
