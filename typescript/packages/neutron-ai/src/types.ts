@@ -1,8 +1,19 @@
-/** Token usage for a single model call. */
+/**
+ * Token usage for a single model call. Cache fields appear only when the
+ * provider reports them, and their accounting follows the provider's own
+ * semantics: Anthropic EXCLUDES cached tokens from inputTokens (they're
+ * separate line items at different prices); OpenAI-compatible providers
+ * INCLUDE cached tokens in inputTokens and report the cached portion.
+ * totalTokens always covers everything billed.
+ */
 export interface Usage {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  /** Tokens served from the provider's prompt cache (cheaper). */
+  cacheReadTokens?: number;
+  /** Tokens written to the provider's prompt cache (Anthropic only). */
+  cacheWriteTokens?: number;
 }
 
 /**

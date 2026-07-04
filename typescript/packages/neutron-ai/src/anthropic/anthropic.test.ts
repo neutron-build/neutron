@@ -370,6 +370,54 @@ test("streaming thinking emits reasoning deltas and an assembled signed part", a
   assert.deepEqual(assistant.content[0], { type: "reasoning", text: "Consider the input.", signature: "sig-2" });
 });
 
+test("prompt caching: cache option sets top-level cache_control and usage carries cache fields", async () => {
+  const cachedFixture = {
+    ...GENERATE_FIXTURE,
+    content: [{ type: "text", text: "cached reply" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 12, output_tokens: 8, cache_read_input_tokens: 2000, cache_creation_input_tokens: 300 },
+  };
+  const { impl, calls } = mockFetch(() => jsonResponse(cachedFixture));
+  const anthropic = createAnthropic({ apiKey: "test-key", fetch: impl });
+
+  // default 5m
+  const result = await generateText({ model: anthropic("claude-sonnet-5", { cache: true }), prompt: "hi" });
+  assert.deepEqual(JSON.parse(calls[0]?.init.body as string).cache_control, { type: "ephemeral" });
+  assert.equal(result.usage.cacheReadTokens, 2000);
+  assert.equal(result.usage.cacheWriteTokens, 300);
+  // Anthropic excludes cached tokens from input_tokens; total covers everything billed
+  assert.equal(result.usage.totalTokens, 12 + 8 + 2000 + 300);
+
+  // 1h ttl form
+  await generateText({ model: anthropic("claude-sonnet-5", { cache: { ttl: "1h" } }), prompt: "hi" });
+  assert.deepEqual(JSON.parse(calls[1]?.init.body as string).cache_control, { type: "ephemeral", ttl: "1h" });
+
+  // no option → no field
+  await generateText({ model: anthropic("claude-sonnet-5"), prompt: "hi" });
+  assert.equal(JSON.parse(calls[2]?.init.body as string).cache_control, undefined);
+});
+
+test("prompt caching: streaming usage picks cache fields up from message_start", async () => {
+  const events: Array<[string, unknown]> = [
+    ["message_start", {
+      type: "message_start",
+      message: { usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 1500, cache_creation_input_tokens: 0 } },
+    }],
+    ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
+    ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } }],
+    ["content_block_stop", { type: "content_block_stop", index: 0 }],
+    ["message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 5 } }],
+    ["message_stop", { type: "message_stop" }],
+  ];
+  const { impl } = mockFetch(() => sseResponse(events));
+  const anthropic = createAnthropic({ apiKey: "test-key", fetch: impl });
+  const result = streamText({ model: anthropic("claude-sonnet-5", { cache: true }), prompt: "hi" });
+  const usage = await result.usage;
+  assert.equal(usage.cacheReadTokens, 1500);
+  assert.equal(usage.cacheWriteTokens, undefined);
+  assert.equal(usage.totalTokens, 10 + 5 + 1500);
+});
+
 test("a custom baseURL routes the request (AI Gateway seam)", async () => {
   const { impl, calls } = mockFetch(() => jsonResponse(GENERATE_FIXTURE));
   const anthropic = createAnthropic({ apiKey: "test-key", baseURL: "https://gateway.example.com/", fetch: impl });

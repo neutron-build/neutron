@@ -15,10 +15,14 @@ import type {
 export const ZERO_USAGE: Usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
 
 export function addUsage(a: Usage, b: Usage): Usage {
+  const cacheRead = (a.cacheReadTokens ?? 0) + (b.cacheReadTokens ?? 0);
+  const cacheWrite = (a.cacheWriteTokens ?? 0) + (b.cacheWriteTokens ?? 0);
   return {
     inputTokens: a.inputTokens + b.inputTokens,
     outputTokens: a.outputTokens + b.outputTokens,
     totalTokens: a.totalTokens + b.totalTokens,
+    ...(cacheRead > 0 ? { cacheReadTokens: cacheRead } : {}),
+    ...(cacheWrite > 0 ? { cacheWriteTokens: cacheWrite } : {}),
   };
 }
 
