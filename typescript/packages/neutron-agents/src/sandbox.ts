@@ -55,6 +55,26 @@ export class SandboxExecutor implements AgentExecutor {
     return new SandboxExecutor(runId, options);
   }
 
+  /**
+   * Commit this run's filesystem to a snapshot image. The image survives
+   * the run (and the daemon's TTL reaper) — start a later run from it
+   * via `SandboxExecutor.start({ create: { image } })`. Delete it with
+   * `SandboxExecutor.deleteSnapshot` when done.
+   */
+  async snapshot(): Promise<string> {
+    const response = await request(this.#options, "POST", `/v1/runs/${this.runId}/snapshot`);
+    const body = (await response.json()) as { image?: string };
+    if (typeof body.image !== "string") {
+      throw new AgentError(problemFromStatus(500, "Sandbox daemon returned no snapshot image."));
+    }
+    return body.image;
+  }
+
+  /** Delete a snapshot image (static — the run that made it may be long gone). */
+  static async deleteSnapshot(options: SandboxExecutorOptions & { image: string }): Promise<void> {
+    await request(options, "DELETE", `/v1/snapshots?image=${encodeURIComponent(options.image)}`);
+  }
+
   async exec(command: string, options: ExecOptions = {}): Promise<ExecResult> {
     const timeoutSec = Math.ceil((options.timeoutMs ?? 120_000) / 1000);
     const response = await request(

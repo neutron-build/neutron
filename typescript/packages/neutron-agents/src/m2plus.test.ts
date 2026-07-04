@@ -250,6 +250,12 @@ function fakeDaemon(): { impl: typeof globalThis.fetch; requests: Array<{ method
         'event: stdout\ndata: hello \n\nevent: stdout\ndata: sandbox\n\nevent: stderr\ndata: warn: slow\n\nevent: exit\ndata: {"exitCode":0,"timedOut":false}\n\n';
       return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
     }
+    if (method === "POST" && url.includes("/snapshot")) {
+      return Response.json({ image: "teploy-sbx-snap:01test", server: "test-box" }, { status: 201 });
+    }
+    if (method === "DELETE" && url.includes("/v1/snapshots")) {
+      return new Response(null, { status: 204 });
+    }
     if (method === "PUT" && url.includes("/files/")) {
       files.set(url, new Uint8Array(await new Response(init?.body as BodyInit).arrayBuffer()));
       return new Response(null, { status: 204 });
@@ -290,4 +296,22 @@ test("SandboxExecutor speaks the daemon contract end-to-end", async () => {
   await sandbox.destroy();
   assert.ok(daemon.requests.every((r) => r.auth === "Bearer secret"));
   assert.equal(daemon.requests.at(-1)?.method, "DELETE");
+});
+
+test("SandboxExecutor snapshot lifecycle speaks the daemon contract", async () => {
+  const daemon = fakeDaemon();
+  const sandbox = await SandboxExecutor.start({
+    baseURL: "http://127.0.0.1:7070",
+    token: "secret",
+    fetch: daemon.impl,
+    create: { image: "python:3.12-slim" },
+  });
+  const image = await sandbox.snapshot();
+  assert.equal(image, "teploy-sbx-snap:01test");
+  assert.ok(daemon.requests.some((r) => r.method === "POST" && r.url.endsWith(`/v1/runs/${sandbox.runId}/snapshot`)));
+
+  await SandboxExecutor.deleteSnapshot({ baseURL: "http://127.0.0.1:7070", token: "secret", fetch: daemon.impl, image });
+  const del = daemon.requests.at(-1);
+  assert.equal(del?.method, "DELETE");
+  assert.ok(del?.url.includes("image=teploy-sbx-snap%3A01test"));
 });
