@@ -275,14 +275,8 @@ fn main_impl() {
                     );
                     repro_log.push(sql.clone());
                     if let Some(text) = run_text(&ex, &sql) {
-                        let ids: Vec<String> = text
-                            .split(',')
-                            .filter(|s| !s.is_empty())
-                            .map(|part| {
-                                // format is "ms-seq:field=val;..."
-                                part.split(':').next().unwrap_or("").to_string()
-                            })
-                            .collect();
+                        // format is JSON: [{"id":"ms-seq","fields":{...}}]
+                        let ids: Vec<String> = parse_entry_ids(&text);
                         for w in ids.windows(2) {
                             if !id_le(&w[0], &w[1]) {
                                 if violations.len() < max_report {
@@ -309,7 +303,7 @@ fn main_impl() {
                     );
                     repro_log.push(sql.clone());
                     if let Some(text) = run_text(&ex, &sql) {
-                        let returned = text.split(',').filter(|s| !s.is_empty()).count();
+                        let returned = parse_entry_ids(&text).len();
                         let expected = stream_state.entries.len().min(count);
                         if returned != expected {
                             if violations.len() < max_report {
@@ -586,6 +580,18 @@ fn main_impl() {
 }
 
 /// Compare two stream IDs of the form "ms-seq".  Returns true if a <= b.
+/// Entry ids from the STREAM_XRANGE/XREAD wire format
+/// (`[{"id":"ms-seq","fields":{...}}]`, FRAMEWORK_CONTRACT.md §3.9).
+fn parse_entry_ids(text: &str) -> Vec<String> {
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_str(text) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| item.get("id").and_then(|v| v.as_str()).map(String::from))
+        .collect()
+}
+
 fn id_le(a: &str, b: &str) -> bool {
     fn parse(s: &str) -> (u64, u64) {
         let mut parts = s.splitn(2, '-');
