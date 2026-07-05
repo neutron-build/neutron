@@ -52,6 +52,7 @@ mod txn;
 mod types;
 
 pub use expr::FilterResult; // Phase 2C: Lazy materialization for WHERE clause filtering
+pub(crate) use scalar_fns::side_effecting_return_type;
 use helpers::*;
 use schema_types::*;
 use session::CURRENT_SESSION;

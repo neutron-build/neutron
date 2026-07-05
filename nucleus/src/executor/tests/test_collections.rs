@@ -316,9 +316,13 @@ async fn test_stream_xrange() {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
     };
-    // Should contain both entries
-    assert!(text.contains("k=v1"));
-    assert!(text.contains("k=v2"));
+    // Contract format (§3.9): [{"id":"ms-seq","fields":{...}}]
+    let entries: serde_json::Value = serde_json::from_str(&text).expect("xrange returns JSON");
+    let items = entries.as_array().expect("JSON array");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["fields"]["k"], "v1");
+    assert_eq!(items[1]["fields"]["k"], "v2");
+    assert!(items[0]["id"].as_str().unwrap().contains('-'));
 }
 
 #[tokio::test]
@@ -334,7 +338,8 @@ async fn test_stream_xread() {
         other => panic!("expected Text, got {other:?}"),
     };
     // Should have at most 2 entries
-    let entry_count = text.split(',').filter(|s| !s.is_empty()).count();
+    let entries: serde_json::Value = serde_json::from_str(&text).expect("xread returns JSON");
+    let entry_count = entries.as_array().expect("JSON array").len();
     assert!(
         entry_count <= 2,
         "xread count=2 should return at most 2 entries, got {}",
@@ -354,7 +359,8 @@ async fn test_stream_xgroup_xreadgroup_xack() {
         "SELECT stream_xgroup_create('grp_stream', 'mygroup', 0)",
     )
     .await;
-    assert_eq!(scalar(&r[0]), &Value::Text("OK".into()));
+    // Contract (§3.9): BOOLEAN
+    assert_eq!(scalar(&r[0]), &Value::Bool(true));
     // Read via consumer group
     let r = exec(
         &ex,
@@ -365,8 +371,12 @@ async fn test_stream_xgroup_xreadgroup_xack() {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
     };
-    assert!(text.contains("msg=hello"));
-    assert!(text.contains("msg=world"));
+    let entries: serde_json::Value =
+        serde_json::from_str(&text).expect("xreadgroup returns JSON");
+    let items = entries.as_array().expect("JSON array");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["fields"]["msg"], "hello");
+    assert_eq!(items[1]["fields"]["msg"], "world");
 }
 
 #[tokio::test]

@@ -2069,11 +2069,21 @@ impl NucleusHandler {
     /// This executes a `LIMIT 0` version of the query to retrieve schema
     /// information without actually fetching data. Falls back to an empty
     /// column list on any error.
+    ///
+    /// Statements that invoke side-effecting scalar functions are described
+    /// STATICALLY instead: `LIMIT 0` does not stop projection evaluation, so
+    /// probe-executing `SELECT KV_SETNX(...)` here fired the write at
+    /// Describe time and again at Execute — the client's Execute then saw
+    /// the second evaluation (KV_SETNX false with the key actually set).
     async fn describe_select_columns(&self, sql: &str) -> Result<Vec<FieldInfo>, PgWireError> {
         // Try executing the query directly with LIMIT 0 appended, or if that
         // fails, run the original query. This avoids the subquery wrapping
         // that can trigger nesting depth errors for function calls like VERSION().
         let trimmed = sql.trim().trim_end_matches(';').trim();
+
+        if let Some(fields) = describe_static_fields(trimmed) {
+            return Ok(fields);
+        }
 
         // First try: add LIMIT 0 to avoid returning data
         let probe_sql = format!("{trimmed} LIMIT 0");
@@ -2847,6 +2857,115 @@ fn pg_type_to_data_type(pg_type: &Type) -> DataType {
 // ============================================================================
 // COPY helpers
 // ============================================================================
+
+/// True when `sql` appears to invoke a side-effecting scalar function
+/// (an identifier from the executor's registry immediately followed by
+/// `(`). A cheap textual scan: false positives (e.g. the name inside a
+/// string literal) merely route Describe to the static path below, which
+/// degrades type precision but never fires effects.
+fn mentions_side_effecting_fn(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len()
+                && bytes[j] == b'('
+                && crate::executor::side_effecting_return_type(&upper[start..i]).is_some()
+            {
+                return true;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Describe a SELECT that invokes side-effecting scalar functions WITHOUT
+/// executing anything. Returns `None` for statements with no such calls
+/// (callers fall through to the probe-execution path); for the rest,
+/// derives one field per projection item — registry type for known
+/// mutating functions, VARCHAR otherwise — and falls back to a single
+/// VARCHAR field when the statement shape defies static analysis.
+/// Execution is never a fallback here.
+fn describe_static_fields(sql: &str) -> Option<Vec<FieldInfo>> {
+    use sqlparser::ast::{Expr, ObjectNamePart, SelectItem, SetExpr, Statement};
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    if !mentions_side_effecting_fn(sql) {
+        return None;
+    }
+
+    let fallback = || {
+        Some(vec![FieldInfo::new(
+            "result".into(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        )])
+    };
+
+    let Ok(stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
+        return fallback();
+    };
+    let Some(Statement::Query(query)) = stmts.into_iter().next() else {
+        return fallback();
+    };
+    let SetExpr::Select(select) = *query.body else {
+        return fallback();
+    };
+    if select.projection.is_empty() {
+        return fallback();
+    }
+
+    let mut fields = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        let (alias, expr) = match item {
+            SelectItem::UnnamedExpr(expr) => (None, expr),
+            SelectItem::ExprWithAlias { expr, alias } => (Some(alias.value.clone()), expr),
+            _ => return fallback(),
+        };
+        let fn_name = if let Expr::Function(func) = expr {
+            func.name.0.last().and_then(|part| match part {
+                ObjectNamePart::Identifier(ident) => Some(ident.value.to_ascii_uppercase()),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let dt = fn_name
+            .as_deref()
+            .and_then(crate::executor::side_effecting_return_type);
+        let name = alias.unwrap_or_else(|| {
+            fn_name
+                .map(|n| n.to_ascii_lowercase())
+                .unwrap_or_else(|| "?column?".into())
+        });
+        let field = match dt {
+            Some(dt) => FieldInfo::new(
+                name,
+                None,
+                None,
+                data_type_to_pg(&dt),
+                data_type_field_format(&dt),
+            ),
+            None => FieldInfo::new(name, None, None, Type::VARCHAR, FieldFormat::Text),
+        };
+        fields.push(field);
+    }
+    Some(fields)
+}
 
 /// Parse a `COPY table [(cols)] FROM STDIN [WITH (...)]` statement and return
 /// a `CopyInfo` if it is a valid COPY FROM STDIN.  Returns `None` for all
@@ -4186,5 +4305,48 @@ mod security_tests {
     fn lo_blob_key_format() {
         assert_eq!(lo_blob_key(12345), "_lo/12345");
         assert_eq!(lo_blob_key(0), "_lo/0");
+    }
+
+    // ── Describe must not execute side-effecting scalar functions ──
+
+    #[test]
+    fn describe_static_fields_covers_mutating_fns() {
+        // Bound-parameter shape (statement describe) and substituted
+        // literals (portal describe) both resolve statically.
+        for sql in [
+            "SELECT KV_SETNX($1, $2, 30)",
+            "SELECT KV_SETNX('k', 'v', 30)",
+            "SELECT kv_setnx('k', 'v')",
+        ] {
+            let fields = describe_static_fields(sql).expect("static describe");
+            assert_eq!(fields.len(), 1);
+            assert_eq!(fields[0].name(), "kv_setnx");
+            assert_eq!(*fields[0].datatype(), Type::BOOL);
+        }
+
+        let fields = describe_static_fields("SELECT DOC_INSERT($1)").unwrap();
+        assert_eq!(*fields[0].datatype(), Type::INT8);
+        let fields = describe_static_fields("SELECT STREAM_XADD($1, $2, $3)").unwrap();
+        assert_eq!(*fields[0].datatype(), Type::VARCHAR);
+        let fields =
+            describe_static_fields("SELECT KV_CDEL($1, $2) AS released").unwrap();
+        assert_eq!(fields[0].name(), "released");
+        assert_eq!(*fields[0].datatype(), Type::BOOL);
+    }
+
+    #[test]
+    fn describe_static_fields_ignores_pure_queries() {
+        // Pure reads keep the probe-execution path (None).
+        assert!(describe_static_fields("SELECT KV_GET($1)").is_none());
+        assert!(describe_static_fields("SELECT * FROM users WHERE id = 1").is_none());
+        assert!(describe_static_fields("SELECT UPPER('a'), STREAM_XLEN('s')").is_none());
+    }
+
+    #[test]
+    fn describe_static_fields_never_falls_through_on_odd_shapes() {
+        // Unparseable or non-plain-select statements containing a mutating
+        // call still get a static answer — execution is never the fallback.
+        let fields = describe_static_fields("SELECT KV_SETNX('k', 'v', 30) UNION SELECT 1");
+        assert!(fields.is_some());
     }
 }

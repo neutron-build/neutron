@@ -126,7 +126,11 @@ def _parse_stream_entries(raw: str | None) -> list[StreamEntry]:
         for item in data:
             if isinstance(item, dict):
                 entry_id = str(item.get("id", ""))
-                fields = {k: v for k, v in item.items() if k != "id"}
+                raw_fields = item.get("fields")
+                if isinstance(raw_fields, dict):
+                    fields = raw_fields
+                else:  # legacy flat shape: fields at the top level
+                    fields = {k: v for k, v in item.items() if k != "id"}
                 entries.append(StreamEntry(id=entry_id, fields=fields))
         return entries
     except (json.JSONDecodeError, TypeError):

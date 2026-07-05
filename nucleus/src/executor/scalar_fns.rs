@@ -3387,15 +3387,7 @@ impl Executor {
                         let start_id = crate::pubsub::StreamEntryId::new(start_ms, 0);
                         let end_id = crate::pubsub::StreamEntryId::new(end_ms, u64::MAX);
                         let entries = stream.xrange(&start_id, &end_id, Some(count));
-                        let parts: Vec<String> = entries
-                            .iter()
-                            .map(|e| {
-                                let fields: Vec<String> =
-                                    e.fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                                format!("{}:{}", e.id, fields.join(";"))
-                            })
-                            .collect();
-                        Ok(Value::Text(parts.join(",")))
+                        Ok(Value::Text(stream_entries_to_json(&entries)))
                     }
                     None => Ok(Value::Text(String::new())),
                 }
@@ -3414,15 +3406,7 @@ impl Executor {
                     Some(stream) => {
                         let last_id = crate::pubsub::StreamEntryId::new(last_id_ms, u64::MAX);
                         let entries = stream.xread(&last_id, count);
-                        let parts: Vec<String> = entries
-                            .iter()
-                            .map(|e| {
-                                let fields: Vec<String> =
-                                    e.fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                                format!("{}:{}", e.id, fields.join(";"))
-                            })
-                            .collect();
-                        Ok(Value::Text(parts.join(",")))
+                        Ok(Value::Text(stream_entries_to_json(&entries)))
                     }
                     None => Ok(Value::Text(String::new())),
                 }
@@ -3442,7 +3426,8 @@ impl Executor {
                 let mut streams = self.streams.write();
                 let stream = streams.entry(stream_name).or_default();
                 stream.xgroup_create(&group, crate::pubsub::StreamEntryId::new(start_ms, 0));
-                Ok(Value::Text("OK".into()))
+                // Contract (§3.9): BOOLEAN. Creation is idempotent-overwrite.
+                Ok(Value::Bool(true))
             }
             "STREAM_XREADGROUP" => {
                 // stream_xreadgroup(stream, group, consumer, count) → entries as text
@@ -3464,15 +3449,7 @@ impl Executor {
                 match streams.get_mut(&stream_name) {
                     Some(stream) => {
                         let entries = stream.xreadgroup(&group, &consumer, count);
-                        let parts: Vec<String> = entries
-                            .iter()
-                            .map(|e| {
-                                let fields: Vec<String> =
-                                    e.fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                                format!("{}:{}", e.id, fields.join(";"))
-                            })
-                            .collect();
-                        Ok(Value::Text(parts.join(",")))
+                        Ok(Value::Text(stream_entries_to_json(&entries)))
                     }
                     None => Ok(Value::Text(String::new())),
                 }
@@ -5492,4 +5469,63 @@ impl Executor {
             }
         }
     }
+}
+
+/// Serialize stream entries as the contract wire format
+/// (FRAMEWORK_CONTRACT.md §3.9: TEXT (JSON)):
+/// `[{"id":"<ms>-<seq>","fields":{"k":"v",...}}]`.
+/// The Go, TypeScript, Julia, and Elixir SDKs all JSON-parse this value;
+/// the previous ad-hoc `id:k=v;k=v,...` text broke every one of them the
+/// moment a field value contained `,`, `;`, or `=` — unparseable by
+/// construction for JSON payloads.
+fn stream_entries_to_json(entries: &[&crate::pubsub::StreamEntry]) -> String {
+    let items: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            let fields: serde_json::Map<String, serde_json::Value> = e
+                .fields
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            serde_json::json!({ "id": e.id.to_string(), "fields": fields })
+        })
+        .collect();
+    serde_json::Value::Array(items).to_string()
+}
+
+/// Return type of a *side-effecting* built-in scalar function, or `None`
+/// for pure ones. This is the registry the pgwire Describe path uses to
+/// answer "what columns would this SELECT produce?" WITHOUT executing:
+/// probe-executing a mutating function at Describe time fires its effect
+/// twice per client Execute (node-postgres always Describes), and the
+/// client then receives the second evaluation's result — KV_SETNX
+/// returned false while the key was in fact set.
+///
+/// Keep this in sync with `eval_scalar_fn`: any new arm that WRITES
+/// (kv/doc/stream/graph/fts/blob/columnar/datalog/tensor/sequence/...)
+/// must be added here with its return type.
+pub(crate) fn side_effecting_return_type(name: &str) -> Option<crate::types::DataType> {
+    use crate::types::DataType;
+    let dt = match name {
+        // -- booleans: did-it-happen results --
+        "KV_DEL" | "KV_EXPIRE" | "KV_SETNX" | "KV_CDEL" | "KV_CEXPIRE" | "KV_HSET"
+        | "KV_HDEL" | "KV_SADD" | "KV_SREM" | "KV_ZADD" | "KV_ZREM" | "KV_PFADD"
+        | "KV_PFMERGE" | "SPARSE_INSERT" | "SPARSE_REMOVE" | "FTS_INDEX"
+        | "FTS_INDEX_FACETED" | "FTS_REMOVE" | "BLOB_STORE" | "BLOB_DELETE" | "BLOB_TAG"
+        | "GRAPH_DELETE_NODE" | "GRAPH_DELETE_EDGE" | "DB_BRANCH_DELETE" | "PROC_DROP"
+        | "UNSUBSCRIBE" | "STREAM_XGROUP_CREATE" => DataType::Bool,
+        // -- integers: ids, counts, sequence values --
+        "NEXTVAL" | "SETVAL" | "KV_INCR" | "KV_LPUSH" | "KV_RPUSH" | "STREAM_XACK"
+        | "PUBSUB_PUBLISH" | "DOC_INSERT" | "GRAPH_ADD_NODE" | "GRAPH_ADD_EDGE"
+        | "SUBSCRIBE" | "DB_BRANCH_CREATE" => DataType::Int64,
+        // -- text: status strings, stream ids, popped values --
+        "KV_SET" | "KV_FLUSHDB" | "KV_LPOP" | "KV_RPOP" | "STREAM_XADD"
+        | "STREAM_XREADGROUP" | "COLUMNAR_INSERT" | "TS_INSERT"
+        | "TS_RETENTION" | "DATALOG_ASSERT" | "DATALOG_RULE" | "DATALOG_RETRACT"
+        | "DATALOG_CLEAR" | "DATALOG_IMPORT" | "DATALOG_IMPORT_GRAPH"
+        | "DATALOG_IMPORT_NODES" | "TENSOR_STORE" | "RETENTION_SET" | "DB_BRANCH_MERGE"
+        | "PROC_REGISTER" => DataType::Text,
+        _ => return None,
+    };
+    Some(dt)
 }
