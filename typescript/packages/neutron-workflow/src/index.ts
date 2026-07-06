@@ -2,9 +2,9 @@ export { workflow } from "./workflow.js";
 export type { WorkflowDefinition, WorkflowOptions } from "./workflow.js";
 
 export type { StepOptions, WorkflowContext } from "./context.js";
-export { StepError, Suspension, isSuspension } from "./context.js";
+export { Cancellation, StepError, Suspension, isSuspension } from "./context.js";
 
-export { completeSleep, deliverEvent, executeRun } from "./run.js";
+export { cancelRun, completeSleep, deliverEvent, executeRun } from "./run.js";
 export type { ExecuteRunOptions, RunOutcome, RunStatus } from "./run.js";
 
 export { MemoryEventStore } from "./store.js";

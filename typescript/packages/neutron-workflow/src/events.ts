@@ -33,7 +33,8 @@ export type WorkflowEventType =
   | "event-waiting"
   | "event-received"
   | "run-completed"
-  | "run-failed";
+  | "run-failed"
+  | "run-cancelled";
 
 export interface WorkflowEvent {
   v: number;
@@ -73,6 +74,10 @@ export interface RunCompletedData {
   output: unknown;
 }
 
+export interface RunCancelledData {
+  reason: string | null;
+}
+
 export interface RunFailedData {
   error: { message: string };
 }
@@ -91,5 +96,9 @@ export function isCursorEvent(event: WorkflowEvent): boolean {
 
 /** Events appended from outside the run while it is suspended. */
 export function isExternalEvent(event: WorkflowEvent): boolean {
-  return event.type === "sleep-completed" || event.type === "event-received";
+  return (
+    event.type === "sleep-completed" ||
+    event.type === "event-received" ||
+    event.type === "run-cancelled"
+  );
 }

@@ -23,7 +23,7 @@ export interface DocumentLike {
 export interface RunRecord {
   runId: string;
   workflow: string;
-  status: "sleeping" | "waiting" | "retrying" | "wake" | "completed" | "failed";
+  status: "sleeping" | "waiting" | "retrying" | "wake" | "completed" | "failed" | "cancelled";
   wakeAt?: string;
   eventName?: string;
   updatedAt: string;

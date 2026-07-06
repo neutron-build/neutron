@@ -47,6 +47,19 @@ export interface WorkflowContext {
 }
 
 /**
+ * Control-flow signal thrown when a live step is about to execute on a
+ * run that has been cancelled (a run-cancelled event landed in the log
+ * while this pass was executing). Same non-Error contract as Suspension.
+ */
+export class Cancellation {
+  readonly reason: string | null;
+
+  constructor(reason: string | null) {
+    this.reason = reason;
+  }
+}
+
+/**
  * Control-flow signal, not an error: the run parks until the scheduler or
  * an event wakes it. Deliberately does NOT extend Error — never swallow
  * unknown throws in workflow code (rethrow anything you didn't expect).
@@ -137,6 +150,11 @@ export class ReplayContext implements WorkflowContext {
       throw this.#mismatch(`step "${name}"`, recorded);
     }
 
+    // The live boundary is the cancellation point: a cancel that lands
+    // mid-pass takes effect before the next side-effecting step runs,
+    // never mid-step. Replayed steps above never touch the store.
+    await this.#throwIfCancelled();
+
     for (;;) {
       try {
         const result = await this.#attemptWithTimeout(fn, options.timeout);
@@ -161,6 +179,14 @@ export class ReplayContext implements WorkflowContext {
           wakeAt: new Date(Date.now() + delayMs).toISOString(),
         });
       }
+    }
+  }
+
+  async #throwIfCancelled(): Promise<void> {
+    const events = await this.#store.load(this.runId);
+    const cancelled = events.find((event) => event.type === "run-cancelled");
+    if (cancelled !== undefined) {
+      throw new Cancellation((cancelled.data as { reason?: string | null } | undefined)?.reason ?? null);
     }
   }
 

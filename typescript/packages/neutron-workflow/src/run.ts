@@ -1,8 +1,9 @@
-import { ReplayContext, Suspension } from "./context.js";
+import { Cancellation, ReplayContext, Suspension } from "./context.js";
 import { parseDuration } from "./duration.js";
 import { NondeterminismError, WorkflowError, problemFromStatus } from "./errors.js";
 import type { ProblemDetails } from "./errors.js";
 import type {
+  RunCancelledData,
   RunCompletedData,
   RunFailedData,
   RunStartedData,
@@ -12,7 +13,7 @@ import { WIRE_FORMAT_VERSION } from "./events.js";
 import type { EventStore } from "./store.js";
 import type { WorkflowDefinition } from "./workflow.js";
 
-export type RunStatus = "completed" | "failed" | "sleeping" | "waiting" | "retrying";
+export type RunStatus = "completed" | "failed" | "cancelled" | "sleeping" | "waiting" | "retrying";
 
 export interface RunOutcome {
   status: RunStatus;
@@ -76,7 +77,9 @@ export async function executeRun<In>(options: ExecuteRunOptions<In>): Promise<Ru
     input = data.input as In;
   }
 
-  const terminal = events.find((event) => event.type === "run-completed" || event.type === "run-failed");
+  const terminal = events.find(
+    (event) => event.type === "run-completed" || event.type === "run-failed" || event.type === "run-cancelled",
+  );
   if (terminal !== undefined) return outcomeFromTerminal(terminal);
 
   const ctx = new ReplayContext(options.runId, options.store, events);
@@ -107,6 +110,13 @@ export async function executeRun<In>(options: ExecuteRunOptions<In>): Promise<Ru
     });
     return { status: "completed", output: (stored.data as RunCompletedData).output };
   } catch (thrown) {
+    if (thrown instanceof Cancellation) {
+      // run-cancelled is already in the log (cancelRun wrote it); this
+      // pass just stops cleanly. The next pass short-circuits terminally.
+      const outcome: RunOutcome = { status: "cancelled" };
+      if (thrown.reason !== null) outcome.error = problemFromStatus(499, thrown.reason);
+      return outcome;
+    }
     if (thrown instanceof Suspension) {
       if (thrown.reason === "sleeping" || thrown.reason === "retrying") {
         const outcome: RunOutcome = { status: thrown.reason };
@@ -126,6 +136,31 @@ export async function executeRun<In>(options: ExecuteRunOptions<In>): Promise<Ru
     await ctx.append("run-failed", undefined, { error: { message: problem.detail } } satisfies RunFailedData);
     return { status: "failed", error: problem };
   }
+}
+
+/**
+ * Cancel a run: appends the terminal run-cancelled event. Suspended runs
+ * settle on their next execution pass; a run mid-execution stops at its
+ * next live step (the pass's cancellation point). Idempotent — cancelling
+ * a cancelled run is a no-op; completed/failed runs 409.
+ */
+export async function cancelRun(store: EventStore, runId: string, reason?: string): Promise<void> {
+  const events = await store.load(runId);
+  if (events.length === 0) {
+    throw new WorkflowError(problemFromStatus(404, `Unknown run: ${runId}.`));
+  }
+  if (events.some((event) => event.type === "run-cancelled")) return;
+  if (events.some((event) => event.type === "run-completed" || event.type === "run-failed")) {
+    throw new WorkflowError(problemFromStatus(409, `Run ${runId} already finished.`));
+  }
+  const raw: WorkflowEvent = {
+    v: WIRE_FORMAT_VERSION,
+    seq: events.reduce((max, event) => Math.max(max, event.seq), -1) + 1,
+    type: "run-cancelled",
+    at: new Date().toISOString(),
+    data: { reason: reason ?? null } satisfies RunCancelledData,
+  };
+  await store.append(runId, JSON.parse(JSON.stringify(raw)) as WorkflowEvent);
 }
 
 /** Signal a suspended run: buffered until its waitForEvent(name) consumes it. */
@@ -157,7 +192,12 @@ async function requireLiveRun(store: EventStore, runId: string): Promise<Workflo
   if (events.length === 0) {
     throw new WorkflowError(problemFromStatus(404, `Unknown run: ${runId}.`));
   }
-  if (events.some((event) => event.type === "run-completed" || event.type === "run-failed")) {
+  if (
+    events.some(
+      (event) =>
+        event.type === "run-completed" || event.type === "run-failed" || event.type === "run-cancelled",
+    )
+  ) {
     throw new WorkflowError(problemFromStatus(409, `Run ${runId} already finished.`));
   }
   return events;
@@ -185,6 +225,12 @@ async function appendExternal(
 function outcomeFromTerminal(event: WorkflowEvent): RunOutcome {
   if (event.type === "run-completed") {
     return { status: "completed", output: (event.data as RunCompletedData).output };
+  }
+  if (event.type === "run-cancelled") {
+    const reason = (event.data as RunCancelledData | undefined)?.reason ?? null;
+    const outcome: RunOutcome = { status: "cancelled" };
+    if (reason !== null) outcome.error = problemFromStatus(499, reason);
+    return outcome;
   }
   return {
     status: "failed",
