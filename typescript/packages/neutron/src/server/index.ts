@@ -839,6 +839,19 @@ async function handleAppRouteRequest(
     );
 
     if (!pageModule?.default) {
+      // Resource route: a module with no component can still serve — its
+      // loader (GET) or action (mutations) must produce a raw Response
+      // (returned or thrown). Anything else has nothing to render → 404.
+      const handler = isMutationMethod(request.method) ? pageModule?.action : pageModule?.loader;
+      if (handler) {
+        try {
+          const result = await handler({ request, params: match.params, context });
+          if (result instanceof Response) return result;
+        } catch (error) {
+          if (error instanceof Response) return error;
+          throw error;
+        }
+      }
       return new Response("Not Found", { status: 404 });
     }
 
