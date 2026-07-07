@@ -410,13 +410,23 @@ export async function createServer(
   // GET /health — contract shape { status, nucleus, version }. Registered before
   // the static/SSR routes so it always answers. The SSR server holds no Nucleus
   // pool (loaders connect per-request), so nucleus is "unconfigured" here.
-  app.get("/health", (c) =>
-    c.json({
-      status: "ok",
-      nucleus: "unconfigured",
-      version: serverVersion,
-    }),
+  //
+  // Suppressed when the app defines its own /health route: the user route must
+  // win so it can report dependency-aware health (e.g. 503 when a backing store
+  // is down) instead of the built-in returning a false 200. The catch-all below
+  // then serves it like any other route.
+  const userDefinesHealthRoute = routes.some(
+    (route) => route.path === "/health" && !route.file.includes("_layout")
   );
+  if (!userDefinesHealthRoute) {
+    app.get("/health", (c) =>
+      c.json({
+        status: "ok",
+        nucleus: "unconfigured",
+        version: serverVersion,
+      }),
+    );
+  }
 
   // SSR-only routes: static assets, image optimization, server islands, and the HTML
   // catch-all. "api"/"raw" modes skip these entirely.
@@ -1125,7 +1135,11 @@ async function handleAppRouteRequest(
           );
         }
       }
-      return renderAppRouteHtmlResponse({
+      // Awaited so a synchronous compose failure (e.g. the full-document guard)
+      // is caught here and routed through the render error boundary, rather than
+      // escaping to the generic request-level handler. Streaming body errors
+      // still surface via the stream controller, unaffected by this await.
+      return await renderAppRouteHtmlResponse({
         request,
         element,
         pathname,
@@ -1135,6 +1149,8 @@ async function handleAppRouteRequest(
         clientEntryScriptSrc,
         includeClientRuntime,
         headers: routeHeaders,
+        // Outermost layout/route — the most likely author of a stray <html>.
+        sourceFile: allRoutes[0]?.file,
         // Set by createCspNonceMiddleware (if used) before next(); carried onto
         // the framework's inline scripts so a nonce-based CSP admits them.
         nonce:
@@ -1187,6 +1203,8 @@ interface RenderAppRouteHtmlResponseArgs {
   includeClientRuntime: boolean;
   headers: Headers;
   nonce?: string;
+  /** Outermost layout/route file, named in the full-document guard error. */
+  sourceFile?: string;
 }
 
 async function renderAppRouteHtmlResponse(
@@ -1197,10 +1215,13 @@ async function renderAppRouteHtmlResponse(
     return new Response(null, { headers });
   }
 
-  const streamRenderFn = await getStreamRenderFn();
-  if (!streamRenderFn) {
+  // Non-streaming compose: render, guard against a full-document render, then
+  // wrap the fragment in the shell. Also the fallback when streaming is
+  // unavailable or fails to initialize.
+  const composeFullDocument = (): string => {
     const html = renderToString(args.element);
-    const fullHtml = wrapHtml(
+    assertRenderedFragment(html, args.sourceFile);
+    return wrapHtml(
       html,
       args.pathname,
       args.headHtml,
@@ -1210,7 +1231,11 @@ async function renderAppRouteHtmlResponse(
       args.includeClientRuntime,
       args.nonce
     );
-    return new Response(fullHtml, { headers });
+  };
+
+  const streamRenderFn = await getStreamRenderFn();
+  if (!streamRenderFn) {
+    return new Response(composeFullDocument(), { headers });
   }
 
   const shellPrefix = buildHtmlPrefix(args.pathname, args.headHtml);
@@ -1222,42 +1247,48 @@ async function renderAppRouteHtmlResponse(
     args.nonce
   );
 
+  let reader: ReadableStreamDefaultReader<Uint8Array>;
+  let firstChunk: ReadableStreamReadResult<Uint8Array>;
   try {
-    const body = streamHtmlDocument(streamRenderFn(args.element), shellPrefix, shellSuffix);
-    return new Response(body, { headers });
+    reader = streamRenderFn(args.element).getReader();
+    firstChunk = await reader.read();
   } catch {
-    const html = renderToString(args.element);
-    const fullHtml = wrapHtml(
-      html,
-      args.pathname,
-      args.headHtml,
-      args.loaderData,
-      args.actionData,
-      args.clientEntryScriptSrc,
-      args.includeClientRuntime,
-      args.nonce
-    );
-    return new Response(fullHtml, { headers });
+    return new Response(composeFullDocument(), { headers });
   }
+
+  // Guard the first streamed bytes before the shell prefix is emitted, so a
+  // full-document render (nested <html>/<body> inside #app) fails as a clean
+  // error response rather than shipping malformed, doubly-hydrated markup.
+  if (!firstChunk.done && firstChunk.value) {
+    assertRenderedFragment(decodeChunkStart(firstChunk.value), args.sourceFile);
+  }
+
+  const body = streamHtmlDocument(reader, firstChunk, shellPrefix, shellSuffix);
+  return new Response(body, { headers });
 }
 
 function streamHtmlDocument(
-  contentStream: ReadableStream<Uint8Array>,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  firstChunk: ReadableStreamReadResult<Uint8Array>,
   prefix: string,
   suffix: string
 ): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       controller.enqueue(TEXT_ENCODER.encode(prefix));
-      const reader = contentStream.getReader();
       try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) {
-            break;
+        if (!firstChunk.done) {
+          if (firstChunk.value) {
+            controller.enqueue(firstChunk.value);
           }
-          if (value) {
-            controller.enqueue(value);
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              break;
+            }
+            if (value) {
+              controller.enqueue(value);
+            }
           }
         }
         controller.enqueue(TEXT_ENCODER.encode(suffix));
@@ -1269,6 +1300,29 @@ function streamHtmlDocument(
       }
     },
   });
+}
+
+/**
+ * App-mode SSR mounts the rendered output inside the shell's `<div id="app">`
+ * (buildHtmlPrefix owns `<html>`/`<head>`/`<body>`). A route or layout that
+ * renders a full document instead of a fragment would be nested inside `#app` —
+ * markup browsers silently flatten and hydration then duplicates (the page
+ * renders twice). Reject it with an actionable error before it ships.
+ */
+const FULL_DOCUMENT_START = /^\s*<(?:!doctype\s|html[\s/>]|body[\s/>])/i;
+
+function assertRenderedFragment(rendered: string, sourceFile?: string): void {
+  if (!FULL_DOCUMENT_START.test(rendered)) {
+    return;
+  }
+  const where = sourceFile ? ` (in ${sourceFile})` : "";
+  throw new Error(
+    `route/layout rendered a full document (<html>)${where} — in app mode the shell owns the document; render a fragment instead (move charset/title to index.html or a head() export)`
+  );
+}
+
+function decodeChunkStart(chunk: Uint8Array): string {
+  return new TextDecoder().decode(chunk.subarray(0, 256));
 }
 
 async function resolveRouteHeaders(
