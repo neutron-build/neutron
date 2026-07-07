@@ -24,7 +24,10 @@ use futures::sink::{Sink, SinkExt};
 use futures::{StreamExt, stream};
 use tokio::sync::broadcast;
 
-use pgwire::api::auth::sasl::{SASLState, scram::ScramAuth};
+use pgwire::api::auth::sasl::{
+    SASLState,
+    scram::{SCRAM_ITERATIONS, ScramAuth, gen_salted_password},
+};
 use pgwire::api::auth::{
     AuthSource, DefaultServerParameterProvider, LoginInfo, Password as AuthPassword,
     StartupHandler, finish_authentication, protocol_negotiation,
@@ -75,23 +78,55 @@ fn exec_error_to_pgwire(e: ExecError) -> PgWireError {
 // Authentication
 // ============================================================================
 
+/// Length in bytes of the random salt generated for SCRAM-SHA-256 auth.
+/// Matches PostgreSQL's default (16 bytes).
+const SCRAM_SALT_LEN: usize = 16;
+
 /// Stores credentials for password-based authentication.
 ///
 /// When the server is configured with a `UserAuthenticator`, clients must
 /// provide the correct username and password via the configured auth method
 /// (SCRAM-SHA-256 by default, optional cleartext for legacy clients).
+///
+/// The shape of the credential returned to pgwire depends on `auth_method`:
+///   - `Cleartext`: the raw password with no salt (the startup handler compares
+///     it directly against the client-supplied password).
+///   - `ScramSha256`: an RFC 5802 salted password `Hi(password, salt, iters)`
+///     together with the `salt` it was derived from. pgwire's SCRAM flow
+///     requires both — returning a salt-less password panics it at
+///     `salt.expect("Salt required for SCRAM auth source")`.
 #[derive(Debug, Clone)]
 pub struct UserAuthenticator {
     username: String,
     password: String,
+    /// Negotiated auth method; decides whether `get_password` returns cleartext
+    /// or a SCRAM salted password + salt.
+    auth_method: AuthMethod,
+    /// Random salt used to derive the SCRAM salted password. Generated once at
+    /// construction so it stays constant across the multi-round SCRAM exchange
+    /// (the client is told this salt in server-first and must derive the same
+    /// salted password). Unused for cleartext auth.
+    salt: Vec<u8>,
 }
 
 impl UserAuthenticator {
-    /// Create a new authenticator with the given credentials.
+    /// Create a new authenticator with the given credentials, defaulting to the
+    /// default auth method (SCRAM-SHA-256).
     pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self::with_method(username, password, AuthMethod::default())
+    }
+
+    /// Create a new authenticator with an explicit auth method.
+    pub fn with_method(
+        username: impl Into<String>,
+        password: impl Into<String>,
+        auth_method: AuthMethod,
+    ) -> Self {
         Self {
             username: username.into(),
             password: password.into(),
+            auth_method,
+            salt: rand::random::<[u8; SCRAM_SALT_LEN]>().to_vec(),
         }
     }
 
@@ -104,6 +139,18 @@ impl UserAuthenticator {
     pub fn password(&self) -> &str {
         &self.password
     }
+
+    /// The auth method this authenticator produces credentials for.
+    pub fn auth_method(&self) -> AuthMethod {
+        self.auth_method
+    }
+
+    /// Override the auth method (keeps username/password/salt). Used by the
+    /// handler to align a caller-supplied authenticator with the negotiated
+    /// method so the returned credential is in the shape that flow expects.
+    fn set_auth_method(&mut self, auth_method: AuthMethod) {
+        self.auth_method = auth_method;
+    }
 }
 
 #[async_trait]
@@ -114,7 +161,23 @@ impl AuthSource for UserAuthenticator {
         if incoming_user != self.username {
             return Err(PgWireError::InvalidPassword(incoming_user.to_owned()));
         }
-        Ok(AuthPassword::new(None, self.password.as_bytes().to_vec()))
+        match self.auth_method {
+            // Cleartext: the startup handler compares these bytes against the
+            // client-supplied password directly, so hand back the raw password
+            // with no salt.
+            AuthMethod::Cleartext => {
+                Ok(AuthPassword::new(None, self.password.as_bytes().to_vec()))
+            }
+            // SCRAM-SHA-256: pgwire needs the salted password + salt. Derive
+            // Hi(password, salt, iterations) per RFC 5802 using pgwire's own
+            // helper (SASLprep-normalizes then PBKDF2-HMAC-SHA256), with the
+            // same iteration count pgwire advertises to the client.
+            AuthMethod::ScramSha256 => {
+                let salted =
+                    gen_salted_password(&self.password, &self.salt, SCRAM_ITERATIONS);
+                Ok(AuthPassword::new(Some(self.salt.clone()), salted))
+            }
+        }
     }
 }
 
@@ -539,6 +602,13 @@ impl NucleusHandler {
         authenticator: Option<UserAuthenticator>,
         auth_method: AuthMethod,
     ) -> Self {
+        // Keep the authenticator's credential shape in lock-step with the
+        // negotiated auth method: the AuthSource must return cleartext for
+        // Cleartext and a salted password + salt for SCRAM.
+        let authenticator = authenticator.map(|mut auth| {
+            auth.set_auth_method(auth_method);
+            auth
+        });
         let scram_auth = if auth_method == AuthMethod::ScramSha256 {
             authenticator
                 .as_ref()
@@ -3193,14 +3263,52 @@ mod tests {
     // ── AuthSource trait tests ─────────────────────────────────────────
 
     #[tokio::test]
-    async fn auth_source_returns_password_for_valid_user() {
-        let auth = UserAuthenticator::new("nucleus", "mypass");
+    async fn auth_source_cleartext_returns_raw_password_no_salt() {
+        // Cleartext auth: the startup handler compares these bytes directly,
+        // so the AuthSource must return the raw password with no salt.
+        let auth = UserAuthenticator::with_method("nucleus", "mypass", AuthMethod::Cleartext);
         let login = LoginInfo::new(Some("nucleus"), None, "127.0.0.1".into());
         let result = auth.get_password(&login).await;
         assert!(result.is_ok());
         let pw = result.unwrap();
         assert_eq!(pw.password(), b"mypass");
         assert!(pw.salt().is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_source_scram_returns_salted_password_with_salt() {
+        // SCRAM auth: the AuthSource must return a salt AND the RFC 5802 salted
+        // password Hi(password, salt, iters). Returning a salt-less password is
+        // what panicked pgwire ("Salt required for SCRAM auth source").
+        let auth = UserAuthenticator::with_method("nucleus", "mypass", AuthMethod::ScramSha256);
+        let login = LoginInfo::new(Some("nucleus"), None, "127.0.0.1".into());
+        let pw = auth.get_password(&login).await.expect("scram get_password");
+
+        // A salt must be present.
+        let salt = pw.salt().expect("SCRAM password must carry a salt");
+        assert_eq!(salt.len(), SCRAM_SALT_LEN);
+
+        // The returned "password" is the salted password, not the cleartext.
+        assert_ne!(pw.password(), b"mypass");
+        // SHA-256 output width.
+        assert_eq!(pw.password().len(), 32);
+
+        // Derivation is deterministic given the same salt + iteration count:
+        // recomputing Hi(password, salt, iters) must reproduce it exactly.
+        let expected = gen_salted_password("mypass", salt, SCRAM_ITERATIONS);
+        assert_eq!(pw.password(), expected.as_slice());
+    }
+
+    #[tokio::test]
+    async fn auth_source_scram_salt_is_stable_across_calls() {
+        // The salt must be constant across the multi-round SCRAM exchange (the
+        // client is told the salt and must derive the same salted password).
+        let auth = UserAuthenticator::with_method("nucleus", "mypass", AuthMethod::ScramSha256);
+        let login = LoginInfo::new(Some("nucleus"), None, "127.0.0.1".into());
+        let a = auth.get_password(&login).await.unwrap();
+        let b = auth.get_password(&login).await.unwrap();
+        assert_eq!(a.salt(), b.salt());
+        assert_eq!(a.password(), b.password());
     }
 
     #[tokio::test]
@@ -3268,6 +3376,27 @@ mod tests {
     }
 
     #[test]
+    fn handler_aligns_authenticator_method_with_negotiated_cleartext() {
+        // An authenticator built with the default method (SCRAM) must be
+        // realigned to Cleartext when the handler negotiates cleartext, so the
+        // AuthSource hands back the raw password the cleartext path compares.
+        let auth = UserAuthenticator::new("nucleus", "mypass");
+        assert_eq!(auth.auth_method(), AuthMethod::ScramSha256);
+        let handler = NucleusHandler::with_auth_and_method(
+            make_executor(),
+            Some(auth),
+            AuthMethod::Cleartext,
+        );
+        assert_eq!(handler.auth_method(), AuthMethod::Cleartext);
+        assert_eq!(
+            handler.authenticator.as_ref().unwrap().auth_method(),
+            AuthMethod::Cleartext
+        );
+        // No SCRAM state should be built for the cleartext handler.
+        assert!(handler.scram_auth.is_none());
+    }
+
+    #[test]
     fn handler_with_password_cleartext_mode() {
         let handler = NucleusHandler::with_password_and_method(
             make_executor(),
@@ -3283,7 +3412,9 @@ mod tests {
 
     #[tokio::test]
     async fn password_bytes_match_correctly() {
-        let auth = UserAuthenticator::new("nucleus", "nucleus");
+        // Exercises the cleartext comparison path: the AuthSource returns raw
+        // password bytes that the wire handler compares against the incoming ones.
+        let auth = UserAuthenticator::with_method("nucleus", "nucleus", AuthMethod::Cleartext);
         let login = LoginInfo::new(Some("nucleus"), None, "127.0.0.1".into());
         let expected = auth.get_password(&login).await.unwrap();
         // Simulate what the wire handler does: compare expected vs incoming bytes
@@ -3293,7 +3424,7 @@ mod tests {
 
     #[tokio::test]
     async fn password_bytes_mismatch_detected() {
-        let auth = UserAuthenticator::new("nucleus", "correct");
+        let auth = UserAuthenticator::with_method("nucleus", "correct", AuthMethod::Cleartext);
         let login = LoginInfo::new(Some("nucleus"), None, "127.0.0.1".into());
         let expected = auth.get_password(&login).await.unwrap();
         assert_ne!(expected.password(), b"wrong");
