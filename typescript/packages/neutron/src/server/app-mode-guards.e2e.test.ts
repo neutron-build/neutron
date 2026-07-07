@@ -251,4 +251,40 @@ describe("app-mode /health route and full-document guard", () => {
     // The offending layout file is named in the message.
     expect(renderError!.error.message).toContain("_layout.ts");
   }, 30000);
+
+  it("serves a loader-only resource route's returned Response (no default component)", async () => {
+    const root = await makeFixture();
+    await writeDistShell(root);
+    await fs.mkdir(path.join(root, "src", "routes"), { recursive: true });
+    // Ship's real health route shape: config + loader RETURNING a Response,
+    // no component. Previously hard-404'd on the missing default export.
+    await fs.writeFile(
+      path.join(root, "src", "routes", "health.ts"),
+      `
+export const config = { mode: "app" };
+export async function loader() {
+  return new Response(JSON.stringify({ status: "ok", nucleus: "ok" }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+`,
+      "utf-8"
+    );
+    const port = await getFreePort();
+    const running = await createServer({
+      host: "127.0.0.1",
+      port,
+      rootDir: root,
+      distDir: "dist",
+      routesDir: "src/routes",
+      compress: false,
+    });
+    closers.push(running.close);
+
+    const res = await fetch(`http://127.0.0.1:${port}/health`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.nucleus).toBe("ok");
+  }, 30000);
 });
