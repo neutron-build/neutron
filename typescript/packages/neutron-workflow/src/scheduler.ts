@@ -95,6 +95,12 @@ export interface SchedulerOptions {
   /** Poll interval (default 15s). */
   intervalMs?: number;
   onError?: (runId: string, error: unknown) => void;
+  /**
+   * Tick-level failures (e.g. the run index is unreachable) that abort a
+   * whole poll pass. Falls back to `onError` with run id "(tick)" when
+   * absent. The interval keeps running either way.
+   */
+  onTickError?: (error: unknown) => void;
 }
 
 /**
@@ -141,9 +147,15 @@ export class Scheduler {
   start(): void {
     if (this.#timer !== null) return;
     this.#timer = setInterval(() => {
-      void this.tick().catch(() => {});
+      void this.tick().catch((error) => this.#reportTickError(error));
     }, this.#options.intervalMs ?? 15_000);
     this.#timer.unref?.();
+  }
+
+  /** Surface a tick-level failure without killing the poll loop. */
+  #reportTickError(error: unknown): void {
+    if (this.#options.onTickError !== undefined) this.#options.onTickError(error);
+    else this.#options.onError?.("(tick)", error);
   }
 
   stop(): void {

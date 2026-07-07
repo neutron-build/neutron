@@ -3,7 +3,7 @@ import { test } from "node:test";
 
 import { createEventsHandler } from "./events-http.js";
 import { LeaseManager, type KVLike } from "./lease.js";
-import { executeRun } from "./run.js";
+import { deliverEvent, executeRun } from "./run.js";
 import { RunIndex, Scheduler, type DocumentLike } from "./scheduler.js";
 import { MemoryEventStore } from "./store.js";
 import { workflow } from "./workflow.js";
@@ -126,4 +126,116 @@ test("the events handler maps errors to problem details", async () => {
 
   const wrongMethod = await handler(new Request("http://x/events", { method: "GET" }));
   assert.equal(wrongMethod.status, 400);
+});
+
+/** Docs whose find() throws while state.fail is true; other ops always work. */
+function failableDocs(state: { fail: boolean; findCalls: number }): DocumentLike {
+  const docs = fakeDocs();
+  return {
+    insert: (collection, doc) => docs.insert(collection, doc),
+    update: (collection, filter, update) => docs.update(collection, filter, update),
+    async find(collection, filter) {
+      state.findCalls += 1;
+      if (state.fail) throw new Error("store unreachable");
+      return docs.find(collection, filter);
+    },
+  };
+}
+
+async function until(cond: () => boolean | Promise<boolean>, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await cond()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("condition not met in time");
+}
+
+test("start() routes index.due failures to onTickError and the loop survives", async () => {
+  const store = new MemoryEventStore();
+  const leases = new LeaseManager(simpleKV(), { ttlSeconds: 30 });
+  const state = { fail: true, findCalls: 0 };
+  const index = new RunIndex(failableDocs(state));
+  const wf = workflow("approval", async (ctx) => {
+    await ctx.waitForEvent("decision");
+    return "done";
+  });
+
+  const outcome = await executeRun({ workflow: wf, runId: "run-1", store, input: null });
+  await index.record("run-1", wf.name, outcome);
+  await deliverEvent(store, "run-1", "decision", { ok: true });
+  await index.markWake("run-1");
+
+  const tickErrors: unknown[] = [];
+  const scheduler = new Scheduler({
+    workflows: [wf],
+    store,
+    leases,
+    index,
+    owner: "worker-1",
+    intervalMs: 5,
+    onTickError: (error) => tickErrors.push(error),
+  });
+  scheduler.start();
+  try {
+    await until(() => tickErrors.length >= 1);
+    assert.equal((tickErrors[0] as Error).message, "store unreachable");
+
+    // store comes back: a subsequent tick still runs and completes the run
+    state.fail = false;
+    await until(async () => (await store.load("run-1")).some((e) => e.type === "run-completed"));
+  } finally {
+    scheduler.stop();
+  }
+});
+
+test("without onTickError, tick failures fall back to onError with run id \"(tick)\"", async () => {
+  const store = new MemoryEventStore();
+  const leases = new LeaseManager(simpleKV(), { ttlSeconds: 30 });
+  const state = { fail: true, findCalls: 0 };
+  const index = new RunIndex(failableDocs(state));
+  const wf = workflow("noop", async () => "done");
+
+  const errors: Array<{ runId: string; error: unknown }> = [];
+  const scheduler = new Scheduler({
+    workflows: [wf],
+    store,
+    leases,
+    index,
+    owner: "worker-1",
+    intervalMs: 5,
+    onError: (runId, error) => errors.push({ runId, error }),
+  });
+  scheduler.start();
+  try {
+    await until(() => errors.length >= 1);
+    assert.equal(errors[0]?.runId, "(tick)");
+    assert.equal((errors[0]?.error as Error).message, "store unreachable");
+  } finally {
+    scheduler.stop();
+  }
+});
+
+test("with neither handler, tick failures do not crash and the loop keeps polling", async () => {
+  const store = new MemoryEventStore();
+  const leases = new LeaseManager(simpleKV(), { ttlSeconds: 30 });
+  const state = { fail: true, findCalls: 0 };
+  const index = new RunIndex(failableDocs(state));
+  const wf = workflow("noop", async () => "done");
+
+  const scheduler = new Scheduler({
+    workflows: [wf],
+    store,
+    leases,
+    index,
+    owner: "worker-1",
+    intervalMs: 5,
+  });
+  scheduler.start();
+  try {
+    // at least two failing passes prove the interval survived the first error
+    await until(() => state.findCalls >= 2);
+  } finally {
+    scheduler.stop();
+  }
 });
