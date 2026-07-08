@@ -34,6 +34,7 @@ import {
 } from "./cache-store.js";
 import { createEntityTag, requestHasMatchingEtag } from "./cache-utils.js";
 import { escapeHtml } from "../core/escape.js";
+import { assertRenderedFragment, decodeChunkStart } from "../core/fragment-guard.js";
 import { neutronPlugin } from "../vite/plugin.js";
 import {
   resolveRuntimeAliases,
@@ -1313,29 +1314,6 @@ function streamHtmlDocument(
       }
     },
   });
-}
-
-/**
- * App-mode SSR mounts the rendered output inside the shell's `<div id="app">`
- * (buildHtmlPrefix owns `<html>`/`<head>`/`<body>`). A route or layout that
- * renders a full document instead of a fragment would be nested inside `#app` —
- * markup browsers silently flatten and hydration then duplicates (the page
- * renders twice). Reject it with an actionable error before it ships.
- */
-const FULL_DOCUMENT_START = /^\s*<(?:!doctype\s|html[\s/>]|body[\s/>])/i;
-
-function assertRenderedFragment(rendered: string, sourceFile?: string): void {
-  if (!FULL_DOCUMENT_START.test(rendered)) {
-    return;
-  }
-  const where = sourceFile ? ` (in ${sourceFile})` : "";
-  throw new Error(
-    `route/layout rendered a full document (<html>)${where} — in app mode the shell owns the document; render a fragment instead (move charset/title to index.html or a head() export)`
-  );
-}
-
-function decodeChunkStart(chunk: Uint8Array): string {
-  return new TextDecoder().decode(chunk.subarray(0, 256));
 }
 
 async function resolveRouteHeaders(
