@@ -10,6 +10,7 @@ import type {
   HeadArgs,
 } from "./types.js";
 import { discoverRoutes } from "./manifest.js";
+import { assertRenderedFragment } from "./fragment-guard.js";
 import {
   mergeSeoMetaInput,
   renderDocumentHead,
@@ -104,6 +105,10 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
       }
 
       const html = renderToString(element);
+      // The rendered output is mounted inside the shell's `<div id="app">`
+      // (wrapHtml owns `<html>`/`<head>`/`<body>`). A full-document render would
+      // nest a second document inside #app — reject it before it is written.
+      assertRenderedFragment(html, layoutChain[0]?.file ?? pageRoute.file);
       const headHtml = await resolveRouteHeadHtml(
         pageRoute,
         layoutChain,

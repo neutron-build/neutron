@@ -1,6 +1,7 @@
 export { createRouter } from "./core/router.js";
 export { discoverRoutes, parseRouteConfig } from "./core/manifest.js";
 export { renderStatic, renderToString } from "./core/render-static.js";
+export { assertRenderedFragment } from "./core/fragment-guard.js";
 export { redirect, safeRedirect, isSafeRedirect, json, notFound, isResponse, defer, isDeferredData, DeferredData } from "./core/response.js";
 export { cache, clearCache, clearCacheByPrefix, resetRequestCache, revalidateTag, revalidateTags, getCacheTags, getCacheKeysByTag, type CacheOptions } from "./core/cache.js";
 export { generateFontHTML, validateFontConfig, type FontConfig, type FontSource } from "./core/fonts.js";

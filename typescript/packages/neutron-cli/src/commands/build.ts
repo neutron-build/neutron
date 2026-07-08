@@ -17,6 +17,7 @@ import {
   mergeSeoMetaInput,
   renderDocumentHead,
   setActiveMarkdownConfig,
+  assertRenderedFragment,
 } from "@neutron-build/core";
 import type {
   NeutronConfig,
@@ -552,6 +553,10 @@ export async function build(): Promise<void> {
           }
 
           const html = appRender(element);
+          // Mounted inside the shell's `<div id="app">` (wrapHtml owns the
+          // document). A full-document render would nest a second document
+          // inside #app — reject it before the page is written.
+          assertRenderedFragment(html, layoutChain[0]?.file ?? route.file);
           const headHtml = await resolveRouteHeadHtml(
             route,
             layoutChain,
@@ -629,6 +634,10 @@ export async function build(): Promise<void> {
       }
 
       const html = appRender(element);
+      // Mounted inside the shell's `<div id="app">` (wrapHtml owns the
+      // document). A full-document render would nest a second document inside
+      // #app — reject it before the page is written.
+      assertRenderedFragment(html, layoutChain[0]?.file ?? route.file);
       const headHtml = await resolveRouteHeadHtml(
         route,
         layoutChain,

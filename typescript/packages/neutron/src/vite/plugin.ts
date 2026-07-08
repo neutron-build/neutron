@@ -3,6 +3,7 @@ import * as path from "node:path";
 import MagicString from "magic-string";
 import type { Plugin, ViteDevServer } from "vite";
 import { escapeHtml } from "../core/escape.js";
+import { assertRenderedFragment } from "../core/fragment-guard.js";
 import { discoverRoutes } from "../core/manifest.js";
 import { prepareRouteTypes } from "../core/route-typegen.js";
 import { createRouter } from "../core/router.js";
@@ -862,6 +863,11 @@ async function handleRequest(
           `  Use the head() export instead: export function head() { return { title: "..." }; }`
       );
     }
+
+    // The rendered output is mounted inside the shell's `<div id="app">`
+    // (wrapHtml owns `<html>`/`<head>`/`<body>`). A full-document render would
+    // nest a second document inside #app — reject it with an actionable error.
+    assertRenderedFragment(html, layoutChain[0]?.file ?? route.file);
 
     const fullHtml = wrapHtml(html, route, request, loaderData, clientEntry, actionData, headHtml, mergedSeo);
 
