@@ -101,6 +101,14 @@ export interface SchedulerOptions {
    * absent. The interval keeps running either way.
    */
   onTickError?: (error: unknown) => void;
+  /** Called just before a due run is executed this tick — for pickup logging. */
+  onRunStart?: (runId: string) => void;
+  /**
+   * Called after a due run executes and produces a terminal-or-suspend
+   * outcome — for completion logging/metrics. Not called for runs skipped
+   * because another executor holds the lease (outcome null).
+   */
+  onComplete?: (runId: string, outcome: RunOutcome) => void;
 }
 
 /**
@@ -130,6 +138,7 @@ export class Scheduler {
         const wf = name !== undefined ? this.#byName.get(name) : undefined;
         if (wf === undefined) continue; // not this worker's workflow
         if (sleeping) await completeSleep(this.#options.store, runId);
+        this.#options.onRunStart?.(runId);
         const outcome = await executeRunExclusive({
           workflow: wf,
           runId,
@@ -137,7 +146,10 @@ export class Scheduler {
           leases: this.#options.leases,
           owner: this.#options.owner,
         });
-        if (outcome !== null) await this.#options.index.record(runId, wf.name, outcome);
+        if (outcome !== null) {
+          await this.#options.index.record(runId, wf.name, outcome);
+          this.#options.onComplete?.(runId, outcome);
+        }
       } catch (error) {
         this.#options.onError?.(runId, error);
       }

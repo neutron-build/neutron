@@ -85,6 +85,36 @@ test("scheduler wakes due sleepers and completes them", async () => {
   assert.deepEqual(await index.due(new Date(Date.now() + 4 * 3_600_000)), []);
 });
 
+test("onRunStart and onComplete observe a run through the scheduler", async () => {
+  const { store, index, leases } = harness();
+  const wf = workflow("observed", async (ctx) => {
+    await ctx.step("work", () => "did work");
+    await ctx.sleep("1h");
+    return "done";
+  });
+  const outcome = await executeRun({ workflow: wf, runId: "run-1", store, input: null });
+  await index.record("run-1", wf.name, outcome);
+
+  const started: string[] = [];
+  const completed: Array<{ runId: string; status: string }> = [];
+  const scheduler = new Scheduler({
+    workflows: [wf],
+    store,
+    leases,
+    index,
+    owner: "worker-1",
+    onRunStart: (runId) => started.push(runId),
+    onComplete: (runId, o) => completed.push({ runId, status: o.status }),
+  });
+
+  // Past the sleep: the run resumes, executes, and completes.
+  await scheduler.tick(new Date(Date.now() + 2 * 3_600_000));
+  assert.deepEqual(started, ["run-1"]);
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0]?.runId, "run-1");
+  assert.equal(completed[0]?.status, "completed");
+});
+
 test("the events handler delivers, flags the run, and the next tick resumes it", async () => {
   const { store, index, leases } = harness();
   const wf = workflow("approval", async (ctx) => {
