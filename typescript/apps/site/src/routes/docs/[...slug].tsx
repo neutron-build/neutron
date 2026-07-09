@@ -1,5 +1,17 @@
 import { getCollection, getEntry } from "@neutron-build/core";
 
+// Read from loader data (built already) instead of calling getEntry here —
+// an async head() importing the content runtime pulls server-only code
+// (chokidar/fsevents) into the client bundle and breaks the build.
+export function head({ data, loaderData }: any) {
+  const d: any = data ?? (loaderData ? Object.values(loaderData)[0] : null);
+  const title = d?.entry?.data?.title;
+  return {
+    title: title ? `${title} — Neutron Docs` : "Docs — Neutron",
+    ...(d?.entry?.data?.description ? { description: d.entry.data.description } : {}),
+  };
+}
+
 export async function getStaticPaths() {
   const docs = await getCollection("docs");
   const paths = [];

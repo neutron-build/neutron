@@ -1,5 +1,12 @@
 import { getCollection } from "@neutron-build/core";
 
+export function head() {
+  return {
+    title: "Blog - Neutron",
+    description: "Engineering notes, benchmarks, and release updates from the Neutron team.",
+  };
+}
+
 interface BlogPost {
   slug: string;
   data: {
