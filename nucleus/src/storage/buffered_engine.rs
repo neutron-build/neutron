@@ -250,6 +250,10 @@ impl StorageEngine for BufferedDiskEngine {
         }
     }
 
+    async fn sync_schema(&self, table: &str) -> Result<(), StorageError> {
+        self.inner.sync_schema(table).await
+    }
+
     // -- Transaction lifecycle --
 
     async fn begin_txn(&self) -> Result<(), StorageError> {
