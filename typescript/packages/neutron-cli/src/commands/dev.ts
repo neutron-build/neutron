@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import * as fs from "node:fs";
+import { createRequire } from "node:module";
 import { createServer, loadConfigFromFile, mergeConfig } from "vite";
 import {
   neutronPlugin,
@@ -10,6 +11,8 @@ import {
   resolveRuntime,
   resolveRuntimeAliases,
   resolveRuntimeNoExternal,
+  resolvePreactSsr,
+  mergePreactAliases,
   type NeutronConfig,
 } from "@neutron-build/core";
 
@@ -20,6 +23,10 @@ export async function dev(): Promise<void> {
   const runtime = resolveRuntime(neutronConfig);
   const runtimeAliases = resolveRuntimeAliases(runtime);
   const runtimeNoExternal = resolveRuntimeNoExternal(runtime);
+  const preactSsr = resolvePreactSsr(cwd, {
+    from: [createRequire(import.meta.url).resolve("../../package.json")],
+  });
+  const preactAliases = mergePreactAliases(preactSsr, runtimeAliases);
 
   // Parse CLI args
   const args = process.argv.slice(3);
@@ -91,15 +98,15 @@ export async function dev(): Promise<void> {
         }),
       ],
       resolve: {
-        ...(runtimeAliases ? { alias: runtimeAliases } : {}),
-        // One preact copy so dev SSR components and the renderer share a hooks
-        // dispatcher (matches the build path).
+        // Absolute aliases so preact-render-to-string is resolvable even when
+        // the app only declares `preact` (pnpm keeps RTS under core/cli).
+        alias: preactAliases,
         dedupe: ["preact", "preact/hooks", "preact/jsx-runtime", "preact/compat"],
       },
       ssr: {
         // @neutron-build/core shares the SSR graph's preact too, so its inline
         // hook components (e.g. Link) don't crash dev SSR with "reading '__H'".
-        noExternal: ["preact", "preact/hooks", "preact-render-to-string", "@neutron-build/core", ...runtimeNoExternal],
+        noExternal: [...preactSsr.noExternal, ...runtimeNoExternal],
       },
       server: {
         port,

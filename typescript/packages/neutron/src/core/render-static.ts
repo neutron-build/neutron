@@ -1,7 +1,5 @@
 import * as path from "node:path";
 import * as fs from "node:fs";
-import { renderToString } from "preact-render-to-string";
-import { h } from "preact";
 import type {
   Route,
   RouteModule,
@@ -16,15 +14,36 @@ import {
   renderDocumentHead,
   type SeoMetaInput,
 } from "./seo.js";
+import { resolvePreactSsr, importPreactSsr } from "./preact-ssr.js";
 
 export interface StaticRenderOptions {
   routesDir: string;
   outputDir: string;
   baseUrl?: string;
+  /**
+   * App root used to resolve preact / preact-render-to-string. Defaults to the
+   * parent of `routesDir` (…/src → app root). Override when routes live outside
+   * the usual src/routes layout.
+   */
+  appRoot?: string;
 }
 
 export async function renderStatic(options: StaticRenderOptions): Promise<void> {
   const { routesDir, outputDir, baseUrl = "" } = options;
+  // Prefer explicit appRoot; otherwise process.cwd() (CLI runs from the app).
+  // Falling back to parent-of-routes only when cwd has no package.json.
+  const appRoot =
+    options.appRoot ??
+    (fs.existsSync(path.join(process.cwd(), "package.json"))
+      ? process.cwd()
+      : path.resolve(routesDir, ".."));
+
+  // Resolve + import preact and the renderer from one physical graph so hooks
+  // on route modules share options.__r with renderToString. A top-level static
+  // import of either package would bind the caller's node_modules copy and
+  // dual-instance crash under pnpm / monorepos.
+  const preactSsr = resolvePreactSsr(appRoot);
+  const { h, renderToString } = await importPreactSsr(preactSsr);
 
   const allRoutes = discoverRoutes({ routesDir });
 
@@ -227,4 +246,6 @@ function getOutputPath(outputDir: string, routePath: string): string {
   return path.join(outputDir, cleanPath, "index.html");
 }
 
-export { renderToString };
+// Re-export for callers that only need the string renderer from this module.
+// Prefer resolvePreactSsr + importPreactSsr when sharing a graph with app code.
+export { renderToString } from "preact-render-to-string";
