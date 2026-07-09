@@ -20,6 +20,9 @@ export default function Footer() {
           <a href="/julia">Julia</a>
           <a href="/nucleus">Nucleus</a>
           <a href="/studio">Studio</a>
+          <a href="/ai">AI</a>
+          <a href="/agents">Agents</a>
+          <a href="/workflow">Workflow</a>
           <a href="/native">Native</a>
           <a href="/docs">Docs</a>
           <a href="/blog">Blog</a>

@@ -3,6 +3,8 @@ declare module "@neutron-build/core" {
   interface NeutronGeneratedRouteMap {
     paths:
     | "/"
+    | "/agents"
+    | "/ai"
     | "/blog"
     | `/blog/${string}`
     | "/cli"
@@ -26,6 +28,7 @@ declare module "@neutron-build/core" {
     | "/studio"
     | "/typescript"
     | "/web"
+    | "/workflow"
     | "/zig"
   }
 }
