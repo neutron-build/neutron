@@ -14,6 +14,8 @@ import {
   resolveRuntime,
   resolveRuntimeAliases,
   resolveRuntimeNoExternal,
+  resolvePreactSsr,
+  mergePreactAliases,
   mergeSeoMetaInput,
   renderDocumentHead,
   setActiveMarkdownConfig,
@@ -33,6 +35,7 @@ import type {
 } from "@neutron-build/core";
 import { renderToString } from "preact-render-to-string";
 import { h } from "preact";
+import { createRequire } from "node:module";
 
 export async function build(): Promise<void> {
   const cwd = process.cwd();
@@ -42,6 +45,14 @@ export async function build(): Promise<void> {
   const runtime = resolveRuntime(neutronConfig);
   const runtimeAliases = resolveRuntimeAliases(runtime);
   const runtimeNoExternal = resolveRuntimeNoExternal(runtime);
+  // Absolute preact / RTS paths so Vite SSR can resolve the renderer even when
+  // the app only declares `preact` (pnpm keeps RTS under core/cli). Without
+  // these aliases, ssrLoadModule("preact-render-to-string") fails and a native
+  // fallback binds a second Preact options object → hooks crash with __H.
+  const preactSsr = resolvePreactSsr(cwd, {
+    from: [createRequire(import.meta.url).resolve("../../package.json")],
+  });
+  const preactAliases = mergePreactAliases(preactSsr, runtimeAliases);
   const buildArgs = parseBuildArgs(process.argv.slice(3));
   const selectedAdapter = resolveAdapterForBuild(neutronConfig, buildArgs);
 
@@ -163,7 +174,7 @@ export async function build(): Promise<void> {
         plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
         css: cssConfig,
         resolve: {
-          ...(runtimeAliases ? { alias: runtimeAliases } : {}),
+          alias: preactAliases,
           dedupe: ["preact", "preact/hooks", "preact/compat", "preact/jsx-runtime"],
         },
         build: {
@@ -207,7 +218,7 @@ export async function build(): Promise<void> {
         plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
         css: cssConfig,
         resolve: {
-          ...(runtimeAliases ? { alias: runtimeAliases } : {}),
+          alias: preactAliases,
           dedupe: ["preact", "preact/hooks", "preact/compat", "preact/jsx-runtime"],
         },
         build: {
@@ -248,7 +259,7 @@ export async function build(): Promise<void> {
         plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
         css: cssConfig,
         resolve: {
-          ...(runtimeAliases ? { alias: runtimeAliases } : {}),
+          alias: preactAliases,
           dedupe: ["preact", "preact/hooks", "preact/compat", "preact/jsx-runtime"],
         },
         build: {
@@ -284,8 +295,8 @@ export async function build(): Promise<void> {
     pageRoutes,
     clientEntryScriptSrc,
     userConfig,
-    runtimeAliases,
-    runtimeNoExternal,
+    runtimeAliases: preactAliases,
+    runtimeNoExternal: [...preactSsr.noExternal, ...runtimeNoExternal],
   });
 
   // Create a Vite SSR server for rendering
@@ -296,25 +307,22 @@ export async function build(): Promise<void> {
       plugins: [neutronPlugin({ routesDir, rootDir: cwd, routeRules: neutronConfig.routes })],
       css: cssConfig,
       resolve: {
-        ...(runtimeAliases ? { alias: runtimeAliases } : {}),
-        // Force one preact copy so route components and the renderer share the
-        // same hooks dispatcher (otherwise hooks crash during pre-render).
+        // Absolute aliases force one preact + RTS into the SSR graph even when
+        // the app does not declare preact-render-to-string (pnpm isolation).
+        alias: preactAliases,
         dedupe: ["preact", "preact/hooks", "preact/jsx-runtime", "preact/compat"],
       },
       ssr: {
-        // Process these through Vite's SSR graph (deduped) instead of native
-        // node resolution, so preact-render-to-string binds to the app's preact.
-        // @neutron-build/core MUST share the SSR graph's preact too: its inline
-        // components (e.g. Link) use hooks, and if core resolves preact natively
-        // while the renderer/route components use the SSR-graph copy, the hooks
-        // dispatcher is unset and pre-render crashes ("reading '__H'").
-        noExternal: ["preact", "preact/hooks", "preact-render-to-string", "@neutron-build/core", ...runtimeNoExternal],
+        // Process these through Vite's SSR graph (aliased + noExternal) instead
+        // of native node resolution. @neutron-build/core MUST share this graph
+        // too: its inline components (e.g. Link) use hooks.
+        noExternal: [...preactSsr.noExternal, ...runtimeNoExternal],
       },
       server: {
         middlewareMode: true,
         hmr: false,
         ws: false,
-        // Allow loading the CLI-provided renderer from outside the app root.
+        // Allow loading the framework-provided renderer from outside the app root.
         fs: { strict: false },
       },
       optimizeDeps: {
@@ -325,31 +333,20 @@ export async function build(): Promise<void> {
   );
 
   // Resolve the renderer through the SAME Vite SSR server that loads the route
-  // modules, so preact-render-to-string and the components share ONE preact
-  // instance. The CLI's own preact-render-to-string can otherwise bind to a
-  // different preact copy (e.g. under pnpm, or a linked/monorepo install),
-  // leaving the hooks dispatcher unset and crashing any component that uses
-  // useState/useEffect during pre-render with "Cannot read properties of
-  // undefined (reading '__H')".
-  let appH = h;
-  let appRender = renderToString;
-  try {
-    // Load the renderer + preact through the SAME Vite SSR graph as the route
-    // components so they share ONE preact instance (otherwise hooks crash during
-    // pre-render). This resolves them from the app, where preact and (ideally)
-    // preact-render-to-string are installed at a single matched version. If the
-    // app doesn't ship preact-render-to-string, we fall back to the CLI copy,
-    // which is correct whenever the app and CLI resolve the same preact.
-    const appPreact = (await server.ssrLoadModule("preact")) as { h?: typeof h };
-    const appRts = (await server.ssrLoadModule("preact-render-to-string")) as {
-      renderToString?: typeof renderToString;
-      default?: { renderToString?: typeof renderToString };
-    };
-    if (appPreact?.h) appH = appPreact.h;
-    const rts = appRts?.renderToString ?? appRts?.default?.renderToString;
-    if (rts) appRender = rts;
-  } catch {
-    // Fall back to the CLI-bundled renderer (single-preact installs are fine).
+  // modules. No native fallback: a second Preact options object is exactly the
+  // dual-instance __H crash. Aliases above make these resolvable.
+  const appPreact = (await server.ssrLoadModule("preact")) as { h?: typeof h };
+  const appRts = (await server.ssrLoadModule("preact-render-to-string")) as {
+    renderToString?: typeof renderToString;
+    default?: { renderToString?: typeof renderToString };
+  };
+  const appH = appPreact?.h;
+  const appRender = appRts?.renderToString ?? appRts?.default?.renderToString;
+  if (!appH || !appRender) {
+    throw new Error(
+      "[Neutron] Failed to load preact / preact-render-to-string through the Vite SSR graph. " +
+        "Install preact in the app and ensure @neutron-build/core is installed."
+    );
   }
 
   // Get layouts map
@@ -1040,7 +1037,10 @@ async function buildRuntimeBundle(
           routeRules: options.routeRules,
         }),
       ],
-      ...(options.runtimeAliases ? { resolve: { alias: options.runtimeAliases } } : {}),
+      resolve: {
+        ...(options.runtimeAliases ? { alias: options.runtimeAliases } : {}),
+        dedupe: ["preact", "preact/hooks", "preact/compat", "preact/jsx-runtime"],
+      },
       ssr: {
         target: target === "worker" ? "webworker" : "node",
         // Bundle @neutron-build/core with the same preact the renderer uses, so
@@ -1048,6 +1048,7 @@ async function buildRuntimeBundle(
         // two-preact-instance "__H" crash at runtime — matching the build/dev paths.
         noExternal: [
           "preact",
+          "preact/hooks",
           "preact-render-to-string",
           "@neutron-build/core",
           ...(options.runtimeNoExternal || []),

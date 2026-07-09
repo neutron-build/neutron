@@ -77,6 +77,12 @@ export {
   type NeutronWorkerConfig,
   type NeutronRuntime,
 } from "./config.js";
+export {
+  resolvePreactSsr,
+  mergePreactAliases,
+  importPreactSsr,
+  type PreactSsrResolution,
+} from "./core/preact-ssr.js";
 export { cspPlugin, defaultCspConfig, type CspConfig, type CspDirectives } from "./vite/csp-plugin.js";
 export {
   adapterNode,
