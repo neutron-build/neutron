@@ -15,7 +15,7 @@ import {
   resolveRuntimeAliases,
   resolveRuntimeNoExternal,
   resolvePreactSsr,
-  mergePreactAliases,
+  vitePreactAliases,
   mergeSeoMetaInput,
   renderDocumentHead,
   setActiveMarkdownConfig,
@@ -52,7 +52,9 @@ export async function build(): Promise<void> {
   const preactSsr = resolvePreactSsr(cwd, {
     from: [createRequire(import.meta.url).resolve("../../package.json")],
   });
-  const preactAliases = mergePreactAliases(preactSsr, runtimeAliases);
+  // Ordered array: subpaths before bare `preact` so jsx-dev-runtime is not
+  // joined onto the package root (Vite string aliases are prefix-matched).
+  const preactAliases = vitePreactAliases(preactSsr, runtimeAliases);
   const buildArgs = parseBuildArgs(process.argv.slice(3));
   const selectedAdapter = resolveAdapterForBuild(neutronConfig, buildArgs);
 
@@ -898,8 +900,8 @@ interface RuntimeBundleBuilderOptions {
   routes: Route[];
   pageRoutes: Route[];
   clientEntryScriptSrc: string | null;
-  userConfig: any;
-  runtimeAliases?: Record<string, string>;
+  userConfig: Record<string, any>;
+  runtimeAliases?: Array<{ find: string; replacement: string }> | Record<string, string>;
   runtimeNoExternal?: string[];
 }
 

@@ -4,7 +4,12 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { resolvePreactSsr, mergePreactAliases, importPreactSsr } from "./preact-ssr.js";
+import {
+  resolvePreactSsr,
+  vitePreactAliases,
+  mergePreactAliases,
+  importPreactSsr,
+} from "./preact-ssr.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -42,29 +47,60 @@ describe("resolvePreactSsr", () => {
     });
     expect(fs.existsSync(resolved.paths.preact)).toBe(true);
     expect(fs.existsSync(resolved.paths["preact/hooks"])).toBe(true);
+    expect(fs.existsSync(resolved.paths["preact/jsx-runtime"])).toBe(true);
+    expect(fs.existsSync(resolved.paths["preact/jsx-dev-runtime"])).toBe(true);
     expect(fs.existsSync(resolved.paths["preact-render-to-string"])).toBe(true);
-    // App root must not need its own RTS install.
     expect(fs.existsSync(path.join(root, "node_modules", "preact-render-to-string"))).toBe(
       false
     );
-    // Aliases are absolute paths.
-    for (const value of Object.values(resolved.aliases)) {
-      expect(path.isAbsolute(value)).toBe(true);
-    }
   });
 
-  it("mergePreactAliases rewrites react-compat bare targets to absolute paths", () => {
+  it("vitePreactAliases lists subpaths before bare preact (prefix-match safety)", () => {
     const root = makeApp();
     const preact = resolvePreactSsr(root);
-    const merged = mergePreactAliases(preact, {
+    const aliases = vitePreactAliases(preact);
+    const finds = aliases.map((a) => a.find);
+
+    expect(finds).toContain("preact/jsx-dev-runtime");
+    expect(finds).toContain("preact/jsx-runtime");
+    expect(finds).toContain("preact/hooks");
+    expect(finds).toContain("preact");
+    expect(finds).toContain("preact-render-to-string");
+
+    const bareIdx = finds.indexOf("preact");
+    const jsxDevIdx = finds.indexOf("preact/jsx-dev-runtime");
+    const jsxIdx = finds.indexOf("preact/jsx-runtime");
+    expect(jsxDevIdx).toBeLessThan(bareIdx);
+    expect(jsxIdx).toBeLessThan(bareIdx);
+
+    // Subpath replacements are real files, not package roots.
+    const jsxDev = aliases.find((a) => a.find === "preact/jsx-dev-runtime")!;
+    expect(fs.existsSync(jsxDev.replacement)).toBe(true);
+    expect(fs.statSync(jsxDev.replacement).isFile()).toBe(true);
+
+    // Bare preact is the package root (exports for unlisted subpaths).
+    const bare = aliases.find((a) => a.find === "preact")!;
+    expect(fs.existsSync(path.join(bare.replacement, "package.json"))).toBe(true);
+  });
+
+  it("vitePreactAliases rewrites react-compat targets onto absolute preact paths", () => {
+    const root = makeApp();
+    const preact = resolvePreactSsr(root);
+    const aliases = vitePreactAliases(preact, {
       react: "preact/compat",
       "react-dom/server": "preact-render-to-string",
     });
-    expect(merged.react).toBe(preact.paths["preact/compat"]);
-    expect(merged["react-dom/server"]).toBe(preact.aliases["preact-render-to-string"]);
-    // preact alias is the package root (not the entry file).
-    expect(merged.preact).toBe(preact.aliases.preact);
-    expect(fs.existsSync(path.join(merged.preact, "package.json"))).toBe(true);
+    const map = Object.fromEntries(aliases.map((a) => [a.find, a.replacement]));
+    expect(map.react).toBe(preact.paths["preact/compat"]);
+    expect(map["react-dom/server"]).toBe(preact.packageRoots["preact-render-to-string"]);
+  });
+
+  it("mergePreactAliases flat map still covers the ordered keys", () => {
+    const root = makeApp();
+    const preact = resolvePreactSsr(root);
+    const map = mergePreactAliases(preact);
+    expect(map["preact/jsx-dev-runtime"]).toBe(preact.paths["preact/jsx-dev-runtime"]);
+    expect(map.preact).toBe(preact.packageRoots.preact);
   });
 
   it("importPreactSsr returns a working h + renderToString pair", async () => {

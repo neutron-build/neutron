@@ -12,7 +12,7 @@ import {
   resolveRuntimeAliases,
   resolveRuntimeNoExternal,
   resolvePreactSsr,
-  mergePreactAliases,
+  vitePreactAliases,
   type NeutronConfig,
 } from "@neutron-build/core";
 
@@ -26,7 +26,9 @@ export async function dev(): Promise<void> {
   const preactSsr = resolvePreactSsr(cwd, {
     from: [createRequire(import.meta.url).resolve("../../package.json")],
   });
-  const preactAliases = mergePreactAliases(preactSsr, runtimeAliases);
+  // Ordered: jsx-dev-runtime / jsx-runtime / hooks before bare preact so Vite
+  // does not prefix-match `preact` onto export-map-only subpaths.
+  const preactAliases = vitePreactAliases(preactSsr, runtimeAliases);
 
   // Parse CLI args
   const args = process.argv.slice(3);
@@ -99,14 +101,33 @@ export async function dev(): Promise<void> {
       ],
       resolve: {
         // Absolute aliases so preact-render-to-string is resolvable even when
-        // the app only declares `preact` (pnpm keeps RTS under core/cli).
+        // the app only declares `preact` (pnpm keeps RTS under core/cli), and
+        // so jsx-dev-runtime resolves to a real file under the client graph.
         alias: preactAliases,
-        dedupe: ["preact", "preact/hooks", "preact/jsx-runtime", "preact/compat"],
+        dedupe: [
+          "preact",
+          "preact/hooks",
+          "preact/jsx-runtime",
+          "preact/jsx-dev-runtime",
+          "preact/compat",
+        ],
       },
       ssr: {
         // @neutron-build/core shares the SSR graph's preact too, so its inline
         // hook components (e.g. Link) don't crash dev SSR with "reading '__H'".
         noExternal: [...preactSsr.noExternal, ...runtimeNoExternal],
+      },
+      optimizeDeps: {
+        // Force the client optimizer to pre-bundle the same absolute entries
+        // we alias — without this, @preact/preset-vite's include of
+        // `preact/jsx-dev-runtime` fails under pnpm + file: linked packages.
+        include: [
+          "preact",
+          "preact/hooks",
+          "preact/jsx-runtime",
+          "preact/jsx-dev-runtime",
+          "preact/compat",
+        ],
       },
       server: {
         port,
