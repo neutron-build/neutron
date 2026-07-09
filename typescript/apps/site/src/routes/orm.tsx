@@ -1,6 +1,14 @@
 import FeatureGrid from "../components/FeatureGrid";
 import SectionBreak from "../components/SectionBreak";
 
+export function head() {
+  return {
+    title: "ORM - Neutron",
+    description:
+      "The Neutron ORM: one typed data layer over every Nucleus model. In active development.",
+  };
+}
+
 export default function OrmPage() {
   return (
     <>
@@ -151,7 +159,7 @@ export default function OrmPage() {
                 <span class="terminal-dot"></span>
               </div>
               <pre class="terminal-body"><code><span class="terminal-prompt">#</span> Coming soon
-<span class="terminal-prompt">#</span> Follow development at github.com/tystack</code></pre>
+<span class="terminal-prompt">#</span> Follow development at github.com/neutron-build/neutron</code></pre>
             </div>
           </div>
         </section>

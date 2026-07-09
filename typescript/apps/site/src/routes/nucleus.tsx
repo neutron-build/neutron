@@ -3,6 +3,14 @@ import FeatureGrid from "../components/FeatureGrid";
 import BenchmarkBars from "../components/BenchmarkBars";
 import SectionBreak from "../components/SectionBreak";
 
+export function head() {
+  return {
+    title: "Nucleus - Neutron",
+    description:
+      "Nucleus is Neutron's multi-model database in one pgwire-compatible engine: relational, key-value, vector, time-series, document, graph, full-text search, geo, and pub/sub.",
+  };
+}
+
 export default function NucleusPage() {
   return (
     <>

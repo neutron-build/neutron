@@ -6,6 +6,14 @@ import FeatureGrid from "../components/FeatureGrid";
 import BenchmarkBars from "../components/BenchmarkBars";
 import ComparisonTable from "../components/ComparisonTable";
 
+export function head() {
+  return {
+    title: "TypeScript - Neutron",
+    description:
+      "Neutron's TypeScript framework: server-side rendering, islands architecture, file-based routing, and a typed Nucleus client. Single-binary deploy, benchmarked head-to-head with Next.js.",
+  };
+}
+
 export default function TypeScriptPage() {
   return (
     <>
