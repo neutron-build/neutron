@@ -79,9 +79,11 @@ export {
 } from "./config.js";
 export {
   resolvePreactSsr,
+  vitePreactAliases,
   mergePreactAliases,
   importPreactSsr,
   type PreactSsrResolution,
+  type ViteAliasEntry,
 } from "./core/preact-ssr.js";
 export { cspPlugin, defaultCspConfig, type CspConfig, type CspDirectives } from "./vite/csp-plugin.js";
 export {

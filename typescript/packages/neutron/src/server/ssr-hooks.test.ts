@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 import { createRequire } from "node:module";
-import { resolvePreactSsr, mergePreactAliases } from "../core/preact-ssr.js";
+import { resolvePreactSsr, vitePreactAliases } from "../core/preact-ssr.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -88,7 +88,7 @@ export function ThemeToggle() {
     const preactSsr = resolvePreactSsr(root, {
       from: [createRequire(import.meta.url).resolve("../../package.json")],
     });
-    const aliases = mergePreactAliases(preactSsr);
+    const aliases = vitePreactAliases(preactSsr);
 
     const server = await createServer({
       configFile: false,
