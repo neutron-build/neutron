@@ -177,6 +177,15 @@ pub trait StorageEngine: Send + Sync {
         Ok(())
     }
 
+    /// Rebuild every secondary index on `table` from its current rows. Called
+    /// after ALTER TABLE ADD COLUMN so indexes recover from the row rewrite the
+    /// backfill performs (the incremental index maintenance during that rewrite
+    /// reads pre-widen tuples against the post-widen schema and can leave stale
+    /// entries). Default: no-op, for engines that don't keep secondary indexes.
+    async fn rebuild_table_indexes(&self, _table: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     /// Scan returning only rows where column `col_idx` equals `value`, with
     /// their scan-order positions. Enables UPDATE/DELETE by PK without
     /// materialising the entire table. Default: full scan + filter.
