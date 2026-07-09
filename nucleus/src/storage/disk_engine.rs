@@ -1683,6 +1683,25 @@ impl StorageEngine for DiskEngine {
         Ok(())
     }
 
+    async fn rebuild_table_indexes(&self, table: &str) -> Result<(), StorageError> {
+        // Re-create each index on the table from its current tuples.
+        // create_index_inner reads the (now widened) schema + rows and
+        // overwrites the index entry, so any stale entries from the backfill's
+        // incremental maintenance are replaced with a correct index.
+        let to_rebuild: Vec<(String, usize)> = {
+            let indexes = self.indexes.read();
+            indexes
+                .iter()
+                .filter(|(_, m)| m.table == table)
+                .map(|(name, m)| (name.clone(), m.col_idx))
+                .collect()
+        };
+        for (name, col_idx) in to_rebuild {
+            self.create_index_inner(&name, table, col_idx)?;
+        }
+        Ok(())
+    }
+
     async fn flush_all_dirty(&self) -> Result<(), StorageError> {
         if let Some(ref ops) = self.async_ops {
             // Async path: collect dirty pages (sync, memory-only), write via io_uring/tokio::fs.

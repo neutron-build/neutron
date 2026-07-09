@@ -254,6 +254,10 @@ impl StorageEngine for BufferedDiskEngine {
         self.inner.sync_schema(table).await
     }
 
+    async fn rebuild_table_indexes(&self, table: &str) -> Result<(), StorageError> {
+        self.inner.rebuild_table_indexes(table).await
+    }
+
     // -- Transaction lifecycle --
 
     async fn begin_txn(&self) -> Result<(), StorageError> {

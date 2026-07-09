@@ -1089,6 +1089,11 @@ impl Executor {
                     if !updates.is_empty() {
                         engine.update(&table_name, &updates).await?;
                     }
+                    // The row rewrite above maintains indexes incrementally
+                    // against the pre-widen tuples, which can leave stale
+                    // entries; rebuild the table's indexes from the widened
+                    // rows to keep lookups correct.
+                    engine.rebuild_table_indexes(&table_name).await?;
                 }
                 ast::AlterTableOperation::DropColumn {
                     column_names,

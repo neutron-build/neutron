@@ -2522,6 +2522,39 @@ mod tests {
         assert_eq!(*scalar(&res[0]), Value::Null);
     }
 
+    // Audit: ADD COLUMN on an INDEXED table (disk engine). The backfill's
+    // update re-reads existing tuples for index maintenance, so verify the
+    // index still resolves and the new column is writable afterward.
+    #[tokio::test]
+    async fn test_add_column_indexed_table_disk() {
+        use crate::storage::buffered_engine::BufferedDiskEngine;
+        use crate::storage::disk_engine::DiskEngine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::new());
+        let disk = Arc::new(DiskEngine::open(&dir.path().join("test.db"), catalog.clone()).unwrap());
+        let engine: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(disk));
+        let ex = Arc::new(Executor::new(catalog, engine));
+
+        run(&ex, "CREATE TABLE docs (collection TEXT, run_id TEXT, model TEXT)").await;
+        run(&ex, "CREATE INDEX idx_run ON docs (run_id)").await;
+        run(&ex, "INSERT INTO docs VALUES ('meta', 'run-1', 'sonnet')").await;
+        run(&ex, "INSERT INTO docs VALUES ('meta', 'run-2', 'haiku')").await;
+
+        run(&ex, "ALTER TABLE docs ADD COLUMN ran_on TEXT").await;
+
+        // Index-backed lookup still finds the row after the widening.
+        let res = run(&ex, "SELECT model FROM docs WHERE run_id = 'run-1'").await;
+        assert_eq!(*scalar(&res[0]), Value::Text("sonnet".into()));
+
+        // New column is writable, and the index still routes the update.
+        run(&ex, "UPDATE docs SET ran_on = 'host-a' WHERE run_id = 'run-1'").await;
+        let res = run(&ex, "SELECT ran_on FROM docs WHERE run_id = 'run-1'").await;
+        assert_eq!(*scalar(&res[0]), Value::Text("host-a".into()));
+        let res = run(&ex, "SELECT ran_on FROM docs WHERE run_id = 'run-2'").await;
+        assert_eq!(*scalar(&res[0]), Value::Null);
+    }
+
     // ========================================================================
     // 28. Cross-module: MVCC with complex queries (CTE + aggregation)
     // ========================================================================
