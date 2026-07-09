@@ -74,6 +74,12 @@ export interface ExecuteRunExclusiveOptions<In> extends ExecuteRunOptions<In> {
   leases: LeaseManager;
   /** Executor identity, embedded in the lease token. */
   owner: string;
+  /**
+   * Fired once, only when THIS call wins the lease and is about to execute —
+   * not when the lease is held elsewhere. Pairs 1:1 with the returned outcome,
+   * so callers can count in-flight work without leaking on lease contention.
+   */
+  onStart?: () => void;
 }
 
 /**
@@ -87,6 +93,7 @@ export async function executeRunExclusive<In>(
 ): Promise<RunOutcome | null> {
   const lease = await options.leases.acquire(options.runId, options.owner);
   if (lease === null) return null;
+  options.onStart?.();
 
   const intervalMs = Math.max(1000, (lease.ttlSeconds * 1000) / 3);
   const heartbeat = setInterval(() => {

@@ -138,13 +138,16 @@ export class Scheduler {
         const wf = name !== undefined ? this.#byName.get(name) : undefined;
         if (wf === undefined) continue; // not this worker's workflow
         if (sleeping) await completeSleep(this.#options.store, runId);
-        this.#options.onRunStart?.(runId);
+        // onRunStart fires only when we actually win the lease (via onStart),
+        // so it pairs 1:1 with onComplete — a worker that loses the lease to
+        // another in the fleet doesn't leave a dangling "started".
         const outcome = await executeRunExclusive({
           workflow: wf,
           runId,
           store: this.#options.store,
           leases: this.#options.leases,
           owner: this.#options.owner,
+          onStart: () => this.#options.onRunStart?.(runId),
         });
         if (outcome !== null) {
           await this.#options.index.record(runId, wf.name, outcome);
