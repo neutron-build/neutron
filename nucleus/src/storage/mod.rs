@@ -168,6 +168,15 @@ pub trait StorageEngine: Send + Sync {
     /// Update rows at the given scan-order positions with new row values.
     async fn update(&self, table: &str, updates: &[(usize, Row)]) -> Result<usize, StorageError>;
 
+    /// Re-read a table's column schema from the catalog into any cache the
+    /// engine keeps. Called after ALTER TABLE so an engine that caches its own
+    /// column types (e.g. the disk engine's meta page) stays consistent with
+    /// the catalog — otherwise it serializes rows against the stale shape.
+    /// Default: no-op, for engines that read the catalog on every access.
+    async fn sync_schema(&self, _table: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     /// Scan returning only rows where column `col_idx` equals `value`, with
     /// their scan-order positions. Enables UPDATE/DELETE by PK without
     /// materialising the entire table. Default: full scan + filter.

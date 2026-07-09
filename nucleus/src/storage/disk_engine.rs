@@ -1655,6 +1655,34 @@ impl StorageEngine for DiskEngine {
         Ok(count)
     }
 
+    async fn sync_schema(&self, table: &str) -> Result<(), StorageError> {
+        // Refresh the cached col_types/col_names from the catalog after an
+        // ALTER. Without this the meta page keeps the pre-ALTER shape and
+        // serialize_row writes rows against the wrong column count.
+        let Some(table_def) = self.catalog.get_table(table).await else {
+            return Ok(());
+        };
+        let col_types: Vec<DataType> = table_def
+            .columns
+            .iter()
+            .map(|c| c.data_type.clone())
+            .collect();
+        let col_names: Vec<String> = table_def.columns.iter().map(|c| c.name.clone()).collect();
+        {
+            let mut tables = self.tables.write();
+            match tables.get_mut(table) {
+                Some(meta) => {
+                    meta.col_types = col_types;
+                    meta.col_names = col_names;
+                }
+                None => return Ok(()),
+            }
+        }
+        // Persist so the widened schema survives a restart.
+        self.save_table_directory()?;
+        Ok(())
+    }
+
     async fn flush_all_dirty(&self) -> Result<(), StorageError> {
         if let Some(ref ops) = self.async_ops {
             // Async path: collect dirty pages (sync, memory-only), write via io_uring/tokio::fs.

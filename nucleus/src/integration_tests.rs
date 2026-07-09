@@ -2463,6 +2463,65 @@ mod tests {
         assert_eq!(r[0][1], Value::Text("BASE TABLE".into()));
     }
 
+    // Regression: ADD COLUMN without a default, then UPDATE that column with a
+    // WHERE clause. This is the path that terminated the pgwire connection in
+    // teploy-ship (dogfood finding #29): existing rows read the new column, but
+    // updating it crashed. Exercises catalog+storage on the widened row.
+    #[tokio::test]
+    async fn test_add_column_no_default_then_update() {
+        let ex = setup();
+        run(&ex, "CREATE TABLE docs (collection TEXT, run_id TEXT, model TEXT)").await;
+        run(&ex, "INSERT INTO docs VALUES ('meta', 'run-1', 'sonnet')").await;
+        run(&ex, "INSERT INTO docs VALUES ('meta', 'run-2', 'haiku')").await;
+
+        run(&ex, "ALTER TABLE docs ADD COLUMN ran_on TEXT").await;
+
+        // Existing rows have NULL in the new column.
+        let res = run(&ex, "SELECT ran_on FROM docs WHERE run_id = 'run-1'").await;
+        assert_eq!(*scalar(&res[0]), Value::Null);
+
+        // Update the new column on one row.
+        run(&ex, "UPDATE docs SET ran_on = 'host-a' WHERE run_id = 'run-1'").await;
+
+        let res = run(&ex, "SELECT ran_on FROM docs WHERE run_id = 'run-1'").await;
+        assert_eq!(*scalar(&res[0]), Value::Text("host-a".into()));
+        // Untouched row is still NULL.
+        let res = run(&ex, "SELECT ran_on FROM docs WHERE run_id = 'run-2'").await;
+        assert_eq!(*scalar(&res[0]), Value::Null);
+    }
+
+    // Same as above but on the production engine (BufferedDiskEngine over
+    // DiskEngine) — the actual engine teploy-ship's Nucleus runs. The
+    // MemoryEngine version passes; this one is where the page-backed storage
+    // mishandles the widened row.
+    #[tokio::test]
+    async fn test_add_column_no_default_then_update_disk() {
+        use crate::storage::buffered_engine::BufferedDiskEngine;
+        use crate::storage::disk_engine::DiskEngine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::new());
+        let disk = Arc::new(DiskEngine::open(&dir.path().join("test.db"), catalog.clone()).unwrap());
+        let engine: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(disk));
+        let ex = Arc::new(Executor::new(catalog, engine));
+
+        run(&ex, "CREATE TABLE docs (collection TEXT, run_id TEXT, model TEXT)").await;
+        run(&ex, "INSERT INTO docs VALUES ('meta', 'run-1', 'sonnet')").await;
+        run(&ex, "INSERT INTO docs VALUES ('meta', 'run-2', 'haiku')").await;
+
+        run(&ex, "ALTER TABLE docs ADD COLUMN ran_on TEXT").await;
+
+        let res = run(&ex, "SELECT ran_on FROM docs WHERE run_id = 'run-1'").await;
+        assert_eq!(*scalar(&res[0]), Value::Null);
+
+        run(&ex, "UPDATE docs SET ran_on = 'host-a' WHERE run_id = 'run-1'").await;
+
+        let res = run(&ex, "SELECT ran_on FROM docs WHERE run_id = 'run-1'").await;
+        assert_eq!(*scalar(&res[0]), Value::Text("host-a".into()));
+        let res = run(&ex, "SELECT ran_on FROM docs WHERE run_id = 'run-2'").await;
+        assert_eq!(*scalar(&res[0]), Value::Null);
+    }
+
     // ========================================================================
     // 28. Cross-module: MVCC with complex queries (CTE + aggregation)
     // ========================================================================

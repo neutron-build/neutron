@@ -1068,6 +1068,9 @@ impl Executor {
                     };
 
                     let engine = self.storage_for(&table_name);
+                    // Read existing rows with the engine's pre-ALTER schema so
+                    // old tuples deserialize at their original width, then widen
+                    // each with the new column's default value.
                     let rows = engine.scan(&table_name).await?;
                     let updates: Vec<(usize, Row)> = rows
                         .into_iter()
@@ -1077,6 +1080,12 @@ impl Executor {
                             (i, r)
                         })
                         .collect();
+                    // Sync the engine's cached column schema to the new shape
+                    // before writing the widened rows — otherwise an engine that
+                    // caches col_types (the disk engine) serializes them against
+                    // the stale count and corrupts the tuples. Also runs when the
+                    // table is empty so future INSERTs use the new shape.
+                    engine.sync_schema(&table_name).await?;
                     if !updates.is_empty() {
                         engine.update(&table_name, &updates).await?;
                     }
