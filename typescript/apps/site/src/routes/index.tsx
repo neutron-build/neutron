@@ -398,6 +398,60 @@ export default function HomePage() {
                   </p>
                 </div>
               </a>
+              <a
+                href="/ai"
+                class="products__card products__card--ai"
+                data-animate
+                style="--animate-delay: 0.52s"
+              >
+                <div class="products__inner">
+                  <div class="products__header">
+                    <span class="products__name">AI</span>
+                    <span class="products__badge products__badge--available">
+                      Available
+                    </span>
+                  </div>
+                  <p class="products__desc">
+                    Model calls, streaming, structured output, tools. Any provider.
+                  </p>
+                </div>
+              </a>
+              <a
+                href="/agents"
+                class="products__card products__card--agents"
+                data-animate
+                style="--animate-delay: 0.54s"
+              >
+                <div class="products__inner">
+                  <div class="products__header">
+                    <span class="products__name">Agents</span>
+                    <span class="products__badge products__badge--available">
+                      Available
+                    </span>
+                  </div>
+                  <p class="products__desc">
+                    File-based durable agents. Plan, act, survive restarts.
+                  </p>
+                </div>
+              </a>
+              <a
+                href="/workflow"
+                class="products__card products__card--workflow"
+                data-animate
+                style="--animate-delay: 0.56s"
+              >
+                <div class="products__inner">
+                  <div class="products__header">
+                    <span class="products__name">Workflow</span>
+                    <span class="products__badge products__badge--available">
+                      Available
+                    </span>
+                  </div>
+                  <p class="products__desc">
+                    Durable event-sourced execution. Suspend for days, resume exactly.
+                  </p>
+                </div>
+              </a>
               <div
                 class="products__card products__card--platform"
                 data-animate

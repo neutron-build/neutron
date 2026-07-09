@@ -32,6 +32,12 @@ const database = [
   { id: "studio", label: "Studio", desc: "Visual database management", href: "/studio" },
 ];
 
+const ai = [
+  { id: "ai", label: "AI", desc: "Model calls, streaming, tools", href: "/ai" },
+  { id: "agents", label: "Agents", desc: "Durable file-based agents", href: "/agents" },
+  { id: "workflow", label: "Workflow", desc: "Event-sourced durable execution", href: "/workflow" },
+];
+
 export default function Nav({ activeProduct }: NavProps) {
   return (
     <>
@@ -77,6 +83,9 @@ export default function Nav({ activeProduct }: NavProps) {
             </button>
             <button class="nav__item nav__trigger" data-dropdown="database">
               Database <span class="nav__caret">&#9662;</span>
+            </button>
+            <button class="nav__item nav__trigger" data-dropdown="ai">
+              AI <span class="nav__caret">&#9662;</span>
             </button>
           </div>
 
@@ -138,6 +147,12 @@ export default function Nav({ activeProduct }: NavProps) {
                 ))}
               </div>
               <div class="nav__drawer-section">
+                <h3 class="nav__drawer-title">AI</h3>
+                {ai.map((a) => (
+                  <a href={a.href} class="nav__drawer-link" key={a.id}>{a.label}</a>
+                ))}
+              </div>
+              <div class="nav__drawer-section">
                 <a href="/cli" class="nav__drawer-link nav__drawer-link--primary">CLI</a>
                 <a href="/docs" class="nav__drawer-link nav__drawer-link--primary">Docs</a>
                 <a href="https://github.com/neutron-build/neutron" class="nav__drawer-link nav__drawer-link--primary" target="_blank" rel="noopener noreferrer">GitHub</a>
@@ -180,6 +195,16 @@ export default function Nav({ activeProduct }: NavProps) {
                   <a href={d.href} class="nav__tile" key={d.id}>
                     <span class="nav__tile-label">{d.label}</span>
                     <span class="nav__tile-desc">{d.desc}</span>
+                  </a>
+                ))}
+              </div>
+            </div>
+            <div class="nav__panel" data-panel="ai">
+              <div class="nav__tile-grid">
+                {ai.map((a) => (
+                  <a href={a.href} class="nav__tile" key={a.id}>
+                    <span class="nav__tile-label">{a.label}</span>
+                    <span class="nav__tile-desc">{a.desc}</span>
                   </a>
                 ))}
               </div>
