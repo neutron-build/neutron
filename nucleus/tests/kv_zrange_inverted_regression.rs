@@ -44,16 +44,20 @@ async fn kv_zrange_sql_inverted_range_is_empty() {
     one(&ex, "SELECT KV_ZADD('z',3,'c')").await.unwrap();
 
     // Inverted ranges must be empty (the bug returned one spurious element).
-    assert_eq!(one(&ex, "SELECT KV_ZRANGE('z',2,1)").await.unwrap(), "");
-    assert_eq!(one(&ex, "SELECT KV_ZRANGE('z',2,0)").await.unwrap(), "");
+    // KV collections speak JSON on the wire since b9d0bf6 (comma-corruption fix).
+    assert_eq!(one(&ex, "SELECT KV_ZRANGE('z',2,1)").await.unwrap(), "[]");
+    assert_eq!(one(&ex, "SELECT KV_ZRANGE('z',2,0)").await.unwrap(), "[]");
 
     // start == stop still returns exactly one element (unchanged behavior).
-    assert_eq!(one(&ex, "SELECT KV_ZRANGE('z',0,0)").await.unwrap(), "a:1");
+    assert_eq!(
+        one(&ex, "SELECT KV_ZRANGE('z',0,0)").await.unwrap(),
+        r#"[["a",1.0]]"#
+    );
 
     // Normal ascending range still works (unchanged behavior).
     assert_eq!(
         one(&ex, "SELECT KV_ZRANGE('z',0,2)").await.unwrap(),
-        "a:1,b:2,c:3"
+        r#"[["a",1.0],["b",2.0],["c",3.0]]"#
     );
 }
 

@@ -1747,6 +1747,46 @@ mod tests {
         Arc::new(Executor::new(catalog, storage))
     }
 
+    /// ORDER BY on a select-list alias of a COMPUTED expression must sort by
+    /// that expression. Regression: the alias resolved against source columns
+    /// only, the bare identifier then evaluated to Null per row, and the sort
+    /// silently no-oped — with LIMIT k this dropped the best rows entirely
+    /// (found via vector search: ORDER BY distance returned insertion order).
+    #[tokio::test]
+    async fn order_by_alias_of_computed_expression_sorts() {
+        let ex = setup_mvcc();
+        run(&ex, "CREATE TABLE ob (id INT NOT NULL, a INT, b INT)").await;
+        run(&ex, "INSERT INTO ob VALUES (1, 10, 1), (2, 2, 1), (3, 5, 1)").await;
+
+        // alias of an arithmetic expression
+        let res = run(&ex, "SELECT id, a + b AS total FROM ob ORDER BY total").await;
+        let r = rows(&res[0]);
+        let ids: Vec<_> = r.iter().map(|row| row[0].clone()).collect();
+        assert_eq!(
+            ids,
+            vec![Value::Int32(2), Value::Int32(3), Value::Int32(1)],
+            "ORDER BY <alias of computed expr> must sort ascending by the expression"
+        );
+
+        // DESC + LIMIT: the top row must be the true maximum, not insertion order
+        let res = run(&ex, "SELECT id, a + b AS total FROM ob ORDER BY total DESC LIMIT 1").await;
+        assert_eq!(rows(&res[0])[0][0], Value::Int32(1));
+
+        // alias of a scalar-function expression over a vector column
+        run(&ex, "CREATE TABLE obv (id INT NOT NULL, v VECTOR(3))").await;
+        run(&ex, "INSERT INTO obv VALUES (1, VECTOR('[0,1,0]')), (2, VECTOR('[1,0,0]'))").await;
+        let res = run(
+            &ex,
+            "SELECT id, VECTOR_DISTANCE(v, VECTOR('[1,0,0]'), 'cosine') AS distance FROM obv ORDER BY distance LIMIT 1",
+        )
+        .await;
+        assert_eq!(
+            rows(&res[0])[0][0],
+            Value::Int32(2),
+            "the nearest vector must rank first when ordering by the distance alias"
+        );
+    }
+
     #[tokio::test]
     async fn mvcc_basic_crud() {
         let ex = setup_mvcc();

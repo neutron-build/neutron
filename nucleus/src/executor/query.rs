@@ -6866,11 +6866,32 @@ impl Executor {
             let nulls_first = ob_expr.options.nulls_first.unwrap_or(!asc);
             match self.resolve_order_by_expr(&ob_expr.expr, columns, col_meta, projection) {
                 Ok(col_idx) => sort_keys.push((SortKey::Column(col_idx), asc, nulls_first)),
-                Err(_) => sort_keys.push((
-                    SortKey::Expr(Box::new(ob_expr.expr.clone())),
-                    asc,
-                    nulls_first,
-                )),
+                Err(_) => {
+                    // ORDER BY <alias> where the alias names a COMPLEX
+                    // projection expression (e.g. `SELECT f(x) AS d ... ORDER
+                    // BY d`): the alias is not a source column, so sort by the
+                    // underlying expression itself. Without this substitution
+                    // the bare identifier is evaluated per-row against source
+                    // columns, fails, and every key becomes Null — the sort
+                    // silently no-ops.
+                    let mut key_expr = ob_expr.expr.clone();
+                    if let ast::Expr::Identifier(ident) = &ob_expr.expr
+                        && let Some(proj) = projection
+                    {
+                        for item in proj {
+                            if let SelectItem::ExprWithAlias {
+                                expr: proj_expr,
+                                alias,
+                            } = item
+                                && alias.value == ident.value
+                            {
+                                key_expr = proj_expr.clone();
+                                break;
+                            }
+                        }
+                    }
+                    sort_keys.push((SortKey::Expr(Box::new(key_expr)), asc, nulls_first))
+                }
             }
         }
 

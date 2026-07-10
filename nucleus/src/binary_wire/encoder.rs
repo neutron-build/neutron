@@ -1,7 +1,7 @@
 //! Binary protocol message encoding — TLV frame format.
 //!
 //! Frame structure:
-//! ```
+//! ```text
 //! [type:1byte][length:4bytes Big Endian][payload:N bytes]
 //! ```
 //!
