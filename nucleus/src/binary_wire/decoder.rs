@@ -4,7 +4,7 @@
 //! and supports streaming (incomplete frame buffering).
 //!
 //! Frame structure:
-//! ```
+//! ```text
 //! [type:1byte][length:4bytes Big Endian][payload:N bytes]
 //! ```
 

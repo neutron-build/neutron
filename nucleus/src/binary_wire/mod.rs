@@ -5,7 +5,7 @@
 //! # Message Format
 //!
 //! All messages follow TLV (Type-Length-Value) format:
-//! ```
+//! ```text
 //! [type:1byte][length:4bytes BE][payload:N bytes]
 //! ```
 //!

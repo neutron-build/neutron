@@ -34,7 +34,7 @@ use pgwire::api::auth::{
     save_startup_parameters_to_metadata,
 };
 use pgwire::api::copy::CopyHandler;
-use pgwire::api::portal::Portal;
+use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
     CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
@@ -699,22 +699,23 @@ impl NucleusHandler {
     /// format as required by the PostgreSQL wire protocol spec.  When false
     /// (ExtendedQuery protocol), numeric types use binary encoding for
     /// performance.
-    fn build_response(result: ExecResult, text_only: bool) -> PgWireResult<Response> {
+    /// `formats`: the client-requested result formats from Bind (extended
+    /// protocol), or `None` for the simple protocol (always text). The
+    /// server must never choose binary unilaterally — a text-mode client
+    /// decodes the raw bytes as a number string and reads garbage.
+    fn build_response(result: ExecResult, formats: Option<&Format>) -> PgWireResult<Response> {
         match result {
             ExecResult::Select { columns, rows } => {
                 let schema: Vec<FieldInfo> = columns
                     .iter()
-                    .map(|(name, dt)| {
+                    .enumerate()
+                    .map(|(i, (name, dt))| {
                         FieldInfo::new(
                             name.clone(),
                             None,
                             None,
                             data_type_to_pg(dt),
-                            if text_only {
-                                FieldFormat::Text
-                            } else {
-                                data_type_field_format(dt)
-                            },
+                            formats.map_or(FieldFormat::Text, |f| requested_format(f, i)),
                         )
                     })
                     .collect();
@@ -1287,7 +1288,7 @@ impl SimpleQueryHandler for NucleusHandler {
 
         // ── Large Objects fast path: intercept lo_* function calls ───────
         if !in_txn && let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, query) {
-            let resp = Self::build_response(lo_result, true)?;
+            let resp = Self::build_response(lo_result, None)?;
             self.flush_pending_notifications(client).await?;
             return Ok(vec![resp]);
         }
@@ -1324,7 +1325,7 @@ impl SimpleQueryHandler for NucleusHandler {
         if !in_txn && let Some(kv_cmd) = kv_fast_path::try_parse_kv(query) {
             let result = kv_fast_path::execute_kv_command(&kv_cmd, self.executor.kv_store());
             self.flush_pending_notifications(client).await?;
-            return Ok(vec![Self::build_response(result, true)?]);
+            return Ok(vec![Self::build_response(result, None)?]);
         }
 
         // ── SQL OLTP fast path: intercept simple point queries/mutations ──
@@ -1335,7 +1336,7 @@ impl SimpleQueryHandler for NucleusHandler {
             self.flush_pending_notifications(client).await?;
             return Ok(vec![Self::build_response(
                 result.map_err(exec_error_to_pgwire)?,
-                true,
+                None,
             )?]);
         }
         // Fall through to normal path if fast-path couldn't handle it
@@ -1397,7 +1398,7 @@ impl SimpleQueryHandler for NucleusHandler {
             }
             // Approximate wire bytes: count rows * avg 64 bytes per row + header
             bytes_estimate += Self::estimate_result_bytes(&result);
-            responses.push(Self::build_response(result, true)?);
+            responses.push(Self::build_response(result, None)?);
         }
         if bytes_estimate > 0 {
             self.executor.metrics().bytes_sent.inc_by(bytes_estimate);
@@ -1446,7 +1447,7 @@ impl ExtendedQueryHandler for NucleusHandler {
         // For SELECT statements, we can execute with dummy values to get the
         // schema. For non-SELECT statements, return no data.
         let fields = if is_select_query(sql) {
-            match self.describe_select_columns(sql).await {
+            match self.describe_select_columns(sql, None).await {
                 Ok(cols) => cols,
                 Err(e) => {
                     tracing::warn!("Failed to describe SELECT columns: {e}");
@@ -1478,7 +1479,7 @@ impl ExtendedQueryHandler for NucleusHandler {
             // more accurately by substituting and executing.
             let substituted =
                 Self::substitute_parameters_with_executor(sql, portal, Some(&self.executor))?;
-            match self.describe_select_columns(&substituted).await {
+            match self.describe_select_columns(&substituted, Some(&portal.result_column_format)).await {
                 Ok(cols) => cols,
                 Err(e) => {
                     tracing::warn!("Failed to describe SELECT columns: {e}");
@@ -1511,7 +1512,7 @@ impl ExtendedQueryHandler for NucleusHandler {
         // ── Large Objects fast path (extended query) ────────────────────
         if let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, &parsed_stmt.sql) {
             self.flush_pending_notifications(client).await?;
-            return Self::build_response(lo_result, false);
+            return Self::build_response(lo_result, Some(&portal.result_column_format));
         }
 
         // ── LISTEN/NOTIFY wire-level registration (extended query) ──────
@@ -1589,7 +1590,7 @@ impl ExtendedQueryHandler for NucleusHandler {
             }
             // Flush pending notifications before the response (before ReadyForQuery).
             self.flush_pending_notifications(client).await?;
-            Self::build_response(result, false)
+            Self::build_response(result, Some(&portal.result_column_format))
         } else {
             self.flush_pending_notifications(client).await?;
             Ok(Response::EmptyQuery)
@@ -2145,13 +2146,17 @@ impl NucleusHandler {
     /// probe-executing `SELECT KV_SETNX(...)` here fired the write at
     /// Describe time and again at Execute — the client's Execute then saw
     /// the second evaluation (KV_SETNX false with the key actually set).
-    async fn describe_select_columns(&self, sql: &str) -> Result<Vec<FieldInfo>, PgWireError> {
+    async fn describe_select_columns(
+        &self,
+        sql: &str,
+        formats: Option<&Format>,
+    ) -> Result<Vec<FieldInfo>, PgWireError> {
         // Try executing the query directly with LIMIT 0 appended, or if that
         // fails, run the original query. This avoids the subquery wrapping
         // that can trigger nesting depth errors for function calls like VERSION().
         let trimmed = sql.trim().trim_end_matches(';').trim();
 
-        if let Some(fields) = describe_static_fields(trimmed) {
+        if let Some(fields) = describe_static_fields(trimmed, formats) {
             return Ok(fields);
         }
 
@@ -2172,13 +2177,14 @@ impl NucleusHandler {
             if let ExecResult::Select { columns, .. } = r {
                 return Ok(columns
                     .iter()
-                    .map(|(name, dt)| {
+                    .enumerate()
+                    .map(|(i, (name, dt))| {
                         FieldInfo::new(
                             name.clone(),
                             None,
                             None,
                             data_type_to_pg(dt),
-                            data_type_field_format(dt),
+                            formats.map_or(FieldFormat::Text, |f| requested_format(f, i)),
                         )
                     })
                     .collect());
@@ -2843,15 +2849,20 @@ fn data_type_to_pg(dt: &DataType) -> Type {
     }
 }
 
-/// Choose the wire format for a given data type.
+/// The client-requested result format for column `idx` (from Bind).
 ///
-/// Int32, Int64, Float64 use binary encoding to avoid text conversion overhead.
-/// Bool uses text format ("t"/"f") because some drivers (e.g. Go pgx) fail to
-/// decode binary bool (0x00/0x01) from function results.
-fn data_type_field_format(dt: &DataType) -> FieldFormat {
-    match dt {
-        DataType::Int32 | DataType::Int64 | DataType::Float64 => FieldFormat::Binary,
-        _ => FieldFormat::Text,
+/// The Postgres protocol puts result formats under CLIENT control; the old
+/// server-side per-type choice (binary for ints/floats "to avoid text
+/// conversion overhead") silently fed binary bytes to text-mode clients,
+/// which decode them as garbage numbers. `Individual` with too few codes
+/// falls back to text — never invent binary the client didn't ask for.
+fn requested_format(fmt: &Format, idx: usize) -> FieldFormat {
+    match fmt {
+        Format::UnifiedText => FieldFormat::Text,
+        Format::UnifiedBinary => FieldFormat::Binary,
+        Format::Individual(codes) => codes
+            .get(idx)
+            .map_or(FieldFormat::Text, |c| FieldFormat::from(*c)),
     }
 }
 
@@ -2967,7 +2978,7 @@ fn mentions_side_effecting_fn(sql: &str) -> bool {
 /// mutating functions, VARCHAR otherwise — and falls back to a single
 /// VARCHAR field when the statement shape defies static analysis.
 /// Execution is never a fallback here.
-fn describe_static_fields(sql: &str) -> Option<Vec<FieldInfo>> {
+fn describe_static_fields(sql: &str, formats: Option<&Format>) -> Option<Vec<FieldInfo>> {
     use sqlparser::ast::{Expr, ObjectNamePart, SelectItem, SetExpr, Statement};
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
@@ -3022,15 +3033,11 @@ fn describe_static_fields(sql: &str) -> Option<Vec<FieldInfo>> {
                 .map(|n| n.to_ascii_lowercase())
                 .unwrap_or_else(|| "?column?".into())
         });
+        let idx = fields.len();
+        let fmt = formats.map_or(FieldFormat::Text, |f| requested_format(f, idx));
         let field = match dt {
-            Some(dt) => FieldInfo::new(
-                name,
-                None,
-                None,
-                data_type_to_pg(&dt),
-                data_type_field_format(&dt),
-            ),
-            None => FieldInfo::new(name, None, None, Type::VARCHAR, FieldFormat::Text),
+            Some(dt) => FieldInfo::new(name, None, None, data_type_to_pg(&dt), fmt),
+            None => FieldInfo::new(name, None, None, Type::VARCHAR, fmt),
         };
         fields.push(field);
     }
@@ -3707,12 +3714,68 @@ mod tests {
                 vec![Value::Int32(2), Value::Text("bob".into())],
             ],
         };
-        let response = NucleusHandler::build_response(result, true);
+        let response = NucleusHandler::build_response(result, None);
         assert!(response.is_ok());
         match response.unwrap() {
             Response::Query(_) => {} // Expected
             _ => panic!("Expected Query response"),
         }
+    }
+
+    /// Result formats belong to the CLIENT (Bind): text-mode clients must
+    /// get text even for numeric columns — the server unilaterally sending
+    /// binary made node-postgres read Float64(1.0) back as ~0.992 garbage.
+    #[tokio::test]
+    async fn build_response_honors_client_result_formats() {
+        let make = || ExecResult::Select {
+            columns: vec![
+                ("d".to_string(), DataType::Float64),
+                ("n".to_string(), DataType::Int64),
+                ("s".to_string(), DataType::Text),
+            ],
+            rows: vec![vec![
+                Value::Float64(1.0),
+                Value::Int64(7),
+                Value::Text("x".into()),
+            ]],
+        };
+        let field_formats = |response: Response| match response {
+            Response::Query(q) => q
+                .row_schema()
+                .iter()
+                .map(|f| f.format())
+                .collect::<Vec<_>>(),
+            _ => panic!("Expected Query response"),
+        };
+
+        // Simple protocol (None) and an explicit text request: all text.
+        for formats in [None, Some(Format::UnifiedText)] {
+            let response =
+                NucleusHandler::build_response(make(), formats.as_ref()).expect("response");
+            assert!(
+                field_formats(response)
+                    .iter()
+                    .all(|f| *f == FieldFormat::Text),
+                "text-mode clients must never receive binary columns"
+            );
+        }
+
+        // A client that ASKS for binary still gets it.
+        let response = NucleusHandler::build_response(make(), Some(&Format::UnifiedBinary))
+            .expect("response");
+        assert!(
+            field_formats(response)
+                .iter()
+                .all(|f| *f == FieldFormat::Binary)
+        );
+
+        // Per-column codes are honored; missing codes fall back to text.
+        let response = NucleusHandler::build_response(make(), Some(&Format::Individual(vec![1, 0])))
+            .expect("response");
+        assert_eq!(
+            field_formats(response),
+            vec![FieldFormat::Binary, FieldFormat::Text, FieldFormat::Text]
+        );
     }
 
     #[tokio::test]
@@ -3721,7 +3784,7 @@ mod tests {
             tag: "INSERT".to_string(),
             rows_affected: 3,
         };
-        let response = NucleusHandler::build_response(result, true);
+        let response = NucleusHandler::build_response(result, None);
         assert!(response.is_ok());
         match response.unwrap() {
             Response::Execution(tag) => {
@@ -3780,7 +3843,7 @@ mod tests {
             ],
             rows: vec![],
         };
-        let response = NucleusHandler::build_response(result, true);
+        let response = NucleusHandler::build_response(result, None);
         assert!(response.is_ok());
     }
 
@@ -3790,7 +3853,7 @@ mod tests {
             tag: "DELETE".to_string(),
             rows_affected: 0,
         };
-        let response = NucleusHandler::build_response(result, true);
+        let response = NucleusHandler::build_response(result, None);
         assert!(response.is_ok());
         match response.unwrap() {
             Response::Execution(tag) => {
@@ -3812,7 +3875,7 @@ mod tests {
                 vec![Value::Int32(2), Value::Text("hello".into())],
             ],
         };
-        let response = NucleusHandler::build_response(result, true);
+        let response = NucleusHandler::build_response(result, None);
         assert!(response.is_ok());
     }
 
@@ -3832,7 +3895,7 @@ mod tests {
                 Value::Bool(true),
             ]],
         };
-        let response = NucleusHandler::build_response(result, true);
+        let response = NucleusHandler::build_response(result, None);
         assert!(response.is_ok());
     }
 
@@ -4449,18 +4512,18 @@ mod security_tests {
             "SELECT KV_SETNX('k', 'v', 30)",
             "SELECT kv_setnx('k', 'v')",
         ] {
-            let fields = describe_static_fields(sql).expect("static describe");
+            let fields = describe_static_fields(sql, None).expect("static describe");
             assert_eq!(fields.len(), 1);
             assert_eq!(fields[0].name(), "kv_setnx");
             assert_eq!(*fields[0].datatype(), Type::BOOL);
         }
 
-        let fields = describe_static_fields("SELECT DOC_INSERT($1)").unwrap();
+        let fields = describe_static_fields("SELECT DOC_INSERT($1)", None).unwrap();
         assert_eq!(*fields[0].datatype(), Type::INT8);
-        let fields = describe_static_fields("SELECT STREAM_XADD($1, $2, $3)").unwrap();
+        let fields = describe_static_fields("SELECT STREAM_XADD($1, $2, $3)", None).unwrap();
         assert_eq!(*fields[0].datatype(), Type::VARCHAR);
         let fields =
-            describe_static_fields("SELECT KV_CDEL($1, $2) AS released").unwrap();
+            describe_static_fields("SELECT KV_CDEL($1, $2) AS released", None).unwrap();
         assert_eq!(fields[0].name(), "released");
         assert_eq!(*fields[0].datatype(), Type::BOOL);
     }
@@ -4468,16 +4531,16 @@ mod security_tests {
     #[test]
     fn describe_static_fields_ignores_pure_queries() {
         // Pure reads keep the probe-execution path (None).
-        assert!(describe_static_fields("SELECT KV_GET($1)").is_none());
-        assert!(describe_static_fields("SELECT * FROM users WHERE id = 1").is_none());
-        assert!(describe_static_fields("SELECT UPPER('a'), STREAM_XLEN('s')").is_none());
+        assert!(describe_static_fields("SELECT KV_GET($1)", None).is_none());
+        assert!(describe_static_fields("SELECT * FROM users WHERE id = 1", None).is_none());
+        assert!(describe_static_fields("SELECT UPPER('a'), STREAM_XLEN('s')", None).is_none());
     }
 
     #[test]
     fn describe_static_fields_never_falls_through_on_odd_shapes() {
         // Unparseable or non-plain-select statements containing a mutating
         // call still get a static answer — execution is never the fallback.
-        let fields = describe_static_fields("SELECT KV_SETNX('k', 'v', 30) UNION SELECT 1");
+        let fields = describe_static_fields("SELECT KV_SETNX('k', 'v', 30) UNION SELECT 1", None);
         assert!(fields.is_some());
     }
 }
