@@ -70,6 +70,13 @@ export interface LocalExecutorOptions {
   /** Shell used for exec (default /bin/sh -c). */
   shell?: string;
   env?: Record<string, string>;
+  /**
+   * Env var NAMES stripped from the inherited environment before every
+   * exec — secret scoping for agent workloads sharing the host process
+   * (an agent's `env` must not read the operator's tokens). Explicit
+   * `env` values (constructor or per-exec) still win over the strip.
+   */
+  envDenylist?: string[];
 }
 
 /**
@@ -82,12 +89,20 @@ export class LocalExecutor implements AgentExecutor {
   #root: string;
   #shell: string;
   #env?: Record<string, string>;
+  #envDenylist: string[];
   #destroyed = false;
 
   constructor(options: LocalExecutorOptions) {
     this.#root = resolve(options.root);
     this.#shell = options.shell ?? "/bin/sh";
     if (options.env !== undefined) this.#env = options.env;
+    this.#envDenylist = options.envDenylist ?? [];
+  }
+
+  #execEnv(overrides?: Record<string, string>): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const name of this.#envDenylist) delete env[name];
+    return { ...env, ...this.#env, ...overrides };
   }
 
   #resolveInsideRoot(path: string): string {
@@ -113,7 +128,7 @@ export class LocalExecutor implements AgentExecutor {
     return new Promise<ExecResult>((resolvePromise, rejectPromise) => {
       const child = spawn(this.#shell, ["-c", command], {
         cwd,
-        env: { ...process.env, ...this.#env, ...options.env },
+        env: this.#execEnv(options.env),
         stdio: ["ignore", "pipe", "pipe"],
       });
 
