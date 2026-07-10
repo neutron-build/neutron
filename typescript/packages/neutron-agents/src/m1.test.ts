@@ -193,3 +193,25 @@ test("approval suspension passes through with resume-ready messages", async () =
   assert.equal(resumed.finishReason, "stop");
   assert.equal(resumed.text, "done");
 });
+
+test("LocalExecutor envDenylist strips secrets from exec env; explicit env still wins", async () => {
+  process.env.TEST_SBX_SECRET = "leaky";
+  try {
+    const scrubbed = new LocalExecutor({
+      root: await mkdtemp(join(tmpdir(), "exec-deny-")),
+      envDenylist: ["TEST_SBX_SECRET"],
+    });
+    const result = await scrubbed.exec('echo "got:${TEST_SBX_SECRET:-none}"');
+    assert.equal(result.stdout.trim(), "got:none", "denylisted var must not reach the child");
+
+    const withOverride = new LocalExecutor({
+      root: await mkdtemp(join(tmpdir(), "exec-deny2-")),
+      envDenylist: ["TEST_SBX_SECRET"],
+      env: { TEST_SBX_SECRET: "scoped-replacement" },
+    });
+    const overridden = await withOverride.exec('echo "got:${TEST_SBX_SECRET:-none}"');
+    assert.equal(overridden.stdout.trim(), "got:scoped-replacement", "explicit env outranks the strip");
+  } finally {
+    delete process.env.TEST_SBX_SECRET;
+  }
+});
