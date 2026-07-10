@@ -65,6 +65,49 @@ func (f *FTSModel) Index(ctx context.Context, docID int64, text string) (bool, e
 	return ok, wrapErr("fts index", err)
 }
 
+// IndexFaceted adds a document tagged with a single facet (field=value, e.g.
+// "site_id"="abc") so SearchFilter can scope BM25 ranking to that partition.
+// Use this instead of Index for any multi-tenant index — without a facet all
+// tenants share one ranked result budget and a busy tenant starves the rest.
+func (f *FTSModel) IndexFaceted(ctx context.Context, docID int64, text, field, value string) (bool, error) {
+	if err := f.client.requireNucleus("FTS.IndexFaceted"); err != nil {
+		return false, err
+	}
+	var ok bool
+	// CAST workaround for nucleus_dogfood #22 — see Search() comment.
+	err := f.pool.QueryRow(ctx,
+		"SELECT FTS_INDEX_FACETED(CAST($1 AS BIGINT), $2, $3, $4)",
+		strconv.FormatInt(docID, 10), text, field, value).Scan(&ok)
+	return ok, wrapErr("fts index faceted", err)
+}
+
+// SearchFilter performs a full-text search scoped to documents whose facet
+// `field` contains `value` (e.g. a single site_id), so BM25 ranks only within
+// that partition. Documents must have been indexed via IndexFaceted with the
+// same field. Supports WithFTSLimit.
+func (f *FTSModel) SearchFilter(ctx context.Context, query, field, value string, opts ...FTSOption) ([]FTSResult, error) {
+	if err := f.client.requireNucleus("FTS.SearchFilter"); err != nil {
+		return nil, err
+	}
+	o := ftsOpts{limit: 10}
+	for _, fn := range opts {
+		fn(&o)
+	}
+	var raw string
+	// CAST workaround for nucleus_dogfood #22 (see Search()).
+	err := f.pool.QueryRow(ctx,
+		"SELECT FTS_SEARCH_FILTER($1, CAST($2 AS BIGINT), $3, $4)",
+		query, strconv.FormatInt(o.limit, 10), field, value).Scan(&raw)
+	if err != nil {
+		return nil, wrapErr("fts search filter", err)
+	}
+	var results []FTSResult
+	if err := json.Unmarshal([]byte(raw), &results); err != nil {
+		return nil, fmt.Errorf("nucleus: fts unmarshal: %w", err)
+	}
+	return results, nil
+}
+
 // Search performs a full-text search query.
 // Supports WithFuzzy, WithFTSLimit, WithHighlight, and WithFacets options.
 func (f *FTSModel) Search(ctx context.Context, query string, opts ...FTSOption) ([]FTSResult, error) {
