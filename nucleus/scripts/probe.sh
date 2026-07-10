@@ -56,6 +56,7 @@ PROBES=(
   "probe_fts_rank|--iterations $((2000 * M))"
   "probe_concurrency_threads|--seed 1 --rounds $((200 * M))"
   "probe_recover_engines|--iterations $((300 * M))"
+  "probe_blob|"
   # All Tier 1/2 findings are fixed and gated. Remaining open items (tracked in
   # tests/tier_findings_open.rs) are #4 (READ COMMITTED per-statement snapshot —
   # LOW, currently stricter-than-spec/safe), which has no dedicated probe.
