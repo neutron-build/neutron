@@ -7,17 +7,40 @@
 //!   - Metadata and tagging on blobs
 //!   - BLAKE3 cryptographic hashing for content addressing
 //!   - Byte-range index for O(log N) range access
-//!   - Optional WAL-backed durability (via `BlobStore::open`)
+//!   - Disk-tiered chunk storage: capacity is disk-bound, not RAM-bound
+//!     (via `BlobStore::open`); a byte-bounded LRU cache keeps hot chunks
+//!     RAM-fast
+//!   - WAL-backed durability for blob manifests (via `BlobStore::open`)
 //!
 //! Replaces S3, GCS, MinIO for blob storage within Nucleus.
+//!
+//! ## Storage architecture (disk mode)
+//!
+//! Chunk data lives in append-only segment files ([`segment::SegmentStore`]);
+//! the WAL ([`wal::BlobWal`]) records only blob manifests (chunk hashes +
+//! lengths). A put appends chunks to their segment and flushes them *before*
+//! logging the manifest, so a manifest that survives a crash always references
+//! chunk data that also survived. The RAM cache is write-through: evicting
+//! from it can never lose data.
+//!
+//! Chunks are content-addressed and shared across blobs, so each chunk carries
+//! a reference count (one per manifest reference). Chunks that reach zero
+//! references are swept — removed from the cache, marked dead in their segment,
+//! and reclaimed by segment compaction — but only when no transaction snapshot
+//! is outstanding, because a ROLLBACK may restore manifests that still
+//! reference them.
 
+pub mod segment;
 pub mod wal;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
-use wal::{BlobStoreSnapshot, BlobWal};
+use parking_lot::Mutex;
+
+use segment::SegmentStore;
+use wal::{BlobMetaSnapshot, BlobWal};
 
 // ============================================================================
 // Content-addressable chunk store (BLAKE3)
@@ -49,13 +72,126 @@ pub fn content_hash(data: &[u8]) -> u64 {
     ])
 }
 
-/// Content-addressable chunk store — deduplicates identical chunks via BLAKE3.
-#[derive(Clone)]
+/// Default RAM budget for the hot-chunk cache in disk mode. Override with the
+/// `NUCLEUS_BLOB_CACHE_BYTES` environment variable.
+pub const DEFAULT_BLOB_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Byte-bounded LRU cache of chunk data.
+struct ChunkCache {
+    map: HashMap<ChunkHash, (Vec<u8>, u64)>,
+    /// last-use tick -> hash; lowest tick is the eviction candidate.
+    order: BTreeMap<u64, ChunkHash>,
+    tick: u64,
+    bytes: usize,
+    limit: usize,
+}
+
+impl ChunkCache {
+    fn new(limit: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: BTreeMap::new(),
+            tick: 0,
+            bytes: 0,
+            limit,
+        }
+    }
+
+    fn touch(
+        entry_tick: &mut u64,
+        order: &mut BTreeMap<u64, ChunkHash>,
+        tick: &mut u64,
+        hash: ChunkHash,
+    ) {
+        order.remove(entry_tick);
+        *tick += 1;
+        *entry_tick = *tick;
+        order.insert(*tick, hash);
+    }
+
+    /// Append the chunk's data to `out`. Returns false on miss.
+    fn read_into(&mut self, hash: &ChunkHash, out: &mut Vec<u8>) -> bool {
+        let Some((data, entry_tick)) = self.map.get_mut(hash) else {
+            return false;
+        };
+        out.extend_from_slice(data);
+        Self::touch(entry_tick, &mut self.order, &mut self.tick, *hash);
+        true
+    }
+
+    fn get_clone(&mut self, hash: &ChunkHash) -> Option<Vec<u8>> {
+        let (data, entry_tick) = self.map.get_mut(hash)?;
+        let out = data.clone();
+        Self::touch(entry_tick, &mut self.order, &mut self.tick, *hash);
+        Some(out)
+    }
+
+    fn insert(&mut self, hash: ChunkHash, data: Vec<u8>) {
+        if data.len() > self.limit {
+            return; // larger than the whole budget — serve from disk
+        }
+        if let Some((_, entry_tick)) = self.map.get_mut(&hash) {
+            Self::touch(entry_tick, &mut self.order, &mut self.tick, hash);
+            return;
+        }
+        while self.bytes + data.len() > self.limit {
+            let Some((&oldest, _)) = self.order.iter().next() else {
+                break;
+            };
+            let victim = self.order.remove(&oldest).unwrap();
+            if let Some((old_data, _)) = self.map.remove(&victim) {
+                self.bytes -= old_data.len();
+            }
+        }
+        self.tick += 1;
+        self.bytes += data.len();
+        self.order.insert(self.tick, hash);
+        self.map.insert(hash, (data, self.tick));
+    }
+
+    fn remove(&mut self, hash: &ChunkHash) {
+        if let Some((data, entry_tick)) = self.map.remove(hash) {
+            self.bytes -= data.len();
+            self.order.remove(&entry_tick);
+        }
+    }
+
+    fn retain_keys<F: Fn(&ChunkHash) -> bool>(&mut self, keep: F) {
+        let victims: Vec<ChunkHash> = self.map.keys().filter(|h| !keep(h)).copied().collect();
+        for h in victims {
+            self.remove(&h);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChunkRef {
+    /// Number of manifest references (one per chunk occurrence per blob).
+    /// Zero means the chunk is garbage pending a sweep.
+    count: u64,
+    len: u32,
+}
+
+/// Content-addressable chunk store — deduplicates identical chunks via BLAKE3
+/// and reference-counts them (chunks are shared across blobs).
+///
+/// Two modes:
+///   - RAM-only (`ChunkStore::new`): all chunk data lives in the cache,
+///     which is unbounded. Used by `BlobStore::new()` (tests, ephemeral).
+///   - Disk-tiered (`BlobStore::open`): chunk data lives in segment files;
+///     the cache is a byte-bounded write-through LRU, so capacity is
+///     disk-bound and cache eviction can never lose data.
 pub struct ChunkStore {
-    /// hash -> chunk data
-    chunks: HashMap<ChunkHash, Vec<u8>>,
-    /// Total bytes stored (deduplicated).
+    /// Interior mutability so reads stay `&self` (LRU bookkeeping + fill).
+    cache: Mutex<ChunkCache>,
+    disk: Option<SegmentStore>,
+    refs: HashMap<ChunkHash, ChunkRef>,
+    /// Total bytes of live (referenced) unique chunks.
     stored_bytes: usize,
+    /// Cloned into every transaction snapshot; garbage is only swept when the
+    /// count is back to 1 (no snapshot could restore a reference to it).
+    txn_pin: Arc<()>,
+    needs_sweep: bool,
 }
 
 impl Default for ChunkStore {
@@ -65,50 +201,201 @@ impl Default for ChunkStore {
 }
 
 impl ChunkStore {
+    /// RAM-only chunk store (unbounded cache, no disk tier).
     pub fn new() -> Self {
         Self {
-            chunks: HashMap::new(),
+            cache: Mutex::new(ChunkCache::new(usize::MAX)),
+            disk: None,
+            refs: HashMap::new(),
             stored_bytes: 0,
+            txn_pin: Arc::new(()),
+            needs_sweep: false,
         }
     }
 
-    /// Store a chunk. Returns the BLAKE3 hash. If already stored, deduplicates.
+    fn with_disk(
+        disk: SegmentStore,
+        cache_limit: usize,
+        refs: HashMap<ChunkHash, ChunkRef>,
+    ) -> Self {
+        let stored_bytes = refs
+            .values()
+            .filter(|r| r.count > 0)
+            .map(|r| r.len as usize)
+            .sum();
+        Self {
+            cache: Mutex::new(ChunkCache::new(cache_limit)),
+            disk: Some(disk),
+            refs,
+            stored_bytes,
+            txn_pin: Arc::new(()),
+            needs_sweep: true, // reconcile any orphaned segment records
+        }
+    }
+
+    /// Store a chunk (or add a reference to it if already stored). Returns the
+    /// BLAKE3 hash. In disk mode the chunk is on disk (flushed) on return.
     pub fn put(&mut self, data: Vec<u8>) -> ChunkHash {
         let hash = content_hash_blake3(&data);
-        if !self.chunks.contains_key(&hash) {
-            self.stored_bytes += data.len();
-            self.chunks.insert(hash, data);
+        let len = data.len();
+
+        if let Some(r) = self.refs.get_mut(&hash) {
+            if r.count == 0 {
+                // Garbage awaiting sweep — revive instead of re-storing.
+                self.stored_bytes += len;
+                if let Some(disk) = &mut self.disk {
+                    disk.revive(&hash);
+                }
+            }
+            r.count += 1;
+            return hash;
         }
+
+        if let Some(disk) = &mut self.disk
+            && let Err(e) = disk.append(&hash, &data)
+        {
+            eprintln!("blob segments: failed to persist chunk: {e}");
+        }
+        self.cache.get_mut().insert(hash, data);
+        self.refs.insert(
+            hash,
+            ChunkRef {
+                count: 1,
+                len: len as u32,
+            },
+        );
+        self.stored_bytes += len;
         hash
     }
 
-    /// Insert a chunk with a known hash (used during WAL recovery).
-    fn put_with_hash(&mut self, hash: ChunkHash, data: Vec<u8>) {
-        if !self.chunks.contains_key(&hash) {
-            self.stored_bytes += data.len();
-            self.chunks.insert(hash, data);
+    /// Add a reference to an already-stored chunk (no data needed). Returns
+    /// `false` if the chunk does not exist or is garbage awaiting sweep.
+    pub fn add_ref(&mut self, hash: &ChunkHash) -> bool {
+        match self.refs.get_mut(hash) {
+            Some(r) if r.count > 0 => {
+                r.count += 1;
+                true
+            }
+            _ => false,
         }
     }
 
-    /// Get a chunk by hash.
-    pub fn get(&self, hash: &ChunkHash) -> Option<&[u8]> {
-        self.chunks.get(hash).map(|v| v.as_slice())
+    /// Drop one reference to a chunk. At zero references the chunk becomes
+    /// garbage, physically reclaimed by the next unpinned [`Self::sweep`].
+    pub fn release(&mut self, hash: &ChunkHash) {
+        if let Some(r) = self.refs.get_mut(hash)
+            && r.count > 0
+        {
+            r.count -= 1;
+            if r.count == 0 {
+                self.stored_bytes -= r.len as usize;
+                self.needs_sweep = true;
+            }
+        }
     }
 
-    /// Check if a chunk exists.
+    /// Get a chunk by hash. Served from the RAM cache when hot; falls back to
+    /// a segment read (and refills the cache) in disk mode.
+    pub fn get(&self, hash: &ChunkHash) -> Option<Vec<u8>> {
+        if let Some(data) = self.cache.lock().get_clone(hash) {
+            return Some(data);
+        }
+        self.read_from_disk(hash)
+    }
+
+    /// Append a chunk's data to `out`. Returns false if the chunk is absent
+    /// or unreadable.
+    pub fn read_into(&self, hash: &ChunkHash, out: &mut Vec<u8>) -> bool {
+        if self.cache.lock().read_into(hash, out) {
+            return true;
+        }
+        match self.read_from_disk(hash) {
+            Some(data) => {
+                out.extend_from_slice(&data);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn read_from_disk(&self, hash: &ChunkHash) -> Option<Vec<u8>> {
+        let disk = self.disk.as_ref()?;
+        match disk.read(hash) {
+            Ok(Some(data)) => {
+                self.cache.lock().insert(*hash, data.clone());
+                Some(data)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("blob segments: chunk read failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Check if a chunk exists (has at least one reference).
     pub fn contains(&self, hash: &ChunkHash) -> bool {
-        self.chunks.contains_key(hash)
+        self.refs.get(hash).is_some_and(|r| r.count > 0)
     }
 
-    /// Total deduplicated bytes stored.
+    /// Total deduplicated bytes of live chunks.
     pub fn stored_bytes(&self) -> usize {
         self.stored_bytes
     }
 
-    /// Number of unique chunks.
+    /// Number of unique live chunks.
     pub fn chunk_count(&self) -> usize {
-        self.chunks.len()
+        self.refs.values().filter(|r| r.count > 0).count()
     }
+
+    /// Physically reclaim garbage: drop zero-reference chunks from the cache,
+    /// mark their segment records dead, and compact eligible segments.
+    ///
+    /// Deferred while any transaction snapshot is outstanding — a ROLLBACK may
+    /// restore manifests that still reference the garbage.
+    pub fn sweep(&mut self) {
+        if !self.needs_sweep || Arc::strong_count(&self.txn_pin) > 1 {
+            return;
+        }
+        self.needs_sweep = false;
+
+        self.refs.retain(|_, r| r.count > 0);
+        let refs = &self.refs;
+        let cache = self.cache.get_mut();
+        // Also drops orphans with no refs entry at all (rolled-back puts).
+        cache.retain_keys(|h| refs.contains_key(h));
+        if let Some(disk) = &mut self.disk {
+            disk.mark_dead_where(|h| refs.contains_key(h));
+            if let Err(e) = disk.compact() {
+                eprintln!("blob segments: compaction failed: {e}");
+            }
+        }
+    }
+
+    fn txn_snapshot(&self) -> ChunkTxnSnapshot {
+        ChunkTxnSnapshot {
+            refs: self.refs.clone(),
+            stored_bytes: self.stored_bytes,
+            _pin: Arc::clone(&self.txn_pin),
+        }
+    }
+
+    fn txn_restore(&mut self, snap: ChunkTxnSnapshot) {
+        self.refs = snap.refs;
+        self.stored_bytes = snap.stored_bytes;
+        // Chunks written since the snapshot are now orphans; deleted chunks
+        // may have come back to life. Reconcile on the next sweep.
+        self.needs_sweep = true;
+    }
+}
+
+/// Chunk-store state captured for transaction rollback: reference counts only
+/// — no chunk data. The held pin defers garbage sweeps so every chunk the
+/// snapshot references stays physically readable until commit or rollback.
+struct ChunkTxnSnapshot {
+    refs: HashMap<ChunkHash, ChunkRef>,
+    stored_bytes: usize,
+    _pin: Arc<()>,
 }
 
 // ============================================================================
@@ -181,6 +468,38 @@ pub struct BlobMetadata {
     pub index: BlobIndex,
 }
 
+impl BlobMetadata {
+    /// Per-chunk sizes recovered from the byte-range index.
+    fn chunk_sizes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.index.offsets.iter().map(|(_, sz)| *sz)
+    }
+
+    /// WAL manifest form: `(hash, len)` per chunk.
+    fn wal_chunks(&self) -> Vec<(ChunkHash, u32)> {
+        self.chunk_hashes
+            .iter()
+            .zip(self.chunk_sizes())
+            .map(|(h, sz)| (*h, sz as u32))
+            .collect()
+    }
+
+    fn wal_tags(&self) -> Vec<(&str, &str)> {
+        self.tags
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+
+    /// Whether the durable state (manifest + tags) differs — used to decide
+    /// which corrective WAL entries a rollback must log.
+    fn durable_state_differs(&self, other: &BlobMetadata) -> bool {
+        self.chunk_hashes != other.chunk_hashes
+            || self.size != other.size
+            || self.content_type != other.content_type
+            || self.tags != other.tags
+    }
+}
+
 // ============================================================================
 // Blob store
 // ============================================================================
@@ -190,9 +509,10 @@ pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Blob store — manages large objects as chunked, deduplicated data.
 ///
-/// When opened with `BlobStore::open(dir)`, all mutations are logged to a WAL
-/// for crash recovery. The in-memory-only constructor `BlobStore::new()` is
-/// retained for backward compatibility and testing.
+/// When opened with `BlobStore::open(dir)`, chunk data is disk-tiered into
+/// segment files with a RAM LRU cache on top, and manifests are logged to a
+/// WAL for crash recovery. The in-memory-only constructor `BlobStore::new()`
+/// is retained for backward compatibility and testing.
 pub struct BlobStore {
     chunks: ChunkStore,
     /// key -> blob metadata
@@ -224,28 +544,67 @@ impl BlobStore {
         }
     }
 
-    /// Open a WAL-backed blob store at `dir`.
+    /// Open a disk-tiered, WAL-backed blob store at `dir`.
     ///
-    /// Replays the WAL to recover previous state, then appends new mutations.
+    /// Replays the WAL to recover blob manifests (chunk data is read from
+    /// segment files on demand), then appends new mutations. The hot-chunk
+    /// cache budget defaults to [`DEFAULT_BLOB_CACHE_BYTES`], overridable via
+    /// the `NUCLEUS_BLOB_CACHE_BYTES` environment variable.
     pub fn open(dir: &Path) -> std::io::Result<Self> {
         Self::open_with_chunk_size(dir, DEFAULT_CHUNK_SIZE)
     }
 
-    /// Open a WAL-backed blob store with a custom chunk size.
+    /// Open a disk-tiered, WAL-backed blob store with a custom chunk size.
     pub fn open_with_chunk_size(dir: &Path, chunk_size: usize) -> std::io::Result<Self> {
-        let (wal, state) = BlobWal::open(dir)?;
-        let wal = Arc::new(wal);
+        let cache_limit = std::env::var("NUCLEUS_BLOB_CACHE_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_BLOB_CACHE_BYTES);
+        Self::open_with_options(dir, chunk_size, cache_limit)
+    }
 
-        let mut chunks = ChunkStore::new();
+    /// Open a disk-tiered, WAL-backed blob store with explicit chunk size and
+    /// hot-chunk cache budget (bytes).
+    pub fn open_with_options(
+        dir: &Path,
+        chunk_size: usize,
+        cache_limit: usize,
+    ) -> std::io::Result<Self> {
+        let mut segments = SegmentStore::open(dir)?;
+        let (wal, state) = BlobWal::open(dir)?;
+        let migrate_legacy = state.legacy_entries_seen;
+
+        let mut refs: HashMap<ChunkHash, ChunkRef> = HashMap::new();
         let mut blobs = HashMap::new();
 
-        for (id, entry) in state.blobs {
+        'blob: for (id, entry) in state.blobs {
+            // Every referenced chunk must be present in the segment files.
+            // Legacy WAL entries carry the data inline — migrate it into
+            // segments. A metadata entry whose chunk is missing means torn
+            // or corrupt storage: drop the blob (best-effort recovery).
+            for c in &entry.chunks {
+                if segments.revive(&c.hash) {
+                    continue; // present (live or revived dead copy)
+                }
+                if let Some(data) = &c.data {
+                    segments.append(&c.hash, data)?;
+                } else {
+                    eprintln!("blob store: dropping blob '{id}': chunk data missing from segments");
+                    continue 'blob;
+                }
+            }
+
             let mut chunk_hashes = Vec::with_capacity(entry.chunks.len());
             let mut chunk_sizes = Vec::with_capacity(entry.chunks.len());
-            for (hash, data) in &entry.chunks {
-                chunk_sizes.push(data.len());
-                chunk_hashes.push(*hash);
-                chunks.put_with_hash(*hash, data.clone());
+            for c in &entry.chunks {
+                chunk_hashes.push(c.hash);
+                chunk_sizes.push(c.len as usize);
+                refs.entry(c.hash)
+                    .or_insert(ChunkRef {
+                        count: 0,
+                        len: c.len,
+                    })
+                    .count += 1;
             }
             let index = BlobIndex::build(&chunk_sizes);
             let meta = BlobMetadata {
@@ -262,25 +621,41 @@ impl BlobStore {
             blobs.insert(id, meta);
         }
 
-        Ok(Self {
-            chunks,
+        // Self-heal: segment records not referenced by any recovered manifest
+        // (orphans from crashes mid-put or pre-compaction copies) are dead.
+        segments.mark_dead_where(|h| refs.contains_key(h));
+
+        let store = Self {
+            chunks: ChunkStore::with_disk(segments, cache_limit, refs),
             blobs,
             chunk_size,
-            wal: Some(wal),
-        })
+            wal: Some(Arc::new(wal)),
+        };
+
+        // A legacy WAL embedded chunk data; now that it lives in segments,
+        // rewrite the log in the metadata-only format to shrink it.
+        if migrate_legacy && let Err(e) = store.checkpoint() {
+            eprintln!("blob WAL: post-migration checkpoint failed: {e}");
+        }
+
+        Ok(store)
     }
 
     /// Store a blob. Splits into chunks and deduplicates.
     pub fn put(&mut self, key: &str, data: &[u8], content_type: Option<&str>) {
+        self.chunks.sweep();
+
+        let old_meta = self.blobs.remove(key);
+
         let mut chunk_hashes = Vec::new();
-        let mut wal_chunks: Vec<([u8; 32], Vec<u8>)> = Vec::new();
         let mut chunk_sizes = Vec::new();
+        let mut wal_chunks: Vec<(ChunkHash, u32)> = Vec::new();
 
         for chunk_data in data.chunks(self.chunk_size) {
             let hash = self.chunks.put(chunk_data.to_vec());
             chunk_hashes.push(hash);
             chunk_sizes.push(chunk_data.len());
-            wal_chunks.push((hash, chunk_data.to_vec()));
+            wal_chunks.push((hash, chunk_data.len() as u32));
         }
 
         // Handle empty data
@@ -288,14 +663,24 @@ impl BlobStore {
             let hash = self.chunks.put(Vec::new());
             chunk_hashes.push(hash);
             chunk_sizes.push(0);
-            wal_chunks.push((hash, Vec::new()));
+            wal_chunks.push((hash, 0));
         }
 
-        // Log to WAL before in-memory mutation
+        // Chunks are on disk (flushed) at this point; the manifest may now be
+        // logged — a recovered manifest never references unwritten data.
         if let Some(wal) = &self.wal
-            && let Err(e) = wal.log_store(key, content_type, data.len() as u64, &wal_chunks)
+            && let Err(e) =
+                wal.log_store_meta(key, content_type, data.len() as u64, &wal_chunks, &[])
         {
             eprintln!("blob WAL: failed to log store for '{key}': {e}");
+        }
+
+        // Release the overwritten manifest's references only after the new
+        // ones exist, so chunks shared between versions never hit zero.
+        if let Some(old) = old_meta {
+            for hash in &old.chunk_hashes {
+                self.chunks.release(hash);
+            }
         }
 
         let index = BlobIndex::build(&chunk_sizes);
@@ -320,13 +705,89 @@ impl BlobStore {
         self.blobs.insert(key.to_string(), meta);
     }
 
+    /// Compose a new blob from the chunks of existing blobs, in order —
+    /// zero data copy. Chunks are content-addressed and shared, so only
+    /// reference counts and a new manifest are written; the source blobs
+    /// remain intact. Returns `false` (storing nothing) if any source blob
+    /// is missing.
+    ///
+    /// This is what makes multipart-style assembly O(metadata): the composed
+    /// blob references the same physical chunks as its sources.
+    pub fn compose(&mut self, key: &str, sources: &[&str], content_type: Option<&str>) -> bool {
+        self.chunks.sweep();
+
+        let mut chunk_hashes = Vec::new();
+        let mut chunk_sizes = Vec::new();
+        let mut total_size: u64 = 0;
+        for src in sources {
+            let Some(meta) = self.blobs.get(*src) else {
+                return false;
+            };
+            for (hash, size) in meta.chunk_hashes.iter().zip(meta.chunk_sizes()) {
+                chunk_hashes.push(*hash);
+                chunk_sizes.push(size);
+            }
+            total_size += meta.size;
+        }
+
+        if chunk_hashes.is_empty() {
+            // No sources — mirror put()'s empty-blob representation.
+            self.put(key, b"", content_type);
+            return true;
+        }
+
+        let old_meta = self.blobs.remove(key);
+
+        // Sources hold live references to every chunk, so add_ref cannot miss.
+        for hash in &chunk_hashes {
+            self.chunks.add_ref(hash);
+        }
+
+        let wal_chunks: Vec<(ChunkHash, u32)> = chunk_hashes
+            .iter()
+            .zip(chunk_sizes.iter())
+            .map(|(h, sz)| (*h, *sz as u32))
+            .collect();
+        if let Some(wal) = &self.wal
+            && let Err(e) = wal.log_store_meta(key, content_type, total_size, &wal_chunks, &[])
+        {
+            eprintln!("blob WAL: failed to log compose for '{key}': {e}");
+        }
+
+        if let Some(old) = old_meta {
+            for hash in &old.chunk_hashes {
+                self.chunks.release(hash);
+            }
+        }
+
+        let index = BlobIndex::build(&chunk_sizes);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let meta = BlobMetadata {
+            key: key.to_string(),
+            size: total_size,
+            chunk_size: self.chunk_size,
+            chunk_hashes,
+            content_type: content_type.map(|s| s.to_string()),
+            tags: HashMap::new(),
+            created_at: ts,
+            updated_at: ts,
+            index,
+        };
+        self.blobs.insert(key.to_string(), meta);
+        true
+    }
+
     /// Read an entire blob.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         let meta = self.blobs.get(key)?;
         let mut data = Vec::with_capacity(meta.size as usize);
         for hash in &meta.chunk_hashes {
-            if let Some(chunk) = self.chunks.get(hash) {
-                data.extend_from_slice(chunk);
+            if !self.chunks.read_into(hash, &mut data) {
+                eprintln!("blob store: blob '{key}' has an unreadable chunk");
+                return None;
             }
         }
         Some(data)
@@ -374,15 +835,23 @@ impl BlobStore {
         Some(data)
     }
 
-    /// Delete a blob (metadata only -- chunks may still be referenced by other blobs).
+    /// Delete a blob. Its chunks lose one reference each; unreferenced chunks
+    /// are physically reclaimed by a later sweep/compaction.
     pub fn delete(&mut self, key: &str) -> bool {
+        self.chunks.sweep();
+        let Some(meta) = self.blobs.remove(key) else {
+            return false;
+        };
         // Log to WAL before in-memory mutation
         if let Some(wal) = &self.wal
             && let Err(e) = wal.log_delete(key)
         {
             eprintln!("blob WAL: failed to log delete for '{key}': {e}");
         }
-        self.blobs.remove(key).is_some()
+        for hash in &meta.chunk_hashes {
+            self.chunks.release(hash);
+        }
+        true
     }
 
     /// Get blob metadata.
@@ -430,7 +899,7 @@ impl BlobStore {
         self.blobs.values().map(|m| m.size).sum()
     }
 
-    /// Total physical bytes (after dedup).
+    /// Total physical bytes (after dedup) of live chunks.
     pub fn total_physical_bytes(&self) -> usize {
         self.chunks.stored_bytes()
     }
@@ -444,36 +913,27 @@ impl BlobStore {
         self.total_logical_bytes() as f64 / physical as f64
     }
 
-    /// Create a snapshot for WAL checkpoint.
-    fn build_snapshot(&self) -> BlobStoreSnapshot<'_> {
-        let mut snap_blobs = Vec::new();
-        for (id, meta) in &self.blobs {
-            let mut chunks_ref = Vec::new();
-            for hash in &meta.chunk_hashes {
-                if let Some(data) = self.chunks.get(hash) {
-                    chunks_ref.push((hash, data));
-                }
-            }
-            let tags: Vec<(&str, &str)> = meta
-                .tags
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
-            snap_blobs.push((
-                id.as_str(),
-                meta.content_type.as_deref(),
-                meta.size,
-                chunks_ref,
-                tags,
-            ));
-        }
-        BlobStoreSnapshot { blobs: snap_blobs }
+    /// Physically reclaim unreferenced chunk space now (cache + segments).
+    /// Normally this happens automatically on mutations; explicit calls are
+    /// useful after bulk deletes.
+    pub fn gc(&mut self) {
+        self.chunks.sweep();
     }
 
-    /// Checkpoint the WAL (truncate to a single snapshot).
+    /// Checkpoint the WAL (truncate to a single manifest snapshot).
     pub fn checkpoint(&self) -> std::io::Result<()> {
         if let Some(wal) = &self.wal {
-            let snapshot = self.build_snapshot();
+            let mut snap_blobs = Vec::with_capacity(self.blobs.len());
+            for (id, meta) in &self.blobs {
+                snap_blobs.push((
+                    id.as_str(),
+                    meta.content_type.as_deref(),
+                    meta.size,
+                    meta.wal_chunks(),
+                    meta.wal_tags(),
+                ));
+            }
+            let snapshot = BlobMetaSnapshot { blobs: snap_blobs };
             wal.checkpoint(&snapshot)?;
         }
         Ok(())
@@ -481,25 +941,56 @@ impl BlobStore {
 
     /// Capture a snapshot of all mutable blob state for transaction rollback.
     ///
-    /// The WAL handle is not snapshotted — it is append-only and shared.
+    /// Cheap: manifests and chunk reference counts only — no chunk data. The
+    /// snapshot pins garbage collection so every referenced chunk stays
+    /// physically readable until the snapshot is dropped (COMMIT) or consumed
+    /// by [`Self::txn_restore`] (ROLLBACK).
     pub fn txn_snapshot(&self) -> BlobTxnSnapshot {
         BlobTxnSnapshot {
-            chunks: self.chunks.clone(),
             blobs: self.blobs.clone(),
+            chunks: self.chunks.txn_snapshot(),
         }
     }
 
     /// Restore mutable blob state from a transaction snapshot (for ROLLBACK).
     pub fn txn_restore(&mut self, snap: BlobTxnSnapshot) {
-        self.chunks = snap.chunks;
+        // The WAL already holds entries for the rolled-back mutations; log
+        // corrective entries so a replay reconstructs the restored state.
+        if let Some(wal) = &self.wal {
+            for key in self.blobs.keys() {
+                if !snap.blobs.contains_key(key)
+                    && let Err(e) = wal.log_delete(key)
+                {
+                    eprintln!("blob WAL: failed to log rollback delete for '{key}': {e}");
+                }
+            }
+            for (key, meta) in &snap.blobs {
+                let differs = match self.blobs.get(key) {
+                    None => true,
+                    Some(cur) => cur.durable_state_differs(meta),
+                };
+                if differs
+                    && let Err(e) = wal.log_store_meta(
+                        key,
+                        meta.content_type.as_deref(),
+                        meta.size,
+                        &meta.wal_chunks(),
+                        &meta.wal_tags(),
+                    )
+                {
+                    eprintln!("blob WAL: failed to log rollback restore for '{key}': {e}");
+                }
+            }
+        }
         self.blobs = snap.blobs;
+        self.chunks.txn_restore(snap.chunks);
     }
 }
 
 /// Snapshot of `BlobStore` mutable state for transaction rollback.
 pub struct BlobTxnSnapshot {
-    chunks: ChunkStore,
     blobs: HashMap<String, BlobMetadata>,
+    chunks: ChunkTxnSnapshot,
 }
 
 // ============================================================================
@@ -694,6 +1185,29 @@ mod tests {
         assert!(!cs.contains(&fake));
     }
 
+    #[test]
+    fn chunk_store_refcount_release() {
+        let mut cs = ChunkStore::new();
+        let hash = cs.put(vec![1, 2, 3]);
+        cs.put(vec![1, 2, 3]); // second reference
+        assert_eq!(cs.chunk_count(), 1);
+
+        cs.release(&hash);
+        assert!(cs.contains(&hash)); // still one reference
+        assert_eq!(cs.stored_bytes(), 3);
+
+        cs.release(&hash);
+        assert!(!cs.contains(&hash)); // garbage now
+        assert_eq!(cs.stored_bytes(), 0);
+        cs.sweep();
+        assert!(cs.get(&hash).is_none()); // physically gone
+
+        // Re-put after full release stores it again.
+        let hash2 = cs.put(vec![1, 2, 3]);
+        assert_eq!(hash, hash2);
+        assert_eq!(cs.get(&hash2).unwrap(), vec![1, 2, 3]);
+    }
+
     // ========================================================================
     // BlobIndex tests
     // ========================================================================
@@ -807,6 +1321,38 @@ mod tests {
         assert!(store.delete("temp"));
         assert_eq!(store.blob_count(), 0);
         assert!(store.get("temp").is_none());
+        // Unreferenced chunk space is reclaimed.
+        assert_eq!(store.total_physical_bytes(), 0);
+    }
+
+    #[test]
+    fn delete_keeps_shared_chunks() {
+        let mut store = BlobStore::with_chunk_size(4);
+        let data = b"AAAABBBB";
+        store.put("one", data, None);
+        store.put("two", data, None);
+
+        assert!(store.delete("one"));
+        store.gc();
+        // "two" still reads fine — its chunks were shared with "one".
+        assert_eq!(store.get("two").unwrap(), data);
+        assert_eq!(store.total_physical_bytes(), 8);
+
+        assert!(store.delete("two"));
+        store.gc();
+        assert_eq!(store.total_physical_bytes(), 0);
+    }
+
+    #[test]
+    fn overwrite_releases_old_chunks() {
+        let mut store = BlobStore::with_chunk_size(4);
+        store.put("file", b"XXXXYYYY", None);
+        assert_eq!(store.total_physical_bytes(), 8);
+        store.put("file", b"XXXXZZZZ", None);
+        store.gc();
+        // "YYYY" released, "XXXX" shared between versions, "ZZZZ" added.
+        assert_eq!(store.total_physical_bytes(), 8);
+        assert_eq!(store.get("file").unwrap(), b"XXXXZZZZ");
     }
 
     #[test]
@@ -946,7 +1492,119 @@ mod tests {
     }
 
     // ========================================================================
-    // WAL-backed BlobStore tests
+    // Compose (zero-copy concatenation) tests
+    // ========================================================================
+
+    #[test]
+    fn compose_concatenates_without_copy() {
+        let mut store = BlobStore::with_chunk_size(4);
+        store.put("p1", b"aaaabbbb", None);
+        store.put("p2", b"ccccdd", None); // trailing partial chunk
+        store.put("p3", b"eeee", None);
+
+        assert!(store.compose("joined", &["p1", "p2", "p3"], Some("text/plain")));
+        assert_eq!(store.get("joined").unwrap(), b"aaaabbbbccccddeeee");
+        assert_eq!(store.metadata("joined").unwrap().size, 18);
+        // Zero copy: physical bytes unchanged by the compose.
+        assert_eq!(store.total_physical_bytes(), 18);
+        // Range reads work across part boundaries (partial chunk in middle).
+        assert_eq!(store.get_range("joined", 6, 8).unwrap(), b"bbccccdd");
+
+        // Deleting the sources must not break the composed blob.
+        store.delete("p1");
+        store.delete("p2");
+        store.delete("p3");
+        store.gc();
+        assert_eq!(store.get("joined").unwrap(), b"aaaabbbbccccddeeee");
+    }
+
+    #[test]
+    fn compose_missing_source_fails() {
+        let mut store = BlobStore::new();
+        store.put("a", b"data", None);
+        assert!(!store.compose("out", &["a", "ghost"], None));
+        assert!(store.get("out").is_none());
+    }
+
+    #[test]
+    fn compose_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = BlobStore::open_with_chunk_size(dir.path(), 4).unwrap();
+            store.put("p1", b"hello ", None);
+            store.put("p2", b"world!", None);
+            assert!(store.compose("msg", &["p1", "p2"], Some("text/plain")));
+            store.delete("p1");
+            store.delete("p2");
+        }
+        let store = BlobStore::open_with_chunk_size(dir.path(), 4).unwrap();
+        assert_eq!(store.get("msg").unwrap(), b"hello world!");
+        assert_eq!(
+            store.metadata("msg").unwrap().content_type.as_deref(),
+            Some("text/plain")
+        );
+    }
+
+    // ========================================================================
+    // Transaction snapshot/restore tests
+    // ========================================================================
+
+    #[test]
+    fn txn_rollback_restores_blobs_ram() {
+        let mut store = BlobStore::with_chunk_size(4);
+        store.put("keep", b"keep me around", None);
+        store.put("victim", b"delete me", None);
+
+        let snap = store.txn_snapshot();
+
+        store.delete("victim");
+        store.put("keep", b"clobbered!", None);
+        store.put("new", b"added in txn", None);
+        store.set_tag("keep", "tainted", "yes");
+
+        store.txn_restore(snap);
+
+        assert_eq!(store.blob_count(), 2);
+        assert_eq!(store.get("keep").unwrap(), b"keep me around");
+        assert_eq!(store.get("victim").unwrap(), b"delete me");
+        assert!(store.get("new").is_none());
+        assert!(store.metadata("keep").unwrap().tags.is_empty());
+
+        // Post-rollback the store keeps working, and garbage from the
+        // rolled-back writes is reclaimable.
+        store.put("after", b"life goes on", None);
+        assert_eq!(store.get("after").unwrap(), b"life goes on");
+    }
+
+    #[test]
+    fn txn_commit_drops_snapshot_and_allows_reclaim() {
+        let mut store = BlobStore::with_chunk_size(4);
+        store.put("a", b"AAAA", None);
+        let snap = store.txn_snapshot();
+        store.delete("a");
+        // Snapshot outstanding: chunk data must survive for a possible rollback.
+        drop(snap); // COMMIT
+        store.gc();
+        assert_eq!(store.total_physical_bytes(), 0);
+    }
+
+    #[test]
+    fn txn_snapshot_pins_deleted_chunk_data() {
+        let mut store = BlobStore::with_chunk_size(4);
+        store.put("a", b"precious data", None);
+        let snap = store.txn_snapshot();
+
+        store.delete("a");
+        // Force sweep attempts while pinned — data must survive.
+        store.gc();
+        store.put("unrelated", b"xyz", None);
+
+        store.txn_restore(snap);
+        assert_eq!(store.get("a").unwrap(), b"precious data");
+    }
+
+    // ========================================================================
+    // Disk-tiered (WAL + segments) BlobStore tests
     // ========================================================================
 
     #[test]
@@ -1090,6 +1748,18 @@ mod tests {
     }
 
     #[test]
+    fn wal_empty_blob_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = BlobStore::open(dir.path()).unwrap();
+            store.put("empty", b"", None);
+        }
+        let store2 = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(store2.get("empty").unwrap(), Vec::<u8>::new());
+        assert_eq!(store2.metadata("empty").unwrap().size, 0);
+    }
+
+    #[test]
     fn wal_corrupt_graceful_recovery() {
         use std::io::Write;
 
@@ -1112,6 +1782,236 @@ mod tests {
         let store2 = BlobStore::open(dir.path()).unwrap();
         assert_eq!(store2.blob_count(), 1);
         assert_eq!(store2.get("good").unwrap(), b"good data");
+    }
+
+    #[test]
+    fn disk_capacity_beyond_cache() {
+        // Cache holds ~2 chunks; store 50 blobs and read them all back —
+        // most reads must come off disk.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = BlobStore::open_with_options(dir.path(), 64, 128).unwrap();
+            for i in 0..50u8 {
+                store.put(&format!("blob-{i}"), &[i; 100], None);
+            }
+            for i in 0..50u8 {
+                assert_eq!(
+                    store.get(&format!("blob-{i}")).unwrap(),
+                    vec![i; 100],
+                    "blob-{i} readable while store is open"
+                );
+            }
+        }
+        // And again after restart (cache starts cold).
+        let store = BlobStore::open_with_options(dir.path(), 64, 128).unwrap();
+        for i in 0..50u8 {
+            assert_eq!(store.get(&format!("blob-{i}")).unwrap(), vec![i; 100]);
+        }
+    }
+
+    #[test]
+    fn disk_delete_reclaims_space_after_gc() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = BlobStore::open_with_options(dir.path(), 64, 1024).unwrap();
+        for i in 0..20u8 {
+            store.put(&format!("b{i}"), &[i; 200], None);
+        }
+        let before = store.total_physical_bytes();
+        for i in 0..20u8 {
+            store.delete(&format!("b{i}"));
+        }
+        store.gc();
+        assert_eq!(store.total_physical_bytes(), 0);
+        assert!(before > 0);
+        // Store still fully functional after compaction.
+        store.put("fresh", b"fresh data", None);
+        assert_eq!(store.get("fresh").unwrap(), b"fresh data");
+        drop(store);
+        let store = BlobStore::open_with_options(dir.path(), 64, 1024).unwrap();
+        assert_eq!(store.blob_count(), 1);
+        assert_eq!(store.get("fresh").unwrap(), b"fresh data");
+    }
+
+    #[test]
+    fn txn_rollback_durable_across_restart() {
+        // A rolled-back transaction must not resurrect on restart: the WAL
+        // gets corrective entries at restore time.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = BlobStore::open_with_chunk_size(dir.path(), 4).unwrap();
+            store.put("stable", b"stable data", None);
+            store.put("victim", b"victim data", None);
+
+            let snap = store.txn_snapshot();
+            store.delete("victim");
+            store.put("phantom", b"phantom data", None);
+            store.put("stable", b"clobbered", None);
+            store.txn_restore(snap);
+
+            assert_eq!(store.get("victim").unwrap(), b"victim data");
+        }
+        let store = BlobStore::open_with_chunk_size(dir.path(), 4).unwrap();
+        assert_eq!(store.blob_count(), 2);
+        assert_eq!(store.get("stable").unwrap(), b"stable data");
+        assert_eq!(store.get("victim").unwrap(), b"victim data");
+        assert!(store.get("phantom").is_none());
+    }
+
+    #[test]
+    fn txn_rollback_restores_tags_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = BlobStore::open(dir.path()).unwrap();
+            store.put("doc", b"data", None);
+            store.set_tag("doc", "state", "clean");
+
+            let snap = store.txn_snapshot();
+            store.set_tag("doc", "state", "dirty");
+            store.set_tag("doc", "extra", "junk");
+            store.txn_restore(snap);
+
+            assert_eq!(store.metadata("doc").unwrap().tags["state"], "clean");
+            assert!(!store.metadata("doc").unwrap().tags.contains_key("extra"));
+        }
+        let store = BlobStore::open(dir.path()).unwrap();
+        let tags = &store.metadata("doc").unwrap().tags;
+        assert_eq!(tags["state"], "clean");
+        assert!(!tags.contains_key("extra"));
+    }
+
+    #[test]
+    fn legacy_wal_migrates_to_segments() {
+        // Simulate a pre-segment WAL (chunk data embedded in STORE entries),
+        // then open: data must migrate into segment files and the WAL must be
+        // rewritten metadata-only.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (wal, _) = BlobWal::open(dir.path()).unwrap();
+            let c1 = b"legacy chunk one".to_vec();
+            let c2 = b"legacy chunk two".to_vec();
+            let h1 = content_hash_blake3(&c1);
+            let h2 = content_hash_blake3(&c2);
+            wal.log_store_legacy(
+                "old_blob",
+                Some("text/plain"),
+                (c1.len() + c2.len()) as u64,
+                &[(h1, c1), (h2, c2)],
+            )
+            .unwrap();
+        }
+        let wal_size_before = std::fs::metadata(dir.path().join("blob.wal"))
+            .unwrap()
+            .len();
+        {
+            let store = BlobStore::open(dir.path()).unwrap();
+            assert_eq!(store.blob_count(), 1);
+            assert_eq!(
+                store.get("old_blob").unwrap(),
+                b"legacy chunk onelegacy chunk two"
+            );
+        }
+        // Post-migration checkpoint rewrote the WAL without chunk data.
+        let wal_size_after = std::fs::metadata(dir.path().join("blob.wal"))
+            .unwrap()
+            .len();
+        assert!(wal_size_after < wal_size_before);
+        // And it stays readable on subsequent opens.
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store.get("old_blob").unwrap(),
+            b"legacy chunk onelegacy chunk two"
+        );
+    }
+
+    #[test]
+    fn checkpoint_truncates_and_preserves_state() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = BlobStore::open_with_chunk_size(dir.path(), 4).unwrap();
+            for i in 0..10u8 {
+                store.put(&format!("k{i}"), &[i; 10], None);
+            }
+            store.delete("k3");
+            store.set_tag("k5", "keep", "yes");
+            store.checkpoint().unwrap();
+            store.put("post", b"post-checkpoint", None);
+        }
+        let store = BlobStore::open_with_chunk_size(dir.path(), 4).unwrap();
+        assert_eq!(store.blob_count(), 10); // 10 - k3 + post
+        assert!(store.get("k3").is_none());
+        assert_eq!(store.get("k5").unwrap(), vec![5u8; 10]);
+        assert_eq!(store.metadata("k5").unwrap().tags["keep"], "yes");
+        assert_eq!(store.get("post").unwrap(), b"post-checkpoint");
+    }
+
+    #[test]
+    fn eviction_stress_differential() {
+        // Tiny cache, many interleaved puts/overwrites/deletes/reads; every
+        // observable read must match a plain HashMap reference model.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = BlobStore::open_with_options(dir.path(), 16, 256).unwrap();
+        let mut model: HashMap<String, Vec<u8>> = HashMap::new();
+
+        let mut seed = 0xDEADBEEFu64;
+        let mut rng = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for round in 0..2000u32 {
+            let key = format!("k{}", rng() % 40);
+            match rng() % 10 {
+                0..=4 => {
+                    // put (sizes cross chunk boundaries; contents repeat for dedup)
+                    let len = (rng() % 100) as usize;
+                    let fill = (rng() % 7) as u8;
+                    let data = vec![fill; len];
+                    store.put(&key, &data, None);
+                    model.insert(key, data);
+                }
+                5..=6 => {
+                    let expected = model.get(&key).cloned();
+                    let actual = store.get(&key);
+                    assert_eq!(actual, expected, "round {round} get({key})");
+                }
+                7 => {
+                    let deleted = store.delete(&key);
+                    assert_eq!(deleted, model.remove(&key).is_some(), "round {round}");
+                }
+                8 => {
+                    if let Some(expected) = model.get(&key) {
+                        let off = rng() % 50;
+                        let len = rng() % 60;
+                        let want: Vec<u8> = expected
+                            .iter()
+                            .skip(off as usize)
+                            .take(len as usize)
+                            .copied()
+                            .collect();
+                        let got = store.get_range(&key, off, len).unwrap();
+                        assert_eq!(got, want, "round {round} range({key},{off},{len})");
+                    }
+                }
+                _ => store.gc(),
+            }
+        }
+
+        // Full verification, then restart and verify again.
+        for (key, expected) in &model {
+            assert_eq!(store.get(key).unwrap(), *expected, "final get({key})");
+        }
+        drop(store);
+        let store = BlobStore::open_with_options(dir.path(), 16, 256).unwrap();
+        assert_eq!(store.blob_count(), model.len());
+        for (key, expected) in &model {
+            assert_eq!(
+                store.get(key).unwrap(),
+                *expected,
+                "post-restart get({key})"
+            );
+        }
     }
 
     // ========================================================================
