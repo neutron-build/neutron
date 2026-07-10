@@ -1798,10 +1798,7 @@ impl CompositePropertyIndex {
     fn make_key(&self, node: &Node) -> Option<Vec<IndexKey>> {
         let mut keys = Vec::with_capacity(self.properties.len());
         for prop in &self.properties {
-            match node.properties.get(prop) {
-                Some(val) => keys.push(IndexKey::from_prop(val)),
-                None => return None,
-            }
+            keys.push(IndexKey::from_prop(node.properties.get(prop)?));
         }
         Some(keys)
     }

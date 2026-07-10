@@ -5098,31 +5098,22 @@ impl Executor {
             Expr::BinaryOp { left, op, right } => {
                 // Try col op literal
                 if let Some(col) = self.expr_as_column_name(left) {
-                    if let Ok(val) = self.eval_const_expr(right) {
-                        (col, op.clone(), val)
-                    } else {
-                        return None;
-                    }
-                }
-                // Try literal op col (flip the operator)
-                else if let Some(col) = self.expr_as_column_name(right) {
-                    if let Ok(val) = self.eval_const_expr(left) {
-                        // Flip: `5 > col` becomes `col < 5`
-                        let flipped = match op {
-                            ast::BinaryOperator::Eq => ast::BinaryOperator::Eq,
-                            ast::BinaryOperator::NotEq => ast::BinaryOperator::NotEq,
-                            ast::BinaryOperator::Gt => ast::BinaryOperator::Lt,
-                            ast::BinaryOperator::Lt => ast::BinaryOperator::Gt,
-                            ast::BinaryOperator::GtEq => ast::BinaryOperator::LtEq,
-                            ast::BinaryOperator::LtEq => ast::BinaryOperator::GtEq,
-                            _ => return None,
-                        };
-                        (col, flipped, val)
-                    } else {
-                        return None;
-                    }
+                    (col, op.clone(), self.eval_const_expr(right).ok()?)
                 } else {
-                    return None;
+                    // Try literal op col (flip the operator)
+                    let col = self.expr_as_column_name(right)?;
+                    let val = self.eval_const_expr(left).ok()?;
+                    // Flip: `5 > col` becomes `col < 5`
+                    let flipped = match op {
+                        ast::BinaryOperator::Eq => ast::BinaryOperator::Eq,
+                        ast::BinaryOperator::NotEq => ast::BinaryOperator::NotEq,
+                        ast::BinaryOperator::Gt => ast::BinaryOperator::Lt,
+                        ast::BinaryOperator::Lt => ast::BinaryOperator::Gt,
+                        ast::BinaryOperator::GtEq => ast::BinaryOperator::LtEq,
+                        ast::BinaryOperator::LtEq => ast::BinaryOperator::GtEq,
+                        _ => return None,
+                    };
+                    (col, flipped, val)
                 }
             }
             _ => return None,
