@@ -1046,6 +1046,30 @@ port = 5555
     }
 
     #[test]
+    fn test_env_max_memory_survives_default_cli_merge() {
+        // Regression: `nucleus start` used to pass its clap default
+        // (Some(512)) into merge_cli_args unconditionally, stomping
+        // NUCLEUS_MAX_MEMORY_MB / nucleus.toml. main.rs now passes None
+        // when --max-memory wasn't explicitly given; merge_cli_args must
+        // preserve the env-driven value in that case.
+        let mut cfg = NucleusConfig::default();
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
+        unsafe {
+            env::set_var("NUCLEUS_MAX_MEMORY_MB", "8192");
+        }
+        cfg.apply_env_overrides();
+        cfg.merge_cli_args(None, None, None, None, None);
+        assert_eq!(cfg.server.max_memory_mb, 8192);
+        // An explicit CLI value still wins.
+        cfg.merge_cli_args(None, None, None, None, Some(1024));
+        assert_eq!(cfg.server.max_memory_mb, 1024);
+        // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.
+        unsafe {
+            env::remove_var("NUCLEUS_MAX_MEMORY_MB");
+        }
+    }
+
+    #[test]
     fn test_env_override_wal_extended() {
         let mut cfg = NucleusConfig::default();
         // SAFETY: test-only. edition-2024 marks process-env mutation unsafe (not thread-safe); each test sets and removes its own NUCLEUS_* keys.

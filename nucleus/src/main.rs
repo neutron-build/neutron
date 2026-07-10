@@ -398,7 +398,14 @@ async fn cmd_start(cfg: StartConfig) {
         },
         data_override.as_deref(),
         if memory { Some(true) } else { None },
-        Some(max_memory),
+        // Like host/port/data above, treat the clap default as "unspecified"
+        // so NUCLEUS_MAX_MEMORY_MB / nucleus.toml can drive the budget when
+        // --max-memory isn't explicitly passed.
+        if max_memory != 512 {
+            Some(max_memory)
+        } else {
+            None
+        },
     );
 
     // Derive subsystem budgets from the global memory limit
