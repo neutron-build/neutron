@@ -31,6 +31,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 clap = { version = "4.5.58", features = ["derive"], optional = true }
 base64 = "0.22.1"
 blake3 = "1"
+sha2 = { version = "0.10", optional = true }
+hmac = { version = "0.12", optional = true }
 toml = "0.8"
 core_affinity = { version = "0.8", optional = true }
 rustyline = { version = "14", optional = true }
@@ -71,7 +73,7 @@ default = ["server"]
 server = [
     "dep:pgwire", "dep:rayon", "dep:core_affinity", "dep:rustyline",
     "dep:clap", "dep:rcgen", "dep:rustls-pemfile", "dep:tokio-postgres",
-    "dep:tracing-subscriber", "dep:zstd", "mimalloc-allocator",
+    "dep:tracing-subscriber", "dep:zstd", "dep:sha2", "dep:hmac", "mimalloc-allocator",
     "tokio/full", "tokio/rt-multi-thread",
 ]
 wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:serde-wasm-bindgen", "getrandom/js"]

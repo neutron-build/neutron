@@ -140,6 +140,11 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         binary_port: u16,
 
+        /// Port for the S3-compatible gateway (default: 0 = disabled).
+        /// Requires NUCLEUS_S3_ACCESS_KEY and NUCLEUS_S3_SECRET_KEY.
+        #[arg(long, default_value_t = 0)]
+        s3_port: u16,
+
         /// OpenTelemetry OTLP endpoint for distributed tracing.
         /// Example: http://localhost:4317 (gRPC) or http://localhost:4318 (HTTP).
         /// Requires the 'otel' feature to be enabled at compile time.
@@ -220,6 +225,7 @@ struct StartConfig {
     compress: bool,
     resp_port: u16,
     binary_port: u16,
+    s3_port: u16,
     otlp_endpoint: Option<String>,
     max_memory: usize,
 }
@@ -253,6 +259,7 @@ async fn main() {
             compress,
             resp_port,
             binary_port,
+            s3_port,
             otlp_endpoint,
             max_memory,
         }) => {
@@ -276,6 +283,7 @@ async fn main() {
                 compress,
                 resp_port,
                 binary_port,
+                s3_port,
                 otlp_endpoint,
                 max_memory,
             })
@@ -315,6 +323,7 @@ async fn main() {
                 compress: false,
                 resp_port: 6379,
                 binary_port: 0,
+                s3_port: 0,
                 otlp_endpoint: None,
                 max_memory: 512,
             })
@@ -348,6 +357,7 @@ async fn cmd_start(cfg: StartConfig) {
         compress,
         resp_port,
         binary_port,
+        s3_port,
         otlp_endpoint,
         max_memory,
     } = cfg;
@@ -1457,6 +1467,39 @@ async fn cmd_start(cfg: StartConfig) {
         tracing::info!("RESP server on port {resp_port} (redis-cli compatible)");
     }
 
+    // Spawn S3-compatible gateway
+    if s3_port > 0 {
+        let access_key = std::env::var("NUCLEUS_S3_ACCESS_KEY").unwrap_or_default();
+        let secret_key = std::env::var("NUCLEUS_S3_SECRET_KEY").unwrap_or_default();
+        if access_key.is_empty() || secret_key.is_empty() {
+            tracing::error!(
+                "--s3-port set but NUCLEUS_S3_ACCESS_KEY / NUCLEUS_S3_SECRET_KEY missing; \
+                 S3 gateway NOT started"
+            );
+        } else {
+            let max_object_bytes = std::env::var("NUCLEUS_S3_MAX_OBJECT_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024 * 1024 * 1024);
+            let s3_addr = format!("{host}:{s3_port}");
+            let s3_exec = executor.clone();
+            let s3_config = std::sync::Arc::new(nucleus::s3::S3Config {
+                access_key,
+                secret_key,
+                max_object_bytes,
+            });
+            let s3_shutdown = shutdown_notify.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    nucleus::s3::start_s3_server(s3_addr, s3_exec, s3_config, s3_shutdown).await
+                {
+                    tracing::error!("S3 gateway error: {e}");
+                }
+            });
+            tracing::info!("S3 gateway on port {s3_port} (path-style, SigV4)");
+        }
+    }
+
     // Spawn binary wire protocol server
     if binary_port > 0 {
         let binary_addr = format!("{host}:{binary_port}");
@@ -1579,6 +1622,9 @@ async fn cmd_start(cfg: StartConfig) {
     }
     if binary_port > 0 {
         println!("  Binary port:  {binary_port}");
+    }
+    if s3_port > 0 {
+        println!("  S3 port:      {s3_port}");
     }
     println!("  Connect:      psql -h {host} -p {port}");
     println!();

@@ -59,6 +59,8 @@ pub mod resp;
 #[cfg(feature = "server")]
 pub mod runtime;
 #[cfg(feature = "server")]
+pub mod s3;
+#[cfg(feature = "server")]
 pub mod sharding;
 #[cfg(feature = "server")]
 pub mod tls;
