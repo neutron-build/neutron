@@ -3068,6 +3068,22 @@ impl Executor {
                     Err(e) => Err(ExecError::Unsupported(e.to_string())),
                 }
             }
+            "KV_KEYS" => {
+                // kv_keys(pattern) → JSON array of non-expired keys matching a
+                // simple glob (* wildcard). Exposes KvStore::keys over SQL so
+                // operators (teploy kv list) and apps can enumerate a shared
+                // config namespace by prefix, e.g. KV_KEYS('flags/*').
+                require_args(fname, &args, 1)?;
+                let pattern = match &args[0] {
+                    Value::Text(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let mut keys = self.kv_store.keys(&pattern);
+                keys.sort();
+                Ok(Value::Text(
+                    serde_json::to_string(&keys).unwrap_or_else(|_| "[]".into()),
+                ))
+            }
             "KV_SMEMBERS" => {
                 // kv_smembers(key) → comma-separated members
                 require_args(fname, &args, 1)?;

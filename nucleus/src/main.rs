@@ -183,6 +183,17 @@ enum Commands {
         /// Port to connect to.
         #[arg(short, long, default_value_t = 5432)]
         port: u16,
+
+        /// Execute a single SQL statement and exit (non-interactive).
+        /// Exits 1 if the statement errors. Enables scripted access, e.g.
+        /// `docker exec <c> nucleus shell -c "SELECT KV_GET('k')"`.
+        #[arg(short = 'c', long)]
+        command: Option<String>,
+
+        /// With -c: print SELECT results as a JSON array of objects
+        /// (machine-readable) instead of an ASCII table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -298,8 +309,17 @@ async fn main() {
         Some(Commands::Status { host }) => {
             cmd_status(&host).await;
         }
-        Some(Commands::Shell { host, port }) => {
-            cmd_shell(&host, port).await;
+        Some(Commands::Shell {
+            host,
+            port,
+            command,
+            json,
+        }) => {
+            if let Some(sql) = command {
+                cmd_shell_exec(&host, port, &sql, json).await;
+            } else {
+                cmd_shell(&host, port).await;
+            }
         }
         None => {
             // Default: start in server mode (same as `nucleus start`)
@@ -2148,6 +2168,77 @@ async fn cmd_status(host: &str) {
             eprintln!("Cannot connect to Nucleus at {host}: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// One-shot shell: execute a single SQL statement and exit (`shell -c`).
+/// Prints SELECT results as a table (or JSON with --json), command tags as-is.
+/// Exits 1 on connection failure or statement error so scripts can gate on it.
+async fn cmd_shell_exec(host: &str, port: u16, sql: &str, json: bool) {
+    use nucleus::cli::{PgClient, QueryResult, TableDisplay};
+
+    let mut client = match PgClient::connect(host, port).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to connect: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let sql = sql.trim().trim_end_matches(';');
+    let mut failed = false;
+    match client.simple_query(sql).await {
+        Ok(QueryResult::Select { columns, rows }) => {
+            if json {
+                // JSON array of objects keyed by column name; all values are
+                // the wire's text rendering (KV/FTS results are text anyway).
+                let objs: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|row| {
+                        let mut obj = serde_json::Map::new();
+                        for (i, col) in columns.iter().enumerate() {
+                            let v = row
+                                .get(i)
+                                .map(|s| serde_json::Value::String(s.clone()))
+                                .unwrap_or(serde_json::Value::Null);
+                            obj.insert(col.clone(), v);
+                        }
+                        serde_json::Value::Object(obj)
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string(&objs).unwrap_or_else(|_| "[]".into())
+                );
+            } else {
+                let display = TableDisplay::new(columns, rows);
+                println!("{}", display.format());
+            }
+        }
+        Ok(QueryResult::Command { tag }) => {
+            if json {
+                println!("{}", serde_json::json!({ "tag": tag }));
+            } else if tag.is_empty() {
+                println!("OK");
+            } else {
+                println!("{tag}");
+            }
+        }
+        Ok(QueryResult::Error { message }) => {
+            eprintln!("ERROR: {message}");
+            failed = true;
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            failed = true;
+        }
+    }
+
+    if let Err(e) = client.close().await {
+        eprintln!("Warning: disconnect error: {e}");
+    }
+    if failed {
+        std::process::exit(1);
     }
 }
 
