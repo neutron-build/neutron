@@ -323,11 +323,9 @@ impl Executor {
                     && let Some(v) = row.get_mut(i)
                     && let Value::Text(s) = v
                 {
-                    let parsed = serde_json::from_str::<serde_json::Value>(s.as_str())
-                        .map_err(|e| {
-                            ExecError::Runtime(format!(
-                                "invalid input syntax for type json: {e}"
-                            ))
+                    let parsed =
+                        serde_json::from_str::<serde_json::Value>(s.as_str()).map_err(|e| {
+                            ExecError::Runtime(format!("invalid input syntax for type json: {e}"))
                         })?;
                     *v = Value::Jsonb(parsed);
                 }

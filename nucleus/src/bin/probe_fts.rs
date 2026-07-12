@@ -35,7 +35,9 @@ impl Rng {
         self.0
     }
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { return 0; }
+        if n == 0 {
+            return 0;
+        }
         (self.next() % n as u64) as usize
     }
     fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
@@ -51,15 +53,76 @@ impl Rng {
 fn is_stopword(w: &str) -> bool {
     matches!(
         w,
-        "a" | "an" | "the" | "is" | "are" | "was" | "were" | "be" | "been"
-        | "being" | "have" | "has" | "had" | "do" | "does" | "did" | "will"
-        | "would" | "could" | "should" | "may" | "might" | "shall" | "can"
-        | "to" | "of" | "in" | "for" | "on" | "with" | "at" | "by" | "from"
-        | "as" | "into" | "through" | "during" | "before" | "after" | "and"
-        | "but" | "or" | "not" | "no" | "if" | "then" | "than" | "so"
-        | "that" | "this" | "it" | "its" | "i" | "me" | "my" | "we" | "our"
-        | "you" | "your" | "he" | "him" | "his" | "she" | "her" | "they"
-        | "them" | "their" | "what" | "which" | "who" | "whom"
+        "a" | "an"
+            | "the"
+            | "is"
+            | "are"
+            | "was"
+            | "were"
+            | "be"
+            | "been"
+            | "being"
+            | "have"
+            | "has"
+            | "had"
+            | "do"
+            | "does"
+            | "did"
+            | "will"
+            | "would"
+            | "could"
+            | "should"
+            | "may"
+            | "might"
+            | "shall"
+            | "can"
+            | "to"
+            | "of"
+            | "in"
+            | "for"
+            | "on"
+            | "with"
+            | "at"
+            | "by"
+            | "from"
+            | "as"
+            | "into"
+            | "through"
+            | "during"
+            | "before"
+            | "after"
+            | "and"
+            | "but"
+            | "or"
+            | "not"
+            | "no"
+            | "if"
+            | "then"
+            | "than"
+            | "so"
+            | "that"
+            | "this"
+            | "it"
+            | "its"
+            | "i"
+            | "me"
+            | "my"
+            | "we"
+            | "our"
+            | "you"
+            | "your"
+            | "he"
+            | "him"
+            | "his"
+            | "she"
+            | "her"
+            | "they"
+            | "them"
+            | "their"
+            | "what"
+            | "which"
+            | "who"
+            | "whom"
     )
 }
 
@@ -107,9 +170,13 @@ fn tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     for word in text.split(|c: char| !c.is_alphanumeric() && c != '\'') {
         let word = word.trim_matches('\'');
-        if word.is_empty() { continue; }
+        if word.is_empty() {
+            continue;
+        }
         let lower = word.to_lowercase();
-        if is_stopword(&lower) { continue; }
+        if is_stopword(&lower) {
+            continue;
+        }
         tokens.push(stem(&lower));
     }
     tokens
@@ -193,9 +260,11 @@ fn run_scalar(ex: &Executor, sql: &str) -> Result<Value, ()> {
     }));
     match res {
         Ok(Ok(mut results)) => match results.pop() {
-            Some(ExecResult::Select { rows, .. }) => {
-                Ok(rows.into_iter().next().and_then(|mut r| r.pop()).unwrap_or(Value::Null))
-            }
+            Some(ExecResult::Select { rows, .. }) => Ok(rows
+                .into_iter()
+                .next()
+                .and_then(|mut r| r.pop())
+                .unwrap_or(Value::Null)),
             _ => Err(()),
         },
         _ => Err(()),
@@ -231,7 +300,9 @@ fn parse_search_ids(v: &Value) -> Option<HashSet<u64>> {
     for chunk in s.split("doc_id\":") {
         // After "doc_id":" comes the number before the next comma or brace
         let rest = chunk.trim_start_matches(|c: char| c == ' ');
-        if rest.is_empty() || rest.starts_with('[') { continue; }
+        if rest.is_empty() || rest.starts_with('[') {
+            continue;
+        }
         let num_s: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         if let Ok(id) = num_s.parse::<u64>() {
             ids.insert(id);
@@ -254,11 +325,9 @@ fn run_search_ids(ex: &Executor, query: &str, limit: usize) -> Option<HashSet<u6
 
 /// Words that are NOT stopwords so they actually get indexed.
 const WORDS: &[&str] = &[
-    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot",
-    "gamma", "hotel", "index", "kilo", "lima", "mike",
-    "november", "oscar", "papa", "quebec", "romeo", "sierra",
-    "tango", "uniform", "victor", "whiskey", "xray", "yankee",
-    "zulu", "rust", "fast", "slow", "quick", "brown", "fox",
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "gamma", "hotel", "index", "kilo",
+    "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango", "uniform",
+    "victor", "whiskey", "xray", "yankee", "zulu", "rust", "fast", "slow", "quick", "brown", "fox",
     "jump", "lazy", "data", "base", "query", "search", "text",
 ];
 
@@ -290,7 +359,6 @@ enum Op {
     TermCount,
 }
 
-
 fn gen_op(rng: &mut Rng, doc_ids: &[u64]) -> Op {
     match rng.below(10) {
         0 | 1 | 2 | 3 => {
@@ -315,7 +383,11 @@ fn gen_op(rng: &mut Rng, doc_ids: &[u64]) -> Op {
             Op::Match(id, gen_query(rng))
         }
         _ => {
-            if rng.chance(50) { Op::DocCount } else { Op::TermCount }
+            if rng.chance(50) {
+                Op::DocCount
+            } else {
+                Op::TermCount
+            }
         }
     }
 }
@@ -329,10 +401,22 @@ fn main_impl() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed" => { i += 1; seed = args[i].parse().unwrap(); }
-            "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
-            "--ops" => { i += 1; ops_per = args[i].parse().unwrap(); }
-            "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
+            "--seed" => {
+                i += 1;
+                seed = args[i].parse().unwrap();
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args[i].parse().unwrap();
+            }
+            "--ops" => {
+                i += 1;
+                ops_per = args[i].parse().unwrap();
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = args[i].parse().unwrap();
+            }
             _ => {}
         }
         i += 1;
@@ -388,9 +472,12 @@ fn main_impl() {
                             }
                         }
                         Ok(Err(e)) => {
-                            divergences += 1; iter_divs += 1;
+                            divergences += 1;
+                            iter_divs += 1;
                             if divergences <= max_report {
-                                println!("─── DIVERGENCE #{divergences} (iter {iter}) FTS_INDEX errored ───");
+                                println!(
+                                    "─── DIVERGENCE #{divergences} (iter {iter}) FTS_INDEX errored ───"
+                                );
                                 println!("  sql: {sql}");
                                 println!("  err: {e:?}\n");
                             }
@@ -426,9 +513,12 @@ fn main_impl() {
                             // if empty and nucleus returned error, could be
                             // acceptable. Only flag when expected has results.
                             if !expected.is_empty() {
-                                divergences += 1; iter_divs += 1;
+                                divergences += 1;
+                                iter_divs += 1;
                                 if divergences <= max_report {
-                                    println!("─── DIVERGENCE #{divergences} (iter {iter}) FTS_SEARCH errored but expected hits ───");
+                                    println!(
+                                        "─── DIVERGENCE #{divergences} (iter {iter}) FTS_SEARCH errored but expected hits ───"
+                                    );
                                     println!("  query   : {query}");
                                     println!("  expected ids: {expected:?}\n");
                                 }
@@ -437,11 +527,16 @@ fn main_impl() {
                         Some(got_ids) => {
                             // Compare membership sets (not order, not scores)
                             if got_ids != expected {
-                                divergences += 1; iter_divs += 1;
+                                divergences += 1;
+                                iter_divs += 1;
                                 if divergences <= max_report {
-                                    let missing: Vec<u64> = expected.difference(&got_ids).copied().collect();
-                                    let extra: Vec<u64> = got_ids.difference(&expected).copied().collect();
-                                    println!("─── DIVERGENCE #{divergences} (iter {iter}) FTS_SEARCH membership ───");
+                                    let missing: Vec<u64> =
+                                        expected.difference(&got_ids).copied().collect();
+                                    let extra: Vec<u64> =
+                                        got_ids.difference(&expected).copied().collect();
+                                    println!(
+                                        "─── DIVERGENCE #{divergences} (iter {iter}) FTS_SEARCH membership ───"
+                                    );
                                     println!("  query   : {query}");
                                     println!("  expected ids : {expected:?}");
                                     println!("  nucleus  ids : {got_ids:?}");
@@ -472,18 +567,24 @@ fn main_impl() {
                         None => {
                             // If oracle says match, this is a real divergence
                             if expected {
-                                divergences += 1; iter_divs += 1;
+                                divergences += 1;
+                                iter_divs += 1;
                                 if divergences <= max_report {
-                                    println!("─── DIVERGENCE #{divergences} (iter {iter}) FTS_MATCH errored but expected true ───");
+                                    println!(
+                                        "─── DIVERGENCE #{divergences} (iter {iter}) FTS_MATCH errored but expected true ───"
+                                    );
                                     println!("  {sql_m}\n");
                                 }
                             }
                         }
                         Some(got) => {
                             if got != expected {
-                                divergences += 1; iter_divs += 1;
+                                divergences += 1;
+                                iter_divs += 1;
                                 if divergences <= max_report {
-                                    println!("─── DIVERGENCE #{divergences} (iter {iter}) FTS_MATCH ───");
+                                    println!(
+                                        "─── DIVERGENCE #{divergences} (iter {iter}) FTS_MATCH ───"
+                                    );
                                     println!("  sql      : {sql_m}");
                                     println!("  expected : {expected}");
                                     println!("  nucleus  : {got}\n");
@@ -497,21 +598,29 @@ fn main_impl() {
                     let expected = oracle.doc_count() as i64;
                     match run_i64(&ex, "SELECT FTS_DOC_COUNT()") {
                         None => {
-                            divergences += 1; iter_divs += 1;
+                            divergences += 1;
+                            iter_divs += 1;
                             if divergences <= max_report {
-                                println!("─── DIVERGENCE #{divergences} (iter {iter}) FTS_DOC_COUNT errored ───");
+                                println!(
+                                    "─── DIVERGENCE #{divergences} (iter {iter}) FTS_DOC_COUNT errored ───"
+                                );
                                 println!("  expected: {expected}\n");
                             }
                         }
                         Some(got) => {
                             if got != expected {
-                                divergences += 1; iter_divs += 1;
+                                divergences += 1;
+                                iter_divs += 1;
                                 if divergences <= max_report {
-                                    println!("─── DIVERGENCE #{divergences} (iter {iter}) FTS_DOC_COUNT ───");
+                                    println!(
+                                        "─── DIVERGENCE #{divergences} (iter {iter}) FTS_DOC_COUNT ───"
+                                    );
                                     println!("  expected: {expected}");
                                     println!("  nucleus : {got}");
                                     println!("  ── op log ──");
-                                    for l in &op_log { println!("    {l}"); }
+                                    for l in &op_log {
+                                        println!("    {l}");
+                                    }
                                     println!();
                                 }
                             }
@@ -523,21 +632,29 @@ fn main_impl() {
                     let expected = oracle.term_count() as i64;
                     match run_i64(&ex, "SELECT FTS_TERM_COUNT()") {
                         None => {
-                            divergences += 1; iter_divs += 1;
+                            divergences += 1;
+                            iter_divs += 1;
                             if divergences <= max_report {
-                                println!("─── DIVERGENCE #{divergences} (iter {iter}) FTS_TERM_COUNT errored ───");
+                                println!(
+                                    "─── DIVERGENCE #{divergences} (iter {iter}) FTS_TERM_COUNT errored ───"
+                                );
                                 println!("  expected: {expected}\n");
                             }
                         }
                         Some(got) => {
                             if got != expected {
-                                divergences += 1; iter_divs += 1;
+                                divergences += 1;
+                                iter_divs += 1;
                                 if divergences <= max_report {
-                                    println!("─── DIVERGENCE #{divergences} (iter {iter}) FTS_TERM_COUNT ───");
+                                    println!(
+                                        "─── DIVERGENCE #{divergences} (iter {iter}) FTS_TERM_COUNT ───"
+                                    );
                                     println!("  expected: {expected}");
                                     println!("  nucleus : {got}");
                                     println!("  ── op log ──");
-                                    for l in &op_log { println!("    {l}"); }
+                                    for l in &op_log {
+                                        println!("    {l}");
+                                    }
                                     println!();
                                 }
                             }
@@ -547,7 +664,9 @@ fn main_impl() {
             }
 
             // Stop burning cycles if this iteration already found problems
-            if iter_divs > 0 { break; }
+            if iter_divs > 0 {
+                break;
+            }
         }
     }
 

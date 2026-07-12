@@ -28,46 +28,97 @@ impl Rng {
         self.0 ^= self.0 << 17;
         self.0
     }
-    fn below(&mut self, n: usize) -> usize { (self.next() % n as u64) as usize }
-    fn chance(&mut self, pct: u64) -> bool { self.next() % 100 < pct }
-    fn int(&mut self, lo: i64, hi: i64) -> i64 { lo + (self.next() % ((hi - lo + 1) as u64)) as i64 }
-    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T { &xs[self.below(xs.len())] }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+    fn chance(&mut self, pct: u64) -> bool {
+        self.next() % 100 < pct
+    }
+    fn int(&mut self, lo: i64, hi: i64) -> i64 {
+        lo + (self.next() % ((hi - lo + 1) as u64)) as i64
+    }
+    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+        &xs[self.below(xs.len())]
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Ty { Int, Real, Text }
+enum Ty {
+    Int,
+    Real,
+    Text,
+}
 #[derive(Clone)]
-struct Col { name: &'static str, ty: Ty, nn: bool }
-struct Schema { cols: Vec<Col> }
+struct Col {
+    name: &'static str,
+    ty: Ty,
+    nn: bool,
+}
+struct Schema {
+    cols: Vec<Col>,
+}
 
 const NAMES: &[&str] = &["c1", "c2", "c3", "c4"];
 const CATS: &[&str] = &["red", "green", "blue", "amber", "str0", "str1"];
 
 impl Schema {
     fn random(rng: &mut Rng) -> Schema {
-        let mut cols = vec![Col { name: "id", ty: Ty::Int, nn: true }];
-        cols.push(Col { name: NAMES[0], ty: Ty::Int, nn: true });
+        let mut cols = vec![Col {
+            name: "id",
+            ty: Ty::Int,
+            nn: true,
+        }];
+        cols.push(Col {
+            name: NAMES[0],
+            ty: Ty::Int,
+            nn: true,
+        });
         let extra = 1 + rng.below(3);
         for k in 0..extra {
             let ty = *rng.pick(&[Ty::Int, Ty::Real, Ty::Text]);
-            cols.push(Col { name: NAMES[1 + k], ty, nn: rng.chance(45) });
+            cols.push(Col {
+                name: NAMES[1 + k],
+                ty,
+                nn: rng.chance(45),
+            });
         }
         Schema { cols }
     }
     fn ddl(&self) -> String {
-        let parts: Vec<String> = self.cols.iter().enumerate().map(|(i, c)| {
-            if i == 0 { return "id INTEGER PRIMARY KEY".to_string(); }
-            let ty = match c.ty { Ty::Int => "INTEGER", Ty::Real => "REAL", Ty::Text => "TEXT" };
-            format!("{} {ty}{}", c.name, if c.nn { " NOT NULL" } else { "" })
-        }).collect();
+        let parts: Vec<String> = self
+            .cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == 0 {
+                    return "id INTEGER PRIMARY KEY".to_string();
+                }
+                let ty = match c.ty {
+                    Ty::Int => "INTEGER",
+                    Ty::Real => "REAL",
+                    Ty::Text => "TEXT",
+                };
+                format!("{} {ty}{}", c.name, if c.nn { " NOT NULL" } else { "" })
+            })
+            .collect();
         format!("CREATE TABLE t ({})", parts.join(", "))
     }
-    fn names(&self) -> String { self.cols.iter().map(|c| c.name).collect::<Vec<_>>().join(",") }
-    fn pick<'a>(&'a self, rng: &mut Rng) -> &'a Col { &self.cols[rng.below(self.cols.len())] }
+    fn names(&self) -> String {
+        self.cols
+            .iter()
+            .map(|c| c.name)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+    fn pick<'a>(&'a self, rng: &mut Rng) -> &'a Col {
+        &self.cols[rng.below(self.cols.len())]
+    }
 }
 
 fn gen_value(rng: &mut Rng, c: &Col) -> String {
-    if !c.nn && rng.chance(22) { return "NULL".into(); }
+    if !c.nn && rng.chance(22) {
+        return "NULL".into();
+    }
     match c.ty {
         Ty::Int => rng.int(-9, 30).to_string(),
         Ty::Real => format!("{:.1}", rng.int(-50, 50) as f64 / 10.0),
@@ -84,21 +135,57 @@ fn gen_literal(rng: &mut Rng, c: &Col) -> String {
 fn gen_pred(s: &Schema, rng: &mut Rng) -> String {
     let c = s.pick(rng);
     match rng.below(4) {
-        0 if !c.nn => format!("{} IS {}NULL", c.name, if rng.chance(50) { "NOT " } else { "" }),
-        1 if c.ty == Ty::Int => format!("{} {} {}", c.name, rng.pick(&["<", "<=", ">", ">=", "="]), gen_literal(rng, c)),
-        _ => format!("{} {} {}", c.name, rng.pick(&["=", "<>"]), gen_literal(rng, c)),
+        0 if !c.nn => format!(
+            "{} IS {}NULL",
+            c.name,
+            if rng.chance(50) { "NOT " } else { "" }
+        ),
+        1 if c.ty == Ty::Int => format!(
+            "{} {} {}",
+            c.name,
+            rng.pick(&["<", "<=", ">", ">=", "="]),
+            gen_literal(rng, c)
+        ),
+        _ => format!(
+            "{} {} {}",
+            c.name,
+            rng.pick(&["=", "<>"]),
+            gen_literal(rng, c)
+        ),
     }
 }
 
 fn gen_insert(s: &Schema, rng: &mut Rng, id: i64) -> String {
-    let cells: Vec<String> = s.cols.iter().enumerate()
-        .map(|(i, c)| if i == 0 { id.to_string() } else { gen_value(rng, c) }).collect();
+    let cells: Vec<String> = s
+        .cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if i == 0 {
+                id.to_string()
+            } else {
+                gen_value(rng, c)
+            }
+        })
+        .collect();
     format!("INSERT INTO t ({}) VALUES ({})", s.names(), cells.join(","))
 }
 fn gen_mutation(s: &Schema, rng: &mut Rng, next_id: &mut i64) -> String {
     match rng.below(4) {
-        0 | 1 => { let id = *next_id; *next_id += 1; gen_insert(s, rng, id) }
-        2 => { let c = *rng.pick(&s.cols.iter().skip(1).collect::<Vec<_>>()); format!("UPDATE t SET {} = {} WHERE {}", c.name, gen_value(rng, c), gen_pred(s, rng)) }
+        0 | 1 => {
+            let id = *next_id;
+            *next_id += 1;
+            gen_insert(s, rng, id)
+        }
+        2 => {
+            let c = *rng.pick(&s.cols.iter().skip(1).collect::<Vec<_>>());
+            format!(
+                "UPDATE t SET {} = {} WHERE {}",
+                c.name,
+                gen_value(rng, c),
+                gen_pred(s, rng)
+            )
+        }
         _ => format!("DELETE FROM t WHERE {}", gen_pred(s, rng)),
     }
 }
@@ -112,7 +199,9 @@ fn canon(v: &Value) -> String {
         Value::Float64(f) => {
             if f.is_finite() && (f - f.round()).abs() < 1e-9 && f.abs() < 9e15 {
                 format!("{}", f.round() as i64)
-            } else { format!("{f:.6}") }
+            } else {
+                format!("{f:.6}")
+            }
         }
         Value::Text(s) => format!("'{s}'"),
         other => format!("'{other}'"),
@@ -131,8 +220,10 @@ fn snapshot(db: &Database, cols: &str) -> Result<Vec<Vec<String>>, String> {
     let sql = format!("SELECT {cols} FROM t ORDER BY id ASC");
     match tokio::task::block_in_place(|| rt.block_on(db.execute(&sql))) {
         Ok(mut r) => match r.pop() {
-            Some(ExecResult::Select { rows, .. }) =>
-                Ok(rows.iter().map(|row| row.iter().map(canon).collect()).collect()),
+            Some(ExecResult::Select { rows, .. }) => Ok(rows
+                .iter()
+                .map(|row| row.iter().map(canon).collect())
+                .collect()),
             other => Err(format!("non-select: {other:?}")),
         },
         Err(e) => Err(format!("{e:?}")),
@@ -150,7 +241,9 @@ impl TmpDir {
     }
 }
 impl Drop for TmpDir {
-    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn open(dir: &PathBuf) -> Result<Database, String> {
@@ -166,16 +259,30 @@ fn main_impl() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed" => { i += 1; seed = args[i].parse().unwrap(); }
-            "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
-            "--ops" => { i += 1; ops_per = args[i].parse().unwrap(); }
-            "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
+            "--seed" => {
+                i += 1;
+                seed = args[i].parse().unwrap();
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args[i].parse().unwrap();
+            }
+            "--ops" => {
+                i += 1;
+                ops_per = args[i].parse().unwrap();
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = args[i].parse().unwrap();
+            }
             _ => {}
         }
         i += 1;
     }
     std::panic::set_hook(Box::new(|_| {}));
-    println!("Nucleus WAL recovery round-trip fuzzer\nseed={seed} iterations={iterations} ops/iter={ops_per}\n");
+    println!(
+        "Nucleus WAL recovery round-trip fuzzer\nseed={seed} iterations={iterations} ops/iter={ops_per}\n"
+    );
 
     let mut total = 0usize;
     let mut divergences = 0usize;
@@ -197,26 +304,48 @@ fn main_impl() {
                 Ok(d) => d,
                 Err(e) => {
                     divergences += 1;
-                    if divergences <= max_report { println!("─── RECOVERY OPEN FAILED #{divergences} (iter {iter}) ── {e}\n"); }
+                    if divergences <= max_report {
+                        println!("─── RECOVERY OPEN FAILED #{divergences} (iter {iter}) ── {e}\n");
+                    }
                     continue 'outer;
                 }
             };
             if cycle == 0 {
-                if exec(&db, &schema.ddl()).is_err() { continue 'outer; }
+                if exec(&db, &schema.ddl()).is_err() {
+                    continue 'outer;
+                }
             } else if let Some(exp) = &expected {
                 // Verify the prior crash recovered exactly the committed state.
                 total += 1;
                 let recovered = match snapshot(&db, &cols) {
                     Ok(s) => s,
-                    Err(e) => { divergences += 1; if divergences <= max_report { println!("─── RECOVERY READ FAILED #{divergences} (iter {iter}) ── {e}\n"); } continue 'outer; }
+                    Err(e) => {
+                        divergences += 1;
+                        if divergences <= max_report {
+                            println!(
+                                "─── RECOVERY READ FAILED #{divergences} (iter {iter}) ── {e}\n"
+                            );
+                        }
+                        continue 'outer;
+                    }
                 };
                 if &recovered != exp {
                     divergences += 1;
                     if divergences <= max_report {
-                        println!("─── RECOVERY DIVERGENCE #{divergences} (iter {iter}, cycle {cycle}, seed {seed}) ───");
+                        println!(
+                            "─── RECOVERY DIVERGENCE #{divergences} (iter {iter}, cycle {cycle}, seed {seed}) ───"
+                        );
                         println!("  schema   : {}", schema.ddl());
-                        println!("  pre-crash ({} rows): {:?}", exp.len(), &exp[..exp.len().min(6)]);
-                        println!("  recovered ({} rows): {:?}", recovered.len(), &recovered[..recovered.len().min(6)]);
+                        println!(
+                            "  pre-crash ({} rows): {:?}",
+                            exp.len(),
+                            &exp[..exp.len().min(6)]
+                        );
+                        println!(
+                            "  recovered ({} rows): {:?}",
+                            recovered.len(),
+                            &recovered[..recovered.len().min(6)]
+                        );
                         println!();
                     }
                     continue 'outer;
@@ -230,7 +359,9 @@ fn main_impl() {
             }
             let _ = db.sync();
             expected = snapshot(&db, &cols).ok();
-            if expected.is_none() { continue 'outer; }
+            if expected.is_none() {
+                continue 'outer;
+            }
 
             // Stage writes that must NOT survive the crash: an open txn, no commit.
             if rng.chance(35) {

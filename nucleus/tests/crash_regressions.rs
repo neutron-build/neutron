@@ -32,7 +32,12 @@ async fn val(ex: &Executor, sql: &str) -> Result<String, String> {
 #[tokio::test]
 async fn pad_repeat_length_is_bounded() {
     let ex = fresh().await;
-    assert_eq!(val(&ex, "SELECT LPAD('hi',-9223372036854775808)").await.unwrap(), "");
+    assert_eq!(
+        val(&ex, "SELECT LPAD('hi',-9223372036854775808)")
+            .await
+            .unwrap(),
+        ""
+    );
     assert_eq!(val(&ex, "SELECT RPAD('hi',-5)").await.unwrap(), "");
     assert_eq!(val(&ex, "SELECT REPEAT('ab',-1)").await.unwrap(), "");
     assert_eq!(val(&ex, "SELECT REPEAT('ab',0)").await.unwrap(), "");
@@ -51,7 +56,11 @@ async fn generate_series_is_bounded() {
     // small series still works
     assert!(val(&ex, "SELECT GENERATE_SERIES(1,3)").await.is_ok());
     // enormous range errors instead of OOM-aborting
-    assert!(val(&ex, "SELECT GENERATE_SERIES(1,9223372036854775807)").await.is_err());
+    assert!(
+        val(&ex, "SELECT GENERATE_SERIES(1,9223372036854775807)")
+            .await
+            .is_err()
+    );
 }
 
 /// TENSOR_STORE hex_data of odd length must not panic (it sliced a 2-byte
@@ -60,7 +69,11 @@ async fn generate_series_is_bounded() {
 async fn tensor_store_odd_hex_no_panic() {
     let ex = fresh().await;
     // 'false' is 5 chars (odd) — previously panicked "byte index 6 out of bounds".
-    let r = val(&ex, "SELECT TENSOR_STORE('t','1','[1,2,3]','float32','false')").await;
+    let r = val(
+        &ex,
+        "SELECT TENSOR_STORE('t','1','[1,2,3]','float32','false')",
+    )
+    .await;
     // Either Ok or a graceful Err is acceptable; the point is no panic/abort.
     let _ = r;
     // An odd hex string should be handled without crashing.

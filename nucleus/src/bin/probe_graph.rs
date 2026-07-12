@@ -229,7 +229,9 @@ fn parse_neighbors_json(s: &str) -> BTreeSet<u64> {
     let mut rest = s;
     while let Some(pos) = rest.find("\"neighbor_id\":") {
         rest = &rest[pos + "\"neighbor_id\":".len()..];
-        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
         if end > 0 {
             if let Ok(n) = rest[..end].parse::<u64>() {
                 set.insert(n);
@@ -381,7 +383,10 @@ fn main_impl() {
             ($label:expr, $sql:expr, $exp:expr, $got:expr) => {{
                 divergences += 1;
                 if divergences <= max_report {
-                    println!("─── DIVERGENCE #{} {} (iter {}) ───", divergences, $label, iter);
+                    println!(
+                        "─── DIVERGENCE #{} {} (iter {}) ───",
+                        divergences, $label, iter
+                    );
                     println!("  expected : {:?}", $exp);
                     println!("  got      : {:?}", $got);
                     println!("  sql      : {}", $sql);
@@ -464,12 +469,7 @@ fn main_impl() {
                     match run_bool(&ex, &sql) {
                         (Ok(got), _) if got == expected => {}
                         (Ok(got), _) => {
-                            report_div!(
-                                "DeleteNode bool mismatch",
-                                &sql,
-                                expected,
-                                got
-                            );
+                            report_div!("DeleteNode bool mismatch", &sql, expected, got);
                         }
                         (Err(()), true) => {
                             panics += 1;
@@ -480,7 +480,12 @@ fn main_impl() {
                         }
                         (Err(()), false) => {
                             if expected {
-                                report_div!("DeleteNode returned Err, expected true", &sql, true, "Err");
+                                report_div!(
+                                    "DeleteNode returned Err, expected true",
+                                    &sql,
+                                    true,
+                                    "Err"
+                                );
                             }
                         }
                     }
@@ -493,12 +498,7 @@ fn main_impl() {
                     match run_bool(&ex, &sql) {
                         (Ok(got), _) if got == expected => {}
                         (Ok(got), _) => {
-                            report_div!(
-                                "DeleteEdge bool mismatch",
-                                &sql,
-                                expected,
-                                got
-                            );
+                            report_div!("DeleteEdge bool mismatch", &sql, expected, got);
                         }
                         (Err(()), true) => {
                             panics += 1;
@@ -509,7 +509,12 @@ fn main_impl() {
                         }
                         (Err(()), false) => {
                             if expected {
-                                report_div!("DeleteEdge returned Err, expected true", &sql, true, "Err");
+                                report_div!(
+                                    "DeleteEdge returned Err, expected true",
+                                    &sql,
+                                    true,
+                                    "Err"
+                                );
                             }
                         }
                     }
@@ -580,7 +585,12 @@ fn main_impl() {
                         (Err(()), false) => {
                             // If node doesn't exist in oracle, Err is acceptable.
                             if oracle.nodes.contains(id) {
-                                report_div!("Neighbors returned Err for live node", &sql, &expected, "Err");
+                                report_div!(
+                                    "Neighbors returned Err for live node",
+                                    &sql,
+                                    &expected,
+                                    "Err"
+                                );
                             }
                         }
                     }
@@ -612,7 +622,12 @@ fn main_impl() {
                         (Err(()), false) => {
                             // Acceptable only if both nodes are not live.
                             if oracle.nodes.contains(from) && oracle.nodes.contains(to) {
-                                report_div!("ShortestPath returned Err for live nodes", &sql, expected_len, "Err");
+                                report_div!(
+                                    "ShortestPath returned Err for live nodes",
+                                    &sql,
+                                    expected_len,
+                                    "Err"
+                                );
                             }
                         }
                     }
@@ -636,11 +651,9 @@ fn main_impl() {
     let uex = Arc::new(Executor::new(cat2, st2));
 
     for iter in 0..util_iters {
-        let mut rng = Rng(
-            (seed ^ 0xFEED_CAFE)
-                .wrapping_add(iter as u64)
-                .wrapping_mul(0x100000001B3),
-        );
+        let mut rng = Rng((seed ^ 0xFEED_CAFE)
+            .wrapping_add(iter as u64)
+            .wrapping_mul(0x100000001B3));
 
         // Build a small random directed graph.
         let n_nodes = 3 + rng.below(5); // 3..7 nodes; IDs 1..=n_nodes
@@ -704,25 +717,32 @@ fn main_impl() {
                     }
                 }
                 // If either node is not in the JSON edge list, nucleus returns NULL
-                let from_in = edge_list.iter().any(|(f, t)| *f == from_id || *t == from_id);
+                let from_in = edge_list
+                    .iter()
+                    .any(|(f, t)| *f == from_id || *t == from_id);
                 let to_in = edge_list.iter().any(|(f, t)| *f == to_id || *t == to_id);
                 if !from_in || !to_in { None } else { result }
             }
         };
 
-        let spl_sql = format!(
-            "SELECT GRAPH_SHORTEST_PATH_LENGTH({edges_json_sql},{from_id},{to_id})"
-        );
+        let spl_sql =
+            format!("SELECT GRAPH_SHORTEST_PATH_LENGTH({edges_json_sql},{from_id},{to_id})");
         match run_str(&uex, &spl_sql) {
             (_, true) => {
                 util_panics += 1;
                 if util_panics <= max_report {
-                    println!("─── PANIC #{util_panics} GRAPH_SHORTEST_PATH_LENGTH (util iter {iter}) ───");
+                    println!(
+                        "─── PANIC #{util_panics} GRAPH_SHORTEST_PATH_LENGTH (util iter {iter}) ───"
+                    );
                     println!("  sql: {spl_sql}\n");
                 }
             }
             (Ok(ref s), false) => {
-                let got_len: Option<i64> = if s == "NULL" { None } else { s.parse::<i64>().ok() };
+                let got_len: Option<i64> = if s == "NULL" {
+                    None
+                } else {
+                    s.parse::<i64>().ok()
+                };
                 if got_len != expected_len {
                     util_div += 1;
                     if util_div <= max_report {
@@ -769,9 +789,7 @@ fn main_impl() {
             (Ok(d), false) => {
                 util_div += 1;
                 if util_div <= max_report {
-                    println!(
-                        "─── DIVERGENCE #{util_div} GRAPH_NODE_DEGREE (util iter {iter}) ───"
-                    );
+                    println!("─── DIVERGENCE #{util_div} GRAPH_NODE_DEGREE (util iter {iter}) ───");
                     println!("  edges_json: {edges_json_str}");
                     println!("  probe_node={probe_node} expected={expected_degree} got={d}");
                     println!("  sql: {deg_sql}\n");

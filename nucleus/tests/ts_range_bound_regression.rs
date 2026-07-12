@@ -48,13 +48,33 @@ async fn ts_range_count_includes_end_boundary() {
     one(&ex, "SELECT TS_INSERT('s', 30, 3.0)").await.unwrap();
 
     // Inclusive [10, 30] -> all three points (the bug returned 2).
-    assert_eq!(one(&ex, "SELECT TS_RANGE_COUNT('s', 10, 30)").await.unwrap(), "3");
+    assert_eq!(
+        one(&ex, "SELECT TS_RANGE_COUNT('s', 10, 30)")
+            .await
+            .unwrap(),
+        "3"
+    );
     // Lower bound is inclusive too (unchanged): [20, 30] -> 20, 30.
-    assert_eq!(one(&ex, "SELECT TS_RANGE_COUNT('s', 20, 30)").await.unwrap(), "2");
+    assert_eq!(
+        one(&ex, "SELECT TS_RANGE_COUNT('s', 20, 30)")
+            .await
+            .unwrap(),
+        "2"
+    );
     // A range that ends just before the last point still excludes it.
-    assert_eq!(one(&ex, "SELECT TS_RANGE_COUNT('s', 10, 29)").await.unwrap(), "2");
+    assert_eq!(
+        one(&ex, "SELECT TS_RANGE_COUNT('s', 10, 29)")
+            .await
+            .unwrap(),
+        "2"
+    );
     // Single-point interval where start == end picks up exactly that point.
-    assert_eq!(one(&ex, "SELECT TS_RANGE_COUNT('s', 30, 30)").await.unwrap(), "1");
+    assert_eq!(
+        one(&ex, "SELECT TS_RANGE_COUNT('s', 30, 30)")
+            .await
+            .unwrap(),
+        "1"
+    );
 }
 
 /// TS_RANGE_AVG must average the end-boundary point as well.
@@ -82,9 +102,12 @@ async fn ts_range_count_end_in_own_partition() {
     let hour = 3_600_000u64;
     // Points at hour 0, 1, 2, 3 (each in its own hour partition).
     for h in 0..4u64 {
-        one(&ex, &format!("SELECT TS_INSERT('p', {}, {}.0)", h * hour, h))
-            .await
-            .unwrap();
+        one(
+            &ex,
+            &format!("SELECT TS_INSERT('p', {}, {}.0)", h * hour, h),
+        )
+        .await
+        .unwrap();
     }
     // Inclusive [0, 3h]: the point at exactly 3h sits in a partition whose
     // min_ts == end and must not be pruned -> all four points.

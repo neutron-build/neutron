@@ -44,7 +44,11 @@ struct Ref {
 fn norm_index(i: i64, len: usize) -> Option<usize> {
     let len = len as i64;
     let idx = if i < 0 { len + i } else { i };
-    if idx < 0 || idx >= len { None } else { Some(idx as usize) }
+    if idx < 0 || idx >= len {
+        None
+    } else {
+        Some(idx as usize)
+    }
 }
 
 /// Redis LRANGE normalization → inclusive [start,stop] clamped to bounds.
@@ -52,8 +56,12 @@ fn norm_range(start: i64, stop: i64, len: usize) -> (usize, usize, bool) {
     let len = len as i64;
     let mut s = if start < 0 { len + start } else { start };
     let mut e = if stop < 0 { len + stop } else { stop };
-    if s < 0 { s = 0; }
-    if e >= len { e = len - 1; }
+    if s < 0 {
+        s = 0;
+    }
+    if e >= len {
+        e = len - 1;
+    }
     if s > e || s >= len || len == 0 {
         (0, 0, true) // empty
     } else {
@@ -79,9 +87,23 @@ impl Ref {
                     Ok("true".into())
                 }
             }
-            Op::Get(k) => Ok(self.strings.get(k).cloned().unwrap_or_else(|| "NULL".into())),
-            Op::Del(k) => Ok(if self.strings.remove(k).is_some() { "true" } else { "false" }.into()),
-            Op::Exists(k) => Ok(if self.strings.contains_key(k) { "true" } else { "false" }.into()),
+            Op::Get(k) => Ok(self
+                .strings
+                .get(k)
+                .cloned()
+                .unwrap_or_else(|| "NULL".into())),
+            Op::Del(k) => Ok(if self.strings.remove(k).is_some() {
+                "true"
+            } else {
+                "false"
+            }
+            .into()),
+            Op::Exists(k) => Ok(if self.strings.contains_key(k) {
+                "true"
+            } else {
+                "false"
+            }
+            .into()),
             Op::Incr(k, amt) => {
                 let cur = match self.strings.get(k) {
                     None => 0i64,
@@ -134,7 +156,12 @@ impl Ref {
                 if empty {
                     Ok(String::new())
                 } else {
-                    Ok(l.iter().skip(lo).take(hi - lo + 1).cloned().collect::<Vec<_>>().join(","))
+                    Ok(l.iter()
+                        .skip(lo)
+                        .take(hi - lo + 1)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(","))
                 }
             }
         }
@@ -213,7 +240,11 @@ fn run(ex: &Executor, sql: &str) -> Result<String, ()> {
     match res {
         Ok(Ok(mut results)) => match results.pop() {
             Some(ExecResult::Select { rows, .. }) => {
-                let v = rows.first().and_then(|r| r.first()).cloned().unwrap_or(Value::Null);
+                let v = rows
+                    .first()
+                    .and_then(|r| r.first())
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 Ok(v.to_string())
             }
             _ => Err(()),
@@ -240,10 +271,22 @@ fn main_impl() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed" => { i += 1; seed = args[i].parse().unwrap(); }
-            "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
-            "--ops" => { i += 1; ops_per = args[i].parse().unwrap(); }
-            "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
+            "--seed" => {
+                i += 1;
+                seed = args[i].parse().unwrap();
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args[i].parse().unwrap();
+            }
+            "--ops" => {
+                i += 1;
+                ops_per = args[i].parse().unwrap();
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = args[i].parse().unwrap();
+            }
             _ => {}
         }
         i += 1;
@@ -283,7 +326,9 @@ fn main_impl() {
                         if panics <= max_report {
                             println!("─── PANIC #{panics} (iter {iter}) ───\n  op: {sql}\n");
                         }
-                        if panics > max_report { std::process::exit(1); }
+                        if panics > max_report {
+                            std::process::exit(1);
+                        }
                         continue 'outer;
                     }
                     divergences += 1;

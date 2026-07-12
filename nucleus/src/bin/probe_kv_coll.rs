@@ -287,9 +287,9 @@ enum Op {
     Hexists(String, String),
     // HyperLogLog
     Pfadd(String, String),
-    PfcountCheck(String),       // check cardinality bounds
+    PfcountCheck(String),         // check cardinality bounds
     Pfmerge(String, Vec<String>), // dest, srcs
-    PfmergeCheck(String),       // check post-merge cardinality bounds
+    PfmergeCheck(String),         // check post-merge cardinality bounds
 }
 
 const SET_KEYS: &[&str] = &["sa", "sb", "sc"];
@@ -460,13 +460,11 @@ fn run_i64(ex: &Executor, sql: &str) -> Result<i64, ()> {
     }));
     match res {
         Ok(Ok(mut results)) => match results.pop() {
-            Some(ExecResult::Select { rows, .. }) => {
-                match rows.first().and_then(|r| r.first()) {
-                    Some(Value::Int64(n)) => Ok(*n),
-                    Some(Value::Int32(n)) => Ok(*n as i64),
-                    _ => Err(()),
-                }
-            }
+            Some(ExecResult::Select { rows, .. }) => match rows.first().and_then(|r| r.first()) {
+                Some(Value::Int64(n)) => Ok(*n),
+                Some(Value::Int32(n)) => Ok(*n as i64),
+                _ => Err(()),
+            },
             _ => Err(()),
         },
         Ok(Err(_)) => Err(()),
@@ -496,7 +494,11 @@ fn main_impl() {
             "--seed" => {
                 i += 1;
                 seed = if args[i].starts_with("0x") || args[i].starts_with("0X") {
-                    u64::from_str_radix(args[i].trim_start_matches("0x").trim_start_matches("0X"), 16).unwrap()
+                    u64::from_str_radix(
+                        args[i].trim_start_matches("0x").trim_start_matches("0X"),
+                        16,
+                    )
+                    .unwrap()
                 } else {
                     args[i].parse::<u64>().unwrap()
                 };
@@ -598,7 +600,11 @@ fn main_impl() {
 
             macro_rules! check_bool {
                 ($expected:expr) => {
-                    check_str!(if $expected { "true".into() } else { "false".into() })
+                    check_str!(if $expected {
+                        "true".into()
+                    } else {
+                        "false".into()
+                    })
                 };
             }
 
@@ -732,7 +738,9 @@ fn main_impl() {
                             if is_panic(&ex, &sql) {
                                 panics += 1;
                                 if panics <= max_report {
-                                    println!("─── PANIC in PFCOUNT #{panics} (iter {iter}) ───\n  sql: {sql}\n");
+                                    println!(
+                                        "─── PANIC in PFCOUNT #{panics} (iter {iter}) ───\n  sql: {sql}\n"
+                                    );
                                 }
                             } else {
                                 divergences += 1;
@@ -755,7 +763,9 @@ fn main_impl() {
                         if is_panic(&ex, &sql) {
                             panics += 1;
                             if panics <= max_report {
-                                println!("─── PANIC in PFMERGE #{panics} (iter {iter}) ───\n  sql: {sql}\n");
+                                println!(
+                                    "─── PANIC in PFMERGE #{panics} (iter {iter}) ───\n  sql: {sql}\n"
+                                );
                             }
                         } else {
                             divergences += 1;
@@ -777,7 +787,9 @@ fn main_impl() {
                             if !hll_within_tolerance(n, exact) {
                                 divergences += 1;
                                 if divergences <= max_report {
-                                    println!("─── HLL PFMERGE PFCOUNT OUT OF BOUNDS (iter {iter}) ───");
+                                    println!(
+                                        "─── HLL PFMERGE PFCOUNT OUT OF BOUNDS (iter {iter}) ───"
+                                    );
                                     println!("  sql      : {sql}");
                                     println!("  exact_ref: {exact}");
                                     println!("  nucleus  : {n}");

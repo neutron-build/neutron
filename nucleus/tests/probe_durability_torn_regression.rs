@@ -24,17 +24,18 @@ fn rows(db: &Database, rt: &tokio::runtime::Runtime) -> Vec<(i64, String)> {
     let res = rt.block_on(db.execute("SELECT id, c1 FROM t ORDER BY id ASC"));
     let mut out = Vec::new();
     if let Ok(mut r) = res
-        && let Some(ExecResult::Select { rows, .. }) = r.pop() {
-            for row in &rows {
-                let id = match row.first() {
-                    Some(nucleus::types::Value::Int32(n)) => *n as i64,
-                    Some(nucleus::types::Value::Int64(n)) => *n,
-                    _ => continue,
-                };
-                let c1 = format!("{:?}", row.get(1));
-                out.push((id, c1));
-            }
+        && let Some(ExecResult::Select { rows, .. }) = r.pop()
+    {
+        for row in &rows {
+            let id = match row.first() {
+                Some(nucleus::types::Value::Int32(n)) => *n as i64,
+                Some(nucleus::types::Value::Int64(n)) => *n,
+                _ => continue,
+            };
+            let c1 = format!("{:?}", row.get(1));
+            out.push((id, c1));
         }
+    }
     out
 }
 
@@ -72,10 +73,18 @@ fn torn_tail_truncation_recovers_prefix_no_panic() {
     // Every recovered id is a committed one (1..=8) and value matches.
     for (id, c1) in &recovered {
         assert!((1..=8).contains(id), "resurrected non-committed id {id}");
-        assert_eq!(*c1, format!("Some(Text(\"v{id}\"))"), "corrupt value for id {id}");
+        assert_eq!(
+            *c1,
+            format!("Some(Text(\"v{id}\"))"),
+            "corrupt value for id {id}"
+        );
     }
     // A torn tail loses at most the last committed write.
-    assert!(recovered.len() >= 7, "lost too much: {} rows", recovered.len());
+    assert!(
+        recovered.len() >= 7,
+        "lost too much: {} rows",
+        recovered.len()
+    );
 }
 
 #[test]
@@ -115,7 +124,8 @@ fn full_truncation_to_zero_yields_empty_or_missing_no_panic() {
     let rt = rt();
     // Either the table is gone (Err) or it is present with no rows; never corrupt.
     if let Ok(mut r) = rt.block_on(db.execute("SELECT id FROM t"))
-        && let Some(ExecResult::Select { rows, .. }) = r.pop() {
-            assert!(rows.is_empty(), "rows survived a fully-erased WAL");
-        }
+        && let Some(ExecResult::Select { rows, .. }) = r.pop()
+    {
+        assert!(rows.is_empty(), "rows survived a fully-erased WAL");
+    }
 }

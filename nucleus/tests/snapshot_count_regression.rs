@@ -73,7 +73,11 @@ async fn count_reflects_uncommitted_dml_in_txn() {
     );
 
     run(&ex, s, "COMMIT").await;
-    assert_eq!(count_in(&ex, s).await, 3, "post-commit COUNT(*) reflects committed state");
+    assert_eq!(
+        count_in(&ex, s).await,
+        3,
+        "post-commit COUNT(*) reflects committed state"
+    );
     ex.drop_session(s);
 }
 
@@ -117,7 +121,12 @@ async fn count_autocommit_unchanged() {
     let ex = make_executor();
     let s = ex.create_session();
     run(&ex, s, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await;
-    run(&ex, s, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30)").await;
+    run(
+        &ex,
+        s,
+        "INSERT INTO t (id, v) VALUES (1, 10), (2, 20), (3, 30)",
+    )
+    .await;
     assert_eq!(count_in(&ex, s).await, 3);
     ex.drop_session(s);
 }

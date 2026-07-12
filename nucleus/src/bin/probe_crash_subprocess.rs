@@ -46,8 +46,12 @@ impl Rng {
         self.0 ^= self.0 << 17;
         self.0
     }
-    fn below(&mut self, n: usize) -> usize { (self.next() % n as u64) as usize }
-    fn int(&mut self, lo: u64, hi: u64) -> u64 { lo + self.next() % (hi - lo + 1) }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+    fn int(&mut self, lo: u64, hi: u64) -> u64 {
+        lo + self.next() % (hi - lo + 1)
+    }
 }
 
 // Per-row marker value, derived deterministically from the id so we can detect
@@ -90,9 +94,7 @@ fn child_main(dir: &str, n: u64) -> ! {
     for id in start..start + n as i64 {
         let m = marker_for(id);
         let pad = format!("row-{id}-{m}");
-        let sql = format!(
-            "INSERT INTO t (id, m, pad) VALUES ({id}, {m}, '{pad}')"
-        );
+        let sql = format!("INSERT INTO t (id, m, pad) VALUES ({id}, {m}, '{pad}')");
         // One auto-commit txn per row.
         if let Err(e) = rt.block_on(db.execute(&sql)) {
             eprintln!("CHILD_INSERT_ERR id={id} {e:?}");
@@ -131,7 +133,9 @@ impl TmpDir {
     }
 }
 impl Drop for TmpDir {
-    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Hard-kill the child. On Unix, `std::process::Child::kill()` delivers SIGKILL
@@ -147,11 +151,25 @@ fn sigkill(child: &mut std::process::Child) {
 enum Finding {
     ReopenError(String),
     ReadError(String),
-    Gap { missing: i64, max: i64 },          // id `missing` absent though `max` present
+    Gap {
+        missing: i64,
+        max: i64,
+    }, // id `missing` absent though `max` present
     DuplicateId(i64),
-    BadMarker { id: i64, got: i64, want: i64 },
-    BadPad { id: i64, got: String, want: String },
-    LostCommitted { last_printed: i64, recovered_max: i64 }, // k < an id the child fsynced+printed
+    BadMarker {
+        id: i64,
+        got: i64,
+        want: i64,
+    },
+    BadPad {
+        id: i64,
+        got: String,
+        want: String,
+    },
+    LostCommitted {
+        last_printed: i64,
+        recovered_max: i64,
+    }, // k < an id the child fsynced+printed
     NonContiguousType(String),
 }
 
@@ -196,19 +214,37 @@ fn verify(dir: &Path, last_printed: i64) -> Result<i64, Finding> {
         };
         let pad = match &row[2] {
             Value::Text(s) => s.clone(),
-            other => return Err(Finding::NonContiguousType(format!("pad not text: {other:?}"))),
+            other => {
+                return Err(Finding::NonContiguousType(format!(
+                    "pad not text: {other:?}"
+                )));
+            }
         };
         if let Some(p) = prev {
-            if p == id { return Err(Finding::DuplicateId(id)); }
+            if p == id {
+                return Err(Finding::DuplicateId(id));
+            }
         }
         prev = Some(id);
 
         // Cross-field consistency: a torn / partial write would show a marker or
         // pad that doesn't match the id.
         let wm = marker_for(id);
-        if m != wm { return Err(Finding::BadMarker { id, got: m, want: wm }); }
+        if m != wm {
+            return Err(Finding::BadMarker {
+                id,
+                got: m,
+                want: wm,
+            });
+        }
         let wpad = format!("row-{id}-{wm}");
-        if pad != wpad { return Err(Finding::BadPad { id, got: pad, want: wpad }); }
+        if pad != wpad {
+            return Err(Finding::BadPad {
+                id,
+                got: pad,
+                want: wpad,
+            });
+        }
 
         ids.push(id);
     }
@@ -220,13 +256,19 @@ fn verify(dir: &Path, last_printed: i64) -> Result<i64, Finding> {
         if id != expect {
             // Either a gap (id jumped ahead) or out-of-prefix id.
             let max = *ids.last().unwrap();
-            return Err(Finding::Gap { missing: expect, max });
+            return Err(Finding::Gap {
+                missing: expect,
+                max,
+            });
         }
     }
 
     // Durability: everything the child fsynced + printed must be present.
     if k < last_printed {
-        return Err(Finding::LostCommitted { last_printed, recovered_max: k });
+        return Err(Finding::LostCommitted {
+            last_printed,
+            recovered_max: k,
+        });
     }
     Ok(k)
 }
@@ -248,10 +290,22 @@ fn main_impl() {
     let mut i = 1;
     while i < raw.len() {
         match raw[i].as_str() {
-            "--seed" => { i += 1; seed = raw[i].parse().unwrap(); }
-            "--cycles" => { i += 1; cycles = raw[i].parse().unwrap(); }
-            "--rows" => { i += 1; rows_per = raw[i].parse().unwrap(); }
-            "--max-report" => { i += 1; max_report = raw[i].parse().unwrap(); }
+            "--seed" => {
+                i += 1;
+                seed = raw[i].parse().unwrap();
+            }
+            "--cycles" => {
+                i += 1;
+                cycles = raw[i].parse().unwrap();
+            }
+            "--rows" => {
+                i += 1;
+                rows_per = raw[i].parse().unwrap();
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = raw[i].parse().unwrap();
+            }
             _ => {}
         }
         i += 1;
@@ -260,7 +314,10 @@ fn main_impl() {
 
     let exe = std::env::current_exe().expect("current_exe");
     println!("Nucleus subprocess SIGKILL crash-injection fuzzer");
-    println!("seed={seed} cycles={cycles} rows/child={rows_per}\nexe={}\n", exe.display());
+    println!(
+        "seed={seed} cycles={cycles} rows/child={rows_per}\nexe={}\n",
+        exe.display()
+    );
 
     let mut total = 0usize;
     let mut findings = 0usize;
@@ -302,7 +359,10 @@ fn main_impl() {
             .spawn()
         {
             Ok(c) => c,
-            Err(e) => { eprintln!("spawn failed: {e}"); continue; }
+            Err(e) => {
+                eprintln!("spawn failed: {e}");
+                continue;
+            }
         };
         // Read the child's progress on a background thread so we know the highest
         // durably-committed id at kill time (best-effort lower bound on k).
@@ -328,13 +388,17 @@ fn main_impl() {
         // (timeout path / tiny extra-slice) still hit early/very-late states.
         let arm_deadline = std::time::Instant::now() + Duration::from_millis(1500);
         loop {
-            if last_printed.load(std::sync::atomic::Ordering::Relaxed) > 0 { break; }
+            if last_printed.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                break;
+            }
             // Child may have already finished all rows and be idling, or died.
             match child.try_wait() {
                 Ok(Some(_)) => break, // exited on its own (shouldn't, but be safe)
                 _ => {}
             }
-            if std::time::Instant::now() >= arm_deadline { break; }
+            if std::time::Instant::now() >= arm_deadline {
+                break;
+            }
             std::thread::sleep(Duration::from_micros(200));
         }
         // Random extra slice. fsync-per-row makes each commit ~milliseconds, so
@@ -359,20 +423,33 @@ fn main_impl() {
         total += 1;
         let res = std::panic::catch_unwind(|| verify(&dir, printed));
         match res {
-            Ok(Ok(k)) => { last_k = k; if k > max_k { max_k = k; } sum_k += k; verified += 1; }
+            Ok(Ok(k)) => {
+                last_k = k;
+                if k > max_k {
+                    max_k = k;
+                }
+                sum_k += k;
+                verified += 1;
+            }
             Ok(Err(f)) => {
                 findings += 1;
                 if findings <= max_report {
-                    println!("─── FINDING #{findings} (cycle {cycle}, reuse={reuse}, kill@{micros}us, printed_max={printed}) ───");
+                    println!(
+                        "─── FINDING #{findings} (cycle {cycle}, reuse={reuse}, kill@{micros}us, printed_max={printed}) ───"
+                    );
                     println!("  dir   : {}", dir.display());
                     println!("  detail: {f:?}\n");
                 }
-                if !reuse { continue 'outer; }
+                if !reuse {
+                    continue 'outer;
+                }
             }
             Err(_) => {
                 findings += 1;
                 if findings <= max_report {
-                    println!("─── FINDING #{findings} (cycle {cycle}) ── PANIC during reopen/verify (kill@{micros}us)\n");
+                    println!(
+                        "─── FINDING #{findings} (cycle {cycle}) ── PANIC during reopen/verify (kill@{micros}us)\n"
+                    );
                 }
                 continue 'outer;
             }
@@ -382,10 +459,18 @@ fn main_impl() {
     println!("\n════ SUMMARY ════");
     println!("crash/recover cycles: {total}");
     println!("findings            : {findings}");
-    println!("recovered prefix k  : last={last_k} max={max_k} avg={:.1}",
-        if verified > 0 { sum_k as f64 / verified as f64 } else { 0.0 });
+    println!(
+        "recovered prefix k  : last={last_k} max={max_k} avg={:.1}",
+        if verified > 0 {
+            sum_k as f64 / verified as f64
+        } else {
+            0.0
+        }
+    );
     if findings == 0 {
-        println!("\nEvery SIGKILL recovered an exact committed prefix; no gaps/over-recovery/corruption. 🎯");
+        println!(
+            "\nEvery SIGKILL recovered an exact committed prefix; no gaps/over-recovery/corruption. 🎯"
+        );
     } else {
         std::process::exit(1);
     }

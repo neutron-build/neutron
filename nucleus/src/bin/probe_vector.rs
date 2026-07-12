@@ -20,13 +20,21 @@ impl Rng {
         self.0 ^= self.0 << 17;
         self.0
     }
-    fn below(&mut self, n: usize) -> usize { (self.next() % n as u64) as usize }
-    fn comp(&mut self) -> i32 { (self.next() % 11) as i32 - 5 } // -5..5
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+    fn comp(&mut self) -> i32 {
+        (self.next() % 11) as i32 - 5
+    } // -5..5
 }
 
 // ── Brute-force reference (f32, matches the engine's element type) ──
 fn l2(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt()
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f32>()
+        .sqrt()
 }
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
@@ -126,9 +134,18 @@ fn main_impl() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed" => { i += 1; seed = args[i].parse().unwrap(); }
-            "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
-            "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
+            "--seed" => {
+                i += 1;
+                seed = args[i].parse().unwrap();
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args[i].parse().unwrap();
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = args[i].parse().unwrap();
+            }
             _ => {}
         }
         i += 1;
@@ -163,13 +180,53 @@ fn main_impl() {
 
         // Each (description, sql, expected) tuple.
         let cases: Vec<(&str, String, f64)> = vec![
-            ("default(l2)", format!("SELECT VECTOR_DISTANCE({va},{vb})"), l2(&a, &b) as f64),
-            ("l2", format!("SELECT VECTOR_DISTANCE({va},{vb},'l2')"), l2(&a, &b) as f64),
-            ("cosine", format!("SELECT VECTOR_DISTANCE({va},{vb},'cosine')"), cosine(&a, &b) as f64),
-            ("inner(neg)", format!("SELECT VECTOR_DISTANCE({va},{vb},'inner')"), -dot(&a, &b) as f64),
-            ("l2_fn", format!("SELECT VECTOR_L2_DISTANCE({},{})", json_lit(&a), json_lit(&b)), l2(&a, &b) as f64),
-            ("cosine_fn", format!("SELECT VECTOR_COSINE_DISTANCE({},{})", json_lit(&a), json_lit(&b)), cosine(&a, &b) as f64),
-            ("inner_fn(pos)", format!("SELECT VECTOR_INNER_PRODUCT({},{})", json_lit(&a), json_lit(&b)), dot(&a, &b) as f64),
+            (
+                "default(l2)",
+                format!("SELECT VECTOR_DISTANCE({va},{vb})"),
+                l2(&a, &b) as f64,
+            ),
+            (
+                "l2",
+                format!("SELECT VECTOR_DISTANCE({va},{vb},'l2')"),
+                l2(&a, &b) as f64,
+            ),
+            (
+                "cosine",
+                format!("SELECT VECTOR_DISTANCE({va},{vb},'cosine')"),
+                cosine(&a, &b) as f64,
+            ),
+            (
+                "inner(neg)",
+                format!("SELECT VECTOR_DISTANCE({va},{vb},'inner')"),
+                -dot(&a, &b) as f64,
+            ),
+            (
+                "l2_fn",
+                format!(
+                    "SELECT VECTOR_L2_DISTANCE({},{})",
+                    json_lit(&a),
+                    json_lit(&b)
+                ),
+                l2(&a, &b) as f64,
+            ),
+            (
+                "cosine_fn",
+                format!(
+                    "SELECT VECTOR_COSINE_DISTANCE({},{})",
+                    json_lit(&a),
+                    json_lit(&b)
+                ),
+                cosine(&a, &b) as f64,
+            ),
+            (
+                "inner_fn(pos)",
+                format!(
+                    "SELECT VECTOR_INNER_PRODUCT({},{})",
+                    json_lit(&a),
+                    json_lit(&b)
+                ),
+                dot(&a, &b) as f64,
+            ),
             ("dims", format!("SELECT VECTOR_DIMS({va})"), dim as f64),
         ];
 
@@ -188,7 +245,9 @@ fn main_impl() {
     let mut knn_div = 0usize;
     let knn_iters = (iterations / 20).max(1);
     for iter in 0..knn_iters {
-        let mut rng = Rng((seed ^ 0x4B4E_4E00).wrapping_add(iter as u64).wrapping_mul(0x100000001B3));
+        let mut rng = Rng((seed ^ 0x4B4E_4E00)
+            .wrapping_add(iter as u64)
+            .wrapping_mul(0x100000001B3));
         let dim = 1 + rng.below(6);
         let n = 6 + rng.below(10);
         let vecs: Vec<Vec<f32>> = (0..n).map(|_| gen_vec(&mut rng, dim)).collect();
@@ -199,12 +258,18 @@ fn main_impl() {
         let cat = Arc::new(Catalog::new());
         let st: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
         let kex = Arc::new(Executor::new(cat, st));
-        if !exec(&kex, &format!("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR({dim}))")) {
+        if !exec(
+            &kex,
+            &format!("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR({dim}))"),
+        ) {
             continue;
         }
         let mut ok = true;
         for (i, v) in vecs.iter().enumerate() {
-            if !exec(&kex, &format!("INSERT INTO t VALUES ({}, {})", i + 1, lit(v))) {
+            if !exec(
+                &kex,
+                &format!("INSERT INTO t VALUES ({}, {})", i + 1, lit(v)),
+            ) {
                 ok = false;
                 break;
             }
@@ -235,13 +300,19 @@ fn main_impl() {
         // Distances of the rows nucleus returned, sorted ascending.
         let mut got_d: Vec<f32> = got
             .iter()
-            .filter_map(|&id| vecs.get((id - 1) as usize).map(|v| dist_metric(v, &q, metric)))
+            .filter_map(|&id| {
+                vecs.get((id - 1) as usize)
+                    .map(|v| dist_metric(v, &q, metric))
+            })
             .collect();
         got_d.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
         let matches = got.len() == k
             && got_d.len() == expected.len()
-            && got_d.iter().zip(&expected).all(|(g, e)| close(*g as f64, *e as f64));
+            && got_d
+                .iter()
+                .zip(&expected)
+                .all(|(g, e)| close(*g as f64, *e as f64));
         if !matches {
             knn_div += 1;
             if knn_div <= max_report {

@@ -22,10 +22,19 @@ use nucleus::storage::MvccStorageAdapter;
 use nucleus::types::Value;
 
 fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
 }
-fn run(ex: &Executor, r: &tokio::runtime::Runtime, sid: u64, sql: &str) -> Result<Vec<ExecResult>, String> {
-    r.block_on(ex.execute_with_session(sid, sql)).map_err(|e| format!("{e}"))
+fn run(
+    ex: &Executor,
+    r: &tokio::runtime::Runtime,
+    sid: u64,
+    sql: &str,
+) -> Result<Vec<ExecResult>, String> {
+    r.block_on(ex.execute_with_session(sid, sql))
+        .map_err(|e| format!("{e}"))
 }
 fn int_of(res: Result<Vec<ExecResult>, String>) -> Option<i64> {
     let mut r = res.ok()?;
@@ -43,10 +52,19 @@ fn int_of(res: Result<Vec<ExecResult>, String>) -> Option<i64> {
 fn index_read_matches_fullscan_after_contention() {
     let mut divergences = 0;
     for round in 0..60 {
-        let ex = Arc::new(Executor::new(Arc::new(Catalog::new()), Arc::new(MvccStorageAdapter::new())));
+        let ex = Arc::new(Executor::new(
+            Arc::new(Catalog::new()),
+            Arc::new(MvccStorageAdapter::new()),
+        ));
         let r0 = rt();
         let s0 = ex.create_session();
-        run(&ex, &r0, s0, "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)").unwrap();
+        run(
+            &ex,
+            &r0,
+            s0,
+            "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+        )
+        .unwrap();
         run(&ex, &r0, s0, "INSERT INTO counter (id,v) VALUES (1,0)").unwrap();
         ex.drop_session(s0);
 
@@ -66,22 +84,41 @@ fn index_read_matches_fullscan_after_contention() {
                 for _ in 0..per {
                     loop {
                         if run(&ex, &r, sid, "BEGIN ISOLATION LEVEL REPEATABLE READ").is_err() {
-                            let _ = run(&ex, &r, sid, "ROLLBACK"); continue;
+                            let _ = run(&ex, &r, sid, "ROLLBACK");
+                            continue;
                         }
-                        let cur = match int_of(run(&ex, &r, sid, "SELECT v FROM counter WHERE id=1")) {
-                            Some(n) => n, None => { let _ = run(&ex, &r, sid, "ROLLBACK"); continue; }
-                        };
-                        if run(&ex, &r, sid, &format!("UPDATE counter SET v={} WHERE id=1", cur + 1)).is_err() {
-                            let _ = run(&ex, &r, sid, "ROLLBACK"); continue;
+                        let cur =
+                            match int_of(run(&ex, &r, sid, "SELECT v FROM counter WHERE id=1")) {
+                                Some(n) => n,
+                                None => {
+                                    let _ = run(&ex, &r, sid, "ROLLBACK");
+                                    continue;
+                                }
+                            };
+                        if run(
+                            &ex,
+                            &r,
+                            sid,
+                            &format!("UPDATE counter SET v={} WHERE id=1", cur + 1),
+                        )
+                        .is_err()
+                        {
+                            let _ = run(&ex, &r, sid, "ROLLBACK");
+                            continue;
                         }
-                        if run(&ex, &r, sid, "COMMIT").is_ok() { commits.fetch_add(1, Ordering::Relaxed); break; }
+                        if run(&ex, &r, sid, "COMMIT").is_ok() {
+                            commits.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
                         let _ = run(&ex, &r, sid, "ROLLBACK");
                     }
                 }
                 ex.drop_session(sid);
             }));
         }
-        for h in hs { let _ = h.join(); }
+        for h in hs {
+            let _ = h.join();
+        }
         let n = commits.load(Ordering::Relaxed) as i64;
 
         let rc = rt();

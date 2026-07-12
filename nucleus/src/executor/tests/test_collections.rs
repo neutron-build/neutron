@@ -371,8 +371,7 @@ async fn test_stream_xgroup_xreadgroup_xack() {
         Value::Text(s) => s.clone(),
         other => panic!("expected Text, got {other:?}"),
     };
-    let entries: serde_json::Value =
-        serde_json::from_str(&text).expect("xreadgroup returns JSON");
+    let entries: serde_json::Value = serde_json::from_str(&text).expect("xreadgroup returns JSON");
     let items = entries.as_array().expect("JSON array");
     assert_eq!(items.len(), 2);
     assert_eq!(items[0]["fields"]["msg"], "hello");

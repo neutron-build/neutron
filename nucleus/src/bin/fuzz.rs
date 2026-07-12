@@ -53,7 +53,11 @@ impl Rng {
         z ^ (z >> 31)
     }
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { 0 } else { (self.next() % n as u64) as usize }
+        if n == 0 {
+            0
+        } else {
+            (self.next() % n as u64) as usize
+        }
     }
     fn chance(&mut self, pct: u64) -> bool {
         self.next() % 100 < pct
@@ -92,15 +96,31 @@ const CATS: &[&str] = &[
 
 impl Schema {
     fn random(rng: &mut Rng) -> Schema {
-        let mut cols = vec![Col { name: "id", ty: Ty::Int, nn: true }];
+        let mut cols = vec![Col {
+            name: "id",
+            ty: Ty::Int,
+            nn: true,
+        }];
         // Guarantee a NOT NULL int and a NOT NULL text so ORDER BY / GROUP BY
         // always have safe (non-NULL) targets besides id.
-        cols.push(Col { name: NAMES[0], ty: Ty::Int, nn: true });
-        cols.push(Col { name: NAMES[1], ty: Ty::Text, nn: true });
+        cols.push(Col {
+            name: NAMES[0],
+            ty: Ty::Int,
+            nn: true,
+        });
+        cols.push(Col {
+            name: NAMES[1],
+            ty: Ty::Text,
+            nn: true,
+        });
         let extra = 2 + rng.below(4); // total non-id cols: 4..7
         for k in 0..extra {
             let ty = *rng.pick(&[Ty::Int, Ty::Int, Ty::Real, Ty::Text]);
-            cols.push(Col { name: NAMES[2 + k], ty, nn: rng.chance(35) });
+            cols.push(Col {
+                name: NAMES[2 + k],
+                ty,
+                nn: rng.chance(35),
+            });
         }
         Schema { cols }
     }
@@ -169,11 +189,19 @@ fn gen_inserts(schema: &Schema, rng: &mut Rng, rows: usize) -> String {
     for id in 1..=rows {
         let mut cells = Vec::with_capacity(schema.cols.len());
         for (i, c) in schema.cols.iter().enumerate() {
-            cells.push(if i == 0 { id.to_string() } else { gen_value(rng, c) });
+            cells.push(if i == 0 {
+                id.to_string()
+            } else {
+                gen_value(rng, c)
+            });
         }
         vals.push(format!("({})", cells.join(",")));
     }
-    format!("INSERT INTO t ({}) VALUES {}", names.join(","), vals.join(","))
+    format!(
+        "INSERT INTO t ({}) VALUES {}",
+        names.join(","),
+        vals.join(",")
+    )
 }
 
 // ─── Predicates ───────────────────────────────────────────────────────────────
@@ -228,7 +256,11 @@ fn gen_scalar(schema: &Schema, rng: &mut Rng) -> String {
         0 => {
             // CASE WHEN <pred> THEN <int> ELSE <int> END
             let p = gen_predicate(schema, rng, 1);
-            format!("CASE WHEN {p} THEN {} ELSE {} END", rng.int(0, 9), rng.int(0, 9))
+            format!(
+                "CASE WHEN {p} THEN {} ELSE {} END",
+                rng.int(0, 9),
+                rng.int(0, 9)
+            )
         }
         1 if !schema.nullable().is_empty() => {
             let c = *rng.pick(&schema.nullable());
@@ -242,7 +274,11 @@ fn gen_scalar(schema: &Schema, rng: &mut Rng) -> String {
             // Bounded arithmetic (operands tiny → no overflow; no '/' or '%').
             let c = *rng.pick(&schema.int_cols());
             let op = *rng.pick(&["+", "-", "*"]);
-            let k = if op == "*" { rng.int(0, 3) } else { rng.int(0, 10) };
+            let k = if op == "*" {
+                rng.int(0, 3)
+            } else {
+                rng.int(0, 10)
+            };
             format!("({} {op} {k})", c.name)
         }
         4 => {
@@ -255,7 +291,11 @@ fn gen_scalar(schema: &Schema, rng: &mut Rng) -> String {
 
 // ─── ORDER BY (NOT NULL keys + id tiebreaker = deterministic) ─────────────────
 fn gen_orderby(schema: &Schema, rng: &mut Rng) -> String {
-    let nn: Vec<&Col> = schema.nn_cols().into_iter().filter(|c| c.name != "id").collect();
+    let nn: Vec<&Col> = schema
+        .nn_cols()
+        .into_iter()
+        .filter(|c| c.name != "id")
+        .collect();
     let mut keys = Vec::new();
     if !nn.is_empty() {
         let n = 1 + rng.below(2.min(nn.len()));
@@ -301,9 +341,16 @@ fn gen_query(schema: &Schema, rng: &mut Rng, rows: usize) -> (String, bool) {
         // GROUP BY [HAVING].
         1 => {
             // Group by a NOT NULL column (NULL-group conventions differ).
-            let gcols: Vec<&Col> =
-                schema.nn_cols().into_iter().filter(|c| c.ty != Ty::Real).collect();
-            let g = if gcols.is_empty() { "id" } else { rng.pick(&gcols).name };
+            let gcols: Vec<&Col> = schema
+                .nn_cols()
+                .into_iter()
+                .filter(|c| c.ty != Ty::Real)
+                .collect();
+            let g = if gcols.is_empty() {
+                "id"
+            } else {
+                rng.pick(&gcols).name
+            };
             let n = 1 + rng.below(2);
             let aggs: Vec<String> = (0..n).map(|_| gen_agg(schema, rng)).collect();
             let w = if rng.chance(45) {
@@ -318,7 +365,10 @@ fn gen_query(schema: &Schema, rng: &mut Rng, rows: usize) -> (String, bool) {
                 String::new()
             };
             (
-                format!("SELECT {g}, {} FROM t{w} GROUP BY {g}{having} ORDER BY {g} ASC", aggs.join(", ")),
+                format!(
+                    "SELECT {g}, {} FROM t{w} GROUP BY {g}{having} ORDER BY {g} ASC",
+                    aggs.join(", ")
+                ),
                 true,
             )
         }
@@ -384,7 +434,10 @@ fn gen_query(schema: &Schema, rng: &mut Rng, rows: usize) -> (String, bool) {
                     format!("{c} > (SELECT AVG({c}) FROM t)")
                 }
             };
-            (format!("SELECT id FROM t WHERE {pred} ORDER BY id ASC"), true)
+            (
+                format!("SELECT id FROM t WHERE {pred} ORDER BY id ASC"),
+                true,
+            )
         }
         // Projection (+ DISTINCT) with WHERE / ORDER BY / LIMIT / OFFSET.
         _ => {
@@ -435,10 +488,18 @@ fn gen_mutation(schema: &Schema, rng: &mut Rng, next_id: &mut i64) -> String {
             let names: Vec<&str> = schema.cols.iter().map(|c| c.name).collect();
             let mut cells = Vec::with_capacity(schema.cols.len());
             for (i, c) in schema.cols.iter().enumerate() {
-                cells.push(if i == 0 { next_id.to_string() } else { gen_value(rng, c) });
+                cells.push(if i == 0 {
+                    next_id.to_string()
+                } else {
+                    gen_value(rng, c)
+                });
             }
             *next_id += 1;
-            format!("INSERT INTO t ({}) VALUES ({})", names.join(","), cells.join(","))
+            format!(
+                "INSERT INTO t ({}) VALUES ({})",
+                names.join(","),
+                cells.join(",")
+            )
         }
         1 => {
             // UPDATE a non-id column (respecting NOT NULL) on a predicate subset.
@@ -495,9 +556,10 @@ fn run_nucleus(ex: &Executor, sql: &str) -> Result<Vec<Vec<String>>, String> {
     }));
     match res {
         Ok(Ok(mut results)) => match results.pop() {
-            Some(ExecResult::Select { rows, .. }) => {
-                Ok(rows.iter().map(|r| r.iter().map(canon_nucleus).collect()).collect())
-            }
+            Some(ExecResult::Select { rows, .. }) => Ok(rows
+                .iter()
+                .map(|r| r.iter().map(canon_nucleus).collect())
+                .collect()),
             _ => Err("non-select result".into()),
         },
         Ok(Err(e)) => Err(format!("{e:?}")),
@@ -574,12 +636,22 @@ fn dump_inserts(schema: &Schema, rows: &[Vec<String>]) -> String {
         .map(|r| {
             let cells: Vec<String> = r
                 .iter()
-                .map(|c| if c == "∅" { "NULL".to_string() } else { c.clone() })
+                .map(|c| {
+                    if c == "∅" {
+                        "NULL".to_string()
+                    } else {
+                        c.clone()
+                    }
+                })
                 .collect();
             format!("({})", cells.join(","))
         })
         .collect();
-    format!("INSERT INTO t ({}) VALUES {}", names.join(","), tuples.join(","))
+    format!(
+        "INSERT INTO t ({}) VALUES {}",
+        names.join(","),
+        tuples.join(",")
+    )
 }
 
 /// Replay an op sequence on a fresh Nucleus + fresh SQLite, run `q` on both,
@@ -593,7 +665,11 @@ fn replay_diverges(ops: &[String], q: &str, ordered: bool) -> Option<bool> {
     let sqlite = Connection::open_in_memory().ok()?;
     for op in ops {
         let is_select = op.trim_start().to_uppercase().starts_with("SELECT");
-        let nr = if is_select { run_nucleus(&ex, op).map(|_| ()) } else { exec_nucleus(&ex, op) };
+        let nr = if is_select {
+            run_nucleus(&ex, op).map(|_| ())
+        } else {
+            exec_nucleus(&ex, op)
+        };
         if nr.is_err() {
             return None;
         }
@@ -646,11 +722,26 @@ fn main_impl() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed" => { i += 1; seed = args[i].parse().unwrap(); }
-            "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
-            "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
-            "--queries" => { i += 1; queries_per = args[i].parse().unwrap(); }
-            "--rows" => { i += 1; fixed_rows = args[i].parse().unwrap(); }
+            "--seed" => {
+                i += 1;
+                seed = args[i].parse().unwrap();
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args[i].parse().unwrap();
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = args[i].parse().unwrap();
+            }
+            "--queries" => {
+                i += 1;
+                queries_per = args[i].parse().unwrap();
+            }
+            "--rows" => {
+                i += 1;
+                fixed_rows = args[i].parse().unwrap();
+            }
             _ => {}
         }
         i += 1;
@@ -670,7 +761,11 @@ fn main_impl() {
     'outer: for iter in 0..iterations {
         let mut rng = Rng(seed.wrapping_add(iter as u64).wrapping_mul(0x100000001B3));
         let schema = Schema::random(&mut rng);
-        let rows = if fixed_rows > 0 { fixed_rows } else { 8 + rng.below(40) };
+        let rows = if fixed_rows > 0 {
+            fixed_rows
+        } else {
+            8 + rng.below(40)
+        };
         let ddl = schema.ddl();
         let inserts = gen_inserts(&schema, &mut rng, rows);
         let mut next_id = rows as i64 + 1;
@@ -731,7 +826,9 @@ fn main_impl() {
                         {
                             divergences += 1;
                             if divergences <= max_report {
-                                println!("─── STATE DIVERGENCE after mutation #{divergences} (iter {iter}, seed {seed}) ───");
+                                println!(
+                                    "─── STATE DIVERGENCE after mutation #{divergences} (iter {iter}, seed {seed}) ───"
+                                );
                                 println!("  schema : {ddl}");
                                 println!("  data   : {inserts}");
                                 println!("  mutation: {m}");
@@ -767,7 +864,8 @@ fn main_impl() {
                             // Is the LIVE table identical at query time? If yes, the
                             // divergence is a read-path bug, not a desynced mutation.
                             let snap = snapshot(&schema);
-                            let (live_n, live_s) = (run_nucleus(&ex, &snap), run_sqlite(&sqlite, &snap));
+                            let (live_n, live_s) =
+                                (run_nucleus(&ex, &snap), run_sqlite(&sqlite, &snap));
                             let live_match = matches!((&live_n, &live_s), (Ok(x), Ok(y)) if compare(x.clone(), y.clone(), true));
                             let live_data = match (&live_s, &live_n) {
                                 (Ok(rows), _) => dump_inserts(&schema, rows),
@@ -776,7 +874,8 @@ fn main_impl() {
                             };
                             // Re-run the exact query: does it still diverge (persistent)
                             // or was it transient (cache)?
-                            let rerun_match = match (run_nucleus(&ex, &q), run_sqlite(&sqlite, &q)) {
+                            let rerun_match = match (run_nucleus(&ex, &q), run_sqlite(&sqlite, &q))
+                            {
                                 (Ok(x), Ok(y)) => compare(x, y, ordered),
                                 _ => false,
                             };
@@ -786,7 +885,8 @@ fn main_impl() {
                             // not just the rows — so the op-log below is the repro.
                             let fresh_match = {
                                 let cat = Arc::new(Catalog::new());
-                                let st: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
+                                let st: Arc<dyn StorageEngine> =
+                                    Arc::new(MvccStorageAdapter::new());
                                 let fx = Arc::new(Executor::new(cat, st));
                                 let ok = exec_nucleus(&fx, &ddl).is_ok()
                                     && exec_nucleus(&fx, &live_data).is_ok();
@@ -805,13 +905,22 @@ fn main_impl() {
                             // op-log omits (e.g. the post-mutation snapshot probes).
                             let oplog_match = {
                                 let cat = Arc::new(Catalog::new());
-                                let st: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
+                                let st: Arc<dyn StorageEngine> =
+                                    Arc::new(MvccStorageAdapter::new());
                                 let rx = Arc::new(Executor::new(cat, st));
                                 let mut ok = true;
                                 for op in &ops {
-                                    let is_select = op.trim_start().to_uppercase().starts_with("SELECT");
-                                    let r = if is_select { run_nucleus(&rx, op).map(|_| ()) } else { exec_nucleus(&rx, op) };
-                                    if r.is_err() { ok = false; break; }
+                                    let is_select =
+                                        op.trim_start().to_uppercase().starts_with("SELECT");
+                                    let r = if is_select {
+                                        run_nucleus(&rx, op).map(|_| ())
+                                    } else {
+                                        exec_nucleus(&rx, op)
+                                    };
+                                    if r.is_err() {
+                                        ok = false;
+                                        break;
+                                    }
                                 }
                                 if ok {
                                     match (run_nucleus(&rx, &q), run_sqlite(&sqlite, &q)) {
@@ -822,7 +931,9 @@ fn main_impl() {
                                     None
                                 }
                             };
-                            println!("─── DIVERGENCE #{divergences} (iter {iter}, seed {seed}) ───");
+                            println!(
+                                "─── DIVERGENCE #{divergences} (iter {iter}, seed {seed}) ───"
+                            );
                             println!("  query  : {q}");
                             println!("  schema : {ddl}");
                             println!("  data   : {live_data}");
@@ -835,8 +946,16 @@ fn main_impl() {
                             println!("  sqlite ({} rows): {}", b.len(), preview(&b));
                             println!(
                                 "  live-state match: {live_match} | rerun match: {rerun_match} | fresh-rebuild: {} | oplog-replay: {}",
-                                match fresh_match { Some(true) => "match", Some(false) => "diverge", None => "n/a" },
-                                match oplog_match { Some(true) => "MATCH (op-log INSUFFICIENT)", Some(false) => "diverge (op-log reproduces)", None => "n/a" }
+                                match fresh_match {
+                                    Some(true) => "match",
+                                    Some(false) => "diverge",
+                                    None => "n/a",
+                                },
+                                match oplog_match {
+                                    Some(true) => "MATCH (op-log INSUFFICIENT)",
+                                    Some(false) => "diverge (op-log reproduces)",
+                                    None => "n/a",
+                                }
                             );
                             // Minimal replayable sequence — delta-debugged when the
                             // op-log reproduces, else the full sequence.
@@ -845,7 +964,11 @@ fn main_impl() {
                             } else {
                                 ops.clone()
                             };
-                            println!("  ── repro ({} ops, minimized from {}) ──", repro.len(), ops.len());
+                            println!(
+                                "  ── repro ({} ops, minimized from {}) ──",
+                                repro.len(),
+                                ops.len()
+                            );
                             for op in &repro {
                                 println!("    {op};");
                             }
@@ -909,7 +1032,11 @@ fn report_panic(
 }
 
 fn preview(rows: &[Vec<String>]) -> String {
-    let shown: Vec<String> = rows.iter().take(8).map(|r| format!("[{}]", r.join(","))).collect();
+    let shown: Vec<String> = rows
+        .iter()
+        .take(8)
+        .map(|r| format!("[{}]", r.join(",")))
+        .collect();
     let more = if rows.len() > 8 {
         format!(" …(+{})", rows.len() - 8)
     } else {

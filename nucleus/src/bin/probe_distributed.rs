@@ -48,8 +48,12 @@ impl Rng {
         self.0 ^= self.0 << 17;
         self.0
     }
-    fn below(&mut self, n: usize) -> usize { (self.next() % n as u64) as usize }
-    fn chance(&mut self, pct: u64) -> bool { self.next() % 100 < pct }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+    fn chance(&mut self, pct: u64) -> bool {
+        self.next() % 100 < pct
+    }
 }
 
 // ─── Canonicalize a Command for value-equality (Command has no PartialEq) ──────
@@ -64,21 +68,41 @@ fn cmd_canon(c: &Command) -> String {
 
 // ─── In-flight RPCs (point-to-point, deterministic) ────────────────────────────
 enum Rpc {
-    Vote { to: NodeId, from: NodeId, req: RequestVoteRequest },
-    VoteResp { to: NodeId, from: NodeId, resp: RequestVoteResponse },
-    Append { to: NodeId, from: NodeId, req: AppendEntriesRequest },
-    AppendResp { to: NodeId, from: NodeId, resp: AppendEntriesResponse },
+    Vote {
+        to: NodeId,
+        from: NodeId,
+        req: RequestVoteRequest,
+    },
+    VoteResp {
+        to: NodeId,
+        from: NodeId,
+        resp: RequestVoteResponse,
+    },
+    Append {
+        to: NodeId,
+        from: NodeId,
+        req: AppendEntriesRequest,
+    },
+    AppendResp {
+        to: NodeId,
+        from: NodeId,
+        resp: AppendEntriesResponse,
+    },
 }
 impl Rpc {
     fn to(&self) -> NodeId {
         match self {
-            Rpc::Vote { to, .. } | Rpc::VoteResp { to, .. } | Rpc::Append { to, .. }
+            Rpc::Vote { to, .. }
+            | Rpc::VoteResp { to, .. }
+            | Rpc::Append { to, .. }
             | Rpc::AppendResp { to, .. } => *to,
         }
     }
     fn from(&self) -> NodeId {
         match self {
-            Rpc::Vote { from, .. } | Rpc::VoteResp { from, .. } | Rpc::Append { from, .. }
+            Rpc::Vote { from, .. }
+            | Rpc::VoteResp { from, .. }
+            | Rpc::Append { from, .. }
             | Rpc::AppendResp { from, .. } => *from,
         }
     }
@@ -110,7 +134,10 @@ fn dump_cluster(c: &Cluster, tag: &str) {
         );
         println!("    log: {}", logs.join(" "));
         if n.role == Role::Leader {
-            println!("    match_index={:?} next_index={:?}", n.match_index, n.next_index);
+            println!(
+                "    match_index={:?} next_index={:?}",
+                n.match_index, n.next_index
+            );
         }
     }
     let mut led: Vec<_> = c.committed_seen.iter().collect();
@@ -126,24 +153,39 @@ impl Cluster {
             let peers: Vec<NodeId> = ids.iter().copied().filter(|&p| p != id).collect();
             nodes.insert(id, RaftNode::new(id, peers));
         }
-        Cluster { nodes, ids, inflight: Vec::new(), committed_seen: HashMap::new() }
+        Cluster {
+            nodes,
+            ids,
+            inflight: Vec::new(),
+            committed_seen: HashMap::new(),
+        }
     }
 
     /// Trigger an election from `cand`: it becomes candidate and emits RequestVotes.
     fn start_election(&mut self, cand: NodeId) {
         let reqs = self.nodes.get_mut(&cand).unwrap().start_election();
         for (peer, req) in reqs {
-            self.inflight.push(Rpc::Vote { to: peer, from: cand, req });
+            self.inflight.push(Rpc::Vote {
+                to: peer,
+                from: cand,
+                req,
+            });
         }
     }
 
     /// Leader heartbeat / replication: emit AppendEntries to all peers.
     fn replicate(&mut self, leader: NodeId) {
         let node = self.nodes.get(&leader).unwrap();
-        if node.role != Role::Leader { return; }
+        if node.role != Role::Leader {
+            return;
+        }
         let appends = node.build_append_entries();
         for (peer, req) in appends {
-            self.inflight.push(Rpc::Append { to: leader_dummy(peer), from: leader, req });
+            self.inflight.push(Rpc::Append {
+                to: leader_dummy(peer),
+                from: leader,
+                req,
+            });
         }
     }
 
@@ -162,10 +204,18 @@ impl Cluster {
         match rpc {
             Rpc::Vote { to, from, req } => {
                 let resp = self.nodes.get_mut(&to).unwrap().handle_request_vote(&req);
-                self.inflight.push(Rpc::VoteResp { to: from, from: to, resp });
+                self.inflight.push(Rpc::VoteResp {
+                    to: from,
+                    from: to,
+                    resp,
+                });
             }
             Rpc::VoteResp { to, from, resp } => {
-                let became = self.nodes.get_mut(&to).unwrap().handle_vote_response(from, &resp);
+                let became = self
+                    .nodes
+                    .get_mut(&to)
+                    .unwrap()
+                    .handle_vote_response(from, &resp);
                 if became {
                     // New leader replicates immediately (establishes leadership noop).
                     self.replicate(to);
@@ -173,24 +223,37 @@ impl Cluster {
             }
             Rpc::Append { to, from, req } => {
                 let resp = self.nodes.get_mut(&to).unwrap().handle_append_entries(&req);
-                self.inflight.push(Rpc::AppendResp { to: from, from: to, resp });
+                self.inflight.push(Rpc::AppendResp {
+                    to: from,
+                    from: to,
+                    resp,
+                });
             }
             Rpc::AppendResp { to, from, resp } => {
-                self.nodes.get_mut(&to).unwrap().handle_append_response(from, &resp);
+                self.nodes
+                    .get_mut(&to)
+                    .unwrap()
+                    .handle_append_response(from, &resp);
             }
         }
     }
 
     fn leaders(&self) -> Vec<NodeId> {
-        let mut v: Vec<NodeId> =
-            self.ids.iter().copied().filter(|id| self.nodes[id].role == Role::Leader).collect();
+        let mut v: Vec<NodeId> = self
+            .ids
+            .iter()
+            .copied()
+            .filter(|id| self.nodes[id].role == Role::Leader)
+            .collect();
         v.sort();
         v
     }
 }
 
 // `to` for an Append is the peer; helper keeps intent obvious.
-fn leader_dummy(peer: NodeId) -> NodeId { peer }
+fn leader_dummy(peer: NodeId) -> NodeId {
+    peer
+}
 
 // ─── Invariant checks ─────────────────────────────────────────────────────────
 
@@ -234,7 +297,11 @@ fn check_log_matching(c: &Cluster) -> Option<String> {
                     if cmd_canon(&ea.command) != cmd_canon(&eb.command) {
                         return Some(format!(
                             "LOG-MATCH VIOLATION: nodes {} & {} at index {idx} term {} differ: {:?} vs {:?}",
-                            a.id, b.id, ea.term, cmd_canon(&ea.command), cmd_canon(&eb.command)
+                            a.id,
+                            b.id,
+                            ea.term,
+                            cmd_canon(&ea.command),
+                            cmd_canon(&eb.command)
                         ));
                     }
                     for k in 1..idx {
@@ -243,7 +310,13 @@ fn check_log_matching(c: &Cluster) -> Option<String> {
                         if ka.term != kb.term || cmd_canon(&ka.command) != cmd_canon(&kb.command) {
                             return Some(format!(
                                 "LOG-MATCH VIOLATION: nodes {} & {} agree at idx {idx}(term {}) but differ at prefix idx {k}: ({},{:?}) vs ({},{:?})",
-                                a.id, b.id, ea.term, ka.term, cmd_canon(&ka.command), kb.term, cmd_canon(&kb.command)
+                                a.id,
+                                b.id,
+                                ea.term,
+                                ka.term,
+                                cmd_canon(&ka.command),
+                                kb.term,
+                                cmd_canon(&kb.command)
                             ));
                         }
                     }
@@ -282,7 +355,9 @@ fn check_commit_durability(c: &mut Cluster) -> Option<String> {
                 None => to_record.push((idx, val)),
             }
         }
-        if violation.is_some() { break; }
+        if violation.is_some() {
+            break;
+        }
     }
     for (idx, val) in to_record {
         c.committed_seen.entry(idx).or_insert(val);
@@ -300,12 +375,21 @@ fn check_commit_durability(c: &mut Cluster) -> Option<String> {
 /// constrains the leader that could actually act (the one at the maximum term).
 /// So we only check leaders whose term is not superseded by any node.
 fn check_leader_completeness(c: &Cluster) -> Option<String> {
-    let max_term = c.ids.iter().map(|id| c.nodes[id].current_term).max().unwrap_or(0);
+    let max_term = c
+        .ids
+        .iter()
+        .map(|id| c.nodes[id].current_term)
+        .max()
+        .unwrap_or(0);
     for &id in &c.ids {
         let n = &c.nodes[&id];
-        if n.role != Role::Leader { continue; }
+        if n.role != Role::Leader {
+            continue;
+        }
         // Skip stale leaders superseded by a higher term elsewhere in the cluster.
-        if n.current_term < max_term { continue; }
+        if n.current_term < max_term {
+            continue;
+        }
         for (&idx, (term, cmd)) in &c.committed_seen {
             match n.log_at(idx) {
                 None => {
@@ -318,7 +402,9 @@ fn check_leader_completeness(c: &Cluster) -> Option<String> {
                     if e.term != *term || &cmd_canon(&e.command) != cmd {
                         return Some(format!(
                             "LEADER COMPLETENESS VIOLATION: leader {} at committed index {idx} holds (term {}, {}) but committed value is (term {term}, {cmd})",
-                            id, e.term, cmd_canon(&e.command)
+                            id,
+                            e.term,
+                            cmd_canon(&e.command)
                         ));
                     }
                 }
@@ -329,22 +415,36 @@ fn check_leader_completeness(c: &Cluster) -> Option<String> {
 }
 
 fn check_all(c: &mut Cluster) -> Option<String> {
-    if let Some(v) = check_one_leader_per_term(c) { return Some(v); }
-    if let Some(v) = check_log_matching(c) { return Some(v); }
-    if let Some(v) = check_commit_durability(c) { return Some(v); }
-    if let Some(v) = check_leader_completeness(c) { return Some(v); }
+    if let Some(v) = check_one_leader_per_term(c) {
+        return Some(v);
+    }
+    if let Some(v) = check_log_matching(c) {
+        return Some(v);
+    }
+    if let Some(v) = check_commit_durability(c) {
+        return Some(v);
+    }
+    if let Some(v) = check_leader_completeness(c) {
+        return Some(v);
+    }
     None
 }
 
 // ─── One simulated cluster run ─────────────────────────────────────────────────
-struct RunResult { violation: Option<String>, steps_done: usize }
+struct RunResult {
+    violation: Option<String>,
+    steps_done: usize,
+}
 
 fn run_once(seed: u64, iter: usize, n: usize, steps: usize) -> RunResult {
     run_once_inner(seed, iter, n, steps, false)
 }
 
 fn run_once_inner(seed: u64, iter: usize, n: usize, steps: usize, trace: bool) -> RunResult {
-    let mut rng = Rng(seed.wrapping_add(iter as u64).wrapping_mul(0x100000001B3).wrapping_add(1));
+    let mut rng = Rng(seed
+        .wrapping_add(iter as u64)
+        .wrapping_mul(0x100000001B3)
+        .wrapping_add(1));
     let mut c = Cluster::new(n);
     // Partition state: a partition splits nodes into two groups; links across
     // the boundary drop. `part` maps node→group(0/1); None means no partition.
@@ -353,13 +453,16 @@ fn run_once_inner(seed: u64, iter: usize, n: usize, steps: usize, trace: bool) -
     let mut paused: Vec<NodeId> = Vec::new();
     let mut next_key: u64 = 1;
 
-    let link_up = |part: &Option<HashMap<NodeId, u8>>, paused: &[NodeId], a: NodeId, b: NodeId| -> bool {
-        if paused.contains(&a) || paused.contains(&b) { return false; }
-        match part {
-            None => true,
-            Some(m) => m.get(&a) == m.get(&b),
-        }
-    };
+    let link_up =
+        |part: &Option<HashMap<NodeId, u8>>, paused: &[NodeId], a: NodeId, b: NodeId| -> bool {
+            if paused.contains(&a) || paused.contains(&b) {
+                return false;
+            }
+            match part {
+                None => true,
+                Some(m) => m.get(&a) == m.get(&b),
+            }
+        };
 
     for step in 0..steps {
         // ── Inject faults ──
@@ -385,7 +488,8 @@ fn run_once_inner(seed: u64, iter: usize, n: usize, steps: usize, trace: bool) -
             if !leaders.is_empty() {
                 let l = leaders[rng.below(leaders.len())];
                 if !paused.contains(&l) {
-                    let k = next_key; next_key += 1;
+                    let k = next_key;
+                    next_key += 1;
                     c.client_write(l, Command::Sql(format!("INSERT INTO t VALUES ({k})")));
                 }
             }
@@ -397,7 +501,9 @@ fn run_once_inner(seed: u64, iter: usize, n: usize, steps: usize, trace: bool) -
             } else {
                 // Random split into two groups (each side may be a minority).
                 let mut m = HashMap::new();
-                for &id in &c.ids { m.insert(id, (rng.next() & 1) as u8); }
+                for &id in &c.ids {
+                    m.insert(id, (rng.next() & 1) as u8);
+                }
                 part = Some(m);
             }
         }
@@ -416,7 +522,9 @@ fn run_once_inner(seed: u64, iter: usize, n: usize, steps: usize, trace: bool) -
         // ── Deliver a batch of in-flight RPCs (with reordering & loss) ──
         let deliveries = 1 + rng.below(6);
         for _ in 0..deliveries {
-            if c.inflight.is_empty() { break; }
+            if c.inflight.is_empty() {
+                break;
+            }
             let pick = rng.below(c.inflight.len());
             let rpc = c.inflight.swap_remove(pick);
             let (to, from) = (rpc.to(), rpc.from());
@@ -440,7 +548,10 @@ fn run_once_inner(seed: u64, iter: usize, n: usize, steps: usize, trace: bool) -
                 println!("\n>>> FLAG at step {step}: {v}");
                 dump_cluster(&c, "at flag");
             }
-            return RunResult { violation: Some(v), steps_done: step + 1 };
+            return RunResult {
+                violation: Some(v),
+                steps_done: step + 1,
+            };
         }
     }
 
@@ -452,23 +563,34 @@ fn run_once_inner(seed: u64, iter: usize, n: usize, steps: usize, trace: bool) -
     for _ in 0..(n * 60) {
         // Make sure exactly the highest-term leader keeps replicating.
         let leaders = c.leaders();
-        for l in leaders { c.replicate(l); }
+        for l in leaders {
+            c.replicate(l);
+        }
         let mut delivered = false;
         while !c.inflight.is_empty() {
             let rpc = c.inflight.remove(0);
             c.deliver(rpc);
             delivered = true;
             if let Some(v) = check_all(&mut c) {
-                return RunResult { violation: Some(v), steps_done: steps };
+                return RunResult {
+                    violation: Some(v),
+                    steps_done: steps,
+                };
             }
         }
         if !delivered { /* nothing pending; replicate again next round */ }
         if let Some(v) = check_all(&mut c) {
-            return RunResult { violation: Some(v), steps_done: steps };
+            return RunResult {
+                violation: Some(v),
+                steps_done: steps,
+            };
         }
     }
 
-    RunResult { violation: None, steps_done: steps }
+    RunResult {
+        violation: None,
+        steps_done: steps,
+    }
 }
 
 fn main_impl() {
@@ -482,12 +604,30 @@ fn main_impl() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed" => { i += 1; seed = args[i].parse().unwrap(); }
-            "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
-            "--steps" => { i += 1; steps = args[i].parse().unwrap(); }
-            "--nodes" => { i += 1; nodes_opt = Some(args[i].parse().unwrap()); }
-            "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
-            "--trace" => { i += 1; trace_iter = Some(args[i].parse().unwrap()); }
+            "--seed" => {
+                i += 1;
+                seed = args[i].parse().unwrap();
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args[i].parse().unwrap();
+            }
+            "--steps" => {
+                i += 1;
+                steps = args[i].parse().unwrap();
+            }
+            "--nodes" => {
+                i += 1;
+                nodes_opt = Some(args[i].parse().unwrap());
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = args[i].parse().unwrap();
+            }
+            "--trace" => {
+                i += 1;
+                trace_iter = Some(args[i].parse().unwrap());
+            }
             _ => {}
         }
         i += 1;
@@ -512,7 +652,10 @@ fn main_impl() {
     );
 
     // Cluster sizes 3 and 5 (odd, standard Raft). If --nodes given, only that.
-    let sizes: Vec<usize> = match nodes_opt { Some(n) => vec![n], None => vec![3, 5] };
+    let sizes: Vec<usize> = match nodes_opt {
+        Some(n) => vec![n],
+        None => vec![3, 5],
+    };
     let mut total_runs = 0usize;
     let mut violations = 0usize;
 
@@ -528,7 +671,8 @@ fn main_impl() {
                         if violations <= max_report {
                             println!(
                                 "─── VIOLATION #{violations} (n={n}, iter {iter}, seed {seed}, step {}) ───\n  {v}\n  replay: --seed {seed} --nodes {n} --iterations {} (offset {iter})\n",
-                                r.steps_done, iter + 1
+                                r.steps_done,
+                                iter + 1
                             );
                         }
                     }

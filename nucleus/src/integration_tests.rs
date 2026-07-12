@@ -1756,7 +1756,11 @@ mod tests {
     async fn order_by_alias_of_computed_expression_sorts() {
         let ex = setup_mvcc();
         run(&ex, "CREATE TABLE ob (id INT NOT NULL, a INT, b INT)").await;
-        run(&ex, "INSERT INTO ob VALUES (1, 10, 1), (2, 2, 1), (3, 5, 1)").await;
+        run(
+            &ex,
+            "INSERT INTO ob VALUES (1, 10, 1), (2, 2, 1), (3, 5, 1)",
+        )
+        .await;
 
         // alias of an arithmetic expression
         let res = run(&ex, "SELECT id, a + b AS total FROM ob ORDER BY total").await;
@@ -1769,12 +1773,20 @@ mod tests {
         );
 
         // DESC + LIMIT: the top row must be the true maximum, not insertion order
-        let res = run(&ex, "SELECT id, a + b AS total FROM ob ORDER BY total DESC LIMIT 1").await;
+        let res = run(
+            &ex,
+            "SELECT id, a + b AS total FROM ob ORDER BY total DESC LIMIT 1",
+        )
+        .await;
         assert_eq!(rows(&res[0])[0][0], Value::Int32(1));
 
         // alias of a scalar-function expression over a vector column
         run(&ex, "CREATE TABLE obv (id INT NOT NULL, v VECTOR(3))").await;
-        run(&ex, "INSERT INTO obv VALUES (1, VECTOR('[0,1,0]')), (2, VECTOR('[1,0,0]'))").await;
+        run(
+            &ex,
+            "INSERT INTO obv VALUES (1, VECTOR('[0,1,0]')), (2, VECTOR('[1,0,0]'))",
+        )
+        .await;
         let res = run(
             &ex,
             "SELECT id, VECTOR_DISTANCE(v, VECTOR('[1,0,0]'), 'cosine') AS distance FROM obv ORDER BY distance LIMIT 1",
@@ -2510,7 +2522,11 @@ mod tests {
     #[tokio::test]
     async fn test_add_column_no_default_then_update() {
         let ex = setup();
-        run(&ex, "CREATE TABLE docs (collection TEXT, run_id TEXT, model TEXT)").await;
+        run(
+            &ex,
+            "CREATE TABLE docs (collection TEXT, run_id TEXT, model TEXT)",
+        )
+        .await;
         run(&ex, "INSERT INTO docs VALUES ('meta', 'run-1', 'sonnet')").await;
         run(&ex, "INSERT INTO docs VALUES ('meta', 'run-2', 'haiku')").await;
 
@@ -2521,7 +2537,11 @@ mod tests {
         assert_eq!(*scalar(&res[0]), Value::Null);
 
         // Update the new column on one row.
-        run(&ex, "UPDATE docs SET ran_on = 'host-a' WHERE run_id = 'run-1'").await;
+        run(
+            &ex,
+            "UPDATE docs SET ran_on = 'host-a' WHERE run_id = 'run-1'",
+        )
+        .await;
 
         let res = run(&ex, "SELECT ran_on FROM docs WHERE run_id = 'run-1'").await;
         assert_eq!(*scalar(&res[0]), Value::Text("host-a".into()));
@@ -2541,11 +2561,16 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(Catalog::new());
-        let disk = Arc::new(DiskEngine::open(&dir.path().join("test.db"), catalog.clone()).unwrap());
+        let disk =
+            Arc::new(DiskEngine::open(&dir.path().join("test.db"), catalog.clone()).unwrap());
         let engine: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(disk));
         let ex = Arc::new(Executor::new(catalog, engine));
 
-        run(&ex, "CREATE TABLE docs (collection TEXT, run_id TEXT, model TEXT)").await;
+        run(
+            &ex,
+            "CREATE TABLE docs (collection TEXT, run_id TEXT, model TEXT)",
+        )
+        .await;
         run(&ex, "INSERT INTO docs VALUES ('meta', 'run-1', 'sonnet')").await;
         run(&ex, "INSERT INTO docs VALUES ('meta', 'run-2', 'haiku')").await;
 
@@ -2554,7 +2579,11 @@ mod tests {
         let res = run(&ex, "SELECT ran_on FROM docs WHERE run_id = 'run-1'").await;
         assert_eq!(*scalar(&res[0]), Value::Null);
 
-        run(&ex, "UPDATE docs SET ran_on = 'host-a' WHERE run_id = 'run-1'").await;
+        run(
+            &ex,
+            "UPDATE docs SET ran_on = 'host-a' WHERE run_id = 'run-1'",
+        )
+        .await;
 
         let res = run(&ex, "SELECT ran_on FROM docs WHERE run_id = 'run-1'").await;
         assert_eq!(*scalar(&res[0]), Value::Text("host-a".into()));
@@ -2572,11 +2601,16 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(Catalog::new());
-        let disk = Arc::new(DiskEngine::open(&dir.path().join("test.db"), catalog.clone()).unwrap());
+        let disk =
+            Arc::new(DiskEngine::open(&dir.path().join("test.db"), catalog.clone()).unwrap());
         let engine: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(disk));
         let ex = Arc::new(Executor::new(catalog, engine));
 
-        run(&ex, "CREATE TABLE docs (collection TEXT, run_id TEXT, model TEXT)").await;
+        run(
+            &ex,
+            "CREATE TABLE docs (collection TEXT, run_id TEXT, model TEXT)",
+        )
+        .await;
         run(&ex, "CREATE INDEX idx_run ON docs (run_id)").await;
         run(&ex, "INSERT INTO docs VALUES ('meta', 'run-1', 'sonnet')").await;
         run(&ex, "INSERT INTO docs VALUES ('meta', 'run-2', 'haiku')").await;
@@ -2588,7 +2622,11 @@ mod tests {
         assert_eq!(*scalar(&res[0]), Value::Text("sonnet".into()));
 
         // New column is writable, and the index still routes the update.
-        run(&ex, "UPDATE docs SET ran_on = 'host-a' WHERE run_id = 'run-1'").await;
+        run(
+            &ex,
+            "UPDATE docs SET ran_on = 'host-a' WHERE run_id = 'run-1'",
+        )
+        .await;
         let res = run(&ex, "SELECT ran_on FROM docs WHERE run_id = 'run-1'").await;
         assert_eq!(*scalar(&res[0]), Value::Text("host-a".into()));
         let res = run(&ex, "SELECT ran_on FROM docs WHERE run_id = 'run-2'").await;

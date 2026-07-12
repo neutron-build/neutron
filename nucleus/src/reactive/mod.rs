@@ -858,7 +858,10 @@ mod tests {
         );
         // The oldest entries were evicted; the newest sequence is preserved.
         let newest = cdc.read_from(0, usize::MAX);
-        assert_eq!(newest.last().unwrap().sequence, (CdcLog::MAX_EVENTS * 3) as u64);
+        assert_eq!(
+            newest.last().unwrap().sequence,
+            (CdcLog::MAX_EVENTS * 3) as u64
+        );
     }
 
     #[test]
@@ -1227,7 +1230,10 @@ mod tests {
         assert_eq!(cursor, total_emitted as u64);
         match &events[0] {
             CdcEvent::Insert { row_id, .. } => {
-                assert_eq!(*row_id, (total_emitted - CdcManager::MAX_EVENTS_PER_STREAM) as u64);
+                assert_eq!(
+                    *row_id,
+                    (total_emitted - CdcManager::MAX_EVENTS_PER_STREAM) as u64
+                );
             }
             other => panic!("expected Insert, got {other:?}"),
         }

@@ -210,7 +210,12 @@ fn encode_record(rec: &MvccWalRecord) -> Vec<u8> {
             buf.push(TAG_DROP_TABLE);
             write_str(&mut buf, name);
         }
-        MvccWalRecord::Insert { table, txn_id, version_idx, row } => {
+        MvccWalRecord::Insert {
+            table,
+            txn_id,
+            version_idx,
+            row,
+        } => {
             buf.push(TAG_INSERT);
             write_str(&mut buf, table);
             write_u64(&mut buf, *txn_id);
@@ -435,8 +440,7 @@ fn read_value(data: &[u8], pos: &mut usize) -> Option<Value> {
             // A malformed stored JSONB value must not drop the whole row
             // (data loss). Fall back to JSON null; the insert path now rejects
             // invalid JSON up front, so this only guards legacy/foreign rows.
-            let v: serde_json::Value =
-                serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
+            let v: serde_json::Value = serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
             Some(Value::Jsonb(v))
         }
         VAL_VECTOR => {
@@ -660,7 +664,10 @@ fn replay(data: &[u8]) -> MvccWalState {
     for rec in &records {
         let committed_rec = |txn_id: &u64| *txn_id == 0 || committed.contains(txn_id);
         match rec {
-            MvccWalRecord::CreateTable { name, columns: cols } => {
+            MvccWalRecord::CreateTable {
+                name,
+                columns: cols,
+            } => {
                 columns.insert(name.clone(), cols.clone());
                 rowmaps.insert(name.clone(), std::collections::BTreeMap::new());
             }
@@ -668,21 +675,36 @@ fn replay(data: &[u8]) -> MvccWalState {
                 columns.remove(name);
                 rowmaps.remove(name);
             }
-            MvccWalRecord::Insert { table, txn_id, version_idx, row } => {
+            MvccWalRecord::Insert {
+                table,
+                txn_id,
+                version_idx,
+                row,
+            } => {
                 if committed_rec(txn_id)
                     && let Some(m) = rowmaps.get_mut(table)
                 {
                     m.insert(*version_idx, row.clone());
                 }
             }
-            MvccWalRecord::Delete { table, txn_id, version_idx } => {
+            MvccWalRecord::Delete {
+                table,
+                txn_id,
+                version_idx,
+            } => {
                 if committed_rec(txn_id)
                     && let Some(m) = rowmaps.get_mut(table)
                 {
                     m.remove(version_idx);
                 }
             }
-            MvccWalRecord::Update { table, txn_id, old_version_idx, new_version_idx, new_row } => {
+            MvccWalRecord::Update {
+                table,
+                txn_id,
+                old_version_idx,
+                new_version_idx,
+                new_row,
+            } => {
                 if committed_rec(txn_id)
                     && let Some(m) = rowmaps.get_mut(table)
                 {
@@ -705,7 +727,13 @@ fn replay(data: &[u8]) -> MvccWalState {
                 .remove(&name)
                 .map(|m| m.into_values().collect())
                 .unwrap_or_default();
-            (name, RecoveredTable { columns: cols, rows })
+            (
+                name,
+                RecoveredTable {
+                    columns: cols,
+                    rows,
+                },
+            )
         })
         .collect();
 
@@ -738,7 +766,12 @@ fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
             let txn_id = read_u64_val(data, &mut pos)?;
             let version_idx = read_u32_val(data, &mut pos)?;
             let row = read_row(data, &mut pos)?;
-            Some(MvccWalRecord::Insert { table, txn_id, version_idx, row })
+            Some(MvccWalRecord::Insert {
+                table,
+                txn_id,
+                version_idx,
+                row,
+            })
         }
         TAG_DELETE => {
             let table = read_str(data, &mut pos)?;

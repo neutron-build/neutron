@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use nucleus::catalog::Catalog;
-use nucleus::executor::{param_subst, ExecResult, Executor};
+use nucleus::executor::{ExecResult, Executor, param_subst};
 use nucleus::storage::{MvccStorageAdapter, StorageEngine};
 use nucleus::types::Value;
 use sqlparser::dialect::PostgreSqlDialect;
@@ -44,7 +44,8 @@ async fn main() {
 
     // The wire layer's prepared path: parse WITH the placeholder, substitute,
     // execute the statement list with a session.
-    let with_param = "SELECT VECTOR_DISTANCE(VECTOR('[1,0,0]'), VECTOR('[0,1,0]'), 'cosine') AS d, $1 AS x";
+    let with_param =
+        "SELECT VECTOR_DISTANCE(VECTOR('[1,0,0]'), VECTOR('[0,1,0]'), 'cosine') AS d, $1 AS x";
     let mut stmts = Parser::parse_sql(&PostgreSqlDialect {}, with_param).expect("parse");
     for stmt in &mut stmts {
         param_subst::substitute_params_in_stmt(stmt, &[Value::Text("hi".into())]);

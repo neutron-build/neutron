@@ -429,7 +429,11 @@ pub fn group_by_text_agg_f64(key_col: &[Option<String>], val_col: &[Option<f64>]
                 key,
                 count: count_all,
                 sum: if has { Some(sum) } else { None },
-                avg: if has { Some(sum / count_nn as f64) } else { None },
+                avg: if has {
+                    Some(sum / count_nn as f64)
+                } else {
+                    None
+                },
                 min: if has { Some(min) } else { None },
                 max: if has { Some(max) } else { None },
             }

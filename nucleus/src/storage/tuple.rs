@@ -249,8 +249,8 @@ pub fn deserialize_row(data: &[u8], col_types: &[DataType]) -> Option<Row> {
                     return None;
                 }
                 // Malformed stored JSONB must not drop the row; fall back to null.
-                let v: serde_json::Value =
-                    serde_json::from_slice(&data[pos..pos + len]).unwrap_or(serde_json::Value::Null);
+                let v: serde_json::Value = serde_json::from_slice(&data[pos..pos + len])
+                    .unwrap_or(serde_json::Value::Null);
                 row.push(Value::Jsonb(v));
                 pos += len;
             }
@@ -764,8 +764,8 @@ fn decode_column_at(data: &[u8], pos: usize, dtype: &DataType) -> Option<Value> 
                 return None;
             }
             // Malformed stored JSONB must not drop the row; fall back to null.
-            let v: serde_json::Value =
-                serde_json::from_slice(&data[start..start + len]).unwrap_or(serde_json::Value::Null);
+            let v: serde_json::Value = serde_json::from_slice(&data[start..start + len])
+                .unwrap_or(serde_json::Value::Null);
             Some(Value::Jsonb(v))
         }
         DataType::Date => {

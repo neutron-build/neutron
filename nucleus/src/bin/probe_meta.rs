@@ -35,7 +35,9 @@ impl Rng {
         self.0
     }
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { return 0; }
+        if n == 0 {
+            return 0;
+        }
         (self.next() % n as u64) as usize
     }
     fn chance(&mut self, pct: u64) -> bool {
@@ -85,7 +87,9 @@ fn run_select(ex: &Executor, sql: &str) -> Result<Vec<Vec<String>>, String> {
         },
         Ok(Err(e)) => Err(format!("err: {e:?}")),
         Err(p) => {
-            let msg = p.downcast_ref::<&str>().map(|s| s.to_string())
+            let msg = p
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
                 .or_else(|| p.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown".into());
             Err(format!("PANIC: {msg}"))
@@ -112,15 +116,24 @@ fn gen_table(ex: &Executor, rng: &mut Rng, n_rows: usize) -> bool {
         ex,
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER, c TEXT NOT NULL)",
     );
-    if !ok { return false; }
+    if !ok {
+        return false;
+    }
     let mut vals = Vec::with_capacity(n_rows);
     for id in 1..=n_rows {
         let a = *rng.pick(INT_VALS);
-        let b = if rng.chance(20) { "NULL".into() } else { rng.pick(INT_VALS).to_string() };
+        let b = if rng.chance(20) {
+            "NULL".into()
+        } else {
+            rng.pick(INT_VALS).to_string()
+        };
         let c = format!("'{}'", rng.pick(TEXT_VALS));
         vals.push(format!("({id},{a},{b},{c})"));
     }
-    exec_dml(ex, &format!("INSERT INTO t (id,a,b,c) VALUES {}", vals.join(",")))
+    exec_dml(
+        ex,
+        &format!("INSERT INTO t (id,a,b,c) VALUES {}", vals.join(",")),
+    )
 }
 
 // ─── Predicate generator (simple, closed-form) ────────────────────────────────
@@ -205,8 +218,13 @@ fn expand_in(pred: &str) -> Option<String> {
     };
     let items_str = rest.strip_suffix(')')?;
     let items: Vec<&str> = items_str.split(',').collect();
-    if items.is_empty() { return None; }
-    let clauses: Vec<String> = items.iter().map(|v| format!("{col}={}", v.trim())).collect();
+    if items.is_empty() {
+        return None;
+    }
+    let clauses: Vec<String> = items
+        .iter()
+        .map(|v| format!("{col}={}", v.trim()))
+        .collect();
     Some(format!("({})", clauses.join(" OR ")))
 }
 
@@ -266,7 +284,12 @@ fn make_cases(rng: &mut Rng) -> Vec<Case> {
         if let Some(pred2) = commute_pred(&pred) {
             let q1 = format!("SELECT id FROM t WHERE {pred} ORDER BY id ASC");
             let q2 = format!("SELECT id FROM t WHERE {pred2} ORDER BY id ASC");
-            cases.push(Case { kind: TransformKind::PredicateCommute, q1, q2, ordered: true });
+            cases.push(Case {
+                kind: TransformKind::PredicateCommute,
+                q1,
+                q2,
+                ordered: true,
+            });
         }
     }
 
@@ -275,7 +298,12 @@ fn make_cases(rng: &mut Rng) -> Vec<Case> {
         let pred = gen_pred(rng);
         let q1 = format!("SELECT id FROM t WHERE {pred} ORDER BY id ASC");
         let q2 = format!("SELECT id FROM t WHERE NOT(NOT({pred})) ORDER BY id ASC");
-        cases.push(Case { kind: TransformKind::DoubleNegation, q1, q2, ordered: true });
+        cases.push(Case {
+            kind: TransformKind::DoubleNegation,
+            q1,
+            q2,
+            ordered: true,
+        });
     }
 
     // 3. IN → OR expansion ───────────────────────────────────────────────────
@@ -288,7 +316,12 @@ fn make_cases(rng: &mut Rng) -> Vec<Case> {
         if let Some(or_pred) = expand_in(&in_pred) {
             let q1 = format!("SELECT id FROM t WHERE {in_pred} ORDER BY id ASC");
             let q2 = format!("SELECT id FROM t WHERE {or_pred} ORDER BY id ASC");
-            cases.push(Case { kind: TransformKind::InToOr, q1, q2, ordered: true });
+            cases.push(Case {
+                kind: TransformKind::InToOr,
+                q1,
+                q2,
+                ordered: true,
+            });
         }
     }
 
@@ -301,7 +334,12 @@ fn make_cases(rng: &mut Rng) -> Vec<Case> {
         let q2 = format!(
             "SELECT id FROM (SELECT id, a, b, c FROM t) AS sub WHERE {pred} ORDER BY id ASC"
         );
-        cases.push(Case { kind: TransformKind::SubqueryWrap, q1, q2, ordered: true });
+        cases.push(Case {
+            kind: TransformKind::SubqueryWrap,
+            q1,
+            q2,
+            ordered: true,
+        });
     }
 
     // 5. DISTINCT idempotence ─────────────────────────────────────────────────
@@ -312,7 +350,12 @@ fn make_cases(rng: &mut Rng) -> Vec<Case> {
         let q1 = "SELECT DISTINCT id FROM t".to_string();
         let q2 = "SELECT DISTINCT id FROM (SELECT DISTINCT id FROM t) AS sub".to_string();
         // DISTINCT result — compare as sets (no ORDER BY).
-        cases.push(Case { kind: TransformKind::DistinctIdempotent, q1, q2, ordered: false });
+        cases.push(Case {
+            kind: TransformKind::DistinctIdempotent,
+            q1,
+            q2,
+            ordered: false,
+        });
     }
 
     // 6. ORDER reversal ───────────────────────────────────────────────────────
@@ -322,7 +365,12 @@ fn make_cases(rng: &mut Rng) -> Vec<Case> {
     {
         let q1 = "SELECT id,a FROM t ORDER BY a ASC, id ASC".to_string();
         let q2 = "SELECT id,a FROM t ORDER BY a DESC, id DESC".to_string();
-        cases.push(Case { kind: TransformKind::OrderReversal, q1, q2, ordered: true });
+        cases.push(Case {
+            kind: TransformKind::OrderReversal,
+            q1,
+            q2,
+            ordered: true,
+        });
     }
 
     // 7. UNION with always-empty SELECT ──────────────────────────────────────
@@ -332,10 +380,13 @@ fn make_cases(rng: &mut Rng) -> Vec<Case> {
     {
         let pred = gen_pred(rng);
         let q1 = format!("SELECT id,a FROM t WHERE {pred}");
-        let q2 = format!(
-            "SELECT id,a FROM t WHERE {pred} UNION ALL SELECT id,a FROM t WHERE 1=0"
-        );
-        cases.push(Case { kind: TransformKind::UnionEmpty, q1, q2, ordered: false });
+        let q2 = format!("SELECT id,a FROM t WHERE {pred} UNION ALL SELECT id,a FROM t WHERE 1=0");
+        cases.push(Case {
+            kind: TransformKind::UnionEmpty,
+            q1,
+            q2,
+            ordered: false,
+        });
     }
 
     cases
@@ -367,10 +418,22 @@ fn main_impl() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed"       => { i += 1; seed       = args[i].parse().unwrap(); }
-            "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
-            "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
-            "--rows"       => { i += 1; rows_per_table = args[i].parse().unwrap(); }
+            "--seed" => {
+                i += 1;
+                seed = args[i].parse().unwrap();
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args[i].parse().unwrap();
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = args[i].parse().unwrap();
+            }
+            "--rows" => {
+                i += 1;
+                rows_per_table = args[i].parse().unwrap();
+            }
             _ => {}
         }
         i += 1;
@@ -380,7 +443,14 @@ fn main_impl() {
 
     println!("Nucleus metamorphic SQL fuzzer (oracle-free equivalence checking)");
     println!("seed={seed} iterations={iterations}\n");
-    println!("Transforms: {}", TransformKind::ALL.iter().map(|k| k.name()).collect::<Vec<_>>().join(", "));
+    println!(
+        "Transforms: {}",
+        TransformKind::ALL
+            .iter()
+            .map(|k| k.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     println!();
 
     let mut total_cases = 0usize;
@@ -391,7 +461,11 @@ fn main_impl() {
 
     for iter in 0..iterations {
         let mut rng = Rng(seed.wrapping_add(iter as u64).wrapping_mul(0x100000001B3));
-        let n_rows = if rows_per_table > 0 { rows_per_table } else { 4 + rng.below(17) };
+        let n_rows = if rows_per_table > 0 {
+            rows_per_table
+        } else {
+            4 + rng.below(17)
+        };
 
         let catalog = Arc::new(Catalog::new());
         let storage: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
@@ -415,8 +489,10 @@ fn main_impl() {
             if is_panic {
                 panics += 1;
                 if panics <= max_report {
-                    println!("─── PANIC #{panics} (iter {iter}) [{kind}] ───",
-                        kind = case.kind.name());
+                    println!(
+                        "─── PANIC #{panics} (iter {iter}) [{kind}] ───",
+                        kind = case.kind.name()
+                    );
                     println!("  Q1 : {}", case.q1);
                     println!("  Q2 : {}", case.q2);
                     println!("  R1 : {r1:?}");
@@ -441,17 +517,26 @@ fn main_impl() {
             };
 
             if !matches {
-                let kind_idx = TransformKind::ALL.iter().position(|k| *k == case.kind).unwrap_or(0);
+                let kind_idx = TransformKind::ALL
+                    .iter()
+                    .position(|k| *k == case.kind)
+                    .unwrap_or(0);
                 by_kind[kind_idx] += 1;
                 divergences += 1;
 
                 if divergences <= max_report {
                     // Show up to 12 rows from each side.
                     let preview = |rows: &Vec<Vec<String>>| {
-                        let shown: Vec<String> = rows.iter().take(12)
+                        let shown: Vec<String> = rows
+                            .iter()
+                            .take(12)
                             .map(|r| format!("[{}]", r.join(",")))
                             .collect();
-                        let more = if rows.len() > 12 { format!(" ...+{}", rows.len()-12) } else { String::new() };
+                        let more = if rows.len() > 12 {
+                            format!(" ...+{}", rows.len() - 12)
+                        } else {
+                            String::new()
+                        };
                         format!("{}{}", shown.join(" "), more)
                     };
                     let (display1, display2) = if case.kind == TransformKind::OrderReversal {
@@ -462,7 +547,9 @@ fn main_impl() {
                         (preview(&rows1), preview(&rows2))
                     };
 
-                    println!("─── METAMORPHIC DIVERGENCE #{divergences} (iter {iter}, seed {seed}) ───");
+                    println!(
+                        "─── METAMORPHIC DIVERGENCE #{divergences} (iter {iter}, seed {seed}) ───"
+                    );
                     println!("  kind       : {}", case.kind.name());
                     println!("  Q1 (base)  : {}", case.q1);
                     println!("  Q2 (equiv) : {}", case.q2);

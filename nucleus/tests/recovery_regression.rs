@@ -8,11 +8,24 @@ use nucleus::embedded::Database;
 use nucleus::executor::ExecResult;
 
 async fn ids_vals(db: &Database) -> Vec<(i64, i64)> {
-    match db.execute("SELECT id, v FROM t ORDER BY id").await.unwrap().pop().unwrap() {
-        ExecResult::Select { rows, .. } => rows.iter().map(|r| {
-            let g = |v: &nucleus::types::Value| match v { nucleus::types::Value::Int32(n) => *n as i64, nucleus::types::Value::Int64(n) => *n, x => panic!("{x:?}") };
-            (g(&r[0]), g(&r[1]))
-        }).collect(),
+    match db
+        .execute("SELECT id, v FROM t ORDER BY id")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+    {
+        ExecResult::Select { rows, .. } => rows
+            .iter()
+            .map(|r| {
+                let g = |v: &nucleus::types::Value| match v {
+                    nucleus::types::Value::Int32(n) => *n as i64,
+                    nucleus::types::Value::Int64(n) => *n,
+                    x => panic!("{x:?}"),
+                };
+                (g(&r[0]), g(&r[1]))
+            })
+            .collect(),
         o => panic!("{o:?}"),
     }
 }
@@ -29,8 +42,12 @@ async fn single_crash_recovers_committed_state() {
     let dir = tmp("single");
     {
         let db = Database::durable_mvcc(&dir).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await.unwrap();
-        db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)").await.unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)")
+            .await
+            .unwrap();
         db.execute("UPDATE t SET v=99 WHERE id=2").await.unwrap();
         db.execute("DELETE FROM t WHERE id=3").await.unwrap();
         db.sync().unwrap();
@@ -47,8 +64,12 @@ async fn multi_crash_no_version_index_collision() {
     let dir = tmp("multi");
     {
         let db = Database::durable_mvcc(&dir).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await.unwrap();
-        db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").await.unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+            .await
+            .unwrap();
         db.execute("DELETE FROM t WHERE id=2").await.unwrap();
         db.sync().unwrap();
     }
@@ -70,11 +91,17 @@ async fn uncommitted_txn_rolled_back_on_crash() {
     let dir = tmp("rollback");
     {
         let db = Database::durable_mvcc(&dir).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await.unwrap();
-        db.execute("INSERT INTO t VALUES (1,10),(2,20)").await.unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1,10),(2,20)")
+            .await
+            .unwrap();
         db.sync().unwrap();
         db.execute("BEGIN").await.unwrap();
-        db.execute("INSERT INTO t VALUES (3,30),(4,40)").await.unwrap();
+        db.execute("INSERT INTO t VALUES (3,30),(4,40)")
+            .await
+            .unwrap();
         // no COMMIT — crash
     }
     let db = Database::durable_mvcc(&dir).unwrap();
