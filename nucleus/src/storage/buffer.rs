@@ -325,6 +325,11 @@ pub struct BufferPool {
     stats: BufferPoolStats,
     /// Tracked set of dirty frame indices for efficient batch flushing.
     dirty_set: Mutex<HashSet<u32>>,
+    /// Page IDs dirtied since the last commit-time WAL force
+    /// (`wal_force_pending`). Tracks page IDs, not frame IDs, so an entry
+    /// stays meaningful across eviction (an evicted page was WAL-logged and
+    /// group-synced by the flush path, so the force skips it as clean).
+    wal_pending: Mutex<HashSet<u32>>,
     /// Serializes "pin an existing resident page" against "evict a frame to
     /// make room". These are two different operations over two different
     /// data structures (`page_table` and the replacer's per-frame
@@ -385,6 +390,7 @@ impl BufferPool {
             pool_size,
             stats: BufferPoolStats::new(),
             dirty_set: Mutex::new(HashSet::new()),
+            wal_pending: Mutex::new(HashSet::new()),
             eviction_lock: Mutex::new(()),
         }
     }
@@ -559,6 +565,9 @@ impl BufferPool {
         desc.pin_count.store(1, Ordering::Release);
         desc.is_dirty.store(true, Ordering::Release);
         self.dirty_set.lock().insert(frame_id);
+        if self.wal.is_some() {
+            self.wal_pending.lock().insert(page_id);
+        }
 
         self.page_table.insert(page_id, frame_id);
         self.replacer.record_access(frame_id);
@@ -593,13 +602,100 @@ impl BufferPool {
 
     /// Mark a frame as dirty (modified).
     pub fn mark_dirty(&self, frame_id: u32) {
-        let was_dirty = self.descriptors[frame_id as usize]
-            .is_dirty
-            .swap(true, Ordering::AcqRel);
+        let desc = &self.descriptors[frame_id as usize];
+        let was_dirty = desc.is_dirty.swap(true, Ordering::AcqRel);
         if !was_dirty {
             self.stats.dirty_pages.fetch_add(1, Ordering::Relaxed);
         }
         self.dirty_set.lock().insert(frame_id);
+        if self.wal.is_some() {
+            let page_id = desc.page_id.load(Ordering::Acquire);
+            if page_id != INVALID_PAGE_ID {
+                self.wal_pending.lock().insert(page_id);
+            }
+        }
+    }
+
+    /// Commit-time WAL force: log a page image for every page dirtied since
+    /// the last force, then group-sync the WAL up to the highest LSN written.
+    ///
+    /// This is the durability point for committed work — the data pages
+    /// themselves still flush lazily (background flusher / checkpoint), but
+    /// once this returns, crash recovery replays every logged image, so the
+    /// loss window for acked commits is zero rather than the checkpoint
+    /// interval.
+    ///
+    /// Pages that were flushed or evicted since being dirtied are skipped:
+    /// both paths WAL-log the image themselves, and the flush path group-syncs
+    /// (evictions) or writes + syncs the data page (batch flusher).
+    ///
+    /// No-op when no WAL is configured. On error the drained page set is
+    /// merged back so a retry (or the next commit) re-covers these pages.
+    pub fn wal_force_pending(&self) -> Result<(), BufferError> {
+        let Some(ref wal) = self.wal else {
+            return Ok(());
+        };
+        let pending: Vec<u32> = {
+            let mut set = self.wal_pending.lock();
+            if set.is_empty() {
+                return Ok(());
+            }
+            set.drain().collect()
+        };
+
+        let mut max_lsn = 0u64;
+        let restore_on_err = |pool: &Self, remaining: &[u32]| {
+            let mut set = pool.wal_pending.lock();
+            for &p in remaining {
+                set.insert(p);
+            }
+        };
+
+        for (i, &page_id) in pending.iter().enumerate() {
+            // Pin via the eviction-safe path so the frame can't be repurposed
+            // for a different page between lookup and image copy.
+            let Some(frame_id) = self.pin_if_present(page_id) else {
+                // Not resident: it was evicted, and eviction WAL-logs +
+                // group-syncs the image first. Nothing left to force.
+                continue;
+            };
+            let desc = &self.descriptors[frame_id as usize];
+            if desc.is_dirty.load(Ordering::Acquire) {
+                // Read-latch the frame so a concurrent writer can't tear the
+                // image while it streams into the WAL record.
+                let _latch = self.frame_latch(frame_id).read();
+                let data = self.frame_data_mut(frame_id);
+                match wal.log_page_write(0, page_id, data) {
+                    Ok(lsn) => {
+                        page::set_page_lsn(data, lsn);
+                        max_lsn = lsn;
+                    }
+                    Err(e) => {
+                        drop(_latch);
+                        self.unpin(frame_id);
+                        restore_on_err(self, &pending[i..]);
+                        return Err(BufferError::Io(e));
+                    }
+                }
+            }
+            self.unpin(frame_id);
+        }
+
+        if max_lsn > 0
+            && let Err(e) = wal.sync_up_to(max_lsn)
+        {
+            // Records are appended but not durably synced — put every page
+            // back so the next force retries the whole batch.
+            restore_on_err(self, &pending);
+            return Err(BufferError::Io(e));
+        }
+        Ok(())
+    }
+
+    /// Whether any pages are awaiting a commit-time WAL force. Cheap check so
+    /// callers can skip `wal_force_pending` entirely on read-only statements.
+    pub fn wal_force_needed(&self) -> bool {
+        self.wal.is_some() && !self.wal_pending.lock().is_empty()
     }
 
     /// Unpin a frame (decrement pin count).
@@ -1176,8 +1272,9 @@ mod tests {
                     let page_id = page_ids[(t * 37 + i) % page_ids.len()];
                     let frame_id = pool.fetch_page(page_id).unwrap();
                     let data = pool.frame_data(frame_id);
-                    let stamp =
-                        u32::from_le_bytes(data[STAMP_OFFSET..STAMP_OFFSET + 4].try_into().unwrap());
+                    let stamp = u32::from_le_bytes(
+                        data[STAMP_OFFSET..STAMP_OFFSET + 4].try_into().unwrap(),
+                    );
                     assert_eq!(
                         stamp, page_id,
                         "buffer pool handed out a frame for page {page_id} whose content is \
@@ -1389,12 +1486,16 @@ mod eviction_content_integrity_tests {
         for &page_id in &page_ids {
             let frame_id = pool.fetch_page(page_id).unwrap();
             let data = pool.frame_data(frame_id);
-            let stamp = u32::from_le_bytes(data[STAMP_OFFSET..STAMP_OFFSET + 4].try_into().unwrap());
+            let stamp =
+                u32::from_le_bytes(data[STAMP_OFFSET..STAMP_OFFSET + 4].try_into().unwrap());
             pool.unpin(frame_id);
             if stamp != page_id {
                 bad.push((page_id, stamp));
             }
         }
-        assert!(bad.is_empty(), "sequential (single-threaded) corruption found: {bad:?}");
+        assert!(
+            bad.is_empty(),
+            "sequential (single-threaded) corruption found: {bad:?}"
+        );
     }
 }

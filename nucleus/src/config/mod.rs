@@ -116,6 +116,12 @@ pub struct WalConfig {
     pub group_commit_interval_us: u64,
     #[serde(default = "default_sync_mode")]
     pub sync_mode: String,
+    /// Commit-time durability: "on" (default) forces the WAL (group commit)
+    /// before a write statement or COMMIT is acked; "off" defers durability
+    /// to the next flush/checkpoint (bounded loss window, higher throughput).
+    /// Sessions can override with `SET synchronous_commit = on|off`.
+    #[serde(default = "default_synchronous_commit")]
+    pub synchronous_commit: String,
 }
 
 fn default_true() -> bool {
@@ -133,6 +139,9 @@ fn default_group_commit_interval_us() -> u64 {
 fn default_sync_mode() -> String {
     "fsync".to_string()
 }
+fn default_synchronous_commit() -> String {
+    "on".to_string()
+}
 
 impl Default for WalConfig {
     fn default() -> Self {
@@ -142,6 +151,7 @@ impl Default for WalConfig {
             checkpoint_interval_secs: default_checkpoint_interval_secs(),
             group_commit_interval_us: default_group_commit_interval_us(),
             sync_mode: default_sync_mode(),
+            synchronous_commit: default_synchronous_commit(),
         }
     }
 }
@@ -400,6 +410,9 @@ impl NucleusConfig {
         {
             self.wal.enabled = b;
         }
+        if let Ok(v) = env::var("NUCLEUS_WAL_SYNCHRONOUS_COMMIT") {
+            self.wal.synchronous_commit = v;
+        }
 
         // metrics
         if let Ok(v) = env::var("NUCLEUS_METRICS_ENABLED")
@@ -566,6 +579,53 @@ impl NucleusConfig {
 
     /// Derive subsystem memory budgets from the global max_memory_mb setting.
     /// Adjusts buffer_pool_size_mb and cache.max_memory_mb to fit within budget.
+    /// Derive the memory budget from the container's cgroup limit when nothing
+    /// set it explicitly (CLI/env/TOML all left the 512 MB default in place).
+    ///
+    /// A 512 MB default inside an 8 GB container is a foot-gun: the watchdog
+    /// starts silently rejecting writes at ~460 MB RSS while the host has
+    /// gigabytes free (teploy-observe dogfood finding #33). Uses 80% of the
+    /// cgroup limit, leaving headroom for allocator slack and page cache.
+    /// Returns the derived budget in MB when applied.
+    pub fn apply_cgroup_memory_default(&mut self) -> Option<usize> {
+        const DEFAULT_MB: usize = 512;
+        if self.server.max_memory_mb != DEFAULT_MB {
+            return None; // explicitly configured — leave it alone
+        }
+        let limit = Self::cgroup_memory_limit_bytes()?;
+        let derived_mb = ((limit as f64 * 0.80) as usize / (1024 * 1024)).max(DEFAULT_MB);
+        if derived_mb == DEFAULT_MB {
+            return None; // container is <= ~640 MB — the default already fits
+        }
+        self.server.max_memory_mb = derived_mb;
+        Some(derived_mb)
+    }
+
+    /// Read the effective cgroup memory limit, if the process runs under one.
+    /// cgroup v2 (`/sys/fs/cgroup/memory.max`) first, then v1. "max" or
+    /// absurdly large values mean "no limit" and read as None.
+    fn cgroup_memory_limit_bytes() -> Option<u64> {
+        const NO_LIMIT_FLOOR: u64 = 1 << 60;
+        for path in [
+            "/sys/fs/cgroup/memory.max",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        ] {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                let s = s.trim();
+                if s == "max" {
+                    return None;
+                }
+                if let Ok(v) = s.parse::<u64>() {
+                    if v >= NO_LIMIT_FLOOR {
+                        return None;
+                    }
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
     pub fn apply_memory_budget(&mut self) {
         let max = self.server.max_memory_mb;
         if max == 0 {

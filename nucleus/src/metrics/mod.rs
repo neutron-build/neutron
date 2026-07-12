@@ -239,6 +239,13 @@ pub struct MetricsRegistry {
     pub wal_size_bytes: Gauge,
     pub replication_lag_bytes: Gauge,
     pub open_transactions: Gauge,
+    pub memory_rss_bytes: Gauge,
+    pub memory_limit_bytes: Gauge,
+    /// 1 while the memory watchdog is rejecting writes (RSS past the
+    /// critical threshold after eviction), 0 otherwise. The silent
+    /// write-reject state MUST be observable — see teploy-observe dogfood
+    /// finding #33.
+    pub memory_writes_rejected: Gauge,
 
     // Histograms
     pub query_duration: Histogram,
@@ -289,6 +296,15 @@ impl MetricsRegistry {
                 "Replication lag in bytes",
             ),
             open_transactions: Gauge::new("nucleus_open_transactions", "Open transactions"),
+            memory_rss_bytes: Gauge::new("nucleus_memory_rss_bytes", "Process RSS in bytes"),
+            memory_limit_bytes: Gauge::new(
+                "nucleus_memory_limit_bytes",
+                "Configured memory budget in bytes",
+            ),
+            memory_writes_rejected: Gauge::new(
+                "nucleus_memory_writes_rejected",
+                "1 while writes are rejected due to critical memory pressure",
+            ),
 
             query_duration: Histogram::query_duration(),
 
@@ -358,6 +374,9 @@ impl MetricsRegistry {
         render_gauge(&mut out, &self.wal_size_bytes);
         render_gauge(&mut out, &self.replication_lag_bytes);
         render_gauge(&mut out, &self.open_transactions);
+        render_gauge(&mut out, &self.memory_rss_bytes);
+        render_gauge(&mut out, &self.memory_limit_bytes);
+        render_gauge(&mut out, &self.memory_writes_rejected);
 
         // Uptime gauge (computed)
         out.push_str("# HELP nucleus_uptime_seconds Time since server start\n");

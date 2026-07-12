@@ -196,9 +196,7 @@ impl Executor {
                         // count, so REPEAT of a long string errors rather than
                         // OOM-aborting the process.
                         match s.len().checked_mul(n) {
-                            Some(total) if total <= MAX_STR_OUTPUT => {
-                                Ok(Value::Text(s.repeat(n)))
-                            }
+                            Some(total) if total <= MAX_STR_OUTPUT => Ok(Value::Text(s.repeat(n))),
                             _ => Err(ExecError::Unsupported(
                                 "REPEAT: result exceeds maximum length".into(),
                             )),
@@ -5508,23 +5506,77 @@ pub(crate) fn side_effecting_return_type(name: &str) -> Option<crate::types::Dat
     use crate::types::DataType;
     let dt = match name {
         // -- booleans: did-it-happen results --
-        "KV_DEL" | "KV_EXPIRE" | "KV_SETNX" | "KV_CDEL" | "KV_CEXPIRE" | "KV_HSET"
-        | "KV_HDEL" | "KV_SADD" | "KV_SREM" | "KV_ZADD" | "KV_ZREM" | "KV_PFADD"
-        | "KV_PFMERGE" | "SPARSE_INSERT" | "SPARSE_REMOVE" | "FTS_INDEX"
-        | "FTS_INDEX_FACETED" | "FTS_REMOVE" | "BLOB_STORE" | "BLOB_DELETE" | "BLOB_TAG"
-        | "GRAPH_DELETE_NODE" | "GRAPH_DELETE_EDGE" | "DB_BRANCH_DELETE" | "PROC_DROP"
-        | "UNSUBSCRIBE" | "STREAM_XGROUP_CREATE" => DataType::Bool,
+        "KV_DEL"
+        | "KV_EXPIRE"
+        | "KV_SETNX"
+        | "KV_CDEL"
+        | "KV_CEXPIRE"
+        | "KV_HSET"
+        | "KV_HDEL"
+        | "KV_SADD"
+        | "KV_SREM"
+        | "KV_ZADD"
+        | "KV_ZREM"
+        | "KV_PFADD"
+        | "KV_PFMERGE"
+        | "SPARSE_INSERT"
+        | "SPARSE_REMOVE"
+        | "FTS_INDEX"
+        | "FTS_INDEX_FACETED"
+        | "FTS_REMOVE"
+        | "BLOB_STORE"
+        | "BLOB_DELETE"
+        | "BLOB_TAG"
+        | "GRAPH_DELETE_NODE"
+        | "GRAPH_DELETE_EDGE"
+        | "DB_BRANCH_DELETE"
+        | "PROC_DROP"
+        | "UNSUBSCRIBE"
+        | "STREAM_XGROUP_CREATE" => DataType::Bool,
         // -- integers: ids, counts, sequence values --
         "NEXTVAL" | "SETVAL" | "KV_INCR" | "KV_LPUSH" | "KV_RPUSH" | "STREAM_XACK"
-        | "PUBSUB_PUBLISH" | "DOC_INSERT" | "GRAPH_ADD_NODE" | "GRAPH_ADD_EDGE"
-        | "SUBSCRIBE" | "DB_BRANCH_CREATE" => DataType::Int64,
+        | "PUBSUB_PUBLISH" | "DOC_INSERT" | "GRAPH_ADD_NODE" | "GRAPH_ADD_EDGE" | "SUBSCRIBE"
+        | "DB_BRANCH_CREATE" => DataType::Int64,
         // -- text: status strings, stream ids, popped values --
-        "KV_SET" | "KV_FLUSHDB" | "KV_LPOP" | "KV_RPOP" | "STREAM_XADD"
-        | "STREAM_XREADGROUP" | "COLUMNAR_INSERT" | "TS_INSERT"
-        | "TS_RETENTION" | "DATALOG_ASSERT" | "DATALOG_RULE" | "DATALOG_RETRACT"
-        | "DATALOG_CLEAR" | "DATALOG_IMPORT" | "DATALOG_IMPORT_GRAPH"
-        | "DATALOG_IMPORT_NODES" | "TENSOR_STORE" | "RETENTION_SET" | "DB_BRANCH_MERGE"
+        "KV_SET"
+        | "KV_FLUSHDB"
+        | "KV_LPOP"
+        | "KV_RPOP"
+        | "STREAM_XADD"
+        | "STREAM_XREADGROUP"
+        | "COLUMNAR_INSERT"
+        | "TS_INSERT"
+        | "TS_RETENTION"
+        | "DATALOG_ASSERT"
+        | "DATALOG_RULE"
+        | "DATALOG_RETRACT"
+        | "DATALOG_CLEAR"
+        | "DATALOG_IMPORT"
+        | "DATALOG_IMPORT_GRAPH"
+        | "DATALOG_IMPORT_NODES"
+        | "TENSOR_STORE"
+        | "RETENTION_SET"
+        | "DB_BRANCH_MERGE"
         | "PROC_REGISTER" => DataType::Text,
+        _ => return None,
+    };
+    Some(dt)
+}
+
+/// Return type of read-only Nucleus scalar extensions, for wire-level
+/// Describe. These are pure reads, so the describe path COULD probe-execute
+/// them — but a probe of `SELECT FTS_SEARCH($1, $2)` with unbound
+/// placeholders errors inside the function, leaving Describe with zero
+/// columns while Execute returns one (pgx: "number of field descriptions
+/// must equal number of values" — dogfood finding #22 tail). Static typing
+/// avoids the probe entirely.
+pub(crate) fn extension_scalar_return_type(name: &str) -> Option<crate::types::DataType> {
+    use crate::types::DataType;
+    let dt = match name {
+        // JSON-array result strings
+        "FTS_SEARCH" | "FTS_FUZZY_SEARCH" | "FTS_SEARCH_FILTER" => DataType::Text,
+        "FTS_DOC_COUNT" | "FTS_TERM_COUNT" => DataType::Int64,
+        "FTS_MATCH" => DataType::Bool,
         _ => return None,
     };
     Some(dt)

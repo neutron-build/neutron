@@ -165,16 +165,13 @@ impl AuthSource for UserAuthenticator {
             // Cleartext: the startup handler compares these bytes against the
             // client-supplied password directly, so hand back the raw password
             // with no salt.
-            AuthMethod::Cleartext => {
-                Ok(AuthPassword::new(None, self.password.as_bytes().to_vec()))
-            }
+            AuthMethod::Cleartext => Ok(AuthPassword::new(None, self.password.as_bytes().to_vec())),
             // SCRAM-SHA-256: pgwire needs the salted password + salt. Derive
             // Hi(password, salt, iterations) per RFC 5802 using pgwire's own
             // helper (SASLprep-normalizes then PBKDF2-HMAC-SHA256), with the
             // same iteration count pgwire advertises to the client.
             AuthMethod::ScramSha256 => {
-                let salted =
-                    gen_salted_password(&self.password, &self.salt, SCRAM_ITERATIONS);
+                let salted = gen_salted_password(&self.password, &self.salt, SCRAM_ITERATIONS);
                 Ok(AuthPassword::new(Some(self.salt.clone()), salted))
             }
         }
@@ -1479,7 +1476,10 @@ impl ExtendedQueryHandler for NucleusHandler {
             // more accurately by substituting and executing.
             let substituted =
                 Self::substitute_parameters_with_executor(sql, portal, Some(&self.executor))?;
-            match self.describe_select_columns(&substituted, Some(&portal.result_column_format)).await {
+            match self
+                .describe_select_columns(&substituted, Some(&portal.result_column_format))
+                .await
+            {
                 Ok(cols) => cols,
                 Err(e) => {
                     tracing::warn!("Failed to describe SELECT columns: {e}");
@@ -2765,12 +2765,31 @@ fn walk_expr_for_params(
             }
         }
         Expr::Function(func) => {
+            // Known Nucleus scalar extensions: advertise proper types for
+            // their placeholder args instead of the blanket TEXT default.
+            // Without this, `SELECT FTS_SEARCH($1, $2)` described both params
+            // as TEXT and pgx refused to bind an int64 limit ("cannot find
+            // encode plan") — teploy-observe dogfood finding #22. The list
+            // mirrors the executor's scalar_fns signatures.
+            let fname = func.name.to_string().to_uppercase();
+            let sig: &[Type] = match fname.as_str() {
+                "FTS_SEARCH" => &[Type::TEXT, Type::INT8],
+                "FTS_FUZZY_SEARCH" => &[Type::TEXT, Type::INT8, Type::INT8],
+                "FTS_SEARCH_FILTER" => &[Type::TEXT, Type::INT8, Type::TEXT, Type::TEXT],
+                "FTS_INDEX" => &[Type::INT8, Type::TEXT],
+                "FTS_INDEX_FACETED" => &[Type::INT8, Type::TEXT, Type::TEXT, Type::TEXT],
+                "KV_INCR" => &[Type::TEXT, Type::INT8],
+                _ => &[],
+            };
             if let sqlparser::ast::FunctionArguments::List(list) = &func.args {
-                for arg in &list.args {
+                for (pos, arg) in list.args.iter().enumerate() {
                     if let sqlparser::ast::FunctionArg::Unnamed(
                         sqlparser::ast::FunctionArgExpr::Expr(e),
                     ) = arg
                     {
+                        if let Some(ty) = sig.get(pos) {
+                            mark_param(e, ty.clone(), out);
+                        }
                         walk_expr_for_params(e, tables, out);
                     }
                 }
@@ -2944,6 +2963,15 @@ fn pg_type_to_data_type(pg_type: &Type) -> DataType {
 /// `(`). A cheap textual scan: false positives (e.g. the name inside a
 /// string literal) merely route Describe to the static path below, which
 /// degrades type precision but never fires effects.
+/// Return type for functions the wire layer describes statically instead of
+/// probe-executing: side-effecting extensions (a Describe must never run
+/// them) and read-only extensions whose probe would error on unbound
+/// placeholders (finding #22 tail).
+fn statically_described_fn_type(name: &str) -> Option<DataType> {
+    crate::executor::side_effecting_return_type(name)
+        .or_else(|| crate::executor::extension_scalar_return_type(name))
+}
+
 fn mentions_side_effecting_fn(sql: &str) -> bool {
     let upper = sql.to_ascii_uppercase();
     let bytes = upper.as_bytes();
@@ -2960,7 +2988,7 @@ fn mentions_side_effecting_fn(sql: &str) -> bool {
             }
             if j < bytes.len()
                 && bytes[j] == b'('
-                && crate::executor::side_effecting_return_type(&upper[start..i]).is_some()
+                && statically_described_fn_type(&upper[start..i]).is_some()
             {
                 return true;
             }
@@ -3025,9 +3053,7 @@ fn describe_static_fields(sql: &str, formats: Option<&Format>) -> Option<Vec<Fie
         } else {
             None
         };
-        let dt = fn_name
-            .as_deref()
-            .and_then(crate::executor::side_effecting_return_type);
+        let dt = fn_name.as_deref().and_then(statically_described_fn_type);
         let name = alias.unwrap_or_else(|| {
             fn_name
                 .map(|n| n.to_ascii_lowercase())
@@ -3761,8 +3787,8 @@ mod tests {
         }
 
         // A client that ASKS for binary still gets it.
-        let response = NucleusHandler::build_response(make(), Some(&Format::UnifiedBinary))
-            .expect("response");
+        let response =
+            NucleusHandler::build_response(make(), Some(&Format::UnifiedBinary)).expect("response");
         assert!(
             field_formats(response)
                 .iter()
@@ -3770,8 +3796,9 @@ mod tests {
         );
 
         // Per-column codes are honored; missing codes fall back to text.
-        let response = NucleusHandler::build_response(make(), Some(&Format::Individual(vec![1, 0])))
-            .expect("response");
+        let response =
+            NucleusHandler::build_response(make(), Some(&Format::Individual(vec![1, 0])))
+                .expect("response");
         assert_eq!(
             field_formats(response),
             vec![FieldFormat::Binary, FieldFormat::Text, FieldFormat::Text]
@@ -4522,8 +4549,7 @@ mod security_tests {
         assert_eq!(*fields[0].datatype(), Type::INT8);
         let fields = describe_static_fields("SELECT STREAM_XADD($1, $2, $3)", None).unwrap();
         assert_eq!(*fields[0].datatype(), Type::VARCHAR);
-        let fields =
-            describe_static_fields("SELECT KV_CDEL($1, $2) AS released", None).unwrap();
+        let fields = describe_static_fields("SELECT KV_CDEL($1, $2) AS released", None).unwrap();
         assert_eq!(fields[0].name(), "released");
         assert_eq!(*fields[0].datatype(), Type::BOOL);
     }

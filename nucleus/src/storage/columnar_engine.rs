@@ -1363,6 +1363,21 @@ impl StorageEngine for ColumnarStorageEngine {
         }
         Ok(())
     }
+
+    async fn make_durable(&self) -> Result<(), StorageError> {
+        // Mutations are appended to the WAL as they happen (inserts as row
+        // batches, updates/deletes as snapshot rewrites) but only `write()`n
+        // into the OS page cache. The commit point fsyncs via group commit.
+        if let Some(wal) = &self.wal {
+            wal.group_sync()
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn durability_pending(&self) -> bool {
+        self.wal.as_ref().is_some_and(|w| w.is_dirty())
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

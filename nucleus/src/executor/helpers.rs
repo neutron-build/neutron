@@ -209,6 +209,12 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
                     DataType::Array(Box::new(inner))
                 }
                 "JSON_AGG" => DataType::Jsonb,
+                // Nucleus scalar extensions with integer/bool returns: without
+                // these the wire layer described e.g. KV_INCR's result as TEXT
+                // while the executor returned Int64, so pgx got binary int
+                // bytes in a TEXT-described column (dogfood finding #23).
+                "KV_INCR" | "FTS_DOC_COUNT" | "FTS_TERM_COUNT" => DataType::Int64,
+                "FTS_INDEX" | "FTS_INDEX_FACETED" => DataType::Bool,
                 _ => DataType::Text,
             }
         }
@@ -476,6 +482,23 @@ pub(super) fn contains_aggregate(expr: &Expr) -> bool {
         Expr::UnaryOp { expr, .. } => contains_aggregate(expr),
         Expr::Nested(inner) => contains_aggregate(inner),
         Expr::Cast { expr: inner, .. } => contains_aggregate(inner),
+        // CASE WHEN SUM(x) > 0 THEN ... END — dogfood finding #15: without
+        // this arm the whole CASE was treated as a pure per-row scalar and
+        // eval_row_expr errored "aggregate function SUM outside of aggregate
+        // context". The substitution path (substitute_aggregates_inplace)
+        // already handles Case; detection just never routed it there.
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(contains_aggregate)
+                || conditions
+                    .iter()
+                    .any(|cw| contains_aggregate(&cw.condition) || contains_aggregate(&cw.result))
+                || else_result.as_deref().is_some_and(contains_aggregate)
+        }
         _ => false,
     }
 }

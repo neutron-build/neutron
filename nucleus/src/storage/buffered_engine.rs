@@ -277,7 +277,12 @@ impl StorageEngine for BufferedDiskEngine {
                 None => return Ok(()), // no active txn — no-op
             }
         };
-        self.apply_buffer(ops).await
+        self.apply_buffer(ops).await?;
+        // COMMIT is the durability point for the buffered ops just applied.
+        // The executor's statement-level make_durable skipped them while the
+        // transaction was open (writes were only in the in-memory buffer), so
+        // force the WAL here before COMMIT is acked.
+        self.inner.make_durable().await
     }
 
     async fn abort_txn(&self) -> Result<(), StorageError> {
@@ -288,6 +293,20 @@ impl StorageEngine for BufferedDiskEngine {
 
     fn supports_mvcc(&self) -> bool {
         true // We provide transaction atomicity + rollback
+    }
+
+    async fn make_durable(&self) -> Result<(), StorageError> {
+        if self.is_in_txn() {
+            // Writes are buffered in memory until COMMIT — nothing has
+            // reached the inner engine yet, so there is nothing to force.
+            // commit_txn() forces after applying the buffer.
+            return Ok(());
+        }
+        self.inner.make_durable().await
+    }
+
+    fn durability_pending(&self) -> bool {
+        !self.is_in_txn() && self.inner.durability_pending()
     }
 
     // -- Delegate everything else to inner DiskEngine --
