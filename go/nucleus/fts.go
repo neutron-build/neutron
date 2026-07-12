@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 )
 
 // FTSModel provides full-text search over Nucleus SQL functions.
@@ -59,9 +58,7 @@ func (f *FTSModel) Index(ctx context.Context, docID int64, text string) (bool, e
 		return false, err
 	}
 	var ok bool
-	// CAST workaround for nucleus_dogfood #22 — see Search() comment.
-	err := f.pool.QueryRow(ctx, "SELECT FTS_INDEX(CAST($1 AS BIGINT), $2)",
-		strconv.FormatInt(docID, 10), text).Scan(&ok)
+	err := f.pool.QueryRow(ctx, "SELECT FTS_INDEX($1, $2)", docID, text).Scan(&ok)
 	return ok, wrapErr("fts index", err)
 }
 
@@ -74,10 +71,9 @@ func (f *FTSModel) IndexFaceted(ctx context.Context, docID int64, text, field, v
 		return false, err
 	}
 	var ok bool
-	// CAST workaround for nucleus_dogfood #22 — see Search() comment.
 	err := f.pool.QueryRow(ctx,
-		"SELECT FTS_INDEX_FACETED(CAST($1 AS BIGINT), $2, $3, $4)",
-		strconv.FormatInt(docID, 10), text, field, value).Scan(&ok)
+		"SELECT FTS_INDEX_FACETED($1, $2, $3, $4)",
+		docID, text, field, value).Scan(&ok)
 	return ok, wrapErr("fts index faceted", err)
 }
 
@@ -94,10 +90,9 @@ func (f *FTSModel) SearchFilter(ctx context.Context, query, field, value string,
 		fn(&o)
 	}
 	var raw string
-	// CAST workaround for nucleus_dogfood #22 (see Search()).
 	err := f.pool.QueryRow(ctx,
-		"SELECT FTS_SEARCH_FILTER($1, CAST($2 AS BIGINT), $3, $4)",
-		query, strconv.FormatInt(o.limit, 10), field, value).Scan(&raw)
+		"SELECT FTS_SEARCH_FILTER($1, $2, $3, $4)",
+		query, o.limit, field, value).Scan(&raw)
 	if err != nil {
 		return nil, wrapErr("fts search filter", err)
 	}
@@ -123,18 +118,16 @@ func (f *FTSModel) Search(ctx context.Context, query string, opts ...FTSOption) 
 	var raw string
 	var err error
 
-	// CAST workaround for nucleus_dogfood #22: pgwire describes both
-	// params as TEXT, so binding int64 against $2 fails in pgx with
-	// "cannot find encode plan". Force the limit through as text and
-	// CAST it back to BIGINT inside the SQL.
+	// Requires nucleus >= the #22/#23 pgwire fix (function params are
+	// described with their real types, so int64 binds encode natively).
 	if o.fuzzyDist > 0 {
 		err = f.pool.QueryRow(ctx,
-			"SELECT FTS_FUZZY_SEARCH($1, CAST($2 AS BIGINT), CAST($3 AS BIGINT))",
-			query, strconv.Itoa(o.fuzzyDist), strconv.FormatInt(o.limit, 10)).Scan(&raw)
+			"SELECT FTS_FUZZY_SEARCH($1, $2, $3)",
+			query, int64(o.fuzzyDist), o.limit).Scan(&raw)
 	} else {
 		err = f.pool.QueryRow(ctx,
-			"SELECT FTS_SEARCH($1, CAST($2 AS BIGINT))",
-			query, strconv.FormatInt(o.limit, 10)).Scan(&raw)
+			"SELECT FTS_SEARCH($1, $2)",
+			query, o.limit).Scan(&raw)
 	}
 	if err != nil {
 		return nil, wrapErr("fts search", err)
