@@ -396,11 +396,63 @@ impl DiskEngine {
         };
 
         // ── WAL crash recovery ──────────────────────────────────────────
+        // Recovery MUST read the same storage the writer used: the segment
+        // directory when the (default) segmented WAL is on, the single file
+        // otherwise. It used to read only the single file unconditionally —
+        // segmented deployments replayed NOTHING after a crash and silently
+        // lost every commit since the last page flush.
         let wal_path = path.with_extension("wal");
+        let wal_dir = path.with_extension("wal.d");
+        // The next-LSN floor for the fresh backend: recovery disposes of the
+        // single-file WAL's content (truncate/rename), so the new backend
+        // must start above every LSN already stamped on data pages.
+        let mut lsn_floor: u64 = 0;
         if !is_new {
-            let recovered = Self::recover_from_wal(&wal_path, &mut disk, &mut initial_pages)?;
+            let single_file_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+            let mut records = wal::read_wal_records(&wal_path).unwrap_or_default();
+            if use_segmented_wal {
+                records.extend(wal::read_wal_dir_records(&wal_dir).unwrap_or_default());
+            }
+            // Apply strictly in LSN order so latest-per-page wins across the
+            // legacy single file and every segment.
+            records.sort_by_key(|r| r.lsn);
+            lsn_floor = records.last().map(|r| r.lsn).unwrap_or(0);
+            let recovered = Self::apply_wal_records(records, &mut disk, &mut initial_pages)?;
             if recovered > 0 {
                 tracing::info!("WAL recovery: replayed {recovered} page(s)");
+            }
+
+            if single_file_len > 0 {
+                // The single file's content is now applied (or unparseable —
+                // e.g. a pre-CRC-era legacy file, whose page-write records
+                // fail CRC with the record-length constant 0x401d read as the
+                // stored checksum). Either way it must not be re-parsed — and
+                // re-reported as corruption — on every subsequent boot.
+                //
+                // Its LSNs also vanish from the derivable history, so take
+                // the ground-truth floor from the data pages themselves.
+                // Full-file scan, but only at this rare hygiene moment (one
+                // time per legacy file / per single-file crash recovery).
+                lsn_floor = lsn_floor.max(Self::max_page_lsn(&mut disk, initial_pages));
+                if use_segmented_wal {
+                    let aside = path.with_extension("wal.legacy");
+                    match std::fs::rename(&wal_path, &aside) {
+                        Ok(()) => tracing::info!(
+                            "WAL recovery: legacy single-file WAL set aside as {}",
+                            aside.display()
+                        ),
+                        Err(e) => tracing::warn!(
+                            "WAL recovery: could not set aside legacy WAL {}: {e}",
+                            wal_path.display()
+                        ),
+                    }
+                } else if let Ok(file) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&wal_path)
+                {
+                    let _ = file.sync_all();
+                }
             }
         }
 
@@ -422,6 +474,9 @@ impl DiskEngine {
                     .map_err(|e| StorageError::Io(format!("WAL open failed: {e}")))?,
             )
         };
+        if lsn_floor > 0 {
+            wal_backend.bump_next_lsn(lsn_floor + 1);
+        }
 
         let pool = Arc::new(BufferPool::new(
             disk,
@@ -466,24 +521,19 @@ impl DiskEngine {
         Ok(engine)
     }
 
-    /// Replay WAL records to recover pages that may not have been flushed to the
-    /// data file before a crash.
+    /// Apply recovered WAL records (already merged and sorted by LSN) to pages
+    /// that may not have been flushed to the data file before a crash.
     ///
-    /// For each PAGE_WRITE record in the WAL, compares the WAL record's LSN with
-    /// the on-disk page's LSN. If the WAL record is newer, applies the page image
-    /// to the data file (with the correct LSN and checksum set).
+    /// For each PAGE_WRITE record, compares the record's LSN with the on-disk
+    /// page's LSN. If the record is newer, applies the page image to the data
+    /// file (with the correct LSN and checksum set).
     ///
     /// Returns the number of pages recovered.
-    fn recover_from_wal(
-        wal_path: &Path,
+    fn apply_wal_records(
+        records: Vec<wal::WalRecord>,
         disk: &mut DiskManager,
         initial_pages: &mut u32,
     ) -> Result<usize, StorageError> {
-        let records = match wal::read_wal_records(wal_path) {
-            Ok(r) => r,
-            Err(_) => return Ok(0), // No WAL or unreadable — nothing to recover
-        };
-
         if records.is_empty() {
             return Ok(0);
         }
@@ -529,16 +579,22 @@ impl DiskEngine {
             disk.sync().map_err(|e| StorageError::Io(e.to_string()))?;
         }
 
-        // Truncate the WAL after successful recovery
-        if let Ok(file) = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(wal_path)
-        {
-            let _ = file.sync_all();
-        }
-
         Ok(recovered)
+    }
+
+    /// Ground-truth LSN floor: the highest LSN stamped on any data page.
+    /// A full-file scan — used only at rare recovery-hygiene moments
+    /// (legacy-WAL migration, single-file truncation), never on a normal
+    /// boot, where the retained segments carry the LSN history.
+    fn max_page_lsn(disk: &mut DiskManager, pages: u32) -> u64 {
+        let mut max = 0u64;
+        let mut buf = [0u8; PAGE_SIZE];
+        for page_id in 0..pages {
+            if disk.read_page(page_id, &mut buf).is_ok() {
+                max = max.max(page::get_page_lsn(&buf));
+            }
+        }
+        max
     }
 
     /// Flush all dirty pages to disk, including the table directory.
@@ -877,8 +933,7 @@ impl DiskEngine {
                     col_names.push(format!("col{i}"));
                     continue;
                 }
-                let nlen =
-                    u16::from_le_bytes([dir_data[offset], dir_data[offset + 1]]) as usize;
+                let nlen = u16::from_le_bytes([dir_data[offset], dir_data[offset + 1]]) as usize;
                 offset += 2;
                 if nlen == 0 || offset + nlen > dir_data.len() {
                     col_names.push(format!("col{i}"));
@@ -1261,8 +1316,7 @@ impl StorageEngine for DiskEngine {
             .iter()
             .map(|c| c.data_type.clone())
             .collect();
-        let col_names: Vec<String> =
-            table_def.columns.iter().map(|c| c.name.clone()).collect();
+        let col_names: Vec<String> = table_def.columns.iter().map(|c| c.name.clone()).collect();
 
         let mut tables = self.tables.write();
         tables.insert(
@@ -4250,5 +4304,184 @@ mod tests {
         let scan_count = engine.scan("t").await.unwrap().len();
         let fast_count = engine.fast_count_all("t").unwrap();
         assert_eq!(scan_count, fast_count);
+    }
+}
+
+// ============================================================================
+// WAL crash-recovery regression tests (finding #32: recovery read the
+// single-file WAL while the default segmented backend wrote wal.d/ — crashes
+// silently lost everything since the last page flush)
+// ============================================================================
+
+#[cfg(test)]
+mod wal_recovery_tests {
+    use super::*;
+    use crate::catalog::Catalog;
+
+    /// A page image with a recognizable marker and a valid layout for the
+    /// recovery path (LSN + checksum get stamped by recovery itself).
+    fn marker_page(marker: u8) -> Box<PageBuf> {
+        let mut img = Box::new([0u8; PAGE_SIZE]);
+        img[PAGE_SIZE - 1] = marker;
+        img
+    }
+
+    /// THE wiring regression: a page-write record that exists only in the
+    /// segmented WAL directory must be applied when the engine reopens.
+    /// Before the fix, recovery read only `test.wal` (which the segmented
+    /// writer never touches) and replayed nothing.
+    #[tokio::test]
+    async fn open_segmented_replays_segment_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+
+        // Create + cleanly close a segmented engine so data file and wal.d exist.
+        {
+            let catalog = Arc::new(Catalog::new());
+            let engine = DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap();
+            drop(engine);
+        }
+
+        // Simulate a crash-era WAL record the data file never received: log a
+        // page image for a page BEYOND the current file end, then drop the
+        // writer without touching the data file.
+        let target_page: u32;
+        {
+            let wal_dir = db_path.with_extension("wal.d");
+            let seg = wal::SegmentedWal::open(&wal_dir, 1024 * 1024).unwrap();
+            target_page = 7;
+            seg.log_page_write(0, target_page, &marker_page(0xAB))
+                .unwrap();
+            seg.sync().unwrap();
+        }
+
+        // Reopen: recovery must find the record in wal.d and apply it.
+        let catalog = Arc::new(Catalog::new());
+        let engine = DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap();
+        let pool = engine.buffer_pool();
+        let frame = pool.fetch_page(target_page).unwrap();
+        let data = pool.frame_data(frame);
+        let marker = data[PAGE_SIZE - 1];
+        pool.unpin(frame);
+        assert_eq!(
+            marker, 0xAB,
+            "page-write record in the segmented WAL was not replayed on reopen"
+        );
+    }
+
+    /// A stale/garbled legacy single-file WAL next to a segmented deployment
+    /// must be set aside after one recovery pass — not re-parsed (and
+    /// re-reported as corruption) on every boot, which is exactly what prod
+    /// data dirs were doing with pre-CRC-era files (the 0x401d spam).
+    #[tokio::test]
+    async fn legacy_single_file_wal_is_set_aside_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        {
+            let catalog = Arc::new(Catalog::new());
+            let engine = DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap();
+            drop(engine);
+        }
+
+        // Plant a garbage legacy WAL (unparseable under the current layout).
+        let legacy = db_path.with_extension("wal");
+        std::fs::write(&legacy, vec![0x1D, 0x40, 0x00, 0x00, 0xFF, 0xEE, 0xDD]).unwrap();
+
+        {
+            let catalog = Arc::new(Catalog::new());
+            let engine = DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap();
+            drop(engine);
+        }
+        assert!(
+            !legacy.exists(),
+            "legacy WAL must be renamed aside after recovery"
+        );
+        assert!(
+            db_path.with_extension("wal.legacy").exists(),
+            "legacy WAL should be preserved under .wal.legacy for forensics"
+        );
+
+        // And the next boot must not trip over it again.
+        let catalog = Arc::new(Catalog::new());
+        let engine = DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap();
+        drop(engine);
+        assert!(!legacy.exists());
+    }
+
+    /// Single-file mode: a WAL whose content is entirely unparseable used to
+    /// dodge truncation (the empty-records early return) and spam corruption
+    /// errors forever. It must be truncated after the recovery pass.
+    #[tokio::test]
+    async fn garbled_single_file_wal_is_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        {
+            let engine = DiskEngine::open(&db_path, Arc::new(Catalog::new())).unwrap();
+            drop(engine);
+        }
+
+        let wal_path = db_path.with_extension("wal");
+        std::fs::write(&wal_path, vec![0xAA; 64]).unwrap();
+
+        let engine = DiskEngine::open(&db_path, Arc::new(Catalog::new())).unwrap();
+        drop(engine);
+        // The file may legitimately hold NEW records written after recovery
+        // (clean shutdown flushes log pages) — what must be gone is the
+        // planted garbage, which previously dodged truncation forever via
+        // the empty-records early return.
+        let bytes = std::fs::read(&wal_path).unwrap_or_default();
+        assert!(
+            !bytes.starts_with(&[0xAA, 0xAA, 0xAA, 0xAA]),
+            "garbled prefix survived recovery — WAL was not truncated"
+        );
+    }
+
+    /// After recovery disposes of WAL content, the fresh backend must mint
+    /// LSNs ABOVE everything already applied — otherwise the next recovery's
+    /// page-vs-record LSN comparison silently discards the new records.
+    #[tokio::test]
+    async fn recovered_lsns_floor_the_fresh_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        {
+            let catalog = Arc::new(Catalog::new());
+            let engine = DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap();
+            drop(engine);
+        }
+
+        // Craft a segment record with a high LSN by bumping the writer first.
+        {
+            let wal_dir = db_path.with_extension("wal.d");
+            let seg = wal::SegmentedWal::open(&wal_dir, 1024 * 1024).unwrap();
+            wal::WalBackend::bump_next_lsn(&seg, 5_000);
+            seg.log_page_write(0, 9, &marker_page(0x77)).unwrap();
+            seg.sync().unwrap();
+        }
+
+        // Reopen (recovery applies LSN 5000 to page 9), then write a fresh
+        // page through the engine's WAL and confirm its LSN lands above.
+        let catalog = Arc::new(Catalog::new());
+        let engine = DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap();
+        let pool = engine.buffer_pool();
+        let frame = pool.fetch_page(9).unwrap();
+        let data = pool.frame_data(frame);
+        let recovered_lsn = page::get_page_lsn(data);
+        pool.unpin(frame);
+        assert_eq!(recovered_lsn, 5_000, "recovery must stamp the record LSN");
+
+        // New WAL traffic must mint LSNs above the recovered floor: dirty a
+        // page and flush it, which logs a page-write record with a fresh LSN.
+        let frame = pool.fetch_page(0).unwrap();
+        pool.mark_dirty(frame);
+        pool.unpin(frame);
+        pool.flush_page(0).unwrap();
+        drop(engine);
+        let wal_dir = db_path.with_extension("wal.d");
+        let records = wal::read_wal_dir_records(&wal_dir).unwrap();
+        let max_new = records.iter().map(|r| r.lsn).max().unwrap_or(0);
+        assert!(
+            max_new > 5_000,
+            "fresh backend minted LSN {max_new} at/below the recovered floor 5000"
+        );
     }
 }
