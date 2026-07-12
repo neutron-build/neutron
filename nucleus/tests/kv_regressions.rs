@@ -67,8 +67,17 @@ async fn lrange_stop_underflow_is_empty() {
     one(&ex, "SELECT KV_RPUSH('l','a')").await.unwrap();
     one(&ex, "SELECT KV_RPUSH('l','b')").await.unwrap(); // l = [a,b]
     // KV collections speak JSON on the wire since b9d0bf6 (comma-corruption fix).
-    assert_eq!(one(&ex, "SELECT KV_LRANGE('l',0,-1)").await.unwrap(), r#"["a","b"]"#);
-    assert_eq!(one(&ex, "SELECT KV_LRANGE('l',0,-2)").await.unwrap(), r#"["a"]"#);
+    assert_eq!(
+        one(&ex, "SELECT KV_LRANGE('l',0,-1)").await.unwrap(),
+        r#"["a","b"]"#
+    );
+    assert_eq!(
+        one(&ex, "SELECT KV_LRANGE('l',0,-2)").await.unwrap(),
+        r#"["a"]"#
+    );
     assert_eq!(one(&ex, "SELECT KV_LRANGE('l',0,-3)").await.unwrap(), "[]"); // empty
-    assert_eq!(one(&ex, "SELECT KV_LRANGE('l',-100,1)").await.unwrap(), r#"["a","b"]"#); // start clamps
+    assert_eq!(
+        one(&ex, "SELECT KV_LRANGE('l',-100,1)").await.unwrap(),
+        r#"["a","b"]"#
+    ); // start clamps
 }

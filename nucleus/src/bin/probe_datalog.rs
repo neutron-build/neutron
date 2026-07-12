@@ -313,11 +313,9 @@ fn main_impl() {
             if !rules_added && rng.below(6) == 0 {
                 rules_added = true;
                 // Rule 1: path(X,Y) :- edge(X,Y).
-                let sql1 =
-                    "SELECT DATALOG_RULE('path(X,Y) :- edge(X,Y)')".to_string();
+                let sql1 = "SELECT DATALOG_RULE('path(X,Y) :- edge(X,Y)')".to_string();
                 // Rule 2: path(X,Z) :- edge(X,Y), path(Y,Z).
-                let sql2 =
-                    "SELECT DATALOG_RULE('path(X,Z) :- edge(X,Y), path(Y,Z)')".to_string();
+                let sql2 = "SELECT DATALOG_RULE('path(X,Z) :- edge(X,Y), path(Y,Z)')".to_string();
                 let r1 = exec(&ex, &sql1);
                 let r2 = exec(&ex, &sql2);
                 log.push(sql1.clone());

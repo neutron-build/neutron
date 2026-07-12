@@ -243,12 +243,18 @@ impl MvccTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MvccError {
     TableNotFound(String),
-    WriteConflict { table: String, row_idx: usize },
+    WriteConflict {
+        table: String,
+        row_idx: usize,
+    },
     NoActiveTransaction,
     /// A PRIMARY KEY / UNIQUE constraint would be violated — atomically detected
     /// at insert time against committed-live rows AND concurrent uncommitted
     /// inserts (so two racing transactions can't both insert the same key).
-    UniqueViolation { table: String, key: String },
+    UniqueViolation {
+        table: String,
+        key: String,
+    },
 }
 
 impl std::fmt::Display for MvccError {
@@ -267,7 +273,10 @@ impl std::fmt::Display for MvccError {
             }
             Self::NoActiveTransaction => write!(f, "no active transaction"),
             Self::UniqueViolation { table, key } => {
-                write!(f, "duplicate key value violates unique constraint on {table} ({key})")
+                write!(
+                    f,
+                    "duplicate key value violates unique constraint on {table} ({key})"
+                )
             }
         }
     }
@@ -435,9 +444,10 @@ impl MvccMemoryEngine {
                 continue;
             }
             // key match?
-            let matches = cols.iter().enumerate().all(|(i, &c)| {
-                r.data.get(c).is_some_and(|v| value_eq_coerced(v, &key[i]))
-            });
+            let matches = cols
+                .iter()
+                .enumerate()
+                .all(|(i, &c)| r.data.get(c).is_some_and(|v| value_eq_coerced(v, &key[i])));
             if matches {
                 return true;
             }
@@ -504,7 +514,8 @@ impl MvccMemoryEngine {
                     key: format!("{key:?}"),
                 });
             }
-            if self.has_committed_live_key(&tbl, &unique_col_sets[*cid], key, Some(old_version_idx)) {
+            if self.has_committed_live_key(&tbl, &unique_col_sets[*cid], key, Some(old_version_idx))
+            {
                 return Err(MvccError::UniqueViolation {
                     table: table.to_string(),
                     key: format!("{key:?}"),
@@ -1535,8 +1546,10 @@ impl StorageEngine for MvccStorageAdapter {
             let indices: Vec<usize> = results.iter().map(|(idx, _)| *idx).collect();
             self.maybe_record_siread(_txn_id, table, &indices);
         }
-        let out: Vec<(usize, Row)> =
-            results.into_iter().map(|(idx, r)| (idx, (*r).clone())).collect();
+        let out: Vec<(usize, Row)> = results
+            .into_iter()
+            .map(|(idx, r)| (idx, (*r).clone()))
+            .collect();
         if auto {
             self.auto_commit(_txn_id);
         }
@@ -2064,7 +2077,8 @@ impl StorageEngine for MvccStorageAdapter {
         updates: &[(usize, Row)],
         unique_col_sets: &[Vec<usize>],
     ) -> Result<usize, StorageError> {
-        self.update_impl(table, updates, Some(unique_col_sets)).await
+        self.update_impl(table, updates, Some(unique_col_sets))
+            .await
     }
     // -- Transaction lifecycle --
 
@@ -4373,10 +4387,13 @@ impl MvccStorageAdapter {
                 continue;
             };
             let new_vidx = match unique {
-                Some(sets) => self
+                Some(sets) => {
+                    self.engine
+                        .update_unique(table, txn_id, *version_idx, new_row.clone(), sets)
+                }
+                None => self
                     .engine
-                    .update_unique(table, txn_id, *version_idx, new_row.clone(), sets),
-                None => self.engine.update(table, *version_idx, txn_id, new_row.clone()),
+                    .update(table, *version_idx, txn_id, new_row.clone()),
             }
             .map_err(|e| match e {
                 MvccError::WriteConflict { table, row_idx } => {

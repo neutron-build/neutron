@@ -32,11 +32,18 @@ async fn rows(ex: &Executor, s: u64, sql: &str) -> Vec<(i32, i32)> {
 
 #[tokio::test]
 async fn order_by_ordinal_and_expr_sort_in_plan_path() {
-    let ex = Executor::new(Arc::new(Catalog::new()), Arc::new(MvccStorageAdapter::new()));
+    let ex = Executor::new(
+        Arc::new(Catalog::new()),
+        Arc::new(MvccStorageAdapter::new()),
+    );
     let s = ex.create_session();
-    ex.execute_with_session(s, "CREATE TABLE t (a INTEGER, b INTEGER)").await.unwrap();
+    ex.execute_with_session(s, "CREATE TABLE t (a INTEGER, b INTEGER)")
+        .await
+        .unwrap();
     // Insertion order is deliberately none of the sorted orders.
-    ex.execute_with_session(s, "INSERT INTO t (a,b) VALUES (3,1),(1,2),(2,0)").await.unwrap();
+    ex.execute_with_session(s, "INSERT INTO t (a,b) VALUES (3,1),(1,2),(2,0)")
+        .await
+        .unwrap();
 
     // ORDER BY 1 ≡ ORDER BY a.
     assert_eq!(

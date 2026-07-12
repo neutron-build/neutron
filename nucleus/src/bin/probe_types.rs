@@ -39,7 +39,9 @@ impl Rng {
         self.0
     }
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { return 0; }
+        if n == 0 {
+            return 0;
+        }
         (self.next() % n as u64) as usize
     }
     fn int(&mut self, lo: i64, hi: i64) -> i64 {
@@ -117,7 +119,11 @@ fn canon_nucleus_val(v: &Value) -> String {
         Value::Text(s) => s.clone(),
         Value::Numeric(s) => {
             // Try to parse as f64 for comparison
-            if let Ok(f) = s.parse::<f64>() { canon_f64(f) } else { s.clone() }
+            if let Ok(f) = s.parse::<f64>() {
+                canon_f64(f)
+            } else {
+                s.clone()
+            }
         }
         Value::Date(d) => {
             let (y, m, day) = nucleus::types::days_to_ymd(*d);
@@ -141,8 +147,7 @@ fn canon_sqlite_val(v: &rusqlite::types::Value) -> String {
 fn run_sqlite_scalar(conn: &Connection, sql: &str) -> Result<String, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-    let row = rows.next().map_err(|e| e.to_string())?
-        .ok_or("no row")?;
+    let row = rows.next().map_err(|e| e.to_string())?.ok_or("no row")?;
     let v: rusqlite::types::Value = row.get(0).map_err(|e| e.to_string())?;
     Ok(canon_sqlite_val(&v))
 }
@@ -150,22 +155,29 @@ fn run_sqlite_scalar(conn: &Connection, sql: &str) -> Result<String, String> {
 fn run_sqlite_rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     let ncols = stmt.column_count();
-    let rows_iter = stmt.query_map([], |row| {
-        let mut cells = Vec::with_capacity(ncols);
-        for i in 0..ncols {
-            let v: rusqlite::types::Value = row.get(i)?;
-            cells.push(canon_sqlite_val(&v));
-        }
-        Ok(cells)
-    }).map_err(|e| e.to_string())?;
+    let rows_iter = stmt
+        .query_map([], |row| {
+            let mut cells = Vec::with_capacity(ncols);
+            for i in 0..ncols {
+                let v: rusqlite::types::Value = row.get(i)?;
+                cells.push(canon_sqlite_val(&v));
+            }
+            Ok(cells)
+        })
+        .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    for r in rows_iter { out.push(r.map_err(|e| e.to_string())?); }
+    for r in rows_iter {
+        out.push(r.map_err(|e| e.to_string())?);
+    }
     Ok(out)
 }
 
 fn run_nucleus_rows_canon(ex: &Executor, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let rows = run_nucleus(ex, sql)?;
-    Ok(rows.iter().map(|r| r.iter().map(canon_nucleus_val).collect()).collect())
+    Ok(rows
+        .iter()
+        .map(|r| r.iter().map(canon_nucleus_val).collect())
+        .collect())
 }
 
 // ─── Fresh Nucleus executor ───────────────────────────────────────────────────
@@ -183,7 +195,8 @@ fn test_boolean(rng: &mut Rng, findings: &mut Vec<Finding>) {
     let ex = fresh_executor();
     let conn = Connection::open_in_memory().unwrap();
 
-    let ddl = "CREATE TABLE bools (id INTEGER PRIMARY KEY, flag BOOLEAN NOT NULL, val INTEGER NOT NULL)";
+    let ddl =
+        "CREATE TABLE bools (id INTEGER PRIMARY KEY, flag BOOLEAN NOT NULL, val INTEGER NOT NULL)";
     exec_nucleus(&ex, ddl).expect("BOOL DDL failed");
     conn.execute_batch(ddl).expect("SQLite BOOL DDL");
 
@@ -373,9 +386,18 @@ fn test_date(rng: &mut Rng, findings: &mut Vec<Finding>) {
 
     // Fixed pool of known-good dates (avoid edge cases like Feb-29 for simplicity)
     let date_pool: &[&str] = &[
-        "2020-01-15", "2021-06-30", "2022-12-01", "2023-03-15",
-        "2024-07-04", "2019-11-11", "2018-02-28", "2025-09-01",
-        "2000-01-01", "1999-12-31", "2010-05-20", "2015-08-08",
+        "2020-01-15",
+        "2021-06-30",
+        "2022-12-01",
+        "2023-03-15",
+        "2024-07-04",
+        "2019-11-11",
+        "2018-02-28",
+        "2025-09-01",
+        "2000-01-01",
+        "1999-12-31",
+        "2010-05-20",
+        "2015-08-08",
     ];
 
     let n = 8 + rng.below(4);
@@ -586,7 +608,10 @@ fn test_jsonb(rng: &mut Rng, findings: &mut Vec<Finding>) {
     // ── 4c: JSONB_BUILD_ARRAY length check ──
     let n_elems = 2 + rng.below(5);
     let elems: Vec<String> = (0..n_elems).map(|i| rng.int(0, 99).to_string()).collect();
-    let arr_sql = format!("SELECT JSONB_ARRAY_LENGTH(JSONB_BUILD_ARRAY({}))", elems.join(", "));
+    let arr_sql = format!(
+        "SELECT JSONB_ARRAY_LENGTH(JSONB_BUILD_ARRAY({}))",
+        elems.join(", ")
+    );
     match nucleus_scalar(&ex, &arr_sql) {
         Ok(v) => {
             let got = match &v {
@@ -828,7 +853,9 @@ fn test_array(rng: &mut Rng, findings: &mut Vec<Finding>) {
             match run_nucleus(&ex, q) {
                 Ok(rows) => {
                     for (i, row) in rows.iter().enumerate() {
-                        if i >= expected_lens.len() { break; }
+                        if i >= expected_lens.len() {
+                            break;
+                        }
                         let got = match row.get(1) {
                             Some(Value::Int32(n)) => *n as usize,
                             Some(Value::Int64(n)) => *n as usize,
@@ -936,7 +963,9 @@ fn test_uuid(rng: &mut Rng, findings: &mut Vec<Finding>) {
             match run_nucleus(&ex, "SELECT id, uid FROM uuids ORDER BY id") {
                 Ok(rows) => {
                     for (i, row) in rows.iter().enumerate() {
-                        if i >= known_uuids.len() { break; }
+                        if i >= known_uuids.len() {
+                            break;
+                        }
                         let got = row.get(1).map(|v| format!("{v}")).unwrap_or_default();
                         // Compare case-insensitive
                         if got.to_lowercase() != known_uuids[i].to_lowercase() {
@@ -978,15 +1007,31 @@ fn test_uuid(rng: &mut Rng, findings: &mut Vec<Finding>) {
 fn is_valid_uuidv4(s: &str) -> bool {
     // Format: 8-4-4-4-12
     let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 5 { return false; }
-    if parts[0].len() != 8 { return false; }
-    if parts[1].len() != 4 { return false; }
-    if parts[2].len() != 4 { return false; }
-    if parts[3].len() != 4 { return false; }
-    if parts[4].len() != 12 { return false; }
-    if !s.chars().all(|c| c.is_ascii_hexdigit() || c == '-') { return false; }
+    if parts.len() != 5 {
+        return false;
+    }
+    if parts[0].len() != 8 {
+        return false;
+    }
+    if parts[1].len() != 4 {
+        return false;
+    }
+    if parts[2].len() != 4 {
+        return false;
+    }
+    if parts[3].len() != 4 {
+        return false;
+    }
+    if parts[4].len() != 12 {
+        return false;
+    }
+    if !s.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return false;
+    }
     // Version nibble = '4'
-    if parts[2].chars().next() != Some('4') { return false; }
+    if parts[2].chars().next() != Some('4') {
+        return false;
+    }
     // Variant nibble: first char of parts[3] must be 8, 9, a, or b
     let variant = parts[3].chars().next().unwrap_or('x');
     matches!(variant, '8' | '9' | 'a' | 'b' | 'A' | 'B')
@@ -1000,15 +1045,16 @@ fn test_bytea(rng: &mut Rng, findings: &mut Vec<Finding>) {
     let ex = fresh_executor();
 
     // Generate random ASCII strings and verify ENCODE/DECODE are inverse
-    let words: &[&str] = &["hello", "world", "nucleus", "test", "abc", "xyz123", "foobar"];
+    let words: &[&str] = &[
+        "hello", "world", "nucleus", "test", "abc", "xyz123", "foobar",
+    ];
 
     for _ in 0..15 {
         let word = *rng.pick(words);
         for encoding in &["hex", "base64"] {
             // DECODE(ENCODE(word, encoding), encoding) == word
-            let round_trip_sql = format!(
-                "SELECT DECODE(ENCODE('{word}', '{encoding}'), '{encoding}')"
-            );
+            let round_trip_sql =
+                format!("SELECT DECODE(ENCODE('{word}', '{encoding}'), '{encoding}')");
             match nucleus_scalar(&ex, &round_trip_sql) {
                 Ok(v) => {
                     let got = match &v {
@@ -1115,9 +1161,18 @@ fn main_impl() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed"       => { i += 1; seed       = args[i].parse().unwrap(); }
-            "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
-            "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
+            "--seed" => {
+                i += 1;
+                seed = args[i].parse().unwrap();
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args[i].parse().unwrap();
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = args[i].parse().unwrap();
+            }
             _ => {}
         }
         i += 1;
@@ -1137,13 +1192,13 @@ fn main_impl() {
         // Each section is wrapped in catch_unwind so a panic in one section
         // doesn't abort the whole iteration.
         let sections: &[(&str, fn(&mut Rng, &mut Vec<Finding>))] = &[
-            ("BOOLEAN",  test_boolean),
-            ("NUMERIC",  test_numeric_round),
-            ("DATE",     test_date),
-            ("JSONB",    test_jsonb),
-            ("ARRAY",    test_array),
-            ("UUID",     test_uuid),
-            ("BYTEA",    test_bytea),
+            ("BOOLEAN", test_boolean),
+            ("NUMERIC", test_numeric_round),
+            ("DATE", test_date),
+            ("JSONB", test_jsonb),
+            ("ARRAY", test_array),
+            ("UUID", test_uuid),
+            ("BYTEA", test_bytea),
         ];
 
         for (name, test_fn) in sections {
@@ -1156,7 +1211,9 @@ fn main_impl() {
                 Err(p) => {
                     panics += 1;
                     if panics <= max_report {
-                        let msg = p.downcast_ref::<&str>().map(|s| s.to_string())
+                        let msg = p
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
                             .or_else(|| p.downcast_ref::<String>().cloned())
                             .unwrap_or_else(|| "unknown".into());
                         println!("─── PANIC in {name} section (iter {iter}) ───");
@@ -1181,10 +1238,15 @@ fn main_impl() {
             println!();
             shown += 1;
         }
-        if f.real_bug { real_bugs += 1; }
+        if f.real_bug {
+            real_bugs += 1;
+        }
     }
     if all_findings.len() > max_report {
-        println!("  ... {} more findings omitted", all_findings.len() - max_report);
+        println!(
+            "  ... {} more findings omitted",
+            all_findings.len() - max_report
+        );
     }
 
     println!("\n════ SUMMARY ════");

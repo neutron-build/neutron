@@ -35,16 +35,33 @@ async fn ids(ex: &Executor, sql: &str) -> Vec<i32> {
 #[tokio::test]
 async fn zone_map_survivor_not_pruned_after_delete_insert() {
     let ex = fresh().await;
-    ex.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c5 INTEGER)").await.unwrap();
-    ex.execute("INSERT INTO t (id,c5) VALUES (15,-3)").await.unwrap();
-    ex.execute("INSERT INTO t (id,c5) VALUES (16,17)").await.unwrap();
+    ex.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c5 INTEGER)")
+        .await
+        .unwrap();
+    ex.execute("INSERT INTO t (id,c5) VALUES (15,-3)")
+        .await
+        .unwrap();
+    ex.execute("INSERT INTO t (id,c5) VALUES (16,17)")
+        .await
+        .unwrap();
     ex.execute("DELETE FROM t WHERE id = 16").await.unwrap();
-    ex.execute("INSERT INTO t (id,c5) VALUES (17,NULL)").await.unwrap();
+    ex.execute("INSERT INTO t (id,c5) VALUES (17,NULL)")
+        .await
+        .unwrap();
 
     // id15 (c5=-3) matches; id17 (c5=NULL) does not.
-    assert_eq!(ids(&ex, "SELECT id FROM t WHERE c5 < 16 ORDER BY id").await, vec![15]);
-    assert_eq!(ids(&ex, "SELECT id FROM t WHERE c5 IS NOT NULL ORDER BY id").await, vec![15]);
-    assert_eq!(ids(&ex, "SELECT id FROM t WHERE c5 > -100 ORDER BY id").await, vec![15]);
+    assert_eq!(
+        ids(&ex, "SELECT id FROM t WHERE c5 < 16 ORDER BY id").await,
+        vec![15]
+    );
+    assert_eq!(
+        ids(&ex, "SELECT id FROM t WHERE c5 IS NOT NULL ORDER BY id").await,
+        vec![15]
+    );
+    assert_eq!(
+        ids(&ex, "SELECT id FROM t WHERE c5 > -100 ORDER BY id").await,
+        vec![15]
+    );
 }
 
 /// Same defect, multi-column / UPDATE variant: every range filter on a nullable
@@ -54,16 +71,37 @@ async fn zone_map_nullable_columns_after_mutations() {
     let ex = fresh().await;
     ex.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER NOT NULL, c2 TEXT NOT NULL, c3 REAL, c4 INTEGER NOT NULL, c5 INTEGER, c6 INTEGER, c7 TEXT NOT NULL)").await.unwrap();
     ex.execute("INSERT INTO t (id,c1,c2,c3,c4,c5,c6,c7) VALUES (15,13,'red',4.5,0,-3,-4,'red'),(16,16,'str3',-2.6,18,17,15,'amber')").await.unwrap();
-    ex.execute("DELETE FROM t WHERE c2 >= 'str2'").await.unwrap();
-    ex.execute("INSERT INTO t (id,c1,c2,c3,c4,c5,c6,c7) VALUES (17,-1,'amber',NULL,20,NULL,NULL,'amber')").await.unwrap();
+    ex.execute("DELETE FROM t WHERE c2 >= 'str2'")
+        .await
+        .unwrap();
+    ex.execute(
+        "INSERT INTO t (id,c1,c2,c3,c4,c5,c6,c7) VALUES (17,-1,'amber',NULL,20,NULL,NULL,'amber')",
+    )
+    .await
+    .unwrap();
 
     // Nullable columns c3/c5/c6: id15 has a value, id17 is NULL.
-    assert_eq!(ids(&ex, "SELECT id FROM t WHERE c5 < 99 ORDER BY id").await, vec![15]);
-    assert_eq!(ids(&ex, "SELECT id FROM t WHERE c6 < 99 ORDER BY id").await, vec![15]);
-    assert_eq!(ids(&ex, "SELECT id FROM t WHERE c3 < 99 ORDER BY id").await, vec![15]);
+    assert_eq!(
+        ids(&ex, "SELECT id FROM t WHERE c5 < 99 ORDER BY id").await,
+        vec![15]
+    );
+    assert_eq!(
+        ids(&ex, "SELECT id FROM t WHERE c6 < 99 ORDER BY id").await,
+        vec![15]
+    );
+    assert_eq!(
+        ids(&ex, "SELECT id FROM t WHERE c3 < 99 ORDER BY id").await,
+        vec![15]
+    );
     // NOT NULL columns stay correct too.
-    assert_eq!(ids(&ex, "SELECT id FROM t WHERE c1 < 99 ORDER BY id").await, vec![15, 17]);
-    assert_eq!(ids(&ex, "SELECT id FROM t WHERE c4 < 99 ORDER BY id").await, vec![15, 17]);
+    assert_eq!(
+        ids(&ex, "SELECT id FROM t WHERE c1 < 99 ORDER BY id").await,
+        vec![15, 17]
+    );
+    assert_eq!(
+        ids(&ex, "SELECT id FROM t WHERE c4 < 99 ORDER BY id").await,
+        vec![15, 17]
+    );
 }
 
 /// `x NOT IN (<empty subquery>)` must be TRUE for every row, including NULLs:
@@ -72,17 +110,29 @@ async fn zone_map_nullable_columns_after_mutations() {
 #[tokio::test]
 async fn not_in_empty_subquery_includes_null_rows() {
     let ex = fresh().await;
-    ex.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c4 INTEGER)").await.unwrap();
-    ex.execute("INSERT INTO t (id,c4) VALUES (1,5),(2,NULL),(3,7),(4,NULL)").await.unwrap();
+    ex.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c4 INTEGER)")
+        .await
+        .unwrap();
+    ex.execute("INSERT INTO t (id,c4) VALUES (1,5),(2,NULL),(3,7),(4,NULL)")
+        .await
+        .unwrap();
 
     // Inner subquery (c4 = 18) is empty → NOT IN is TRUE for all 4 rows.
     assert_eq!(
-        ids(&ex, "SELECT id FROM t WHERE c4 NOT IN (SELECT c4 FROM t WHERE c4 = 18) ORDER BY id").await,
+        ids(
+            &ex,
+            "SELECT id FROM t WHERE c4 NOT IN (SELECT c4 FROM t WHERE c4 = 18) ORDER BY id"
+        )
+        .await,
         vec![1, 2, 3, 4]
     );
     // IN over the empty set is FALSE for all rows (including NULLs).
     assert_eq!(
-        ids(&ex, "SELECT id FROM t WHERE c4 IN (SELECT c4 FROM t WHERE c4 = 18) ORDER BY id").await,
+        ids(
+            &ex,
+            "SELECT id FROM t WHERE c4 IN (SELECT c4 FROM t WHERE c4 = 18) ORDER BY id"
+        )
+        .await,
         Vec::<i32>::new()
     );
 }
@@ -94,14 +144,33 @@ async fn not_in_empty_subquery_includes_null_rows() {
 #[tokio::test]
 async fn int_column_vs_fractional_float_bound() {
     let ex = fresh().await;
-    ex.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER NOT NULL)").await.unwrap();
-    ex.execute("INSERT INTO t (id,c1) VALUES (1,0),(2,-2),(3,-3)").await.unwrap();
+    ex.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER NOT NULL)")
+        .await
+        .unwrap();
+    ex.execute("INSERT INTO t (id,c1) VALUES (1,0),(2,-2),(3,-3)")
+        .await
+        .unwrap();
 
-    assert_eq!(ids(&ex, "SELECT id FROM t WHERE c1 > -2.333 ORDER BY id").await, vec![1, 2]);
-    assert_eq!(ids(&ex, "SELECT id FROM t WHERE -2.333 < c1 ORDER BY id").await, vec![1, 2]);
-    assert_eq!(ids(&ex, "SELECT id FROM t WHERE c1 < -2.333 ORDER BY id").await, vec![3]);
-    assert_eq!(ids(&ex, "SELECT id FROM t WHERE c1 = 2.5 ORDER BY id").await, Vec::<i32>::new());
-    assert_eq!(ids(&ex, "SELECT id FROM t WHERE c1 <> 2.5 ORDER BY id").await, vec![1, 2, 3]);
+    assert_eq!(
+        ids(&ex, "SELECT id FROM t WHERE c1 > -2.333 ORDER BY id").await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        ids(&ex, "SELECT id FROM t WHERE -2.333 < c1 ORDER BY id").await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        ids(&ex, "SELECT id FROM t WHERE c1 < -2.333 ORDER BY id").await,
+        vec![3]
+    );
+    assert_eq!(
+        ids(&ex, "SELECT id FROM t WHERE c1 = 2.5 ORDER BY id").await,
+        Vec::<i32>::new()
+    );
+    assert_eq!(
+        ids(&ex, "SELECT id FROM t WHERE c1 <> 2.5 ORDER BY id").await,
+        vec![1, 2, 3]
+    );
 }
 
 /// The same fractional-bound bug as observed through a scalar AVG subquery:
@@ -109,10 +178,16 @@ async fn int_column_vs_fractional_float_bound() {
 #[tokio::test]
 async fn gt_avg_scalar_subquery() {
     let ex = fresh().await;
-    ex.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER NOT NULL)").await.unwrap();
+    ex.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER NOT NULL)")
+        .await
+        .unwrap();
     ex.execute("INSERT INTO t (id,c1) VALUES (1,0),(2,-2),(5,-2),(6,-2),(8,-2),(11,-2),(12,-2),(13,-5),(15,-4),(16,-2),(17,-2),(20,-3)").await.unwrap();
     assert_eq!(
-        ids(&ex, "SELECT id FROM t WHERE c1 > (SELECT AVG(c1) FROM t) ORDER BY id").await,
+        ids(
+            &ex,
+            "SELECT id FROM t WHERE c1 > (SELECT AVG(c1) FROM t) ORDER BY id"
+        )
+        .await,
         vec![1, 2, 5, 6, 8, 11, 12, 16, 17]
     );
 }

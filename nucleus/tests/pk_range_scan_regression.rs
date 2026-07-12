@@ -49,9 +49,12 @@ async fn seeded() -> (Arc<Executor>, Arc<MetricsRegistry>) {
         let values: Vec<String> = (inserted..end)
             .map(|i| format!("({}, {})", i as i64, (i as i64) * 7 % 1000))
             .collect();
-        ex.execute(&format!("INSERT INTO eff_test VALUES {}", values.join(", ")))
-            .await
-            .unwrap();
+        ex.execute(&format!(
+            "INSERT INTO eff_test VALUES {}",
+            values.join(", ")
+        ))
+        .await
+        .unwrap();
         inserted = end;
     }
     (ex, metrics)

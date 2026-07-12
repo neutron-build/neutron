@@ -300,11 +300,7 @@ fn parse_path(s: &str) -> Option<Vec<u64>> {
         .split(',')
         .filter_map(|tok| tok.trim().parse::<u64>().ok())
         .collect();
-    if ids.is_empty() {
-        None
-    } else {
-        Some(ids)
-    }
+    if ids.is_empty() { None } else { Some(ids) }
 }
 
 // ─── Operation model ──────────────────────────────────────────────────────────
@@ -576,7 +572,12 @@ fn main_impl() {
                         }
                         (Err(()), false) => {
                             if expected {
-                                report_div!("DeleteNode returned Err, expected true", &sql, true, "Err");
+                                report_div!(
+                                    "DeleteNode returned Err, expected true",
+                                    &sql,
+                                    true,
+                                    "Err"
+                                );
                             }
                         }
                     }
@@ -598,14 +599,18 @@ fn main_impl() {
                         }
                         (Err(()), false) => {
                             if expected {
-                                report_div!("DeleteEdge returned Err, expected true", &sql, true, "Err");
+                                report_div!(
+                                    "DeleteEdge returned Err, expected true",
+                                    &sql,
+                                    true,
+                                    "Err"
+                                );
                             }
                         }
                     }
                 }
 
                 // ── Algorithm checks ──────────────────────────────────────────
-
                 Op::NeighborsIn(id) => {
                     let sql = format!("SELECT GRAPH_NEIGHBORS({id},'in')");
                     log.push(sql.clone());
@@ -885,7 +890,9 @@ fn main_impl() {
                                 (Some(_), false) => {
                                     // Nucleus claims reachable but oracle disagrees.
                                     report_div!(
-                                        format!("PathValid: Nucleus gave path but oracle says unreachable from={from} to={to}"),
+                                        format!(
+                                            "PathValid: Nucleus gave path but oracle says unreachable from={from} to={to}"
+                                        ),
                                         &sql,
                                         "NULL",
                                         s
@@ -894,7 +901,9 @@ fn main_impl() {
                                 (None, true) => {
                                     // Nucleus says unreachable but oracle found a path.
                                     report_div!(
-                                        format!("PathValid: Nucleus returned NULL but oracle says reachable from={from} to={to}"),
+                                        format!(
+                                            "PathValid: Nucleus returned NULL but oracle says reachable from={from} to={to}"
+                                        ),
                                         &sql,
                                         "Some(path)",
                                         "NULL"
@@ -905,7 +914,10 @@ fn main_impl() {
                                     // (c) Endpoints.
                                     if p.first() != Some(from) {
                                         report_div!(
-                                            format!("PathValid: path starts at {:?} not from={from}", p.first()),
+                                            format!(
+                                                "PathValid: path starts at {:?} not from={from}",
+                                                p.first()
+                                            ),
                                             &sql,
                                             from,
                                             p.first().copied().unwrap_or(0)
@@ -913,7 +925,10 @@ fn main_impl() {
                                     }
                                     if p.last() != Some(to) {
                                         report_div!(
-                                            format!("PathValid: path ends at {:?} not to={to}", p.last()),
+                                            format!(
+                                                "PathValid: path ends at {:?} not to={to}",
+                                                p.last()
+                                            ),
                                             &sql,
                                             to,
                                             p.last().copied().unwrap_or(0)
@@ -924,7 +939,9 @@ fn main_impl() {
                                         let (a, b) = (window[0], window[1]);
                                         if !oracle.has_out_edge(a, b) {
                                             report_div!(
-                                                format!("PathValid: step {a}→{b} is not a live edge in graph"),
+                                                format!(
+                                                    "PathValid: step {a}→{b} is not a live edge in graph"
+                                                ),
                                                 &sql,
                                                 format!("valid edge {a}->{b}"),
                                                 format!("no such edge")

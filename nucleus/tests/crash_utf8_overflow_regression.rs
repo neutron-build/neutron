@@ -21,11 +21,19 @@ async fn ok(ex: &Executor, sid: u64, sql: &str) {
 
 #[tokio::test]
 async fn adversarial_scalar_inputs_do_not_panic() {
-    let ex = Executor::new(Arc::new(Catalog::new()), Arc::new(MvccStorageAdapter::new()));
+    let ex = Executor::new(
+        Arc::new(Catalog::new()),
+        Arc::new(MvccStorageAdapter::new()),
+    );
     let s = ex.create_session();
 
     // TENSOR_STORE with a multi-byte UTF-8 "hex" arg (char-boundary panic).
-    ok(&ex, s, "SELECT TENSOR_STORE('a', TRUE, '[1,2,3]', '1,2,3', '日本語🎉')").await;
+    ok(
+        &ex,
+        s,
+        "SELECT TENSOR_STORE('a', TRUE, '[1,2,3]', '1,2,3', '日本語🎉')",
+    )
+    .await;
     ok(&ex, s, "SELECT GRAPH_NODE_DEGREE(ARRAY[0,1], TENSOR_STORE('a',TRUE,'[1,2,3]','1,2,3','日本語🎉'), '\\x00')").await;
 
     // KV TTL overflow (Instant + Duration).
@@ -44,7 +52,10 @@ async fn adversarial_scalar_inputs_do_not_panic() {
 #[tokio::test]
 async fn substr_negative_and_clamped_values() {
     // Verify SUBSTR still returns sensible results (not just no-panic).
-    let ex = Executor::new(Arc::new(Catalog::new()), Arc::new(MvccStorageAdapter::new()));
+    let ex = Executor::new(
+        Arc::new(Catalog::new()),
+        Arc::new(MvccStorageAdapter::new()),
+    );
     let s = ex.create_session();
     use nucleus::executor::ExecResult;
     use nucleus::types::Value;
@@ -57,9 +68,15 @@ async fn substr_negative_and_clamped_values() {
             o => format!("{o:?}"),
         }
     };
-    let r = ex.execute_with_session(s, "SELECT SUBSTR('hello', 2, 3)").await.unwrap();
+    let r = ex
+        .execute_with_session(s, "SELECT SUBSTR('hello', 2, 3)")
+        .await
+        .unwrap();
     assert_eq!(val(r), "ell", "SUBSTR('hello',2,3)");
-    let r = ex.execute_with_session(s, "SELECT SUBSTR('hello', 2)").await.unwrap();
+    let r = ex
+        .execute_with_session(s, "SELECT SUBSTR('hello', 2)")
+        .await
+        .unwrap();
     assert_eq!(val(r), "ello", "SUBSTR('hello',2)");
     ex.drop_session(s);
 }

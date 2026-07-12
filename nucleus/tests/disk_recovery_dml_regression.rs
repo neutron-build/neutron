@@ -34,15 +34,25 @@ async fn disk_abandoned_txn_does_not_survive_reopen() {
     let _ = std::fs::remove_file(path.with_extension("wal"));
     {
         let db = Database::builder().disk(&path).build().unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)").await.unwrap();
-        db.execute("INSERT INTO t VALUES (1,10),(2,20)").await.unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1,10),(2,20)")
+            .await
+            .unwrap();
         // Uncommitted transaction: BEGIN + inserts, then drop WITHOUT commit.
         db.execute("BEGIN").await.unwrap();
-        db.execute("INSERT INTO t VALUES (3,30),(4,40)").await.unwrap();
+        db.execute("INSERT INTO t VALUES (3,30),(4,40)")
+            .await
+            .unwrap();
         // no COMMIT — db dropped below
     }
     let db = Database::builder().disk(&path).build().unwrap();
-    let recovered = rows_of(db.execute("SELECT id,v FROM t ORDER BY id,v").await.unwrap());
+    let recovered = rows_of(
+        db.execute("SELECT id,v FROM t ORDER BY id,v")
+            .await
+            .unwrap(),
+    );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("wal"));
     assert_eq!(
@@ -60,10 +70,14 @@ async fn disk_recovery_explicit_txn_multicycle() {
 
     {
         let db = Database::builder().disk(&path).build().unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)").await.unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+            .await
+            .unwrap();
         // explicit transaction
         db.execute("BEGIN").await.unwrap();
-        db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").await.unwrap();
+        db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+            .await
+            .unwrap();
         db.execute("DELETE FROM t WHERE id=2").await.unwrap();
         db.execute("UPDATE t SET v=99 WHERE id=3").await.unwrap();
         db.execute("COMMIT").await.unwrap();
@@ -72,7 +86,11 @@ async fn disk_recovery_explicit_txn_multicycle() {
     // cycle 1: reopen, mutate more in a txn, drop
     {
         let db = Database::builder().disk(&path).build().unwrap();
-        let r = rows_of(db.execute("SELECT id,v FROM t ORDER BY id,v").await.unwrap());
+        let r = rows_of(
+            db.execute("SELECT id,v FROM t ORDER BY id,v")
+                .await
+                .unwrap(),
+        );
         assert_eq!(r, vec![(1, 10), (3, 99)], "cycle1 open state");
         db.execute("BEGIN").await.unwrap();
         db.execute("INSERT INTO t VALUES (4,40)").await.unwrap();
@@ -82,10 +100,18 @@ async fn disk_recovery_explicit_txn_multicycle() {
 
     // cycle 2: reopen, verify final state
     let db = Database::builder().disk(&path).build().unwrap();
-    let recovered = rows_of(db.execute("SELECT id,v FROM t ORDER BY id,v").await.unwrap());
+    let recovered = rows_of(
+        db.execute("SELECT id,v FROM t ORDER BY id,v")
+            .await
+            .unwrap(),
+    );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("wal"));
-    assert_eq!(recovered, vec![(1, 11), (3, 99), (4, 40)], "cycle2 recovered state");
+    assert_eq!(
+        recovered,
+        vec![(1, 11), (3, 99), (4, 40)],
+        "cycle2 recovered state"
+    );
 }
 
 #[tokio::test]
@@ -97,22 +123,41 @@ async fn disk_recovery_reflects_update_delete() {
     let expected;
     {
         let db = Database::builder().disk(&path).build().unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)").await.unwrap();
-        db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,50)").await.unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,50)")
+            .await
+            .unwrap();
         db.execute("DELETE FROM t WHERE id=2").await.unwrap();
         db.execute("DELETE FROM t WHERE id=4").await.unwrap();
         db.execute("UPDATE t SET v=999 WHERE id=3").await.unwrap();
         let _ = db.sync();
-        expected = rows_of(db.execute("SELECT id, v FROM t ORDER BY id, v").await.unwrap());
+        expected = rows_of(
+            db.execute("SELECT id, v FROM t ORDER BY id, v")
+                .await
+                .unwrap(),
+        );
     }
     // expected = [(1,10),(3,999),(5,50)]
-    assert_eq!(expected, vec![(1, 10), (3, 999), (5, 50)], "pre-reopen state wrong");
+    assert_eq!(
+        expected,
+        vec![(1, 10), (3, 999), (5, 50)],
+        "pre-reopen state wrong"
+    );
 
     let db = Database::builder().disk(&path).build().unwrap();
-    let recovered = rows_of(db.execute("SELECT id, v FROM t ORDER BY id, v").await.unwrap());
+    let recovered = rows_of(
+        db.execute("SELECT id, v FROM t ORDER BY id, v")
+            .await
+            .unwrap(),
+    );
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("wal"));
 
-    assert_eq!(recovered, expected, "recovered state diverged from pre-reopen state");
+    assert_eq!(
+        recovered, expected,
+        "recovered state diverged from pre-reopen state"
+    );
 }

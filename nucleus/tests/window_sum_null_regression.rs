@@ -34,9 +34,13 @@ fn as_f64(v: &Value) -> Option<f64> {
 #[tokio::test]
 async fn window_sum_all_null_frame_is_null() {
     let e = ex(Arc::new(MvccStorageAdapter::new()));
-    e.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await.unwrap();
+    e.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .await
+        .unwrap();
     // Every row has a NULL value column.
-    e.execute("INSERT INTO t (id, v) VALUES (1, NULL), (2, NULL), (3, NULL)").await.unwrap();
+    e.execute("INSERT INTO t (id, v) VALUES (1, NULL), (2, NULL), (3, NULL)")
+        .await
+        .unwrap();
     let r = rows(
         &e,
         "SELECT id, SUM(v) OVER (ORDER BY id ASC) AS s FROM t ORDER BY id ASC",
@@ -44,7 +48,12 @@ async fn window_sum_all_null_frame_is_null() {
     .await;
     assert_eq!(r.len(), 3);
     for row in &r {
-        assert_eq!(row[1], Value::Null, "all-NULL frame must yield NULL, got {:?}", row[1]);
+        assert_eq!(
+            row[1],
+            Value::Null,
+            "all-NULL frame must yield NULL, got {:?}",
+            row[1]
+        );
     }
 }
 
@@ -53,13 +62,17 @@ async fn window_sum_all_null_frame_is_null() {
 #[tokio::test]
 async fn window_sum_mixed_frame_skips_nulls() {
     let e = ex(Arc::new(MvccStorageAdapter::new()));
-    e.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").await.unwrap();
+    e.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .await
+        .unwrap();
     // Running frame "rows so far" (default RANGE UNBOUNDED PRECEDING):
     //   id=1: {NULL}             -> NULL
     //   id=2: {NULL, 10}         -> 10
     //   id=3: {NULL, 10, NULL}   -> 10
     //   id=4: {NULL, 10, NULL,5} -> 15
-    e.execute("INSERT INTO t (id, v) VALUES (1, NULL), (2, 10), (3, NULL), (4, 5)").await.unwrap();
+    e.execute("INSERT INTO t (id, v) VALUES (1, NULL), (2, 10), (3, NULL), (4, 5)")
+        .await
+        .unwrap();
     let r = rows(
         &e,
         "SELECT id, SUM(v) OVER (ORDER BY id ASC) AS s FROM t ORDER BY id ASC",

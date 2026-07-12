@@ -47,9 +47,12 @@ async fn seeded() -> (Arc<Executor>, Arc<MetricsRegistry>) {
         let values: Vec<String> = (inserted..end)
             .map(|i| format!("({}, {})", i as i64, (i as i64) * 7 % 1000))
             .collect();
-        ex.execute(&format!("INSERT INTO eff_test VALUES {}", values.join(", ")))
-            .await
-            .unwrap();
+        ex.execute(&format!(
+            "INSERT INTO eff_test VALUES {}",
+            values.join(", ")
+        ))
+        .await
+        .unwrap();
         inserted = end;
     }
     (ex, metrics)
@@ -100,7 +103,10 @@ async fn indexed_pk_equality_stays_cheap() {
     let (ex, metrics) = seeded().await;
 
     let before = metrics.rows_scanned.get();
-    let _ = ex.execute("SELECT * FROM eff_test WHERE id = 1234").await.unwrap();
+    let _ = ex
+        .execute("SELECT * FROM eff_test WHERE id = 1234")
+        .await
+        .unwrap();
     let scanned = metrics.rows_scanned.get() - before;
 
     assert!(

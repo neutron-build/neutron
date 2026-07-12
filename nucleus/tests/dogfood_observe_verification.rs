@@ -54,7 +54,11 @@ async fn f1_bigint_version_newest_wins() {
     exec(&ex, "INSERT INTO f1_rt (k, v, ver) VALUES ('a', 'new', 2)").await;
     let r = rows(&ex, "SELECT v FROM f1_rt").await;
     assert_eq!(r.len(), 1, "dedup left {} rows", r.len());
-    assert_eq!(r[0][0], Value::Text("new".into()), "newest version did not win");
+    assert_eq!(
+        r[0][0],
+        Value::Text("new".into()),
+        "newest version did not win"
+    );
 }
 
 // ---- #4: aggregates over a replacing table dedup before summing ----
@@ -72,12 +76,32 @@ async fn f4_sum_dedups_before_aggregating() {
 #[tokio::test]
 async fn f5_argmax_supported() {
     let ex = fresh().await;
-    exec(&ex, "CREATE TABLE f5_plain (k TEXT, amt BIGINT, ver BIGINT)").await;
-    exec(&ex, "INSERT INTO f5_plain (k, amt, ver) VALUES ('a', 10, 1)").await;
-    exec(&ex, "INSERT INTO f5_plain (k, amt, ver) VALUES ('a', 99, 3)").await;
-    exec(&ex, "INSERT INTO f5_plain (k, amt, ver) VALUES ('a', 50, 2)").await;
+    exec(
+        &ex,
+        "CREATE TABLE f5_plain (k TEXT, amt BIGINT, ver BIGINT)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO f5_plain (k, amt, ver) VALUES ('a', 10, 1)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO f5_plain (k, amt, ver) VALUES ('a', 99, 3)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO f5_plain (k, amt, ver) VALUES ('a', 50, 2)",
+    )
+    .await;
     let r = rows(&ex, "SELECT argMax(amt, ver) FROM f5_plain GROUP BY k").await;
-    assert_eq!(i64v(&r[0][0]), 99, "argMax did not return amt at max version");
+    assert_eq!(
+        i64v(&r[0][0]),
+        99,
+        "argMax did not return amt at max version"
+    );
 }
 
 // ---- #7: retention DELETE with numeric + text predicate coercion ----
@@ -85,18 +109,34 @@ async fn f5_argmax_supported() {
 async fn f7_delete_range_int_literal() {
     let ex = fresh().await;
     exec(&ex, "CREATE TABLE f7a (id BIGINT PRIMARY KEY, ts BIGINT)").await;
-    exec(&ex, "INSERT INTO f7a (id, ts) VALUES (1, 100), (2, 200), (3, 300)").await;
+    exec(
+        &ex,
+        "INSERT INTO f7a (id, ts) VALUES (1, 100), (2, 200), (3, 300)",
+    )
+    .await;
     exec(&ex, "DELETE FROM f7a WHERE ts < 250").await;
-    assert_eq!(i64v(&rows(&ex, "SELECT COUNT(*) FROM f7a").await[0][0]), 1, "int-literal retention DELETE missed rows");
+    assert_eq!(
+        i64v(&rows(&ex, "SELECT COUNT(*) FROM f7a").await[0][0]),
+        1,
+        "int-literal retention DELETE missed rows"
+    );
 }
 #[tokio::test]
 async fn f7_delete_range_text_literal() {
     let ex = fresh().await;
     exec(&ex, "CREATE TABLE f7b (id BIGINT PRIMARY KEY, ts BIGINT)").await;
-    exec(&ex, "INSERT INTO f7b (id, ts) VALUES (1, 100), (2, 200), (3, 300)").await;
+    exec(
+        &ex,
+        "INSERT INTO f7b (id, ts) VALUES (1, 100), (2, 200), (3, 300)",
+    )
+    .await;
     // pgx simple protocol: WHERE ts < $1 arrives as WHERE ts < '250'
     exec(&ex, "DELETE FROM f7b WHERE ts < '250'").await;
-    assert_eq!(i64v(&rows(&ex, "SELECT COUNT(*) FROM f7b").await[0][0]), 1, "text-literal retention DELETE missed rows");
+    assert_eq!(
+        i64v(&rows(&ex, "SELECT COUNT(*) FROM f7b").await[0][0]),
+        1,
+        "text-literal retention DELETE missed rows"
+    );
 }
 
 // ---- #8: result cache must not serve stale rows after DELETE ----
@@ -107,7 +147,11 @@ async fn f8_cache_invalidated_after_delete() {
     exec(&ex, "INSERT INTO f8 (id, val) VALUES (1, 'x'), (2, 'y')").await;
     let _ = rows(&ex, "SELECT COUNT(*) FROM f8").await; // prime any cache
     exec(&ex, "DELETE FROM f8 WHERE id = 1").await;
-    assert_eq!(i64v(&rows(&ex, "SELECT COUNT(*) FROM f8").await[0][0]), 1, "stale cached COUNT after DELETE");
+    assert_eq!(
+        i64v(&rows(&ex, "SELECT COUNT(*) FROM f8").await[0][0]),
+        1,
+        "stale cached COUNT after DELETE"
+    );
 }
 
 // ---- #10: open projection / CAST / HAVING bugs ----
@@ -117,7 +161,12 @@ async fn f10_24_cast_aggregate_as_text() {
     exec(&ex, "CREATE TABLE f10_24 (id BIGINT)").await;
     exec(&ex, "INSERT INTO f10_24 (id) VALUES (1), (2), (3)").await;
     let r = rows(&ex, "SELECT CAST(COUNT(*) AS TEXT) FROM f10_24").await;
-    assert_eq!(r.len(), 1, "CAST(aggregate AS TEXT) returned {} rows, want 1", r.len());
+    assert_eq!(
+        r.len(),
+        1,
+        "CAST(aggregate AS TEXT) returned {} rows, want 1",
+        r.len()
+    );
     assert_eq!(r[0][0], Value::Text("3".into()));
 }
 #[tokio::test]
@@ -132,9 +181,18 @@ async fn f10_26_coalesce_max() {
 async fn f10_28_having_count() {
     let ex = fresh().await;
     exec(&ex, "CREATE TABLE f10_28 (g TEXT)").await;
-    exec(&ex, "INSERT INTO f10_28 (g) VALUES ('a'), ('a'), ('a'), ('b')").await;
+    exec(
+        &ex,
+        "INSERT INTO f10_28 (g) VALUES ('a'), ('a'), ('a'), ('b')",
+    )
+    .await;
     let r = rows(&ex, "SELECT g FROM f10_28 GROUP BY g HAVING COUNT(*) >= 2").await;
-    assert_eq!(r.len(), 1, "HAVING COUNT(*)>=N returned {} rows, want 1", r.len());
+    assert_eq!(
+        r.len(),
+        1,
+        "HAVING COUNT(*)>=N returned {} rows, want 1",
+        r.len()
+    );
     assert_eq!(r[0][0], Value::Text("a".into()));
 }
 
@@ -149,7 +207,11 @@ async fn f2_alter_column_type_rewrites_existing_data() {
     let r = rows(&ex, "SELECT v FROM f2 ORDER BY id").await;
     assert_eq!(i64v(&r[0][0]), 0);
     assert_eq!(i64v(&r[1][0]), 42);
-    assert_eq!(i64v(&rows(&ex, "SELECT SUM(v) FROM f2").await[0][0]), 42, "numeric SUM after ALTER");
+    assert_eq!(
+        i64v(&rows(&ex, "SELECT SUM(v) FROM f2").await[0][0]),
+        42,
+        "numeric SUM after ALTER"
+    );
 }
 
 // ---- #6: AggregatingMergeTree accepted; percentiles via functional form ----
@@ -158,12 +220,32 @@ async fn f6_aggregating_engine_and_percentiles() {
     let ex = fresh().await;
     // AggregatingMergeTree is a real engine (SummingMergeTree falls through to
     // Default — accepted but no summing semantics; observe should not rely on it).
-    exec(&ex, "CREATE TABLE f6g (k TEXT, n BIGINT) WITH (engine='aggregating_mergetree') ORDER BY (k)").await;
+    exec(
+        &ex,
+        "CREATE TABLE f6g (k TEXT, n BIGINT) WITH (engine='aggregating_mergetree') ORDER BY (k)",
+    )
+    .await;
     // Percentiles: functional form QUANTILE/PERCENTILE_CONT(value, fraction),
     // MEDIAN(value). Standard `WITHIN GROUP (ORDER BY ...)` is NOT supported.
     exec(&ex, "CREATE TABLE f6q (lat BIGINT)").await;
-    exec(&ex, "INSERT INTO f6q (lat) VALUES (10), (20), (30), (40), (100)").await;
-    assert_eq!(i64v(&rows(&ex, "SELECT MEDIAN(lat) FROM f6q").await[0][0]), 30, "MEDIAN");
-    assert_eq!(i64v(&rows(&ex, "SELECT QUANTILE(lat, 1.0) FROM f6q").await[0][0]), 100, "QUANTILE p100");
-    assert_eq!(i64v(&rows(&ex, "SELECT COUNT(DISTINCT lat) FROM f6q").await[0][0]), 5, "COUNT(DISTINCT)");
+    exec(
+        &ex,
+        "INSERT INTO f6q (lat) VALUES (10), (20), (30), (40), (100)",
+    )
+    .await;
+    assert_eq!(
+        i64v(&rows(&ex, "SELECT MEDIAN(lat) FROM f6q").await[0][0]),
+        30,
+        "MEDIAN"
+    );
+    assert_eq!(
+        i64v(&rows(&ex, "SELECT QUANTILE(lat, 1.0) FROM f6q").await[0][0]),
+        100,
+        "QUANTILE p100"
+    );
+    assert_eq!(
+        i64v(&rows(&ex, "SELECT COUNT(DISTINCT lat) FROM f6q").await[0][0]),
+        5,
+        "COUNT(DISTINCT)"
+    );
 }

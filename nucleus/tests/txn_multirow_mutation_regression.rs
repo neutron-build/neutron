@@ -44,13 +44,24 @@ async fn txn_update_where_eq_hits_correct_row() {
         Arc::new(MvccStorageAdapter::new()),
     ));
     let s = ex.create_session();
-    ex.execute_with_session(s, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)").await.unwrap();
-    ex.execute_with_session(s, "INSERT INTO t VALUES (1,10),(2,20),(3,30)").await.unwrap();
+    ex.execute_with_session(
+        s,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+    )
+    .await
+    .unwrap();
+    ex.execute_with_session(s, "INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .await
+        .unwrap();
 
     // UPDATE in a transaction, targeting the middle and last rows by PK.
     ex.execute_with_session(s, "BEGIN").await.unwrap();
-    ex.execute_with_session(s, "UPDATE t SET v=222 WHERE id=2").await.unwrap();
-    ex.execute_with_session(s, "UPDATE t SET v=333 WHERE id=3").await.unwrap();
+    ex.execute_with_session(s, "UPDATE t SET v=222 WHERE id=2")
+        .await
+        .unwrap();
+    ex.execute_with_session(s, "UPDATE t SET v=333 WHERE id=3")
+        .await
+        .unwrap();
     ex.execute_with_session(s, "COMMIT").await.unwrap();
 
     assert_eq!(
@@ -61,7 +72,9 @@ async fn txn_update_where_eq_hits_correct_row() {
 
     // DELETE in a transaction, targeting a non-first row by PK.
     ex.execute_with_session(s, "BEGIN").await.unwrap();
-    ex.execute_with_session(s, "DELETE FROM t WHERE id=2").await.unwrap();
+    ex.execute_with_session(s, "DELETE FROM t WHERE id=2")
+        .await
+        .unwrap();
     ex.execute_with_session(s, "COMMIT").await.unwrap();
 
     assert_eq!(
@@ -73,7 +86,9 @@ async fn txn_update_where_eq_hits_correct_row() {
     // A read-only point SELECT before a non-PK-eq UPDATE must not poison it.
     ex.execute_with_session(s, "BEGIN").await.unwrap();
     let _ = rows(&ex, s, "SELECT id, v FROM t WHERE id=1").await; // populates scan cache
-    ex.execute_with_session(s, "UPDATE t SET v=v+1 WHERE v >= 0").await.unwrap(); // non-fast path
+    ex.execute_with_session(s, "UPDATE t SET v=v+1 WHERE v >= 0")
+        .await
+        .unwrap(); // non-fast path
     ex.execute_with_session(s, "COMMIT").await.unwrap();
 
     assert_eq!(

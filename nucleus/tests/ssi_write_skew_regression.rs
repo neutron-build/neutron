@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use nucleus::catalog::Catalog;
 use nucleus::executor::{ExecResult, Executor};
-use nucleus::types::Value;
 use nucleus::storage::MvccStorageAdapter;
+use nucleus::types::Value;
 
 fn ex() -> Arc<Executor> {
     Arc::new(Executor::new(
@@ -45,63 +45,120 @@ async fn first_int(ex: &Executor, sid: u64, sql: &str) -> Option<i64> {
 async fn serializable_detects_write_skew_after_commit() {
     let ex = ex();
     let s = ex.create_session();
-    ex.execute_with_session(s, "CREATE TABLE oncall (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)").await.unwrap();
-    ex.execute_with_session(s, "INSERT INTO oncall VALUES (1,1),(2,1)").await.unwrap();
+    ex.execute_with_session(
+        s,
+        "CREATE TABLE oncall (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+    )
+    .await
+    .unwrap();
+    ex.execute_with_session(s, "INSERT INTO oncall VALUES (1,1),(2,1)")
+        .await
+        .unwrap();
     ex.drop_session(s);
 
     let a = ex.create_session();
     let b = ex.create_session();
-    ex.execute_with_session(a, "BEGIN ISOLATION LEVEL SERIALIZABLE").await.unwrap();
-    ex.execute_with_session(b, "BEGIN ISOLATION LEVEL SERIALIZABLE").await.unwrap();
+    ex.execute_with_session(a, "BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    ex.execute_with_session(b, "BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
 
     // A reads row2, writes row1, commits — all BEFORE B does anything.
-    assert_eq!(first_int(&ex, a, "SELECT v FROM oncall WHERE id=2").await, Some(1));
-    ex.execute_with_session(a, "UPDATE oncall SET v=0 WHERE id=1").await.unwrap();
+    assert_eq!(
+        first_int(&ex, a, "SELECT v FROM oncall WHERE id=2").await,
+        Some(1)
+    );
+    ex.execute_with_session(a, "UPDATE oncall SET v=0 WHERE id=1")
+        .await
+        .unwrap();
     ex.execute_with_session(a, "COMMIT").await.unwrap();
 
     // B reads row1 (its snapshot still sees 1) then writes row2 from that read.
-    assert_eq!(first_int(&ex, b, "SELECT v FROM oncall WHERE id=1").await, Some(1));
-    let upd = ex.execute_with_session(b, "UPDATE oncall SET v=0 WHERE id=2").await;
-    let rejected = upd.is_err()
-        || ex.execute_with_session(b, "COMMIT").await.is_err();
+    assert_eq!(
+        first_int(&ex, b, "SELECT v FROM oncall WHERE id=1").await,
+        Some(1)
+    );
+    let upd = ex
+        .execute_with_session(b, "UPDATE oncall SET v=0 WHERE id=2")
+        .await;
+    let rejected = upd.is_err() || ex.execute_with_session(b, "COMMIT").await.is_err();
 
     let chk = ex.create_session();
-    let r1 = first_int(&ex, chk, "SELECT v FROM oncall WHERE id=1").await.unwrap();
-    let r2 = first_int(&ex, chk, "SELECT v FROM oncall WHERE id=2").await.unwrap();
+    let r1 = first_int(&ex, chk, "SELECT v FROM oncall WHERE id=1")
+        .await
+        .unwrap();
+    let r2 = first_int(&ex, chk, "SELECT v FROM oncall WHERE id=2")
+        .await
+        .unwrap();
     ex.drop_session(chk);
 
     assert!(rejected, "SERIALIZABLE must reject the write-skew");
-    assert!(r1 + r2 >= 1, "write-skew anomaly: both rows ended at 0 ({r1},{r2})");
+    assert!(
+        r1 + r2 >= 1,
+        "write-skew anomaly: both rows ended at 0 ({r1},{r2})"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serializable_disjoint_both_commit() {
     let ex = ex();
     let s = ex.create_session();
-    ex.execute_with_session(s, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)").await.unwrap();
-    ex.execute_with_session(s, "INSERT INTO t VALUES (1,10),(2,20)").await.unwrap();
+    ex.execute_with_session(
+        s,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+    )
+    .await
+    .unwrap();
+    ex.execute_with_session(s, "INSERT INTO t VALUES (1,10),(2,20)")
+        .await
+        .unwrap();
     ex.drop_session(s);
 
     let a = ex.create_session();
     let b = ex.create_session();
-    ex.execute_with_session(a, "BEGIN ISOLATION LEVEL SERIALIZABLE").await.unwrap();
-    ex.execute_with_session(b, "BEGIN ISOLATION LEVEL SERIALIZABLE").await.unwrap();
+    ex.execute_with_session(a, "BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    ex.execute_with_session(b, "BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
 
     // Disjoint rows by PK: A touches id=1, B touches id=2 — no rw-antidependency
     // cycle, so BOTH must commit on the first try (precise tuple-level SIREAD).
-    assert_eq!(first_int(&ex, a, "SELECT v FROM t WHERE id=1").await, Some(10));
-    assert_eq!(first_int(&ex, b, "SELECT v FROM t WHERE id=2").await, Some(20));
-    ex.execute_with_session(a, "UPDATE t SET v=11 WHERE id=1").await.unwrap();
-    ex.execute_with_session(b, "UPDATE t SET v=22 WHERE id=2").await.unwrap();
+    assert_eq!(
+        first_int(&ex, a, "SELECT v FROM t WHERE id=1").await,
+        Some(10)
+    );
+    assert_eq!(
+        first_int(&ex, b, "SELECT v FROM t WHERE id=2").await,
+        Some(20)
+    );
+    ex.execute_with_session(a, "UPDATE t SET v=11 WHERE id=1")
+        .await
+        .unwrap();
+    ex.execute_with_session(b, "UPDATE t SET v=22 WHERE id=2")
+        .await
+        .unwrap();
 
-    assert!(ex.execute_with_session(a, "COMMIT").await.is_ok(), "A must commit");
+    assert!(
+        ex.execute_with_session(a, "COMMIT").await.is_ok(),
+        "A must commit"
+    );
     assert!(
         ex.execute_with_session(b, "COMMIT").await.is_ok(),
         "B must commit — disjoint access must NOT be a spurious serialization failure"
     );
 
     let chk = ex.create_session();
-    assert_eq!(first_int(&ex, chk, "SELECT v FROM t WHERE id=1").await, Some(11));
-    assert_eq!(first_int(&ex, chk, "SELECT v FROM t WHERE id=2").await, Some(22));
+    assert_eq!(
+        first_int(&ex, chk, "SELECT v FROM t WHERE id=1").await,
+        Some(11)
+    );
+    assert_eq!(
+        first_int(&ex, chk, "SELECT v FROM t WHERE id=2").await,
+        Some(22)
+    );
     ex.drop_session(chk);
 }

@@ -121,7 +121,10 @@ fn gen_nested_subquery(depth: usize) -> String {
     if depth == 0 {
         return "SELECT 1".into();
     }
-    format!("SELECT * FROM ({}) AS sub_{depth}", gen_nested_subquery(depth - 1))
+    format!(
+        "SELECT * FROM ({}) AS sub_{depth}",
+        gen_nested_subquery(depth - 1)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +333,13 @@ fn main_impl() {
     for depth in [10, 45, 48, 60, 100, 300] {
         let mut expr = "1".to_string();
         for d in 0..depth {
-            let t = if d % 3 == 0 { "INTEGER" } else if d % 3 == 1 { "REAL" } else { "TEXT" };
+            let t = if d % 3 == 0 {
+                "INTEGER"
+            } else if d % 3 == 1 {
+                "REAL"
+            } else {
+                "TEXT"
+            };
             expr = format!("CAST({expr} AS {t})");
         }
         probe!(format!("SELECT {expr}"));
@@ -352,7 +361,13 @@ fn main_impl() {
     // Very large IN with NULLs mixed in
     {
         let items: Vec<String> = (0..10_000)
-            .map(|i| if i % 100 == 0 { "NULL".to_string() } else { i.to_string() })
+            .map(|i| {
+                if i % 100 == 0 {
+                    "NULL".to_string()
+                } else {
+                    i.to_string()
+                }
+            })
             .collect();
         probe!(format!("SELECT 42 IN ({})", items.join(",")));
     }
@@ -393,7 +408,8 @@ fn main_impl() {
               SELECT 0,1 \
               UNION ALL \
               SELECT b, a+b FROM fib WHERE a < 1000000\
-            ) SELECT COUNT(*) FROM fib".to_string()
+            ) SELECT COUNT(*) FROM fib"
+                .to_string()
         );
     }
     // Non-terminating-looking CTE that converges (the WHERE stops it)
@@ -403,7 +419,8 @@ fn main_impl() {
               SELECT 1 \
               UNION ALL \
               SELECT n+1 FROM nums WHERE n < 2000\
-            ) SELECT SUM(n) FROM nums".to_string()
+            ) SELECT SUM(n) FROM nums"
+                .to_string()
         );
     }
 
@@ -459,9 +476,7 @@ fn main_impl() {
         let pattern: String = (0..plen)
             .map(|_| like_chars[rng2.below(like_chars.len())])
             .collect();
-        let text: String = (0..tlen)
-            .map(|_| ['a', 'b', 'c'][rng2.below(3)])
-            .collect();
+        let text: String = (0..tlen).map(|_| ['a', 'b', 'c'][rng2.below(3)]).collect();
         // Escape any single quotes inside the strings to avoid SQL injection into our own query
         let safe_pattern = pattern.replace('\'', "''");
         let safe_text = text.replace('\'', "''");
@@ -493,14 +508,19 @@ fn main_impl() {
     // CONCAT_WS
     {
         let pieces: Vec<String> = (0..500).map(|_| "'hello'".to_string()).collect();
-        probe!(format!("SELECT LENGTH(CONCAT_WS(',', {}))", pieces.join(",")));
+        probe!(format!(
+            "SELECT LENGTH(CONCAT_WS(',', {}))",
+            pieces.join(",")
+        ));
     }
     // TRANSLATE with large mapping
     {
         let from_chars = "abcdefghij";
         let to_chars = "0123456789";
         let s = "abcdefghij".repeat(1000);
-        probe!(format!("SELECT LENGTH(TRANSLATE('{s}', '{from_chars}', '{to_chars}'))"));
+        probe!(format!(
+            "SELECT LENGTH(TRANSLATE('{s}', '{from_chars}', '{to_chars}'))"
+        ));
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -551,7 +571,8 @@ fn main_impl() {
         probe!(
             "WITH RECURSIVE r(s) AS (\
               SELECT 'aaaa' UNION ALL SELECT s || 'a' FROM r WHERE LENGTH(s) < 20\
-            ) SELECT COUNT(*) FROM r WHERE s LIKE '%a%a%a%'".to_string()
+            ) SELECT COUNT(*) FROM r WHERE s LIKE '%a%a%a%'"
+                .to_string()
         );
     }
     // Nested arithmetic inside IN list (keep short — 50-item IN with depth-10 arith)
@@ -668,7 +689,10 @@ fn main_impl() {
     {
         // This tests the parser; the table won't match, graceful error expected.
         let vals: Vec<String> = (0..500).map(|i| i.to_string()).collect();
-        probe!(format!("INSERT INTO fake_table VALUES ({})", vals.join(",")));
+        probe!(format!(
+            "INSERT INTO fake_table VALUES ({})",
+            vals.join(",")
+        ));
     }
     // WHERE with many OR'd conditions
     {

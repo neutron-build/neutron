@@ -56,7 +56,11 @@ async fn assert_prefix(db: &Database, expect_k: i64) {
             Value::Text(s) => s.clone(),
             o => panic!("pad not text: {o:?}"),
         };
-        assert_eq!(pad, format!("row-{id}-{}", marker_for(id)), "torn pad id={id}");
+        assert_eq!(
+            pad,
+            format!("row-{id}-{}", marker_for(id)),
+            "torn pad id={id}"
+        );
     }
 }
 

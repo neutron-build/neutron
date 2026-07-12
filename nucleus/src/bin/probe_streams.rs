@@ -48,7 +48,9 @@ impl Rng {
         &xs[self.below(xs.len())]
     }
     fn hex_bytes(&mut self, len: usize) -> String {
-        (0..len).map(|_| format!("{:02x}", self.next() as u8)).collect()
+        (0..len)
+            .map(|_| format!("{:02x}", self.next() as u8))
+            .collect()
     }
 }
 
@@ -151,7 +153,9 @@ struct StreamState {
 
 impl Default for StreamState {
     fn default() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 }
 
@@ -192,10 +196,22 @@ fn main_impl() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed" => { i += 1; seed = args[i].parse().unwrap(); }
-            "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
-            "--ops" => { i += 1; ops_per = args[i].parse().unwrap(); }
-            "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
+            "--seed" => {
+                i += 1;
+                seed = args[i].parse().unwrap();
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args[i].parse().unwrap();
+            }
+            "--ops" => {
+                i += 1;
+                ops_per = args[i].parse().unwrap();
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = args[i].parse().unwrap();
+            }
             _ => {}
         }
         i += 1;
@@ -217,9 +233,10 @@ fn main_impl() {
 
         // Create a table for CDC testing.
         let cdc_table = "cdc_target";
-        exec_ddl(&ex, &format!(
-            "CREATE TABLE {cdc_table} (id INTEGER PRIMARY KEY, val INTEGER)"
-        ));
+        exec_ddl(
+            &ex,
+            &format!("CREATE TABLE {cdc_table} (id INTEGER PRIMARY KEY, val INTEGER)"),
+        );
 
         let stream_name = format!("s{}", iter % 4);
         let mut stream_state = StreamState::default();
@@ -228,10 +245,12 @@ fn main_impl() {
         let mut repro_log: Vec<String> = Vec::new();
 
         // ── CDC: snapshot count before ops ────────────────────────────────────
-        let cdc_before = run_i64(&ex, "SELECT CDC_COUNT(0,0)").or_else(|| {
-            // CDC_COUNT takes no args in the implementation
-            run_i64(&ex, "SELECT CDC_COUNT()")
-        }).unwrap_or(0);
+        let cdc_before = run_i64(&ex, "SELECT CDC_COUNT(0,0)")
+            .or_else(|| {
+                // CDC_COUNT takes no args in the implementation
+                run_i64(&ex, "SELECT CDC_COUNT()")
+            })
+            .unwrap_or(0);
 
         for _op in 0..ops_per {
             total_ops += 1;
@@ -240,9 +259,7 @@ fn main_impl() {
                 0..=5 => {
                     let field = format!("f{}", rng.below(4));
                     let val = format!("v{}", rng.below(8));
-                    let sql = format!(
-                        "SELECT STREAM_XADD('{stream_name}', '{field}', '{val}')"
-                    );
+                    let sql = format!("SELECT STREAM_XADD('{stream_name}', '{field}', '{val}')");
                     repro_log.push(sql.clone());
                     if run_sql(&ex, &sql).is_some() {
                         stream_state.entries.push((field, val));
@@ -283,10 +300,7 @@ fn main_impl() {
                                     violations.push(Violation {
                                         model: "STREAM",
                                         invariant: "XRANGE returns entries in append order",
-                                        detail: format!(
-                                            "out-of-order: {} before {}",
-                                            w[0], w[1]
-                                        ),
+                                        detail: format!("out-of-order: {} before {}", w[0], w[1]),
                                         repro: repro_log.clone(),
                                     });
                                 }
@@ -298,9 +312,7 @@ fn main_impl() {
                 8 => {
                     // XREAD with last_id = 0: should return all entries up to count.
                     let count = stream_state.entries.len().max(1);
-                    let sql = format!(
-                        "SELECT STREAM_XREAD('{stream_name}', 0, {count})"
-                    );
+                    let sql = format!("SELECT STREAM_XREAD('{stream_name}', 0, {count})");
                     repro_log.push(sql.clone());
                     if let Some(text) = run_text(&ex, &sql) {
                         let returned = parse_entry_ids(&text).len();
@@ -404,10 +416,7 @@ fn main_impl() {
                                 violations.push(Violation {
                                     model: "BLOB",
                                     invariant: "BLOB_COUNT tracks add/delete accurately",
-                                    detail: format!(
-                                        "expected {}, got {actual}",
-                                        blob_state.count
-                                    ),
+                                    detail: format!("expected {}, got {actual}", blob_state.count),
                                     repro: repro_log.clone(),
                                 });
                             }
@@ -426,9 +435,7 @@ fn main_impl() {
                             "INSERT INTO {cdc_table} VALUES ({row_id}, {val}) \
                              ON CONFLICT (id) DO UPDATE SET val = {val}"
                         ),
-                        1 => format!(
-                            "UPDATE {cdc_table} SET val = {val} WHERE id = {row_id}"
-                        ),
+                        1 => format!("UPDATE {cdc_table} SET val = {val} WHERE id = {row_id}"),
                         _ => format!("DELETE FROM {cdc_table} WHERE id = {row_id}"),
                     };
                     repro_log.push(format!("{sql};"));
@@ -467,9 +474,8 @@ fn main_impl() {
                     if total_entries == 0 {
                         continue;
                     }
-                    let read_sql = format!(
-                        "SELECT CDC_TABLE_READ('{cdc_table}', 0, {total_entries})"
-                    );
+                    let read_sql =
+                        format!("SELECT CDC_TABLE_READ('{cdc_table}', 0, {total_entries})");
                     repro_log.push(read_sql.clone());
                     if let Some(json) = run_text(&ex, &read_sql) {
                         let tables = extract_tables(&json);
@@ -534,7 +540,9 @@ fn main_impl() {
         // and check the delta.
         let _ = exec_ddl(
             &ex,
-            &format!("INSERT INTO {cdc_table} VALUES (9999, 1) ON CONFLICT (id) DO UPDATE SET val = val + 1")
+            &format!(
+                "INSERT INTO {cdc_table} VALUES (9999, 1) ON CONFLICT (id) DO UPDATE SET val = val + 1"
+            ),
         );
         let cdc_after = run_i64(&ex, "SELECT CDC_COUNT()").unwrap_or(0);
         let _ = cdc_before; // used only for context
@@ -561,7 +569,12 @@ fn main_impl() {
     println!("violations found   : {}", violations.len());
 
     for (idx, v) in violations.iter().enumerate() {
-        println!("\n─── VIOLATION #{} ─── [{} / {}]", idx + 1, v.model, v.invariant);
+        println!(
+            "\n─── VIOLATION #{} ─── [{} / {}]",
+            idx + 1,
+            v.model,
+            v.invariant
+        );
         println!("  detail : {}", v.detail);
         println!("  repro  ({} steps):", v.repro.len());
         // Print only the last 20 ops to keep output readable.
@@ -572,7 +585,9 @@ fn main_impl() {
     }
 
     if violations.is_empty() {
-        println!("\nAll Stream / Blob / CDC / PubSub invariants hold across {iterations} iterations.");
+        println!(
+            "\nAll Stream / Blob / CDC / PubSub invariants hold across {iterations} iterations."
+        );
         std::process::exit(0);
     } else {
         std::process::exit(1);

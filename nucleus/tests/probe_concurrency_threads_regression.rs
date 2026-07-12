@@ -16,13 +16,25 @@ use nucleus::storage::MvccStorageAdapter;
 use nucleus::types::Value;
 
 fn ex() -> Arc<Executor> {
-    Arc::new(Executor::new(Arc::new(Catalog::new()), Arc::new(MvccStorageAdapter::new())))
+    Arc::new(Executor::new(
+        Arc::new(Catalog::new()),
+        Arc::new(MvccStorageAdapter::new()),
+    ))
 }
 fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
 }
-fn run(ex: &Executor, rt: &tokio::runtime::Runtime, sid: u64, sql: &str) -> Result<Vec<ExecResult>, String> {
-    rt.block_on(ex.execute_with_session(sid, sql)).map_err(|e| format!("{e}"))
+fn run(
+    ex: &Executor,
+    rt: &tokio::runtime::Runtime,
+    sid: u64,
+    sql: &str,
+) -> Result<Vec<ExecResult>, String> {
+    rt.block_on(ex.execute_with_session(sid, sql))
+        .map_err(|e| format!("{e}"))
 }
 fn read1(ex: &Executor, rt: &tokio::runtime::Runtime, sid: u64, sql: &str) -> Option<i64> {
     let mut r = run(ex, rt, sid, sql).ok()?;
@@ -81,8 +93,20 @@ fn serializable_detects_conflict_with_committed_txn() {
     let database = ex();
     let r0 = rt();
     let setup = database.create_session();
-    run(&database, &r0, setup, "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)").unwrap();
-    run(&database, &r0, setup, "INSERT INTO counter (id, v) VALUES (1, 10)").unwrap();
+    run(
+        &database,
+        &r0,
+        setup,
+        "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+    )
+    .unwrap();
+    run(
+        &database,
+        &r0,
+        setup,
+        "INSERT INTO counter (id, v) VALUES (1, 10)",
+    )
+    .unwrap();
     database.drop_session(setup);
 
     let s1 = database.create_session();
@@ -99,13 +123,24 @@ fn serializable_detects_conflict_with_committed_txn() {
     assert_eq!(v2, 10);
 
     // T1 increments and COMMITs first (this triggers cleanup_ssi(T1)).
-    run(&database, &r1, s1, &format!("UPDATE counter SET v={} WHERE id=1", v1 + 1)).unwrap();
+    run(
+        &database,
+        &r1,
+        s1,
+        &format!("UPDATE counter SET v={} WHERE id=1", v1 + 1),
+    )
+    .unwrap();
     run(&database, &r1, s1, "COMMIT").unwrap();
 
     // T2 (still open) now increments based on its stale read of 10 and COMMITs.
     // Under SERIALIZABLE this MUST fail (write skew / lost update); both txns
     // read 10 and both write 11, so one increment would be lost.
-    let upd = run(&database, &r2, s2, &format!("UPDATE counter SET v={} WHERE id=1", v2 + 1));
+    let upd = run(
+        &database,
+        &r2,
+        s2,
+        &format!("UPDATE counter SET v={} WHERE id=1", v2 + 1),
+    );
     let commit = if upd.is_ok() {
         run(&database, &r2, s2, "COMMIT")
     } else {
@@ -154,8 +189,20 @@ fn assert_no_lost_update(select: &str) {
     {
         let r = rt();
         let s = database.create_session();
-        run(&database, &r, s, "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)").unwrap();
-        run(&database, &r, s, "INSERT INTO counter (id, v) VALUES (1, 0)").unwrap();
+        run(
+            &database,
+            &r,
+            s,
+            "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+        )
+        .unwrap();
+        run(
+            &database,
+            &r,
+            s,
+            "INSERT INTO counter (id, v) VALUES (1, 0)",
+        )
+        .unwrap();
         database.drop_session(s);
     }
     let commits = Arc::new(AtomicUsize::new(0));
@@ -178,9 +225,19 @@ fn assert_no_lost_update(select: &str) {
                     }
                     let cur = match read1(&database, &r, s, &select) {
                         Some(n) => n,
-                        None => { let _ = run(&database, &r, s, "ROLLBACK"); continue; }
+                        None => {
+                            let _ = run(&database, &r, s, "ROLLBACK");
+                            continue;
+                        }
                     };
-                    if run(&database, &r, s, &format!("UPDATE counter SET v={} WHERE id=1", cur + 1)).is_err() {
+                    if run(
+                        &database,
+                        &r,
+                        s,
+                        &format!("UPDATE counter SET v={} WHERE id=1", cur + 1),
+                    )
+                    .is_err()
+                    {
                         let _ = run(&database, &r, s, "ROLLBACK");
                         continue;
                     }
@@ -194,11 +251,16 @@ fn assert_no_lost_update(select: &str) {
             database.drop_session(s);
         }));
     }
-    for h in hs { h.join().unwrap(); }
+    for h in hs {
+        h.join().unwrap();
+    }
     let n = commits.load(Ordering::Relaxed);
     let r = rt();
     let s = database.create_session();
     let final_v = read1(&database, &r, s, "SELECT v FROM counter WHERE id=1").unwrap();
     database.drop_session(s);
-    assert_eq!(final_v, n as i64, "lost update: final={final_v} committed={n} (select via `{select}`)");
+    assert_eq!(
+        final_v, n as i64,
+        "lost update: final={final_v} committed={n} (select via `{select}`)"
+    );
 }

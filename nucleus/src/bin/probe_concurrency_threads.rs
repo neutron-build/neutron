@@ -51,14 +51,23 @@ impl Rng {
         self.0 ^= self.0 << 17;
         self.0
     }
-    fn below(&mut self, n: usize) -> usize { (self.next() % n as u64) as usize }
-    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T { &xs[self.below(xs.len())] }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+        &xs[self.below(xs.len())]
+    }
 }
 
 // ─── Per-worker runtime + session helpers ─────────────────────────────────────
 
 /// Run `sql` in this worker's session. Returns Ok(results) or Err(message).
-fn run(ex: &Executor, rt: &tokio::runtime::Runtime, sid: u64, sql: &str) -> Result<Vec<ExecResult>, String> {
+fn run(
+    ex: &Executor,
+    rt: &tokio::runtime::Runtime,
+    sid: u64,
+    sql: &str,
+) -> Result<Vec<ExecResult>, String> {
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rt.block_on(ex.execute_with_session(sid, sql))
     }));
@@ -79,7 +88,12 @@ fn is_serialization_err(e: &str) -> bool {
 }
 
 /// Read the single integer cell of `SELECT <col> FROM counter WHERE id=<id>`.
-fn read_int(ex: &Executor, rt: &tokio::runtime::Runtime, sid: u64, sql: &str) -> Result<Option<i64>, String> {
+fn read_int(
+    ex: &Executor,
+    rt: &tokio::runtime::Runtime,
+    sid: u64,
+    sql: &str,
+) -> Result<Option<i64>, String> {
     let mut r = run(ex, rt, sid, sql)?;
     match r.pop() {
         Some(ExecResult::Select { rows, .. }) => {
@@ -104,7 +118,10 @@ fn new_rt() -> tokio::runtime::Runtime {
 
 // ─── Fresh executor per round (in-memory MVCC) ────────────────────────────────
 fn fresh_executor() -> Arc<Executor> {
-    Arc::new(Executor::new(Arc::new(Catalog::new()), Arc::new(MvccStorageAdapter::new())))
+    Arc::new(Executor::new(
+        Arc::new(Catalog::new()),
+        Arc::new(MvccStorageAdapter::new()),
+    ))
 }
 
 /// DDL + one auto-committed setup statement, run on a throwaway session.
@@ -127,7 +144,10 @@ impl Report {
     fn fail(&mut self, title: &str, detail: String) {
         self.divergences += 1;
         if self.divergences <= self.max {
-            println!("─── INVARIANT VIOLATION #{} : {title} ───", self.divergences);
+            println!(
+                "─── INVARIANT VIOLATION #{} : {title} ───",
+                self.divergences
+            );
             println!("{detail}\n");
         }
     }
@@ -146,10 +166,13 @@ fn test_lost_update(rng: &mut Rng, report: &mut Report) {
     let per_worker = 3 + rng.below(6); // 3..=8
 
     let ex = fresh_executor();
-    if let Err(e) = setup(&ex, &[
-        "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
-        "INSERT INTO counter (id, v) VALUES (1, 0)",
-    ]) {
+    if let Err(e) = setup(
+        &ex,
+        &[
+            "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+            "INSERT INTO counter (id, v) VALUES (1, 0)",
+        ],
+    ) {
         report.fail("lost-update setup failed", format!("  {e}"));
         return;
     }
@@ -175,23 +198,41 @@ fn test_lost_update(rng: &mut Rng, report: &mut Report) {
                     }
                     let cur = match read_int(&ex, &rt, sid, "SELECT v FROM counter WHERE id=1") {
                         Ok(Some(n)) => n,
-                        _ => { let _ = run(&ex, &rt, sid, "ROLLBACK"); continue; }
+                        _ => {
+                            let _ = run(&ex, &rt, sid, "ROLLBACK");
+                            continue;
+                        }
                     };
-                    if let Err(e) = run(&ex, &rt, sid, &format!("UPDATE counter SET v={} WHERE id=1", cur + 1)) {
+                    if let Err(e) = run(
+                        &ex,
+                        &rt,
+                        sid,
+                        &format!("UPDATE counter SET v={} WHERE id=1", cur + 1),
+                    ) {
                         let _ = run(&ex, &rt, sid, "ROLLBACK");
-                        if is_serialization_err(&e) { continue; }
+                        if is_serialization_err(&e) {
+                            continue;
+                        }
                         continue; // any error → retry
                     }
                     match run(&ex, &rt, sid, "COMMIT") {
-                        Ok(_) => { commits.fetch_add(1, Ordering::Relaxed); break; }
-                        Err(_) => { let _ = run(&ex, &rt, sid, "ROLLBACK"); continue; }
+                        Ok(_) => {
+                            commits.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        Err(_) => {
+                            let _ = run(&ex, &rt, sid, "ROLLBACK");
+                            continue;
+                        }
                     }
                 }
             }
             ex.drop_session(sid);
         }));
     }
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
 
     let n_commits = commits.load(Ordering::Relaxed);
     let rt = new_rt();
@@ -231,10 +272,13 @@ fn test_dirty_read(rng: &mut Rng, report: &mut Report) {
     let reader_iso = *rng.pick(&["SERIALIZABLE", "REPEATABLE READ", "READ COMMITTED"]);
 
     let ex = fresh_executor();
-    if let Err(e) = setup(&ex, &[
-        "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
-        &format!("INSERT INTO counter (id, v) VALUES (1, {BASE})"),
-    ]) {
+    if let Err(e) = setup(
+        &ex,
+        &[
+            "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+            &format!("INSERT INTO counter (id, v) VALUES (1, {BASE})"),
+        ],
+    ) {
         report.fail("dirty-read setup failed", format!("  {e}"));
         return;
     }
@@ -253,7 +297,12 @@ fn test_dirty_read(rng: &mut Rng, report: &mut Report) {
             let rt = new_rt();
             let sid = ex.create_session();
             let _ = run(&ex, &rt, sid, &format!("BEGIN ISOLATION LEVEL {iso}"));
-            let _ = run(&ex, &rt, sid, &format!("UPDATE counter SET v={SENTINEL} WHERE id=1"));
+            let _ = run(
+                &ex,
+                &rt,
+                sid,
+                &format!("UPDATE counter SET v={SENTINEL} WHERE id=1"),
+            );
             wr.wait(); // signal readers: uncommitted write is in place
             rd.wait(); // wait for readers to finish hammering
             let _ = run(&ex, &rt, sid, "ROLLBACK");
@@ -290,7 +339,9 @@ fn test_dirty_read(rng: &mut Rng, report: &mut Report) {
         }));
     }
     let _ = writer.join();
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
 
     let n = dirty_seen.load(Ordering::Relaxed);
     if n > 0 {
@@ -333,10 +384,13 @@ fn test_torn_read(rng: &mut Rng, report: &mut Report) {
     let r_iso = *rng.pick(&["SERIALIZABLE", "REPEATABLE READ", "READ COMMITTED"]);
 
     let ex = fresh_executor();
-    if let Err(e) = setup(&ex, &[
-        "CREATE TABLE acct (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL)",
-        &format!("INSERT INTO acct (id, a, b) VALUES (1, 0, {CONST})"),
-    ]) {
+    if let Err(e) = setup(
+        &ex,
+        &[
+            "CREATE TABLE acct (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL)",
+            &format!("INSERT INTO acct (id, a, b) VALUES (1, 0, {CONST})"),
+        ],
+    ) {
         report.fail("torn-read setup failed", format!("  {e}"));
         return;
     }
@@ -359,9 +413,17 @@ fn test_torn_read(rng: &mut Rng, report: &mut Report) {
             barrier.wait();
             while !stop.load(Ordering::Relaxed) {
                 let x = (r.next() % (CONST as u64 + 1)) as i64;
-                if run(&ex, &rt, sid, &format!("BEGIN ISOLATION LEVEL {iso}")).is_err() { continue; }
+                if run(&ex, &rt, sid, &format!("BEGIN ISOLATION LEVEL {iso}")).is_err() {
+                    continue;
+                }
                 let ok1 = run(&ex, &rt, sid, &format!("UPDATE acct SET a={x} WHERE id=1")).is_ok();
-                let ok2 = run(&ex, &rt, sid, &format!("UPDATE acct SET b={} WHERE id=1", CONST - x)).is_ok();
+                let ok2 = run(
+                    &ex,
+                    &rt,
+                    sid,
+                    &format!("UPDATE acct SET b={} WHERE id=1", CONST - x),
+                )
+                .is_ok();
                 if ok1 && ok2 {
                     let _ = run(&ex, &rt, sid, "COMMIT");
                 } else {
@@ -385,7 +447,10 @@ fn test_torn_read(rng: &mut Rng, report: &mut Report) {
                 let _ = run(&ex, &rt, sid, &format!("BEGIN ISOLATION LEVEL {iso}"));
                 let mut r = match run(&ex, &rt, sid, "SELECT a, b FROM acct WHERE id=1") {
                     Ok(x) => x,
-                    Err(_) => { let _ = run(&ex, &rt, sid, "ROLLBACK"); continue; }
+                    Err(_) => {
+                        let _ = run(&ex, &rt, sid, "ROLLBACK");
+                        continue;
+                    }
                 };
                 if let Some(ExecResult::Select { rows, .. }) = r.pop() {
                     if let Some(row) = rows.get(0) {
@@ -416,7 +481,9 @@ fn test_torn_read(rng: &mut Rng, report: &mut Report) {
         }
         stop.store(true, Ordering::Relaxed);
     }
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
 
     // Final committed invariant must hold.
     let rt = new_rt();
@@ -428,7 +495,10 @@ fn test_torn_read(rng: &mut Rng, report: &mut Report) {
                     if a + b != CONST {
                         report.fail(
                             "FINAL STATE VIOLATES INVARIANT (a+b != CONST after all commits)",
-                            format!("  a={a} b={b} a+b={} expected {CONST}  w_iso={w_iso}", a + b),
+                            format!(
+                                "  a={a} b={b} a+b={} expected {CONST}  w_iso={w_iso}",
+                                a + b
+                            ),
                         );
                     }
                 }
@@ -472,10 +542,13 @@ fn as_int(v: Option<&Value>) -> Option<i64> {
 fn test_write_conflict(rng: &mut Rng, report: &mut Report, stats: &mut ConflictStats) {
     let iso = *rng.pick(&["SERIALIZABLE", "REPEATABLE READ"]);
     let ex = fresh_executor();
-    if let Err(e) = setup(&ex, &[
-        "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
-        "INSERT INTO counter (id, v) VALUES (1, 0)",
-    ]) {
+    if let Err(e) = setup(
+        &ex,
+        &[
+            "CREATE TABLE counter (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+            "INSERT INTO counter (id, v) VALUES (1, 0)",
+        ],
+    ) {
         report.fail("write-conflict setup failed", format!("  {e}"));
         return;
     }
@@ -499,7 +572,12 @@ fn test_write_conflict(rng: &mut Rng, report: &mut Report, stats: &mut ConflictS
             let sid = ex.create_session();
             barrier.wait();
             let _ = run(&ex, &rt, sid, &format!("BEGIN ISOLATION LEVEL {iso}"));
-            let upd = run(&ex, &rt, sid, &format!("UPDATE counter SET v={val} WHERE id=1"));
+            let upd = run(
+                &ex,
+                &rt,
+                sid,
+                &format!("UPDATE counter SET v={val} WHERE id=1"),
+            );
             barrier.wait(); // both attempt update before either commits
             if upd.is_err() {
                 let _ = run(&ex, &rt, sid, "ROLLBACK");
@@ -519,18 +597,26 @@ fn test_write_conflict(rng: &mut Rng, report: &mut Report, stats: &mut ConflictS
             ex.drop_session(sid);
         }));
     }
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
 
     let committed = outcome[0].load(Ordering::Relaxed);
     let rejected = outcome[1].load(Ordering::Relaxed);
     stats.trials += 1;
-    if rejected > 0 { stats.conflicts_detected += 1; }
-    if committed == 2 { stats.both_committed += 1; }
+    if rejected > 0 {
+        stats.conflicts_detected += 1;
+    }
+    if committed == 2 {
+        stats.both_committed += 1;
+    }
 
     // Final value sanity: must be a value some committed writer wrote.
     let rt = new_rt();
     let sid = ex.create_session();
-    let final_v = read_int(&ex, &rt, sid, "SELECT v FROM counter WHERE id=1").ok().flatten();
+    let final_v = read_int(&ex, &rt, sid, "SELECT v FROM counter WHERE id=1")
+        .ok()
+        .flatten();
     ex.drop_session(sid);
     let cvals = committed_vals.lock().unwrap().clone();
 
@@ -551,7 +637,9 @@ fn test_write_conflict(rng: &mut Rng, report: &mut Report, stats: &mut ConflictS
             if fv != 0 {
                 report.fail(
                     "GHOST WRITE (value changed though no writer committed)",
-                    format!("  iso={iso} both writers rejected/rolled back but final={fv} (expected 0)"),
+                    format!(
+                        "  iso={iso} both writers rejected/rolled back but final={fv} (expected 0)"
+                    ),
                 );
             }
         }
@@ -586,9 +674,18 @@ fn main_impl() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed" => { i += 1; seed = args[i].parse().unwrap(); }
-            "--rounds" => { i += 1; rounds = args[i].parse().unwrap(); }
-            "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
+            "--seed" => {
+                i += 1;
+                seed = args[i].parse().unwrap();
+            }
+            "--rounds" => {
+                i += 1;
+                rounds = args[i].parse().unwrap();
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = args[i].parse().unwrap();
+            }
             _ => {}
         }
         i += 1;
@@ -600,12 +697,22 @@ fn main_impl() {
     println!("seed={seed} rounds={rounds} (4 invariants/round, genuine OS-thread contention)\n");
 
     let mut rng = Rng(seed | 1);
-    let mut report = Report { divergences: 0, max: max_report };
-    let mut cstats = ConflictStats { trials: 0, conflicts_detected: 0, both_committed: 0 };
+    let mut report = Report {
+        divergences: 0,
+        max: max_report,
+    };
+    let mut cstats = ConflictStats {
+        trials: 0,
+        conflicts_detected: 0,
+        both_committed: 0,
+    };
 
     for round in 0..rounds {
         if round % 25 == 0 && round > 0 {
-            println!("  …round {round}/{rounds} (violations so far: {})", report.divergences);
+            println!(
+                "  …round {round}/{rounds} (violations so far: {})",
+                report.divergences
+            );
         }
         test_lost_update(&mut rng, &mut report);
         test_dirty_read(&mut rng, &mut report);

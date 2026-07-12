@@ -36,8 +36,14 @@ fn as_i64(v: &Value) -> i64 {
 #[tokio::test]
 async fn chained_cte_second_references_first() {
     let e = ex(Arc::new(MvccStorageAdapter::new()));
-    e.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER)").await.unwrap();
-    e.execute("INSERT INTO t (id, c1) VALUES (1,10),(2,20),(3,30),(4,40),(5,50),(6,60),(7,70),(8,80)").await.unwrap();
+    e.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER)")
+        .await
+        .unwrap();
+    e.execute(
+        "INSERT INTO t (id, c1) VALUES (1,10),(2,20),(3,30),(4,40),(5,50),(6,60),(7,70),(8,80)",
+    )
+    .await
+    .unwrap();
 
     let r = rows(
         &e,
@@ -57,8 +63,12 @@ async fn chained_cte_second_references_first() {
 #[tokio::test]
 async fn chained_cte_three_deep() {
     let e = ex(Arc::new(MvccStorageAdapter::new()));
-    e.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER)").await.unwrap();
-    e.execute("INSERT INTO t (id, c1) VALUES (1,1),(2,2),(3,3),(4,4),(5,5)").await.unwrap();
+    e.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER)")
+        .await
+        .unwrap();
+    e.execute("INSERT INTO t (id, c1) VALUES (1,1),(2,2),(3,3),(4,4),(5,5)")
+        .await
+        .unwrap();
 
     let r = rows(
         &e,
@@ -78,8 +88,12 @@ async fn chained_cte_three_deep() {
 #[tokio::test]
 async fn chained_cte_join_earlier() {
     let e = ex(Arc::new(MvccStorageAdapter::new()));
-    e.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER)").await.unwrap();
-    e.execute("INSERT INTO t (id, c1) VALUES (1,10),(2,20),(3,30)").await.unwrap();
+    e.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c1 INTEGER)")
+        .await
+        .unwrap();
+    e.execute("INSERT INTO t (id, c1) VALUES (1,10),(2,20),(3,30)")
+        .await
+        .unwrap();
 
     let r = rows(
         &e,

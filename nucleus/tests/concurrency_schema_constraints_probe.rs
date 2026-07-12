@@ -36,7 +36,10 @@ impl Rng {
 }
 
 fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
 }
 /// Run sql, swallowing per-op errors (serialization/constraint/conflict are all
 /// acceptable). Returns true if it did NOT panic.
@@ -47,7 +50,12 @@ fn run(ex: &Executor, r: &tokio::runtime::Runtime, sid: u64, sql: &str) -> bool 
     .is_ok()
 }
 
-fn select_rows(ex: &Executor, r: &tokio::runtime::Runtime, sid: u64, sql: &str) -> Option<Vec<Vec<Value>>> {
+fn select_rows(
+    ex: &Executor,
+    r: &tokio::runtime::Runtime,
+    sid: u64,
+    sql: &str,
+) -> Option<Vec<Vec<Value>>> {
     match r.block_on(ex.execute_with_session(sid, sql)) {
         Ok(mut v) => match v.pop() {
             Some(ExecResult::Select { rows, .. }) => Some(rows),
@@ -68,8 +76,12 @@ fn schema_and_constraints_hold_under_concurrency() {
         let r0 = rt();
         let s0 = ex.create_session();
         // PK on id, UNIQUE on uq, CHECK v >= 0.
-        run(&ex, &r0, s0,
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, uq INTEGER UNIQUE, v INTEGER CHECK (v >= 0))");
+        run(
+            &ex,
+            &r0,
+            s0,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, uq INTEGER UNIQUE, v INTEGER CHECK (v >= 0))",
+        );
         ex.drop_session(s0);
 
         let workers = 6;
@@ -91,7 +103,12 @@ fn schema_and_constraints_hold_under_concurrency() {
                     let uq = rng.below(key_space);
                     let v = rng.below(20) as i64 - 5; // sometimes negative → CHECK violation
                     let ok = match rng.below(10) {
-                        0..=4 => run(&ex, &r, sid, &format!("INSERT INTO t (id, uq, v) VALUES ({id},{uq},{v})")),
+                        0..=4 => run(
+                            &ex,
+                            &r,
+                            sid,
+                            &format!("INSERT INTO t (id, uq, v) VALUES ({id},{uq},{v})"),
+                        ),
                         5..=6 => run(&ex, &r, sid, &format!("UPDATE t SET v={v} WHERE id={id}")),
                         7 => run(&ex, &r, sid, &format!("UPDATE t SET uq={uq} WHERE id={id}")),
                         8 => run(&ex, &r, sid, &format!("DELETE FROM t WHERE id={id}")),
@@ -100,7 +117,12 @@ fn schema_and_constraints_hold_under_concurrency() {
                             match rng.below(3) {
                                 0 => run(&ex, &r, sid, "CREATE INDEX IF NOT EXISTS ix_v ON t (v)"),
                                 1 => run(&ex, &r, sid, "DROP INDEX IF EXISTS ix_v"),
-                                _ => run(&ex, &r, sid, &format!("ALTER TABLE t ADD COLUMN c{} INTEGER", rng.below(3))),
+                                _ => run(
+                                    &ex,
+                                    &r,
+                                    sid,
+                                    &format!("ALTER TABLE t ADD COLUMN c{} INTEGER", rng.below(3)),
+                                ),
                             }
                         }
                     };
@@ -145,10 +167,19 @@ fn schema_and_constraints_hold_under_concurrency() {
         }
         let dup_id: Vec<_> = ids.iter().filter(|&(_, &c)| c > 1).collect();
         let dup_uq: Vec<_> = uqs.iter().filter(|&(_, &c)| c > 1).collect();
-        assert!(dup_id.is_empty(), "round {round}: PRIMARY KEY duplicated: {dup_id:?}");
-        assert!(dup_uq.is_empty(), "round {round}: UNIQUE column duplicated: {dup_uq:?}");
+        assert!(
+            dup_id.is_empty(),
+            "round {round}: PRIMARY KEY duplicated: {dup_id:?}"
+        );
+        assert!(
+            dup_uq.is_empty(),
+            "round {round}: UNIQUE column duplicated: {dup_uq:?}"
+        );
 
         ex.drop_session(sc);
     }
-    println!("20 rounds clean ({} per-op errors swallowed, 0 panics)", panics.load(Ordering::Relaxed));
+    println!(
+        "20 rounds clean ({} per-op errors swallowed, 0 panics)",
+        panics.load(Ordering::Relaxed)
+    );
 }

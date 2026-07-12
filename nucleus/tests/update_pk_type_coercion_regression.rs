@@ -28,7 +28,11 @@ async fn fresh() -> Arc<Executor> {
 }
 
 async fn exec(ex: &Executor, sql: &str) -> ExecResult {
-    ex.execute(sql).await.expect(sql).pop().expect("a statement result")
+    ex.execute(sql)
+        .await
+        .expect(sql)
+        .pop()
+        .expect("a statement result")
 }
 
 async fn select_rows(ex: &Executor, sql: &str) -> Vec<Vec<Value>> {
@@ -42,9 +46,17 @@ async fn select_rows(ex: &Executor, sql: &str) -> Vec<Vec<Value>> {
 #[tokio::test]
 async fn update_by_bigint_pk_matches_text_bound_value() {
     let ex = fresh().await;
-    exec(&ex, "CREATE TABLE api_keys (id BIGINT PRIMARY KEY, revoked TEXT)").await;
+    exec(
+        &ex,
+        "CREATE TABLE api_keys (id BIGINT PRIMARY KEY, revoked TEXT)",
+    )
+    .await;
     // Simple-protocol clients bind params as text → stored as Int64 via INSERT coercion.
-    exec(&ex, "INSERT INTO api_keys (id, revoked) VALUES ('5', 'false')").await;
+    exec(
+        &ex,
+        "INSERT INTO api_keys (id, revoked) VALUES ('5', 'false')",
+    )
+    .await;
     // Literal re-parses to Int32; must still match the Int64-stored PK.
     exec(&ex, "UPDATE api_keys SET revoked = 'true' WHERE id = 5").await;
 
@@ -61,23 +73,47 @@ async fn update_by_bigint_pk_matches_text_bound_value() {
 #[tokio::test]
 async fn update_by_bigint_pk_matches_text_literal_predicate() {
     let ex = fresh().await;
-    exec(&ex, "CREATE TABLE api_keys (id BIGINT PRIMARY KEY, revoked TEXT)").await;
-    exec(&ex, "INSERT INTO api_keys (id, revoked) VALUES ('5', 'false')").await;
+    exec(
+        &ex,
+        "CREATE TABLE api_keys (id BIGINT PRIMARY KEY, revoked TEXT)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO api_keys (id, revoked) VALUES ('5', 'false')",
+    )
+    .await;
     // pgx simple protocol: WHERE id = $1 arrives as WHERE id = '5'.
     exec(&ex, "UPDATE api_keys SET revoked = 'true' WHERE id = '5'").await;
 
     let rows = select_rows(&ex, "SELECT revoked FROM api_keys").await;
-    assert_eq!(rows[0][0], Value::Text("true".into()), "text-literal UPDATE no-oped");
+    assert_eq!(
+        rows[0][0],
+        Value::Text("true".into()),
+        "text-literal UPDATE no-oped"
+    );
 }
 
 /// DELETE must coerce too (retention / hard revoke).
 #[tokio::test]
 async fn delete_by_bigint_pk_matches_text_bound_value() {
     let ex = fresh().await;
-    exec(&ex, "CREATE TABLE api_keys (id BIGINT PRIMARY KEY, revoked TEXT)").await;
-    exec(&ex, "INSERT INTO api_keys (id, revoked) VALUES ('7', 'false')").await;
+    exec(
+        &ex,
+        "CREATE TABLE api_keys (id BIGINT PRIMARY KEY, revoked TEXT)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO api_keys (id, revoked) VALUES ('7', 'false')",
+    )
+    .await;
     exec(&ex, "DELETE FROM api_keys WHERE id = 7").await;
 
     let rows = select_rows(&ex, "SELECT revoked FROM api_keys").await;
-    assert_eq!(rows.len(), 0, "DELETE by numeric literal missed the Int64-stored PK");
+    assert_eq!(
+        rows.len(),
+        0,
+        "DELETE by numeric literal missed the Int64-stored PK"
+    );
 }

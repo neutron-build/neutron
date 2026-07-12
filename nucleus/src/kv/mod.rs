@@ -2285,7 +2285,10 @@ mod tests {
         assert!(!store.setnx_ttl("lock", Value::Text("owner-2".into()), Some(10)));
         assert_eq!(store.get("lock"), Some(Value::Text("owner-1".into())));
         let ttl = store.ttl("lock");
-        assert!(ttl > 3500, "owner-2's failed acquire must not shorten the TTL");
+        assert!(
+            ttl > 3500,
+            "owner-2's failed acquire must not shorten the TTL"
+        );
         // no-TTL variant still behaves like plain setnx
         assert!(store.setnx_ttl("plain", Value::Int64(1), None));
         assert_eq!(store.ttl("plain"), -1);
@@ -2331,7 +2334,11 @@ mod tests {
         // wrong holder cannot renew
         assert!(!store.cexpire("lock", &Value::Text("owner-2".into()), 3600));
         let ttl = store.ttl("lock");
-        assert!(ttl <= 10, "failed renewal must not extend the TTL, got {}", ttl);
+        assert!(
+            ttl <= 10,
+            "failed renewal must not extend the TTL, got {}",
+            ttl
+        );
         // right holder renews
         assert!(store.cexpire("lock", &Value::Text("owner-1".into()), 3600));
         let ttl = store.ttl("lock");
@@ -2350,7 +2357,11 @@ mod tests {
         let store2 = KvStore::open(dir.path()).unwrap();
         assert_eq!(store2.get("lock"), Some(Value::Text("owner-1".into())));
         let ttl = store2.ttl("lock");
-        assert!(ttl > 3500 && ttl <= 3600, "TTL must survive recovery, got {}", ttl);
+        assert!(
+            ttl > 3500 && ttl <= 3600,
+            "TTL must survive recovery, got {}",
+            ttl
+        );
     }
 
     #[test]

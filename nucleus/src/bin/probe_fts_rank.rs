@@ -51,7 +51,9 @@ impl Rng {
         self.0
     }
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { return 0; }
+        if n == 0 {
+            return 0;
+        }
         (self.next() % n as u64) as usize
     }
     fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
@@ -71,9 +73,11 @@ fn run_scalar(ex: &Executor, sql: &str) -> Result<Value, String> {
     }));
     match res {
         Ok(Ok(mut results)) => match results.pop() {
-            Some(ExecResult::Select { rows, .. }) => {
-                Ok(rows.into_iter().next().and_then(|mut r| r.pop()).unwrap_or(Value::Null))
-            }
+            Some(ExecResult::Select { rows, .. }) => Ok(rows
+                .into_iter()
+                .next()
+                .and_then(|mut r| r.pop())
+                .unwrap_or(Value::Null)),
             Some(other) => Err(format!("unexpected result: {other:?}")),
             None => Err("empty result set".into()),
         },
@@ -108,7 +112,12 @@ fn parse_search_results(v: &Value) -> Option<Vec<(u64, f64)>> {
         };
         let score = {
             let after = entry.split("\"score\":").nth(1)?;
-            let num: String = after.chars().take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == 'e' || *c == 'E').collect();
+            let num: String = after
+                .chars()
+                .take_while(|c| {
+                    c.is_ascii_digit() || *c == '.' || *c == '-' || *c == 'e' || *c == 'E'
+                })
+                .collect();
             num.parse::<f64>().ok()?
         };
         results.push((doc_id, score));
@@ -138,11 +147,9 @@ fn fts_rank(ex: &Executor, doc_text: &str, query: &str) -> Option<f64> {
 // ─── Small non-stopword corpus ────────────────────────────────────────────────
 
 const WORDS: &[&str] = &[
-    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot",
-    "gamma", "hotel", "index", "kilo", "lima", "mike",
-    "november", "oscar", "papa", "quebec", "romeo", "sierra",
-    "tango", "uniform", "victor", "whiskey", "xray", "yankee",
-    "zulu", "rust", "fast", "quick", "brown", "jump",
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "gamma", "hotel", "index", "kilo",
+    "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango", "uniform",
+    "victor", "whiskey", "xray", "yankee", "zulu", "rust", "fast", "quick", "brown", "jump",
     "data", "base", "query", "search", "text", "graph",
 ];
 
@@ -202,19 +209,31 @@ impl BM25Oracle {
 /// Check that `got` (from FTS_SEARCH SQL) has the same relative order as
 /// `expected` (from InvertedIndex::search). Returns None on agreement,
 /// Some(description) on violation.
-fn check_ordering(
-    expected: &[(u64, f64)],
-    got: &[(u64, f64)],
-) -> Option<String> {
+fn check_ordering(expected: &[(u64, f64)], got: &[(u64, f64)]) -> Option<String> {
     // Only check docs that appear in BOTH lists (SQL might return subset).
     // Build a position map for each.
-    let exp_pos: HashMap<u64, usize> = expected.iter().enumerate().map(|(i, (id, _))| (*id, i)).collect();
-    let got_pos: HashMap<u64, usize> = got.iter().enumerate().map(|(i, (id, _))| (*id, i)).collect();
+    let exp_pos: HashMap<u64, usize> = expected
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| (*id, i))
+        .collect();
+    let got_pos: HashMap<u64, usize> = got
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| (*id, i))
+        .collect();
 
     // For every pair of docs that both appear in expected and got,
     // their relative order must agree.
-    let common: Vec<u64> = expected.iter()
-        .filter_map(|(id, _)| if got_pos.contains_key(id) { Some(*id) } else { None })
+    let common: Vec<u64> = expected
+        .iter()
+        .filter_map(|(id, _)| {
+            if got_pos.contains_key(id) {
+                Some(*id)
+            } else {
+                None
+            }
+        })
         .collect();
 
     for i in 0..common.len() {
@@ -249,11 +268,7 @@ fn check_ordering(
 }
 
 /// Check that scores from SQL match oracle scores within tolerance.
-fn check_scores(
-    expected: &[(u64, f64)],
-    got: &[(u64, f64)],
-    tol: f64,
-) -> Option<String> {
+fn check_scores(expected: &[(u64, f64)], got: &[(u64, f64)], tol: f64) -> Option<String> {
     let exp_map: HashMap<u64, f64> = expected.iter().copied().collect();
     let got_map: HashMap<u64, f64> = got.iter().copied().collect();
     for (id, exp_score) in &exp_map {
@@ -271,7 +286,12 @@ fn check_scores(
 
 /// Monotonicity: a doc with more occurrences of a specific term should rank >= one with fewer.
 /// Build two synthetic docs that differ only in frequency of the query term and check.
-fn check_monotonicity_freq(oracle: &mut BM25Oracle, ex: &Executor, rng: &mut Rng, term: &str) -> Option<String> {
+fn check_monotonicity_freq(
+    oracle: &mut BM25Oracle,
+    ex: &Executor,
+    rng: &mut Rng,
+    term: &str,
+) -> Option<String> {
     // Use very high doc IDs to avoid colliding with regular corpus (90000+)
     let id_more = 90001u64;
     let id_fewer = 90002u64;
@@ -346,10 +366,22 @@ fn main_impl() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed" => { i += 1; seed = args[i].parse().unwrap(); }
-            "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
-            "--corpus" => { i += 1; corpus_size = args[i].parse().unwrap(); }
-            "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
+            "--seed" => {
+                i += 1;
+                seed = args[i].parse().unwrap();
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args[i].parse().unwrap();
+            }
+            "--corpus" => {
+                i += 1;
+                corpus_size = args[i].parse().unwrap();
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = args[i].parse().unwrap();
+            }
             _ => {}
         }
         i += 1;
@@ -358,7 +390,9 @@ fn main_impl() {
 
     println!("Nucleus FTS ranking differential fuzzer");
     println!("seed={seed} iterations={iterations} corpus_size={corpus_size}");
-    println!("Checks: (A) relative order, (B) score accuracy, (C) monotonicity, (D) FTS_RANK vs BM25\n");
+    println!(
+        "Checks: (A) relative order, (B) score accuracy, (C) monotonicity, (D) FTS_RANK vs BM25\n"
+    );
 
     let mut total_queries = 0usize;
     let mut order_violations = 0usize;
@@ -406,7 +440,10 @@ fn main_impl() {
                         if parse_errors <= max_report {
                             println!("─── PARSE/EXEC ERROR (iter {iter}) ───");
                             println!("  query: {query}");
-                            println!("  oracle returned {} results but SQL failed\n", oracle_results.len());
+                            println!(
+                                "  oracle returned {} results but SQL failed\n",
+                                oracle_results.len()
+                            );
                         }
                     }
                     continue;
@@ -418,8 +455,19 @@ fn main_impl() {
                         if order_violations <= max_report {
                             println!("─── ORDER VIOLATION #{order_violations} (iter {iter}) ───");
                             println!("  query           : {query}");
-                            println!("  oracle order    : {:?}", oracle_results.iter().map(|(id, s)| format!("doc{id}={s:.4}")).collect::<Vec<_>>());
-                            println!("  sql    order    : {:?}", sql.iter().map(|(id, s)| format!("doc{id}={s:.4}")).collect::<Vec<_>>());
+                            println!(
+                                "  oracle order    : {:?}",
+                                oracle_results
+                                    .iter()
+                                    .map(|(id, s)| format!("doc{id}={s:.4}"))
+                                    .collect::<Vec<_>>()
+                            );
+                            println!(
+                                "  sql    order    : {:?}",
+                                sql.iter()
+                                    .map(|(id, s)| format!("doc{id}={s:.4}"))
+                                    .collect::<Vec<_>>()
+                            );
                             println!("  violation       : {violation}");
                             println!("  corpus ({n_docs} docs):");
                             for doc_id in 1..=(n_docs as u64) {
@@ -438,8 +486,19 @@ fn main_impl() {
                             println!("─── SCORE MISMATCH #{score_violations} (iter {iter}) ───");
                             println!("  query    : {query}");
                             println!("  {violation}");
-                            println!("  oracle   : {:?}", oracle_results.iter().map(|(id, s)| format!("doc{id}={s:.8}")).collect::<Vec<_>>());
-                            println!("  sql      : {:?}", sql.iter().map(|(id, s)| format!("doc{id}={s:.8}")).collect::<Vec<_>>());
+                            println!(
+                                "  oracle   : {:?}",
+                                oracle_results
+                                    .iter()
+                                    .map(|(id, s)| format!("doc{id}={s:.8}"))
+                                    .collect::<Vec<_>>()
+                            );
+                            println!(
+                                "  sql      : {:?}",
+                                sql.iter()
+                                    .map(|(id, s)| format!("doc{id}={s:.8}"))
+                                    .collect::<Vec<_>>()
+                            );
                             println!("  corpus ({n_docs} docs):");
                             for doc_id in 1..=(n_docs as u64) {
                                 if let Some(t) = doc_texts.get(&doc_id) {
@@ -485,11 +544,19 @@ fn main_impl() {
                                     if bm25_gap > 1e-9 && rank_gap < -1e-9 {
                                         rank_violations += 1;
                                         if rank_violations <= max_report {
-                                            println!("─── FTS_RANK vs BM25 ORDER MISMATCH #{rank_violations} (iter {iter}) ───");
+                                            println!(
+                                                "─── FTS_RANK vs BM25 ORDER MISMATCH #{rank_violations} (iter {iter}) ───"
+                                            );
                                             println!("  single-term query: {query}");
-                                            println!("  BM25 says doc {id_a} (score {bm25_a:.6}) > doc {id_b} (score {bm25_b:.6})");
-                                            println!("  FTS_RANK says doc {id_a} ({rank_a:.6}) < doc {id_b} ({rank_b:.6})");
-                                            if let (Some(ta), Some(tb)) = (doc_texts.get(&id_a), doc_texts.get(&id_b)) {
+                                            println!(
+                                                "  BM25 says doc {id_a} (score {bm25_a:.6}) > doc {id_b} (score {bm25_b:.6})"
+                                            );
+                                            println!(
+                                                "  FTS_RANK says doc {id_a} ({rank_a:.6}) < doc {id_b} ({rank_b:.6})"
+                                            );
+                                            if let (Some(ta), Some(tb)) =
+                                                (doc_texts.get(&id_a), doc_texts.get(&id_b))
+                                            {
                                                 println!("  doc {id_a}: {ta}");
                                                 println!("  doc {id_b}: {tb}");
                                             }
@@ -532,7 +599,9 @@ fn main_impl() {
     if total_violations == 0 && parse_errors == 0 {
         println!("\nNo ranking violations found. FTS_SEARCH ordering matches BM25 oracle.");
         if rank_violations > 0 {
-            println!("NOTE: {rank_violations} FTS_RANK vs BM25 order differences observed — expected (FTS_RANK uses TF-only, not BM25).");
+            println!(
+                "NOTE: {rank_violations} FTS_RANK vs BM25 order differences observed — expected (FTS_RANK uses TF-only, not BM25)."
+            );
         }
     } else {
         std::process::exit(1);

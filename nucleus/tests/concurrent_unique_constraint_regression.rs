@@ -14,7 +14,10 @@ use nucleus::executor::{ExecResult, Executor};
 use nucleus::storage::MvccStorageAdapter;
 
 fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
 }
 
 #[test]
@@ -27,7 +30,9 @@ fn concurrent_same_pk_insert_only_one_wins() {
         ));
         let r0 = rt();
         let s0 = ex.create_session();
-        let _ = r0.block_on(ex.execute_with_session(s0, "CREATE TABLE t (id INTEGER PRIMARY KEY, w INTEGER)"));
+        let _ = r0.block_on(
+            ex.execute_with_session(s0, "CREATE TABLE t (id INTEGER PRIMARY KEY, w INTEGER)"),
+        );
         ex.drop_session(s0);
 
         let n = 4;
@@ -41,7 +46,9 @@ fn concurrent_same_pk_insert_only_one_wins() {
                 let sid = ex.create_session();
                 barrier.wait();
                 // every worker tries to insert the SAME pk=1 (auto-commit)
-                let _ = r.block_on(ex.execute_with_session(sid, &format!("INSERT INTO t (id, w) VALUES (1, {w})")));
+                let _ = r.block_on(
+                    ex.execute_with_session(sid, &format!("INSERT INTO t (id, w) VALUES (1, {w})")),
+                );
                 ex.drop_session(sid);
             }));
         }
@@ -50,7 +57,12 @@ fn concurrent_same_pk_insert_only_one_wins() {
         }
         let rc = rt();
         let sc = ex.create_session();
-        let rows = match rc.block_on(ex.execute_with_session(sc, "SELECT id FROM t WHERE id=1")).unwrap().pop().unwrap() {
+        let rows = match rc
+            .block_on(ex.execute_with_session(sc, "SELECT id FROM t WHERE id=1"))
+            .unwrap()
+            .pop()
+            .unwrap()
+        {
             ExecResult::Select { rows, .. } => rows.len(),
             _ => 0,
         };
@@ -59,5 +71,8 @@ fn concurrent_same_pk_insert_only_one_wins() {
             dup_rounds += 1;
         }
     }
-    assert_eq!(dup_rounds, 0, "concurrent same-PK inserts produced duplicates in {dup_rounds}/40 rounds");
+    assert_eq!(
+        dup_rounds, 0,
+        "concurrent same-PK inserts produced duplicates in {dup_rounds}/40 rounds"
+    );
 }

@@ -49,7 +49,11 @@ impl Rng {
         z ^ (z >> 31)
     }
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { 0 } else { (self.next() % n as u64) as usize }
+        if n == 0 {
+            0
+        } else {
+            (self.next() % n as u64) as usize
+        }
     }
     fn chance(&mut self, pct: u64) -> bool {
         self.next() % 100 < pct
@@ -65,12 +69,12 @@ impl Rng {
 // ─── Column type taxonomy ─────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Ty {
-    Int,       // INTEGER — core numeric
-    Real,      // REAL    — floating point
-    Text,      // TEXT    — strings
-    Bool,      // BOOLEAN — stored as 0/1 integer in both engines
-    DateStr,   // DATE    — stored as TEXT 'YYYY-MM-DD' in both engines
-    TsInt,     // TIMESTAMP — stored as INTEGER epoch seconds in both engines
+    Int,     // INTEGER — core numeric
+    Real,    // REAL    — floating point
+    Text,    // TEXT    — strings
+    Bool,    // BOOLEAN — stored as 0/1 integer in both engines
+    DateStr, // DATE    — stored as TEXT 'YYYY-MM-DD' in both engines
+    TsInt,   // TIMESTAMP — stored as INTEGER epoch seconds in both engines
 }
 
 #[derive(Clone)]
@@ -85,8 +89,12 @@ const NAMES: &[&str] = &["c1", "c2", "c3", "c4", "c5", "c6"];
 const CATS: &[&str] = &["red", "green", "blue", "amber", "str0", "str1"];
 // Date strings: all valid YYYY-MM-DD, comparable as text in both engines.
 const DATES: &[&str] = &[
-    "2020-01-01", "2021-06-15", "2022-03-31", "2023-11-20",
-    "2024-07-04", "2019-12-25",
+    "2020-01-01",
+    "2021-06-15",
+    "2022-03-31",
+    "2023-11-20",
+    "2024-07-04",
+    "2019-12-25",
 ];
 // Epoch seconds (timestamps) in the 2019..2024 range — no TZ issues.
 const TS_EPOCHS: &[i64] = &[
@@ -105,17 +113,40 @@ struct Schema {
 
 impl Schema {
     fn random(rng: &mut Rng) -> Schema {
-        let mut cols = vec![Col { name: "id", ty: Ty::Int, nn: true }];
+        let mut cols = vec![Col {
+            name: "id",
+            ty: Ty::Int,
+            nn: true,
+        }];
         // Guarantee NN int (for safe ORDER BY / GROUP BY).
-        cols.push(Col { name: NAMES[0], ty: Ty::Int, nn: true });
+        cols.push(Col {
+            name: NAMES[0],
+            ty: Ty::Int,
+            nn: true,
+        });
         // Guarantee NN text (for GROUP BY, LIKE tests).
-        cols.push(Col { name: NAMES[1], ty: Ty::Text, nn: true });
+        cols.push(Col {
+            name: NAMES[1],
+            ty: Ty::Text,
+            nn: true,
+        });
         // Add 2-4 extra cols with varied types including extended types.
         let extra = 2 + rng.below(3);
-        let ext_types = [Ty::Int, Ty::Real, Ty::Text, Ty::Bool, Ty::DateStr, Ty::TsInt];
+        let ext_types = [
+            Ty::Int,
+            Ty::Real,
+            Ty::Text,
+            Ty::Bool,
+            Ty::DateStr,
+            Ty::TsInt,
+        ];
         for k in 0..extra {
             let ty = *rng.pick(&ext_types);
-            cols.push(Col { name: NAMES[2 + k], ty, nn: rng.chance(40) });
+            cols.push(Col {
+                name: NAMES[2 + k],
+                ty,
+                nn: rng.chance(40),
+            });
         }
         Schema { cols }
     }
@@ -132,9 +163,9 @@ impl Schema {
                 Ty::Int => "INTEGER",
                 Ty::Real => "REAL",
                 Ty::Text => "TEXT",
-                Ty::Bool => "INTEGER",    // 0/1 in both
-                Ty::DateStr => "TEXT",    // 'YYYY-MM-DD' stored as text in both
-                Ty::TsInt => "INTEGER",   // epoch seconds
+                Ty::Bool => "INTEGER",  // 0/1 in both
+                Ty::DateStr => "TEXT",  // 'YYYY-MM-DD' stored as text in both
+                Ty::TsInt => "INTEGER", // epoch seconds
             };
             let nn = if c.nn { " NOT NULL" } else { "" };
             parts.push(format!("{} {ty_str}{nn}", c.name));
@@ -143,7 +174,10 @@ impl Schema {
     }
 
     fn int_cols(&self) -> Vec<&Col> {
-        self.cols.iter().filter(|c| matches!(c.ty, Ty::Int)).collect()
+        self.cols
+            .iter()
+            .filter(|c| matches!(c.ty, Ty::Int))
+            .collect()
     }
 }
 
@@ -156,7 +190,7 @@ fn gen_value(rng: &mut Rng, c: &Col) -> String {
         Ty::Int => rng.int(-5, 20).to_string(),
         Ty::Real => format!("{:.2}", rng.int(-100, 100) as f64 / 10.0),
         Ty::Text => format!("'{}'", rng.pick(CATS)),
-        Ty::Bool => rng.int(0, 1).to_string(),     // 0 or 1
+        Ty::Bool => rng.int(0, 1).to_string(), // 0 or 1
         Ty::DateStr => format!("'{}'", rng.pick(DATES)),
         Ty::TsInt => TS_EPOCHS[rng.below(TS_EPOCHS.len())].to_string(),
     }
@@ -168,17 +202,27 @@ fn gen_inserts(schema: &Schema, rng: &mut Rng, rows: usize) -> String {
     for id in 1..=rows {
         let mut cells = Vec::with_capacity(schema.cols.len());
         for (i, c) in schema.cols.iter().enumerate() {
-            cells.push(if i == 0 { id.to_string() } else { gen_value(rng, c) });
+            cells.push(if i == 0 {
+                id.to_string()
+            } else {
+                gen_value(rng, c)
+            });
         }
         vals.push(format!("({})", cells.join(",")));
     }
-    format!("INSERT INTO t ({}) VALUES {}", names.join(","), vals.join(","))
+    format!(
+        "INSERT INTO t ({}) VALUES {}",
+        names.join(","),
+        vals.join(",")
+    )
 }
 
 // ─── Value canonicalization ───────────────────────────────────────────────────
 /// Absolute + relative tolerance for float comparisons.
 fn floats_close(a: f64, b: f64) -> bool {
-    if a == b { return true; }
+    if a == b {
+        return true;
+    }
     let diff = (a - b).abs();
     let mag = a.abs().max(b.abs());
     diff <= 1e-9 + mag * 1e-9
@@ -187,7 +231,13 @@ fn floats_close(a: f64, b: f64) -> bool {
 fn canon_nucleus(v: &Value) -> String {
     match v {
         Value::Null => "NULL".into(),
-        Value::Bool(b) => if *b { "1".into() } else { "0".into() },
+        Value::Bool(b) => {
+            if *b {
+                "1".into()
+            } else {
+                "0".into()
+            }
+        }
         Value::Int32(n) => n.to_string(),
         Value::Int64(n) => n.to_string(),
         Value::Float64(f) => {
@@ -230,9 +280,13 @@ fn canon_sqlite(v: &rusqlite::types::Value) -> String {
 /// Row-level equality: cells must match exactly (after canon_*), except float
 /// columns where we fall back to per-cell float comparison.
 fn rows_equal(a: &[String], b: &[String]) -> bool {
-    if a.len() != b.len() { return false; }
+    if a.len() != b.len() {
+        return false;
+    }
     a.iter().zip(b.iter()).all(|(x, y)| {
-        if x == y { return true; }
+        if x == y {
+            return true;
+        }
         // Try float comparison for numeric-looking values.
         if let (Ok(fa), Ok(fb)) = (x.parse::<f64>(), y.parse::<f64>()) {
             return floats_close(fa, fb);
@@ -267,9 +321,10 @@ fn run_nucleus(ex: &Executor, sql: &str) -> Result<Vec<Vec<String>>, String> {
     }));
     match res {
         Ok(Ok(mut results)) => match results.pop() {
-            Some(ExecResult::Select { rows, .. }) => {
-                Ok(rows.iter().map(|r| r.iter().map(canon_nucleus).collect()).collect())
-            }
+            Some(ExecResult::Select { rows, .. }) => Ok(rows
+                .iter()
+                .map(|r| r.iter().map(canon_nucleus).collect())
+                .collect()),
             _ => Err("non-select result".into()),
         },
         Ok(Err(e)) => Err(format!("{e:?}")),
@@ -334,7 +389,10 @@ fn probe(
                 *divergences += 1;
                 if *divergences <= max_report {
                     let (mut a, mut b) = (nr, sr);
-                    if !ordered { a.sort(); b.sort(); }
+                    if !ordered {
+                        a.sort();
+                        b.sort();
+                    }
                     println!(
                         "─── DIVERGENCE #{divergences} [{label}] (iter {iter}, seed {seed}) ───"
                     );
@@ -408,8 +466,17 @@ fn run_extended_types(
     macro_rules! p {
         ($sql:expr, $ordered:expr) => {
             probe(
-                ex, sqlite, "ext-types", $sql, $ordered,
-                divergences, panics, nuc_errors, max_report, seed, iter,
+                ex,
+                sqlite,
+                "ext-types",
+                $sql,
+                $ordered,
+                divergences,
+                panics,
+                nuc_errors,
+                max_report,
+                seed,
+                iter,
             )
         };
     }
@@ -429,9 +496,7 @@ fn run_extended_types(
         let dc = rng.pick(&date_cols).name;
         let d = rng.pick(DATES);
         let op = *rng.pick(&["<", ">", "=", "<=", ">="]);
-        let q = format!(
-            "SELECT id, {dc} FROM t WHERE {dc} {op} '{d}' ORDER BY id ASC"
-        );
+        let q = format!("SELECT id, {dc} FROM t WHERE {dc} {op} '{d}' ORDER BY id ASC");
         p!(&q, true);
 
         // GROUP BY date col, count rows per date.
@@ -447,9 +512,7 @@ fn run_extended_types(
         let lo = TS_EPOCHS[rng.below(TS_EPOCHS.len())];
         let hi = TS_EPOCHS[rng.below(TS_EPOCHS.len())];
         let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-        let q = format!(
-            "SELECT id, {tc} FROM t WHERE {tc} BETWEEN {lo} AND {hi} ORDER BY id ASC"
-        );
+        let q = format!("SELECT id, {tc} FROM t WHERE {tc} BETWEEN {lo} AND {hi} ORDER BY id ASC");
         p!(&q, true);
 
         // MIN/MAX of epoch col.
@@ -494,17 +557,13 @@ fn run_extended_types(
     if !int_cols.is_empty() && rng.chance(50) {
         let ic = rng.pick(&int_cols).name;
         let val = rng.int(-5, 20);
-        let q = format!(
-            "SELECT id, NULLIF({ic}, {val}) AS n FROM t ORDER BY id ASC"
-        );
+        let q = format!("SELECT id, NULLIF({ic}, {val}) AS n FROM t ORDER BY id ASC");
         p!(&q, true);
     }
 
     // Arithmetic: ABS(int) + ORDER BY id.
     let _ = rows; // suppress unused warning
-    let q = format!(
-        "SELECT id, ABS({nn_int_col}) AS absv FROM t ORDER BY id ASC"
-    );
+    let q = format!("SELECT id, ABS({nn_int_col}) AS absv FROM t ORDER BY id ASC");
     p!(&q, true);
 }
 
@@ -528,8 +587,17 @@ fn run_window(
     macro_rules! p {
         ($sql:expr, $ordered:expr) => {
             probe(
-                ex, sqlite, "window", $sql, $ordered,
-                divergences, panics, nuc_errors, max_report, seed, iter,
+                ex,
+                sqlite,
+                "window",
+                $sql,
+                $ordered,
+                divergences,
+                panics,
+                nuc_errors,
+                max_report,
+                seed,
+                iter,
             )
         };
     }
@@ -554,7 +622,11 @@ fn run_window(
 
     // SUM(int) OVER (PARTITION BY text ORDER BY id) — running sum per partition.
     if !int_cols.is_empty() && rng.chance(70) {
-        let ic = if rng.chance(50) { nn_int } else { rng.pick(&int_cols).name };
+        let ic = if rng.chance(50) {
+            nn_int
+        } else {
+            rng.pick(&int_cols).name
+        };
         let q = format!(
             "SELECT id, {nn_text}, \
              SUM({ic}) OVER (PARTITION BY {nn_text} ORDER BY id ASC) AS running \
@@ -615,8 +687,17 @@ fn run_ctes(
     macro_rules! p {
         ($sql:expr, $ordered:expr) => {
             probe(
-                ex, sqlite, "cte", $sql, $ordered,
-                divergences, panics, nuc_errors, max_report, seed, iter,
+                ex,
+                sqlite,
+                "cte",
+                $sql,
+                $ordered,
+                divergences,
+                panics,
+                nuc_errors,
+                max_report,
+                seed,
+                iter,
             )
         };
     }
@@ -703,14 +784,23 @@ fn run_scalar_fns(
     iter: usize,
 ) {
     let nn_text = schema.cols[2].name; // guaranteed NN text
-    let nn_int = schema.cols[1].name;  // guaranteed NN int
+    let nn_int = schema.cols[1].name; // guaranteed NN int
     let int_cols = schema.int_cols();
 
     macro_rules! p {
         ($sql:expr, $ordered:expr) => {
             probe(
-                ex, sqlite, "scalar-fn", $sql, $ordered,
-                divergences, panics, nuc_errors, max_report, seed, iter,
+                ex,
+                sqlite,
+                "scalar-fn",
+                $sql,
+                $ordered,
+                divergences,
+                panics,
+                nuc_errors,
+                max_report,
+                seed,
+                iter,
             )
         };
     }
@@ -737,9 +827,8 @@ fn run_scalar_fns(
     if rng.chance(70) {
         let start = rng.int(1, 3);
         let len = rng.int(1, 4);
-        let q = format!(
-            "SELECT id, SUBSTR({nn_text}, {start}, {len}) AS sub FROM t ORDER BY id ASC"
-        );
+        let q =
+            format!("SELECT id, SUBSTR({nn_text}, {start}, {len}) AS sub FROM t ORDER BY id ASC");
         p!(&q, true);
     }
 
@@ -747,9 +836,8 @@ fn run_scalar_fns(
     if rng.chance(60) {
         // Replace first char of one cat with a known char.
         let from = *rng.pick(&["r", "g", "b", "a", "s"]);
-        let q = format!(
-            "SELECT id, REPLACE({nn_text}, '{from}', 'X') AS rep FROM t ORDER BY id ASC"
-        );
+        let q =
+            format!("SELECT id, REPLACE({nn_text}, '{from}', 'X') AS rep FROM t ORDER BY id ASC");
         p!(&q, true);
     }
 
@@ -804,18 +892,14 @@ fn run_scalar_fns(
         .collect();
     if !nullable_ints.is_empty() && rng.chance(60) {
         let nc = rng.pick(&nullable_ints).name;
-        let q = format!(
-            "SELECT id, COALESCE({nc}, -99) AS coa FROM t ORDER BY id ASC"
-        );
+        let q = format!("SELECT id, COALESCE({nc}, -99) AS coa FROM t ORDER BY id ASC");
         p!(&q, true);
     }
 
     // NULLIF(int, constant).
     if rng.chance(50) {
         let val = rng.int(-5, 10);
-        let q = format!(
-            "SELECT id, NULLIF({nn_int}, {val}) AS ni FROM t ORDER BY id ASC"
-        );
+        let q = format!("SELECT id, NULLIF({nn_int}, {val}) AS ni FROM t ORDER BY id ASC");
         p!(&q, true);
     }
 
@@ -889,7 +973,10 @@ fn main_impl() {
         let ex = Arc::new(Executor::new(catalog, storage));
         let sqlite = match Connection::open_in_memory() {
             Ok(c) => c,
-            Err(_) => { setup_failures += 1; continue; }
+            Err(_) => {
+                setup_failures += 1;
+                continue;
+            }
         };
 
         // Setup must succeed on both.
@@ -927,22 +1014,16 @@ fn main_impl() {
         );
 
         run_extended_types(
-            args.0, args.1, args.2, args.3,
-            args.4, args.5, args.6, args.7, args.8, args.9,
-            rows,
+            args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9, rows,
         );
         run_window(
-            args.0, args.1, args.2, args.3,
-            args.4, args.5, args.6, args.7, args.8, args.9,
+            args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
         );
         run_ctes(
-            args.0, args.1, args.2, args.3,
-            args.4, args.5, args.6, args.7, args.8, args.9,
-            rows,
+            args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9, rows,
         );
         run_scalar_fns(
-            args.0, args.1, args.2, args.3,
-            args.4, args.5, args.6, args.7, args.8, args.9,
+            args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
         );
     }
 

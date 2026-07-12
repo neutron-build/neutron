@@ -70,12 +70,12 @@ type Tuples = HashSet<Vec<String>>;
 
 #[derive(Default, Clone)]
 struct RefDb {
-    edge:     HashSet<(String, String)>,
-    parent:   HashSet<(String, String)>,
+    edge: HashSet<(String, String)>,
+    parent: HashSet<(String, String)>,
     works_in: HashSet<(String, String)>,
-    loc_in:   HashSet<(String, String)>,
-    person:   HashSet<String>,
-    member:   HashSet<String>,
+    loc_in: HashSet<(String, String)>,
+    person: HashSet<String>,
+    member: HashSet<String>,
 }
 
 impl RefDb {
@@ -111,10 +111,8 @@ impl RefDb {
     fn sg(&self) -> HashSet<(String, String)> {
         // Seed: every node is same-generation as itself
         let all_nodes: HashSet<String> = NODES.iter().map(|s| s.to_string()).collect();
-        let mut result: HashSet<(String, String)> = all_nodes
-            .iter()
-            .map(|n| (n.clone(), n.clone()))
-            .collect();
+        let mut result: HashSet<(String, String)> =
+            all_nodes.iter().map(|n| (n.clone(), n.clone())).collect();
         loop {
             let mut new_pairs = HashSet::new();
             // sg(X,Y) :- parent(Px,X), parent(Py,Y), sg(Px,Py)
@@ -164,28 +162,43 @@ impl RefDb {
 
     // ─── Helpers to turn relation sets into Tuples for comparison ─────────────
     fn path_tuples(&self) -> Tuples {
-        self.path().into_iter().map(|(a,b)| vec![a,b]).collect()
+        self.path().into_iter().map(|(a, b)| vec![a, b]).collect()
     }
     fn sg_tuples(&self) -> Tuples {
-        self.sg().into_iter().map(|(a,b)| vec![a,b]).collect()
+        self.sg().into_iter().map(|(a, b)| vec![a, b]).collect()
     }
     fn region_of_tuples(&self) -> Tuples {
-        self.region_of().into_iter().map(|(a,b)| vec![a,b]).collect()
+        self.region_of()
+            .into_iter()
+            .map(|(a, b)| vec![a, b])
+            .collect()
     }
     fn not_member_tuples(&self) -> Tuples {
         self.not_member().into_iter().map(|x| vec![x]).collect()
     }
     fn edge_tuples(&self) -> Tuples {
-        self.edge.iter().map(|(a,b)| vec![a.clone(), b.clone()]).collect()
+        self.edge
+            .iter()
+            .map(|(a, b)| vec![a.clone(), b.clone()])
+            .collect()
     }
     fn parent_tuples(&self) -> Tuples {
-        self.parent.iter().map(|(a,b)| vec![a.clone(), b.clone()]).collect()
+        self.parent
+            .iter()
+            .map(|(a, b)| vec![a.clone(), b.clone()])
+            .collect()
     }
     fn works_in_tuples(&self) -> Tuples {
-        self.works_in.iter().map(|(a,b)| vec![a.clone(), b.clone()]).collect()
+        self.works_in
+            .iter()
+            .map(|(a, b)| vec![a.clone(), b.clone()])
+            .collect()
     }
     fn loc_in_tuples(&self) -> Tuples {
-        self.loc_in.iter().map(|(a,b)| vec![a.clone(), b.clone()]).collect()
+        self.loc_in
+            .iter()
+            .map(|(a, b)| vec![a.clone(), b.clone()])
+            .collect()
     }
     fn person_tuples(&self) -> Tuples {
         self.person.iter().map(|x| vec![x.clone()]).collect()
@@ -289,19 +302,27 @@ fn parse_json_tuples(s: &str) -> Tuples {
         match ch {
             '[' => {
                 depth += 1;
-                if depth > 1 { current.push(ch); }
+                if depth > 1 {
+                    current.push(ch);
+                }
             }
             ']' => {
                 depth -= 1;
                 if depth == 0 {
                     let tuple = parse_string_array(&current);
-                    if !tuple.is_empty() { result.insert(tuple); }
+                    if !tuple.is_empty() {
+                        result.insert(tuple);
+                    }
                     current.clear();
                 } else {
                     current.push(ch);
                 }
             }
-            _ => { if depth > 0 { current.push(ch); } }
+            _ => {
+                if depth > 0 {
+                    current.push(ch);
+                }
+            }
         }
     }
     result
@@ -435,28 +456,31 @@ fn gen_op(rng: &mut Rng) -> Op {
     let l = (*rng.pick(LOCS)).to_string();
     let r = (*rng.pick(REGIONS)).to_string();
     match rng.below(30) {
-        0..=3  => Op::AssertEdge(x, y),
-        4      => Op::RetractEdge(x, y),
-        5      => Op::ClearEdge,
-        6..=8  => Op::AssertParent(x, y),
-        9      => Op::RetractParent(x, y),
+        0..=3 => Op::AssertEdge(x, y),
+        4 => Op::RetractEdge(x, y),
+        5 => Op::ClearEdge,
+        6..=8 => Op::AssertParent(x, y),
+        9 => Op::RetractParent(x, y),
         10..=11 => Op::AssertWorksIn(p.clone(), l.clone()),
-        12     => Op::RetractWorksIn(p, l.clone()),
-        13     => Op::AssertLocIn(l, r),
-        14     => Op::RetractLocIn((*rng.pick(LOCS)).to_string(), (*rng.pick(REGIONS)).to_string()),
-        15     => Op::AssertPerson(x.clone()),
+        12 => Op::RetractWorksIn(p, l.clone()),
+        13 => Op::AssertLocIn(l, r),
+        14 => Op::RetractLocIn(
+            (*rng.pick(LOCS)).to_string(),
+            (*rng.pick(REGIONS)).to_string(),
+        ),
+        15 => Op::AssertPerson(x.clone()),
         16..=17 => Op::AssertMember(x.clone()),
-        18     => Op::RetractMember(x),
+        18 => Op::RetractMember(x),
         19..=20 => Op::QueryEdge,
         21..=22 => Op::QueryPath,
-        23     => Op::QueryParent,
-        24     => Op::QuerySg,
-        25     => Op::QueryWorksIn,
-        26     => Op::QueryLocIn,
-        27     => Op::QueryRegionOf,
-        28     => Op::QueryPerson,
-        29     => Op::QueryNotMember,
-        _      => Op::QueryMember,
+        23 => Op::QueryParent,
+        24 => Op::QuerySg,
+        25 => Op::QueryWorksIn,
+        26 => Op::QueryLocIn,
+        27 => Op::QueryRegionOf,
+        28 => Op::QueryPerson,
+        29 => Op::QueryNotMember,
+        _ => Op::QueryMember,
     }
 }
 
@@ -472,10 +496,22 @@ fn main_impl() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed"       => { i += 1; seed       = args[i].parse().unwrap(); }
-            "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
-            "--ops"        => { i += 1; ops_per    = args[i].parse().unwrap(); }
-            "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
+            "--seed" => {
+                i += 1;
+                seed = args[i].parse().unwrap();
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args[i].parse().unwrap();
+            }
+            "--ops" => {
+                i += 1;
+                ops_per = args[i].parse().unwrap();
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = args[i].parse().unwrap();
+            }
             _ => {}
         }
         i += 1;
@@ -486,16 +522,18 @@ fn main_impl() {
     println!("probe_datalog_rich — Nucleus Datalog rich differential fuzzer");
     println!("seed={seed} iterations={iterations} ops/iter={ops_per}\n");
 
-    let mut total_ops    = 0usize;
-    let mut divergences  = 0usize;
-    let mut rule_errors  = 0usize;
+    let mut total_ops = 0usize;
+    let mut divergences = 0usize;
+    let mut rule_errors = 0usize;
 
     // We run multiple seeds for coverage
     for seed_round in 0..4u64 {
         let round_seed = seed.wrapping_add(seed_round.wrapping_mul(0x9E3779B97F4A7C15));
 
         'outer: for iter in 0..iterations {
-            let mut rng = Rng(round_seed.wrapping_add(iter as u64).wrapping_mul(0x100000001B3));
+            let mut rng = Rng(round_seed
+                .wrapping_add(iter as u64)
+                .wrapping_mul(0x100000001B3));
 
             // Fresh engine per iteration
             let catalog = Arc::new(Catalog::new());
@@ -593,7 +631,9 @@ fn main_impl() {
                             Ok(got) => {
                                 if got != expected {
                                     if divergences < max_report {
-                                        report_divergence($label, iter, &pattern, &got, &expected, &log);
+                                        report_divergence(
+                                            $label, iter, &pattern, &got, &expected, &log,
+                                        );
                                     }
                                     divergences += 1;
                                     continue 'outer;

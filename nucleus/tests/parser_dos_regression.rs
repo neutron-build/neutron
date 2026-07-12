@@ -24,7 +24,10 @@ fn deep_cast_chain_rejected_fast() {
     let res = parse(&sql);
     let elapsed = t0.elapsed();
 
-    assert!(res.is_err(), "deep CAST chain must be rejected, not accepted");
+    assert!(
+        res.is_err(),
+        "deep CAST chain must be rejected, not accepted"
+    );
     assert!(
         elapsed < Duration::from_millis(500),
         "deep CAST chain must be rejected quickly (took {elapsed:?}); the DoS guard \
@@ -66,10 +69,16 @@ fn parens_inside_string_literal_not_counted() {
 #[test]
 fn parens_inside_comments_not_counted() {
     let line = format!("SELECT 1 -- {}\n", "(".repeat(300));
-    assert!(parse(&line).is_ok(), "parens in line comment must be ignored");
+    assert!(
+        parse(&line).is_ok(),
+        "parens in line comment must be ignored"
+    );
 
     let block = format!("SELECT 1 /* {} */", "(".repeat(300));
-    assert!(parse(&block).is_ok(), "parens in block comment must be ignored");
+    assert!(
+        parse(&block).is_ok(),
+        "parens in block comment must be ignored"
+    );
 }
 
 /// Legitimate queries that nest only a handful of CASTs / parens / subqueries

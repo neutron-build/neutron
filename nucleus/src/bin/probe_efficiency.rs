@@ -105,9 +105,7 @@ fn run_scenario(n: usize, seed: u64) -> Vec<Finding> {
     let shared_metrics = Arc::new(MetricsRegistry::new());
     let catalog = Arc::new(Catalog::new());
     let storage: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
-    let ex = Arc::new(
-        Executor::new(catalog, storage).with_metrics(Arc::clone(&shared_metrics)),
-    );
+    let ex = Arc::new(Executor::new(catalog, storage).with_metrics(Arc::clone(&shared_metrics)));
 
     // ── Create table and bulk-insert N rows ───────────────────────────────────
     exec_ignore(
@@ -146,9 +144,7 @@ fn run_scenario(n: usize, seed: u64) -> Vec<Finding> {
     if actual_n < n {
         // If we couldn't even insert, skip this scenario rather than generating
         // false findings.
-        eprintln!(
-            "  [warn] Only inserted {actual_n}/{n} rows; skipping scenario seed={seed}"
-        );
+        eprintln!("  [warn] Only inserted {actual_n}/{n} rows; skipping scenario seed={seed}");
         return findings;
     }
 
@@ -216,9 +212,7 @@ fn run_scenario(n: usize, seed: u64) -> Vec<Finding> {
     // Scan a range of exactly 10 consecutive PK values starting at a random offset.
     let range_lo = rng.below(n.saturating_sub(10)) as i64;
     let range_hi = range_lo + 9;
-    let range_sql = format!(
-        "SELECT * FROM eff_test WHERE id >= {range_lo} AND id <= {range_hi}"
-    );
+    let range_sql = format!("SELECT * FROM eff_test WHERE id >= {range_lo} AND id <= {range_hi}");
     let (range_scanned, range_returned) = measure(&ex, &range_sql);
 
     // For a 10-row range scan, we tolerate up to 5% of N or 50 rows (whichever
@@ -228,12 +222,19 @@ fn run_scenario(n: usize, seed: u64) -> Vec<Finding> {
     if range_scanned > range_threshold {
         // Capture EXPLAIN output to diagnose whether IndexScan or SeqScan is chosen.
         let explain_plan = {
-            let explain_sql =
-                format!("EXPLAIN SELECT * FROM eff_test WHERE id >= {range_lo} AND id <= {range_hi}");
+            let explain_sql = format!(
+                "EXPLAIN SELECT * FROM eff_test WHERE id >= {range_lo} AND id <= {range_hi}"
+            );
             let rows = exec_rows(&ex, &explain_sql);
             rows.iter()
                 .flat_map(|r| r.iter())
-                .filter_map(|v| if let Value::Text(s) = v { Some(s.clone()) } else { None })
+                .filter_map(|v| {
+                    if let Value::Text(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" | ")
         };
@@ -279,14 +280,17 @@ fn run_scenario(n: usize, seed: u64) -> Vec<Finding> {
     let explain_sql = format!("EXPLAIN ANALYZE SELECT * FROM eff_test WHERE id = {pk}");
     let explain_rows = exec_rows(&ex, &explain_sql);
     // Look for "Actual Rows: N" line in EXPLAIN output.
-    let actual_rows_line = explain_rows.iter().flat_map(|row| row.iter()).find_map(|v| {
-        if let Value::Text(s) = v {
-            if s.trim_start().starts_with("Actual Rows:") {
-                return Some(s.clone());
+    let actual_rows_line = explain_rows
+        .iter()
+        .flat_map(|row| row.iter())
+        .find_map(|v| {
+            if let Value::Text(s) = v {
+                if s.trim_start().starts_with("Actual Rows:") {
+                    return Some(s.clone());
+                }
             }
-        }
-        None
-    });
+            None
+        });
     if let Some(line) = actual_rows_line {
         // Parse the number after "Actual Rows: "
         if let Some(num_str) = line.trim().strip_prefix("Actual Rows:") {
@@ -373,7 +377,10 @@ fn main_impl() {
     } else {
         for (fi, f) in all_findings.iter().enumerate() {
             if fi >= max_report {
-                println!("  ... ({} more findings suppressed)", all_findings.len() - max_report);
+                println!(
+                    "  ... ({} more findings suppressed)",
+                    all_findings.len() - max_report
+                );
                 break;
             }
             println!("\n─── Finding #{} ({:?}) ───", fi + 1, f.kind);

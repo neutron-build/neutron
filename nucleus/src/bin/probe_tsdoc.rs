@@ -82,15 +82,13 @@ fn run_f64(ex: &Executor, sql: &str) -> Result<Option<f64>, ()> {
     }));
     match res {
         Ok(Ok(mut results)) => match results.pop() {
-            Some(ExecResult::Select { rows, .. }) => {
-                match rows.first().and_then(|r| r.first()) {
-                    Some(Value::Null) | None => Ok(None),
-                    Some(Value::Float64(f)) => Ok(Some(*f)),
-                    Some(Value::Int64(n)) => Ok(Some(*n as f64)),
-                    Some(Value::Int32(n)) => Ok(Some(*n as f64)),
-                    _ => Err(()),
-                }
-            }
+            Some(ExecResult::Select { rows, .. }) => match rows.first().and_then(|r| r.first()) {
+                Some(Value::Null) | None => Ok(None),
+                Some(Value::Float64(f)) => Ok(Some(*f)),
+                Some(Value::Int64(n)) => Ok(Some(*n as f64)),
+                Some(Value::Int32(n)) => Ok(Some(*n as f64)),
+                _ => Err(()),
+            },
             _ => Err(()),
         },
         Ok(Err(_)) => Err(()),
@@ -106,13 +104,11 @@ fn run_i64(ex: &Executor, sql: &str) -> Result<i64, ()> {
     }));
     match res {
         Ok(Ok(mut results)) => match results.pop() {
-            Some(ExecResult::Select { rows, .. }) => {
-                match rows.first().and_then(|r| r.first()) {
-                    Some(Value::Int64(n)) => Ok(*n),
-                    Some(Value::Int32(n)) => Ok(*n as i64),
-                    _ => Err(()),
-                }
-            }
+            Some(ExecResult::Select { rows, .. }) => match rows.first().and_then(|r| r.first()) {
+                Some(Value::Int64(n)) => Ok(*n),
+                Some(Value::Int32(n)) => Ok(*n as i64),
+                _ => Err(()),
+            },
             _ => Err(()),
         },
         Ok(Err(_)) => Err(()),
@@ -422,10 +418,7 @@ impl DocRef {
     }
 
     fn get(&self, id: u64) -> Option<&serde_json::Value> {
-        self.docs
-            .iter()
-            .find(|(i, _)| *i == id)
-            .map(|(_, v)| v)
+        self.docs.iter().find(|(i, _)| *i == id).map(|(_, v)| v)
     }
 
     fn count(&self) -> i64 {
@@ -463,15 +456,11 @@ impl DocRef {
 /// Reference containment operator (@>).
 fn json_contains(doc: &serde_json::Value, query: &serde_json::Value) -> bool {
     match (doc, query) {
-        (serde_json::Value::Object(d), serde_json::Value::Object(q)) => {
-            q.iter().all(|(k, qv)| {
-                d.get(k)
-                    .is_some_and(|dv| json_contains(dv, qv))
-            })
-        }
+        (serde_json::Value::Object(d), serde_json::Value::Object(q)) => q
+            .iter()
+            .all(|(k, qv)| d.get(k).is_some_and(|dv| json_contains(dv, qv))),
         (serde_json::Value::Array(d), serde_json::Value::Array(q)) => {
-            q.iter()
-                .all(|qv| d.iter().any(|dv| json_contains(dv, qv)))
+            q.iter().all(|qv| d.iter().any(|dv| json_contains(dv, qv)))
         }
         (a, b) => a == b,
     }
@@ -488,11 +477,7 @@ fn canonical_json(v: &serde_json::Value) -> String {
                 .as_f64()
                 .or_else(|| n.as_i64().map(|i| i as f64))
                 .unwrap_or(0.0);
-            if f.fract() == 0.0
-                && f.is_finite()
-                && f >= i64::MIN as f64
-                && f <= i64::MAX as f64
-            {
+            if f.fract() == 0.0 && f.is_finite() && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
                 format!("{}", f as i64)
             } else {
                 format!("{f}")

@@ -179,9 +179,9 @@ impl AsyncDiskOps for IoUringDiskOps {
                     .build()
                     .user_data(0x42);
 
-            let mut ring_guard = ring.lock().map_err(|e| {
-                io::Error::other(format!("ring lock poisoned: {e}"))
-            })?;
+            let mut ring_guard = ring
+                .lock()
+                .map_err(|e| io::Error::other(format!("ring lock poisoned: {e}")))?;
 
             // SAFETY: the SQE references read_buf, which is owned by this closure
             // and outlives the operation — submit_and_wait(1) below blocks until
@@ -238,9 +238,9 @@ impl AsyncDiskOps for IoUringDiskOps {
             .build()
             .user_data(0x43);
 
-            let mut ring_guard = ring.lock().map_err(|e| {
-                io::Error::other(format!("ring lock poisoned: {e}"))
-            })?;
+            let mut ring_guard = ring
+                .lock()
+                .map_err(|e| io::Error::other(format!("ring lock poisoned: {e}")))?;
 
             // SAFETY: the SQE references write_buf, owned by this closure and
             // kept alive past submit_and_wait(1), which blocks until the kernel
@@ -278,9 +278,9 @@ impl AsyncDiskOps for IoUringDiskOps {
 
             let fsync_e = io_uring::opcode::Fsync::new(fd).build().user_data(0x44);
 
-            let mut ring_guard = ring.lock().map_err(|e| {
-                io::Error::other(format!("ring lock poisoned: {e}"))
-            })?;
+            let mut ring_guard = ring
+                .lock()
+                .map_err(|e| io::Error::other(format!("ring lock poisoned: {e}")))?;
 
             // SAFETY: the fsync SQE references only the file descriptor (no data
             // buffer); the fd stays open for the duration of submit_and_wait(1),

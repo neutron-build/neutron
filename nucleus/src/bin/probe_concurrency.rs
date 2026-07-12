@@ -99,7 +99,8 @@ fn run_cmd(ex: &Executor, sid: u64, sql: &str) -> Result<String, String> {
 fn count(ex: &Executor, sid: u64, table: &str) -> Result<i64, String> {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     let s = run_str(ex, sid, &sql)?;
-    s.parse::<i64>().map_err(|e| format!("parse count: {e} (got {s:?})"))
+    s.parse::<i64>()
+        .map_err(|e| format!("parse count: {e} (got {s:?})"))
 }
 
 /// Read a single integer value (first row, first col) from a SELECT.
@@ -110,18 +111,18 @@ fn read_val(ex: &Executor, sid: u64, sql: &str) -> Result<Option<i64>, String> {
     }));
     match res {
         Ok(Ok(mut results)) => match results.pop() {
-            Some(ExecResult::Select { rows, .. }) => {
-                match rows.first().and_then(|r| r.first()) {
-                    Some(Value::Null) | None => Ok(None),
-                    Some(Value::Int32(n)) => Ok(Some(*n as i64)),
-                    Some(Value::Int64(n)) => Ok(Some(*n)),
-                    Some(Value::Float64(f)) => Ok(Some(*f as i64)),
-                    Some(other) => {
-                        let s = other.to_string();
-                        s.parse::<i64>().map(Some).map_err(|_| format!("unexpected value: {s}"))
-                    }
+            Some(ExecResult::Select { rows, .. }) => match rows.first().and_then(|r| r.first()) {
+                Some(Value::Null) | None => Ok(None),
+                Some(Value::Int32(n)) => Ok(Some(*n as i64)),
+                Some(Value::Int64(n)) => Ok(Some(*n)),
+                Some(Value::Float64(f)) => Ok(Some(*f as i64)),
+                Some(other) => {
+                    let s = other.to_string();
+                    s.parse::<i64>()
+                        .map(Some)
+                        .map_err(|_| format!("unexpected value: {s}"))
                 }
-            }
+            },
             _ => Err("no select result".into()),
         },
         Ok(Err(e)) => Err(format!("{e:?}")),
@@ -151,12 +152,24 @@ impl Ctx {
         let sb = ex.create_session();
         Ctx { ex, sa, sb }
     }
-    fn a(&self, sql: &str) -> Result<String, String> { run_cmd(&self.ex, self.sa, sql) }
-    fn b(&self, sql: &str) -> Result<String, String> { run_cmd(&self.ex, self.sb, sql) }
-    fn a_val(&self, sql: &str) -> Result<Option<i64>, String> { read_val(&self.ex, self.sa, sql) }
-    fn b_val(&self, sql: &str) -> Result<Option<i64>, String> { read_val(&self.ex, self.sb, sql) }
-    fn a_count(&self, tbl: &str) -> Result<i64, String> { count(&self.ex, self.sa, tbl) }
-    fn b_count(&self, tbl: &str) -> Result<i64, String> { count(&self.ex, self.sb, tbl) }
+    fn a(&self, sql: &str) -> Result<String, String> {
+        run_cmd(&self.ex, self.sa, sql)
+    }
+    fn b(&self, sql: &str) -> Result<String, String> {
+        run_cmd(&self.ex, self.sb, sql)
+    }
+    fn a_val(&self, sql: &str) -> Result<Option<i64>, String> {
+        read_val(&self.ex, self.sa, sql)
+    }
+    fn b_val(&self, sql: &str) -> Result<Option<i64>, String> {
+        read_val(&self.ex, self.sb, sql)
+    }
+    fn a_count(&self, tbl: &str) -> Result<i64, String> {
+        count(&self.ex, self.sa, tbl)
+    }
+    fn b_count(&self, tbl: &str) -> Result<i64, String> {
+        count(&self.ex, self.sb, tbl)
+    }
 }
 
 impl Drop for Ctx {
@@ -175,7 +188,13 @@ struct Violations {
 }
 
 impl Violations {
-    fn new(max: usize) -> Self { Violations { list: Vec::new(), max, panics: 0 } }
+    fn new(max: usize) -> Self {
+        Violations {
+            list: Vec::new(),
+            max,
+            panics: 0,
+        }
+    }
     fn record(&mut self, inv: &str, detail: String) {
         if self.list.len() < self.max {
             self.list.push((inv.into(), detail));
@@ -185,7 +204,9 @@ impl Violations {
         self.panics += 1;
         self.record("PANIC", format!("{ctx}: {msg}"));
     }
-    fn total(&self) -> usize { self.list.len() }
+    fn total(&self) -> usize {
+        self.list.len()
+    }
 }
 
 // ─── Individual invariant scenarios ───────────────────────────────────────────
@@ -194,8 +215,13 @@ impl Violations {
 /// A writes (uncommitted), B reads — B must NOT see A's write.
 fn check_no_dirty_read(ctx: &Ctx, tbl: &str, key: i64, val: i64, v: &mut Violations) {
     // A begins and inserts a row.
-    if ctx.a(&format!("BEGIN")).is_err() { return; }
-    if ctx.a(&format!("INSERT INTO {tbl} VALUES ({key}, {val})")).is_err() {
+    if ctx.a(&format!("BEGIN")).is_err() {
+        return;
+    }
+    if ctx
+        .a(&format!("INSERT INTO {tbl} VALUES ({key}, {val})"))
+        .is_err()
+    {
         let _ = ctx.a("ROLLBACK");
         return;
     }
@@ -206,9 +232,7 @@ fn check_no_dirty_read(ctx: &Ctx, tbl: &str, key: i64, val: i64, v: &mut Violati
         Ok(Some(got)) if got == val => {
             v.record(
                 "DIRTY_READ",
-                format!(
-                    "table={tbl} key={key}: B saw A's uncommitted value {got} before COMMIT"
-                ),
+                format!("table={tbl} key={key}: B saw A's uncommitted value {got} before COMMIT"),
             );
         }
         Ok(Some(_)) => {} // different value — e.g. from a prior iteration
@@ -222,8 +246,13 @@ fn check_no_dirty_read(ctx: &Ctx, tbl: &str, key: i64, val: i64, v: &mut Violati
 /// Invariant 2: Read your own writes.
 /// A writes inside a transaction, then A reads — A must see its own write.
 fn check_read_own_writes(ctx: &Ctx, tbl: &str, key: i64, val: i64, v: &mut Violations) {
-    if ctx.a("BEGIN").is_err() { return; }
-    if ctx.a(&format!("INSERT INTO {tbl} VALUES ({key}, {val})")).is_err() {
+    if ctx.a("BEGIN").is_err() {
+        return;
+    }
+    if ctx
+        .a(&format!("INSERT INTO {tbl} VALUES ({key}, {val})"))
+        .is_err()
+    {
         let _ = ctx.a("ROLLBACK");
         return;
     }
@@ -233,7 +262,9 @@ fn check_read_own_writes(ctx: &Ctx, tbl: &str, key: i64, val: i64, v: &mut Viola
         Ok(None) => {
             v.record(
                 "READ_OWN_WRITES",
-                format!("table={tbl} key={key}: A could not see its own uncommitted insert (got NULL)"),
+                format!(
+                    "table={tbl} key={key}: A could not see its own uncommitted insert (got NULL)"
+                ),
             );
         }
         Ok(Some(got)) => {
@@ -253,15 +284,24 @@ fn check_read_own_writes(ctx: &Ctx, tbl: &str, key: i64, val: i64, v: &mut Viola
 /// A commits a write; B starts a NEW transaction after the commit — B must see it.
 fn check_commit_visibility(ctx: &Ctx, tbl: &str, key: i64, val: i64, v: &mut Violations) {
     // A: begin → insert → commit
-    if ctx.a("BEGIN").is_err() { return; }
-    if ctx.a(&format!("INSERT INTO {tbl} VALUES ({key}, {val})")).is_err() {
+    if ctx.a("BEGIN").is_err() {
+        return;
+    }
+    if ctx
+        .a(&format!("INSERT INTO {tbl} VALUES ({key}, {val})"))
+        .is_err()
+    {
         let _ = ctx.a("ROLLBACK");
         return;
     }
-    if ctx.a("COMMIT").is_err() { return; }
+    if ctx.a("COMMIT").is_err() {
+        return;
+    }
 
     // B: new snapshot after commit → must see row
-    if ctx.b("BEGIN").is_err() { return; }
+    if ctx.b("BEGIN").is_err() {
+        return;
+    }
     match ctx.b_val(&format!("SELECT val FROM {tbl} WHERE id = {key}")) {
         Ok(Some(got)) if got == val => {} // correct
         Ok(None) => {
@@ -284,15 +324,24 @@ fn check_commit_visibility(ctx: &Ctx, tbl: &str, key: i64, val: i64, v: &mut Vio
 /// Invariant 4: Rollback discards writes.
 /// A inserts then rolls back; B reads after — B must NOT see A's write.
 fn check_rollback_discards(ctx: &Ctx, tbl: &str, key: i64, val: i64, v: &mut Violations) {
-    if ctx.a("BEGIN").is_err() { return; }
-    if ctx.a(&format!("INSERT INTO {tbl} VALUES ({key}, {val})")).is_err() {
+    if ctx.a("BEGIN").is_err() {
+        return;
+    }
+    if ctx
+        .a(&format!("INSERT INTO {tbl} VALUES ({key}, {val})"))
+        .is_err()
+    {
         let _ = ctx.a("ROLLBACK");
         return;
     }
-    if ctx.a("ROLLBACK").is_err() { return; }
+    if ctx.a("ROLLBACK").is_err() {
+        return;
+    }
 
     // B reads after rollback — should NOT see the row
-    if ctx.b("BEGIN").is_err() { return; }
+    if ctx.b("BEGIN").is_err() {
+        return;
+    }
     match ctx.b_val(&format!("SELECT val FROM {tbl} WHERE id = {key}")) {
         Ok(None) => {} // correct
         Ok(Some(got)) if got == val => {
@@ -313,20 +362,34 @@ fn check_rollback_discards(ctx: &Ctx, tbl: &str, key: i64, val: i64, v: &mut Vio
 /// same count as its first read (snapshot isolation, not read-committed).
 fn check_repeatable_read(ctx: &Ctx, tbl: &str, key: i64, val: i64, v: &mut Violations) {
     // B opens its snapshot first.
-    if ctx.b("BEGIN").is_err() { return; }
+    if ctx.b("BEGIN").is_err() {
+        return;
+    }
     let count_before = match ctx.b_count(tbl) {
         Ok(n) => n,
-        Err(_) => { let _ = ctx.b("ROLLBACK"); return; }
+        Err(_) => {
+            let _ = ctx.b("ROLLBACK");
+            return;
+        }
     };
 
     // A inserts and commits *while B's txn is open*.
-    if ctx.a("BEGIN").is_err() { let _ = ctx.b("ROLLBACK"); return; }
-    if ctx.a(&format!("INSERT INTO {tbl} VALUES ({key}, {val})")).is_err() {
+    if ctx.a("BEGIN").is_err() {
+        let _ = ctx.b("ROLLBACK");
+        return;
+    }
+    if ctx
+        .a(&format!("INSERT INTO {tbl} VALUES ({key}, {val})"))
+        .is_err()
+    {
         let _ = ctx.a("ROLLBACK");
         let _ = ctx.b("ROLLBACK");
         return;
     }
-    if ctx.a("COMMIT").is_err() { let _ = ctx.b("ROLLBACK"); return; }
+    if ctx.a("COMMIT").is_err() {
+        let _ = ctx.b("ROLLBACK");
+        return;
+    }
 
     // B re-reads — under Snapshot isolation must still match count_before.
     let count_after = match ctx.b_count(tbl) {
@@ -336,7 +399,10 @@ fn check_repeatable_read(ctx: &Ctx, tbl: &str, key: i64, val: i64, v: &mut Viola
             let _ = ctx.b("ROLLBACK");
             return;
         }
-        Err(_) => { let _ = ctx.b("ROLLBACK"); return; }
+        Err(_) => {
+            let _ = ctx.b("ROLLBACK");
+            return;
+        }
     };
 
     if count_after != count_before {
@@ -360,19 +426,29 @@ fn check_rollback_count(ctx: &Ctx, tbl: &str, rng: &mut Rng, v: &mut Violations)
         Err(_) => return,
     };
 
-    if ctx.a("BEGIN").is_err() { return; }
+    if ctx.a("BEGIN").is_err() {
+        return;
+    }
     let n = rng.int(1, 4);
     let mut inserted = 0i64;
     for _ in 0..n {
         let key = rng.int(5000, 9999);
         let val = rng.int(1, 100);
-        if ctx.a(&format!("INSERT INTO {tbl} VALUES ({key}, {val})")).is_ok() {
+        if ctx
+            .a(&format!("INSERT INTO {tbl} VALUES ({key}, {val})"))
+            .is_ok()
+        {
             inserted += 1;
         }
     }
-    if inserted == 0 { let _ = ctx.a("ROLLBACK"); return; }
+    if inserted == 0 {
+        let _ = ctx.a("ROLLBACK");
+        return;
+    }
 
-    if ctx.a("ROLLBACK").is_err() { return; }
+    if ctx.a("ROLLBACK").is_err() {
+        return;
+    }
 
     let after = match ctx.a_count(tbl) {
         Ok(n) => n,
@@ -402,7 +478,9 @@ fn run_scenario(ex: Arc<Executor>, seed: u64, iter: usize, v: &mut Violations) {
             tokio::task::block_in_place(|| {
                 rt.block_on(ex.execute_with_session(
                     sid,
-                    &format!("CREATE TABLE IF NOT EXISTS {tbl} (id INTEGER PRIMARY KEY, val INTEGER)"),
+                    &format!(
+                        "CREATE TABLE IF NOT EXISTS {tbl} (id INTEGER PRIMARY KEY, val INTEGER)"
+                    ),
                 ))
             })
         }));
@@ -465,9 +543,18 @@ fn main_impl() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed"       => { i += 1; seed       = args[i].parse().unwrap(); }
-            "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
-            "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
+            "--seed" => {
+                i += 1;
+                seed = args[i].parse().unwrap();
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args[i].parse().unwrap();
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = args[i].parse().unwrap();
+            }
             _ => {}
         }
         i += 1;
@@ -502,10 +589,17 @@ fn main_impl() {
     }
 
     println!("\n════ SUMMARY ════");
-    println!("iterations run   : {}", iterations.min(
-        // approximate: we may have stopped early
-        if all_violations.total() >= max_report { all_violations.total() } else { iterations }
-    ));
+    println!(
+        "iterations run   : {}",
+        iterations.min(
+            // approximate: we may have stopped early
+            if all_violations.total() >= max_report {
+                all_violations.total()
+            } else {
+                iterations
+            }
+        )
+    );
     println!("violations       : {}", all_violations.total());
     println!("panics           : {}", all_violations.panics);
 

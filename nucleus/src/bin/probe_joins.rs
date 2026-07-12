@@ -39,7 +39,11 @@ impl Rng {
         z ^ (z >> 31)
     }
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { 0 } else { (self.next() % n as u64) as usize }
+        if n == 0 {
+            0
+        } else {
+            (self.next() % n as u64) as usize
+        }
     }
     fn chance(&mut self, pct: u64) -> bool {
         self.next() % 100 < pct
@@ -54,7 +58,10 @@ impl Rng {
 
 // ─── Schema (one table) ───────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Ty { Int, Text }
+enum Ty {
+    Int,
+    Text,
+}
 
 #[derive(Clone)]
 struct Col {
@@ -76,32 +83,62 @@ const TEXT_VALS: &[&str] = &["alpha", "beta", "gamma", "delta", "eta"];
 
 impl Schema {
     fn new(tname: &'static str, rng: &mut Rng) -> Self {
-        let mut cols = vec![Col { name: "id", ty: Ty::Int, nn: true }];
+        let mut cols = vec![Col {
+            name: "id",
+            ty: Ty::Int,
+            nn: true,
+        }];
         // Guarantee a NOT NULL int join-key column (col index 1).
-        cols.push(Col { name: COL_NAMES[0], ty: Ty::Int, nn: true });
+        cols.push(Col {
+            name: COL_NAMES[0],
+            ty: Ty::Int,
+            nn: true,
+        });
         // Guarantee a NOT NULL text column (col index 2).
-        cols.push(Col { name: COL_NAMES[1], ty: Ty::Text, nn: true });
+        cols.push(Col {
+            name: COL_NAMES[1],
+            ty: Ty::Text,
+            nn: true,
+        });
         // 0–2 extra nullable columns for variety.
         let extra = rng.below(3);
         for k in 0..extra {
             let ty = if rng.chance(60) { Ty::Int } else { Ty::Text };
-            cols.push(Col { name: COL_NAMES[2 + k], ty, nn: false });
+            cols.push(Col {
+                name: COL_NAMES[2 + k],
+                ty,
+                nn: false,
+            });
         }
         Schema { tname, cols }
     }
 
     fn ddl(&self) -> String {
-        let parts: Vec<String> = self.cols.iter().enumerate().map(|(i, c)| {
-            if i == 0 { return "id INTEGER PRIMARY KEY".to_string(); }
-            let ty = match c.ty { Ty::Int => "INTEGER", Ty::Text => "TEXT" };
-            let nn = if c.nn { " NOT NULL" } else { "" };
-            format!("{} {ty}{nn}", c.name)
-        }).collect();
+        let parts: Vec<String> = self
+            .cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == 0 {
+                    return "id INTEGER PRIMARY KEY".to_string();
+                }
+                let ty = match c.ty {
+                    Ty::Int => "INTEGER",
+                    Ty::Text => "TEXT",
+                };
+                let nn = if c.nn { " NOT NULL" } else { "" };
+                format!("{} {ty}{nn}", c.name)
+            })
+            .collect();
         format!("CREATE TABLE {} ({})", self.tname, parts.join(", "))
     }
 
-    fn int_join_col(&self) -> &'static str { COL_NAMES[0] } // always c1
-    fn text_col(&self) -> &'static str { COL_NAMES[1] }     // always c2
+    fn int_join_col(&self) -> &'static str {
+        COL_NAMES[0]
+    } // always c1
+    fn text_col(&self) -> &'static str {
+        COL_NAMES[1]
+    } // always c2
 
     fn gen_inserts(&self, rng: &mut Rng, rows: usize) -> String {
         let names: Vec<&str> = self.cols.iter().map(|c| c.name).collect();
@@ -117,12 +154,19 @@ impl Schema {
             }
             vals.push(format!("({})", cells.join(",")));
         }
-        format!("INSERT INTO {} ({}) VALUES {}", self.tname, names.join(","), vals.join(","))
+        format!(
+            "INSERT INTO {} ({}) VALUES {}",
+            self.tname,
+            names.join(","),
+            vals.join(",")
+        )
     }
 }
 
 fn gen_cell(rng: &mut Rng, c: &Col) -> String {
-    if !c.nn && rng.chance(20) { return "NULL".into(); }
+    if !c.nn && rng.chance(20) {
+        return "NULL".into();
+    }
     match c.ty {
         Ty::Int => rng.pick(INT_VALS).to_string(),
         Ty::Text => format!("'{}'", rng.pick(TEXT_VALS)),
@@ -133,7 +177,10 @@ fn gen_cell(rng: &mut Rng, c: &Col) -> String {
 
 /// Generate a WHERE predicate involving a single table aliased as `alias`.
 fn gen_pred(rng: &mut Rng, alias: &str, s: &Schema) -> String {
-    let c = s.cols.get(1 + rng.below(s.cols.len() - 1)).unwrap_or(&s.cols[1]);
+    let c = s
+        .cols
+        .get(1 + rng.below(s.cols.len() - 1))
+        .unwrap_or(&s.cols[1]);
     let (cref, lit) = (format!("{alias}.{}", c.name), gen_lit(rng, c));
     let op = rng.pick(&["=", "<>", "<", "<=", ">", ">="]);
     format!("{cref} {op} {lit}")
@@ -159,8 +206,8 @@ fn det_orderby_three(a_alias: &str, b_alias: &str, c_alias: &str) -> String {
 /// (sql, ordered) — ordered means rows must match positionally.
 fn gen_join_query(
     rng: &mut Rng,
-    sa: &Schema, // table a
-    sb: &Schema, // table b
+    sa: &Schema,         // table a
+    sb: &Schema,         // table b
     sc: Option<&Schema>, // optional table c
     rows_a: usize,
     rows_b: usize,
@@ -178,17 +225,32 @@ fn gen_join_query(
                 String::new()
             };
             let proj = if rng.chance(50) {
-                format!("{aa}.id, {ba}.id, {aa}.{jcol}", aa=aa, ba=ba, jcol=jcol)
+                format!(
+                    "{aa}.id, {ba}.id, {aa}.{jcol}",
+                    aa = aa,
+                    ba = ba,
+                    jcol = jcol
+                )
             } else {
-                format!("{aa}.id, {ba}.id, {aa}.{}, {ba}.{}", sa.text_col(), sb.text_col(), aa=aa, ba=ba)
+                format!(
+                    "{aa}.id, {ba}.id, {aa}.{}, {ba}.{}",
+                    sa.text_col(),
+                    sb.text_col(),
+                    aa = aa,
+                    ba = ba
+                )
             };
             let w = if rng.chance(40) {
                 format!(" WHERE {}", gen_pred(rng, aa, sa))
-            } else { String::new() };
+            } else {
+                String::new()
+            };
             (
                 format!(
                     "SELECT {proj} FROM {ta} {aa} JOIN {tb} {ba} ON {aa}.{jcol} = {ba}.{jcol}{extra}{w} {ob}",
-                    ta=sa.tname, tb=sb.tname, ob=det_orderby_two(aa, ba)
+                    ta = sa.tname,
+                    tb = sb.tname,
+                    ob = det_orderby_two(aa, ba)
                 ),
                 true,
             )
@@ -199,13 +261,20 @@ fn gen_join_query(
             let jcol = sa.int_join_col();
             let extra_on = if rng.chance(35) {
                 let k = *rng.pick(INT_VALS);
-                format!(" AND {ba}.{jcol} < {k}", ba=ba, jcol=jcol)
-            } else { String::new() };
+                format!(" AND {ba}.{jcol} < {k}", ba = ba, jcol = jcol)
+            } else {
+                String::new()
+            };
             (
                 format!(
                     "SELECT {aa}.id, {ba}.id, {aa}.{jc} FROM {ta} {aa} LEFT JOIN {tb} {ba} ON {aa}.{jc} = {ba}.{jc}{ext} {ob}",
-                    ta=sa.tname, tb=sb.tname, aa=aa, ba=ba, jc=jcol, ext=extra_on,
-                    ob=det_orderby_two(aa, ba)
+                    ta = sa.tname,
+                    tb = sb.tname,
+                    aa = aa,
+                    ba = ba,
+                    jc = jcol,
+                    ext = extra_on,
+                    ob = det_orderby_two(aa, ba)
                 ),
                 true,
             )
@@ -219,7 +288,11 @@ fn gen_join_query(
             (
                 format!(
                     "SELECT {ba}.id, {aa}.id, {ba}.{jc} FROM {ta} {aa} RIGHT JOIN {tb} {ba} ON {aa}.{jc} = {ba}.{jc} ORDER BY {ba}.id ASC, {aa}.id ASC",
-                    ta=sa.tname, tb=sb.tname, aa=aa, ba=ba, jc=jcol
+                    ta = sa.tname,
+                    tb = sb.tname,
+                    aa = aa,
+                    ba = ba,
+                    jc = jcol
                 ),
                 true,
             )
@@ -232,7 +305,10 @@ fn gen_join_query(
             (
                 format!(
                     "SELECT {aa}.id, {ba}.id FROM {ta} {aa} CROSS JOIN {tb} {ba} ORDER BY {aa}.id ASC, {ba}.id ASC LIMIT {limit}",
-                    ta=sa.tname, tb=sb.tname, aa=aa, ba=ba
+                    ta = sa.tname,
+                    tb = sb.tname,
+                    aa = aa,
+                    ba = ba
                 ),
                 true,
             )
@@ -243,12 +319,24 @@ fn gen_join_query(
             let jcol = sa.int_join_col();
             let neg = if rng.chance(40) { "NOT " } else { "" };
             let inner_pred = if rng.chance(40) {
-                format!(" AND {ba}.{jc} > {v}", ba=ba, jc=jcol, v=*rng.pick(INT_VALS))
-            } else { String::new() };
+                format!(
+                    " AND {ba}.{jc} > {v}",
+                    ba = ba,
+                    jc = jcol,
+                    v = *rng.pick(INT_VALS)
+                )
+            } else {
+                String::new()
+            };
             (
                 format!(
                     "SELECT {aa}.id FROM {ta} {aa} WHERE {neg}EXISTS (SELECT 1 FROM {tb} {ba} WHERE {ba}.{jc} = {aa}.{jc}{ip}) ORDER BY {aa}.id ASC",
-                    ta=sa.tname, tb=sb.tname, aa=aa, ba=ba, jc=jcol, ip=inner_pred
+                    ta = sa.tname,
+                    tb = sb.tname,
+                    aa = aa,
+                    ba = ba,
+                    jc = jcol,
+                    ip = inner_pred
                 ),
                 true,
             )
@@ -260,11 +348,18 @@ fn gen_join_query(
             let neg = if rng.chance(40) { "NOT " } else { "" };
             let extra_pred = if rng.chance(40) {
                 format!(" AND {}", gen_pred(rng, ba, sb))
-            } else { String::new() };
+            } else {
+                String::new()
+            };
             (
                 format!(
                     "SELECT {aa}.id FROM {ta} {aa} WHERE {aa}.{jc} {neg}IN (SELECT {ba}.{jc} FROM {tb} {ba} WHERE {ba}.{jc} = {aa}.{jc}{ep}) ORDER BY {aa}.id ASC",
-                    ta=sa.tname, tb=sb.tname, aa=aa, ba=ba, jc=jcol, ep=extra_pred
+                    ta = sa.tname,
+                    tb = sb.tname,
+                    aa = aa,
+                    ba = ba,
+                    jc = jcol,
+                    ep = extra_pred
                 ),
                 true,
             )
@@ -275,15 +370,25 @@ fn gen_join_query(
             let jcol = sa.int_join_col();
             let inner_where = if rng.chance(50) {
                 let k = *rng.pick(INT_VALS);
-                format!(" WHERE {jc} > {k}", jc=jcol)
-            } else { String::new() };
+                format!(" WHERE {jc} > {k}", jc = jcol)
+            } else {
+                String::new()
+            };
             let inner_limit = if rng.chance(40) {
                 format!(" ORDER BY id ASC LIMIT {}", 2 + rng.below(rows_b.max(1)))
-            } else { String::new() };
+            } else {
+                String::new()
+            };
             (
                 format!(
                     "SELECT {aa}.id, {da}.{jc} FROM {ta} {aa} JOIN (SELECT id, {jc} FROM {tb}{iw}{il}) AS {da} ON {aa}.{jc} = {da}.{jc} ORDER BY {aa}.id ASC, {da}.id ASC",
-                    ta=sa.tname, tb=sb.tname, aa=aa, da=da, jc=jcol, iw=inner_where, il=inner_limit
+                    ta = sa.tname,
+                    tb = sb.tname,
+                    aa = aa,
+                    da = da,
+                    jc = jcol,
+                    iw = inner_where,
+                    il = inner_limit
                 ),
                 true,
             )
@@ -293,11 +398,19 @@ fn gen_join_query(
             let (aa, ba) = ("a", "b");
             let jcol = sa.int_join_col();
             let agg = rng.pick(&["COUNT(*)", "MAX(id)", "MIN(id)"]);
-            let w = if rng.chance(40) { format!(" WHERE {}", gen_pred(rng, aa, sa)) } else { String::new() };
+            let w = if rng.chance(40) {
+                format!(" WHERE {}", gen_pred(rng, aa, sa))
+            } else {
+                String::new()
+            };
             (
                 format!(
                     "SELECT {aa}.id, (SELECT {agg} FROM {tb} {ba} WHERE {ba}.{jc} = {aa}.{jc}) AS sub FROM {ta} {aa}{w} ORDER BY {aa}.id ASC",
-                    ta=sa.tname, tb=sb.tname, aa=aa, ba=ba, jc=jcol
+                    ta = sa.tname,
+                    tb = sb.tname,
+                    aa = aa,
+                    ba = ba,
+                    jc = jcol
                 ),
                 true,
             )
@@ -311,12 +424,21 @@ fn gen_join_query(
                 let having = if rng.chance(40) {
                     let k = rng.int(0, 3);
                     format!(" HAVING COUNT(*) >= {k}")
-                } else { String::new() };
+                } else {
+                    String::new()
+                };
                 (
                     format!(
                         "SELECT {aa}.{jc}, COUNT(*) AS cnt FROM {ta} {aa} {ij} {tb} {ba} ON {aa}.{jc} = {ba}.{jc} {ij} {tc} {ca} ON {aa}.{jc} = {ca}.{jc} GROUP BY {aa}.{jc}{hv} ORDER BY {aa}.{jc} ASC",
-                        ta=sa.tname, tb=sb.tname, tc=sc.tname, aa=aa, ba=ba, ca=ca,
-                        jc=jcol, ij=inner_join, hv=having
+                        ta = sa.tname,
+                        tb = sb.tname,
+                        tc = sc.tname,
+                        aa = aa,
+                        ba = ba,
+                        ca = ca,
+                        jc = jcol,
+                        ij = inner_join,
+                        hv = having
                     ),
                     true,
                 )
@@ -327,7 +449,11 @@ fn gen_join_query(
                 (
                     format!(
                         "SELECT {aa}.{jc}, COUNT(*) FROM {ta} {aa} JOIN {tb} {ba} ON {aa}.{jc} = {ba}.{jc} GROUP BY {aa}.{jc} ORDER BY {aa}.{jc} ASC",
-                        ta=sa.tname, tb=sb.tname, aa=aa, ba=ba, jc=jcol
+                        ta = sa.tname,
+                        tb = sb.tname,
+                        aa = aa,
+                        ba = ba,
+                        jc = jcol
                     ),
                     true,
                 )
@@ -339,12 +465,20 @@ fn gen_join_query(
             let jcol = sa.int_join_col();
             let kind = rng.pick(&["JOIN", "LEFT JOIN"]);
             let limit = 1 + rng.below(rows_a.max(1) + rows_b.max(1)).min(40);
-            let w = if rng.chance(40) { format!(" WHERE {}", gen_pred(rng, aa, sa)) } else { String::new() };
+            let w = if rng.chance(40) {
+                format!(" WHERE {}", gen_pred(rng, aa, sa))
+            } else {
+                String::new()
+            };
             (
                 format!(
                     "SELECT {aa}.id, {ba}.id, {aa}.{jc} FROM {ta} {aa} {kind} {tb} {ba} ON {aa}.{jc} = {ba}.{jc}{w} {ob} LIMIT {limit}",
-                    ta=sa.tname, tb=sb.tname, aa=aa, ba=ba, jc=jcol,
-                    ob=det_orderby_two(aa, ba)
+                    ta = sa.tname,
+                    tb = sb.tname,
+                    aa = aa,
+                    ba = ba,
+                    jc = jcol,
+                    ob = det_orderby_two(aa, ba)
                 ),
                 true,
             )
@@ -386,7 +520,8 @@ fn canon_sqlite(v: &rusqlite::types::Value) -> String {
 
 // ─── Executor wrappers ────────────────────────────────────────────────────────
 fn panic_msg(p: &(dyn std::any::Any + Send)) -> String {
-    p.downcast_ref::<&str>().map(|s| s.to_string())
+    p.downcast_ref::<&str>()
+        .map(|s| s.to_string())
         .or_else(|| p.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "unknown".into())
 }
@@ -398,9 +533,10 @@ fn run_nucleus(ex: &Executor, sql: &str) -> Result<Vec<Vec<String>>, String> {
     }));
     match res {
         Ok(Ok(mut results)) => match results.pop() {
-            Some(ExecResult::Select { rows, .. }) => {
-                Ok(rows.iter().map(|r| r.iter().map(canon_nucleus).collect()).collect())
-            }
+            Some(ExecResult::Select { rows, .. }) => Ok(rows
+                .iter()
+                .map(|r| r.iter().map(canon_nucleus).collect())
+                .collect()),
             _ => Err("non-select result".into()),
         },
         Ok(Err(e)) => Err(format!("{e:?}")),
@@ -423,14 +559,16 @@ fn exec_nucleus(ex: &Executor, sql: &str) -> Result<(), String> {
 fn run_sqlite(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> {
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     let ncol = stmt.column_count();
-    let rows_iter = stmt.query_map([], |row| {
-        let mut cells = Vec::with_capacity(ncol);
-        for i in 0..ncol {
-            let v: rusqlite::types::Value = row.get(i)?;
-            cells.push(canon_sqlite(&v));
-        }
-        Ok(cells)
-    }).map_err(|e| e.to_string())?;
+    let rows_iter = stmt
+        .query_map([], |row| {
+            let mut cells = Vec::with_capacity(ncol);
+            for i in 0..ncol {
+                let v: rusqlite::types::Value = row.get(i)?;
+                cells.push(canon_sqlite(&v));
+            }
+            Ok(cells)
+        })
+        .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for r in rows_iter {
         out.push(r.map_err(|e| e.to_string())?);
@@ -439,13 +577,24 @@ fn run_sqlite(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, String> 
 }
 
 fn compare(mut nuc: Vec<Vec<String>>, mut sq: Vec<Vec<String>>, ordered: bool) -> bool {
-    if !ordered { nuc.sort(); sq.sort(); }
+    if !ordered {
+        nuc.sort();
+        sq.sort();
+    }
     nuc == sq
 }
 
 fn preview(rows: &[Vec<String>]) -> String {
-    let shown: Vec<String> = rows.iter().take(6).map(|r| format!("[{}]", r.join(","))).collect();
-    let more = if rows.len() > 6 { format!(" …(+{})", rows.len() - 6) } else { String::new() };
+    let shown: Vec<String> = rows
+        .iter()
+        .take(6)
+        .map(|r| format!("[{}]", r.join(",")))
+        .collect();
+    let more = if rows.len() > 6 {
+        format!(" …(+{})", rows.len() - 6)
+    } else {
+        String::new()
+    };
     format!("{}{more}", shown.join(" "))
 }
 
@@ -468,10 +617,22 @@ fn main_impl() {
     }
     while i < args.len() {
         match args[i].as_str() {
-            "--seed"       => { i += 1; seed       = parse_u64(&args[i]); }
-            "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
-            "--queries"    => { i += 1; queries_per = args[i].parse().unwrap(); }
-            "--max-report" => { i += 1; max_report  = args[i].parse().unwrap(); }
+            "--seed" => {
+                i += 1;
+                seed = parse_u64(&args[i]);
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args[i].parse().unwrap();
+            }
+            "--queries" => {
+                i += 1;
+                queries_per = args[i].parse().unwrap();
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = args[i].parse().unwrap();
+            }
             _ => {}
         }
         i += 1;
@@ -482,10 +643,10 @@ fn main_impl() {
     println!("Nucleus ⇄ SQLite join-shape differential fuzzer");
     println!("seed={seed} iterations={iterations} queries/iter={queries_per}\n");
 
-    let mut total       = 0usize;
+    let mut total = 0usize;
     let mut divergences = 0usize;
-    let mut panics      = 0usize;
-    let mut nuc_errors  = 0usize;
+    let mut panics = 0usize;
+    let mut nuc_errors = 0usize;
 
     'outer: for iter in 0..iterations {
         let mut rng = Rng(seed.wrapping_add(iter as u64).wrapping_mul(0x100000001B3));
@@ -494,18 +655,22 @@ fn main_impl() {
         let use_three = rng.chance(30);
         let sa = Schema::new("ta", &mut rng);
         let sb = Schema::new("tb", &mut rng);
-        let sc_opt: Option<Schema> = if use_three { Some(Schema::new("tc", &mut rng)) } else { None };
+        let sc_opt: Option<Schema> = if use_three {
+            Some(Schema::new("tc", &mut rng))
+        } else {
+            None
+        };
 
         let rows_a = 4 + rng.below(10);
         let rows_b = 4 + rng.below(10);
         let rows_c = 4 + rng.below(8);
 
-        let ddl_a   = sa.ddl();
-        let ddl_b   = sb.ddl();
-        let ins_a   = sa.gen_inserts(&mut rng, rows_a);
-        let ins_b   = sb.gen_inserts(&mut rng, rows_b);
-        let ddl_c   = sc_opt.as_ref().map(|s| s.ddl());
-        let ins_c   = sc_opt.as_ref().map(|s| s.gen_inserts(&mut rng, rows_c));
+        let ddl_a = sa.ddl();
+        let ddl_b = sb.ddl();
+        let ins_a = sa.gen_inserts(&mut rng, rows_a);
+        let ins_b = sb.gen_inserts(&mut rng, rows_b);
+        let ddl_c = sc_opt.as_ref().map(|s| s.ddl());
+        let ins_c = sc_opt.as_ref().map(|s| s.gen_inserts(&mut rng, rows_c));
 
         // ── Fresh engines ──────────────────────────────────────────────────
         let catalog: Arc<_> = Arc::new(Catalog::new());
@@ -527,15 +692,15 @@ fn main_impl() {
                 break;
             }
         }
-        if !ok { continue 'outer; }
+        if !ok {
+            continue 'outer;
+        }
 
         // ── Query loop ─────────────────────────────────────────────────────
         for _ in 0..queries_per {
             total += 1;
 
-            let (q, ordered) = gen_join_query(
-                &mut rng, &sa, &sb, sc_opt.as_ref(), rows_a, rows_b,
-            );
+            let (q, ordered) = gen_join_query(&mut rng, &sa, &sb, sc_opt.as_ref(), rows_a, rows_b);
 
             let n = run_nucleus(&ex, &q);
             let s = run_sqlite(&sqlite, &q);
@@ -546,13 +711,20 @@ fn main_impl() {
                         divergences += 1;
                         if divergences <= max_report {
                             let (mut a, mut b) = (nr, sr);
-                            if !ordered { a.sort(); b.sort(); }
-                            println!("─── DIVERGENCE #{divergences} (iter {iter}, seed {seed}) ───");
+                            if !ordered {
+                                a.sort();
+                                b.sort();
+                            }
+                            println!(
+                                "─── DIVERGENCE #{divergences} (iter {iter}, seed {seed}) ───"
+                            );
                             println!("  query   : {q}");
                             println!("  nucleus ({} rows): {}", a.len(), preview(&a));
                             println!("  sqlite  ({} rows): {}", b.len(), preview(&b));
                             println!("  ── setup ({} stmts) ──", setup_stmts.len());
-                            for s in &setup_stmts { println!("    {s};"); }
+                            for s in &setup_stmts {
+                                println!("    {s};");
+                            }
                             println!("    {q};");
                             println!();
                         }
@@ -566,10 +738,14 @@ fn main_impl() {
                             println!("  sql : {q}");
                             println!("  {ne}");
                             println!("  ── setup ──");
-                            for s in &setup_stmts { println!("    {s};"); }
+                            for s in &setup_stmts {
+                                println!("    {s};");
+                            }
                             println!();
                         }
-                        if panics > max_report { std::process::exit(1); }
+                        if panics > max_report {
+                            std::process::exit(1);
+                        }
                         continue 'outer;
                     } else {
                         nuc_errors += 1;

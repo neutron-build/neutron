@@ -173,7 +173,9 @@ fn check_nesting_depth(sql: &str) -> Result<(), ParseError> {
                     i = j + 1;
                     // Scan for the closing tag.
                     while i < len {
-                        if bytes[i] == b'$' && i + tag.len() <= len && &bytes[i..i + tag.len()] == tag
+                        if bytes[i] == b'$'
+                            && i + tag.len() <= len
+                            && &bytes[i..i + tag.len()] == tag
                         {
                             i += tag.len();
                             break;

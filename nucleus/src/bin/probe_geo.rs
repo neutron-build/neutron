@@ -186,9 +186,18 @@ fn main_impl() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--seed"       => { i += 1; seed       = args[i].parse().unwrap(); }
-            "--iterations" => { i += 1; iterations = args[i].parse().unwrap(); }
-            "--max-report" => { i += 1; max_report = args[i].parse().unwrap(); }
+            "--seed" => {
+                i += 1;
+                seed = args[i].parse().unwrap();
+            }
+            "--iterations" => {
+                i += 1;
+                iterations = args[i].parse().unwrap();
+            }
+            "--max-report" => {
+                i += 1;
+                max_report = args[i].parse().unwrap();
+            }
             _ => {}
         }
         i += 1;
@@ -203,7 +212,7 @@ fn main_impl() {
     let storage: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
     let ex = Arc::new(Executor::new(catalog, storage));
 
-    let mut total       = 0usize;
+    let mut total = 0usize;
     let mut divergences = 0usize;
 
     for iter in 0..iterations {
@@ -227,8 +236,22 @@ fn main_impl() {
             let expected = format!("POINT({x1} {y1})");
             match run_text(&ex, &sql) {
                 Ok(got) if got == expected => {}
-                Ok(got) => report(&mut divergences, max_report, "ST_MAKEPOINT text", &sql, &expected, &got),
-                Err(e)  => report(&mut divergences, max_report, "ST_MAKEPOINT error", &sql, &expected, &e),
+                Ok(got) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_MAKEPOINT text",
+                    &sql,
+                    &expected,
+                    &got,
+                ),
+                Err(e) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_MAKEPOINT error",
+                    &sql,
+                    &expected,
+                    &e,
+                ),
             }
         }
         {
@@ -238,8 +261,22 @@ fn main_impl() {
             let sql = format!("SELECT ST_X('{pt_wkt}')");
             match run_f64(&ex, &sql) {
                 Ok(got) if close(got, x1) => {}
-                Ok(got) => report(&mut divergences, max_report, "ST_X", &sql, &x1.to_string(), &got.to_string()),
-                Err(e)  => report(&mut divergences, max_report, "ST_X error", &sql, &x1.to_string(), &e),
+                Ok(got) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_X",
+                    &sql,
+                    &x1.to_string(),
+                    &got.to_string(),
+                ),
+                Err(e) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_X error",
+                    &sql,
+                    &x1.to_string(),
+                    &e,
+                ),
             }
         }
         {
@@ -248,8 +285,22 @@ fn main_impl() {
             let sql = format!("SELECT ST_Y('{pt_wkt}')");
             match run_f64(&ex, &sql) {
                 Ok(got) if close(got, y1) => {}
-                Ok(got) => report(&mut divergences, max_report, "ST_Y", &sql, &y1.to_string(), &got.to_string()),
-                Err(e)  => report(&mut divergences, max_report, "ST_Y error", &sql, &y1.to_string(), &e),
+                Ok(got) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_Y",
+                    &sql,
+                    &y1.to_string(),
+                    &got.to_string(),
+                ),
+                Err(e) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_Y error",
+                    &sql,
+                    &y1.to_string(),
+                    &e,
+                ),
             }
         }
 
@@ -260,8 +311,22 @@ fn main_impl() {
             let sql = format!("SELECT ST_X(ST_MAKEPOINT({x2},{y2}))");
             match run_f64(&ex, &sql) {
                 Ok(got) if close(got, x2) => {}
-                Ok(got) => report(&mut divergences, max_report, "ST_X(ST_MAKEPOINT)", &sql, &x2.to_string(), &got.to_string()),
-                Err(e)  => report(&mut divergences, max_report, "ST_X(ST_MAKEPOINT) error", &sql, &x2.to_string(), &e),
+                Ok(got) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_X(ST_MAKEPOINT)",
+                    &sql,
+                    &x2.to_string(),
+                    &got.to_string(),
+                ),
+                Err(e) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_X(ST_MAKEPOINT) error",
+                    &sql,
+                    &x2.to_string(),
+                    &e,
+                ),
             }
         }
         {
@@ -269,8 +334,22 @@ fn main_impl() {
             let sql = format!("SELECT ST_Y(ST_MAKEPOINT({x2},{y2}))");
             match run_f64(&ex, &sql) {
                 Ok(got) if close(got, y2) => {}
-                Ok(got) => report(&mut divergences, max_report, "ST_Y(ST_MAKEPOINT)", &sql, &y2.to_string(), &got.to_string()),
-                Err(e)  => report(&mut divergences, max_report, "ST_Y(ST_MAKEPOINT) error", &sql, &y2.to_string(), &e),
+                Ok(got) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_Y(ST_MAKEPOINT)",
+                    &sql,
+                    &y2.to_string(),
+                    &got.to_string(),
+                ),
+                Err(e) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_Y(ST_MAKEPOINT) error",
+                    &sql,
+                    &y2.to_string(),
+                    &e,
+                ),
             }
         }
 
@@ -282,8 +361,22 @@ fn main_impl() {
             let sql = format!("SELECT ST_DISTANCE_EUCLIDEAN({x1},{y1},{x2},{y2})");
             match run_f64(&ex, &sql) {
                 Ok(got) if close(got, expected) => {}
-                Ok(got) => report(&mut divergences, max_report, "ST_DISTANCE_EUCLIDEAN", &sql, &format!("{expected:.9}"), &format!("{got:.9}")),
-                Err(e)  => report(&mut divergences, max_report, "ST_DISTANCE_EUCLIDEAN error", &sql, &format!("{expected:.9}"), &e),
+                Ok(got) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_DISTANCE_EUCLIDEAN",
+                    &sql,
+                    &format!("{expected:.9}"),
+                    &format!("{got:.9}"),
+                ),
+                Err(e) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_DISTANCE_EUCLIDEAN error",
+                    &sql,
+                    &format!("{expected:.9}"),
+                    &e,
+                ),
             }
         }
 
@@ -295,8 +388,22 @@ fn main_impl() {
             let sql = format!("SELECT ST_DISTANCE({lat1},{lon1},{lat2},{lon2})");
             match run_f64(&ex, &sql) {
                 Ok(got) if close(got, expected) => {}
-                Ok(got) => report(&mut divergences, max_report, "ST_DISTANCE(haversine)", &sql, &format!("{expected:.3}"), &format!("{got:.3}")),
-                Err(e)  => report(&mut divergences, max_report, "ST_DISTANCE error", &sql, &format!("{expected:.3}"), &e),
+                Ok(got) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_DISTANCE(haversine)",
+                    &sql,
+                    &format!("{expected:.3}"),
+                    &format!("{got:.3}"),
+                ),
+                Err(e) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_DISTANCE error",
+                    &sql,
+                    &format!("{expected:.3}"),
+                    &e,
+                ),
             }
         }
 
@@ -310,8 +417,17 @@ fn main_impl() {
             match (&d_ab, &d_ba) {
                 (Ok(a), Ok(b)) if close(*a, *b) => {}
                 (Ok(a), Ok(b)) => {
-                    let s = format!("ST_DISTANCE({lat1},{lon1},{lat2},{lon2}) = {a:.3} != {b:.3} = ST_DISTANCE({lat2},{lon2},{lat1},{lon1})");
-                    report(&mut divergences, max_report, "ST_DISTANCE symmetry", &s, "symmetric", "asymmetric");
+                    let s = format!(
+                        "ST_DISTANCE({lat1},{lon1},{lat2},{lon2}) = {a:.3} != {b:.3} = ST_DISTANCE({lat2},{lon2},{lat1},{lon1})"
+                    );
+                    report(
+                        &mut divergences,
+                        max_report,
+                        "ST_DISTANCE symmetry",
+                        &s,
+                        "symmetric",
+                        "asymmetric",
+                    );
                 }
                 _ => {}
             }
@@ -327,8 +443,17 @@ fn main_impl() {
             match (&d_ab, &d_ba) {
                 (Ok(a), Ok(b)) if close(*a, *b) => {}
                 (Ok(a), Ok(b)) => {
-                    let s = format!("euclidean({x1},{y1},{x2},{y2})={a:.6} vs ({x2},{y2},{x1},{y1})={b:.6}");
-                    report(&mut divergences, max_report, "ST_DISTANCE_EUCLIDEAN symmetry", &s, "symmetric", "asymmetric");
+                    let s = format!(
+                        "euclidean({x1},{y1},{x2},{y2})={a:.6} vs ({x2},{y2},{x1},{y1})={b:.6}"
+                    );
+                    report(
+                        &mut divergences,
+                        max_report,
+                        "ST_DISTANCE_EUCLIDEAN symmetry",
+                        &s,
+                        "symmetric",
+                        "asymmetric",
+                    );
                 }
                 _ => {}
             }
@@ -340,8 +465,22 @@ fn main_impl() {
             let sql = format!("SELECT ST_DISTANCE_EUCLIDEAN({x1},{y1},{x1},{y1})");
             match run_f64(&ex, &sql) {
                 Ok(got) if got.abs() < 1e-9 => {}
-                Ok(got) => report(&mut divergences, max_report, "self-euclidean=0", &sql, "0", &got.to_string()),
-                Err(e)  => report(&mut divergences, max_report, "self-euclidean error", &sql, "0", &e),
+                Ok(got) => report(
+                    &mut divergences,
+                    max_report,
+                    "self-euclidean=0",
+                    &sql,
+                    "0",
+                    &got.to_string(),
+                ),
+                Err(e) => report(
+                    &mut divergences,
+                    max_report,
+                    "self-euclidean error",
+                    &sql,
+                    "0",
+                    &e,
+                ),
             }
         }
         {
@@ -349,8 +488,22 @@ fn main_impl() {
             let sql = format!("SELECT ST_DISTANCE({lat1},{lon1},{lat1},{lon1})");
             match run_f64(&ex, &sql) {
                 Ok(got) if got.abs() < 1e-6 => {}
-                Ok(got) => report(&mut divergences, max_report, "self-haversine=0", &sql, "0", &got.to_string()),
-                Err(e)  => report(&mut divergences, max_report, "self-haversine error", &sql, "0", &e),
+                Ok(got) => report(
+                    &mut divergences,
+                    max_report,
+                    "self-haversine=0",
+                    &sql,
+                    "0",
+                    &got.to_string(),
+                ),
+                Err(e) => report(
+                    &mut divergences,
+                    max_report,
+                    "self-haversine error",
+                    &sql,
+                    "0",
+                    &e,
+                ),
             }
         }
 
@@ -367,17 +520,45 @@ fn main_impl() {
             let sql_below = format!("SELECT ST_DWITHIN({lat1},{lon1},{lat2},{lon2},{below})");
 
             match run_bool(&ex, &sql_above) {
-                Ok(true)  => {}
-                Ok(false) => report(&mut divergences, max_report, "ST_DWITHIN above", &sql_above, "true", "false"),
-                Err(e)    => report(&mut divergences, max_report, "ST_DWITHIN above error", &sql_above, "true", &e),
+                Ok(true) => {}
+                Ok(false) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_DWITHIN above",
+                    &sql_above,
+                    "true",
+                    "false",
+                ),
+                Err(e) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_DWITHIN above error",
+                    &sql_above,
+                    "true",
+                    &e,
+                ),
             }
             // When the two points are distinct, d > 0, so d-1 < d, so should be false.
             if haversine_d > 1.0 {
                 total += 1;
                 match run_bool(&ex, &sql_below) {
                     Ok(false) => {}
-                    Ok(true)  => report(&mut divergences, max_report, "ST_DWITHIN below", &sql_below, "false", "true"),
-                    Err(e)    => report(&mut divergences, max_report, "ST_DWITHIN below error", &sql_below, "false", &e),
+                    Ok(true) => report(
+                        &mut divergences,
+                        max_report,
+                        "ST_DWITHIN below",
+                        &sql_below,
+                        "false",
+                        "true",
+                    ),
+                    Err(e) => report(
+                        &mut divergences,
+                        max_report,
+                        "ST_DWITHIN below error",
+                        &sql_below,
+                        "false",
+                        &e,
+                    ),
                 }
             }
         }
@@ -393,10 +574,26 @@ fn main_impl() {
                 Ok(got) if got == expected_within => {}
                 Ok(got) => {
                     let dist = ref_haversine(lat1, lon1, lat2, lon2);
-                    let detail = format!("haversine={dist:.1}m radius={radius:.1}m => expected {expected_within} got {got}");
-                    report(&mut divergences, max_report, "ST_DWITHIN vs formula", &detail, &expected_within.to_string(), &got.to_string());
+                    let detail = format!(
+                        "haversine={dist:.1}m radius={radius:.1}m => expected {expected_within} got {got}"
+                    );
+                    report(
+                        &mut divergences,
+                        max_report,
+                        "ST_DWITHIN vs formula",
+                        &detail,
+                        &expected_within.to_string(),
+                        &got.to_string(),
+                    );
                 }
-                Err(e) => report(&mut divergences, max_report, "ST_DWITHIN error", &sql, &expected_within.to_string(), &e),
+                Err(e) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_DWITHIN error",
+                    &sql,
+                    &expected_within.to_string(),
+                    &e,
+                ),
             }
         }
 
@@ -408,18 +605,34 @@ fn main_impl() {
                 .collect();
             // Deduplicate consecutive identical vertices (degenerate case handled by ref already)
             verts.dedup();
-            if verts.len() < 3 { continue; }
+            if verts.len() < 3 {
+                continue;
+            }
 
             let expected_area = ref_area(&verts);
             total += 1;
 
             // Build SQL: ST_AREA(x1,y1, x2,y2, ...)
-            let coord_args: Vec<String> = verts.iter().map(|(x,y)| format!("{x},{y}")).collect();
+            let coord_args: Vec<String> = verts.iter().map(|(x, y)| format!("{x},{y}")).collect();
             let sql = format!("SELECT ST_AREA({})", coord_args.join(","));
             match run_f64(&ex, &sql) {
                 Ok(got) if close(got, expected_area) => {}
-                Ok(got) => report(&mut divergences, max_report, "ST_AREA", &sql, &format!("{expected_area:.9}"), &format!("{got:.9}")),
-                Err(e)  => report(&mut divergences, max_report, "ST_AREA error", &sql, &format!("{expected_area:.9}"), &e),
+                Ok(got) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_AREA",
+                    &sql,
+                    &format!("{expected_area:.9}"),
+                    &format!("{got:.9}"),
+                ),
+                Err(e) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_AREA error",
+                    &sql,
+                    &format!("{expected_area:.9}"),
+                    &e,
+                ),
             }
         }
 
@@ -436,19 +649,35 @@ fn main_impl() {
             let py = rng.int(-2, h as i64 + 2) as f64;
 
             let poly_wkt = format!("POLYGON((0 0, {wf} 0, {wf} {hf}, 0 {hf}, 0 0))");
-            let pt_wkt   = format!("POINT({px} {py})");
-            let poly_pts  = vec![(0.0,0.0),(wf,0.0),(wf,hf),(0.0,hf),(0.0,0.0)];
-            let expected  = ref_contains(&poly_pts, px, py);
+            let pt_wkt = format!("POINT({px} {py})");
+            let poly_pts = vec![(0.0, 0.0), (wf, 0.0), (wf, hf), (0.0, hf), (0.0, 0.0)];
+            let expected = ref_contains(&poly_pts, px, py);
 
             total += 1;
             let sql = format!("SELECT ST_CONTAINS('{poly_wkt}','{pt_wkt}')");
             match run_bool(&ex, &sql) {
                 Ok(got) if got == expected => {}
                 Ok(got) => {
-                    let detail = format!("poly=({wf}x{hf} rect) pt=({px},{py}) expected={expected} got={got}");
-                    report(&mut divergences, max_report, "ST_CONTAINS", &detail, &expected.to_string(), &got.to_string());
+                    let detail = format!(
+                        "poly=({wf}x{hf} rect) pt=({px},{py}) expected={expected} got={got}"
+                    );
+                    report(
+                        &mut divergences,
+                        max_report,
+                        "ST_CONTAINS",
+                        &detail,
+                        &expected.to_string(),
+                        &got.to_string(),
+                    );
                 }
-                Err(e) => report(&mut divergences, max_report, "ST_CONTAINS error", &sql, &expected.to_string(), &e),
+                Err(e) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_CONTAINS error",
+                    &sql,
+                    &expected.to_string(),
+                    &e,
+                ),
             }
         }
 
@@ -462,17 +691,32 @@ fn main_impl() {
             let cx = wf / 2.0;
             let cy = hf / 2.0;
             let poly_wkt = format!("POLYGON((0 0, {wf} 0, {wf} {hf}, 0 {hf}, 0 0))");
-            let pt_wkt   = format!("POINT({cx} {cy})");
+            let pt_wkt = format!("POINT({cx} {cy})");
 
             total += 1;
             let sql = format!("SELECT ST_CONTAINS('{poly_wkt}','{pt_wkt}')");
             match run_bool(&ex, &sql) {
                 Ok(true) => {}
                 Ok(false) => {
-                    let detail = format!("centroid ({cx},{cy}) of ({wf}x{hf} rect) should be inside");
-                    report(&mut divergences, max_report, "ST_CONTAINS centroid", &detail, "true", "false");
+                    let detail =
+                        format!("centroid ({cx},{cy}) of ({wf}x{hf} rect) should be inside");
+                    report(
+                        &mut divergences,
+                        max_report,
+                        "ST_CONTAINS centroid",
+                        &detail,
+                        "true",
+                        "false",
+                    );
                 }
-                Err(e) => report(&mut divergences, max_report, "ST_CONTAINS centroid error", &sql, "true", &e),
+                Err(e) => report(
+                    &mut divergences,
+                    max_report,
+                    "ST_CONTAINS centroid error",
+                    &sql,
+                    "true",
+                    &e,
+                ),
             }
         }
     }
@@ -485,8 +729,22 @@ fn main_impl() {
         total += 1;
         match run_f64(&ex, sql) {
             Ok(got) if close(got, 1.0) => {}
-            Ok(got) => report(&mut divergences, max_report, "R1 unit-square area", sql, "1.0", &got.to_string()),
-            Err(e)  => report(&mut divergences, max_report, "R1 unit-square error", sql, "1.0", &e),
+            Ok(got) => report(
+                &mut divergences,
+                max_report,
+                "R1 unit-square area",
+                sql,
+                "1.0",
+                &got.to_string(),
+            ),
+            Err(e) => report(
+                &mut divergences,
+                max_report,
+                "R1 unit-square error",
+                sql,
+                "1.0",
+                &e,
+            ),
         }
     }
     // R2: Equilateral right triangle area = 0.5
@@ -495,8 +753,22 @@ fn main_impl() {
         total += 1;
         match run_f64(&ex, sql) {
             Ok(got) if close(got, 0.5) => {}
-            Ok(got) => report(&mut divergences, max_report, "R2 right-triangle area", sql, "0.5", &got.to_string()),
-            Err(e)  => report(&mut divergences, max_report, "R2 right-triangle error", sql, "0.5", &e),
+            Ok(got) => report(
+                &mut divergences,
+                max_report,
+                "R2 right-triangle area",
+                sql,
+                "0.5",
+                &got.to_string(),
+            ),
+            Err(e) => report(
+                &mut divergences,
+                max_report,
+                "R2 right-triangle error",
+                sql,
+                "0.5",
+                &e,
+            ),
         }
     }
     // R3: ST_DISTANCE origin→origin = 0
@@ -505,8 +777,22 @@ fn main_impl() {
         total += 1;
         match run_f64(&ex, sql) {
             Ok(got) if got.abs() < 1e-9 => {}
-            Ok(got) => report(&mut divergences, max_report, "R3 self-distance=0", sql, "0", &got.to_string()),
-            Err(e)  => report(&mut divergences, max_report, "R3 self-distance error", sql, "0", &e),
+            Ok(got) => report(
+                &mut divergences,
+                max_report,
+                "R3 self-distance=0",
+                sql,
+                "0",
+                &got.to_string(),
+            ),
+            Err(e) => report(
+                &mut divergences,
+                max_report,
+                "R3 self-distance error",
+                sql,
+                "0",
+                &e,
+            ),
         }
     }
     // R4: Euclidean (3,4) → (0,0) = 5
@@ -515,8 +801,22 @@ fn main_impl() {
         total += 1;
         match run_f64(&ex, sql) {
             Ok(got) if close(got, 5.0) => {}
-            Ok(got) => report(&mut divergences, max_report, "R4 pythagorean 3-4-5", sql, "5.0", &got.to_string()),
-            Err(e)  => report(&mut divergences, max_report, "R4 pythagorean error", sql, "5.0", &e),
+            Ok(got) => report(
+                &mut divergences,
+                max_report,
+                "R4 pythagorean 3-4-5",
+                sql,
+                "5.0",
+                &got.to_string(),
+            ),
+            Err(e) => report(
+                &mut divergences,
+                max_report,
+                "R4 pythagorean error",
+                sql,
+                "5.0",
+                &e,
+            ),
         }
     }
     // R5: ST_X/ST_Y of POINT(7 -3) = 7 / -3
@@ -525,8 +825,22 @@ fn main_impl() {
         total += 1;
         match run_f64(&ex, sql) {
             Ok(got) if close(got, 7.0) => {}
-            Ok(got) => report(&mut divergences, max_report, "R5 ST_X=7", sql, "7.0", &got.to_string()),
-            Err(e)  => report(&mut divergences, max_report, "R5 ST_X error", sql, "7.0", &e),
+            Ok(got) => report(
+                &mut divergences,
+                max_report,
+                "R5 ST_X=7",
+                sql,
+                "7.0",
+                &got.to_string(),
+            ),
+            Err(e) => report(
+                &mut divergences,
+                max_report,
+                "R5 ST_X error",
+                sql,
+                "7.0",
+                &e,
+            ),
         }
     }
     {
@@ -534,8 +848,22 @@ fn main_impl() {
         total += 1;
         match run_f64(&ex, sql) {
             Ok(got) if close(got, -3.0) => {}
-            Ok(got) => report(&mut divergences, max_report, "R5 ST_Y=-3", sql, "-3.0", &got.to_string()),
-            Err(e)  => report(&mut divergences, max_report, "R5 ST_Y error", sql, "-3.0", &e),
+            Ok(got) => report(
+                &mut divergences,
+                max_report,
+                "R5 ST_Y=-3",
+                sql,
+                "-3.0",
+                &got.to_string(),
+            ),
+            Err(e) => report(
+                &mut divergences,
+                max_report,
+                "R5 ST_Y error",
+                sql,
+                "-3.0",
+                &e,
+            ),
         }
     }
     // R6: Point strictly outside rectangle should not be contained
@@ -544,8 +872,22 @@ fn main_impl() {
         total += 1;
         match run_bool(&ex, sql) {
             Ok(false) => {}
-            Ok(true)  => report(&mut divergences, max_report, "R6 outside-rect", sql, "false", "true"),
-            Err(e)    => report(&mut divergences, max_report, "R6 outside error", sql, "false", &e),
+            Ok(true) => report(
+                &mut divergences,
+                max_report,
+                "R6 outside-rect",
+                sql,
+                "false",
+                "true",
+            ),
+            Err(e) => report(
+                &mut divergences,
+                max_report,
+                "R6 outside error",
+                sql,
+                "false",
+                &e,
+            ),
         }
     }
 
