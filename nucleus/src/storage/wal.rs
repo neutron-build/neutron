@@ -144,6 +144,13 @@ pub trait WalBackend: Send + Sync {
     /// NEXT recovery's page-vs-record LSN comparison silently discards the
     /// new records.
     fn bump_next_lsn(&self, min_next: u64);
+    /// Start a fresh segment (no-op for single-file backends). Recovery
+    /// rotates after replay so every pre-recovery segment — including ones
+    /// carrying legacy-format records that log CRC errors on each re-parse
+    /// — becomes inactive and prunable at the next checkpoint.
+    fn rotate(&self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// The write-ahead log.
@@ -859,6 +866,9 @@ impl WalBackend for SegmentedWal {
     }
     fn bump_next_lsn(&self, min_next: u64) {
         self.next_lsn.fetch_max(min_next, Ordering::SeqCst);
+    }
+    fn rotate(&self) -> std::io::Result<()> {
+        SegmentedWal::rotate(self)
     }
 }
 
