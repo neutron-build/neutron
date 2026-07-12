@@ -1162,10 +1162,10 @@ async fn cmd_start(cfg: StartConfig) {
                         // UNBOUNDED window of committed rows and WAL segments
                         // accumulated forever. The interval now bounds the
                         // crash-loss window (wal.checkpoint_interval_secs).
-                        if let Some(ref engine) = disk_for_workers {
-                            if let Err(e) = engine.checkpoint() {
-                                tracing::warn!("SQL WAL checkpoint failed: {e}");
-                            }
+                        if let Some(ref engine) = disk_for_workers
+                            && let Err(e) = engine.checkpoint()
+                        {
+                            tracing::warn!("SQL WAL checkpoint failed: {e}");
                         }
                         if let Err(e) = executor_for_workers.checkpoint_cdc_wal() {
                             tracing::warn!("CDC WAL checkpoint failed: {e}");
