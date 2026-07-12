@@ -1155,6 +1155,18 @@ async fn cmd_start(cfg: StartConfig) {
                         // correct index snapshot needs new accessors on
                         // HnswIndex and doesn't cover IvfFlat; see
                         // vector/wal.rs::IndexSnapshot.
+                        // SQL disk engine: flush dirty pages, checkpoint the
+                        // WAL, and prune fully-checkpointed segments. This was
+                        // never wired — SQL pages flushed only on clean
+                        // shutdown or buffer-pool pressure, so a crash lost an
+                        // UNBOUNDED window of committed rows and WAL segments
+                        // accumulated forever. The interval now bounds the
+                        // crash-loss window (wal.checkpoint_interval_secs).
+                        if let Some(ref engine) = disk_for_workers {
+                            if let Err(e) = engine.checkpoint() {
+                                tracing::warn!("SQL WAL checkpoint failed: {e}");
+                            }
+                        }
                         if let Err(e) = executor_for_workers.checkpoint_cdc_wal() {
                             tracing::warn!("CDC WAL checkpoint failed: {e}");
                         }
@@ -1167,8 +1179,7 @@ async fn cmd_start(cfg: StartConfig) {
                         if let Err(e) = executor_for_workers.blob_store().read().checkpoint() {
                             tracing::warn!("Blob WAL checkpoint failed: {e}");
                         }
-                        if let Err(e) = executor_for_workers.graph_store().read().checkpoint_wal()
-                        {
+                        if let Err(e) = executor_for_workers.graph_store().read().checkpoint_wal() {
                             tracing::warn!("Graph WAL checkpoint failed: {e}");
                         }
                         if let Err(e) = executor_for_workers.doc_store().read().checkpoint() {

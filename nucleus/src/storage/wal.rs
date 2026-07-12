@@ -138,6 +138,12 @@ pub trait WalBackend: Send + Sync {
     fn truncate_before(&self, _before_lsn: u64) -> std::io::Result<usize> {
         Ok(0)
     }
+    /// Raise the next-LSN floor. Crash recovery calls this after replaying
+    /// (and disposing of) WAL content: a freshly opened backend must never
+    /// mint LSNs at or below what is already stamped on data pages, or the
+    /// NEXT recovery's page-vs-record LSN comparison silently discards the
+    /// new records.
+    fn bump_next_lsn(&self, min_next: u64);
 }
 
 /// The write-ahead log.
@@ -330,6 +336,9 @@ impl WalBackend for Wal {
 
     fn log_checkpoint(&self) -> std::io::Result<u64> {
         Wal::log_checkpoint(self)
+    }
+    fn bump_next_lsn(&self, min_next: u64) {
+        self.next_lsn.fetch_max(min_next, Ordering::SeqCst);
     }
 }
 
@@ -848,6 +857,9 @@ impl WalBackend for SegmentedWal {
     fn truncate_before(&self, before_lsn: u64) -> std::io::Result<usize> {
         SegmentedWal::truncate_before(self, before_lsn)
     }
+    fn bump_next_lsn(&self, min_next: u64) {
+        self.next_lsn.fetch_max(min_next, Ordering::SeqCst);
+    }
 }
 
 impl std::fmt::Debug for SegmentedWal {
@@ -952,6 +964,26 @@ impl GroupCommitter {
     }
 }
 
+/// Read every record from every segment of a segmented-WAL directory, in
+/// segment order. A missing directory reads as empty. Used by crash
+/// recovery, which must read the same storage the segmented writer used —
+/// recovery used to read only the single-file WAL and silently replayed
+/// nothing for segmented (default) deployments.
+pub fn read_wal_dir_records(dir: &Path) -> std::io::Result<Vec<WalRecord>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut segments = list_segments(dir)?;
+    segments.sort_unstable();
+    let mut all = Vec::new();
+    for seg in segments {
+        if let Ok(mut records) = read_wal_records(&segment_path(dir, seg)) {
+            all.append(&mut records);
+        }
+    }
+    Ok(all)
+}
+
 // ============================================================================
 // Segment helpers
 // ============================================================================
@@ -1025,8 +1057,12 @@ mod tests {
         }
         // Simulate a crash mid-append: valid length prefix, torn payload.
         {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
-            f.write_all(&(CONTROL_RECORD_SIZE as u32).to_le_bytes()).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&wal_path)
+                .unwrap();
+            f.write_all(&(CONTROL_RECORD_SIZE as u32).to_le_bytes())
+                .unwrap();
             f.write_all(&[0xAB; 7]).unwrap(); // partial header, then crash
             f.sync_all().unwrap();
         }
@@ -1039,7 +1075,10 @@ mod tests {
         }
         let records = read_wal_records(&wal_path).unwrap();
         assert_eq!(records.len(), 3);
-        assert_eq!(records.iter().map(|r| r.txn_id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            records.iter().map(|r| r.txn_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
         // And it stays clean across further restarts (the fixed-LSN symptom).
         {
             let wal = Wal::open(&wal_path).unwrap();
@@ -1065,7 +1104,12 @@ mod tests {
             wal.sync().unwrap();
         }
         let records = read_wal_records(&wal_path).unwrap();
-        assert_eq!(records.len(), 3, "reopen+append clobbered earlier records: got {:?}", records.iter().map(|r| r.txn_id).collect::<Vec<_>>());
+        assert_eq!(
+            records.len(),
+            3,
+            "reopen+append clobbered earlier records: got {:?}",
+            records.iter().map(|r| r.txn_id).collect::<Vec<_>>()
+        );
     }
 
     #[test]
