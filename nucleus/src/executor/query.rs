@@ -633,6 +633,26 @@ impl Executor {
                 // built (otherwise the projection runs per source row).
                 Self::collect_aggregates_from_expr(inner, out);
             }
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                // CASE WHEN SUM(x) > 0 THEN SUM(y)/SUM(x) END — aggregates
+                // referenced only inside CASE branches must still reach the
+                // aggregate node (dogfood finding #15).
+                if let Some(op) = operand {
+                    Self::collect_aggregates_from_expr(op, out);
+                }
+                for cw in conditions {
+                    Self::collect_aggregates_from_expr(&cw.condition, out);
+                    Self::collect_aggregates_from_expr(&cw.result, out);
+                }
+                if let Some(e) = else_result {
+                    Self::collect_aggregates_from_expr(e, out);
+                }
+            }
             _ => {}
         }
     }
@@ -1133,14 +1153,14 @@ impl Executor {
         // SERIALIZABLE (instead of a full scan's table-wide predicate lock). The
         // pushed predicate is re-applied by apply_pushdown_for_factor, so results
         // are unaffected even when the storage layer can't accelerate the shape.
-        let single_table_key: Option<String> = if from.len() == 1
-            && from[0].joins.is_empty()
-            && !has_outer_join
-        {
-            Self::table_factor_names(&from[0].relation).into_iter().next()
-        } else {
-            None
-        };
+        let single_table_key: Option<String> =
+            if from.len() == 1 && from[0].joins.is_empty() && !has_outer_join {
+                Self::table_factor_names(&from[0].relation)
+                    .into_iter()
+                    .next()
+            } else {
+                None
+            };
         let mut by_relation: HashMap<String, Vec<Expr>> = HashMap::new();
         let mut remaining: Vec<Expr> = Vec::new();
         for pred in planner::split_conjunction(where_expr).into_iter().cloned() {
@@ -5150,10 +5170,7 @@ impl Executor {
                     // compares via int↔float promotion. Integral in-range floats
                     // (e.g. 5.0) coerce losslessly and keep the SIMD fast path.
                     Value::Float64(f) => {
-                        if f.fract() != 0.0
-                            || *f < i64::MIN as f64
-                            || *f > i64::MAX as f64
-                        {
+                        if f.fract() != 0.0 || *f < i64::MIN as f64 || *f > i64::MAX as f64 {
                             return None;
                         }
                         *f as i64
@@ -5375,7 +5392,8 @@ impl Executor {
                     Self::coerce_literal_to_column_type(filter_val, &col_meta[col_idx].dtype)?;
                 // This path does not feed the rows_scanned metric, so the examined
                 // count is intentionally discarded here.
-                let (rows, _examined) = storage.fast_scan_where_eq(&table_name, col_idx, &coerced)?;
+                let (rows, _examined) =
+                    storage.fast_scan_where_eq(&table_name, col_idx, &coerced)?;
                 Some((col_meta, rows))
             }
             FilterKind::Range(col_name, lo, hi) => {

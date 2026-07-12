@@ -122,6 +122,12 @@ pub trait WalBackend: Send + Sync {
             tracing::error!("WAL group_sync failed: {e}");
         }
     }
+    /// Durability-grade group sync: return only once a completed sync covers
+    /// `lsn`. Unlike `group_sync`, the result is propagated — commit acks
+    /// must not be sent if the WAL could not be made durable.
+    fn sync_up_to(&self, _lsn: u64) -> std::io::Result<()> {
+        self.sync()
+    }
     /// Log a COMMIT record for the given transaction. Returns the assigned LSN.
     fn log_commit(&self, _txn_id: u64) -> std::io::Result<u64> {
         Ok(0)
@@ -234,8 +240,11 @@ impl Wal {
         page_id: u32,
         page_image: &PageBuf,
     ) -> std::io::Result<u64> {
-        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         let mut writer = self.writer.lock();
+        // LSN allocated under the writer lock: every LSN below next_lsn is
+        // fully appended once the lock is held, so sync_covering() can report
+        // an exact durable-coverage LSN with no gaps from in-flight appends.
+        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
 
         let record_len = PAGE_WRITE_RECORD_SIZE as u32;
         writer.write_all(&record_len.to_le_bytes())?;
@@ -277,7 +286,17 @@ impl Wal {
     /// Force WAL to disk using the configured sync mode.
     /// Must be called after commit for durability.
     pub fn sync(&self) -> std::io::Result<()> {
+        self.sync_covering().map(|_| ())
+    }
+
+    /// Sync and report the highest LSN durably covered by this sync.
+    ///
+    /// The coverage LSN is captured under the writer lock, where LSN
+    /// allocation also happens — so every record at or below it is fully
+    /// appended and therefore flushed+synced by this call.
+    pub fn sync_covering(&self) -> std::io::Result<u64> {
         let mut writer = self.writer.lock();
+        let covered = self.next_lsn.load(Ordering::SeqCst).saturating_sub(1);
         writer.flush()?;
         match self.sync_mode {
             SyncMode::Fsync => writer.get_ref().sync_all()?,
@@ -285,7 +304,12 @@ impl Wal {
             SyncMode::None => {} // skip sync entirely
         }
         self.syncs.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(covered)
+    }
+
+    /// Block until a completed sync covers `lsn` (group commit).
+    pub fn sync_up_to(&self, lsn: u64) -> std::io::Result<()> {
+        self.committer.sync_up_to(lsn, || self.sync_covering())
     }
 
     /// Get the current (next to be assigned) LSN.
@@ -347,13 +371,17 @@ impl WalBackend for Wal {
     fn bump_next_lsn(&self, min_next: u64) {
         self.next_lsn.fetch_max(min_next, Ordering::SeqCst);
     }
+    fn sync_up_to(&self, lsn: u64) -> std::io::Result<()> {
+        Wal::sync_up_to(self, lsn)
+    }
 }
 
 impl Wal {
     // Internal: write a control record (commit/abort/checkpoint).
     fn log_control(&self, record_type: u8, txn_id: u64) -> std::io::Result<u64> {
-        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         let mut writer = self.writer.lock();
+        // LSN allocated under the writer lock — see log_page_write.
+        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
 
         let record_len = CONTROL_RECORD_SIZE as u32;
         writer.write_all(&record_len.to_le_bytes())?;
@@ -630,8 +658,9 @@ impl SegmentedWal {
         page_id: u32,
         page_image: &PageBuf,
     ) -> std::io::Result<u64> {
-        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         let mut active = self.active.lock();
+        // LSN allocated under the segment lock — see Wal::log_page_write.
+        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
 
         let record_len = PAGE_WRITE_RECORD_SIZE as u32;
         active.writer.write_all(&record_len.to_le_bytes())?;
@@ -676,7 +705,17 @@ impl SegmentedWal {
 
     /// Force all buffered WAL data to disk using the configured sync mode.
     pub fn sync(&self) -> std::io::Result<()> {
+        self.sync_covering().map(|_| ())
+    }
+
+    /// Sync and report the highest LSN durably covered by this sync.
+    ///
+    /// Coverage is exact: LSNs are allocated under the segment lock, so every
+    /// LSN below `next_lsn` is fully appended (to this or an already-fsynced
+    /// rotated-out segment) by the time we hold the lock here.
+    pub fn sync_covering(&self) -> std::io::Result<u64> {
         let mut active = self.active.lock();
+        let covered = self.next_lsn.load(Ordering::SeqCst).saturating_sub(1);
         active.writer.flush()?;
         match self.sync_mode {
             SyncMode::Fsync => active.writer.get_ref().sync_all()?,
@@ -684,7 +723,12 @@ impl SegmentedWal {
             SyncMode::None => {} // skip sync entirely
         }
         self.syncs.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(covered)
+    }
+
+    /// Block until a completed sync covers `lsn` (group commit).
+    pub fn sync_up_to(&self, lsn: u64) -> std::io::Result<()> {
+        self.committer.sync_up_to(lsn, || self.sync_covering())
     }
 
     /// Manually rotate to a new segment.
@@ -760,8 +804,9 @@ impl SegmentedWal {
 
     // Internal: write a control record.
     fn log_control(&self, record_type: u8, txn_id: u64) -> std::io::Result<u64> {
-        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         let mut active = self.active.lock();
+        // LSN allocated under the segment lock — see Wal::log_page_write.
+        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
 
         let record_len = CONTROL_RECORD_SIZE as u32;
         active.writer.write_all(&record_len.to_le_bytes())?;
@@ -870,6 +915,9 @@ impl WalBackend for SegmentedWal {
     fn rotate(&self) -> std::io::Result<()> {
         SegmentedWal::rotate(self)
     }
+    fn sync_up_to(&self, lsn: u64) -> std::io::Result<()> {
+        SegmentedWal::sync_up_to(self, lsn)
+    }
 }
 
 impl std::fmt::Debug for SegmentedWal {
@@ -905,6 +953,9 @@ struct GroupCommitState {
     epoch: u64,
     waiters: u64,
     sync_count: u64,
+    /// Highest LSN known to be covered by a completed sync. Only advanced by
+    /// `sync_up_to`, whose sync closure reports the coverage it achieved.
+    synced_lsn: u64,
 }
 
 impl Default for GroupCommitter {
@@ -921,6 +972,7 @@ impl GroupCommitter {
                 epoch: 0,
                 waiters: 0,
                 sync_count: 0,
+                synced_lsn: 0,
             }),
             done: parking_lot::Condvar::new(),
         }
@@ -951,6 +1003,57 @@ impl GroupCommitter {
         drop(state);
         self.done.notify_all();
         epoch
+    }
+
+    /// Durability-grade group sync: returns only once a completed sync covers
+    /// `target_lsn`.
+    ///
+    /// Unlike `group_sync`, a caller arriving while a sync is in flight does
+    /// NOT piggyback on it blindly — that sync may have started before the
+    /// caller's records were appended and therefore not cover them. Instead the
+    /// caller re-checks `synced_lsn` after every completed sync and becomes the
+    /// next leader if its records still aren't covered.
+    ///
+    /// `sync_fn` must perform the sync and return the highest LSN it durably
+    /// covered (capture it under the WAL writer lock before syncing). Errors
+    /// from the leader's own sync attempt are returned to that leader; waiting
+    /// followers simply retry as leader on the next loop iteration.
+    pub fn sync_up_to<F: Fn() -> std::io::Result<u64>>(
+        &self,
+        target_lsn: u64,
+        sync_fn: F,
+    ) -> std::io::Result<()> {
+        loop {
+            let mut state = self.state.lock();
+            if state.synced_lsn >= target_lsn {
+                return Ok(());
+            }
+            if state.syncing {
+                let my_epoch = state.epoch;
+                state.waiters += 1;
+                while state.epoch == my_epoch && state.syncing {
+                    self.done.wait(&mut state);
+                }
+                state.waiters -= 1;
+                // Re-check coverage on the next loop iteration.
+                continue;
+            }
+            state.syncing = true;
+            drop(state);
+            let result = sync_fn();
+            let mut state = self.state.lock();
+            state.syncing = false;
+            state.epoch += 1;
+            state.sync_count += 1;
+            if let Ok(covered) = result {
+                state.synced_lsn = state.synced_lsn.max(covered);
+            }
+            drop(state);
+            self.done.notify_all();
+            // Propagate our own sync failure; on success the loop re-checks
+            // coverage (a rotation mid-append can leave target > covered).
+            result?;
+        }
     }
 
     pub fn sync_count(&self) -> u64 {
@@ -1814,5 +1917,114 @@ mod group_commit_tests {
         let wal = Wal::new(&path, SyncMode::None).unwrap();
         wal.group_sync();
         // Should work without error
+    }
+
+    // ── Commit-time durability: LSN-aware group commit ──────────────────
+
+    #[test]
+    fn sync_covering_reports_last_appended_lsn() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Wal::new(&dir.path().join("t.wal"), SyncMode::Fsync).unwrap();
+        let page = [0u8; PAGE_SIZE];
+        let mut last = 0;
+        for _ in 0..3 {
+            last = wal.log_page_write(0, 1, &page).unwrap();
+        }
+        assert_eq!(wal.sync_covering().unwrap(), last);
+
+        let seg = SegmentedWal::open(&dir.path().join("t.wal.d"), 64 * 1024 * 1024).unwrap();
+        let mut last = 0;
+        for _ in 0..3 {
+            last = seg.log_page_write(0, 1, &page).unwrap();
+        }
+        assert_eq!(seg.sync_covering().unwrap(), last);
+    }
+
+    #[test]
+    fn sync_up_to_skips_when_already_covered() {
+        let gc = GroupCommitter::new();
+        let calls = Arc::new(AtomicU64::new(0));
+        // First call covers up to 10.
+        let c = calls.clone();
+        gc.sync_up_to(5, move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(10)
+        })
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Target already covered — sync_fn must not run again.
+        let c = calls.clone();
+        gc.sync_up_to(10, move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(10)
+        })
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Uncovered target syncs again.
+        let c = calls.clone();
+        gc.sync_up_to(11, move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(20)
+        })
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn sync_up_to_never_returns_before_coverage() {
+        // Stress: N threads "append" (bump an appended counter) then demand
+        // coverage. The sync closure copies appended -> durable. Every thread
+        // must observe durable >= its own append mark on return — a follower
+        // piggybacking on an fsync that started before its append would trip
+        // the assert.
+        let gc = Arc::new(GroupCommitter::new());
+        let appended = Arc::new(AtomicU64::new(0));
+        let durable = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let gc = gc.clone();
+            let appended = appended.clone();
+            let durable = durable.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let my_mark = appended.fetch_add(1, Ordering::SeqCst) + 1;
+                    let a = appended.clone();
+                    let d = durable.clone();
+                    gc.sync_up_to(my_mark, move || {
+                        // Simulated fsync: everything appended so far is
+                        // durable once this returns.
+                        let covered = a.load(Ordering::SeqCst);
+                        std::thread::yield_now();
+                        d.fetch_max(covered, Ordering::SeqCst);
+                        Ok(covered)
+                    })
+                    .unwrap();
+                    assert!(
+                        durable.load(Ordering::SeqCst) >= my_mark,
+                        "sync_up_to returned before the caller's append was durable"
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Group commit must have batched at least some of the 3200 requests.
+        assert!(
+            gc.sync_count() < 3200,
+            "no batching happened at all ({} syncs)",
+            gc.sync_count()
+        );
+    }
+
+    #[test]
+    fn sync_up_to_propagates_leader_error() {
+        let gc = GroupCommitter::new();
+        let err = gc
+            .sync_up_to(1, || Err(std::io::Error::other("disk gone")))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "disk gone");
+        // A later successful sync still works and covers.
+        gc.sync_up_to(1, || Ok(5)).unwrap();
     }
 }

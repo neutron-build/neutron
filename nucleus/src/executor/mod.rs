@@ -52,8 +52,8 @@ mod txn;
 mod types;
 
 pub use expr::FilterResult; // Phase 2C: Lazy materialization for WHERE clause filtering
-pub(crate) use scalar_fns::side_effecting_return_type;
 use helpers::*;
+pub(crate) use scalar_fns::{extension_scalar_return_type, side_effecting_return_type};
 use schema_types::*;
 use session::CURRENT_SESSION;
 pub use session::Session;
@@ -87,6 +87,12 @@ pub struct Executor {
     storage: Arc<dyn StorageEngine>,
     /// Per-table override engines, created when `CREATE TABLE ... WITH (engine = 'columnar')`.
     table_engines: parking_lot::RwLock<HashMap<String, Arc<dyn StorageEngine>>>,
+    /// Data directory for durable per-table engine storage + the engines.json
+    /// sidecar (None = memory mode, per-table engines stay in-memory only).
+    data_dir: Option<std::path::PathBuf>,
+    /// Server-wide default for synchronous_commit (config `wal.synchronous_commit`).
+    /// Sessions override via `SET synchronous_commit = on|off`.
+    sync_commit_default: AtomicBool,
     triggers: RwLock<Vec<TriggerDef>>,
     roles: RwLock<HashMap<String, RoleDef>>,
     pubsub: RwLock<crate::pubsub::PubSubHub>,
@@ -283,11 +289,14 @@ impl Executor {
         health.register("timeseries");
         health.register("storage");
         health.register("graph");
+        health.register("memory");
 
         Self {
             catalog,
             storage,
             table_engines: parking_lot::RwLock::new(HashMap::new()),
+            data_dir: None,
+            sync_commit_default: AtomicBool::new(true),
             views: RwLock::new(HashMap::new()),
             sequences: parking_lot::RwLock::new(HashMap::new()),
             triggers: RwLock::new(Vec::new()),
@@ -405,6 +414,7 @@ impl Executor {
     ) -> Self {
         let mut exec = Self::new(catalog, storage);
         exec.catalog_path = catalog_path;
+        exec.data_dir = data_dir.map(|d| d.to_path_buf());
 
         // Open durable multi-model stores when a data directory is provided
         if let Some(dir) = data_dir {
@@ -1684,6 +1694,63 @@ impl Executor {
         &self.columnar_store
     }
 
+    // ========================================================================
+    // Commit-time durability (synchronous_commit)
+    // ========================================================================
+
+    /// Set the server-wide default for `synchronous_commit` (config
+    /// `wal.synchronous_commit`). Sessions override with SET.
+    pub fn set_synchronous_commit_default(&self, on: bool) {
+        self.sync_commit_default.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the current session requires commit-time WAL durability.
+    /// Session `SET synchronous_commit = off` wins over the server default.
+    fn synchronous_commit_enabled(&self) -> bool {
+        let sess = self.current_session();
+        if let Some(v) = sess.settings.read().get("synchronous_commit") {
+            let t = v.trim_matches('\'').trim_matches('"').to_ascii_lowercase();
+            return !matches!(t.as_str(), "off" | "false" | "0");
+        }
+        self.sync_commit_default.load(Ordering::Relaxed)
+    }
+
+    /// Whether the current session has an explicit transaction open.
+    /// Errs toward "not in a transaction" — an extra WAL force is safe,
+    /// a skipped one is an unacked durability hole.
+    fn session_in_txn(&self) -> bool {
+        self.current_session()
+            .txn_state
+            .try_read()
+            .map(|t| t.active)
+            .unwrap_or(false)
+    }
+
+    /// Force WAL durability on every engine with pending un-synced work:
+    /// the global engine plus any per-table override engines. This is the
+    /// commit point for autocommit write statements — nothing is acked to the
+    /// client until this returns.
+    async fn force_wal_durability(&self) -> Result<(), ExecError> {
+        if self.storage.durability_pending() {
+            self.storage
+                .make_durable()
+                .await
+                .map_err(ExecError::Storage)?;
+        }
+        let pending: Vec<Arc<dyn StorageEngine>> = {
+            let engines = self.table_engines.read();
+            engines
+                .values()
+                .filter(|e| e.durability_pending())
+                .cloned()
+                .collect()
+        };
+        for engine in pending {
+            engine.make_durable().await.map_err(ExecError::Storage)?;
+        }
+        Ok(())
+    }
+
     /// Get a reference to the time-series store.
     pub fn ts_store(&self) -> &parking_lot::RwLock<crate::timeseries::TimeSeriesStore> {
         &self.ts_store
@@ -2215,13 +2282,26 @@ impl Executor {
                     .collect();
                 let storage = self.storage_for(table);
                 match storage.insert(table, row).await {
-                    // Bare tag — the wire layer normalizes "INSERT" to "INSERT 0"
-                    // and appends rows_affected. Embedding the count here would
-                    // double it on the wire ("INSERT 0 1 1"). Matches general path.
-                    Ok(()) => Some(Ok(ExecResult::Command {
-                        tag: "INSERT".into(),
-                        rows_affected: 1,
-                    })),
+                    Ok(()) => {
+                        // The parsed DML path invalidates the query result
+                        // cache after every write; this wire-level fast path
+                        // bypasses it, so without this call a cached SELECT
+                        // served stale rows for up to the cache TTL after a
+                        // point-write (dogfood findings #2/#27 family).
+                        self.query_cache_invalidate_all();
+                        // Commit point for the wire-level fast path — same
+                        // durability contract as the parsed INSERT path.
+                        if let Err(e) = self.fast_path_durability(&storage).await {
+                            return Some(Err(e));
+                        }
+                        // Bare tag — the wire layer normalizes "INSERT" to "INSERT 0"
+                        // and appends rows_affected. Embedding the count here would
+                        // double it on the wire ("INSERT 0 1 1"). Matches general path.
+                        Some(Ok(ExecResult::Command {
+                            tag: "INSERT".into(),
+                            rows_affected: 1,
+                        }))
+                    }
                     Err(e) => Some(Err(ExecError::Storage(e))),
                 }
             }
@@ -2283,6 +2363,12 @@ impl Executor {
                     Ok(n) => n,
                     Err(e) => return Some(Err(ExecError::Storage(e))),
                 };
+                // See SimpleInsert: the fast path must invalidate the query
+                // result cache like the parsed DML path does.
+                self.query_cache_invalidate_all();
+                if let Err(e) = self.fast_path_durability(&storage).await {
+                    return Some(Err(e));
+                }
                 Some(Ok(ExecResult::Command {
                     // Bare tag; wire appends rows_affected (see PointInsert).
                     tag: "UPDATE".into(),
@@ -2322,6 +2408,12 @@ impl Executor {
                     Ok(n) => n,
                     Err(e) => return Some(Err(ExecError::Storage(e))),
                 };
+                // See SimpleInsert: the fast path must invalidate the query
+                // result cache like the parsed DML path does.
+                self.query_cache_invalidate_all();
+                if let Err(e) = self.fast_path_durability(&storage).await {
+                    return Some(Err(e));
+                }
                 Some(Ok(ExecResult::Command {
                     // Bare tag; wire appends rows_affected (see PointInsert).
                     tag: "DELETE".into(),
@@ -2329,6 +2421,23 @@ impl Executor {
                 }))
             }
         }
+    }
+
+    /// Commit-time durability for the wire-level OLTP fast path: force the
+    /// touched engine's WAL before the write is acked, unless the session is
+    /// inside an explicit transaction (COMMIT forces then) or runs with
+    /// synchronous_commit=off.
+    async fn fast_path_durability(
+        &self,
+        storage: &Arc<dyn StorageEngine>,
+    ) -> Result<(), ExecError> {
+        if !self.synchronous_commit_enabled() || self.session_in_txn() {
+            return Ok(());
+        }
+        if storage.durability_pending() {
+            storage.make_durable().await.map_err(ExecError::Storage)?;
+        }
+        Ok(())
     }
 
     pub fn execute<'a>(
@@ -2739,6 +2848,11 @@ impl Executor {
                 | Statement::Commit { .. }
                 | Statement::Rollback { .. }
         );
+        // COMMIT is a durability point: per-table engines apply writes
+        // eagerly even inside explicit transactions, so their WALs must be
+        // forced when the transaction commits (the buffered global engine
+        // forces its own WAL inside commit_txn).
+        let is_commit = matches!(&stmt, Statement::Commit { .. });
 
         // Check if we're inside an active transaction. If so, skip query
         // result caching entirely — transaction-local writes may not be
@@ -3060,6 +3174,20 @@ impl Executor {
             self.query_cache_invalidate_all();
             #[cfg(feature = "server")]
             self.persist_catalog().await;
+        }
+
+        // Commit-time durability: force the WAL before the statement is acked.
+        // Autocommit writes (and DDL) are their own commit point; writes made
+        // inside an explicit transaction defer to COMMIT. Skipped when the
+        // session runs with synchronous_commit=off — those writes become
+        // durable at the next force, flush, or checkpoint (bounded window).
+        if result.is_ok()
+            && (is_commit || ((is_dml_write || is_ddl) && !in_txn))
+            && self.synchronous_commit_enabled()
+        {
+            // The write already applied in memory; if the WAL can't be made
+            // durable the client must NOT get a success ack.
+            self.force_wal_durability().await?;
         }
 
         result

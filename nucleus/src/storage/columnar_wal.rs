@@ -25,9 +25,11 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
+use crate::storage::wal::GroupCommitter;
 use crate::types::{Row, Value};
 
 // ─── Entry type tags ──────────────────────────────────────────────────────────
@@ -49,6 +51,14 @@ pub struct WalState {
 pub struct ColumnarWal {
     path: PathBuf,
     writer: Mutex<BufWriter<File>>,
+    /// Monotone append counter, incremented under the writer lock — serves as
+    /// this WAL's LSN for durable-coverage tracking.
+    appends: AtomicU64,
+    /// Highest append-counter value covered by a COMPLETED fsync. Updated
+    /// only after the fsync returns, so `synced >= mark` is a durable claim.
+    synced: AtomicU64,
+    /// Group-commit coordinator so concurrent commit-time syncs share fsyncs.
+    committer: GroupCommitter,
 }
 
 impl ColumnarWal {
@@ -71,9 +81,47 @@ impl ColumnarWal {
             Self {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
+                appends: AtomicU64::new(0),
+                synced: AtomicU64::new(0),
+                committer: GroupCommitter::new(),
             },
             state,
         ))
+    }
+
+    /// Whether appends exist that no completed fsync covers yet.
+    pub fn is_dirty(&self) -> bool {
+        self.synced.load(Ordering::Acquire) < self.appends.load(Ordering::Acquire)
+    }
+
+    /// Fsync the log and record the append mark the sync covered.
+    /// Returns that mark. The mark is captured under the writer lock, where
+    /// appends also increment it, so every append at or below it is flushed
+    /// and fsynced by this call.
+    fn sync_covering(&self) -> io::Result<u64> {
+        let mut w = self.writer.lock();
+        let covered = self.appends.load(Ordering::Acquire);
+        w.flush()?;
+        w.get_ref().sync_all()?;
+        self.synced.fetch_max(covered, Ordering::AcqRel);
+        Ok(covered)
+    }
+
+    /// Fsync the log to stable storage. Appends only `write()` into the OS
+    /// page cache; a commit ack requires this.
+    pub fn sync(&self) -> io::Result<()> {
+        self.sync_covering().map(|_| ())
+    }
+
+    /// Group-commit sync: concurrent committers share fsyncs, but each caller
+    /// only returns once a completed sync covers every append made before
+    /// this call.
+    pub fn group_sync(&self) -> io::Result<()> {
+        let mark = self.appends.load(Ordering::Acquire);
+        if self.synced.load(Ordering::Acquire) >= mark {
+            return Ok(());
+        }
+        self.committer.sync_up_to(mark, || self.sync_covering())
     }
 
     /// Log a CREATE TABLE operation.
@@ -118,10 +166,11 @@ impl ColumnarWal {
             }
         }
 
-        // Flush existing writer, then truncate file and rewrite as one entry.
-        {
-            self.writer.lock().flush()?;
-        }
+        // Hold the writer lock across truncate + rewrite + swap so no append
+        // can interleave: an entry appended between the truncate and the
+        // writer swap would be destroyed without being in the snapshot.
+        let mut writer = self.writer.lock();
+        writer.flush()?;
 
         let file = OpenOptions::new()
             .write(true)
@@ -130,11 +179,17 @@ impl ColumnarWal {
         let mut w = BufWriter::new(file);
         write_entry(&mut w, ENTRY_SNAPSHOT, "", &payload)?;
         w.flush()?;
+        // The snapshot replaces the entire log — it must be durable before
+        // the pre-truncate log content is considered gone.
+        w.get_ref().sync_all()?;
         drop(w);
 
-        // Re-open in append mode for future writes.
+        // Re-open in append mode for future writes, and count the snapshot
+        // as a covered append so coverage marks stay consistent.
         let file = OpenOptions::new().append(true).open(&self.path)?;
-        *self.writer.lock() = BufWriter::new(file);
+        *writer = BufWriter::new(file);
+        let mark = self.appends.fetch_add(1, Ordering::AcqRel) + 1;
+        self.synced.fetch_max(mark, Ordering::AcqRel);
         Ok(())
     }
 
@@ -143,7 +198,10 @@ impl ColumnarWal {
     fn append(&self, entry_type: u8, name: &str, payload: &[u8]) -> io::Result<()> {
         let mut w = self.writer.lock();
         write_entry(&mut *w, entry_type, name, payload)?;
-        w.flush()
+        w.flush()?;
+        // Counted under the writer lock so sync_covering's mark is exact.
+        self.appends.fetch_add(1, Ordering::AcqRel);
+        Ok(())
     }
 }
 
@@ -404,6 +462,37 @@ mod tests {
 
     fn int_row(id: i64, v: f64) -> Row {
         vec![Value::Int64(id), Value::Float64(v)]
+    }
+
+    #[test]
+    fn group_sync_covers_prior_appends_and_clears_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _state) = ColumnarWal::open(dir.path()).unwrap();
+        assert!(!wal.is_dirty(), "fresh WAL must start clean");
+
+        wal.log_create_table("t").unwrap();
+        wal.log_insert_rows("t", &[int_row(1, 1.0)]).unwrap();
+        assert!(wal.is_dirty(), "appends must mark the WAL dirty");
+
+        wal.group_sync().unwrap();
+        assert!(!wal.is_dirty(), "a completed sync covers prior appends");
+
+        wal.log_insert_rows("t", &[int_row(2, 2.0)]).unwrap();
+        assert!(wal.is_dirty(), "new appends after a sync are uncovered");
+    }
+
+    #[test]
+    fn checkpoint_counts_as_covered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _state) = ColumnarWal::open(dir.path()).unwrap();
+        wal.log_create_table("t").unwrap();
+        wal.log_insert_rows("t", &[int_row(1, 1.0)]).unwrap();
+        assert!(wal.is_dirty());
+        wal.checkpoint(&[("t", vec![int_row(1, 1.0)])]).unwrap();
+        assert!(
+            !wal.is_dirty(),
+            "checkpoint fsyncs the snapshot — nothing left to force"
+        );
     }
 
     #[test]

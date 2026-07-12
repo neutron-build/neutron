@@ -185,6 +185,12 @@ pub struct DiskEngine {
     txn_state: parking_lot::Mutex<Option<DiskTxnState>>,
     /// Monotonically increasing transaction ID counter for WAL records.
     next_txn_id: AtomicU64,
+    /// Serializes `save_table_directory` writers: it rewrites meta page 0
+    /// (and any overflow pages) through `frame_data_mut` without a latch, so
+    /// two concurrent commit-time forces could interleave torn directory
+    /// bytes. Only the directory save is serialized — the WAL force itself
+    /// stays concurrent so group commit keeps batching fsyncs.
+    dir_save_lock: parking_lot::Mutex<()>,
 }
 
 /// Linked-list pointers stored in the data page's reserved area.
@@ -517,6 +523,7 @@ impl DiskEngine {
             free_page_count: parking_lot::Mutex::new(fl_count),
             async_ops: None,
             txn_state: parking_lot::Mutex::new(None),
+            dir_save_lock: parking_lot::Mutex::new(()),
             next_txn_id: AtomicU64::new(1),
         };
 
@@ -682,6 +689,8 @@ impl DiskEngine {
     /// are reused to avoid leaking pages. The last 4 bytes of each page's directory
     /// area store the overflow page ID (INVALID_PAGE_ID if no overflow).
     fn save_table_directory(&self) -> Result<(), StorageError> {
+        // One directory writer at a time — see `dir_save_lock`.
+        let _guard = self.dir_save_lock.lock();
         let tables = self.tables.read();
         // Serialize the directory into a byte buffer
         let mut dir_buf: Vec<u8> = Vec::new();
@@ -1784,6 +1793,29 @@ impl StorageEngine for DiskEngine {
             // Sync fallback (default when async_ops not set).
             self.flush()
         }
+    }
+
+    async fn make_durable(&self) -> Result<(), StorageError> {
+        // Commit point: WAL-log every page dirtied since the last force and
+        // group-sync. Data pages still flush lazily; recovery replays the
+        // logged images, so acked work survives kill -9 immediately instead
+        // of only after the next checkpoint.
+        if !self.pool.wal_force_needed() {
+            return Ok(());
+        }
+        // Serialize the table directory + free list into meta page 0 first
+        // (written through the buffer pool, so the force below covers it).
+        // Without this, replayed heap pages are orphans: the on-disk
+        // directory still carries the pre-crash first-page pointers and the
+        // recovered rows are invisible to scans.
+        self.save_table_directory()?;
+        self.pool
+            .wal_force_pending()
+            .map_err(|e| StorageError::Io(e.to_string()))
+    }
+
+    fn durability_pending(&self) -> bool {
+        self.pool.wal_force_needed()
     }
 
     async fn checkpoint(&self) -> Result<(), StorageError> {

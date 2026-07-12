@@ -342,6 +342,23 @@ pub trait StorageEngine: Send + Sync {
     fn sync(&self) -> Result<(), StorageError> {
         Ok(())
     }
+    /// Make all work applied so far durable before the client is acked.
+    ///
+    /// This is the commit point: called at the end of an autocommit write
+    /// statement, or at COMMIT of an explicit transaction, when
+    /// `synchronous_commit` is on. Unlike `sync`, engines whose WAL is written
+    /// lazily (page-image logging at flush time) must first LOG the images of
+    /// pages dirtied since the last force, then group-sync — otherwise the
+    /// fsync covers nothing. Engines without a WAL no-op.
+    async fn make_durable(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+    /// Cheap check: does `make_durable` currently have work to do? Lets the
+    /// executor skip per-engine durability calls on engines a statement never
+    /// touched. Default: false (no-op engines never have pending work).
+    fn durability_pending(&self) -> bool {
+        false
+    }
 
     /// Begin an explicit transaction. Engines that support MVCC will take a
     /// snapshot; simple engines do nothing.

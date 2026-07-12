@@ -34,7 +34,189 @@ use super::types::{
 };
 use super::{ExecError, ExecResult, Executor};
 
+/// Sidecar metadata (`<data_dir>/engines.json`) describing per-table engine
+/// overrides so they can be re-registered at boot. Without this, a table
+/// created `WITH (engine='mergetree')` silently fell back to the default
+/// heap engine after a restart: the in-memory `table_engines` routing map
+/// and the replacing-dedup registry were populated only by the original
+/// CREATE TABLE statement.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub(super) struct TableEngineMeta {
+    pub engine: String,
+    #[serde(default)]
+    pub order_by: Vec<String>,
+    #[serde(default)]
+    pub version_column: Option<String>,
+    #[serde(default)]
+    pub sum_columns: Vec<String>,
+    #[serde(default)]
+    pub count_columns: Vec<String>,
+}
+
 impl Executor {
+    // ========================================================================
+    // Per-table engine sidecar (engines.json) + durable engine storage
+    // ========================================================================
+
+    fn engines_meta_path(&self) -> Option<std::path::PathBuf> {
+        self.data_dir.as_ref().map(|d| d.join("engines.json"))
+    }
+
+    pub(super) fn load_engines_meta(&self) -> HashMap<String, TableEngineMeta> {
+        let Some(path) = self.engines_meta_path() else {
+            return HashMap::new();
+        };
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_engines_meta(&self, metas: &HashMap<String, TableEngineMeta>) {
+        let Some(path) = self.engines_meta_path() else {
+            return;
+        };
+        let Ok(json) = serde_json::to_string_pretty(metas) else {
+            return;
+        };
+        // Write-then-rename so a crash mid-write can't leave a torn file.
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
+            tracing::warn!("failed to persist engines.json: {e}");
+        }
+    }
+
+    pub(super) fn record_table_engine(&self, table: &str, meta: TableEngineMeta) {
+        if self.data_dir.is_none() {
+            return;
+        }
+        let mut metas = self.load_engines_meta();
+        metas.insert(table.to_string(), meta);
+        self.save_engines_meta(&metas);
+    }
+
+    pub(super) fn remove_table_engine_meta(&self, table: &str) {
+        if self.data_dir.is_none() {
+            return;
+        }
+        let mut metas = self.load_engines_meta();
+        if metas.remove(table).is_some() {
+            self.save_engines_meta(&metas);
+        }
+        if let Some(dir) = self.table_engine_dir(table)
+            && dir.exists()
+        {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Directory backing a per-table columnar engine's WAL. The table name is
+    /// sanitized for the filesystem and suffixed with a hash of the raw name
+    /// so distinct quoted identifiers can't collide after sanitization.
+    pub(super) fn table_engine_dir(&self, table: &str) -> Option<std::path::PathBuf> {
+        let dir = self.data_dir.as_ref()?;
+        let clean: String = table
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        Some(
+            dir.join("columnar_engines")
+                .join(format!("{clean}_{:08x}", crc32c::crc32c(table.as_bytes()))),
+        )
+    }
+
+    /// Create the columnar engine for a table: WAL-backed (crash-durable)
+    /// when a data directory exists, in-memory otherwise (memory mode).
+    #[cfg(feature = "server")]
+    pub(super) fn open_columnar_engine(
+        &self,
+        table: &str,
+    ) -> Arc<crate::storage::ColumnarStorageEngine> {
+        if let Some(dir) = self.table_engine_dir(table) {
+            match crate::storage::ColumnarStorageEngine::open(&dir) {
+                Ok(eng) => return Arc::new(eng),
+                Err(e) => tracing::warn!(
+                    "columnar engine for '{table}': WAL open failed ({e}); \
+                     falling back to in-memory (NOT crash-durable)"
+                ),
+            }
+        }
+        Arc::new(crate::storage::ColumnarStorageEngine::new())
+    }
+
+    /// Re-register per-table engines recorded in engines.json. Called once at
+    /// boot (after the catalog is loaded): reopens each engine's WAL-backed
+    /// storage, restores replacing-dedup configs, and re-creates the shared
+    /// columnar store's MergeTree registration (which reopens its on-disk
+    /// state when present).
+    #[cfg(feature = "server")]
+    pub async fn restore_table_engines(&self) {
+        let metas = self.load_engines_meta();
+        if metas.is_empty() {
+            return;
+        }
+        for (table, meta) in metas {
+            let eng = self.open_columnar_engine(&table);
+            if let Err(e) = eng.create_table(&table).await {
+                tracing::warn!("restore engine '{table}': create_table failed: {e}");
+            }
+            if let Some(def) = self.catalog.get_table(&table).await {
+                let col_info: Vec<(String, DataType)> = def
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.data_type.clone()))
+                    .collect();
+                eng.store_table_schema(&table, &col_info);
+                self.table_columns.write().insert(table.clone(), col_info);
+                if meta.engine == "replacing_mergetree" {
+                    let pk_idx: Vec<usize> = meta
+                        .order_by
+                        .iter()
+                        .filter_map(|name| {
+                            def.columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(name))
+                        })
+                        .collect();
+                    let ver_idx = meta.version_column.as_ref().and_then(|name| {
+                        def.columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(name))
+                    });
+                    crate::columnar::register_replacing_table(&table, pk_idx, ver_idx);
+                }
+            } else {
+                tracing::warn!(
+                    "engines.json lists table '{table}' but the catalog has no such table"
+                );
+            }
+            if meta.engine != "columnar" {
+                use crate::columnar::MergeStrategy;
+                let strategy = match meta.engine.as_str() {
+                    "replacing_mergetree" => MergeStrategy::Replacing {
+                        version_column: meta.version_column.clone(),
+                    },
+                    "aggregating_mergetree" => MergeStrategy::Aggregating {
+                        group_columns: meta.order_by.clone(),
+                        sum_columns: meta.sum_columns.clone(),
+                        count_columns: meta.count_columns.clone(),
+                    },
+                    _ => MergeStrategy::Default,
+                };
+                self.columnar_store
+                    .write()
+                    .create_merge_tree_table_with_strategy(&table, meta.order_by.clone(), strategy);
+            }
+            tracing::info!("restored '{}' engine for table '{table}'", meta.engine);
+            self.table_engines.write().insert(table, eng);
+        }
+    }
     // ========================================================================
     // DDL: CREATE TYPE
     // ========================================================================
@@ -121,22 +303,17 @@ impl Executor {
                 );
                 let tbl_storage: Arc<dyn StorageEngine> = match engine_name.as_deref() {
                     #[cfg(feature = "server")]
-                    Some("columnar") => {
-                        let eng = Arc::new(crate::storage::ColumnarStorageEngine::new());
-                        self.table_engines
-                            .write()
-                            .insert(table_name.clone(), eng.clone());
-                        eng
-                    }
-                    #[cfg(feature = "server")]
-                    Some("mergetree")
+                    Some("columnar")
+                    | Some("mergetree")
                     | Some("replacing_mergetree")
                     | Some("aggregating_mergetree") => {
-                        // MergeTree variants use the columnar storage engine backed by MergeTree.
-                        let eng = Arc::new(crate::storage::ColumnarStorageEngine::new());
+                        // Columnar/MergeTree tables route to a per-table
+                        // columnar engine — WAL-backed when a data dir exists
+                        // so the rows survive restarts and crashes.
+                        let eng = self.open_columnar_engine(&table_name);
                         self.table_engines
                             .write()
-                            .insert(table_name.clone(), eng.clone());
+                            .insert(table_name.clone(), eng.clone() as Arc<dyn StorageEngine>);
                         eng
                     }
                     #[cfg(feature = "server")]
@@ -231,6 +408,30 @@ impl Executor {
                             order_by_cols.clone(),
                             strategy,
                         );
+                }
+                // Persist the engine override so it survives restarts
+                // (restore_table_engines re-registers from engines.json at boot).
+                if is_mergetree || matches!(engine_name.as_deref(), Some("columnar")) {
+                    self.record_table_engine(
+                        &table_name,
+                        TableEngineMeta {
+                            engine: engine_name.clone().unwrap_or_default(),
+                            order_by: order_by_cols.clone(),
+                            version_column: Self::extract_string_option(
+                                &create.table_options,
+                                "version_column",
+                            )
+                            .or_else(|| Self::extract_engine_paren_arg(&create.table_options)),
+                            sum_columns: Self::extract_csv_option(
+                                &create.table_options,
+                                "sum_columns",
+                            ),
+                            count_columns: Self::extract_csv_option(
+                                &create.table_options,
+                                "count_columns",
+                            ),
+                        },
+                    );
                 }
                 // Cache column metadata for sync index scan path
                 let col_info: Vec<(String, DataType)> = table_def
@@ -445,6 +646,8 @@ impl Executor {
                             // Drop replacing-mergetree dedup config so a
                             // subsequent CREATE doesn't inherit stale entries.
                             crate::columnar::unregister_replacing_table(&table_name);
+                            // Drop the engines.json entry + on-disk engine WAL.
+                            self.remove_table_engine_meta(&table_name);
                             // Clean up sync caches
                             self.table_columns.write().remove(&table_name);
                             self.btree_indexes.retain(|(t, _), _| t != &table_name);

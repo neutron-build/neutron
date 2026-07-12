@@ -408,6 +408,11 @@ async fn cmd_start(cfg: StartConfig) {
         },
     );
 
+    // No explicit budget anywhere? Inside a container, size to the cgroup
+    // limit instead of the 512 MB default (finding #33: the default budget
+    // silently rejected writes in an 8 GB container).
+    let cgroup_derived_mb = config.apply_cgroup_memory_default();
+
     // Derive subsystem budgets from the global memory limit
     config.apply_memory_budget();
 
@@ -543,10 +548,15 @@ async fn cmd_start(cfg: StartConfig) {
         env!("CARGO_PKG_VERSION")
     );
     tracing::info!(
-        "Memory budget: {} MB (buffer pool: {} MB, cache: {} MB)",
+        "Memory budget: {} MB (buffer pool: {} MB, cache: {} MB){}",
         config.server.max_memory_mb,
         config.storage.buffer_pool_size_mb,
         config.cache.max_memory_mb,
+        if cgroup_derived_mb.is_some() {
+            " — derived from cgroup limit (set --max-memory / NUCLEUS_MAX_MEMORY_MB to override)"
+        } else {
+            ""
+        },
     );
 
     if let Some(ref region) = region {
@@ -774,11 +784,34 @@ async fn cmd_start(cfg: StartConfig) {
     );
     tracing::info!("Cache: {} MB", config.cache.max_memory_mb);
 
+    // Commit-time durability default (config wal.synchronous_commit;
+    // sessions override with SET synchronous_commit = on|off).
+    let sync_commit_on = !matches!(
+        config.wal.synchronous_commit.to_ascii_lowercase().as_str(),
+        "off" | "false" | "0"
+    );
+    executor.set_synchronous_commit_default(sync_commit_on);
+    tracing::info!(
+        "Durability: synchronous_commit={} (commit-time WAL force{})",
+        if sync_commit_on { "on" } else { "off" },
+        if sync_commit_on {
+            ""
+        } else {
+            " disabled — loss window bounded by checkpoint interval"
+        },
+    );
+
     // Load persisted ANALYZE statistics so the optimizer is warm on restart.
     executor.load_stats().await;
 
     // Load persisted executor metadata (views, sequences, triggers, roles, functions).
     executor.load_meta().await;
+
+    // Re-register per-table engine overrides (mergetree/columnar tables) from
+    // engines.json: reopens their WAL-backed storage and restores
+    // replacing-dedup configs. Without this, engine tables silently fell back
+    // to the default heap engine after every restart.
+    executor.restore_table_engines().await;
 
     // Rebuild specialty indexes (IvfFlat, encrypted) from table data after restart.
     executor.rebuild_specialty_indexes().await;
@@ -1156,12 +1189,12 @@ async fn cmd_start(cfg: StartConfig) {
                         // HnswIndex and doesn't cover IvfFlat; see
                         // vector/wal.rs::IndexSnapshot.
                         // SQL disk engine: flush dirty pages, checkpoint the
-                        // WAL, and prune fully-checkpointed segments. This was
-                        // never wired — SQL pages flushed only on clean
-                        // shutdown or buffer-pool pressure, so a crash lost an
-                        // UNBOUNDED window of committed rows and WAL segments
-                        // accumulated forever. The interval now bounds the
-                        // crash-loss window (wal.checkpoint_interval_secs).
+                        // WAL, and prune fully-checkpointed segments. With
+                        // synchronous_commit=on (default) acked commits are
+                        // already WAL-forced at commit time, so this interval
+                        // is about data-page flushing + segment pruning; it is
+                        // the crash-loss bound ONLY for sessions running
+                        // synchronous_commit=off (wal.checkpoint_interval_secs).
                         if let Some(ref engine) = disk_for_workers
                             && let Err(e) = engine.checkpoint()
                         {
@@ -1235,14 +1268,42 @@ async fn cmd_start(cfg: StartConfig) {
     {
         let executor_for_mem = executor.clone();
         let memory_flag = executor.memory_critical_flag().clone();
+        let metrics_for_mem = metrics.clone();
         let max_memory_bytes = config.server.max_memory_mb as u64 * 1024 * 1024;
+        metrics.memory_limit_bytes.set(max_memory_bytes as i64);
         tokio::spawn(async move {
             let warn_threshold = (max_memory_bytes as f64 * 0.60) as u64;
             let pressure_threshold = (max_memory_bytes as f64 * 0.75) as u64;
             let critical_threshold = (max_memory_bytes as f64 * 0.90) as u64;
+            // Mirror the write-reject flag into the metrics gauge + health
+            // registry so the state is observable instead of silent
+            // (finding #33: writes were rejected with no external signal).
+            let mut was_rejecting = false;
+            let mut surface_reject_state = |rejecting: bool, rss: u64| {
+                metrics_for_mem
+                    .memory_writes_rejected
+                    .set(if rejecting { 1 } else { 0 });
+                if rejecting != was_rejecting {
+                    let mut health = executor_for_mem.health_registry().write();
+                    if rejecting {
+                        health.mark_degraded(
+                            "memory",
+                            &format!(
+                                "writes rejected: RSS {} MB >= 90% of {} MB budget",
+                                rss / (1024 * 1024),
+                                max_memory_bytes / (1024 * 1024)
+                            ),
+                        );
+                    } else {
+                        health.mark_healthy("memory");
+                    }
+                    was_rejecting = rejecting;
+                }
+            };
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 let rss_bytes = read_rss_bytes();
+                metrics_for_mem.memory_rss_bytes.set(rss_bytes as i64);
                 if rss_bytes == 0 {
                     continue; // /proc/self/statm not available (macOS, etc.)
                 }
@@ -1284,6 +1345,7 @@ async fn cmd_start(cfg: StartConfig) {
                     let rss_after = read_rss_bytes();
                     if rss_after > critical_threshold {
                         memory_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        surface_reject_state(true, rss_after);
                         tracing::error!(
                             "CRITICAL: RSS {} MB exceeds 90% of {} MB limit after eviction. \
                              New writes will be rejected until memory drops.",
@@ -1293,10 +1355,12 @@ async fn cmd_start(cfg: StartConfig) {
                     } else {
                         // Eviction brought us below critical — allow writes again
                         memory_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                        surface_reject_state(false, rss_after);
                     }
                 } else {
                     // Below pressure threshold — ensure writes are allowed
                     memory_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                    surface_reject_state(false, rss_bytes);
                     if rss_bytes > warn_threshold {
                         // Diagnostic: report per-subsystem estimates
                         let col_bytes = executor_for_mem
