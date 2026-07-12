@@ -477,6 +477,13 @@ impl DiskEngine {
         if lsn_floor > 0 {
             wal_backend.bump_next_lsn(lsn_floor + 1);
         }
+        if !is_new && use_segmented_wal {
+            // Seal the pre-recovery segments: rotating makes them inactive,
+            // so the next checkpoint's truncate_before can prune them —
+            // including segments whose legacy-format records would otherwise
+            // re-log CRC errors on every checkpoint re-parse, forever.
+            let _ = wal_backend.rotate();
+        }
 
         let pool = Arc::new(BufferPool::new(
             disk,
@@ -4434,6 +4441,44 @@ mod wal_recovery_tests {
             !bytes.starts_with(&[0xAA, 0xAA, 0xAA, 0xAA]),
             "garbled prefix survived recovery — WAL was not truncated"
         );
+    }
+
+    /// Reopening a segmented engine must seal the pre-recovery segments
+    /// (rotate), so the next checkpoint can prune them — otherwise segments
+    /// carrying legacy-format records re-log CRC errors on every checkpoint
+    /// re-parse, forever (observed live on both prod boxes).
+    #[tokio::test]
+    async fn reopen_rotates_active_segment_for_pruning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+        {
+            let catalog = Arc::new(Catalog::new());
+            let engine = DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap();
+            drop(engine); // clean close leaves records in segment 1
+        }
+        let wal_dir = db_path.with_extension("wal.d");
+        let before: Vec<String> = std::fs::read_dir(&wal_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+
+        {
+            let catalog = Arc::new(Catalog::new());
+            let engine = DiskEngine::open_segmented(&db_path, catalog, 64, 1).unwrap();
+            // checkpoint prunes everything sealed by the reopen's rotation
+            engine.checkpoint().unwrap();
+            drop(engine);
+        }
+        let after: Vec<String> = std::fs::read_dir(&wal_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        for old in &before {
+            assert!(
+                !after.contains(old),
+                "pre-recovery segment {old} survived rotate + checkpoint pruning"
+            );
+        }
     }
 
     /// After recovery disposes of WAL content, the fresh backend must mint
