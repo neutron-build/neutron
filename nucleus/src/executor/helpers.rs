@@ -538,6 +538,14 @@ pub(super) fn val_to_u64(v: &Value, context: &str) -> Result<u64, ExecError> {
         Value::Int64(n) => Err(ExecError::Unsupported(format!(
             "{context}: value must be non-negative, got {n}"
         ))),
+        // pgwire clients (node-postgres in particular) ship parameters as
+        // TEXT — a bound integer arrives here as Value::Text("42"). Parse it
+        // so scalar functions taking an id (DOC_*, etc.) work over the wire
+        // without the caller having to CAST or inline. Same class as the
+        // #22/#23 BIGINT-as-TEXT pgwire fixes.
+        Value::Text(t) => t.trim().parse::<u64>().map_err(|_| {
+            ExecError::Unsupported(format!("{context}: expected integer, got {t:?}"))
+        }),
         _ => Err(ExecError::Unsupported(format!(
             "{context}: expected integer"
         ))),
