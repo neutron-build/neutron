@@ -559,7 +559,16 @@ export async function createServer(
       const rewrite = resolveRouteRuleRewrite(compiledRouteRules, originalPathname);
       const effectivePathname = rewrite?.pathname || originalPathname;
 
-      if (method === "GET" || method === "HEAD") {
+      const match = router.match(effectivePathname);
+
+      // Static dist HTML may only answer when no non-static app route claims
+      // the path. The pre-seeded cache (buildStaticHtmlCache walks dist/ at
+      // boot, including index.html -> "/") used to short-circuit BEFORE the
+      // router, so an app route at "/" — e.g. an auth-gated home — was
+      // silently shadowed by the built shell and its loader never ran.
+      const staticAllowed = !match || isStaticRoute(match);
+
+      if ((method === "GET" || method === "HEAD") && staticAllowed) {
         const cached = staticHtmlCache.get(effectivePathname);
         if (cached) {
           const response = createStaticHtmlResponse(
@@ -575,9 +584,7 @@ export async function createServer(
         }
       }
 
-      const match = router.match(effectivePathname);
-
-      if ((method === "GET" || method === "HEAD") && !isJsonRequest(c.req.raw) && (!match || isStaticRoute(match))) {
+      if ((method === "GET" || method === "HEAD") && !isJsonRequest(c.req.raw) && staticAllowed) {
         const html = tryReadStaticHtml(resolvedDistDir, effectivePathname);
         if (html !== null) {
           const entry = createStaticHtmlEntry(html);
