@@ -36,7 +36,15 @@ export async function preview(): Promise<void> {
 
   const hasAppRoutes = detectAppRoutes(routesDir);
   if (hasAppRoutes) {
-    console.log("\nDetected app routes. Starting Neutron production preview server...\n");
+    // This runs the SSR runtime against your built output using the local
+    // toolchain (Vite + src/). It is a LOCAL preview, not the deployed
+    // artifact: a real deployment runs the preset-generated entry
+    // (`build --preset <target>`), which ships no Vite. Preview needs src/
+    // and dev dependencies present; use it to smoke-test locally, and the
+    // preset build to validate the actual production artifact.
+    console.log(
+      "\nDetected app routes. Starting local preview server (SSR via the dev toolchain — not the deployed artifact)...\n"
+    );
     await startServer({
       ...neutronConfig.server,
       routes: neutronConfig.routes,
