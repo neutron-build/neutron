@@ -613,6 +613,189 @@ class EmbeddedTransactionTransport implements TransactionTransport {
 }
 
 // ---------------------------------------------------------------------------
+// PgTransport — the canonical Nucleus connection path (PostgreSQL wire)
+// ---------------------------------------------------------------------------
+
+// `pg` is an OPTIONAL dependency imported lazily, so browser/RN bundles that
+// use HttpTransport/MobileTransport never pull it. Typed loosely because it
+// is not a compile-time dependency.
+type PgModule = {
+  Pool: new (cfg: { connectionString: string; max?: number }) => PgPool;
+};
+interface PgPool {
+  query(sql: string, params?: unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }>;
+  connect(): Promise<PgPoolClient>;
+  end(): Promise<void>;
+  on(event: 'error', cb: (err: Error) => void): void;
+}
+interface PgPoolClient {
+  query(sql: string, params?: unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }>;
+  release(): void;
+}
+
+let pgModulePromise: Promise<PgModule> | null = null;
+async function loadPg(): Promise<PgModule> {
+  if (!pgModulePromise) {
+    // Specifier via variable so the optional 'pg' dep isn't a compile-time
+    // requirement — resolved at runtime only when a postgres:// URL is used.
+    const pgSpecifier = 'pg';
+    pgModulePromise = import(pgSpecifier).then(
+      (m) => ((m as { default?: PgModule }).default ?? (m as unknown as PgModule)),
+      () => {
+        throw new NucleusConnectionError(
+          "postgres:// connections require the 'pg' package — install it: npm i pg"
+        );
+      }
+    );
+  }
+  return pgModulePromise;
+}
+
+const ISOLATION_SQL: Record<IsolationLevel, string> = {
+  read_committed: 'READ COMMITTED',
+  repeatable_read: 'REPEATABLE READ',
+  serializable: 'SERIALIZABLE',
+};
+
+/**
+ * Nucleus client over the PostgreSQL wire protocol — the canonical path
+ * (`nucleus start`, no gateway between). This is the proven Node transport
+ * (mirrors Teploy Ship's adapter). The pool is created lazily on first use
+ * so construction stays synchronous and browser-safe.
+ */
+export class PgTransport implements Transport {
+  private readonly url: string;
+  private pool: PgPool | null = null;
+
+  constructor(url: string) {
+    this.url = url;
+  }
+
+  private async getPool(): Promise<PgPool> {
+    if (!this.pool) {
+      const pg = await loadPg();
+      const pool = new pg.Pool({ connectionString: this.url, max: 8 });
+      // An idle pooled connection dying (engine restart / accessory upgrade)
+      // emits 'error' on the pool; unhandled, that CRASHES the process. This
+      // handler absorbs the idle death so the pool can mint fresh connections;
+      // in-flight queries still reject through their own promises.
+      pool.on('error', () => {});
+      this.pool = pool;
+    }
+    return this.pool;
+  }
+
+  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<QueryResult<T>> {
+    const pool = await this.getPool();
+    const res = await pool.query(sql, params);
+    return { rows: res.rows as T[], rowCount: res.rowCount ?? 0 };
+  }
+
+  async execute(sql: string, params: unknown[] = []): Promise<number> {
+    const pool = await this.getPool();
+    const res = await pool.query(sql, params);
+    return res.rowCount ?? 0;
+  }
+
+  async fetchval<T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> {
+    const pool = await this.getPool();
+    const res = await pool.query(sql, params);
+    const row = res.rows[0] as Record<string, unknown> | undefined;
+    if (row === undefined) return null;
+    const value = Object.values(row)[0];
+    return (value ?? null) as T | null;
+  }
+
+  async beginTransaction(isolationLevel?: IsolationLevel): Promise<TransactionTransport> {
+    const pool = await this.getPool();
+    const client = await pool.connect();
+    try {
+      const level = isolationLevel ? ` ISOLATION LEVEL ${ISOLATION_SQL[isolationLevel]}` : '';
+      await client.query(`BEGIN${level}`);
+    } catch (err) {
+      client.release();
+      throw err;
+    }
+    return new PgTransactionTransport(client);
+  }
+
+  async ping(): Promise<void> {
+    const pool = await this.getPool();
+    await pool.query('SELECT 1');
+  }
+
+  async close(): Promise<void> {
+    if (this.pool) {
+      await this.pool.end();
+      this.pool = null;
+    }
+  }
+}
+
+/** A transaction bound to one checked-out pooled connection. */
+class PgTransactionTransport implements TransactionTransport {
+  private readonly client: PgPoolClient;
+  private finished = false;
+
+  constructor(client: PgPoolClient) {
+    this.client = client;
+  }
+
+  private assertOpen(): void {
+    if (this.finished) throw new NucleusTransactionError('transaction already finished');
+  }
+
+  async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<QueryResult<T>> {
+    this.assertOpen();
+    const res = await this.client.query(sql, params);
+    return { rows: res.rows as T[], rowCount: res.rowCount ?? 0 };
+  }
+
+  async execute(sql: string, params: unknown[] = []): Promise<number> {
+    this.assertOpen();
+    const res = await this.client.query(sql, params);
+    return res.rowCount ?? 0;
+  }
+
+  async fetchval<T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> {
+    this.assertOpen();
+    const res = await this.client.query(sql, params);
+    const row = res.rows[0] as Record<string, unknown> | undefined;
+    if (row === undefined) return null;
+    const value = Object.values(row)[0];
+    return (value ?? null) as T | null;
+  }
+
+  // Nested transactions are not supported — a savepoint model would go here.
+  async beginTransaction(): Promise<TransactionTransport> {
+    throw new NucleusTransactionError('nested transactions are not supported');
+  }
+
+  async commit(): Promise<void> {
+    this.assertOpen();
+    await this.client.query('COMMIT');
+    this.finished = true;
+    this.client.release();
+  }
+
+  async rollback(): Promise<void> {
+    if (this.finished) return;
+    await this.client.query('ROLLBACK');
+    this.finished = true;
+    this.client.release();
+  }
+
+  async ping(): Promise<void> {
+    this.assertOpen();
+    await this.client.query('SELECT 1');
+  }
+
+  async close(): Promise<void> {
+    if (!this.finished) await this.rollback();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Auto-detection factory
 // ---------------------------------------------------------------------------
 
@@ -635,6 +818,15 @@ export function createTransport(config: MobileTransportConfig): Transport {
     return new MobileTransport(config);
   }
 
-  // Web / Node / everything else — standard HTTP
+  // Node with a postgres:// URL — the canonical Nucleus path (pgwire).
+  // This is the proven connection story; HttpTransport targets an HTTP
+  // query gateway that `nucleus start` does not serve, so it only applies
+  // to a deployment that fronts Nucleus with such a gateway.
+  const isNode = typeof process !== 'undefined' && !!process.versions?.node;
+  if (isNode && /^postgres(ql)?:\/\//i.test(config.url)) {
+    return new PgTransport(config.url);
+  }
+
+  // Web / http(s) gateway — standard HTTP.
   return new HttpTransport(config.url, config.headers, config.timeout);
 }
