@@ -1018,6 +1018,13 @@ async function handleAppRouteRequest(
 
       try {
         const data = await module.loader(loaderArgs);
+        // A loader may RETURN a raw Response (redirect, custom status,
+        // streamed body) — not only throw one. Serve it directly instead of
+        // treating it as component data. Matches resource-route + action
+        // semantics; a plain object is still normal loader data.
+        if (data instanceof Response) {
+          return { routeId: route.id, data: undefined, response: data };
+        }
         if (loaderCacheKey) {
           await storeLoaderDataCache(
             loaderDataCache,
@@ -1089,6 +1096,9 @@ async function handleAppRouteRequest(
     // Check for errors and build data map
     const loaderData: Record<string, unknown> = {};
     for (const result of loaderResults) {
+      if ((result as { response?: Response }).response) {
+        return (result as { response: Response }).response;
+      }
       if (result.error) {
         if (result.error instanceof Response) {
           return result.error;

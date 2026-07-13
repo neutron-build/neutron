@@ -342,4 +342,41 @@ export async function loader() {
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.nucleus).toBe("ok");
   }, 30000);
+
+  it("serves a Response RETURNED (not thrown) by a component route's loader", async () => {
+    const root = await makeFixture();
+    await writeDistShell(root);
+    await fs.mkdir(path.join(root, "src", "routes", "gated"), { recursive: true });
+    // A route WITH a component whose loader RETURNS a redirect Response.
+    // Previously the Response became component data and the shell rendered
+    // a 200 instead of the redirect.
+    await fs.writeFile(
+      path.join(root, "src", "routes", "gated", "index.ts"),
+      `
+import { h } from "preact";
+export const config = { mode: "app" };
+export async function loader() {
+  return new Response(null, { status: 302, headers: { Location: "/login" } });
+}
+export default function Gated() {
+  return h("main", null, "should not render");
+}
+`,
+      "utf-8"
+    );
+    const port = await getFreePort();
+    const running = await createServer({
+      host: "127.0.0.1",
+      port,
+      rootDir: root,
+      distDir: "dist",
+      routesDir: "src/routes",
+      compress: false,
+    });
+    closers.push(running.close);
+
+    const res = await fetch(`http://127.0.0.1:${port}/gated`, { redirect: "manual" });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/login");
+  }, 30000);
 });
