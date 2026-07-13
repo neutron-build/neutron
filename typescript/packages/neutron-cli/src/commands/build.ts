@@ -1043,6 +1043,38 @@ async function buildRuntimeBundle(
       configFile: false,
       root: options.cwd,
       plugins: [
+        // Vite's SSR resolver does not honor the `exports` map for the
+        // dynamic-import subpath `preact-render-to-string/stream` inside the
+        // noExternal @neutron-build/core dep — it falls back to a raw
+        // <pkgdir>/stream path (ENOENT), breaking the docker/node runtime
+        // bundle (and thus streaming SSR in production). This resolveId hook
+        // runs before the default resolver and returns the real file via
+        // Node's own exports resolution. Only this one subpath tripped it.
+        {
+          name: "neutron:resolve-render-to-string-stream",
+          enforce: "pre" as const,
+          resolveId(id: string) {
+            if (id === "preact-render-to-string/stream") {
+              // Return the real file so rollup bundles it (Vite's SSR
+              // noExternal resolver otherwise yields a raw <pkgdir>/stream
+              // path that fails to load — docker/node preset breakage).
+              return createRequire(path.join(options.cwd, "package.json")).resolve(id);
+            }
+            return null;
+          },
+          load(id: string) {
+            // Backstop: if some earlier resolver already produced the raw
+            // `.../preact-render-to-string/stream` path (no extension), Vite's
+            // load-fallback ENOENTs on it. Serve the real module contents.
+            if (id.endsWith("/preact-render-to-string/stream")) {
+              const real = createRequire(path.join(options.cwd, "package.json")).resolve(
+                "preact-render-to-string/stream"
+              );
+              return fs.readFileSync(real, "utf-8");
+            }
+            return null;
+          },
+        },
         neutronPlugin({
           routesDir: options.routesDir,
           rootDir: options.cwd,
