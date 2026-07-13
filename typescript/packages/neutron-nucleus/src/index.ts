@@ -25,7 +25,7 @@ export {
   NucleusAuthError,
 } from './errors.js';
 
-export { HttpTransport, MobileTransport, EmbeddedTransport, createTransport } from './transport.js';
+export { HttpTransport, MobileTransport, EmbeddedTransport, PgTransport, createTransport } from './transport.js';
 export type { TransportConfig, MobileTransportConfig } from './transport.js';
 export { detectFeatures } from './features.js';
 export { requireNucleus, assertIdentifier } from './helpers.js';

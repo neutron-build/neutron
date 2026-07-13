@@ -5,6 +5,7 @@ import {
   HttpTransport,
   MobileTransport,
   EmbeddedTransport,
+  PgTransport,
   createTransport,
   NucleusConnectionError,
   NucleusQueryError,
@@ -69,6 +70,27 @@ describe("createTransport", () => {
     };
     const transport = createTransport({ url: "" });
     assert(transport instanceof EmbeddedTransport);
+  });
+
+  it("returns PgTransport for a postgres:// URL in Node (the canonical path)", () => {
+    delete (globalThis as Record<string, unknown>).window;
+    delete (globalThis as Record<string, unknown>).navigator;
+    const transport = createTransport({ url: "postgres://nucleus@localhost:5432/nucleus" });
+    assert(transport instanceof PgTransport);
+  });
+
+  it("returns PgTransport for postgresql:// too", () => {
+    delete (globalThis as Record<string, unknown>).window;
+    delete (globalThis as Record<string, unknown>).navigator;
+    const transport = createTransport({ url: "postgresql://localhost:5432/db" });
+    assert(transport instanceof PgTransport);
+  });
+
+  it("still returns HttpTransport for an http:// gateway URL", () => {
+    delete (globalThis as Record<string, unknown>).window;
+    delete (globalThis as Record<string, unknown>).navigator;
+    const transport = createTransport({ url: "http://gateway.example.com" });
+    assert(transport instanceof HttpTransport);
   });
 
   it("prefers EmbeddedTransport over MobileTransport when both present", () => {

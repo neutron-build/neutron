@@ -210,8 +210,11 @@ class DocumentModelImpl implements DocumentModel {
       if (!doc) continue;
       Object.assign(doc, update);
       const data = JSON.stringify(doc);
-      await this.transport.execute('UPDATE documents SET data = $1::jsonb WHERE id = $2', [data, id]);
-      count++;
+      // DOC_UPDATE replaces the document in place (preserving id). The old
+      // `UPDATE documents ...` targeted a relation that does not exist — the
+      // document store is a specialty store reached only via DOC_* functions.
+      const ok = await this.transport.fetchval<boolean>('SELECT DOC_UPDATE($1, $2)', [id, data]);
+      if (ok) count++;
     }
 
     return count;
@@ -223,8 +226,9 @@ class DocumentModelImpl implements DocumentModel {
     let count = 0;
 
     for (const id of ids) {
-      await this.transport.execute('DELETE FROM documents WHERE id = $1', [id]);
-      count++;
+      // DOC_DELETE, not `DELETE FROM documents` (no such relation).
+      const ok = await this.transport.fetchval<boolean>('SELECT DOC_DELETE($1)', [id]);
+      if (ok) count++;
     }
 
     return count;
