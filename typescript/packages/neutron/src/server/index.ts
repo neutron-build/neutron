@@ -341,6 +341,14 @@ export async function createServer(
   const ssrServer = hasAppRoutes
     ? await createSsrServer(resolvedRootDir, resolvedRoutesDir, runtime)
     : null;
+  // Global middleware: an optional src/middleware.ts (default export = a
+  // MiddlewareFn) runs OUTERMOST, before any per-route middleware, on every
+  // app-route request. Loaded once at startup through the same SSR runtime as
+  // routes so it shares the module graph (hooks, aliases). Absent file = none.
+  const globalMiddleware: MiddlewareFn[] =
+    hasAppRoutes && ssrServer
+      ? await loadGlobalMiddleware(ssrServer, resolvedRootDir)
+      : [];
   const routeModuleCache = new Map<string, Promise<RouteModule>>();
   const appResponseCacheStore =
     cache?.app || createMemoryAppCacheStore();
@@ -675,7 +683,8 @@ export async function createServer(
             routeModuleCache,
             loaderDataCacheStore,
             requestTrace,
-            hooks
+            hooks,
+            globalMiddleware
           );
           await maybeStoreAppResponse(
             appResponseCacheStore,
@@ -707,7 +716,8 @@ export async function createServer(
         routeModuleCache,
         loaderDataCacheStore,
         requestTrace,
-        hooks
+        hooks,
+        globalMiddleware
       );
 
       if (isMutationMethod(method)) {
@@ -814,7 +824,8 @@ async function handleAppRouteRequest(
   moduleCache: Map<string, Promise<RouteModule>>,
   loaderDataCache: NeutronLoaderCacheStore,
   requestTrace: RequestTraceContext,
-  hooks?: NeutronServerHooks
+  hooks?: NeutronServerHooks,
+  globalMiddleware?: MiddlewareFn[]
 ): Promise<Response> {
   const allRoutes = [...match.layouts, match.route];
   const includeClientRuntime = allRoutes.every((route) => route.config.hydrate !== false);
@@ -828,6 +839,9 @@ async function handleAppRouteRequest(
   );
 
   const middlewares: MiddlewareFn[] = [];
+  if (globalMiddleware && globalMiddleware.length > 0) {
+    middlewares.push(...globalMiddleware);
+  }
   for (const route of allRoutes) {
     const module = routeModules.get(route.id);
     if (module?.middleware) {
@@ -1425,6 +1439,53 @@ function isStaticRoute(match: RouteMatch): boolean {
     return true;
   }
   return match.route.config.mode === "static";
+}
+
+// Load an optional global middleware from <rootDir>/src/middleware.ts (or
+// .js/.tsx). Returns its default export if it is a function, else null. A
+// present-but-malformed file warns and is ignored rather than crashing boot.
+async function loadGlobalMiddleware(
+  ssrServer: SsrServer,
+  rootDir: string
+): Promise<MiddlewareFn[]> {
+  const candidates = [
+    "src/middleware.ts",
+    "src/middleware.tsx",
+    "src/middleware.js",
+    "src/middleware.mjs",
+  ];
+  for (const rel of candidates) {
+    const abs = path.join(rootDir, rel);
+    if (!fs.existsSync(abs)) continue;
+    try {
+      const mod = (await ssrServer.ssrLoadModule(abs)) as {
+        default?: unknown;
+        middleware?: unknown;
+      };
+      // Documented form: `export const middleware: MiddlewareFn[]`. Also
+      // accept a single function (default or named) for ergonomics.
+      const exported = mod.middleware ?? mod.default;
+      const list = normalizeMiddlewareExport(exported);
+      if (list.length === 0 && exported !== undefined) {
+        console.warn(
+          `Global middleware ${rel}: export is neither a function nor an array of functions — ignoring.`
+        );
+      }
+      return list;
+    } catch (error) {
+      console.warn(`Failed to load global middleware ${rel}: ${String(error)}`);
+      return [];
+    }
+  }
+  return [];
+}
+
+function normalizeMiddlewareExport(exported: unknown): MiddlewareFn[] {
+  if (typeof exported === "function") return [exported as MiddlewareFn];
+  if (Array.isArray(exported)) {
+    return exported.filter((f): f is MiddlewareFn => typeof f === "function");
+  }
+  return [];
 }
 
 function loadRouteModule(

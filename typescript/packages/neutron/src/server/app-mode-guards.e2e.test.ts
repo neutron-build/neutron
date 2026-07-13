@@ -379,4 +379,60 @@ export default function Gated() {
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/login");
   }, 30000);
+
+  it("runs a global src/middleware.ts outermost on app-route requests", async () => {
+    const root = await makeFixture();
+    await writeDistShell(root);
+    await fs.mkdir(path.join(root, "src", "routes"), { recursive: true });
+    // Global middleware: gate everything unless a header is present, and stamp
+    // a response header to prove it wrapped the route.
+    await fs.writeFile(
+      path.join(root, "src", "middleware.ts"),
+      `
+export const middleware = [
+  async (request, _context, next) => {
+    if (!request.headers.get("x-allow")) {
+      return new Response("blocked by global", { status: 403 });
+    }
+    const res = await next();
+    res.headers.set("x-global-mw", "1");
+    return res;
+  },
+];
+`,
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(root, "src", "routes", "index.ts"),
+      `
+import { h } from "preact";
+export const config = { mode: "app" };
+export async function loader() { return { ok: true }; }
+export default function Home() { return h("main", null, "home"); }
+`,
+      "utf-8"
+    );
+    const port = await getFreePort();
+    const running = await createServer({
+      host: "127.0.0.1",
+      port,
+      rootDir: root,
+      distDir: "dist",
+      routesDir: "src/routes",
+      compress: false,
+    });
+    closers.push(running.close);
+
+    // Blocked without the header — global middleware ran before the route.
+    const blocked = await fetch(`http://127.0.0.1:${port}/`);
+    expect(blocked.status).toBe(403);
+    expect(await blocked.text()).toBe("blocked by global");
+
+    // Allowed — route renders AND the middleware's response header is present.
+    const allowed = await fetch(`http://127.0.0.1:${port}/`, {
+      headers: { "x-allow": "1" },
+    });
+    expect(allowed.status).toBe(200);
+    expect(allowed.headers.get("x-global-mw")).toBe("1");
+  }, 30000);
 });
