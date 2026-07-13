@@ -17,3 +17,9 @@ export {
   resolveRouteRuleRewrite,
   resolveRouteRuleHeaders,
 } from "../core/route-rules.js";
+export {
+  renderAppRoute,
+  isMutationMethod,
+  isJsonRequest,
+} from "../core/render-app-route.js";
+export { createMemoryLoaderCacheStore } from "../server/cache-store.js";
