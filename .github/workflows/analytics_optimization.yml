@@ -41,7 +41,7 @@ jobs:
           workspaces: nucleus
 
       - name: Test zone maps and granule statistics
-        run: cargo test --lib storage::buffer --lib storage::mvcc -q
+        run: cargo test --lib -q -- storage::buffer storage::mvcc
         working-directory: nucleus
 
       - name: Test GROUP BY and aggregations
@@ -77,7 +77,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: nucleus
-      - run: cargo clippy --lib executor --lib storage --lib simd -- -D warnings
+      - run: cargo clippy --lib -- -D warnings
         working-directory: nucleus
 
   documentation:

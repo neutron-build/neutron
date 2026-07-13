@@ -148,21 +148,24 @@ impl Ref {
                 })
             }
             Op::LRange(k, s, e) => {
-                let l = match self.lists.get(k) {
-                    Some(l) => l,
-                    None => return Ok(String::new()),
+                // Engine returns a JSON array (KV_LRANGE serde_json::to_string),
+                // not comma-joined — so list values containing ',' survive the
+                // round-trip. The oracle mirrors that: [] for empty/missing,
+                // ["a","b"] otherwise. (Was stale: expected "" / "a,b", which
+                // tripped the fuzzer on every empty range — probe bug, not an
+                // engine bug.)
+                let slice: Vec<String> = match self.lists.get(k) {
+                    None => Vec::new(),
+                    Some(l) => {
+                        let (lo, hi, empty) = norm_range(*s, *e, l.len());
+                        if empty {
+                            Vec::new()
+                        } else {
+                            l.iter().skip(lo).take(hi - lo + 1).cloned().collect()
+                        }
+                    }
                 };
-                let (lo, hi, empty) = norm_range(*s, *e, l.len());
-                if empty {
-                    Ok(String::new())
-                } else {
-                    Ok(l.iter()
-                        .skip(lo)
-                        .take(hi - lo + 1)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(","))
-                }
+                Ok(serde_json::to_string(&slice).unwrap_or_else(|_| "[]".into()))
             }
         }
     }
