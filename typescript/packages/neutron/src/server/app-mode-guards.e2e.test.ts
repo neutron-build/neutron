@@ -131,6 +131,32 @@ async function writeStaticOnlyFixture(rootDir: string): Promise<void> {
   await fs.mkdir(path.join(rootDir, "src", "routes"), { recursive: true });
 }
 
+// Fixture: an auth-gated app route AT "/" alongside a dist/index.html shell.
+// The route must win — if the static shell is served instead, the loader's
+// auth gate silently never runs (the security regression this pins).
+async function writeRootAuthFixture(rootDir: string): Promise<void> {
+  await writeDistShell(rootDir);
+  await fs.mkdir(path.join(rootDir, "src", "routes"), { recursive: true });
+
+  await fs.writeFile(
+    path.join(rootDir, "src", "routes", "index.ts"),
+    `
+import { h } from "preact";
+export const config = { mode: "app" };
+export async function loader({ request }) {
+  if (!request.headers.get("authorization")) {
+    throw new Response("unauthorized", { status: 401 });
+  }
+  return { user: "tyler" };
+}
+export default function Home({ data }) {
+  return h("main", null, "private home for " + data.user);
+}
+`,
+    "utf-8"
+  );
+}
+
 describe("app-mode /health route and full-document guard", () => {
   const roots: string[] = [];
   const closers: Array<() => Promise<void>> = [];
@@ -192,6 +218,35 @@ describe("app-mode /health route and full-document guard", () => {
     expect(Object.keys(body).sort()).toEqual(["nucleus", "status", "version"]);
     expect(body.status).toBe("ok");
     expect(body.version).toBe("9.9.9");
+  }, 30000);
+
+  it("an app route at / wins over dist/index.html — the auth gate must run (security)", async () => {
+    const root = await makeFixture();
+    await writeRootAuthFixture(root);
+    const port = await getFreePort();
+    const running = await createServer({
+      host: "127.0.0.1",
+      port,
+      rootDir: root,
+      distDir: "dist",
+      routesDir: "src/routes",
+      compress: false,
+    });
+    closers.push(running.close);
+
+    // Unauthenticated: the loader's 401 must surface. Serving the static
+    // shell here would bypass auth entirely.
+    const anon = await fetch(`http://127.0.0.1:${port}/`);
+    expect(anon.status).toBe(401);
+    expect(await anon.text()).toBe("unauthorized");
+
+    // Authenticated: SSR output, not the shell.
+    const authed = await fetch(`http://127.0.0.1:${port}/`, {
+      headers: { authorization: "Bearer t" },
+    });
+    expect(authed.status).toBe(200);
+    const html = await authed.text();
+    expect(html).toContain("private home for tyler");
   }, 30000);
 
   it("composes a fragment-rendering layout into #app exactly as before (Bug 2: fragment)", async () => {
