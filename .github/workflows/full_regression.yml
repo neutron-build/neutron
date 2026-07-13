@@ -40,7 +40,7 @@ jobs:
         working-directory: nucleus
 
       - name: Run all wire/transport tests (133 tests)
-        run: cargo test --lib wire --lib transport -q
+        run: cargo test --lib -q -- wire transport
         working-directory: nucleus
 
       - name: Run all storage tests
@@ -48,7 +48,7 @@ jobs:
         working-directory: nucleus
 
       - name: Run all data model tests
-        run: cargo test --lib kv --lib vector --lib document --lib graph --lib fts --lib geo --lib blob --lib streams --lib columnar --lib datalog --lib pubsub --lib timeseries -q
+        run: cargo test --lib -q -- kv vector document graph fts geo blob streams columnar datalog pubsub timeseries
         working-directory: nucleus
 
       - name: Run all integration tests

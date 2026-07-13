@@ -76,10 +76,13 @@ impl RefOracle {
     }
 
     fn smembers(&self, key: &str) -> String {
-        match self.sets.get(key) {
-            None => String::new(),
-            Some(s) => s.iter().cloned().collect::<Vec<_>>().join(","),
-        }
+        // Engine returns a JSON array of members (sorted); mirror it exactly.
+        let members: Vec<String> = self
+            .sets
+            .get(key)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        serde_json::to_string(&members).unwrap_or_else(|_| "[]".into())
     }
 
     fn sismember(&self, key: &str, member: &str) -> bool {
@@ -129,47 +132,46 @@ impl RefOracle {
         }
     }
 
-    /// ZRANGE: 0-based inclusive rank range [start, stop].
+    /// ZRANGE: 0-based inclusive rank range [start, stop]. Engine returns a
+    /// JSON array of [member, score] tuples (f64 scores serialize as e.g.
+    /// 1.0), so the oracle serializes the same (String, f64) shape.
     fn zrange(&self, key: &str, start: usize, stop: usize) -> String {
-        let v = match self.zsets.get(key) {
-            Some(v) => v,
-            None => return String::new(),
+        let empty: Vec<(String, f64)> = Vec::new();
+        let entries: Vec<(String, f64)> = match self.zsets.get(key) {
+            None => empty,
+            Some(v) => {
+                if start >= v.len() {
+                    empty
+                } else {
+                    let end = std::cmp::min(stop, v.len().saturating_sub(1));
+                    if start > end {
+                        empty
+                    } else {
+                        v[start..=end]
+                            .iter()
+                            .map(|(score, m)| (m.clone(), *score))
+                            .collect()
+                    }
+                }
+            }
         };
-        if start >= v.len() {
-            return String::new();
-        }
-        let end = std::cmp::min(stop, v.len().saturating_sub(1));
-        if start > end {
-            return String::new();
-        }
-        v[start..=end]
-            .iter()
-            .map(|(score, m)| {
-                // Match Nucleus format: member:score
-                // Nucleus uses format!("{}:{}", e.member, e.score)
-                // which for integer-valued scores prints e.g. "m:1" not "m:1.0"
-                // f64 Display in Rust prints "1" for 1.0? No — f64 always prints decimal.
-                // Actually Rust's f64 Display: 1_f64 prints as "1" — NO, it prints "1"
-                // Let's check: format!("{}", 1.0_f64) = "1" in Rust.
-                // Actually in Rust: format!("{}", 1.0f64) = "1" — NOT "1.0"
-                // We must match exactly what Nucleus does.
-                format!("{}:{}", m, score)
-            })
-            .collect::<Vec<_>>()
-            .join(",")
+        serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into())
     }
 
-    /// ZRANGEBYSCORE: score in [min, max] inclusive.
+    /// ZRANGEBYSCORE: score in [min, max] inclusive. JSON [member, score]
+    /// tuples, matching the engine (see zrange).
     fn zrangebyscore(&self, key: &str, min: f64, max: f64) -> String {
-        let v = match self.zsets.get(key) {
-            Some(v) => v,
-            None => return String::new(),
-        };
-        v.iter()
-            .filter(|(score, _)| *score >= min && *score <= max)
-            .map(|(score, m)| format!("{}:{}", m, score))
-            .collect::<Vec<_>>()
-            .join(",")
+        let entries: Vec<(String, f64)> = self
+            .zsets
+            .get(key)
+            .map(|v| {
+                v.iter()
+                    .filter(|(score, _)| *score >= min && *score <= max)
+                    .map(|(score, m)| (m.clone(), *score))
+                    .collect()
+            })
+            .unwrap_or_default();
+        serde_json::to_string(&entries).unwrap_or_else(|_| "[]".into())
     }
 
     fn zcard(&self, key: &str) -> usize {
@@ -204,16 +206,15 @@ impl RefOracle {
         }
     }
 
-    /// HGETALL returns sorted by field name, format "field=value,...".
+    /// HGETALL: JSON array of [field, value] pairs, sorted by field —
+    /// matches the engine's serde_json output (was "field=value,...").
     fn hgetall(&self, key: &str) -> String {
-        match self.hashes.get(key) {
-            None => String::new(),
-            Some(h) => h
-                .iter()
-                .map(|(f, v)| format!("{}={}", f, v))
-                .collect::<Vec<_>>()
-                .join(","),
-        }
+        let pairs: Vec<[String; 2]> = self
+            .hashes
+            .get(key)
+            .map(|h| h.iter().map(|(f, v)| [f.clone(), v.clone()]).collect())
+            .unwrap_or_default();
+        serde_json::to_string(&pairs).unwrap_or_else(|_| "[]".into())
     }
 
     fn hlen(&self, key: &str) -> usize {

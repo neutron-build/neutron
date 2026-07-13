@@ -39,7 +39,7 @@ jobs:
         working-directory: nucleus
 
       - name: Run binary protocol tests
-        run: cargo test --lib wire --lib transport -q
+        run: cargo test --lib -q -- wire transport
         working-directory: nucleus
 
       - name: Run integration tests (binary protocol focus)
@@ -67,5 +67,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: nucleus
-      - run: cargo clippy --lib wire --lib transport -- -D warnings
+      - run: cargo clippy --lib -- -D warnings
         working-directory: nucleus
