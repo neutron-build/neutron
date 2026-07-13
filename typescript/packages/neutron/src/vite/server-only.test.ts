@@ -71,4 +71,40 @@ describe("server-only module handling", () => {
     expect(transformed.includes("export async function GET")).toBe(false);
     expect(transformed.includes("export const POST")).toBe(false);
   });
+
+  it("strips node: builtin imports from the client route module (R3 #5)", () => {
+    // A loader's node builtin import survives the loader's removal and, left
+    // in place, breaks the browser bundle. Both node: and bare-builtin forms.
+    const code = `
+      import { readFileSync } from "node:fs";
+      import path from "path";
+      import { getUser } from "./db.server.ts";
+      import { h } from "preact";
+      export async function loader() {
+        return { data: readFileSync(path.join("/x")), user: getUser() };
+      }
+      export default function Page() { return h("div", null, "hi"); }
+    `;
+
+    const transformed = stripServerOnlyRouteModule(code);
+
+    expect(transformed.includes("node:fs")).toBe(false);
+    expect(/from ["']path["']/.test(transformed)).toBe(false);
+    expect(transformed.includes("db.server")).toBe(false);
+    // The isomorphic import and the component survive.
+    expect(transformed.includes("preact")).toBe(true);
+    expect(transformed.includes("export default function Page")).toBe(true);
+  });
+
+  it("keeps look-alike packages (fs-extra, path-browserify) that are NOT builtins", () => {
+    const code = `
+      import fse from "fs-extra";
+      import pb from "path-browserify";
+      import { h } from "preact";
+      export default function Page() { return h("div", null, String(fse) + String(pb)); }
+    `;
+    const transformed = stripServerOnlyRouteModule(code);
+    expect(transformed.includes("fs-extra")).toBe(true);
+    expect(transformed.includes("path-browserify")).toBe(true);
+  });
 });

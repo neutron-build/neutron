@@ -72,6 +72,30 @@ export function isServerOnlySpecifier(specifier: string): boolean {
   return SERVER_FILE_RE.test(clean);
 }
 
+// Node built-in modules (import { readFileSync } from "node:fs" — or the bare
+// "fs"/"path"/... aliases). Used ONLY when stripping the CLIENT half of a
+// route module: such an import survives only because a now-stripped server
+// export (loader/action) used it, and left in place it breaks the browser
+// bundle. This is deliberately NOT part of isServerOnlySpecifier — that would
+// make every client node: import silently resolve to empty and mask genuine
+// mistakes; here it is scoped to the route-client transform.
+const NODE_BUILTIN_RE = /^node:/;
+const BARE_NODE_BUILTINS = new Set([
+  "assert", "async_hooks", "buffer", "child_process", "cluster", "console",
+  "crypto", "dgram", "diagnostics_channel", "dns", "domain", "events", "fs",
+  "http", "http2", "https", "inspector", "module", "net", "os", "path",
+  "perf_hooks", "process", "punycode", "querystring", "readline", "repl",
+  "stream", "string_decoder", "timers", "tls", "trace_events", "tty", "url",
+  "util", "v8", "vm", "wasi", "worker_threads", "zlib",
+]);
+
+function isNodeBuiltinImport(specifier: string): boolean {
+  const clean = specifier.split("?")[0].split("#")[0];
+  if (NODE_BUILTIN_RE.test(clean)) return true;
+  const root = clean.split("/")[0];
+  return BARE_NODE_BUILTINS.has(root);
+}
+
 export function parseImports(code: string): ImportRecord[] {
   const ast = parse(code, {
     sourceType: "module",
@@ -110,7 +134,7 @@ export function stripServerOnlyRouteModule(code: string): string {
   for (const node of getProgramBody(ast)) {
     if (node.type === "ImportDeclaration") {
       const source = typeof node.source?.value === "string" ? node.source.value : "";
-      if (isServerOnlySpecifier(source)) {
+      if (isServerOnlySpecifier(source) || isNodeBuiltinImport(source)) {
         magic.remove(node.start, node.end);
       }
       continue;

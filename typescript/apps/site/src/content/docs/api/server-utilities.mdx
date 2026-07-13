@@ -28,3 +28,54 @@ export async function loader() {
   }
 }
 ```
+
+## Keeping code server-only
+
+Two conventions keep server code out of the browser bundle:
+
+### `.server.ts` files
+
+Any module whose filename ends in `.server` (e.g. `db.server.ts`,
+`auth.server.ts`) is **server-only**. Its imports are stripped from the
+client build, so it is safe to use secrets, database drivers, or Node
+built-ins there:
+
+```ts
+// src/lib/db.server.ts
+import { Pool } from "pg";
+export const db = new Pool({ connectionString: process.env.DATABASE_URL });
+```
+
+```tsx
+// src/routes/users.tsx
+import { db } from "../lib/db.server.ts"; // stripped from the client bundle
+
+export async function loader() {
+  return { users: (await db.query("SELECT * FROM users")).rows };
+}
+```
+
+### Node built-ins in route modules
+
+You can import Node built-ins (`node:fs`, `path`, `crypto`, …) directly in a
+route module as long as you only use them in server exports (`loader`,
+`action`, HTTP handlers). When Neutron builds the client half of the route it
+removes those exports **and** their now-unused built-in imports, so they never
+reach the browser:
+
+```tsx
+import { readFileSync } from "node:fs"; // removed from the client bundle
+
+export const config = { mode: "app" };
+
+export async function loader() {
+  return { version: readFileSync("VERSION", "utf8") };
+}
+
+export default function Page({ data }) {
+  return <p>Version {data.version}</p>;
+}
+```
+
+Look-alike packages that are **not** built-ins (`fs-extra`, `path-browserify`)
+are left untouched — only real Node built-ins are stripped.
