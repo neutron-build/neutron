@@ -182,16 +182,3 @@ func (f *FTSModel) TermCount(ctx context.Context) (int64, error) {
 	err := f.pool.QueryRow(ctx, "SELECT FTS_TERM_COUNT()").Scan(&n)
 	return n, wrapErr("fts term_count", err)
 }
-
-// CreateIndex creates a full-text search index with the given configuration.
-func (f *FTSModel) CreateIndex(ctx context.Context, name string, config map[string]any) error {
-	if err := f.client.requireNucleus("FTS.CreateIndex"); err != nil {
-		return err
-	}
-	configJSON, err := json.Marshal(config)
-	if err != nil {
-		return fmt.Errorf("nucleus: fts create index marshal: %w", err)
-	}
-	_, err = f.pool.Exec(ctx, "SELECT FTS_INDEX($1, $2)", name, string(configJSON))
-	return wrapErr("fts create_index", err)
-}

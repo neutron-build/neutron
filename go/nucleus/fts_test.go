@@ -64,7 +64,6 @@ func TestFTSRequiresNucleus(t *testing.T) {
 		{"Remove", func() error { _, err := f.Remove(context.Background(), 1); return err }},
 		{"DocCount", func() error { _, err := f.DocCount(context.Background()); return err }},
 		{"TermCount", func() error { _, err := f.TermCount(context.Background()); return err }},
-		{"CreateIndex", func() error { return f.CreateIndex(context.Background(), "idx", nil) }},
 	}
 
 	for _, tc := range tests {
