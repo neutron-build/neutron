@@ -12,6 +12,29 @@ App routes are fully dynamic, server-side rendered (SSR) routes that hydrate on 
 -   **Client-side Navigation**: Clicking links uses client-side routing, avoiding full page reloads.
 -   **Shared State**: Layouts persist state during navigation.
 
+## The client entry
+
+App routes hydrate on the client from a single **client entry** — `src/main.tsx`
+(or `src/client.tsx`; `.ts`/`.jsx`/`.js` variants are also detected). Every
+Neutron project starts with one, and the starter templates include it:
+
+```tsx
+// src/main.tsx
+import { init, registerRoutes } from "neutron/client";
+import { routes } from "virtual:neutron/routes";
+
+registerRoutes(routes);
+void init();
+```
+
+`registerRoutes` hands the client router the same route table the server used
+(via the `virtual:neutron/routes` module the build injects), and `init()`
+hydrates the server-rendered HTML and takes over client-side navigation. You
+normally never edit this file — add hydration-time setup (analytics, error
+reporting, a global store) before `init()` if you need it. If the entry is
+missing, pages still server-render but do not hydrate (no interactivity or
+client navigation).
+
 ## Configuration
 
 To make a route an app route, set the mode to `app`:
