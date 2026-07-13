@@ -3801,6 +3801,35 @@ impl Executor {
                 let id = self.doc_store.write().insert(jv);
                 Ok(Value::Int64(id as i64))
             }
+            "DOC_UPDATE" => {
+                // doc_update(id, json_text) → bool. Replaces the document in
+                // place (preserving its id) when it exists; false otherwise.
+                // The document store has no SQL-exposed mutation otherwise —
+                // clients previously (and wrongly) tried `UPDATE documents`,
+                // a relation that does not exist.
+                require_args(fname, &args, 2)?;
+                let id = val_to_u64(&args[0], "DOC_UPDATE id")?;
+                let json_text = match &args[1] {
+                    Value::Text(s) => s.clone(),
+                    Value::Null => return Ok(Value::Bool(false)),
+                    other => other.to_string(),
+                };
+                let jv = parse_json_to_doc(&json_text)
+                    .map_err(|e| ExecError::Unsupported(format!("DOC_UPDATE invalid JSON: {e}")))?;
+                let mut store = self.doc_store.write();
+                if store.get(id).is_none() {
+                    return Ok(Value::Bool(false));
+                }
+                store.insert_with_id(id, jv);
+                Ok(Value::Bool(true))
+            }
+            "DOC_DELETE" => {
+                // doc_delete(id) → bool (true if the document existed).
+                require_args(fname, &args, 1)?;
+                let id = val_to_u64(&args[0], "DOC_DELETE id")?;
+                let removed = self.doc_store.write().delete(id);
+                Ok(Value::Bool(removed))
+            }
             "DOC_GET" => {
                 // doc_get(id) → JSON text or NULL
                 require_args(fname, &args, 1)?;
@@ -5540,6 +5569,8 @@ pub(crate) fn side_effecting_return_type(name: &str) -> Option<crate::types::Dat
         | "FTS_INDEX"
         | "FTS_INDEX_FACETED"
         | "FTS_REMOVE"
+        | "DOC_DELETE"
+        | "DOC_UPDATE"
         | "BLOB_STORE"
         | "BLOB_DELETE"
         | "BLOB_TAG"
