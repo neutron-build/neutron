@@ -1015,6 +1015,15 @@ async function buildRuntimeBundle(
   fs.mkdirSync(runtimeDir, { recursive: true });
 
   const entryPath = path.join(runtimeDir, `entry.${target}.ts`);
+  // Optional global middleware: <cwd>/src/middleware.{ts,tsx,js,mjs}.
+  const globalMiddlewarePath = [
+    "src/middleware.ts",
+    "src/middleware.tsx",
+    "src/middleware.js",
+    "src/middleware.mjs",
+  ]
+    .map((rel) => path.join(options.cwd, rel))
+    .find((abs) => fs.existsSync(abs));
   fs.writeFileSync(
     entryPath,
     generateRuntimeEntrySource(
@@ -1022,7 +1031,8 @@ async function buildRuntimeBundle(
       appRoutes,
       options.clientEntryScriptSrc,
       entryPath,
-      options.routeRules
+      options.routeRules,
+      globalMiddlewarePath
     ),
     "utf-8"
   );
@@ -1113,13 +1123,26 @@ function generateRuntimeEntrySource(
   appRoutes: Route[],
   clientEntryScriptSrc: string | null,
   entryPath: string,
-  routeRules: NeutronConfig["routes"] | undefined
+  routeRules: NeutronConfig["routes"] | undefined,
+  globalMiddlewarePath?: string
 ): string {
   const imports: string[] = [];
   const moduleEntries: string[] = [];
+  // Prepend an optional global middleware (outermost) in the generated entry.
+  // Only references __globalMiddlewareModule when its import was emitted.
+  const globalMiddlewarePrelude = globalMiddlewarePath
+    ? "  const __gmExport = __globalMiddlewareModule.middleware ?? __globalMiddlewareModule.default;\n" +
+      "  const __gmList = typeof __gmExport === 'function' ? [__gmExport] : (Array.isArray(__gmExport) ? __gmExport.filter((f) => typeof f === 'function') : []);\n" +
+      "  middlewares.push(...__gmList);\n"
+    : "";
   const routeDefs: string[] = [];
   const appRouteIds = appRoutes.map((route) => route.id);
   const routeRulesJson = JSON.stringify(routeRules || {});
+
+  if (globalMiddlewarePath) {
+    const relGm = relativeImportPath(path.dirname(entryPath), globalMiddlewarePath);
+    imports.push(`import * as __globalMiddlewareModule from "${relGm}";`);
+  }
 
   runtimeRoutes.forEach((route, index) => {
     const importVar = `routeModule${index}`;
@@ -1198,7 +1221,7 @@ async function handleNeutronRequestInner(request) {
   }
 
   const middlewares = [];
-  for (const route of allRoutes) {
+${globalMiddlewarePrelude}  for (const route of allRoutes) {
     const mod = routeModules.get(route.id);
     if (mod?.middleware) {
       middlewares.push(mod.middleware);
