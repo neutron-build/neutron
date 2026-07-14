@@ -60,6 +60,19 @@ pub use session::Session;
 pub use types::PreparedStmtHandle;
 use types::*;
 
+/// RAII guard that marks a session's command finished (idle from now) on drop —
+/// including when the command future is cancelled by statement_timeout, so the
+/// session never gets stuck "executing" and hidden from the idle sweep.
+#[cfg(feature = "server")]
+struct CommandGuard(std::sync::Arc<Session>);
+
+#[cfg(feature = "server")]
+impl Drop for CommandGuard {
+    fn drop(&mut self) {
+        self.0.mark_command_end();
+    }
+}
+
 /// The result of executing a statement.
 #[derive(Debug)]
 pub enum ExecResult {
@@ -1462,6 +1475,79 @@ impl Executor {
         actions
     }
 
+    /// Roll back transactions left open and idle longer than `timeout_ms`
+    /// (T1.3 idle-in-transaction). An abandoned `BEGIN` pins an MVCC read
+    /// snapshot, which holds the GC watermark down at that transaction's id so
+    /// no superseded row version can ever be reclaimed — unbounded disk growth
+    /// for the life of the process. This releases those snapshots. `timeout_ms
+    /// == 0` disables the sweep (matches Postgres's default). Returns how many
+    /// transactions were rolled back.
+    ///
+    /// The action is a server-side rollback identical to a client `ROLLBACK`
+    /// (the same session-scoped `rollback_transaction`, so cross-model state is
+    /// restored too). The client socket is left open — pgwire owns the read
+    /// loop and exposes no per-connection cancellation — so the client's next
+    /// statement simply runs in a fresh implicit transaction.
+    ///
+    /// Safe from a background task: every structure on the abort path is
+    /// lock-protected and `Send + Sync`, and a session is driven by a single
+    /// connection task, so the sweep contends only with that one task on
+    /// `txn_state`. The `executing` guard skips a session mid-command, and both
+    /// `commit`/`abort` are idempotent (`if let Some(txn)`), so a client that
+    /// resumes in the same instant is not corrupted — at worst the
+    /// `open_transactions` gauge is transiently off by one.
+    #[cfg(feature = "server")]
+    pub async fn sweep_idle_in_transaction(&self, timeout_ms: u64) -> usize {
+        use std::sync::atomic::Ordering;
+        if timeout_ms == 0 {
+            return 0;
+        }
+        let now = session::now_millis();
+        // Snapshot (id, Arc<Session>) under the sync lock; abort asynchronously
+        // afterward so the sessions map is not held across an await.
+        let candidates: Vec<(u64, Arc<Session>)> = self
+            .sessions
+            .read()
+            .iter()
+            .map(|(id, s)| (*id, s.clone()))
+            .collect();
+        let mut aborted = 0usize;
+        for (id, session) in candidates {
+            // A session running a command is not idle (a long query must not be
+            // mistaken for an abandoned transaction).
+            if session.executing.load(Ordering::Relaxed) {
+                continue;
+            }
+            let idle = now.saturating_sub(session.last_activity_ms.load(Ordering::Relaxed));
+            if idle < timeout_ms {
+                continue;
+            }
+            // Only an open transaction holds a snapshot worth releasing.
+            if !session.txn_state.read().await.active {
+                continue;
+            }
+            // Final re-check to shrink the window where the client resumes just
+            // as the sweep fires.
+            if session.executing.load(Ordering::Relaxed) {
+                continue;
+            }
+            CURRENT_SESSION
+                .scope(
+                    session.clone(),
+                    STORAGE_SESSION_ID.scope(id, async {
+                        let _ = self.rollback_transaction().await;
+                    }),
+                )
+                .await;
+            tracing::warn!(
+                "idle-in-transaction: rolled back session {id} after {idle}ms idle \
+                 (timeout {timeout_ms}ms); MVCC snapshot released"
+            );
+            aborted += 1;
+        }
+        aborted
+    }
+
     /// Get the session for the given ID, falling back to the default session.
     fn get_session(&self, id: u64) -> Arc<Session> {
         self.sessions
@@ -1542,9 +1628,14 @@ impl Executor {
         Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>,
     > {
         let session = self.get_session(session_id);
+        let guard_sess = session.clone();
         Box::pin(CURRENT_SESSION.scope(
             session,
-            STORAGE_SESSION_ID.scope(session_id, async move { self.execute(sql).await }),
+            STORAGE_SESSION_ID.scope(session_id, async move {
+                guard_sess.mark_command_start();
+                let _guard = CommandGuard(guard_sess);
+                self.execute(sql).await
+            }),
         ))
     }
 
@@ -1559,9 +1650,12 @@ impl Executor {
         Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>,
     > {
         let session = self.get_session(session_id);
+        let guard_sess = session.clone();
         Box::pin(CURRENT_SESSION.scope(
             session,
             STORAGE_SESSION_ID.scope(session_id, async move {
+                guard_sess.mark_command_start();
+                let _guard = CommandGuard(guard_sess);
                 let mut results = Vec::new();
                 for stmt in statements {
                     results.push(self.execute_statement(stmt).await?);
