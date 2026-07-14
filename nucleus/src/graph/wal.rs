@@ -87,6 +87,8 @@ pub struct GraphSnapshot<'a> {
 pub struct GraphWal {
     path: PathBuf,
     writer: Mutex<BufWriter<File>>,
+    /// Group-commit fsync coordinator (durability of the un-checkpointed tail).
+    syncer: crate::storage::wal_util::WalSync,
 }
 
 impl GraphWal {
@@ -109,6 +111,7 @@ impl GraphWal {
             Self {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
+                syncer: crate::storage::wal_util::WalSync::new(),
             },
             state,
         ))
@@ -225,7 +228,31 @@ impl GraphWal {
         crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
         let file = OpenOptions::new().append(true).open(&self.path)?;
         *w = BufWriter::new(file);
+        // The snapshot was fsync'd by `atomic_replace_wal`; count it as covered.
+        let mark = self.syncer.on_append();
+        self.syncer.mark_synced(mark);
         Ok(())
+    }
+
+    /// Flush + `fsync` the log, capturing (under the writer lock) the highest
+    /// append LSN the fsync covers.
+    fn sync_covering(&self) -> io::Result<u64> {
+        let mut w = self.writer.lock();
+        let covered = self.syncer.current();
+        w.flush()?;
+        w.get_ref().sync_all()?;
+        Ok(covered)
+    }
+
+    /// Group-commit sync: durable coverage of every append made before this
+    /// call; concurrent committers share fsyncs.
+    pub fn group_sync(&self) -> io::Result<()> {
+        self.syncer.group_sync(|| self.sync_covering())
+    }
+
+    /// Whether appends exist that no completed fsync covers yet.
+    pub fn is_dirty(&self) -> bool {
+        self.syncer.is_dirty()
     }
 
     // ─── Internal helpers ─────────────────────────────────────────────────
@@ -233,7 +260,9 @@ impl GraphWal {
     fn append_raw(&self, data: &[u8]) -> io::Result<()> {
         let mut w = self.writer.lock();
         w.write_all(data)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 }
 
@@ -570,6 +599,18 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect()
+    }
+
+    #[test]
+    fn group_sync_marks_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = GraphWal::open(dir.path()).unwrap();
+        assert!(!wal.is_dirty(), "a fresh WAL has no un-fsynced appends");
+        let props = make_props(&[("name", PropValue::Text("Alice".into()))]);
+        wal.log_add_node(1, &["Person".into()], &props).unwrap();
+        assert!(wal.is_dirty(), "an append is uncovered until fsync");
+        wal.group_sync().unwrap();
+        assert!(!wal.is_dirty(), "group_sync fsyncs the tail");
     }
 
     #[test]
