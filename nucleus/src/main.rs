@@ -195,6 +195,39 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Back up a data directory to a portable snapshot (physical, v1).
+    ///
+    /// Take it against a STOPPED instance for a consistent snapshot. Restore
+    /// requires the same Nucleus version (physical snapshots are version-locked).
+    Backup {
+        /// Data directory to back up.
+        #[arg(short, long, default_value = "nucleus_data")]
+        data: PathBuf,
+
+        /// Destination snapshot directory.
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Overwrite the destination if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Restore a data directory from a snapshot created by `backup`.
+    Restore {
+        /// Snapshot directory produced by `nucleus backup`.
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Data directory to restore into. Must be empty unless --force.
+        #[arg(short, long, default_value = "nucleus_data")]
+        data: PathBuf,
+
+        /// Overwrite the data directory if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -320,6 +353,16 @@ async fn main() {
             } else {
                 cmd_shell(&host, port).await;
             }
+        }
+        Some(Commands::Backup {
+            data,
+            output,
+            force,
+        }) => {
+            cmd_backup(data, output, force);
+        }
+        Some(Commands::Restore { input, data, force }) => {
+            cmd_restore(input, data, force);
         }
         None => {
             // Default: start in server mode (same as `nucleus start`)
@@ -2009,6 +2052,36 @@ fn cmd_init(data: PathBuf) {
     std::fs::create_dir_all(&data).expect("failed to create data directory");
     println!("Initialized Nucleus data directory: {}", data.display());
     println!("Start with: nucleus start --data {}", data.display());
+}
+
+fn cmd_backup(data: PathBuf, output: PathBuf, force: bool) {
+    match nucleus::backup::backup_data_dir(&data, &output, force, env!("CARGO_PKG_VERSION")) {
+        Ok(manifest) => {
+            println!("Backup complete: {} -> {}", data.display(), output.display());
+            println!("  Nucleus version: {}", manifest.nucleus_version);
+            println!(
+                "  Restore with: nucleus restore --input {} --data <dir>",
+                output.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("Backup failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_restore(input: PathBuf, data: PathBuf, force: bool) {
+    match nucleus::backup::restore_data_dir(&input, &data, force, env!("CARGO_PKG_VERSION")) {
+        Ok(_) => {
+            println!("Restore complete: {} -> {}", input.display(), data.display());
+            println!("  Start with: nucleus start --data {}", data.display());
+        }
+        Err(e) => {
+            eprintln!("Restore failed: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn cmd_version() {
