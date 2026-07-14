@@ -4,7 +4,12 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 /// A value in Nucleus. All data flows through this enum.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `PartialEq`/`Eq`/`Hash`/`Ord` are hand-implemented (not derived) so integer widths
+/// (`Int32`/`Int64`) are interchangeable as keys everywhere — the same logical SQL value
+/// must compare, hash, and index-encode identically regardless of width. See
+/// [`Value::as_canonical_int`].
+#[derive(Debug, Clone)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -410,6 +415,23 @@ impl Value {
         }
     }
 
+    /// Canonical `i64` if this is an integer (`Int32`/`Int64`), else `None`.
+    ///
+    /// Integer widths are the same logical SQL value, so equality, hashing, and B-tree
+    /// index-key encoding all canonicalize through this — `Int32(n)` and `Int64(n)` must
+    /// be interchangeable as keys everywhere (`PartialEq`/`Hash` agree with `Ord`). This
+    /// is what keeps indexed lookups, UNIQUE enforcement, joins, GROUP BY, and DISTINCT
+    /// correct when the same value is stored at different widths (`VALUES` yields `Int32`,
+    /// `INSERT ... SELECT`/`generate_series` yields `Int64`).
+    #[inline]
+    pub(crate) fn as_canonical_int(&self) -> Option<i64> {
+        match self {
+            Value::Int32(n) => Some(*n as i64),
+            Value::Int64(n) => Some(*n),
+            _ => None,
+        }
+    }
+
     /// Return the type name as a string.
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -455,16 +477,71 @@ impl Value {
     }
 }
 
+impl PartialEq for Value {
+    fn eq(&self, other: &Value) -> bool {
+        // Integer widths (`Int32`/`Int64`) are value-equal — the same logical SQL value —
+        // matching `Ord`. This keeps every `HashMap`/`HashSet`/`==`-keyed structure
+        // consistent with every `BTreeMap`/sort-keyed one, which is what makes indexed
+        // lookups, UNIQUE enforcement, joins, GROUP BY, and DISTINCT correct across widths.
+        // (Int↔Float stays strict here: columns are single-typed and folding floats would
+        // perturb DISTINCT/GROUP BY; the `Ord` int/float coercion is a separate legacy case.)
+        if let (Some(a), Some(b)) = (self.as_canonical_int(), other.as_canonical_int()) {
+            return a == b;
+        }
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Float64(a), Value::Float64(b)) => a == b,
+            (Value::Text(a), Value::Text(b)) => a == b,
+            (Value::Jsonb(a), Value::Jsonb(b)) => a == b,
+            (Value::Date(a), Value::Date(b)) => a == b,
+            (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
+            (Value::TimestampTz(a), Value::TimestampTz(b)) => a == b,
+            (Value::Numeric(a), Value::Numeric(b)) => a == b,
+            (Value::Uuid(a), Value::Uuid(b)) => a == b,
+            (Value::Bytea(a), Value::Bytea(b)) => a == b,
+            (Value::Array(a), Value::Array(b)) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => a == b,
+            (
+                Value::Interval {
+                    months: am,
+                    days: ad,
+                    microseconds: aus,
+                },
+                Value::Interval {
+                    months: bm,
+                    days: bd,
+                    microseconds: bus,
+                },
+            ) => am == bm && ad == bd && aus == bus,
+            _ => false,
+        }
+    }
+}
+
 impl Eq for Value {}
+
+/// Fixed tag mixed into integer hashes so `Int32(n)` and `Int64(n)` (which are now
+/// `PartialEq`-equal) also hash equal, independent of their enum discriminant. Any
+/// constant works — collisions with other variants are harmless; only equal-hashes-
+/// for-equal-values matters.
+const INT_HASH_TAG: u8 = 0xF1;
 
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        // Integers hash by canonical `i64` (behind a fixed tag) so `Int32(n)` and
+        // `Int64(n)` land in the same bucket — required for `Hash`/`Eq` agreement now
+        // that they are equal. Everything else keeps the discriminant-first scheme.
+        if let Some(i) = self.as_canonical_int() {
+            INT_HASH_TAG.hash(state);
+            i.hash(state);
+            return;
+        }
         core::mem::discriminant(self).hash(state);
         match self {
             Value::Null => {}
             Value::Bool(b) => b.hash(state),
-            Value::Int32(n) => n.hash(state),
-            Value::Int64(n) => n.hash(state),
+            Value::Int32(_) | Value::Int64(_) => unreachable!("integers handled above"),
             Value::Float64(f) => f.to_bits().hash(state),
             Value::Text(s) | Value::Numeric(s) => s.hash(state),
             Value::Jsonb(v) => format!("{v}").hash(state),
