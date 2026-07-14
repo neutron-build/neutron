@@ -1818,6 +1818,18 @@ impl StorageEngine for DiskEngine {
         self.pool.wal_force_needed()
     }
 
+    async fn flush_schema(&self) -> Result<(), StorageError> {
+        // `save_table_directory` writes meta page 0 through the buffer pool,
+        // which dirties it; `wal_force_pending` then WAL-logs and group-syncs
+        // that page. Unlike `make_durable`, there is no pending-page gate — a
+        // bare CREATE/DROP dirties no data page, and skipping the force here is
+        // exactly the catalog-ahead-of-storage hole we are closing.
+        self.save_table_directory()?;
+        self.pool
+            .wal_force_pending()
+            .map_err(|e| StorageError::Io(e.to_string()))
+    }
+
     async fn checkpoint(&self) -> Result<(), StorageError> {
         self.checkpoint()
     }

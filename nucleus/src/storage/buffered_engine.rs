@@ -309,6 +309,10 @@ impl StorageEngine for BufferedDiskEngine {
         !self.is_in_txn() && self.inner.durability_pending()
     }
 
+    async fn flush_schema(&self) -> Result<(), StorageError> {
+        self.inner.flush_schema().await
+    }
+
     // -- Delegate everything else to inner DiskEngine --
 
     async fn create_index(
