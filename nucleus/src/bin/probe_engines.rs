@@ -10,7 +10,8 @@ use std::sync::Arc;
 use nucleus::catalog::Catalog;
 use nucleus::executor::{ExecResult, Executor};
 use nucleus::storage::{
-    ColumnarStorageEngine, LsmStorageEngine, MemoryEngine, MvccStorageAdapter, StorageEngine,
+    ColumnarStorageEngine, DiskEngine, LsmStorageEngine, MemoryEngine, MvccStorageAdapter,
+    StorageEngine,
 };
 use nucleus::types::Value;
 
@@ -39,6 +40,7 @@ impl Rng {
 #[derive(Clone, Copy, PartialEq)]
 enum Ty {
     Int,
+    BigInt,
     Real,
     Text,
 }
@@ -74,11 +76,18 @@ impl Schema {
             ty: Ty::Text,
             nn: true,
         });
-        let extra = 1 + rng.below(3);
+        // A guaranteed BIGINT column so every run exercises the enduring width surface
+        // (Int32 literal / Int32 column vs Int64-stored BIGINT) after canonicalization.
+        cols.push(Col {
+            name: NAMES[2],
+            ty: Ty::BigInt,
+            nn: true,
+        });
+        let extra = 1 + rng.below(2);
         for k in 0..extra {
-            let ty = *rng.pick(&[Ty::Int, Ty::Int, Ty::Real, Ty::Text]);
+            let ty = *rng.pick(&[Ty::Int, Ty::BigInt, Ty::Real, Ty::Text]);
             cols.push(Col {
-                name: NAMES[2 + k],
+                name: NAMES[3 + k],
                 ty,
                 nn: rng.chance(40),
             });
@@ -96,6 +105,7 @@ impl Schema {
                 }
                 let ty = match c.ty {
                     Ty::Int => "INTEGER",
+                    Ty::BigInt => "BIGINT",
                     Ty::Real => "REAL",
                     Ty::Text => "TEXT",
                 };
@@ -108,7 +118,7 @@ impl Schema {
         self.cols.iter().filter(|c| f(c)).collect()
     }
     fn int_cols(&self) -> Vec<&Col> {
-        self.of(|c| c.ty == Ty::Int)
+        self.of(|c| matches!(c.ty, Ty::Int | Ty::BigInt))
     }
     fn nn_nonid(&self) -> Vec<&Col> {
         self.of(|c| c.nn && c.name != "id")
@@ -123,14 +133,14 @@ fn gen_value(rng: &mut Rng, c: &Col) -> String {
         return "NULL".into();
     }
     match c.ty {
-        Ty::Int => rng.int(-5, 20).to_string(),
+        Ty::Int | Ty::BigInt => rng.int(-5, 20).to_string(),
         Ty::Real => format!("{:.1}", rng.int(-50, 50) as f64 / 10.0),
         Ty::Text => format!("'{}'", rng.pick(CATS)),
     }
 }
 fn gen_literal(rng: &mut Rng, c: &Col) -> String {
     match c.ty {
-        Ty::Int => rng.int(-5, 20).to_string(),
+        Ty::Int | Ty::BigInt => rng.int(-5, 20).to_string(),
         Ty::Real => format!("{:.1}", rng.int(-50, 50) as f64 / 10.0),
         Ty::Text => format!("'{}'", rng.pick(CATS)),
     }
@@ -395,11 +405,21 @@ fn compare(mut a: Vec<Vec<String>>, mut b: Vec<Vec<String>>, ordered: bool) -> b
     a == b
 }
 
-fn make_engine(name: &str) -> Arc<dyn StorageEngine> {
+fn make_engine(name: &str, catalog: &Arc<Catalog>) -> Arc<dyn StorageEngine> {
     match name {
         "lsm" => Arc::new(LsmStorageEngine::new()),
         "memory" => Arc::new(MemoryEngine::new()),
         "columnar" => Arc::new(ColumnarStorageEngine::new()),
+        // The disk engine is where the integer-width bug actually diverged — its B-tree
+        // compares serialized key bytes. Include it so the differential guards it. Fresh
+        // temp file per call; the previous iteration's engine is already dropped.
+        "disk" => {
+            let path = std::env::temp_dir().join("probe_engines_disk.ndb");
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("wal"));
+            let _ = std::fs::remove_dir_all(path.with_extension("wal.d"));
+            Arc::new(DiskEngine::open(&path, catalog.clone()).expect("disk engine open"))
+        }
         _ => Arc::new(MvccStorageAdapter::new()),
     }
 }
@@ -423,11 +443,10 @@ fn run_pair(
         let inserts = gen_inserts(&schema, &mut rng, rows);
         let mut next_id = rows as i64 + 1;
 
-        let exa = Arc::new(Executor::new(Arc::new(Catalog::new()), make_engine("mvcc")));
-        let exb = Arc::new(Executor::new(
-            Arc::new(Catalog::new()),
-            make_engine(engine_b),
-        ));
+        let cat_a = Arc::new(Catalog::new());
+        let exa = Arc::new(Executor::new(cat_a.clone(), make_engine("mvcc", &cat_a)));
+        let cat_b = Arc::new(Catalog::new());
+        let exb = Arc::new(Executor::new(cat_b.clone(), make_engine(engine_b, &cat_b)));
         let mut ops = vec![ddl.clone(), inserts.clone()];
         for stmt in [&ddl, &inserts] {
             if !exec(&exa, stmt) || !exec(&exb, stmt) {
@@ -500,6 +519,7 @@ fn main_impl() {
         "lsm".to_string(),
         "memory".to_string(),
         "columnar".to_string(),
+        "disk".to_string(),
     ];
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;

@@ -1908,7 +1908,7 @@ impl StorageEngine for DiskEngine {
             let key_rids = idx.btree.range_scan(Some(&low_key), Some(&high_key)).ok()?;
             let mut rows = Vec::with_capacity(key_rids.len());
             for (key_bytes, _rid) in &key_rids {
-                if let Some(val) = deserialize_index_key(key_bytes) {
+                if let Some(val) = deserialize_index_key(key_bytes, &idx.col_type) {
                     rows.push(vec![val]);
                 }
             }
@@ -1918,7 +1918,7 @@ impl StorageEngine for DiskEngine {
             let key_rids = idx.btree.range_scan(None, None).ok()?;
             let mut rows = Vec::with_capacity(key_rids.len());
             for (key_bytes, _rid) in &key_rids {
-                if let Some(val) = deserialize_index_key(key_bytes) {
+                if let Some(val) = deserialize_index_key(key_bytes, &idx.col_type) {
                     rows.push(vec![val]);
                 }
             }
@@ -2307,22 +2307,23 @@ fn normalize_index_bound_value(value: &Value, index_type: &DataType) -> Option<V
 }
 
 fn serialize_index_key(val: &Value) -> Vec<u8> {
+    // Integers of any width (`Int32`/`Int64`) encode identically — tag 7 + the
+    // canonical i64, sign-flipped for order-preserving unsigned byte comparison — so
+    // the same logical value maps to the same key bytes regardless of the width it was
+    // stored at. This is what makes disk-engine point lookups, UNIQUE enforcement, and
+    // range scans correct across `VALUES` (Int32) vs `INSERT ... SELECT`/`generate_series`
+    // (Int64) inserts, and fixes a latent mis-ordering (the old code tagged every Int32
+    // below every Int64 regardless of value). Legacy tags 2/3 are still decoded on read
+    // for safety but are never written.
+    if let Some(i) = val.as_canonical_int() {
+        let mut buf = vec![7];
+        let u = (i as u64) ^ 0x8000_0000_0000_0000;
+        buf.extend_from_slice(&u.to_be_bytes());
+        return buf;
+    }
     match val {
         Value::Null => vec![0],
         Value::Bool(b) => vec![1, *b as u8],
-        Value::Int32(i) => {
-            let mut buf = vec![2];
-            // XOR sign bit for comparable ordering
-            let u = (*i as u32) ^ 0x8000_0000;
-            buf.extend_from_slice(&u.to_be_bytes());
-            buf
-        }
-        Value::Int64(i) => {
-            let mut buf = vec![3];
-            let u = (*i as u64) ^ 0x8000_0000_0000_0000;
-            buf.extend_from_slice(&u.to_be_bytes());
-            buf
-        }
         Value::Float64(f) => {
             let mut buf = vec![4];
             let bits = f.to_bits();
@@ -2349,24 +2350,48 @@ fn serialize_index_key(val: &Value) -> Vec<u8> {
     }
 }
 
-/// Deserialize a B-tree index key back into a Value.
-/// Inverse of `serialize_index_key`.
-fn deserialize_index_key(data: &[u8]) -> Option<Value> {
+/// Reconstruct an integer key at the index column's declared width, so an
+/// index-only scan returns the same type a heap scan would (an `INT` column
+/// yields `Int32`, not `Int64`).
+fn int_value_for_type(i: i64, col_type: &DataType) -> Value {
+    match col_type {
+        DataType::Int32 => match i32::try_from(i) {
+            Ok(v) => Value::Int32(v),
+            Err(_) => Value::Int64(i),
+        },
+        _ => Value::Int64(i),
+    }
+}
+
+/// Deserialize a B-tree index key back into a Value. Inverse of
+/// `serialize_index_key`. `col_type` is the index column's declared type, used to
+/// reconstruct integer keys at the correct width.
+fn deserialize_index_key(data: &[u8], col_type: &DataType) -> Option<Value> {
     if data.is_empty() {
         return None;
     }
     match data[0] {
         0 => Some(Value::Null),
         1 => data.get(1).map(|&b| Value::Bool(b != 0)),
+        // Canonical integer key (current format).
+        7 if data.len() >= 9 => {
+            let u = u64::from_be_bytes([
+                data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
+            ]);
+            Some(int_value_for_type((u ^ 0x8000_0000_0000_0000) as i64, col_type))
+        }
+        // Legacy Int32 (4-byte) key — never written by current code; decoded
+        // defensively so a pre-canonicalization key can't silently drop a row.
         2 if data.len() >= 5 => {
             let u = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-            Some(Value::Int32((u ^ 0x8000_0000) as i32))
+            Some(int_value_for_type(((u ^ 0x8000_0000) as i32) as i64, col_type))
         }
+        // Legacy Int64 (8-byte) key — likewise defensive.
         3 if data.len() >= 9 => {
             let u = u64::from_be_bytes([
                 data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
             ]);
-            Some(Value::Int64((u ^ 0x8000_0000_0000_0000) as i64))
+            Some(int_value_for_type((u ^ 0x8000_0000_0000_0000) as i64, col_type))
         }
         4 if data.len() >= 9 => {
             let u = u64::from_be_bytes([
