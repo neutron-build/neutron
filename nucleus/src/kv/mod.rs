@@ -1433,6 +1433,13 @@ impl KvStore {
         self.wal.as_ref()
     }
 
+    /// Access the collections WAL (if any) — the second durable log this store
+    /// owns (lists/hashes/sets/zsets/HLL/streams).
+    #[cfg(feature = "server")]
+    pub fn collections_wal(&self) -> Option<&Arc<crate::kv::collections_wal::CollectionWal>> {
+        self.collections.wal()
+    }
+
     /// Capture a snapshot of all non-expired entries for transaction rollback.
     pub fn txn_snapshot(&self) -> KvTxnSnapshot {
         let mut entries = HashMap::new();

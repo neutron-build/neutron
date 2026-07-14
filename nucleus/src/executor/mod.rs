@@ -1752,17 +1752,52 @@ impl Executor {
     }
 
     /// Force durability of the specialty-store WALs that log through scalar
-    /// functions and the KV path (KV, timeseries, vector, graph, streams, CDC).
-    /// Unlike SQL DML, those writes never flow through `force_wal_durability`,
-    /// yet an acked write must be just as durable. `is_dirty()` is a single
-    /// atomic load, so this is ~free when nothing was written (e.g. a pure
-    /// read); only a log with un-fsynced appends pays an fsync, and concurrent
-    /// callers group-commit. The caller gates on synchronous_commit + the
-    /// autocommit/commit boundary.
+    /// functions and the KV path (KV, KV-collections, timeseries, vector,
+    /// graph, streams). Unlike SQL DML, those writes never flow through
+    /// `force_wal_durability`, yet an acked write must be just as durable.
+    /// `is_dirty()` is a single atomic load, so this is ~free when nothing was
+    /// written (e.g. a pure read); only a log with un-fsynced appends pays an
+    /// fsync, and concurrent callers group-commit. The caller gates on
+    /// synchronous_commit + the autocommit/commit boundary.
+    ///
+    /// The CDC log is deliberately excluded: it appends on *every* DML row
+    /// change, so fsyncing it here would add a second fsync to every SQL commit
+    /// (on top of `force_wal_durability`). CDC is a derived change-feed — the
+    /// source rows are already durable via the SQL WAL, and consumers re-sync
+    /// from that source of truth — so a bounded, checkpoint-sized tail loss is
+    /// acceptable. When logical replication is wired, CDC should instead be
+    /// folded into the SQL WAL so one fsync covers both.
     fn force_specialty_durability(&self) -> Result<(), ExecError> {
         let io_err =
             |e: std::io::Error| ExecError::Storage(crate::storage::StorageError::Io(e.to_string()));
         if let Some(wal) = self.kv_store().wal()
+            && wal.is_dirty()
+        {
+            wal.group_sync().map_err(io_err)?;
+        }
+        if let Some(wal) = self.kv_store().collections_wal()
+            && wal.is_dirty()
+        {
+            wal.group_sync().map_err(io_err)?;
+        }
+        {
+            let ts = self.ts_store.read();
+            if ts.wal_is_dirty() {
+                ts.wal_group_sync().map_err(io_err)?;
+            }
+        }
+        if let Some(ref wal) = self.vector_wal
+            && wal.is_dirty()
+        {
+            wal.group_sync().map_err(io_err)?;
+        }
+        {
+            let graph = self.graph_store().read();
+            if graph.wal_is_dirty() {
+                graph.wal_group_sync().map_err(io_err)?;
+            }
+        }
+        if let Some(ref wal) = self.streams_wal
             && wal.is_dirty()
         {
             wal.group_sync().map_err(io_err)?;

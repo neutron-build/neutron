@@ -50,6 +50,8 @@ pub struct StreamsWalState {
 pub struct StreamsWal {
     path: PathBuf,
     writer: Mutex<BufWriter<File>>,
+    /// Group-commit fsync coordinator (durability of the un-checkpointed tail).
+    syncer: crate::storage::wal_util::WalSync,
 }
 
 impl StreamsWal {
@@ -74,6 +76,7 @@ impl StreamsWal {
             Self {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
+                syncer: crate::storage::wal_util::WalSync::new(),
             },
             state,
         ))
@@ -105,7 +108,30 @@ impl StreamsWal {
 
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
+    }
+
+    /// Flush + `fsync` the log, capturing (under the writer lock) the highest
+    /// append LSN the fsync covers.
+    fn sync_covering(&self) -> io::Result<u64> {
+        let mut w = self.writer.lock();
+        let covered = self.syncer.current();
+        w.flush()?;
+        w.get_ref().sync_all()?;
+        Ok(covered)
+    }
+
+    /// Group-commit sync: durable coverage of every append made before this
+    /// call; concurrent committers share fsyncs.
+    pub fn group_sync(&self) -> io::Result<()> {
+        self.syncer.group_sync(|| self.sync_covering())
+    }
+
+    /// Whether appends exist that no completed fsync covers yet.
+    pub fn is_dirty(&self) -> bool {
+        self.syncer.is_dirty()
     }
 
     /// Write a full snapshot and truncate the log to just that snapshot.
@@ -152,6 +178,9 @@ impl StreamsWal {
         crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
         let file = OpenOptions::new().append(true).open(&self.path)?;
         *w = BufWriter::new(file);
+        // The snapshot was fsync'd by `atomic_replace_wal`; count it as covered.
+        let mark = self.syncer.on_append();
+        self.syncer.mark_synced(mark);
         Ok(())
     }
 }
@@ -318,6 +347,22 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_sync_marks_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = StreamsWal::open(dir.path()).unwrap();
+        assert!(!wal.is_dirty(), "a fresh WAL has no un-fsynced appends");
+        wal.log_xadd(
+            "s",
+            &StreamEntryId::new(1, 0),
+            &[("k".into(), "v".into())],
+        )
+        .unwrap();
+        assert!(wal.is_dirty(), "an append is uncovered until fsync");
+        wal.group_sync().unwrap();
+        assert!(!wal.is_dirty(), "group_sync fsyncs the tail");
+    }
 
     #[test]
     fn test_xadd_and_replay() {

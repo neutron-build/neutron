@@ -551,6 +551,20 @@ impl GraphStore {
         }
     }
 
+    /// Whether the WAL has appended mutations no completed fsync covers yet.
+    pub fn wal_is_dirty(&self) -> bool {
+        self.wal.as_ref().is_some_and(|w| w.is_dirty())
+    }
+
+    /// Group-commit fsync the WAL: make every appended mutation durable before
+    /// the write is acked. No-op in memory-only mode.
+    pub fn wal_group_sync(&self) -> std::io::Result<()> {
+        match self.wal {
+            Some(ref w) => w.group_sync(),
+            None => Ok(()),
+        }
+    }
+
     /// Capture full graph state for transaction rollback.
     pub fn txn_snapshot(&self) -> GraphTxnSnapshot {
         GraphTxnSnapshot {

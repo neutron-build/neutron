@@ -299,6 +299,13 @@ impl ShardedCollections {
         self.wal = Some(wal);
     }
 
+    /// The attached collections WAL, if any (durable mode). Used to force
+    /// group-commit fsync at the ack boundary.
+    #[cfg(feature = "server")]
+    pub fn wal(&self) -> Option<&Arc<CollectionWal>> {
+        self.wal.as_ref()
+    }
+
     /// Determine shard index for a given key.
     fn shard_index(key: &str) -> usize {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
