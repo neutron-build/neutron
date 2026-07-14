@@ -12,18 +12,28 @@ version **at publish time** — bump core first and the pin is automatic.
 
 ## Branch state (verified 2026-07-14)
 
-`feat/render-core-unification` is **complete** (5 commits: d1a066b docker-preset
-fix, ecb11f7 dev core, 51f8817 prod codegen, da84835 dead-code, ad1583c
-playground regen) and a **clean fast-forward from main** (main is 0 ahead). So
-you can merge it to main first, then publish from main:
+- **`feat/render-core-unification`** — the render-core unification, 5 commits,
+  a **clean fast-forward from main** (main 0 ahead). This is the minimal,
+  isolated publish source.
+- **A follow-on commit `d8e7557`** (on `fix/nucleus-value-type-consistency`)
+  extracts shared `core/head.ts` + adds the render-guards CI harness + docs
+  import fixes. TS-only, 271 tests + guard green. It's an *improvement* on top
+  of render-core, not required to publish.
+
+**Two publish choices:**
 
 ```bash
-# (optional, recommended) merge the finished branch — it's a clean fast-forward
+# (a) minimal — publish render-core as-is (proven, byte-identical golden output)
 git checkout main && git merge --ff-only feat/render-core-unification
+
+# (b) include the head-extraction — cherry-pick the TS-only follow-on first
+git checkout feat/render-core-unification
+git cherry-pick d8e7557        # clean: touches only typescript/ (no nucleus)
+# then merge to main + publish
 ```
 
-Note: another workstream may have uncommitted `nucleus/*.rs` changes in the
-working tree — commit/stash those before switching branches.
+Note: `fix/nucleus-value-type-consistency` also has unrelated in-progress
+`nucleus/*.rs` (Rust) work — nothing to do with the npm TS packages; leave it.
 
 ## Steps
 
