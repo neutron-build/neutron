@@ -361,6 +361,20 @@ pub trait StorageEngine: Send + Sync {
         false
     }
 
+    /// Force the on-disk schema/directory (table→first-page map + free list)
+    /// durable, regardless of whether any data page is WAL-pending.
+    ///
+    /// This is the DDL commit primitive. A bare `CREATE TABLE` (or dropping an
+    /// empty table) dirties no data page, so `make_durable`'s pending-page gate
+    /// would skip forcing the directory — leaving the catalog, which is fsync'd
+    /// on every DDL, ahead of storage. On a crash there, storage would either
+    /// not know a just-created table or trust a stale first-page pointer. Called
+    /// before the catalog is persisted so storage is never behind it. Engines
+    /// without a persistent directory no-op.
+    async fn flush_schema(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     /// Begin an explicit transaction. Engines that support MVCC will take a
     /// snapshot; simple engines do nothing.
     async fn begin_txn(&self) -> Result<(), StorageError> {

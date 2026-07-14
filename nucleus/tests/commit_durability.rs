@@ -115,6 +115,42 @@ async fn autocommit_inserts_survive_simulated_crash() {
     );
 }
 
+/// A bare `CREATE TABLE` (no inserts) dirties no data page, so pre-fix the
+/// on-disk table directory was never forced — only the catalog was fsync'd,
+/// leaving storage behind it. The `flush_schema` at DDL commit now forces the
+/// directory. We verify at the raw DiskEngine level (NO catalog re-register, the
+/// band-aid that would otherwise mask this): the recovered directory itself must
+/// carry the table across a kill -9, so a scan returns empty rather than
+/// TableNotFound.
+#[tokio::test]
+async fn bare_create_table_directory_is_crash_durable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let (ex, _buf) = boot(&data).await;
+
+    exec(&ex, "CREATE TABLE cd_bare (id BIGINT)").await;
+
+    // kill -9 snapshot taken while the engine is alive (no clean-shutdown flush).
+    let crash = tmp.path().join("crash");
+    copy_dir(&data, &crash);
+    drop(ex);
+
+    // Reopen the DiskEngine directly — a fresh empty catalog, so nothing
+    // re-creates the table from catalog metadata. Only storage's own recovered
+    // directory can know it.
+    let catalog = Arc::new(Catalog::new());
+    let db_path = crash.join("nucleus.db");
+    let engine =
+        DiskEngine::open_segmented_with_sync(&db_path, catalog, 1024, 16, SyncMode::Fsync).unwrap();
+    let scanned = engine.scan("cd_bare").await;
+    assert!(
+        scanned.is_ok(),
+        "a CREATE-only table must be recoverable from the crash-forced storage \
+         directory, got {scanned:?}"
+    );
+    assert_eq!(scanned.unwrap().len(), 0, "the recovered table is empty");
+}
+
 #[tokio::test]
 async fn synchronous_commit_off_defers_durability() {
     let tmp = tempfile::tempdir().unwrap();

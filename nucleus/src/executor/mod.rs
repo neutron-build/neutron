@@ -3289,7 +3289,18 @@ impl Executor {
             self.ast_cache.write().clear();
             self.query_cache_invalidate_all();
             #[cfg(feature = "server")]
-            self.persist_catalog().await;
+            {
+                // Force STORAGE durable BEFORE the catalog. The catalog is
+                // fsync'd on every DDL; if storage lagged it, a crash here would
+                // leave the catalog naming a table storage never durably
+                // recorded (missing, or worse, pointing at a stale first page).
+                // Forcing storage first makes the only crash-window failure
+                // "storage ahead of catalog" — a reclaimable orphan, not silent
+                // corruption. Unconditional (not synchronous_commit-gated),
+                // matching persist_catalog, so DDL is durable on both sides.
+                self.storage.flush_schema().await.map_err(ExecError::Storage)?;
+                self.persist_catalog().await;
+            }
         }
 
         // Commit-time durability: force the WAL before the statement is acked.
