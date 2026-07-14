@@ -620,3 +620,61 @@ async fn test_index_visibility_rollback() {
 }
 
 // ========================================================================
+
+// ── T1.3: idle-in-transaction sweep ─────────────────────────────────────────
+
+#[cfg(feature = "server")]
+#[tokio::test]
+async fn idle_in_transaction_sweep_releases_and_respects_activity() {
+    use std::sync::atomic::Ordering;
+    let ex = test_executor();
+    let sid = ex.create_session();
+    ex.execute_with_session(sid, "CREATE TABLE idt (id INT)")
+        .await
+        .unwrap();
+    ex.execute_with_session(sid, "BEGIN").await.unwrap();
+    assert!(ex.session_in_transaction(sid), "in transaction after BEGIN");
+
+    // Disabled (timeout 0) never sweeps.
+    assert_eq!(ex.sweep_idle_in_transaction(0).await, 0);
+    // Fresh activity: a large timeout finds nothing.
+    assert_eq!(ex.sweep_idle_in_transaction(60_000).await, 0);
+    assert!(
+        ex.session_in_transaction(sid),
+        "not idle long enough — must stay in transaction"
+    );
+
+    // Backdate last activity so the session looks abandoned, then sweep.
+    ex.get_session(sid).last_activity_ms.store(0, Ordering::Relaxed);
+    assert_eq!(
+        ex.sweep_idle_in_transaction(1).await,
+        1,
+        "an idle-in-transaction session must be rolled back"
+    );
+    assert!(
+        !ex.session_in_transaction(sid),
+        "the transaction (and its snapshot) must be released"
+    );
+    // Idempotent: nothing left to sweep.
+    assert_eq!(ex.sweep_idle_in_transaction(1).await, 0);
+}
+
+#[cfg(feature = "server")]
+#[tokio::test]
+async fn idle_sweep_skips_executing_session() {
+    use std::sync::atomic::Ordering;
+    let ex = test_executor();
+    let sid = ex.create_session();
+    ex.execute_with_session(sid, "BEGIN").await.unwrap();
+    // Looks idle by timestamp, but a command is in flight (a long query): the
+    // sweep must not mistake it for abandoned.
+    let sess = ex.get_session(sid);
+    sess.last_activity_ms.store(0, Ordering::Relaxed);
+    sess.executing.store(true, Ordering::Relaxed);
+    assert_eq!(
+        ex.sweep_idle_in_transaction(1).await,
+        0,
+        "an executing session must never be swept"
+    );
+    assert!(ex.session_in_transaction(sid), "transaction must remain open");
+}

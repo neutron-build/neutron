@@ -5,7 +5,16 @@ use super::types::{CteTableMap, PreparedStmt};
 use crate::types::Row;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::RwLock;
+
+/// Wall-clock milliseconds since the Unix epoch (for idle tracking).
+pub(super) fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[cfg(feature = "server")]
 tokio::task_local! {
@@ -170,6 +179,13 @@ pub struct Session {
     pub(super) active_ctes: parking_lot::RwLock<CteTableMap>,
     #[allow(dead_code)]
     pub(super) session_context: parking_lot::RwLock<crate::security::SessionContext>,
+    /// Wall-clock ms of the last command boundary on this session — updated when
+    /// a command starts and completes. The idle-in-transaction sweep uses it to
+    /// find sessions that have sat in an open transaction with no activity.
+    pub(super) last_activity_ms: AtomicU64,
+    /// True while a command is executing on this session. The sweep skips
+    /// executing sessions so a long-running query is never mistaken for idle.
+    pub(super) executing: AtomicBool,
 }
 
 impl Default for Session {
@@ -200,7 +216,23 @@ impl Session {
             session_context: parking_lot::RwLock::new(crate::security::SessionContext::new(
                 "nucleus",
             )),
+            last_activity_ms: AtomicU64::new(now_millis()),
+            executing: AtomicBool::new(false),
         }
+    }
+
+    /// Mark a command as started on this session (idle tracking).
+    pub(super) fn mark_command_start(&self) {
+        self.executing.store(true, Ordering::Relaxed);
+        self.last_activity_ms.store(now_millis(), Ordering::Relaxed);
+    }
+
+    /// Mark the current command finished; the session becomes idle from now.
+    /// Called from a drop guard so a cancelled (statement-timeout) future still
+    /// clears the flag rather than leaving the session stuck "executing".
+    pub(super) fn mark_command_end(&self) {
+        self.last_activity_ms.store(now_millis(), Ordering::Relaxed);
+        self.executing.store(false, Ordering::Relaxed);
     }
 
     /// Reset session state for connection reuse.

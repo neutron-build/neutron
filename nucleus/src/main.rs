@@ -1246,6 +1246,31 @@ async fn cmd_start(cfg: StartConfig) {
         nucleus::background::Priority::Normal,
         std::time::Duration::from_secs(5),
     );
+    // Idle-in-transaction sweep (T1.3): roll back transactions left open and
+    // idle past the configured timeout so their MVCC snapshots are released and
+    // GC can advance. Only spawned when enabled (timeout > 0), so the default
+    // deployment is unchanged.
+    let idle_txn_timeout_secs = config.server.idle_in_transaction_timeout_secs;
+    if idle_txn_timeout_secs > 0 {
+        let executor_for_idle = executor.clone();
+        // Sweep on a cadence bounded to [1s, 30s] so an abandoned transaction is
+        // reclaimed promptly without busy-looping on very large timeouts.
+        let sweep_secs = idle_txn_timeout_secs.clamp(1, 30);
+        let timeout_ms = idle_txn_timeout_secs.saturating_mul(1000);
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
+            loop {
+                ticker.tick().await;
+                let n = executor_for_idle.sweep_idle_in_transaction(timeout_ms).await;
+                if n > 0 {
+                    tracing::info!("Idle-in-transaction sweep rolled back {n} transaction(s)");
+                }
+            }
+        });
+        tracing::info!("Idle-in-transaction timeout: {idle_txn_timeout_secs}s");
+    }
+
     // Set up WAL notifier for streaming replication broadcast channel.
     // The notifier bridges the storage WAL to the TCP replication transport.
     let wal_notifier = Arc::new(tokio::sync::Mutex::new(
