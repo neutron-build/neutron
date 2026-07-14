@@ -138,25 +138,20 @@ impl StreamsWal {
             }
         }
 
-        // Flush existing writer
-        {
-            self.writer.lock().flush()?;
-        }
+        // Serialize the complete new log body (SNAPSHOT tag + payload).
+        let mut contents = Vec::with_capacity(payload.len() + 1);
+        contents.push(ENTRY_SNAPSHOT);
+        contents.extend_from_slice(&payload);
 
-        // Truncate and rewrite as single SNAPSHOT entry
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        let mut w = BufWriter::new(file);
-        w.write_all(&[ENTRY_SNAPSHOT])?;
-        w.write_all(&payload)?;
+        // Hold the writer lock across the whole checkpoint so no append can interleave
+        // between the flush and the reopen. Replace atomically — temp file + fsync +
+        // rename — so a crash mid-checkpoint leaves the old log or the new snapshot,
+        // never an empty file.
+        let mut w = self.writer.lock();
         w.flush()?;
-        drop(w);
-
-        // Re-open in append mode for future writes
+        crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
         let file = OpenOptions::new().append(true).open(&self.path)?;
-        *self.writer.lock() = BufWriter::new(file);
+        *w = BufWriter::new(file);
         Ok(())
     }
 }

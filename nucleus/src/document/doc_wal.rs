@@ -92,12 +92,7 @@ impl DocWal {
     /// `docs` is a slice of `(doc_id, jsonb_bytes)` covering every document
     /// that the store currently holds.
     pub fn checkpoint(&self, docs: &[(u64, Vec<u8>)]) -> io::Result<()> {
-        // Flush existing writer before truncating.
-        {
-            self.writer.lock().flush()?;
-        }
-
-        // Build snapshot into a temporary buffer, then write atomically.
+        // Build the complete new log body (SNAPSHOT tag + all docs).
         let mut buf: Vec<u8> = Vec::new();
         buf.push(ENTRY_SNAPSHOT);
         buf.extend_from_slice(&(docs.len() as u32).to_le_bytes());
@@ -107,18 +102,15 @@ impl DocWal {
             buf.extend_from_slice(jsonb);
         }
 
-        // Truncate and rewrite.
-        let mut file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        file.write_all(&buf)?;
-        file.flush()?;
-        drop(file);
-
-        // Re-open in append mode for future writes.
+        // Hold the writer lock across the whole checkpoint so no append can interleave
+        // between the flush and the reopen. Replace atomically — temp file + fsync +
+        // rename — so a crash mid-checkpoint leaves the old log or the new snapshot,
+        // never an empty file.
+        let mut w = self.writer.lock();
+        w.flush()?;
+        crate::storage::wal_util::atomic_replace_wal(&self.path, &buf)?;
         let file = OpenOptions::new().append(true).open(&self.path)?;
-        *self.writer.lock() = file;
+        *w = file;
         Ok(())
     }
 }

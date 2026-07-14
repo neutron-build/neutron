@@ -172,17 +172,12 @@ impl ColumnarWal {
         let mut writer = self.writer.lock();
         writer.flush()?;
 
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        let mut w = BufWriter::new(file);
-        write_entry(&mut w, ENTRY_SNAPSHOT, "", &payload)?;
-        w.flush()?;
-        // The snapshot replaces the entire log — it must be durable before
-        // the pre-truncate log content is considered gone.
-        w.get_ref().sync_all()?;
-        drop(w);
+        // Serialize the complete new log body, then replace atomically (temp file +
+        // fsync + rename) so a crash between the truncate and the snapshot rewrite
+        // can't leave a truncated or empty file.
+        let mut contents: Vec<u8> = Vec::new();
+        write_entry(&mut contents, ENTRY_SNAPSHOT, "", &payload)?;
+        crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
 
         // Re-open in append mode for future writes, and count the snapshot
         // as a covered append so coverage marks stay consistent.

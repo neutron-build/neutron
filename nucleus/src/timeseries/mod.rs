@@ -1014,52 +1014,48 @@ impl TsWal {
         if let Some(ref mut w) = *guard {
             let _ = w.flush();
         }
-        // Truncate and rewrite
+        // Build the complete new log body (snapshot), then replace atomically.
         let wal_path = self.wal_path();
-        if let Ok(file) = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&wal_path)
-        {
-            let mut w = std::io::BufWriter::new(file);
-            // Write snapshot
-            let mut buf = vec![WAL_SNAPSHOT];
-            buf.extend_from_slice(&(series_map.len() as u32).to_le_bytes());
-            for (name, series) in series_map {
-                let name_bytes = name.as_bytes();
-                buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-                buf.extend_from_slice(name_bytes);
-                let n = series.timestamps.len();
-                buf.extend_from_slice(&(n as u32).to_le_bytes());
-                for &ts in &series.timestamps {
-                    buf.extend_from_slice(&ts.to_le_bytes());
-                }
-                for &val in &series.values {
-                    buf.extend_from_slice(&val.to_le_bytes());
-                }
-                buf.extend_from_slice(&(series.tag_columns.len() as u32).to_le_bytes());
-                for (key, col) in &series.tag_columns {
-                    let kb = key.as_bytes();
-                    buf.extend_from_slice(&(kb.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(kb);
-                    for opt in col {
-                        match opt {
-                            Some(v) => {
-                                buf.push(1);
-                                let vb = v.as_bytes();
-                                buf.extend_from_slice(&(vb.len() as u32).to_le_bytes());
-                                buf.extend_from_slice(vb);
-                            }
-                            None => buf.push(0),
+        let mut buf = vec![WAL_SNAPSHOT];
+        buf.extend_from_slice(&(series_map.len() as u32).to_le_bytes());
+        for (name, series) in series_map {
+            let name_bytes = name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            let n = series.timestamps.len();
+            buf.extend_from_slice(&(n as u32).to_le_bytes());
+            for &ts in &series.timestamps {
+                buf.extend_from_slice(&ts.to_le_bytes());
+            }
+            for &val in &series.values {
+                buf.extend_from_slice(&val.to_le_bytes());
+            }
+            buf.extend_from_slice(&(series.tag_columns.len() as u32).to_le_bytes());
+            for (key, col) in &series.tag_columns {
+                let kb = key.as_bytes();
+                buf.extend_from_slice(&(kb.len() as u32).to_le_bytes());
+                buf.extend_from_slice(kb);
+                for opt in col {
+                    match opt {
+                        Some(v) => {
+                            buf.push(1);
+                            let vb = v.as_bytes();
+                            buf.extend_from_slice(&(vb.len() as u32).to_le_bytes());
+                            buf.extend_from_slice(vb);
                         }
+                        None => buf.push(0),
                     }
                 }
             }
-            let _ = w.write_all(&buf).and_then(|_| w.flush());
-            // Reopen in append mode
-            if let Ok(file) = std::fs::OpenOptions::new().append(true).open(&wal_path) {
-                *guard = Some(std::io::BufWriter::new(file));
-            }
+        }
+        // Replace atomically (temp + fsync + rename) so a crash mid-checkpoint can't
+        // leave an empty file. Best-effort on this background path: log, don't propagate.
+        if let Err(e) = crate::storage::wal_util::atomic_replace_wal(&wal_path, &buf) {
+            tracing::error!("timeseries WAL checkpoint failed: {e}");
+        }
+        // Reopen in append mode.
+        if let Ok(file) = std::fs::OpenOptions::new().append(true).open(&wal_path) {
+            *guard = Some(std::io::BufWriter::new(file));
         }
     }
 
