@@ -352,27 +352,22 @@ impl CollectionWal {
     pub fn checkpoint(&self, collections: &ShardedCollections) -> io::Result<()> {
         let snapshot_data = serialize_snapshot(collections);
 
-        // Flush existing writer, then truncate file and rewrite.
-        {
-            self.writer.lock().flush()?;
-        }
+        // Serialize the complete new log body (SNAPSHOT tag + empty key + snapshot).
+        let mut contents: Vec<u8> = Vec::new();
+        contents.push(OP_SNAPSHOT);
+        write_string_to_writer("", &mut contents)?;
+        contents.extend_from_slice(&(snapshot_data.len() as u32).to_le_bytes());
+        contents.extend_from_slice(&snapshot_data);
 
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        let mut w = BufWriter::new(file);
-        w.write_all(&[OP_SNAPSHOT])?;
-        // Snapshot has no key — write empty key
-        write_string_to_writer("", &mut w)?;
-        w.write_all(&(snapshot_data.len() as u32).to_le_bytes())?;
-        w.write_all(&snapshot_data)?;
+        // Hold the writer lock across the whole checkpoint so no append can interleave
+        // between the flush and the reopen. Replace atomically — temp file + fsync +
+        // rename — so a crash mid-checkpoint leaves the old log or the new snapshot,
+        // never an empty file.
+        let mut w = self.writer.lock();
         w.flush()?;
-        drop(w);
-
-        // Re-open in append mode for future writes.
+        crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
         let file = OpenOptions::new().append(true).open(&self.path)?;
-        *self.writer.lock() = BufWriter::new(file);
+        *w = BufWriter::new(file);
         Ok(())
     }
 }

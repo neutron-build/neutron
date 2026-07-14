@@ -38,6 +38,7 @@ pub mod page;
 pub mod persistence;
 pub mod tuple;
 pub mod txn;
+pub(crate) mod wal_util;
 #[cfg(feature = "server")]
 pub mod wal;
 
