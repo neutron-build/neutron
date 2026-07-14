@@ -902,6 +902,17 @@ async fn cmd_start(cfg: StartConfig) {
     );
     tracing::info!("Cache: {} MB", config.cache.max_memory_mb);
 
+    // Query execution memory budget (T1.2): make the operator's configured
+    // memory limit the ceiling for the hash-join result circuit-breaker, instead
+    // of the hardcoded 256 MB default that ignored config. 0 → unlimited.
+    executor.set_query_memory_limit((config.server.max_memory_mb as u64) * 1024 * 1024);
+    if config.server.max_memory_mb > 0 {
+        tracing::info!(
+            "Query memory budget: {} MB (hash-join circuit-breaker)",
+            config.server.max_memory_mb
+        );
+    }
+
     // Commit-time durability default (config wal.synchronous_commit;
     // sessions override with SET synchronous_commit = on|off).
     let sync_commit_on = !matches!(

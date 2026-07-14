@@ -1848,3 +1848,17 @@ async fn test_ts_retention_wiring_purges_old_points() {
         "old point must be purged once the periodic retention task runs; recent point kept"
     );
 }
+
+#[tokio::test]
+async fn test_query_memory_limit_wiring() {
+    // T1.2: set_query_memory_limit drives the budget the hash-join result
+    // circuit-breaker checks (previously hardcoded to 256 MB, ignoring config).
+    // This tests the wiring the server applies at startup; 0 → unlimited.
+    let ex = test_executor();
+    ex.set_query_memory_limit(4 * 1024 * 1024);
+    assert_eq!(ex.query_memory_limit(), 4 * 1024 * 1024);
+    ex.set_query_memory_limit(64 * 1024 * 1024);
+    assert_eq!(ex.query_memory_limit(), 64 * 1024 * 1024);
+    ex.set_query_memory_limit(0);
+    assert_eq!(ex.query_memory_limit(), u64::MAX, "0 configures no limit");
+}

@@ -928,10 +928,28 @@ impl Executor {
         &self.catalog
     }
 
-    /// Set the query execution memory limit.
+    /// Set the query execution memory limit (builder form).
     pub fn with_query_memory_limit(self, limit_bytes: u64) -> Self {
         self.query_memory.set_limit(limit_bytes);
         self
+    }
+
+    /// Set the query execution memory budget after construction (T1.2). The
+    /// executor is shared behind an `Arc` by the time config is applied, so the
+    /// consuming builder above can't be used; this drives the same budget the
+    /// hash-join circuit-breaker checks. `0` is treated as "no limit".
+    pub fn set_query_memory_limit(&self, limit_bytes: u64) {
+        let effective = if limit_bytes == 0 {
+            u64::MAX
+        } else {
+            limit_bytes
+        };
+        self.query_memory.set_limit(effective);
+    }
+
+    /// Current query execution memory budget in bytes.
+    pub fn query_memory_limit(&self) -> u64 {
+        self.query_memory.limit()
     }
 
     // =========================================================================
