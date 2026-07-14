@@ -48,10 +48,18 @@ Allows manual revalidation of loaders.
 const { revalidate, state } = useRevalidator();
 ```
 
-## `useRouteError`
+## Handling errors
 
-Returns the error thrown during rendering, loading, or action execution.
+There is no `useRouteError` hook. Errors are handled by exporting an `ErrorBoundary` component, which receives the error as a prop:
 
 ```tsx
-const error = useRouteError();
+import type { ErrorBoundaryProps } from "@neutron-build/core";
+
+export function ErrorBoundary({ error, reset }: ErrorBoundaryProps) {
+  return <p>{error.message}</p>;
+}
 ```
+
+See [Error Boundaries](/docs/routing/error-boundaries) for details.
+
+> Additional client hooks exported from `@neutron-build/core/client` — `useNavigate`, `useSubmit`, `useSearchParams`, `useBlocker`, `useMatches` — follow the same signatures as their React Router equivalents.

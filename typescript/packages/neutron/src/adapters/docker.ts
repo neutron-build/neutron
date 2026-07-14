@@ -77,6 +77,8 @@ ENV NODE_ENV=production
 ENV PORT=${options.port}
 
 EXPOSE ${options.port}
+# SIGTERM is Docker's default stop signal; the server drains in-flight requests on it.
+STOPSIGNAL SIGTERM
 CMD ["node", "server.mjs"]
 `;
 }
@@ -117,7 +119,7 @@ const MIME_TYPES = {
   ".txt": "text/plain; charset=utf-8",
 };
 
-createServer(async (req, res) => {
+const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", \`http://\${req.headers.host || "localhost"}\`);
     const pathname = decodeURIComponent(url.pathname);
@@ -134,9 +136,37 @@ ${runtimeFallback}
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.end("Internal Server Error");
   }
-}).listen(PORT, "0.0.0.0", () => {
+});
+
+server.listen(PORT, "0.0.0.0", () => {
   console.log(\`Neutron Docker server listening on http://0.0.0.0:\${PORT}\`);
 });
+
+// Graceful shutdown: stop accepting new connections and let in-flight requests
+// finish (bounded), so a container rollout (docker/k8s sends SIGTERM) never
+// drops requests. Mirrors the drain in \`neutron start\`.
+const SHUTDOWN_TIMEOUT_MS = Number(process.env.NEUTRON_SHUTDOWN_TIMEOUT_MS || 30000);
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(\`Received \${signal}, draining in-flight requests…\`);
+  const forceExit = setTimeout(() => {
+    console.error("Drain timeout exceeded; forcing exit.");
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+  forceExit.unref();
+  server.close((err) => {
+    clearTimeout(forceExit);
+    if (err) {
+      console.error("Error during shutdown:", err);
+      process.exit(1);
+    }
+    process.exit(0);
+  });
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 function resolveStaticPath(pathname) {
   if (pathname.includes(String.fromCharCode(0))) {

@@ -41,17 +41,19 @@ Progressive enhancement wrapper for HTML forms.
 </Form>
 ```
 
-## `<Outlet>`
+## Layout `children`
 
-Renders the child route within a parent layout.
+A layout renders its child route via the standard `children` prop — Neutron has no `<Outlet>` component.
 
 ```tsx
 // _layout.tsx
-export default function Layout() {
+import type { ComponentChildren } from "preact";
+
+export default function Layout({ children }: { children?: ComponentChildren }) {
   return (
     <div>
       <Sidebar />
-      <Outlet />
+      {children}
     </div>
   );
 }

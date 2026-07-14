@@ -12,7 +12,7 @@ Create a file with square brackets `[]` to capture a parameter.
 **File**: `src/routes/users/[id].tsx`
 
 ```tsx
-import { useLoaderData } from "neutron";
+import { useLoaderData } from "@neutron-build/core";
 
 export async function loader({ params }: LoaderArgs) {
   // Access the parameter via params.id
