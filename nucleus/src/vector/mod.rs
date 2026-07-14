@@ -811,6 +811,19 @@ impl HnswIndex {
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
+
+    /// Dimensionality of the indexed vectors (0 if the index is empty).
+    ///
+    /// All vectors in an index share one dimension, so sampling any node is
+    /// sufficient. Used when writing a WAL checkpoint snapshot, which records
+    /// `dims` as recovery metadata.
+    pub fn dims(&self) -> usize {
+        self.nodes
+            .values()
+            .next()
+            .map(|n| n.vector.dim())
+            .unwrap_or(0)
+    }
 }
 
 impl std::fmt::Debug for HnswIndex {

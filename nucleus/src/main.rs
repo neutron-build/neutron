@@ -1246,11 +1246,11 @@ async fn cmd_start(cfg: StartConfig) {
                         // what caused the 2026-06-30 observe-nucleus OOM
                         // (CDC log in memory) and was already visibly
                         // inflating kv.wal (493MB from a ~1.2GB dataset) on
-                        // that same host. Vector-index WAL checkpointing is
-                        // deliberately not wired here yet — building a
-                        // correct index snapshot needs new accessors on
-                        // HnswIndex and doesn't cover IvfFlat; see
-                        // vector/wal.rs::IndexSnapshot.
+                        // that same host. Vector, timeseries, and columnar are
+                        // checkpointed alongside the rest below; the geo WAL is
+                        // opened for recovery but never appended to (geo data
+                        // persists as ordinary SQL columns), so it needs no
+                        // checkpoint here.
                         // SQL disk engine: flush dirty pages, checkpoint the
                         // WAL, and prune fully-checkpointed segments. With
                         // synchronous_commit=on (default) acked commits are
@@ -1283,6 +1283,20 @@ async fn cmd_start(cfg: StartConfig) {
                         }
                         if let Err(e) = executor_for_workers.fts_index().read().checkpoint_wal() {
                             tracing::warn!("FTS WAL checkpoint failed: {e}");
+                        }
+                        // Vector index WAL: HNSW inserts/deletes log one record
+                        // each; snapshot every live HNSW index (IvfFlat rebuilds
+                        // from base-table data, never logged here).
+                        if let Err(e) = executor_for_workers.checkpoint_vector_wal() {
+                            tracing::warn!("Vector WAL checkpoint failed: {e}");
+                        }
+                        // TimeSeries WAL: every insert appends a record; snapshot
+                        // truncates it to the current series state.
+                        executor_for_workers.ts_store().read().snapshot();
+                        // Columnar WAL: every append/create logs a record; snapshot
+                        // truncates it to the current table state.
+                        if let Err(e) = executor_for_workers.columnar_store().write().checkpoint() {
+                            tracing::warn!("Columnar WAL checkpoint failed: {e}");
                         }
                     }
                     nucleus::background::BackgroundTask::ReplicationSync => {

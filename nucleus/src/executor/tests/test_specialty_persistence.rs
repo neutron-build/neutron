@@ -153,6 +153,72 @@ async fn test_ivfflat_multiple_indexes_survive_restart() {
     }
 }
 
+// ── HNSW persistence via WAL checkpoint ─────────────────────────────────────────
+
+/// Unlike IvfFlat (rebuilt from base-table data at boot), HNSW indexes recover
+/// solely from the vector WAL. This exercises the checkpoint path directly:
+/// `checkpoint_vector_wal()` truncates the log to a single snapshot, further
+/// inserts append deltas on top, and a restart must reconstruct snapshot +
+/// deltas exactly. Asserting on the recovered index itself (not a SQL query,
+/// which could fall back to a base-table scan) makes this HNSW-specific.
+#[tokio::test]
+async fn test_hnsw_index_survives_wal_checkpoint_restart() {
+    use super::super::types::VectorIndexKind;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE TABLE embs (id INT, v VECTOR(3))").await;
+        for (i, v) in ["[1,0,0]", "[0,1,0]", "[0,0,1]", "[1,1,0]", "[0,1,1]"]
+            .iter()
+            .enumerate()
+        {
+            exec(
+                &ex,
+                &format!("INSERT INTO embs VALUES ({}, VECTOR('{}'))", i + 1, v),
+            )
+            .await;
+        }
+        exec(&ex, "CREATE INDEX idx_embs_v ON embs USING HNSW (v)").await;
+
+        // Snapshot + truncate the vector WAL, then add more vectors as deltas
+        // appended after the snapshot.
+        ex.checkpoint_vector_wal().unwrap();
+        exec(&ex, "INSERT INTO embs VALUES (6, VECTOR('[1,0,1]'))").await;
+        exec(&ex, "INSERT INTO embs VALUES (7, VECTOR('[0,0,0]'))").await;
+
+        let vi = ex.vector_indexes.read();
+        match &vi.get("idx_embs_v").expect("HNSW index must exist").kind {
+            VectorIndexKind::Hnsw(h) => {
+                assert_eq!(h.len(), 7, "index should hold all 7 vectors pre-restart");
+            }
+            _ => panic!("idx_embs_v should be an HNSW index"),
+        }
+    }
+
+    // ── Restart: HNSW recovers from snapshot + post-checkpoint deltas ──
+    {
+        let ex = open_executor(dir.path()).await;
+        let vi = ex.vector_indexes.read();
+        match &vi
+            .get("idx_embs_v")
+            .expect("HNSW index must survive restart via the checkpointed WAL")
+            .kind
+        {
+            VectorIndexKind::Hnsw(h) => {
+                assert_eq!(
+                    h.len(),
+                    7,
+                    "snapshot (5) + deltas (2) must both replay after restart"
+                );
+                assert_eq!(h.dims(), 3, "recovered index must retain its dimension");
+            }
+            _ => panic!("idx_embs_v should recover as an HNSW index"),
+        }
+    }
+}
+
 // ── Encrypted index persistence ───────────────────────────────────────────────
 
 #[tokio::test]
