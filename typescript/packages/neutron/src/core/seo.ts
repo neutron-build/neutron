@@ -309,10 +309,21 @@ export function renderDocumentHead(
   const antiFlashStyle =
     '<style>html{background:var(--neutron-bg,#0A0A0A);color-scheme:var(--neutron-color-scheme,dark)}</style>';
 
+  // <neutron-island> (the hydration wrapper <Island> renders) is a custom
+  // element with no built-in styling, so browsers treat it as inline. Inside
+  // a flex container with non-stretch alignment (e.g. `align-items: center`),
+  // an inline/auto-sized flex item sizes via shrink-to-fit rather than a
+  // definite width, which breaks percentage widths on its children (they have
+  // no definite containing block to resolve against). Force a real, definite
+  // block box so island content sizes predictably in every layout context.
+  const islandBaseStyle =
+    '<style>neutron-island{display:block;width:100%}</style>';
+
   return [
     '<meta charset="UTF-8">',
     '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
     antiFlashStyle,
+    islandBaseStyle,
     titleTag,
     seoHtml,
     extraHead,

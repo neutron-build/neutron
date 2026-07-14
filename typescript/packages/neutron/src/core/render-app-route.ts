@@ -1,17 +1,20 @@
 // Shared render core — the single implementation of the app-route render
 // pipeline (loader/action/middleware loop, head/headers resolution, HTML
 // wrapping, streaming, error rendering). Runtime-agnostic: it operates on an
-// ALREADY-LOADED route-module map, so every entry point (dev Vite server,
-// prod codegen entry, static SSG) loads modules its own way and then calls
-// renderAppRoute. This replaces three drifting copies of the same logic.
+// ALREADY-LOADED route-module map, so both request-serving entry points (the
+// dev Vite server and the prod codegen entry) load modules their own way and
+// then call renderAppRoute. This replaced two drifting copies of the same
+// logic. The static (SSG) renderer keeps its own lean, mutation-free pipeline
+// (see render-static.ts) but shares head resolution via core/head.ts, so head
+// output can never drift between the request-serving and build-time paths.
 import { h } from "preact";
 import type * as preact from "preact";
 
 import { escapeHtml } from "./escape.js";
 import { encodeSerializedPayloadAsJson, serializeForInlineScript } from "./serialization.js";
 import { assertRenderedFragment, decodeChunkStart } from "./fragment-guard.js";
-import { renderDocumentHead, mergeSeoMetaInput } from "./seo.js";
-import type { SeoMetaInput } from "./seo.js";
+import { renderDocumentHead } from "./seo.js";
+import { resolveHeadHtml } from "./head.js";
 import { runMiddlewareChain } from "./middleware.js";
 import { renderToString } from "preact-render-to-string";
 import type {
@@ -23,7 +26,6 @@ import type {
   LoaderArgs,
   ActionArgs,
   HeadersArgs,
-  HeadArgs,
   ErrorBoundaryProps,
 } from "./types.js";
 import type { NeutronLoaderCacheStore } from "../server/cache-store.js";
@@ -244,46 +246,6 @@ async function resolveRouteHeaders(
   }
 
   return headers;
-}
-
-async function resolveRouteHeadHtml(
-  allRoutes: Route[],
-  modules: Map<string, RouteModule>,
-  args: HeadArgs
-): Promise<string> {
-  let mergedSeo: SeoMetaInput | null = null;
-  const headFragments: string[] = [];
-
-  for (const route of allRoutes) {
-    const mod = modules.get(route.id);
-    if (!mod?.head) {
-      continue;
-    }
-
-    const resolved = await mod.head({ ...args, data: args.loaderData[route.id] });
-    if (!resolved) {
-      continue;
-    }
-
-    if (typeof resolved === "string") {
-      // A raw string returned from head() is developer-authored markup (the
-      // explicit escape hatch), so it is emitted faithfully — matching the
-      // production build output. Data-driven head content should use the
-      // structured SeoMetaInput return value, which is HTML-escaped.
-      headFragments.push(resolved);
-      continue;
-    }
-
-    mergedSeo = mergeSeoMetaInput(mergedSeo, resolved);
-  }
-
-  // Carry the CSP nonce (set by createCspNonceMiddleware) onto head-emitted
-  // scripts (JSON-LD, inline headScripts) so a nonce-based CSP admits them.
-  const nonce =
-    typeof (args.context as { cspNonce?: unknown }).cspNonce === "string"
-      ? ((args.context as { cspNonce?: unknown }).cspNonce as string)
-      : undefined;
-  return renderDocumentHead(args.pathname, mergedSeo, headFragments, nonce);
 }
 
 function findNearestErrorBoundary(
@@ -901,14 +863,24 @@ export async function renderAppRoute(
     });
 
     const pathname = new URL(request.url).pathname;
-    const headHtml = await resolveRouteHeadHtml(allRoutes, routeModules, {
-      request,
-      params: match.params,
-      context,
-      loaderData,
-      actionData,
-      pathname,
-    });
+    // Carry the CSP nonce (set by createCspNonceMiddleware) onto head-emitted
+    // scripts (JSON-LD, inline headScripts) so a nonce-based CSP admits them.
+    const cspNonce =
+      typeof (context as { cspNonce?: unknown }).cspNonce === "string"
+        ? ((context as { cspNonce?: unknown }).cspNonce as string)
+        : undefined;
+    const headHtml = await resolveHeadHtml(
+      allRoutes.map((route) => ({ route, module: routeModules.get(route.id) })),
+      {
+        request,
+        params: match.params,
+        context,
+        pathname,
+        loaderData,
+        actionData,
+        nonce: cspNonce,
+      }
+    );
 
     if (isJsonRequest(request)) {
       const payload: Record<string, unknown> = { ...loaderData };
