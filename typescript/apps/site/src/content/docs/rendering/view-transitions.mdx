@@ -7,22 +7,19 @@ Neutron has built-in support for the View Transitions API, allowing for native, 
 
 ## Enabling View Transitions
 
-To enable view transitions, you simply need to add the `<ViewTransitions />` component to your root layout's `<head>`.
+To enable view transitions, add the `<ViewTransitions />` component to your root layout.
 
 ```tsx
 // src/routes/_layout.tsx
-import { ViewTransitions, Outlet } from "neutron";
+import type { ComponentChildren } from "preact";
+import { ViewTransitions } from "@neutron-build/core/client";
 
-export default function RootLayout() {
+export default function RootLayout({ children }: { children?: ComponentChildren }) {
   return (
-    <html>
-      <head>
-        <ViewTransitions />
-      </head>
-      <body>
-        <Outlet />
-      </body>
-    </html>
+    <div>
+      <ViewTransitions />
+      {children}
+    </div>
   );
 }
 ```

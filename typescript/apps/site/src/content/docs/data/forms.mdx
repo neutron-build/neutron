@@ -8,7 +8,7 @@ Neutron provides a `<Form>` component that works just like a standard HTML `<for
 ## The `<Form>` Component
 
 ```tsx
-import { Form } from "neutron";
+import { Form } from "@neutron-build/core";
 
 export default function Login() {
   return (
@@ -32,7 +32,7 @@ The beauty of `<Form>` is that it works **without JavaScript**.
 To provide a great user experience, you often want to show a loading state while the form is submitting. You can use `useNavigation`.
 
 ```tsx
-import { Form, useNavigation } from "neutron";
+import { Form, useNavigation } from "@neutron-build/core";
 
 export default function Login() {
   const navigation = useNavigation();

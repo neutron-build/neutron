@@ -27,7 +27,7 @@ Just write your loader to fetch the source of truth from the database. When you 
 If you need to trigger a revalidation without a form submission (e.g., after a WebSocket event), you can use `useRevalidator`.
 
 ```tsx
-import { useRevalidator } from "neutron";
+import { useRevalidator } from "@neutron-build/core";
 
 export function RealtimeComponent() {
   const revalidator = useRevalidator();

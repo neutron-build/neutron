@@ -11,30 +11,20 @@ Any route file can export an `ErrorBoundary` component.
 
 ```tsx
 // src/routes/app/dashboard.tsx
-import { useRouteError, isRouteErrorResponse } from "neutron";
+import type { ErrorBoundaryProps } from "@neutron-build/core";
 
 export default function Dashboard() {
   throw new Error("Something broke!");
 }
 
-export function ErrorBoundary() {
-  const error = useRouteError();
-
-  if (isRouteErrorResponse(error)) {
-    // Handle expected errors (404, 401, etc.)
-    return (
-      <div className="error">
-        <h1>{error.status}</h1>
-        <p>{error.statusText}</p>
-      </div>
-    );
-  }
-
-  // Handle unexpected errors
+// The nearest ErrorBoundary catches the error. It receives the thrown error
+// as a prop, plus an optional `reset` to retry rendering.
+export function ErrorBoundary({ error, reset }: ErrorBoundaryProps) {
   return (
     <div className="error">
       <h1>Oops!</h1>
-      <p>Something unexpected went wrong.</p>
+      <p>{error.message}</p>
+      {reset && <button onClick={reset}>Try again</button>}
     </div>
   );
 }
@@ -53,18 +43,20 @@ This means if a specific part of your page crashes (e.g., a widget in the dashbo
 
 ## Expected Errors (Throwing Responses)
 
-You can "throw" a Response object to trigger the Error Boundary intentionally. This is useful for 404s or permission checks.
+To short-circuit a request with a specific HTTP response — a 404, a redirect, a permission error — throw a `Response` from a loader or action (the `notFound()` and `redirect()` helpers return one). Neutron serves it **directly as the HTTP response**; it does not render the `ErrorBoundary`.
 
 ```tsx
+import { notFound, type LoaderArgs } from "@neutron-build/core";
+
 export async function loader({ params }: LoaderArgs) {
   const project = await getProject(params.id);
-  
+
   if (!project) {
-    throw new Response("Project Not Found", { status: 404 });
+    throw notFound(); // → 404 response, served as-is
   }
-  
+
   return { project };
 }
 ```
 
-In your `ErrorBoundary`, `isRouteErrorResponse(error)` will return true, and you can access `.status` and `.statusText`.
+Throwing (or letting propagate) an `Error` — rather than a `Response` — is what triggers the nearest `ErrorBoundary`.
