@@ -29,6 +29,16 @@ pub enum KvCommand {
     Exists(String),
 }
 
+impl KvCommand {
+    /// Whether this command mutates the store (and so needs a durable ack).
+    pub fn is_write(&self) -> bool {
+        matches!(
+            self,
+            KvCommand::Set(..) | KvCommand::Del(..) | KvCommand::Incr(..)
+        )
+    }
+}
+
 // ============================================================================
 // Parser
 // ============================================================================

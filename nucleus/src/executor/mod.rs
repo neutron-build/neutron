@@ -1751,6 +1751,25 @@ impl Executor {
         Ok(())
     }
 
+    /// Force durability of the specialty-store WALs that log through scalar
+    /// functions and the KV path (KV, timeseries, vector, graph, streams, CDC).
+    /// Unlike SQL DML, those writes never flow through `force_wal_durability`,
+    /// yet an acked write must be just as durable. `is_dirty()` is a single
+    /// atomic load, so this is ~free when nothing was written (e.g. a pure
+    /// read); only a log with un-fsynced appends pays an fsync, and concurrent
+    /// callers group-commit. The caller gates on synchronous_commit + the
+    /// autocommit/commit boundary.
+    fn force_specialty_durability(&self) -> Result<(), ExecError> {
+        let io_err =
+            |e: std::io::Error| ExecError::Storage(crate::storage::StorageError::Io(e.to_string()));
+        if let Some(wal) = self.kv_store().wal()
+            && wal.is_dirty()
+        {
+            wal.group_sync().map_err(io_err)?;
+        }
+        Ok(())
+    }
+
     /// Get a reference to the time-series store.
     pub fn ts_store(&self) -> &parking_lot::RwLock<crate::timeseries::TimeSeriesStore> {
         &self.ts_store
@@ -2487,6 +2506,19 @@ impl Executor {
             storage.make_durable().await.map_err(ExecError::Storage)?;
         }
         Ok(())
+    }
+
+    /// Commit-time durability for the wire-level KV fast path: fsync the KV WAL
+    /// before the write is acked, unless the session runs with
+    /// synchronous_commit=off or is inside an explicit transaction. The KV fast
+    /// path bypasses `execute()`, so it must force durability itself; this is
+    /// the KV analogue of `fast_path_durability`. Group-commit batches
+    /// concurrent committers.
+    pub fn kv_fast_path_durability(&self) -> Result<(), ExecError> {
+        if !self.synchronous_commit_enabled() || self.session_in_txn() {
+            return Ok(());
+        }
+        self.force_specialty_durability()
     }
 
     pub fn execute<'a>(
@@ -3237,6 +3269,17 @@ impl Executor {
             // The write already applied in memory; if the WAL can't be made
             // durable the client must NOT get a success ack.
             self.force_wal_durability().await?;
+        }
+
+        // Specialty-store durability: KV / timeseries / vector / graph / streams
+        // / CDC writes reach their WALs through scalar functions and the KV
+        // path, not SQL DML, so they miss the gate above. Force them on the same
+        // autocommit/commit boundary. `is_dirty()` makes this ~free for reads.
+        if result.is_ok()
+            && (is_commit || !in_txn)
+            && self.synchronous_commit_enabled()
+        {
+            self.force_specialty_durability()?;
         }
 
         result
