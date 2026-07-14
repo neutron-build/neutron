@@ -1345,6 +1345,11 @@ async fn cmd_start(cfg: StartConfig) {
                         if let Err(e) = executor_for_workers.checkpoint_vector_wal() {
                             tracing::warn!("Vector WAL checkpoint failed: {e}");
                         }
+                        // TimeSeries retention (T1.3): purge points older than the
+                        // configured TS_RETENTION policy BEFORE snapshotting, so the
+                        // WAL is truncated to the retained state and old data does
+                        // not grow the store forever. No-op when no policy is set.
+                        executor_for_workers.ts_store().write().apply_retention();
                         // TimeSeries WAL: every insert appends a record; snapshot
                         // truncates it to the current series state.
                         executor_for_workers.ts_store().read().snapshot();
