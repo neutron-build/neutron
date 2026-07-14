@@ -104,6 +104,9 @@ impl DatabaseBuilder {
         let catalog = Arc::new(Catalog::new());
         let mut recovered_schemas: Vec<(String, Vec<(String, crate::types::DataType)>)> =
             Vec::new();
+        #[allow(unused_mut, unused_assignments)]
+        let mut recovered_epochs: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
         let mut data_dir: Option<std::path::PathBuf> = None;
         let storage: Arc<dyn StorageEngine> = match self.mode {
             StorageMode::Memory => Arc::new(MemoryEngine::new()),
@@ -124,6 +127,11 @@ impl DatabaseBuilder {
                 // Repopulate the catalog from the restored on-disk table directory
                 // so reopened tables are visible to SQL (the catalog starts empty).
                 recovered_schemas = engine.recovered_schemas();
+                // Carry each table's on-disk epoch into the rebuilt catalog so
+                // the two agree — otherwise reconciliation would see a nonzero
+                // directory epoch against a default-0 catalog epoch and wrongly
+                // treat every reopened table as a stale drop+recreate (T0.3).
+                recovered_epochs = engine.recovered_table_epochs();
                 Arc::new(engine)
             }
         };
@@ -140,11 +148,13 @@ impl DatabaseBuilder {
                     default_expr: None,
                 })
                 .collect();
+            let epoch = recovered_epochs.get(&name).copied().unwrap_or(0);
             let td = TableDef {
                 name,
                 columns: cols,
                 constraints: Vec::new(),
                 append_only: false,
+                epoch,
             };
             let _ = catalog.create_table_sync(td);
         }

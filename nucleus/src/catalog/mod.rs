@@ -65,6 +65,13 @@ pub struct TableDef {
     pub constraints: Vec<TableConstraint>,
     /// Append-only table — UPDATE and DELETE are rejected.
     pub append_only: bool,
+    /// Per-table generation id, monotonically allocated at CREATE and persisted
+    /// alongside the table (catalog.json) and its storage directory. On boot,
+    /// a storage-directory entry whose epoch differs from the catalog's is a
+    /// dropped-then-recreated predecessor; its `first_page` is stale and must
+    /// not be trusted (T0.3). `0` is the legacy/unknown value (pre-v2 databases);
+    /// both sides reading `0` means "no epoch recorded" and are treated as equal.
+    pub epoch: u64,
 }
 
 impl TableDef {
@@ -162,6 +169,13 @@ pub struct Catalog {
     // Epoch counter incremented on every DDL mutation. Consumers snapshot the
     // epoch and can cheaply detect staleness.
     catalog_epoch: AtomicU64,
+    /// Monotonic per-table generation allocator (T0.3). Every CREATE TABLE draws
+    /// a fresh value via `alloc_table_epoch`; persisted in catalog.json and
+    /// restored on load so a table recreated after restart always gets a
+    /// strictly higher epoch than any prior generation of the same name — that
+    /// is what lets boot reconciliation reject stale on-disk pages. Starts at 1
+    /// (0 is reserved for legacy pre-v2 tables). Never counts down.
+    next_table_epoch: AtomicU64,
     /// Sync cache: table_name → Arc<TableDef>.
     table_cache: parking_lot::RwLock<HashMap<String, Arc<TableDef>>>,
     /// Sync cache: table_name → Vec<Arc<IndexDef>>.
@@ -181,8 +195,32 @@ impl Catalog {
             indexes: RwLock::new(HashMap::new()),
             enum_types: RwLock::new(HashMap::new()),
             catalog_epoch: AtomicU64::new(0),
+            next_table_epoch: AtomicU64::new(1),
             table_cache: parking_lot::RwLock::new(HashMap::new()),
             index_cache: parking_lot::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Allocate the next per-table generation id (T0.3). Called once per CREATE
+    /// TABLE. Monotonic and never reused for the life of the database (the high
+    /// water mark is persisted in catalog.json and restored on load).
+    pub fn alloc_table_epoch(&self) -> u64 {
+        self.next_table_epoch.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The next epoch that would be allocated — persisted so the counter never
+    /// counts down across a restart.
+    pub fn peek_next_table_epoch(&self) -> u64 {
+        self.next_table_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Restore the epoch allocator from a persisted high-water mark on load.
+    /// Clamped up only (never down), and forced above every loaded table's epoch
+    /// so a subsequent CREATE can never collide with an existing generation.
+    pub fn restore_table_epoch_counter(&self, at_least: u64) {
+        let cur = self.next_table_epoch.load(Ordering::Relaxed);
+        if at_least > cur {
+            self.next_table_epoch.store(at_least, Ordering::Relaxed);
         }
     }
 
@@ -516,6 +554,7 @@ mod tests {
             ],
             constraints: vec![],
             append_only: false,
+            epoch: 0,
         })
         .await
         .unwrap();
@@ -543,6 +582,7 @@ mod tests {
             }],
             constraints: vec![],
             append_only: false,
+            epoch: 0,
         })
         .await
         .unwrap();
@@ -663,6 +703,7 @@ mod tests {
             }],
             constraints: vec![],
             append_only: false,
+            epoch: 0,
         })
         .await
         .unwrap();

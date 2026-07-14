@@ -424,6 +424,7 @@ mod tests {
                 ],
                 constraints: vec![],
                 append_only: false,
+                epoch: 0,
             })
             .await
             .unwrap();

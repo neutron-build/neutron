@@ -23,6 +23,14 @@ pub struct BackupManifest {
     pub created_unix: u64,
     /// Human-readable source data directory.
     pub source: String,
+    /// On-disk database format version (`DB_FORMAT_VERSION`) at backup time.
+    /// A physical snapshot is byte-for-byte, so restore compatibility is
+    /// governed by the on-disk format — not the release version. Comparing this
+    /// instead of `nucleus_version` lets a patch release restore a snapshot from
+    /// another patch that shares the format. `0` in legacy manifests (pre-field)
+    /// → fall back to the exact-version check.
+    #[serde(default)]
+    pub format_version: u32,
 }
 
 const FORMAT_V1: &str = "physical-v1";
@@ -84,6 +92,7 @@ pub fn backup_data_dir(
             .map(|d| d.as_secs())
             .unwrap_or(0),
         source: data_dir.display().to_string(),
+        format_version: crate::storage::page::DB_FORMAT_VERSION,
     };
     let json = serde_json::to_string_pretty(&manifest)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -113,7 +122,25 @@ pub fn restore_data_dir(
     let manifest: BackupManifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    if manifest.nucleus_version != nucleus_version {
+    // Compatibility is governed by the on-disk format, not the release string:
+    // a physical snapshot restores into any build that reads the same
+    // `DB_FORMAT_VERSION` (so patch releases interoperate). Legacy manifests
+    // predate the field (format_version == 0) — fall back to the exact-version
+    // check for those.
+    let current_format = crate::storage::page::DB_FORMAT_VERSION;
+    if manifest.format_version != 0 {
+        if manifest.format_version != current_format {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "format mismatch: backup uses on-disk format v{}, this build uses v{}. \
+                     Physical snapshots are format-locked — restore with a build on the same \
+                     format version (backup was from Nucleus {}).",
+                    manifest.format_version, current_format, manifest.nucleus_version
+                ),
+            ));
+        }
+    } else if manifest.nucleus_version != nucleus_version {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -190,13 +217,59 @@ mod tests {
     }
 
     #[test]
-    fn restore_refuses_version_mismatch() {
-        let root = unique_tmp("versionlock");
+    fn restore_allows_differing_patch_on_same_format() {
+        // Compatibility is by on-disk format, not release string: a snapshot
+        // from 0.1.1 restores under 0.2.0 as long as the format version matches.
+        let root = unique_tmp("patchinterop");
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data_dir");
+        let snap = root.join("snap");
+        write(&data, "catalog.json", b"{}");
+        let m = backup_data_dir(&data, &snap, false, "0.1.1").unwrap();
+        assert_eq!(m.format_version, crate::storage::page::DB_FORMAT_VERSION);
+
+        restore_data_dir(&snap, &root.join("restored"), false, "0.2.0")
+            .expect("same on-disk format must restore across patch releases");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_refuses_format_mismatch() {
+        let root = unique_tmp("formatlock");
         let _ = std::fs::remove_dir_all(&root);
         let data = root.join("data_dir");
         let snap = root.join("snap");
         write(&data, "catalog.json", b"{}");
         backup_data_dir(&data, &snap, false, "0.1.1").unwrap();
+
+        // Rewrite the manifest to claim a different on-disk format version.
+        let mpath = snap.join(MANIFEST_NAME);
+        let mut manifest: BackupManifest =
+            serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+        manifest.format_version = 999;
+        std::fs::write(&mpath, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+
+        let err = restore_data_dir(&snap, &root.join("restored"), false, "0.1.1").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("format mismatch"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_manifest_without_format_version_is_version_locked() {
+        // A pre-format_version manifest (field absent → 0) falls back to the
+        // exact release-string check, preserving the old lock for old backups.
+        let root = unique_tmp("legacylock");
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data_dir");
+        let snap = root.join("snap");
+        write(&data, "catalog.json", b"{}");
+        backup_data_dir(&data, &snap, false, "0.1.1").unwrap();
+
+        // Emulate a legacy manifest: strip the format_version field.
+        let mpath = snap.join(MANIFEST_NAME);
+        let legacy = r#"{"nucleus_version":"0.1.1","format":"physical-v1","created_unix":0,"source":"x"}"#;
+        std::fs::write(&mpath, legacy).unwrap();
 
         let err = restore_data_dir(&snap, &root.join("restored"), false, "0.2.0").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

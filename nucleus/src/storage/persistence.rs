@@ -99,6 +99,9 @@ struct TableDefSer {
     constraints: Vec<TableConstraintSer>,
     #[serde(default)]
     append_only: bool,
+    /// Per-table generation id (T0.3). Absent in pre-v2 catalog files → 0.
+    #[serde(default)]
+    epoch: u64,
 }
 
 /// Serializable representation of an index definition.
@@ -118,6 +121,12 @@ struct IndexDefSer {
 struct CatalogSnapshot {
     tables: Vec<TableDefSer>,
     indexes: Vec<IndexDefSer>,
+    /// High-water mark of the per-table epoch allocator (T0.3). Persisted so a
+    /// table recreated after a restart draws a strictly higher generation id
+    /// than any predecessor. Absent in pre-v2 files → 0, then re-derived from
+    /// the loaded tables' epochs.
+    #[serde(default)]
+    next_table_epoch: u64,
 }
 
 /// Convert an internal `DataType` to its string representation for persistence.
@@ -307,6 +316,7 @@ impl CatalogPersistence {
                         .collect(),
                     constraints: t.constraints.iter().map(constraint_to_ser).collect(),
                     append_only: t.append_only,
+                    epoch: t.epoch,
                 })
                 .collect(),
             indexes: indexes
@@ -324,6 +334,7 @@ impl CatalogPersistence {
                     },
                 })
                 .collect(),
+            next_table_epoch: catalog.peek_next_table_epoch(),
         };
 
         let json = serde_json::to_string_pretty(&snapshot)
@@ -374,6 +385,7 @@ impl CatalogPersistence {
                 columns: columns?,
                 constraints,
                 append_only: t.append_only,
+                epoch: t.epoch,
             };
 
             catalog
@@ -381,6 +393,13 @@ impl CatalogPersistence {
                 .await
                 .map_err(|e| PersistenceError::Catalog(e.to_string()))?;
         }
+
+        // Restore the per-table epoch allocator (T0.3). Take the persisted
+        // high-water mark, but also lift it above every loaded table's epoch so
+        // a subsequent CREATE can never collide with an existing generation
+        // (defends against a pre-v2 file that has table epochs but no counter).
+        let max_epoch = snapshot.tables.iter().map(|t| t.epoch).max().unwrap_or(0);
+        catalog.restore_table_epoch_counter(snapshot.next_table_epoch.max(max_epoch + 1));
 
         // Load indexes
         for i in &snapshot.indexes {
@@ -839,6 +858,7 @@ mod tests {
                     columns: vec!["id".into()],
                 }],
                 append_only: false,
+                epoch: 0,
             })
             .await
             .unwrap();
@@ -868,6 +888,7 @@ mod tests {
                 ],
                 constraints: vec![],
                 append_only: false,
+                epoch: 0,
             })
             .await
             .unwrap();
@@ -1329,6 +1350,7 @@ mod tests {
                     }],
                     constraints: vec![],
                     append_only: false,
+                    epoch: 0,
                 })
                 .await
                 .unwrap();

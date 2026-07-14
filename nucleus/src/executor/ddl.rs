@@ -217,6 +217,93 @@ impl Executor {
             self.table_engines.write().insert(table, eng);
         }
     }
+
+    /// Migrate a per-table override engine (columnar / mergetree / lsm) from an
+    /// old name to a new one during ALTER TABLE ... RENAME (T0.3). The override's
+    /// on-disk directory, engines.json entry, routing-map key, and columnar
+    /// registrations are all keyed by name, so a rename must re-key every one of
+    /// them and physically move the rows into a fresh engine opened under the
+    /// new name — otherwise `storage_for(new)` resolves to the empty base heap.
+    /// The catalog rename has already happened when this is called.
+    #[cfg(feature = "server")]
+    pub(super) async fn rename_override_engine(
+        &self,
+        old: &str,
+        new: &str,
+        meta: TableEngineMeta,
+    ) -> Result<(), ExecError> {
+        use crate::columnar::{MergeStrategy, register_replacing_table, unregister_replacing_table};
+
+        // Open a fresh engine under the new name and copy the rows across.
+        let old_engine = self.storage_for(old);
+        let rows = old_engine.scan(old).await?;
+        let new_engine: Arc<dyn StorageEngine> = if meta.engine == "lsm" {
+            Arc::new(crate::storage::LsmStorageEngine::new())
+        } else {
+            self.open_columnar_engine(new) as Arc<dyn StorageEngine>
+        };
+        new_engine.create_table(new).await?;
+        for row in rows {
+            new_engine.insert(new, row).await?;
+        }
+
+        // Re-register the columnar store's MergeTree strategy + replacing-dedup
+        // config under the new name (mirrors CREATE), reconstructed from the
+        // sidecar meta and the freshly-renamed catalog definition.
+        let is_mergetree = matches!(
+            meta.engine.as_str(),
+            "mergetree" | "replacing_mergetree" | "aggregating_mergetree"
+        );
+        if is_mergetree {
+            let new_def = self.catalog.get_table(new).await;
+            let strategy = match meta.engine.as_str() {
+                "replacing_mergetree" => {
+                    if let Some(def) = new_def.as_ref() {
+                        let pk_idx: Vec<usize> = meta
+                            .order_by
+                            .iter()
+                            .filter_map(|name| {
+                                def.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
+                            })
+                            .collect();
+                        let ver_idx = meta.version_column.as_ref().and_then(|name| {
+                            def.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
+                        });
+                        register_replacing_table(new, pk_idx, ver_idx);
+                    }
+                    MergeStrategy::Replacing {
+                        version_column: meta.version_column.clone(),
+                    }
+                }
+                "aggregating_mergetree" => MergeStrategy::Aggregating {
+                    group_columns: meta.order_by.clone(),
+                    sum_columns: meta.sum_columns.clone(),
+                    count_columns: meta.count_columns.clone(),
+                },
+                _ => MergeStrategy::Default,
+            };
+            self.columnar_store
+                .write()
+                .create_merge_tree_table_with_strategy(new, meta.order_by.clone(), strategy);
+        }
+
+        // Route the new name to the new engine and persist the sidecar.
+        self.table_engines
+            .write()
+            .insert(new.to_string(), new_engine);
+        self.record_table_engine(new, meta);
+
+        // Tear down the old side completely (mirrors DROP cleanup).
+        if let Err(e) = old_engine.drop_table(old).await {
+            eprintln!("ALTER TABLE RENAME: failed to drop old override table '{old}': {e}");
+        }
+        self.table_engines.write().remove(old);
+        unregister_replacing_table(old);
+        self.columnar_store.write().clear(old);
+        self.remove_table_engine_meta(old);
+        Ok(())
+    }
+
     // ========================================================================
     // DDL: CREATE TYPE
     // ========================================================================
@@ -292,6 +379,10 @@ impl Executor {
             columns,
             constraints,
             append_only,
+            // Fresh generation id for this table (T0.3). Persisted in the
+            // catalog and stamped into the storage directory when the table is
+            // materialized, so a later drop+recreate is detectable on recovery.
+            epoch: self.catalog.alloc_table_epoch(),
         };
 
         match self.catalog.create_table(table_def.clone()).await {
@@ -728,8 +819,14 @@ impl Executor {
                         Some(t) => self.storage_for(t),
                         None => self.storage.clone(),
                     };
+                    // Surface a storage-side failure in the logs rather than
+                    // swallowing it to stderr. Not propagated: an orphaned
+                    // storage index is a space leak, not a correctness hazard
+                    // (the planner routes off the catalog, which is dropped
+                    // below), and propagating would break IF EXISTS + engines
+                    // that report a benign not-found. (T0.3 sibling.)
                     if let Err(e) = drop_storage.drop_index(&index_name).await {
-                        eprintln!("DDL: failed to drop storage index '{index_name}': {e}");
+                        tracing::warn!("DROP INDEX '{index_name}': storage drop failed: {e}");
                     }
                     match self.catalog.drop_index(&index_name).await {
                         Ok(()) => {}
@@ -1122,11 +1219,18 @@ impl Executor {
     ) -> Result<ExecResult, ExecError> {
         for target in &truncate.table_names {
             let table_name = target.name.to_string();
+            // Route to the table's actual engine (T0.3): a columnar/mergetree/lsm
+            // table's rows live in its per-table override engine, not the base
+            // heap. Truncating `self.storage` for such a table dropped/recreated
+            // an empty base-heap table and left the real data fully intact — a
+            // silent no-op. `storage_for` falls back to the base engine for
+            // ordinary tables, so this is correct for both.
+            let engine = self.storage_for(&table_name);
             // Drop and recreate to clear all data (drop failure is non-fatal)
-            if let Err(e) = self.storage.drop_table(&table_name).await {
+            if let Err(e) = engine.drop_table(&table_name).await {
                 eprintln!("TRUNCATE: failed to drop '{table_name}' before recreate: {e}");
             }
-            self.storage.create_table(&table_name).await?;
+            engine.create_table(&table_name).await?;
             // Re-store schema in WAL after truncate recreate
             if let Some(td) = self.catalog.get_table(&table_name).await {
                 let col_info: Vec<(String, DataType)> = td
@@ -1134,8 +1238,13 @@ impl Executor {
                     .iter()
                     .map(|c| (c.name.clone(), c.data_type.clone()))
                     .collect();
-                self.storage.store_table_schema(&table_name, &col_info);
+                engine.store_table_schema(&table_name, &col_info);
             }
+            // A mergetree table may also carry rows in the shared columnar store
+            // (populated via the columnar_insert() function). Clear that too so
+            // TRUNCATE is complete for every write path.
+            #[cfg(feature = "server")]
+            self.columnar_store.write().clear(&table_name);
 
             // Clear index entries for the truncated table to avoid orphaned references
             self.btree_indexes.retain(|(t, _), _| t != &table_name);
@@ -1184,18 +1293,40 @@ impl Executor {
                         }
                     };
                     self.catalog.rename_table(&table_name, &new).await?;
-                    // Rename in storage: create new, copy data, drop old
-                    let engine = self.storage_for(&table_name);
-                    let rows = engine.scan(&table_name).await?;
-                    engine.create_table(&new).await?;
-                    for row in rows {
-                        engine.insert(&new, row).await?;
+
+                    // A table created `WITH (engine=...)` lives in a per-table
+                    // override engine whose on-disk directory + engines.json
+                    // entry + columnar registrations are all keyed by the OLD
+                    // name (T0.3). Copying rows within the old engine object and
+                    // never re-keying the routing map left `storage_for(new)`
+                    // resolving to the empty base heap — the rows became
+                    // unreachable, permanently after a restart. Migrate the
+                    // override across engines; plain heap tables keep the simple
+                    // create-new / copy / drop-old path (both names resolve to
+                    // the base engine).
+                    #[cfg(feature = "server")]
+                    let override_meta = self.load_engines_meta().remove(&table_name);
+                    #[cfg(not(feature = "server"))]
+                    let override_meta: Option<TableEngineMeta> = None;
+
+                    if let Some(meta) = override_meta {
+                        #[cfg(feature = "server")]
+                        self.rename_override_engine(&table_name, &new, meta).await?;
+                    } else {
+                        // Rename in storage: create new, copy data, drop old.
+                        let engine = self.storage_for(&table_name);
+                        let rows = engine.scan(&table_name).await?;
+                        engine.create_table(&new).await?;
+                        for row in rows {
+                            engine.insert(&new, row).await?;
+                        }
+                        if let Err(e) = engine.drop_table(&table_name).await {
+                            eprintln!(
+                                "ALTER TABLE RENAME: failed to drop old table '{table_name}': {e}"
+                            );
+                        }
                     }
-                    if let Err(e) = engine.drop_table(&table_name).await {
-                        eprintln!(
-                            "ALTER TABLE RENAME: failed to drop old table '{table_name}': {e}"
-                        );
-                    }
+
                     // Update the table_columns cache for the new name
                     if let Some(updated_def) = self.catalog.get_table(&new).await {
                         let col_info: Vec<(String, DataType)> = updated_def
