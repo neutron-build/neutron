@@ -65,7 +65,7 @@ Regardless of the runtime, your code uses standard React-style hooks and JSX.
 App routes use `loader` functions to fetch data on the server.
 
 ```tsx
-import { useLoaderData } from "neutron";
+import { useLoaderData } from "@neutron-build/core";
 
 export const config = { mode: "app" };
 
@@ -85,7 +85,7 @@ export default function Profile() {
 App routes use `action` functions to handle form submissions and data mutations.
 
 ```tsx
-import { Form } from "neutron";
+import { Form } from "@neutron-build/core";
 
 export async function action({ request }: ActionArgs) {
   const formData = await request.formData();

@@ -58,7 +58,7 @@ export default defineConfig({
 Global middleware that runs on every request. Use this for authentication, logging, or modifying headers globally.
 
 ```ts
-import type { MiddlewareFn } from "neutron";
+import type { MiddlewareFn } from "@neutron-build/core";
 
 export const middleware: MiddlewareFn[] = [
   async (request, context, next) => {

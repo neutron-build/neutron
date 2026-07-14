@@ -5,15 +5,11 @@ import type {
   RouteModule,
   AppContext,
   LoaderArgs,
-  HeadArgs,
 } from "./types.js";
 import { discoverRoutes } from "./manifest.js";
 import { assertRenderedFragment } from "./fragment-guard.js";
-import {
-  mergeSeoMetaInput,
-  renderDocumentHead,
-  type SeoMetaInput,
-} from "./seo.js";
+import { renderDocumentHead } from "./seo.js";
+import { resolveHeadHtml } from "./head.js";
 import { resolvePreactSsr, importPreactSsr } from "./preact-ssr.js";
 
 export interface StaticRenderOptions {
@@ -105,7 +101,8 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
 
       const layoutChain = getLayoutChain(pageRoute);
 
-      // Pre-load all layout modules to avoid redundant loads in resolveRouteHeadHtml
+      // Pre-load all layout modules so head resolution can read them straight
+      // from moduleCache without re-importing.
       for (const layoutRoute of layoutChain) {
         await loadRouteModule(layoutRoute.file, moduleCache);
       }
@@ -128,15 +125,23 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
       // (wrapHtml owns `<html>`/`<head>`/`<body>`). A full-document render would
       // nest a second document inside #app — reject it before it is written.
       assertRenderedFragment(html, layoutChain[0]?.file ?? pageRoute.file);
-      const headHtml = await resolveRouteHeadHtml(
-        pageRoute,
-        layoutChain,
-        request,
-        context,
-        {},
-        loaderData,
-        pageRoute.path,
-        moduleCache
+      // Outermost layout first, page route last — the same chain order the
+      // app-route renderer uses, so shared head resolution merges identically.
+      const orderedRoutes = [...layoutChain].reverse();
+      orderedRoutes.push(pageRoute);
+      const headHtml = await resolveHeadHtml(
+        orderedRoutes.map((route) => ({
+          route,
+          module: moduleCache.get(path.resolve(route.file)),
+        })),
+        {
+          request,
+          params: {},
+          context,
+          pathname: pageRoute.path,
+          loaderData: loaderData !== undefined ? { [pageRoute.id]: loaderData } : {},
+          // No nonce at build time — SSG runs no CSP-nonce middleware.
+        }
       );
       const fullHtml = wrapHtml(html, pageRoute.path, headHtml);
 
@@ -149,56 +154,6 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
       console.error(`  Error rendering ${pageRoute.path}:`, error);
     }
   }
-}
-
-async function resolveRouteHeadHtml(
-  route: Route,
-  layoutChain: Route[],
-  request: Request,
-  context: AppContext,
-  params: Record<string, string>,
-  loaderData: unknown,
-  pathname: string,
-  moduleCache?: Map<string, RouteModule>
-): Promise<string> {
-  const allRoutes = [...layoutChain].reverse();
-  allRoutes.push(route);
-
-  const loaderDataMap: Record<string, unknown> = {};
-  if (loaderData !== undefined) {
-    loaderDataMap[route.id] = loaderData;
-  }
-
-  let mergedSeo: SeoMetaInput | null = null;
-  const headFragments: string[] = [];
-
-  for (const currentRoute of allRoutes) {
-    const currentModule = await loadRouteModule(currentRoute.file, moduleCache);
-    if (!currentModule.head) {
-      continue;
-    }
-
-    const args: HeadArgs = {
-      request,
-      params,
-      context,
-      loaderData: loaderDataMap,
-      pathname,
-    };
-    const resolved = await currentModule.head(args);
-    if (!resolved) {
-      continue;
-    }
-
-    if (typeof resolved === "string") {
-      headFragments.push(resolved);
-      continue;
-    }
-
-    mergedSeo = mergeSeoMetaInput(mergedSeo, resolved);
-  }
-
-  return renderDocumentHead(pathname, mergedSeo, headFragments);
 }
 
 async function loadRouteModule(file: string, cache?: Map<string, RouteModule>): Promise<RouteModule> {

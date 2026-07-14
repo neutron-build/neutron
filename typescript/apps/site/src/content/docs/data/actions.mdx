@@ -10,8 +10,8 @@ Actions are responsible for handling data mutations. Anytime a non-GET request (
 Export an async function named `action` from your route module.
 
 ```tsx
-import type { ActionArgs } from "neutron";
-import { redirect } from "neutron";
+import type { ActionArgs } from "@neutron-build/core";
+import { redirect } from "@neutron-build/core";
 
 export async function action({ request }: ActionArgs) {
   const formData = await request.formData();
@@ -62,7 +62,7 @@ Similar to loaders, actions receive:
 It is common to redirect the user after a successful action. Use the `redirect` helper.
 
 ```tsx
-import { redirect } from "neutron";
+import { redirect } from "@neutron-build/core";
 // ...
 throw redirect("/dashboard"); // or return redirect("/dashboard")
 ```
