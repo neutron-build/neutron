@@ -134,6 +134,12 @@ struct TableMeta {
     /// Column names, persisted so the catalog can be repopulated after a reopen
     /// (otherwise restored tables exist physically but are invisible to SQL).
     col_names: Vec<String>,
+    /// Per-table generation id (T0.3), mirrored from the catalog's `TableDef`
+    /// when the table is materialized and persisted in the directory (v2+).
+    /// On boot, a mismatch against the catalog's epoch means these pages belong
+    /// to a dropped-then-recreated predecessor and `first_page` is stale. `0`
+    /// for legacy (pre-v2) directory entries.
+    epoch: u64,
 }
 
 /// Metadata for an active index.
@@ -498,20 +504,57 @@ impl DiskEngine {
             initial_pages,
         ));
 
-        // Load free list head from the meta page (or initialize for new databases).
-        let (fl_head, fl_count) = if is_new {
-            (INVALID_PAGE_ID, 0u32)
+        // Load free list head + validate the on-disk format from the meta page
+        // (or initialize for new databases). T1.1: refuse a database whose magic
+        // is foreign or whose format version is newer than this build can read,
+        // rather than silently misinterpreting the bytes.
+        let (fl_head, fl_count, stored_format_version) = if is_new {
+            (INVALID_PAGE_ID, 0u32, page::DB_FORMAT_VERSION)
         } else {
             let frame_id = pool
                 .fetch_page(0)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = pool.frame_data(frame_id);
+
+            // Magic check. Databases created before the magic stamp existed have
+            // zeros here — accept those (legacy). A non-zero mismatch is a
+            // foreign or corrupt file: refuse.
+            let magic = &pg[page::META_MAGIC..page::META_MAGIC + 8];
+            if magic != page::MAGIC_BYTES && magic.iter().any(|&b| b != 0) {
+                pool.unpin(frame_id);
+                return Err(StorageError::Io(format!(
+                    "{}: not a Nucleus database (bad magic bytes)",
+                    path.display()
+                )));
+            }
+
+            // Version check. A stored version newer than we support means an
+            // older binary must not touch a database written by a newer one.
+            let stored_version = page::read_u32(pg, page::META_DB_VERSION);
+            if stored_version > page::DB_FORMAT_VERSION {
+                pool.unpin(frame_id);
+                return Err(StorageError::Io(format!(
+                    "{}: database format version {stored_version} is newer than this \
+                     build supports (max {}); upgrade Nucleus to open it",
+                    path.display(),
+                    page::DB_FORMAT_VERSION
+                )));
+            }
+
             let head = page::read_u32(pg, META_FREE_LIST_HEAD);
             let count = page::read_u32(pg, META_FREE_PAGE_COUNT);
             pool.unpin(frame_id);
             // Backwards compat: zeroed meta page means no free list
             let head = if head == 0 { INVALID_PAGE_ID } else { head };
-            (head, count)
+            if stored_version < page::DB_FORMAT_VERSION {
+                tracing::info!(
+                    "{}: on-disk format v{stored_version} < v{}; upgrading on next \
+                     directory save",
+                    path.display(),
+                    page::DB_FORMAT_VERSION
+                );
+            }
+            (head, count, stored_version)
         };
 
         let mut engine = Self {
@@ -529,7 +572,7 @@ impl DiskEngine {
 
         // For existing databases, load the table directory from the (potentially recovered) meta page
         if !is_new {
-            engine.load_table_directory()?;
+            engine.load_table_directory(stored_format_version)?;
         }
 
         Ok(engine)
@@ -703,6 +746,8 @@ impl DiskEngine {
             dir_buf.extend_from_slice(&name_len.to_le_bytes());
             dir_buf.extend_from_slice(name_bytes);
             dir_buf.extend_from_slice(&meta.first_page.to_le_bytes());
+            // v2: per-table epoch immediately after first_page (T0.3).
+            dir_buf.extend_from_slice(&meta.epoch.to_le_bytes());
             let col_count = meta.col_types.len() as u16;
             dir_buf.extend_from_slice(&col_count.to_le_bytes());
             for ct in &meta.col_types {
@@ -757,6 +802,11 @@ impl DiskEngine {
             .fetch_page(0)
             .map_err(|e| StorageError::Io(e.to_string()))?;
         let pg = self.pool.frame_data_mut(frame_id);
+        // Stamp the current format version: the entries below are written in v2
+        // layout (with per-table epoch), so the meta page must advertise v2.
+        // This is what transparently upgrades a v1 database on its first
+        // directory save after open (T0.3 / T1.1).
+        page::write_u32(pg, page::META_DB_VERSION, page::DB_FORMAT_VERSION);
         // Zero the directory area first
         pg[META_TABLE_DIR_START..].fill(0);
 
@@ -845,7 +895,11 @@ impl DiskEngine {
 
     /// Load the table directory from the meta page (and overflow pages if present),
     /// restoring the tables HashMap.
-    fn load_table_directory(&mut self) -> Result<(), StorageError> {
+    fn load_table_directory(&mut self, format_version: u32) -> Result<(), StorageError> {
+        // `format_version` is the meta page's stored `META_DB_VERSION`. v2+
+        // directory entries carry a per-table epoch after `first_page`; v1
+        // entries do not (parsed as epoch 0). See `DB_FORMAT_VERSION`.
+        let has_epoch = format_version >= 2;
         // Read the meta page and collect directory bytes, following overflow pages.
         let meta_dir_capacity = PAGE_SIZE - META_TABLE_DIR_START - 4;
         let overflow_capacity = PAGE_SIZE - 4;
@@ -925,6 +979,28 @@ impl DiskEngine {
             ]);
             offset += 4;
 
+            // v2: per-table epoch (u64) directly after first_page. v1 entries
+            // omit it — default to 0 (legacy/unknown generation).
+            let epoch = if has_epoch {
+                if offset + 8 > dir_data.len() {
+                    break;
+                }
+                let e = u64::from_le_bytes([
+                    dir_data[offset],
+                    dir_data[offset + 1],
+                    dir_data[offset + 2],
+                    dir_data[offset + 3],
+                    dir_data[offset + 4],
+                    dir_data[offset + 5],
+                    dir_data[offset + 6],
+                    dir_data[offset + 7],
+                ]);
+                offset += 8;
+                e
+            } else {
+                0
+            };
+
             // Read col_count + col_types
             if offset + 2 > dir_data.len() {
                 break;
@@ -980,6 +1056,7 @@ impl DiskEngine {
                     last_page: last,
                     col_types,
                     col_names,
+                    epoch,
                 },
             );
         }
@@ -1015,6 +1092,19 @@ impl DiskEngine {
                     .collect();
                 (name.clone(), cols)
             })
+            .collect()
+    }
+
+    /// Per-table epoch (generation id) of every table in the on-disk directory
+    /// (T0.3). The embedded builder pairs this with `recovered_schemas` so the
+    /// catalog it rebuilds from storage carries the same epoch the directory
+    /// holds — otherwise a nonzero directory epoch vs a default-0 catalog epoch
+    /// would look like a drop+recreate and wrongly empty the table.
+    pub fn recovered_table_epochs(&self) -> HashMap<String, u64> {
+        self.tables
+            .read()
+            .iter()
+            .map(|(name, meta)| (name.clone(), meta.epoch))
             .collect()
     }
 
@@ -1283,8 +1373,10 @@ impl DiskEngine {
         Ok((pages_scanned, dead_reclaimed, pages_freed, bytes_reclaimed))
     }
 
-    /// Get all table names.
-    fn table_names(&self) -> Vec<String> {
+    /// Get all table names currently in the on-disk directory (as opposed to
+    /// the catalog). Boot reconciliation uses this to find storage-ahead
+    /// orphans — directory tables the catalog no longer knows about (T0.3).
+    pub fn table_names(&self) -> Vec<String> {
         self.tables.read().keys().cloned().collect()
     }
 }
@@ -1312,10 +1404,31 @@ impl StorageEngine for DiskEngine {
                     .collect();
                 let col_names: Vec<String> =
                     table_def.columns.iter().map(|c| c.name.clone()).collect();
+                let cat_epoch = table_def.epoch;
                 let mut tables = self.tables.write();
                 if let Some(meta) = tables.get_mut(table) {
                     meta.col_types = col_types;
                     meta.col_names = col_names;
+                    // T0.3 epoch reconciliation: the on-disk directory records a
+                    // different generation than the catalog's current table. That
+                    // means this name was dropped and recreated but the drop's
+                    // directory flush was lost — so `first_page` points at the
+                    // *old* table's chain (or, if those pages were freed and
+                    // reused, at another table's rows). Trusting it returns wrong
+                    // data. Abandon the chain and recover the table empty. We do
+                    // NOT free the pages: they may already be owned by a live
+                    // table, so freeing would corrupt it — a small leak (until a
+                    // future full vacuum) is the safe trade against corruption.
+                    if meta.epoch != cat_epoch {
+                        tracing::warn!(
+                            "table '{table}': storage directory epoch {} != catalog epoch \
+                             {cat_epoch}; abandoning stale first_page (recovered empty)",
+                            meta.epoch
+                        );
+                        meta.first_page = INVALID_PAGE_ID;
+                        meta.last_page = INVALID_PAGE_ID;
+                        meta.epoch = cat_epoch;
+                    }
                 }
             }
             return Ok(());
@@ -1333,6 +1446,7 @@ impl StorageEngine for DiskEngine {
             .map(|c| c.data_type.clone())
             .collect();
         let col_names: Vec<String> = table_def.columns.iter().map(|c| c.name.clone()).collect();
+        let epoch = table_def.epoch;
 
         let mut tables = self.tables.write();
         tables.insert(
@@ -1342,6 +1456,9 @@ impl StorageEngine for DiskEngine {
                 last_page: INVALID_PAGE_ID,
                 col_types,
                 col_names,
+                // Stamp the catalog's current generation so a later drop+recreate
+                // (which draws a fresh epoch) is detectable on recovery (T0.3).
+                epoch,
             },
         );
         Ok(())
@@ -2476,6 +2593,7 @@ mod tests {
                 ],
                 constraints: vec![],
                 append_only: false,
+                epoch: 0,
             })
             .await
             .unwrap();
@@ -2765,6 +2883,7 @@ mod tests {
                 ],
                 constraints: vec![],
                 append_only: false,
+                epoch: 0,
             })
             .await
             .unwrap();
@@ -3247,6 +3366,7 @@ mod tests {
             ],
             constraints: vec![],
             append_only: false,
+            epoch: 0,
         };
 
         let row = vec![

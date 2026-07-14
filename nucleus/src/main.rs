@@ -773,10 +773,65 @@ async fn cmd_start(cfg: StartConfig) {
             if compress { ", compressed" } else { "" },
         );
 
-        // Re-register tables restored from catalog so DiskEngine knows about them
+        // Re-register tables restored from catalog so DiskEngine knows about
+        // them — and let create_table reconcile epochs (a directory entry whose
+        // generation differs from the catalog's is a stale drop+recreate, whose
+        // first_page is abandoned rather than trusted; T0.3).
         for table_name in catalog.table_names().await {
             if let Err(e) = engine.create_table(&table_name).await {
                 tracing::warn!("Failed to re-register table {table_name}: {e}");
+            }
+        }
+
+        // Bidirectional reconciliation: reclaim storage-ahead orphans — tables
+        // the on-disk directory still holds but the (authoritative,
+        // persisted-last) catalog does not. Because DDL forces storage durable
+        // *before* the catalog, the only crash-window residue is storage-ahead:
+        // an uncommitted CREATE or a half-applied DROP. Dropping the orphan
+        // frees its pages and keeps the two sides convergent. This replaces the
+        // old purely one-directional re-register (which could only ever leak).
+        //
+        // SAFETY GUARD: only reclaim when the catalog is NON-empty. A missing or
+        // corrupt catalog.json loads as an empty catalog (load_catalog returns
+        // Ok with no tables), and reclaiming against that would drop EVERY
+        // storage table — turning a recoverable catalog problem into permanent
+        // data loss. An empty catalog beside populated storage is treated as
+        // "catalog needs recovery", not "everything is an orphan": leave the
+        // tables intact (they are invisible to SQL until the catalog is restored,
+        // but preserved).
+        {
+            let cataloged: std::collections::HashSet<String> =
+                catalog.table_names().await.into_iter().collect();
+            let storage_tables = engine.table_names();
+            if cataloged.is_empty() {
+                if !storage_tables.is_empty() {
+                    tracing::warn!(
+                        "reconcile: catalog is empty but storage holds {} table(s) — NOT \
+                         reclaiming (likely a missing/corrupt catalog, not orphans); tables are \
+                         preserved but invisible until the catalog is restored",
+                        storage_tables.len()
+                    );
+                }
+            } else {
+                let orphans: Vec<String> = storage_tables
+                    .into_iter()
+                    .filter(|t| !cataloged.contains(t))
+                    .collect();
+                let reclaimed = !orphans.is_empty();
+                for orphan in orphans {
+                    tracing::warn!(
+                        "reconcile: reclaiming orphan storage table '{orphan}' (absent from catalog)"
+                    );
+                    if let Err(e) = engine.drop_table(&orphan).await {
+                        tracing::warn!("reconcile: failed to reclaim orphan '{orphan}': {e}");
+                    }
+                }
+                // Persist the reclaimed directory so orphans don't reappear next boot.
+                if reclaimed
+                    && let Err(e) = engine.flush_schema().await
+                {
+                    tracing::warn!("reconcile: failed to persist directory after reclaim: {e}");
+                }
             }
         }
 
