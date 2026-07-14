@@ -1836,6 +1836,44 @@ impl Executor {
         Ok(())
     }
 
+    /// Checkpoint the on-disk vector-index WAL: writes a snapshot of every
+    /// live HNSW index and truncates the WAL file to just that snapshot.
+    ///
+    /// `CREATE INDEX ... USING hnsw` and every subsequent vector INSERT/DELETE
+    /// log to this WAL (`wal_log_vector_insert`/`_delete`) with no consumer
+    /// required — without periodic checkpointing the file grows one record per
+    /// write forever. IvfFlat indexes are excluded on purpose: they are never
+    /// logged to this WAL (they rebuild from base-table data at startup, see
+    /// `rebuild_specialty_indexes`), so a snapshot need only cover HNSW. The
+    /// index→(table,column) sidecar is written separately at CREATE time and
+    /// is untouched here. Called from the recurring `WalCheckpoint` background
+    /// task (`main.rs`) on the same cadence as the primary storage WAL.
+    pub fn checkpoint_vector_wal(&self) -> std::io::Result<()> {
+        let Some(ref wal) = self.vector_wal else {
+            return Ok(());
+        };
+        // Hold the read lock across `checkpoint` so the borrowed HNSW indexes
+        // stay live while they serialize; vector writes take the write lock and
+        // block briefly, matching the other subsystem checkpoints.
+        let indexes = self.vector_indexes.read();
+        let mut snapshots: HashMap<String, vector::wal::IndexSnapshot<'_>> = HashMap::new();
+        for (name, entry) in indexes.iter() {
+            if let VectorIndexKind::Hnsw(hnsw) = &entry.kind {
+                snapshots.insert(
+                    name.clone(),
+                    vector::wal::IndexSnapshot {
+                        hnsw,
+                        dims: hnsw.dims() as u32,
+                        metric: vector::metric_to_u8(hnsw.metric()),
+                        m: hnsw.m() as u32,
+                        ef: hnsw.ef_search() as u32,
+                    },
+                );
+            }
+        }
+        wal.checkpoint(&snapshots)
+    }
+
     /// Get a reference to the CDC log.
     #[cfg(feature = "server")]
     pub fn cdc_log(&self) -> &parking_lot::RwLock<crate::reactive::CdcLog> {
@@ -2262,6 +2300,17 @@ impl Executor {
 
             SqlFastPathCommand::SimpleInsert { table, values } => {
                 let table_def = self.catalog.get_table_cached(table)?;
+                // Correctness gate: this fast path writes straight to storage and
+                // does NOT enforce constraints. Fall through to the full executor
+                // (execute_sql_session — which enforces PRIMARY KEY / UNIQUE /
+                // NOT NULL / CHECK / FOREIGN KEY) for any table that has them, so a
+                // wire-level autocommit INSERT can never silently bypass a
+                // constraint. The fast path stays only for constraint-free tables.
+                let has_enforceable_constraints = !table_def.constraints.is_empty()
+                    || table_def.columns.iter().any(|col| !col.nullable);
+                if has_enforceable_constraints {
+                    return None;
+                }
                 // Column count must match exactly for a simple VALUES insert.
                 if values.len() != table_def.columns.len() {
                     return None; // Fall through to normal path for better error reporting.

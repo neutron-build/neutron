@@ -1010,6 +1010,40 @@ impl ColumnarStore {
         }
         names
     }
+
+    /// Write a snapshot of every table (raw + MergeTree-backed) to the WAL and
+    /// truncate the log to just that snapshot. No-op when the store is purely
+    /// in-memory (no WAL attached).
+    ///
+    /// `append`, `append_with_dict`, `create_table`, and `create_merge_tree_*`
+    /// log unconditionally to `columnar.wal`, so without periodic checkpointing
+    /// the file grows one entry per write forever. The snapshot captures the
+    /// same logical rows a full WAL replay would reconstruct — replay
+    /// materializes every table's rows into `tables` (see `open`) — so this is
+    /// state-preserving. Called from the recurring `WalCheckpoint` background
+    /// task (`main.rs`) on the same cadence as the primary storage WAL.
+    pub fn checkpoint(&mut self) -> std::io::Result<()> {
+        self.poll_all_merge_results();
+        let Some(ref wal) = self.wal else {
+            return Ok(());
+        };
+        let names = self.table_names();
+        let rows_per_table: Vec<Vec<Row>> = names
+            .iter()
+            .map(|name| {
+                self.batches_all(name)
+                    .iter()
+                    .flat_map(batch_to_rows)
+                    .collect()
+            })
+            .collect();
+        let snapshot: Vec<(&str, Vec<Row>)> = names
+            .iter()
+            .map(String::as_str)
+            .zip(rows_per_table)
+            .collect();
+        wal.checkpoint(&snapshot)
+    }
 }
 
 // ============================================================================
@@ -5746,6 +5780,54 @@ mod tests {
             // in the WAL yet), but the data should be recoverable.
             assert!(store.table_exists("events"));
             assert_eq!(store.row_count("events"), 3);
+        }
+    }
+
+    #[test]
+    fn checkpoint_truncates_wal_and_preserves_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+        let wal_path = dir_path.join("columnar.wal");
+
+        {
+            let mut store = ColumnarStore::open(dir_path).unwrap();
+            store.create_table("raw");
+            store.create_merge_tree_table("mt", vec!["ts".into()]);
+            // Many small appends so the WAL accumulates one INSERT_ROWS entry each.
+            for i in 0..50i64 {
+                store.append(
+                    "raw",
+                    ColumnBatch::new(vec![("k".into(), ColumnData::Int64(vec![Some(i)]))]),
+                );
+                store.append(
+                    "mt",
+                    ColumnBatch::new(vec![
+                        ("ts".into(), ColumnData::Int64(vec![Some(i)])),
+                        ("v".into(), ColumnData::Float64(vec![Some(i as f64)])),
+                    ]),
+                );
+            }
+            let before = std::fs::metadata(&wal_path).unwrap().len();
+
+            store.checkpoint().unwrap();
+
+            let after = std::fs::metadata(&wal_path).unwrap().len();
+            assert!(
+                after < before,
+                "checkpoint must shrink the WAL (before={before}, after={after})"
+            );
+            assert_eq!(store.row_count("raw"), 50);
+            assert_eq!(store.row_count("mt"), 50);
+        }
+
+        // Reopen from the checkpointed WAL: the single SNAPSHOT entry must
+        // reconstruct every row for both the raw and MergeTree-backed tables.
+        {
+            let store = ColumnarStore::open(dir_path).unwrap();
+            assert!(store.table_exists("raw"));
+            assert!(store.table_exists("mt"));
+            assert_eq!(store.row_count("raw"), 50, "raw rows must survive checkpoint");
+            assert_eq!(store.row_count("mt"), 50, "MergeTree rows must survive checkpoint");
         }
     }
 
