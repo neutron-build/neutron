@@ -1321,6 +1321,14 @@ impl SimpleQueryHandler for NucleusHandler {
         // ── KV fast path: intercept common KV queries before SQL parsing ──
         if !in_txn && let Some(kv_cmd) = kv_fast_path::try_parse_kv(query) {
             let result = kv_fast_path::execute_kv_command(&kv_cmd, self.executor.kv_store());
+            // A KV write must be durable before it is acked — this path bypasses
+            // execute()'s commit-time force, so force here (no-op under
+            // synchronous_commit=off, matching the SQL fast path).
+            if kv_cmd.is_write() {
+                self.executor
+                    .kv_fast_path_durability()
+                    .map_err(exec_error_to_pgwire)?;
+            }
             self.flush_pending_notifications(client).await?;
             return Ok(vec![Self::build_response(result, None)?]);
         }

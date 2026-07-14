@@ -219,6 +219,39 @@ async fn test_hnsw_index_survives_wal_checkpoint_restart() {
     }
 }
 
+// ── KV write durability (group-commit fsync) ────────────────────────────────────
+
+/// A KV write through the SQL scalar path must be fsync-durable before the
+/// executor returns when synchronous_commit is on: the KV WAL reads clean (its
+/// tail forced by the specialty-durability hook). With synchronous_commit off,
+/// the write applies but the fsync is deferred (bounded loss window), so the
+/// WAL stays dirty. This exercises `force_specialty_durability` end-to-end.
+#[tokio::test]
+async fn test_kv_write_is_fsync_durable_on_ack() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = open_executor(dir.path()).await;
+
+    // Default synchronous_commit = on.
+    exec(&ex, "SELECT kv_set('greeting', 'hello')").await;
+    let wal = ex
+        .kv_store()
+        .wal()
+        .expect("a persistent KV store has a WAL")
+        .clone();
+    assert!(
+        !wal.is_dirty(),
+        "kv_set must fsync the KV WAL before acking under synchronous_commit=on"
+    );
+
+    // synchronous_commit = off: the write applies but its fsync is deferred.
+    ex.set_synchronous_commit_default(false);
+    exec(&ex, "SELECT kv_set('greeting2', 'world')").await;
+    assert!(
+        wal.is_dirty(),
+        "synchronous_commit=off should defer the KV fsync, leaving the tail dirty"
+    );
+}
+
 // ── Encrypted index persistence ───────────────────────────────────────────────
 
 #[tokio::test]
