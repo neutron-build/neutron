@@ -163,6 +163,7 @@
   cursor: pointer;
   padding: 0;
   margin-left: auto;
+  touch-action: manipulation;
   transition: background 0.15s, border-color 0.15s;
 }
 .nav__hamburger:hover { background: var(--surface-hover, rgba(255,255,255,0.04)); }
