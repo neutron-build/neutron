@@ -243,6 +243,12 @@ fn encode_value(val: &Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
         }
+        Value::Numeric(s) => {
+            buf.push(10);
+            let b = s.as_bytes();
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
         Value::Date(d) => {
             buf.push(7);
             buf.extend_from_slice(&d.to_le_bytes());
@@ -421,6 +427,17 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Option<Value> {
         7 => Some(Value::Date(read_i32(data, pos)?)),
         8 => Some(Value::Timestamp(read_i64(data, pos)?)),
         9 => Some(Value::TimestampTz(read_i64(data, pos)?)),
+        10 => {
+            let len = read_u32(data, pos)? as usize;
+            if *pos + len > data.len() {
+                return None;
+            }
+            let value = std::str::from_utf8(&data[*pos..*pos + len])
+                .ok()?
+                .to_string();
+            *pos += len;
+            Some(Value::Numeric(value))
+        }
         _ => None, // Unknown tag — stop decoding row.
     }
 }

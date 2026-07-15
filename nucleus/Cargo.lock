@@ -2772,6 +2772,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rusqlite",
+ "rust_decimal",
  "rustls-pemfile",
  "rustyline",
  "serde",

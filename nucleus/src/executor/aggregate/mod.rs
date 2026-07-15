@@ -12,6 +12,7 @@ pub use fastmap::{AggregateState, FastHashMap, select_fast_map};
 
 use std::collections::{HashMap, HashSet};
 
+use rust_decimal::Decimal;
 use sqlparser::ast::{self, Expr, SelectItem};
 
 use crate::simd;
@@ -862,7 +863,9 @@ impl Executor {
                 // Use i128 accumulator for integer precision when mixing int+float
                 let mut sum_int: i128 = 0;
                 let mut sum_f64: f64 = 0.0;
+                let mut sum_numeric = Decimal::ZERO;
                 let mut is_float = false;
+                let mut is_numeric = false;
                 let mut has_value = false;
                 for val in vals {
                     match val {
@@ -875,9 +878,28 @@ impl Executor {
                             sum_int += n as i128;
                         }
                         Value::Float64(n) => {
+                            if is_numeric {
+                                return Err(ExecError::Unsupported(
+                                    "SUM cannot mix NUMERIC and floating-point values".into(),
+                                ));
+                            }
                             has_value = true;
                             is_float = true;
                             sum_f64 += n;
+                        }
+                        Value::Numeric(value) => {
+                            if is_float {
+                                return Err(ExecError::Unsupported(
+                                    "SUM cannot mix NUMERIC and floating-point values".into(),
+                                ));
+                            }
+                            has_value = true;
+                            is_numeric = true;
+                            let decimal =
+                                crate::types::parse_numeric(&value).map_err(ExecError::Runtime)?;
+                            sum_numeric = sum_numeric.checked_add(decimal).ok_or_else(|| {
+                                ExecError::Runtime("numeric value out of range".into())
+                            })?;
                         }
                         _ => return Err(ExecError::Unsupported("SUM on non-numeric".into())),
                     }
@@ -885,7 +907,14 @@ impl Executor {
                 if !has_value {
                     return Ok(Value::Null);
                 }
-                if is_float {
+                if is_numeric {
+                    let integer = crate::types::parse_numeric(&sum_int.to_string())
+                        .map_err(|_| ExecError::Runtime("numeric value out of range".into()))?;
+                    let total = sum_numeric
+                        .checked_add(integer)
+                        .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))?;
+                    Ok(Value::Numeric(total.normalize().to_string()))
+                } else if is_float {
                     Ok(Value::Float64(sum_f64 + sum_int as f64))
                 } else {
                     // Return Int64 if it fits, otherwise use Numeric for large sums
@@ -934,16 +963,49 @@ impl Executor {
                     return Ok(Value::Null);
                 }
                 let mut sum: f64 = 0.0;
+                let mut numeric_sum = Decimal::ZERO;
+                let mut numeric = false;
+                let mut non_numeric = false;
                 let count = vals.len();
                 for val in vals {
                     match val {
-                        Value::Int32(n) => sum += n as f64,
-                        Value::Int64(n) => sum += n as f64,
-                        Value::Float64(n) => sum += n,
+                        Value::Int32(n) => {
+                            non_numeric = true;
+                            sum += n as f64;
+                        }
+                        Value::Int64(n) => {
+                            non_numeric = true;
+                            sum += n as f64;
+                        }
+                        Value::Float64(n) => {
+                            non_numeric = true;
+                            sum += n;
+                        }
+                        Value::Numeric(value) => {
+                            numeric = true;
+                            let decimal =
+                                crate::types::parse_numeric(&value).map_err(ExecError::Runtime)?;
+                            numeric_sum = numeric_sum.checked_add(decimal).ok_or_else(|| {
+                                ExecError::Runtime("numeric value out of range".into())
+                            })?;
+                        }
                         _ => return Err(ExecError::Unsupported("AVG on non-numeric".into())),
                     }
                 }
-                Ok(Value::Float64(sum / count as f64))
+                if numeric {
+                    if non_numeric {
+                        return Err(ExecError::Unsupported(
+                            "AVG cannot mix NUMERIC and floating-point values".into(),
+                        ));
+                    }
+                    let divisor = Decimal::from(count as u64);
+                    let average = numeric_sum
+                        .checked_div(divisor)
+                        .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))?;
+                    Ok(Value::Numeric(average.normalize().to_string()))
+                } else {
+                    Ok(Value::Float64(sum / count as f64))
+                }
             }
             "MIN" => {
                 let expr = arg_expr
@@ -1619,43 +1681,78 @@ impl Executor {
                         Value::Float64(count_leq as f64 / partition_size as f64)
                     }
                     // Aggregate window functions: SUM, AVG, COUNT, MIN, MAX OVER()
-                    "SUM" => {
+                    "SUM" | "AVG" => {
                         // SQL-standard SUM is NULL-ignoring: skip NULL argument
                         // values and return NULL when the frame contains no
                         // non-NULL value at all (mirrors the non-window SUM's
                         // has_value logic above). Returning 0 for an all-NULL
                         // frame would diverge from Postgres/SQLite and from
                         // Nucleus's own plain-aggregate SUM.
-                        let mut sum = 0.0f64;
-                        let mut has_value = false;
+                        let mut values = Vec::new();
                         for &(_, r) in &members[frame_start..=frame_end] {
                             if let Some(e) = arg_expr {
                                 let v = self.eval_row_expr(e, r, col_meta)?;
                                 if v == Value::Null {
                                     continue;
                                 }
-                                sum += value_to_f64(&v).unwrap_or(0.0);
-                                has_value = true;
+                                values.push(v);
                             }
                         }
-                        if has_value {
-                            Value::Float64(sum)
-                        } else {
+                        if values.is_empty() {
                             Value::Null
-                        }
-                    }
-                    "AVG" => {
-                        let mut sum = 0.0f64;
-                        let count = frame_end - frame_start + 1;
-                        for &(_, r) in &members[frame_start..=frame_end] {
-                            if let Some(e) = arg_expr {
-                                let v = self.eval_row_expr(e, r, col_meta)?;
-                                sum += value_to_f64(&v).unwrap_or(0.0);
+                        } else if values
+                            .iter()
+                            .any(|value| matches!(value, Value::Numeric(_)))
+                        {
+                            let mut sum = Decimal::ZERO;
+                            for value in &values {
+                                let decimal = match value {
+                                    Value::Numeric(raw) => crate::types::parse_numeric(raw)
+                                        .map_err(ExecError::Runtime)?,
+                                    _ => {
+                                        return Err(ExecError::Runtime(
+                                            "cannot mix NUMERIC with non-NUMERIC in a window aggregate"
+                                                .into(),
+                                        ));
+                                    }
+                                };
+                                sum = sum.checked_add(decimal).ok_or_else(|| {
+                                    ExecError::Runtime("numeric value out of range".into())
+                                })?;
                             }
+                            let result = if fname == "AVG" {
+                                sum.checked_div(Decimal::from(values.len() as u64))
+                                    .ok_or_else(|| {
+                                        ExecError::Runtime("numeric value out of range".into())
+                                    })?
+                            } else {
+                                sum
+                            };
+                            Value::Numeric(result.normalize().to_string())
+                        } else {
+                            let mut sum = 0.0f64;
+                            for value in &values {
+                                sum += value_to_f64(value)?;
+                            }
+                            if fname == "AVG" {
+                                sum /= values.len() as f64;
+                            }
+                            Value::Float64(sum)
                         }
-                        Value::Float64(sum / count as f64)
                     }
-                    "COUNT" => Value::Int64((frame_end - frame_start + 1) as i64),
+                    "COUNT" => {
+                        if let Some(expr) = arg_expr {
+                            let mut count = 0i64;
+                            for &(_, row) in &members[frame_start..=frame_end] {
+                                if self.eval_row_expr(expr, row, col_meta)? != Value::Null {
+                                    count += 1;
+                                }
+                            }
+                            Value::Int64(count)
+                        } else {
+                            Value::Int64((frame_end - frame_start + 1) as i64)
+                        }
+                    }
                     "MIN" => {
                         let mut min_val = Value::Null;
                         for &(_, r) in &members[frame_start..=frame_end] {

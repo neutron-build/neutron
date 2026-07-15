@@ -2531,6 +2531,17 @@ impl Executor {
                                                 .position(|(c, _)| c.eq_ignore_ascii_case(name))
                                         };
                                         if let Some(col_idx) = resolve(&col_name) {
+                                            // Storage fast aggregates operate in f64 and either
+                                            // lose NUMERIC precision or report an empty result for
+                                            // non-primitive physical columns. Exact NUMERIC work is
+                                            // handled by the checked fallback below.
+                                            if matches!(
+                                                ci.get(col_idx).map(|(_, dt)| dt),
+                                                Some(DataType::Numeric)
+                                            ) {
+                                                all_handled = false;
+                                                break;
+                                            }
                                             match func_name.as_str() {
                                                 "SUM" => {
                                                     match tbl_storage.fast_sum_f64(table, col_idx) {
@@ -2688,15 +2699,25 @@ impl Executor {
                         } else {
                             Self::resolve_plan_col_idx(&meta, &col_name)
                         };
-                        // Try SIMD fast-path for SUM/MIN/MAX on numeric columns
-                        let val = col_idx
-                            .and_then(|ci| simd_aggregate(&func_name, ci, &meta, &rows))
-                            .unwrap_or_else(|| compute_aggregate(&func_name, col_idx, &rows));
                         // Resolve the dtype from the aggregate function + the
                         // arg column's type so empty input (Value::Null) doesn't
                         // collapse the column type to TEXT.  Falls back to the
                         // value's dynamic type only when both sides are unknown.
                         let arg_dt = col_idx.and_then(|i| meta.get(i)).map(|c| c.dtype.clone());
+                        let val = if matches!(arg_dt.as_ref(), Some(DataType::Numeric))
+                            && matches!(func_name.as_str(), "SUM" | "AVG")
+                        {
+                            compute_numeric_aggregate(
+                                &func_name,
+                                col_idx.expect("NUMERIC aggregate has a column"),
+                                &rows,
+                            )?
+                        } else {
+                            // Try SIMD fast-path for primitive SUM/MIN/MAX.
+                            col_idx
+                                .and_then(|ci| simd_aggregate(&func_name, ci, &meta, &rows))
+                                .unwrap_or_else(|| compute_aggregate(&func_name, col_idx, &rows))
+                        };
                         let static_dt = match func_name.as_str() {
                             "COUNT" => Some(DataType::Int64),
                             "SUM" => match &arg_dt {
@@ -2707,6 +2728,9 @@ impl Executor {
                                 None => None,
                             },
                             "MAX" | "MIN" => arg_dt.clone(),
+                            "AVG" if matches!(arg_dt.as_ref(), Some(DataType::Numeric)) => {
+                                Some(DataType::Numeric)
+                            }
                             "AVG" | "STDDEV" | "VARIANCE" => Some(DataType::Float64),
                             _ => None,
                         };
@@ -2776,8 +2800,17 @@ impl Executor {
                                     _ => false,
                                 }
                             });
+                            let fast_value_type_ok = val_idx
+                                .and_then(|index| ci.get(index))
+                                .is_none_or(|(_, dtype)| {
+                                    matches!(
+                                        dtype,
+                                        DataType::Int32 | DataType::Int64 | DataType::Float64
+                                    )
+                                });
                             if let Some(ki) = key_idx
                                 && fast_ok
+                                && fast_value_type_ok
                             {
                                 let tbl_storage = self.storage_for(table);
                                 if let Some(groups) = tbl_storage.fast_group_by(table, ki, val_idx)
@@ -2896,6 +2929,9 @@ impl Executor {
                                 None => DataType::Float64,
                             },
                             "MAX" | "MIN" => arg_dt.unwrap_or(DataType::Float64),
+                            "AVG" if matches!(arg_dt.as_ref(), Some(DataType::Numeric)) => {
+                                DataType::Numeric
+                            }
                             "AVG" | "STDDEV" | "VARIANCE" => DataType::Float64,
                             _ => DataType::Float64,
                         };
@@ -2931,11 +2967,23 @@ impl Executor {
                                 } else {
                                     Self::resolve_plan_col_idx(&meta, &col_name)
                                 };
-                                row_out.push(compute_aggregate_refs(
-                                    &func_name,
-                                    col_idx,
-                                    &group_rows,
-                                ));
+                                let numeric = col_idx.is_some_and(|index| {
+                                    matches!(
+                                        meta.get(index).map(|column| &column.dtype),
+                                        Some(DataType::Numeric)
+                                    )
+                                });
+                                let value =
+                                    if numeric && matches!(func_name.as_str(), "SUM" | "AVG") {
+                                        compute_numeric_aggregate_refs(
+                                            &func_name,
+                                            col_idx.expect("NUMERIC aggregate has a column"),
+                                            &group_rows,
+                                        )?
+                                    } else {
+                                        compute_aggregate_refs(&func_name, col_idx, &group_rows)
+                                    };
+                                row_out.push(value);
                             }
                             result_rows.push(row_out);
                         }
@@ -2969,7 +3017,22 @@ impl Executor {
                             } else {
                                 Self::resolve_plan_col_idx(&meta, &col_name)
                             };
-                            row_out.push(compute_aggregate_refs(&func_name, col_idx, &group_rows));
+                            let numeric = col_idx.is_some_and(|index| {
+                                matches!(
+                                    meta.get(index).map(|column| &column.dtype),
+                                    Some(DataType::Numeric)
+                                )
+                            });
+                            let value = if numeric && matches!(func_name.as_str(), "SUM" | "AVG") {
+                                compute_numeric_aggregate_refs(
+                                    &func_name,
+                                    col_idx.expect("NUMERIC aggregate has a column"),
+                                    &group_rows,
+                                )?
+                            } else {
+                                compute_aggregate_refs(&func_name, col_idx, &group_rows)
+                            };
+                            row_out.push(value);
                         }
                         result_rows.push(row_out);
                     }
@@ -3113,6 +3176,17 @@ impl Executor {
                 // Postgres semantics requested by callers that don't want a
                 // hard error on unparseable text.
                 let cmp = || super::helpers::compare_values(&lv, &rv);
+                if matches!(
+                    op,
+                    ast::BinaryOperator::Plus
+                        | ast::BinaryOperator::Minus
+                        | ast::BinaryOperator::Multiply
+                        | ast::BinaryOperator::Divide
+                        | ast::BinaryOperator::Modulo
+                ) && let Some(result) = eval_numeric_arithmetic(&lv, op, &rv)
+                {
+                    return result;
+                }
                 match op {
                     ast::BinaryOperator::Eq => {
                         Ok(Value::Bool(cmp() == Some(std::cmp::Ordering::Equal)))
@@ -4737,6 +4811,12 @@ impl Executor {
                                 Some(i) => i,
                                 None => return Ok(None),
                             };
+                            if !matches!(
+                                col_info[ci].1,
+                                DataType::Int32 | DataType::Int64 | DataType::Float64
+                            ) {
+                                return Ok(None);
+                            }
                             items.push((col_label, FastAgg::Sum(ci)));
                         }
                         "AVG" => {
@@ -4744,6 +4824,12 @@ impl Executor {
                                 Some(i) => i,
                                 None => return Ok(None),
                             };
+                            if !matches!(
+                                col_info[ci].1,
+                                DataType::Int32 | DataType::Int64 | DataType::Float64
+                            ) {
+                                return Ok(None);
+                            }
                             items.push((col_label, FastAgg::Avg(ci)));
                         }
                         "MIN" => {
@@ -4751,6 +4837,12 @@ impl Executor {
                                 Some(i) => i,
                                 None => return Ok(None),
                             };
+                            if !matches!(
+                                col_info[ci].1,
+                                DataType::Int32 | DataType::Int64 | DataType::Float64
+                            ) {
+                                return Ok(None);
+                            }
                             items.push((col_label, FastAgg::Min(ci)));
                         }
                         "MAX" => {
@@ -4758,6 +4850,12 @@ impl Executor {
                                 Some(i) => i,
                                 None => return Ok(None),
                             };
+                            if !matches!(
+                                col_info[ci].1,
+                                DataType::Int32 | DataType::Int64 | DataType::Float64
+                            ) {
+                                return Ok(None);
+                            }
                             items.push((col_label, FastAgg::Max(ci)));
                         }
                         _ => return Ok(None),
