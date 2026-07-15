@@ -1816,6 +1816,54 @@ mod tests {
 
     #[cfg(feature = "server")]
     #[tokio::test]
+    async fn durable_mvcc_hnsw_pk_vector_search_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        // PK values are 10/20/30 (not 0/1/2) so pk != scan position — this
+        // exposes any positional-vs-PK-id mismatch after recovery.
+        {
+            let db = Database::durable_mvcc(dir.path()).unwrap();
+            db.execute("CREATE TABLE pv (id INT PRIMARY KEY, v VECTOR(3))")
+                .await
+                .unwrap();
+            db.execute(
+                "INSERT INTO pv VALUES (10, VECTOR('[1,0,0]')), (20, VECTOR('[0,1,0]')), (30, VECTOR('[0,0,1]'))",
+            )
+            .await
+            .unwrap();
+            db.execute("CREATE INDEX pv_v ON pv USING HNSW (v)")
+                .await
+                .unwrap();
+            db.execute("DELETE FROM pv WHERE id = 20").await.unwrap();
+            db.sync().unwrap();
+            db.close();
+        }
+        {
+            let db = Database::durable_mvcc(dir.path()).unwrap();
+            let rows = db
+                .query("SELECT id FROM pv ORDER BY VECTOR_DISTANCE(v, VECTOR('[1,0,0]'), 'l2') LIMIT 3")
+                .await
+                .unwrap();
+            let ids: Vec<i64> = rows
+                .iter()
+                .filter_map(|r| match r.first() {
+                    Some(Value::Int32(n)) => Some(*n as i64),
+                    Some(Value::Int64(n)) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                ids.contains(&10),
+                "vector search after reopen must find id 10 (nearest to [1,0,0]): {ids:?}"
+            );
+            assert!(
+                !ids.contains(&20),
+                "deleted id 20 must not resurface after reopen: {ids:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
     async fn durable_mvcc_aborted_txn_not_recovered() {
         let dir = tempfile::tempdir().unwrap();
 
