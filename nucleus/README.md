@@ -284,6 +284,10 @@ versions and aborted inserts, repairs aborted-delete tombstones, reclaims resolv
 metadata, and rebuilds affected secondary-index version pointers after compaction. Idle transaction
 timeouts prevent abandoned sessions from pinning that horizon indefinitely.
 
+MVCC transaction IDs are 64-bit, monotonic, and never wrap into reserved bootstrap/invalid IDs.
+When the allocatable space is exhausted, new explicit and implicit transactions fail with a
+`transaction ID space exhausted` error; the operator must migrate through a fresh logical backup.
+
 ## License
 
 Business Source License 1.1 -- converts to MIT after 4 years. See [LICENSE](./LICENSE).

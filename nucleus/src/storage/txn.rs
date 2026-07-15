@@ -269,6 +269,10 @@ pub struct Transaction {
     pub snapshot: Snapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("transaction ID space exhausted; restart from a fresh logical backup")]
+pub struct TransactionIdExhausted;
+
 // ============================================================================
 // Transaction manager
 // ============================================================================
@@ -340,6 +344,17 @@ impl TransactionManager {
 
     /// Begin a new transaction with the given isolation level.
     pub fn begin(&self, isolation: IsolationLevel) -> Transaction {
+        self.try_begin(isolation)
+            .expect("transaction ID space exhausted")
+    }
+
+    /// Fallible transaction allocation used by every public storage path. ID 0
+    /// and 1 are reserved and `u64::MAX` is an exhaustion sentinel; allocation
+    /// never wraps into either reserved value.
+    pub fn try_begin(
+        &self,
+        isolation: IsolationLevel,
+    ) -> Result<Transaction, TransactionIdExhausted> {
         // Assign the id and capture the snapshot ATOMICALLY under the active
         // lock. If the id assignment (`fetch_add`) and the active-set capture are
         // separate, a transaction can receive id N but observe an active set that
@@ -351,7 +366,12 @@ impl TransactionManager {
         // guarantees: snapshot.active holds exactly the still-running txns with
         // ids < N, and xmax = N excludes everything from N onward.
         let mut active = self.active.lock();
-        let id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
+        let id = self
+            .next_txn_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| TransactionIdExhausted)?;
         let snapshot = Snapshot {
             txn_id: id,
             xmin: *active.iter().min().unwrap_or(&id),
@@ -381,12 +401,17 @@ impl TransactionManager {
         }
         drop(active);
 
-        Transaction {
+        Ok(Transaction {
             id,
             status: TxnStatus::Active,
             isolation,
             snapshot,
-        }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_txn_id_for_test(&self, next: u64) {
+        self.next_txn_id.store(next, Ordering::SeqCst);
     }
 
     /// Commit a transaction.
@@ -1277,6 +1302,29 @@ mod tests {
         assert_eq!(mgr.active_count(), 2);
         drop(t1); // drop doesn't affect the manager (no auto-abort)
         assert_eq!(mgr.active_count(), 2); // still tracked until explicit commit/abort
+    }
+
+    #[test]
+    fn transaction_id_exhaustion_never_wraps_reserved_ids() {
+        let mgr = TransactionManager::new();
+        mgr.set_next_txn_id_for_test(u64::MAX - 1);
+
+        let mut last = mgr.try_begin(IsolationLevel::Snapshot).unwrap();
+        assert_eq!(last.id, u64::MAX - 1);
+        assert!(matches!(
+            mgr.try_begin(IsolationLevel::Snapshot),
+            Err(TransactionIdExhausted)
+        ));
+        mgr.commit(&mut last);
+        assert!(
+            matches!(
+                mgr.try_begin(IsolationLevel::Snapshot),
+                Err(TransactionIdExhausted)
+            ),
+            "exhaustion is terminal and must never wrap to transaction 0"
+        );
+        assert!(!mgr.active.lock().contains(&0));
+        assert!(!mgr.active.lock().contains(&TXN_COMMITTED_BEFORE_ALL));
     }
 
     // ====================================================================

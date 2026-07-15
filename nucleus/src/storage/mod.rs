@@ -1196,6 +1196,8 @@ pub enum StorageError {
     SerializationFailure(String),
     #[error("duplicate key value violates unique constraint: {0}")]
     UniqueViolation(String),
+    #[error("transaction ID space exhausted; restart from a fresh logical backup")]
+    TransactionIdExhausted,
 }
 
 pub use mvcc::MvccStorageAdapter;
