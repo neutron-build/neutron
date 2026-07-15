@@ -267,6 +267,53 @@ async fn mergetree_rows_survive_simulated_crash() {
 }
 
 #[tokio::test]
+async fn lsm_rows_and_mutations_survive_simulated_crash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let (ex, _buf) = boot(&data).await;
+
+    exec(
+        &ex,
+        "CREATE TABLE durable_lsm (id INT PRIMARY KEY, val BIGINT, note TEXT) WITH (engine='lsm')",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO durable_lsm VALUES (1, 10, 'old'), (2, 20, 'keep'), (3, 30, 'drop')",
+    )
+    .await;
+    exec(
+        &ex,
+        "UPDATE durable_lsm SET val = 99, note = 'new' WHERE id = 1",
+    )
+    .await;
+    exec(&ex, "DELETE FROM durable_lsm WHERE id = 3").await;
+    exec(&ex, "ALTER TABLE durable_lsm RENAME TO durable_lsm_new").await;
+
+    let crash = tmp.path().join("crash");
+    copy_dir(&data, &crash);
+    drop(ex);
+
+    let (reopened, _) = boot(&crash).await;
+    assert_eq!(
+        rows(
+            &reopened,
+            "SELECT id, val, note FROM durable_lsm_new ORDER BY id",
+        )
+        .await,
+        vec![
+            vec![Value::Int32(1), Value::Int64(99), Value::Text("new".into()),],
+            vec![
+                Value::Int32(2),
+                Value::Int64(20),
+                Value::Text("keep".into()),
+            ],
+        ],
+        "LSM insert/update/delete/rename state must survive restart",
+    );
+}
+
+#[tokio::test]
 async fn drop_table_removes_engine_sidecar() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");

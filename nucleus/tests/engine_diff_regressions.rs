@@ -179,3 +179,29 @@ async fn columnar_insert_schema_coercion_is_strict() {
         Value::Int64(1)
     );
 }
+
+/// An UPDATE literal must be coerced just like an INSERT literal. Previously,
+/// assigning an Int32 literal to a BIGINT column made the rebuilt columnar batch
+/// choose Int32 storage; every untouched Int64 in that column decoded as NULL.
+#[tokio::test]
+async fn columnar_update_preserves_declared_type_and_neighbor_values() {
+    let e = ex(Arc::new(ColumnarStorageEngine::new()));
+    e.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, big BIGINT NOT NULL, optional BIGINT)")
+        .await
+        .unwrap();
+    e.execute("INSERT INTO t VALUES (1, 10, 1), (2, 20, NULL), (3, 30, 3)")
+        .await
+        .unwrap();
+    e.execute("UPDATE t SET big = -3 WHERE id <> 3")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows(&e, "SELECT id, big, optional FROM t ORDER BY id").await,
+        vec![
+            vec![Value::Int32(1), Value::Int64(-3), Value::Int64(1)],
+            vec![Value::Int32(2), Value::Int64(-3), Value::Null],
+            vec![Value::Int32(3), Value::Int64(30), Value::Int64(3)],
+        ]
+    );
+}

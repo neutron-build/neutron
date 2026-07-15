@@ -17,13 +17,10 @@
 //!     so a process crash (drop) keeps committed KV state; reopen replays the WAL.
 //!     We exercise this directly via `db.kv()`.
 //!
-//! NOT testable here (durable modes that are NOT wired into `StorageMode`):
-//!   * LSM engine (src/storage/lsm_engine.rs `LsmStorageEngine::open`) and Columnar
-//!     engine (src/storage/columnar_engine.rs `ColumnarStorageEngine::open`) both
-//!     implement `StorageEngine` and have on-disk `open(dir)` constructors, but
-//!     `embedded::StorageMode` has only {Memory, Mvcc, DurableMvcc, Disk}. There is
-//!     no builder method to select them, so they cannot be reached through `Database`
-//!     and are out of scope for a public-API recovery harness. (Reported in summary.)
+//! Per-table LSM and columnar/MergeTree engines are durable and publicly reachable
+//! through `CREATE TABLE ... WITH (engine=...)` when the executor has a data
+//! directory. Their restart/crash-copy coverage lives in `commit_durability.rs`;
+//! this older whole-database harness remains focused on the global Disk engine.
 //!
 //! Build/run: `cargo run --release --features "server rusqlite" --bin probe_recover_engines`
 //!   (rusqlite is unused here but harmless; `--features server` also works.)

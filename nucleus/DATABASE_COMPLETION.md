@@ -24,8 +24,8 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 239248; Source Rust files: 214; Top-level modules: 50.
-- Declared unit tests: 3864; Declared integration tests: 309; Ignored tests: 155;
+- Source LOC: 239286; Source Rust files: 214; Top-level modules: 50.
+- Declared unit tests: 3864; Declared integration tests: 312; Ignored tests: 155;
   Binary-protocol stubs: 113. These are static declarations, not executed-test claims.
 - The most recent full library run executed 3,737 passing tests and 113 ignored native-binary
   test stubs. Core-only executed 1,853 passing tests with no ignores.
@@ -91,8 +91,8 @@ Goal: close known semantic holes before expanding interfaces.
 
 - [x] Wire schema coercion into columnar INSERT and validate all supported source/target types.
 - [x] Wire GIN indexes into query planning/execution, including updates, deletes, restart, and EXPLAIN.
-- [ ] Differential-test planner execution against the AST path for every supported SELECT shape.
-- [ ] Differential-test LSM and columnar engines against MVCC for filters, ranges, grouping, NULLs,
+- [x] Differential-test planner execution against the AST path for every supported SELECT shape.
+- [x] Differential-test LSM and columnar engines against MVCC for filters, ranges, grouping, NULLs,
       ordering, updates, deletes, and restart.
 - [ ] Complete numeric/decimal aggregate precision and overflow behavior.
 - [ ] Verify collations, time zones, date arithmetic, NULL ordering, casts, and three-valued logic.
@@ -109,6 +109,13 @@ Evidence:
   transactions, insert/update/delete/drop, duplicate DDL, generation-safe invalidation, and rebuild
   from the persisted catalog. The 2026-07-15 full library run passed 3,737 tests; strict all-target
   clippy passed with `bench-tools,memory-debug`.
+- `planner_ast_differential` compares columns, types, values, NULLs, and ordering across scans,
+  predicates, expressions, DISTINCT, limits, aggregates, grouping/HAVING, joins, B-tree/GIN access,
+  CTEs, subqueries, set operations, and windows with result caching explicitly invalidated.
+- `probe_engines` completed 12,000 generated LSM/columnar comparisons against MVCC across three
+  recorded seeds with zero divergence after fixing UPDATE write coercion. Active regressions cover
+  the discovered nullable-neighbor corruption, and `commit_durability` proves per-table LSM
+  insert/update/delete state and routing survive a crash-copy restart.
 
 Exit gate:
 

@@ -19,7 +19,7 @@ use std::hash::{Hash, Hasher};
 
 use sqlparser::ast::{self, Expr, SelectItem, SetExpr, Statement, TableFactor};
 
-use crate::catalog::TableDef;
+use crate::catalog::{ColumnDef, TableDef};
 #[cfg(feature = "server")]
 use crate::reactive::ChangeType;
 use crate::sql;
@@ -52,6 +52,42 @@ fn table_name_to_id(name: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     name.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Canonicalize a value to the declared storage type before any write path
+/// reaches an engine. Columnar batches choose one physical representation per
+/// column, so a single uncoerced UPDATE value can otherwise turn neighboring
+/// values into NULL while rebuilding a batch.
+fn coerce_value_for_write(value: &mut Value, column: &ColumnDef) -> Result<(), ExecError> {
+    if matches!(value, Value::Null) {
+        return Ok(());
+    }
+    if matches!(column.data_type, DataType::Jsonb) {
+        if let Value::Text(text) = value {
+            let parsed = serde_json::from_str::<serde_json::Value>(text).map_err(|error| {
+                ExecError::Runtime(format!("invalid input syntax for type json: {error}"))
+            })?;
+            *value = Value::Jsonb(parsed);
+        }
+        return Ok(());
+    }
+
+    match value.cast(&column.data_type) {
+        Ok(coerced) => *value = coerced,
+        Err(error)
+            if matches!(
+                column.data_type,
+                DataType::Bool | DataType::Int32 | DataType::Int64 | DataType::Float64
+            ) =>
+        {
+            return Err(ExecError::Runtime(format!(
+                "invalid value for column '{}' ({}): {error}",
+                column.name, column.data_type
+            )));
+        }
+        Err(_) => {}
+    }
+    Ok(())
 }
 
 impl Executor {
@@ -300,47 +336,8 @@ impl Executor {
             // loop below. Primitive columns reject uncastable values instead of
             // silently storing a physically mixed column.
             for (i, col) in table_def.columns.iter().enumerate() {
-                if let Some(v) = row.get_mut(i)
-                    && !matches!(v, Value::Null)
-                    && !matches!(col.data_type, DataType::Jsonb)
-                {
-                    match v.cast(&col.data_type) {
-                        Ok(coerced) => *v = coerced,
-                        Err(error)
-                            if matches!(
-                                col.data_type,
-                                DataType::Bool
-                                    | DataType::Int32
-                                    | DataType::Int64
-                                    | DataType::Float64
-                            ) =>
-                        {
-                            return Err(ExecError::Runtime(format!(
-                                "invalid value for column '{}' ({}): {error}",
-                                col.name, col.data_type
-                            )));
-                        }
-                        Err(_) => {}
-                    }
-                }
-            }
-
-            // JSONB columns: parse text into a real JSON value and reject
-            // invalid JSON the way Postgres does. Without this, an unparseable
-            // value (e.g. an empty string) is stored as raw Text in a JSONB
-            // slot and then silently dropped on read because the decode path
-            // can't parse it back — data loss by default. Valid JSON text is
-            // normalized to Value::Jsonb so writes and reads stay consistent.
-            for (i, col) in table_def.columns.iter().enumerate() {
-                if matches!(col.data_type, DataType::Jsonb)
-                    && let Some(v) = row.get_mut(i)
-                    && let Value::Text(s) = v
-                {
-                    let parsed =
-                        serde_json::from_str::<serde_json::Value>(s.as_str()).map_err(|e| {
-                            ExecError::Runtime(format!("invalid input syntax for type json: {e}"))
-                        })?;
-                    *v = Value::Jsonb(parsed);
+                if let Some(value) = row.get_mut(i) {
+                    coerce_value_for_write(value, col)?;
                 }
             }
 
@@ -1646,7 +1643,9 @@ impl Executor {
             if matches {
                 let mut new_row = row.clone();
                 for (col_idx, val_expr) in &assign_targets {
-                    new_row[*col_idx] = self.eval_row_expr(val_expr, row, &col_meta)?;
+                    let mut value = self.eval_row_expr(val_expr, row, &col_meta)?;
+                    coerce_value_for_write(&mut value, &table_def.columns[*col_idx])?;
+                    new_row[*col_idx] = value;
                 }
 
                 // Fire BEFORE UPDATE row-level triggers (old = current row, new = updated row)
