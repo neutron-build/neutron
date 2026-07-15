@@ -297,6 +297,11 @@ name = "probe_index_coherence"
 path = "src/bin/probe_index_coherence.rs"
 required-features = ["server"]
 
+[[bin]]
+name = "probe_soak"
+path = "src/bin/probe_soak.rs"
+required-features = ["server"]
+
 [[bench]]
 name = "query_bench"
 harness = false

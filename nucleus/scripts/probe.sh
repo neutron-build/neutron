@@ -34,6 +34,7 @@ PROBES=(
   "probe_kv_coll|--iterations $((3000 * M))"
   "probe_vector|--iterations $((20000 * M))"
   "probe_index_coherence|--iterations $((200 * M)) --engines mvcc,memory,columnar,lsm,disk"
+  "probe_soak|--duration-secs $((10 * M)) --concurrency 8"
   "probe_crash|--iterations $((60000 * M))"
   "probe_sqlext|--iterations $((1500 * M))"
   "probe_fts|--iterations $((2000 * M))"
