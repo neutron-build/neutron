@@ -253,7 +253,8 @@ async fn test_gin_index_creation() {
         other => panic!("expected Command result, got {other:?}"),
     }
 
-    // Queries still work after GIN index creation
+    // Queries still work after GIN index creation, and the public planner
+    // reports the accelerator rather than silently leaving it unused.
     let results = exec(
         &ex,
         r#"SELECT id FROM indexed_events WHERE props @> '{"browser": "chrome"}'"#,
@@ -262,6 +263,157 @@ async fn test_gin_index_creation() {
     let r = rows(&results[0]);
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::Int32(1));
+
+    let explained = exec(
+        &ex,
+        r#"EXPLAIN SELECT id FROM indexed_events WHERE props @> '{"browser": "chrome"}'"#,
+    )
+    .await;
+    let plan = rows(&explained[0])
+        .iter()
+        .filter_map(|row| match row.first() {
+            Some(Value::Text(line)) => Some(line.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("Index Scan"),
+        "expected GIN Index Scan:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_gin_index_tracks_mutations_and_array_containment() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE gin_docs (id INT, body JSONB)").await;
+    exec(
+        &ex,
+        r#"INSERT INTO gin_docs VALUES
+           (1, '{"tags": ["db", "rust"], "state": "draft"}'),
+           (2, '{"tags": ["python"], "state": "draft"}')"#,
+    )
+    .await;
+    exec(
+        &ex,
+        "CREATE INDEX gin_docs_body ON gin_docs USING GIN (body)",
+    )
+    .await;
+
+    // JSON array containment is order-independent. Normalizing array paths in
+    // GIN must not miss `rust` merely because it is the second stored element.
+    let result = exec(
+        &ex,
+        r#"SELECT id FROM gin_docs WHERE body @> '{"tags": ["rust"]}'"#,
+    )
+    .await;
+    assert_eq!(rows(&result[0]), &vec![vec![Value::Int32(1)]]);
+
+    exec(
+        &ex,
+        r#"UPDATE gin_docs SET body = '{"tags": ["db"], "state": "published"}' WHERE id = 1"#,
+    )
+    .await;
+    let old = exec(
+        &ex,
+        r#"SELECT id FROM gin_docs WHERE body @> '{"tags": ["rust"]}'"#,
+    )
+    .await;
+    assert!(rows(&old[0]).is_empty());
+    let updated = exec(
+        &ex,
+        r#"SELECT id FROM gin_docs WHERE body @> '{"state": "published"}'"#,
+    )
+    .await;
+    assert_eq!(rows(&updated[0]), &vec![vec![Value::Int32(1)]]);
+
+    exec(&ex, "DELETE FROM gin_docs WHERE id = 1").await;
+    let deleted = exec(
+        &ex,
+        r#"SELECT id FROM gin_docs WHERE body @> '{"state": "published"}'"#,
+    )
+    .await;
+    assert!(rows(&deleted[0]).is_empty());
+
+    // Removing the accelerator must preserve query semantics through the
+    // ordinary scan path.
+    exec(&ex, "DROP INDEX gin_docs_body").await;
+    let remaining = exec(
+        &ex,
+        r#"SELECT id FROM gin_docs WHERE body @> '{"state": "draft"}'"#,
+    )
+    .await;
+    assert_eq!(rows(&remaining[0]), &vec![vec![Value::Int32(2)]]);
+}
+
+#[tokio::test]
+async fn test_gin_bypasses_uncommitted_state_and_rebuilds_after_commit() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE gin_tx (id INT, body JSONB)").await;
+    exec(&ex, r#"INSERT INTO gin_tx VALUES (1, '{"state": "old"}')"#).await;
+    exec(&ex, "CREATE INDEX gin_tx_body ON gin_tx USING GIN (body)").await;
+
+    exec(&ex, "BEGIN").await;
+    exec(
+        &ex,
+        r#"UPDATE gin_tx SET body = '{"state": "new"}' WHERE id = 1"#,
+    )
+    .await;
+    let inside = exec(
+        &ex,
+        r#"SELECT id FROM gin_tx WHERE body @> '{"state": "new"}'"#,
+    )
+    .await;
+    assert_eq!(rows(&inside[0]), &vec![vec![Value::Int32(1)]]);
+    exec(&ex, "COMMIT").await;
+
+    let committed = exec(
+        &ex,
+        r#"SELECT id FROM gin_tx WHERE body @> '{"state": "new"}'"#,
+    )
+    .await;
+    assert_eq!(rows(&committed[0]), &vec![vec![Value::Int32(1)]]);
+    let stale = exec(
+        &ex,
+        r#"SELECT id FROM gin_tx WHERE body @> '{"state": "old"}'"#,
+    )
+    .await;
+    assert!(rows(&stale[0]).is_empty());
+}
+
+#[tokio::test]
+async fn test_gin_ddl_rejects_unsupported_shapes_without_side_effects() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE gin_types (id INT, body JSONB, label TEXT)",
+    )
+    .await;
+
+    assert!(
+        ex.execute("CREATE INDEX bad_gin ON gin_types USING GIN (label)")
+            .await
+            .is_err()
+    );
+    exec(&ex, "CREATE INDEX good_gin ON gin_types USING GIN (body)").await;
+    // IF NOT EXISTS must return before touching the live index associated with
+    // the existing catalog name, even when the proposed definition differs.
+    exec(
+        &ex,
+        "CREATE INDEX IF NOT EXISTS good_gin ON gin_types USING GIN (label)",
+    )
+    .await;
+    exec(
+        &ex,
+        r#"INSERT INTO gin_types VALUES (1, '{"ok": true}', 'x')"#,
+    )
+    .await;
+    let result = exec(
+        &ex,
+        r#"SELECT id FROM gin_types WHERE body @> '{"ok": true}'"#,
+    )
+    .await;
+    assert_eq!(rows(&result[0]), &vec![vec![Value::Int32(1)]]);
 }
 
 // ======================================================================

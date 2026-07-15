@@ -61,6 +61,7 @@ impl Executor {
         txn.security_pending = None;
         txn.security_savepoints.clear();
         txn.policy_dirty = false;
+        txn.gin_dirty = false;
 
         txn.active = true;
         self.metrics.open_transactions.inc();
@@ -140,6 +141,7 @@ impl Executor {
             return Err(error.into());
         }
 
+        let gin_dirty = txn.gin_dirty;
         txn.active = false;
         txn.snapshot = None;
         txn.savepoints.clear();
@@ -148,7 +150,16 @@ impl Executor {
         txn.security_pending = None;
         txn.security_savepoints.clear();
         txn.policy_dirty = false;
+        txn.gin_dirty = false;
         self.metrics.open_transactions.dec();
+
+        // GIN is shared across sessions, so DML deliberately leaves it on the
+        // committed image while a transaction is open. Refresh only after the
+        // storage commit has succeeded and the session is no longer active.
+        if gin_dirty {
+            self.mark_gin_committed_write();
+            self.rebuild_all_gin_indexes().await;
+        }
 
         Ok(ExecResult::Command {
             tag: "COMMIT".into(),
@@ -216,6 +227,7 @@ impl Executor {
         txn.security_pending = None;
         txn.security_savepoints.clear();
         txn.policy_dirty = false;
+        txn.gin_dirty = false;
 
         self.metrics.open_transactions.dec();
 

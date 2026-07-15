@@ -153,6 +153,50 @@ async fn test_ivfflat_multiple_indexes_survive_restart() {
     }
 }
 
+// ── GIN persistence via catalog rebuild ─────────────────────────────────────
+
+#[tokio::test]
+async fn test_gin_index_survives_restart_and_tracks_new_writes() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE TABLE json_docs (id INT, body JSONB)").await;
+        exec(
+            &ex,
+            r#"INSERT INTO json_docs VALUES (1, '{"kind": "before"}')"#,
+        )
+        .await;
+        exec(
+            &ex,
+            "CREATE INDEX json_docs_body_gin ON json_docs USING GIN (body)",
+        )
+        .await;
+    }
+
+    {
+        let ex = open_executor(dir.path()).await;
+        let restored = exec(
+            &ex,
+            r#"SELECT id FROM json_docs WHERE body @> '{"kind": "before"}'"#,
+        )
+        .await;
+        assert_eq!(rows(&restored[0]), &vec![vec![Value::Int32(1)]]);
+
+        exec(
+            &ex,
+            r#"INSERT INTO json_docs VALUES (2, '{"kind": "after"}')"#,
+        )
+        .await;
+        let written = exec(
+            &ex,
+            r#"SELECT id FROM json_docs WHERE body @> '{"kind": "after"}'"#,
+        )
+        .await;
+        assert_eq!(rows(&written[0]), &vec![vec![Value::Int32(2)]]);
+    }
+}
+
 // ── HNSW persistence via WAL checkpoint ─────────────────────────────────────────
 
 /// Unlike IvfFlat (rebuilt from base-table data at boot), HNSW indexes recover

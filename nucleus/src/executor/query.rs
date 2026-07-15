@@ -508,6 +508,41 @@ impl Executor {
 
         let table_def = self.get_table(&table_name).await?;
 
+        // JSONB containment has a dedicated GIN access path. Keep the full
+        // predicate in the plan so execution can recheck candidates (GIN may
+        // deliberately return false positives for nested array/object pairs).
+        if let Some(where_expr) = where_clause
+            && let Some((column_name, query_value)) = self.extract_gin_contains(where_expr)
+            && !query_value.gin_extract().is_empty()
+            && let Some(index) = self
+                .catalog
+                .get_indexes_cached(&table_name)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|idx| {
+                    matches!(idx.index_type, crate::catalog::IndexType::Gin)
+                        && idx
+                            .columns
+                            .first()
+                            .is_some_and(|column| column.eq_ignore_ascii_case(&column_name))
+                })
+        {
+            return Ok(planner::PlanNode::IndexScan {
+                table: table_name,
+                index_name: index.name.clone(),
+                estimated_rows: 10,
+                estimated_cost: planner::Cost(2.0),
+                lookup_key: Some(where_expr.to_string()),
+                lookup_key_expr: Some(where_expr.clone()),
+                range_lo: None,
+                range_lo_expr: None,
+                range_hi: None,
+                range_hi_expr: None,
+                range_predicate: None,
+                range_predicate_expr: None,
+            });
+        }
+
         // ── Fast path: single PK equality (Fix 4) ──────────────────────
         // When the WHERE clause is exactly `pk_col = literal`, skip the
         // full cost-model planning and emit an IndexScan directly. This
@@ -1706,6 +1741,36 @@ impl Executor {
                             dtype: c.data_type.clone(),
                         })
                         .collect();
+
+                    let is_gin = self
+                        .catalog
+                        .get_indexes_cached(table)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|idx| {
+                            idx.name == *index_name
+                                && matches!(idx.index_type, crate::catalog::IndexType::Gin)
+                        });
+                    if is_gin {
+                        let predicate = lookup_key_expr.as_ref().cloned().or_else(|| {
+                            lookup_key
+                                .as_ref()
+                                .and_then(|sql| Self::parse_expr_string(sql).ok())
+                        });
+                        if let Some(predicate) = predicate
+                            && let Some((_, mut rows, _, _)) =
+                                self.try_gin_index_scan(table, table, &predicate).await
+                        {
+                            rows.retain(|row| {
+                                self.eval_where_plan(&predicate, row, &meta)
+                                    .unwrap_or(false)
+                            });
+                            return Ok((meta, rows));
+                        }
+                        return Err(ExecError::Unsupported(
+                            "GIN lookup failed, falling back to AST".into(),
+                        ));
+                    }
 
                     // ── Range index scan ──────────────────────────────────────
                     // Use pre-parsed exprs if available, otherwise fall back to parsing
@@ -5899,6 +5964,74 @@ impl Executor {
         None
     }
 
+    fn extract_gin_contains(&self, expr: &Expr) -> Option<(String, crate::document::JsonValue)> {
+        match expr {
+            Expr::Nested(inner) => self.extract_gin_contains(inner),
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::And,
+                right,
+            } => self
+                .extract_gin_contains(left)
+                .or_else(|| self.extract_gin_contains(right)),
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::AtArrow,
+                right,
+            } => {
+                let column = match left.as_ref() {
+                    Expr::Identifier(ident) => ident.value.clone(),
+                    Expr::CompoundIdentifier(parts) => parts.last()?.value.clone(),
+                    _ => return None,
+                };
+                let value = self.eval_const_expr(right).ok()?;
+                Some((column, value_to_doc_json(&value)?))
+            }
+            _ => None,
+        }
+    }
+
+    /// Narrow a JSONB containment query through a live GIN posting map. The
+    /// storage scan and full predicate recheck remain authoritative, so a stale
+    /// or lossy posting representation can never manufacture a result.
+    pub(super) async fn try_gin_index_scan(
+        &self,
+        table_name: &str,
+        label: &str,
+        where_expr: &Expr,
+    ) -> IndexScanResult {
+        if self.rls_active(table_name) || self.current_session().txn_state.read().await.active {
+            return None;
+        }
+        let (column_name, query) = self.extract_gin_contains(where_expr)?;
+        if query.gin_extract().is_empty() {
+            return None;
+        }
+
+        let candidates = {
+            let indexes = self.gin_indexes.read();
+            let generation = self
+                .gin_write_gen
+                .load(std::sync::atomic::Ordering::Acquire);
+            let entry = indexes.values().find(|entry| {
+                entry.table_name == table_name
+                    && entry.column_name.eq_ignore_ascii_case(&column_name)
+                    && entry.generation == generation
+            })?;
+            entry.index.query_contains(&query)
+        };
+
+        let all_rows = self.storage_for(table_name).scan(table_name).await.ok()?;
+        self.metrics.rows_scanned.inc_by(all_rows.len() as u64);
+        let rows = all_rows
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row_id, row)| candidates.contains(&(row_id as u64)).then_some(row))
+            .collect();
+        let col_meta = self.build_col_meta_from_cache(table_name, label)?;
+        Some((col_meta, rows, Some(where_expr.clone()), None))
+    }
+
     /// SELECT execution that is CTE-aware -- delegates to load_table_factor_with_ctes.
     pub(super) async fn execute_select_inner_with_ctes(
         &self,
@@ -5972,7 +6105,14 @@ impl Executor {
                     .unwrap_or_else(|| table_name.clone());
                 // Don't try index scan for CTEs or virtual tables
                 if !cte_tables.contains_key(&table_name) {
-                    self.try_index_scan_sync(&table_name, &label, selection)
+                    if let Some(gin) = self
+                        .try_gin_index_scan(&table_name, &label, selection)
+                        .await
+                    {
+                        Some(gin)
+                    } else {
+                        self.try_index_scan_sync(&table_name, &label, selection)
+                    }
                 } else {
                     None
                 }

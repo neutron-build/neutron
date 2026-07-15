@@ -111,8 +111,11 @@ impl JsonValue {
                 }
             }
             JsonValue::Array(arr) => {
-                for (i, v) in arr.iter().enumerate() {
-                    let path = format!("{prefix}[{i}]");
+                for v in arr {
+                    // JSON containment is order-independent. Indexing by the
+                    // concrete array position causes false negatives when the
+                    // queried value appears at a different position.
+                    let path = format!("{prefix}[]");
                     v.gin_extract_inner(path, out);
                 }
             }
@@ -1212,14 +1215,14 @@ mod tests {
         // Should contain:
         //   ("a", Number(1.0))
         //   ("b.c", Str("deep"))
-        //   ("d[0]", Bool(true))
-        //   ("d[1]", Number(99.0))
+        //   ("d[]", Bool(true))
+        //   ("d[]", Number(99.0))
         assert_eq!(pairs.len(), 4);
 
         assert!(pairs.contains(&("a".to_string(), JsonValue::Number(1.0))));
         assert!(pairs.contains(&("b.c".to_string(), JsonValue::Str("deep".to_string()))));
-        assert!(pairs.contains(&("d[0]".to_string(), JsonValue::Bool(true))));
-        assert!(pairs.contains(&("d[1]".to_string(), JsonValue::Number(99.0))));
+        assert!(pairs.contains(&("d[]".to_string(), JsonValue::Bool(true))));
+        assert!(pairs.contains(&("d[]".to_string(), JsonValue::Number(99.0))));
     }
 
     // -- 7. DocumentStore insert / get / query by path ----------------------
@@ -1433,15 +1436,15 @@ mod tests {
         // Verify a few specific deep paths exist.
         assert!(pairs.contains(&("data.metadata.total".to_string(), JsonValue::Number(2.0))));
         assert!(pairs.contains(&(
-            "data.users[0].name".to_string(),
+            "data.users[].name".to_string(),
             JsonValue::Str("Alice".to_string())
         )));
         assert!(pairs.contains(&(
-            "data.users[1].permissions.write".to_string(),
+            "data.users[].permissions.write".to_string(),
             JsonValue::Bool(true)
         )));
         assert!(pairs.contains(&(
-            "data.users[0].permissions.scopes[1]".to_string(),
+            "data.users[].permissions.scopes[]".to_string(),
             JsonValue::Str("user".to_string())
         )));
     }
@@ -1785,13 +1788,13 @@ mod tests {
         assert_eq!(pairs.len(), 3002);
 
         // Verify specific entries in the extraction.
-        assert!(pairs.contains(&("items[0].index".to_string(), JsonValue::Number(0.0))));
+        assert!(pairs.contains(&("items[].index".to_string(), JsonValue::Number(0.0))));
         assert!(pairs.contains(&(
-            "items[999].label".to_string(),
+            "items[].label".to_string(),
             JsonValue::Str("item_999".to_string())
         )));
-        assert!(pairs.contains(&("items[500].active".to_string(), JsonValue::Bool(true))));
-        assert!(pairs.contains(&("items[501].active".to_string(), JsonValue::Bool(false))));
+        assert!(pairs.contains(&("items[].active".to_string(), JsonValue::Bool(true))));
+        assert!(pairs.contains(&("items[].active".to_string(), JsonValue::Bool(false))));
 
         // Insert into a store and query.
         let mut store = DocumentStore::new();

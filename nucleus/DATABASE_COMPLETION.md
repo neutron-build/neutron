@@ -1,6 +1,6 @@
 # Nucleus Database Completion Program
 
-Updated: 2026-07-14
+Updated: 2026-07-15
 
 This is the canonical execution plan for taking Nucleus from its current broad,
 pre-production implementation to feature-complete database status. It covers the
@@ -24,10 +24,10 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 238789; Source Rust files: 214; Top-level modules: 50.
-- Declared unit tests: 3860; Declared integration tests: 308; Ignored tests: 155;
+- Source LOC: 239248; Source Rust files: 214; Top-level modules: 50.
+- Declared unit tests: 3864; Declared integration tests: 309; Ignored tests: 155;
   Binary-protocol stubs: 113. These are static declarations, not executed-test claims.
-- The most recent full library run executed 3,733 passing tests and 113 ignored native-binary
+- The most recent full library run executed 3,737 passing tests and 113 ignored native-binary
   test stubs. Core-only executed 1,853 passing tests with no ignores.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
   families, specialty indexes, encryption, TLS, embedded mode, physical backup v1, probes, Raft
@@ -89,8 +89,8 @@ Exit gate:
 
 Goal: close known semantic holes before expanding interfaces.
 
-- [ ] Wire schema coercion into columnar INSERT and validate all supported source/target types.
-- [ ] Wire GIN indexes into query planning/execution, including updates, deletes, restart, and EXPLAIN.
+- [x] Wire schema coercion into columnar INSERT and validate all supported source/target types.
+- [x] Wire GIN indexes into query planning/execution, including updates, deletes, restart, and EXPLAIN.
 - [ ] Differential-test planner execution against the AST path for every supported SELECT shape.
 - [ ] Differential-test LSM and columnar engines against MVCC for filters, ranges, grouping, NULLs,
       ordering, updates, deletes, and restart.
@@ -100,6 +100,15 @@ Goal: close known semantic holes before expanding interfaces.
 - [ ] Finish MVCC garbage collection/vacuum behavior for long snapshots and high churn.
 - [ ] Add deterministic transaction-ID exhaustion/wraparound behavior.
 - [ ] Ensure query caches and specialty indexes invalidate on every relevant DDL/DML transition.
+
+Evidence:
+
+- `columnar_insert_schema_coercion_is_strict` covers every native columnar physical type and
+  fail-closed invalid input through the public executor path.
+- The active GIN unit/restart suite covers planner selection and EXPLAIN, exact rechecks, arrays,
+  transactions, insert/update/delete/drop, duplicate DDL, generation-safe invalidation, and rebuild
+  from the persisted catalog. The 2026-07-15 full library run passed 3,737 tests; strict all-target
+  clippy passed with `bench-tools,memory-debug`.
 
 Exit gate:
 

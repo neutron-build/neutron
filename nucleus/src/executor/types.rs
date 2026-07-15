@@ -79,16 +79,15 @@ pub(crate) struct EncryptedIndexEntry {
 
 /// A live GIN (Generalized Inverted Index) for a JSONB column.
 /// Maps (path, encoded_leaf) pairs to row IDs for fast containment (`@>`) queries.
-// NOTE: the GIN index is built at CREATE INDEX time and stored in
-// `Executor::gin_indexes`, but the query planner does not yet consult it to
-// accelerate `@>` containment scans — so these fields are write-only for now.
-// Tracked in AUDIT_FINDINGS.md (Phase 3: wire up the GIN read path).
-#[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct GinIndexEntry {
     pub table_name: String,
     pub column_name: String,
-    pub col_idx: usize,
     pub index: crate::document::GinIndex,
+    /// Committed-write generation represented by this posting map. Queries
+    /// fall back to a full scan whenever it differs from the executor's
+    /// generation, preventing a concurrent rebuild from causing false negatives.
+    pub generation: u64,
 }
 
 /// Cached query result entry.
