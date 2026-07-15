@@ -302,6 +302,11 @@ name = "probe_soak"
 path = "src/bin/probe_soak.rs"
 required-features = ["server"]
 
+[[bin]]
+name = "probe_vector_recall"
+path = "src/bin/probe_vector_recall.rs"
+required-features = ["server"]
+
 [[bench]]
 name = "query_bench"
 harness = false
