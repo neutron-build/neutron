@@ -1,7 +1,6 @@
 //! Findings from the engine-vs-engine differential fuzzer (`src/bin/probe_engines.rs`).
-//! Mvcc (the default engine) and Memory agree perfectly; LSM and Columnar each
-//! have a confirmed correctness bug. The buggy cases are `#[ignore]`d and assert
-//! the CORRECT (Mvcc) behavior — remove `#[ignore]` once the engine is fixed.
+//! Each historical engine mismatch below is now fixed. The tests remain active
+//! so MVCC, Memory, LSM, and Columnar cannot silently diverge again.
 #![cfg(feature = "server")]
 use nucleus::catalog::Catalog;
 use nucleus::executor::{ExecResult, Executor};

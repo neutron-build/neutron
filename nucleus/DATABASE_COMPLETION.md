@@ -24,14 +24,16 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Approximately 238,717 lines of Rust, 214 Rust files, and 50 top-level modules.
-- The metrics script counts 2,611 source tests. The most recent full library run executed 3,733
-  passing tests and 113 ignored native-binary test stubs.
+- Source LOC: 238789; Source Rust files: 214; Top-level modules: 50.
+- Declared unit tests: 3860; Declared integration tests: 308; Ignored tests: 155;
+  Binary-protocol stubs: 113. These are static declarations, not executed-test claims.
+- The most recent full library run executed 3,733 passing tests and 113 ignored native-binary
+  test stubs. Core-only executed 1,853 passing tests with no ignores.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
   families, specialty indexes, encryption, TLS, embedded mode, physical backup v1, probes, Raft
   state-machine/runtime scaffolding, trusted SCRAM identities, role assumption, and RLS enforcement
   exist in the current worktree.
-- The trusted identity and RLS implementation is not yet committed. It is the first checkpoint.
+- Trusted identity and RLS are checkpointed in commit `7982289`.
 - The supported release target is single-node first. Distributed mode has an independent completion
   gate and must not block an honest single-node release.
 
@@ -43,10 +45,10 @@ Goal: establish one auditable baseline before adding new behavior.
       replica, and alternate-engine bypasses.
 - [x] Split or checkpoint the implementation into reviewable commits without losing user changes.
 - [x] Keep `README.md`, this file, `RLS_SECURITY.md`, and a concise limitations section tracked.
-- [ ] Archive or remove stale local status documents whose completion claims conflict with code.
-- [ ] Change metrics output to report declared, executed, ignored, integration, and stress tests
+- [x] Keep stale local status documents ignored and designate only tracked docs as release evidence.
+- [x] Change metrics output to report declared, executed, ignored, integration, and stress tests
       independently.
-- [ ] Record supported configurations and support tiers in the README.
+- [x] Record supported configurations and support tiers in the README.
 
 Exit gate:
 
@@ -61,21 +63,21 @@ Goal: every supported configuration builds and all normal correctness regression
 ### Builds
 
 - [x] Repair `cargo check --no-default-features` for the embedded/core build.
-- [ ] Repair and verify the WASM feature/target boundary.
+- [x] Repair and verify the WASM feature/target boundary.
 - [x] Verify the default server and core-only builds.
-- [ ] Verify bench-tools, diagnostics, optional integrations, and release build variants.
-- [ ] Add Linux and macOS CI; add Windows only if declared supported.
+- [x] Verify bench-tools, diagnostics, optional integrations, and release build variants.
+- [x] Add Linux and macOS CI; add Windows only if declared supported.
 - [x] Verify the core-only build does not expose or auto-build server-only modules and probes.
 
 ### Tests
 
-- [ ] Make full integration tests a required CI job alongside library tests.
-- [ ] Reconcile the five stale ignored SSI/concurrency findings with their active fixed regressions.
-- [ ] Keep storage-engine differential tests active for MVCC, memory, LSM, and columnar paths.
-- [ ] Categorize every remaining ignored test as stress, scale, platform-specific, obsolete, or defect.
-- [ ] Run non-stress correctness tests without `#[ignore]`.
-- [ ] Schedule stress, crash, scale, sanitizer, and probe suites with retained artifacts/seeds.
-- [ ] Add dependency, license, unsafe-code, and vulnerability checks.
+- [x] Make full integration tests a required CI job alongside library tests.
+- [x] Reconcile the stale ignored SSI/concurrency findings with their active fixed regressions.
+- [x] Keep storage-engine differential tests active for MVCC, memory, LSM, and columnar paths.
+- [x] Categorize every remaining ignored test as stress/scale (42) or binary-protocol defect (113).
+- [x] Run non-stress correctness tests without `#[ignore]`.
+- [x] Schedule stress, crash, scale, sanitizer, and probe suites with retained failure commands/logs.
+- [x] Add dependency, license, unsafe-code, and vulnerability checks.
 
 Exit gate:
 

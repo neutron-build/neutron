@@ -1108,7 +1108,7 @@ async fn main() {
     let should_run = |model: &str| -> bool {
         model_filter
             .as_ref()
-            .map_or(true, |f| f.iter().any(|m| m == model))
+            .is_none_or(|f| f.iter().any(|m| m == model))
     };
 
     println!("========================================");

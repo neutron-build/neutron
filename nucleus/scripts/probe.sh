@@ -23,6 +23,9 @@ case "${PROBE_SCALE:-ci}" in
 esac
 FEATURES="server rusqlite"
 BIN="${CARGO_TARGET_DIR:-target}/release"
+LOG_DIR="${PROBE_LOG_DIR:-probe-artifacts}"
+rm -rf "$LOG_DIR"
+mkdir -p "$LOG_DIR"
 
 # name | args (iteration counts scale with M)
 PROBES=(
@@ -75,17 +78,18 @@ echo
 echo "==> Running ${#PROBES[@]} harnesses"
 for entry in "${PROBES[@]}"; do
   name="${entry%%|*}"; args="${entry#*|}"
-  log="$(mktemp -t "probe_${name}.XXXXXX")"
+  log="$LOG_DIR/${name}.log"
+  printf 'scale=%s\ncommand=%s/%s %s\n' "${PROBE_SCALE:-ci}" "$BIN" "$name" "$args" >"$log"
   # shellcheck disable=SC2086
-  if "$BIN/$name" $args >"$log" 2>&1; then
+  if "$BIN/$name" $args >>"$log" 2>&1; then
     echo "  PASS  $name"
     passed=$((passed + 1))
+    rm -f "$log"
   else
     echo "  FAIL  $name  (exit $?)"
     sed 's/^/        /' "$log" | tail -25
     fail=1
   fi
-  rm -f "$log"
 done
 
 echo

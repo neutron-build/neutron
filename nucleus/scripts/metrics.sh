@@ -1,164 +1,98 @@
 #!/bin/sh
-# nucleus/scripts/metrics.sh -- Compute codebase metrics and validate docs.
+# Compute source metrics without pretending static declarations are test runs.
 #
 # Usage:
-#   sh scripts/metrics.sh          # print current metrics
-#   sh scripts/metrics.sh --check  # validate docs match reality (exit 1 on drift)
+#   sh scripts/metrics.sh          # print the current inventory
+#   sh scripts/metrics.sh --check  # verify the canonical plan's baseline
 set -eu
 
-NUCLEUS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SRC_DIR="$NUCLEUS_DIR/src"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SRC="$ROOT/src"
+TEST_DIR="$ROOT/tests"
 
-# -- Compute metrics from source -----------------------------------------------
+count_matching_lines() {
+    _dir=$1
+    _pattern=$2
+    find "$_dir" -type f -name '*.rs' -exec grep -Eh "$_pattern" {} + 2>/dev/null \
+        | wc -l | tr -d ' '
+}
 
-LOC=$(find "$SRC_DIR" -name '*.rs' -exec cat {} + | wc -l | tr -d ' ')
-TESTS=$(grep -r '#\[test\]' "$SRC_DIR" --include='*.rs' | wc -l | tr -d ' ')
-MODULES=$(find "$SRC_DIR" -mindepth 1 -maxdepth 1 -type d -not -name bin | wc -l | tr -d ' ')
-RS_FILES=$(find "$SRC_DIR" -name '*.rs' | wc -l | tr -d ' ')
-WAL_COUNT=$(find "$SRC_DIR" -name '*wal*' -name '*.rs' | wc -l | tr -d ' ')
-TIERED_COUNT=$(find "$SRC_DIR" -name 'tiered.rs' | wc -l | tr -d ' ')
+LOC=$(find "$SRC" -type f -name '*.rs' -exec wc -l {} + | awk 'END {print $1}')
+RS_FILES=$(find "$SRC" -type f -name '*.rs' | wc -l | tr -d ' ')
+MODULES=$(find "$SRC" -mindepth 1 -maxdepth 1 -type d -not -name bin | wc -l | tr -d ' ')
+UNIT_DECLARED=$(count_matching_lines "$SRC" '^[[:space:]]*#\[(tokio::)?test([^]]*)?\]')
+INTEGRATION_DECLARED=$(count_matching_lines "$TEST_DIR" '^[[:space:]]*#\[(tokio::)?test([^]]*)?\]')
+DECLARED_TESTS=$((UNIT_DECLARED + INTEGRATION_DECLARED))
+UNIT_IGNORED=$(count_matching_lines "$SRC" '^[[:space:]]*#\[ignore([^]]*)?\]')
+INTEGRATION_IGNORED=$(count_matching_lines "$TEST_DIR" '^[[:space:]]*#\[ignore([^]]*)?\]')
+IGNORED_TESTS=$((UNIT_IGNORED + INTEGRATION_IGNORED))
+BINARY_PROTOCOL_STUBS=$(count_matching_lines "$SRC/binary_wire/tests" '^[[:space:]]*#\[ignore([^]]*)?\]')
+STRESS_IGNORED=$(find "$TEST_DIR" -type f -name '*.rs' -exec grep -Ehi \
+    '^[[:space:]]*#\[ignore([^]]*)?(stress|scale|large|concurrent|crash|overflow|expression)' {} + \
+    2>/dev/null | wc -l | tr -d ' ')
+UNCLASSIFIED_INTEGRATION_IGNORES=$((INTEGRATION_IGNORED - STRESS_IGNORED))
+WAL_FILES=$(find "$SRC" -type f -name '*wal*.rs' | wc -l | tr -d ' ')
+TIERED_FILES=$(find "$SRC" -type f -name 'tiered.rs' | wc -l | tr -d ' ')
 
-# Model-specific WAL existence
-WAL_KV="no";       [ -f "$SRC_DIR/storage/kv_wal.rs" ]      && WAL_KV="yes"
-WAL_GRAPH="no";    [ -f "$SRC_DIR/graph/wal.rs" ]            && WAL_GRAPH="yes"
-WAL_DOC="no";      [ -f "$SRC_DIR/document/doc_wal.rs" ]     && WAL_DOC="yes"
-WAL_VECTOR="no";   [ -f "$SRC_DIR/vector/wal.rs" ]           && WAL_VECTOR="yes"
-WAL_BLOB="no";     [ -f "$SRC_DIR/blob/wal.rs" ]             && WAL_BLOB="yes"
-WAL_FTS="no";      [ -f "$SRC_DIR/fts/fts_wal.rs" ]          && WAL_FTS="yes"
-WAL_COLUMNAR="no"; [ -f "$SRC_DIR/storage/columnar_wal.rs" ] && WAL_COLUMNAR="yes"
-
-# Count durable models
-DURABLE=0
-for w in $WAL_KV $WAL_GRAPH $WAL_DOC $WAL_VECTOR $WAL_BLOB $WAL_FTS $WAL_COLUMNAR; do
-    [ "$w" = "yes" ] && DURABLE=$((DURABLE + 1))
-done
-[ -f "$SRC_DIR/storage/wal.rs" ] && DURABLE=$((DURABLE + 1))
-
-# -- Default mode: print metrics -----------------------------------------------
+print_metrics() {
+    echo "SOURCE_LOC=$LOC"
+    echo "SOURCE_RS_FILES=$RS_FILES"
+    echo "TOP_LEVEL_MODULES=$MODULES"
+    echo "DECLARED_UNIT_TESTS=$UNIT_DECLARED"
+    echo "DECLARED_INTEGRATION_TESTS=$INTEGRATION_DECLARED"
+    echo "DECLARED_TESTS=$DECLARED_TESTS"
+    echo "IGNORED_UNIT_TESTS=$UNIT_IGNORED"
+    echo "IGNORED_INTEGRATION_TESTS=$INTEGRATION_IGNORED"
+    echo "IGNORED_TESTS=$IGNORED_TESTS"
+    echo "BINARY_PROTOCOL_STUBS=$BINARY_PROTOCOL_STUBS"
+    echo "INTENTIONAL_STRESS_IGNORES=$STRESS_IGNORED"
+    echo "UNCLASSIFIED_INTEGRATION_IGNORES=$UNCLASSIFIED_INTEGRATION_IGNORES"
+    echo "WAL_SOURCE_FILES=$WAL_FILES"
+    echo "TIERED_SOURCE_FILES=$TIERED_FILES"
+    echo "EXECUTED_TESTS=not-measured (use CI/test output; cfg and parameterized tests change runtime counts)"
+}
 
 if [ "${1:-}" != "--check" ]; then
-    echo "LOC=$LOC"
-    echo "TESTS=$TESTS"
-    echo "MODULES=$MODULES"
-    echo "RS_FILES=$RS_FILES"
-    echo "WAL_COUNT=$WAL_COUNT"
-    echo "TIERED_COUNT=$TIERED_COUNT"
-    echo "DURABLE=$DURABLE"
-    echo ""
-    echo "WAL status per model:"
-    echo "  Relational: yes (storage/wal.rs)"
-    echo "  Columnar:   $WAL_COLUMNAR"
-    echo "  KV:         $WAL_KV"
-    echo "  FTS:        $WAL_FTS"
-    echo "  Vector:     $WAL_VECTOR"
-    echo "  Graph:      $WAL_GRAPH"
-    echo "  Document:   $WAL_DOC"
-    echo "  Blob:       $WAL_BLOB"
+    print_metrics
     exit 0
 fi
 
-# -- Check mode: validate docs match reality -----------------------------------
-#
-# Rather than broadly grepping for "N tests" (which matches per-module lines),
-# we check a curated list of (file, line-pattern, metric, tolerance) tuples.
-# Each doc's "header" or "summary" line has a known shape we can target.
+PLAN="$ROOT/DATABASE_COMPLETION.md"
+if [ ! -f "$PLAN" ]; then
+    echo "FAIL: canonical DATABASE_COMPLETION.md is missing" >&2
+    exit 1
+fi
 
-rm -f "$NUCLEUS_DIR/scripts/.metrics_fail"
-FAIL_COUNT=0
-
-# check_line <file> <line-pattern> <number-keyword> <actual> <tolerance-pct>
-# Finds a line matching <line-pattern>, then extracts "N <number-keyword>" from it.
-check_line() {
-    _file="$1"
-    _line_pattern="$2"
-    _num_keyword="$3"
-    _actual="$4"
-    _tol="${5:-0}"
-    _basename=$(basename "$_file")
-
-    if [ ! -f "$_file" ]; then
-        return
-    fi
-
-    _line=$(grep -i "$_line_pattern" "$_file" 2>/dev/null | head -1 || true)
-    if [ -z "$_line" ]; then
-        return
-    fi
-
-    # Extract "N keyword" pair from the line (e.g., "1,999 tests" or "~135K LOC")
-    _numstr=$(echo "$_line" | grep -ioE '[~]?[0-9][0-9,]*[kK]?[[:space:]]+'"$_num_keyword" | head -1 | grep -oE '[~]?[0-9][0-9,]*[kK]?' || true)
-    if [ -z "$_numstr" ]; then
-        return
-    fi
-
-    _approx=0
-    case "$_numstr" in
-        '~'*) _approx=1; _numstr=$(echo "$_numstr" | sed 's/^~//');;
-    esac
-
-    case "$_numstr" in
-        *[kK])
-            _numstr=$(echo "$_numstr" | sed 's/[kK]$//' | tr -d ',')
-            _numstr=$((_numstr * 1000))
-            ;;
-        *)
-            _numstr=$(echo "$_numstr" | tr -d ',')
-            ;;
-    esac
-
-    _effective_tol=$_tol
-    [ "$_approx" -eq 1 ] && _effective_tol=5
-
-    _diff=$((_actual - _numstr))
-    [ "$_diff" -lt 0 ] && _diff=$((-_diff))
-
-    _threshold=0
-    if [ "$_effective_tol" -gt 0 ] && [ "$_actual" -gt 0 ]; then
-        _threshold=$((_actual * _effective_tol / 100))
-    fi
-
-    if [ "$_diff" -gt "$_threshold" ]; then
-        echo "FAIL  $_basename: $_num_keyword claims $_numstr, actual is $_actual"
-        echo "1" > "$NUCLEUS_DIR/scripts/.metrics_fail"
+assert_plan_value() {
+    _label=$1
+    _actual=$2
+    if grep -Fq "$_label: $_actual" "$PLAN"; then
+        echo "OK: $_label=$_actual"
     else
-        echo "OK    $_basename: $_num_keyword ($_numstr vs $_actual)"
+        echo "FAIL: DATABASE_COMPLETION.md must contain '$_label: $_actual'" >&2
+        return 1
     fi
 }
 
-echo "Checking doc metrics against source code..."
-echo "  Actual: LOC=$LOC  TESTS=$TESTS  MODULES=$MODULES"
-echo ""
-
-D="$NUCLEUS_DIR"
-
-# STATUS.md header: "Tests: **N passing**"  and "Modules: **N**"
-check_line "$D/STATUS.md"         "^> Tests:"               "passing" "$TESTS"  0
-check_line "$D/STATUS.md"         "^> Modules:"             "Modules" "$MODULES" 0
-
-# NUCLEUS-ROADMAP.md line 4: "103K LOC, 53 modules, 2171 tests, ..."
-check_line "$D/NUCLEUS-ROADMAP.md" "LOC.*modules.*tests"    "tests"   "$TESTS"  0
-check_line "$D/NUCLEUS-ROADMAP.md" "LOC.*modules.*tests"    "modules" "$MODULES" 0
-check_line "$D/NUCLEUS-ROADMAP.md" "LOC.*modules.*tests"    "LOC"     "$LOC"    5
-
-# AUDIT-REPORT.md header: "N tests passing | N modules | ~N lines of Rust"
-check_line "$D/AUDIT-REPORT.md"   "tests passing"           "tests"     "$TESTS"    0
-check_line "$D/AUDIT-REPORT.md"   "tests passing"           "modules"   "$MODULES"  0
-check_line "$D/AUDIT-REPORT.md"   "lines of Rust"           "lines"     "$LOC"      5
-
-# TODO-NEXT.md header: "N tests passing | N modules | ~N lines of Rust"
-check_line "$D/TODO-NEXT.md"      "tests passing"           "tests"     "$TESTS"    0
-check_line "$D/TODO-NEXT.md"      "tests passing"           "modules"   "$MODULES"  0
-check_line "$D/TODO-NEXT.md"      "lines of Rust"           "lines"     "$LOC"      5
-
-# COMPETITOR-GAPS.md footer: "Tests: N passing"
-check_line "$D/COMPETITOR-GAPS.md" "Tests:.*passing"        "passing" "$TESTS"  0
-
-echo ""
-if [ -f "$NUCLEUS_DIR/scripts/.metrics_fail" ]; then
-    rm -f "$NUCLEUS_DIR/scripts/.metrics_fail"
-    echo "Doc metrics are stale. Run 'sh scripts/metrics.sh' to see current values."
-    exit 1
+echo "Checking canonical plan metrics..."
+fail=0
+assert_plan_value "Source LOC" "$LOC" || fail=1
+assert_plan_value "Source Rust files" "$RS_FILES" || fail=1
+assert_plan_value "Top-level modules" "$MODULES" || fail=1
+assert_plan_value "Declared unit tests" "$UNIT_DECLARED" || fail=1
+assert_plan_value "Declared integration tests" "$INTEGRATION_DECLARED" || fail=1
+assert_plan_value "Ignored tests" "$IGNORED_TESTS" || fail=1
+assert_plan_value "Binary-protocol stubs" "$BINARY_PROTOCOL_STUBS" || fail=1
+if [ "$UNCLASSIFIED_INTEGRATION_IGNORES" -ne 0 ]; then
+    echo "FAIL: $UNCLASSIFIED_INTEGRATION_IGNORES integration ignores are not categorized" >&2
+    fail=1
 else
-    echo "All doc metrics match source code."
-    exit 0
+    echo "OK: every integration ignore is categorized stress/scale"
 fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "Current values:" >&2
+    print_metrics >&2
+    exit 1
+fi
+echo "Canonical plan metrics are current."

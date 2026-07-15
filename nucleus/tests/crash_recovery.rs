@@ -843,7 +843,7 @@ async fn crash_recovery_disk_multimodel() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore] // stress test — run with: cargo test --test crash_recovery crash_recovery_disk_concurrent_load -- --ignored
+#[ignore = "stress test; run explicitly with --ignored"]
 async fn crash_recovery_disk_concurrent_load() {
     let dir = tempfile::tempdir().unwrap();
     let writer_count = 8u32;
