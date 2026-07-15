@@ -108,58 +108,6 @@ export default function Nav({ activeProduct }: NavProps) {
             </svg>
           </button>
         </div>
-        {/* Mobile drawer — rendered for all viewports but only shown when .is-open on mobile */}
-        <div class="nav__drawer" id="nav-drawer" aria-hidden="true">
-          <div class="nav__drawer-backdrop" data-drawer-close></div>
-          <div class="nav__drawer-panel" role="dialog" aria-modal="true" aria-label="Main navigation">
-            <div class="nav__drawer-header">
-              <a href="/" class="nav__logo">neutron</a>
-              <button type="button" class="nav__drawer-close" data-drawer-close aria-label="Close menu">
-                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                  <line x1="6" y1="6" x2="18" y2="18" />
-                  <line x1="18" y1="6" x2="6" y2="18" />
-                </svg>
-              </button>
-            </div>
-            <nav class="nav__drawer-body" aria-label="Mobile menu">
-              <div class="nav__drawer-section">
-                <h3 class="nav__drawer-title">Languages</h3>
-                {languages.map((l) => (
-                  <a href={l.href} class="nav__drawer-link" key={l.id}>{l.label}</a>
-                ))}
-              </div>
-              <div class="nav__drawer-section">
-                <h3 class="nav__drawer-title">Verification</h3>
-                {verification.map((v) => (
-                  <a href={v.href} class="nav__drawer-link" key={v.id}>{v.label}</a>
-                ))}
-              </div>
-              <div class="nav__drawer-section">
-                <h3 class="nav__drawer-title">Platforms</h3>
-                {platforms.map((p) => (
-                  <a href={p.href} class="nav__drawer-link" key={p.id}>{p.label}</a>
-                ))}
-              </div>
-              <div class="nav__drawer-section">
-                <h3 class="nav__drawer-title">Database</h3>
-                {database.map((d) => (
-                  <a href={d.href} class="nav__drawer-link" key={d.id}>{d.label}</a>
-                ))}
-              </div>
-              <div class="nav__drawer-section">
-                <h3 class="nav__drawer-title">AI</h3>
-                {ai.map((a) => (
-                  <a href={a.href} class="nav__drawer-link" key={a.id}>{a.label}</a>
-                ))}
-              </div>
-              <div class="nav__drawer-section">
-                <a href="/cli" class="nav__drawer-link nav__drawer-link--primary">CLI</a>
-                <a href="/docs" class="nav__drawer-link nav__drawer-link--primary">Docs</a>
-                <a href="https://github.com/neutron-build/neutron" class="nav__drawer-link nav__drawer-link--primary" target="_blank" rel="noopener noreferrer">GitHub</a>
-              </div>
-            </nav>
-          </div>
-        </div>
         <div class="nav__popover" aria-hidden="true" id="nav-popover">
           <div class="nav__popover-bg" id="nav-popover-bg"></div>
           <div class="nav__popover-content">
@@ -212,6 +160,61 @@ export default function Nav({ activeProduct }: NavProps) {
           </div>
         </div>
       </nav>
+      {/* Mobile drawer — deliberately OUTSIDE <nav>. .nav has backdrop-filter,
+          which creates a new containing block for position:fixed descendants,
+          so a fixed drawer nested inside it resolves inset:0 against the
+          56px nav bar instead of the viewport. Keep it a sibling. */}
+      <div class="nav__drawer" id="nav-drawer" aria-hidden="true">
+        <div class="nav__drawer-backdrop" data-drawer-close></div>
+        <div class="nav__drawer-panel" role="dialog" aria-modal="true" aria-label="Main navigation">
+          <div class="nav__drawer-header">
+            <a href="/" class="nav__logo">neutron</a>
+            <button type="button" class="nav__drawer-close" data-drawer-close aria-label="Close menu">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <line x1="6" y1="6" x2="18" y2="18" />
+                <line x1="18" y1="6" x2="6" y2="18" />
+              </svg>
+            </button>
+          </div>
+          <nav class="nav__drawer-body" aria-label="Mobile menu">
+            <div class="nav__drawer-section">
+              <h3 class="nav__drawer-title">Languages</h3>
+              {languages.map((l) => (
+                <a href={l.href} class="nav__drawer-link" key={l.id}>{l.label}</a>
+              ))}
+            </div>
+            <div class="nav__drawer-section">
+              <h3 class="nav__drawer-title">Verification</h3>
+              {verification.map((v) => (
+                <a href={v.href} class="nav__drawer-link" key={v.id}>{v.label}</a>
+              ))}
+            </div>
+            <div class="nav__drawer-section">
+              <h3 class="nav__drawer-title">Platforms</h3>
+              {platforms.map((p) => (
+                <a href={p.href} class="nav__drawer-link" key={p.id}>{p.label}</a>
+              ))}
+            </div>
+            <div class="nav__drawer-section">
+              <h3 class="nav__drawer-title">Database</h3>
+              {database.map((d) => (
+                <a href={d.href} class="nav__drawer-link" key={d.id}>{d.label}</a>
+              ))}
+            </div>
+            <div class="nav__drawer-section">
+              <h3 class="nav__drawer-title">AI</h3>
+              {ai.map((a) => (
+                <a href={a.href} class="nav__drawer-link" key={a.id}>{a.label}</a>
+              ))}
+            </div>
+            <div class="nav__drawer-section">
+              <a href="/cli" class="nav__drawer-link nav__drawer-link--primary">CLI</a>
+              <a href="/docs" class="nav__drawer-link nav__drawer-link--primary">Docs</a>
+              <a href="https://github.com/neutron-build/neutron" class="nav__drawer-link nav__drawer-link--primary" target="_blank" rel="noopener noreferrer">GitHub</a>
+            </div>
+          </nav>
+        </div>
+      </div>
     </>
   );
 }
