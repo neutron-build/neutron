@@ -278,6 +278,18 @@ pub struct Executor {
     /// is ready to store, the store is skipped — preventing a concurrent DML
     /// from being obscured by a stale cache entry written after invalidation.
     cache_write_gen: AtomicU64,
+    /// Row-level security + column masking engine (T2.2). Populated by policy
+    /// DDL; consulted on every row-producing path for non-superuser sessions.
+    /// Empty by default (no enabled tables / no policies → no enforcement,
+    /// matching Postgres). `policy_gen` bumps on any policy change so the query
+    /// cache can key on it and never serve one principal's rows to another.
+    #[allow(dead_code)] // consumed as enforcement sites are wired (T2.2)
+    security: parking_lot::RwLock<crate::security::SecurityManager>,
+    /// Bumped on every RLS/masking policy mutation; folded into the query-cache
+    /// key so cached result sets can't cross a policy change or (with the
+    /// principal) a user boundary.
+    #[allow(dead_code)] // consumed as enforcement sites are wired (T2.2)
+    policy_gen: AtomicU64,
 }
 
 impl Executor {
@@ -411,6 +423,8 @@ impl Executor {
             plan_cache_key_hint: parking_lot::Mutex::new(None),
             zone_map_index: crate::storage::granule_stats::ZoneMapIndex::new(),
             memory_critical: Arc::new(AtomicBool::new(false)),
+            security: parking_lot::RwLock::new(crate::security::SecurityManager::new()),
+            policy_gen: AtomicU64::new(0),
         }
     }
 
@@ -1617,6 +1631,154 @@ impl Executor {
         CURRENT_SESSION
             .try_with(|s| s.clone())
             .unwrap_or_else(|_| self.default_session.clone())
+    }
+
+    // ── Row-level security (T2.2) ────────────────────────────────────────────
+    // Foundation: engine + identity model + fail-closed gate/filter helpers.
+    // `recompute_session_context` is already wired into SET; the gate/filter
+    // helpers are consumed as each enforcement site is wired (allow(dead_code)
+    // until then so the scaffolding lands clean and behavior-neutral).
+
+    /// Bump the policy generation counter — folded into the query-cache key so
+    /// no cached result set crosses a policy change.
+    #[cfg(feature = "server")]
+    #[allow(dead_code)]
+    pub(super) fn bump_policy_gen(&self) {
+        self.policy_gen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The current RLS principal + policy generation, folded into the query
+    /// cache key so a result cached for one identity is never served to another
+    /// (the SQL-text-only cache key is otherwise a straight RLS bypass).
+    #[cfg(feature = "server")]
+    #[allow(dead_code)] // wired as enforcement lands (T2.2)
+    pub(super) fn rls_cache_principal(&self) -> String {
+        let session = self.current_session();
+        let ctx = session.session_context.read();
+        let pgen = self.policy_gen.load(Ordering::Relaxed);
+        // roles are small; join for a stable per-principal key.
+        format!("{}|{}|{}", pgen, ctx.user, ctx.roles.join(","))
+    }
+
+    /// Recompute a session's SecurityContext from its identity settings. Called
+    /// on session creation and whenever `SET session_authorization` / `SET ROLE`
+    /// / the tenant GUC changes. Default (user "nucleus") is a superuser, so an
+    /// unconfigured single-user deployment sees no RLS enforcement — matching
+    /// today's behavior. A non-superuser identity engages RLS.
+    #[cfg(feature = "server")]
+    pub(super) fn recompute_session_context(&self, session: &Session) {
+        let raw = session
+            .settings
+            .read()
+            .get("session_authorization")
+            .cloned()
+            .unwrap_or_else(|| "nucleus".to_string());
+        let user = raw.trim().trim_matches(|c| c == '\'' || c == '"').to_string();
+        let mut ctx = crate::security::SessionContext::new(&user).with_role(&user);
+        // Sync try_read (called from the sync SET path). On contention, fall
+        // back to superuser-only-for-"nucleus" — a real user then gets a
+        // non-superuser context, i.e. RLS engages (fail closed), never the
+        // reverse.
+        let is_super = match self.roles.try_read() {
+            Ok(roles) => roles
+                .get(&user)
+                .map(|r| r.is_superuser)
+                .unwrap_or(user == "nucleus"),
+            Err(_) => user == "nucleus",
+        };
+        if is_super {
+            ctx = ctx.with_role("superuser");
+        }
+        let tenant = session
+            .settings
+            .read()
+            .get("nucleus.tenant_id")
+            .map(|t| t.trim().trim_matches(|c| c == '\'' || c == '"').to_string());
+        if let Some(t) = tenant {
+            if !t.is_empty() {
+                ctx = ctx.with_tenant(&t);
+            }
+        }
+        *session.session_context.write() = ctx;
+    }
+
+    /// Whether RLS row-filtering is active for `table` in the current session:
+    /// RLS enabled on the table AND the session is not a superuser. This is the
+    /// FAIL-CLOSED gate every fast/bypass read path checks — when true, that
+    /// path must defer to the general materialize-and-filter path.
+    #[cfg(feature = "server")]
+    #[allow(dead_code)] // wired as enforcement lands (T2.2)
+    pub(super) fn rls_active(&self, table: &str) -> bool {
+        if self
+            .current_session()
+            .session_context
+            .read()
+            .has_role("superuser")
+        {
+            return false;
+        }
+        self.security.read().rls.is_enabled(table)
+    }
+
+    /// Whether ANY table in the current query needs RLS filtering — used to
+    /// disable the SQL-text-keyed result cache path wholesale when policies are
+    /// live (cheap: only true for non-superuser sessions with ≥1 enabled table).
+    #[cfg(feature = "server")]
+    #[allow(dead_code)] // wired as enforcement lands (T2.2)
+    pub(super) fn any_rls_active(&self) -> bool {
+        if self
+            .current_session()
+            .session_context
+            .read()
+            .has_role("superuser")
+        {
+            return false;
+        }
+        self.security.read().rls.any_enabled()
+    }
+
+    /// Drop rows the current session may not see under `table`'s RLS policies.
+    /// No-op (returns input) when RLS is not active for this session/table.
+    #[cfg(feature = "server")]
+    #[allow(dead_code)] // wired as enforcement lands (T2.2)
+    pub(super) fn rls_filter_rows(
+        &self,
+        table: &str,
+        cmd: crate::security::PolicyCommand,
+        rows: Vec<Row>,
+    ) -> Vec<Row> {
+        if !self.rls_active(table) {
+            return rows;
+        }
+        let Some(def) = self.catalog.get_table_cached(table) else {
+            // No schema → we cannot build the predicate row map. Fail closed:
+            // an RLS-enabled table with unknown columns yields nothing.
+            return Vec::new();
+        };
+        let col_names: Vec<&str> = def.columns.iter().map(|c| c.name.as_str()).collect();
+        let ctx = self.current_session().session_context.read().clone();
+        let maps: Vec<std::collections::HashMap<String, String>> = rows
+            .iter()
+            .map(|row| {
+                col_names
+                    .iter()
+                    .zip(row.iter())
+                    .map(|(n, v)| ((*n).to_string(), v.to_string()))
+                    .collect()
+            })
+            .collect();
+        let keep: std::collections::HashSet<usize> = self
+            .security
+            .read()
+            .rls
+            .filter_rows(table, cmd, &maps, &ctx)
+            .into_iter()
+            .collect();
+        rows.into_iter()
+            .enumerate()
+            .filter(|(i, _)| keep.contains(i))
+            .map(|(_, r)| r)
+            .collect()
     }
 
     /// Take (consume) the plan cache key hint stored by `parse_with_ast_cache`.

@@ -213,9 +213,13 @@ impl Session {
             cursors: RwLock::new(HashMap::new()),
             settings: parking_lot::RwLock::new(default_settings),
             active_ctes: parking_lot::RwLock::new(HashMap::new()),
-            session_context: parking_lot::RwLock::new(crate::security::SessionContext::new(
-                "nucleus",
-            )),
+            // Default identity is the bootstrap superuser, so an unconfigured
+            // (single-user) deployment bypasses RLS entirely — enforcement only
+            // engages once a session assumes a non-superuser identity via
+            // SET session_authorization / SET ROLE (T2.2).
+            session_context: parking_lot::RwLock::new(
+                crate::security::SessionContext::new("nucleus").with_role("superuser"),
+            ),
             last_activity_ms: AtomicU64::new(now_millis()),
             executing: AtomicBool::new(false),
         }

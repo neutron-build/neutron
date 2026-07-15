@@ -162,6 +162,21 @@ impl RlsEngine {
         self.enabled_tables.contains(table)
     }
 
+    /// Whether RLS is enabled on any table at all (cheap wholesale gate).
+    pub fn any_enabled(&self) -> bool {
+        !self.enabled_tables.is_empty()
+    }
+
+    /// Names of all RLS-enabled tables (for catalog persistence).
+    pub fn enabled_tables(&self) -> Vec<String> {
+        self.enabled_tables.iter().cloned().collect()
+    }
+
+    /// All policies across all tables (for catalog persistence).
+    pub fn all_policies(&self) -> Vec<&RlsPolicy> {
+        self.policies.values().flatten().collect()
+    }
+
     /// Add a policy.
     pub fn add_policy(&mut self, policy: RlsPolicy) {
         self.policies
