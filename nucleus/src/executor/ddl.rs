@@ -1632,23 +1632,10 @@ impl Executor {
             #[cfg(feature = "server")]
             self.columnar_store.write().clear(&table_name);
 
-            // Clear index entries for the truncated table to avoid orphaned references
-            self.btree_indexes.retain(|(t, _), _| t != &table_name);
-            #[cfg(feature = "server")]
-            self.hash_indexes.retain(|(t, _), _| t != &table_name);
-            self.vector_indexes
-                .write()
-                .retain(|_, entry| entry.table_name != table_name);
-            self.encrypted_indexes
-                .write()
-                .retain(|_, entry| entry.table_name != table_name);
-            // Clear zone map stats for the truncated table
-            {
-                let mut hasher = DefaultHasher::new();
-                table_name.hash(&mut hasher);
-                let zm_table_id = hasher.finish();
-                self.zone_map_index.clear_table(zm_table_id);
-            }
+            // Index definitions survive TRUNCATE. Recreate engine-local index
+            // structures and replace every in-memory posting map with the
+            // authoritative empty-table image.
+            self.rebuild_table_derived_state(&table_name).await;
         }
         Ok(ExecResult::Command {
             tag: "TRUNCATE TABLE".into(),
@@ -1741,6 +1728,26 @@ impl Executor {
                         self.table_columns.write().insert(new.clone(), col_info);
                     }
                     self.table_columns.write().remove(&table_name);
+                    self.btree_indexes
+                        .retain(|(table, _), _| table != &table_name);
+                    #[cfg(feature = "server")]
+                    self.hash_indexes
+                        .retain(|(table, _), _| table != &table_name);
+                    self.vector_indexes
+                        .write()
+                        .retain(|_, entry| entry.table_name != table_name);
+                    self.encrypted_indexes
+                        .write()
+                        .retain(|_, entry| entry.table_name != table_name);
+                    self.gin_indexes
+                        .write()
+                        .retain(|_, entry| entry.table_name != table_name);
+                    {
+                        let mut hasher = DefaultHasher::new();
+                        table_name.hash(&mut hasher);
+                        self.zone_map_index.clear_table(hasher.finish());
+                    }
+                    self.rebuild_table_derived_state(&new).await;
                     {
                         let mut security = self.security.write();
                         security.rls.rename_table(&table_name, &new);
@@ -1854,6 +1861,91 @@ impl Executor {
                             return Err(ExecError::ColumnNotFound(col_str));
                         }
                     }
+                    let dropped_names: HashSet<String> = drop_indices
+                        .iter()
+                        .filter_map(|index| table_def.columns.get(*index))
+                        .map(|column| column.name.clone())
+                        .collect();
+                    let indexed_dependency = self
+                        .catalog
+                        .get_indexes(&table_name)
+                        .await
+                        .into_iter()
+                        .find(|index| {
+                            index
+                                .columns
+                                .iter()
+                                .any(|column| dropped_names.contains(column))
+                        });
+                    if let Some(index) = indexed_dependency {
+                        return Err(ExecError::ConstraintViolation(format!(
+                            "cannot drop column because index \"{}\" depends on it; drop the index first",
+                            index.name
+                        )));
+                    }
+                    let constraint_dependency = self
+                        .catalog
+                        .list_tables()
+                        .await
+                        .into_iter()
+                        .find_map(|table| {
+                            table
+                                .constraints
+                                .iter()
+                                .find_map(|constraint| match constraint {
+                                    crate::catalog::TableConstraint::PrimaryKey {
+                                        columns,
+                                        name,
+                                    }
+                                    | crate::catalog::TableConstraint::Unique { columns, name }
+                                    | crate::catalog::TableConstraint::ForeignKey {
+                                        columns,
+                                        name,
+                                        ..
+                                    } if table.name == table_name
+                                        && columns
+                                            .iter()
+                                            .any(|column| dropped_names.contains(column)) =>
+                                    {
+                                        Some(
+                                            name.clone()
+                                                .unwrap_or_else(|| "unnamed constraint".into()),
+                                        )
+                                    }
+                                    crate::catalog::TableConstraint::ForeignKey {
+                                        name,
+                                        ref_table,
+                                        ref_columns,
+                                        ..
+                                    } if ref_table == &table_name
+                                        && ref_columns
+                                            .iter()
+                                            .any(|column| dropped_names.contains(column)) =>
+                                    {
+                                        Some(
+                                            name.clone()
+                                                .unwrap_or_else(|| "unnamed foreign key".into()),
+                                        )
+                                    }
+                                    crate::catalog::TableConstraint::Check { name, expr }
+                                        if table.name == table_name
+                                            && dropped_names.iter().any(|column| {
+                                                expr.split(|ch: char| {
+                                                    !ch.is_ascii_alphanumeric() && ch != '_'
+                                                })
+                                                .any(|token| token.eq_ignore_ascii_case(column))
+                                            }) =>
+                                    {
+                                        Some(name.clone().unwrap_or_else(|| "unnamed check".into()))
+                                    }
+                                    _ => None,
+                                })
+                        });
+                    if let Some(constraint) = constraint_dependency {
+                        return Err(ExecError::ConstraintViolation(format!(
+                            "cannot drop column because constraint \"{constraint}\" depends on it; drop the constraint first"
+                        )));
+                    }
                     // Sort descending to remove from end first
                     drop_indices.sort_unstable();
                     drop_indices.dedup();
@@ -1888,13 +1980,102 @@ impl Executor {
                     new_column_name,
                 } => {
                     let mut updated = (*table_def).clone();
+                    if updated.constraints.iter().any(|constraint| {
+                        matches!(constraint, crate::catalog::TableConstraint::Check { expr, .. }
+                            if expr.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                                .any(|token| token.eq_ignore_ascii_case(&old_column_name.value)))
+                    }) {
+                        return Err(ExecError::ConstraintViolation(format!(
+                            "cannot rename column \"{}\" while a CHECK constraint depends on it; drop the constraint first",
+                            old_column_name.value
+                        )));
+                    }
                     let col = updated
                         .columns
                         .iter_mut()
                         .find(|c| c.name == old_column_name.value)
                         .ok_or_else(|| ExecError::ColumnNotFound(old_column_name.value.clone()))?;
                     col.name = new_column_name.value.clone();
+                    for constraint in &mut updated.constraints {
+                        match constraint {
+                            crate::catalog::TableConstraint::PrimaryKey { columns, .. }
+                            | crate::catalog::TableConstraint::Unique { columns, .. } => {
+                                for column in columns {
+                                    if column == &old_column_name.value {
+                                        *column = new_column_name.value.clone();
+                                    }
+                                }
+                            }
+                            crate::catalog::TableConstraint::ForeignKey {
+                                columns,
+                                ref_table,
+                                ref_columns,
+                                ..
+                            } => {
+                                for column in columns {
+                                    if column == &old_column_name.value {
+                                        *column = new_column_name.value.clone();
+                                    }
+                                }
+                                if ref_table == &table_name {
+                                    for column in ref_columns {
+                                        if column == &old_column_name.value {
+                                            *column = new_column_name.value.clone();
+                                        }
+                                    }
+                                }
+                            }
+                            crate::catalog::TableConstraint::Check { .. } => {}
+                        }
+                    }
                     self.catalog.update_table(updated).await?;
+
+                    // Rewrite incoming FK references and catalog index columns.
+                    for dependency in self.catalog.list_tables().await {
+                        if dependency.name == table_name {
+                            continue;
+                        }
+                        let mut changed = false;
+                        let mut rewritten = (*dependency).clone();
+                        for constraint in &mut rewritten.constraints {
+                            if let crate::catalog::TableConstraint::ForeignKey {
+                                ref_table,
+                                ref_columns,
+                                ..
+                            } = constraint
+                                && ref_table == &table_name
+                            {
+                                for column in ref_columns {
+                                    if column == &old_column_name.value {
+                                        *column = new_column_name.value.clone();
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                        if changed {
+                            self.catalog.update_table(rewritten).await?;
+                        }
+                    }
+                    for index in self.catalog.get_indexes(&table_name).await {
+                        if !index
+                            .columns
+                            .iter()
+                            .any(|column| column == &old_column_name.value)
+                        {
+                            continue;
+                        }
+                        let mut rewritten = (*index).clone();
+                        for column in &mut rewritten.columns {
+                            if column == &old_column_name.value {
+                                *column = new_column_name.value.clone();
+                            }
+                        }
+                        self.catalog.drop_index(&rewritten.name).await?;
+                        self.catalog.create_index(rewritten).await?;
+                    }
+                    self.btree_indexes
+                        .remove(&(table_name.clone(), old_column_name.value.clone()));
                 }
                 ast::AlterTableOperation::AlterColumn { column_name, op } => {
                     let mut updated = (*table_def).clone();
@@ -2266,6 +2447,12 @@ impl Executor {
                         if let Err(_e) = self.catalog.drop_index(&constraint_name).await {
                             // Index may not exist (e.g., CHECK constraints have no backing index).
                         }
+                        self.btree_indexes
+                            .retain(|_, name| name != &constraint_name);
+                        let _ = self
+                            .storage_for(&table_name)
+                            .drop_index(&constraint_name)
+                            .await;
                     }
                 }
                 _ => {
@@ -2286,6 +2473,7 @@ impl Executor {
             self.table_columns
                 .write()
                 .insert(table_name.clone(), col_info);
+            self.rebuild_table_derived_state(&table_name).await;
         } else {
             self.table_columns.write().remove(&table_name);
         }

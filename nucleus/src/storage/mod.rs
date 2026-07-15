@@ -796,10 +796,13 @@ impl StorageEngine for MemoryEngine {
         }
         {
             let mut tnames = self.table_idx_names.write();
-            tnames
-                .entry(table.to_string())
-                .or_default()
-                .push(index_name.to_string());
+            let names = tnames.entry(table.to_string()).or_default();
+            // Idempotent: re-creating an existing index (e.g. a derived-state
+            // rebuild) must not double-register the name, or per-name index
+            // maintenance would insert every row twice.
+            if !names.iter().any(|n| n == index_name) {
+                names.push(index_name.to_string());
+            }
         }
         Ok(())
     }

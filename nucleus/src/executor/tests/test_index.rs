@@ -230,6 +230,114 @@ async fn test_encrypted_index_maintained_on_insert() {
     }
 }
 
+#[tokio::test]
+async fn test_encrypted_index_row_ids_rebuilt_after_delete_and_rollback() {
+    unsafe {
+        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef");
+    }
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE enc_shift (id INT, code TEXT)").await;
+    exec(
+        &ex,
+        "INSERT INTO enc_shift VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .await;
+    exec(
+        &ex,
+        "CREATE INDEX enc_shift_code ON enc_shift USING encrypted (code)",
+    )
+    .await;
+
+    exec(&ex, "DELETE FROM enc_shift WHERE id = 1").await;
+    let result = exec(
+        &ex,
+        "SELECT ENCRYPTED_LOOKUP('enc_shift_code', 'c') FROM enc_shift LIMIT 1",
+    )
+    .await;
+    assert_eq!(rows(&result[0])[0][0], Value::Text("1".into()));
+
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "DELETE FROM enc_shift WHERE id = 2").await;
+    exec(&ex, "ROLLBACK").await;
+    let result = exec(
+        &ex,
+        "SELECT ENCRYPTED_LOOKUP('enc_shift_code', 'c') FROM enc_shift LIMIT 1",
+    )
+    .await;
+    assert_eq!(rows(&result[0])[0][0], Value::Text("1".into()));
+}
+
+#[tokio::test]
+async fn test_specialty_index_rebuilt_after_fk_cascade() {
+    unsafe {
+        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef");
+    }
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE enc_parent (id INT PRIMARY KEY)").await;
+    exec(
+        &ex,
+        "CREATE TABLE enc_child (id INT, pid INT REFERENCES enc_parent(id) ON DELETE CASCADE, code TEXT)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO enc_parent VALUES (1), (2)").await;
+    exec(
+        &ex,
+        "INSERT INTO enc_child VALUES (10, 1, 'gone'), (20, 2, 'kept')",
+    )
+    .await;
+    exec(
+        &ex,
+        "CREATE INDEX enc_child_code ON enc_child USING encrypted (code)",
+    )
+    .await;
+
+    exec(&ex, "DELETE FROM enc_parent WHERE id = 1").await;
+    let result = exec(
+        &ex,
+        "SELECT ENCRYPTED_LOOKUP('enc_child_code', 'kept') FROM enc_child LIMIT 1",
+    )
+    .await;
+    assert_eq!(rows(&result[0])[0][0], Value::Text("0".into()));
+}
+
+#[tokio::test]
+async fn test_truncate_and_rename_preserve_index_definitions() {
+    let (ex, _tmp) = disk_executor();
+    exec(&ex, "CREATE TABLE indexed_lifecycle (id INT, value TEXT)").await;
+    exec(&ex, "CREATE INDEX lifecycle_id ON indexed_lifecycle (id)").await;
+    exec(&ex, "INSERT INTO indexed_lifecycle VALUES (1, 'old')").await;
+    exec(&ex, "TRUNCATE TABLE indexed_lifecycle").await;
+    exec(&ex, "INSERT INTO indexed_lifecycle VALUES (2, 'new')").await;
+    let result = exec(&ex, "SELECT value FROM indexed_lifecycle WHERE id = 2").await;
+    assert_eq!(rows(&result[0])[0][0], Value::Text("new".into()));
+
+    exec(
+        &ex,
+        "ALTER TABLE indexed_lifecycle RENAME TO indexed_renamed",
+    )
+    .await;
+    let result = exec(&ex, "SELECT value FROM indexed_renamed WHERE id = 2").await;
+    assert_eq!(rows(&result[0])[0][0], Value::Text("new".into()));
+    assert!(
+        ex.btree_indexes
+            .contains_key(&("indexed_renamed".into(), "id".into()))
+    );
+
+    exec(&ex, "ALTER TABLE indexed_renamed RENAME COLUMN id TO key").await;
+    let result = exec(&ex, "SELECT value FROM indexed_renamed WHERE key = 2").await;
+    assert_eq!(rows(&result[0])[0][0], Value::Text("new".into()));
+    assert!(
+        ex.btree_indexes
+            .contains_key(&("indexed_renamed".into(), "key".into()))
+    );
+
+    let error = ex
+        .execute("ALTER TABLE indexed_renamed DROP COLUMN key")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("index \"lifecycle_id\" depends"));
+}
+
 // ================================================================
 
 // SIMD-accelerated aggregate test

@@ -4,7 +4,7 @@ use super::schema_types::CursorDef;
 use super::types::{CteTableMap, PreparedStmt};
 use crate::security::SecurityManager;
 use crate::types::Row;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::RwLock;
@@ -163,6 +163,10 @@ pub(super) struct TxnState {
     pub policy_dirty: bool,
     /// Whether relational DML changed rows that may feed a shared GIN index.
     pub gin_dirty: bool,
+    /// Tables whose position-addressed derived indexes must be rebuilt after
+    /// COMMIT or ROLLBACK.  Vector/encrypted indexes are shared across sessions,
+    /// so an aborted transaction must repair them from committed base rows too.
+    pub derived_dirty_tables: HashSet<String>,
 }
 
 impl TxnState {
@@ -177,6 +181,7 @@ impl TxnState {
             security_savepoints: Vec::new(),
             policy_dirty: false,
             gin_dirty: false,
+            derived_dirty_tables: HashSet::new(),
         }
     }
 }
@@ -281,6 +286,7 @@ impl Session {
             txn.snapshot = None;
             txn.savepoints.clear();
             txn.gin_dirty = false;
+            txn.derived_dirty_tables.clear();
         }
         // Clear prepared statements
         self.prepared_stmts.write().await.clear();
