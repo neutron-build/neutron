@@ -68,6 +68,8 @@ struct ColumnDefSer {
 #[serde(tag = "type")]
 enum TableConstraintSer {
     PrimaryKey {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         columns: Vec<String>,
     },
     Unique {
@@ -216,7 +218,8 @@ fn string_to_index_type(s: &str) -> Result<IndexType, PersistenceError> {
 /// Convert a `TableConstraint` to its serializable form.
 fn constraint_to_ser(c: &TableConstraint) -> TableConstraintSer {
     match c {
-        TableConstraint::PrimaryKey { columns } => TableConstraintSer::PrimaryKey {
+        TableConstraint::PrimaryKey { name, columns } => TableConstraintSer::PrimaryKey {
+            name: name.clone(),
             columns: columns.clone(),
         },
         TableConstraint::Unique { name, columns } => TableConstraintSer::Unique {
@@ -248,7 +251,8 @@ fn constraint_to_ser(c: &TableConstraint) -> TableConstraintSer {
 /// Convert a serializable constraint back to the internal `TableConstraint`.
 fn ser_to_constraint(c: &TableConstraintSer) -> TableConstraint {
     match c {
-        TableConstraintSer::PrimaryKey { columns } => TableConstraint::PrimaryKey {
+        TableConstraintSer::PrimaryKey { name, columns } => TableConstraint::PrimaryKey {
+            name: name.clone(),
             columns: columns.clone(),
         },
         TableConstraintSer::Unique { name, columns } => TableConstraint::Unique {
@@ -855,6 +859,7 @@ mod tests {
                     },
                 ],
                 constraints: vec![TableConstraint::PrimaryKey {
+                    name: Some("users_pk".into()),
                     columns: vec!["id".into()],
                 }],
                 append_only: false,
@@ -939,6 +944,11 @@ mod tests {
         assert_eq!(users.columns[1].name, "email");
         assert_eq!(users.columns[2].name, "active");
         assert!(users.columns[2].nullable);
+        assert!(matches!(
+            &users.constraints[0],
+            TableConstraint::PrimaryKey { name: Some(name), columns }
+                if name == "users_pk" && columns == &["id"]
+        ));
 
         // Verify orders table with Array type
         let orders = catalog2.get_table("orders").await.unwrap();

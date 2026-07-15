@@ -37,7 +37,10 @@ pub struct ColumnDef {
 #[derive(Debug, Clone)]
 pub enum TableConstraint {
     /// PRIMARY KEY (column_names).
-    PrimaryKey { columns: Vec<String> },
+    PrimaryKey {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
     /// UNIQUE (column_names).
     Unique {
         name: Option<String>,
@@ -82,7 +85,7 @@ impl TableDef {
     /// Return the primary key column names, if any.
     pub fn primary_key_columns(&self) -> Option<&[String]> {
         self.constraints.iter().find_map(|c| match c {
-            TableConstraint::PrimaryKey { columns } => Some(columns.as_slice()),
+            TableConstraint::PrimaryKey { columns, .. } => Some(columns.as_slice()),
             _ => None,
         })
     }

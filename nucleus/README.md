@@ -271,6 +271,13 @@ explicitly. Locale-aware collations are not implemented: the deterministic binar
 and `UCS_BASIC` collations are supported, while other collation names reject instead of silently
 using binary ordering.
 
+Relational `PRIMARY KEY`, `UNIQUE`, `CHECK`, `NOT NULL`, and `FOREIGN KEY` constraints are
+immediate and persist across restart. Foreign keys require a type-compatible primary/unique target
+and support `MATCH SIMPLE` with `RESTRICT`/`NO ACTION`, `CASCADE`, `SET NULL`, and `SET DEFAULT`
+actions. Cascades are preflighted as one logical operation and enforce the child table's full
+constraint and RLS envelope. Unsupported deferred constraints, `MATCH FULL`/`MATCH PARTIAL`,
+`UNIQUE NULLS NOT DISTINCT`, and dependency `DROP ... CASCADE` reject explicitly.
+
 ## License
 
 Business Source License 1.1 -- converts to MIT after 4 years. See [LICENSE](./LICENSE).

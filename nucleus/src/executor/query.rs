@@ -1122,7 +1122,7 @@ impl Executor {
         let mut seen_columns: HashSet<String> = HashSet::new();
         for constraint in &table_def.constraints {
             let (columns, index_name) = match constraint {
-                TableConstraint::PrimaryKey { columns } => {
+                TableConstraint::PrimaryKey { columns, .. } => {
                     (columns, format!("{}_pkey", table_def.name))
                 }
                 TableConstraint::Unique { name, columns } => {
@@ -1181,6 +1181,32 @@ impl Executor {
     ) -> (HashMap<String, Vec<Expr>>, Option<Expr>) {
         let relation_names = Self::collect_from_relation_names(from);
         let has_outer_join = Self::from_has_outer_join(from);
+        let mut nullable_relations = HashSet::new();
+        for table_with_joins in from {
+            let mut left_relations: HashSet<String> =
+                Self::table_factor_names(&table_with_joins.relation)
+                    .into_iter()
+                    .collect();
+            for join in &table_with_joins.joins {
+                let right_relations: HashSet<String> = Self::table_factor_names(&join.relation)
+                    .into_iter()
+                    .collect();
+                match &join.join_operator {
+                    ast::JoinOperator::Left(_) | ast::JoinOperator::LeftOuter(_) => {
+                        nullable_relations.extend(right_relations.iter().cloned());
+                    }
+                    ast::JoinOperator::Right(_) | ast::JoinOperator::RightOuter(_) => {
+                        nullable_relations.extend(left_relations.iter().cloned());
+                    }
+                    ast::JoinOperator::FullOuter(_) => {
+                        nullable_relations.extend(left_relations.iter().cloned());
+                        nullable_relations.extend(right_relations.iter().cloned());
+                    }
+                    _ => {}
+                }
+                left_relations.extend(right_relations);
+            }
+        }
         // For a single-table FROM (no joins / outer joins) an UNQUALIFIED column
         // predicate (e.g. `WHERE id = 1`) belongs unambiguously to that table, so
         // push it down too. This lets `SELECT … WHERE pk = v` use the storage
@@ -1204,17 +1230,12 @@ impl Executor {
             if refs.len() == 1
                 && let Some(name) = refs.iter().next()
                 && relation_names.contains(name)
+                && !nullable_relations.contains(name)
             {
                 by_relation
                     .entry(name.clone())
                     .or_default()
                     .push(pred.clone());
-                // For outer joins, keep pushed predicates as post-join filters too.
-                // This preserves NULL-extension semantics while still enabling
-                // relation-level pushdown.
-                if has_outer_join {
-                    remaining.push(pred);
-                }
                 continue;
             }
             // Unqualified predicate over the single FROM table → push it there.

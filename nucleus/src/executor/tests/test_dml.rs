@@ -26,6 +26,37 @@ async fn test_primary_key_constraint() {
 }
 
 #[tokio::test]
+async fn test_table_level_primary_key_implies_not_null_and_is_unique() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE table_pk (tenant INT, id INT, PRIMARY KEY (tenant, id))",
+    )
+    .await;
+    assert!(
+        ex.execute("INSERT INTO table_pk VALUES (NULL, 1)")
+            .await
+            .is_err()
+    );
+    exec(&ex, "INSERT INTO table_pk VALUES (1, 1)").await;
+    assert!(
+        ex.execute("INSERT INTO table_pk VALUES (1, 1)")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn test_create_table_rejects_multiple_primary_keys() {
+    let ex = test_executor();
+    assert!(
+        ex.execute("CREATE TABLE two_pk (id INT PRIMARY KEY, code INT, PRIMARY KEY (code))")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn test_unique_constraint() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE uq (id INT, email TEXT UNIQUE)").await;
@@ -844,6 +875,24 @@ async fn test_fk_self_referencing_cascade() {
 }
 
 #[tokio::test]
+async fn test_fk_self_referencing_delete_cascade_removes_entire_subtree() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE self_tree (id INT PRIMARY KEY, parent_id INT REFERENCES self_tree(id) ON DELETE CASCADE)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO self_tree VALUES (1, NULL)").await;
+    exec(&ex, "INSERT INTO self_tree VALUES (2, 1)").await;
+    exec(&ex, "INSERT INTO self_tree VALUES (3, 2)").await;
+    exec(&ex, "INSERT INTO self_tree VALUES (4, 1)").await;
+
+    exec(&ex, "DELETE FROM self_tree WHERE id = 1").await;
+    let count = exec(&ex, "SELECT COUNT(*) FROM self_tree").await;
+    assert_eq!(*scalar(&count[0]), Value::Int64(0));
+}
+
+#[tokio::test]
 async fn test_fk_partial_delete_cascade() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE pd_parent (id INT PRIMARY KEY)").await;
@@ -1039,6 +1088,27 @@ async fn test_fk_set_default_on_update() {
 }
 
 #[tokio::test]
+async fn test_fk_set_default_on_update_can_reference_pending_new_parent_key() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE pending_default_parent (id INT PRIMARY KEY)",
+    )
+    .await;
+    exec(
+        &ex,
+        "CREATE TABLE pending_default_child (id INT, pid INT DEFAULT 2 REFERENCES pending_default_parent(id) ON UPDATE SET DEFAULT)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO pending_default_parent VALUES (1)").await;
+    exec(&ex, "INSERT INTO pending_default_child VALUES (10, 1)").await;
+
+    exec(&ex, "UPDATE pending_default_parent SET id = 2 WHERE id = 1").await;
+    let child = exec(&ex, "SELECT pid FROM pending_default_child").await;
+    assert_eq!(*scalar(&child[0]), Value::Int32(2));
+}
+
+#[tokio::test]
 async fn test_fk_mixed_actions_delete_cascade_update_restrict() {
     let ex = test_executor();
     exec(&ex, "CREATE TABLE mx_parent (id INT PRIMARY KEY)").await;
@@ -1059,6 +1129,231 @@ async fn test_fk_mixed_actions_delete_cascade_update_restrict() {
     exec(&ex, "DELETE FROM mx_parent WHERE id = 1").await;
     let r = exec(&ex, "SELECT COUNT(*) FROM mx_child").await;
     assert_eq!(*scalar(&r[0]), Value::Int64(0));
+}
+
+#[tokio::test]
+async fn test_fk_cascade_delete_rolls_back_atomically() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE rb_parent (id INT PRIMARY KEY)").await;
+    exec(
+        &ex,
+        "CREATE TABLE rb_child (id INT PRIMARY KEY, pid INT REFERENCES rb_parent(id) ON DELETE CASCADE)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO rb_parent VALUES (1)").await;
+    exec(&ex, "INSERT INTO rb_child VALUES (10, 1)").await;
+
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "DELETE FROM rb_parent WHERE id = 1").await;
+    exec(&ex, "ROLLBACK").await;
+
+    let parents = exec(&ex, "SELECT COUNT(*) FROM rb_parent").await;
+    let children = exec(&ex, "SELECT COUNT(*) FROM rb_child").await;
+    assert_eq!(*scalar(&parents[0]), Value::Int64(1));
+    assert_eq!(*scalar(&children[0]), Value::Int64(1));
+}
+
+#[tokio::test]
+async fn test_fk_set_null_validates_not_null_and_preserves_statement_atomicity() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE nn_action_parent (id INT PRIMARY KEY)").await;
+    exec(
+        &ex,
+        "CREATE TABLE nn_action_child (id INT PRIMARY KEY, pid INT NOT NULL REFERENCES nn_action_parent(id) ON DELETE SET NULL)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO nn_action_parent VALUES (1)").await;
+    exec(&ex, "INSERT INTO nn_action_child VALUES (10, 1)").await;
+
+    assert!(
+        ex.execute("DELETE FROM nn_action_parent WHERE id = 1")
+            .await
+            .is_err(),
+        "SET NULL must enforce the child column's NOT NULL constraint"
+    );
+    let parents = exec(&ex, "SELECT COUNT(*) FROM nn_action_parent").await;
+    let child = exec(&ex, "SELECT pid FROM nn_action_child WHERE id = 10").await;
+    assert_eq!(*scalar(&parents[0]), Value::Int64(1));
+    assert_eq!(*scalar(&child[0]), Value::Int32(1));
+}
+
+#[tokio::test]
+async fn test_fk_set_default_validates_referential_integrity() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE bad_default_parent (id INT PRIMARY KEY)").await;
+    exec(
+        &ex,
+        "CREATE TABLE bad_default_child (id INT PRIMARY KEY, pid INT DEFAULT 0 REFERENCES bad_default_parent(id) ON DELETE SET DEFAULT)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO bad_default_parent VALUES (1)").await;
+    exec(&ex, "INSERT INTO bad_default_child VALUES (10, 1)").await;
+
+    assert!(
+        ex.execute("DELETE FROM bad_default_parent WHERE id = 1")
+            .await
+            .is_err(),
+        "SET DEFAULT must reject a default that has no referenced parent"
+    );
+    let parents = exec(&ex, "SELECT COUNT(*) FROM bad_default_parent").await;
+    let child = exec(&ex, "SELECT pid FROM bad_default_child WHERE id = 10").await;
+    assert_eq!(*scalar(&parents[0]), Value::Int64(1));
+    assert_eq!(*scalar(&child[0]), Value::Int32(1));
+}
+
+#[tokio::test]
+async fn test_fk_set_default_cannot_retain_deleted_parent_key() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE same_default_parent (id INT PRIMARY KEY)").await;
+    exec(
+        &ex,
+        "CREATE TABLE same_default_child (id INT PRIMARY KEY, pid INT DEFAULT 1 REFERENCES same_default_parent(id) ON DELETE SET DEFAULT)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO same_default_parent VALUES (1)").await;
+    exec(&ex, "INSERT INTO same_default_child VALUES (10, 1)").await;
+
+    assert!(
+        ex.execute("DELETE FROM same_default_parent WHERE id = 1")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        *scalar(&exec(&ex, "SELECT COUNT(*) FROM same_default_parent").await[0]),
+        Value::Int64(1)
+    );
+    assert_eq!(
+        *scalar(&exec(&ex, "SELECT pid FROM same_default_child").await[0]),
+        Value::Int32(1)
+    );
+}
+
+#[tokio::test]
+async fn test_multilevel_cascade_failure_rolls_back_all_implicit_writes() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE cascade_atomic_gp (id INT PRIMARY KEY)").await;
+    exec(
+        &ex,
+        "CREATE TABLE cascade_atomic_parent (gp_id INT PRIMARY KEY REFERENCES cascade_atomic_gp(id) ON UPDATE CASCADE)",
+    )
+    .await;
+    exec(
+        &ex,
+        "CREATE TABLE cascade_atomic_child (id INT PRIMARY KEY, parent_id INT NOT NULL REFERENCES cascade_atomic_parent(gp_id) ON UPDATE SET NULL)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO cascade_atomic_gp VALUES (1)").await;
+    exec(&ex, "INSERT INTO cascade_atomic_parent VALUES (1)").await;
+    exec(&ex, "INSERT INTO cascade_atomic_child VALUES (10, 1)").await;
+
+    assert!(
+        ex.execute("UPDATE cascade_atomic_gp SET id = 2 WHERE id = 1")
+            .await
+            .is_err()
+    );
+    let gp = exec(&ex, "SELECT id FROM cascade_atomic_gp").await;
+    let parent = exec(&ex, "SELECT gp_id FROM cascade_atomic_parent").await;
+    let child = exec(&ex, "SELECT parent_id FROM cascade_atomic_child").await;
+    assert_eq!(*scalar(&gp[0]), Value::Int32(1));
+    assert_eq!(*scalar(&parent[0]), Value::Int32(1));
+    assert_eq!(*scalar(&child[0]), Value::Int32(1));
+}
+
+#[tokio::test]
+async fn test_fk_ddl_requires_unique_type_compatible_target() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE fk_shape_parent (id INT, code TEXT UNIQUE)",
+    )
+    .await;
+
+    assert!(
+        ex.execute(
+            "CREATE TABLE fk_nonunique_child (id INT, pid INT REFERENCES fk_shape_parent(id))",
+        )
+        .await
+        .is_err(),
+        "a foreign key cannot reference unconstrained duplicate values"
+    );
+    assert!(
+        ex.execute(
+            "CREATE TABLE fk_wrong_type_child (id INT, parent_code INT REFERENCES fk_shape_parent(code))",
+        )
+        .await
+        .is_err(),
+        "foreign-key columns must have compatible declared types"
+    );
+}
+
+#[tokio::test]
+async fn test_alter_add_fk_validates_existing_rows_before_catalog_publish() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE alter_fk_parent (id INT PRIMARY KEY)").await;
+    exec(&ex, "CREATE TABLE alter_fk_child (id INT, pid INT)").await;
+    exec(&ex, "INSERT INTO alter_fk_child VALUES (1, 999)").await;
+
+    assert!(
+        ex.execute(
+            "ALTER TABLE alter_fk_child ADD CONSTRAINT fk_existing FOREIGN KEY (pid) REFERENCES alter_fk_parent(id)",
+        )
+        .await
+        .is_err(),
+        "existing orphan rows must prevent the FK from being published"
+    );
+
+    exec(&ex, "INSERT INTO alter_fk_child VALUES (2, 1000)").await;
+    let count = exec(&ex, "SELECT COUNT(*) FROM alter_fk_child").await;
+    assert_eq!(
+        *scalar(&count[0]),
+        Value::Int64(2),
+        "failed ALTER must leave no partially published constraint"
+    );
+}
+
+#[cfg(feature = "server")]
+#[tokio::test]
+async fn test_concurrent_parent_delete_and_child_insert_cannot_commit_orphan() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE fk_race_parent (id INT PRIMARY KEY)").await;
+    exec(
+        &ex,
+        "CREATE TABLE fk_race_child (id INT PRIMARY KEY, pid INT REFERENCES fk_race_parent(id))",
+    )
+    .await;
+    exec(&ex, "INSERT INTO fk_race_parent VALUES (1)").await;
+
+    let child_session = ex.create_session();
+    let parent_session = ex.create_session();
+    ex.execute_with_session(child_session, "BEGIN")
+        .await
+        .unwrap();
+    ex.execute_with_session(child_session, "INSERT INTO fk_race_child VALUES (10, 1)")
+        .await
+        .unwrap();
+
+    let parent_delete = ex
+        .execute_with_session(parent_session, "DELETE FROM fk_race_parent WHERE id = 1")
+        .await;
+    let child_commit = ex.execute_with_session(child_session, "COMMIT").await;
+
+    assert!(
+        parent_delete.is_err() || child_commit.is_err(),
+        "the conflicting parent delete and child insert must not both commit: delete={parent_delete:?}, commit={child_commit:?}"
+    );
+    if child_commit.is_err() {
+        let _ = ex.execute_with_session(child_session, "ROLLBACK").await;
+    }
+    let parent_count = exec(&ex, "SELECT COUNT(*) FROM fk_race_parent").await;
+    let child_count = exec(&ex, "SELECT COUNT(*) FROM fk_race_child").await;
+    assert_eq!(*scalar(&parent_count[0]), Value::Int64(1));
+    assert_eq!(*scalar(&child_count[0]), Value::Int64(1));
+    let orphans = exec(
+        &ex,
+        "SELECT COUNT(*) FROM fk_race_child c LEFT JOIN fk_race_parent p ON c.pid = p.id WHERE p.id IS NULL",
+    )
+    .await;
+    assert_eq!(*scalar(&orphans[0]), Value::Int64(0));
 }
 
 // CTE with INSERT/UPDATE/DELETE tests
