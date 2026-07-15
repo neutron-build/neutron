@@ -278,6 +278,12 @@ actions. Cascades are preflighted as one logical operation and enforce the child
 constraint and RLS envelope. Unsupported deferred constraints, `MATCH FULL`/`MATCH PARTIAL`,
 `UNIQUE NULLS NOT DISTINCT`, and dependency `DROP ... CASCADE` reject explicitly.
 
+MVCC `VACUUM [table]` uses the oldest retained snapshot horizon, not merely the oldest currently
+active transaction ID. It preserves versions required by long snapshots, removes committed dead
+versions and aborted inserts, repairs aborted-delete tombstones, reclaims resolved transaction
+metadata, and rebuilds affected secondary-index version pointers after compaction. Idle transaction
+timeouts prevent abandoned sessions from pinning that horizon indefinitely.
+
 ## License
 
 Business Source License 1.1 -- converts to MIT after 4 years. See [LICENSE](./LICENSE).

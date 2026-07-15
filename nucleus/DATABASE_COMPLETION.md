@@ -27,7 +27,7 @@ behavior satisfies the relevant gate above.
 - Source LOC: 239286; Source Rust files: 214; Top-level modules: 50.
 - Declared unit tests: 3864; Declared integration tests: 312; Ignored tests: 155;
   Binary-protocol stubs: 113. These are static declarations, not executed-test claims.
-- The most recent full library run executed 3,759 passing tests and 113 ignored native-binary
+- The most recent full library run executed 3,766 passing tests and 113 ignored native-binary
   test stubs. Core-only executed 1,853 passing tests with no ignores.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
   families, specialty indexes, encryption, TLS, embedded mode, physical backup v1, probes, Raft
@@ -97,7 +97,7 @@ Goal: close known semantic holes before expanding interfaces.
 - [x] Complete numeric/decimal aggregate precision and overflow behavior.
 - [x] Verify collations, time zones, date arithmetic, NULL ordering, casts, and three-valued logic.
 - [x] Verify constraints and cascades across transactions and restart.
-- [ ] Finish MVCC garbage collection/vacuum behavior for long snapshots and high churn.
+- [x] Finish MVCC garbage collection/vacuum behavior for long snapshots and high churn.
 - [ ] Add deterministic transaction-ID exhaustion/wraparound behavior.
 - [ ] Ensure query caches and specialty indexes invalidate on every relevant DDL/DML transition.
 
@@ -138,6 +138,13 @@ Evidence:
   multilevel failure atomicity, all FK actions, all four engines, and two crash-copy restarts. The
   2026-07-15 full library run passed 3,759 tests with 113 native-protocol stubs ignored; the focused
   engine/restart suites passed 10 and 19 tests respectively.
+- MVCC vacuum now derives its watermark from every active snapshot's retained `xmin`, preserves a
+  pre-delete version for snapshots overlapping the deleter, removes committed-dead and
+  aborted-created versions, repairs aborted-delete tombstones before status reclamation, scopes
+  `VACUUM table` correctly, and rebuilds secondary indexes after version-vector compaction. Active
+  regressions cover the formerly unsafe committed-deleter interleaving, aborted insert/delete
+  cleanup, table isolation, index lookup after compaction, idempotent metadata GC, idle-transaction
+  release, and a 1,000-update chain retained by a long snapshot then reduced to one live version.
 
 Exit gate:
 

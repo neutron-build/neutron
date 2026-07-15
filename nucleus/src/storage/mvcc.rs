@@ -10,7 +10,7 @@
 //!   - Write-write conflict detection (two txns can't modify the same row)
 //!   - Garbage collection of old, invisible versions
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -204,13 +204,24 @@ impl MvccTable {
     /// Garbage collect: remove versions that are invisible to ALL possible
     /// future transactions (deleted by a committed txn, and no active txn
     /// could still see the old version).
-    fn gc(&self, oldest_active_xmin: u64) -> usize {
+    fn gc(&self, oldest_active_xmin: u64, txn_mgr: &TransactionManager) -> usize {
         let mut rows = self.rows.write();
         let before = rows.len();
         rows.retain(|r| {
+            // An aborted creator never produced a visible row. Once it is no
+            // longer active, the physical version can be removed outright.
+            if txn_mgr.get_status(r.version.created_by) == TxnStatus::Aborted {
+                return false;
+            }
             // Keep if not deleted
             let deleted = r.version.deleted_by.load(Ordering::Acquire);
             if deleted == TXN_INVALID {
+                return true;
+            }
+            // An aborted delete never removed the row. Clear the stale
+            // tombstone before its transaction status is reclaimed.
+            if txn_mgr.get_status(deleted) == TxnStatus::Aborted {
+                r.version.deleted_by.store(TXN_INVALID, Ordering::Release);
                 return true;
             }
             // Soundness (checked against lean4 `MvccProofs`/`MvccSpec`): the
@@ -228,6 +239,16 @@ impl MvccTable {
                 && deleted != TXN_INVALID)
         });
         before - rows.len()
+    }
+
+    fn referenced_txn_ids(&self, referenced: &mut HashSet<u64>) {
+        for row in self.rows.read().iter() {
+            referenced.insert(row.version.created_by);
+            let deleted = row.version.deleted_by.load(Ordering::Acquire);
+            if deleted != TXN_INVALID {
+                referenced.insert(deleted);
+            }
+        }
     }
 
     /// Get the number of row versions in this table.
@@ -652,9 +673,21 @@ impl MvccMemoryEngine {
         let all_tables = self.get_all_tables();
         let mut total = 0;
         for tbl in &all_tables {
-            total += tbl.gc(oldest_active_xmin);
+            total += tbl.gc(oldest_active_xmin, &self.txn_mgr);
         }
         total
+    }
+
+    pub fn gc_table(&self, table: &str, oldest_active_xmin: u64) -> Result<usize, MvccError> {
+        Ok(self.get_table(table)?.gc(oldest_active_xmin, &self.txn_mgr))
+    }
+
+    fn referenced_txn_ids(&self) -> HashSet<u64> {
+        let mut referenced = HashSet::new();
+        for table in self.get_all_tables() {
+            table.referenced_txn_ids(&mut referenced);
+        }
+        referenced
     }
 
     /// Get the total number of row versions (including deleted) across all tables.
@@ -2532,13 +2565,40 @@ impl StorageEngine for MvccStorageAdapter {
             .map(|&n| n.max(0) as usize)
     }
 
-    async fn vacuum(&self, _table: &str) -> Result<(usize, usize, usize, usize), StorageError> {
+    async fn vacuum(&self, table: &str) -> Result<(usize, usize, usize, usize), StorageError> {
         let watermark = self.engine.txn_mgr().gc_watermark();
-        let removed = self.engine.gc(watermark);
-        let (_, gc_committed, gc_aborted) = self.engine.txn_mgr().run_gc();
+        let affected_tables: Vec<String> = if table.is_empty() {
+            self.engine.tables.read().keys().cloned().collect()
+        } else {
+            vec![table.to_string()]
+        };
+        let removed = if table.is_empty() {
+            self.engine.gc(watermark)
+        } else {
+            self.engine
+                .gc_table(table, watermark)
+                .map_err(|error| StorageError::TableNotFound(error.to_string()))?
+        };
+        let referenced = self.engine.referenced_txn_ids();
+        let gc_aborted = self
+            .engine
+            .txn_mgr()
+            .gc_resolved_aborted(watermark, &referenced);
+        let (_, gc_committed, retained_aborted) = self.engine.txn_mgr().run_gc();
+        // GC compacts each table's version vector, so physical version indices
+        // change. Rebuild every affected secondary index before returning;
+        // otherwise an index can point at a different surviving row.
+        for affected in affected_tables {
+            let mut observer = self.engine.txn_mgr().begin(IsolationLevel::Snapshot);
+            let snapshot = observer.snapshot.clone();
+            if let Ok(rows) = self.engine.scan(&affected, &snapshot) {
+                self.rebuild_indexes_for_table(&affected, &rows);
+            }
+            self.engine.txn_mgr().commit(&mut observer);
+        }
         // (pages_scanned, dead_tuples_reclaimed, pages_freed, bytes_reclaimed)
         // For in-memory MVCC, "pages" are not meaningful; report version counts.
-        Ok((0, removed, 0, (gc_committed + gc_aborted)))
+        Ok((0, removed, 0, gc_committed + gc_aborted + retained_aborted))
     }
 
     async fn vacuum_all(&self) -> Result<(usize, usize, usize, usize), StorageError> {
@@ -2769,6 +2829,136 @@ mod tests {
     }
 
     #[test]
+    fn gc_preserves_version_for_snapshot_overlapping_its_deleter() {
+        let (engine, txn_mgr) = setup();
+        engine.create_table("gc_horizon");
+
+        let mut creator = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.insert("gc_horizon", creator.id, row(&[1])).unwrap();
+        txn_mgr.commit(&mut creator);
+
+        let mut deleter = txn_mgr.begin(IsolationLevel::Snapshot);
+        let version = engine.scan("gc_horizon", &deleter.snapshot).unwrap()[0].0;
+        engine.delete("gc_horizon", version, deleter.id).unwrap();
+
+        let mut observer = txn_mgr.begin(IsolationLevel::Snapshot);
+        assert_eq!(observer.snapshot.xmin, deleter.id);
+        txn_mgr.commit(&mut deleter);
+
+        assert_eq!(engine.gc(txn_mgr.gc_watermark()), 0);
+        assert_eq!(
+            engine.scan_rows("gc_horizon", &observer.snapshot).unwrap(),
+            vec![row(&[1])],
+            "the overlapping snapshot must retain and see the pre-delete version"
+        );
+
+        txn_mgr.abort(&mut observer);
+        assert_eq!(engine.gc(txn_mgr.gc_watermark()), 1);
+        assert_eq!(engine.total_versions(), 0);
+    }
+
+    #[test]
+    fn gc_removes_aborted_insert_and_repairs_aborted_delete() {
+        let (engine, txn_mgr) = setup();
+        engine.create_table("gc_aborts");
+
+        let mut creator = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.insert("gc_aborts", creator.id, row(&[1])).unwrap();
+        txn_mgr.commit(&mut creator);
+
+        let mut aborted_insert = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine
+            .insert("gc_aborts", aborted_insert.id, row(&[2]))
+            .unwrap();
+        txn_mgr.abort(&mut aborted_insert);
+
+        let mut aborted_delete = txn_mgr.begin(IsolationLevel::Snapshot);
+        let version = engine.scan("gc_aborts", &aborted_delete.snapshot).unwrap()[0].0;
+        engine
+            .delete("gc_aborts", version, aborted_delete.id)
+            .unwrap();
+        txn_mgr.abort(&mut aborted_delete);
+
+        assert_eq!(engine.total_versions(), 2);
+        assert_eq!(engine.gc(txn_mgr.gc_watermark()), 1);
+        let observer = txn_mgr.begin(IsolationLevel::Snapshot);
+        assert_eq!(
+            engine.scan_rows("gc_aborts", &observer.snapshot).unwrap(),
+            vec![row(&[1])],
+            "vacuum must preserve a row whose deleting transaction aborted"
+        );
+    }
+
+    #[test]
+    fn table_scoped_gc_does_not_reclaim_other_tables() {
+        let (engine, txn_mgr) = setup();
+        engine.create_table("gc_one");
+        engine.create_table("gc_two");
+
+        let mut creator = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.insert("gc_one", creator.id, row(&[1])).unwrap();
+        engine.insert("gc_two", creator.id, row(&[2])).unwrap();
+        txn_mgr.commit(&mut creator);
+
+        let mut deleter = txn_mgr.begin(IsolationLevel::Snapshot);
+        let one = engine.scan("gc_one", &deleter.snapshot).unwrap()[0].0;
+        let two = engine.scan("gc_two", &deleter.snapshot).unwrap()[0].0;
+        engine.delete("gc_one", one, deleter.id).unwrap();
+        engine.delete("gc_two", two, deleter.id).unwrap();
+        txn_mgr.commit(&mut deleter);
+
+        assert_eq!(engine.total_versions(), 2);
+        assert_eq!(
+            engine.gc_table("gc_one", txn_mgr.gc_watermark()).unwrap(),
+            1
+        );
+        assert_eq!(engine.total_versions(), 1);
+        assert_eq!(
+            engine.gc_table("gc_two", txn_mgr.gc_watermark()).unwrap(),
+            1
+        );
+        assert_eq!(engine.total_versions(), 0);
+    }
+
+    #[test]
+    fn high_churn_gc_respects_long_snapshot_then_reclaims_chain() {
+        let (engine, txn_mgr) = setup();
+        engine.create_table("gc_churn");
+
+        let mut creator = txn_mgr.begin(IsolationLevel::Snapshot);
+        engine.insert("gc_churn", creator.id, row(&[0])).unwrap();
+        txn_mgr.commit(&mut creator);
+
+        let mut long_snapshot = txn_mgr.begin(IsolationLevel::Snapshot);
+        for value in 1..=1_000 {
+            let mut updater = txn_mgr.begin(IsolationLevel::Snapshot);
+            let version = engine.scan("gc_churn", &updater.snapshot).unwrap()[0].0;
+            engine
+                .update("gc_churn", version, updater.id, row(&[value]))
+                .unwrap();
+            txn_mgr.commit(&mut updater);
+        }
+
+        assert_eq!(engine.total_versions(), 1_001);
+        assert_eq!(engine.gc(txn_mgr.gc_watermark()), 0);
+        assert_eq!(
+            engine
+                .scan_rows("gc_churn", &long_snapshot.snapshot)
+                .unwrap(),
+            vec![row(&[0])]
+        );
+
+        txn_mgr.commit(&mut long_snapshot);
+        assert_eq!(engine.gc(txn_mgr.gc_watermark()), 1_000);
+        assert_eq!(engine.total_versions(), 1);
+        let observer = txn_mgr.begin(IsolationLevel::Snapshot);
+        assert_eq!(
+            engine.scan_rows("gc_churn", &observer.snapshot).unwrap(),
+            vec![row(&[1_000])]
+        );
+    }
+
+    #[test]
     fn multiple_tables_independent() {
         let (engine, txn_mgr) = setup();
         engine.create_table("a");
@@ -2916,6 +3106,39 @@ mod tests {
         let rows = adapter.scan("t").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], adapter_row(&[1]));
+    }
+
+    #[tokio::test]
+    async fn adapter_vacuum_rebuilds_secondary_version_indices() {
+        let adapter = MvccStorageAdapter::new();
+        adapter.create_table("vacuum_index").await.unwrap();
+        adapter.insert("vacuum_index", row(&[1, 10])).await.unwrap();
+        adapter.insert("vacuum_index", row(&[2, 20])).await.unwrap();
+        adapter
+            .create_index("vacuum_index", "vacuum_value_idx", 1)
+            .await
+            .unwrap();
+        adapter
+            .update("vacuum_index", &[(0, row(&[1, 11]))])
+            .await
+            .unwrap();
+
+        let (_, reclaimed, _, _) = adapter.vacuum("vacuum_index").await.unwrap();
+        assert_eq!(reclaimed, 1);
+        assert_eq!(
+            adapter
+                .index_lookup("vacuum_index", "vacuum_value_idx", &Value::Int32(11))
+                .await
+                .unwrap(),
+            Some(vec![row(&[1, 11])])
+        );
+        assert_eq!(
+            adapter
+                .index_lookup("vacuum_index", "vacuum_value_idx", &Value::Int32(20))
+                .await
+                .unwrap(),
+            Some(vec![row(&[2, 20])])
+        );
     }
 
     #[tokio::test]
