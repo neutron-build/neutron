@@ -1415,7 +1415,8 @@ impl Executor {
                     let hnsw_m = config.m;
                     let hnsw_ef = config.ef_construction;
                     let mut hnsw = vector::HnswIndex::new(config);
-                    let pk_col = self.pk_col_for_incremental(&table_def);
+                    let pk_column = self.resolve_pk_column(&table_name, &table_def);
+                    let pk_col = pk_column.as_ref().and_then(|n| table_def.column_index(n));
 
                     // Scan existing rows and insert into index (PK-keyed stable id
                     // when the table has an integer PK, else positional).
@@ -1436,6 +1437,7 @@ impl Executor {
                             table_name: table_name.clone(),
                             column_name: col_name,
                             kind: VectorIndexKind::Hnsw(hnsw),
+                            pk_column,
                         },
                     );
 
@@ -1511,6 +1513,7 @@ impl Executor {
                             table_name: table_name.clone(),
                             column_name: col_name,
                             kind: VectorIndexKind::IvfFlat(ivf),
+                            pk_column: None,
                         },
                     );
                 }

@@ -3960,9 +3960,8 @@ impl Executor {
                     // Try vector index optimization: ORDER BY VECTOR_DISTANCE(...) LIMIT k
                     let mut used_vec_index = false;
                     if let Some(ref ob) = order_by
-                        && let Some(optimized) = self
-                            .try_vector_index_scan(ob, &limit_clause, &rows, &col_meta)
-                            .await
+                        && let Some(optimized) =
+                            self.try_vector_index_scan(ob, &limit_clause, &rows, &col_meta)
                     {
                         rows = optimized;
                         used_vec_index = true;

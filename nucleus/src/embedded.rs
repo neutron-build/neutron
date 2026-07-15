@@ -1859,6 +1859,30 @@ mod tests {
                 !ids.contains(&20),
                 "deleted id 20 must not resurface after reopen: {ids:?}"
             );
+
+            // DELETE after reopen exercises the incremental fast path on a
+            // recovered durable index (pk-keying preserved via the sidecar).
+            db.execute("DELETE FROM pv WHERE id = 30").await.unwrap();
+            let rows = db
+                .query("SELECT id FROM pv ORDER BY VECTOR_DISTANCE(v, VECTOR('[0,0,1]'), 'l2') LIMIT 3")
+                .await
+                .unwrap();
+            let ids: Vec<i64> = rows
+                .iter()
+                .filter_map(|r| match r.first() {
+                    Some(Value::Int32(n)) => Some(*n as i64),
+                    Some(Value::Int64(n)) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !ids.contains(&30),
+                "id 30 deleted after reopen must not appear: {ids:?}"
+            );
+            assert!(
+                ids.contains(&10),
+                "surviving id 10 must still be found after post-reopen delete: {ids:?}"
+            );
         }
     }
 
