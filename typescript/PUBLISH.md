@@ -15,11 +15,6 @@ future version. Run pnpm from inside each package directory: using
 `pnpm --dir <package> publish` with pnpm 9.15.4 and npm 11.17.0 produced a
 malformed npm invocation.
 
-The private `apps/codex` content demo has a pre-existing browser-bundle failure
-and is not part of this package release. Use
-`RELEASE_CHECK_SKIP_CODEX=1 pnpm run ci:release` to run the complete release
-gate with that one explicit exclusion; the default gate continues to include it.
-
 The render-core-unification work added new `@neutron-build/core/runtime-edge`
 exports (`renderAppRoute`, `isMutationMethod`, `isJsonRequest`,
 `createMemoryLoaderCacheStore`), and the CLI's generated prod entry now imports

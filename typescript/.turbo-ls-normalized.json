@@ -1,7 +1,7 @@
 {
   "packageManager": "pnpm9",
   "packages": {
-    "count": 22,
+    "count": 21,
     "items": [
       {
         "name": "@neutron-build/agents",
@@ -66,10 +66,6 @@
       {
         "name": "@neutron/playground-react-compat",
         "path": "apps/playground-react-compat"
-      },
-      {
-        "name": "codex",
-        "path": "apps/codex"
       },
       {
         "name": "create-neutron",
