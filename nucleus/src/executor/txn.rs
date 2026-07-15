@@ -62,6 +62,7 @@ impl Executor {
         txn.security_savepoints.clear();
         txn.policy_dirty = false;
         txn.gin_dirty = false;
+        txn.derived_dirty_tables.clear();
 
         txn.active = true;
         self.metrics.open_transactions.inc();
@@ -142,6 +143,7 @@ impl Executor {
         }
 
         let gin_dirty = txn.gin_dirty;
+        let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
         txn.active = false;
         txn.snapshot = None;
         txn.savepoints.clear();
@@ -151,7 +153,9 @@ impl Executor {
         txn.security_savepoints.clear();
         txn.policy_dirty = false;
         txn.gin_dirty = false;
+        txn.derived_dirty_tables.clear();
         self.metrics.open_transactions.dec();
+        drop(txn);
 
         // GIN is shared across sessions, so DML deliberately leaves it on the
         // committed image while a transaction is open. Refresh only after the
@@ -159,6 +163,9 @@ impl Executor {
         if gin_dirty {
             self.mark_gin_committed_write();
             self.rebuild_all_gin_indexes().await;
+        }
+        for table in derived_dirty_tables {
+            self.rebuild_table_derived_state(&table).await;
         }
 
         Ok(ExecResult::Command {
@@ -220,6 +227,7 @@ impl Executor {
             }
         }
 
+        let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
         txn.active = false;
         txn.snapshot = None;
         txn.savepoints.clear();
@@ -228,8 +236,16 @@ impl Executor {
         txn.security_savepoints.clear();
         txn.policy_dirty = false;
         txn.gin_dirty = false;
+        txn.derived_dirty_tables.clear();
 
         self.metrics.open_transactions.dec();
+        drop(txn);
+
+        // Incremental index maintenance may have observed transaction-local
+        // rows. Rebuild after abort from the now-authoritative committed image.
+        for table in derived_dirty_tables {
+            self.rebuild_table_derived_state(&table).await;
+        }
 
         Ok(ExecResult::Command {
             tag: "ROLLBACK".into(),
@@ -338,6 +354,11 @@ impl Executor {
         self.bump_policy_gen();
         txn.security_savepoints.truncate(security_pos + 1);
         txn.policy_dirty = true;
+        let derived_dirty_tables: Vec<String> = txn.derived_dirty_tables.iter().cloned().collect();
+        drop(txn);
+        for table in derived_dirty_tables {
+            self.rebuild_table_derived_state(&table).await;
+        }
         Ok(ExecResult::Command {
             tag: "ROLLBACK".into(),
             rows_affected: 0,

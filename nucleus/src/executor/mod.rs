@@ -1074,6 +1074,193 @@ impl Executor {
         self.rebuild_gin_indexes_for_table(table_name).await;
     }
 
+    /// Rebuild every position-addressed specialty index for one table from the
+    /// authoritative base rows. DELETE, cascades, and table rewrites can shift
+    /// physical positions, so incremental tombstones alone are not sufficient.
+    pub(super) async fn rebuild_position_indexes_for_table(&self, table_name: &str) {
+        let definitions: Vec<_> = self
+            .catalog
+            .get_indexes(table_name)
+            .await
+            .into_iter()
+            .filter(|index| {
+                matches!(
+                    index.index_type,
+                    crate::catalog::IndexType::Hnsw | crate::catalog::IndexType::IvfFlat
+                ) || index.options.contains_key("encryption_mode")
+            })
+            .collect();
+
+        if definitions.is_empty() {
+            // Fast path: this table has no vector/encrypted (position-addressed)
+            // indexes, so there is nothing to rebuild. Skip the full maintenance
+            // scan every DML would otherwise pay. Still evict any stale in-memory
+            // entries — e.g. after the table's last such index was dropped — and
+            // persist only if something was actually removed.
+            let removed_vec = {
+                let mut live = self.vector_indexes.write();
+                let before = live.len();
+                live.retain(|_, entry| entry.table_name != table_name);
+                before != live.len()
+            };
+            let removed_enc = {
+                let mut live = self.encrypted_indexes.write();
+                let before = live.len();
+                live.retain(|_, entry| entry.table_name != table_name);
+                before != live.len()
+            };
+            if removed_vec || removed_enc {
+                self.save_vector_index_meta();
+                if let Err(error) = self.checkpoint_vector_wal() {
+                    tracing::warn!(
+                        "vector index checkpoint after evicting '{table_name}' failed: {error}"
+                    );
+                }
+            }
+            return;
+        }
+
+        let Some(table_def) = self.catalog.get_table(table_name).await else {
+            self.vector_indexes
+                .write()
+                .retain(|_, entry| entry.table_name != table_name);
+            self.encrypted_indexes
+                .write()
+                .retain(|_, entry| entry.table_name != table_name);
+            return;
+        };
+        let rows = self
+            .storage_for(table_name)
+            .scan_for_maintenance(table_name)
+            .await
+            .unwrap_or_default();
+
+        let key = std::env::var("NUCLEUS_ENCRYPTION_KEY")
+            .ok()
+            .and_then(|value| value.as_bytes().try_into().ok());
+        let mut vectors = Vec::new();
+        let mut encrypted = Vec::new();
+        for definition in definitions {
+            let Some(column_name) = definition.columns.first().cloned() else {
+                continue;
+            };
+            let Some(column_index) = table_def.column_index(&column_name) else {
+                continue;
+            };
+            match definition.index_type {
+                crate::catalog::IndexType::Hnsw => {
+                    let mut index = vector::HnswIndex::new(vector::HnswConfig::default());
+                    for (row_id, row) in rows.iter().enumerate() {
+                        if let Some(Value::Vector(value)) = row.get(column_index) {
+                            index.insert(row_id as u64, vector::Vector::new(value.clone()));
+                        }
+                    }
+                    vectors.push((
+                        definition.name.clone(),
+                        VectorIndexEntry {
+                            table_name: table_name.to_string(),
+                            column_name,
+                            kind: VectorIndexKind::Hnsw(index),
+                        },
+                    ));
+                }
+                crate::catalog::IndexType::IvfFlat => {
+                    let dims = match table_def.columns[column_index].data_type {
+                        DataType::Vector(dims) => dims,
+                        _ => continue,
+                    };
+                    let source: Vec<Vec<f32>> = rows
+                        .iter()
+                        .filter_map(|row| match row.get(column_index) {
+                            Some(Value::Vector(value)) => Some(value.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    let nlist = (source.len() as f64).sqrt().ceil() as usize;
+                    let mut index = vector::IvfFlatIndex::new(
+                        dims,
+                        nlist.max(1),
+                        (nlist.max(1) / 4).max(1),
+                        vector::DistanceMetric::L2,
+                    );
+                    if !source.is_empty() {
+                        index.train(&source);
+                        for (row_id, row) in rows.iter().enumerate() {
+                            if let Some(Value::Vector(value)) = row.get(column_index) {
+                                index.add(row_id, value.clone());
+                            }
+                        }
+                    }
+                    vectors.push((
+                        definition.name.clone(),
+                        VectorIndexEntry {
+                            table_name: table_name.to_string(),
+                            column_name,
+                            kind: VectorIndexKind::IvfFlat(index),
+                        },
+                    ));
+                }
+                crate::catalog::IndexType::BTree
+                    if definition.options.contains_key("encryption_mode") =>
+                {
+                    let Some(key) = key else {
+                        tracing::warn!(
+                            "encrypted index '{}' disabled during rebuild: NUCLEUS_ENCRYPTION_KEY is unavailable",
+                            definition.name
+                        );
+                        continue;
+                    };
+                    let mode = match definition
+                        .options
+                        .get("encryption_mode")
+                        .map(String::as_str)
+                    {
+                        Some(value) if value.contains("Order") || value.contains("OPE") => {
+                            crate::storage::encrypted_index::EncryptionMode::OrderPreserving
+                        }
+                        Some(value) if value.contains("Random") => {
+                            crate::storage::encrypted_index::EncryptionMode::Randomized
+                        }
+                        _ => crate::storage::encrypted_index::EncryptionMode::Deterministic,
+                    };
+                    let mut index = crate::storage::encrypted_index::EncryptedIndex::new(key, mode);
+                    for (row_id, row) in rows.iter().enumerate() {
+                        if let Some(value) = row.get(column_index) {
+                            let plaintext = self.value_to_text_string(value);
+                            index.insert(plaintext.as_bytes(), row_id as u64);
+                        }
+                    }
+                    encrypted.push((
+                        definition.name.clone(),
+                        EncryptedIndexEntry {
+                            table_name: table_name.to_string(),
+                            column_name,
+                            index,
+                        },
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        {
+            let mut live = self.vector_indexes.write();
+            live.retain(|_, entry| entry.table_name != table_name);
+            live.extend(vectors);
+        }
+        {
+            let mut live = self.encrypted_indexes.write();
+            live.retain(|_, entry| entry.table_name != table_name);
+            live.extend(encrypted);
+        }
+        self.save_vector_index_meta();
+        if let Err(error) = self.checkpoint_vector_wal() {
+            tracing::warn!(
+                "vector index checkpoint after rebuilding '{table_name}' failed: {error}"
+            );
+        }
+    }
+
     pub(super) fn mark_gin_committed_write(&self) {
         self.gin_write_gen.fetch_add(1, Ordering::AcqRel);
     }

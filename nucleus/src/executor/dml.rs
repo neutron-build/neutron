@@ -346,6 +346,11 @@ impl Executor {
         let mut count = 0;
         let mut returned_rows = Vec::new();
         let mut inserted_rows: Vec<Row> = Vec::new();
+        // Set when an ON CONFLICT DO UPDATE rewrites an existing row in place.
+        // That path bypasses the staged-insert index bookkeeping, so its derived
+        // indexes must be rebuilt. Plain appends maintain indexes incrementally
+        // and must NOT pay for a full rebuild.
+        let mut conflict_updated = false;
 
         for mut row in source_rows {
             // Canonicalize every value to its column's declared type at write time,
@@ -522,6 +527,7 @@ impl Executor {
                                         returned_rows.push(returned);
                                     }
                                     count += 1;
+                                    conflict_updated = true;
                                     break;
                                 }
                             }
@@ -619,7 +625,13 @@ impl Executor {
                 }
             }
         }
-        if count > 0 {
+        if conflict_updated {
+            // ON CONFLICT DO UPDATE rewrote a row in place, bypassing the staged
+            // insert bookkeeping. Rebuild the derived indexes from base rows.
+            self.rebuild_table_derived_state(&table_name).await;
+        } else if count > 0 {
+            // Plain appends already maintained vector/encrypted indexes inline;
+            // only the GIN/FTS postings need the incremental refresh.
             self.refresh_gin_after_write(&table_name).await;
         }
 
@@ -1290,6 +1302,7 @@ impl Executor {
                                         .await?;
                                         if apply {
                                             child_storage.update(child_table, &updates).await?;
+                                            self.rebuild_table_derived_state(child_table).await;
                                         }
                                     }
                                     FkAction::SetNull => {
@@ -1339,6 +1352,7 @@ impl Executor {
                                         .await?;
                                         if apply {
                                             child_storage.update(child_table, &updates).await?;
+                                            self.rebuild_table_derived_state(child_table).await;
                                         }
                                     }
                                     FkAction::SetDefault => {
@@ -1413,6 +1427,7 @@ impl Executor {
                                         .await?;
                                         if apply {
                                             child_storage.update(child_table, &updates).await?;
+                                            self.rebuild_table_derived_state(child_table).await;
                                         }
                                     }
                                 }
@@ -1517,6 +1532,7 @@ impl Executor {
                                             child_storage
                                                 .delete(child_table, &current_positions)
                                                 .await?;
+                                            self.rebuild_table_derived_state(child_table).await;
                                         }
                                     }
                                     FkAction::SetNull => {
@@ -1566,6 +1582,7 @@ impl Executor {
                                         .await?;
                                         if apply {
                                             child_storage.update(child_table, &updates).await?;
+                                            self.rebuild_table_derived_state(child_table).await;
                                         }
                                     }
                                     FkAction::SetDefault => {
@@ -1618,6 +1635,7 @@ impl Executor {
                                         .await?;
                                         if apply {
                                             child_storage.update(child_table, &updates).await?;
+                                            self.rebuild_table_derived_state(child_table).await;
                                         }
                                     }
                                 }
@@ -1717,6 +1735,48 @@ impl Executor {
             );
             self.zone_map_index
                 .update_granule(zm_table_id, granule_id as u32, stats);
+        }
+    }
+
+    /// Repair every derived representation whose row IDs or values can become
+    /// stale after UPDATE/DELETE, FK actions, or a schema rewrite.
+    pub(super) async fn rebuild_table_derived_state(&self, table_name: &str) {
+        // TRUNCATE recreates the physical table and therefore removes its
+        // engine-local indexes while catalog definitions remain. Re-create any
+        // missing physical indexes before rebuilding their postings.
+        if let Some(table_def) = self.catalog.get_table(table_name).await {
+            for index in self.catalog.get_indexes(table_name).await {
+                if matches!(
+                    index.index_type,
+                    crate::catalog::IndexType::BTree | crate::catalog::IndexType::Hash
+                ) && !index.options.contains_key("encryption_mode")
+                    && let Some(column) = index.columns.first()
+                    && let Some(column_index) = table_def.column_index(column)
+                {
+                    let _ = self
+                        .storage_for(table_name)
+                        .create_index(table_name, &index.name, column_index)
+                        .await;
+                    self.btree_indexes
+                        .insert((table_name.to_string(), column.clone()), index.name.clone());
+                }
+            }
+        }
+        if let Err(error) = self
+            .storage_for(table_name)
+            .rebuild_table_indexes(table_name)
+            .await
+        {
+            tracing::warn!("failed to rebuild storage indexes for '{table_name}': {error}");
+        }
+        self.rebuild_zone_map(table_name).await;
+        self.refresh_gin_after_write(table_name).await;
+        self.rebuild_position_indexes_for_table(table_name).await;
+
+        let session = self.current_session();
+        let mut txn = session.txn_state.write().await;
+        if txn.active {
+            txn.derived_dirty_tables.insert(table_name.to_string());
         }
     }
 
@@ -2024,8 +2084,7 @@ impl Executor {
         // min/max bounds stale. A bare clear would leave the map to be
         // partially repopulated by later INSERTs, under-representing survivors.
         if count > 0 {
-            self.rebuild_zone_map(&table_name).await;
-            self.refresh_gin_after_write(&table_name).await;
+            self.rebuild_table_derived_state(&table_name).await;
         }
 
         // Fire AFTER UPDATE statement-level triggers
@@ -2261,8 +2320,7 @@ impl Executor {
         // to be partially repopulated by later INSERTs, under-representing
         // surviving rows and causing valid rows to be wrongly pruned.
         if count > 0 {
-            self.rebuild_zone_map(&table_name).await;
-            self.refresh_gin_after_write(&table_name).await;
+            self.rebuild_table_derived_state(&table_name).await;
         }
 
         // Fire AFTER DELETE row-level triggers for each deleted row
