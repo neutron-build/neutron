@@ -166,10 +166,10 @@ mod tests {
             std::thread::spawn(move || {
                 let mut empties = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    if let Ok(b) = std::fs::read(&path) {
-                        if b.is_empty() {
-                            empties += 1;
-                        }
+                    if let Ok(b) = std::fs::read(&path)
+                        && b.is_empty()
+                    {
+                        empties += 1;
                     }
                 }
                 empties

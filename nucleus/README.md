@@ -4,6 +4,25 @@ Multi-model database engine. One pgwire endpoint, multiple data models, unified 
 
 SQL, Key-Value, Columnar, Vector, Timeseries, Document, Full-Text Search, Graph, Geo, Blob, Datalog, and Pub/Sub -- all accessed through standard SQL function calls over a single PostgreSQL-compatible connection. No secondary ports, no secondary protocols, no secondary clients. Also supports the RESP (Redis) wire protocol for KV operations.
 
+## Support status
+
+Nucleus is currently a developer preview, not a production-complete database. The authoritative
+completion program and current evidence are in [DATABASE_COMPLETION.md](DATABASE_COMPLETION.md).
+Ignored local status/roadmap files are historical scratch material and are not release evidence.
+
+| Surface | Current tier |
+|---|---|
+| Single-node server and pgwire SQL | Primary development target; correctness work remains |
+| Embedded/core Rust library | Builds and tests without server features |
+| Trusted SCRAM roles and relational RLS | Implemented; broader surface and masking audit remains |
+| RESP and specialty data models | Experimental until durability, policy, and compatibility gates pass |
+| Browser/WASM | Experimental build target |
+| Native binary protocol | Unsupported stub; do not deploy or integrate against it |
+| Distributed/Raft mode | Incomplete and unsupported |
+
+Cross-model rollback works in-process, but crash-atomic commit across model-specific WALs is not yet
+claimed. Backup/PITR, full client compatibility, and operational hardening are also incomplete.
+
 ## Quick Start
 
 ```bash

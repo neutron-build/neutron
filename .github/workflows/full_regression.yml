@@ -13,6 +13,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
   RUST_BACKTRACE: 1
 
 jobs:
@@ -35,11 +37,11 @@ jobs:
         run: cargo build --features bench-tools
         working-directory: nucleus
 
-      - name: Run all executor tests (3184 tests)
+      - name: Run all executor tests
         run: cargo test --lib executor -q
         working-directory: nucleus
 
-      - name: Run all wire/transport tests (133 tests)
+      - name: Run all wire/transport tests
         run: cargo test --lib -q -- wire transport
         working-directory: nucleus
 
@@ -83,7 +85,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: nucleus
-      - run: cargo clippy --all-targets --features bench-tools -- -D warnings
+      - run: cargo clippy --all-targets --features bench-tools,memory-debug -- -D warnings
         working-directory: nucleus
 
   fmt_check:
