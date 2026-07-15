@@ -930,6 +930,36 @@ async fn test_nulls_first_last_order_by() {
         panic!("expected select");
     }
 
+    let r = exec(&ex, "SELECT val FROM ntest ORDER BY val ASC").await;
+    assert_eq!(
+        rows(&r[0])
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Value::Int32(1),
+            Value::Int32(2),
+            Value::Int32(3),
+            Value::Null,
+            Value::Null,
+        ]
+    );
+
+    let r = exec(&ex, "SELECT val FROM ntest ORDER BY val DESC").await;
+    assert_eq!(
+        rows(&r[0])
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Value::Null,
+            Value::Null,
+            Value::Int32(3),
+            Value::Int32(2),
+            Value::Int32(1),
+        ]
+    );
+
     // NULLS FIRST (explicit): NULLs at start
     let r = exec(&ex, "SELECT val FROM ntest ORDER BY val ASC NULLS FIRST").await;
     if let ExecResult::Select { rows, .. } = &r[0] {

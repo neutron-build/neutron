@@ -23,20 +23,64 @@ use crate::storage::{FilterOp, StorageEngine, StorageError};
 use crate::types::{Row, Value};
 
 // ColumnData intentionally has a compact primitive physical type set. Preserve
-// exact decimals in its Text representation with a private logical-type tag;
+// exact logical scalars in its Text representation with private type tags;
 // SQL text cannot contain NUL on the PostgreSQL wire, so ordinary TEXT cannot
 // collide with this encoding.
 const NUMERIC_TEXT_TAG: &str = "\0nucleus:numeric:";
+const DATE_TEXT_TAG: &str = "\0nucleus:date:";
+const TIMESTAMP_TEXT_TAG: &str = "\0nucleus:timestamp:";
+const TIMESTAMPTZ_TEXT_TAG: &str = "\0nucleus:timestamptz:";
+const INTERVAL_TEXT_TAG: &str = "\0nucleus:interval:";
 
-fn encode_numeric_text(value: &str) -> String {
-    format!("{NUMERIC_TEXT_TAG}{value}")
+fn encode_logical_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Numeric(value) => Some(format!("{NUMERIC_TEXT_TAG}{value}")),
+        Value::Date(value) => Some(format!("{DATE_TEXT_TAG}{value}")),
+        Value::Timestamp(value) => Some(format!("{TIMESTAMP_TEXT_TAG}{value}")),
+        Value::TimestampTz(value) => Some(format!("{TIMESTAMPTZ_TEXT_TAG}{value}")),
+        Value::Interval {
+            months,
+            days,
+            microseconds,
+        } => Some(format!("{INTERVAL_TEXT_TAG}{months},{days},{microseconds}")),
+        _ => None,
+    }
 }
 
 fn decode_columnar_text(value: &str) -> Value {
-    value
-        .strip_prefix(NUMERIC_TEXT_TAG)
-        .map(|raw| Value::Numeric(raw.to_owned()))
-        .unwrap_or_else(|| Value::Text(value.to_owned()))
+    if let Some(raw) = value.strip_prefix(NUMERIC_TEXT_TAG) {
+        return Value::Numeric(raw.to_owned());
+    }
+    if let Some(raw) = value.strip_prefix(DATE_TEXT_TAG)
+        && let Ok(value) = raw.parse()
+    {
+        return Value::Date(value);
+    }
+    if let Some(raw) = value.strip_prefix(TIMESTAMP_TEXT_TAG)
+        && let Ok(value) = raw.parse()
+    {
+        return Value::Timestamp(value);
+    }
+    if let Some(raw) = value.strip_prefix(TIMESTAMPTZ_TEXT_TAG)
+        && let Ok(value) = raw.parse()
+    {
+        return Value::TimestampTz(value);
+    }
+    if let Some(raw) = value.strip_prefix(INTERVAL_TEXT_TAG) {
+        let mut parts = raw.split(',');
+        if let (Some(months), Some(days), Some(microseconds), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+            && let (Ok(months), Ok(days), Ok(microseconds)) =
+                (months.parse(), days.parse(), microseconds.parse())
+        {
+            return Value::Interval {
+                months,
+                days,
+                microseconds,
+            };
+        }
+    }
+    Value::Text(value.to_owned())
 }
 
 // ─── Write buffer ─────────────────────────────────────────────────────────────
@@ -192,7 +236,11 @@ fn val_to_coldata(v: Value) -> ColumnData {
         Value::Int64(n) => ColumnData::Int64(vec![Some(n)]),
         Value::Float64(f) => ColumnData::Float64(vec![Some(f)]),
         Value::Text(s) => ColumnData::Text(vec![Some(s)]),
-        Value::Numeric(s) => ColumnData::Text(vec![Some(encode_numeric_text(&s))]),
+        logical @ (Value::Numeric(_)
+        | Value::Date(_)
+        | Value::Timestamp(_)
+        | Value::TimestampTz(_)
+        | Value::Interval { .. }) => ColumnData::Text(vec![encode_logical_text(&logical)]),
         Value::Null => ColumnData::Text(vec![None]),
         other => ColumnData::Text(vec![Some(other.to_string())]),
     }
@@ -241,12 +289,17 @@ fn vals_to_coldata(vals: Vec<Value>) -> ColumnData {
                 })
                 .collect(),
         ),
-        Some(Value::Numeric(_)) => ColumnData::Text(
+        Some(
+            Value::Numeric(_)
+            | Value::Date(_)
+            | Value::Timestamp(_)
+            | Value::TimestampTz(_)
+            | Value::Interval { .. },
+        ) => ColumnData::Text(
             vals.into_iter()
                 .map(|v| match v {
-                    Value::Numeric(s) => Some(encode_numeric_text(&s)),
                     Value::Null => None,
-                    _ => None,
+                    other => encode_logical_text(&other),
                 })
                 .collect(),
         ),
@@ -461,8 +514,8 @@ fn eq_mask(col: &ColumnData, val: &Value) -> Vec<bool> {
         (ColumnData::Text(v), Value::Text(s)) => {
             v.iter().map(|o| o.as_deref() == Some(s.as_str())).collect()
         }
-        (ColumnData::Text(v), Value::Numeric(raw)) => {
-            let encoded = encode_numeric_text(raw);
+        (ColumnData::Text(v), logical) if encode_logical_text(logical).is_some() => {
+            let encoded = encode_logical_text(logical).expect("guarded logical scalar");
             v.iter()
                 .map(|value| value.as_deref() == Some(encoded.as_str()))
                 .collect()
@@ -533,18 +586,16 @@ fn cmp_mask(col: &ColumnData, op: FilterOp, val: &Value) -> Vec<bool> {
             ColumnData::Text(_) => vec![false; col.len()],
         };
     }
-    if let (ColumnData::Text(values), Value::Numeric(raw)) = (col, val) {
-        let Ok(predicate) = crate::types::parse_numeric(raw) else {
-            return vec![false; values.len()];
-        };
+    if let ColumnData::Text(values) = col
+        && encode_logical_text(val).is_some()
+    {
         return values
             .iter()
             .map(|value| {
                 value
                     .as_deref()
-                    .and_then(|text| text.strip_prefix(NUMERIC_TEXT_TAG))
-                    .and_then(|text| crate::types::parse_numeric(text).ok())
-                    .is_some_and(|value| apply_ord(value.cmp(&predicate), op))
+                    .map(decode_columnar_text)
+                    .is_some_and(|value| apply_ord(value.cmp(val), op))
             })
             .collect();
     }

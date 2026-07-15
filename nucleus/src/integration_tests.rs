@@ -4190,13 +4190,13 @@ mod tests {
         // Non-existent setting
         assert_eq!(ex.get_session_setting(sid, "nonexistent"), None);
 
-        // Set and read back (sqlparser preserves quotes)
+        // Set and read back in canonical IANA form.
         ex.execute_with_session(sid, "SET timezone = 'US/Pacific'")
             .await
             .unwrap();
         assert_eq!(
             ex.get_session_setting(sid, "timezone"),
-            Some("'US/Pacific'".into())
+            Some("US/Pacific".into())
         );
     }
 
@@ -4323,12 +4323,12 @@ mod tests {
         // Each session retains its own setting.
         assert_eq!(
             ex.get_session_setting(sid_a, "timezone"),
-            Some("'US/Eastern'".into()),
+            Some("US/Eastern".into()),
             "session A timezone should be US/Eastern"
         );
         assert_eq!(
             ex.get_session_setting(sid_b, "timezone"),
-            Some("'US/Pacific'".into()),
+            Some("US/Pacific".into()),
             "session B timezone should be US/Pacific"
         );
 

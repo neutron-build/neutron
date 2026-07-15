@@ -10,6 +10,8 @@ use crate::geo;
 use crate::graph::PropValue as GraphPropValue;
 use crate::timeseries;
 use crate::types::{DataType, Row, Value};
+use chrono::{Datelike, TimeZone, Timelike, Utc};
+use chrono_tz::Tz;
 use sqlparser::ast::{self, Expr};
 use std::collections::HashMap;
 
@@ -176,6 +178,12 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
         Expr::Cast { data_type, .. } => {
             crate::sql::convert_data_type(data_type).unwrap_or(DataType::Text)
         }
+        Expr::Interval(_) => DataType::Interval,
+        Expr::Collate { expr, .. } => infer_expr_type(expr, col_meta),
+        Expr::AtTimeZone { timestamp, .. } => match infer_expr_type(timestamp, col_meta) {
+            DataType::TimestampTz => DataType::Timestamp,
+            _ => DataType::TimestampTz,
+        },
         Expr::Function(func) => {
             let name = func.name.to_string().to_uppercase();
             let arg_expr = match &func.args {
@@ -234,6 +242,20 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
                     let lt = infer_expr_type(left, col_meta);
                     let rt = infer_expr_type(right, col_meta);
                     match (&lt, &rt) {
+                        (DataType::Date, DataType::Date) if matches!(op, Minus) => DataType::Int32,
+                        (DataType::Date, DataType::Interval)
+                        | (DataType::Interval, DataType::Date) => DataType::Timestamp,
+                        (DataType::Timestamp, DataType::Interval)
+                        | (DataType::Interval, DataType::Timestamp) => DataType::Timestamp,
+                        (DataType::TimestampTz, DataType::Interval)
+                        | (DataType::Interval, DataType::TimestampTz) => DataType::TimestampTz,
+                        (DataType::Timestamp, DataType::Timestamp)
+                        | (DataType::TimestampTz, DataType::TimestampTz)
+                            if matches!(op, Minus) =>
+                        {
+                            DataType::Interval
+                        }
+                        (DataType::Interval, DataType::Interval) => DataType::Interval,
                         (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
                         (DataType::Numeric, _) | (_, DataType::Numeric) => DataType::Numeric,
                         (DataType::Int64, _) | (_, DataType::Int64) => DataType::Int64,
@@ -268,11 +290,123 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
         | Expr::IsFalse(_)
         | Expr::IsNotTrue(_)
         | Expr::IsNotFalse(_)
+        | Expr::IsUnknown(_)
+        | Expr::IsNotUnknown(_)
         | Expr::InList { .. }
         | Expr::Between { .. }
         | Expr::Like { .. }
         | Expr::ILike { .. } => DataType::Bool,
         _ => DataType::Text,
+    }
+}
+
+pub(super) fn validate_binary_collation(collation: &ast::ObjectName) -> Result<(), ExecError> {
+    let rendered = collation.to_string();
+    let name = rendered
+        .rsplit('.')
+        .next()
+        .unwrap_or(&rendered)
+        .trim_matches('"')
+        .to_ascii_uppercase();
+    if matches!(name.as_str(), "C" | "POSIX" | "DEFAULT" | "UCS_BASIC") {
+        Ok(())
+    } else {
+        Err(ExecError::Unsupported(format!(
+            "collation '{collation}' is not supported; available deterministic collations: C, POSIX"
+        )))
+    }
+}
+
+pub(super) fn parse_time_zone(value: &str) -> Result<Tz, ExecError> {
+    let name = value.trim().trim_matches(['\'', '"']);
+    name.parse::<Tz>()
+        .map_err(|_| ExecError::Runtime(format!("time zone '{name}' is not recognized")))
+}
+
+const POSTGRES_UNIX_EPOCH_SECONDS: i64 = 946_684_800;
+const DAY_MICROSECONDS: i64 = 86_400_000_000;
+
+fn naive_from_pg_micros(value: i64) -> Result<chrono::NaiveDateTime, ExecError> {
+    let days = value.div_euclid(DAY_MICROSECONDS);
+    let day_micros = value.rem_euclid(DAY_MICROSECONDS);
+    let (year, month, day) = crate::types::days_to_ymd(
+        i32::try_from(days)
+            .map_err(|_| ExecError::Runtime("timestamp value out of range".into()))?,
+    );
+    chrono::NaiveDate::from_ymd_opt(year, month, day)
+        .and_then(|date| {
+            date.and_hms_micro_opt(
+                (day_micros / 3_600_000_000) as u32,
+                ((day_micros % 3_600_000_000) / 60_000_000) as u32,
+                ((day_micros % 60_000_000) / 1_000_000) as u32,
+                (day_micros % 1_000_000) as u32,
+            )
+        })
+        .ok_or_else(|| ExecError::Runtime("timestamp value out of range".into()))
+}
+
+fn pg_micros_from_naive(value: chrono::NaiveDateTime) -> Result<i64, ExecError> {
+    let days = crate::types::ymd_to_days(value.year(), value.month(), value.day()) as i64;
+    days.checked_mul(DAY_MICROSECONDS)
+        .and_then(|base| base.checked_add(value.hour() as i64 * 3_600_000_000))
+        .and_then(|base| base.checked_add(value.minute() as i64 * 60_000_000))
+        .and_then(|base| base.checked_add(value.second() as i64 * 1_000_000))
+        .and_then(|base| base.checked_add(value.nanosecond() as i64 / 1_000))
+        .ok_or_else(|| ExecError::Runtime("timestamp value out of range".into()))
+}
+
+pub(super) fn local_timestamp_at_time_zone(value: i64, zone: Tz) -> Result<i64, ExecError> {
+    let local = naive_from_pg_micros(value)?;
+    let zoned = match zone.from_local_datetime(&local) {
+        chrono::LocalResult::Single(value) => value,
+        chrono::LocalResult::Ambiguous(_, _) => {
+            return Err(ExecError::Runtime(format!(
+                "local timestamp {local} is ambiguous in time zone {zone}"
+            )));
+        }
+        chrono::LocalResult::None => {
+            return Err(ExecError::Runtime(format!(
+                "local timestamp {local} does not exist in time zone {zone}"
+            )));
+        }
+    };
+    zoned
+        .timestamp()
+        .checked_sub(POSTGRES_UNIX_EPOCH_SECONDS)
+        .and_then(|seconds| seconds.checked_mul(1_000_000))
+        .and_then(|base| base.checked_add(zoned.timestamp_subsec_micros() as i64))
+        .ok_or_else(|| ExecError::Runtime("timestamp value out of range".into()))
+}
+
+pub(super) fn timestamptz_at_time_zone(value: i64, zone: Tz) -> Result<i64, ExecError> {
+    let seconds = value.div_euclid(1_000_000);
+    let micros = value.rem_euclid(1_000_000) as u32;
+    let utc = Utc
+        .timestamp_opt(
+            seconds
+                .checked_add(POSTGRES_UNIX_EPOCH_SECONDS)
+                .ok_or_else(|| ExecError::Runtime("timestamp value out of range".into()))?,
+            micros * 1_000,
+        )
+        .single()
+        .ok_or_else(|| ExecError::Runtime("timestamp value out of range".into()))?;
+    pg_micros_from_naive(utc.with_timezone(&zone).naive_local())
+}
+
+pub(super) fn eval_at_time_zone(timestamp: Value, zone: Value) -> Result<Value, ExecError> {
+    let Value::Text(zone) = zone else {
+        return Err(ExecError::Runtime("time zone must be text".into()));
+    };
+    let zone = parse_time_zone(&zone)?;
+    match timestamp {
+        Value::Null => Ok(Value::Null),
+        Value::Timestamp(value) => {
+            local_timestamp_at_time_zone(value, zone).map(Value::TimestampTz)
+        }
+        Value::TimestampTz(value) => timestamptz_at_time_zone(value, zone).map(Value::Timestamp),
+        other => Err(ExecError::Unsupported(format!(
+            "AT TIME ZONE requires TIMESTAMP or TIMESTAMPTZ, got {other:?}"
+        ))),
     }
 }
 
@@ -380,10 +514,7 @@ fn parse_pg_bool(s: &str) -> Option<bool> {
 /// Parse an ISO-style timestamp string ("YYYY-MM-DD[ T]HH:MM:SS") into
 /// microseconds-since-epoch. Returns `None` if unparseable.
 fn text_to_timestamp_us(s: &str) -> Option<i64> {
-    let (y, m, d, hh, mm, ss) = parse_timestamp_parts(s)?;
-    let days = crate::types::ymd_to_days(y, m, d) as i64;
-    let secs = days * 86_400 + (hh as i64) * 3600 + (mm as i64) * 60 + (ss as i64);
-    Some(secs * 1_000_000)
+    crate::types::parse_timestamp(s).ok()
 }
 
 /// Parse a canonical UUID text form ("8-4-4-4-12" lowercase or uppercase
@@ -867,6 +998,302 @@ pub(super) fn eval_numeric_arithmetic(
         }
         .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))?;
         Ok(Value::Numeric(value.normalize().to_string()))
+    })();
+    Some(result)
+}
+
+pub(super) fn parse_interval_literal(
+    raw: &str,
+    leading_field: Option<&ast::DateTimeField>,
+) -> Result<Value, ExecError> {
+    use ast::DateTimeField;
+    use rust_decimal::prelude::ToPrimitive;
+
+    let mut months = 0i64;
+    let mut days = 0i64;
+    let mut micros = 0i128;
+    let add_unit = |number: &str,
+                    unit: &DateTimeField,
+                    months: &mut i64,
+                    days: &mut i64,
+                    micros: &mut i128|
+     -> Result<(), ExecError> {
+        let value = crate::types::parse_numeric(number).map_err(ExecError::Runtime)?;
+        match unit {
+            DateTimeField::Year => {
+                let whole = value
+                    .to_i64()
+                    .ok_or_else(|| ExecError::Runtime("interval year must be an integer".into()))?;
+                *months =
+                    months
+                        .checked_add(whole.checked_mul(12).ok_or_else(|| {
+                            ExecError::Runtime("interval value out of range".into())
+                        })?)
+                        .ok_or_else(|| ExecError::Runtime("interval value out of range".into()))?;
+            }
+            DateTimeField::Month => {
+                let whole = value.to_i64().ok_or_else(|| {
+                    ExecError::Runtime("interval month must be an integer".into())
+                })?;
+                *months = months
+                    .checked_add(whole)
+                    .ok_or_else(|| ExecError::Runtime("interval value out of range".into()))?;
+            }
+            DateTimeField::Day => {
+                let whole = value
+                    .to_i64()
+                    .ok_or_else(|| ExecError::Runtime("interval day must be an integer".into()))?;
+                *days = days
+                    .checked_add(whole)
+                    .ok_or_else(|| ExecError::Runtime("interval value out of range".into()))?;
+            }
+            DateTimeField::Hour | DateTimeField::Minute | DateTimeField::Second => {
+                let factor = match unit {
+                    DateTimeField::Hour => 3_600_000_000i64,
+                    DateTimeField::Minute => 60_000_000i64,
+                    _ => 1_000_000i64,
+                };
+                let scaled = value
+                    .checked_mul(rust_decimal::Decimal::from(factor))
+                    .and_then(|value| value.trunc().to_i128())
+                    .ok_or_else(|| ExecError::Runtime("interval value out of range".into()))?;
+                *micros = micros
+                    .checked_add(scaled)
+                    .ok_or_else(|| ExecError::Runtime("interval value out of range".into()))?;
+            }
+            _ => {
+                return Err(ExecError::Unsupported(format!(
+                    "unsupported interval field {unit}"
+                )));
+            }
+        }
+        Ok(())
+    };
+
+    if let Some(field) = leading_field {
+        add_unit(raw.trim(), field, &mut months, &mut days, &mut micros)?;
+    } else {
+        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        let mut index = 0;
+        while index < tokens.len() {
+            let token = tokens[index];
+            if token.contains(':') {
+                let negative = token.starts_with('-');
+                let time = token.trim_start_matches(['+', '-']);
+                let pieces: Vec<&str> = time.split(':').collect();
+                if pieces.len() != 3 {
+                    return Err(ExecError::Runtime(format!(
+                        "invalid interval value '{raw}'"
+                    )));
+                }
+                let sign = if negative { "-" } else { "" };
+                add_unit(
+                    &format!("{sign}{}", pieces[0]),
+                    &DateTimeField::Hour,
+                    &mut months,
+                    &mut days,
+                    &mut micros,
+                )?;
+                add_unit(
+                    &format!("{sign}{}", pieces[1]),
+                    &DateTimeField::Minute,
+                    &mut months,
+                    &mut days,
+                    &mut micros,
+                )?;
+                add_unit(
+                    &format!("{sign}{}", pieces[2]),
+                    &DateTimeField::Second,
+                    &mut months,
+                    &mut days,
+                    &mut micros,
+                )?;
+                index += 1;
+                continue;
+            }
+            let unit = tokens.get(index + 1).ok_or_else(|| {
+                ExecError::Runtime(format!("interval value '{raw}' is missing a unit"))
+            })?;
+            let field = match unit.to_ascii_lowercase().trim_end_matches('s') {
+                "year" => DateTimeField::Year,
+                "mon" | "month" => DateTimeField::Month,
+                "day" => DateTimeField::Day,
+                "hour" => DateTimeField::Hour,
+                "minute" | "min" => DateTimeField::Minute,
+                "second" | "sec" => DateTimeField::Second,
+                _ => {
+                    return Err(ExecError::Runtime(format!(
+                        "unsupported interval unit '{unit}'"
+                    )));
+                }
+            };
+            add_unit(token, &field, &mut months, &mut days, &mut micros)?;
+            index += 2;
+        }
+    }
+    Ok(Value::Interval {
+        months: i32::try_from(months)
+            .map_err(|_| ExecError::Runtime("interval value out of range".into()))?,
+        days: i32::try_from(days)
+            .map_err(|_| ExecError::Runtime("interval value out of range".into()))?,
+        microseconds: i64::try_from(micros)
+            .map_err(|_| ExecError::Runtime("interval value out of range".into()))?,
+    })
+}
+
+/// Checked SQL temporal arithmetic. Returns `None` when neither operand is a
+/// temporal value so ordinary numeric/string dispatch can continue.
+pub(super) fn eval_temporal_arithmetic(
+    left: &Value,
+    op: &ast::BinaryOperator,
+    right: &Value,
+) -> Option<Result<Value, ExecError>> {
+    use ast::BinaryOperator::{Minus, Plus};
+    const DAY_US: i64 = 86_400_000_000;
+    let is_temporal = |value: &Value| {
+        matches!(
+            value,
+            Value::Date(_) | Value::Timestamp(_) | Value::TimestampTz(_) | Value::Interval { .. }
+        )
+    };
+    if !is_temporal(left) && !is_temporal(right) {
+        return None;
+    }
+    let overflow = || ExecError::Runtime("date/time value out of range".into());
+    let add_interval =
+        |timestamp: i64, months: i32, days: i32, microseconds: i64| -> Result<i64, ExecError> {
+            let date = timestamp.div_euclid(DAY_US);
+            let time = timestamp.rem_euclid(DAY_US);
+            let date = i32::try_from(date).map_err(|_| overflow())?;
+            let shifted = crate::types::date_add_interval(date, months, days);
+            (shifted as i64)
+                .checked_mul(DAY_US)
+                .and_then(|value| value.checked_add(time))
+                .and_then(|value| value.checked_add(microseconds))
+                .ok_or_else(overflow)
+        };
+    let result = (|| -> Result<Value, ExecError> {
+        match (left, op, right) {
+            (Value::Date(date), Plus, Value::Int32(days))
+            | (Value::Int32(days), Plus, Value::Date(date)) => date
+                .checked_add(*days)
+                .map(Value::Date)
+                .ok_or_else(overflow),
+            (Value::Date(date), Minus, Value::Int32(days)) => date
+                .checked_sub(*days)
+                .map(Value::Date)
+                .ok_or_else(overflow),
+            (Value::Date(left), Minus, Value::Date(right)) => left
+                .checked_sub(*right)
+                .map(Value::Int32)
+                .ok_or_else(overflow),
+            (
+                Value::Date(date),
+                Plus | Minus,
+                Value::Interval {
+                    months,
+                    days,
+                    microseconds,
+                },
+            ) => {
+                let sign = if matches!(op, Plus) { 1 } else { -1 };
+                add_interval(
+                    (*date as i64).checked_mul(DAY_US).ok_or_else(overflow)?,
+                    months.checked_mul(sign).ok_or_else(overflow)?,
+                    days.checked_mul(sign).ok_or_else(overflow)?,
+                    microseconds.checked_mul(sign as i64).ok_or_else(overflow)?,
+                )
+                .map(Value::Timestamp)
+            }
+            (Value::Interval { .. }, Plus, Value::Date(_)) => {
+                eval_temporal_arithmetic(right, op, left)
+                    .expect("reversed DATE/INTERVAL remains temporal")
+            }
+            (
+                Value::Timestamp(timestamp),
+                Plus | Minus,
+                Value::Interval {
+                    months,
+                    days,
+                    microseconds,
+                },
+            )
+            | (
+                Value::TimestampTz(timestamp),
+                Plus | Minus,
+                Value::Interval {
+                    months,
+                    days,
+                    microseconds,
+                },
+            ) => {
+                let sign = if matches!(op, Plus) { 1 } else { -1 };
+                let shifted = add_interval(
+                    *timestamp,
+                    months.checked_mul(sign).ok_or_else(overflow)?,
+                    days.checked_mul(sign).ok_or_else(overflow)?,
+                    microseconds.checked_mul(sign as i64).ok_or_else(overflow)?,
+                );
+                shifted.map(|value| {
+                    if matches!(left, Value::TimestampTz(_)) {
+                        Value::TimestampTz(value)
+                    } else {
+                        Value::Timestamp(value)
+                    }
+                })
+            }
+            (Value::Interval { .. }, Plus, Value::Timestamp(_) | Value::TimestampTz(_)) => {
+                eval_temporal_arithmetic(right, op, left)
+                    .expect("reversed TIMESTAMP/INTERVAL remains temporal")
+            }
+            (Value::Timestamp(left), Minus, Value::Timestamp(right))
+            | (Value::TimestampTz(left), Minus, Value::TimestampTz(right)) => left
+                .checked_sub(*right)
+                .map(|microseconds| Value::Interval {
+                    months: 0,
+                    days: 0,
+                    microseconds,
+                })
+                .ok_or_else(overflow),
+            (
+                Value::Interval {
+                    months: lm,
+                    days: ld,
+                    microseconds: lu,
+                },
+                Plus | Minus,
+                Value::Interval {
+                    months: rm,
+                    days: rd,
+                    microseconds: ru,
+                },
+            ) => {
+                let operation = |left: i32, right: i32| {
+                    if matches!(op, Plus) {
+                        left.checked_add(right)
+                    } else {
+                        left.checked_sub(right)
+                    }
+                };
+                let microseconds = if matches!(op, Plus) {
+                    lu.checked_add(*ru)
+                } else {
+                    lu.checked_sub(*ru)
+                };
+                operation(*lm, *rm)
+                    .zip(operation(*ld, *rd))
+                    .zip(microseconds)
+                    .map(|((months, days), microseconds)| Value::Interval {
+                        months,
+                        days,
+                        microseconds,
+                    })
+                    .ok_or_else(overflow)
+            }
+            _ => Err(ExecError::Unsupported(format!(
+                "operator {op} is not defined for {left:?} and {right:?}"
+            ))),
+        }
     })();
     Some(result)
 }
@@ -1828,15 +2255,7 @@ pub(super) fn parse_grant_objects(objects: &ast::GrantObjects) -> Vec<String> {
 
 /// Parse a date string like "2024-03-15" into days since 2000-01-01.
 pub(super) fn parse_date_string(s: &str) -> Option<i32> {
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() >= 3 {
-        let y = parts[0].parse::<i32>().ok()?;
-        let m = parts[1].parse::<u32>().ok()?;
-        let d = parts[2].split_whitespace().next()?.parse::<u32>().ok()?;
-        Some(crate::types::ymd_to_days(y, m, d))
-    } else {
-        None
-    }
+    crate::types::parse_date(s).ok()
 }
 
 /// Parse a date/timestamp string into (year, month, day, hour, minute, second).
@@ -1857,20 +2276,24 @@ pub(super) fn parse_timestamp_parts(s: &str) -> Option<(i32, u32, u32, u32, u32,
         (rest, None)
     };
     let d = day_str.parse::<u32>().ok()?;
+    crate::types::parse_date(&format!("{y:04}-{m:02}-{d:02}")).ok()?;
     let (hour, minute, second) = if let Some(ts) = time_str {
         let time_parts: Vec<&str> = ts.split(':').collect();
-        let h = time_parts
-            .first()
-            .and_then(|p| p.parse::<u32>().ok())
-            .unwrap_or(0);
-        let min = time_parts
-            .get(1)
-            .and_then(|p| p.parse::<u32>().ok())
-            .unwrap_or(0);
+        if time_parts.len() != 3 {
+            return None;
+        }
+        let h = time_parts.first()?.parse::<u32>().ok()?;
+        let min = time_parts.get(1)?.parse::<u32>().ok()?;
         let sec = time_parts
-            .get(2)
-            .and_then(|p| p.trim().parse::<u32>().ok())
-            .unwrap_or(0);
+            .get(2)?
+            .trim()
+            .split('.')
+            .next()?
+            .parse::<u32>()
+            .ok()?;
+        if h > 23 || min > 59 || sec > 59 {
+            return None;
+        }
         (h, min, sec)
     } else {
         (0, 0, 0)

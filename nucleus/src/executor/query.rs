@@ -3154,6 +3154,26 @@ impl Executor {
                 ast::Value::Null => Ok(Value::Null),
                 _ => Ok(Value::Null),
             },
+            Expr::Interval(interval) => {
+                let value = self.eval_expr_plan(&interval.value, row, meta)?;
+                let Value::Text(raw) = value else {
+                    return Err(ExecError::Runtime(
+                        "INTERVAL value must be a string literal".into(),
+                    ));
+                };
+                parse_interval_literal(&raw, interval.leading_field.as_ref())
+            }
+            Expr::Collate { expr, collation } => {
+                validate_binary_collation(collation)?;
+                self.eval_expr_plan(expr, row, meta)
+            }
+            Expr::AtTimeZone {
+                timestamp,
+                time_zone,
+            } => eval_at_time_zone(
+                self.eval_expr_plan(timestamp, row, meta)?,
+                self.eval_expr_plan(time_zone, row, meta)?,
+            ),
             Expr::BinaryOp { left, op, right } => {
                 let lv = self.eval_expr_plan(left, row, meta)?;
                 let rv = self.eval_expr_plan(right, row, meta)?;
@@ -3176,6 +3196,11 @@ impl Executor {
                 // Postgres semantics requested by callers that don't want a
                 // hard error on unparseable text.
                 let cmp = || super::helpers::compare_values(&lv, &rv);
+                if matches!(op, ast::BinaryOperator::Plus | ast::BinaryOperator::Minus)
+                    && let Some(result) = eval_temporal_arithmetic(&lv, op, &rv)
+                {
+                    return result;
+                }
                 if matches!(
                     op,
                     ast::BinaryOperator::Plus
@@ -3310,6 +3335,30 @@ impl Executor {
             Expr::IsNotNull(inner) => {
                 let v = self.eval_expr_plan(inner, row, meta)?;
                 Ok(Value::Bool(v != Value::Null))
+            }
+            Expr::IsTrue(inner) => {
+                let value = self.eval_expr_plan(inner, row, meta)?;
+                Ok(Value::Bool(matches!(value, Value::Bool(true))))
+            }
+            Expr::IsNotTrue(inner) => {
+                let value = self.eval_expr_plan(inner, row, meta)?;
+                Ok(Value::Bool(!matches!(value, Value::Bool(true))))
+            }
+            Expr::IsFalse(inner) => {
+                let value = self.eval_expr_plan(inner, row, meta)?;
+                Ok(Value::Bool(matches!(value, Value::Bool(false))))
+            }
+            Expr::IsNotFalse(inner) => {
+                let value = self.eval_expr_plan(inner, row, meta)?;
+                Ok(Value::Bool(!matches!(value, Value::Bool(false))))
+            }
+            Expr::IsUnknown(inner) => {
+                let value = self.eval_expr_plan(inner, row, meta)?;
+                Ok(Value::Bool(matches!(value, Value::Null)))
+            }
+            Expr::IsNotUnknown(inner) => {
+                let value = self.eval_expr_plan(inner, row, meta)?;
+                Ok(Value::Bool(!matches!(value, Value::Null)))
             }
             Expr::Nested(inner) => self.eval_expr_plan(inner, row, meta),
             Expr::UnaryOp {
@@ -5120,6 +5169,9 @@ impl Executor {
         };
         let col_idx = resolve_col(col_name)?;
         let val = Self::ast_expr_to_literal(lit_expr)?;
+        if matches!(val, Value::Null) {
+            return None;
+        }
         Some((col_idx, fop, val))
     }
 
@@ -5175,7 +5227,9 @@ impl Executor {
                 right,
             } => {
                 // Try right side as literal (col = literal)
-                Self::ast_expr_to_literal(right).or_else(|| Self::ast_expr_to_literal(left))
+                Self::ast_expr_to_literal(right)
+                    .or_else(|| Self::ast_expr_to_literal(left))
+                    .filter(|value| !matches!(value, Value::Null))
             }
             _ => None,
         }

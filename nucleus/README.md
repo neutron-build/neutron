@@ -263,6 +263,14 @@ range is a 96-bit coefficient with at most 28 fractional digits; larger values f
 `numeric value out of range` rather than rounding through floating point. Declared precision and
 scale modifiers such as `NUMERIC(10,2)` are parsed but are not yet enforced as column typemods.
 
+Date and timestamp input is validated as ISO calendar data with microsecond precision. Checked
+date/timestamp/interval arithmetic, SQL three-valued boolean logic, and PostgreSQL-compatible
+default NULL ordering are enforced across the supported table engines. Session time zones and
+`AT TIME ZONE` accept canonical IANA zone names; ambiguous or nonexistent local DST times reject
+explicitly. Locale-aware collations are not implemented: the deterministic binary `C`, `POSIX`,
+and `UCS_BASIC` collations are supported, while other collation names reject instead of silently
+using binary ordering.
+
 ## License
 
 Business Source License 1.1 -- converts to MIT after 4 years. See [LICENSE](./LICENSE).

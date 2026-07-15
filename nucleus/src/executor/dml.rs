@@ -58,7 +58,11 @@ fn table_name_to_id(name: &str) -> u64 {
 /// reaches an engine. Columnar batches choose one physical representation per
 /// column, so a single uncoerced UPDATE value can otherwise turn neighboring
 /// values into NULL while rebuilding a batch.
-fn coerce_value_for_write(value: &mut Value, column: &ColumnDef) -> Result<(), ExecError> {
+fn coerce_value_for_write(
+    value: &mut Value,
+    column: &ColumnDef,
+    session_time_zone: chrono_tz::Tz,
+) -> Result<(), ExecError> {
     if matches!(value, Value::Null) {
         return Ok(());
     }
@@ -71,25 +75,41 @@ fn coerce_value_for_write(value: &mut Value, column: &ColumnDef) -> Result<(), E
         }
         return Ok(());
     }
+    if matches!(column.data_type, DataType::Interval)
+        && let Value::Text(text) = value
+    {
+        *value = super::helpers::parse_interval_literal(text, None)?;
+        return Ok(());
+    }
+    if matches!(column.data_type, DataType::TimestampTz) {
+        let local = match value {
+            Value::Text(text) => Some(crate::types::parse_timestamp(text).map_err(|error| {
+                ExecError::Runtime(format!(
+                    "invalid value for column '{}' ({}): {error}",
+                    column.name, column.data_type
+                ))
+            })?),
+            Value::Timestamp(timestamp) => Some(*timestamp),
+            Value::TimestampTz(_) => None,
+            _ => None,
+        };
+        if let Some(local) = local {
+            *value = Value::TimestampTz(super::helpers::local_timestamp_at_time_zone(
+                local,
+                session_time_zone,
+            )?);
+            return Ok(());
+        }
+    }
 
     match value.cast(&column.data_type) {
         Ok(coerced) => *value = coerced,
-        Err(error)
-            if matches!(
-                column.data_type,
-                DataType::Bool
-                    | DataType::Int32
-                    | DataType::Int64
-                    | DataType::Float64
-                    | DataType::Numeric
-            ) =>
-        {
+        Err(error) => {
             return Err(ExecError::Runtime(format!(
                 "invalid value for column '{}' ({}): {error}",
                 column.name, column.data_type
             )));
         }
-        Err(_) => {}
     }
     Ok(())
 }
@@ -341,7 +361,7 @@ impl Executor {
             // silently storing a physically mixed column.
             for (i, col) in table_def.columns.iter().enumerate() {
                 if let Some(value) = row.get_mut(i) {
-                    coerce_value_for_write(value, col)?;
+                    coerce_value_for_write(value, col, self.session_time_zone()?)?;
                 }
             }
 
@@ -1648,7 +1668,11 @@ impl Executor {
                 let mut new_row = row.clone();
                 for (col_idx, val_expr) in &assign_targets {
                     let mut value = self.eval_row_expr(val_expr, row, &col_meta)?;
-                    coerce_value_for_write(&mut value, &table_def.columns[*col_idx])?;
+                    coerce_value_for_write(
+                        &mut value,
+                        &table_def.columns[*col_idx],
+                        self.session_time_zone()?,
+                    )?;
                     new_row[*col_idx] = value;
                 }
 

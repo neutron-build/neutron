@@ -27,7 +27,7 @@ behavior satisfies the relevant gate above.
 - Source LOC: 239286; Source Rust files: 214; Top-level modules: 50.
 - Declared unit tests: 3864; Declared integration tests: 312; Ignored tests: 155;
   Binary-protocol stubs: 113. These are static declarations, not executed-test claims.
-- The most recent full library run executed 3,738 passing tests and 113 ignored native-binary
+- The most recent full library run executed 3,742 passing tests and 113 ignored native-binary
   test stubs. Core-only executed 1,853 passing tests with no ignores.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
   families, specialty indexes, encryption, TLS, embedded mode, physical backup v1, probes, Raft
@@ -95,7 +95,7 @@ Goal: close known semantic holes before expanding interfaces.
 - [x] Differential-test LSM and columnar engines against MVCC for filters, ranges, grouping, NULLs,
       ordering, updates, deletes, and restart.
 - [x] Complete numeric/decimal aggregate precision and overflow behavior.
-- [ ] Verify collations, time zones, date arithmetic, NULL ordering, casts, and three-valued logic.
+- [x] Verify collations, time zones, date arithmetic, NULL ordering, casts, and three-valued logic.
 - [ ] Verify constraints and cascades across transactions and restart.
 - [ ] Finish MVCC garbage collection/vacuum behavior for long snapshots and high churn.
 - [ ] Add deterministic transaction-ID exhaustion/wraparound behavior.
@@ -122,6 +122,13 @@ Evidence:
   tests cover precision beyond f64, NULL frames, DISTINCT, overflow/division-by-zero, all four
   engines, and heap/LSM/MergeTree restart. README documents the 96-bit/28-scale range and the
   currently unenforced precision/scale typemod limitation.
+- Strict ISO date/timestamp parsing, checked interval/calendar arithmetic, IANA session zones and
+  `AT TIME ZONE`, explicit DST-gap rejection, binary `C`/`POSIX` collation, PostgreSQL NULL ordering,
+  and complete three-valued truth tests now share the row, planned, and constant-expression paths.
+  DML coercion preserves session-aware zoned instants and logical temporal types across MVCC,
+  memory, LSM, columnar WAL/restart, and engine-differential tests. Unsupported locale collations
+  reject explicitly. The 2026-07-15 full library run passed 3,742 tests with 113 native-protocol
+  stubs ignored.
 
 Exit gate:
 

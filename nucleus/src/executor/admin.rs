@@ -10,7 +10,7 @@ use sqlparser::ast;
 use crate::fault::SubsystemHealth;
 use crate::types::{DataType, Row, Value};
 
-use super::helpers::{grantee_name, parse_grant_objects, parse_privileges};
+use super::helpers::{grantee_name, parse_grant_objects, parse_privileges, parse_time_zone};
 use super::schema_types::{CursorDef, RoleDef};
 use super::{ExecError, ExecResult, Executor};
 
@@ -131,7 +131,7 @@ impl Executor {
         {
             let var_name = variable.to_string().to_lowercase();
             let val_str: Vec<String> = values.iter().map(|v| v.to_string()).collect();
-            let val = val_str.join(", ");
+            let mut val = val_str.join(", ");
 
             if matches!(var_name.as_str(), "session_authorization" | "role") {
                 return Err(ExecError::PermissionDenied(format!(
@@ -143,6 +143,9 @@ impl Executor {
                     "tenant identity can only be installed by a trusted authentication boundary"
                         .into(),
                 ));
+            }
+            if var_name == "timezone" {
+                val = parse_time_zone(&val)?.to_string();
             }
 
             // Handle SET TRANSACTION ISOLATION LEVEL
@@ -235,7 +238,7 @@ impl Executor {
             "MAX_CONNECTIONS" => "100".to_string(),
             "TRANSACTION_ISOLATION" => "read committed".to_string(),
             "DEFAULT_TRANSACTION_ISOLATION" => "read committed".to_string(),
-            "LC_COLLATE" => "en_US.UTF-8".to_string(),
+            "LC_COLLATE" => "C".to_string(),
             "LC_CTYPE" => "en_US.UTF-8".to_string(),
             _ => "(not set)".to_string(),
         };

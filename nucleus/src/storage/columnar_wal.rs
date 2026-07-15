@@ -261,6 +261,16 @@ fn encode_value(val: &Value, buf: &mut Vec<u8>) {
             buf.push(9);
             buf.extend_from_slice(&t.to_le_bytes());
         }
+        Value::Interval {
+            months,
+            days,
+            microseconds,
+        } => {
+            buf.push(11);
+            buf.extend_from_slice(&months.to_le_bytes());
+            buf.extend_from_slice(&days.to_le_bytes());
+            buf.extend_from_slice(&microseconds.to_le_bytes());
+        }
         other => {
             // Fallback: encode as Text (lossy for exotic types — sufficient for
             // columnar analytical workloads that don't use JSON/UUID/Array).
@@ -438,6 +448,11 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Option<Value> {
             *pos += len;
             Some(Value::Numeric(value))
         }
+        11 => Some(Value::Interval {
+            months: read_i32(data, pos)?,
+            days: read_i32(data, pos)?,
+            microseconds: read_i64(data, pos)?,
+        }),
         _ => None, // Unknown tag — stop decoding row.
     }
 }
