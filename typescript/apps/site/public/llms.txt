@@ -81,7 +81,7 @@ Visual database management GUI. Browse all 14 data models in one UI with toggles
 - Backend: `cli/internal/studio/`, Frontend: `studio/src/`
 
 ### cli/ — Neutron CLI
-Universal CLI in Go + Cobra. 17 commands including `dev`, `build`, `deploy`, `desktop`, `native`, `studio`. ~21MB binary.
+Universal CLI in Go + Cobra. 16 top-level commands including `dev`, `migrate`, `generate`, `desktop`, `native`, `studio`, and `mcp`. ~20MB binary.
 - Build: `go build` in `cli/`
 
 ## Transport Layer

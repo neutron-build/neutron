@@ -38,6 +38,17 @@ neutron dev
 
 Delegates to the language-specific dev server based on auto-detection.
 
+### `neutron generate`
+
+Generate typed models from one database table or every table in a schema.
+
+```bash
+neutron generate --table users --lang ts --out src/models/users.ts
+neutron generate --all --schema public --lang go --out internal/models/
+```
+
+Supported targets are Go, TypeScript (`ts`), Rust, Python, Elixir, and Zig.
+
 ## Database
 
 ### `neutron db start`
@@ -107,6 +118,15 @@ neutron migrate create add_role_column
 
 Creates `{version}_{name}.up.sql` and `{version}_{name}.down.sql`.
 
+### `neutron migrate down [N]`
+
+Revert the latest migration, or the latest `N` migrations.
+
+```bash
+neutron migrate down
+neutron migrate down 3
+```
+
 ## Data
 
 ### `neutron seed`
@@ -127,6 +147,29 @@ neutron repl
 ```
 
 Supports multi-line SQL, table-formatted output, and meta-commands (`\dt`, `\q`, `\?`).
+
+## Desktop and Native
+
+### `neutron desktop`
+
+Develop, build, or preview a Tauri desktop application.
+
+```bash
+neutron desktop dev
+neutron desktop build
+neutron desktop preview
+```
+
+### `neutron native`
+
+Scaffold, develop, run, or build an iOS/Android application.
+
+```bash
+neutron native init my-app
+neutron native dev
+neutron native run ios
+neutron native build --ios --android
+```
 
 ## Studio
 

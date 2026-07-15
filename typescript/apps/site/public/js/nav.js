@@ -160,7 +160,10 @@
     d.setAttribute('aria-hidden', 'false');
     document.body.classList.add('nav-drawer-open');
     var trigger = document.getElementById('nav-hamburger');
-    if (trigger) trigger.setAttribute('aria-expanded', 'true');
+    if (trigger) {
+      trigger.setAttribute('aria-expanded', 'true');
+      trigger.setAttribute('aria-label', 'Close menu');
+    }
   }
   function closeDrawer() {
     var d = getDrawer();
@@ -169,7 +172,10 @@
     d.setAttribute('aria-hidden', 'true');
     document.body.classList.remove('nav-drawer-open');
     var trigger = document.getElementById('nav-hamburger');
-    if (trigger) trigger.setAttribute('aria-expanded', 'false');
+    if (trigger) {
+      trigger.setAttribute('aria-expanded', 'false');
+      trigger.setAttribute('aria-label', 'Open menu');
+    }
   }
   document.addEventListener('click', function (e) {
     if (e.target.closest && e.target.closest('#nav-hamburger')) {

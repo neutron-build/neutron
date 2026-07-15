@@ -139,8 +139,8 @@
 
 /* === NAV RESPONSIVE LAYOUT ===
    Wide (>1200): logo · [full language bar] · [dropdowns] · CLI Docs GitHub
-   Medium (641–1200): logo · [Languages▾ Platforms▾ Database▾] · CLI Docs GitHub
-   Mobile (≤640): logo · hamburger → drawer
+   Medium (769–1200): logo · [Languages▾ Platforms▾ Database▾] · CLI Docs GitHub
+   Mobile (≤768): logo · hamburger → drawer
 */
 
 /* Wide: full language bar visible, compact Languages trigger hidden */
@@ -268,7 +268,7 @@ body.nav-drawer-open { overflow: hidden; }
 }
 
 /* Mobile: collapse everything behind a hamburger drawer */
-@media (max-width: 640px) {
+@media (max-width: 768px) {
   .nav__inner { gap: var(--space-2); }
   .nav__dropdowns { display: none; }
   .nav__links { display: none; }

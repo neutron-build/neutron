@@ -255,15 +255,6 @@
   letter-spacing: 0.02em;
 }
 
-/* Hide parent layout nav/footer/scripts that leak into docs content-wrapper
-   due to nested layout composition order in static builds. */
-.content-wrapper > .skip-link,
-.content-wrapper > .nav,
-.content-wrapper > .footer,
-.content-wrapper > script {
-  display: none !important;
-}
-
 @media (max-width: 768px) {
   .docs-container {
     flex-direction: column;

@@ -1,6 +1,3 @@
-import Nav from "../../components/Nav";
-import Footer from "../../components/Footer";
-
 interface DocsLayoutProps {
   children: any;
   title?: string;
@@ -287,10 +284,7 @@ export default function DocsLayout({
   currentPath = "",
 }: DocsLayoutProps) {
   return (
-    <>
-      <a href="#main-content" class="skip-link">Skip to content</a>
-      <Nav />
-      <div class="docs-container container">
+    <div class="docs-container container">
         <aside class="sidebar">
           {sidebar.map((section) => (
             <div class="sidebar-section" key={section.label}>
@@ -315,8 +309,6 @@ export default function DocsLayout({
         <main id="main-content" class="docs-content">
           <div class="content-wrapper">{children}</div>
         </main>
-      </div>
-      <Footer />
-    </>
+    </div>
   );
 }

@@ -75,16 +75,16 @@ export default function Nav({ activeProduct }: NavProps) {
 
           {/* Dropdown triggers — all four use the same popover system */}
           <div class="nav__dropdowns">
-            <button class="nav__item nav__trigger nav__trigger--compact" data-dropdown="languages">
+            <button type="button" class="nav__item nav__trigger nav__trigger--compact" data-dropdown="languages">
               Languages <span class="nav__caret">&#9662;</span>
             </button>
-            <button class="nav__item nav__trigger" data-dropdown="platforms">
+            <button type="button" class="nav__item nav__trigger" data-dropdown="platforms">
               Platforms <span class="nav__caret">&#9662;</span>
             </button>
-            <button class="nav__item nav__trigger" data-dropdown="database">
+            <button type="button" class="nav__item nav__trigger" data-dropdown="database">
               Database <span class="nav__caret">&#9662;</span>
             </button>
-            <button class="nav__item nav__trigger" data-dropdown="ai">
+            <button type="button" class="nav__item nav__trigger" data-dropdown="ai">
               AI <span class="nav__caret">&#9662;</span>
             </button>
           </div>
@@ -100,7 +100,7 @@ export default function Nav({ activeProduct }: NavProps) {
           </div>
 
           {/* Mobile hamburger — only visible below 768px */}
-          <button class="nav__hamburger" id="nav-hamburger" aria-label="Open menu" aria-expanded="false" aria-controls="nav-drawer">
+          <button type="button" class="nav__hamburger" id="nav-hamburger" aria-label="Open menu" aria-expanded="false" aria-controls="nav-drawer">
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
               <line x1="4" y1="7" x2="20" y2="7" />
               <line x1="4" y1="12" x2="20" y2="12" />
@@ -114,7 +114,7 @@ export default function Nav({ activeProduct }: NavProps) {
           <div class="nav__drawer-panel" role="dialog" aria-modal="true" aria-label="Main navigation">
             <div class="nav__drawer-header">
               <a href="/" class="nav__logo">neutron</a>
-              <button class="nav__drawer-close" data-drawer-close aria-label="Close menu">
+              <button type="button" class="nav__drawer-close" data-drawer-close aria-label="Close menu">
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                   <line x1="6" y1="6" x2="18" y2="18" />
                   <line x1="18" y1="6" x2="6" y2="18" />
