@@ -1149,7 +1149,7 @@ impl Executor {
             };
             match definition.index_type {
                 crate::catalog::IndexType::Hnsw => {
-                    let pk_col = Self::integer_pk_col(&table_def);
+                    let pk_col = self.pk_col_for_incremental(&table_def);
                     let mut index = vector::HnswIndex::new(vector::HnswConfig::default());
                     for (row_id, row) in rows.iter().enumerate() {
                         if let Some(Value::Vector(value)) = row.get(column_index) {
@@ -4545,9 +4545,10 @@ impl Executor {
             found?
         };
 
-        // HNSW postings are keyed on the row's integer PK (when the table has
-        // one); IvfFlat and no-PK tables remain positional.
-        let pk_col = if is_hnsw {
+        // HNSW postings are keyed on the row's integer PK (when the table has one
+        // and the index is not durable — see pk_col_for_incremental); IvfFlat,
+        // no-PK, and durable indexes remain positional.
+        let pk_col = if is_hnsw && self.vector_wal.is_none() {
             self.catalog
                 .get_table(&table_name)
                 .await
@@ -4649,6 +4650,19 @@ impl Executor {
         }
     }
 
+    /// The integer-PK column to use for PK-keyed HNSW maintenance, but only when
+    /// it is durability-safe. A durable index persists its postings in the vector
+    /// WAL and recovers before the catalog's PK constraint does, so PK-keyed
+    /// postings would meet a positional resolve after a reopen. Gating on the
+    /// absence of a vector WAL keeps durable indexes on the proven positional
+    /// full-rebuild path while in-memory indexes get the incremental fast path.
+    pub(super) fn pk_col_for_incremental(&self, table_def: &TableDef) -> Option<usize> {
+        if self.vector_wal.is_some() {
+            return None;
+        }
+        Self::integer_pk_col(table_def)
+    }
+
     /// Stable u64 posting id for a row: its integer PK bit-cast to u64. Int32
     /// widens through i64 so it agrees with an equal Int64 PK of the same value.
     pub(super) fn stable_row_id(row: &Row, pk_col: usize) -> Option<u64> {
@@ -4670,7 +4684,9 @@ impl Executor {
         table_name: &str,
         table_def: &TableDef,
     ) -> bool {
-        if Self::integer_pk_col(table_def).is_none() {
+        // Also excludes durable indexes (pk_col_for_incremental returns None when
+        // a vector WAL is present), which stay on the full-rebuild path.
+        if self.pk_col_for_incremental(table_def).is_none() {
             return false;
         }
         if self.current_session().txn_state.read().await.active {
@@ -4703,7 +4719,7 @@ impl Executor {
 
     /// Add a newly inserted row to any live vector indexes on the table.
     fn update_vector_indexes_on_insert(&self, table_name: &str, row: &Row, table_def: &TableDef) {
-        let pk_col = Self::integer_pk_col(table_def);
+        let pk_col = self.pk_col_for_incremental(table_def);
         let mut indexes = self.vector_indexes.write();
         // Collect WAL log entries to write after releasing the lock
         let mut wal_inserts: Vec<(String, u64, Vec<f32>)> = Vec::new();
@@ -4797,7 +4813,9 @@ impl Executor {
         row_position: usize,
         table_def: &TableDef,
     ) {
-        let pk_id = Self::integer_pk_col(table_def).and_then(|pc| Self::stable_row_id(row, pc));
+        let pk_id = self
+            .pk_col_for_incremental(table_def)
+            .and_then(|pc| Self::stable_row_id(row, pc));
         let mut indexes = self.vector_indexes.write();
         let mut wal_deletes: Vec<(String, u64)> = Vec::new();
         for (idx_name, entry) in indexes.iter_mut() {

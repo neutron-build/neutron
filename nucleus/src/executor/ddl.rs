@@ -1415,7 +1415,7 @@ impl Executor {
                     let hnsw_m = config.m;
                     let hnsw_ef = config.ef_construction;
                     let mut hnsw = vector::HnswIndex::new(config);
-                    let pk_col = Self::integer_pk_col(&table_def);
+                    let pk_col = self.pk_col_for_incremental(&table_def);
 
                     // Scan existing rows and insert into index (PK-keyed stable id
                     // when the table has an integer PK, else positional).
