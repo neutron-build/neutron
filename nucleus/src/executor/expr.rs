@@ -16,7 +16,7 @@ use super::helpers::*;
 use super::session::sync_block_on;
 use super::types::ColMeta;
 use super::{ExecError, ExecResult, Executor};
-use crate::types::{Row, Value};
+use crate::types::{DataType, Row, Value};
 
 // ---------------------------------------------------------------------------
 // Lazy Materialization — Phase 2C
@@ -486,6 +486,17 @@ impl Executor {
         }
 
         // Arithmetic and string operations
+        if matches!(
+            op,
+            ast::BinaryOperator::Plus
+                | ast::BinaryOperator::Minus
+                | ast::BinaryOperator::Multiply
+                | ast::BinaryOperator::Divide
+                | ast::BinaryOperator::Modulo
+        ) && let Some(result) = eval_numeric_arithmetic(left, op, right)
+        {
+            return result;
+        }
         match (left, right) {
             (Value::Int32(l), Value::Int32(r)) => match op {
                 ast::BinaryOperator::Plus => l
@@ -1448,14 +1459,7 @@ impl Executor {
                 _ => Err(ExecError::Unsupported("cannot cast to BYTEA".to_string())),
             },
             ast::DataType::Numeric(_) | ast::DataType::Decimal(_) | ast::DataType::Dec(_) => {
-                match val {
-                    Value::Numeric(_) => Ok(val),
-                    Value::Int32(n) => Ok(Value::Numeric(n.to_string())),
-                    Value::Int64(n) => Ok(Value::Numeric(n.to_string())),
-                    Value::Float64(n) => Ok(Value::Numeric(n.to_string())),
-                    Value::Text(s) => Ok(Value::Numeric(s)),
-                    _ => Err(ExecError::Unsupported("cannot cast to NUMERIC".to_string())),
-                }
+                val.cast(&DataType::Numeric).map_err(ExecError::Runtime)
             }
             ast::DataType::Array(_) => {
                 // Pass through arrays

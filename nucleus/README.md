@@ -257,6 +257,12 @@ assumption. Row-level security policy DDL and fail-closed executor enforcement a
 [RLS_SECURITY.md](./RLS_SECURITY.md) for supported predicates, enforcement coverage, and explicit
 limitations. Column masking is not yet an enforced SQL feature.
 
+`NUMERIC`/`DECIMAL` uses checked exact decimal arithmetic for casts, comparisons, arithmetic,
+plain/grouped/window aggregates, every table engine, and durable restart. The current supported
+range is a 96-bit coefficient with at most 28 fractional digits; larger values fail with
+`numeric value out of range` rather than rounding through floating point. Declared precision and
+scale modifiers such as `NUMERIC(10,2)` are parsed but are not yet enforced as column typemods.
+
 ## License
 
 Business Source License 1.1 -- converts to MIT after 4 years. See [LICENSE](./LICENSE).

@@ -27,7 +27,7 @@ behavior satisfies the relevant gate above.
 - Source LOC: 239286; Source Rust files: 214; Top-level modules: 50.
 - Declared unit tests: 3864; Declared integration tests: 312; Ignored tests: 155;
   Binary-protocol stubs: 113. These are static declarations, not executed-test claims.
-- The most recent full library run executed 3,737 passing tests and 113 ignored native-binary
+- The most recent full library run executed 3,738 passing tests and 113 ignored native-binary
   test stubs. Core-only executed 1,853 passing tests with no ignores.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
   families, specialty indexes, encryption, TLS, embedded mode, physical backup v1, probes, Raft
@@ -94,7 +94,7 @@ Goal: close known semantic holes before expanding interfaces.
 - [x] Differential-test planner execution against the AST path for every supported SELECT shape.
 - [x] Differential-test LSM and columnar engines against MVCC for filters, ranges, grouping, NULLs,
       ordering, updates, deletes, and restart.
-- [ ] Complete numeric/decimal aggregate precision and overflow behavior.
+- [x] Complete numeric/decimal aggregate precision and overflow behavior.
 - [ ] Verify collations, time zones, date arithmetic, NULL ordering, casts, and three-valued logic.
 - [ ] Verify constraints and cascades across transactions and restart.
 - [ ] Finish MVCC garbage collection/vacuum behavior for long snapshots and high churn.
@@ -116,6 +116,12 @@ Evidence:
   recorded seeds with zero divergence after fixing UPDATE write coercion. Active regressions cover
   the discovered nullable-neighbor corruption, and `commit_durability` proves per-table LSM
   insert/update/delete state and routing survive a crash-copy restart.
+- Exact bounded `NUMERIC` now rejects malformed/out-of-range writes, compares and hashes canonical
+  decimals, performs checked arithmetic and plain/grouped/window SUM/AVG without f64 conversion,
+  and preserves logical decimal values in MVCC, memory, LSM, heap, and columnar storage. Active
+  tests cover precision beyond f64, NULL frames, DISTINCT, overflow/division-by-zero, all four
+  engines, and heap/LSM/MergeTree restart. README documents the 96-bit/28-scale range and the
+  currently unenforced precision/scale typemod limitation.
 
 Exit gate:
 

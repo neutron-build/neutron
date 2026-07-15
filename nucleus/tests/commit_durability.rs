@@ -314,6 +314,42 @@ async fn lsm_rows_and_mutations_survive_simulated_crash() {
 }
 
 #[tokio::test]
+async fn exact_numeric_values_and_aggregates_survive_restart_across_engines() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let (ex, _buf) = boot(&data).await;
+
+    exec(&ex, "CREATE TABLE numeric_heap (id INT, amount NUMERIC)").await;
+    exec(
+        &ex,
+        "CREATE TABLE numeric_lsm (id INT PRIMARY KEY, amount NUMERIC) WITH (engine='lsm')",
+    )
+    .await;
+    exec(
+        &ex,
+        "CREATE TABLE numeric_mt (id INT, amount NUMERIC) WITH (engine='mergetree') ORDER BY (id)",
+    )
+    .await;
+    for table in ["numeric_heap", "numeric_lsm", "numeric_mt"] {
+        exec(
+            &ex,
+            &format!("INSERT INTO {table} VALUES (1, '10000000000000000000000000.1'), (2, '0.2')"),
+        )
+        .await;
+    }
+    drop(ex);
+
+    let (reopened, _) = boot(&data).await;
+    for table in ["numeric_heap", "numeric_lsm", "numeric_mt"] {
+        assert_eq!(
+            rows(&reopened, &format!("SELECT SUM(amount) FROM {table}"),).await,
+            vec![vec![Value::Numeric("10000000000000000000000000.3".into())]],
+            "{table} exact NUMERIC after restart"
+        );
+    }
+}
+
+#[tokio::test]
 async fn drop_table_removes_engine_sidecar() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");

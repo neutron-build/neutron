@@ -205,3 +205,51 @@ async fn columnar_update_preserves_declared_type_and_neighbor_values() {
         ]
     );
 }
+
+/// Exact NUMERIC semantics must not depend on the physical table engine. In
+/// particular, columnar f64 aggregate shortcuts must never consume decimals.
+#[tokio::test]
+async fn numeric_is_exact_and_checked_across_engines() {
+    let engines: Vec<(&str, Arc<dyn StorageEngine>)> = vec![
+        ("mvcc", Arc::new(MvccStorageAdapter::new())),
+        ("memory", Arc::new(MemoryEngine::new())),
+        ("lsm", Arc::new(LsmStorageEngine::new())),
+        ("columnar", Arc::new(ColumnarStorageEngine::new())),
+    ];
+    for (name, storage) in engines {
+        let e = ex(storage);
+        e.execute("CREATE TABLE exact (id INT, bucket TEXT, amount NUMERIC)")
+            .await
+            .unwrap();
+        e.execute("INSERT INTO exact VALUES (1, 'a', '0.1'), (2, 'a', '0.2'), (3, 'b', NULL)")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows(&e, "SELECT SUM(amount), AVG(amount) FROM exact").await,
+            vec![vec![
+                Value::Numeric("0.3".into()),
+                Value::Numeric("0.15".into()),
+            ]],
+            "{name} plain aggregates"
+        );
+        assert_eq!(
+            rows(
+                &e,
+                "SELECT bucket, SUM(amount) FROM exact GROUP BY bucket ORDER BY bucket",
+            )
+            .await,
+            vec![
+                vec![Value::Text("a".into()), Value::Numeric("0.3".into())],
+                vec![Value::Text("b".into()), Value::Null],
+            ],
+            "{name} grouped aggregates"
+        );
+        assert!(
+            e.execute("INSERT INTO exact VALUES (4, 'bad', 'not-a-number')")
+                .await
+                .is_err(),
+            "{name} must reject malformed NUMERIC writes"
+        );
+    }
+}

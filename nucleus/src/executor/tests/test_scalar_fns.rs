@@ -679,6 +679,121 @@ async fn test_cast_to_numeric() {
 }
 
 #[tokio::test]
+async fn test_numeric_exact_comparison_aggregates_and_overflow() {
+    let ex = test_executor();
+
+    let arithmetic = exec(
+        &ex,
+        "SELECT CAST('0.1' AS NUMERIC) + CAST('0.2' AS NUMERIC), CAST('1' AS NUMERIC) / 3",
+    )
+    .await;
+    assert_eq!(
+        rows(&arithmetic[0]),
+        &vec![vec![
+            Value::Numeric("0.3".into()),
+            Value::Numeric("0.3333333333333333333333333333".into()),
+        ]]
+    );
+
+    exec(&ex, "CREATE TABLE exact_nums (id INT, value NUMERIC)").await;
+    exec(
+        &ex,
+        "INSERT INTO exact_nums VALUES (1, '0.10'), (2, '0.20'), (3, '0.20')",
+    )
+    .await;
+
+    let result = exec(
+        &ex,
+        "SELECT SUM(value), AVG(value), COUNT(DISTINCT value) FROM exact_nums",
+    )
+    .await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![vec![
+            Value::Numeric("0.5".into()),
+            Value::Numeric("0.1666666666666666666666666667".into()),
+            Value::Int64(2),
+        ]]
+    );
+
+    exec(&ex, "CREATE TABLE close_nums (id INT, value NUMERIC)").await;
+    exec(
+        &ex,
+        "INSERT INTO close_nums VALUES (1, '10000000000000000000000000.1'), (2, '10000000000000000000000000.2')",
+    )
+    .await;
+    let ordered = exec(
+        &ex,
+        "SELECT id FROM close_nums WHERE value > '10000000000000000000000000.1' ORDER BY value",
+    )
+    .await;
+    assert_eq!(rows(&ordered[0]), &vec![vec![Value::Int32(2)]]);
+
+    exec(&ex, "CREATE TABLE numeric_window (id INT, value NUMERIC)").await;
+    exec(
+        &ex,
+        "INSERT INTO numeric_window VALUES (1, '0.1'), (2, NULL), (3, '0.2')",
+    )
+    .await;
+    let windowed = exec(
+        &ex,
+        "SELECT id, SUM(value) OVER (ORDER BY id), AVG(value) OVER (ORDER BY id), COUNT(value) OVER (ORDER BY id) FROM numeric_window ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows(&windowed[0]),
+        &vec![
+            vec![
+                Value::Int32(1),
+                Value::Numeric("0.1".into()),
+                Value::Numeric("0.1".into()),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int32(2),
+                Value::Numeric("0.1".into()),
+                Value::Numeric("0.1".into()),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int32(3),
+                Value::Numeric("0.3".into()),
+                Value::Numeric("0.15".into()),
+                Value::Int64(2),
+            ],
+        ]
+    );
+
+    assert!(
+        ex.execute("INSERT INTO exact_nums VALUES (4, 'not-a-number')")
+            .await
+            .is_err()
+    );
+
+    exec(&ex, "CREATE TABLE numeric_overflow (value NUMERIC)").await;
+    exec(
+        &ex,
+        "INSERT INTO numeric_overflow VALUES ('79228162514264337593543950335'), (1)",
+    )
+    .await;
+    let overflow = ex.execute("SELECT SUM(value) FROM numeric_overflow").await;
+    assert!(
+        overflow.is_err(),
+        "NUMERIC aggregate overflow must return an error, not round or wrap: {overflow:?}"
+    );
+    assert!(
+        ex.execute("SELECT CAST('79228162514264337593543950335' AS NUMERIC) * CAST(2 AS NUMERIC)")
+            .await
+            .is_err()
+    );
+    assert!(
+        ex.execute("SELECT CAST(1 AS NUMERIC) / CAST(0 AS NUMERIC)")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn test_cast_text_to_int() {
     let ex = test_executor();
     let results = exec(&ex, "SELECT CAST('123' AS INT)").await;

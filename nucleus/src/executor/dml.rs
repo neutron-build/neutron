@@ -77,7 +77,11 @@ fn coerce_value_for_write(value: &mut Value, column: &ColumnDef) -> Result<(), E
         Err(error)
             if matches!(
                 column.data_type,
-                DataType::Bool | DataType::Int32 | DataType::Int64 | DataType::Float64
+                DataType::Bool
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float64
+                    | DataType::Numeric
             ) =>
         {
             return Err(ExecError::Runtime(format!(

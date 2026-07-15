@@ -2,6 +2,20 @@
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::str::FromStr;
+
+use rust_decimal::Decimal;
+
+/// Parse the bounded exact NUMERIC representation used by Nucleus. The current
+/// physical type is rust_decimal (96-bit coefficient, scale <= 28); values
+/// outside that range reject explicitly instead of degrading to f64.
+pub(crate) fn parse_numeric(value: &str) -> Result<Decimal, String> {
+    Decimal::from_str(value.trim()).map_err(|error| format!("invalid numeric value: {error}"))
+}
+
+pub(crate) fn canonical_numeric(value: &str) -> Result<String, String> {
+    parse_numeric(value).map(|decimal| decimal.normalize().to_string())
+}
 
 /// A value in Nucleus. All data flows through this enum.
 ///
@@ -334,7 +348,7 @@ impl Value {
             (Value::Int64(_), DataType::Int64) => Ok(self.clone()),
             (Value::Float64(_), DataType::Float64) => Ok(self.clone()),
             (Value::Text(_), DataType::Text) => Ok(self.clone()),
-            (Value::Numeric(_), DataType::Numeric) => Ok(self.clone()),
+            (Value::Numeric(s), DataType::Numeric) => canonical_numeric(s).map(Value::Numeric),
             // Bool conversions
             (Value::Bool(b), DataType::Int32) => Ok(Value::Int32(if *b { 1 } else { 0 })),
             (Value::Bool(b), DataType::Int64) => Ok(Value::Int64(if *b { 1 } else { 0 })),
@@ -375,7 +389,9 @@ impl Value {
                 Ok(Value::Int64(rounded as i64))
             }
             (Value::Float64(n), DataType::Text) => Ok(Value::Text(n.to_string())),
-            (Value::Float64(n), DataType::Numeric) => Ok(Value::Numeric(n.to_string())),
+            (Value::Float64(n), DataType::Numeric) => {
+                canonical_numeric(&n.to_string()).map(Value::Numeric)
+            }
             // Text conversions
             (Value::Text(s), DataType::Int32) => s
                 .parse::<i32>()
@@ -394,7 +410,7 @@ impl Value {
                 "false" | "f" | "0" | "no" | "off" => Ok(Value::Bool(false)),
                 _ => Err(format!("cannot cast '{s}' to boolean")),
             },
-            (Value::Text(s), DataType::Numeric) => Ok(Value::Numeric(s.clone())),
+            (Value::Text(s), DataType::Numeric) => canonical_numeric(s).map(Value::Numeric),
             // Numeric conversions
             (Value::Numeric(s), DataType::Int32) => s
                 .parse::<i32>()
@@ -497,7 +513,10 @@ impl PartialEq for Value {
             (Value::Date(a), Value::Date(b)) => a == b,
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
             (Value::TimestampTz(a), Value::TimestampTz(b)) => a == b,
-            (Value::Numeric(a), Value::Numeric(b)) => a == b,
+            (Value::Numeric(a), Value::Numeric(b)) => match (parse_numeric(a), parse_numeric(b)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => a == b,
+            },
             (Value::Uuid(a), Value::Uuid(b)) => a == b,
             (Value::Bytea(a), Value::Bytea(b)) => a == b,
             (Value::Array(a), Value::Array(b)) => a == b,
@@ -543,7 +562,10 @@ impl Hash for Value {
             Value::Bool(b) => b.hash(state),
             Value::Int32(_) | Value::Int64(_) => unreachable!("integers handled above"),
             Value::Float64(f) => f.to_bits().hash(state),
-            Value::Text(s) | Value::Numeric(s) => s.hash(state),
+            Value::Text(s) => s.hash(state),
+            Value::Numeric(s) => canonical_numeric(s)
+                .unwrap_or_else(|_| s.clone())
+                .hash(state),
             Value::Jsonb(v) => format!("{v}").hash(state),
             Value::Date(d) => d.hash(state),
             Value::Timestamp(t) | Value::TimestampTz(t) => t.hash(state),
@@ -596,12 +618,10 @@ impl Ord for Value {
                 }
             }
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
-            (Value::Numeric(a), Value::Numeric(b)) => {
-                // Parse as f64 for proper numeric ordering (not lexicographic)
-                let av: f64 = a.parse().unwrap_or(f64::NAN);
-                let bv: f64 = b.parse().unwrap_or(f64::NAN);
-                av.partial_cmp(&bv).unwrap_or(Ordering::Equal)
-            }
+            (Value::Numeric(a), Value::Numeric(b)) => match (parse_numeric(a), parse_numeric(b)) {
+                (Ok(a), Ok(b)) => a.cmp(&b),
+                _ => a.cmp(b),
+            },
             (Value::Date(a), Value::Date(b)) => a.cmp(b),
             (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
             (Value::TimestampTz(a), Value::TimestampTz(b)) => a.cmp(b),

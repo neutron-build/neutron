@@ -187,6 +187,14 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
             };
             match name.as_str() {
                 "COUNT" => DataType::Int64,
+                "AVG"
+                    if matches!(
+                        arg_expr.map(|expr| infer_expr_type(expr, col_meta)),
+                        Some(DataType::Numeric)
+                    ) =>
+                {
+                    DataType::Numeric
+                }
                 "AVG" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP" | "VARIANCE" | "VAR_POP"
                 | "VAR_SAMP" => DataType::Float64,
                 "SUM" => match arg_expr.map(|e| infer_expr_type(e, col_meta)) {
@@ -227,6 +235,7 @@ pub(super) fn infer_expr_type(expr: &Expr, col_meta: &[ColMeta]) -> DataType {
                     let rt = infer_expr_type(right, col_meta);
                     match (&lt, &rt) {
                         (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
+                        (DataType::Numeric, _) | (_, DataType::Numeric) => DataType::Numeric,
                         (DataType::Int64, _) | (_, DataType::Int64) => DataType::Int64,
                         (DataType::Int32, DataType::Int32) => DataType::Int32,
                         _ => lt,
@@ -291,11 +300,9 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering>
         (Value::TimestampTz(a), Value::TimestampTz(b)) => Some(a.cmp(b)),
         (Value::Timestamp(a), Value::TimestampTz(b)) => Some(a.cmp(b)),
         (Value::TimestampTz(a), Value::Timestamp(b)) => Some(a.cmp(b)),
-        (Value::Numeric(a), Value::Numeric(b)) => {
-            let fa: f64 = a.parse().unwrap_or(0.0);
-            let fb: f64 = b.parse().unwrap_or(0.0);
-            fa.partial_cmp(&fb)
-        }
+        (Value::Numeric(a), Value::Numeric(b)) => crate::types::parse_numeric(a)
+            .ok()?
+            .partial_cmp(&crate::types::parse_numeric(b).ok()?),
         (Value::Uuid(a), Value::Uuid(b)) => Some(a.cmp(b)),
         (Value::Bytea(a), Value::Bytea(b)) => Some(a.cmp(b)),
         (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
@@ -332,16 +339,12 @@ fn coerce_text_and_compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Value::Float64(f), Value::Text(s)) => {
             s.trim().parse::<f64>().ok().and_then(|v| f.partial_cmp(&v))
         }
-        (Value::Text(s), Value::Numeric(n)) => {
-            let lhs = s.trim().parse::<f64>().ok()?;
-            let rhs = n.parse::<f64>().ok()?;
-            lhs.partial_cmp(&rhs)
-        }
-        (Value::Numeric(n), Value::Text(s)) => {
-            let lhs = n.parse::<f64>().ok()?;
-            let rhs = s.trim().parse::<f64>().ok()?;
-            lhs.partial_cmp(&rhs)
-        }
+        (Value::Text(s), Value::Numeric(n)) => crate::types::parse_numeric(s)
+            .ok()?
+            .partial_cmp(&crate::types::parse_numeric(n).ok()?),
+        (Value::Numeric(n), Value::Text(s)) => crate::types::parse_numeric(n)
+            .ok()?
+            .partial_cmp(&crate::types::parse_numeric(s).ok()?),
         (Value::Text(s), Value::Bool(b)) => parse_pg_bool(s).map(|v| v.cmp(b)),
         (Value::Bool(b), Value::Text(s)) => parse_pg_bool(s).map(|v| b.cmp(&v)),
         // text vs date/timestamp — let the existing parsers do the heavy
@@ -755,6 +758,117 @@ pub(super) fn parse_agg_spec(spec: &str) -> (String, String) {
     } else {
         (spec.to_uppercase(), "*".to_string())
     }
+}
+
+fn checked_numeric_aggregate<'a>(
+    func: &str,
+    values: impl Iterator<Item = &'a Value>,
+) -> Result<Value, ExecError> {
+    let mut sum = rust_decimal::Decimal::ZERO;
+    let mut count = 0u64;
+    for value in values {
+        match value {
+            Value::Null => continue,
+            Value::Numeric(raw) => {
+                let decimal = crate::types::parse_numeric(raw).map_err(ExecError::Runtime)?;
+                sum = sum
+                    .checked_add(decimal)
+                    .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))?;
+                count += 1;
+            }
+            _ => {
+                return Err(ExecError::Runtime(
+                    "non-NUMERIC value in NUMERIC aggregate".into(),
+                ));
+            }
+        }
+    }
+    if count == 0 {
+        return Ok(Value::Null);
+    }
+    match func {
+        "SUM" => Ok(Value::Numeric(sum.normalize().to_string())),
+        "AVG" => sum
+            .checked_div(rust_decimal::Decimal::from(count))
+            .map(|value| Value::Numeric(value.normalize().to_string()))
+            .ok_or_else(|| ExecError::Runtime("numeric value out of range".into())),
+        _ => Err(ExecError::Unsupported(format!(
+            "checked NUMERIC aggregate {func}"
+        ))),
+    }
+}
+
+pub(super) fn compute_numeric_aggregate(
+    func: &str,
+    col_idx: usize,
+    rows: &[Row],
+) -> Result<Value, ExecError> {
+    checked_numeric_aggregate(func, rows.iter().filter_map(|row| row.get(col_idx)))
+}
+
+pub(super) fn compute_numeric_aggregate_refs(
+    func: &str,
+    col_idx: usize,
+    rows: &[&Row],
+) -> Result<Value, ExecError> {
+    checked_numeric_aggregate(func, rows.iter().filter_map(|row| row.get(col_idx)))
+}
+
+/// Evaluate arithmetic that has at least one exact NUMERIC operand. Integers
+/// promote losslessly to NUMERIC; mixing NUMERIC with FLOAT8 is rejected so an
+/// exact expression cannot silently cross the f64 precision boundary.
+pub(super) fn eval_numeric_arithmetic(
+    left: &Value,
+    op: &ast::BinaryOperator,
+    right: &Value,
+) -> Option<Result<Value, ExecError>> {
+    use rust_decimal::Decimal;
+
+    if !matches!(left, Value::Numeric(_)) && !matches!(right, Value::Numeric(_)) {
+        return None;
+    }
+    let as_decimal = |value: &Value| -> Result<Decimal, ExecError> {
+        match value {
+            Value::Numeric(raw) => crate::types::parse_numeric(raw).map_err(ExecError::Runtime),
+            Value::Int32(value) => Ok(Decimal::from(*value)),
+            Value::Int64(value) => Ok(Decimal::from(*value)),
+            Value::Float64(_) => Err(ExecError::Runtime(
+                "cannot mix exact NUMERIC and FLOAT8 without an explicit cast".into(),
+            )),
+            _ => Err(ExecError::Runtime(format!(
+                "cannot apply numeric operator {op} to {value:?}"
+            ))),
+        }
+    };
+    let result = (|| {
+        let left = as_decimal(left)?;
+        let right = as_decimal(right)?;
+        let value = match op {
+            ast::BinaryOperator::Plus => left.checked_add(right),
+            ast::BinaryOperator::Minus => left.checked_sub(right),
+            ast::BinaryOperator::Multiply => left.checked_mul(right),
+            ast::BinaryOperator::Divide => {
+                if right.is_zero() {
+                    return Err(ExecError::Runtime("division by zero".into()));
+                }
+                left.checked_div(right)
+            }
+            ast::BinaryOperator::Modulo => {
+                if right.is_zero() {
+                    return Err(ExecError::Runtime("division by zero".into()));
+                }
+                left.checked_rem(right)
+            }
+            _ => {
+                return Err(ExecError::Unsupported(format!(
+                    "NUMERIC operator {op} is not arithmetic"
+                )));
+            }
+        }
+        .ok_or_else(|| ExecError::Runtime("numeric value out of range".into()))?;
+        Ok(Value::Numeric(value.normalize().to_string()))
+    })();
+    Some(result)
 }
 
 /// Compute an aggregate function over rows.
