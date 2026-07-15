@@ -7,26 +7,33 @@ The Neutron CLI is a single binary that works across all languages in the ecosys
 
 ## Install
 
+Download a prebuilt Go CLI archive from the
+[GitHub releases](https://github.com/neutron-build/neutron/releases/tag/cli%2Fv0.1.0),
+or build the current source:
+
 ```bash
-# macOS / Linux
-curl -fsSL https://get.neutron.build | sh
+git clone https://github.com/neutron-build/neutron.git
+cd neutron/cli
+make install
+```
 
-# Homebrew
-brew install neutron-build/tap/neutron
+The TypeScript framework has a separate Node-based CLI whose executable is
+`neutron-ts`:
 
-# npm (wrapper)
-npx @neutron-build/cli
+```bash
+npm install -D @neutron-build/cli
+npx neutron-ts --help
 ```
 
 ## What It Does
 
 | Area | Commands |
 |------|----------|
-| **Projects** | `new`, `init`, `dev` |
+| **Projects** | `new`, `init`, `dev`, `desktop`, `native` |
 | **Database** | `db start`, `db stop`, `db status`, `db reset` |
 | **Migrations** | `migrate`, `migrate status`, `migrate create` |
 | **Data** | `seed`, `repl` |
-| **Tools** | `studio`, `mcp`, `doctor`, `upgrade` |
+| **Tools** | `generate`, `studio`, `mcp`, `doctor`, `upgrade`, `completion`, `version` |
 
 ## Language Auto-Detection
 

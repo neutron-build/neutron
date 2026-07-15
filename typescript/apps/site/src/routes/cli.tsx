@@ -5,7 +5,7 @@ import CodeBlock from "../components/CodeBlock";
 export function head() {
   return {
     title: "CLI - Neutron",
-    description: "One Go binary, 17 commands. Scaffold, dev, build, migrate, deploy, studio, and MCP &mdash; all from neutron. 21 MB, cross-platform, zero dependencies.",
+    description: "One Go binary, 16 top-level commands. Scaffold, develop, migrate, generate, manage Nucleus, launch Studio, and serve MCP tools.",
   };
 }
 
@@ -13,37 +13,35 @@ export default function CliPage() {
   return (
     <ProductPage
       title="Neutron CLI"
-      description="One 21 MB Go binary that handles scaffolding, dev servers, database migrations, builds, deploys, Studio, and MCP. Auto-detects your project's language and delegates to the right sub-toolchain."
+      description="One 20 MB Go binary that handles scaffolding, dev servers, migrations, code generation, Nucleus, Studio, native and desktop workflows, and MCP."
       category="tool"
       status="available"
       accent="var(--accent-ts)"
       heroAccentRgb="49, 120, 198"
-      heroTagline="One binary. Seventeen commands. Every language."
+      heroTagline="One binary. Sixteen commands. Every language."
       stats={[
-        { value: '17', label: 'Commands' },
-        { value: '21 MB', label: 'Single Binary' },
+        { value: '16', label: 'Top-Level Commands' },
+        { value: '20 MB', label: 'Single Binary' },
         { value: 'Go', label: 'Cross-Compiled' },
         { value: '0', label: 'Dependencies' },
       ]}
     >
       <section>
         <h2>Install once. Run anything.</h2>
-        <p>A single <code>neutron</code> binary handles every SDK in the ecosystem. It detects your project's language from <code>neutron.config.*</code> and invokes the right tool underneath &mdash; Vite for TypeScript, Cargo for Rust, Go's build system for Go, setuptools for Python, <code>zig build</code> for Zig, and so on. You don't learn seven command-line surfaces; you learn one.</p>
+        <p>A single <code>neutron</code> binary handles every SDK in the ecosystem. It detects the project language from its standard manifest and delegates development to the appropriate toolchain. It also manages Nucleus, migrations, Studio, generated database types, native and desktop workflows, and MCP.</p>
       </section>
 
       <CodeBlock filename="terminal">
-        <pre><code>{`$ neutron new my-app                 # scaffold from 20+ templates
-$ neutron dev                        # HMR dev server
-$ neutron build                      # production build, all targets
-$ neutron preview                    # serve the built output
+        <pre><code>{`$ neutron new my-app --lang typescript # scaffold a project
+$ neutron dev                          # HMR dev server
+$ neutron migrate                      # apply pending migrations
+$ neutron migrate down                 # roll back one migration
+$ neutron generate --table users --lang ts
 
-$ neutron db migrate                 # apply pending migrations
-$ neutron db studio                  # launch visual database manager
-$ neutron db reset                   # wipe and re-seed
-
-$ neutron deploy --target cloudflare # deploy to any configured adapter
-$ neutron studio                     # standalone Studio server
-$ neutron mcp --stdio                # MCP server for AI clients
+$ neutron db start                     # start local Nucleus
+$ neutron db reset                     # wipe and recreate the database
+$ neutron studio                       # standalone Studio server
+$ neutron mcp                          # MCP server over stdio
 
 $ neutron desktop dev                # Tauri desktop dev
 $ neutron native run ios             # build + run on iOS sim
@@ -53,7 +51,7 @@ $ neutron native run android         # build + run on Android emulator`}</code><
       <FeatureGrid columns={3} accentRgb="49, 120, 198">
         <div class="feature-card">
           <div class="feature-card__title">Scaffold</div>
-          <div class="feature-card__desc"><code>neutron new</code> with 20+ templates: web app, API, full-stack, mobile (Expo Go), desktop (Tauri), worker, static site, documentation.</div>
+          <div class="feature-card__desc"><code>neutron new</code> scaffolds TypeScript, Python, Go, Rust, Zig, and Julia projects with native manifests and starter source.</div>
         </div>
         <div class="feature-card">
           <div class="feature-card__title">Dev server</div>
@@ -64,8 +62,8 @@ $ neutron native run android         # build + run on Android emulator`}</code><
           <div class="feature-card__desc">Generate, apply, and roll back schema changes across all 14 Nucleus models. Up/down files, SQL or TypeScript.</div>
         </div>
         <div class="feature-card">
-          <div class="feature-card__title">Multi-target build</div>
-          <div class="feature-card__desc">One command emits artifacts for every adapter your config declares: edge worker, Node server, static bundle, Lambda zip, Tauri installer.</div>
+          <div class="feature-card__title">Typed generation</div>
+          <div class="feature-card__desc"><code>neutron generate</code> reads database tables and emits typed Go, TypeScript, Rust, Python, Elixir, or Zig models.</div>
         </div>
         <div class="feature-card">
           <div class="feature-card__title">Studio launcher</div>
@@ -82,17 +80,14 @@ $ neutron native run android         # build + run on Android emulator`}</code><
         <p>One static binary, cross-compiled to every OS and arch we support. No Node runtime to bring. No Python interpreter to pin. Install with a single curl, or grab a release from GitHub. The CLI is the same size and shape on Linux, macOS, Windows, and ARM &mdash; and it's how your CI servers will talk to Neutron too.</p>
 
         <CodeBlock filename="install">
-          <pre><code>{`# macOS / Linux
-curl -fsSL https://neutron.build/install.sh | sh
+          <pre><code>{`# Download a prebuilt archive from GitHub Releases, or build from source:
+git clone https://github.com/neutron-build/neutron.git
+cd neutron/cli
+make install
 
-# Homebrew
-brew install neutron-build/tap/neutron
-
-# Windows
-winget install neutron.neutron
-
-# Or grab a release binary from GitHub
-`}</code></pre>
+# TypeScript projects use the separate framework CLI:
+npm install -D @neutron-build/cli
+npx neutron-ts --help`}</code></pre>
         </CodeBlock>
       </section>
 
