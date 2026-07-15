@@ -30,6 +30,49 @@ impl Executor {
     ) -> Result<Value, ExecError> {
         let args = self.extract_fn_args(func, row, col_meta)?;
 
+        // Specialty stores do not yet carry table-policy metadata. When any
+        // RLS policy is active for this principal, allowing their direct SQL
+        // functions would create an alternate read/write channel around the
+        // secured relational access path. Fail closed until a store has native
+        // policy semantics.
+        let specialty_surface = [
+            "COLUMNAR_",
+            "DOC_",
+            "FTS_",
+            "GRAPH_",
+            "CDC_",
+            "KV_",
+            "TS_",
+            "STREAM_",
+            "BLOB_",
+            "SPARSE_",
+            "LO_",
+            "DATALOG_",
+            "ENCRYPTED_",
+            "DB_BRANCH_",
+            "VERSION_",
+            "TENSOR_",
+            "PUBSUB_",
+            "PROC_",
+            "SUBSCRIPTION_",
+        ]
+        .iter()
+        .any(|prefix| fname.starts_with(prefix))
+            || matches!(
+                fname,
+                "VECTOR_SEARCH"
+                    | "VECTOR_INSERT"
+                    | "VECTOR_DELETE"
+                    | "CYPHER"
+                    | "SUBSCRIBE"
+                    | "UNSUBSCRIBE"
+            );
+        if specialty_surface && self.any_rls_active() {
+            return Err(ExecError::PermissionDenied(format!(
+                "{fname} is unavailable while row-level security is active because this specialty-store surface has no policy-aware access path"
+            )));
+        }
+
         match fname {
             // -- String functions --
             "UPPER" => {

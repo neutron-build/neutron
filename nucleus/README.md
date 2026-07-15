@@ -233,6 +233,11 @@ nucleus/
 
 Active development. See `STATUS.md` for current feature status and known gaps, and `NUCLEUS-ROADMAP.md` for the implementation roadmap.
 
+Multi-user PostgreSQL-wire sessions use catalog-backed SCRAM identities and privilege-checked role
+assumption. Row-level security policy DDL and fail-closed executor enforcement are implemented; see
+[RLS_SECURITY.md](./RLS_SECURITY.md) for supported predicates, enforcement coverage, and explicit
+limitations. Column masking is not yet an enforced SQL feature.
+
 ## License
 
 Business Source License 1.1 -- converts to MIT after 4 years. See [LICENSE](./LICENSE).

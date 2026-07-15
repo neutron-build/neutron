@@ -178,6 +178,33 @@ impl AuthSource for UserAuthenticator {
     }
 }
 
+/// Catalog-backed authentication source. It exposes only stored SCRAM salted
+/// material and therefore never retains or recovers raw role passwords.
+#[derive(Clone)]
+struct CatalogAuthenticator {
+    executor: Arc<Executor>,
+}
+
+impl std::fmt::Debug for CatalogAuthenticator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatalogAuthenticator")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl AuthSource for CatalogAuthenticator {
+    async fn get_password(&self, login: &LoginInfo) -> PgWireResult<AuthPassword> {
+        let user = login.user().unwrap_or("");
+        let (salt, salted) = self
+            .executor
+            .scram_credentials(user)
+            .await
+            .ok_or_else(|| PgWireError::InvalidPassword(user.to_owned()))?;
+        Ok(AuthPassword::new(Some(salt), salted))
+    }
+}
+
 /// Password authentication method for the wire protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AuthMethod {
@@ -506,6 +533,7 @@ struct CopyInProgress {
 pub struct NucleusHandler {
     executor: Arc<Executor>,
     authenticator: Option<UserAuthenticator>,
+    catalog_authenticator: Option<CatalogAuthenticator>,
     auth_method: AuthMethod,
     scram_auth: Option<ScramAuth>,
     parameter_provider: DefaultServerParameterProvider,
@@ -551,6 +579,7 @@ impl NucleusHandler {
         Self {
             executor,
             authenticator: None,
+            catalog_authenticator: None,
             auth_method: AuthMethod::default(),
             scram_auth: None,
             parameter_provider: DefaultServerParameterProvider::default(),
@@ -617,6 +646,7 @@ impl NucleusHandler {
         Self {
             executor,
             authenticator,
+            catalog_authenticator: None,
             auth_method,
             scram_auth,
             parameter_provider: DefaultServerParameterProvider::default(),
@@ -635,6 +665,20 @@ impl NucleusHandler {
         }
     }
 
+    /// Create a multi-user handler backed by the persisted role catalog.
+    /// Catalog authentication intentionally supports SCRAM-SHA-256 only.
+    pub fn with_catalog_auth(executor: Arc<Executor>) -> Self {
+        let catalog_authenticator = CatalogAuthenticator {
+            executor: executor.clone(),
+        };
+        let scram_auth = Some(ScramAuth::new(Arc::new(catalog_authenticator.clone())));
+        let mut handler = Self::new(executor);
+        handler.auth_method = AuthMethod::ScramSha256;
+        handler.catalog_authenticator = Some(catalog_authenticator);
+        handler.scram_auth = scram_auth;
+        handler
+    }
+
     /// Active authentication method for this handler.
     pub fn auth_method(&self) -> AuthMethod {
         self.auth_method
@@ -644,7 +688,7 @@ impl NucleusHandler {
         &self,
         client: &mut C,
         mut msg: PasswordMessageFamily,
-    ) -> PgWireResult<()>
+    ) -> PgWireResult<bool>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
@@ -682,12 +726,13 @@ impl NucleusHandler {
             .send(PgWireBackendMessage::Authentication(resp))
             .await?;
 
-        if matches!(new_state, SASLState::Finished) {
+        let finished = matches!(new_state, SASLState::Finished);
+        if finished {
             finish_authentication(client, &self.parameter_provider).await?;
         } else {
             self.sasl_registry.write().insert(peer_addr, new_state);
         }
-        Ok(())
+        Ok(finished)
     }
 
     /// Build a query response from executor results for a single ExecResult.
@@ -1167,11 +1212,17 @@ impl StartupHandler for NucleusHandler {
                 protocol_negotiation(client, startup).await?;
                 save_startup_parameters_to_metadata(client, startup);
                 // Create a per-connection session for state isolation.
-                let session_id = self.executor.create_session();
+                let auth_required =
+                    self.authenticator.is_some() || self.catalog_authenticator.is_some();
+                let session_id = if auth_required {
+                    self.executor.create_unauthenticated_session()
+                } else {
+                    self.executor.create_session()
+                };
                 let addr = client.socket_addr().to_string();
                 self.session_registry.write().insert(addr, session_id);
 
-                if self.authenticator.is_none() {
+                if !auth_required {
                     finish_authentication(client, &self.parameter_provider).await?;
                 } else {
                     client.set_state(PgWireConnectionState::AuthenticationInProgress);
@@ -1209,7 +1260,7 @@ impl StartupHandler for NucleusHandler {
 
             // ── Password response: verify against configured auth mode ───
             PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
-                if let Some(auth) = &self.authenticator {
+                if self.authenticator.is_some() || self.catalog_authenticator.is_some() {
                     // ── Rate-limit check: reject if too many recent failures ──
                     let source_ip = client.socket_addr().ip();
                     if self.login_rate_limiter.is_locked_out(source_ip) {
@@ -1221,21 +1272,34 @@ impl StartupHandler for NucleusHandler {
                         ))));
                     }
 
-                    let result = match self.auth_method {
+                    let (result, authentication_complete) = match self.auth_method {
                         AuthMethod::Cleartext => {
+                            let auth = self.authenticator.as_ref().ok_or_else(|| {
+                                PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "FATAL".to_owned(),
+                                    "0A000".to_owned(),
+                                    "catalog authentication supports SCRAM-SHA-256 only".to_owned(),
+                                )))
+                            })?;
                             let pwd = pwd.into_password()?;
                             let login_info = LoginInfo::from_client_info(client);
                             let expected = auth.get_password(&login_info).await?;
                             if constant_time_eq(expected.password(), pwd.password.as_bytes()) {
-                                finish_authentication(client, &self.parameter_provider).await
+                                (
+                                    finish_authentication(client, &self.parameter_provider).await,
+                                    true,
+                                )
                             } else {
                                 let user =
                                     login_info.user().map(|u| u.to_owned()).unwrap_or_default();
-                                Err(PgWireError::InvalidPassword(user))
+                                (Err(PgWireError::InvalidPassword(user)), false)
                             }
                         }
                         AuthMethod::ScramSha256 => {
-                            self.handle_scram_password_message(client, pwd).await
+                            match self.handle_scram_password_message(client, pwd).await {
+                                Ok(done) => (Ok(()), done),
+                                Err(e) => (Err(e), false),
+                            }
                         }
                     };
 
@@ -1244,8 +1308,17 @@ impl StartupHandler for NucleusHandler {
                         self.cleanup_session(&client.socket_addr().to_string());
                         return Err(e);
                     }
-                    // Successful auth: clear any prior failure record.
-                    self.login_rate_limiter.clear(source_ip);
+                    if authentication_complete {
+                        let login_info = LoginInfo::from_client_info(client);
+                        let user = login_info.user().unwrap_or("");
+                        let session_id = self.session_id_from_client(client);
+                        self.executor
+                            .bind_authenticated_session(session_id, user)
+                            .await
+                            .map_err(exec_error_to_pgwire)?;
+                        // Successful auth: clear any prior failure record.
+                        self.login_rate_limiter.clear(source_ip);
+                    }
                 } else {
                     tracing::warn!("Received password message but authentication is disabled");
                 }
@@ -1282,9 +1355,13 @@ impl SimpleQueryHandler for NucleusHandler {
         // ROLLBACK and break read-your-own-writes. Route everything through the
         // session-scoped executor until COMMIT/ROLLBACK.
         let in_txn = self.executor.session_in_transaction(session_id);
+        let rls_active = self.executor.session_has_active_rls(session_id);
 
         // ── Large Objects fast path: intercept lo_* function calls ───────
-        if !in_txn && let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, query) {
+        if !in_txn
+            && !rls_active
+            && let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, query)
+        {
             let resp = Self::build_response(lo_result, None)?;
             self.flush_pending_notifications(client).await?;
             return Ok(vec![resp]);
@@ -1319,7 +1396,10 @@ impl SimpleQueryHandler for NucleusHandler {
         }
 
         // ── KV fast path: intercept common KV queries before SQL parsing ──
-        if !in_txn && let Some(kv_cmd) = kv_fast_path::try_parse_kv(query) {
+        if !in_txn
+            && !rls_active
+            && let Some(kv_cmd) = kv_fast_path::try_parse_kv(query)
+        {
             let result = kv_fast_path::execute_kv_command(&kv_cmd, self.executor.kv_store());
             // A KV write must be durable before it is acked — this path bypasses
             // execute()'s commit-time force, so force here (no-op under
@@ -1335,6 +1415,7 @@ impl SimpleQueryHandler for NucleusHandler {
 
         // ── SQL OLTP fast path: intercept simple point queries/mutations ──
         if !in_txn
+            && !rls_active
             && let Some(sql_cmd) = kv_fast_path::try_parse_sql_fast_path(query)
             && let Some(result) = self.executor.execute_sql_fast_path(&sql_cmd).await
         {
@@ -1516,9 +1597,12 @@ impl ExtendedQueryHandler for NucleusHandler {
         let parsed_stmt = &portal.statement.statement;
         let session_id = self.session_id_from_client(client);
         let peer_addr_str = client.socket_addr().to_string();
+        let rls_active = self.executor.session_has_active_rls(session_id);
 
         // ── Large Objects fast path (extended query) ────────────────────
-        if let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, &parsed_stmt.sql) {
+        if !rls_active
+            && let Some(lo_result) = self.try_handle_large_object(&peer_addr_str, &parsed_stmt.sql)
+        {
             self.flush_pending_notifications(client).await?;
             return Self::build_response(lo_result, Some(&portal.result_column_format));
         }
@@ -3350,6 +3434,32 @@ mod tests {
         let b = auth.get_password(&login).await.unwrap();
         assert_eq!(a.salt(), b.salt());
         assert_eq!(a.password(), b.password());
+    }
+
+    #[tokio::test]
+    async fn catalog_auth_uses_each_login_roles_persistable_scram_verifier() {
+        let executor = make_executor();
+        executor
+            .execute("CREATE ROLE alice LOGIN PASSWORD 'alice-secret'")
+            .await
+            .unwrap();
+        let auth = CatalogAuthenticator {
+            executor: executor.clone(),
+        };
+        let login = LoginInfo::new(Some("alice"), None, "127.0.0.1".into());
+        let password = auth.get_password(&login).await.unwrap();
+        let salt = password.salt().expect("catalog SCRAM verifier has a salt");
+        assert_eq!(
+            password.password(),
+            gen_salted_password("alice-secret", salt, SCRAM_ITERATIONS)
+        );
+
+        let no_login = LoginInfo::new(Some("missing"), None, "127.0.0.1".into());
+        assert!(auth.get_password(&no_login).await.is_err());
+        let handler = NucleusHandler::with_catalog_auth(executor);
+        assert_eq!(handler.auth_method(), AuthMethod::ScramSha256);
+        assert!(handler.catalog_authenticator.is_some());
+        assert!(handler.scram_auth.is_some());
     }
 
     #[tokio::test]

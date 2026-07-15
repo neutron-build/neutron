@@ -232,7 +232,9 @@ impl Executor {
         new: &str,
         meta: TableEngineMeta,
     ) -> Result<(), ExecError> {
-        use crate::columnar::{MergeStrategy, register_replacing_table, unregister_replacing_table};
+        use crate::columnar::{
+            MergeStrategy, register_replacing_table, unregister_replacing_table,
+        };
 
         // Open a fresh engine under the new name and copy the rows across.
         let old_engine = self.storage_for(old);
@@ -263,11 +265,15 @@ impl Executor {
                             .order_by
                             .iter()
                             .filter_map(|name| {
-                                def.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
+                                def.columns
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case(name))
                             })
                             .collect();
                         let ver_idx = meta.version_column.as_ref().and_then(|name| {
-                            def.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
+                            def.columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(name))
                         });
                         register_replacing_table(new, pk_idx, ver_idx);
                     }
@@ -753,6 +759,12 @@ impl Executor {
                                 .retain(|_, entry| entry.table_name != table_name);
                             // Clean up view dependency tracking
                             self.view_deps.write().remove(&table_name);
+                            {
+                                let mut security = self.security.write();
+                                security.rls.drop_table(&table_name);
+                                security.masking.drop_table(&table_name);
+                            }
+                            self.bump_policy_gen();
                             // Clean up zone map stats
                             {
                                 let mut hasher = DefaultHasher::new();
@@ -1217,6 +1229,7 @@ impl Executor {
         &self,
         truncate: ast::Truncate,
     ) -> Result<ExecResult, ExecError> {
+        self.require_security_admin("truncate tables")?;
         for target in &truncate.table_names {
             let table_name = target.name.to_string();
             // Route to the table's actual engine (T0.3): a columnar/mergetree/lsm
@@ -1283,6 +1296,23 @@ impl Executor {
 
         for op in &alter_table.operations {
             match op {
+                ast::AlterTableOperation::EnableRowLevelSecurity => {
+                    self.require_security_admin("enable row level security")?;
+                    self.with_mutable_security(|security| security.rls.enable_rls(&table_name))?;
+                    self.bump_policy_gen();
+                }
+                ast::AlterTableOperation::DisableRowLevelSecurity => {
+                    self.require_security_admin("disable row level security")?;
+                    self.with_mutable_security(|security| security.rls.disable_rls(&table_name))?;
+                    self.bump_policy_gen();
+                }
+                // Nucleus never grants table-owner bypass. FORCE/NO FORCE are
+                // accepted for PostgreSQL compatibility but do not weaken the
+                // superuser/BYPASSRLS-only bypass rule.
+                ast::AlterTableOperation::ForceRowLevelSecurity
+                | ast::AlterTableOperation::NoForceRowLevelSecurity => {
+                    self.require_security_admin("change row level security enforcement")?;
+                }
                 ast::AlterTableOperation::RenameTable {
                     table_name: new_name,
                 } => {
@@ -1337,6 +1367,12 @@ impl Executor {
                         self.table_columns.write().insert(new.clone(), col_info);
                     }
                     self.table_columns.write().remove(&table_name);
+                    {
+                        let mut security = self.security.write();
+                        security.rls.rename_table(&table_name, &new);
+                        security.masking.rename_table(&table_name, &new);
+                    }
+                    self.bump_policy_gen();
                 }
                 ast::AlterTableOperation::AddColumn {
                     column_keyword: _,

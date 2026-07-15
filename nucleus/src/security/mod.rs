@@ -11,17 +11,23 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 // ============================================================================
 // Session context
 // ============================================================================
 
 /// Session context for policy evaluation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionContext {
     pub user: String,
     pub roles: Vec<String>,
     pub tenant_id: Option<String>,
     pub properties: HashMap<String, String>,
+    /// Set only from catalog-backed role attributes. Never derived from a
+    /// client-writable setting.
+    #[serde(default)]
+    pub bypass_rls: bool,
 }
 
 impl SessionContext {
@@ -31,6 +37,7 @@ impl SessionContext {
             roles: Vec::new(),
             tenant_id: None,
             properties: HashMap::new(),
+            bypass_rls: false,
         }
     }
 
@@ -49,6 +56,11 @@ impl SessionContext {
         self
     }
 
+    pub fn with_bypass_rls(mut self, bypass_rls: bool) -> Self {
+        self.bypass_rls = bypass_rls;
+        self
+    }
+
     pub fn has_role(&self, role: &str) -> bool {
         self.roles.iter().any(|r| r == role)
     }
@@ -59,7 +71,7 @@ impl SessionContext {
 // ============================================================================
 
 /// The operation type a policy applies to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyCommand {
     Select,
     Insert,
@@ -69,7 +81,7 @@ pub enum PolicyCommand {
 }
 
 /// A predicate that can be evaluated against a row.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RlsPredicate {
     /// Column must equal a constant string value.
     ColumnEqStr { column: String, value: String },
@@ -83,6 +95,8 @@ pub enum RlsPredicate {
     And(Box<RlsPredicate>, Box<RlsPredicate>),
     /// OR of two predicates.
     Or(Box<RlsPredicate>, Box<RlsPredicate>),
+    /// Negation of a predicate.
+    Not(Box<RlsPredicate>),
     /// Always true (permissive default).
     AlwaysTrue,
     /// Always false (restrictive default).
@@ -105,6 +119,7 @@ impl RlsPredicate {
             RlsPredicate::HasRole { role } => ctx.has_role(role),
             RlsPredicate::And(a, b) => a.evaluate(row, ctx) && b.evaluate(row, ctx),
             RlsPredicate::Or(a, b) => a.evaluate(row, ctx) || b.evaluate(row, ctx),
+            RlsPredicate::Not(p) => !p.evaluate(row, ctx),
             RlsPredicate::AlwaysTrue => true,
             RlsPredicate::AlwaysFalse => false,
         }
@@ -112,7 +127,7 @@ impl RlsPredicate {
 }
 
 /// A row-level security policy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RlsPolicy {
     pub name: String,
     pub table: String,
@@ -121,22 +136,21 @@ pub struct RlsPolicy {
     pub target_roles: Vec<String>,
     /// The predicate that must be true for a row to be visible/writable.
     pub predicate: RlsPredicate,
+    /// Predicate applied to the new row for INSERT/UPDATE. When omitted,
+    /// PostgreSQL semantics reuse `predicate`.
+    #[serde(default)]
+    pub check_predicate: Option<RlsPredicate>,
     /// Whether this is a permissive or restrictive policy.
     pub permissive: bool,
 }
 
 /// Row-level security engine.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RlsEngine {
     /// table_name → list of policies
     policies: HashMap<String, Vec<RlsPolicy>>,
     /// Tables with RLS enabled.
     enabled_tables: std::collections::HashSet<String>,
-}
-
-impl Default for RlsEngine {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl RlsEngine {
@@ -155,6 +169,23 @@ impl RlsEngine {
     /// Disable RLS on a table.
     pub fn disable_rls(&mut self, table: &str) {
         self.enabled_tables.remove(table);
+    }
+
+    pub fn rename_table(&mut self, old: &str, new: &str) {
+        if self.enabled_tables.remove(old) {
+            self.enabled_tables.insert(new.to_string());
+        }
+        if let Some(mut policies) = self.policies.remove(old) {
+            for policy in &mut policies {
+                policy.table = new.to_string();
+            }
+            self.policies.insert(new.to_string(), policies);
+        }
+    }
+
+    pub fn drop_table(&mut self, table: &str) {
+        self.enabled_tables.remove(table);
+        self.policies.remove(table);
     }
 
     /// Check if RLS is enabled on a table.
@@ -185,6 +216,13 @@ impl RlsEngine {
             .push(policy);
     }
 
+    /// Return a policy by table/name.
+    pub fn policy(&self, table: &str, name: &str) -> Option<&RlsPolicy> {
+        self.policies
+            .get(table)
+            .and_then(|policies| policies.iter().find(|p| p.name == name))
+    }
+
     /// Remove a policy by name and table.
     pub fn remove_policy(&mut self, table: &str, name: &str) -> bool {
         if let Some(policies) = self.policies.get_mut(table) {
@@ -206,7 +244,7 @@ impl RlsEngine {
         ctx: &SessionContext,
     ) -> bool {
         // Superuser bypasses RLS
-        if ctx.has_role("superuser") {
+        if ctx.bypass_rls || ctx.has_role("superuser") {
             return true;
         }
 
@@ -217,7 +255,7 @@ impl RlsEngine {
 
         let policies = match self.policies.get(table) {
             Some(p) => p,
-            None => return true, // No policies = allow all
+            None => return false, // RLS enabled with no policies = default deny
         };
 
         // Filter applicable policies
@@ -228,7 +266,9 @@ impl RlsEngine {
                 (p.command == command || p.command == PolicyCommand::All)
                 // Role match (empty = all roles)
                 && (p.target_roles.is_empty()
-                    || p.target_roles.iter().any(|r| ctx.has_role(r)))
+                    || p.target_roles
+                        .iter()
+                        .any(|r| r.eq_ignore_ascii_case("public") || ctx.has_role(r)))
             })
             .collect();
 
@@ -242,15 +282,58 @@ impl RlsEngine {
         let restrictive: Vec<&&RlsPolicy> = applicable.iter().filter(|p| !p.permissive).collect();
 
         // If there are permissive policies, at least one must allow
-        let permissive_pass = if permissive.is_empty() {
-            true // No permissive policies = pass by default
-        } else {
-            permissive.iter().any(|p| p.predicate.evaluate(row, ctx))
-        };
+        // At least one permissive policy is required. Restrictive policies can
+        // narrow access, but can never grant it by themselves.
+        let permissive_pass = permissive.iter().any(|p| p.predicate.evaluate(row, ctx));
 
         // All restrictive policies must allow
         let restrictive_pass = restrictive.iter().all(|p| p.predicate.evaluate(row, ctx));
 
+        permissive_pass && restrictive_pass
+    }
+
+    /// Check a proposed INSERT/UPDATE row using WITH CHECK semantics.
+    pub fn check_new_row(
+        &self,
+        table: &str,
+        command: PolicyCommand,
+        row: &HashMap<String, String>,
+        ctx: &SessionContext,
+    ) -> bool {
+        if ctx.bypass_rls || ctx.has_role("superuser") {
+            return true;
+        }
+        if !self.is_enabled(table) {
+            return true;
+        }
+        let Some(policies) = self.policies.get(table) else {
+            return false;
+        };
+        let applicable: Vec<&RlsPolicy> = policies
+            .iter()
+            .filter(|p| {
+                (p.command == command || p.command == PolicyCommand::All)
+                    && (p.target_roles.is_empty()
+                        || p.target_roles
+                            .iter()
+                            .any(|r| r.eq_ignore_ascii_case("public") || ctx.has_role(r)))
+            })
+            .collect();
+        if applicable.is_empty() {
+            return false;
+        }
+        let permissive_pass = applicable.iter().filter(|p| p.permissive).any(|p| {
+            p.check_predicate
+                .as_ref()
+                .unwrap_or(&p.predicate)
+                .evaluate(row, ctx)
+        });
+        let restrictive_pass = applicable.iter().filter(|p| !p.permissive).all(|p| {
+            p.check_predicate
+                .as_ref()
+                .unwrap_or(&p.predicate)
+                .evaluate(row, ctx)
+        });
         permissive_pass && restrictive_pass
     }
 
@@ -275,7 +358,7 @@ impl RlsEngine {
 // ============================================================================
 
 /// How to mask a column's value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MaskingRule {
     /// Full redaction: replace with a constant.
     Redact(String),
@@ -347,7 +430,7 @@ impl MaskingRule {
 }
 
 /// A masking policy: which columns to mask for which roles.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaskingPolicy {
     pub table: String,
     pub column: String,
@@ -356,15 +439,10 @@ pub struct MaskingPolicy {
 }
 
 /// Data masking engine.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MaskingEngine {
     /// (table, column, role) → masking rule
     policies: Vec<MaskingPolicy>,
-}
-
-impl Default for MaskingEngine {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl MaskingEngine {
@@ -377,6 +455,29 @@ impl MaskingEngine {
     /// Add a masking policy.
     pub fn add_policy(&mut self, policy: MaskingPolicy) {
         self.policies.push(policy);
+    }
+
+    pub fn all_policies(&self) -> &[MaskingPolicy] {
+        &self.policies
+    }
+
+    pub fn remove_policy(&mut self, table: &str, column: &str, role: &str) -> bool {
+        let before = self.policies.len();
+        self.policies
+            .retain(|p| p.table != table || p.column != column || p.role != role);
+        before != self.policies.len()
+    }
+
+    pub fn rename_table(&mut self, old: &str, new: &str) {
+        for policy in &mut self.policies {
+            if policy.table == old {
+                policy.table = new.to_string();
+            }
+        }
+    }
+
+    pub fn drop_table(&mut self, table: &str) {
+        self.policies.retain(|policy| policy.table != table);
     }
 
     /// Get the masking rule for a specific table/column/role combination.
@@ -524,6 +625,15 @@ impl SecurityManager {
         Self {
             rls: RlsEngine::new(),
             masking: MaskingEngine::new(),
+            audit: AuditLog::new(),
+        }
+    }
+
+    /// Clone durable policy state without copying the append-only runtime audit log.
+    pub fn clone_policy_state(&self) -> Self {
+        Self {
+            rls: self.rls.clone(),
+            masking: self.masking.clone(),
             audit: AuditLog::new(),
         }
     }
@@ -867,6 +977,7 @@ mod tests {
             predicate: RlsPredicate::ColumnEqTenant {
                 column: "org_id".into(),
             },
+            check_predicate: None,
             permissive: true,
         });
 
@@ -889,6 +1000,7 @@ mod tests {
             command: PolicyCommand::All,
             target_roles: vec![],
             predicate: RlsPredicate::AlwaysFalse,
+            check_predicate: None,
             permissive: true,
         });
 
@@ -912,6 +1024,7 @@ mod tests {
             predicate: RlsPredicate::ColumnEqUser {
                 column: "owner".into(),
             },
+            check_predicate: None,
             permissive: true,
         });
 
@@ -925,6 +1038,7 @@ mod tests {
                 column: "status".into(),
                 value: "published".into(),
             },
+            check_predicate: None,
             permissive: false,
         });
 
@@ -955,6 +1069,7 @@ mod tests {
             predicate: RlsPredicate::ColumnEqTenant {
                 column: "tenant".into(),
             },
+            check_predicate: None,
             permissive: true,
         });
 
@@ -1083,6 +1198,7 @@ mod tests {
             predicate: RlsPredicate::ColumnEqTenant {
                 column: "org_id".into(),
             },
+            check_predicate: None,
             permissive: true,
         });
 

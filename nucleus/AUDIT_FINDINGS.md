@@ -164,9 +164,10 @@ is risky or the fix is a larger feature. Triaged honestly rather than rushed.
 - **RESP ZRANGE negative indices** (`resp/handler.rs`, high). `i64 as usize` turns `-1` into a
   huge index. Needs `col_zrange` to take `i64` + relative-index handling (signature ripple).
 - **Security: SessionContext never set to the authenticated user** (`executor/session.rs`,
-  high). RLS/masking always evaluate as user "nucleus"; the engines exist but are not wired
-  into scan paths against the real connection identity. This is a **feature-sized** gap, not
-  a one-liner — prominent follow-up.
+  high) — **RESOLVED IN THE T2.2 FOLLOW-UP.** Catalog-backed SCRAM identities now bind to each wire
+  session, role assumption is privilege checked and continuously revalidated, and RLS is enforced
+  through the policy-aware executor paths. Column masking remains explicitly unsupported at SQL
+  level; see `RLS_SECURITY.md`.
 - **document empty-JSONB containment returns nothing** (`document/mod.rs`, high) — should match
   all (GIN `query_contains` empty-query special case).
 - **vector HNSW filtered early-exit** (`vector/mod.rs`, high) — may return < k under a selective
@@ -311,20 +312,16 @@ convention where columns *are* named by stringified index).
   write sites and the read/verify site. (Control records already CRC'd their header.) WAL-format change
   — taken at this pre-release boundary (no frozen WAL format yet; nucleus binary deferred). Test:
   corrupting the page_id header field is now caught and the record dropped.
-- **RLS-to-authenticated-user wiring — DEFERRED SECURITY FEATURE (documented, not shipped).** The
-  `security` module has a complete, unit-tested RLS + column-masking engine (`RlsManager::filter_rows`,
-  `MaskingManager::mask_row`, `SessionContext` with user/role/tenant), but it is **entirely unwired**:
-  the Executor holds no RlsManager/MaskingManager, no scan path calls the enforcement functions, and
-  `Session::session_context` is hardcoded to `"nucleus"` (`#[allow(dead_code)]`). This is a missing
-  integration, not a one-line bug. Deliberately NOT half-wired — partial RLS enforcement is a security
-  liability (a missed read path leaks rows; an over-broad one breaks all queries). **Implementation
-  checklist for a dedicated, reviewed change:** (1) plumb the authenticated `username` from the wire
-  auth layer (`wire/mod.rs` has it) into `Session::session_context` on connect/reset; (2) give the
-  Executor an `RlsManager`/`MaskingManager` (DDL: CREATE POLICY / ALTER TABLE … ENABLE ROW LEVEL
-  SECURITY / column masking rules); (3) apply `filter_rows` + `mask_row` against the session context in
-  EVERY row-producing path — SELECT (plan + AST), joins, subqueries/CTEs, and the visibility scans of
-  UPDATE/DELETE/RETURNING — with superuser/`BYPASSRLS` handling; (4) adversarial tests for leakage
-  under joins/subqueries/aggregates and for masking precedence. Until then, RLS policies are inert.
+- **RLS-to-authenticated-user wiring — RESOLVED IN THE T2.2 FOLLOW-UP.** The implementation now has
+  catalog-backed SCRAM login roles, immutable per-connection authenticated identity, authorized
+  `SET ROLE`, transactional `CREATE/DROP POLICY` plus `ALTER TABLE … ENABLE/DISABLE ROW LEVEL
+  SECURITY`, durable policy metadata, and fail-closed enforcement across relational reads/writes,
+  caches, COPY, wire shortcuts, cross-model SQL surfaces, CDC, and follower execution. Security DDL
+  is leader-ordered through Raft; principal-less follower write forwarding is rejected. Adversarial
+  tests cover joins, subqueries, aggregates, DML `WITH CHECK`, identity spoofing, cache separation,
+  lifecycle, transactions/savepoints, restart persistence, exports, and cross-model denial. Residual
+  side channels and the still-unimplemented column-masking SQL feature are documented in
+  `RLS_SECURITY.md`.
 
 ## Phase D — FIXED (deferred highs with signature ripple)
 

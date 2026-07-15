@@ -109,6 +109,7 @@ impl Executor {
             while row.len() < num_cols {
                 row.push(Value::Null);
             }
+            self.enforce_rls_new_row(&table_name, crate::security::PolicyCommand::Insert, &row)?;
             self.storage.insert(&table_name, row).await?;
             count += 1;
         }
@@ -140,7 +141,10 @@ impl Executor {
                 columns,
             } => {
                 let table_def = self.get_table(&table_name.to_string()).await?;
-                let all_rows = self.storage.scan(&table_name.to_string()).await?;
+                let table = table_name.to_string();
+                let all_rows = self.storage.scan(&table).await?;
+                let all_rows =
+                    self.rls_filter_rows(&table, crate::security::PolicyCommand::Select, all_rows);
 
                 let col_names: Vec<String> = if columns.is_empty() {
                     table_def.columns.iter().map(|c| c.name.clone()).collect()
