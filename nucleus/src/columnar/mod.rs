@@ -5826,8 +5826,16 @@ mod tests {
             let store = ColumnarStore::open(dir_path).unwrap();
             assert!(store.table_exists("raw"));
             assert!(store.table_exists("mt"));
-            assert_eq!(store.row_count("raw"), 50, "raw rows must survive checkpoint");
-            assert_eq!(store.row_count("mt"), 50, "MergeTree rows must survive checkpoint");
+            assert_eq!(
+                store.row_count("raw"),
+                50,
+                "raw rows must survive checkpoint"
+            );
+            assert_eq!(
+                store.row_count("mt"),
+                50,
+                "MergeTree rows must survive checkpoint"
+            );
         }
     }
 

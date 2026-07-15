@@ -2507,20 +2507,29 @@ fn deserialize_index_key(data: &[u8], col_type: &DataType) -> Option<Value> {
             let u = u64::from_be_bytes([
                 data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
             ]);
-            Some(int_value_for_type((u ^ 0x8000_0000_0000_0000) as i64, col_type))
+            Some(int_value_for_type(
+                (u ^ 0x8000_0000_0000_0000) as i64,
+                col_type,
+            ))
         }
         // Legacy Int32 (4-byte) key — never written by current code; decoded
         // defensively so a pre-canonicalization key can't silently drop a row.
         2 if data.len() >= 5 => {
             let u = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-            Some(int_value_for_type(((u ^ 0x8000_0000) as i32) as i64, col_type))
+            Some(int_value_for_type(
+                ((u ^ 0x8000_0000) as i32) as i64,
+                col_type,
+            ))
         }
         // Legacy Int64 (8-byte) key — likewise defensive.
         3 if data.len() >= 9 => {
             let u = u64::from_be_bytes([
                 data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
             ]);
-            Some(int_value_for_type((u ^ 0x8000_0000_0000_0000) as i64, col_type))
+            Some(int_value_for_type(
+                (u ^ 0x8000_0000_0000_0000) as i64,
+                col_type,
+            ))
         }
         4 if data.len() >= 9 => {
             let u = u64::from_be_bytes([

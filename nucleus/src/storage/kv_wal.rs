@@ -535,7 +535,8 @@ mod tests {
         assert!(wal.is_dirty());
         // The checkpoint fsyncs its snapshot atomically, so the WAL must read
         // clean afterward (its snapshot append is counted as covered).
-        wal.checkpoint(&[("a".into(), Value::Int64(1), None)]).unwrap();
+        wal.checkpoint(&[("a".into(), Value::Int64(1), None)])
+            .unwrap();
         assert!(
             !wal.is_dirty(),
             "checkpoint durably rewrote the log — nothing left to force"

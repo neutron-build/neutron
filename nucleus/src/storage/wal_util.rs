@@ -152,8 +152,8 @@ mod tests {
     /// rename never exposes one. This directly guards the fixed failure mode.
     #[test]
     fn concurrent_reader_never_sees_an_empty_live_file() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let path = tmp("concurrent");
         let _ = std::fs::remove_file(&path);

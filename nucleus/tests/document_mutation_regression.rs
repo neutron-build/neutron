@@ -36,12 +36,19 @@ async fn doc_update_replaces_in_place() {
     let id = scalar(&ex, r#"SELECT DOC_INSERT('{"name":"a","n":1}')"#).await;
 
     // Update by id — must preserve the id and replace the body.
-    let ok = scalar(&ex, &format!(r#"SELECT DOC_UPDATE({id}, '{{"name":"b","n":2}}')"#)).await;
+    let ok = scalar(
+        &ex,
+        &format!(r#"SELECT DOC_UPDATE({id}, '{{"name":"b","n":2}}')"#),
+    )
+    .await;
     assert_eq!(ok, "true");
 
     let got = scalar(&ex, &format!("SELECT DOC_GET({id})")).await;
     assert!(got.contains("\"b\""), "updated body not stored: {got}");
-    assert!(got.contains("\"n\":2") || got.contains("2"), "n not updated: {got}");
+    assert!(
+        got.contains("\"n\":2") || got.contains("2"),
+        "n not updated: {got}"
+    );
 
     // Count stays 1 (replace, not insert).
     assert_eq!(scalar(&ex, "SELECT DOC_COUNT()").await, "1");
@@ -62,10 +69,16 @@ async fn doc_delete_removes() {
     let id = scalar(&ex, r#"SELECT DOC_INSERT('{"k":1}')"#).await;
     assert_eq!(scalar(&ex, "SELECT DOC_COUNT()").await, "1");
 
-    assert_eq!(scalar(&ex, &format!("SELECT DOC_DELETE({id})")).await, "true");
+    assert_eq!(
+        scalar(&ex, &format!("SELECT DOC_DELETE({id})")).await,
+        "true"
+    );
     assert_eq!(scalar(&ex, "SELECT DOC_COUNT()").await, "0");
     // Second delete is a no-op.
-    assert_eq!(scalar(&ex, &format!("SELECT DOC_DELETE({id})")).await, "false");
+    assert_eq!(
+        scalar(&ex, &format!("SELECT DOC_DELETE({id})")).await,
+        "false"
+    );
     assert_eq!(scalar(&ex, &format!("SELECT DOC_GET({id})")).await, "NULL");
 }
 
@@ -84,5 +97,8 @@ async fn doc_functions_accept_text_encoded_ids() {
         scalar(&ex, &format!(r#"SELECT DOC_UPDATE('{id}', '{{"v":43}}')"#)).await,
         "true"
     );
-    assert_eq!(scalar(&ex, &format!("SELECT DOC_DELETE('{id}')")).await, "true");
+    assert_eq!(
+        scalar(&ex, &format!("SELECT DOC_DELETE('{id}')")).await,
+        "true"
+    );
 }

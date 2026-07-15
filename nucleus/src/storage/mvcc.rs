@@ -1312,13 +1312,13 @@ impl StorageEngine for MvccStorageAdapter {
         Ok(())
     }
 
-    fn store_table_schema(&self, table: &str, columns: &[(String, crate::types::DataType)]) {
+    fn store_table_schema(&self, table: &str, _columns: &[(String, crate::types::DataType)]) {
         // Re-log CreateTable with full schema so recovery can restore the catalog.
         if let Err(e) = wal_log!(
             self,
             MvccWalRecord::CreateTable {
                 name: table.to_string(),
-                columns: columns.to_vec(),
+                columns: _columns.to_vec(),
             }
         ) {
             tracing::error!("MVCC WAL failed to log schema for table {table}: {e}");
@@ -1452,7 +1452,7 @@ impl StorageEngine for MvccStorageAdapter {
         // One implicit transaction for the whole batch — avoids N auto-commit transactions.
         let n = rows.len() as i64;
         let (txn_id, _snap, auto) = self.current_or_auto();
-        let wal_txn_id = if auto { 0 } else { txn_id };
+        let _wal_txn_id = if auto { 0 } else { txn_id };
         let mut version_indices: Vec<usize> = Vec::with_capacity(rows.len());
         for row in &rows {
             let vidx = self
@@ -1473,7 +1473,7 @@ impl StorageEngine for MvccStorageAdapter {
                 self,
                 MvccWalRecord::Insert {
                     table: table.to_string(),
-                    txn_id: wal_txn_id,
+                    txn_id: _wal_txn_id,
                     version_idx: vidx as u32,
                     row: row.clone(),
                 }
@@ -2008,7 +2008,7 @@ impl StorageEngine for MvccStorageAdapter {
         sorted.dedup();
 
         let mut count = 0;
-        let wal_txn_id = if auto { 0 } else { txn_id };
+        let _wal_txn_id = if auto { 0 } else { txn_id };
         let mut written_indices = Vec::new();
         // (old_row, version_idx) of each deleted row, for auto-commit index removal.
         let mut deleted: Vec<(Arc<Row>, usize)> = Vec::new();
@@ -2031,7 +2031,7 @@ impl StorageEngine for MvccStorageAdapter {
                 self,
                 MvccWalRecord::Delete {
                     table: table.to_string(),
-                    txn_id: wal_txn_id,
+                    txn_id: _wal_txn_id,
                     version_idx: version_idx as u32,
                 }
             )?;
@@ -4376,7 +4376,7 @@ impl MvccStorageAdapter {
         // mutate each version directly so the write always lands on the row that
         // row-finding matched, never a re-scan position that could be the wrong row.
         let mut count = 0;
-        let wal_txn_id = if auto { 0 } else { txn_id };
+        let _wal_txn_id = if auto { 0 } else { txn_id };
         let mut written_indices = Vec::new();
         // (old_vidx, new_vidx, old_row, new_row) of each applied update, for
         // auto-commit incremental index maintenance.
@@ -4409,7 +4409,7 @@ impl MvccStorageAdapter {
                 self,
                 MvccWalRecord::Update {
                     table: table.to_string(),
-                    txn_id: wal_txn_id,
+                    txn_id: _wal_txn_id,
                     old_version_idx: *version_idx as u32,
                     new_version_idx: new_vidx as u32,
                     new_row: new_row.clone(),

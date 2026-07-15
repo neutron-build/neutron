@@ -645,7 +645,9 @@ async fn idle_in_transaction_sweep_releases_and_respects_activity() {
     );
 
     // Backdate last activity so the session looks abandoned, then sweep.
-    ex.get_session(sid).last_activity_ms.store(0, Ordering::Relaxed);
+    ex.get_session(sid)
+        .last_activity_ms
+        .store(0, Ordering::Relaxed);
     assert_eq!(
         ex.sweep_idle_in_transaction(1).await,
         1,
@@ -676,5 +678,8 @@ async fn idle_sweep_skips_executing_session() {
         0,
         "an executing session must never be swept"
     );
-    assert!(ex.session_in_transaction(sid), "transaction must remain open");
+    assert!(
+        ex.session_in_transaction(sid),
+        "transaction must remain open"
+    );
 }

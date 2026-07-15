@@ -11,9 +11,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
+#[cfg(feature = "server")]
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(feature = "server")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 
@@ -1510,6 +1513,7 @@ pub fn start_sweeper(store: Arc<KvStore>, interval_secs: u64) -> tokio::task::Jo
 // ============================================================================
 
 /// Current time as milliseconds since the Unix epoch.
+#[cfg(feature = "server")]
 fn epoch_ms_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1518,6 +1522,7 @@ fn epoch_ms_now() -> u64 {
 }
 
 /// Convert an `Instant` expiration to absolute epoch milliseconds.
+#[cfg(feature = "server")]
 fn instant_to_epoch_ms(t: Instant) -> u64 {
     let now_inst = Instant::now();
     let now_epoch = epoch_ms_now();
@@ -2354,6 +2359,7 @@ mod tests {
         assert!(!store.cexpire("missing", &Value::Text("x".into()), 60));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn wal_setnx_ttl_reopen_verify() {
         let dir = tempfile::tempdir().unwrap();
@@ -2371,6 +2377,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn wal_cdel_reopen_verify() {
         let dir = tempfile::tempdir().unwrap();
@@ -2387,6 +2394,7 @@ mod tests {
         assert_eq!(store2.get("other"), Some(Value::Text("keep".into())));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn wal_insert_reopen_verify() {
         let dir = tempfile::tempdir().unwrap();
@@ -2400,6 +2408,7 @@ mod tests {
         assert_eq!(store2.get("version"), Some(Value::Int64(1)));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn wal_delete_reopen_verify() {
         let dir = tempfile::tempdir().unwrap();
@@ -2414,6 +2423,7 @@ mod tests {
         assert_eq!(store2.get("b"), Some(Value::Int32(2)));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn wal_ttl_reopen_verify() {
         let dir = tempfile::tempdir().unwrap();
@@ -2430,6 +2440,7 @@ mod tests {
         assert!(ttl > 3500 && ttl <= 3600, "expected ~3600, got {}", ttl);
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn wal_checkpoint_truncates() {
         let dir = tempfile::tempdir().unwrap();
@@ -2452,6 +2463,7 @@ mod tests {
         assert_eq!(store2.get("k0"), Some(Value::Int64(0)));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn wal_corrupt_trailing_recovery() {
         let dir = tempfile::tempdir().unwrap();
@@ -2474,6 +2486,7 @@ mod tests {
         assert_eq!(store2.get("good"), Some(Value::Int32(42)));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn wal_incr_survives_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -2488,6 +2501,7 @@ mod tests {
         assert_eq!(store2.incr("counter").unwrap(), 4);
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn wal_empty_fresh_store() {
         let dir = tempfile::tempdir().unwrap();
@@ -2496,6 +2510,7 @@ mod tests {
         assert_eq!(store.get("anything"), None);
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn wal_pattern_matching_after_recovery() {
         let dir = tempfile::tempdir().unwrap();
@@ -2516,6 +2531,7 @@ mod tests {
     // Batch WAL / MSET tests
     // ========================================================================
 
+    #[cfg(feature = "server")]
     #[test]
     fn wal_mset_batch_replay() {
         let dir = tempfile::tempdir().unwrap();
@@ -2534,6 +2550,7 @@ mod tests {
         assert_eq!(store2.get("z"), Some(Value::Int32(30)));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn wal_mset_large_batch_replay() {
         let dir = tempfile::tempdir().unwrap();
@@ -2552,6 +2569,7 @@ mod tests {
         assert_eq!(store2.get("key_499"), Some(Value::Int64(499)));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn wal_mset_then_individual_ops() {
         let dir = tempfile::tempdir().unwrap();
@@ -2610,6 +2628,7 @@ mod tests {
         assert_eq!(store.keys("*").len(), 4);
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn bench_mset_vs_individual_set() {
         // This test verifies that batch mset (single WAL write) is faster
@@ -2862,6 +2881,7 @@ mod tests {
     // Cold tier (tiered storage) tests
     // ========================================================================
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_kv_cold_tier_basic() {
         let dir = tempfile::tempdir().unwrap();
@@ -2873,6 +2893,7 @@ mod tests {
         assert_eq!(store.get("hello"), Some(Value::Text("world".into())));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_kv_cold_eviction() {
         let dir = tempfile::tempdir().unwrap();
@@ -2893,6 +2914,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_kv_cold_promotion() {
         let dir = tempfile::tempdir().unwrap();
@@ -2914,6 +2936,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_kv_cold_del() {
         let dir = tempfile::tempdir().unwrap();
@@ -2932,6 +2955,7 @@ mod tests {
         assert!(!store.del("k0"), "second delete should return false");
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn test_kv_cold_persistence() {
         let dir = tempfile::tempdir().unwrap();

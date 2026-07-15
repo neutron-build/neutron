@@ -12,7 +12,6 @@ pub mod buffer;
 pub mod buffered_engine;
 #[cfg(feature = "server")]
 pub mod columnar_engine;
-#[cfg(feature = "server")]
 pub mod columnar_wal;
 pub mod compression;
 #[cfg(feature = "server")]
@@ -38,9 +37,8 @@ pub mod page;
 pub mod persistence;
 pub mod tuple;
 pub mod txn;
-pub(crate) mod wal_util;
-#[cfg(feature = "server")]
 pub mod wal;
+pub(crate) mod wal_util;
 
 use std::collections::{BTreeMap, HashMap};
 use tokio::sync::RwLock;

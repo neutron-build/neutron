@@ -3026,7 +3026,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.path().join("ts_gsync");
         let mut store = TimeSeriesStore::open(&dir_path, BucketSize::Hour).unwrap();
-        assert!(!store.wal_is_dirty(), "a fresh WAL has no un-fsynced appends");
+        assert!(
+            !store.wal_is_dirty(),
+            "a fresh WAL has no un-fsynced appends"
+        );
         store.insert(
             "s",
             DataPoint {

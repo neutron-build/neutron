@@ -201,9 +201,11 @@ pub struct Session {
     /// Wall-clock ms of the last command boundary on this session — updated when
     /// a command starts and completes. The idle-in-transaction sweep uses it to
     /// find sessions that have sat in an open transaction with no activity.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(super) last_activity_ms: AtomicU64,
     /// True while a command is executing on this session. The sweep skips
     /// executing sessions so a long-running query is never mistaken for idle.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(super) executing: AtomicBool,
 }
 
@@ -248,6 +250,7 @@ impl Session {
     }
 
     /// Mark a command as started on this session (idle tracking).
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(super) fn mark_command_start(&self) {
         self.executing.store(true, Ordering::Relaxed);
         self.last_activity_ms.store(now_millis(), Ordering::Relaxed);
@@ -256,6 +259,7 @@ impl Session {
     /// Mark the current command finished; the session becomes idle from now.
     /// Called from a drop guard so a cancelled (statement-timeout) future still
     /// clears the flag rather than leaving the session stuck "executing".
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(super) fn mark_command_end(&self) {
         self.last_activity_ms.store(now_millis(), Ordering::Relaxed);
         self.executing.store(false, Ordering::Relaxed);

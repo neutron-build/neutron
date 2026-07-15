@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+#[cfg(feature = "server")]
 use std::sync::Arc;
 
 use parking_lot::RwLock;
