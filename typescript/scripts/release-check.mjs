@@ -4,12 +4,20 @@ import * as path from "node:path";
 import process from "node:process";
 
 const frameworkPackageDir = resolveFrameworkPackageDir();
+const buildCommand = process.env.RELEASE_CHECK_SKIP_CODEX === "1"
+  ? ["pnpm", "--filter", "!codex", "-r", "build"]
+  : ["pnpm", "-r", "build"];
 
 const steps = [
   { label: "Naming checks", command: ["pnpm", "run", "ci:naming"] },
   { label: "Workspace graph checks", command: ["pnpm", "run", "ci:workspace"] },
   { label: "Mirror sync checks", command: ["pnpm", "run", "ci:mirror-sync"] },
-  { label: "Build packages", command: ["pnpm", "-r", "build"] },
+  {
+    label: process.env.RELEASE_CHECK_SKIP_CODEX === "1"
+      ? "Build packages (excluding private Codex demo)"
+      : "Build packages",
+    command: buildCommand,
+  },
   { label: "Framework tests", command: ["pnpm", "--dir", frameworkPackageDir, "test"] },
   { label: "Runtime compatibility smoke", command: ["pnpm", "run", "ci:runtime-compat"] },
   { label: "Deploy preset checks", command: ["pnpm", "run", "ci:deploy-presets"] },

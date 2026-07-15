@@ -127,6 +127,7 @@ mojo/specs/
 # Site build output (source is tracked, dist is not)
 typescript/apps/site/dist/
 typescript/apps/site/.neutron/
+typescript/apps/codex/.neutron/
 
 # Claude internal
 .claude/
