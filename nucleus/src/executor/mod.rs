@@ -1149,10 +1149,16 @@ impl Executor {
             };
             match definition.index_type {
                 crate::catalog::IndexType::Hnsw => {
+                    let pk_col = Self::integer_pk_col(&table_def);
                     let mut index = vector::HnswIndex::new(vector::HnswConfig::default());
                     for (row_id, row) in rows.iter().enumerate() {
                         if let Some(Value::Vector(value)) = row.get(column_index) {
-                            index.insert(row_id as u64, vector::Vector::new(value.clone()));
+                            // PK-keyed stable id so incremental maintenance and a
+                            // full rebuild agree on the posting id space.
+                            let id = pk_col
+                                .and_then(|pc| Self::stable_row_id(row, pc))
+                                .unwrap_or(row_id as u64);
+                            index.insert(id, vector::Vector::new(value.clone()));
                         }
                     }
                     vectors.push((
@@ -4446,7 +4452,7 @@ impl Executor {
 
     /// Try to use a vector index for ORDER BY VECTOR_DISTANCE(...) LIMIT k.
     /// Returns Some(reordered_rows) if optimization applied, None otherwise.
-    fn try_vector_index_scan(
+    async fn try_vector_index_scan(
         &self,
         ob: &ast::OrderBy,
         limit_clause: &Option<ast::LimitClause>,
@@ -4521,63 +4527,183 @@ impl Executor {
             _ => return None,
         };
 
-        // Find a vector index on this column
-        let vi = self.vector_indexes.read();
-        let mut best_entry: Option<&VectorIndexEntry> = None;
-        for entry in vi.values() {
-            if entry.column_name == col_name {
-                // Check that we have rows from this table
-                if col_meta.iter().any(|c| c.name == col_name) {
-                    best_entry = Some(entry);
+        // Locate the matching index (name + table + kind), then release the lock
+        // before any await so we never hold a sync guard across a suspension.
+        let (index_name, table_name, is_hnsw) = {
+            let vi = self.vector_indexes.read();
+            let mut found = None;
+            for (name, entry) in vi.iter() {
+                if entry.column_name == col_name && col_meta.iter().any(|c| c.name == col_name) {
+                    found = Some((
+                        name.clone(),
+                        entry.table_name.clone(),
+                        matches!(entry.kind, VectorIndexKind::Hnsw(_)),
+                    ));
                     break;
                 }
             }
-        }
-        let entry = best_entry?;
+            found?
+        };
 
-        // Build a set of valid row indices from the pre-filtered rows.
-        // This allows the vector index to skip rows that were eliminated
-        // by the WHERE clause, improving recall for filtered searches.
-        let valid_row_ids: std::collections::HashSet<u64> = (0..rows.len() as u64).collect();
+        // HNSW postings are keyed on the row's integer PK (when the table has
+        // one); IvfFlat and no-PK tables remain positional.
+        let pk_col = if is_hnsw {
+            self.catalog
+                .get_table(&table_name)
+                .await
+                .and_then(|td| Self::integer_pk_col(&td))
+        } else {
+            None
+        };
 
-        // Use the index to find top-k nearest neighbors, filtering to only
-        // return rows that passed the WHERE clause.
-        let result_ids: Vec<u64> = match &entry.kind {
-            VectorIndexKind::Hnsw(hnsw) => {
-                if valid_row_ids.len() < rows.len() || valid_row_ids.len() < hnsw.len() {
-                    // Filtered search: only return IDs present in valid rows
-                    let results = hnsw.search_filtered(&vector::Vector::new(query_vec), k, |id| {
-                        valid_row_ids.contains(&id)
-                    });
-                    results.into_iter().map(|(id, _)| id).collect()
-                } else {
-                    let results = hnsw.search(&vector::Vector::new(query_vec), k);
-                    results.into_iter().map(|(id, _)| id).collect()
-                }
+        let vi = self.vector_indexes.read();
+        let entry = vi.get(&index_name)?;
+        let query = vector::Vector::new(query_vec.clone());
+
+        let result_ids: Vec<u64> = if let Some(pc) = pk_col {
+            // Valid set = PK ids present in the pre-filtered (post-WHERE) rows.
+            // Using search_filtered unconditionally also excludes any stale index
+            // posting whose row is no longer in the current scan.
+            let valid_pks: std::collections::HashSet<u64> = rows
+                .iter()
+                .filter_map(|r| Self::stable_row_id(r, pc))
+                .collect();
+            match &entry.kind {
+                VectorIndexKind::Hnsw(hnsw) => hnsw
+                    .search_filtered(&query, k, |id| valid_pks.contains(&id))
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect(),
+                VectorIndexKind::IvfFlat(_) => return None,
             }
-            VectorIndexKind::IvfFlat(ivf) => {
-                if valid_row_ids.len() < rows.len() || valid_row_ids.len() < ivf.len() {
-                    let results = ivf
-                        .search_filtered(&query_vec, k, |id| valid_row_ids.contains(&(id as u64)));
-                    results.into_iter().map(|(id, _)| id as u64).collect()
-                } else {
-                    let results = ivf.search(&query_vec, k);
-                    results.into_iter().map(|(id, _)| id as u64).collect()
+        } else {
+            // Positional resolution (IvfFlat, or HNSW without an integer PK).
+            let valid_row_ids: std::collections::HashSet<u64> = (0..rows.len() as u64).collect();
+            match &entry.kind {
+                VectorIndexKind::Hnsw(hnsw) => {
+                    if valid_row_ids.len() < rows.len() || valid_row_ids.len() < hnsw.len() {
+                        hnsw.search_filtered(&query, k, |id| valid_row_ids.contains(&id))
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .collect()
+                    } else {
+                        hnsw.search(&query, k)
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .collect()
+                    }
+                }
+                VectorIndexKind::IvfFlat(ivf) => {
+                    if valid_row_ids.len() < rows.len() || valid_row_ids.len() < ivf.len() {
+                        ivf.search_filtered(&query_vec, k, |id| {
+                            valid_row_ids.contains(&(id as u64))
+                        })
+                        .into_iter()
+                        .map(|(id, _)| id as u64)
+                        .collect()
+                    } else {
+                        ivf.search(&query_vec, k)
+                            .into_iter()
+                            .map(|(id, _)| id as u64)
+                            .collect()
+                    }
                 }
             }
         };
 
-        // Reorder rows: return indexed rows in order of proximity
-        let reordered: Vec<Row> = result_ids
-            .iter()
-            .filter_map(|&id| rows.get(id as usize).cloned())
-            .collect();
+        // Reorder rows into proximity order.
+        let reordered: Vec<Row> = if let Some(pc) = pk_col {
+            let mut pk_to_row: std::collections::HashMap<u64, &Row> =
+                std::collections::HashMap::with_capacity(rows.len());
+            for r in rows {
+                if let Some(id) = Self::stable_row_id(r, pc) {
+                    pk_to_row.insert(id, r);
+                }
+            }
+            result_ids
+                .iter()
+                .filter_map(|id| pk_to_row.get(id).map(|r| (*r).clone()))
+                .collect()
+        } else {
+            result_ids
+                .iter()
+                .filter_map(|&id| rows.get(id as usize).cloned())
+                .collect()
+        };
 
         Some(reordered)
     }
 
+    /// Column index of a single-column integer PRIMARY KEY, or None. This is the
+    /// stable row identity used for incremental HNSW maintenance; None falls the
+    /// table back to positional full-rebuild maintenance.
+    pub(super) fn integer_pk_col(table_def: &TableDef) -> Option<usize> {
+        let pk = table_def.primary_key_columns()?;
+        if pk.len() != 1 {
+            return None;
+        }
+        let col_idx = table_def.column_index(&pk[0])?;
+        match table_def.columns.get(col_idx)?.data_type {
+            crate::types::DataType::Int32 | crate::types::DataType::Int64 => Some(col_idx),
+            _ => None,
+        }
+    }
+
+    /// Stable u64 posting id for a row: its integer PK bit-cast to u64. Int32
+    /// widens through i64 so it agrees with an equal Int64 PK of the same value.
+    pub(super) fn stable_row_id(row: &Row, pk_col: usize) -> Option<u64> {
+        match row.get(pk_col)? {
+            Value::Int32(n) => Some(*n as i64 as u64),
+            Value::Int64(n) => Some(*n as u64),
+            _ => None,
+        }
+    }
+
+    /// Whether DELETE/UPDATE on `table_name` may maintain derived indexes
+    /// incrementally (the PK-keyed vector hooks having already run) instead of a
+    /// full rebuild. Requires a single-column integer PK, autocommit (no active
+    /// explicit transaction), only HNSW vector indexes (IvfFlat postings are
+    /// positional), no encrypted index (positional postings), and no GIN index
+    /// (whose reader generation guard relies on the rebuild bumping it).
+    pub(super) async fn incremental_maintenance_eligible(
+        &self,
+        table_name: &str,
+        table_def: &TableDef,
+    ) -> bool {
+        if Self::integer_pk_col(table_def).is_none() {
+            return false;
+        }
+        if self.current_session().txn_state.read().await.active {
+            return false;
+        }
+        {
+            let vi = self.vector_indexes.read();
+            if vi
+                .values()
+                .any(|e| e.table_name == table_name && !matches!(e.kind, VectorIndexKind::Hnsw(_)))
+            {
+                return false;
+            }
+        }
+        if self
+            .encrypted_indexes
+            .read()
+            .values()
+            .any(|e| e.table_name == table_name)
+        {
+            return false;
+        }
+        !self
+            .catalog
+            .get_indexes(table_name)
+            .await
+            .iter()
+            .any(|i| matches!(i.index_type, crate::catalog::IndexType::Gin))
+    }
+
     /// Add a newly inserted row to any live vector indexes on the table.
     fn update_vector_indexes_on_insert(&self, table_name: &str, row: &Row, table_def: &TableDef) {
+        let pk_col = Self::integer_pk_col(table_def);
         let mut indexes = self.vector_indexes.write();
         // Collect WAL log entries to write after releasing the lock
         let mut wal_inserts: Vec<(String, u64, Vec<f32>)> = Vec::new();
@@ -4591,9 +4717,13 @@ impl Executor {
             {
                 match &mut entry.kind {
                     VectorIndexKind::Hnsw(hnsw) => {
-                        let row_id = hnsw.len() as u64;
-                        hnsw.insert(row_id, vector::Vector::new(v.clone()));
-                        wal_inserts.push((idx_name.clone(), row_id, v.clone()));
+                        // PK-keyed stable id when the table has an integer PK,
+                        // else fall back to a positional append id.
+                        let id = pk_col
+                            .and_then(|pc| Self::stable_row_id(row, pc))
+                            .unwrap_or_else(|| hnsw.len() as u64);
+                        hnsw.insert(id, vector::Vector::new(v.clone()));
+                        wal_inserts.push((idx_name.clone(), id, v.clone()));
                     }
                     VectorIndexKind::IvfFlat(ivf) => {
                         if ivf.is_trained() {
@@ -4657,8 +4787,17 @@ impl Executor {
         }
     }
 
-    /// Mark a row as deleted in any live vector indexes on the table.
-    fn remove_from_vector_indexes(&self, table_name: &str, row_position: usize) {
+    /// Mark a row as deleted in any live vector indexes on the table. HNSW keys
+    /// on the row's stable (PK) id when available; IvfFlat still keys on the
+    /// physical scan position.
+    fn remove_from_vector_indexes(
+        &self,
+        table_name: &str,
+        row: &Row,
+        row_position: usize,
+        table_def: &TableDef,
+    ) {
+        let pk_id = Self::integer_pk_col(table_def).and_then(|pc| Self::stable_row_id(row, pc));
         let mut indexes = self.vector_indexes.write();
         let mut wal_deletes: Vec<(String, u64)> = Vec::new();
         for (idx_name, entry) in indexes.iter_mut() {
@@ -4667,8 +4806,9 @@ impl Executor {
             }
             match &mut entry.kind {
                 VectorIndexKind::Hnsw(hnsw) => {
-                    hnsw.mark_deleted(row_position as u64);
-                    wal_deletes.push((idx_name.clone(), row_position as u64));
+                    let id = pk_id.unwrap_or(row_position as u64);
+                    hnsw.mark_deleted(id);
+                    wal_deletes.push((idx_name.clone(), id));
                 }
                 VectorIndexKind::IvfFlat(ivf) => {
                     ivf.mark_deleted(row_position);

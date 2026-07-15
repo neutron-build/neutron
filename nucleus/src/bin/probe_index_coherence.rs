@@ -162,6 +162,7 @@ fn run_lifecycle(
     iter: usize,
     ops: usize,
     use_hnsw: bool,
+    use_encrypted: bool,
     rng: &mut Rng,
     rep: &mut Report,
 ) {
@@ -200,7 +201,12 @@ fn run_lifecycle(
 
     stmt!("CREATE INDEX t_val ON t (val)".to_string());
     stmt!(format!("CREATE INDEX t_v ON t USING {idx_kind} (v)"));
-    stmt!("CREATE INDEX t_code ON t USING encrypted (code)".to_string());
+    // Omitting the encrypted index makes an HNSW + integer-PK table eligible for
+    // the incremental DELETE fast path, so those iterations exercise it with the
+    // exact btree/PK checks below.
+    if use_encrypted {
+        stmt!("CREATE INDEX t_code ON t USING encrypted (code)".to_string());
+    }
 
     for _ in 0..ops {
         // ---- mutate ----
@@ -253,7 +259,9 @@ fn run_lifecycle(
         check_btree(ex, engine, iter, &log, &model, rng, rep);
         check_pk_uniqueness(ex, engine, iter, &log, &model, rng, rep);
         check_vector(ex, engine, iter, &log, &model, rng, rep);
-        check_encrypted(ex, engine, iter, &log, &model, &recently_deleted, rng, rep);
+        if use_encrypted {
+            check_encrypted(ex, engine, iter, &log, &model, &recently_deleted, rng, rep);
+        }
     }
 
     let _ = exec(ex, "DROP TABLE t");
@@ -509,7 +517,19 @@ fn main_impl() {
             let storage = make_engine(engine, &catalog, &format!("{engine}_{iter}"));
             let ex = Arc::new(Executor::new(catalog, storage));
             let use_hnsw = iter % 2 == 0;
-            run_lifecycle(&ex, engine, iter, ops, use_hnsw, &mut rng, &mut rep);
+            // Skip the encrypted index on ~1/3 of iterations so HNSW + integer-PK
+            // tables become eligible for the incremental DELETE fast path.
+            let use_encrypted = iter % 3 != 0;
+            run_lifecycle(
+                &ex,
+                engine,
+                iter,
+                ops,
+                use_hnsw,
+                use_encrypted,
+                &mut rng,
+                &mut rep,
+            );
             total_ops += ops as u64;
         }
     }

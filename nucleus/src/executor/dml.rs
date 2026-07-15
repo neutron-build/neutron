@@ -2029,7 +2029,7 @@ impl Executor {
                         self.remove_from_encrypted_indexes(&table_name, old_row, *pos, &table_def);
                     }
                     if has_vector_indexes {
-                        self.remove_from_vector_indexes(&table_name, *pos);
+                        self.remove_from_vector_indexes(&table_name, old_row, *pos, &table_def);
                     }
                 }
                 if has_encrypted_indexes {
@@ -2083,6 +2083,11 @@ impl Executor {
         // Rebuild zone map stats — column values may have changed, making
         // min/max bounds stale. A bare clear would leave the map to be
         // partially repopulated by later INSERTs, under-representing survivors.
+        //
+        // UPDATE always takes the full-rebuild path: an in-place HNSW node
+        // overwrite (mark-deleted + re-insert under the same PK id) corrupts the
+        // graph, so a clean rebuild is required. Only DELETE (a pure tombstone)
+        // is safe to maintain incrementally.
         if count > 0 {
             self.rebuild_table_derived_state(&table_name).await;
         }
@@ -2294,7 +2299,7 @@ impl Executor {
                             );
                         }
                         if has_vec {
-                            self.remove_from_vector_indexes(&table_name, pos);
+                            self.remove_from_vector_indexes(&table_name, old_row, pos, &table_def);
                         }
                     }
                 }
@@ -2320,7 +2325,18 @@ impl Executor {
         // to be partially repopulated by later INSERTs, under-representing
         // surviving rows and causing valid rows to be wrongly pruned.
         if count > 0 {
-            self.rebuild_table_derived_state(&table_name).await;
+            if self
+                .incremental_maintenance_eligible(&table_name, &table_def)
+                .await
+            {
+                // Fast path: the PK-keyed vector hooks above already tombstoned
+                // the deleted rows in the HNSW index. Clear the zone map (O(1));
+                // its pruning path falls back to the row filter when empty.
+                self.zone_map_index
+                    .clear_table(table_name_to_id(&table_name));
+            } else {
+                self.rebuild_table_derived_state(&table_name).await;
+            }
         }
 
         // Fire AFTER DELETE row-level triggers for each deleted row
