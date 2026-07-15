@@ -8,8 +8,8 @@
 //! All methods are `pub(super)` so the main executor module can delegate to them,
 //! except for private helpers like `extract_append_only_option`.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -367,13 +367,251 @@ impl Executor {
     // DDL: CREATE TABLE, DROP TABLE
     // ========================================================================
 
+    /// Validate the structural requirements of every foreign key before it is
+    /// published in the catalog. Runtime row checks cannot make an FK sound if
+    /// its target is missing, type-incompatible, or not uniquely constrained.
+    async fn validate_foreign_key_definitions(
+        &self,
+        table_def: &TableDef,
+    ) -> Result<(), ExecError> {
+        use crate::catalog::TableConstraint;
+
+        for constraint in &table_def.constraints {
+            let TableConstraint::ForeignKey {
+                columns,
+                ref_table,
+                ref_columns,
+                ..
+            } = constraint
+            else {
+                continue;
+            };
+
+            if columns.is_empty() || columns.len() != ref_columns.len() {
+                return Err(ExecError::ConstraintViolation(format!(
+                    "foreign key on table \"{}\" must reference the same non-zero number of columns",
+                    table_def.name
+                )));
+            }
+
+            let referenced = if ref_table.eq_ignore_ascii_case(&table_def.name) {
+                table_def.clone()
+            } else {
+                (*self.get_table(ref_table).await?).clone()
+            };
+
+            for (local_name, referenced_name) in columns.iter().zip(ref_columns) {
+                let local_idx = table_def
+                    .column_index(local_name)
+                    .ok_or_else(|| ExecError::ColumnNotFound(local_name.clone()))?;
+                let referenced_idx = referenced
+                    .column_index(referenced_name)
+                    .ok_or_else(|| ExecError::ColumnNotFound(referenced_name.clone()))?;
+                let local_type = &table_def.columns[local_idx].data_type;
+                let referenced_type = &referenced.columns[referenced_idx].data_type;
+                if local_type != referenced_type {
+                    return Err(ExecError::ConstraintViolation(format!(
+                        "foreign key columns \"{}.{}\" and \"{}.{}\" have incompatible types {} and {}",
+                        table_def.name,
+                        local_name,
+                        referenced.name,
+                        referenced_name,
+                        local_type,
+                        referenced_type
+                    )));
+                }
+            }
+
+            let target_is_unique = referenced
+                .constraints
+                .iter()
+                .any(|candidate| match candidate {
+                    TableConstraint::PrimaryKey { columns, .. }
+                    | TableConstraint::Unique { columns, .. } => columns == ref_columns,
+                    _ => false,
+                });
+            if !target_is_unique {
+                return Err(ExecError::ConstraintViolation(format!(
+                    "there is no unique constraint matching referenced columns ({}) on table \"{}\"",
+                    ref_columns.join(", "),
+                    referenced.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_existing_unique_constraints(
+        &self,
+        table_name: &str,
+        table_def: &TableDef,
+        primary_key_columns: Option<&[String]>,
+    ) -> Result<(), ExecError> {
+        let rows = self.storage_for(table_name).scan(table_name).await?;
+        for (position, row) in rows.iter().enumerate() {
+            if let Some(columns) = primary_key_columns {
+                for column in columns {
+                    let index = table_def
+                        .column_index(column)
+                        .ok_or_else(|| ExecError::ColumnNotFound(column.clone()))?;
+                    if row
+                        .get(index)
+                        .is_none_or(|value| matches!(value, Value::Null))
+                    {
+                        return Err(ExecError::ConstraintViolation(format!(
+                            "column \"{column}\" contains null values and cannot be part of a primary key"
+                        )));
+                    }
+                }
+            }
+            self.check_unique_constraints(table_name, table_def, row, Some(position))
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn validate_constraint_names(table_def: &TableDef) -> Result<(), ExecError> {
+        let mut names = HashSet::new();
+        for constraint in &table_def.constraints {
+            let name = match constraint {
+                crate::catalog::TableConstraint::PrimaryKey { name, .. }
+                | crate::catalog::TableConstraint::Unique { name, .. }
+                | crate::catalog::TableConstraint::Check { name, .. }
+                | crate::catalog::TableConstraint::ForeignKey { name, .. } => name,
+            };
+            if let Some(name) = name
+                && !names.insert(name.to_lowercase())
+            {
+                return Err(ExecError::ConstraintViolation(format!(
+                    "constraint \"{name}\" for relation \"{}\" already exists",
+                    table_def.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_immediate_constraint_characteristics(
+        characteristics: Option<&ast::ConstraintCharacteristics>,
+    ) -> Result<(), ExecError> {
+        let Some(characteristics) = characteristics else {
+            return Ok(());
+        };
+        if characteristics.deferrable == Some(true)
+            || matches!(
+                characteristics.initially,
+                Some(ast::DeferrableInitial::Deferred)
+            )
+        {
+            return Err(ExecError::Unsupported(
+                "deferrable constraints are not supported; constraints are immediate".into(),
+            ));
+        }
+        if characteristics.enforced == Some(false) {
+            return Err(ExecError::Unsupported(
+                "NOT ENFORCED constraints are not supported".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn execute_create_table(
         &self,
         create: ast::CreateTable,
     ) -> Result<ExecResult, ExecError> {
         let table_name = create.name.to_string();
         let mut columns = sql::extract_columns(&create.columns)?;
-        let constraints = sql::extract_constraints(&create.columns, &create.constraints);
+        let mut constraints = sql::extract_constraints(&create.columns, &create.constraints);
+        let primary_key_declarations = create
+            .columns
+            .iter()
+            .flat_map(|column| &column.options)
+            .filter(|option| matches!(option.option, ast::ColumnOption::PrimaryKey(_)))
+            .count()
+            + create
+                .constraints
+                .iter()
+                .filter(|constraint| matches!(constraint, ast::TableConstraint::PrimaryKey(_)))
+                .count();
+        if primary_key_declarations > 1 {
+            return Err(ExecError::ConstraintViolation(
+                "multiple primary keys for table are not allowed".into(),
+            ));
+        }
+        for constraint in &create.constraints {
+            match constraint {
+                ast::TableConstraint::PrimaryKey(primary_key) => {
+                    Self::validate_immediate_constraint_characteristics(
+                        primary_key.characteristics.as_ref(),
+                    )?;
+                }
+                ast::TableConstraint::Unique(unique) => {
+                    Self::validate_immediate_constraint_characteristics(
+                        unique.characteristics.as_ref(),
+                    )?;
+                    if matches!(unique.nulls_distinct, ast::NullsDistinctOption::NotDistinct) {
+                        return Err(ExecError::Unsupported(
+                            "UNIQUE NULLS NOT DISTINCT is not supported".into(),
+                        ));
+                    }
+                }
+                ast::TableConstraint::ForeignKey(foreign_key) => {
+                    Self::validate_immediate_constraint_characteristics(
+                        foreign_key.characteristics.as_ref(),
+                    )?;
+                    if matches!(
+                        foreign_key.match_kind,
+                        Some(
+                            ast::ConstraintReferenceMatchKind::Full
+                                | ast::ConstraintReferenceMatchKind::Partial
+                        )
+                    ) {
+                        return Err(ExecError::Unsupported(
+                            "only MATCH SIMPLE foreign keys are supported".into(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for column in &create.columns {
+            for option in &column.options {
+                match &option.option {
+                    ast::ColumnOption::PrimaryKey(primary_key) => {
+                        Self::validate_immediate_constraint_characteristics(
+                            primary_key.characteristics.as_ref(),
+                        )?;
+                    }
+                    ast::ColumnOption::Unique(unique) => {
+                        Self::validate_immediate_constraint_characteristics(
+                            unique.characteristics.as_ref(),
+                        )?;
+                        if matches!(unique.nulls_distinct, ast::NullsDistinctOption::NotDistinct) {
+                            return Err(ExecError::Unsupported(
+                                "UNIQUE NULLS NOT DISTINCT is not supported".into(),
+                            ));
+                        }
+                    }
+                    ast::ColumnOption::ForeignKey(foreign_key) => {
+                        Self::validate_immediate_constraint_characteristics(
+                            foreign_key.characteristics.as_ref(),
+                        )?;
+                        if matches!(
+                            foreign_key.match_kind,
+                            Some(
+                                ast::ConstraintReferenceMatchKind::Full
+                                    | ast::ConstraintReferenceMatchKind::Partial
+                            )
+                        ) {
+                            return Err(ExecError::Unsupported(
+                                "only MATCH SIMPLE foreign keys are supported".into(),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // Check for WITH (append_only = true) and WITH (engine = '...') options.
         let append_only = Self::extract_append_only_option(&create.table_options);
@@ -405,6 +643,63 @@ impl Executor {
             }
         }
 
+        for (position, constraint) in constraints.iter_mut().enumerate() {
+            match constraint {
+                crate::catalog::TableConstraint::PrimaryKey { name, .. } => {
+                    name.get_or_insert_with(|| format!("{table_name}_pkey"));
+                }
+                crate::catalog::TableConstraint::Unique { name, columns } => {
+                    name.get_or_insert_with(|| format!("{}_{}_key", table_name, columns.join("_")));
+                }
+                crate::catalog::TableConstraint::Check { name, .. } => {
+                    name.get_or_insert_with(|| format!("{table_name}_check_{}", position + 1));
+                }
+                crate::catalog::TableConstraint::ForeignKey { name, columns, .. } => {
+                    name.get_or_insert_with(|| {
+                        format!("{}_{}_fkey", table_name, columns.join("_"))
+                    });
+                }
+            }
+        }
+
+        for constraint in &constraints {
+            match constraint {
+                crate::catalog::TableConstraint::PrimaryKey {
+                    name: _,
+                    columns: key_columns,
+                } => {
+                    if key_columns.is_empty() {
+                        return Err(ExecError::ConstraintViolation(
+                            "primary key must contain at least one column".into(),
+                        ));
+                    }
+                    for name in key_columns {
+                        let column = columns
+                            .iter_mut()
+                            .find(|column| column.name == *name)
+                            .ok_or_else(|| ExecError::ColumnNotFound(name.clone()))?;
+                        column.nullable = false;
+                    }
+                }
+                crate::catalog::TableConstraint::Unique {
+                    columns: key_columns,
+                    ..
+                } => {
+                    if key_columns.is_empty() {
+                        return Err(ExecError::ConstraintViolation(
+                            "unique constraint must contain at least one column".into(),
+                        ));
+                    }
+                    for name in key_columns {
+                        if !columns.iter().any(|column| column.name == *name) {
+                            return Err(ExecError::ColumnNotFound(name.clone()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let table_def = TableDef {
             name: table_name.clone(),
             columns,
@@ -415,6 +710,8 @@ impl Executor {
             // materialized, so a later drop+recreate is detectable on recovery.
             epoch: self.catalog.alloc_table_epoch(),
         };
+        Self::validate_constraint_names(&table_def)?;
+        self.validate_foreign_key_definitions(&table_def).await?;
 
         match self.catalog.create_table(table_def.clone()).await {
             Ok(()) => {
@@ -1608,10 +1905,14 @@ impl Executor {
                         .ok_or_else(|| ExecError::ColumnNotFound(column_name.value.clone()))?;
                     // Set when SetDataType changes the type: triggers a physical rewrite below.
                     let mut retype: Option<DataType> = None;
+                    let mut validate_not_null = false;
                     {
                         let col = &mut updated.columns[col_idx];
                         match op {
-                            ast::AlterColumnOperation::SetNotNull => col.nullable = false,
+                            ast::AlterColumnOperation::SetNotNull => {
+                                validate_not_null = true;
+                                col.nullable = false;
+                            }
                             ast::AlterColumnOperation::DropNotNull => col.nullable = true,
                             ast::AlterColumnOperation::SetDefault { value } => {
                                 col.default_expr = Some(value.to_string());
@@ -1633,6 +1934,18 @@ impl Executor {
                             }
                         }
                     }
+                    if validate_not_null {
+                        let rows = self.storage_for(&table_name).scan(&table_name).await?;
+                        if rows.iter().any(|row| {
+                            row.get(col_idx)
+                                .is_none_or(|value| matches!(value, Value::Null))
+                        }) {
+                            return Err(ExecError::ConstraintViolation(format!(
+                                "column \"{}\" contains null values",
+                                column_name.value
+                            )));
+                        }
+                    }
                     // ALTER COLUMN … TYPE: rewrite stored values so the physical
                     // representation matches the new declared type. Without this the
                     // catalog claims the new type while storage still holds the old
@@ -1641,6 +1954,33 @@ impl Executor {
                     // the stale type (silent catalog/storage divergence). A value that
                     // can't be cast to the new type aborts the ALTER with a clear error.
                     if let Some(new_type) = retype {
+                        let outgoing_reference = table_def.constraints.iter().any(|constraint| {
+                            matches!(
+                                constraint,
+                                crate::catalog::TableConstraint::ForeignKey { columns, .. }
+                                    if columns.iter().any(|name| name == &column_name.value)
+                            )
+                        });
+                        let incoming_reference =
+                            self.catalog.list_tables().await.iter().any(|table| {
+                                table.constraints.iter().any(|constraint| {
+                                matches!(
+                                    constraint,
+                                    crate::catalog::TableConstraint::ForeignKey {
+                                        ref_table,
+                                        ref_columns,
+                                        ..
+                                    } if ref_table.eq_ignore_ascii_case(&table_name)
+                                        && ref_columns.iter().any(|name| name == &column_name.value)
+                                )
+                            })
+                            });
+                        if outgoing_reference || incoming_reference {
+                            return Err(ExecError::ConstraintViolation(format!(
+                                "cannot alter type of column \"{}\" because a foreign key depends on it; drop the foreign key first",
+                                column_name.value
+                            )));
+                        }
                         let storage = self.storage_for(&table_name);
                         let rows = storage.scan_physical(&table_name).await?;
                         let mut rewrites = Vec::new();
@@ -1672,6 +2012,9 @@ impl Executor {
                     let mut updated = (*table_def).clone();
                     match constraint {
                         ast::TableConstraint::PrimaryKey(pk) => {
+                            Self::validate_immediate_constraint_characteristics(
+                                pk.characteristics.as_ref(),
+                            )?;
                             // Reject if there's already a PK.
                             if updated.constraints.iter().any(|c| {
                                 matches!(c, crate::catalog::TableConstraint::PrimaryKey { .. })
@@ -1694,8 +2037,25 @@ impl Executor {
                             updated
                                 .constraints
                                 .push(crate::catalog::TableConstraint::PrimaryKey {
+                                    name: Some(
+                                        pk.name
+                                            .as_ref()
+                                            .map(|name| name.to_string())
+                                            .unwrap_or_else(|| format!("{table_name}_pkey")),
+                                    ),
                                     columns: columns.clone(),
                                 });
+                            Self::validate_constraint_names(&updated)?;
+                            self.validate_existing_unique_constraints(
+                                &table_name,
+                                &updated,
+                                Some(&columns),
+                            )
+                            .await?;
+                            for column in &columns {
+                                let index = updated.column_index(column).expect("validated column");
+                                updated.columns[index].nullable = false;
+                            }
                             self.catalog.update_table(updated.clone()).await?;
                             // Create backing unique index.
                             if let Err(e) = self.create_implicit_unique_indexes(&updated).await {
@@ -1705,7 +2065,14 @@ impl Executor {
                             }
                         }
                         ast::TableConstraint::Unique(u) => {
-                            let constraint_name = u.name.as_ref().map(|n| n.to_string());
+                            Self::validate_immediate_constraint_characteristics(
+                                u.characteristics.as_ref(),
+                            )?;
+                            if matches!(u.nulls_distinct, ast::NullsDistinctOption::NotDistinct) {
+                                return Err(ExecError::Unsupported(
+                                    "UNIQUE NULLS NOT DISTINCT is not supported".into(),
+                                ));
+                            }
                             let columns: Vec<String> = u
                                 .columns
                                 .iter()
@@ -1720,9 +2087,19 @@ impl Executor {
                             updated
                                 .constraints
                                 .push(crate::catalog::TableConstraint::Unique {
-                                    name: constraint_name,
+                                    name: Some(
+                                        u.name
+                                            .as_ref()
+                                            .map(|name| name.to_string())
+                                            .unwrap_or_else(|| {
+                                                format!("{}_{}_key", table_name, columns.join("_"))
+                                            }),
+                                    ),
                                     columns: columns.clone(),
                                 });
+                            Self::validate_constraint_names(&updated)?;
+                            self.validate_existing_unique_constraints(&table_name, &updated, None)
+                                .await?;
                             self.catalog.update_table(updated.clone()).await?;
                             // Create backing unique index.
                             if let Err(e) = self.create_implicit_unique_indexes(&updated).await {
@@ -1732,7 +2109,12 @@ impl Executor {
                             }
                         }
                         ast::TableConstraint::Check(ck) => {
-                            let constraint_name = ck.name.as_ref().map(|n| n.to_string());
+                            let constraint_name = Some(
+                                ck.name
+                                    .as_ref()
+                                    .map(|name| name.to_string())
+                                    .unwrap_or_else(|| format!("{table_name}_check")),
+                            );
                             let expr_str = ck.expr.to_string();
                             // Validate that existing rows satisfy the check constraint before adding it.
                             // Build a temporary table def with the new constraint to reuse check_check_constraints.
@@ -1748,9 +2130,24 @@ impl Executor {
                                 self.check_check_constraints(&tmp_def, row)?;
                             }
                             updated.constraints.push(check_constraint);
+                            Self::validate_constraint_names(&updated)?;
                             self.catalog.update_table(updated).await?;
                         }
                         ast::TableConstraint::ForeignKey(fk) => {
+                            Self::validate_immediate_constraint_characteristics(
+                                fk.characteristics.as_ref(),
+                            )?;
+                            if matches!(
+                                fk.match_kind,
+                                Some(
+                                    ast::ConstraintReferenceMatchKind::Full
+                                        | ast::ConstraintReferenceMatchKind::Partial
+                                )
+                            ) {
+                                return Err(ExecError::Unsupported(
+                                    "only MATCH SIMPLE foreign keys are supported".into(),
+                                ));
+                            }
                             let constraint_name = fk.name.as_ref().map(|n| n.to_string());
                             let columns: Vec<String> =
                                 fk.columns.iter().map(|c| c.value.clone()).collect();
@@ -1769,13 +2166,22 @@ impl Executor {
                             updated
                                 .constraints
                                 .push(crate::catalog::TableConstraint::ForeignKey {
-                                    name: constraint_name,
+                                    name: Some(constraint_name.unwrap_or_else(|| {
+                                        format!("{}_{}_fkey", table_name, columns.join("_"))
+                                    })),
                                     columns,
                                     ref_table,
                                     ref_columns,
                                     on_delete: sql::convert_fk_action(&fk.on_delete),
                                     on_update: sql::convert_fk_action(&fk.on_update),
                                 });
+                            Self::validate_constraint_names(&updated)?;
+                            self.validate_foreign_key_definitions(&updated).await?;
+                            let existing_rows =
+                                self.storage_for(&table_name).scan(&table_name).await?;
+                            for row in &existing_rows {
+                                self.check_fk_constraints(&updated, row).await?;
+                            }
                             self.catalog.update_table(updated).await?;
                         }
                         _ => {
@@ -1787,15 +2193,58 @@ impl Executor {
                 }
                 // ── DROP CONSTRAINT ────────────────────────────────────────────
                 ast::AlterTableOperation::DropConstraint {
-                    name, if_exists, ..
+                    name,
+                    if_exists,
+                    drop_behavior,
                 } => {
+                    if matches!(drop_behavior, Some(ast::DropBehavior::Cascade)) {
+                        return Err(ExecError::Unsupported(
+                            "DROP CONSTRAINT CASCADE is not supported; drop dependent foreign keys explicitly"
+                                .into(),
+                        ));
+                    }
                     let constraint_name = name.to_string();
                     let mut updated = (*table_def).clone();
                     let original_len = updated.constraints.len();
+                    let removed_unique_columns =
+                        updated
+                            .constraints
+                            .iter()
+                            .find_map(|constraint| match constraint {
+                                crate::catalog::TableConstraint::PrimaryKey { name, columns }
+                                | crate::catalog::TableConstraint::Unique { name, columns }
+                                    if name.as_deref() == Some(constraint_name.as_str()) =>
+                                {
+                                    Some(columns.clone())
+                                }
+                                _ => None,
+                            });
+                    if let Some(columns) = &removed_unique_columns {
+                        let dependent = self.catalog.list_tables().await.into_iter().any(|table| {
+                            table.constraints.iter().any(|constraint| {
+                                matches!(
+                                    constraint,
+                                    crate::catalog::TableConstraint::ForeignKey {
+                                        ref_table,
+                                        ref_columns,
+                                        ..
+                                    } if ref_table.eq_ignore_ascii_case(&table_name)
+                                        && ref_columns == columns
+                                )
+                            })
+                        });
+                        if dependent {
+                            return Err(ExecError::ConstraintViolation(format!(
+                                "cannot drop constraint \"{constraint_name}\" because foreign keys depend on it"
+                            )));
+                        }
+                    }
                     // Find and remove the constraint by name.
                     updated.constraints.retain(|c| {
                         let cname = match c {
-                            crate::catalog::TableConstraint::PrimaryKey { .. } => None,
+                            crate::catalog::TableConstraint::PrimaryKey { name, .. } => {
+                                name.as_deref()
+                            }
                             crate::catalog::TableConstraint::Unique { name, .. } => name.as_deref(),
                             crate::catalog::TableConstraint::Check { name, .. } => name.as_deref(),
                             crate::catalog::TableConstraint::ForeignKey { name, .. } => {

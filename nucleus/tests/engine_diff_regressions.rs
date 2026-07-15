@@ -18,6 +18,47 @@ async fn rows(ex: &Executor, sql: &str) -> Vec<Vec<Value>> {
     }
 }
 
+#[tokio::test]
+async fn immediate_constraints_and_cascades_match_across_engines() {
+    let engines: Vec<(&str, Arc<dyn StorageEngine>)> = vec![
+        ("mvcc", Arc::new(MvccStorageAdapter::new())),
+        ("memory", Arc::new(MemoryEngine::new())),
+        ("lsm", Arc::new(LsmStorageEngine::new())),
+        ("columnar", Arc::new(ColumnarStorageEngine::new())),
+    ];
+    for (name, storage) in engines {
+        let e = ex(storage);
+        e.execute("CREATE TABLE constraint_parent (id INT PRIMARY KEY)")
+            .await
+            .unwrap();
+        e.execute(
+            "CREATE TABLE constraint_child (id INT PRIMARY KEY, pid INT REFERENCES constraint_parent(id) ON DELETE CASCADE)",
+        )
+        .await
+        .unwrap();
+        e.execute("INSERT INTO constraint_parent VALUES (1), (2)")
+            .await
+            .unwrap();
+        e.execute("INSERT INTO constraint_child VALUES (10, 1), (20, 2)")
+            .await
+            .unwrap();
+        assert!(
+            e.execute("INSERT INTO constraint_child VALUES (30, 999)")
+                .await
+                .is_err(),
+            "{name}: orphan insert must reject"
+        );
+        e.execute("DELETE FROM constraint_parent WHERE id = 1")
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&e, "SELECT id, pid FROM constraint_child ORDER BY id").await,
+            vec![vec![Value::Int32(20), Value::Int32(2)]],
+            "{name}: cascade result"
+        );
+    }
+}
+
 /// Baseline: the default (Mvcc) and Memory engines return integer GROUP BY keys
 /// as integers in numeric order.
 #[tokio::test]

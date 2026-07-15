@@ -588,7 +588,7 @@ impl Executor {
                         .constraints
                         .iter()
                         .filter_map(|c| match c {
-                            TableConstraint::PrimaryKey { columns }
+                            TableConstraint::PrimaryKey { columns, .. }
                             | TableConstraint::Unique { columns, .. } => {
                                 let idxs: Vec<usize> = columns
                                     .iter()
@@ -791,7 +791,7 @@ impl Executor {
 
         for constraint in &table_def.constraints {
             match constraint {
-                TableConstraint::PrimaryKey { columns }
+                TableConstraint::PrimaryKey { columns, .. }
                 | TableConstraint::Unique { columns, .. } => {
                     let indices: Vec<usize> = columns
                         .iter()
@@ -1024,6 +1024,19 @@ impl Executor {
         table_def: &TableDef,
         new_row: &Row,
     ) -> Result<(), ExecError> {
+        self.check_fk_constraints_except(table_def, new_row, None)
+            .await
+    }
+
+    /// Check all foreign keys except the one currently being maintained by an
+    /// `ON UPDATE CASCADE`. The new parent key is not visible until the parent
+    /// update is applied, but every unrelated foreign key must still be checked.
+    async fn check_fk_constraints_except(
+        &self,
+        table_def: &TableDef,
+        new_row: &Row,
+        skip: Option<(&str, &[String], &[String])>,
+    ) -> Result<(), ExecError> {
         use crate::catalog::TableConstraint;
 
         for constraint in &table_def.constraints {
@@ -1034,6 +1047,13 @@ impl Executor {
                 ..
             } = constraint
             {
+                if skip.is_some_and(|(skip_table, skip_columns, skip_ref_columns)| {
+                    ref_table == skip_table
+                        && columns == skip_columns
+                        && ref_columns == skip_ref_columns
+                }) {
+                    continue;
+                }
                 // Resolve column indices in the source table
                 let col_indices: Vec<usize> = columns
                     .iter()
@@ -1083,6 +1103,26 @@ impl Executor {
         Ok(())
     }
 
+    /// Validate the complete child-row constraint envelope before applying an
+    /// implicit foreign-key action. Cascades are writes, so they must not bypass
+    /// NOT NULL, CHECK, ENUM, UNIQUE, or unrelated foreign keys.
+    async fn enforce_fk_action_constraints(
+        &self,
+        child_table: &str,
+        child_table_def: &TableDef,
+        row: &Row,
+        old_position: usize,
+        skip_cascaded_fk: Option<(&str, &[String], &[String])>,
+    ) -> Result<(), ExecError> {
+        Self::check_not_null_constraints(child_table_def, row)?;
+        self.check_check_constraints(child_table_def, row)?;
+        self.check_enum_constraints(child_table_def, row).await?;
+        self.check_fk_constraints_except(child_table_def, row, skip_cascaded_fk)
+            .await?;
+        self.check_unique_constraints(child_table, child_table_def, row, Some(old_position))
+            .await
+    }
+
     /// Enforce FK actions on child tables when a parent table is mutated (DELETE or UPDATE).
     ///
     /// For DELETE: `deleted_rows` contains the rows being deleted from the parent.
@@ -1095,6 +1135,7 @@ impl Executor {
         deleted_rows: &'a [Row],
         new_parent_rows: Option<&'a [(Row, Row)]>, // (old_row, new_row) pairs for UPDATE
         depth: usize,
+        apply: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ExecError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -1222,6 +1263,14 @@ impl Executor {
                                                 crate::security::PolicyCommand::Update,
                                                 &updated_row,
                                             )?;
+                                            self.enforce_fk_action_constraints(
+                                                child_table,
+                                                child_table_def,
+                                                &updated_row,
+                                                pos,
+                                                Some((parent_table, columns, ref_columns)),
+                                            )
+                                            .await?;
                                             updates.push((pos, updated_row));
                                         }
                                         // Recursively check if this child table is also a parent
@@ -1231,14 +1280,17 @@ impl Executor {
                                                 (child_rows[*pos].clone(), new.clone())
                                             })
                                             .collect();
-                                        child_storage.update(child_table, &updates).await?;
                                         self.enforce_fk_on_parent_mutation(
                                             child_table,
                                             &[],
                                             Some(&cascade_pairs),
                                             depth + 1,
+                                            apply,
                                         )
                                         .await?;
+                                        if apply {
+                                            child_storage.update(child_table, &updates).await?;
+                                        }
                                     }
                                     FkAction::SetNull => {
                                         let mut updates = Vec::new();
@@ -1261,9 +1313,33 @@ impl Executor {
                                                 crate::security::PolicyCommand::Update,
                                                 &updated_row,
                                             )?;
+                                            self.enforce_fk_action_constraints(
+                                                child_table,
+                                                child_table_def,
+                                                &updated_row,
+                                                pos,
+                                                None,
+                                            )
+                                            .await?;
                                             updates.push((pos, updated_row));
                                         }
-                                        child_storage.update(child_table, &updates).await?;
+                                        let action_pairs: Vec<(Row, Row)> = updates
+                                            .iter()
+                                            .map(|(pos, new)| {
+                                                (child_rows[*pos].clone(), new.clone())
+                                            })
+                                            .collect();
+                                        self.enforce_fk_on_parent_mutation(
+                                            child_table,
+                                            &[],
+                                            Some(&action_pairs),
+                                            depth + 1,
+                                            apply,
+                                        )
+                                        .await?;
+                                        if apply {
+                                            child_storage.update(child_table, &updates).await?;
+                                        }
                                     }
                                     FkAction::SetDefault => {
                                         let mut updates = Vec::new();
@@ -1289,9 +1365,55 @@ impl Executor {
                                                 crate::security::PolicyCommand::Update,
                                                 &updated_row,
                                             )?;
+                                            let retains_old_key = child_col_indices
+                                                .iter()
+                                                .zip(old_vals.iter())
+                                                .all(|(&index, value)| {
+                                                    updated_row.get(index) == Some(*value)
+                                                });
+                                            if retains_old_key {
+                                                return Err(ExecError::ConstraintViolation(
+                                                    "ON UPDATE SET DEFAULT would retain the old referenced key"
+                                                        .into(),
+                                                ));
+                                            }
+                                            let references_pending_new_key = child_col_indices
+                                                .iter()
+                                                .zip(new_vals.iter())
+                                                .all(|(&index, value)| {
+                                                    updated_row.get(index) == Some(*value)
+                                                });
+                                            self.enforce_fk_action_constraints(
+                                                child_table,
+                                                child_table_def,
+                                                &updated_row,
+                                                pos,
+                                                references_pending_new_key.then_some((
+                                                    parent_table,
+                                                    columns,
+                                                    ref_columns,
+                                                )),
+                                            )
+                                            .await?;
                                             updates.push((pos, updated_row));
                                         }
-                                        child_storage.update(child_table, &updates).await?;
+                                        let action_pairs: Vec<(Row, Row)> = updates
+                                            .iter()
+                                            .map(|(pos, new)| {
+                                                (child_rows[*pos].clone(), new.clone())
+                                            })
+                                            .collect();
+                                        self.enforce_fk_on_parent_mutation(
+                                            child_table,
+                                            &[],
+                                            Some(&action_pairs),
+                                            depth + 1,
+                                            apply,
+                                        )
+                                        .await?;
+                                        if apply {
+                                            child_storage.update(child_table, &updates).await?;
+                                        }
                                     }
                                 }
                             }
@@ -1326,6 +1448,27 @@ impl Executor {
                                     continue;
                                 }
 
+                                if matches!(action, FkAction::SetDefault) {
+                                    let defaults: Result<Vec<Value>, ExecError> = child_col_indices
+                                        .iter()
+                                        .map(|&index| {
+                                            self.eval_column_default(
+                                                &child_table_def.columns[index],
+                                            )
+                                        })
+                                        .collect();
+                                    if defaults?
+                                        .iter()
+                                        .zip(parent_vals.iter())
+                                        .all(|(default, parent)| default == *parent)
+                                    {
+                                        return Err(ExecError::ConstraintViolation(
+                                            "ON DELETE SET DEFAULT would retain the deleted referenced key"
+                                                .into(),
+                                        ));
+                                    }
+                                }
+
                                 match action {
                                     FkAction::Restrict | FkAction::NoAction => {
                                         return Err(ExecError::ConstraintViolation(format!(
@@ -1355,11 +1498,26 @@ impl Executor {
                                             &rows_to_delete,
                                             None,
                                             depth + 1,
+                                            apply,
                                         )
                                         .await?;
-                                        child_storage
-                                            .delete(child_table, &matching_positions)
-                                            .await?;
+                                        if apply {
+                                            let current_rows =
+                                                child_storage.scan(child_table).await?;
+                                            let current_positions: Vec<usize> = current_rows
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(_, row)| {
+                                                    rows_to_delete
+                                                        .iter()
+                                                        .any(|target| target == *row)
+                                                })
+                                                .map(|(position, _)| position)
+                                                .collect();
+                                            child_storage
+                                                .delete(child_table, &current_positions)
+                                                .await?;
+                                        }
                                     }
                                     FkAction::SetNull => {
                                         let mut updates = Vec::new();
@@ -1382,9 +1540,33 @@ impl Executor {
                                                 crate::security::PolicyCommand::Update,
                                                 &updated_row,
                                             )?;
+                                            self.enforce_fk_action_constraints(
+                                                child_table,
+                                                child_table_def,
+                                                &updated_row,
+                                                pos,
+                                                None,
+                                            )
+                                            .await?;
                                             updates.push((pos, updated_row));
                                         }
-                                        child_storage.update(child_table, &updates).await?;
+                                        let action_pairs: Vec<(Row, Row)> = updates
+                                            .iter()
+                                            .map(|(pos, new)| {
+                                                (child_rows[*pos].clone(), new.clone())
+                                            })
+                                            .collect();
+                                        self.enforce_fk_on_parent_mutation(
+                                            child_table,
+                                            &[],
+                                            Some(&action_pairs),
+                                            depth + 1,
+                                            apply,
+                                        )
+                                        .await?;
+                                        if apply {
+                                            child_storage.update(child_table, &updates).await?;
+                                        }
                                     }
                                     FkAction::SetDefault => {
                                         let mut updates = Vec::new();
@@ -1410,9 +1592,33 @@ impl Executor {
                                                 crate::security::PolicyCommand::Update,
                                                 &updated_row,
                                             )?;
+                                            self.enforce_fk_action_constraints(
+                                                child_table,
+                                                child_table_def,
+                                                &updated_row,
+                                                pos,
+                                                None,
+                                            )
+                                            .await?;
                                             updates.push((pos, updated_row));
                                         }
-                                        child_storage.update(child_table, &updates).await?;
+                                        let action_pairs: Vec<(Row, Row)> = updates
+                                            .iter()
+                                            .map(|(pos, new)| {
+                                                (child_rows[*pos].clone(), new.clone())
+                                            })
+                                            .collect();
+                                        self.enforce_fk_on_parent_mutation(
+                                            child_table,
+                                            &[],
+                                            Some(&action_pairs),
+                                            depth + 1,
+                                            apply,
+                                        )
+                                        .await?;
+                                        if apply {
+                                            child_storage.update(child_table, &updates).await?;
+                                        }
                                     }
                                 }
                             }
@@ -1591,7 +1797,7 @@ impl Executor {
         let mut has_check_constraints = false;
         for constraint in &table_def.constraints {
             match constraint {
-                crate::catalog::TableConstraint::PrimaryKey { columns }
+                crate::catalog::TableConstraint::PrimaryKey { columns, .. }
                 | crate::catalog::TableConstraint::Unique { columns, .. } => {
                     if columns
                         .iter()
@@ -1748,7 +1954,9 @@ impl Executor {
                         .map(|old| ((*old).clone(), new_row.clone()))
                 })
                 .collect();
-            self.enforce_fk_on_parent_mutation(&table_name, &[], Some(&update_pairs), 0)
+            self.enforce_fk_on_parent_mutation(&table_name, &[], Some(&update_pairs), 0, false)
+                .await?;
+            self.enforce_fk_on_parent_mutation(&table_name, &[], Some(&update_pairs), 0, true)
                 .await?;
         }
 
@@ -1785,7 +1993,7 @@ impl Executor {
                     .constraints
                     .iter()
                     .filter_map(|c| match c {
-                        TableConstraint::PrimaryKey { columns }
+                        TableConstraint::PrimaryKey { columns, .. }
                         | TableConstraint::Unique { columns, .. } => {
                             let idxs: Vec<usize> = columns
                                 .iter()
@@ -1993,7 +2201,9 @@ impl Executor {
             .map(|(_, row)| row.clone())
             .collect();
         if !deleted_rows.is_empty() {
-            self.enforce_fk_on_parent_mutation(&table_name, &deleted_rows, None, 0)
+            self.enforce_fk_on_parent_mutation(&table_name, &deleted_rows, None, 0, false)
+                .await?;
+            self.enforce_fk_on_parent_mutation(&table_name, &deleted_rows, None, 0, true)
                 .await?;
         }
 
@@ -2032,9 +2242,18 @@ impl Executor {
             }
         }
 
+        let current_rows = self
+            .storage_for(&table_name)
+            .scan_physical(&table_name)
+            .await?;
+        let current_positions: Vec<usize> = current_rows
+            .iter()
+            .filter(|(_, row)| deleted_rows.iter().any(|target| target == row))
+            .map(|(position, _)| *position)
+            .collect();
         let count = self
             .storage_for(&table_name)
-            .delete(&table_name, &positions)
+            .delete(&table_name, &current_positions)
             .await?;
 
         // Rebuild zone map stats — row positions have shifted after delete, so
@@ -2128,7 +2347,7 @@ impl Executor {
             };
             // Check if this column is a single-column PK or UNIQUE
             let is_pk_or_unique = table_def.constraints.iter().any(|c| match c {
-                crate::catalog::TableConstraint::PrimaryKey { columns }
+                crate::catalog::TableConstraint::PrimaryKey { columns, .. }
                 | crate::catalog::TableConstraint::Unique { columns, .. } => {
                     columns.len() == 1 && columns[0].eq_ignore_ascii_case(&col_name)
                 }

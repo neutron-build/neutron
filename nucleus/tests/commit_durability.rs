@@ -199,6 +199,56 @@ async fn explicit_transaction_commit_is_durable() {
     );
 }
 
+#[tokio::test]
+async fn foreign_key_constraints_and_cascades_survive_crash_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let (ex, _buf) = boot(&data).await;
+
+    exec(&ex, "CREATE TABLE durable_fk_parent (id INT PRIMARY KEY)").await;
+    exec(
+        &ex,
+        "CREATE TABLE durable_fk_child (id INT PRIMARY KEY, pid INT REFERENCES durable_fk_parent(id) ON DELETE CASCADE)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO durable_fk_parent VALUES (1)").await;
+    exec(&ex, "INSERT INTO durable_fk_child VALUES (10, 1)").await;
+
+    let crash_one = tmp.path().join("crash-one");
+    copy_dir(&data, &crash_one);
+    drop(ex);
+
+    let (reopened, _buf) = boot(&crash_one).await;
+    assert!(
+        reopened
+            .execute("INSERT INTO durable_fk_child VALUES (20, 999)")
+            .await
+            .is_err(),
+        "the restored catalog must still enforce the foreign key"
+    );
+    exec(&reopened, "DELETE FROM durable_fk_parent WHERE id = 1").await;
+    assert_eq!(
+        count_of(&rows(&reopened, "SELECT COUNT(*) FROM durable_fk_child").await),
+        0,
+        "the restored ON DELETE CASCADE action must execute"
+    );
+
+    let crash_two = tmp.path().join("crash-two");
+    copy_dir(&crash_one, &crash_two);
+    drop(reopened);
+
+    let (reopened_again, _) = boot(&crash_two).await;
+    assert_eq!(
+        count_of(&rows(&reopened_again, "SELECT COUNT(*) FROM durable_fk_parent").await),
+        0
+    );
+    assert_eq!(
+        count_of(&rows(&reopened_again, "SELECT COUNT(*) FROM durable_fk_child").await),
+        0,
+        "the committed parent/cascade delete must recover atomically"
+    );
+}
+
 // ── MergeTree tables (per-table columnar engine + engines.json) ─────────────
 
 #[tokio::test]
