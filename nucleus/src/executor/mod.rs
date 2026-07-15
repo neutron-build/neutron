@@ -537,23 +537,41 @@ impl Executor {
             let vec_dir = dir.join("vector");
             std::fs::create_dir_all(&vec_dir).ok();
             if let Ok((wal, state)) = vector::VectorWal::open(&vec_dir) {
-                // Load table/column metadata from sidecar JSON
+                // Load table/column/pk metadata from sidecar JSON. New format is
+                // a (table, column, pk_column) triple; fall back to the old
+                // (table, column) pair (which had no pk_column) for compatibility.
                 let meta_path = vec_dir.join("index_meta.json");
-                let meta: HashMap<String, (String, String)> = std::fs::read_to_string(&meta_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
+                let raw = std::fs::read_to_string(&meta_path).ok();
+                let meta: HashMap<String, (String, String, String)> = raw
+                    .as_ref()
+                    .and_then(|s| {
+                        serde_json::from_str::<HashMap<String, (String, String, String)>>(s).ok()
+                    })
+                    .or_else(|| {
+                        raw.as_ref()
+                            .and_then(|s| {
+                                serde_json::from_str::<HashMap<String, (String, String)>>(s).ok()
+                            })
+                            .map(|old| {
+                                old.into_iter()
+                                    .map(|(k, (t, c))| (k, (t, c, String::new())))
+                                    .collect()
+                            })
+                    })
                     .unwrap_or_default();
 
                 // Restore recovered indexes
                 for (index_name, recovered) in state.indexes {
-                    let (table_name, column_name) =
+                    let (table_name, column_name, pk_col_name) =
                         meta.get(&index_name).cloned().unwrap_or_default();
+                    let pk_column = (!pk_col_name.is_empty()).then_some(pk_col_name);
                     exec.vector_indexes.write().insert(
                         index_name,
                         VectorIndexEntry {
                             table_name,
                             column_name,
                             kind: VectorIndexKind::Hnsw(recovered.hnsw),
+                            pk_column,
                         },
                     );
                 }
@@ -887,6 +905,7 @@ impl Executor {
                             table_name: idx.table_name.clone(),
                             column_name: col_name,
                             kind: VectorIndexKind::IvfFlat(ivf),
+                            pk_column: None,
                         },
                     );
                     tracing::info!(
@@ -1149,7 +1168,8 @@ impl Executor {
             };
             match definition.index_type {
                 crate::catalog::IndexType::Hnsw => {
-                    let pk_col = self.pk_col_for_incremental(&table_def);
+                    let pk_column = self.resolve_pk_column(table_name, &table_def);
+                    let pk_col = pk_column.as_ref().and_then(|n| table_def.column_index(n));
                     let mut index = vector::HnswIndex::new(vector::HnswConfig::default());
                     for (row_id, row) in rows.iter().enumerate() {
                         if let Some(Value::Vector(value)) = row.get(column_index) {
@@ -1167,6 +1187,7 @@ impl Executor {
                             table_name: table_name.to_string(),
                             column_name,
                             kind: VectorIndexKind::Hnsw(index),
+                            pk_column,
                         },
                     ));
                 }
@@ -1203,6 +1224,7 @@ impl Executor {
                             table_name: table_name.to_string(),
                             column_name,
                             kind: VectorIndexKind::IvfFlat(index),
+                            pk_column: None,
                         },
                     ));
                 }
@@ -4452,7 +4474,7 @@ impl Executor {
 
     /// Try to use a vector index for ORDER BY VECTOR_DISTANCE(...) LIMIT k.
     /// Returns Some(reordered_rows) if optimization applied, None otherwise.
-    async fn try_vector_index_scan(
+    fn try_vector_index_scan(
         &self,
         ob: &ast::OrderBy,
         limit_clause: &Option<ast::LimitClause>,
@@ -4527,38 +4549,27 @@ impl Executor {
             _ => return None,
         };
 
-        // Locate the matching index (name + table + kind), then release the lock
-        // before any await so we never hold a sync guard across a suspension.
-        let (index_name, table_name, is_hnsw) = {
-            let vi = self.vector_indexes.read();
-            let mut found = None;
-            for (name, entry) in vi.iter() {
-                if entry.column_name == col_name && col_meta.iter().any(|c| c.name == col_name) {
-                    found = Some((
-                        name.clone(),
-                        entry.table_name.clone(),
-                        matches!(entry.kind, VectorIndexKind::Hnsw(_)),
-                    ));
-                    break;
-                }
-            }
-            found?
-        };
-
-        // HNSW postings are keyed on the row's integer PK (when the table has one
-        // and the index is not durable — see pk_col_for_incremental); IvfFlat,
-        // no-PK, and durable indexes remain positional.
-        let pk_col = if is_hnsw && self.vector_wal.is_none() {
-            self.catalog
-                .get_table(&table_name)
-                .await
-                .and_then(|td| Self::integer_pk_col(&td))
-        } else {
-            None
-        };
-
+        // Resolution is fully synchronous. HNSW postings are keyed on the PK
+        // column recorded on the index entry (recovery-safe: persisted in the
+        // sidecar, independent of the live catalog's constraints) and located in
+        // the scanned rows via col_meta. IvfFlat and no-PK indexes stay positional.
         let vi = self.vector_indexes.read();
-        let entry = vi.get(&index_name)?;
+        let mut found: Option<(&VectorIndexEntry, Option<usize>)> = None;
+        for entry in vi.values() {
+            if entry.column_name == col_name && col_meta.iter().any(|c| c.name == col_name) {
+                let pk_col = if matches!(entry.kind, VectorIndexKind::Hnsw(_)) {
+                    entry
+                        .pk_column
+                        .as_ref()
+                        .and_then(|n| col_meta.iter().position(|c| &c.name == n))
+                } else {
+                    None
+                };
+                found = Some((entry, pk_col));
+                break;
+            }
+        }
+        let (entry, pk_col) = found?;
         let query = vector::Vector::new(query_vec.clone());
 
         let result_ids: Vec<u64> = if let Some(pc) = pk_col {
@@ -4650,17 +4661,37 @@ impl Executor {
         }
     }
 
-    /// The integer-PK column to use for PK-keyed HNSW maintenance, but only when
-    /// it is durability-safe. A durable index persists its postings in the vector
-    /// WAL and recovers before the catalog's PK constraint does, so PK-keyed
-    /// postings would meet a positional resolve after a reopen. Gating on the
-    /// absence of a vector WAL keeps durable indexes on the proven positional
-    /// full-rebuild path while in-memory indexes get the incremental fast path.
-    pub(super) fn pk_col_for_incremental(&self, table_def: &TableDef) -> Option<usize> {
-        if self.vector_wal.is_some() {
-            return None;
+    /// The PK column NAME an HNSW index on `table_name` keys its postings on,
+    /// resolved independently of the live catalog. Prefers the catalog PK
+    /// (authoritative when constraints are present); falls back to a live index
+    /// entry's persisted `pk_column`, which survives a reopen even when the
+    /// recovered catalog has dropped its PK constraint. This is what makes the
+    /// PK-keyed fast path recovery-safe on the durable path.
+    pub(super) fn resolve_pk_column(
+        &self,
+        table_name: &str,
+        table_def: &TableDef,
+    ) -> Option<String> {
+        if let Some(i) = Self::integer_pk_col(table_def) {
+            return table_def.columns.get(i).map(|c| c.name.clone());
         }
-        Self::integer_pk_col(table_def)
+        self.vector_indexes
+            .read()
+            .values()
+            .find(|e| e.table_name == table_name && e.pk_column.is_some())
+            .and_then(|e| e.pk_column.clone())
+    }
+
+    /// The PK column INDEX for incremental maintenance on `table_name`, or None
+    /// for positional. Resolves the PK column name (recovery-safe) then maps it
+    /// to a position in the current schema.
+    pub(super) fn pk_col_for_incremental(
+        &self,
+        table_name: &str,
+        table_def: &TableDef,
+    ) -> Option<usize> {
+        let name = self.resolve_pk_column(table_name, table_def)?;
+        table_def.column_index(&name)
     }
 
     /// Stable u64 posting id for a row: its integer PK bit-cast to u64. Int32
@@ -4684,9 +4715,9 @@ impl Executor {
         table_name: &str,
         table_def: &TableDef,
     ) -> bool {
-        // Also excludes durable indexes (pk_col_for_incremental returns None when
-        // a vector WAL is present), which stay on the full-rebuild path.
-        if self.pk_col_for_incremental(table_def).is_none() {
+        // Requires a PK-keyed HNSW index. resolve_pk_column is recovery-safe
+        // (falls back to the persisted pk_column), so durable indexes qualify.
+        if self.pk_col_for_incremental(table_name, table_def).is_none() {
             return false;
         }
         if self.current_session().txn_state.read().await.active {
@@ -4719,7 +4750,7 @@ impl Executor {
 
     /// Add a newly inserted row to any live vector indexes on the table.
     fn update_vector_indexes_on_insert(&self, table_name: &str, row: &Row, table_def: &TableDef) {
-        let pk_col = self.pk_col_for_incremental(table_def);
+        let pk_col = self.pk_col_for_incremental(table_name, table_def);
         let mut indexes = self.vector_indexes.write();
         // Collect WAL log entries to write after releasing the lock
         let mut wal_inserts: Vec<(String, u64, Vec<f32>)> = Vec::new();
@@ -4762,12 +4793,16 @@ impl Executor {
             return;
         }
         let indexes = self.vector_indexes.read();
-        let meta: HashMap<&str, (&str, &str)> = indexes
+        let meta: HashMap<&str, (&str, &str, &str)> = indexes
             .iter()
             .map(|(name, entry)| {
                 (
                     name.as_str(),
-                    (entry.table_name.as_str(), entry.column_name.as_str()),
+                    (
+                        entry.table_name.as_str(),
+                        entry.column_name.as_str(),
+                        entry.pk_column.as_deref().unwrap_or(""),
+                    ),
                 )
             })
             .collect();
@@ -4814,7 +4849,7 @@ impl Executor {
         table_def: &TableDef,
     ) {
         let pk_id = self
-            .pk_col_for_incremental(table_def)
+            .pk_col_for_incremental(table_name, table_def)
             .and_then(|pc| Self::stable_row_id(row, pc));
         let mut indexes = self.vector_indexes.write();
         let mut wal_deletes: Vec<(String, u64)> = Vec::new();

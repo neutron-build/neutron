@@ -68,6 +68,12 @@ pub(crate) struct VectorIndexEntry {
     pub table_name: String,
     pub column_name: String,
     pub kind: VectorIndexKind,
+    /// Name of the integer PRIMARY KEY column this index's postings are keyed on
+    /// (HNSW only), or None for positional keying. Persisted in the vector index
+    /// sidecar so PK-keying survives a reopen even when the recovered catalog has
+    /// dropped its PK constraint — the source of truth for resolution, not the
+    /// live catalog.
+    pub pk_column: Option<String>,
 }
 
 /// A live encrypted index for a specific column.
