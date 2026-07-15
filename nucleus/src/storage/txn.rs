@@ -279,6 +279,11 @@ pub struct TransactionManager {
     next_txn_id: AtomicU64,
     /// Active transactions.
     active: Mutex<HashSet<u64>>,
+    /// Oldest visibility horizon retained by each active transaction. This is
+    /// not always the transaction's own id: a snapshot can retain an earlier,
+    /// concurrently committing transaction after that transaction leaves
+    /// `active`.
+    active_snapshot_xmins: Mutex<HashMap<u64, u64>>,
     /// Committed transaction IDs (kept for visibility checks).
     committed: Mutex<HashSet<u64>>,
     /// Aborted transaction IDs (not GC'd — kept until row versions are vacuumed).
@@ -320,6 +325,7 @@ impl TransactionManager {
         Self {
             next_txn_id: AtomicU64::new(2), // 1 is reserved for bootstrap
             active: Mutex::new(HashSet::new()),
+            active_snapshot_xmins: Mutex::new(HashMap::new()),
             committed: Mutex::new(HashSet::new()),
             aborted: Mutex::new(HashSet::new()),
             aborted_count: AtomicU64::new(0),
@@ -353,6 +359,7 @@ impl TransactionManager {
             active: active.clone(),
         };
         active.insert(id);
+        self.active_snapshot_xmins.lock().insert(id, snapshot.xmin);
 
         // Register SERIALIZABLE transactions for SSI tracking. Done while holding
         // `active` so the concurrent-peer set is captured atomically with the
@@ -394,7 +401,11 @@ impl TransactionManager {
         // removal; the committed insert is bookkeeping that keeps get_status
         // consistent across the window.)
         self.committed.lock().insert(txn.id);
-        self.active.lock().remove(&txn.id);
+        {
+            let mut active = self.active.lock();
+            active.remove(&txn.id);
+            self.active_snapshot_xmins.lock().remove(&txn.id);
+        }
         self.maybe_gc();
         // Note: SSI cleanup is NOT done here because commit_serializable()
         // needs the data for its check. Callers using commit_serializable()
@@ -409,7 +420,11 @@ impl TransactionManager {
         // `active`, mirroring commit(): never leave the txn absent from both sets.
         self.aborted.lock().insert(txn.id);
         self.aborted_count.fetch_add(1, Ordering::Release);
-        self.active.lock().remove(&txn.id);
+        {
+            let mut active = self.active.lock();
+            active.remove(&txn.id);
+            self.active_snapshot_xmins.lock().remove(&txn.id);
+        }
         self.maybe_gc();
         if txn.isolation == IsolationLevel::Serializable {
             // An aborted txn's effects are rolled back, so purge its SSI data
@@ -476,6 +491,9 @@ impl TransactionManager {
             xmax: self.next_txn_id.load(Ordering::Acquire),
             active: active.clone(),
         };
+        self.active_snapshot_xmins
+            .lock()
+            .insert(txn.id, txn.snapshot.xmin);
     }
 
     /// Compute the GC watermark: the oldest snapshot xmin across all active transactions.
@@ -486,11 +504,16 @@ impl TransactionManager {
             // No active transactions — everything committed/aborted can be GC'd
             return self.next_txn_id.load(Ordering::Acquire);
         }
-        // SAFETY: active is non-empty (checked above), but use fallback for robustness
-        match active.iter().min() {
-            Some(&min_id) => min_id,
-            None => self.next_txn_id.load(Ordering::Acquire),
-        }
+        let snapshots = self.active_snapshot_xmins.lock();
+        snapshots
+            .iter()
+            .filter(|(id, _)| active.contains(id))
+            .map(|(_, xmin)| *xmin)
+            .min()
+            // Defensive compatibility fallback for an active transaction
+            // created before snapshot-horizon tracking was initialized.
+            .or_else(|| active.iter().min().copied())
+            .unwrap_or_else(|| self.next_txn_id.load(Ordering::Acquire))
     }
 
     /// Garbage-collect committed transaction metadata.
@@ -521,6 +544,19 @@ impl TransactionManager {
 
         // Aborted set is NOT GC'd — see doc comment above.
         (removed_c, 0)
+    }
+
+    /// Reclaim aborted transaction statuses only after vacuum has removed or
+    /// repaired every row-version header that refers to them. Below the GC
+    /// watermark no active snapshot can acquire a new dependency on these IDs.
+    pub fn gc_resolved_aborted(&self, watermark: u64, referenced_txn_ids: &HashSet<u64>) -> usize {
+        let mut aborted = self.aborted.lock();
+        let before = aborted.len();
+        aborted.retain(|id| *id >= watermark || referenced_txn_ids.contains(id));
+        let removed = before - aborted.len();
+        self.aborted_count
+            .store(aborted.len() as u64, Ordering::Release);
+        removed
     }
 
     /// Run a full GC cycle: compute watermark and clean up old txn metadata.
@@ -1134,6 +1170,24 @@ mod tests {
     }
 
     #[test]
+    fn gc_watermark_retains_snapshot_xmin_after_older_transaction_commits() {
+        let mgr = TransactionManager::new();
+        let mut older = mgr.begin(IsolationLevel::Snapshot);
+        let mut observer = mgr.begin(IsolationLevel::Snapshot);
+        assert_eq!(observer.snapshot.xmin, older.id);
+
+        mgr.commit(&mut older);
+        assert_eq!(
+            mgr.gc_watermark(),
+            older.id,
+            "the observer still needs versions whose visibility depends on the older transaction"
+        );
+
+        mgr.abort(&mut observer);
+        assert!(mgr.gc_watermark() > older.id);
+    }
+
+    #[test]
     fn gc_removes_old_committed() {
         let mgr = TransactionManager::new();
         let mut t1 = mgr.begin(IsolationLevel::Snapshot);
@@ -1163,6 +1217,24 @@ mod tests {
         assert_eq!(removed_a, 0, "aborted set should NOT be GC'd");
         assert_eq!(mgr.aborted_count(), 1);
         assert_eq!(mgr.get_status(t1.id), TxnStatus::Aborted);
+    }
+
+    #[test]
+    fn vacuum_can_reclaim_unreferenced_aborted_statuses() {
+        let mgr = TransactionManager::new();
+        let mut aborted = mgr.begin(IsolationLevel::Snapshot);
+        let aborted_id = aborted.id;
+        mgr.abort(&mut aborted);
+        let watermark = mgr.gc_watermark();
+
+        assert_eq!(mgr.gc_resolved_aborted(watermark, &HashSet::new()), 1);
+        mgr.gc(watermark);
+        assert_eq!(mgr.aborted_count(), 0);
+        assert_eq!(
+            mgr.get_status(aborted_id),
+            TxnStatus::Committed,
+            "below the committed watermark, an unreferenced reclaimed ID is resolved"
+        );
     }
 
     #[test]
