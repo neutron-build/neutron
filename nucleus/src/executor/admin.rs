@@ -35,10 +35,18 @@ impl Executor {
                 self.storage.set_next_isolation_level(&level);
             }
 
-            self.current_session()
-                .settings
-                .write()
-                .insert(var_name, val);
+            let session = self.current_session();
+            session.settings.write().insert(var_name.clone(), val);
+
+            // Identity-affecting settings recompute the RLS SessionContext (T2.2)
+            // so subsequent reads enforce policies as the assumed identity.
+            #[cfg(feature = "server")]
+            if var_name == "session_authorization"
+                || var_name == "role"
+                || var_name == "nucleus.tenant_id"
+            {
+                self.recompute_session_context(&session);
+            }
         }
         Ok(ExecResult::Command {
             tag: "SET".into(),
