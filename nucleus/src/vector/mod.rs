@@ -454,6 +454,11 @@ impl HnswIndex {
 
     /// Insert a vector into the index.
     pub fn insert(&mut self, id: u64, vector: Vector) {
+        // Re-inserting an id revives it: incremental UPDATE maintenance marks the
+        // old posting deleted then re-inserts under the same (PK-derived) id, so
+        // the id must not stay tombstoned or the updated row would vanish from
+        // search results.
+        self.deleted.remove(&id);
         let node_layer = self.random_layer();
 
         // First, add the node to the map (with empty neighbors)

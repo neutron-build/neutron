@@ -1415,13 +1415,18 @@ impl Executor {
                     let hnsw_m = config.m;
                     let hnsw_ef = config.ef_construction;
                     let mut hnsw = vector::HnswIndex::new(config);
+                    let pk_col = Self::integer_pk_col(&table_def);
 
-                    // Scan existing rows and insert into index
+                    // Scan existing rows and insert into index (PK-keyed stable id
+                    // when the table has an integer PK, else positional).
                     for (row_id, row) in existing_rows.iter().enumerate() {
                         if col_idx < row.len()
                             && let Value::Vector(v) = &row[col_idx]
                         {
-                            hnsw.insert(row_id as u64, vector::Vector::new(v.clone()));
+                            let id = pk_col
+                                .and_then(|pc| Self::stable_row_id(row, pc))
+                                .unwrap_or(row_id as u64);
+                            hnsw.insert(id, vector::Vector::new(v.clone()));
                         }
                     }
 
@@ -1450,15 +1455,19 @@ impl Executor {
                         ) {
                             eprintln!("vector WAL: failed to log create_index '{index_name}': {e}");
                         }
-                        // Log existing row vectors
+                        // Log existing row vectors under the same PK-keyed id.
                         for (row_id, row) in existing_rows.iter().enumerate() {
                             if col_idx < row.len()
                                 && let Value::Vector(v) = &row[col_idx]
-                                && let Err(e) = wal.log_insert(&index_name, row_id as u64, v, "")
                             {
-                                eprintln!(
-                                    "vector WAL: failed to log insert for '{index_name}/{row_id}': {e}"
-                                );
+                                let id = pk_col
+                                    .and_then(|pc| Self::stable_row_id(row, pc))
+                                    .unwrap_or(row_id as u64);
+                                if let Err(e) = wal.log_insert(&index_name, id, v, "") {
+                                    eprintln!(
+                                        "vector WAL: failed to log insert for '{index_name}/{id}': {e}"
+                                    );
+                                }
                             }
                         }
                         self.save_vector_index_meta();

@@ -263,6 +263,61 @@ async fn test_hnsw_index_survives_wal_checkpoint_restart() {
     }
 }
 
+/// PK-keyed HNSW recovery: a table with an integer PRIMARY KEY keys its HNSW
+/// postings on the PK, and DELETE takes the incremental fast path (a tombstone,
+/// no full rebuild). After a restart the deleted rows must not resurface in a
+/// vector search and the survivors must still be found.
+#[tokio::test]
+async fn test_hnsw_pk_keyed_recovery_after_fastpath_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE TABLE pkv (id INT PRIMARY KEY, v VECTOR(3))").await;
+        for (i, v) in ["[1,0,0]", "[0,1,0]", "[0,0,1]", "[1,1,0]", "[0,1,1]"]
+            .iter()
+            .enumerate()
+        {
+            exec(
+                &ex,
+                &format!("INSERT INTO pkv VALUES ({}, VECTOR('{}'))", i + 1, v),
+            )
+            .await;
+        }
+        exec(&ex, "CREATE INDEX pkv_v ON pkv USING HNSW (v)").await;
+        // Incremental fast-path deletes (integer-PK table, HNSW-only, autocommit).
+        exec(&ex, "DELETE FROM pkv WHERE id = 2").await;
+        exec(&ex, "DELETE FROM pkv WHERE id = 4").await;
+        ex.checkpoint_vector_wal().unwrap();
+    }
+    {
+        let ex = open_executor(dir.path()).await;
+        let r = exec(
+            &ex,
+            "SELECT id FROM pkv ORDER BY VECTOR_DISTANCE(v, VECTOR('[0,1,0]'), 'l2') LIMIT 5",
+        )
+        .await;
+        let ids: Vec<i32> = rows(&r[0])
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(Value::Int32(v)) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !ids.contains(&2),
+            "deleted id 2 must not survive recovery: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&4),
+            "deleted id 4 must not survive recovery: {ids:?}"
+        );
+        assert!(
+            ids.contains(&1) && ids.contains(&3) && ids.contains(&5),
+            "live rows 1,3,5 must be found after recovery: {ids:?}"
+        );
+    }
+}
+
 // ── KV write durability (group-commit fsync) ────────────────────────────────────
 
 /// A KV write through the SQL scalar path must be fsync-durable before the
