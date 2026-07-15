@@ -258,6 +258,73 @@ pub fn ymd_to_days(year: i32, month: u32, day: u32) -> i32 {
     jdn - 2451545 // subtract J2000 epoch
 }
 
+/// Strict ISO date parser used by casts and write coercion.
+pub fn parse_date(value: &str) -> Result<i32, String> {
+    let parts: Vec<&str> = value.trim().split('-').collect();
+    if parts.len() != 3 {
+        return Err(format!("invalid date value: {value}"));
+    }
+    let year = parts[0]
+        .parse::<i32>()
+        .map_err(|_| format!("invalid date value: {value}"))?;
+    let month = parts[1]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid date value: {value}"))?;
+    let day = parts[2]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid date value: {value}"))?;
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return Err(format!("date field value out of range: {value}"));
+    }
+    Ok(ymd_to_days(year, month, day))
+}
+
+/// Strict ISO timestamp-without-time-zone parser with microsecond precision.
+pub fn parse_timestamp(value: &str) -> Result<i64, String> {
+    let value = value.trim();
+    let (date, time) = value
+        .split_once([' ', 'T'])
+        .map_or((value, "00:00:00"), |parts| parts);
+    let days = parse_date(date)? as i64;
+    let pieces: Vec<&str> = time.split(':').collect();
+    if pieces.len() != 3 {
+        return Err(format!("invalid timestamp value: {value}"));
+    }
+    let hour = pieces[0]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid timestamp value: {value}"))?;
+    let minute = pieces[1]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid timestamp value: {value}"))?;
+    let (second_text, fraction_text) = pieces[2]
+        .split_once('.')
+        .map_or((pieces[2], None), |(second, fraction)| {
+            (second, Some(fraction))
+        });
+    let second = second_text
+        .parse::<u32>()
+        .map_err(|_| format!("invalid timestamp value: {value}"))?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return Err(format!("timestamp field value out of range: {value}"));
+    }
+    let fraction = match fraction_text {
+        None => 0,
+        Some(text) if !text.is_empty() && text.len() <= 6 => {
+            let parsed = text
+                .parse::<u32>()
+                .map_err(|_| format!("invalid timestamp value: {value}"))?;
+            parsed * 10u32.pow(6 - text.len() as u32)
+        }
+        Some(_) => return Err(format!("timestamp precision exceeds 6 digits: {value}")),
+    };
+    days.checked_mul(86_400_000_000)
+        .and_then(|base| base.checked_add(hour as i64 * 3_600_000_000))
+        .and_then(|base| base.checked_add(minute as i64 * 60_000_000))
+        .and_then(|base| base.checked_add(second as i64 * 1_000_000))
+        .and_then(|base| base.checked_add(fraction as i64))
+        .ok_or_else(|| "timestamp value out of range".to_string())
+}
+
 /// Format microseconds since 2000-01-01 as "YYYY-MM-DD HH:MM:SS.ffffff".
 fn format_timestamp(f: &mut fmt::Formatter<'_>, us: i64) -> fmt::Result {
     let total_secs = us / 1_000_000;
@@ -349,6 +416,15 @@ impl Value {
             (Value::Float64(_), DataType::Float64) => Ok(self.clone()),
             (Value::Text(_), DataType::Text) => Ok(self.clone()),
             (Value::Numeric(s), DataType::Numeric) => canonical_numeric(s).map(Value::Numeric),
+            (Value::Jsonb(_), DataType::Jsonb)
+            | (Value::Date(_), DataType::Date)
+            | (Value::Timestamp(_), DataType::Timestamp)
+            | (Value::TimestampTz(_), DataType::TimestampTz)
+            | (Value::Uuid(_), DataType::Uuid)
+            | (Value::Bytea(_), DataType::Bytea)
+            | (Value::Array(_), DataType::Array(_))
+            | (Value::Vector(_), DataType::Vector(_))
+            | (Value::Interval { .. }, DataType::Interval) => Ok(self.clone()),
             // Bool conversions
             (Value::Bool(b), DataType::Int32) => Ok(Value::Int32(if *b { 1 } else { 0 })),
             (Value::Bool(b), DataType::Int64) => Ok(Value::Int64(if *b { 1 } else { 0 })),
@@ -411,6 +487,15 @@ impl Value {
                 _ => Err(format!("cannot cast '{s}' to boolean")),
             },
             (Value::Text(s), DataType::Numeric) => canonical_numeric(s).map(Value::Numeric),
+            (Value::Text(s), DataType::Date) => parse_date(s).map(Value::Date),
+            (Value::Text(s), DataType::Timestamp) => parse_timestamp(s).map(Value::Timestamp),
+            (Value::Text(s), DataType::TimestampTz) => parse_timestamp(s).map(Value::TimestampTz),
+            (Value::Text(s), DataType::Uuid) => parse_uuid(s).map(Value::Uuid),
+            (Value::Text(s), DataType::Bytea) => Ok(Value::Bytea(s.as_bytes().to_vec())),
+            (Value::Text(s), DataType::Jsonb) => serde_json::from_str(s)
+                .map(Value::Jsonb)
+                .map_err(|error| format!("invalid JSON: {error}")),
+            (Value::Text(_), DataType::UserDefined(_)) => Ok(self.clone()),
             // Numeric conversions
             (Value::Numeric(s), DataType::Int32) => s
                 .parse::<i32>()
@@ -425,6 +510,22 @@ impl Value {
                 .map(Value::Float64)
                 .map_err(|e| e.to_string()),
             (Value::Numeric(s), DataType::Text) => Ok(Value::Text(s.clone())),
+            (Value::Date(days), DataType::Timestamp) => (*days as i64)
+                .checked_mul(86_400_000_000)
+                .map(Value::Timestamp)
+                .ok_or_else(|| "timestamp value out of range".to_string()),
+            (Value::Date(days), DataType::TimestampTz) => (*days as i64)
+                .checked_mul(86_400_000_000)
+                .map(Value::TimestampTz)
+                .ok_or_else(|| "timestamp value out of range".to_string()),
+            (Value::Timestamp(value), DataType::Date)
+            | (Value::TimestampTz(value), DataType::Date) => {
+                i32::try_from(value.div_euclid(86_400_000_000))
+                    .map(Value::Date)
+                    .map_err(|_| "date value out of range".to_string())
+            }
+            (Value::Timestamp(value), DataType::TimestampTz) => Ok(Value::TimestampTz(*value)),
+            (Value::TimestampTz(value), DataType::Timestamp) => Ok(Value::Timestamp(*value)),
             // Fallback: use Display
             (_, DataType::Text) => Ok(Value::Text(self.to_string())),
             _ => Err(format!("cannot cast {} to {target}", self.type_name())),
@@ -730,75 +831,77 @@ pub fn timestamp_add_interval(ts_us: i64, months: i32, days: i32, microseconds: 
 }
 
 // ============================================================================
-// Numeric (arbitrary-precision) arithmetic helpers
+// Numeric (bounded exact-decimal) arithmetic helpers
 // ============================================================================
 
-/// Add two numeric strings, returning the result as a string.
-///
-/// Uses f64 internally as a pragmatic first step; a true arbitrary-precision
-/// decimal library can replace this later.
-pub fn numeric_add(a: &str, b: &str) -> String {
-    let av: f64 = a.parse().unwrap_or(0.0);
-    let bv: f64 = b.parse().unwrap_or(0.0);
-    format_numeric(av + bv)
+fn checked_numeric_binary(
+    a: &str,
+    b: &str,
+    operation: impl FnOnce(Decimal, Decimal) -> Option<Decimal>,
+) -> Result<String, String> {
+    operation(parse_numeric(a)?, parse_numeric(b)?)
+        .map(|value| value.normalize().to_string())
+        .ok_or_else(|| "numeric value out of range".to_string())
+}
+
+/// Add two exact numeric strings.
+pub fn numeric_add(a: &str, b: &str) -> Result<String, String> {
+    checked_numeric_binary(a, b, Decimal::checked_add)
 }
 
 /// Subtract two numeric strings (a - b).
-pub fn numeric_sub(a: &str, b: &str) -> String {
-    let av: f64 = a.parse().unwrap_or(0.0);
-    let bv: f64 = b.parse().unwrap_or(0.0);
-    format_numeric(av - bv)
+pub fn numeric_sub(a: &str, b: &str) -> Result<String, String> {
+    checked_numeric_binary(a, b, Decimal::checked_sub)
 }
 
 /// Multiply two numeric strings.
-pub fn numeric_mul(a: &str, b: &str) -> String {
-    let av: f64 = a.parse().unwrap_or(0.0);
-    let bv: f64 = b.parse().unwrap_or(0.0);
-    format_numeric(av * bv)
+pub fn numeric_mul(a: &str, b: &str) -> Result<String, String> {
+    checked_numeric_binary(a, b, Decimal::checked_mul)
 }
 
 /// Divide two numeric strings (a / b), returning an error on division by zero.
 pub fn numeric_div(a: &str, b: &str) -> Result<String, String> {
-    let av: f64 = a.parse().unwrap_or(0.0);
-    let bv: f64 = b.parse().unwrap_or(0.0);
-    if bv == 0.0 {
+    let divisor = parse_numeric(b)?;
+    if divisor.is_zero() {
         return Err("division by zero".to_string());
     }
-    Ok(format_numeric(av / bv))
+    parse_numeric(a)?
+        .checked_div(divisor)
+        .map(|value| value.normalize().to_string())
+        .ok_or_else(|| "numeric value out of range".to_string())
 }
 
 /// Remainder of two numeric strings (a % b).
 pub fn numeric_rem(a: &str, b: &str) -> Result<String, String> {
-    let av: f64 = a.parse().unwrap_or(0.0);
-    let bv: f64 = b.parse().unwrap_or(0.0);
-    if bv == 0.0 {
+    let divisor = parse_numeric(b)?;
+    if divisor.is_zero() {
         return Err("division by zero".to_string());
     }
-    Ok(format_numeric(av % bv))
+    parse_numeric(a)?
+        .checked_rem(divisor)
+        .map(|value| value.normalize().to_string())
+        .ok_or_else(|| "numeric value out of range".to_string())
 }
 
 /// Negate a numeric string.
-pub fn numeric_neg(a: &str) -> String {
-    let av: f64 = a.parse().unwrap_or(0.0);
-    format_numeric(-av)
+pub fn numeric_neg(a: &str) -> Result<String, String> {
+    Decimal::ZERO
+        .checked_sub(parse_numeric(a)?)
+        .map(|value| value.normalize().to_string())
+        .ok_or_else(|| "numeric value out of range".to_string())
 }
 
 /// Absolute value of a numeric string.
-pub fn numeric_abs(a: &str) -> String {
-    let av: f64 = a.parse().unwrap_or(0.0);
-    format_numeric(av.abs())
-}
-
-/// Format an f64 as a clean numeric string.
-fn format_numeric(v: f64) -> String {
-    if v.fract() == 0.0 && v.abs() < (i64::MAX as f64) {
-        format!("{}", v as i64)
+pub fn numeric_abs(a: &str) -> Result<String, String> {
+    let value = parse_numeric(a)?;
+    let value = if value.is_sign_negative() {
+        Decimal::ZERO.checked_sub(value)
     } else {
-        let s = format!("{v:.17}");
-        let s = s.trim_end_matches('0');
-        let s = s.trim_end_matches('.');
-        s.to_string()
-    }
+        Some(value)
+    };
+    value
+        .map(|value| value.normalize().to_string())
+        .ok_or_else(|| "numeric value out of range".to_string())
 }
 
 // ============================================================================
@@ -1003,22 +1106,22 @@ mod tests {
 
     #[test]
     fn test_numeric_add_positive() {
-        assert_eq!(numeric_add("1.5", "2.5"), "4");
+        assert_eq!(numeric_add("1.5", "2.5").unwrap(), "4");
     }
 
     #[test]
     fn test_numeric_add_negative() {
-        assert_eq!(numeric_add("-3", "5"), "2");
+        assert_eq!(numeric_add("-3", "5").unwrap(), "2");
     }
 
     #[test]
     fn test_numeric_sub() {
-        assert_eq!(numeric_sub("10", "3"), "7");
+        assert_eq!(numeric_sub("10", "3").unwrap(), "7");
     }
 
     #[test]
     fn test_numeric_mul() {
-        assert_eq!(numeric_mul("6", "7"), "42");
+        assert_eq!(numeric_mul("6", "7").unwrap(), "42");
     }
 
     #[test]
@@ -1038,20 +1141,20 @@ mod tests {
 
     #[test]
     fn test_numeric_neg() {
-        assert_eq!(numeric_neg("42"), "-42");
-        assert_eq!(numeric_neg("-7"), "7");
+        assert_eq!(numeric_neg("42").unwrap(), "-42");
+        assert_eq!(numeric_neg("-7").unwrap(), "7");
     }
 
     #[test]
     fn test_numeric_abs() {
-        assert_eq!(numeric_abs("-42"), "42");
-        assert_eq!(numeric_abs("42"), "42");
+        assert_eq!(numeric_abs("-42").unwrap(), "42");
+        assert_eq!(numeric_abs("42").unwrap(), "42");
     }
 
     #[test]
     fn test_numeric_large_numbers() {
-        assert_eq!(numeric_add("999999999999", "1"), "1000000000000");
-        assert_eq!(numeric_mul("1000000", "1000000"), "1000000000000");
+        assert_eq!(numeric_add("999999999999", "1").unwrap(), "1000000000000");
+        assert_eq!(numeric_mul("1000000", "1000000").unwrap(), "1000000000000");
     }
 
     // ========================================================================

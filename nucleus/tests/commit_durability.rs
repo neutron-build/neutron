@@ -337,6 +337,16 @@ async fn exact_numeric_values_and_aggregates_survive_restart_across_engines() {
         )
         .await;
     }
+    exec(
+        &ex,
+        "CREATE TABLE temporal_mt (id INT, day DATE, moment TIMESTAMP, span INTERVAL) WITH (engine='mergetree') ORDER BY (id)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO temporal_mt VALUES (1, '2024-02-29', '2024-02-29 12:34:56.123456', '1 month 2 days 00:00:00.5')",
+    )
+    .await;
     drop(ex);
 
     let (reopened, _) = boot(&data).await;
@@ -347,6 +357,25 @@ async fn exact_numeric_values_and_aggregates_survive_restart_across_engines() {
             "{table} exact NUMERIC after restart"
         );
     }
+    assert_eq!(
+        rows(
+            &reopened,
+            "SELECT day, moment, span FROM temporal_mt WHERE id = 1",
+        )
+        .await,
+        vec![vec![
+            Value::Date(nucleus::types::ymd_to_days(2024, 2, 29)),
+            Value::Timestamp(
+                nucleus::types::ymd_to_days(2024, 2, 29) as i64 * 86_400_000_000 + 45_296_123_456,
+            ),
+            Value::Interval {
+                months: 1,
+                days: 2,
+                microseconds: 500_000,
+            },
+        ]],
+        "columnar temporal logical types must survive WAL snapshot/restart"
+    );
 }
 
 #[tokio::test]

@@ -253,3 +253,54 @@ async fn numeric_is_exact_and_checked_across_engines() {
         );
     }
 }
+
+#[tokio::test]
+async fn temporal_values_and_arithmetic_match_across_engines() {
+    let engines: Vec<(&str, Arc<dyn StorageEngine>)> = vec![
+        ("mvcc", Arc::new(MvccStorageAdapter::new())),
+        ("memory", Arc::new(MemoryEngine::new())),
+        ("lsm", Arc::new(LsmStorageEngine::new())),
+        ("columnar", Arc::new(ColumnarStorageEngine::new())),
+    ];
+    for (name, storage) in engines {
+        let e = ex(storage);
+        e.execute("CREATE TABLE temporal (id INT, day DATE, moment TIMESTAMP)")
+            .await
+            .unwrap();
+        e.execute(
+            "INSERT INTO temporal VALUES (1, DATE '2024-01-31', TIMESTAMP '2024-01-31 23:00:00'), (2, DATE '2024-02-29', TIMESTAMP '2024-02-29 01:00:00')",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows(
+                &e,
+                "SELECT id, day + INTERVAL '1 month', moment + INTERVAL '2 hours' FROM temporal ORDER BY id",
+            )
+            .await,
+            vec![
+                vec![
+                    Value::Int32(1),
+                    Value::Timestamp(
+                        nucleus::types::ymd_to_days(2024, 2, 29) as i64 * 86_400_000_000,
+                    ),
+                    Value::Timestamp(
+                        nucleus::types::ymd_to_days(2024, 2, 1) as i64 * 86_400_000_000
+                            + 3_600_000_000,
+                    ),
+                ],
+                vec![
+                    Value::Int32(2),
+                    Value::Timestamp(
+                        nucleus::types::ymd_to_days(2024, 3, 29) as i64 * 86_400_000_000,
+                    ),
+                    Value::Timestamp(
+                        nucleus::types::ymd_to_days(2024, 2, 29) as i64 * 86_400_000_000
+                            + 10_800_000_000,
+                    ),
+                ],
+            ],
+            "{name} temporal semantics"
+        );
+    }
+}

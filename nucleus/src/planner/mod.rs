@@ -862,9 +862,23 @@ pub fn is_equality_predicate(expr: &sqlparser::ast::Expr) -> Option<(String, Str
         && matches!(op, sqlparser::ast::BinaryOperator::Eq)
     {
         if let Some(col) = extract_column_name(left) {
+            if matches!(
+                right.as_ref(),
+                sqlparser::ast::Expr::Value(value)
+                    if matches!(value.value, sqlparser::ast::Value::Null)
+            ) {
+                return None;
+            }
             return Some((col, right.to_string()));
         }
         if let Some(col) = extract_column_name(right) {
+            if matches!(
+                left.as_ref(),
+                sqlparser::ast::Expr::Value(value)
+                    if matches!(value.value, sqlparser::ast::Value::Null)
+            ) {
+                return None;
+            }
             return Some((col, left.to_string()));
         }
     }

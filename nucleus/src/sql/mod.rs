@@ -255,7 +255,18 @@ pub fn convert_data_type(dt: &ast::DataType) -> Result<DataType, ParseError> {
         ast::DataType::JSONB => Ok(DataType::Jsonb),
         ast::DataType::JSON => Ok(DataType::Jsonb),
         ast::DataType::Date => Ok(DataType::Date),
-        ast::DataType::Timestamp(_, _) => Ok(DataType::Timestamp),
+        ast::DataType::Timestamp(_, timezone) => {
+            if matches!(
+                timezone,
+                ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz
+            ) {
+                Ok(DataType::TimestampTz)
+            } else {
+                Ok(DataType::Timestamp)
+            }
+        }
+        ast::DataType::TimestampNtz(_) => Ok(DataType::Timestamp),
+        ast::DataType::Interval { .. } => Ok(DataType::Interval),
         ast::DataType::Numeric(_) | ast::DataType::Decimal(_) | ast::DataType::Dec(_) => {
             Ok(DataType::Numeric)
         }
