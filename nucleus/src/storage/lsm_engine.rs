@@ -450,6 +450,22 @@ impl StorageEngine for LsmStorageEngine {
         }
         Ok(())
     }
+
+    async fn make_durable(&self) -> Result<(), StorageError> {
+        // The LSM has no separate WAL yet; its commit representation is an
+        // SSTable. Force every pending memtable before the executor acknowledges
+        // an autocommit write or COMMIT.
+        self.flush_all_dirty().await
+    }
+
+    fn durability_pending(&self) -> bool {
+        self.disk_dir.is_some()
+            && self
+                .tables
+                .read()
+                .values()
+                .any(|table| table.tree.memtable_size() > 0)
+    }
 }
 
 #[cfg(test)]

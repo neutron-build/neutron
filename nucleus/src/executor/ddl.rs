@@ -150,6 +150,22 @@ impl Executor {
         Arc::new(crate::storage::ColumnarStorageEngine::new())
     }
 
+    /// Create the per-table LSM engine, disk-backed whenever the executor has
+    /// a data directory. Using `new()` here made `WITH (engine='lsm')` silently
+    /// ephemeral even in an otherwise durable database.
+    #[cfg(feature = "server")]
+    pub(super) fn open_lsm_engine(&self, table: &str) -> Arc<crate::storage::LsmStorageEngine> {
+        if let Some(dir) = self.table_engine_dir(table) {
+            match crate::storage::LsmStorageEngine::open(&dir) {
+                Ok(engine) => return Arc::new(engine),
+                Err(error) => tracing::warn!(
+                    "LSM engine for '{table}': open failed ({error}); falling back to in-memory (NOT crash-durable)"
+                ),
+            }
+        }
+        Arc::new(crate::storage::LsmStorageEngine::new())
+    }
+
     /// Re-register per-table engines recorded in engines.json. Called once at
     /// boot (after the catalog is loaded): reopens each engine's WAL-backed
     /// storage, restores replacing-dedup configs, and re-creates the shared
@@ -162,6 +178,15 @@ impl Executor {
             return;
         }
         for (table, meta) in metas {
+            if meta.engine == "lsm" {
+                let engine = self.open_lsm_engine(&table);
+                if let Err(error) = engine.create_table(&table).await {
+                    tracing::warn!("restore LSM engine '{table}': create_table failed: {error}");
+                }
+                tracing::info!("restored LSM engine for table '{table}'");
+                self.table_engines.write().insert(table, engine);
+                continue;
+            }
             let eng = self.open_columnar_engine(&table);
             if let Err(e) = eng.create_table(&table).await {
                 tracing::warn!("restore engine '{table}': create_table failed: {e}");
@@ -240,7 +265,7 @@ impl Executor {
         let old_engine = self.storage_for(old);
         let rows = old_engine.scan(old).await?;
         let new_engine: Arc<dyn StorageEngine> = if meta.engine == "lsm" {
-            Arc::new(crate::storage::LsmStorageEngine::new())
+            self.open_lsm_engine(new) as Arc<dyn StorageEngine>
         } else {
             self.open_columnar_engine(new) as Arc<dyn StorageEngine>
         };
@@ -415,7 +440,7 @@ impl Executor {
                     }
                     #[cfg(feature = "server")]
                     Some("lsm") => {
-                        let eng = Arc::new(crate::storage::LsmStorageEngine::new());
+                        let eng = self.open_lsm_engine(&table_name);
                         self.table_engines
                             .write()
                             .insert(table_name.clone(), eng.clone());
@@ -508,7 +533,8 @@ impl Executor {
                 }
                 // Persist the engine override so it survives restarts
                 // (restore_table_engines re-registers from engines.json at boot).
-                if is_mergetree || matches!(engine_name.as_deref(), Some("columnar")) {
+                if is_mergetree || matches!(engine_name.as_deref(), Some("columnar") | Some("lsm"))
+                {
                     self.record_table_engine(
                         &table_name,
                         TableEngineMeta {
