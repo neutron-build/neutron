@@ -161,6 +161,8 @@ pub(super) struct TxnState {
     pub security_savepoints: Vec<(String, SecurityManager)>,
     /// Whether this transaction changed security policy metadata.
     pub policy_dirty: bool,
+    /// Whether relational DML changed rows that may feed a shared GIN index.
+    pub gin_dirty: bool,
 }
 
 impl TxnState {
@@ -174,6 +176,7 @@ impl TxnState {
             security_pending: None,
             security_savepoints: Vec::new(),
             policy_dirty: false,
+            gin_dirty: false,
         }
     }
 }
@@ -277,6 +280,7 @@ impl Session {
             txn.active = false;
             txn.snapshot = None;
             txn.savepoints.clear();
+            txn.gin_dirty = false;
         }
         // Clear prepared statements
         self.prepared_stmts.write().await.clear();

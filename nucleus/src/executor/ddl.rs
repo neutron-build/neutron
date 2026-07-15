@@ -757,6 +757,9 @@ impl Executor {
                             self.encrypted_indexes
                                 .write()
                                 .retain(|_, entry| entry.table_name != table_name);
+                            self.gin_indexes
+                                .write()
+                                .retain(|_, entry| entry.table_name != table_name);
                             // Clean up view dependency tracking
                             self.view_deps.write().remove(&table_name);
                             {
@@ -818,12 +821,21 @@ impl Executor {
                     // can drop it from that table's engine (columnar/lsm tables
                     // have a per-table engine, not the base one).
                     let index_table = self
-                        .btree_indexes
-                        .iter()
-                        .find(|e| e.value() == &index_name)
-                        .map(|e| e.key().0.clone());
+                        .catalog
+                        .get_all_indexes()
+                        .await
+                        .into_iter()
+                        .find(|index| index.name == index_name)
+                        .map(|index| index.table_name.clone())
+                        .or_else(|| {
+                            self.btree_indexes
+                                .iter()
+                                .find(|entry| entry.value() == &index_name)
+                                .map(|entry| entry.key().0.clone())
+                        });
                     // Remove from sync btree_indexes and hash_indexes maps
                     self.btree_indexes.retain(|_, v| v != &index_name);
+                    self.gin_indexes.write().remove(&index_name);
                     // Also clean up hash_indexes if this was a hash index
                     // (hash_indexes is keyed by (table, col), so we just leave it; catalog drop handles it)
                     // Drop the storage engine index (log errors if not present)
@@ -901,8 +913,27 @@ impl Executor {
             .unwrap_or_else(|| "unnamed_idx".to_string());
         let table_name = create_index.table_name.to_string();
 
-        // Verify table exists
-        let _table_def = self.get_table(&table_name).await?;
+        // Verify table exists and reject duplicate names before constructing
+        // any live index state. Otherwise `IF NOT EXISTS` could overwrite an
+        // existing in-memory index and only then discover the catalog entry.
+        let table_def = self.get_table(&table_name).await?;
+        if self
+            .catalog
+            .get_all_indexes()
+            .await
+            .iter()
+            .any(|index| index.name == index_name)
+        {
+            if create_index.if_not_exists {
+                return Ok(ExecResult::Command {
+                    tag: "CREATE INDEX".into(),
+                    rows_affected: 0,
+                });
+            }
+            return Err(ExecError::Unsupported(format!(
+                "index creation failed: index '{index_name}' already exists"
+            )));
+        }
 
         // Extract column names from index columns
         let columns: Vec<String> = create_index
@@ -924,6 +955,23 @@ impl Executor {
             Some(ref s) if s == "IVFFLAT" => crate::catalog::IndexType::IvfFlat,
             _ => crate::catalog::IndexType::BTree,
         };
+
+        if matches!(index_type, crate::catalog::IndexType::Gin) {
+            if columns.len() != 1 {
+                return Err(ExecError::Unsupported(
+                    "GIN indexes currently require exactly one JSONB column".into(),
+                ));
+            }
+            let column = &columns[0];
+            let Some(position) = table_def.column_index(column) else {
+                return Err(ExecError::ColumnNotFound(column.clone()));
+            };
+            if !matches!(table_def.columns[position].data_type, DataType::Jsonb) {
+                return Err(ExecError::Unsupported(format!(
+                    "GIN index column '{column}' must have type JSONB"
+                )));
+            }
+        }
 
         // Parse index options (for vector indexes: distance metric, dims, etc.)
         let mut options = std::collections::HashMap::new();
@@ -1193,8 +1241,10 @@ impl Executor {
                     GinIndexEntry {
                         table_name: table_name.clone(),
                         column_name: col_name.clone(),
-                        col_idx,
                         index: gin,
+                        generation: self
+                            .gin_write_gen
+                            .load(std::sync::atomic::Ordering::Acquire),
                     },
                 );
             }

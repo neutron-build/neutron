@@ -142,3 +142,40 @@ async fn columnar_all_null_group_kept() {
         "expected 2 groups (incl. the all-NULL one), got {r:?}"
     );
 }
+
+/// The executor must coerce INSERT values to the declared schema before the
+/// columnar engine encodes them, and reject invalid primitive values instead of
+/// leaving a mixed-type column that fails later during scans or aggregation.
+#[tokio::test]
+async fn columnar_insert_schema_coercion_is_strict() {
+    let e = ex(Arc::new(ColumnarStorageEngine::new()));
+    e.execute(
+        "CREATE TABLE typed (id INTEGER, wide BIGINT, score DOUBLE, active BOOLEAN, note TEXT)",
+    )
+    .await
+    .unwrap();
+    e.execute("INSERT INTO typed VALUES ('7', '9000000000', '3.5', 'true', 42)")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows(&e, "SELECT id, wide, score, active, note FROM typed").await,
+        vec![vec![
+            Value::Int32(7),
+            Value::Int64(9_000_000_000),
+            Value::Float64(3.5),
+            Value::Bool(true),
+            Value::Text("42".into()),
+        ]]
+    );
+
+    assert!(
+        e.execute("INSERT INTO typed VALUES ('not-an-int', 1, 1, true, 'bad')")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        rows(&e, "SELECT COUNT(*) FROM typed").await[0][0],
+        Value::Int64(1)
+    );
+}

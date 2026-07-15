@@ -297,16 +297,31 @@ impl Executor {
             // from reintroducing the integer-width silent-wrong-results class, and it
             // also fixes mixed-variant columns (Text+Int breaking numeric ordering, the
             // columnar concat invariant). NULL stays NULL; JSONB is normalized in the
-            // loop below. Fail open: an uncastable value (out-of-range narrowing,
-            // unparseable text) is left for the type/constraint checks to handle —
-            // never silently zeroed.
+            // loop below. Primitive columns reject uncastable values instead of
+            // silently storing a physically mixed column.
             for (i, col) in table_def.columns.iter().enumerate() {
                 if let Some(v) = row.get_mut(i)
                     && !matches!(v, Value::Null)
                     && !matches!(col.data_type, DataType::Jsonb)
-                    && let Ok(coerced) = v.cast(&col.data_type)
                 {
-                    *v = coerced;
+                    match v.cast(&col.data_type) {
+                        Ok(coerced) => *v = coerced,
+                        Err(error)
+                            if matches!(
+                                col.data_type,
+                                DataType::Bool
+                                    | DataType::Int32
+                                    | DataType::Int64
+                                    | DataType::Float64
+                            ) =>
+                        {
+                            return Err(ExecError::Runtime(format!(
+                                "invalid value for column '{}' ({}): {error}",
+                                col.name, col.data_type
+                            )));
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
 
@@ -582,6 +597,9 @@ impl Executor {
                         })?;
                 }
             }
+        }
+        if count > 0 {
+            self.refresh_gin_after_write(&table_name).await;
         }
 
         // Fire AFTER INSERT statement-level triggers
@@ -1772,6 +1790,7 @@ impl Executor {
         // partially repopulated by later INSERTs, under-representing survivors.
         if count > 0 {
             self.rebuild_zone_map(&table_name).await;
+            self.refresh_gin_after_write(&table_name).await;
         }
 
         // Fire AFTER UPDATE statement-level triggers
@@ -1997,6 +2016,7 @@ impl Executor {
         // surviving rows and causing valid rows to be wrongly pruned.
         if count > 0 {
             self.rebuild_zone_map(&table_name).await;
+            self.refresh_gin_after_write(&table_name).await;
         }
 
         // Fire AFTER DELETE row-level triggers for each deleted row
@@ -2116,82 +2136,5 @@ impl Executor {
             return Some((col_idx, value));
         }
         None
-    }
-}
-
-/// Coerce row values to match DDL column types.
-///
-/// When SimpleProtocol sends INSERT values, all parameters arrive as text strings.
-/// The executor stores them as `Value::Text` even for BIGINT, INTEGER, BOOLEAN, etc.
-/// This function converts each value to the correct type based on the table definition,
-/// so MergeTree columns store typed data and arithmetic/comparison works correctly.
-// NOTE: not yet wired into the columnar/MergeTree INSERT path. Extended-protocol
-// params arrive as text and currently reach `columnar_engine::rows_to_batch`
-// untyped. Tracked in AUDIT_FINDINGS.md (Phase 3: coerce text params before
-// MergeTree ingest).
-#[allow(dead_code)]
-fn coerce_rows_to_schema(table_def: &TableDef, rows: Vec<Row>) -> Vec<Row> {
-    rows.into_iter()
-        .map(|row| {
-            row.into_iter()
-                .enumerate()
-                .map(|(i, val)| {
-                    if i < table_def.columns.len() {
-                        coerce_value(val, &table_def.columns[i].data_type)
-                    } else {
-                        val
-                    }
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// Coerce a single value to match the target data type.
-/// Only converts when the source is Text and the target expects a different type.
-// NOTE: only called by `coerce_rows_to_schema`, which is not yet wired in.
-#[allow(dead_code)]
-fn coerce_value(val: Value, target: &DataType) -> Value {
-    match (&val, target) {
-        // Text → Int64 (BIGINT)
-        (Value::Text(s), DataType::Int64) => {
-            if let Ok(n) = s.parse::<i64>() {
-                Value::Int64(n)
-            } else {
-                val
-            }
-        }
-        // Text → Int32 (INTEGER)
-        (Value::Text(s), DataType::Int32) => {
-            if let Ok(n) = s.parse::<i32>() {
-                Value::Int32(n)
-            } else {
-                val
-            }
-        }
-        // Text → Float64 (DOUBLE PRECISION / REAL)
-        (Value::Text(s), DataType::Float64) => {
-            if let Ok(n) = s.parse::<f64>() {
-                Value::Float64(n)
-            } else {
-                val
-            }
-        }
-        // Text → Bool (BOOLEAN)
-        (Value::Text(s), DataType::Bool) => match s.as_str() {
-            "true" | "t" | "1" | "yes" => Value::Bool(true),
-            "false" | "f" | "0" | "no" => Value::Bool(false),
-            _ => val,
-        },
-        // Text → Jsonb (parse if it looks like JSON)
-        (Value::Text(s), DataType::Jsonb) => {
-            if let Ok(j) = serde_json::from_str(s) {
-                Value::Jsonb(j)
-            } else {
-                val
-            }
-        }
-        // Already correct type or no coercion needed
-        _ => val,
     }
 }

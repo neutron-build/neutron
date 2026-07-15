@@ -204,6 +204,9 @@ pub struct Executor {
     hash_indexes: DashMap<(String, String), crate::storage::btree::HashIndex>,
     /// Live GIN indexes for JSONB columns: index_name → GinIndexEntry.
     gin_indexes: parking_lot::RwLock<HashMap<String, GinIndexEntry>>,
+    /// Advances whenever a write becomes committed. GIN entries are usable
+    /// only when stamped with this generation.
+    gin_write_gen: AtomicU64,
     /// Sync cache of table column metadata: table_name → [(col_name, DataType)].
     table_columns: parking_lot::RwLock<HashMap<String, Vec<(String, DataType)>>>,
     /// Persistent statistics store populated by ANALYZE, used by EXPLAIN / query planner.
@@ -408,6 +411,7 @@ impl Executor {
             #[cfg(feature = "server")]
             hash_indexes: DashMap::new(),
             gin_indexes: parking_lot::RwLock::new(HashMap::new()),
+            gin_write_gen: AtomicU64::new(0),
             table_columns: parking_lot::RwLock::new(HashMap::new()),
             stats_store: Arc::new(planner::StatsStore::new()),
             #[cfg(feature = "server")]
@@ -964,6 +968,114 @@ impl Executor {
                 _ => {}
             }
         }
+
+        self.rebuild_all_gin_indexes().await;
+    }
+
+    /// Rebuild the live GIN indexes for one table from its current logical rows.
+    /// Posting IDs intentionally use scan-order positions; queries re-read the
+    /// same logical scan and always recheck the full predicate for correctness.
+    pub async fn rebuild_gin_indexes_for_table(&self, table_name: &str) {
+        let indexes: Vec<_> = self
+            .catalog
+            .get_indexes(table_name)
+            .await
+            .into_iter()
+            .filter(|idx| matches!(idx.index_type, crate::catalog::IndexType::Gin))
+            .collect();
+
+        if indexes.is_empty() {
+            self.gin_indexes
+                .write()
+                .retain(|_, entry| entry.table_name != table_name);
+            return;
+        }
+
+        let generation = self.gin_write_gen.load(Ordering::Acquire);
+
+        let table_def = match self.catalog.get_table(table_name).await {
+            Some(table) => table,
+            None => return,
+        };
+        let rows = self
+            .storage_for(table_name)
+            .scan_for_maintenance(table_name)
+            .await
+            .unwrap_or_default();
+
+        let mut rebuilt = Vec::new();
+        for idx in indexes {
+            let Some(column_name) = idx.columns.first().cloned() else {
+                continue;
+            };
+            let Some(col_idx) = table_def.column_index(&column_name) else {
+                continue;
+            };
+            let mut gin = crate::document::GinIndex::new();
+            for (row_id, row) in rows.iter().enumerate() {
+                if let Some(value) = row.get(col_idx)
+                    && let Some(doc) = value_to_doc_json(value)
+                {
+                    gin.insert(row_id as u64, &doc);
+                }
+            }
+            rebuilt.push((
+                idx.name.clone(),
+                GinIndexEntry {
+                    table_name: table_name.to_string(),
+                    column_name,
+                    index: gin,
+                    generation,
+                },
+            ));
+        }
+
+        // A concurrent committed write makes this scan incomplete. Leave any
+        // previous entries in place but stale; readers observe the generation
+        // mismatch and take the authoritative full-scan path.
+        if self.gin_write_gen.load(Ordering::Acquire) != generation {
+            return;
+        }
+
+        let mut live = self.gin_indexes.write();
+        live.retain(|_, entry| entry.table_name != table_name);
+        for (name, entry) in rebuilt {
+            live.insert(name, entry);
+        }
+    }
+
+    async fn rebuild_all_gin_indexes(&self) {
+        let tables: HashSet<String> = self
+            .catalog
+            .get_all_indexes()
+            .await
+            .into_iter()
+            .filter(|idx| matches!(idx.index_type, crate::catalog::IndexType::Gin))
+            .map(|idx| idx.table_name.clone())
+            .collect();
+        for table in tables {
+            self.rebuild_gin_indexes_for_table(&table).await;
+        }
+    }
+
+    /// Keep shared GIN state at committed visibility. During an explicit
+    /// transaction it remains on the pre-transaction image and is rebuilt once
+    /// COMMIT succeeds; transaction-local SELECTs therefore bypass GIN.
+    pub(super) async fn refresh_gin_after_write(&self, table_name: &str) {
+        let session = self.current_session();
+        {
+            let mut txn = session.txn_state.write().await;
+            if txn.active {
+                txn.gin_dirty = true;
+                return;
+            }
+        }
+        self.gin_write_gen.fetch_add(1, Ordering::AcqRel);
+        self.rebuild_gin_indexes_for_table(table_name).await;
+    }
+
+    pub(super) fn mark_gin_committed_write(&self) {
+        self.gin_write_gen.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Load persisted ANALYZE statistics from disk (call once at startup).
