@@ -292,6 +292,11 @@ name = "probe_vector"
 path = "src/bin/probe_vector.rs"
 required-features = ["server"]
 
+[[bin]]
+name = "probe_index_coherence"
+path = "src/bin/probe_index_coherence.rs"
+required-features = ["server"]
+
 [[bench]]
 name = "query_bench"
 harness = false
