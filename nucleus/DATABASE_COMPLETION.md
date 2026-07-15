@@ -27,7 +27,7 @@ behavior satisfies the relevant gate above.
 - Source LOC: 239286; Source Rust files: 214; Top-level modules: 50.
 - Declared unit tests: 3864; Declared integration tests: 312; Ignored tests: 155;
   Binary-protocol stubs: 113. These are static declarations, not executed-test claims.
-- The most recent full library run executed 3,766 passing tests and 113 ignored native-binary
+- The most recent full library run executed 3,768 passing tests and 113 ignored native-binary
   test stubs. Core-only executed 1,853 passing tests with no ignores.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
   families, specialty indexes, encryption, TLS, embedded mode, physical backup v1, probes, Raft
@@ -98,7 +98,7 @@ Goal: close known semantic holes before expanding interfaces.
 - [x] Verify collations, time zones, date arithmetic, NULL ordering, casts, and three-valued logic.
 - [x] Verify constraints and cascades across transactions and restart.
 - [x] Finish MVCC garbage collection/vacuum behavior for long snapshots and high churn.
-- [ ] Add deterministic transaction-ID exhaustion/wraparound behavior.
+- [x] Add deterministic transaction-ID exhaustion/wraparound behavior.
 - [ ] Ensure query caches and specialty indexes invalidate on every relevant DDL/DML transition.
 
 Evidence:
@@ -145,6 +145,11 @@ Evidence:
   regressions cover the formerly unsafe committed-deleter interleaving, aborted insert/delete
   cleanup, table isolation, index lookup after compaction, idempotent metadata GC, idle-transaction
   release, and a 1,000-update chain retained by a long snapshot then reduced to one live version.
+- The MVCC allocator now uses a checked atomic transition, reserves `u64::MAX` as a terminal
+  exhaustion sentinel, and cannot wrap into invalid/bootstrap IDs. Every public explicit and
+  implicit transaction path returns a stable `transaction ID space exhausted` storage error before
+  mutating state; deterministic near-boundary tests prove the final allocatable ID, repeated
+  terminal failure, read/write rejection, and absence of reserved active IDs.
 
 Exit gate:
 

@@ -1065,21 +1065,25 @@ impl MvccStorageAdapter {
 
     /// Get the current transaction's (txn_id, snapshot), or create an
     /// implicit auto-commit transaction. Returns (txn_id, snapshot, is_auto).
-    fn current_or_auto(&self) -> (u64, super::txn::Snapshot, bool) {
+    fn current_or_auto(&self) -> Result<(u64, super::txn::Snapshot, bool), StorageError> {
         let sess = self.mvcc_session();
         let lock = sess.session_txn.read();
         if let Some(ref txn) = *lock {
-            return (txn.id, txn.snapshot.clone(), false);
+            return Ok((txn.id, txn.snapshot.clone(), false));
         }
         drop(lock);
         // Auto-commit: create an implicit transaction
-        let txn = self.engine.txn_mgr().begin(IsolationLevel::Snapshot);
+        let txn = self
+            .engine
+            .txn_mgr()
+            .try_begin(IsolationLevel::Snapshot)
+            .map_err(|_| StorageError::TransactionIdExhausted)?;
         let id = txn.id;
         let snap = txn.snapshot.clone();
         // Immediately commit it — the writes are visible to future txns
         // We store the txn temporarily for commit after the operation.
         // For auto-commit, we return is_auto=true so the caller commits.
-        (id, snap, true)
+        Ok((id, snap, true))
     }
 
     /// Auto-commit: commit an implicit transaction by ID.
@@ -1383,7 +1387,7 @@ impl StorageEngine for MvccStorageAdapter {
     }
 
     async fn insert(&self, table: &str, row: Row) -> Result<(), StorageError> {
-        let (txn_id, _snap, auto) = self.current_or_auto();
+        let (txn_id, _snap, auto) = self.current_or_auto()?;
         let version_idx = self
             .engine
             .insert(table, txn_id, row.clone())
@@ -1433,7 +1437,7 @@ impl StorageEngine for MvccStorageAdapter {
         row: Row,
         unique_col_sets: &[Vec<usize>],
     ) -> Result<(), StorageError> {
-        let (txn_id, _snap, auto) = self.current_or_auto();
+        let (txn_id, _snap, auto) = self.current_or_auto()?;
         let version_idx = self
             .engine
             .insert_unique(table, txn_id, row.clone(), unique_col_sets)
@@ -1484,7 +1488,7 @@ impl StorageEngine for MvccStorageAdapter {
         }
         // One implicit transaction for the whole batch — avoids N auto-commit transactions.
         let n = rows.len() as i64;
-        let (txn_id, _snap, auto) = self.current_or_auto();
+        let (txn_id, _snap, auto) = self.current_or_auto()?;
         let _wal_txn_id = if auto { 0 } else { txn_id };
         let mut version_indices: Vec<usize> = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -1531,7 +1535,7 @@ impl StorageEngine for MvccStorageAdapter {
     }
 
     async fn scan(&self, table: &str) -> Result<Vec<Row>, StorageError> {
-        let (_txn_id, snap, auto) = self.current_or_auto();
+        let (_txn_id, snap, auto) = self.current_or_auto()?;
         // Use scan() (not scan_rows) to get version indices for SSI tracking
         let results = self
             .engine
@@ -1553,7 +1557,7 @@ impl StorageEngine for MvccStorageAdapter {
         // Same as scan() but does NOT record SIREAD — used by internal stat/zone-map
         // rebuilds, which are not part of the transaction's logical read set and
         // must not introduce spurious SSI rw-conflicts.
-        let (txn_id, snap, auto) = self.current_or_auto();
+        let (txn_id, snap, auto) = self.current_or_auto()?;
         let results = self
             .engine
             .scan(table, &snap)
@@ -1570,7 +1574,7 @@ impl StorageEngine for MvccStorageAdapter {
     /// which mutate the exact version (no scan-order remapping). Overrides the
     /// trait default (which would return scan-order positions).
     async fn scan_physical(&self, table: &str) -> Result<Vec<(usize, Row)>, StorageError> {
-        let (_txn_id, snap, auto) = self.current_or_auto();
+        let (_txn_id, snap, auto) = self.current_or_auto()?;
         let results = self
             .engine
             .scan(table, &snap)
@@ -1601,7 +1605,7 @@ impl StorageEngine for MvccStorageAdapter {
         col_idx: usize,
         value: &Value,
     ) -> Result<Vec<(usize, Row)>, StorageError> {
-        let (txn_id, snap, auto) = self.current_or_auto();
+        let (txn_id, snap, auto) = self.current_or_auto()?;
 
         // --- Try index-based O(1) lookup first ---
         // If there is a BTreeMap index on this column with version tracking,
@@ -1666,7 +1670,7 @@ impl StorageEngine for MvccStorageAdapter {
         key_col: usize,
         val_col: Option<usize>,
     ) -> Option<Vec<(Value, i64, Option<f64>)>> {
-        let (_txn_id, snap, auto) = self.current_or_auto();
+        let (_txn_id, snap, auto) = self.current_or_auto().ok()?;
         let tbl = {
             let tables = self.engine.tables.read();
             tables.get(table)?.clone()
@@ -1743,7 +1747,7 @@ impl StorageEngine for MvccStorageAdapter {
         filter_col: usize,
         filter_val: &Value,
     ) -> Option<(f64, usize)> {
-        let (_txn_id, snap, auto) = self.current_or_auto();
+        let (_txn_id, snap, auto) = self.current_or_auto().ok()?;
         let tbl = {
             let tables = self.engine.tables.read();
             tables.get(table)?.clone()
@@ -1794,7 +1798,7 @@ impl StorageEngine for MvccStorageAdapter {
         filter_col: usize,
         filter_val: &Value,
     ) -> Option<usize> {
-        let (_txn_id, snap, auto) = self.current_or_auto();
+        let (_txn_id, snap, auto) = self.current_or_auto().ok()?;
         let tbl = {
             let tables = self.engine.tables.read();
             tables.get(table)?.clone()
@@ -1826,7 +1830,7 @@ impl StorageEngine for MvccStorageAdapter {
         filter_col: usize,
         filter_val: &Value,
     ) -> Option<(Vec<Row>, usize)> {
-        let (txn_id, snap, auto) = self.current_or_auto();
+        let (txn_id, snap, auto) = self.current_or_auto().ok()?;
         let tbl = {
             let tables = self.engine.tables.read();
             tables.get(table)?.clone()
@@ -1887,7 +1891,7 @@ impl StorageEngine for MvccStorageAdapter {
             return Some(Vec::new());
         }
 
-        let (_txn_id, snap, auto) = self.current_or_auto();
+        let (_txn_id, snap, auto) = self.current_or_auto().ok()?;
         let tbl = {
             let tables = self.engine.tables.read();
             tables.get(table)?.clone()
@@ -1993,7 +1997,7 @@ impl StorageEngine for MvccStorageAdapter {
         low: &Value,
         high: &Value,
     ) -> Option<Vec<Row>> {
-        let (txn_id, snap, auto) = self.current_or_auto();
+        let (txn_id, snap, auto) = self.current_or_auto().ok()?;
         let tbl = {
             let tables = self.engine.tables.read();
             tables.get(table)?.clone()
@@ -2032,7 +2036,7 @@ impl StorageEngine for MvccStorageAdapter {
     }
 
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
-        let (txn_id, _snap, auto) = self.current_or_auto();
+        let (txn_id, _snap, auto) = self.current_or_auto()?;
 
         // `positions` are stable MVCC version indices (from scan_where_eq_positions
         // / scan_physical), NOT scan-order positions — operate on each directly.
@@ -2138,7 +2142,11 @@ impl StorageEngine for MvccStorageAdapter {
             *next = IsolationLevel::Snapshot; // reset for next BEGIN
             iso
         };
-        let txn = self.engine.txn_mgr().begin(iso);
+        let txn = self
+            .engine
+            .txn_mgr()
+            .try_begin(iso)
+            .map_err(|_| StorageError::TransactionIdExhausted)?;
         wal_log!(self, MvccWalRecord::Begin { txn_id: txn.id })?;
         *lock = Some(txn);
         Ok(())
@@ -2201,7 +2209,11 @@ impl StorageEngine for MvccStorageAdapter {
         // Also refresh committed_counts from the post-commit view.
         let dirty: Vec<String> = sess.dirty_tables.write().drain().collect();
         for table in dirty {
-            let mut read_txn = self.engine.txn_mgr().begin(IsolationLevel::Snapshot);
+            let mut read_txn = self
+                .engine
+                .txn_mgr()
+                .try_begin(IsolationLevel::Snapshot)
+                .map_err(|_| StorageError::TransactionIdExhausted)?;
             let snap = read_txn.snapshot.clone();
             if let Ok(rows_with_vidx) = self.engine.scan(&table, &snap) {
                 let n = rows_with_vidx.len() as i64;
@@ -2357,7 +2369,7 @@ impl StorageEngine for MvccStorageAdapter {
         col_idx: usize,
     ) -> Result<(), StorageError> {
         // Scan committed rows (with version indices) and build the index.
-        let (txn_id, snap, auto) = self.current_or_auto();
+        let (txn_id, snap, auto) = self.current_or_auto()?;
         let results = self
             .engine
             .scan(table, &snap)
@@ -2589,7 +2601,11 @@ impl StorageEngine for MvccStorageAdapter {
         // change. Rebuild every affected secondary index before returning;
         // otherwise an index can point at a different surviving row.
         for affected in affected_tables {
-            let mut observer = self.engine.txn_mgr().begin(IsolationLevel::Snapshot);
+            let mut observer = self
+                .engine
+                .txn_mgr()
+                .try_begin(IsolationLevel::Snapshot)
+                .map_err(|_| StorageError::TransactionIdExhausted)?;
             let snapshot = observer.snapshot.clone();
             if let Ok(rows) = self.engine.scan(&affected, &snapshot) {
                 self.rebuild_indexes_for_table(&affected, &rows);
@@ -3139,6 +3155,27 @@ mod tests {
                 .unwrap(),
             Some(vec![row(&[2, 20])])
         );
+    }
+
+    #[tokio::test]
+    async fn adapter_returns_explicit_transaction_id_exhaustion() {
+        let adapter = MvccStorageAdapter::new();
+        adapter.create_table("txn_exhaustion").await.unwrap();
+        adapter.engine.txn_mgr().set_next_txn_id_for_test(u64::MAX);
+
+        assert!(matches!(
+            adapter.insert("txn_exhaustion", row(&[1])).await,
+            Err(StorageError::TransactionIdExhausted)
+        ));
+        assert!(matches!(
+            adapter.begin_txn().await,
+            Err(StorageError::TransactionIdExhausted)
+        ));
+        assert!(matches!(
+            adapter.scan("txn_exhaustion").await,
+            Err(StorageError::TransactionIdExhausted)
+        ));
+        assert_eq!(adapter.engine.total_versions(), 0);
     }
 
     #[tokio::test]
@@ -4592,7 +4629,7 @@ impl MvccStorageAdapter {
         updates: &[(usize, Row)],
         unique: Option<&[Vec<usize>]>,
     ) -> Result<usize, StorageError> {
-        let (txn_id, _snap, auto) = self.current_or_auto();
+        let (txn_id, _snap, auto) = self.current_or_auto()?;
 
         // `updates` keys are stable MVCC version indices (from
         // scan_where_eq_positions / scan_physical), NOT scan-order positions —
