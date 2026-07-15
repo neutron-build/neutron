@@ -1,4 +1,24 @@
-# Publishing the render-core packages (OTP-gated — run locally)
+# Render-core package release
+
+## Release status (completed 2026-07-14)
+
+The render-core packages are published and publicly available:
+
+- `@neutron-build/core@0.1.5`
+- `@neutron-build/cli@0.1.4` (published dependency: core `^0.1.5`)
+- `@neutron-build/ai@0.1.0`
+- `@neutron-build/workflow@0.1.0`
+- `@neutron-build/agents@0.1.0`
+
+The commands below are retained as the verified manual release procedure for a
+future version. Run pnpm from inside each package directory: using
+`pnpm --dir <package> publish` with pnpm 9.15.4 and npm 11.17.0 produced a
+malformed npm invocation.
+
+The private `apps/codex` content demo has a pre-existing browser-bundle failure
+and is not part of this package release. Use
+`RELEASE_CHECK_SKIP_CODEX=1 pnpm run ci:release` to run the complete release
+gate with that one explicit exclusion; the default gate continues to include it.
 
 The render-core-unification work added new `@neutron-build/core/runtime-edge`
 exports (`renderAppRoute`, `isMutationMethod`, `isJsonRequest`,
@@ -12,10 +32,9 @@ version **at publish time** — bump core first and the pin is automatic.
 
 ## Branch state (verified 2026-07-14)
 
-`feat/render-core-unification` is **complete** (5 commits: d1a066b docker-preset
-fix, ecb11f7 dev core, 51f8817 prod codegen, da84835 dead-code, ad1583c
-playground regen) and a **clean fast-forward from main** (main is 0 ahead). So
-you can merge it to main first, then publish from main:
+`feat/render-core-unification` is a clean fast-forward from main (main is 0
+ahead). It contains the original five render-core commits plus the follow-on
+head-resolution/render-guards commit `e3f19e9`.
 
 ```bash
 # (optional, recommended) merge the finished branch — it's a clean fast-forward
@@ -39,16 +58,15 @@ npm --prefix packages/neutron-cli    version patch --no-git-tag-version   # cli 
 # 2. Build everything.
 pnpm -r build
 
-# 3. Log in (your OTP).
-npm login
+# 3. Log in through the browser/security-key flow.
+npm login --auth-type=web
 
-# 4. Publish in dependency order — core FIRST (cli's workspace:^ resolves to it),
-#    then cli, then the three new SDKs. --access public for the scoped org.
-npm publish packages/neutron          --access public   # @neutron-build/core@0.1.5
-npm publish packages/neutron-cli      --access public   # @neutron-build/cli@0.1.4  (deps core ^0.1.5)
-npm publish packages/neutron-ai       --access public   # @neutron-build/ai@0.1.0
-npm publish packages/neutron-workflow --access public   # @neutron-build/workflow@0.1.0
-npm publish packages/neutron-agents   --access public   # @neutron-build/agents@0.1.0
+# 4. Publish in dependency order — core FIRST. pnpm rewrites workspace:^.
+(cd packages/neutron          && pnpm publish --no-git-checks --access public)
+(cd packages/neutron-cli      && pnpm publish --no-git-checks --access public)
+(cd packages/neutron-ai       && pnpm publish --no-git-checks --access public)
+(cd packages/neutron-workflow && pnpm publish --no-git-checks --access public)
+(cd packages/neutron-agents   && pnpm publish --no-git-checks --access public)
 
 # 5. Verify.
 for p in core cli ai workflow agents; do echo -n "@neutron-build/$p: "; npm view @neutron-build/$p version; done
@@ -58,10 +76,11 @@ Sanity check before publishing cli: `npm pack --dry-run packages/neutron-cli` an
 confirm the resolved `@neutron-build/core` dependency is `^0.1.5` (not
 `workspace:^`).
 
-## Then: de-vendor Ship (R5)
+## Ship de-vendoring (R5)
 
-Ship currently installs the SDKs from packed tarballs because they were ahead of
-npm. Once the above lands, switch to the published versions and drop the packing.
+Ship previously installed the SDKs from packed tarballs because they were ahead
+of npm. The `Teploy/teploy-ship` deployment image now uses the published
+versions directly.
 
 In `Teploy/teploy-ship`:
 

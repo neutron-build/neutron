@@ -107,7 +107,7 @@ async function verifyCase(testCase) {
       "--filter",
       PLAYGROUND_FILTER,
       "exec",
-      "neutron",
+      "neutron-ts",
       "start",
       "--host",
       "127.0.0.1",
