@@ -2,6 +2,7 @@
 
 use super::schema_types::CursorDef;
 use super::types::{CteTableMap, PreparedStmt};
+use crate::security::SecurityManager;
 use crate::types::Row;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -152,6 +153,14 @@ pub(super) struct TxnState {
     pub savepoints: Vec<(String, HashMap<String, Vec<Row>>)>,
     /// Cross-model snapshots for rolling back KV/Graph/Doc/Datalog mutations.
     pub cross_model: Option<CrossModelSnapshots>,
+    /// Security catalog at BEGIN, used to make policy DDL transactional.
+    pub security_snapshot: Option<SecurityManager>,
+    /// Session-local security catalog staged by policy DDL until COMMIT.
+    pub security_pending: Option<SecurityManager>,
+    /// Security snapshots associated with SQL savepoints.
+    pub security_savepoints: Vec<(String, SecurityManager)>,
+    /// Whether this transaction changed security policy metadata.
+    pub policy_dirty: bool,
 }
 
 impl TxnState {
@@ -161,6 +170,10 @@ impl TxnState {
             snapshot: None,
             savepoints: Vec::new(),
             cross_model: None,
+            security_snapshot: None,
+            security_pending: None,
+            security_savepoints: Vec::new(),
+            policy_dirty: false,
         }
     }
 }
@@ -176,6 +189,12 @@ pub struct Session {
     pub(super) prepared_stmts: RwLock<HashMap<String, Arc<PreparedStmt>>>,
     pub(super) cursors: RwLock<HashMap<String, CursorDef>>,
     pub(super) settings: parking_lot::RwLock<HashMap<String, String>>,
+    /// Principal proven by the connection authentication handshake.
+    pub(super) authenticated_user: parking_lot::RwLock<Option<String>>,
+    /// Effective role selected through the authorized SET ROLE path.
+    pub(super) current_role: parking_lot::RwLock<Option<String>>,
+    /// Tenant claim installed by a trusted boundary, never by generic SET.
+    pub(super) trusted_tenant_id: parking_lot::RwLock<Option<String>>,
     pub(super) active_ctes: parking_lot::RwLock<CteTableMap>,
     #[allow(dead_code)]
     pub(super) session_context: parking_lot::RwLock<crate::security::SessionContext>,
@@ -212,6 +231,9 @@ impl Session {
             prepared_stmts: RwLock::new(HashMap::new()),
             cursors: RwLock::new(HashMap::new()),
             settings: parking_lot::RwLock::new(default_settings),
+            authenticated_user: parking_lot::RwLock::new(Some("nucleus".to_string())),
+            current_role: parking_lot::RwLock::new(None),
+            trusted_tenant_id: parking_lot::RwLock::new(None),
             active_ctes: parking_lot::RwLock::new(HashMap::new()),
             // Default identity is the bootstrap superuser, so an unconfigured
             // (single-user) deployment bypasses RLS entirely — enforcement only
@@ -268,5 +290,7 @@ impl Session {
             settings.insert("timezone".to_string(), "UTC".to_string());
             settings.insert("plan_execution".to_string(), "on".to_string());
         }
+        *self.current_role.write() = None;
+        *self.trusted_tenant_id.write() = None;
     }
 }

@@ -827,9 +827,7 @@ async fn cmd_start(cfg: StartConfig) {
                     }
                 }
                 // Persist the reclaimed directory so orphans don't reappear next boot.
-                if reclaimed
-                    && let Err(e) = engine.flush_schema().await
-                {
+                if reclaimed && let Err(e) = engine.flush_schema().await {
                     tracing::warn!("reconcile: failed to persist directory after reclaim: {e}");
                 }
             }
@@ -984,14 +982,22 @@ async fn cmd_start(cfg: StartConfig) {
                 std::process::exit(1);
             }
         }
+        if resolved_auth_method != AuthMethod::ScramSha256 {
+            tracing::error!(
+                "Catalog-backed multi-user authentication requires SCRAM-SHA-256; \
+                 cleartext authentication is no longer accepted by the production server"
+            );
+            std::process::exit(1);
+        }
     }
     let resolved_password_for_resp = resolved_password.clone();
     let resolved_password_for_binary = resolved_password.clone();
-    let handler = Arc::new(NucleusHandler::with_password_and_method(
-        executor.clone(),
-        resolved_password,
-        resolved_auth_method,
-    ));
+    let handler = if let Some(ref bootstrap_password) = resolved_password {
+        executor.set_bootstrap_password(bootstrap_password).await;
+        Arc::new(NucleusHandler::with_catalog_auth(executor.clone()))
+    } else {
+        Arc::new(NucleusHandler::new(executor.clone()))
+    };
     let handler_ref = handler.clone();
     let server = Arc::new(NucleusServer::new(handler));
     let resolved_tls_client_ca = tls_client_ca.or_else(|| {
@@ -1161,7 +1167,7 @@ async fn cmd_start(cfg: StartConfig) {
     tokio::spawn(async move {
         let mut rx = apply_rx;
         while let Some(sql) = rx.recv().await {
-            if let Err(e) = executor_for_apply.execute(&sql).await {
+            if let Err(e) = executor_for_apply.apply_replicated_sql(&sql).await {
                 tracing::warn!("Failed to apply Raft-committed SQL: {e}: sql={sql}");
             }
         }
@@ -1269,11 +1275,12 @@ async fn cmd_start(cfg: StartConfig) {
         let sweep_secs = idle_txn_timeout_secs.clamp(1, 30);
         let timeout_ms = idle_txn_timeout_secs.saturating_mul(1000);
         tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
             loop {
                 ticker.tick().await;
-                let n = executor_for_idle.sweep_idle_in_transaction(timeout_ms).await;
+                let n = executor_for_idle
+                    .sweep_idle_in_transaction(timeout_ms)
+                    .await;
                 if n > 0 {
                     tracing::info!("Idle-in-transaction sweep rolled back {n} transaction(s)");
                 }
@@ -2058,7 +2065,7 @@ async fn handle_cluster_message(
                 "ForwardQuery from {}: shard={shard_id} query={query}",
                 env.from
             );
-            match executor.execute(&query).await {
+            match executor.execute_principal_less_forward(&query).await {
                 Ok(results) => {
                     // Serialize result rows as JSON-encoded bytes
                     let mut encoded_rows = Vec::new();
@@ -2102,7 +2109,8 @@ async fn handle_cluster_message(
             tracing::debug!("ForwardDml from {}: sql={sql}", env.from);
             let request_id = env.id; // Preserve for send_request() correlation.
             let from = env.from;
-            let (response_msg, self_id) = match executor.execute(&sql).await {
+            let (response_msg, self_id) = match executor.execute_principal_less_forward(&sql).await
+            {
                 Ok(results) => {
                     let rows_affected: usize = results
                         .iter()
@@ -2167,7 +2175,11 @@ fn cmd_init(data: PathBuf) {
 fn cmd_backup(data: PathBuf, output: PathBuf, force: bool) {
     match nucleus::backup::backup_data_dir(&data, &output, force, env!("CARGO_PKG_VERSION")) {
         Ok(manifest) => {
-            println!("Backup complete: {} -> {}", data.display(), output.display());
+            println!(
+                "Backup complete: {} -> {}",
+                data.display(),
+                output.display()
+            );
             println!("  Nucleus version: {}", manifest.nucleus_version);
             println!(
                 "  Restore with: nucleus restore --input {} --data <dir>",
@@ -2184,7 +2196,11 @@ fn cmd_backup(data: PathBuf, output: PathBuf, force: bool) {
 fn cmd_restore(input: PathBuf, data: PathBuf, force: bool) {
     match nucleus::backup::restore_data_dir(&input, &data, force, env!("CARGO_PKG_VERSION")) {
         Ok(_) => {
-            println!("Restore complete: {} -> {}", input.display(), data.display());
+            println!(
+                "Restore complete: {} -> {}",
+                input.display(),
+                data.display()
+            );
             println!("  Start with: nucleus start --data {}", data.display());
         }
         Err(e) => {

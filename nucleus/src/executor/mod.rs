@@ -32,6 +32,51 @@ use crate::storage::StorageEngine;
 use crate::types::{DataType, Row, Value};
 use crate::vector;
 
+#[cfg(feature = "server")]
+pub(crate) fn encode_scram_verifier(password: &str) -> String {
+    use base64::Engine as _;
+    let salt = rand::random::<[u8; 16]>();
+    let salted = pgwire::api::auth::sasl::scram::gen_salted_password(
+        password,
+        &salt,
+        pgwire::api::auth::sasl::scram::SCRAM_ITERATIONS,
+    );
+    format!(
+        "SCRAM-SHA-256${}${}${}",
+        pgwire::api::auth::sasl::scram::SCRAM_ITERATIONS,
+        base64::engine::general_purpose::STANDARD.encode(salt),
+        base64::engine::general_purpose::STANDARD.encode(salted)
+    )
+}
+
+#[cfg(not(feature = "server"))]
+pub(crate) fn encode_scram_verifier(password: &str) -> String {
+    // Embedded builds have no pgwire dependency. A server build must reset
+    // this credential before the role is eligible for wire login.
+    format!(
+        "EMBEDDED-BLAKE3${}",
+        blake3::hash(password.as_bytes()).to_hex()
+    )
+}
+
+#[cfg(feature = "server")]
+pub(crate) fn decode_scram_verifier(encoded: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    use base64::Engine as _;
+    let mut parts = encoded.split('$');
+    if parts.next()? != "SCRAM-SHA-256"
+        || parts.next()?.parse::<usize>().ok()? != pgwire::api::auth::sasl::scram::SCRAM_ITERATIONS
+    {
+        return None;
+    }
+    let salt = base64::engine::general_purpose::STANDARD
+        .decode(parts.next()?)
+        .ok()?;
+    let salted = base64::engine::general_purpose::STANDARD
+        .decode(parts.next()?)
+        .ok()?;
+    (parts.next().is_none()).then_some((salt, salted))
+}
+
 mod admin;
 mod aggregate;
 mod cache;
@@ -43,6 +88,7 @@ mod helpers;
 mod join;
 mod meta_persistence;
 pub mod param_subst;
+mod policy;
 mod project;
 mod query;
 mod scalar_fns;
@@ -302,7 +348,9 @@ impl Executor {
                 name: "nucleus".to_string(),
                 password_hash: None,
                 is_superuser: true,
+                bypass_rls: true,
                 can_login: true,
+                member_of: Vec::new(),
                 privileges: HashMap::new(),
             },
         );
@@ -714,6 +762,11 @@ impl Executor {
         }
         if !loaded.functions.is_empty() {
             *self.functions.write() = loaded.functions;
+        }
+        {
+            let mut security = self.security.write();
+            security.rls = loaded.rls;
+            security.masking = loaded.masking;
         }
 
         // Override sequences with dedicated sequences.json if it exists (more up-to-date).
@@ -1456,6 +1509,69 @@ impl Executor {
         id
     }
 
+    /// Create a wire session that has no authority until authentication binds
+    /// a catalog role to it.
+    #[cfg(feature = "server")]
+    pub fn create_unauthenticated_session(&self) -> u64 {
+        let id = self.create_session();
+        let session = self.get_session(id);
+        *session.authenticated_user.write() = None;
+        *session.current_role.write() = None;
+        *session.session_context.write() = crate::security::SessionContext::new("");
+        id
+    }
+
+    /// Install/rotate the bootstrap role's SCRAM verifier. Used by the server
+    /// startup flag before accepting connections.
+    #[cfg(feature = "server")]
+    pub async fn set_bootstrap_password(&self, password: &str) {
+        if let Some(role) = self.roles.write().await.get_mut("nucleus") {
+            role.password_hash = Some(encode_scram_verifier(password));
+        }
+    }
+
+    /// Return stored SCRAM material only for a login-capable catalog role.
+    #[cfg(feature = "server")]
+    pub async fn scram_credentials(&self, user: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+        let roles = self.roles.read().await;
+        let role = roles.get(user)?;
+        if !role.can_login {
+            return None;
+        }
+        decode_scram_verifier(role.password_hash.as_deref()?)
+    }
+
+    /// Bind a successfully authenticated pgwire connection to its immutable
+    /// session principal.
+    #[cfg(feature = "server")]
+    pub async fn bind_authenticated_session(&self, id: u64, user: &str) -> Result<(), ExecError> {
+        let allowed = self
+            .roles
+            .read()
+            .await
+            .get(user)
+            .is_some_and(|r| r.can_login);
+        if !allowed {
+            return Err(ExecError::PermissionDenied(format!(
+                "role '{user}' is not permitted to log in"
+            )));
+        }
+        let session = self.get_session(id);
+        *session.authenticated_user.write() = Some(user.to_string());
+        *session.current_role.write() = None;
+        self.recompute_session_context(&session);
+        Ok(())
+    }
+
+    /// Install a tenant claim from a trusted authentication/proxy boundary.
+    /// SQL `SET nucleus.tenant_id` is intentionally not an authority source.
+    #[cfg(feature = "server")]
+    pub fn bind_trusted_tenant(&self, id: u64, tenant_id: Option<String>) {
+        let session = self.get_session(id);
+        *session.trusted_tenant_id.write() = tenant_id;
+        self.recompute_session_context(&session);
+    }
+
     /// Drop a session when a connection closes, freeing its state.
     pub fn drop_session(&self, id: u64) {
         self.sessions.write().remove(&id);
@@ -1503,6 +1619,7 @@ impl Executor {
 
         // Perform the actual reset
         session.reset().await;
+        self.recompute_session_context(&session);
 
         actions
     }
@@ -1625,6 +1742,46 @@ impl Executor {
             .unwrap_or(false)
     }
 
+    /// Whether a wire session must avoid every transport-level bypass path.
+    #[cfg(feature = "server")]
+    pub fn session_has_active_rls(&self, session_id: u64) -> bool {
+        let session = self.get_session(session_id);
+        let ctx = session.session_context.read();
+        if ctx.bypass_rls || ctx.has_role("superuser") {
+            return false;
+        }
+        if let Ok(txn) = session.txn_state.try_read()
+            && txn.active
+            && let Some(pending) = txn.security_pending.as_ref()
+        {
+            return pending.rls.any_enabled();
+        }
+        self.security.read().rls.any_enabled()
+    }
+
+    /// Whether the committed catalog contains any RLS-protected table. Used
+    /// by protocols/cluster transports that cannot carry a trusted SQL
+    /// principal: those surfaces must fail closed rather than run as the
+    /// embedded bootstrap superuser.
+    #[cfg(feature = "server")]
+    pub fn rls_configured(&self) -> bool {
+        self.security.read().rls.any_enabled()
+    }
+
+    #[cfg(feature = "server")]
+    pub async fn execute_principal_less_forward(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<ExecResult>, ExecError> {
+        if self.rls_configured() {
+            return Err(ExecError::PermissionDenied(
+                "principal-less cluster SQL forwarding is disabled while row-level security is configured"
+                    .into(),
+            ));
+        }
+        self.execute(sql).await
+    }
+
     /// Get the current session from the task-local, or the default session
     /// if no session has been set (e.g. embedded mode or tests).
     fn current_session(&self) -> Arc<Session> {
@@ -1641,16 +1798,51 @@ impl Executor {
 
     /// Bump the policy generation counter — folded into the query-cache key so
     /// no cached result set crosses a policy change.
-    #[cfg(feature = "server")]
     #[allow(dead_code)]
     pub(super) fn bump_policy_gen(&self) {
         self.policy_gen.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Read the security catalog visible to this SQL transaction. Policy DDL
+    /// is staged per session, so other connections continue to see the
+    /// committed catalog until COMMIT.
+    fn with_visible_security<R>(
+        &self,
+        f: impl FnOnce(&crate::security::SecurityManager) -> R,
+    ) -> R {
+        let session = self.current_session();
+        if let Ok(txn) = session.txn_state.try_read()
+            && txn.active
+            && let Some(pending) = txn.security_pending.as_ref()
+        {
+            return f(pending);
+        }
+        f(&self.security.read())
+    }
+
+    /// Mutate committed policy state in autocommit, or a private staged copy
+    /// inside an explicit transaction.
+    pub(super) fn with_mutable_security<R>(
+        &self,
+        f: impl FnOnce(&mut crate::security::SecurityManager) -> R,
+    ) -> Result<R, ExecError> {
+        let session = self.current_session();
+        let mut txn = session.txn_state.try_write().map_err(|_| {
+            ExecError::Runtime("transaction security state is busy; retry statement".into())
+        })?;
+        if txn.active {
+            if txn.security_pending.is_none() {
+                txn.security_pending = Some(self.security.read().clone_policy_state());
+            }
+            return Ok(f(txn.security_pending.as_mut().expect("initialized above")));
+        }
+        drop(txn);
+        Ok(f(&mut self.security.write()))
+    }
+
     /// The current RLS principal + policy generation, folded into the query
     /// cache key so a result cached for one identity is never served to another
     /// (the SQL-text-only cache key is otherwise a straight RLS bypass).
-    #[cfg(feature = "server")]
     #[allow(dead_code)] // wired as enforcement lands (T2.2)
     pub(super) fn rls_cache_principal(&self) -> String {
         let session = self.current_session();
@@ -1660,44 +1852,76 @@ impl Executor {
         format!("{}|{}|{}", pgen, ctx.user, ctx.roles.join(","))
     }
 
-    /// Recompute a session's SecurityContext from its identity settings. Called
-    /// on session creation and whenever `SET session_authorization` / `SET ROLE`
-    /// / the tenant GUC changes. Default (user "nucleus") is a superuser, so an
-    /// unconfigured single-user deployment sees no RLS enforcement — matching
-    /// today's behavior. A non-superuser identity engages RLS.
-    #[cfg(feature = "server")]
+    /// Recompute security context exclusively from authenticated identity,
+    /// authorized role assumption, and trusted tenant state. Generic session
+    /// settings are deliberately not authority inputs.
     pub(super) fn recompute_session_context(&self, session: &Session) {
-        let raw = session
-            .settings
+        let authenticated = session
+            .authenticated_user
             .read()
-            .get("session_authorization")
-            .cloned()
-            .unwrap_or_else(|| "nucleus".to_string());
-        let user = raw.trim().trim_matches(|c| c == '\'' || c == '"').to_string();
-        let mut ctx = crate::security::SessionContext::new(&user).with_role(&user);
-        // Sync try_read (called from the sync SET path). On contention, fall
-        // back to superuser-only-for-"nucleus" — a real user then gets a
-        // non-superuser context, i.e. RLS engages (fail closed), never the
-        // reverse.
-        let is_super = match self.roles.try_read() {
-            Ok(roles) => roles
-                .get(&user)
-                .map(|r| r.is_superuser)
-                .unwrap_or(user == "nucleus"),
-            Err(_) => user == "nucleus",
-        };
-        if is_super {
-            ctx = ctx.with_role("superuser");
-        }
-        let tenant = session
-            .settings
-            .read()
-            .get("nucleus.tenant_id")
-            .map(|t| t.trim().trim_matches(|c| c == '\'' || c == '"').to_string());
-        if let Some(t) = tenant {
-            if !t.is_empty() {
-                ctx = ctx.with_tenant(&t);
+            .clone()
+            .unwrap_or_default();
+        let requested_role = session.current_role.read().clone();
+        let mut effective = requested_role
+            .clone()
+            .unwrap_or_else(|| authenticated.clone());
+        let mut ctx = crate::security::SessionContext::new(&effective);
+        let mut role_names = vec![effective.clone()];
+        let mut bypass = false;
+        if let Ok(roles) = self.roles.try_read() {
+            // Revalidate an assumed role on every statement. Revoking
+            // membership takes effect immediately for existing sessions.
+            if let Some(target) = requested_role {
+                let mut reachable = roles
+                    .get(&authenticated)
+                    .map(|role| role.member_of.clone())
+                    .unwrap_or_default();
+                let mut cursor = 0;
+                while cursor < reachable.len() {
+                    let name = reachable[cursor].clone();
+                    cursor += 1;
+                    if let Some(role) = roles.get(&name) {
+                        for parent in &role.member_of {
+                            if !reachable.contains(parent) {
+                                reachable.push(parent.clone());
+                            }
+                        }
+                    }
+                }
+                let login_is_superuser = roles
+                    .get(&authenticated)
+                    .is_some_and(|role| role.is_superuser);
+                if !login_is_superuser && target != authenticated && !reachable.contains(&target) {
+                    *session.current_role.write() = None;
+                    effective = authenticated.clone();
+                    ctx = crate::security::SessionContext::new(&effective);
+                    role_names = vec![effective.clone()];
+                }
             }
+            let mut cursor = 0;
+            while cursor < role_names.len() {
+                let name = role_names[cursor].clone();
+                cursor += 1;
+                if let Some(role) = roles.get(&name) {
+                    bypass |= role.is_superuser || role.bypass_rls;
+                    for parent in &role.member_of {
+                        if !role_names.contains(parent) {
+                            role_names.push(parent.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for role in role_names {
+            ctx = ctx.with_role(&role);
+        }
+        if bypass {
+            ctx = ctx.with_role("superuser").with_bypass_rls(true);
+        }
+        if let Some(t) = session.trusted_tenant_id.read().clone()
+            && !t.is_empty()
+        {
+            ctx = ctx.with_tenant(&t);
         }
         *session.session_context.write() = ctx;
     }
@@ -1706,7 +1930,6 @@ impl Executor {
     /// RLS enabled on the table AND the session is not a superuser. This is the
     /// FAIL-CLOSED gate every fast/bypass read path checks — when true, that
     /// path must defer to the general materialize-and-filter path.
-    #[cfg(feature = "server")]
     #[allow(dead_code)] // wired as enforcement lands (T2.2)
     pub(super) fn rls_active(&self, table: &str) -> bool {
         if self
@@ -1717,13 +1940,12 @@ impl Executor {
         {
             return false;
         }
-        self.security.read().rls.is_enabled(table)
+        self.with_visible_security(|security| security.rls.is_enabled(table))
     }
 
     /// Whether ANY table in the current query needs RLS filtering — used to
     /// disable the SQL-text-keyed result cache path wholesale when policies are
     /// live (cheap: only true for non-superuser sessions with ≥1 enabled table).
-    #[cfg(feature = "server")]
     #[allow(dead_code)] // wired as enforcement lands (T2.2)
     pub(super) fn any_rls_active(&self) -> bool {
         if self
@@ -1734,12 +1956,11 @@ impl Executor {
         {
             return false;
         }
-        self.security.read().rls.any_enabled()
+        self.with_visible_security(|security| security.rls.any_enabled())
     }
 
     /// Drop rows the current session may not see under `table`'s RLS policies.
     /// No-op (returns input) when RLS is not active for this session/table.
-    #[cfg(feature = "server")]
     #[allow(dead_code)] // wired as enforcement lands (T2.2)
     pub(super) fn rls_filter_rows(
         &self,
@@ -1768,10 +1989,7 @@ impl Executor {
             })
             .collect();
         let keep: std::collections::HashSet<usize> = self
-            .security
-            .read()
-            .rls
-            .filter_rows(table, cmd, &maps, &ctx)
+            .with_visible_security(|security| security.rls.filter_rows(table, cmd, &maps, &ctx))
             .into_iter()
             .collect();
         rows.into_iter()
@@ -1779,6 +1997,69 @@ impl Executor {
             .filter(|(i, _)| keep.contains(i))
             .map(|(_, r)| r)
             .collect()
+    }
+
+    fn rls_row_map(
+        &self,
+        table: &str,
+        row: &Row,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        let def = self.catalog.get_table_cached(table)?;
+        if def.columns.len() != row.len() {
+            return None;
+        }
+        Some(
+            def.columns
+                .iter()
+                .zip(row.iter())
+                .map(|(column, value)| (column.name.clone(), value.to_string()))
+                .collect(),
+        )
+    }
+
+    /// Fail-closed single-row policy check used by positioned scans and DML.
+    pub(super) fn rls_allows_row(
+        &self,
+        table: &str,
+        command: crate::security::PolicyCommand,
+        row: &Row,
+    ) -> bool {
+        if !self.rls_active(table) {
+            return true;
+        }
+        let Some(row_map) = self.rls_row_map(table, row) else {
+            return false;
+        };
+        let ctx = self.current_session().session_context.read().clone();
+        self.with_visible_security(|security| {
+            security.rls.check_row(table, command, &row_map, &ctx)
+        })
+    }
+
+    pub(super) fn enforce_rls_new_row(
+        &self,
+        table: &str,
+        command: crate::security::PolicyCommand,
+        row: &Row,
+    ) -> Result<(), ExecError> {
+        if !self.rls_active(table) {
+            return Ok(());
+        }
+        let row_map = self.rls_row_map(table, row).ok_or_else(|| {
+            ExecError::PermissionDenied(format!(
+                "row security could not validate the row shape for table '{table}'"
+            ))
+        })?;
+        let ctx = self.current_session().session_context.read().clone();
+        if self.with_visible_security(|security| {
+            security.rls.check_new_row(table, command, &row_map, &ctx)
+        }) {
+            Ok(())
+        } else {
+            Err(ExecError::PermissionDenied(format!(
+                "new row violates row-level security policy for table '{table}'"
+            )))
+        }
     }
 
     /// Take (consume) the plan cache key hint stored by `parse_with_ast_cache`.
@@ -1855,16 +2136,17 @@ impl Executor {
     /// Persist the catalog and executor metadata to disk (if a catalog path is configured).
     /// Called after DDL operations (CREATE TABLE, DROP TABLE, CREATE VIEW, etc.).
     #[cfg(feature = "server")]
-    async fn persist_catalog(&self) {
+    async fn persist_catalog(&self) -> Result<(), ExecError> {
         let Some(ref path) = self.catalog_path else {
-            return;
+            return Ok(());
         };
 
         // 1. Persist table/index catalog.
         let persistence = crate::storage::persistence::CatalogPersistence::new(path);
-        if let Err(e) = persistence.save_catalog(&self.catalog).await {
-            tracing::error!("Failed to persist catalog: {e}");
-        }
+        persistence
+            .save_catalog(&self.catalog)
+            .await
+            .map_err(|e| ExecError::Runtime(format!("catalog persistence failed: {e}")))?;
 
         // 2. Persist executor metadata (views, sequences, triggers, roles, functions).
         // Snapshot parking_lot locks synchronously first (cannot hold them across await).
@@ -1880,22 +2162,25 @@ impl Executor {
                 .collect()
         };
         let functions_snap: HashMap<String, FunctionDef> = self.functions.read().clone();
+        let security_snap = self.security.read().clone_policy_state();
         // Now take async locks.
         let meta_pers = meta_persistence::MetaPersistence::alongside_catalog(path);
         let views = self.views.read().await;
         let mat_views = self.materialized_views.read().await;
         let triggers = self.triggers.read().await;
         let roles = self.roles.read().await;
-        if let Err(e) = meta_pers.save(
-            &views,
-            &mat_views,
-            &sequences_snap,
-            &triggers,
-            &roles,
-            &functions_snap,
-        ) {
-            tracing::error!("Failed to persist executor metadata: {e}");
-        }
+        meta_pers
+            .save(
+                &views,
+                &mat_views,
+                &sequences_snap,
+                &triggers,
+                &roles,
+                &functions_snap,
+                &security_snap,
+            )
+            .map_err(|e| ExecError::Runtime(format!("metadata persistence failed: {e}")))?;
+        Ok(())
     }
 
     /// Check that a subsystem is healthy before dispatching to it.
@@ -2580,6 +2865,9 @@ impl Executor {
                 where_col,
                 where_val,
             } => {
+                if self.rls_active(table) {
+                    return None;
+                }
                 let table_def = self.catalog.get_table_cached(table)?;
                 let col_idx = table_def.column_index(where_col)?;
                 // Coerce the wire-parsed literal to the column's declared
@@ -2627,6 +2915,9 @@ impl Executor {
             }
 
             SqlFastPathCommand::SimpleInsert { table, values } => {
+                if self.rls_active(table) {
+                    return None;
+                }
                 let table_def = self.catalog.get_table_cached(table)?;
                 // Correctness gate: this fast path writes straight to storage and
                 // does NOT enforce constraints. Fall through to the full executor
@@ -2689,6 +2980,9 @@ impl Executor {
                 where_col,
                 where_val,
             } => {
+                if self.rls_active(table) {
+                    return None;
+                }
                 let table_def = self.catalog.get_table_cached(table)?;
                 let pk_idx = table_def.column_index(where_col)?;
                 // Resolve all assignment column indexes upfront. If any column
@@ -2758,6 +3052,9 @@ impl Executor {
                 where_col,
                 where_val,
             } => {
+                if self.rls_active(table) {
+                    return None;
+                }
                 let table_def = self.catalog.get_table_cached(table)?;
                 let col_idx = table_def.column_index(where_col)?;
                 // Coerce text literal to the column's declared type — see
@@ -2898,6 +3195,12 @@ impl Executor {
             let upper = trimmed.to_ascii_uppercase();
             #[cfg(feature = "server")]
             if upper.starts_with("SUBSCRIBE ") {
+                if self.any_rls_active() {
+                    return Err(ExecError::PermissionDenied(
+                        "reactive subscriptions are unavailable while row-level security is active because change diffs do not retain subscriber policy context"
+                            .into(),
+                    ));
+                }
                 return Ok(vec![self.execute_subscribe(trimmed).await?]);
             }
             #[cfg(feature = "server")]
@@ -2906,6 +3209,12 @@ impl Executor {
             }
             #[cfg(feature = "server")]
             if upper.starts_with("FETCH SUBSCRIPTION ") {
+                if self.any_rls_active() {
+                    return Err(ExecError::PermissionDenied(
+                        "subscription diffs are unavailable while row-level security is active"
+                            .into(),
+                    ));
+                }
                 return Ok(vec![self.execute_fetch_subscription(trimmed)?]);
             }
             if upper == "SHOW MEMORY" || upper == "SHOW MEMORY;" {
@@ -2934,11 +3243,13 @@ impl Executor {
             }
             // REFRESH MATERIALIZED VIEW <name> — re-execute the query and update cached rows.
             if upper.starts_with("REFRESH MATERIALIZED VIEW ") {
+                self.require_security_admin("refresh materialized views")?;
                 let view_name = trimmed[26..].trim().trim_end_matches(';').to_string();
                 return Ok(vec![self.execute_refresh_matview(&view_name).await?]);
             }
             // DROP MATERIALIZED VIEW [IF EXISTS] <name>
             if upper.starts_with("DROP MATERIALIZED VIEW ") {
+                self.require_security_admin("drop materialized views")?;
                 let rest = trimmed[23..].trim().trim_end_matches(';');
                 let (if_exists, view_name) = if rest.to_uppercase().starts_with("IF EXISTS ") {
                     (true, rest[10..].trim().to_lowercase())
@@ -2952,6 +3263,11 @@ impl Executor {
             // SHOW TABLE STATS <tablename> — display per-column statistics from ANALYZE.
             if upper.starts_with("SHOW TABLE STATS ") {
                 let table_name = trimmed[17..].trim().trim_end_matches(';').to_lowercase();
+                if self.rls_active(&table_name) {
+                    return Err(ExecError::PermissionDenied(format!(
+                        "raw planner statistics for RLS-protected table '{table_name}' are not visible to this session"
+                    )));
+                }
                 return Ok(vec![self.show_table_stats(&table_name).await?]);
             }
             // CREATE MODEL <name> FROM '<path>' — load an ONNX model for in-DB inference.
@@ -3080,24 +3396,62 @@ impl Executor {
         sql: &str,
         statements: Vec<Statement>,
     ) -> Result<Vec<ExecResult>, ExecError> {
+        self.recompute_session_context(&self.current_session());
         // Cluster-mode DML routing: followers forward to leader; leader appends to Raft log.
         // Skip entirely in standalone mode to avoid lock contention on the Raft mutex.
         #[cfg(feature = "server")]
         if let Some(ref cluster_arc) = self.cluster {
             let mode = { cluster_arc.read().mode() };
             if mode != crate::distributed::ClusterMode::Standalone {
+                let has_security_ddl = statements.iter().any(|statement| {
+                    matches!(
+                        statement,
+                        Statement::CreateRole(_)
+                            | Statement::AlterRole { .. }
+                            | Statement::Grant(_)
+                            | Statement::Revoke(_)
+                            | Statement::CreatePolicy(_)
+                            | Statement::DropPolicy(_)
+                    ) || matches!(statement, Statement::AlterTable(alter) if alter.operations.iter().any(|op| matches!(
+                        op,
+                        ast::AlterTableOperation::EnableRowLevelSecurity
+                            | ast::AlterTableOperation::DisableRowLevelSecurity
+                            | ast::AlterTableOperation::ForceRowLevelSecurity
+                            | ast::AlterTableOperation::NoForceRowLevelSecurity
+                    )))
+                });
                 let has_dml = statements.iter().any(|s| {
                     matches!(
                         s,
                         Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
                     )
                 });
-                if has_dml {
+                if has_security_ddl {
+                    // Authenticate authority before proposing a command that
+                    // followers intentionally apply as the internal Raft user.
+                    self.require_security_admin("change the replicated security catalog")?;
+                }
+                if has_dml || has_security_ddl {
                     let (is_leader, leader_addr) = {
                         let cluster = cluster_arc.read();
                         (cluster.is_leader(), cluster.leader_addr())
                     };
                     if !is_leader {
+                        if has_security_ddl {
+                            return Err(ExecError::PermissionDenied(
+                                "security catalog changes must be submitted to the cluster leader so authenticated authority and policy order are preserved"
+                                    .into(),
+                            ));
+                        }
+                        // SQL-only forwarding cannot carry the authenticated
+                        // connection principal. Never re-authorize an
+                        // RLS-protected write as the leader's internal user.
+                        if self.any_rls_active() {
+                            return Err(ExecError::PermissionDenied(
+                                "RLS-protected writes cannot be forwarded without authenticated principal propagation"
+                                    .into(),
+                            ));
+                        }
                         if let Some(addr) = leader_addr {
                             return self.forward_dml(sql, &addr).await;
                         }
@@ -3105,9 +3459,20 @@ impl Executor {
                         let repl = self.raft_replicator.read().clone();
                         if let Some(replicator) = repl {
                             if let Err(e) = replicator.propose_and_await(sql).await {
+                                if has_security_ddl {
+                                    return Err(ExecError::Runtime(format!(
+                                        "security catalog replication failed: {e}"
+                                    )));
+                                }
                                 tracing::warn!("Raft propose failed: {e}");
                             }
                         } else {
+                            if has_security_ddl {
+                                return Err(ExecError::Runtime(
+                                    "security catalog changes require an active Raft replicator"
+                                        .into(),
+                                ));
+                            }
                             let _ = cluster_arc
                                 .write()
                                 .propose(0u64, crate::distributed::Operation::Sql(sql.to_string()));
@@ -3130,6 +3495,20 @@ impl Executor {
         let mut results = Vec::new();
         for stmt in statements {
             results.push(self.execute_statement(stmt).await?);
+        }
+        Ok(results)
+    }
+
+    /// Apply a SQL command already authenticated and committed by Raft.
+    /// This bypasses client routing (which would otherwise forward the command
+    /// back to the leader) while retaining the normal executor enforcement,
+    /// catalog persistence, and cache invalidation behavior.
+    #[cfg(feature = "server")]
+    pub async fn apply_replicated_sql(&self, sql: &str) -> Result<Vec<ExecResult>, ExecError> {
+        let statements = self.parse_with_ast_cache(sql)?;
+        let mut results = Vec::with_capacity(statements.len());
+        for statement in statements {
+            results.push(self.execute_statement(statement).await?);
         }
         Ok(results)
     }
@@ -3175,6 +3554,7 @@ impl Executor {
     // ========================================================================
 
     async fn execute_statement(&self, stmt: Statement) -> Result<ExecResult, ExecError> {
+        self.recompute_session_context(&self.current_session());
         // Track whether this is a DDL statement that modifies the catalog or metadata.
         let is_ddl = matches!(
             &stmt,
@@ -3192,7 +3572,25 @@ impl Executor {
                 | Statement::CreateFunction(_)
                 | Statement::DropFunction(_)
                 | Statement::CreateTrigger(_)
+                | Statement::CreatePolicy(_)
+                | Statement::DropPolicy(_)
         );
+        let is_policy_ddl = match &stmt {
+            Statement::CreatePolicy(_) | Statement::DropPolicy(_) => true,
+            Statement::AlterTable(alter) => alter.operations.iter().any(|op| {
+                matches!(
+                    op,
+                    ast::AlterTableOperation::EnableRowLevelSecurity
+                        | ast::AlterTableOperation::DisableRowLevelSecurity
+                        | ast::AlterTableOperation::ForceRowLevelSecurity
+                        | ast::AlterTableOperation::NoForceRowLevelSecurity
+                )
+            }),
+            _ => false,
+        };
+        // Policy DDL mutates an isolated in-memory snapshot and is rolled back
+        // if the durable metadata replacement fails.
+        let mut security_before = is_policy_ddl.then(|| self.security.read().clone_policy_state());
 
         // Classify query type for metrics before moving stmt.
         let query_type = match &stmt {
@@ -3260,6 +3658,7 @@ impl Executor {
                 let sql_text = query.to_string();
                 let cacheable = !in_txn
                     && !Self::query_cache_disabled()
+                    && !self.any_rls_active()
                     && Self::query_result_is_cacheable(&sql_text);
                 // Snapshot the write generation at the point of the cache check.
                 // If a DML increments it before we store the result, query_cache_put
@@ -3338,6 +3737,7 @@ impl Executor {
             Statement::Truncate(truncate) => self.execute_truncate(truncate).await,
             Statement::AlterTable(alter_table) => self.execute_alter_table(alter_table).await,
             Statement::CreateView(create_view) if create_view.materialized => {
+                self.require_security_admin("create materialized views")?;
                 let view_name = create_view.name.to_string();
                 let sql = create_view.query.to_string();
                 // Extract source table references for write-time MV refresh.
@@ -3397,6 +3797,8 @@ impl Executor {
                     .await
             }
             Statement::CreateRole(create_role) => self.execute_create_role(create_role).await,
+            Statement::CreatePolicy(policy) => self.execute_create_policy(policy),
+            Statement::DropPolicy(policy) => self.execute_drop_policy(policy),
             Statement::AlterRole { name, operation } => {
                 self.execute_alter_role(&name.to_string(), operation).await
             }
@@ -3523,6 +3925,11 @@ impl Executor {
             )),
         };
 
+        if is_policy_ddl && in_txn && result.is_ok() {
+            let sess = self.current_session();
+            sess.txn_state.write().await.policy_dirty = true;
+        }
+
         // Record metrics: query type, duration, and row counts.
         let duration = start.elapsed().as_secs_f64();
         self.metrics.record_query(query_type, duration);
@@ -3558,7 +3965,7 @@ impl Executor {
         // Persist catalog to disk after successful DDL operations.
         // Also invalidate the plan cache and query result cache since DDL
         // changes may affect query plans and cached results.
-        if is_ddl && result.is_ok() {
+        if is_ddl && result.is_ok() && !(is_policy_ddl && in_txn) {
             self.plan_cache.write().clear();
             self.ast_cache.write().clear();
             self.query_cache_invalidate_all();
@@ -3572,8 +3979,25 @@ impl Executor {
                 // "storage ahead of catalog" — a reclaimable orphan, not silent
                 // corruption. Unconditional (not synchronous_commit-gated),
                 // matching persist_catalog, so DDL is durable on both sides.
-                self.storage.flush_schema().await.map_err(ExecError::Storage)?;
-                self.persist_catalog().await;
+                if let Err(e) = self
+                    .storage
+                    .flush_schema()
+                    .await
+                    .map_err(ExecError::Storage)
+                {
+                    if let Some(previous) = security_before.take() {
+                        *self.security.write() = previous;
+                        self.bump_policy_gen();
+                    }
+                    return Err(e);
+                }
+                if let Err(e) = self.persist_catalog().await {
+                    if let Some(previous) = security_before.take() {
+                        *self.security.write() = previous;
+                        self.bump_policy_gen();
+                    }
+                    return Err(e);
+                }
             }
         }
 
@@ -3595,10 +4019,7 @@ impl Executor {
         // / CDC writes reach their WALs through scalar functions and the KV
         // path, not SQL DML, so they miss the gate above. Force them on the same
         // autocommit/commit boundary. `is_dirty()` makes this ~free for reads.
-        if result.is_ok()
-            && (is_commit || !in_txn)
-            && self.synchronous_commit_enabled()
-        {
+        if result.is_ok() && (is_commit || !in_txn) && self.synchronous_commit_enabled() {
             self.force_specialty_durability()?;
         }
 
@@ -3627,36 +4048,12 @@ impl Executor {
     /// - The user has ALL privilege on the table
     /// - No role is found and user is the default "nucleus" superuser
     async fn check_privilege(&self, table_name: &str, privilege: &str) -> bool {
-        // Get the current session user (default to "nucleus")
-        let session_user = {
-            let sess = self.current_session();
-            let settings = sess.settings.read();
-            match settings.get("session_authorization") {
-                // Fast path: default superuser — no role lookup needed
-                None => return true,
-                Some(raw) => {
-                    let trimmed = raw.trim_matches('\'').trim_matches('"');
-                    // Fast check: if it's still the default user, skip role lookup
-                    if trimmed == "nucleus" {
-                        return true;
-                    }
-                    trimmed.to_string()
-                }
-            }
-        };
-
-        // Look up the role
-        let roles = self.roles.read().await;
-        let role = match roles.get(&session_user) {
-            Some(r) => r,
-            // Unknown roles denied (we already handled "nucleus" above)
-            None => return false,
-        };
-
-        // Superusers can do anything
-        if role.is_superuser {
+        let ctx = self.current_session().session_context.read().clone();
+        if ctx.bypass_rls || ctx.has_role("superuser") {
             return true;
         }
+
+        let roles = self.roles.read().await;
 
         // Convert privilege string to enum
         let required_priv = match privilege.to_uppercase().as_str() {
@@ -3667,21 +4064,15 @@ impl Executor {
             _ => return false,
         };
 
-        // Check if role has privilege on this specific table
-        if let Some(table_privs) = role.privileges.get(table_name)
-            && (table_privs.contains(&Privilege::All) || table_privs.contains(&required_priv))
-        {
-            return true;
-        }
-
-        // Check if role has privilege on all tables (wildcard "*")
-        if let Some(wildcard_privs) = role.privileges.get("*")
-            && (wildcard_privs.contains(&Privilege::All) || wildcard_privs.contains(&required_priv))
-        {
-            return true;
-        }
-
-        false
+        ctx.roles.iter().any(|role_name| {
+            roles.get(role_name).is_some_and(|role| {
+                role.privileges.get(table_name).is_some_and(|privs| {
+                    privs.contains(&Privilege::All) || privs.contains(&required_priv)
+                }) || role.privileges.get("*").is_some_and(|privs| {
+                    privs.contains(&Privilege::All) || privs.contains(&required_priv)
+                })
+            })
+        })
     }
 
     fn table_col_meta(&self, table_def: &TableDef) -> Vec<ColMeta> {

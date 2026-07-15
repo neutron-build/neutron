@@ -329,6 +329,10 @@ impl Executor {
                 }
             }
 
+            // WITH CHECK is evaluated after defaults/coercions have produced the
+            // actual candidate row and before any trigger or constraint side effect.
+            self.enforce_rls_new_row(&table_name, crate::security::PolicyCommand::Insert, &row)?;
+
             // Fire BEFORE INSERT row-level triggers (only if triggers exist)
             if has_triggers {
                 self.fire_triggers(
@@ -418,6 +422,15 @@ impl Executor {
                                     i < row.len() && i < existing.len() && row[i] == existing[i]
                                 });
                                 if matches {
+                                    if !self.rls_allows_row(
+                                        &table_name,
+                                        crate::security::PolicyCommand::Update,
+                                        existing,
+                                    ) {
+                                        return Err(ExecError::PermissionDenied(format!(
+                                            "ON CONFLICT DO UPDATE is not permitted by row-level security for table '{table_name}'"
+                                        )));
+                                    }
                                     let mut updated = existing.clone();
                                     // Build combined row: [existing..., excluded(new)...]
                                     let mut combined_row = existing.clone();
@@ -437,6 +450,11 @@ impl Executor {
                                             )?;
                                         }
                                     }
+                                    self.enforce_rls_new_row(
+                                        &table_name,
+                                        crate::security::PolicyCommand::Update,
+                                        &updated,
+                                    )?;
                                     // Enforce all constraints on the updated row, as
                                     // the regular INSERT/UPDATE paths do. skip_row_idx
                                     // excludes the row being updated, so this both
@@ -1145,12 +1163,26 @@ impl Executor {
                                         // Update child FK columns to new parent values
                                         let mut updates = Vec::new();
                                         for &pos in &matching_positions {
+                                            if !self.rls_allows_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &child_rows[pos],
+                                            ) {
+                                                return Err(ExecError::PermissionDenied(format!(
+                                                    "foreign-key cascade would update a row hidden by row-level security on table '{child_table}'"
+                                                )));
+                                            }
                                             let mut updated_row = child_rows[pos].clone();
                                             for (ci_idx, &ci) in
                                                 child_col_indices.iter().enumerate()
                                             {
                                                 updated_row[ci] = new_vals[ci_idx].clone();
                                             }
+                                            self.enforce_rls_new_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &updated_row,
+                                            )?;
                                             updates.push((pos, updated_row));
                                         }
                                         // Recursively check if this child table is also a parent
@@ -1172,10 +1204,24 @@ impl Executor {
                                     FkAction::SetNull => {
                                         let mut updates = Vec::new();
                                         for &pos in &matching_positions {
+                                            if !self.rls_allows_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &child_rows[pos],
+                                            ) {
+                                                return Err(ExecError::PermissionDenied(format!(
+                                                    "foreign-key action would update a row hidden by row-level security on table '{child_table}'"
+                                                )));
+                                            }
                                             let mut updated_row = child_rows[pos].clone();
                                             for &ci in &child_col_indices {
                                                 updated_row[ci] = Value::Null;
                                             }
+                                            self.enforce_rls_new_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &updated_row,
+                                            )?;
                                             updates.push((pos, updated_row));
                                         }
                                         child_storage.update(child_table, &updates).await?;
@@ -1183,6 +1229,15 @@ impl Executor {
                                     FkAction::SetDefault => {
                                         let mut updates = Vec::new();
                                         for &pos in &matching_positions {
+                                            if !self.rls_allows_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &child_rows[pos],
+                                            ) {
+                                                return Err(ExecError::PermissionDenied(format!(
+                                                    "foreign-key action would update a row hidden by row-level security on table '{child_table}'"
+                                                )));
+                                            }
                                             let mut updated_row = child_rows[pos].clone();
                                             for &ci in &child_col_indices {
                                                 let default_val = self.eval_column_default(
@@ -1190,6 +1245,11 @@ impl Executor {
                                                 )?;
                                                 updated_row[ci] = default_val;
                                             }
+                                            self.enforce_rls_new_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &updated_row,
+                                            )?;
                                             updates.push((pos, updated_row));
                                         }
                                         child_storage.update(child_table, &updates).await?;
@@ -1235,6 +1295,17 @@ impl Executor {
                                         )));
                                     }
                                     FkAction::Cascade => {
+                                        if matching_positions.iter().any(|&pos| {
+                                            !self.rls_allows_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Delete,
+                                                &child_rows[pos],
+                                            )
+                                        }) {
+                                            return Err(ExecError::PermissionDenied(format!(
+                                                "foreign-key cascade would delete a row hidden by row-level security on table '{child_table}'"
+                                            )));
+                                        }
                                         // Recursively enforce FK on grandchildren before deleting
                                         let rows_to_delete: Vec<Row> = matching_positions
                                             .iter()
@@ -1254,10 +1325,24 @@ impl Executor {
                                     FkAction::SetNull => {
                                         let mut updates = Vec::new();
                                         for &pos in &matching_positions {
+                                            if !self.rls_allows_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &child_rows[pos],
+                                            ) {
+                                                return Err(ExecError::PermissionDenied(format!(
+                                                    "foreign-key action would update a row hidden by row-level security on table '{child_table}'"
+                                                )));
+                                            }
                                             let mut updated_row = child_rows[pos].clone();
                                             for &ci in &child_col_indices {
                                                 updated_row[ci] = Value::Null;
                                             }
+                                            self.enforce_rls_new_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &updated_row,
+                                            )?;
                                             updates.push((pos, updated_row));
                                         }
                                         child_storage.update(child_table, &updates).await?;
@@ -1265,6 +1350,15 @@ impl Executor {
                                     FkAction::SetDefault => {
                                         let mut updates = Vec::new();
                                         for &pos in &matching_positions {
+                                            if !self.rls_allows_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &child_rows[pos],
+                                            ) {
+                                                return Err(ExecError::PermissionDenied(format!(
+                                                    "foreign-key action would update a row hidden by row-level security on table '{child_table}'"
+                                                )));
+                                            }
                                             let mut updated_row = child_rows[pos].clone();
                                             for &ci in &child_col_indices {
                                                 let default_val = self.eval_column_default(
@@ -1272,6 +1366,11 @@ impl Executor {
                                                 )?;
                                                 updated_row[ci] = default_val;
                                             }
+                                            self.enforce_rls_new_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &updated_row,
+                                            )?;
                                             updates.push((pos, updated_row));
                                         }
                                         child_storage.update(child_table, &updates).await?;
@@ -1405,7 +1504,7 @@ impl Executor {
         let col_meta = self.table_col_meta(&table_def);
 
         // Fast path: PK/unique equality WHERE → filtered scan (avoids materializing all rows)
-        let (all_rows, pre_filtered) =
+        let (mut all_rows, pre_filtered) =
             match Self::extract_pk_eq_value(&update.selection, &table_def) {
                 Some((col_idx, eq_value)) => {
                     let matches = self
@@ -1429,6 +1528,9 @@ impl Executor {
                     (rows, false)
                 }
             };
+        all_rows.retain(|(_, row)| {
+            self.rls_allows_row(&table_name, crate::security::PolicyCommand::Update, row)
+        });
         // Resolve assignments: (column_index, value_expr)
         let mut assign_targets = Vec::new();
         for a in &update.assignments {
@@ -1542,6 +1644,12 @@ impl Executor {
                     )
                     .await;
                 }
+
+                self.enforce_rls_new_row(
+                    &table_name,
+                    crate::security::PolicyCommand::Update,
+                    &new_row,
+                )?;
 
                 // Enforce all constraints on the updated row
                 self.enforce_constraints(
@@ -1750,7 +1858,7 @@ impl Executor {
         let col_meta = self.table_col_meta(&table_def);
 
         // Fast path: PK/unique equality WHERE → filtered scan
-        let (all_rows, pre_filtered) =
+        let (mut all_rows, pre_filtered) =
             match Self::extract_pk_eq_value(&delete.selection, &table_def) {
                 Some((col_idx, eq_value)) => {
                     let matches = self
@@ -1772,6 +1880,9 @@ impl Executor {
                     (rows, false)
                 }
             };
+        all_rows.retain(|(_, row)| {
+            self.rls_allows_row(&table_name, crate::security::PolicyCommand::Delete, row)
+        });
 
         // Pre-check: does this table have any DELETE triggers?
         let has_triggers = {

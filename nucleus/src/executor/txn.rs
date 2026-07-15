@@ -57,6 +57,10 @@ impl Executor {
             blob: Some(self.blob_store.read().txn_snapshot()),
             vector: Some(self.vector_indexes.read().clone()),
         });
+        txn.security_snapshot = Some(self.security.read().clone_policy_state());
+        txn.security_pending = None;
+        txn.security_savepoints.clear();
+        txn.policy_dirty = false;
 
         txn.active = true;
         self.metrics.open_transactions.inc();
@@ -72,14 +76,78 @@ impl Executor {
         let sess = self.current_session();
         let mut txn = sess.txn_state.write().await;
 
-        if self.storage.supports_mvcc() {
-            self.storage.commit_txn().await?;
+        if !txn.active {
+            return Ok(ExecResult::Command {
+                tag: "WARNING: no transaction in progress".into(),
+                rows_affected: 0,
+            });
+        }
+
+        // Policy metadata is durable before COMMIT is acknowledged. A
+        // persistence failure leaves the transaction active so callers can
+        // retry or roll it back without exposing a partial security catalog.
+        if txn.policy_dirty {
+            let pending = txn.security_pending.take().ok_or_else(|| {
+                ExecError::Runtime("policy transaction has no staged security catalog".into())
+            })?;
+            *self.security.write() = pending;
+            self.bump_policy_gen();
+            #[cfg(feature = "server")]
+            {
+                if let Err(error) = self
+                    .storage
+                    .flush_schema()
+                    .await
+                    .map_err(ExecError::Storage)
+                {
+                    let staged = self.security.read().clone_policy_state();
+                    *self.security.write() = txn
+                        .security_snapshot
+                        .as_ref()
+                        .expect("BEGIN captured security state")
+                        .clone_policy_state();
+                    txn.security_pending = Some(staged);
+                    self.bump_policy_gen();
+                    return Err(error);
+                }
+                if let Err(error) = self.persist_catalog().await {
+                    let staged = self.security.read().clone_policy_state();
+                    *self.security.write() = txn
+                        .security_snapshot
+                        .as_ref()
+                        .expect("BEGIN captured security state")
+                        .clone_policy_state();
+                    txn.security_pending = Some(staged);
+                    self.bump_policy_gen();
+                    return Err(error);
+                }
+            }
+        }
+
+        if self.storage.supports_mvcc()
+            && let Err(error) = self.storage.commit_txn().await
+        {
+            if txn.policy_dirty
+                && let Some(previous) = txn.security_snapshot.as_ref()
+            {
+                let staged = self.security.read().clone_policy_state();
+                *self.security.write() = previous.clone_policy_state();
+                txn.security_pending = Some(staged);
+                self.bump_policy_gen();
+                #[cfg(feature = "server")]
+                self.persist_catalog().await?;
+            }
+            return Err(error.into());
         }
 
         txn.active = false;
         txn.snapshot = None;
         txn.savepoints.clear();
         txn.cross_model = None; // Discard cross-model snapshots on commit
+        txn.security_snapshot = None;
+        txn.security_pending = None;
+        txn.security_savepoints.clear();
+        txn.policy_dirty = false;
         self.metrics.open_transactions.dec();
 
         Ok(ExecResult::Command {
@@ -144,6 +212,10 @@ impl Executor {
         txn.active = false;
         txn.snapshot = None;
         txn.savepoints.clear();
+        txn.security_snapshot = None;
+        txn.security_pending = None;
+        txn.security_savepoints.clear();
+        txn.policy_dirty = false;
 
         self.metrics.open_transactions.dec();
 
@@ -176,6 +248,13 @@ impl Executor {
             }
             txn.savepoints.push((name.to_string(), snapshot));
         }
+        let security_snapshot = txn
+            .security_pending
+            .as_ref()
+            .map(|security| security.clone_policy_state())
+            .unwrap_or_else(|| self.security.read().clone_policy_state());
+        txn.security_savepoints
+            .push((name.to_string(), security_snapshot));
 
         Ok(ExecResult::Command {
             tag: "SAVEPOINT".to_string(),
@@ -188,14 +267,17 @@ impl Executor {
         &self,
         name: &str,
     ) -> Result<ExecResult, ExecError> {
+        let sess = self.current_session();
+        let mut txn = sess.txn_state.write().await;
         if self.storage.supports_mvcc() {
             self.storage.release_savepoint(name).await?;
         } else {
-            let sess = self.current_session();
-            let mut txn = sess.txn_state.write().await;
             if let Some(pos) = txn.savepoints.iter().rposition(|(n, _)| n == name) {
                 txn.savepoints.truncate(pos);
             }
+        }
+        if let Some(pos) = txn.security_savepoints.iter().rposition(|(n, _)| n == name) {
+            txn.security_savepoints.truncate(pos);
         }
         Ok(ExecResult::Command {
             tag: "RELEASE SAVEPOINT".into(),
@@ -208,11 +290,11 @@ impl Executor {
         &self,
         name: &str,
     ) -> Result<ExecResult, ExecError> {
+        let sess = self.current_session();
+        let mut txn = sess.txn_state.write().await;
         if self.storage.supports_mvcc() {
             self.storage.rollback_to_savepoint(name).await?;
         } else {
-            let sess = self.current_session();
-            let mut txn = sess.txn_state.write().await;
             let pos = txn.savepoints.iter().rposition(|(n, _)| n == name);
             if let Some(pos) = pos {
                 let (_, snapshot) = txn.savepoints[pos].clone();
@@ -234,6 +316,16 @@ impl Executor {
                 )));
             }
         }
+        let security_pos = txn
+            .security_savepoints
+            .iter()
+            .rposition(|(n, _)| n == name)
+            .ok_or_else(|| ExecError::Unsupported(format!("savepoint {name} does not exist")))?;
+        let security_snapshot = txn.security_savepoints[security_pos].1.clone_policy_state();
+        txn.security_pending = Some(security_snapshot);
+        self.bump_policy_gen();
+        txn.security_savepoints.truncate(security_pos + 1);
+        txn.policy_dirty = true;
         Ok(ExecResult::Command {
             tag: "ROLLBACK".into(),
             rows_affected: 0,

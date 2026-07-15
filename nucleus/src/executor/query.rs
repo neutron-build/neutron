@@ -1229,6 +1229,9 @@ impl Executor {
         cte_tables: &CteTableMap,
         pushdown: Option<&HashMap<String, Vec<Expr>>>,
     ) -> Result<Option<(Vec<ColMeta>, Vec<Row>)>, ExecError> {
+        if self.any_rls_active() {
+            return Ok(None);
+        }
         let (condition, join_type) = match &join.join_operator {
             ast::JoinOperator::Join(c) | ast::JoinOperator::Inner(c) => (c, JoinType::Inner),
             ast::JoinOperator::Left(c) | ast::JoinOperator::LeftOuter(c) => (c, JoinType::Left),
@@ -3501,6 +3504,10 @@ impl Executor {
     > {
         Box::pin(async move {
             let saved_plan_cache_key_hint = plan_cache_key;
+            // Every optimization below can bypass ordinary row materialization.
+            // Until it consumes secured scans directly, route RLS queries through
+            // the single fail-closed AST/table-factor path.
+            let rls_guarded = self.any_rls_active();
 
             // Handle CTEs (WITH clause)
             let mut cte_tables = if let Some(ref with) = query.with {
@@ -3526,7 +3533,8 @@ impl Executor {
             // no LIMIT/OFFSET. These always return exactly one row, so post-processing
             // is unnecessary. GROUP BY queries need ORDER BY handling and go through
             // the normal path (which has its own fast aggregate call).
-            if let SetExpr::Select(ref select) = *query.body
+            if !rls_guarded
+                && let SetExpr::Select(ref select) = *query.body
                 && matches!(&select.group_by, ast::GroupByExpr::Expressions(e, _) if e.is_empty())
                 && query.order_by.is_none()
                 && query.limit_clause.is_none()
@@ -3539,7 +3547,8 @@ impl Executor {
             // For `SELECT * FROM table WHERE pk = literal` (no JOINs, ORDER BY, LIMIT,
             // GROUP BY, HAVING, DISTINCT), bypass plan cache and plan executor entirely.
             // Directly calls index_lookup → saves 2 plan clones + 2 write lock acqs.
-            if let SetExpr::Select(ref select) = *query.body
+            if !rls_guarded
+                && let SetExpr::Select(ref select) = *query.body
                 && select.from.len() == 1
                 && select.from[0].joins.is_empty()
                 && select.distinct.is_none()
@@ -3608,6 +3617,7 @@ impl Executor {
                     .map(|v| !v.eq_ignore_ascii_case("off"))
                     .unwrap_or(true); // default ON
                 if use_plan
+                    && !rls_guarded
                     && let SetExpr::Select(ref select) = *query.body
                     && Self::query_eligible_for_plan(select, &query)
                 {
@@ -4497,6 +4507,9 @@ impl Executor {
         select: &ast::Select,
         cte_tables: &CteTableMap,
     ) -> Result<Option<ExecResult>, ExecError> {
+        if self.any_rls_active() {
+            return Ok(None);
+        }
         // Guard 1: single FROM table, no JOINs
         if select.from.len() != 1 || !select.from[0].joins.is_empty() {
             return Ok(None);
@@ -5516,6 +5529,9 @@ impl Executor {
         where_expr: &Expr,
         col_meta: &[ColMeta],
     ) -> Option<(Vec<Row>, usize)> {
+        if self.rls_active(table_name) {
+            return None;
+        }
         // Returns `(matched_rows, rows_examined)`. `rows_examined` is the seq-scan
         // size the caller reports to the `rows_scanned` metric. For equality the
         // engine reports the true examined count; for range scans (which do not yet
@@ -5612,6 +5628,9 @@ impl Executor {
         cte_tables: &CteTableMap,
         order_by_cols: &[String],
     ) -> Option<ExecResult> {
+        if self.rls_active(table_name) {
+            return None;
+        }
         // Only single-table, no-join queries
         if select.from.len() != 1 || !select.from[0].joins.is_empty() {
             return None;
@@ -5820,6 +5839,9 @@ impl Executor {
         label: &str,
         where_expr: &Expr,
     ) -> IndexScanResult {
+        if self.rls_active(table_name) {
+            return None;
+        }
         let (eq_preds, range_preds, _remaining) = self.extract_index_predicates(where_expr);
         if eq_preds.is_empty() && range_preds.is_empty() {
             return None;
@@ -5894,7 +5916,9 @@ impl Executor {
         // Columnar fast-aggregate (before any row scan)
         // Intercepts COUNT(*) / SUM / AVG / GROUP BY on ColumnarStorageEngine tables.
         // Returns None if the engine doesn't support it or the pattern is unsupported.
-        if let Some(fast) = self.try_columnar_fast_aggregate(select, cte_tables)? {
+        if !self.any_rls_active()
+            && let Some(fast) = self.try_columnar_fast_aggregate(select, cte_tables)?
+        {
             return Ok(SelectResult::Projected(fast));
         }
 
@@ -5902,7 +5926,8 @@ impl Executor {
         // (SELECT list + WHERE) are covered by a single B-tree index, return
         // results directly from the index without any heap/table access.
         // This achieves 1.5-2x speedup for covering index queries.
-        if select.from.len() == 1
+        if !self.any_rls_active()
+            && select.from.len() == 1
             && select.from[0].joins.is_empty()
             && let TableFactor::Table {
                 name,
@@ -5926,35 +5951,37 @@ impl Executor {
         // Index-aware optimization (fully synchronous)
         // For simple single-table queries with WHERE equality predicates,
         // try to use a B-tree index instead of a full table scan.
-        let index_result: IndexScanResult =
-            if select.from.len() == 1 && select.from[0].joins.is_empty() {
-                if let (
-                    Some(selection),
-                    TableFactor::Table {
-                        name,
-                        alias,
-                        args: None,
-                        ..
-                    },
-                ) = (&select.selection, &select.from[0].relation)
-                {
-                    let table_name = name.to_string();
-                    let label = alias
-                        .as_ref()
-                        .map(|a| a.name.value.clone())
-                        .unwrap_or_else(|| table_name.clone());
-                    // Don't try index scan for CTEs or virtual tables
-                    if !cte_tables.contains_key(&table_name) {
-                        self.try_index_scan_sync(&table_name, &label, selection)
-                    } else {
-                        None
-                    }
+        let index_result: IndexScanResult = if !self.any_rls_active()
+            && select.from.len() == 1
+            && select.from[0].joins.is_empty()
+        {
+            if let (
+                Some(selection),
+                TableFactor::Table {
+                    name,
+                    alias,
+                    args: None,
+                    ..
+                },
+            ) = (&select.selection, &select.from[0].relation)
+            {
+                let table_name = name.to_string();
+                let label = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| table_name.clone());
+                // Don't try index scan for CTEs or virtual tables
+                if !cte_tables.contains_key(&table_name) {
+                    self.try_index_scan_sync(&table_name, &label, selection)
                 } else {
                     None
                 }
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         let (col_meta, filtered, sorted_by_col) =
             if let Some((col_meta, rows, remaining_where, sorted_by)) = index_result {
@@ -5972,8 +5999,8 @@ impl Executor {
                     rows
                 };
                 (col_meta, filtered, sorted_by)
-            } else if let Some((col_meta, rows)) =
-                self.try_columnar_filtered_scan(select, cte_tables)
+            } else if !self.any_rls_active()
+                && let Some((col_meta, rows)) = self.try_columnar_filtered_scan(select, cte_tables)
             {
                 // Columnar filter pushdown: engine filtered non-matching rows before
                 // materialising -- no further WHERE evaluation needed.
@@ -6078,7 +6105,8 @@ impl Executor {
         // When FROM t1, t2 WHERE t1.pk = t2.fk AND t2.filter, defer loading t1
         // until we know the join strategy. If t2 is small and t1's join key is
         // indexed, use batch index lookups instead of scanning all of t1.
-        if from.len() == 2
+        if !self.any_rls_active()
+            && from.len() == 2
             && from[0].joins.is_empty()
             && from[1].joins.is_empty()
             && !remaining_preds.is_empty()
@@ -6283,7 +6311,10 @@ impl Executor {
                 // Index nested-loop optimization: when one side is small and the
                 // join key on the other side is indexed, replace the full table
                 // with batch index lookups — avoids scanning the large table.
-                let effective_left = if filtered_right.len() < 1000 && left_keys.len() == 1 {
+                let effective_left = if !self.any_rls_active()
+                    && filtered_right.len() < 1000
+                    && left_keys.len() == 1
+                {
                     let lk = left_keys[0];
                     let rk = right_keys[0];
                     let left_col = &col_meta[lk];
@@ -6463,6 +6494,11 @@ impl Executor {
                     .get(&table_name)
                     .cloned();
                 if let Some(mv) = mv_opt {
+                    if self.any_rls_active() {
+                        return Err(ExecError::PermissionDenied(format!(
+                            "materialized view '{table_name}' is unavailable while row-level security is active; refreshable snapshots do not yet preserve invoker-policy semantics"
+                        )));
+                    }
                     let col_meta: Vec<ColMeta> = mv
                         .columns
                         .iter()
@@ -6505,7 +6541,8 @@ impl Executor {
 
                 // For JOIN-aware AST execution, attempt indexed lookup using relation-local
                 // pushdown predicates before falling back to full table scan.
-                if let Some(where_expr) = pushdown_expr
+                if !self.rls_active(&table_name)
+                    && let Some(where_expr) = pushdown_expr
                     && let Some((col_meta, rows, remaining_where, _sorted_by)) =
                         self.try_index_scan_sync(&table_name, &label, where_expr)
                 {
@@ -6530,7 +6567,8 @@ impl Executor {
                     .collect();
 
                 // Try storage-level filtered scan for pushed-down predicates
-                if let Some(where_expr) = pushdown_expr
+                if !self.rls_active(&table_name)
+                    && let Some(where_expr) = pushdown_expr
                     && let Some((rows, examined)) =
                         self.try_storage_fast_scan(&table_name, where_expr, &col_meta)
                 {
@@ -6541,6 +6579,8 @@ impl Executor {
 
                 let mut rows = self.storage_for(&table_name).scan(&table_name).await?;
                 self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                rows =
+                    self.rls_filter_rows(&table_name, crate::security::PolicyCommand::Select, rows);
 
                 // ── Zone map pruning ────────────────────────────────────
                 // If a pushdown predicate is available, try to skip entire

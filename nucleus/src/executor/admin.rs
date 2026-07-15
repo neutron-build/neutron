@@ -15,11 +15,115 @@ use super::schema_types::{CursorDef, RoleDef};
 use super::{ExecError, ExecResult, Executor};
 
 impl Executor {
+    pub(super) fn require_security_admin(&self, action: &str) -> Result<(), ExecError> {
+        let session = self.current_session();
+        let effective = session.session_context.read().user.clone();
+        let roles = self.roles.try_read().map_err(|_| {
+            ExecError::PermissionDenied(format!("cannot verify authority to {action}; retry"))
+        })?;
+        if roles.get(&effective).is_some_and(|r| r.is_superuser) {
+            Ok(())
+        } else {
+            Err(ExecError::PermissionDenied(format!(
+                "superuser authority is required to {action}"
+            )))
+        }
+    }
+
     // ========================================================================
     // SET / SHOW
     // ========================================================================
 
     pub(super) fn execute_set(&self, set: ast::Set) -> Result<ExecResult, ExecError> {
+        let session = self.current_session();
+        match &set {
+            ast::Set::SetRole { role_name, .. } => {
+                let Some(login_user) = session.authenticated_user.read().clone() else {
+                    return Err(ExecError::PermissionDenied(
+                        "session has no authenticated principal".into(),
+                    ));
+                };
+                if let Some(role_name) = role_name {
+                    let target = role_name.value.clone();
+                    let roles = self.roles.try_read().map_err(|_| {
+                        ExecError::PermissionDenied("role catalog is busy; retry SET ROLE".into())
+                    })?;
+                    let login = roles.get(&login_user).ok_or_else(|| {
+                        ExecError::PermissionDenied("authenticated role no longer exists".into())
+                    })?;
+                    let mut reachable = login.member_of.clone();
+                    let mut i = 0;
+                    while i < reachable.len() {
+                        let name = reachable[i].clone();
+                        i += 1;
+                        if let Some(role) = roles.get(&name) {
+                            for parent in &role.member_of {
+                                if !reachable.contains(parent) {
+                                    reachable.push(parent.clone());
+                                }
+                            }
+                        }
+                    }
+                    if !roles.contains_key(&target) {
+                        return Err(ExecError::PermissionDenied(format!(
+                            "role '{target}' does not exist"
+                        )));
+                    }
+                    if !login.is_superuser && target != login_user && !reachable.contains(&target) {
+                        return Err(ExecError::PermissionDenied(format!(
+                            "permission denied to set role '{target}'"
+                        )));
+                    }
+                    *session.current_role.write() = Some(target);
+                } else {
+                    *session.current_role.write() = None;
+                }
+                self.recompute_session_context(&session);
+                return Ok(ExecResult::Command {
+                    tag: "SET ROLE".into(),
+                    rows_affected: 0,
+                });
+            }
+            ast::Set::SetSessionAuthorization(param) => {
+                let Some(login_user) = session.authenticated_user.read().clone() else {
+                    return Err(ExecError::PermissionDenied(
+                        "session has no authenticated principal".into(),
+                    ));
+                };
+                let target = match &param.kind {
+                    ast::SetSessionAuthorizationParamKind::Default => None,
+                    ast::SetSessionAuthorizationParamKind::User(user) => Some(user.value.clone()),
+                };
+                if let Some(ref target) = target {
+                    let roles = self.roles.try_read().map_err(|_| {
+                        ExecError::PermissionDenied(
+                            "role catalog is busy; retry SET SESSION AUTHORIZATION".into(),
+                        )
+                    })?;
+                    let login = roles.get(&login_user).ok_or_else(|| {
+                        ExecError::PermissionDenied("authenticated role no longer exists".into())
+                    })?;
+                    if !roles.contains_key(target) {
+                        return Err(ExecError::PermissionDenied(format!(
+                            "role '{target}' does not exist"
+                        )));
+                    }
+                    if !login.is_superuser && target != &login_user {
+                        return Err(ExecError::PermissionDenied(
+                            "only a superuser may change session authorization".into(),
+                        ));
+                    }
+                }
+                *session.current_role.write() = target;
+                self.recompute_session_context(&session);
+                return Ok(ExecResult::Command {
+                    tag: "SET SESSION AUTHORIZATION".into(),
+                    rows_affected: 0,
+                });
+            }
+            _ => {}
+        }
+
         // Store SET values for SHOW to retrieve
         if let ast::Set::SingleAssignment {
             variable, values, ..
@@ -29,24 +133,25 @@ impl Executor {
             let val_str: Vec<String> = values.iter().map(|v| v.to_string()).collect();
             let val = val_str.join(", ");
 
+            if matches!(var_name.as_str(), "session_authorization" | "role") {
+                return Err(ExecError::PermissionDenied(format!(
+                    "{var_name} must be changed with its dedicated, privilege-checked SET syntax"
+                )));
+            }
+            if var_name == "nucleus.tenant_id" {
+                return Err(ExecError::PermissionDenied(
+                    "tenant identity can only be installed by a trusted authentication boundary"
+                        .into(),
+                ));
+            }
+
             // Handle SET TRANSACTION ISOLATION LEVEL
             if var_name == "transaction_isolation" || var_name == "default_transaction_isolation" {
                 let level = val.trim_matches('\'').trim_matches('"').to_lowercase();
                 self.storage.set_next_isolation_level(&level);
             }
 
-            let session = self.current_session();
             session.settings.write().insert(var_name.clone(), val);
-
-            // Identity-affecting settings recompute the RLS SessionContext (T2.2)
-            // so subsequent reads enforce policies as the assumed identity.
-            #[cfg(feature = "server")]
-            if var_name == "session_authorization"
-                || var_name == "role"
-                || var_name == "nucleus.tenant_id"
-            {
-                self.recompute_session_context(&session);
-            }
         }
         Ok(ExecResult::Command {
             tag: "SET".into(),
@@ -106,8 +211,21 @@ impl Executor {
             "SERVER_VERSION" => "16.0 (Nucleus)".to_string(),
             "SERVER_ENCODING" => "UTF8".to_string(),
             "CLIENT_ENCODING" => "UTF8".to_string(),
-            "IS_SUPERUSER" => "on".to_string(),
-            "SESSION_AUTHORIZATION" => "nucleus".to_string(),
+            "IS_SUPERUSER" => {
+                let effective = sess.session_context.read().user.clone();
+                if self
+                    .roles
+                    .try_read()
+                    .ok()
+                    .and_then(|roles| roles.get(&effective).map(|role| role.is_superuser))
+                    .unwrap_or(false)
+                {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                }
+            }
+            "SESSION_AUTHORIZATION" => sess.authenticated_user.read().clone().unwrap_or_default(),
             "STANDARD_CONFORMING_STRINGS" => "on".to_string(),
             "TIMEZONE" => "UTC".to_string(),
             "DATESTYLE" => "ISO, MDY".to_string(),
@@ -149,28 +267,45 @@ impl Executor {
         let mut rows = Vec::new();
 
         // Add default settings
+        let effective = sess.session_context.read().user.clone();
+        let is_superuser = self
+            .roles
+            .try_read()
+            .ok()
+            .and_then(|roles| roles.get(&effective).map(|role| role.is_superuser))
+            .unwrap_or(false);
+        let session_authorization = sess.authenticated_user.read().clone().unwrap_or_default();
         let defaults = vec![
-            ("server_version", "16.0 (Nucleus)"),
-            ("server_encoding", "UTF8"),
-            ("client_encoding", "UTF8"),
-            ("is_superuser", "on"),
-            ("session_authorization", "nucleus"),
-            ("standard_conforming_strings", "on"),
-            ("timezone", "UTC"),
-            ("datestyle", "ISO, MDY"),
-            ("integer_datetimes", "on"),
-            ("intervalstyle", "postgres"),
-            ("search_path", "\"$user\", public"),
-            ("max_connections", "100"),
-            ("transaction_isolation", "read committed"),
-            ("default_transaction_isolation", "read committed"),
-            ("lc_collate", "en_US.UTF-8"),
-            ("lc_ctype", "en_US.UTF-8"),
+            ("server_version", "16.0 (Nucleus)".to_string()),
+            ("server_encoding", "UTF8".to_string()),
+            ("client_encoding", "UTF8".to_string()),
+            (
+                "is_superuser",
+                if is_superuser { "on" } else { "off" }.to_string(),
+            ),
+            ("session_authorization", session_authorization),
+            ("standard_conforming_strings", "on".to_string()),
+            ("timezone", "UTC".to_string()),
+            ("datestyle", "ISO, MDY".to_string()),
+            ("integer_datetimes", "on".to_string()),
+            ("intervalstyle", "postgres".to_string()),
+            ("search_path", "\"$user\", public".to_string()),
+            ("max_connections", "100".to_string()),
+            ("transaction_isolation", "read committed".to_string()),
+            (
+                "default_transaction_isolation",
+                "read committed".to_string(),
+            ),
+            ("lc_collate", "en_US.UTF-8".to_string()),
+            ("lc_ctype", "en_US.UTF-8".to_string()),
         ];
 
         for (name, value) in &defaults {
             // Check if user has overridden this setting
-            let final_value = settings.get(*name).map(|s| s.as_str()).unwrap_or(*value);
+            let final_value = settings
+                .get(*name)
+                .map(|s| s.as_str())
+                .unwrap_or(value.as_str());
             rows.push(vec![
                 Value::Text(name.to_string()),
                 Value::Text(final_value.to_string()),
@@ -541,6 +676,44 @@ impl Executor {
         objects: Option<ast::GrantObjects>,
         grantees: Vec<ast::Grantee>,
     ) -> Result<ExecResult, ExecError> {
+        self.require_security_admin("grant privileges")?;
+        if objects.is_none()
+            && let ast::Privileges::Actions(actions) = &privileges
+            && actions
+                .iter()
+                .all(|action| matches!(action, ast::Action::Role { .. }))
+        {
+            let granted_roles: Vec<String> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    ast::Action::Role { role } => Some(role.to_string()),
+                    _ => None,
+                })
+                .collect();
+            let mut roles = self.roles.write().await;
+            for granted in &granted_roles {
+                if !roles.contains_key(granted) {
+                    return Err(ExecError::Unsupported(format!(
+                        "role '{granted}' does not exist"
+                    )));
+                }
+            }
+            for grantee in &grantees {
+                let member = grantee_name(grantee);
+                let role = roles.get_mut(&member).ok_or_else(|| {
+                    ExecError::Unsupported(format!("role '{member}' does not exist"))
+                })?;
+                for granted in &granted_roles {
+                    if !role.member_of.contains(granted) {
+                        role.member_of.push(granted.clone());
+                    }
+                }
+            }
+            return Ok(ExecResult::Command {
+                tag: "GRANT ROLE".into(),
+                rows_affected: 0,
+            });
+        }
         let privs = parse_privileges(&privileges);
         let object_names = objects
             .as_ref()
@@ -554,7 +727,9 @@ impl Executor {
                 name: role_name,
                 password_hash: None,
                 is_superuser: false,
+                bypass_rls: false,
                 can_login: false,
+                member_of: Vec::new(),
                 privileges: HashMap::new(),
             });
             for obj in &object_names {
@@ -579,6 +754,32 @@ impl Executor {
         objects: Option<ast::GrantObjects>,
         grantees: Vec<ast::Grantee>,
     ) -> Result<ExecResult, ExecError> {
+        self.require_security_admin("revoke privileges")?;
+        if objects.is_none()
+            && let ast::Privileges::Actions(actions) = &privileges
+            && actions
+                .iter()
+                .all(|action| matches!(action, ast::Action::Role { .. }))
+        {
+            let revoked: Vec<String> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    ast::Action::Role { role } => Some(role.to_string()),
+                    _ => None,
+                })
+                .collect();
+            let mut roles = self.roles.write().await;
+            for grantee in &grantees {
+                let member = grantee_name(grantee);
+                if let Some(role) = roles.get_mut(&member) {
+                    role.member_of.retain(|parent| !revoked.contains(parent));
+                }
+            }
+            return Ok(ExecResult::Command {
+                tag: "REVOKE ROLE".into(),
+                rows_affected: 0,
+            });
+        }
         let privs = parse_privileges(&privileges);
         let object_names = objects
             .as_ref()
@@ -607,6 +808,7 @@ impl Executor {
         &self,
         create_role: ast::CreateRole,
     ) -> Result<ExecResult, ExecError> {
+        self.require_security_admin("create roles")?;
         let mut roles = self.roles.write().await;
         for name in &create_role.names {
             let role_name = name.to_string();
@@ -614,15 +816,21 @@ impl Executor {
                 name: role_name.clone(),
                 password_hash: None,
                 is_superuser: create_role.superuser.unwrap_or(false),
+                bypass_rls: create_role.bypassrls.unwrap_or(false),
                 can_login: create_role.login.unwrap_or(false),
+                member_of: create_role
+                    .in_role
+                    .iter()
+                    .chain(create_role.in_group.iter())
+                    .map(|r| r.value.clone())
+                    .collect(),
                 privileges: HashMap::new(),
             };
             if let Some(ref pwd) = create_role.password {
                 match pwd {
                     ast::Password::Password(expr) => {
                         let raw = expr.to_string().trim_matches('\'').to_string();
-                        role.password_hash =
-                            Some(blake3::hash(raw.as_bytes()).to_hex().to_string());
+                        role.password_hash = Some(super::encode_scram_verifier(&raw));
                     }
                     ast::Password::NullPassword => {}
                 }
@@ -640,6 +848,7 @@ impl Executor {
         role_name: &str,
         operation: ast::AlterRoleOperation,
     ) -> Result<ExecResult, ExecError> {
+        self.require_security_admin("alter roles")?;
         let mut roles = self.roles.write().await;
         let role = roles
             .get_mut(role_name)
@@ -650,12 +859,12 @@ impl Executor {
                 for opt in &options {
                     match opt {
                         ast::RoleOption::SuperUser(v) => role.is_superuser = *v,
+                        ast::RoleOption::BypassRLS(v) => role.bypass_rls = *v,
                         ast::RoleOption::Login(v) => role.can_login = *v,
                         ast::RoleOption::Password(pwd) => match pwd {
                             ast::Password::Password(expr) => {
                                 let raw = expr.to_string().trim_matches('\'').to_string();
-                                role.password_hash =
-                                    Some(blake3::hash(raw.as_bytes()).to_hex().to_string());
+                                role.password_hash = Some(super::encode_scram_verifier(&raw));
                             }
                             ast::Password::NullPassword => {
                                 role.password_hash = None;
