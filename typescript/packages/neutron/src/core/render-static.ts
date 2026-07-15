@@ -83,6 +83,32 @@ export async function renderStatic(options: StaticRenderOptions): Promise<void> 
       const module = await loadRouteModule(pageRoute.file, moduleCache);
 
       if (!module?.default) {
+        // Resource route: no component to render, but a GET loader that
+        // returns a raw Response (sitemap.xml, rss feeds, robots.txt, JSON
+        // endpoints, ...) can still be baked to a static file. Mirrors the
+        // resource-route handling in render-app-route.ts for live requests.
+        if (module?.loader) {
+          const requestOrigin = baseUrl || "http://localhost";
+          const request = new Request(requestOrigin + pageRoute.path);
+          let response: Response | undefined;
+          try {
+            const result = await module.loader({ request, params: {}, context: {} } as LoaderArgs);
+            if (result instanceof Response) response = result;
+          } catch (error) {
+            if (error instanceof Response) response = error;
+            else throw error;
+          }
+
+          if (response) {
+            const body = Buffer.from(await response.arrayBuffer());
+            const outPath = getResourceOutputPath(outputDir, pageRoute.path);
+            fs.mkdirSync(path.dirname(outPath), { recursive: true });
+            fs.writeFileSync(outPath, body);
+            console.log(`  ${pageRoute.path} → ${path.relative(outputDir, outPath)}`);
+            continue;
+          }
+        }
+
         console.log(`  Skipping ${pageRoute.path} (no component)`);
         continue;
       }
@@ -199,6 +225,12 @@ function getOutputPath(outputDir: string, routePath: string): string {
 
   const cleanPath = routePath.replace(/\/$/, "");
   return path.join(outputDir, cleanPath, "index.html");
+}
+
+// Resource routes serve a specific file (sitemap.xml, rss.xml, ...), not an
+// HTML page — write to the literal path, not <path>/index.html.
+function getResourceOutputPath(outputDir: string, routePath: string): string {
+  return path.join(outputDir, routePath.replace(/^\//, ""));
 }
 
 // Re-export for callers that only need the string renderer from this module.

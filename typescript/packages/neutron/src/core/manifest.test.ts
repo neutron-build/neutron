@@ -40,6 +40,15 @@ function setupTestRoutes() {
     path.join(TEST_ROUTES_DIR, "(marketing)", "pricing.tsx"),
     "export default function Pricing() {}"
   );
+  fs.writeFileSync(
+    path.join(TEST_ROUTES_DIR, "sitemap[.]xml.ts"),
+    "export async function loader() { return new Response(''); }"
+  );
+  fs.mkdirSync(path.join(TEST_ROUTES_DIR, "docs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(TEST_ROUTES_DIR, "docs", "[...slug].tsx"),
+    "export default function DocsSlug() {}"
+  );
 }
 
 function cleanupTestRoutes() {
@@ -76,6 +85,21 @@ describe("manifest", () => {
 
     expect(layout).toBeDefined();
     expect(dashboard?.parentId).toBe(layout?.id);
+  });
+
+  it("resolves a [.] escape to a literal dot instead of splitting the route", () => {
+    const routes = discoverRoutes({ routesDir: TEST_ROUTES_DIR });
+    const paths = routes.map((r) => r.path);
+
+    expect(paths).toContain("/sitemap.xml");
+    expect(paths).not.toContain("/sitemap/xml");
+  });
+
+  it("still splits catch-all dots normally alongside the [.] escape", () => {
+    const routes = discoverRoutes({ routesDir: TEST_ROUTES_DIR });
+    const catchAll = routes.find((r) => r.path === "/docs/*slug");
+
+    expect(catchAll).toBeDefined();
   });
 
   it("extracts route params", () => {
