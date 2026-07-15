@@ -580,6 +580,10 @@ impl Executor {
         })
     }
 
+    // The server-only live rows precede the always-present metrics rows. In the
+    // core-only build cfg elimination makes this look like a trivial vec init,
+    // but keeping one ordered construction avoids duplicating the result shape.
+    #[allow(clippy::vec_init_then_push)]
     pub(super) fn show_replication_status(&self) -> Result<ExecResult, ExecError> {
         let mut result_rows: Vec<Row> = Vec::new();
 

@@ -1339,9 +1339,10 @@ impl Executor {
                     #[cfg(not(feature = "server"))]
                     let override_meta: Option<TableEngineMeta> = None;
 
-                    if let Some(meta) = override_meta {
+                    if let Some(_meta) = override_meta {
                         #[cfg(feature = "server")]
-                        self.rename_override_engine(&table_name, &new, meta).await?;
+                        self.rename_override_engine(&table_name, &new, _meta)
+                            .await?;
                     } else {
                         // Rename in storage: create new, copy data, drop old.
                         let engine = self.storage_for(&table_name);

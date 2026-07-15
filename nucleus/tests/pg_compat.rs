@@ -293,7 +293,9 @@ async fn pg_autocommit_insert_enforces_constraints() {
         .expect("first insert");
 
     // Duplicate primary key, autocommit — must be rejected (23505), not accepted.
-    let dup = client.simple_query("INSERT INTO cons_t VALUES (1, 'bob')").await;
+    let dup = client
+        .simple_query("INSERT INTO cons_t VALUES (1, 'bob')")
+        .await;
     assert!(
         dup.is_err(),
         "duplicate primary key must be rejected, not silently accepted"
@@ -307,7 +309,9 @@ async fn pg_autocommit_insert_enforces_constraints() {
     }
 
     // NULL into a NOT NULL column, autocommit — must be rejected (23502).
-    let null_row = client.simple_query("INSERT INTO cons_t VALUES (2, NULL)").await;
+    let null_row = client
+        .simple_query("INSERT INTO cons_t VALUES (2, NULL)")
+        .await;
     assert!(
         null_row.is_err(),
         "NULL into NOT NULL column must be rejected"

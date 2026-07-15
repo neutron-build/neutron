@@ -102,11 +102,13 @@ impl DatabaseBuilder {
     /// Build and return the database.
     pub fn build(self) -> Result<Database, DatabaseError> {
         let catalog = Arc::new(Catalog::new());
+        #[allow(unused_mut)]
         let mut recovered_schemas: Vec<(String, Vec<(String, crate::types::DataType)>)> =
             Vec::new();
         #[allow(unused_mut, unused_assignments)]
         let mut recovered_epochs: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
+        #[allow(unused_mut)]
         let mut data_dir: Option<std::path::PathBuf> = None;
         let storage: Arc<dyn StorageEngine> = match self.mode {
             StorageMode::Memory => Arc::new(MemoryEngine::new()),
@@ -1047,16 +1049,26 @@ impl Drop for Transaction {
     fn drop(&mut self) {
         if !self.finished {
             // Best-effort rollback on drop. We cannot run async code in Drop,
-            // so we spawn a blocking task on the executor. This is a safety net
-            // — callers should explicitly commit or rollback.
+            // so schedule it on the current server runtime when available. The
+            // core-only embedded build deliberately has no Tokio runtime feature;
+            // it uses a small executor on a helper thread instead. This is a safety
+            // net — callers should explicitly commit or rollback.
             let executor = self.executor.clone();
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Handle::try_current();
-                if let Ok(handle) = rt {
+            #[cfg(feature = "server")]
+            {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
                         let _ = executor.execute("ROLLBACK").await;
                     });
+                } else {
+                    std::thread::spawn(move || {
+                        let _ = futures::executor::block_on(executor.execute("ROLLBACK"));
+                    });
                 }
+            }
+            #[cfg(not(feature = "server"))]
+            std::thread::spawn(move || {
+                let _ = futures::executor::block_on(executor.execute("ROLLBACK"));
             });
         }
     }
@@ -1286,6 +1298,7 @@ mod tests {
         assert_eq!(affected, 3);
     }
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn embedded_disk_roundtrip() {
         let dir = std::env::temp_dir().join("nucleus_embed_test");
@@ -1770,6 +1783,7 @@ mod tests {
     // Durable MVCC crash recovery tests
     // ========================================================================
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn durable_mvcc_crash_recovery() {
         let dir = tempfile::tempdir().unwrap();
@@ -1800,6 +1814,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn durable_mvcc_aborted_txn_not_recovered() {
         let dir = tempfile::tempdir().unwrap();
@@ -1826,6 +1841,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn durable_mvcc_committed_txn_recovered() {
         let dir = tempfile::tempdir().unwrap();

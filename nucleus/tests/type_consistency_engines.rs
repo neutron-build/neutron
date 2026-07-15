@@ -66,7 +66,11 @@ async fn indexed_lookup_after_insert_select_finds_row() {
 
         // The bug: Int32(3) literal missed the Int64-keyed index entry.
         let r = select_rows(db.execute("SELECT id FROM t WHERE id = 3").await.unwrap());
-        assert_eq!(r.len(), 1, "[{engine}] WHERE id = 3 must find exactly one row");
+        assert_eq!(
+            r.len(),
+            1,
+            "[{engine}] WHERE id = 3 must find exactly one row"
+        );
         assert_eq!(as_i64(&r[0][0]), 3, "[{engine}] found the wrong row");
 
         // Explicit-bigint probe must find the same row (parity).
@@ -75,7 +79,11 @@ async fn indexed_lookup_after_insert_select_finds_row() {
                 .await
                 .unwrap(),
         );
-        assert_eq!(rb.len(), 1, "[{engine}] CAST(3 AS BIGINT) probe must also match");
+        assert_eq!(
+            rb.len(),
+            1,
+            "[{engine}] CAST(3 AS BIGINT) probe must also match"
+        );
 
         // Full-table count is unaffected (was always correct).
         let c = select_rows(db.execute("SELECT COUNT(*) FROM t").await.unwrap());
@@ -156,18 +164,30 @@ async fn distinct_groupby_and_probe_collapse_across_widths() {
             .unwrap();
 
         let d = select_rows(db.execute("SELECT DISTINCT k FROM t").await.unwrap());
-        assert_eq!(d.len(), 1, "[{engine}] DISTINCT k across widths must collapse to 1");
+        assert_eq!(
+            d.len(),
+            1,
+            "[{engine}] DISTINCT k across widths must collapse to 1"
+        );
 
         let g = select_rows(
             db.execute("SELECT k, COUNT(*) FROM t GROUP BY k")
                 .await
                 .unwrap(),
         );
-        assert_eq!(g.len(), 1, "[{engine}] GROUP BY k across widths must be 1 group");
+        assert_eq!(
+            g.len(),
+            1,
+            "[{engine}] GROUP BY k across widths must be 1 group"
+        );
         assert_eq!(as_i64(&g[0][1]), 3, "[{engine}] group count must be 3");
 
         let w = select_rows(db.execute("SELECT id FROM t WHERE k = 7").await.unwrap());
-        assert_eq!(w.len(), 3, "[{engine}] Int32 literal probe must match all widths");
+        assert_eq!(
+            w.len(),
+            3,
+            "[{engine}] Int32 literal probe must match all widths"
+        );
     }
 }
 

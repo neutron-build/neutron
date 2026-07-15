@@ -74,5 +74,5 @@ pub mod wire;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod integration_tests;

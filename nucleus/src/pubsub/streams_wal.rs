@@ -353,12 +353,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (wal, _) = StreamsWal::open(dir.path()).unwrap();
         assert!(!wal.is_dirty(), "a fresh WAL has no un-fsynced appends");
-        wal.log_xadd(
-            "s",
-            &StreamEntryId::new(1, 0),
-            &[("k".into(), "v".into())],
-        )
-        .unwrap();
+        wal.log_xadd("s", &StreamEntryId::new(1, 0), &[("k".into(), "v".into())])
+            .unwrap();
         assert!(wal.is_dirty(), "an append is uncovered until fsync");
         wal.group_sync().unwrap();
         assert!(!wal.is_dirty(), "group_sync fsyncs the tail");

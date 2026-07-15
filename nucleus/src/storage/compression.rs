@@ -474,9 +474,9 @@ impl PageCompressor {
                 #[cfg(not(feature = "server"))]
                 {
                     let _ = compressed_len;
-                    return Err(CompressionError::InvalidData(
+                    Err(CompressionError::InvalidData(
                         "ZSTD not available in WASM build".into(),
-                    ));
+                    ))
                 }
                 #[cfg(feature = "server")]
                 {
@@ -711,6 +711,7 @@ mod tests {
         assert_eq!(Codec::from_u8(5), Some(Codec::Zstd));
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn page_compress_zstd_zeros() {
         let page = [0u8; PAGE_SIZE];
@@ -725,6 +726,7 @@ mod tests {
         assert_eq!(page, decompressed);
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn page_compress_zstd_structured() {
         let mut page = [0u8; PAGE_SIZE];
@@ -738,6 +740,7 @@ mod tests {
         assert_eq!(page, decompressed);
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn page_compress_zstd_random() {
         // Random data is hard to compress — should fall back to None

@@ -39,10 +39,10 @@ behavior satisfies the relevant gate above.
 
 Goal: establish one auditable baseline before adding new behavior.
 
-- [ ] Review the current identity/RLS diff for authority, persistence, transaction, cache, export,
+- [x] Review the current identity/RLS diff for authority, persistence, transaction, cache, export,
       replica, and alternate-engine bypasses.
-- [ ] Split or checkpoint the implementation into reviewable commits without losing user changes.
-- [ ] Keep `README.md`, this file, `RLS_SECURITY.md`, and a concise limitations section tracked.
+- [x] Split or checkpoint the implementation into reviewable commits without losing user changes.
+- [x] Keep `README.md`, this file, `RLS_SECURITY.md`, and a concise limitations section tracked.
 - [ ] Archive or remove stale local status documents whose completion claims conflict with code.
 - [ ] Change metrics output to report declared, executed, ignored, integration, and stress tests
       independently.
@@ -60,11 +60,12 @@ Goal: every supported configuration builds and all normal correctness regression
 
 ### Builds
 
-- [ ] Repair `cargo check --no-default-features` for the embedded/core build.
+- [x] Repair `cargo check --no-default-features` for the embedded/core build.
 - [ ] Repair and verify the WASM feature/target boundary.
-- [ ] Verify default server, server without optional diagnostics, bench-tools, and release builds.
+- [x] Verify the default server and core-only builds.
+- [ ] Verify bench-tools, diagnostics, optional integrations, and release build variants.
 - [ ] Add Linux and macOS CI; add Windows only if declared supported.
-- [ ] Verify feature combinations do not expose server-only modules in embedded builds.
+- [x] Verify the core-only build does not expose or auto-build server-only modules and probes.
 
 ### Tests
 

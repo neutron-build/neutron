@@ -5590,6 +5590,7 @@ fn stream_entries_to_json(entries: &[&crate::pubsub::StreamEntry]) -> String {
 /// Keep this in sync with `eval_scalar_fn`: any new arm that WRITES
 /// (kv/doc/stream/graph/fts/blob/columnar/datalog/tensor/sequence/...)
 /// must be added here with its return type.
+#[cfg(feature = "server")]
 pub(crate) fn side_effecting_return_type(name: &str) -> Option<crate::types::DataType> {
     use crate::types::DataType;
     let dt = match name {
@@ -5660,6 +5661,7 @@ pub(crate) fn side_effecting_return_type(name: &str) -> Option<crate::types::Dat
 /// columns while Execute returns one (pgx: "number of field descriptions
 /// must equal number of values" — dogfood finding #22 tail). Static typing
 /// avoids the probe entirely.
+#[cfg(feature = "server")]
 pub(crate) fn extension_scalar_return_type(name: &str) -> Option<crate::types::DataType> {
     use crate::types::DataType;
     let dt = match name {

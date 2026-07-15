@@ -373,7 +373,10 @@ async fn recreate_with_new_epoch_recovers_empty_not_stale() {
         .unwrap();
         eng.create_table("t").await.unwrap(); // reconcile: dir@1 != catalog@2 -> empty
         let scanned = eng.scan("t").await;
-        assert!(scanned.is_ok(), "recreated table must be queryable, got {scanned:?}");
+        assert!(
+            scanned.is_ok(),
+            "recreated table must be queryable, got {scanned:?}"
+        );
         assert_eq!(
             scanned.unwrap().len(),
             0,
@@ -622,16 +625,27 @@ async fn boot_reclaims_storage_ahead_orphan_keeps_cataloged() {
     let cataloged: std::collections::HashSet<String> =
         catalog.table_names().await.into_iter().collect();
     let orphans = reclaim_orphans(&cataloged, eng.table_names());
-    assert_eq!(orphans, vec!["orphan".to_string()], "only the orphan is reclaimable");
+    assert_eq!(
+        orphans,
+        vec!["orphan".to_string()],
+        "only the orphan is reclaimable"
+    );
     for o in &orphans {
         eng.drop_table(o).await.unwrap();
     }
     eng.flush_schema().await.unwrap();
 
     let remaining: std::collections::HashSet<String> = eng.table_names().into_iter().collect();
-    assert!(remaining.contains("keeper"), "cataloged table must be preserved");
+    assert!(
+        remaining.contains("keeper"),
+        "cataloged table must be preserved"
+    );
     assert!(!remaining.contains("orphan"), "orphan must be reclaimed");
-    assert_eq!(eng.scan("keeper").await.unwrap().len(), 1, "keeper's rows are intact");
+    assert_eq!(
+        eng.scan("keeper").await.unwrap().len(),
+        1,
+        "keeper's rows are intact"
+    );
 }
 
 /// The catalog-loss guard: an EMPTY catalog beside populated storage must NOT

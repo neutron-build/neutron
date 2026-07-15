@@ -268,7 +268,8 @@ mod tests {
 
         // Emulate a legacy manifest: strip the format_version field.
         let mpath = snap.join(MANIFEST_NAME);
-        let legacy = r#"{"nucleus_version":"0.1.1","format":"physical-v1","created_unix":0,"source":"x"}"#;
+        let legacy =
+            r#"{"nucleus_version":"0.1.1","format":"physical-v1","created_unix":0,"source":"x"}"#;
         std::fs::write(&mpath, legacy).unwrap();
 
         let err = restore_data_dir(&snap, &root.join("restored"), false, "0.2.0").unwrap_err();

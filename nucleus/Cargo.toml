@@ -2,6 +2,7 @@
 name = "nucleus"
 version = "0.1.1"
 edition = "2024"
+autobins = false
 description = "The definitive database engine"
 license = "BSL-1.1"
 authors = ["Tyler"]
@@ -184,6 +185,109 @@ required-features = ["server", "rusqlite"]
 name = "probe_durability_torn"
 path = "src/bin/probe_durability_torn.rs"
 required-features = ["server", "rusqlite"]
+
+# Standalone probe executables are server diagnostics. Listing them explicitly
+# prevents Cargo's automatic binary discovery from compiling cfg-empty crates in
+# the core-only/embedded build.
+[[bin]]
+name = "probe_blob"
+path = "src/bin/probe_blob.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_concurrency"
+path = "src/bin/probe_concurrency.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_crash"
+path = "src/bin/probe_crash.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_datalog"
+path = "src/bin/probe_datalog.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_datalog_rich"
+path = "src/bin/probe_datalog_rich.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_efficiency"
+path = "src/bin/probe_efficiency.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_engines"
+path = "src/bin/probe_engines.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_fts"
+path = "src/bin/probe_fts.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_geo"
+path = "src/bin/probe_geo.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_graph"
+path = "src/bin/probe_graph.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_graph_algo"
+path = "src/bin/probe_graph_algo.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_kv"
+path = "src/bin/probe_kv.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_kv_coll"
+path = "src/bin/probe_kv_coll.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_meta"
+path = "src/bin/probe_meta.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_param_vector"
+path = "src/bin/probe_param_vector.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_recover"
+path = "src/bin/probe_recover.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_security"
+path = "src/bin/probe_security.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_streams"
+path = "src/bin/probe_streams.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_tsdoc"
+path = "src/bin/probe_tsdoc.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "probe_vector"
+path = "src/bin/probe_vector.rs"
+required-features = ["server"]
 
 [[bench]]
 name = "query_bench"

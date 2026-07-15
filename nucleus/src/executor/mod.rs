@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use dashmap::DashMap;
 
-use sqlparser::ast::{self, Expr, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{self, Expr, Statement};
+#[cfg(feature = "server")]
+use sqlparser::ast::{SetExpr, TableFactor};
 use tokio::sync::RwLock;
 
 use crate::cache::CacheTier;
@@ -25,6 +27,7 @@ use crate::metrics::{MetricsRegistry, QueryType};
 use crate::planner;
 #[cfg(feature = "server")]
 use crate::reactive::{ChangeEvent, ChangeNotifier, ChangeType, SubscriptionManager};
+#[cfg(feature = "server")]
 use crate::sql;
 #[cfg(feature = "server")]
 use crate::storage::STORAGE_SESSION_ID;
@@ -86,6 +89,7 @@ mod dml;
 mod expr;
 mod helpers;
 mod join;
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod meta_persistence;
 pub mod param_subst;
 mod policy;
@@ -99,6 +103,7 @@ mod types;
 
 pub use expr::FilterResult; // Phase 2C: Lazy materialization for WHERE clause filtering
 use helpers::*;
+#[cfg(feature = "server")]
 pub(crate) use scalar_fns::{extension_scalar_return_type, side_effecting_return_type};
 use schema_types::*;
 use session::CURRENT_SESSION;
@@ -2326,6 +2331,7 @@ impl Executor {
     /// from that source of truth — so a bounded, checkpoint-sized tail loss is
     /// acceptable. When logical replication is wired, CDC should instead be
     /// folded into the SQL WAL so one fsync covers both.
+    #[cfg(feature = "server")]
     fn force_specialty_durability(&self) -> Result<(), ExecError> {
         let io_err =
             |e: std::io::Error| ExecError::Storage(crate::storage::StorageError::Io(e.to_string()));
@@ -2361,6 +2367,13 @@ impl Executor {
         {
             wal.group_sync().map_err(io_err)?;
         }
+        Ok(())
+    }
+
+    /// Embedded/in-memory builds do not attach the server-only specialty WALs.
+    /// Their transaction boundary therefore has nothing additional to fsync.
+    #[cfg(not(feature = "server"))]
+    fn force_specialty_durability(&self) -> Result<(), ExecError> {
         Ok(())
     }
 
@@ -2853,6 +2866,7 @@ impl Executor {
     /// Returns `None` if the command can't be executed on the fast path (e.g.
     /// table not found, column not found, constraint issues), in which case
     /// the caller should fall through to the normal SQL execution path.
+    #[cfg(feature = "server")]
     pub async fn execute_sql_fast_path(
         &self,
         cmd: &crate::wire::kv_fast_path::SqlFastPathCommand,
@@ -3101,6 +3115,7 @@ impl Executor {
     /// touched engine's WAL before the write is acked, unless the session is
     /// inside an explicit transaction (COMMIT forces then) or runs with
     /// synchronous_commit=off.
+    #[cfg(feature = "server")]
     async fn fast_path_durability(
         &self,
         storage: &Arc<dyn StorageEngine>,
@@ -3396,6 +3411,8 @@ impl Executor {
         sql: &str,
         statements: Vec<Statement>,
     ) -> Result<Vec<ExecResult>, ExecError> {
+        #[cfg(not(feature = "server"))]
+        let _ = sql;
         self.recompute_session_context(&self.current_session());
         // Cluster-mode DML routing: followers forward to leader; leader appends to Raft log.
         // Skip entirely in standalone mode to avoid lock contention on the Raft mutex.
@@ -3590,6 +3607,7 @@ impl Executor {
         };
         // Policy DDL mutates an isolated in-memory snapshot and is rolled back
         // if the durable metadata replacement fails.
+        #[cfg(feature = "server")]
         let mut security_before = is_policy_ddl.then(|| self.security.read().clone_policy_state());
 
         // Classify query type for metrics before moving stmt.
@@ -5761,5 +5779,5 @@ pub enum ExecError {
     MemoryExceeded(String),
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod tests;
