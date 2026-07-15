@@ -1,6 +1,6 @@
 import { getCollection } from "@neutron-build/core";
 
-export async function GET() {
+export async function loader() {
   const posts = (await getCollection('blog', ({ data }: any) => !data.draft))
     .sort((a: any, b: any) => b.data.pubDate.valueOf() - a.data.pubDate.valueOf());
 

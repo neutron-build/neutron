@@ -492,6 +492,31 @@ export async function build(): Promise<void> {
       const module = await loadRouteModule(route);
 
       if (!module?.default) {
+        // Resource route: no component to render, but a GET loader that
+        // returns a raw Response (sitemap.xml, rss feeds, JSON endpoints,
+        // ...) can still be baked to a static file at its literal path.
+        if (module?.loader) {
+          const request = new Request("http://localhost" + route.path);
+          let response: Response | undefined;
+          try {
+            const result = await module.loader({ request, params: {}, context: {} } as LoaderArgs);
+            if (result instanceof Response) response = result;
+          } catch (error) {
+            if (error instanceof Response) response = error;
+            else throw error;
+          }
+
+          if (response) {
+            const body = Buffer.from(await response.arrayBuffer());
+            const outPath = getResourceOutputPath(outputDir, route.path);
+            fs.mkdirSync(path.dirname(outPath), { recursive: true });
+            fs.writeFileSync(outPath, body);
+            console.log(`  ${route.path} → ${path.relative(outputDir, outPath)}`);
+            renderedCount++;
+            continue;
+          }
+        }
+
         console.log(`  Skipping ${route.path} (no component)`);
         skippedCount++;
         continue;
@@ -791,6 +816,12 @@ function getOutputPath(outputDir: string, routePath: string): string {
 
   const cleanPath = routePath.replace(/\/$/, "");
   return path.join(outputDir, cleanPath, "index.html");
+}
+
+// Resource routes serve a specific file (sitemap.xml, rss.xml, ...), not an
+// HTML page — write to the literal path, not <path>/index.html.
+function getResourceOutputPath(outputDir: string, routePath: string): string {
+  return path.join(outputDir, routePath.replace(/^\//, ""));
 }
 
 function extractClientCssFiles(outputDir: string): string[] {
