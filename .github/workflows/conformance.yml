@@ -1,0 +1,66 @@
+name: Cross-SDK Contract Conformance
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "conformance/**"
+      - "go/**"
+      - "python/**"
+      - "rust/**"
+      - "typescript/packages/neutron/**"
+      - ".github/workflows/conformance.yml"
+  pull_request:
+    paths:
+      - "conformance/**"
+      - "go/**"
+      - "python/**"
+      - "rust/**"
+      - "typescript/packages/neutron/**"
+      - ".github/workflows/conformance.yml"
+  schedule:
+    - cron: "0 8 * * 1"
+
+jobs:
+  conformance:
+    name: contract matrix (go × rust × python × ts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Each SDK's runner descriptor skips gracefully when its toolchain is
+      # absent (never fails), so the gate stays green even if one setup breaks —
+      # it only goes red on a real contract FAIL. We provision all four.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python contract deps
+        run: pip install starlette pydantic uvicorn
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+
+      # Builds the TS SDK dist the conformance app boots from.
+      - name: Build TypeScript SDK
+        run: pnpm install && pnpm build
+        working-directory: typescript
+
+      - name: Run conformance matrix
+        run: node run.mjs
+        working-directory: conformance/runner
