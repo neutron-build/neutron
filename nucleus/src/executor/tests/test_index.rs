@@ -1,5 +1,54 @@
 use super::*;
 
+/// Incremental HNSW UPDATE via the pk->node registry: updating a row's vector
+/// must move it in the index (found near its NEW vector, not its old one)
+/// without a full rebuild. This is the case that corrupted the graph before the
+/// registry (in-place node overwrite).
+#[tokio::test]
+async fn test_hnsw_incremental_update_moves_row() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE uu (id INT PRIMARY KEY, v VECTOR(3))").await;
+    exec(
+        &ex,
+        "INSERT INTO uu VALUES (1, VECTOR('[1,0,0]')), (2, VECTOR('[0,1,0]')), (3, VECTOR('[0,0,1]'))",
+    )
+    .await;
+    exec(&ex, "CREATE INDEX uu_v ON uu USING hnsw (v)").await;
+
+    // Move row 2 next to [1,0,0]. Its own vector must now retrieve it.
+    exec(
+        &ex,
+        "UPDATE uu SET v = VECTOR('[0.95,0.05,0]') WHERE id = 2",
+    )
+    .await;
+    let ids = |r: &[ExecResult]| -> Vec<i32> {
+        rows(&r[0])
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(Value::Int32(n)) => Some(*n),
+                _ => None,
+            })
+            .collect()
+    };
+    let near_new = exec(
+        &ex,
+        "SELECT id FROM uu ORDER BY VECTOR_DISTANCE(v, VECTOR('[0.95,0.05,0]'), 'l2') ASC LIMIT 3",
+    )
+    .await;
+    let got = ids(&near_new);
+    assert_eq!(
+        got.first(),
+        Some(&2),
+        "row 2's updated vector must retrieve row 2 first: {got:?}"
+    );
+    // Exactly once — the old node was tombstoned, not left as a stale duplicate.
+    assert_eq!(
+        got.iter().filter(|&&x| x == 2).count(),
+        1,
+        "row 2 must appear exactly once after UPDATE: {got:?}"
+    );
+}
+
 // ================================================================
 // B-tree range index scan tests
 // ================================================================
