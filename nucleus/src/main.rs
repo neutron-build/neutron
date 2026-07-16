@@ -253,6 +253,43 @@ enum Commands {
         #[arg(short, long, default_value = "nucleus_data")]
         data: PathBuf,
     },
+
+    /// Point-in-time recovery: restore a physical base snapshot and replay the
+    /// archived WAL (see `NUCLEUS_WAL_ARCHIVE_DIR`) forward to a target LSN,
+    /// wall-clock time, or the latest archived point. Segmented-WAL databases
+    /// only.
+    RestorePitr {
+        /// Physical base snapshot directory (from `nucleus backup`).
+        #[arg(short, long)]
+        base: PathBuf,
+
+        /// WAL archive directory (the per-database subdirectory of
+        /// `NUCLEUS_WAL_ARCHIVE_DIR`).
+        #[arg(short, long)]
+        archive: PathBuf,
+
+        /// Data directory to restore into. Must be empty unless --force.
+        #[arg(short, long, default_value = "nucleus_data")]
+        data: PathBuf,
+
+        /// Primary data file name inside the data dir.
+        #[arg(long, default_value = "nucleus.db")]
+        db_file: String,
+
+        /// Replay through this exact LSN (inclusive). Mutually exclusive with
+        /// --time; if neither is given, replays to the latest archived point.
+        #[arg(long)]
+        lsn: Option<u64>,
+
+        /// Replay through the last segment archived at or before this Unix time
+        /// (seconds). Segment granularity.
+        #[arg(long)]
+        time: Option<u64>,
+
+        /// Overwrite the data directory if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -394,6 +431,17 @@ async fn main() {
         }
         Some(Commands::Load { input, data }) => {
             cmd_load(input, data).await;
+        }
+        Some(Commands::RestorePitr {
+            base,
+            archive,
+            data,
+            db_file,
+            lsn,
+            time,
+            force,
+        }) => {
+            cmd_restore_pitr(base, archive, data, db_file, lsn, time, force);
         }
         None => {
             // Default: start in server mode (same as `nucleus start`)
@@ -2219,6 +2267,60 @@ fn cmd_backup(data: PathBuf, output: PathBuf, force: bool) {
         }
         Err(e) => {
             eprintln!("Backup failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_restore_pitr(
+    base: PathBuf,
+    archive: PathBuf,
+    data: PathBuf,
+    db_file: String,
+    lsn: Option<u64>,
+    time: Option<u64>,
+    force: bool,
+) {
+    if lsn.is_some() && time.is_some() {
+        eprintln!("PITR restore: pass at most one of --lsn / --time");
+        std::process::exit(1);
+    }
+    let target = match (lsn, time) {
+        (Some(n), _) => nucleus::pitr::PitrTarget::Lsn(n),
+        (_, Some(t)) => nucleus::pitr::PitrTarget::UnixSeconds(t),
+        (None, None) => nucleus::pitr::PitrTarget::Latest,
+    };
+    match nucleus::pitr::restore_pitr(
+        &base,
+        &archive,
+        target,
+        &data,
+        &db_file,
+        env!("CARGO_PKG_VERSION"),
+        force,
+    ) {
+        Ok(report) => {
+            println!(
+                "PITR restore complete: base {} + archive {} -> {}",
+                base.display(),
+                archive.display(),
+                data.display()
+            );
+            println!(
+                "  Replayed to LSN {} ({} WAL segment(s) reconstructed)",
+                report.restored_lsn, report.segments_written
+            );
+            if report.target_lsn != u64::MAX && report.restored_lsn < report.target_lsn {
+                println!(
+                    "  Note: archive ended at LSN {} — target {} was beyond the archived history",
+                    report.restored_lsn, report.target_lsn
+                );
+            }
+            println!("  Start with: nucleus start --data {}", data.display());
+        }
+        Err(e) => {
+            eprintln!("PITR restore failed: {e}");
             std::process::exit(1);
         }
     }
