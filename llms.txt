@@ -4,6 +4,7 @@
 
 - Website: https://neutron.build
 - Docs: https://neutron.build/docs
+- Full docs (single file, for ingestion): https://neutron.build/llms-full.txt
 - Source: https://github.com/neutron-build/neutron
 - License: MIT (frameworks) | BSL 1.1 → MIT on 2046-01-01 (Nucleus)
 
