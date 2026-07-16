@@ -30,8 +30,8 @@ module rate_limiter {
 
     action init = all {
         current_tick' = 0,
-        current_count' = (c => 0),
-        previous_count' = (c => 0),
+        current_count' = CLIENTS.mapBy(c => 0),
+        previous_count' = CLIENTS.mapBy(c => 0),
         window_offset' = 0,
         total_allowed' = 0,
         total_rejected' = 0,
@@ -44,50 +44,55 @@ module rate_limiter {
         prev * (WINDOW_SIZE - offset) / WINDOW_SIZE + curr
 
     // A client makes a request
-    action request(client: ClientId): bool = all {
-        client.in(CLIENTS),
-        current_tick < MAX_TICKS,
-        val est = estimated_count(previous_count(client),
-                                   current_count(client),
+    action request(client: ClientId): bool = {
+        val est = estimated_count(previous_count.get(client),
+                                   current_count.get(client),
                                    window_offset)
-        if (est < MAX_REQUESTS) all {
-            // Allow — increment current window count
-            current_count' = current_count.set(client,
-                current_count(client) + 1),
-            total_allowed' = total_allowed + 1,
-            total_rejected' = total_rejected,
-        } else all {
-            // Reject — over limit
-            current_count' = current_count,
-            total_allowed' = total_allowed,
-            total_rejected' = total_rejected + 1,
-        },
-        current_tick' = current_tick,
-        previous_count' = previous_count,
-        window_offset' = window_offset,
+        all {
+            client.in(CLIENTS),
+            current_tick < MAX_TICKS,
+            if (est < MAX_REQUESTS) all {
+                // Allow — increment current window count
+                current_count' = current_count.set(client,
+                    current_count.get(client) + 1),
+                total_allowed' = total_allowed + 1,
+                total_rejected' = total_rejected,
+            } else all {
+                // Reject — over limit
+                current_count' = current_count,
+                total_allowed' = total_allowed,
+                total_rejected' = total_rejected + 1,
+            },
+            current_tick' = current_tick,
+            previous_count' = previous_count,
+            window_offset' = window_offset,
+        }
     }
 
     // Time advances by one tick
-    action tick: bool = all {
-        current_tick < MAX_TICKS,
+    action tick: bool = {
         val new_offset = window_offset + 1
-        if (new_offset >= WINDOW_SIZE) all {
-            // Window rolls over: current becomes previous, reset current
-            previous_count' = current_count,
-            current_count' = (c => 0),
-            window_offset' = 0,
-        } else all {
-            previous_count' = previous_count,
-            current_count' = current_count,
-            window_offset' = new_offset,
-        },
-        current_tick' = current_tick + 1,
-        total_allowed' = total_allowed,
-        total_rejected' = total_rejected,
+        all {
+            current_tick < MAX_TICKS,
+            if (new_offset >= WINDOW_SIZE) all {
+                // Window rolls over: current becomes previous, reset current
+                previous_count' = current_count,
+                current_count' = CLIENTS.mapBy(c => 0),
+                window_offset' = 0,
+            } else all {
+                previous_count' = previous_count,
+                current_count' = current_count,
+                window_offset' = new_offset,
+            },
+            current_tick' = current_tick + 1,
+            total_allowed' = total_allowed,
+            total_rejected' = total_rejected,
+        }
     }
 
     action step = any {
-        CLIENTS.exists(c => request(c)),
+        { nondet c = CLIENTS.oneOf()
+          request(c) },
         tick,
     }
 
@@ -99,14 +104,14 @@ module rate_limiter {
 
     // Per-client current count never exceeds max (within one window)
     val count_bounded: bool =
-        CLIENTS.forall(c => current_count(c) <= MAX_REQUESTS)
+        CLIENTS.forall(c => current_count.get(c) <= MAX_REQUESTS)
 
     // No client can exceed the limit: estimated count ≤ MAX_REQUESTS
     // (allows equal, because we reject at >=)
     val rate_enforced: bool =
         CLIENTS.forall(c =>
-            estimated_count(previous_count(c),
-                            current_count(c),
+            estimated_count(previous_count.get(c),
+                            current_count.get(c),
                             window_offset) <= MAX_REQUESTS
         )
 
@@ -116,18 +121,18 @@ module rate_limiter {
         CLIENTS.forall(c1 => CLIENTS.forall(c2 =>
             // If both clients made the same number of requests,
             // they should have the same estimated count
-            current_count(c1) == current_count(c2) and
-            previous_count(c1) == previous_count(c2)
+            current_count.get(c1) == current_count.get(c2) and
+            previous_count.get(c1) == previous_count.get(c2)
             implies
-            estimated_count(previous_count(c1), current_count(c1), window_offset) ==
-            estimated_count(previous_count(c2), current_count(c2), window_offset)
+            estimated_count(previous_count.get(c1), current_count.get(c1), window_offset) ==
+            estimated_count(previous_count.get(c2), current_count.get(c2), window_offset)
         ))
 
     // No undercount: estimated count is never negative
     val no_undercount: bool =
         CLIENTS.forall(c =>
-            estimated_count(previous_count(c),
-                            current_count(c),
+            estimated_count(previous_count.get(c),
+                            current_count.get(c),
                             window_offset) >= 0
         )
 
