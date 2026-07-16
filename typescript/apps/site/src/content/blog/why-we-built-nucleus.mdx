@@ -44,11 +44,11 @@ Memory safety without garbage collection pauses. A database needs predictable la
 
 The entire engine, including the storage layer, query executor, and wire protocol implementation, is written in Rust. Zero unsafe blocks in the hot path.
 
-### WAL Everywhere
+### WAL for Durable Writes
 
-Every data model has a Write-Ahead Log. Before any write is applied to the primary data structure, it's written to the WAL. If the process crashes mid-write, the WAL lets us replay and recover to a consistent state on restart.
+Most data models have a Write-Ahead Log. Before any write is applied to the primary data structure, it's written to the WAL. If the process crashes mid-write, the WAL lets us replay and recover to a consistent state on restart.
 
-This was a significant engineering effort — each model has different write patterns and different recovery semantics. The vector index (HNSW graph) has very different WAL needs than the timeseries store (append-only deltas). We shipped WAL for all fourteen models in Phase 1.
+This is a significant engineering effort — each model has different write patterns and different recovery semantics. The vector index (HNSW graph) has very different WAL needs than the timeseries store (append-only deltas). Today 8 of the 14 models are WAL-durable; the remaining models are on the durability roadmap.
 
 ### MVCC for Snapshot Isolation
 

@@ -48,8 +48,8 @@ postgresql://neutron:password@localhost:5432/mydb
 From any language framework:
 
 ```typescript
-// TypeScript (neutron-data)
-import { db } from "neutron-data";
+// TypeScript (@neutron-build/core)
+import { db } from "@neutron-build/core";
 const users = await db.query("SELECT * FROM users");
 ```
 
