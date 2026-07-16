@@ -1,0 +1,189 @@
+---
+title: Layers
+description: The four opt-in layers — wire codecs, HAL networking, protocol servers, and the application framework.
+---
+
+Neutron for Zig is built as four opt-in layers. Each builds on the previous, but any layer can be used independently via the compile-time build flags in the [overview](/docs/zig/overview).
+
+## Layer 0 — Wire Codecs
+
+Zero-allocation, freestanding codecs. No `std` required — works on bare metal.
+
+### PostgreSQL Wire Protocol
+
+```zig
+const pgwire = @import("wire/pgwire/codec.zig");
+
+// Encode a query message (client → server)
+var buf: [4096]u8 = undefined;
+const len = try pgwire.encodeQuery(&buf, "SELECT * FROM users WHERE id = $1");
+
+// Decode a server response (server → client)
+const msg = try pgwire.decodeBackendMessage(response_buf);
+switch (msg) {
+    .DataRow => |row| { /* process columns */ },
+    .CommandComplete => |tag| { /* "SELECT 1" */ },
+    .ErrorResponse => |err| { /* handle error */ },
+}
+```
+
+### HTTP Parser
+
+```zig
+const http = @import("wire/http.zig");
+
+const request = try http.parseRequest(raw_bytes);
+// request.method, request.path, request.headers, request.body
+```
+
+### WebSocket Frames
+
+```zig
+const ws = @import("wire/websocket.zig");
+
+const frame = try ws.decodeFrame(raw_bytes);
+// frame.opcode (.text, .binary, .ping, .pong, .close)
+// frame.payload
+```
+
+### Binary Utilities
+
+Varint encoding, big/little endian conversions.
+
+## Layer 1 — HAL Networking
+
+Platform-abstracted networking: epoll on Linux, kqueue on macOS.
+
+```zig
+const tcp = @import("hal/tcp.zig");
+const pool = @import("hal/pool.zig");
+
+// TCP listener
+var listener = try tcp.TcpListener.bind(allocator, "127.0.0.1", 8080);
+defer listener.deinit();
+
+var stream = try listener.accept();
+defer stream.close();
+
+const bytes_read = try stream.read(&buf);
+try stream.write(response_bytes);
+
+// Connection pool (pre-allocated)
+var conn_pool = try pool.ConnectionPool.init(allocator, .{
+    .max_connections = 100,
+    .idle_timeout_ms = 30_000,
+});
+```
+
+### Timer
+
+```zig
+const timer = @import("hal/timer.zig");
+
+var deadline = timer.Timer.init(5_000); // 5 second timeout
+if (deadline.expired()) { /* handle timeout */ }
+```
+
+## Layer 2 — Protocol Servers
+
+### HTTP Server
+
+```zig
+const HttpServer = @import("protocol/http_server.zig").HttpServer;
+
+fn handler(ctx: *RequestContext) !void {
+    const name = ctx.queryParam("name") orelse "World";
+    try ctx.respondJson(.{ .message = "Hello, " ++ name });
+}
+
+var server = try HttpServer.init(allocator, .{
+    .host = "127.0.0.1",
+    .port = 8080,
+});
+try server.serve(handler);
+```
+
+### PostgreSQL Client
+
+```zig
+const PgClient = @import("protocol/pg_client.zig").PgClient;
+
+var client = try PgClient.connect(allocator, "127.0.0.1", 5432, "mydb", "user", "pass");
+defer client.deinit();
+
+const result = try client.query("SELECT id, name FROM users");
+```
+
+### WebSocket Server
+
+```zig
+const WsServer = @import("protocol/ws_server.zig").WsServer;
+
+// Upgrade from HTTP, then handle frames
+```
+
+### Static Files
+
+```zig
+const static_handler = @import("protocol/static.zig");
+// Serves files with MIME type detection
+```
+
+## Layer 3 — Application Framework
+
+Full web framework with router, middleware, and OpenAPI generation.
+
+### App Lifecycle
+
+```zig
+const App = @import("app/app.zig").App;
+
+const routes = [_]Route{
+    .{ .method = .GET,  .path = "/api/users",      .handler = &listUsers },
+    .{ .method = .GET,  .path = "/api/users/{id}",  .handler = &getUser },
+    .{ .method = .POST, .path = "/api/users",       .handler = &createUser },
+};
+
+var app = App(routes, null).init(allocator, config);
+try app.run(); // Handles SIGTERM/SIGINT gracefully
+```
+
+### Router
+
+Compile-time route dispatch — pattern matching compiled to inline comparisons:
+
+```zig
+const router = @import("app/router.zig");
+
+// Extract path parameters
+const id = router.extractParam("/api/users/{id}", request.path, "id");
+```
+
+### Middleware
+
+10-layer middleware stack matching the Neutron convention:
+
+```zig
+const middleware = @import("app/middleware.zig");
+// CORS, compression, rate limiting, auth, OTel, etc.
+```
+
+### Configuration
+
+Standard environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HOST` | `127.0.0.1` | Bind address |
+| `PORT` | `8080` | Listen port |
+| `DATABASE_URL` | — | Connection string |
+| `LOG_LEVEL` | `info` | Log level |
+
+### OpenAPI
+
+Auto-generated OpenAPI 3.1 spec from routes:
+
+```zig
+const openapi = @import("app/openapi.zig");
+// GET /openapi.json
+```

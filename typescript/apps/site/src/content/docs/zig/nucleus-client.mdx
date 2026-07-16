@@ -1,0 +1,33 @@
+---
+title: Nucleus Client
+description: The typed Zig client for all 14 Nucleus data models.
+---
+
+Neutron for Zig ships a full multi-model client for all 14 Nucleus data models. It connects over the PostgreSQL wire protocol, so it works against Nucleus or plain PostgreSQL, with feature detection to light up the non-SQL models when connected to Nucleus.
+
+```zig
+const NucleusClient = @import("nucleus/client.zig").NucleusClient;
+
+var client = try NucleusClient.fromUrl(allocator, "postgres://localhost:5432/mydb");
+try client.connect();
+defer client.deinit();
+
+// Feature detection (Nucleus vs PostgreSQL)
+if (client.features.is_nucleus) {
+    // Use KV, Vector, Graph, etc.
+}
+
+// SQL
+const rows = try client.query("SELECT * FROM users WHERE active = true");
+
+// Key-Value
+try client.kv.set("session:abc", "user_42");
+const val = try client.kv.get("session:abc");
+
+// Vector search
+const results = try client.vector.search("embeddings", query_vec, .{ .k = 10, .metric = .cosine });
+
+// TimeSeries, Document, Graph, FTS, Geo, Blob, Streams, Columnar, Datalog, CDC, PubSub...
+```
+
+Each data model has its own typed accessor file in `nucleus/` — `sql.zig`, `kv.zig`, `vector.zig`, and so on. Import only the models you use; unused accessors compile away.

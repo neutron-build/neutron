@@ -265,7 +265,12 @@ const sidebar = [
   },
   {
     label: "Zig",
-    items: [{ label: "Overview", link: "/docs/zig/overview" }],
+    items: [
+      { label: "Overview", link: "/docs/zig/overview" },
+      { label: "Quickstart", link: "/docs/zig/quickstart" },
+      { label: "Layers", link: "/docs/zig/layers" },
+      { label: "Nucleus Client", link: "/docs/zig/nucleus-client" },
+    ],
   },
   {
     label: "Julia",
