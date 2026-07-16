@@ -6,7 +6,7 @@ import CodeBlock from "../components/CodeBlock";
 export function head() {
   return {
     title: "Native (iOS & Android) - Neutron",
-    description: "Preact components rendered to native UIKit and Android views via React Native Fabric. Share UI code with web, develop with Expo Go, ship to the App Store.",
+    description: "Preact components rendered to native UIKit and Android views via React Native Fabric. Share UI code with web, develop with Expo Go, target iOS and Android from one codebase.",
   };
 }
 
@@ -14,9 +14,9 @@ export default function NativePage() {
   return (
     <ProductPage
       title="Neutron Native"
-      description="Preact components rendered to real UIKit and Android views via React Native Fabric. Same components run on web, iOS, and Android. Develop through Expo Go, ship to both stores from one build."
+      description="Preact components rendered to real UIKit and Android views via React Native Fabric. Same components run on web, iOS, and Android. Develop through Expo Go, targeting both stores from one build."
       category="platform"
-      status="available"
+      status="in-progress"
       accent="var(--accent-nucleus)"
       heroAccentRgb="0, 200, 83"
       heroTagline="Preact on the web. UIKit on the phone. Same code."
