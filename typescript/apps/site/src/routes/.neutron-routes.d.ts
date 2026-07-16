@@ -16,6 +16,7 @@ declare module "@neutron-build/core" {
     | "/go"
     | "/julia"
     | "/lean"
+    | "/llms-full.txt"
     | "/modelica"
     | "/mojo"
     | "/native"
