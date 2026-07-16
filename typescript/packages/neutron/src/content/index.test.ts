@@ -56,6 +56,36 @@ describe("content collections", () => {
     expect(nestedHtml).toContain("Nested guide");
   });
 
+  it("assigns slugified, de-duplicated ids to plain-markdown headings", async () => {
+    // The TOC sidebar (extractToc + slugify) links to "#<slug>" — without a
+    // matching id on the actual heading element those links silently no-op.
+    const root = await makeFixtureProject();
+    process.chdir(root);
+
+    const nested = await getEntry("blog", "guides/intro");
+    const rendered = await nested!.render();
+    const html = renderToString(h(rendered.Content, {}));
+
+    expect(html).toContain('id="nested-guide"');
+    expect(html).toContain('id="nested-guide-1"');
+  });
+
+  it("assigns slugified, de-duplicated ids to MDX headings", async () => {
+    // MDX compiles through a separate path (compileMdx / @mdx-js/mdx) than plain
+    // markdown, so it needs its own rehype-based id assignment. Neutron's own
+    // docs site is 100% MDX, so this is the path its TOC actually depends on.
+    const root = await makeFixtureProject();
+    process.chdir(root);
+
+    const entry = await getEntry("blog", "hello-world");
+    const rendered = await entry!.render();
+    const html = renderToString(h(rendered.Content, {}));
+
+    expect(html).toContain('id="hello-world"');
+    expect(html).toContain('id="details"');
+    expect(html).toContain('id="details-1"');
+  });
+
   it("writes manifest and type declarations during prepare", async () => {
     const root = await makeFixtureProject();
     await prepareContentCollections({ rootDir: root });
@@ -243,6 +273,10 @@ title: Hello World
 2 + 0 = {2}
 
 This is a test post.
+
+## Details
+
+## Details
 `,
     "utf-8"
   );
@@ -254,6 +288,8 @@ title: Guides Intro
 ---
 
 # Nested guide
+
+## Nested guide
 `,
     "utf-8"
   );

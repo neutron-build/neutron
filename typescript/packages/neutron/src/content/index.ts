@@ -9,6 +9,7 @@ import { Marked } from "marked";
 import type { NeutronMarkdownConfig } from "../config.js";
 import { markedShikiExtension } from "./syntax-highlight.js";
 import { sanitizeHtml } from "./sanitize.js";
+import { slugify } from "./toc.js";
 
 export { sanitizeHtml } from "./sanitize.js";
 export type { SanitizeOptions } from "./sanitize.js";
@@ -849,6 +850,25 @@ async function renderMarkup(
   }
 
   const markedInstance = new Marked();
+  // Heading IDs, generated with the exact slugify() extractToc() already uses
+  // to build each page's "on this page" nav — without this, the TOC sidebar
+  // links to #anchors that don't exist on any element and silently no-op.
+  // Scoped per parse call (not module-level) so duplicate heading text across
+  // unrelated documents can't leak a shared counter.
+  const seenSlugs = new Map<string, number>();
+  markedInstance.use({
+    renderer: {
+      heading({ tokens, depth }) {
+        const text = this.parser.parseInline(tokens);
+        const plain = text.replace(/<[^>]*>/g, "");
+        const base = slugify(plain);
+        const count = seenSlugs.get(base) ?? 0;
+        seenSlugs.set(base, count + 1);
+        const slug = count === 0 ? base : `${base}-${count}`;
+        return `<h${depth} id="${slug}">${text}</h${depth}>\n`;
+      },
+    },
+  });
   // Syntax highlighting via Shiki. Highlighting runs in the extension's async
   // walkTokens hook (Marked v15 renderers are sync-only), and degrades to plain
   // escaped <pre><code> when the optional `shiki` peer dependency is absent.
@@ -874,6 +894,50 @@ async function renderMarkup(
   return { html: typeof html === "string" ? html : String(html) };
 }
 
+// Rehype plugin: give every MDX heading an `id` using the exact same slugify()
+// the TOC (extractToc) uses to build "on this page" links — without a matching
+// id on the heading element those anchor links silently no-op. Dedups repeated
+// heading text within a document (slug, slug-1, slug-2, ...) with the same
+// scheme as the Marked path in renderMarkup(), so the plain-Markdown and MDX
+// renderers produce identical ids for equivalent headings. Reuses slugify from
+// toc.ts deliberately (not rehype-slug/github-slugger, which slugifies
+// differently) to keep the two paths consistent.
+function rehypeHeadingIds() {
+  return (tree: unknown): void => {
+    const seen = new Map<string, number>();
+    const walk = (node: any): void => {
+      if (
+        node &&
+        node.type === "element" &&
+        typeof node.tagName === "string" &&
+        /^h[1-6]$/.test(node.tagName)
+      ) {
+        node.properties = node.properties ?? {};
+        if (node.properties.id == null) {
+          const base = slugify(hastText(node));
+          if (base) {
+            const count = seen.get(base) ?? 0;
+            seen.set(base, count + 1);
+            node.properties.id = count === 0 ? base : `${base}-${count}`;
+          }
+        }
+      }
+      if (node && Array.isArray(node.children)) {
+        for (const child of node.children) walk(child);
+      }
+    };
+    walk(tree);
+  };
+}
+
+// Concatenate the visible text of a hast node (heading text for slugifying).
+function hastText(node: any): string {
+  if (!node) return "";
+  if (node.type === "text") return typeof node.value === "string" ? node.value : "";
+  if (Array.isArray(node.children)) return node.children.map(hastText).join("");
+  return "";
+}
+
 async function compileMdx(
   source: string,
   filePathForErrors?: string,
@@ -892,9 +956,13 @@ async function compileMdx(
     if (markdownConfig?.remarkPlugins?.length) {
       mdxOptions.remarkPlugins = markdownConfig.remarkPlugins;
     }
-    if (markdownConfig?.rehypePlugins?.length) {
-      mdxOptions.rehypePlugins = markdownConfig.rehypePlugins;
-    }
+    // Always assign slugified heading ids (matching the Marked path), then run
+    // any user-supplied rehype plugins after, so consuming sites get working
+    // TOC anchors without opting in.
+    mdxOptions.rehypePlugins = [
+      rehypeHeadingIds,
+      ...(markdownConfig?.rehypePlugins ?? []),
+    ];
     evaluated = (await evaluate(source, mdxOptions as any)) as { default?: preact.FunctionComponent<any> };
   } catch (error) {
     const location =
