@@ -1,5 +1,34 @@
 # Render-core package release
 
+## Pending release: core 0.1.6 / cli 0.1.5
+
+Versions already bumped (`package.json`). These ship framework bug fixes that
+affect every Neutron site, so downstream sites (teploy.com, DLBS) should update
+after publish and can drop any local pnpm patches for these fixes.
+
+What's in it (since core 0.1.5 / cli 0.1.4):
+- **Anchor links (core):** the SPA click interceptor + `navigate()` no longer
+  strip the URL hash — in-page anchors (`#section`, `/page#section`) scroll
+  again. Was broken on every hydrating Neutron site.
+- **Heading IDs (core):** markdown AND MDX headings get slugified `id`s, so the
+  "on this page" TOC anchors resolve (fixes teploy.com's TOC).
+- **Resource routes (core + cli):** dynamic resource routes + catch-all-with-
+  literal-suffix routing — enables per-page endpoints like `/docs/<slug>.md`.
+- **MCP (cli):** `search_docs` / `get_doc` tools added to `neutron mcp`.
+
+Publish runbook (you run this — the login step needs your security key):
+
+```bash
+cd Neutron/typescript
+pnpm -r build
+npm login --auth-type=web
+(cd packages/neutron     && pnpm publish --no-git-checks --access public)   # core 0.1.6 FIRST
+(cd packages/neutron-cli && pnpm publish --no-git-checks --access public)   # cli 0.1.5 (workspace:^ rewritten to core 0.1.6)
+for p in core cli; do echo -n "@neutron-build/$p: "; npm view @neutron-build/$p version; done
+```
+
+Only `core` and `cli` changed this cycle — `ai`/`workflow`/`agents` stay put.
+
 ## Release status (completed 2026-07-14)
 
 The render-core packages are published and publicly available:
