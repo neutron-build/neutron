@@ -70,7 +70,7 @@ let router = Router::new()
 
 Client-side:
 
-```javascript
+```js
 const es = new EventSource("/events");
 es.addEventListener("tick", (e) => {
     console.log("Server time:", e.data);

@@ -20,16 +20,15 @@ interface RootLayoutProps {
 
 export function head() {
   return {
-    headScripts: [
+    // Static <link> tags — rendered into the SSG HTML so fonts and the favicon
+    // are present without JavaScript (no FOUT, crawler- and agent-visible).
+    link: [
+      { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
+      { rel: "preconnect", href: "https://fonts.googleapis.com" },
+      { rel: "preconnect", href: "https://fonts.gstatic.com", crossorigin: "" },
       {
-        content: `
-          (function() {
-            var pc1 = document.createElement('link'); pc1.rel = 'preconnect'; pc1.href = 'https://fonts.googleapis.com'; document.head.appendChild(pc1);
-            var pc2 = document.createElement('link'); pc2.rel = 'preconnect'; pc2.href = 'https://fonts.gstatic.com'; pc2.crossOrigin = ''; document.head.appendChild(pc2);
-            var fl = document.createElement('link'); fl.rel = 'stylesheet'; fl.href = 'https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap'; document.head.appendChild(fl);
-            var ic = document.createElement('link'); ic.rel = 'icon'; ic.type = 'image/svg+xml'; ic.href = '/favicon.svg'; document.head.appendChild(ic);
-          })();
-        `,
+        rel: "stylesheet",
+        href: "https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap",
       },
     ],
     openGraph: {

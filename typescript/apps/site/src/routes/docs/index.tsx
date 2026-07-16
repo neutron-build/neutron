@@ -102,7 +102,7 @@ export default function DocsIndex() {
         <div class="docs-landing__grid">
           <DocsCard
             title="Overview"
-            description="How Nucleus packs SQL, KV, Vector, Graph, Documents, TimeSeries, and nine more into a single process."
+            description="How Nucleus packs SQL, KV, Vector, Graph, Documents, TimeSeries, and eight more into a single process."
             href="/docs/nucleus/overview"
           />
           <DocsCard
@@ -136,10 +136,10 @@ export default function DocsIndex() {
       <section class="docs-landing__section">
         <h2 class="docs-landing__section-title">Language SDKs</h2>
         <p class="docs-landing__section-lead">
-          Eight SDKs, one contract. Same wire protocol, same error format, same health checks &mdash; in the idioms of each language.
+          Seven SDKs, one contract. Same wire protocol, same error format, same health checks &mdash; in the idioms of each language.
         </p>
         <div class="docs-landing__grid docs-landing__grid--compact">
-          <DocsCard title="Rust" description="Hyper + Tokio. Trie router, 18 crates, full auth." href="/docs/rust/overview" />
+          <DocsCard title="Rust" description="Hyper + Tokio. Trie router, 19 crates, full auth." href="/docs/rust/overview" />
           <DocsCard title="Go" description="net/http, idiomatic router, OAuth + WebAuthn." href="/docs/go/overview" />
           <DocsCard title="Python" description="Starlette + Pydantic v2 + asyncpg, async-first." href="/docs/python/overview" />
           <DocsCard title="Elixir" description="Plug + Bandit, OTP supervisors, hot reload." href="/docs/elixir/index" />

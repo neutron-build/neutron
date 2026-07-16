@@ -3,8 +3,6 @@ title: Verification Overview
 description: Formal verification tools for Neutron Rust — prove your code is correct, not just tested.
 ---
 
-# Verification
-
 Neutron Rust includes built-in support for formal verification — tools that mathematically prove your code is correct, not just test it with sample inputs.
 
 ## Why Verification?
@@ -53,7 +51,7 @@ fn check_no_deadlock() {
 }
 ```
 
-### [Verus](/docs/verification/verus) — Full Correctness Proofs (Coming Soon)
+### [Verus](/docs/verification/verus) — Full Correctness Proofs
 
 Deductive verification for Rust. Unlike Kani's bounded checking, Verus proves correctness for **all inputs without bounds** — mathematical proof, not brute force. Currently requires a compiler fork; will be integrated when it becomes a standard cargo dependency.
 

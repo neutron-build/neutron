@@ -1,6 +1,25 @@
 # Neutron
 
-Neutron is a full-stack framework ecosystem. One mental model across web, mobile, desktop, and AI — backed by Nucleus, a multi-model database engine built in Rust.
+> A multi-language, full-stack framework ecosystem backed by Nucleus — a multi-model database engine (14 data models over the PostgreSQL wire protocol). One mental model across web, mobile, desktop, and AI, in 8 languages. Import only what you need; unused code strips at compile time.
+
+- Website: https://neutron.build
+- Docs: https://neutron.build/docs
+- Source: https://github.com/neutron-build/neutron
+- License: MIT (frameworks) | BSL 1.1 → MIT on 2046-01-01 (Nucleus)
+
+## Documentation
+
+- [Getting started](https://neutron.build/docs/getting-started/installation): install and scaffold with `npm create neutron@latest`
+- [Your first route](https://neutron.build/docs/getting-started/your-first-route): file-based routing, static vs app mode
+- [Routing](https://neutron.build/docs/routing/overview): file conventions, dynamic and catch-all routes, layouts
+- [Data loaders](https://neutron.build/docs/data/loaders) and [actions](https://neutron.build/docs/data/actions): server data and mutations
+- [Rendering](https://neutron.build/docs/rendering/overview): SSR, islands, streaming, signals
+- [Deployment](https://neutron.build/docs/deployment/adapters): static, Docker, Vercel, and Cloudflare adapters
+- [Nucleus overview](https://neutron.build/docs/nucleus/overview): the 14-model database, pgwire, MVCC and WAL
+- [Nucleus quickstart](https://neutron.build/docs/nucleus/quickstart): connect with any PostgreSQL client
+- [CLI](https://neutron.build/docs/cli/overview): the `neutron` binary, including `neutron mcp` (MCP server for agents)
+- [API reference](https://neutron.build/docs/api/route-exports): route exports, hooks, and components
+- Language SDKs: [Rust](https://neutron.build/docs/rust/overview) · [Go](https://neutron.build/docs/go/overview) · [Python](https://neutron.build/docs/python/overview) · [Elixir](https://neutron.build/docs/elixir/overview) · [Zig](https://neutron.build/docs/zig/overview) · [Julia](https://neutron.build/docs/julia/overview)
 
 ## Projects
 
@@ -12,10 +31,10 @@ Multi-model database in Rust. One engine for 14 data models: SQL, Key-Value, Vec
 - Vector syntax: `VECTOR('[1,0,0]')` not bare string
 - Port: 5432 (pgwire)
 
-### rs/ — Neutron Rust (Web Framework)
+### rust/ — Neutron Rust (Web Framework)
 High-performance HTTP/1.1, HTTP/2, HTTP/3 web framework in Rust. Hyper 1.x + tokio, middleware pipeline, file-based routing, WebSockets, SSE, multipart, TLS, gRPC, GraphQL. 19 crates including OAuth, WebAuthn, Stripe, SMTP, Redis, OpenTelemetry.
-- Entry: `rs/crates/neutron/src/lib.rs`
-- Tests: `cargo test` in `rs/`
+- Entry: `rust/crates/neutron/src/lib.rs`
+- Tests: `cargo test` in `rust/`
 - Key types: `App`, `Router`, `Request`, `Response`, `Middleware`, `Handler`
 
 ### typescript/ — Neutron TypeScript (UI Framework)
@@ -44,7 +63,7 @@ OTP-based backend framework using Plug + Bandit. Fault-tolerant supervisors, all
 - Key modules: `Neutron.Router`, `Neutron.Nucleus`, `Neutron.Channels`, `Neutron.Presence`
 
 ### mojo/ — Neutron Mojo (ML Library)
-Tensor operations, quantization (Q8/Q4/NF4/FP8), inference pipeline, training stack in Mojo. Runs on CPU with SIMD kernels (337x vs scalar).
+Tensor operations, quantization (Q8/Q4/NF4/FP8), inference pipeline, training stack in Mojo. CPU-first with SIMD kernels. Preview — tracks the Mojo nightly toolchain, awaiting Mojo 1.0.
 - Entry: `mojo/neutron-mojo/src/`
 - Tests: `pixi run mojo build -I src test/test_*.mojo`
 - Key types: `Tensor`, `Model`, `QuantizedModel`, `pipeline_generate`
@@ -81,7 +100,7 @@ Visual database management GUI. Browse all 14 data models in one UI with toggles
 - Backend: `cli/internal/studio/`, Frontend: `studio/src/`
 
 ### cli/ — Neutron CLI
-Universal CLI in Go + Cobra. 17 commands including `dev`, `build`, `deploy`, `desktop`, `native`, `studio`. ~21MB binary.
+Universal CLI in Go + Cobra. Commands include `dev`, `build`, `run`, `generate`, `db`, `studio`, `desktop`, `native`, `migrate`, and `mcp` (MCP server). ~21MB binary.
 - Build: `go build` in `cli/`
 
 ## Transport Layer
@@ -109,7 +128,7 @@ Single schema covers SQL tables, KV stores, vector collections, timeseries metri
 
 Formal verification across three tools:
 
-- **Lean4** (`lean4/`): 26 files, algorithm proofs, 100% proven (Aeneas Rust-to-Lean translation)
+- **Lean4** (`lean4/`): 26 files, 70 theorems, 0 `sorry` — machine-checked proofs of hand-written Lean *models* of the core algorithms (MVCC, B-tree, WAL, Raft, HMAC, Bloom, LRU), modulo explicit axioms. Proves the algorithm designs, not the production Rust binary.
 - **Quint** (`quint/`): 27 protocol specification files, 12 test files, nucleus + framework + realtime specs
 - **Verus** (`verus/`): 12 files, Rust verification for nucleus (MVCC, page, buffer) and framework (JWT, session, rate limit)
 
@@ -125,11 +144,11 @@ Formal verification across three tools:
 
 ## File Conventions
 
-- `rs/crates/neutron/src/app.rs` — main App builder
-- `rs/crates/neutron/src/handler.rs` — Request/Response types
-- `rs/crates/neutron/src/router.rs` — routing
+- `rust/crates/neutron/src/app.rs` — main App builder
+- `rust/crates/neutron/src/handler.rs` — Request/Response types
+- `rust/crates/neutron/src/router.rs` — routing
 - `nucleus/src/` — all database engine modules
-- `ts/packages/neutron/src/` — TypeScript framework source
+- `typescript/packages/neutron/src/` — TypeScript framework source
 - `mojo/neutron-mojo/src/` — Mojo tensor library source
 - `go/` — Go framework packages
 - `elixir/lib/` — Elixir framework modules

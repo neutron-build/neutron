@@ -16,7 +16,7 @@ export default function MojoPage() {
       title="Neutron Mojo"
       description="GPU kernels, quantized inference, and a training stack in a language that reads like Python and runs like CUDA. Preview-shipped today, stable when Mojo 1.0 lands."
       category="language"
-      status="available"
+      status="in-progress"
       accent="var(--accent-mojo)"
       heroAccentRgb="168, 85, 247"
       heroTagline="GPU kernels that speak Python."

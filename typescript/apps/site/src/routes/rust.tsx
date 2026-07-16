@@ -7,7 +7,7 @@ import ComparisonTable from "../components/ComparisonTable";
 export function head() {
   return {
     title: "Rust - Neutron",
-    description: "Async Rust web framework on Hyper and Tokio. Trie routing, 1,161 tests across 18 composable crates, built-in JWT, WebSocket, SSE, OAuth, and WebAuthn. Nucleus integration out of the box.",
+    description: "Async Rust web framework on Hyper and Tokio. Trie routing, 1,210 tests across 19 composable crates, built-in JWT, WebSocket, SSE, OAuth, and WebAuthn. Nucleus integration out of the box.",
   };
 }
 
@@ -15,22 +15,22 @@ export default function RustPage() {
   return (
     <ProductPage
       title="Neutron Rust"
-      description="Async web framework on Hyper and Tokio. Trie routing, 1,161 tests across 18 composable crates, and the auth, real-time, and database layers already wired up."
+      description="Async web framework on Hyper and Tokio. Trie routing, 1,210 tests across 19 composable crates, and the auth, real-time, and database layers already wired up."
       category="language"
       status="available"
       accent="var(--accent-rust)"
       heroAccentRgb="255, 107, 53"
       heroTagline="The backend that compiles into a binary you're not afraid of."
       stats={[
-        { value: '1,161', label: 'Tests Passing' },
-        { value: '18', label: 'Composable Crates' },
+        { value: '1,210', label: 'Tests Passing' },
+        { value: '19', label: 'Composable Crates' },
         { value: '681ns', label: 'Plaintext Response' },
         { value: '277ns', label: 'Route Lookup' },
       ]}
     >
       <section>
         <h2>Stop wiring crates together.</h2>
-        <p>Most Rust web projects start with Axum or Actix plus fifteen dependencies to reach feature parity with a normal framework. Neutron Rust ships with the full stack already composed &mdash; trie router, Tower-style middleware, JWT + OAuth + WebAuthn auth, Nucleus client, WebSocket and SSE, OTel tracing, and a Stripe integration &mdash; all tested across 1,161 tests and versioned together.</p>
+        <p>Most Rust web projects start with Axum or Actix plus fifteen dependencies to reach feature parity with a normal framework. Neutron Rust ships with the full stack already composed &mdash; trie router, Tower-style middleware, JWT + OAuth + WebAuthn auth, Nucleus client, WebSocket and SSE, OTel tracing, and a Stripe integration &mdash; all tested across 1,210 tests and versioned together.</p>
         <p>You import the crates you need. You don't import the ones you don't. Feature-gate everything at the Cargo level, and the binary drops features that aren't in your build.</p>
       </section>
 
@@ -97,7 +97,7 @@ pub async fn recommend(
       </section>
 
       <section>
-        <h2>The 18 crates, composable.</h2>
+        <h2>The 19 crates, composable.</h2>
         <p>Everything is its own crate. Use what you need; the rest never touches your binary.</p>
 
         <ComparisonTable
@@ -133,7 +133,7 @@ pub async fn recommend(
           { label: 'Real-time', value: 'WebSocket + SSE + PubSub', width: 85, color: '#FFA07A' },
           { label: 'Nucleus', value: 'Typed client, all 14 models', width: 80, color: '#FFB899' },
           { label: 'Ops', value: 'OTel, Stripe, jobs, cache, storage', width: 72, color: '#FFCEB3' },
-          { label: 'Tests', value: '1,161 across 18 crates', width: 65, color: '#FFDDC8' },
+          { label: 'Tests', value: '1,210 across 19 crates', width: 65, color: '#FFDDC8' },
         ]}
       />
 
@@ -154,7 +154,7 @@ ENTRYPOINT ["/myapp"]`}</code></pre>
         <p>High-throughput APIs where latency predictability matters. Real-time fan-out to tens of thousands of clients. Edge-compiled WASM services. Tauri desktop backends (the same framework powers Neutron Desktop). Anything where you want Rust's memory safety and throughput without building half a web framework first.</p>
 
         <h3>Production-grade by default</h3>
-        <p>1,161 tests across 18 crates &mdash; unit, integration, property-based, and async. Every crate's public API is checked by <code>cargo-semver-checks</code>. Memory safety guaranteed by the borrow checker; no segfaults, no data races, no null dereferences. Release profile with LTO + codegen-units=1 lands production binaries at ~8&ndash;12 MB.</p>
+        <p>1,210 tests across 19 crates &mdash; unit, integration, property-based, and async. Every crate's public API is checked by <code>cargo-semver-checks</code>. Memory safety guaranteed by the borrow checker; no segfaults, no data races, no null dereferences. Release profile with LTO + codegen-units=1 lands production binaries at ~8&ndash;12 MB.</p>
 
         <h3>Part of a bigger system</h3>
         <p>Use Neutron Rust for the performance-sensitive services. Use Neutron TypeScript for the web, Go for concurrent microservices, Python for ML and data pipelines. Every SDK speaks the same contract and reads the same Nucleus database. You never hit a wall where the framework says no.</p>
