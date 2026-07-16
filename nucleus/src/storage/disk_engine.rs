@@ -246,6 +246,8 @@ impl DiskEngine {
             None,
             false,
             wal::SyncMode::Fsync,
+            None,
+            None,
         )
     }
 
@@ -259,6 +261,8 @@ impl DiskEngine {
             None,
             false,
             wal::SyncMode::Fsync,
+            None,
+            None,
         )
     }
 
@@ -277,6 +281,8 @@ impl DiskEngine {
             Some(encryptor),
             false,
             wal::SyncMode::Fsync,
+            None,
+            None,
         )
     }
 
@@ -295,6 +301,8 @@ impl DiskEngine {
             Some(encryptor),
             true,
             wal::SyncMode::Fsync,
+            None,
+            None,
         )
     }
 
@@ -309,6 +317,8 @@ impl DiskEngine {
             None,
             true,
             wal::SyncMode::Fsync,
+            None,
+            None,
         )
     }
 
@@ -348,6 +358,8 @@ impl DiskEngine {
             None,
             false,
             wal::SyncMode::Fsync,
+            None,
+            None,
         )
     }
 
@@ -368,6 +380,35 @@ impl DiskEngine {
             None,
             false,
             sync_mode,
+            None,
+            None,
+        )
+    }
+
+    /// Open a segmented WAL with continuous archiving (PITR) to an explicit
+    /// directory and an explicit segment size in bytes. Distinct from
+    /// `open_segmented` (which sizes in MB and archives only if
+    /// `NUCLEUS_WAL_ARCHIVE_DIR` is set), this gives embedded/PITR callers full
+    /// control over both the archive location and rotation granularity.
+    pub fn open_segmented_archived(
+        path: &Path,
+        catalog: Arc<Catalog>,
+        pool_frames: usize,
+        max_segment_bytes: u64,
+        sync_mode: wal::SyncMode,
+        archive_dir: &Path,
+    ) -> Result<Self, StorageError> {
+        Self::open_inner(
+            path,
+            catalog,
+            pool_frames,
+            true,
+            0,
+            None,
+            false,
+            sync_mode,
+            Some(max_segment_bytes),
+            Some(archive_dir.to_path_buf()),
         )
     }
 
@@ -381,6 +422,8 @@ impl DiskEngine {
         encryptor: Option<super::encryption::PageEncryptor>,
         compression: bool,
         sync_mode: wal::SyncMode,
+        max_segment_bytes: Option<u64>,
+        archive_dir: Option<std::path::PathBuf>,
     ) -> Result<Self, StorageError> {
         let mut disk = match (&encryptor, compression) {
             (Some(enc), true) => DiskManager::open_compressed_encrypted(path, enc.clone()),
@@ -471,15 +514,17 @@ impl DiskEngine {
         // Open WAL backend — segmented or single-file
         let wal_backend: Box<dyn wal::WalBackend> = if use_segmented_wal {
             let wal_dir = path.with_extension("wal.d");
-            let max_bytes = if max_segment_size_mb > 0 {
+            let max_bytes = max_segment_bytes.unwrap_or(if max_segment_size_mb > 0 {
                 (max_segment_size_mb * 1024 * 1024) as u64
             } else {
                 64 * 1024 * 1024 // 64 MB default
-            };
-            Box::new(
-                wal::SegmentedWal::open_with_sync_mode(&wal_dir, max_bytes, sync_mode)
-                    .map_err(|e| StorageError::Io(format!("Segmented WAL open failed: {e}")))?,
-            )
+            });
+            let seg = match &archive_dir {
+                Some(ad) => wal::SegmentedWal::open_with_archive(&wal_dir, max_bytes, sync_mode, ad),
+                None => wal::SegmentedWal::open_with_sync_mode(&wal_dir, max_bytes, sync_mode),
+            }
+            .map_err(|e| StorageError::Io(format!("Segmented WAL open failed: {e}")))?;
+            Box::new(seg)
         } else {
             Box::new(
                 Wal::open_with_sync_mode(&wal_path, sync_mode)
@@ -4510,6 +4555,150 @@ mod tests {
         let fast_count = engine.fast_count_all("t").unwrap();
         assert_eq!(scan_count, fast_count);
     }
+
+    // ── PITR: base snapshot + WAL archive → restore to a point in time ──────
+    //
+    // End-to-end proof that continuous archiving + restore_pitr recover the
+    // exact row set as of a chosen LSN: rows written AFTER the target must not
+    // reappear, and rows at/before it must all be present.
+    #[tokio::test]
+    async fn pitr_restores_row_set_at_target_lsn() {
+        use crate::pitr::{restore_pitr, PitrTarget};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("live");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("nucleus.db");
+        let live_wal_dir = db_path.with_extension("wal.d");
+        let archive = tmp.path().join("archive");
+
+        // Highest LSN present across the live WAL + the archive right now.
+        let max_lsn_now = |wal_dir: &std::path::Path, arch: &std::path::Path| -> u64 {
+            let mut m = 0u64;
+            for r in wal::read_wal_dir_records(wal_dir).unwrap_or_default() {
+                m = m.max(r.lsn);
+            }
+            if arch.is_dir() {
+                for s in wal::list_archive_segments(arch).unwrap_or_default() {
+                    for r in
+                        wal::read_wal_records(&wal::segment_file_path(arch, s)).unwrap_or_default()
+                    {
+                        m = m.max(r.lsn);
+                    }
+                }
+            }
+            m
+        };
+
+        // Phase 1: batch A, checkpoint, then snapshot the base (pages reflect A).
+        let base_snap = tmp.path().join("base");
+        {
+            let catalog = Arc::new(Catalog::new());
+            register_simple_table(&catalog, "t").await;
+            // Tiny segments so batches rotate and archive continuously.
+            let engine = DiskEngine::open_segmented_archived(
+                &db_path,
+                catalog.clone(),
+                DEFAULT_POOL_SIZE,
+                12_000,
+                wal::SyncMode::Fsync,
+                &archive,
+            )
+            .unwrap();
+            engine.create_table("t").await.unwrap();
+            for i in 0..40 {
+                engine.insert("t", simple_row(i, &format!("a{i}"))).await.unwrap();
+            }
+            engine.checkpoint().unwrap();
+            drop(engine);
+            // Physical base backup of the whole data dir (A only).
+            crate::backup::backup_data_dir(&data_dir, &base_snap, false, "0.1.1").unwrap();
+        }
+
+        // Phase 2: reopen, batch B, checkpoint, capture the target LSN, then
+        // batch C (must NOT survive a restore to the target).
+        let target_lsn;
+        {
+            let catalog = Arc::new(Catalog::new());
+            register_simple_table(&catalog, "t").await;
+            let engine = DiskEngine::open_segmented_archived(
+                &db_path,
+                catalog.clone(),
+                DEFAULT_POOL_SIZE,
+                12_000,
+                wal::SyncMode::Fsync,
+                &archive,
+            )
+            .unwrap();
+            engine.create_table("t").await.unwrap();
+            for i in 100..140 {
+                engine.insert("t", simple_row(i, &format!("b{i}"))).await.unwrap();
+            }
+            engine.checkpoint().unwrap();
+            target_lsn = max_lsn_now(&live_wal_dir, &archive);
+            assert!(target_lsn > 0, "expected a non-zero target LSN after batch B");
+            for i in 200..240 {
+                engine.insert("t", simple_row(i, &format!("c{i}"))).await.unwrap();
+            }
+            engine.checkpoint().unwrap();
+            drop(engine);
+        }
+
+        // Phase 3: restore to target_lsn into a clean dir, reopen, verify.
+        let restored_dir = tmp.path().join("restored");
+        let report = restore_pitr(
+            &base_snap,
+            &archive,
+            PitrTarget::Lsn(target_lsn),
+            &restored_dir,
+            "nucleus.db",
+            "0.1.1",
+            false,
+        )
+        .unwrap();
+        assert!(
+            report.restored_lsn >= target_lsn,
+            "reconstruction did not reach the target: restored {} < target {}",
+            report.restored_lsn,
+            target_lsn
+        );
+
+        let catalog = Arc::new(Catalog::new());
+        register_simple_table(&catalog, "t").await;
+        let restored_db = restored_dir.join("nucleus.db");
+        // Reopen with the segmented backend so recovery reads the reconstructed
+        // wal.d (single-file `open()` would ignore it) — matching how a
+        // segmented-WAL deployment opens in production.
+        let engine = DiskEngine::open_segmented_with_sync(
+            &restored_db,
+            catalog.clone(),
+            DEFAULT_POOL_SIZE,
+            64,
+            wal::SyncMode::Fsync,
+        )
+        .unwrap();
+        engine.create_table("t").await.unwrap();
+        let rows = engine.scan("t").await.unwrap();
+
+        let ids: std::collections::HashSet<i32> = rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Int32(n) => *n,
+                other => panic!("unexpected id value {other:?}"),
+            })
+            .collect();
+        // All of A (0..40) and B (100..140) present; none of C (200..240).
+        for i in 0..40 {
+            assert!(ids.contains(&i), "row A{i} missing after PITR restore");
+        }
+        for i in 100..140 {
+            assert!(ids.contains(&i), "row B{i} missing after PITR restore");
+        }
+        for i in 200..240 {
+            assert!(!ids.contains(&i), "row C{i} wrongly survived PITR to target");
+        }
+    }
+
 }
 
 // ============================================================================
