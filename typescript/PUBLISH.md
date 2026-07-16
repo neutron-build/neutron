@@ -1,6 +1,32 @@
 # Render-core package release
 
-## Pending release: core 0.1.6 / cli 0.1.5
+## Pending release: core 0.1.7 (core only)
+
+Version already bumped. Fixes a build-breaking bug for **hydrating** sites: the
+server-only content module (`getCollection`/`getEntry`, which use node:crypto/fs/
+MDX) leaked into the client/island bundle when a component both loaded content
+and rendered an `<Island>`, failing with "createHash is not exported". Static
+sites (e.g. neutron.build) were unaffected. Verified end-to-end against
+teploy-site (islands + getCollection): builds clean and still emits the island
+bundle.
+
+Only `core` changed. `cli@0.1.5` depends on core `^0.1.6`, so a site on cli 0.1.5
+auto-resolves the fixed core; no cli bump needed.
+
+Publish runbook (you run this — login needs your security key/OTP):
+
+```bash
+cd Neutron/typescript
+pnpm --filter @neutron-build/core build
+npm login --auth-type=web   # if not still logged in
+(cd packages/neutron && pnpm publish --no-git-checks --access public)   # core 0.1.7
+npm view @neutron-build/core version   # expect 0.1.7
+```
+
+After publish, hydrating sites (teploy-site, and any island-using site) can bump
+`@neutron-build/core` to `^0.1.7`, drop their pnpm patches, and build.
+
+## Released: core 0.1.6 / cli 0.1.5
 
 Versions already bumped (`package.json`). These ship framework bug fixes that
 affect every Neutron site, so downstream sites (teploy.com, DLBS) should update
