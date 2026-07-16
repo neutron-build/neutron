@@ -82,7 +82,7 @@ Multi-Version Concurrency Control provides snapshot isolation:
 
 ## Backup & Recovery
 
-All data models use write-ahead logging (WAL) for crash recovery:
+Most data models use write-ahead logging (WAL) for crash recovery — 8 of the 14 are WAL-durable today, with the rest in progress:
 
 1. Operations are written to the WAL before applying
 2. On startup, any incomplete operations are replayed

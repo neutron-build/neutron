@@ -3,7 +3,7 @@ title: Lean 4 Proofs
 description: Machine-checked algorithm proofs for Nucleus.
 ---
 
-The `lean4/` directory contains machine-checked proofs of critical Nucleus algorithms using the Lean 4 proof assistant. These proofs provide mathematical guarantees that core database algorithms are correct.
+The `lean4/` directory contains machine-checked proofs of critical Nucleus algorithms using the Lean 4 proof assistant. These are hand-written Lean models of the algorithms — not machine-extracted from the production Rust — so they give mathematical guarantees that the modeled algorithm *designs* are correct, modulo a small set of explicit axioms.
 
 ## What's Verified
 
@@ -66,21 +66,22 @@ lean4/Nucleus/
 
 ## How It Works
 
-1. **Aeneas models** translate Rust types and functions into Lean 4 equivalents
+1. **Models** hand-mirror the Rust types and functions as Lean 4 equivalents (they are written and maintained by hand, not auto-generated from the Rust)
 2. **Specs** state the properties to prove as Lean theorems
 3. **Proofs** provide machine-checked evidence that the properties hold
-4. Lean's type checker verifies every proof step — no human trust required
+4. Lean's type checker verifies every proof step; the only trusted inputs are the explicit `axiom` declarations the proofs build on
 
 ## Example: No False Negatives
 
 ```lean
 theorem no_false_negatives (bf : BloomFilter) (item : List UInt8) :
-    bf.insert(item).mayContain(item) = true := by
-  sorry  -- proof in progress
+    (bf.insert item).mayContain item = true
 ```
 
-This theorem states: after inserting an item into a Bloom filter, `mayContain` always returns `true` for that item.
+This theorem states: after inserting an item into a Bloom filter, `mayContain` always returns `true` for that item. It is proved in full in `Structures/` — the proof carries no `sorry`.
 
 ## Status
 
-Proofs are in active development. Some use `sorry` (proof obligation marker) for theorems that are stated but not yet fully proven. The Lean type checker ensures that completed proofs are correct.
+The suite is 26 files and 70 theorems with **zero uses of `sorry`** — every stated theorem has a complete, machine-checked proof. Those proofs rest on 28 explicit `axiom` declarations that state foundational assumptions (some load-bearing); the results hold modulo those axioms.
+
+These are hand-written Lean models of the algorithms, not machine-extracted from the production Rust. They establish that the algorithm *designs* are correct — they do not, on their own, certify that the shipped Nucleus binary is formally verified. The Rust implementation is validated separately by its test, property, and differential-fuzzing suites.

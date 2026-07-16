@@ -25,10 +25,10 @@ export default function NucleusPage() {
               14 engines. 1 system.
             </h1>
             <p class="nucleus-hero__desc" data-animate style={{ "--animate-delay": "0.15s" } as any}>
-              Stop running Postgres, Redis, Elasticsearch, TimescaleDB, Neo4j, and MongoDB as separate services. Nucleus gives you 14 specialized storage engines in one process — each purpose-built for its data model. Built in Rust with 3,724 passing tests.
+              Stop running Postgres, Redis, Elasticsearch, TimescaleDB, Neo4j, and MongoDB as separate services. Nucleus gives you 14 specialized storage engines in one process — each purpose-built for its data model. Built in Rust with 2,596 passing tests.
             </p>
             <div class="nucleus-hero__metrics" data-animate style={{ "--animate-delay": "0.2s" } as any}>
-              <MetricCard value="3,724" label="Tests Passing" variant="excellent" />
+              <MetricCard value="2,596" label="Tests Passing" variant="excellent" />
               <MetricCard value="14" label="Data Models" variant="good" />
               <MetricCard value="ACID" label="Transactions" variant="neutral" />
               <MetricCard value="Rust" label="Built With" variant="neutral" />
@@ -123,11 +123,10 @@ export default function NucleusPage() {
               { label: 'COUNT(*)', value: '4.2x faster', width: 71, color: '#34D399' },
               { label: 'INSERT', value: '1.6x faster', width: 27, color: '#6EE7B7' },
               { label: 'GROUP BY', value: '1.2x faster', width: 20, color: '#A7F3D0' },
-              { label: 'Point query', value: '1.1x faster', width: 18, color: '#D1FAE5' },
             ]}
           />
           <p class="nucleus-section__note container" data-animate>
-            <em>Columnar engine benchmarks measured against PostgreSQL. Other engine comparisons in progress.</em>
+            <em>Columnar (embedded) engine measured against PostgreSQL; the aggregation wins come from vectorized scans. On point queries PostgreSQL is competitive to slightly faster. These figures are for the embedded engine — accessed over the PostgreSQL wire protocol, Nucleus adds roughly 34&ndash;40&micro;s per query. Other engine comparisons in progress.</em>
           </p>
         </section>
 
@@ -189,7 +188,7 @@ export default function NucleusPage() {
           <div class="container container--code">
             <h2 class="nucleus-section__title" data-animate>Production-Grade Engineering</h2>
             <div class="production-prose" data-animate style={{ "--animate-delay": "0.05s" } as any}>
-              <p><strong>3,724 tests passing</strong> — unit, integration, and property-based testing with proptest.</p>
+              <p><strong>2,596 tests passing</strong> — unit, integration, and property-based testing with proptest.</p>
               <p><strong>Rust 2024 Edition</strong> — memory safety without garbage collection. No segfaults, no data races, no null pointer exceptions.</p>
               <p><strong>PostgreSQL compatible</strong> — use existing Postgres drivers and tools via pgwire 0.36. Drop-in replacement for OLTP workloads.</p>
               <p><strong>SQL parsing</strong> — powered by sqlparser 0.61 with extensions for multi-model SQL functions.</p>
