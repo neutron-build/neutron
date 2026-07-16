@@ -44,7 +44,10 @@ interface DocEntry {
 export default function DocPage({ data }: { data: { entry: DocEntry; Content: any } }) {
   return (
     <article>
-      <h1>{data.entry.data.title}</h1>
+      <div class="doc-page__header">
+        <h1>{data.entry.data.title}</h1>
+        <a class="doc-page__md-link" href={`/docs/${data.entry.slug}.md`}>View as Markdown</a>
+      </div>
       {data.Content ? <data.Content /> : <p>Content unavailable.</p>}
     </article>
   );

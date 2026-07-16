@@ -12,6 +12,7 @@ declare module "@neutron-build/core" {
     | "/desktop"
     | "/docs"
     | "/docs/*slug"
+    | "/docs/*slug.md"
     | "/elixir"
     | "/go"
     | "/julia"

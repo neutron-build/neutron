@@ -276,6 +276,31 @@
   }
 }
 
+/* Doc page header: title + "view as markdown" affordance */
+.doc-page__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.doc-page__md-link {
+  flex-shrink: 0;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: calc(var(--radius) - 2px);
+  padding: 0.2rem 0.6rem;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.doc-page__md-link:hover {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+
 /* ============================================
    DOCS SEARCH (Cmd/Ctrl+K) — Island component
    ============================================ */
