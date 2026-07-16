@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   hasServerOnlyImport,
+  isContentModuleId,
   isServerOnlySpecifier,
   stripServerOnlyRouteModule,
 } from "./server-only.js";
@@ -11,6 +12,27 @@ describe("server-only module handling", () => {
     expect(isServerOnlySpecifier("./db.server.ts")).toBe(true);
     expect(isServerOnlySpecifier("./db.server.ts?raw")).toBe(true);
     expect(isServerOnlySpecifier("./db.client.ts")).toBe(false);
+  });
+
+  it("detects the server-only content module (subpath, resolved paths, barrel re-export)", () => {
+    // Public subpath as a client component would import it.
+    expect(isContentModuleId("@neutron-build/core/content")).toBe(true);
+    // Fully-resolved module paths: npm dist, pnpm store, workspace src.
+    expect(isContentModuleId("/app/node_modules/@neutron-build/core/dist/content/index.js")).toBe(true);
+    expect(
+      isContentModuleId("/x/node_modules/.pnpm/@neutron-build+core@0.1.6/node_modules/@neutron-build/core/dist/content/index.js")
+    ).toBe(true);
+    expect(isContentModuleId("/repo/typescript/packages/neutron/src/content/index.ts")).toBe(true);
+    // Root barrel's relative re-export (`export … from "./content/index.js"`).
+    expect(
+      isContentModuleId("./content/index.js", "/app/node_modules/@neutron-build/core/dist/index.js")
+    ).toBe(true);
+    // Negatives: client subpath, unrelated modules, a bare relative that is NOT
+    // re-exported from the core index.
+    expect(isContentModuleId("@neutron-build/core/client")).toBe(false);
+    expect(isContentModuleId("@neutron-build/core")).toBe(false);
+    expect(isContentModuleId("./content/index.js", "/app/src/components/DocsShell.tsx")).toBe(false);
+    expect(isContentModuleId("preact")).toBe(false);
   });
 
   it("finds .server imports in module code", () => {

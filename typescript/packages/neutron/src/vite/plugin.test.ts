@@ -1,6 +1,35 @@
 import { describe, it, expect } from "vitest";
-import { generateRoutesModule } from "./plugin.js";
+import { generateRoutesModule, neutronPlugin } from "./plugin.js";
 import type { Route } from "../core/types.js";
+
+describe("content module client stub", () => {
+  const plugin = neutronPlugin();
+  // resolveId/load are plain methods on the plugin object.
+  const resolveId = plugin.resolveId as unknown as (
+    id: string,
+    importer: string | undefined,
+    ctx: { ssr?: boolean }
+  ) => string | null;
+  const load = plugin.load as unknown as (id: string) => Promise<string | null>;
+  const STUB = "\0neutron:content-client-stub";
+
+  it("stubs the server-only content module in client (non-ssr) builds", () => {
+    expect(resolveId("@neutron-build/core/content", undefined, {})).toBe(STUB);
+  });
+
+  it("leaves the content module intact for SSR (server needs the real thing)", () => {
+    expect(resolveId("@neutron-build/core/content", undefined, { ssr: true })).toBe(null);
+  });
+
+  it("the stub satisfies the named content imports without node builtins", async () => {
+    const src = await load(STUB);
+    expect(src).toContain("export const getCollection");
+    expect(src).toContain("export const getEntry");
+    expect(src).toContain("export const defineCollection");
+    expect(src).not.toContain("node:crypto");
+    expect(src).not.toContain("node:fs");
+  });
+});
 
 function makeRoute(overrides: Partial<Route> & Pick<Route, "id" | "path" | "file">): Route {
   return {
