@@ -14,8 +14,8 @@ theorem prepareKey_length (key : Block) :
   simp [prepareKey]
   split
   · -- key.length > BLOCK_SIZE
-    simp [List.length_append, List.length_replicate, sha256_output_len]
-    omega
+    simp [List.length_append, List.length_replicate, sha256_output_len, BLOCK_SIZE, HASH_SIZE] <;>
+      omega
   · split
     · -- key.length < BLOCK_SIZE
       simp [List.length_append, List.length_replicate]

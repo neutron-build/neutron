@@ -5,6 +5,8 @@
   challenge = BASE64URL(SHA256(verifier))
 -/
 
+import Nucleus.Crypto.Hmac
+
 namespace Nucleus.Crypto
 
 /-- A verifier is a 32-byte random string. -/

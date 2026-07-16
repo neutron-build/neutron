@@ -8,34 +8,39 @@ package «Nucleus» where
 
 @[default_target]
 lean_lib «Nucleus» where
-  srcDir := "Nucleus"
+  -- Modules live under `Nucleus/` and are named `Nucleus.*` (matching every
+  -- `import Nucleus.…` in the sources), so the source root is the package dir.
+  srcDir := "."
   roots := #[
-    `Aeneas.Mvcc,
-    `Aeneas.Btree,
-    `Aeneas.Wal,
-    `Aeneas.Raft,
-    `Spec.MvccSpec,
-    `Spec.BtreeSpec,
-    `Spec.WalSpec,
-    `Spec.RaftSpec,
-    `Proofs.MvccProofs,
-    `Proofs.BtreeProofs,
-    `Proofs.WalProofs,
-    `Proofs.RaftProofs,
-    `Helpers.Tactics,
-    `Helpers.Lemmas,
-    `Crypto.Hmac,
-    `Crypto.Pkce,
-    `Crypto.ConstantTime,
-    `Crypto.HmacSpec,
-    `Crypto.HmacProofs,
-    `Structures.Lru,
-    `Structures.Bloom,
-    `Structures.SlidingWindow,
-    `Structures.LruSpec,
-    `Structures.BloomSpec,
-    `Structures.SlidingWindowSpec
+    `Nucleus.Aeneas.Mvcc,
+    `Nucleus.Aeneas.Btree,
+    `Nucleus.Aeneas.Wal,
+    `Nucleus.Aeneas.Raft,
+    `Nucleus.Spec.MvccSpec,
+    `Nucleus.Spec.BtreeSpec,
+    `Nucleus.Spec.WalSpec,
+    `Nucleus.Spec.RaftSpec,
+    `Nucleus.Proofs.MvccProofs,
+    `Nucleus.Proofs.BtreeProofs,
+    `Nucleus.Proofs.WalProofs,
+    `Nucleus.Proofs.RaftProofs,
+    `Nucleus.Helpers.Tactics,
+    `Nucleus.Helpers.Lemmas,
+    `Nucleus.Crypto.Hmac,
+    `Nucleus.Crypto.Pkce,
+    `Nucleus.Crypto.ConstantTime,
+    `Nucleus.Crypto.HmacSpec,
+    `Nucleus.Crypto.HmacProofs,
+    `Nucleus.Structures.Lru,
+    `Nucleus.Structures.Bloom,
+    `Nucleus.Structures.SlidingWindow,
+    `Nucleus.Structures.LruSpec,
+    `Nucleus.Structures.BloomSpec,
+    `Nucleus.Structures.SlidingWindowSpec
   ]
 
-require mathlib from git
-  "https://github.com/leanprover-community/mathlib4" @ "master"
+-- No external dependencies: the proofs are self-contained on the Lean 4 core
+-- library. (Mathlib was previously declared but never imported — a handful of
+-- lemmas that would use it are stated as axioms instead; see Crypto/ConstantTime
+-- and Structures/BloomSpec. Depending on `master` also floated the toolchain off
+-- the pinned `lean-toolchain`, breaking a reproducible build.)

@@ -14,9 +14,9 @@ structure BloomFilter where
   numHashes : Nat
   deriving Repr
 
-/-- Abstract hash function pair for double hashing. -/
-opaque hashPair : List Byte → Nat × Nat
-  where Byte := Nat
+/-- Abstract hash function pair for double hashing (keys are byte lists,
+    each byte modeled as a `Nat`). -/
+opaque hashPair : List Nat → Nat × Nat
 
 /-- Create a bloom filter sized for n keys with given bits per key. -/
 def BloomFilter.new (numKeys bitsPerKey : Nat) : BloomFilter :=
