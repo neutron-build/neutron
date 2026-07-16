@@ -71,7 +71,7 @@ $ neutron native run android         # build + run on Android emulator`}</code><
         </div>
         <div class="feature-card">
           <div class="feature-card__title">MCP server</div>
-          <div class="feature-card__desc"><code>neutron mcp</code> exposes 17 tools over stdio or HTTP. OpenAI-compatible, <code>--dump-schema</code> for AI context priming.</div>
+          <div class="feature-card__desc"><code>neutron mcp</code> exposes 19 tools over stdio or HTTP &mdash; database ops plus docs search. OpenAI-compatible, <code>--dump-schema</code> for AI context priming.</div>
         </div>
       </FeatureGrid>
 

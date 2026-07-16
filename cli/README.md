@@ -79,9 +79,10 @@ neutron generate --all --lang go --out ./gen
 
 ## neutron mcp
 
-The `mcp` command turns any Nucleus database into an agent-native tool surface. It
-exposes 17 tools spanning all of the Nucleus data models over the Model Context
-Protocol, so an LLM can inspect and query your database directly.
+The `mcp` command turns Neutron into an agent-native tool surface over the Model
+Context Protocol. It exposes 19 tools: 17 spanning all of the Nucleus data models
+(so an LLM can inspect and query your database directly), plus `search_docs` and
+`get_doc` for querying the Neutron framework documentation.
 
 ```bash
 # stdio transport (default) -- for Claude Desktop, Cursor, Windsurf, Zed, Continue

@@ -40,6 +40,8 @@ var toolHandlers = map[string]toolHandler{
 	"datalog_eval":        handleDatalogEval,
 	"cdc_changes":         handleCDCChanges,
 	"pubsub_list":         handlePubSubList,
+	"search_docs":         handleSearchDocs,
+	"get_doc":             handleGetDoc,
 }
 
 // toolList returns all tool definitions for the tools/list response.
@@ -185,6 +187,21 @@ func toolList() []toolDef {
 			Name:        "pubsub_list",
 			Description: "List all active pub/sub channels in the Nucleus database.",
 			InputSchema: schema(props{}, nil),
+		},
+		{
+			Name:        "search_docs",
+			Description: "Search the Neutron framework documentation by keyword. Returns matching pages with titles, URLs, slugs, and snippets. Use this to answer 'how do I ...' questions about Neutron (routing, loaders, actions, Nucleus, deployment, the SDKs).",
+			InputSchema: schema(props{
+				"query": strProp("Search terms, e.g. \"loader data\" or \"vector search\"."),
+				"limit": numProp("Maximum results to return (default 8)."),
+			}, []string{"query"}),
+		},
+		{
+			Name:        "get_doc",
+			Description: "Fetch the full markdown of a single Neutron documentation page by slug (e.g. \"routing/app-routes\", \"nucleus/overview\"). Use after search_docs to read a page in full.",
+			InputSchema: schema(props{
+				"slug": strProp("Doc slug or path, e.g. \"data/loaders\" or \"/docs/data/loaders\"."),
+			}, []string{"slug"}),
 		},
 	}
 }
