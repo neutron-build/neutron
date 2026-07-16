@@ -1,0 +1,56 @@
+---
+title: Quickstart
+description: Get a Zig HTTP server and Nucleus client running.
+---
+
+Neutron for Zig is a composable systems library. This page gets you from zero to a running HTTP server and a database connection. For the layered architecture, see the [overview](/docs/zig/overview).
+
+Minimum Zig version: **0.14.0**.
+
+## Build the full stack
+
+```bash
+zig build
+```
+
+The default build includes all four layers. Use the `-D` flags documented in the [overview](/docs/zig/overview) to compile only the layers you need.
+
+## A minimal HTTP server
+
+```zig
+const HttpServer = @import("protocol/http_server.zig").HttpServer;
+
+fn handler(ctx: *RequestContext) !void {
+    const name = ctx.queryParam("name") orelse "World";
+    try ctx.respondJson(.{ .message = "Hello, " ++ name });
+}
+
+var server = try HttpServer.init(allocator, .{
+    .host = "127.0.0.1",
+    .port = 8080,
+});
+try server.serve(handler);
+```
+
+`RequestContext` provides:
+
+- `respondJson(value)` — serialize and send JSON
+- `respondText(text)` — send plain text
+- `respondError(status, detail)` — RFC 7807 Problem Details
+
+## Connect to Nucleus
+
+```zig
+const NucleusClient = @import("nucleus/client.zig").NucleusClient;
+
+var client = try NucleusClient.fromUrl(allocator, "postgres://localhost:5432/mydb");
+try client.connect();
+defer client.deinit();
+
+const rows = try client.query("SELECT * FROM users WHERE active = true");
+```
+
+## Next steps
+
+- [Layers](/docs/zig/layers) — the wire codecs, HAL networking, protocol servers, and application framework.
+- [Nucleus client](/docs/zig/nucleus-client) — the typed client for all 14 data models.
