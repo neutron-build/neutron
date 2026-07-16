@@ -1,0 +1,98 @@
+---
+title: Nucleus Client
+description: The typed Julia client for all 14 Nucleus data models.
+---
+
+Neutron for Julia accesses all 14 Nucleus data models through typed accessors, using multiple dispatch so each model exposes an idiomatic Julia API. Connect once, then reach any model.
+
+```julia
+client = NeutronJulia.connect(url)
+
+sql(client)        # SQL queries
+kv(client)         # Key-Value (TTL, lists, hashes, sets, sorted sets, HyperLogLog)
+vector(client)     # Vector search (HNSW, IVFFlat)
+timeseries(client) # Time series (Gorilla compression)
+document(client)   # Document store (JSONB)
+graph(client)      # Graph (Cypher, adjacency)
+fts(client)        # Full-text search (BM25)
+geo(client)        # Geospatial (R-tree)
+blob(client)       # Blob storage (BLAKE3)
+streams(client)    # Streams (consumer groups)
+columnar(client)   # Columnar analytics
+datalog(client)    # Datalog queries
+cdc(client)        # Change Data Capture
+pubsub(client)     # PubSub (LISTEN/NOTIFY)
+```
+
+## SQL
+
+```julia
+s = sql(client)
+
+rows = query(s, "SELECT id, name, email FROM users WHERE active = \$1", [true])
+row = query_one(s, "SELECT * FROM users WHERE id = \$1", [42])
+execute!(s, "INSERT INTO users (name, email) VALUES (\$1, \$2)", ["Alice", "alice@example.com"])
+```
+
+## Key-Value
+
+```julia
+k = kv(client)
+
+set!(k, "key", "value")
+get(k, "key")              # "value"
+delete!(k, "key")
+
+# Collections
+lpush!(k, "queue", "item1", "item2")
+hset!(k, "user:1", "name", "Alice")
+sadd!(k, "tags", "rust", "julia")
+zadd!(k, "leaderboard", 100.0, "player1")
+pfadd!(k, "visitors", "user1", "user2")   # HyperLogLog
+```
+
+## Vector Search
+
+```julia
+v = vector(client)
+
+create_index!(v, "embeddings", 384; metric=Cosine, index_type=HNSW)
+results = search(v, "embeddings", query_vec; k=10, metric=Cosine)
+d = dims(v, "embeddings")  # 384
+```
+
+## TimeSeries
+
+```julia
+ts = timeseries(client)
+
+insert!(ts, "cpu_usage", [now_ms, now_ms + 1000], [0.75, 0.82])
+last = last_value(ts, "cpu_usage")
+count = ts_count(ts, "cpu_usage")
+avg = range_avg(ts, "cpu_usage", start_ms, end_ms)
+```
+
+## Graph
+
+```julia
+g = graph(client)
+
+add_node!(g, "Person", Dict("name" => "Alice"))
+add_edge!(g, node_a, node_b, "KNOWS", Dict("since" => 2024))
+neighbors(g, node_a)
+path = shortest_path(g, node_a, node_b)
+```
+
+## Transactions
+
+```julia
+tx = transaction(client, read_write)
+try
+    execute!(sql(client), "UPDATE accounts SET balance = balance - 100 WHERE id = 1")
+    execute!(sql(client), "UPDATE accounts SET balance = balance + 100 WHERE id = 2")
+    commit!(tx)
+catch e
+    rollback!(tx)
+    rethrow(e)
+end
+```

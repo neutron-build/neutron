@@ -274,7 +274,11 @@ const sidebar = [
   },
   {
     label: "Julia",
-    items: [{ label: "Overview", link: "/docs/julia/overview" }],
+    items: [
+      { label: "Overview", link: "/docs/julia/overview" },
+      { label: "Nucleus Client", link: "/docs/julia/nucleus-client" },
+      { label: "Ecosystem Extensions", link: "/docs/julia/ecosystem" },
+    ],
   },
   {
     label: "Mojo",
