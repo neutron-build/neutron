@@ -1,0 +1,7 @@
+# neutron.build
+User-agent: *
+Allow: /
+
+Sitemap: https://neutron.build/sitemap.xml
+
+# AI-readable ecosystem index for LLM agents: https://neutron.build/llms.txt
