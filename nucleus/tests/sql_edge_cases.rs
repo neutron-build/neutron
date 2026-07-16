@@ -56,19 +56,12 @@ async fn null_comparison_equals() {
         .await
         .unwrap();
 
-    // val = NULL behavior: SQL standard says this matches no rows (three-valued
-    // logic), but some engines treat it as IS NULL. Nucleus currently matches
-    // NULL rows. The key invariant: no crash, and the result is deterministic.
+    // `= NULL` is UNKNOWN for every row and WHERE retains only TRUE.
     let rows = db
         .query("SELECT id FROM null_cmp WHERE val = NULL")
         .await
         .unwrap();
-    // Nucleus treats `= NULL` like `IS NULL` — accepts either 0 or 1 result
-    assert!(
-        rows.len() <= 1,
-        "val = NULL should match at most the NULL row, got {}",
-        rows.len()
-    );
+    assert!(rows.is_empty(), "val = NULL must match no rows");
 
     // val = 10 should return 2 rows
     let rows = db

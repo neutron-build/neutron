@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use dashmap::DashMap;
 
-use sqlparser::ast::{self, Expr, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{self, Expr, Statement};
+#[cfg(feature = "server")]
+use sqlparser::ast::{SetExpr, TableFactor};
 use tokio::sync::RwLock;
 
 use crate::cache::CacheTier;
@@ -25,12 +27,58 @@ use crate::metrics::{MetricsRegistry, QueryType};
 use crate::planner;
 #[cfg(feature = "server")]
 use crate::reactive::{ChangeEvent, ChangeNotifier, ChangeType, SubscriptionManager};
+#[cfg(feature = "server")]
 use crate::sql;
 #[cfg(feature = "server")]
 use crate::storage::STORAGE_SESSION_ID;
 use crate::storage::StorageEngine;
 use crate::types::{DataType, Row, Value};
 use crate::vector;
+
+#[cfg(feature = "server")]
+pub(crate) fn encode_scram_verifier(password: &str) -> String {
+    use base64::Engine as _;
+    let salt = rand::random::<[u8; 16]>();
+    let salted = pgwire::api::auth::sasl::scram::gen_salted_password(
+        password,
+        &salt,
+        pgwire::api::auth::sasl::scram::SCRAM_ITERATIONS,
+    );
+    format!(
+        "SCRAM-SHA-256${}${}${}",
+        pgwire::api::auth::sasl::scram::SCRAM_ITERATIONS,
+        base64::engine::general_purpose::STANDARD.encode(salt),
+        base64::engine::general_purpose::STANDARD.encode(salted)
+    )
+}
+
+#[cfg(not(feature = "server"))]
+pub(crate) fn encode_scram_verifier(password: &str) -> String {
+    // Embedded builds have no pgwire dependency. A server build must reset
+    // this credential before the role is eligible for wire login.
+    format!(
+        "EMBEDDED-BLAKE3${}",
+        blake3::hash(password.as_bytes()).to_hex()
+    )
+}
+
+#[cfg(feature = "server")]
+pub(crate) fn decode_scram_verifier(encoded: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    use base64::Engine as _;
+    let mut parts = encoded.split('$');
+    if parts.next()? != "SCRAM-SHA-256"
+        || parts.next()?.parse::<usize>().ok()? != pgwire::api::auth::sasl::scram::SCRAM_ITERATIONS
+    {
+        return None;
+    }
+    let salt = base64::engine::general_purpose::STANDARD
+        .decode(parts.next()?)
+        .ok()?;
+    let salted = base64::engine::general_purpose::STANDARD
+        .decode(parts.next()?)
+        .ok()?;
+    (parts.next().is_none()).then_some((salt, salted))
+}
 
 mod admin;
 mod aggregate;
@@ -41,8 +89,13 @@ mod dml;
 mod expr;
 mod helpers;
 mod join;
+mod logical_dump;
+#[cfg(feature = "server")]
+pub use logical_dump::open_persistent_executor;
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod meta_persistence;
 pub mod param_subst;
+mod policy;
 mod project;
 mod query;
 mod scalar_fns;
@@ -53,12 +106,26 @@ mod types;
 
 pub use expr::FilterResult; // Phase 2C: Lazy materialization for WHERE clause filtering
 use helpers::*;
+#[cfg(feature = "server")]
 pub(crate) use scalar_fns::{extension_scalar_return_type, side_effecting_return_type};
 use schema_types::*;
 use session::CURRENT_SESSION;
 pub use session::Session;
 pub use types::PreparedStmtHandle;
 use types::*;
+
+/// RAII guard that marks a session's command finished (idle from now) on drop —
+/// including when the command future is cancelled by statement_timeout, so the
+/// session never gets stuck "executing" and hidden from the idle sweep.
+#[cfg(feature = "server")]
+struct CommandGuard(std::sync::Arc<Session>);
+
+#[cfg(feature = "server")]
+impl Drop for CommandGuard {
+    fn drop(&mut self) {
+        self.0.mark_command_end();
+    }
+}
 
 /// The result of executing a statement.
 #[derive(Debug)]
@@ -140,6 +207,9 @@ pub struct Executor {
     hash_indexes: DashMap<(String, String), crate::storage::btree::HashIndex>,
     /// Live GIN indexes for JSONB columns: index_name → GinIndexEntry.
     gin_indexes: parking_lot::RwLock<HashMap<String, GinIndexEntry>>,
+    /// Advances whenever a write becomes committed. GIN entries are usable
+    /// only when stamped with this generation.
+    gin_write_gen: AtomicU64,
     /// Sync cache of table column metadata: table_name → [(col_name, DataType)].
     table_columns: parking_lot::RwLock<HashMap<String, Vec<(String, DataType)>>>,
     /// Persistent statistics store populated by ANALYZE, used by EXPLAIN / query planner.
@@ -265,6 +335,18 @@ pub struct Executor {
     /// is ready to store, the store is skipped — preventing a concurrent DML
     /// from being obscured by a stale cache entry written after invalidation.
     cache_write_gen: AtomicU64,
+    /// Row-level security + column masking engine (T2.2). Populated by policy
+    /// DDL; consulted on every row-producing path for non-superuser sessions.
+    /// Empty by default (no enabled tables / no policies → no enforcement,
+    /// matching Postgres). `policy_gen` bumps on any policy change so the query
+    /// cache can key on it and never serve one principal's rows to another.
+    #[allow(dead_code)] // consumed as enforcement sites are wired (T2.2)
+    security: parking_lot::RwLock<crate::security::SecurityManager>,
+    /// Bumped on every RLS/masking policy mutation; folded into the query-cache
+    /// key so cached result sets can't cross a policy change or (with the
+    /// principal) a user boundary.
+    #[allow(dead_code)] // consumed as enforcement sites are wired (T2.2)
+    policy_gen: AtomicU64,
 }
 
 impl Executor {
@@ -277,7 +359,9 @@ impl Executor {
                 name: "nucleus".to_string(),
                 password_hash: None,
                 is_superuser: true,
+                bypass_rls: true,
                 can_login: true,
+                member_of: Vec::new(),
                 privileges: HashMap::new(),
             },
         );
@@ -330,6 +414,7 @@ impl Executor {
             #[cfg(feature = "server")]
             hash_indexes: DashMap::new(),
             gin_indexes: parking_lot::RwLock::new(HashMap::new()),
+            gin_write_gen: AtomicU64::new(0),
             table_columns: parking_lot::RwLock::new(HashMap::new()),
             stats_store: Arc::new(planner::StatsStore::new()),
             #[cfg(feature = "server")]
@@ -398,6 +483,8 @@ impl Executor {
             plan_cache_key_hint: parking_lot::Mutex::new(None),
             zone_map_index: crate::storage::granule_stats::ZoneMapIndex::new(),
             memory_critical: Arc::new(AtomicBool::new(false)),
+            security: parking_lot::RwLock::new(crate::security::SecurityManager::new()),
+            policy_gen: AtomicU64::new(0),
         }
     }
 
@@ -453,23 +540,44 @@ impl Executor {
             let vec_dir = dir.join("vector");
             std::fs::create_dir_all(&vec_dir).ok();
             if let Ok((wal, state)) = vector::VectorWal::open(&vec_dir) {
-                // Load table/column metadata from sidecar JSON
+                // Load table/column/pk metadata from sidecar JSON. New format is
+                // a (table, column, pk_column) triple; fall back to the old
+                // (table, column) pair (which had no pk_column) for compatibility.
                 let meta_path = vec_dir.join("index_meta.json");
-                let meta: HashMap<String, (String, String)> = std::fs::read_to_string(&meta_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
+                let raw = std::fs::read_to_string(&meta_path).ok();
+                let meta: HashMap<String, (String, String, String)> = raw
+                    .as_ref()
+                    .and_then(|s| {
+                        serde_json::from_str::<HashMap<String, (String, String, String)>>(s).ok()
+                    })
+                    .or_else(|| {
+                        raw.as_ref()
+                            .and_then(|s| {
+                                serde_json::from_str::<HashMap<String, (String, String)>>(s).ok()
+                            })
+                            .map(|old| {
+                                old.into_iter()
+                                    .map(|(k, (t, c))| (k, (t, c, String::new())))
+                                    .collect()
+                            })
+                    })
                     .unwrap_or_default();
 
                 // Restore recovered indexes
                 for (index_name, recovered) in state.indexes {
-                    let (table_name, column_name) =
+                    let (table_name, column_name, pk_col_name) =
                         meta.get(&index_name).cloned().unwrap_or_default();
+                    let pk_column = (!pk_col_name.is_empty()).then_some(pk_col_name);
                     exec.vector_indexes.write().insert(
                         index_name,
                         VectorIndexEntry {
                             table_name,
                             column_name,
                             kind: VectorIndexKind::Hnsw(recovered.hnsw),
+                            pk_column,
+                            // Not persisted; empty until the first rebuild after
+                            // reopen. Resolve brute-forces while it is empty.
+                            registry: PkRegistry::default(),
                         },
                     );
                 }
@@ -688,6 +796,11 @@ impl Executor {
         if !loaded.functions.is_empty() {
             *self.functions.write() = loaded.functions;
         }
+        {
+            let mut security = self.security.write();
+            security.rls = loaded.rls;
+            security.masking = loaded.masking;
+        }
 
         // Override sequences with dedicated sequences.json if it exists (more up-to-date).
         if let Some(ref cp) = self.catalog_path
@@ -798,6 +911,8 @@ impl Executor {
                             table_name: idx.table_name.clone(),
                             column_name: col_name,
                             kind: VectorIndexKind::IvfFlat(ivf),
+                            pk_column: None,
+                            registry: PkRegistry::default(),
                         },
                     );
                     tracing::info!(
@@ -879,6 +994,314 @@ impl Executor {
                 _ => {}
             }
         }
+
+        self.rebuild_all_gin_indexes().await;
+    }
+
+    /// Rebuild the live GIN indexes for one table from its current logical rows.
+    /// Posting IDs intentionally use scan-order positions; queries re-read the
+    /// same logical scan and always recheck the full predicate for correctness.
+    pub async fn rebuild_gin_indexes_for_table(&self, table_name: &str) {
+        let indexes: Vec<_> = self
+            .catalog
+            .get_indexes(table_name)
+            .await
+            .into_iter()
+            .filter(|idx| matches!(idx.index_type, crate::catalog::IndexType::Gin))
+            .collect();
+
+        if indexes.is_empty() {
+            self.gin_indexes
+                .write()
+                .retain(|_, entry| entry.table_name != table_name);
+            return;
+        }
+
+        let generation = self.gin_write_gen.load(Ordering::Acquire);
+
+        let table_def = match self.catalog.get_table(table_name).await {
+            Some(table) => table,
+            None => return,
+        };
+        let rows = self
+            .storage_for(table_name)
+            .scan_for_maintenance(table_name)
+            .await
+            .unwrap_or_default();
+
+        let mut rebuilt = Vec::new();
+        for idx in indexes {
+            let Some(column_name) = idx.columns.first().cloned() else {
+                continue;
+            };
+            let Some(col_idx) = table_def.column_index(&column_name) else {
+                continue;
+            };
+            let mut gin = crate::document::GinIndex::new();
+            for (row_id, row) in rows.iter().enumerate() {
+                if let Some(value) = row.get(col_idx)
+                    && let Some(doc) = value_to_doc_json(value)
+                {
+                    gin.insert(row_id as u64, &doc);
+                }
+            }
+            rebuilt.push((
+                idx.name.clone(),
+                GinIndexEntry {
+                    table_name: table_name.to_string(),
+                    column_name,
+                    index: gin,
+                    generation,
+                },
+            ));
+        }
+
+        // A concurrent committed write makes this scan incomplete. Leave any
+        // previous entries in place but stale; readers observe the generation
+        // mismatch and take the authoritative full-scan path.
+        if self.gin_write_gen.load(Ordering::Acquire) != generation {
+            return;
+        }
+
+        let mut live = self.gin_indexes.write();
+        live.retain(|_, entry| entry.table_name != table_name);
+        for (name, entry) in rebuilt {
+            live.insert(name, entry);
+        }
+    }
+
+    async fn rebuild_all_gin_indexes(&self) {
+        let tables: HashSet<String> = self
+            .catalog
+            .get_all_indexes()
+            .await
+            .into_iter()
+            .filter(|idx| matches!(idx.index_type, crate::catalog::IndexType::Gin))
+            .map(|idx| idx.table_name.clone())
+            .collect();
+        for table in tables {
+            self.rebuild_gin_indexes_for_table(&table).await;
+        }
+    }
+
+    /// Keep shared GIN state at committed visibility. During an explicit
+    /// transaction it remains on the pre-transaction image and is rebuilt once
+    /// COMMIT succeeds; transaction-local SELECTs therefore bypass GIN.
+    pub(super) async fn refresh_gin_after_write(&self, table_name: &str) {
+        let session = self.current_session();
+        {
+            let mut txn = session.txn_state.write().await;
+            if txn.active {
+                txn.gin_dirty = true;
+                return;
+            }
+        }
+        self.gin_write_gen.fetch_add(1, Ordering::AcqRel);
+        self.rebuild_gin_indexes_for_table(table_name).await;
+    }
+
+    /// Rebuild every position-addressed specialty index for one table from the
+    /// authoritative base rows. DELETE, cascades, and table rewrites can shift
+    /// physical positions, so incremental tombstones alone are not sufficient.
+    pub(super) async fn rebuild_position_indexes_for_table(&self, table_name: &str) {
+        let definitions: Vec<_> = self
+            .catalog
+            .get_indexes(table_name)
+            .await
+            .into_iter()
+            .filter(|index| {
+                matches!(
+                    index.index_type,
+                    crate::catalog::IndexType::Hnsw | crate::catalog::IndexType::IvfFlat
+                ) || index.options.contains_key("encryption_mode")
+            })
+            .collect();
+
+        if definitions.is_empty() {
+            // Fast path: this table has no vector/encrypted (position-addressed)
+            // indexes, so there is nothing to rebuild. Skip the full maintenance
+            // scan every DML would otherwise pay. Still evict any stale in-memory
+            // entries — e.g. after the table's last such index was dropped — and
+            // persist only if something was actually removed.
+            let removed_vec = {
+                let mut live = self.vector_indexes.write();
+                let before = live.len();
+                live.retain(|_, entry| entry.table_name != table_name);
+                before != live.len()
+            };
+            let removed_enc = {
+                let mut live = self.encrypted_indexes.write();
+                let before = live.len();
+                live.retain(|_, entry| entry.table_name != table_name);
+                before != live.len()
+            };
+            if removed_vec || removed_enc {
+                self.save_vector_index_meta();
+                if let Err(error) = self.checkpoint_vector_wal() {
+                    tracing::warn!(
+                        "vector index checkpoint after evicting '{table_name}' failed: {error}"
+                    );
+                }
+            }
+            return;
+        }
+
+        let Some(table_def) = self.catalog.get_table(table_name).await else {
+            self.vector_indexes
+                .write()
+                .retain(|_, entry| entry.table_name != table_name);
+            self.encrypted_indexes
+                .write()
+                .retain(|_, entry| entry.table_name != table_name);
+            return;
+        };
+        let rows = self
+            .storage_for(table_name)
+            .scan_for_maintenance(table_name)
+            .await
+            .unwrap_or_default();
+
+        let key = std::env::var("NUCLEUS_ENCRYPTION_KEY")
+            .ok()
+            .and_then(|value| value.as_bytes().try_into().ok());
+        let mut vectors = Vec::new();
+        let mut encrypted = Vec::new();
+        for definition in definitions {
+            let Some(column_name) = definition.columns.first().cloned() else {
+                continue;
+            };
+            let Some(column_index) = table_def.column_index(&column_name) else {
+                continue;
+            };
+            match definition.index_type {
+                crate::catalog::IndexType::Hnsw => {
+                    let pk_column = self.resolve_pk_column(table_name, &table_def);
+                    let pk_col = pk_column.as_ref().and_then(|n| table_def.column_index(n));
+                    let mut index = vector::HnswIndex::new(vector::HnswConfig::default());
+                    let mut registry = PkRegistry::default();
+                    for (row_id, row) in rows.iter().enumerate() {
+                        if let Some(Value::Vector(value)) = row.get(column_index) {
+                            // Registry allocates a fresh monotonic node id per PK;
+                            // positional (no PK) uses the scan offset.
+                            let node = match pk_col.and_then(|pc| Self::stable_row_id(row, pc)) {
+                                Some(pk) => registry.upsert(pk).0,
+                                None => row_id as u64,
+                            };
+                            index.insert(node, vector::Vector::new(value.clone()));
+                        }
+                    }
+                    vectors.push((
+                        definition.name.clone(),
+                        VectorIndexEntry {
+                            table_name: table_name.to_string(),
+                            column_name,
+                            kind: VectorIndexKind::Hnsw(index),
+                            pk_column,
+                            registry,
+                        },
+                    ));
+                }
+                crate::catalog::IndexType::IvfFlat => {
+                    let dims = match table_def.columns[column_index].data_type {
+                        DataType::Vector(dims) => dims,
+                        _ => continue,
+                    };
+                    let source: Vec<Vec<f32>> = rows
+                        .iter()
+                        .filter_map(|row| match row.get(column_index) {
+                            Some(Value::Vector(value)) => Some(value.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    let nlist = (source.len() as f64).sqrt().ceil() as usize;
+                    let mut index = vector::IvfFlatIndex::new(
+                        dims,
+                        nlist.max(1),
+                        (nlist.max(1) / 4).max(1),
+                        vector::DistanceMetric::L2,
+                    );
+                    if !source.is_empty() {
+                        index.train(&source);
+                        for (row_id, row) in rows.iter().enumerate() {
+                            if let Some(Value::Vector(value)) = row.get(column_index) {
+                                index.add(row_id, value.clone());
+                            }
+                        }
+                    }
+                    vectors.push((
+                        definition.name.clone(),
+                        VectorIndexEntry {
+                            table_name: table_name.to_string(),
+                            column_name,
+                            kind: VectorIndexKind::IvfFlat(index),
+                            pk_column: None,
+                            registry: PkRegistry::default(),
+                        },
+                    ));
+                }
+                crate::catalog::IndexType::BTree
+                    if definition.options.contains_key("encryption_mode") =>
+                {
+                    let Some(key) = key else {
+                        tracing::warn!(
+                            "encrypted index '{}' disabled during rebuild: NUCLEUS_ENCRYPTION_KEY is unavailable",
+                            definition.name
+                        );
+                        continue;
+                    };
+                    let mode = match definition
+                        .options
+                        .get("encryption_mode")
+                        .map(String::as_str)
+                    {
+                        Some(value) if value.contains("Order") || value.contains("OPE") => {
+                            crate::storage::encrypted_index::EncryptionMode::OrderPreserving
+                        }
+                        Some(value) if value.contains("Random") => {
+                            crate::storage::encrypted_index::EncryptionMode::Randomized
+                        }
+                        _ => crate::storage::encrypted_index::EncryptionMode::Deterministic,
+                    };
+                    let mut index = crate::storage::encrypted_index::EncryptedIndex::new(key, mode);
+                    for (row_id, row) in rows.iter().enumerate() {
+                        if let Some(value) = row.get(column_index) {
+                            let plaintext = self.value_to_text_string(value);
+                            index.insert(plaintext.as_bytes(), row_id as u64);
+                        }
+                    }
+                    encrypted.push((
+                        definition.name.clone(),
+                        EncryptedIndexEntry {
+                            table_name: table_name.to_string(),
+                            column_name,
+                            index,
+                        },
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        {
+            let mut live = self.vector_indexes.write();
+            live.retain(|_, entry| entry.table_name != table_name);
+            live.extend(vectors);
+        }
+        {
+            let mut live = self.encrypted_indexes.write();
+            live.retain(|_, entry| entry.table_name != table_name);
+            live.extend(encrypted);
+        }
+        self.save_vector_index_meta();
+        if let Err(error) = self.checkpoint_vector_wal() {
+            tracing::warn!(
+                "vector index checkpoint after rebuilding '{table_name}' failed: {error}"
+            );
+        }
+    }
+
+    pub(super) fn mark_gin_committed_write(&self) {
+        self.gin_write_gen.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Load persisted ANALYZE statistics from disk (call once at startup).
@@ -915,10 +1338,28 @@ impl Executor {
         &self.catalog
     }
 
-    /// Set the query execution memory limit.
+    /// Set the query execution memory limit (builder form).
     pub fn with_query_memory_limit(self, limit_bytes: u64) -> Self {
         self.query_memory.set_limit(limit_bytes);
         self
+    }
+
+    /// Set the query execution memory budget after construction (T1.2). The
+    /// executor is shared behind an `Arc` by the time config is applied, so the
+    /// consuming builder above can't be used; this drives the same budget the
+    /// hash-join circuit-breaker checks. `0` is treated as "no limit".
+    pub fn set_query_memory_limit(&self, limit_bytes: u64) {
+        let effective = if limit_bytes == 0 {
+            u64::MAX
+        } else {
+            limit_bytes
+        };
+        self.query_memory.set_limit(effective);
+    }
+
+    /// Current query execution memory budget in bytes.
+    pub fn query_memory_limit(&self) -> u64 {
+        self.query_memory.limit()
     }
 
     // =========================================================================
@@ -1205,6 +1646,35 @@ impl Executor {
         bytes
     }
 
+    /// Estimate the combined in-memory footprint of a slice of rows.
+    fn estimate_rows_bytes(rows: &[Row]) -> u64 {
+        rows.iter().map(Self::estimate_row_bytes).sum()
+    }
+
+    /// Reserve `bytes` of query working-set memory against the shared budget,
+    /// returning an RAII guard that releases on drop (see
+    /// [`crate::allocator::MemoryReservation`]). Operators call this to bound the
+    /// build sides that would otherwise accumulate unbounded and OOM the process
+    /// — the guard converts that into a clean [`ExecError::MemoryExceeded`]
+    /// (SQLSTATE 53200) and, releasing on every exit path, never leaks the
+    /// reservation into later queries.
+    fn reserve_query_memory(
+        &self,
+        bytes: u64,
+    ) -> Result<crate::allocator::MemoryReservation, ExecError> {
+        self.query_memory
+            .reserve(bytes)
+            .map_err(|_| self.query_mem_err())
+    }
+
+    /// The uniform "query exceeded its memory limit" error (SQLSTATE 53200).
+    fn query_mem_err(&self) -> ExecError {
+        ExecError::MemoryExceeded(format!(
+            "query working set exceeded the memory limit ({} MB); raise server.max_memory_mb, or add a tighter filter/LIMIT",
+            self.query_memory.limit() / (1024 * 1024)
+        ))
+    }
+
     /// Set the cache tier maximum memory in bytes.
     pub fn with_cache_size(self, max_bytes: usize) -> Self {
         *self.cache.write() = CacheTier::new(max_bytes);
@@ -1411,6 +1881,69 @@ impl Executor {
         id
     }
 
+    /// Create a wire session that has no authority until authentication binds
+    /// a catalog role to it.
+    #[cfg(feature = "server")]
+    pub fn create_unauthenticated_session(&self) -> u64 {
+        let id = self.create_session();
+        let session = self.get_session(id);
+        *session.authenticated_user.write() = None;
+        *session.current_role.write() = None;
+        *session.session_context.write() = crate::security::SessionContext::new("");
+        id
+    }
+
+    /// Install/rotate the bootstrap role's SCRAM verifier. Used by the server
+    /// startup flag before accepting connections.
+    #[cfg(feature = "server")]
+    pub async fn set_bootstrap_password(&self, password: &str) {
+        if let Some(role) = self.roles.write().await.get_mut("nucleus") {
+            role.password_hash = Some(encode_scram_verifier(password));
+        }
+    }
+
+    /// Return stored SCRAM material only for a login-capable catalog role.
+    #[cfg(feature = "server")]
+    pub async fn scram_credentials(&self, user: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+        let roles = self.roles.read().await;
+        let role = roles.get(user)?;
+        if !role.can_login {
+            return None;
+        }
+        decode_scram_verifier(role.password_hash.as_deref()?)
+    }
+
+    /// Bind a successfully authenticated pgwire connection to its immutable
+    /// session principal.
+    #[cfg(feature = "server")]
+    pub async fn bind_authenticated_session(&self, id: u64, user: &str) -> Result<(), ExecError> {
+        let allowed = self
+            .roles
+            .read()
+            .await
+            .get(user)
+            .is_some_and(|r| r.can_login);
+        if !allowed {
+            return Err(ExecError::PermissionDenied(format!(
+                "role '{user}' is not permitted to log in"
+            )));
+        }
+        let session = self.get_session(id);
+        *session.authenticated_user.write() = Some(user.to_string());
+        *session.current_role.write() = None;
+        self.recompute_session_context(&session);
+        Ok(())
+    }
+
+    /// Install a tenant claim from a trusted authentication/proxy boundary.
+    /// SQL `SET nucleus.tenant_id` is intentionally not an authority source.
+    #[cfg(feature = "server")]
+    pub fn bind_trusted_tenant(&self, id: u64, tenant_id: Option<String>) {
+        let session = self.get_session(id);
+        *session.trusted_tenant_id.write() = tenant_id;
+        self.recompute_session_context(&session);
+    }
+
     /// Drop a session when a connection closes, freeing its state.
     pub fn drop_session(&self, id: u64) {
         self.sessions.write().remove(&id);
@@ -1458,8 +1991,82 @@ impl Executor {
 
         // Perform the actual reset
         session.reset().await;
+        self.recompute_session_context(&session);
 
         actions
+    }
+
+    /// Roll back transactions left open and idle longer than `timeout_ms`
+    /// (T1.3 idle-in-transaction). An abandoned `BEGIN` pins an MVCC read
+    /// snapshot, which holds the GC watermark down at that transaction's id so
+    /// no superseded row version can ever be reclaimed — unbounded disk growth
+    /// for the life of the process. This releases those snapshots. `timeout_ms
+    /// == 0` disables the sweep (matches Postgres's default). Returns how many
+    /// transactions were rolled back.
+    ///
+    /// The action is a server-side rollback identical to a client `ROLLBACK`
+    /// (the same session-scoped `rollback_transaction`, so cross-model state is
+    /// restored too). The client socket is left open — pgwire owns the read
+    /// loop and exposes no per-connection cancellation — so the client's next
+    /// statement simply runs in a fresh implicit transaction.
+    ///
+    /// Safe from a background task: every structure on the abort path is
+    /// lock-protected and `Send + Sync`, and a session is driven by a single
+    /// connection task, so the sweep contends only with that one task on
+    /// `txn_state`. The `executing` guard skips a session mid-command, and both
+    /// `commit`/`abort` are idempotent (`if let Some(txn)`), so a client that
+    /// resumes in the same instant is not corrupted — at worst the
+    /// `open_transactions` gauge is transiently off by one.
+    #[cfg(feature = "server")]
+    pub async fn sweep_idle_in_transaction(&self, timeout_ms: u64) -> usize {
+        use std::sync::atomic::Ordering;
+        if timeout_ms == 0 {
+            return 0;
+        }
+        let now = session::now_millis();
+        // Snapshot (id, Arc<Session>) under the sync lock; abort asynchronously
+        // afterward so the sessions map is not held across an await.
+        let candidates: Vec<(u64, Arc<Session>)> = self
+            .sessions
+            .read()
+            .iter()
+            .map(|(id, s)| (*id, s.clone()))
+            .collect();
+        let mut aborted = 0usize;
+        for (id, session) in candidates {
+            // A session running a command is not idle (a long query must not be
+            // mistaken for an abandoned transaction).
+            if session.executing.load(Ordering::Relaxed) {
+                continue;
+            }
+            let idle = now.saturating_sub(session.last_activity_ms.load(Ordering::Relaxed));
+            if idle < timeout_ms {
+                continue;
+            }
+            // Only an open transaction holds a snapshot worth releasing.
+            if !session.txn_state.read().await.active {
+                continue;
+            }
+            // Final re-check to shrink the window where the client resumes just
+            // as the sweep fires.
+            if session.executing.load(Ordering::Relaxed) {
+                continue;
+            }
+            CURRENT_SESSION
+                .scope(
+                    session.clone(),
+                    STORAGE_SESSION_ID.scope(id, async {
+                        let _ = self.rollback_transaction().await;
+                    }),
+                )
+                .await;
+            tracing::warn!(
+                "idle-in-transaction: rolled back session {id} after {idle}ms idle \
+                 (timeout {timeout_ms}ms); MVCC snapshot released"
+            );
+            aborted += 1;
+        }
+        aborted
     }
 
     /// Get the session for the given ID, falling back to the default session.
@@ -1507,12 +2114,324 @@ impl Executor {
             .unwrap_or(false)
     }
 
+    /// Whether a wire session must avoid every transport-level bypass path.
+    #[cfg(feature = "server")]
+    pub fn session_has_active_rls(&self, session_id: u64) -> bool {
+        let session = self.get_session(session_id);
+        let ctx = session.session_context.read();
+        if ctx.bypass_rls || ctx.has_role("superuser") {
+            return false;
+        }
+        if let Ok(txn) = session.txn_state.try_read()
+            && txn.active
+            && let Some(pending) = txn.security_pending.as_ref()
+        {
+            return pending.rls.any_enabled();
+        }
+        self.security.read().rls.any_enabled()
+    }
+
+    /// Whether the committed catalog contains any RLS-protected table. Used
+    /// by protocols/cluster transports that cannot carry a trusted SQL
+    /// principal: those surfaces must fail closed rather than run as the
+    /// embedded bootstrap superuser.
+    #[cfg(feature = "server")]
+    pub fn rls_configured(&self) -> bool {
+        self.security.read().rls.any_enabled()
+    }
+
+    #[cfg(feature = "server")]
+    pub async fn execute_principal_less_forward(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<ExecResult>, ExecError> {
+        if self.rls_configured() {
+            return Err(ExecError::PermissionDenied(
+                "principal-less cluster SQL forwarding is disabled while row-level security is configured"
+                    .into(),
+            ));
+        }
+        self.execute(sql).await
+    }
+
     /// Get the current session from the task-local, or the default session
     /// if no session has been set (e.g. embedded mode or tests).
     fn current_session(&self) -> Arc<Session> {
         CURRENT_SESSION
             .try_with(|s| s.clone())
             .unwrap_or_else(|_| self.default_session.clone())
+    }
+
+    // ── Row-level security (T2.2) ────────────────────────────────────────────
+    // Foundation: engine + identity model + fail-closed gate/filter helpers.
+    // `recompute_session_context` is already wired into SET; the gate/filter
+    // helpers are consumed as each enforcement site is wired (allow(dead_code)
+    // until then so the scaffolding lands clean and behavior-neutral).
+
+    /// Bump the policy generation counter — folded into the query-cache key so
+    /// no cached result set crosses a policy change.
+    #[allow(dead_code)]
+    pub(super) fn bump_policy_gen(&self) {
+        self.policy_gen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read the security catalog visible to this SQL transaction. Policy DDL
+    /// is staged per session, so other connections continue to see the
+    /// committed catalog until COMMIT.
+    fn with_visible_security<R>(
+        &self,
+        f: impl FnOnce(&crate::security::SecurityManager) -> R,
+    ) -> R {
+        let session = self.current_session();
+        if let Ok(txn) = session.txn_state.try_read()
+            && txn.active
+            && let Some(pending) = txn.security_pending.as_ref()
+        {
+            return f(pending);
+        }
+        f(&self.security.read())
+    }
+
+    /// Mutate committed policy state in autocommit, or a private staged copy
+    /// inside an explicit transaction.
+    pub(super) fn with_mutable_security<R>(
+        &self,
+        f: impl FnOnce(&mut crate::security::SecurityManager) -> R,
+    ) -> Result<R, ExecError> {
+        let session = self.current_session();
+        let mut txn = session.txn_state.try_write().map_err(|_| {
+            ExecError::Runtime("transaction security state is busy; retry statement".into())
+        })?;
+        if txn.active {
+            if txn.security_pending.is_none() {
+                txn.security_pending = Some(self.security.read().clone_policy_state());
+            }
+            return Ok(f(txn.security_pending.as_mut().expect("initialized above")));
+        }
+        drop(txn);
+        Ok(f(&mut self.security.write()))
+    }
+
+    /// The current RLS principal + policy generation, folded into the query
+    /// cache key so a result cached for one identity is never served to another
+    /// (the SQL-text-only cache key is otherwise a straight RLS bypass).
+    #[allow(dead_code)] // wired as enforcement lands (T2.2)
+    pub(super) fn rls_cache_principal(&self) -> String {
+        let session = self.current_session();
+        let ctx = session.session_context.read();
+        let pgen = self.policy_gen.load(Ordering::Relaxed);
+        // roles are small; join for a stable per-principal key.
+        format!("{}|{}|{}", pgen, ctx.user, ctx.roles.join(","))
+    }
+
+    /// Recompute security context exclusively from authenticated identity,
+    /// authorized role assumption, and trusted tenant state. Generic session
+    /// settings are deliberately not authority inputs.
+    pub(super) fn recompute_session_context(&self, session: &Session) {
+        let authenticated = session
+            .authenticated_user
+            .read()
+            .clone()
+            .unwrap_or_default();
+        let requested_role = session.current_role.read().clone();
+        let mut effective = requested_role
+            .clone()
+            .unwrap_or_else(|| authenticated.clone());
+        let mut ctx = crate::security::SessionContext::new(&effective);
+        let mut role_names = vec![effective.clone()];
+        let mut bypass = false;
+        if let Ok(roles) = self.roles.try_read() {
+            // Revalidate an assumed role on every statement. Revoking
+            // membership takes effect immediately for existing sessions.
+            if let Some(target) = requested_role {
+                let mut reachable = roles
+                    .get(&authenticated)
+                    .map(|role| role.member_of.clone())
+                    .unwrap_or_default();
+                let mut cursor = 0;
+                while cursor < reachable.len() {
+                    let name = reachable[cursor].clone();
+                    cursor += 1;
+                    if let Some(role) = roles.get(&name) {
+                        for parent in &role.member_of {
+                            if !reachable.contains(parent) {
+                                reachable.push(parent.clone());
+                            }
+                        }
+                    }
+                }
+                let login_is_superuser = roles
+                    .get(&authenticated)
+                    .is_some_and(|role| role.is_superuser);
+                if !login_is_superuser && target != authenticated && !reachable.contains(&target) {
+                    *session.current_role.write() = None;
+                    effective = authenticated.clone();
+                    ctx = crate::security::SessionContext::new(&effective);
+                    role_names = vec![effective.clone()];
+                }
+            }
+            let mut cursor = 0;
+            while cursor < role_names.len() {
+                let name = role_names[cursor].clone();
+                cursor += 1;
+                if let Some(role) = roles.get(&name) {
+                    bypass |= role.is_superuser || role.bypass_rls;
+                    for parent in &role.member_of {
+                        if !role_names.contains(parent) {
+                            role_names.push(parent.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for role in role_names {
+            ctx = ctx.with_role(&role);
+        }
+        if bypass {
+            ctx = ctx.with_role("superuser").with_bypass_rls(true);
+        }
+        if let Some(t) = session.trusted_tenant_id.read().clone()
+            && !t.is_empty()
+        {
+            ctx = ctx.with_tenant(&t);
+        }
+        *session.session_context.write() = ctx;
+    }
+
+    /// Whether RLS row-filtering is active for `table` in the current session:
+    /// RLS enabled on the table AND the session is not a superuser. This is the
+    /// FAIL-CLOSED gate every fast/bypass read path checks — when true, that
+    /// path must defer to the general materialize-and-filter path.
+    #[allow(dead_code)] // wired as enforcement lands (T2.2)
+    pub(super) fn rls_active(&self, table: &str) -> bool {
+        if self
+            .current_session()
+            .session_context
+            .read()
+            .has_role("superuser")
+        {
+            return false;
+        }
+        self.with_visible_security(|security| security.rls.is_enabled(table))
+    }
+
+    /// Whether ANY table in the current query needs RLS filtering — used to
+    /// disable the SQL-text-keyed result cache path wholesale when policies are
+    /// live (cheap: only true for non-superuser sessions with ≥1 enabled table).
+    #[allow(dead_code)] // wired as enforcement lands (T2.2)
+    pub(super) fn any_rls_active(&self) -> bool {
+        if self
+            .current_session()
+            .session_context
+            .read()
+            .has_role("superuser")
+        {
+            return false;
+        }
+        self.with_visible_security(|security| security.rls.any_enabled())
+    }
+
+    /// Drop rows the current session may not see under `table`'s RLS policies.
+    /// No-op (returns input) when RLS is not active for this session/table.
+    #[allow(dead_code)] // wired as enforcement lands (T2.2)
+    pub(super) fn rls_filter_rows(
+        &self,
+        table: &str,
+        cmd: crate::security::PolicyCommand,
+        rows: Vec<Row>,
+    ) -> Vec<Row> {
+        if !self.rls_active(table) {
+            return rows;
+        }
+        let Some(def) = self.catalog.get_table_cached(table) else {
+            // No schema → we cannot build the predicate row map. Fail closed:
+            // an RLS-enabled table with unknown columns yields nothing.
+            return Vec::new();
+        };
+        let col_names: Vec<&str> = def.columns.iter().map(|c| c.name.as_str()).collect();
+        let ctx = self.current_session().session_context.read().clone();
+        let maps: Vec<std::collections::HashMap<String, String>> = rows
+            .iter()
+            .map(|row| {
+                col_names
+                    .iter()
+                    .zip(row.iter())
+                    .map(|(n, v)| ((*n).to_string(), v.to_string()))
+                    .collect()
+            })
+            .collect();
+        let keep: std::collections::HashSet<usize> = self
+            .with_visible_security(|security| security.rls.filter_rows(table, cmd, &maps, &ctx))
+            .into_iter()
+            .collect();
+        rows.into_iter()
+            .enumerate()
+            .filter(|(i, _)| keep.contains(i))
+            .map(|(_, r)| r)
+            .collect()
+    }
+
+    fn rls_row_map(
+        &self,
+        table: &str,
+        row: &Row,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        let def = self.catalog.get_table_cached(table)?;
+        if def.columns.len() != row.len() {
+            return None;
+        }
+        Some(
+            def.columns
+                .iter()
+                .zip(row.iter())
+                .map(|(column, value)| (column.name.clone(), value.to_string()))
+                .collect(),
+        )
+    }
+
+    /// Fail-closed single-row policy check used by positioned scans and DML.
+    pub(super) fn rls_allows_row(
+        &self,
+        table: &str,
+        command: crate::security::PolicyCommand,
+        row: &Row,
+    ) -> bool {
+        if !self.rls_active(table) {
+            return true;
+        }
+        let Some(row_map) = self.rls_row_map(table, row) else {
+            return false;
+        };
+        let ctx = self.current_session().session_context.read().clone();
+        self.with_visible_security(|security| {
+            security.rls.check_row(table, command, &row_map, &ctx)
+        })
+    }
+
+    pub(super) fn enforce_rls_new_row(
+        &self,
+        table: &str,
+        command: crate::security::PolicyCommand,
+        row: &Row,
+    ) -> Result<(), ExecError> {
+        if !self.rls_active(table) {
+            return Ok(());
+        }
+        let row_map = self.rls_row_map(table, row).ok_or_else(|| {
+            ExecError::PermissionDenied(format!(
+                "row security could not validate the row shape for table '{table}'"
+            ))
+        })?;
+        let ctx = self.current_session().session_context.read().clone();
+        if self.with_visible_security(|security| {
+            security.rls.check_new_row(table, command, &row_map, &ctx)
+        }) {
+            Ok(())
+        } else {
+            Err(ExecError::PermissionDenied(format!(
+                "new row violates row-level security policy for table '{table}'"
+            )))
+        }
     }
 
     /// Take (consume) the plan cache key hint stored by `parse_with_ast_cache`.
@@ -1542,9 +2461,14 @@ impl Executor {
         Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>,
     > {
         let session = self.get_session(session_id);
+        let guard_sess = session.clone();
         Box::pin(CURRENT_SESSION.scope(
             session,
-            STORAGE_SESSION_ID.scope(session_id, async move { self.execute(sql).await }),
+            STORAGE_SESSION_ID.scope(session_id, async move {
+                guard_sess.mark_command_start();
+                let _guard = CommandGuard(guard_sess);
+                self.execute(sql).await
+            }),
         ))
     }
 
@@ -1559,9 +2483,12 @@ impl Executor {
         Box<dyn std::future::Future<Output = Result<Vec<ExecResult>, ExecError>> + Send + 'a>,
     > {
         let session = self.get_session(session_id);
+        let guard_sess = session.clone();
         Box::pin(CURRENT_SESSION.scope(
             session,
             STORAGE_SESSION_ID.scope(session_id, async move {
+                guard_sess.mark_command_start();
+                let _guard = CommandGuard(guard_sess);
                 let mut results = Vec::new();
                 for stmt in statements {
                     results.push(self.execute_statement(stmt).await?);
@@ -1581,16 +2508,17 @@ impl Executor {
     /// Persist the catalog and executor metadata to disk (if a catalog path is configured).
     /// Called after DDL operations (CREATE TABLE, DROP TABLE, CREATE VIEW, etc.).
     #[cfg(feature = "server")]
-    async fn persist_catalog(&self) {
+    async fn persist_catalog(&self) -> Result<(), ExecError> {
         let Some(ref path) = self.catalog_path else {
-            return;
+            return Ok(());
         };
 
         // 1. Persist table/index catalog.
         let persistence = crate::storage::persistence::CatalogPersistence::new(path);
-        if let Err(e) = persistence.save_catalog(&self.catalog).await {
-            tracing::error!("Failed to persist catalog: {e}");
-        }
+        persistence
+            .save_catalog(&self.catalog)
+            .await
+            .map_err(|e| ExecError::Runtime(format!("catalog persistence failed: {e}")))?;
 
         // 2. Persist executor metadata (views, sequences, triggers, roles, functions).
         // Snapshot parking_lot locks synchronously first (cannot hold them across await).
@@ -1606,22 +2534,25 @@ impl Executor {
                 .collect()
         };
         let functions_snap: HashMap<String, FunctionDef> = self.functions.read().clone();
+        let security_snap = self.security.read().clone_policy_state();
         // Now take async locks.
         let meta_pers = meta_persistence::MetaPersistence::alongside_catalog(path);
         let views = self.views.read().await;
         let mat_views = self.materialized_views.read().await;
         let triggers = self.triggers.read().await;
         let roles = self.roles.read().await;
-        if let Err(e) = meta_pers.save(
-            &views,
-            &mat_views,
-            &sequences_snap,
-            &triggers,
-            &roles,
-            &functions_snap,
-        ) {
-            tracing::error!("Failed to persist executor metadata: {e}");
-        }
+        meta_pers
+            .save(
+                &views,
+                &mat_views,
+                &sequences_snap,
+                &triggers,
+                &roles,
+                &functions_snap,
+                &security_snap,
+            )
+            .map_err(|e| ExecError::Runtime(format!("metadata persistence failed: {e}")))?;
+        Ok(())
     }
 
     /// Check that a subsystem is healthy before dispatching to it.
@@ -1751,6 +2682,68 @@ impl Executor {
         Ok(())
     }
 
+    /// Force durability of the specialty-store WALs that log through scalar
+    /// functions and the KV path (KV, KV-collections, timeseries, vector,
+    /// graph, streams). Unlike SQL DML, those writes never flow through
+    /// `force_wal_durability`, yet an acked write must be just as durable.
+    /// `is_dirty()` is a single atomic load, so this is ~free when nothing was
+    /// written (e.g. a pure read); only a log with un-fsynced appends pays an
+    /// fsync, and concurrent callers group-commit. The caller gates on
+    /// synchronous_commit + the autocommit/commit boundary.
+    ///
+    /// The CDC log is deliberately excluded: it appends on *every* DML row
+    /// change, so fsyncing it here would add a second fsync to every SQL commit
+    /// (on top of `force_wal_durability`). CDC is a derived change-feed — the
+    /// source rows are already durable via the SQL WAL, and consumers re-sync
+    /// from that source of truth — so a bounded, checkpoint-sized tail loss is
+    /// acceptable. When logical replication is wired, CDC should instead be
+    /// folded into the SQL WAL so one fsync covers both.
+    #[cfg(feature = "server")]
+    fn force_specialty_durability(&self) -> Result<(), ExecError> {
+        let io_err =
+            |e: std::io::Error| ExecError::Storage(crate::storage::StorageError::Io(e.to_string()));
+        if let Some(wal) = self.kv_store().wal()
+            && wal.is_dirty()
+        {
+            wal.group_sync().map_err(io_err)?;
+        }
+        if let Some(wal) = self.kv_store().collections_wal()
+            && wal.is_dirty()
+        {
+            wal.group_sync().map_err(io_err)?;
+        }
+        {
+            let ts = self.ts_store.read();
+            if ts.wal_is_dirty() {
+                ts.wal_group_sync().map_err(io_err)?;
+            }
+        }
+        if let Some(ref wal) = self.vector_wal
+            && wal.is_dirty()
+        {
+            wal.group_sync().map_err(io_err)?;
+        }
+        {
+            let graph = self.graph_store().read();
+            if graph.wal_is_dirty() {
+                graph.wal_group_sync().map_err(io_err)?;
+            }
+        }
+        if let Some(ref wal) = self.streams_wal
+            && wal.is_dirty()
+        {
+            wal.group_sync().map_err(io_err)?;
+        }
+        Ok(())
+    }
+
+    /// Embedded/in-memory builds do not attach the server-only specialty WALs.
+    /// Their transaction boundary therefore has nothing additional to fsync.
+    #[cfg(not(feature = "server"))]
+    fn force_specialty_durability(&self) -> Result<(), ExecError> {
+        Ok(())
+    }
+
     /// Get a reference to the time-series store.
     pub fn ts_store(&self) -> &parking_lot::RwLock<crate::timeseries::TimeSeriesStore> {
         &self.ts_store
@@ -1834,6 +2827,44 @@ impl Executor {
             wal.checkpoint(&streams)?;
         }
         Ok(())
+    }
+
+    /// Checkpoint the on-disk vector-index WAL: writes a snapshot of every
+    /// live HNSW index and truncates the WAL file to just that snapshot.
+    ///
+    /// `CREATE INDEX ... USING hnsw` and every subsequent vector INSERT/DELETE
+    /// log to this WAL (`wal_log_vector_insert`/`_delete`) with no consumer
+    /// required — without periodic checkpointing the file grows one record per
+    /// write forever. IvfFlat indexes are excluded on purpose: they are never
+    /// logged to this WAL (they rebuild from base-table data at startup, see
+    /// `rebuild_specialty_indexes`), so a snapshot need only cover HNSW. The
+    /// index→(table,column) sidecar is written separately at CREATE time and
+    /// is untouched here. Called from the recurring `WalCheckpoint` background
+    /// task (`main.rs`) on the same cadence as the primary storage WAL.
+    pub fn checkpoint_vector_wal(&self) -> std::io::Result<()> {
+        let Some(ref wal) = self.vector_wal else {
+            return Ok(());
+        };
+        // Hold the read lock across `checkpoint` so the borrowed HNSW indexes
+        // stay live while they serialize; vector writes take the write lock and
+        // block briefly, matching the other subsystem checkpoints.
+        let indexes = self.vector_indexes.read();
+        let mut snapshots: HashMap<String, vector::wal::IndexSnapshot<'_>> = HashMap::new();
+        for (name, entry) in indexes.iter() {
+            if let VectorIndexKind::Hnsw(hnsw) = &entry.kind {
+                snapshots.insert(
+                    name.clone(),
+                    vector::wal::IndexSnapshot {
+                        hnsw,
+                        dims: hnsw.dims() as u32,
+                        metric: vector::metric_to_u8(hnsw.metric()),
+                        m: hnsw.m() as u32,
+                        ef: hnsw.ef_search() as u32,
+                    },
+                );
+            }
+        }
+        wal.checkpoint(&snapshots)
     }
 
     /// Get a reference to the CDC log.
@@ -2202,6 +3233,7 @@ impl Executor {
     /// Returns `None` if the command can't be executed on the fast path (e.g.
     /// table not found, column not found, constraint issues), in which case
     /// the caller should fall through to the normal SQL execution path.
+    #[cfg(feature = "server")]
     pub async fn execute_sql_fast_path(
         &self,
         cmd: &crate::wire::kv_fast_path::SqlFastPathCommand,
@@ -2214,6 +3246,9 @@ impl Executor {
                 where_col,
                 where_val,
             } => {
+                if self.rls_active(table) {
+                    return None;
+                }
                 let table_def = self.catalog.get_table_cached(table)?;
                 let col_idx = table_def.column_index(where_col)?;
                 // Coerce the wire-parsed literal to the column's declared
@@ -2261,7 +3296,21 @@ impl Executor {
             }
 
             SqlFastPathCommand::SimpleInsert { table, values } => {
+                if self.rls_active(table) {
+                    return None;
+                }
                 let table_def = self.catalog.get_table_cached(table)?;
+                // Correctness gate: this fast path writes straight to storage and
+                // does NOT enforce constraints. Fall through to the full executor
+                // (execute_sql_session — which enforces PRIMARY KEY / UNIQUE /
+                // NOT NULL / CHECK / FOREIGN KEY) for any table that has them, so a
+                // wire-level autocommit INSERT can never silently bypass a
+                // constraint. The fast path stays only for constraint-free tables.
+                let has_enforceable_constraints = !table_def.constraints.is_empty()
+                    || table_def.columns.iter().any(|col| !col.nullable);
+                if has_enforceable_constraints {
+                    return None;
+                }
                 // Column count must match exactly for a simple VALUES insert.
                 if values.len() != table_def.columns.len() {
                     return None; // Fall through to normal path for better error reporting.
@@ -2312,6 +3361,9 @@ impl Executor {
                 where_col,
                 where_val,
             } => {
+                if self.rls_active(table) {
+                    return None;
+                }
                 let table_def = self.catalog.get_table_cached(table)?;
                 let pk_idx = table_def.column_index(where_col)?;
                 // Resolve all assignment column indexes upfront. If any column
@@ -2381,6 +3433,9 @@ impl Executor {
                 where_col,
                 where_val,
             } => {
+                if self.rls_active(table) {
+                    return None;
+                }
                 let table_def = self.catalog.get_table_cached(table)?;
                 let col_idx = table_def.column_index(where_col)?;
                 // Coerce text literal to the column's declared type — see
@@ -2427,6 +3482,7 @@ impl Executor {
     /// touched engine's WAL before the write is acked, unless the session is
     /// inside an explicit transaction (COMMIT forces then) or runs with
     /// synchronous_commit=off.
+    #[cfg(feature = "server")]
     async fn fast_path_durability(
         &self,
         storage: &Arc<dyn StorageEngine>,
@@ -2438,6 +3494,19 @@ impl Executor {
             storage.make_durable().await.map_err(ExecError::Storage)?;
         }
         Ok(())
+    }
+
+    /// Commit-time durability for the wire-level KV fast path: fsync the KV WAL
+    /// before the write is acked, unless the session runs with
+    /// synchronous_commit=off or is inside an explicit transaction. The KV fast
+    /// path bypasses `execute()`, so it must force durability itself; this is
+    /// the KV analogue of `fast_path_durability`. Group-commit batches
+    /// concurrent committers.
+    pub fn kv_fast_path_durability(&self) -> Result<(), ExecError> {
+        if !self.synchronous_commit_enabled() || self.session_in_txn() {
+            return Ok(());
+        }
+        self.force_specialty_durability()
     }
 
     pub fn execute<'a>(
@@ -2508,6 +3577,12 @@ impl Executor {
             let upper = trimmed.to_ascii_uppercase();
             #[cfg(feature = "server")]
             if upper.starts_with("SUBSCRIBE ") {
+                if self.any_rls_active() {
+                    return Err(ExecError::PermissionDenied(
+                        "reactive subscriptions are unavailable while row-level security is active because change diffs do not retain subscriber policy context"
+                            .into(),
+                    ));
+                }
                 return Ok(vec![self.execute_subscribe(trimmed).await?]);
             }
             #[cfg(feature = "server")]
@@ -2516,6 +3591,12 @@ impl Executor {
             }
             #[cfg(feature = "server")]
             if upper.starts_with("FETCH SUBSCRIPTION ") {
+                if self.any_rls_active() {
+                    return Err(ExecError::PermissionDenied(
+                        "subscription diffs are unavailable while row-level security is active"
+                            .into(),
+                    ));
+                }
                 return Ok(vec![self.execute_fetch_subscription(trimmed)?]);
             }
             if upper == "SHOW MEMORY" || upper == "SHOW MEMORY;" {
@@ -2544,11 +3625,13 @@ impl Executor {
             }
             // REFRESH MATERIALIZED VIEW <name> — re-execute the query and update cached rows.
             if upper.starts_with("REFRESH MATERIALIZED VIEW ") {
+                self.require_security_admin("refresh materialized views")?;
                 let view_name = trimmed[26..].trim().trim_end_matches(';').to_string();
                 return Ok(vec![self.execute_refresh_matview(&view_name).await?]);
             }
             // DROP MATERIALIZED VIEW [IF EXISTS] <name>
             if upper.starts_with("DROP MATERIALIZED VIEW ") {
+                self.require_security_admin("drop materialized views")?;
                 let rest = trimmed[23..].trim().trim_end_matches(';');
                 let (if_exists, view_name) = if rest.to_uppercase().starts_with("IF EXISTS ") {
                     (true, rest[10..].trim().to_lowercase())
@@ -2562,6 +3645,11 @@ impl Executor {
             // SHOW TABLE STATS <tablename> — display per-column statistics from ANALYZE.
             if upper.starts_with("SHOW TABLE STATS ") {
                 let table_name = trimmed[17..].trim().trim_end_matches(';').to_lowercase();
+                if self.rls_active(&table_name) {
+                    return Err(ExecError::PermissionDenied(format!(
+                        "raw planner statistics for RLS-protected table '{table_name}' are not visible to this session"
+                    )));
+                }
                 return Ok(vec![self.show_table_stats(&table_name).await?]);
             }
             // CREATE MODEL <name> FROM '<path>' — load an ONNX model for in-DB inference.
@@ -2690,24 +3778,64 @@ impl Executor {
         sql: &str,
         statements: Vec<Statement>,
     ) -> Result<Vec<ExecResult>, ExecError> {
+        #[cfg(not(feature = "server"))]
+        let _ = sql;
+        self.recompute_session_context(&self.current_session());
         // Cluster-mode DML routing: followers forward to leader; leader appends to Raft log.
         // Skip entirely in standalone mode to avoid lock contention on the Raft mutex.
         #[cfg(feature = "server")]
         if let Some(ref cluster_arc) = self.cluster {
             let mode = { cluster_arc.read().mode() };
             if mode != crate::distributed::ClusterMode::Standalone {
+                let has_security_ddl = statements.iter().any(|statement| {
+                    matches!(
+                        statement,
+                        Statement::CreateRole(_)
+                            | Statement::AlterRole { .. }
+                            | Statement::Grant(_)
+                            | Statement::Revoke(_)
+                            | Statement::CreatePolicy(_)
+                            | Statement::DropPolicy(_)
+                    ) || matches!(statement, Statement::AlterTable(alter) if alter.operations.iter().any(|op| matches!(
+                        op,
+                        ast::AlterTableOperation::EnableRowLevelSecurity
+                            | ast::AlterTableOperation::DisableRowLevelSecurity
+                            | ast::AlterTableOperation::ForceRowLevelSecurity
+                            | ast::AlterTableOperation::NoForceRowLevelSecurity
+                    )))
+                });
                 let has_dml = statements.iter().any(|s| {
                     matches!(
                         s,
                         Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
                     )
                 });
-                if has_dml {
+                if has_security_ddl {
+                    // Authenticate authority before proposing a command that
+                    // followers intentionally apply as the internal Raft user.
+                    self.require_security_admin("change the replicated security catalog")?;
+                }
+                if has_dml || has_security_ddl {
                     let (is_leader, leader_addr) = {
                         let cluster = cluster_arc.read();
                         (cluster.is_leader(), cluster.leader_addr())
                     };
                     if !is_leader {
+                        if has_security_ddl {
+                            return Err(ExecError::PermissionDenied(
+                                "security catalog changes must be submitted to the cluster leader so authenticated authority and policy order are preserved"
+                                    .into(),
+                            ));
+                        }
+                        // SQL-only forwarding cannot carry the authenticated
+                        // connection principal. Never re-authorize an
+                        // RLS-protected write as the leader's internal user.
+                        if self.any_rls_active() {
+                            return Err(ExecError::PermissionDenied(
+                                "RLS-protected writes cannot be forwarded without authenticated principal propagation"
+                                    .into(),
+                            ));
+                        }
                         if let Some(addr) = leader_addr {
                             return self.forward_dml(sql, &addr).await;
                         }
@@ -2715,9 +3843,20 @@ impl Executor {
                         let repl = self.raft_replicator.read().clone();
                         if let Some(replicator) = repl {
                             if let Err(e) = replicator.propose_and_await(sql).await {
+                                if has_security_ddl {
+                                    return Err(ExecError::Runtime(format!(
+                                        "security catalog replication failed: {e}"
+                                    )));
+                                }
                                 tracing::warn!("Raft propose failed: {e}");
                             }
                         } else {
+                            if has_security_ddl {
+                                return Err(ExecError::Runtime(
+                                    "security catalog changes require an active Raft replicator"
+                                        .into(),
+                                ));
+                            }
                             let _ = cluster_arc
                                 .write()
                                 .propose(0u64, crate::distributed::Operation::Sql(sql.to_string()));
@@ -2740,6 +3879,20 @@ impl Executor {
         let mut results = Vec::new();
         for stmt in statements {
             results.push(self.execute_statement(stmt).await?);
+        }
+        Ok(results)
+    }
+
+    /// Apply a SQL command already authenticated and committed by Raft.
+    /// This bypasses client routing (which would otherwise forward the command
+    /// back to the leader) while retaining the normal executor enforcement,
+    /// catalog persistence, and cache invalidation behavior.
+    #[cfg(feature = "server")]
+    pub async fn apply_replicated_sql(&self, sql: &str) -> Result<Vec<ExecResult>, ExecError> {
+        let statements = self.parse_with_ast_cache(sql)?;
+        let mut results = Vec::with_capacity(statements.len());
+        for statement in statements {
+            results.push(self.execute_statement(statement).await?);
         }
         Ok(results)
     }
@@ -2785,6 +3938,7 @@ impl Executor {
     // ========================================================================
 
     async fn execute_statement(&self, stmt: Statement) -> Result<ExecResult, ExecError> {
+        self.recompute_session_context(&self.current_session());
         // Track whether this is a DDL statement that modifies the catalog or metadata.
         let is_ddl = matches!(
             &stmt,
@@ -2802,7 +3956,26 @@ impl Executor {
                 | Statement::CreateFunction(_)
                 | Statement::DropFunction(_)
                 | Statement::CreateTrigger(_)
+                | Statement::CreatePolicy(_)
+                | Statement::DropPolicy(_)
         );
+        let is_policy_ddl = match &stmt {
+            Statement::CreatePolicy(_) | Statement::DropPolicy(_) => true,
+            Statement::AlterTable(alter) => alter.operations.iter().any(|op| {
+                matches!(
+                    op,
+                    ast::AlterTableOperation::EnableRowLevelSecurity
+                        | ast::AlterTableOperation::DisableRowLevelSecurity
+                        | ast::AlterTableOperation::ForceRowLevelSecurity
+                        | ast::AlterTableOperation::NoForceRowLevelSecurity
+                )
+            }),
+            _ => false,
+        };
+        // Policy DDL mutates an isolated in-memory snapshot and is rolled back
+        // if the durable metadata replacement fails.
+        #[cfg(feature = "server")]
+        let mut security_before = is_policy_ddl.then(|| self.security.read().clone_policy_state());
 
         // Classify query type for metrics before moving stmt.
         let query_type = match &stmt {
@@ -2870,6 +4043,7 @@ impl Executor {
                 let sql_text = query.to_string();
                 let cacheable = !in_txn
                     && !Self::query_cache_disabled()
+                    && !self.any_rls_active()
                     && Self::query_result_is_cacheable(&sql_text);
                 // Snapshot the write generation at the point of the cache check.
                 // If a DML increments it before we store the result, query_cache_put
@@ -2948,6 +4122,7 @@ impl Executor {
             Statement::Truncate(truncate) => self.execute_truncate(truncate).await,
             Statement::AlterTable(alter_table) => self.execute_alter_table(alter_table).await,
             Statement::CreateView(create_view) if create_view.materialized => {
+                self.require_security_admin("create materialized views")?;
                 let view_name = create_view.name.to_string();
                 let sql = create_view.query.to_string();
                 // Extract source table references for write-time MV refresh.
@@ -3007,6 +4182,8 @@ impl Executor {
                     .await
             }
             Statement::CreateRole(create_role) => self.execute_create_role(create_role).await,
+            Statement::CreatePolicy(policy) => self.execute_create_policy(policy),
+            Statement::DropPolicy(policy) => self.execute_drop_policy(policy),
             Statement::AlterRole { name, operation } => {
                 self.execute_alter_role(&name.to_string(), operation).await
             }
@@ -3133,6 +4310,11 @@ impl Executor {
             )),
         };
 
+        if is_policy_ddl && in_txn && result.is_ok() {
+            let sess = self.current_session();
+            sess.txn_state.write().await.policy_dirty = true;
+        }
+
         // Record metrics: query type, duration, and row counts.
         let duration = start.elapsed().as_secs_f64();
         self.metrics.record_query(query_type, duration);
@@ -3168,12 +4350,40 @@ impl Executor {
         // Persist catalog to disk after successful DDL operations.
         // Also invalidate the plan cache and query result cache since DDL
         // changes may affect query plans and cached results.
-        if is_ddl && result.is_ok() {
+        if is_ddl && result.is_ok() && !(is_policy_ddl && in_txn) {
             self.plan_cache.write().clear();
             self.ast_cache.write().clear();
             self.query_cache_invalidate_all();
             #[cfg(feature = "server")]
-            self.persist_catalog().await;
+            {
+                // Force STORAGE durable BEFORE the catalog. The catalog is
+                // fsync'd on every DDL; if storage lagged it, a crash here would
+                // leave the catalog naming a table storage never durably
+                // recorded (missing, or worse, pointing at a stale first page).
+                // Forcing storage first makes the only crash-window failure
+                // "storage ahead of catalog" — a reclaimable orphan, not silent
+                // corruption. Unconditional (not synchronous_commit-gated),
+                // matching persist_catalog, so DDL is durable on both sides.
+                if let Err(e) = self
+                    .storage
+                    .flush_schema()
+                    .await
+                    .map_err(ExecError::Storage)
+                {
+                    if let Some(previous) = security_before.take() {
+                        *self.security.write() = previous;
+                        self.bump_policy_gen();
+                    }
+                    return Err(e);
+                }
+                if let Err(e) = self.persist_catalog().await {
+                    if let Some(previous) = security_before.take() {
+                        *self.security.write() = previous;
+                        self.bump_policy_gen();
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         // Commit-time durability: force the WAL before the statement is acked.
@@ -3188,6 +4398,14 @@ impl Executor {
             // The write already applied in memory; if the WAL can't be made
             // durable the client must NOT get a success ack.
             self.force_wal_durability().await?;
+        }
+
+        // Specialty-store durability: KV / timeseries / vector / graph / streams
+        // / CDC writes reach their WALs through scalar functions and the KV
+        // path, not SQL DML, so they miss the gate above. Force them on the same
+        // autocommit/commit boundary. `is_dirty()` makes this ~free for reads.
+        if result.is_ok() && (is_commit || !in_txn) && self.synchronous_commit_enabled() {
+            self.force_specialty_durability()?;
         }
 
         result
@@ -3215,36 +4433,12 @@ impl Executor {
     /// - The user has ALL privilege on the table
     /// - No role is found and user is the default "nucleus" superuser
     async fn check_privilege(&self, table_name: &str, privilege: &str) -> bool {
-        // Get the current session user (default to "nucleus")
-        let session_user = {
-            let sess = self.current_session();
-            let settings = sess.settings.read();
-            match settings.get("session_authorization") {
-                // Fast path: default superuser — no role lookup needed
-                None => return true,
-                Some(raw) => {
-                    let trimmed = raw.trim_matches('\'').trim_matches('"');
-                    // Fast check: if it's still the default user, skip role lookup
-                    if trimmed == "nucleus" {
-                        return true;
-                    }
-                    trimmed.to_string()
-                }
-            }
-        };
-
-        // Look up the role
-        let roles = self.roles.read().await;
-        let role = match roles.get(&session_user) {
-            Some(r) => r,
-            // Unknown roles denied (we already handled "nucleus" above)
-            None => return false,
-        };
-
-        // Superusers can do anything
-        if role.is_superuser {
+        let ctx = self.current_session().session_context.read().clone();
+        if ctx.bypass_rls || ctx.has_role("superuser") {
             return true;
         }
+
+        let roles = self.roles.read().await;
 
         // Convert privilege string to enum
         let required_priv = match privilege.to_uppercase().as_str() {
@@ -3255,21 +4449,15 @@ impl Executor {
             _ => return false,
         };
 
-        // Check if role has privilege on this specific table
-        if let Some(table_privs) = role.privileges.get(table_name)
-            && (table_privs.contains(&Privilege::All) || table_privs.contains(&required_priv))
-        {
-            return true;
-        }
-
-        // Check if role has privilege on all tables (wildcard "*")
-        if let Some(wildcard_privs) = role.privileges.get("*")
-            && (wildcard_privs.contains(&Privilege::All) || wildcard_privs.contains(&required_priv))
-        {
-            return true;
-        }
-
-        false
+        ctx.roles.iter().any(|role_name| {
+            roles.get(role_name).is_some_and(|role| {
+                role.privileges.get(table_name).is_some_and(|privs| {
+                    privs.contains(&Privilege::All) || privs.contains(&required_priv)
+                }) || role.privileges.get("*").is_some_and(|privs| {
+                    privs.contains(&Privilege::All) || privs.contains(&required_priv)
+                })
+            })
+        })
     }
 
     fn table_col_meta(&self, table_def: &TableDef) -> Vec<ColMeta> {
@@ -3401,63 +4589,257 @@ impl Executor {
             _ => return None,
         };
 
-        // Find a vector index on this column
+        // Resolution is fully synchronous. HNSW postings are keyed on the PK
+        // column recorded on the index entry (recovery-safe: persisted in the
+        // sidecar, independent of the live catalog's constraints) and located in
+        // the scanned rows via col_meta. IvfFlat and no-PK indexes stay positional.
         let vi = self.vector_indexes.read();
-        let mut best_entry: Option<&VectorIndexEntry> = None;
+        let mut found: Option<(&VectorIndexEntry, Option<usize>)> = None;
         for entry in vi.values() {
-            if entry.column_name == col_name {
-                // Check that we have rows from this table
-                if col_meta.iter().any(|c| c.name == col_name) {
-                    best_entry = Some(entry);
-                    break;
-                }
+            if entry.column_name == col_name && col_meta.iter().any(|c| c.name == col_name) {
+                let pk_col = if matches!(entry.kind, VectorIndexKind::Hnsw(_)) {
+                    entry
+                        .pk_column
+                        .as_ref()
+                        .and_then(|n| col_meta.iter().position(|c| &c.name == n))
+                } else {
+                    None
+                };
+                found = Some((entry, pk_col));
+                break;
             }
         }
-        let entry = best_entry?;
+        let (entry, pk_col) = found?;
 
-        // Build a set of valid row indices from the pre-filtered rows.
-        // This allows the vector index to skip rows that were eliminated
-        // by the WHERE clause, improving recall for filtered searches.
-        let valid_row_ids: std::collections::HashSet<u64> = (0..rows.len() as u64).collect();
+        // PK-keyed HNSW resolves search results (node ids) to rows through the
+        // registry. If the registry is empty (right after a reopen, before the
+        // first rebuild repopulates it), fall back to the exact brute-force scan.
+        if pk_col.is_some() && entry.registry.is_empty() {
+            return None;
+        }
 
-        // Use the index to find top-k nearest neighbors, filtering to only
-        // return rows that passed the WHERE clause.
-        let result_ids: Vec<u64> = match &entry.kind {
-            VectorIndexKind::Hnsw(hnsw) => {
-                if valid_row_ids.len() < rows.len() || valid_row_ids.len() < hnsw.len() {
-                    // Filtered search: only return IDs present in valid rows
-                    let results = hnsw.search_filtered(&vector::Vector::new(query_vec), k, |id| {
-                        valid_row_ids.contains(&id)
-                    });
-                    results.into_iter().map(|(id, _)| id).collect()
-                } else {
-                    let results = hnsw.search(&vector::Vector::new(query_vec), k);
-                    results.into_iter().map(|(id, _)| id).collect()
-                }
+        let query = vector::Vector::new(query_vec.clone());
+
+        let result_ids: Vec<u64> = if let Some(pc) = pk_col {
+            // Valid set = PK ids present in the pre-filtered (post-WHERE) rows.
+            // The HNSW search returns NODE ids; filter and resolve via the registry.
+            let valid_pks: std::collections::HashSet<u64> = rows
+                .iter()
+                .filter_map(|r| Self::stable_row_id(r, pc))
+                .collect();
+            let reg = &entry.registry;
+            match &entry.kind {
+                VectorIndexKind::Hnsw(hnsw) => hnsw
+                    .search_filtered(&query, k, |node| {
+                        reg.node_to_pk
+                            .get(&node)
+                            .is_some_and(|pk| valid_pks.contains(pk))
+                    })
+                    .into_iter()
+                    .map(|(node, _)| node)
+                    .collect(),
+                VectorIndexKind::IvfFlat(_) => return None,
             }
-            VectorIndexKind::IvfFlat(ivf) => {
-                if valid_row_ids.len() < rows.len() || valid_row_ids.len() < ivf.len() {
-                    let results = ivf
-                        .search_filtered(&query_vec, k, |id| valid_row_ids.contains(&(id as u64)));
-                    results.into_iter().map(|(id, _)| id as u64).collect()
-                } else {
-                    let results = ivf.search(&query_vec, k);
-                    results.into_iter().map(|(id, _)| id as u64).collect()
+        } else {
+            // Positional resolution (IvfFlat, or HNSW without an integer PK).
+            let valid_row_ids: std::collections::HashSet<u64> = (0..rows.len() as u64).collect();
+            match &entry.kind {
+                VectorIndexKind::Hnsw(hnsw) => {
+                    if valid_row_ids.len() < rows.len() || valid_row_ids.len() < hnsw.len() {
+                        hnsw.search_filtered(&query, k, |id| valid_row_ids.contains(&id))
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .collect()
+                    } else {
+                        hnsw.search(&query, k)
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .collect()
+                    }
+                }
+                VectorIndexKind::IvfFlat(ivf) => {
+                    if valid_row_ids.len() < rows.len() || valid_row_ids.len() < ivf.len() {
+                        ivf.search_filtered(&query_vec, k, |id| {
+                            valid_row_ids.contains(&(id as u64))
+                        })
+                        .into_iter()
+                        .map(|(id, _)| id as u64)
+                        .collect()
+                    } else {
+                        ivf.search(&query_vec, k)
+                            .into_iter()
+                            .map(|(id, _)| id as u64)
+                            .collect()
+                    }
                 }
             }
         };
 
-        // Reorder rows: return indexed rows in order of proximity
-        let reordered: Vec<Row> = result_ids
-            .iter()
-            .filter_map(|&id| rows.get(id as usize).cloned())
-            .collect();
+        // Reorder rows into proximity order. PK path: node id -> pk -> row.
+        let reordered: Vec<Row> = if let Some(pc) = pk_col {
+            let mut pk_to_row: std::collections::HashMap<u64, &Row> =
+                std::collections::HashMap::with_capacity(rows.len());
+            for r in rows {
+                if let Some(pk) = Self::stable_row_id(r, pc) {
+                    pk_to_row.insert(pk, r);
+                }
+            }
+            let reg = &entry.registry;
+            result_ids
+                .iter()
+                .filter_map(|node| {
+                    reg.node_to_pk
+                        .get(node)
+                        .and_then(|pk| pk_to_row.get(pk))
+                        .map(|r| (*r).clone())
+                })
+                .collect()
+        } else {
+            result_ids
+                .iter()
+                .filter_map(|&id| rows.get(id as usize).cloned())
+                .collect()
+        };
 
         Some(reordered)
     }
 
+    /// Column index of a single-column integer PRIMARY KEY, or None. This is the
+    /// stable row identity used for incremental HNSW maintenance; None falls the
+    /// table back to positional full-rebuild maintenance.
+    pub(super) fn integer_pk_col(table_def: &TableDef) -> Option<usize> {
+        let pk = table_def.primary_key_columns()?;
+        if pk.len() != 1 {
+            return None;
+        }
+        let col_idx = table_def.column_index(&pk[0])?;
+        match table_def.columns.get(col_idx)?.data_type {
+            crate::types::DataType::Int32 | crate::types::DataType::Int64 => Some(col_idx),
+            _ => None,
+        }
+    }
+
+    /// The PK column NAME an HNSW index on `table_name` keys its postings on,
+    /// resolved independently of the live catalog. Prefers the catalog PK
+    /// (authoritative when constraints are present); falls back to a live index
+    /// entry's persisted `pk_column`, which survives a reopen even when the
+    /// recovered catalog has dropped its PK constraint. This is what makes the
+    /// PK-keyed fast path recovery-safe on the durable path.
+    pub(super) fn resolve_pk_column(
+        &self,
+        table_name: &str,
+        table_def: &TableDef,
+    ) -> Option<String> {
+        if let Some(i) = Self::integer_pk_col(table_def) {
+            return table_def.columns.get(i).map(|c| c.name.clone());
+        }
+        self.vector_indexes
+            .read()
+            .values()
+            .find(|e| e.table_name == table_name && e.pk_column.is_some())
+            .and_then(|e| e.pk_column.clone())
+    }
+
+    /// The PK column INDEX for incremental maintenance on `table_name`, or None
+    /// for positional. Resolves the PK column name (recovery-safe) then maps it
+    /// to a position in the current schema.
+    pub(super) fn pk_col_for_incremental(
+        &self,
+        table_name: &str,
+        table_def: &TableDef,
+    ) -> Option<usize> {
+        let name = self.resolve_pk_column(table_name, table_def)?;
+        table_def.column_index(&name)
+    }
+
+    /// Stable u64 posting id for a row: its integer PK bit-cast to u64. Int32
+    /// widens through i64 so it agrees with an equal Int64 PK of the same value.
+    pub(super) fn stable_row_id(row: &Row, pk_col: usize) -> Option<u64> {
+        match row.get(pk_col)? {
+            Value::Int32(n) => Some(*n as i64 as u64),
+            Value::Int64(n) => Some(*n as u64),
+            _ => None,
+        }
+    }
+
+    /// Whether a PK-keyed HNSW index on `table_name` has accumulated enough
+    /// tombstones (from incremental delete/update) that it should be compacted by
+    /// a full rebuild. Deferred compaction bounds graph bloat and recall decay —
+    /// the equivalent of pgvector's VACUUM for HNSW.
+    pub(super) fn vector_index_needs_compaction(&self, table_name: &str) -> bool {
+        let vi = self.vector_indexes.read();
+        vi.values().any(|e| {
+            if e.table_name != table_name
+                || e.pk_column.is_none()
+                || !matches!(e.kind, VectorIndexKind::Hnsw(_))
+            {
+                return false;
+            }
+            let live = e.registry.pk_to_node.len();
+            let tombstones = e.registry.tombstones as usize;
+            // Rebuild once tombstones are material (>= 64) and exceed the live set
+            // (graph is more than half dead).
+            tombstones >= 64 && tombstones > live
+        })
+    }
+
+    /// Whether DELETE/UPDATE on `table_name` may maintain derived indexes
+    /// incrementally (the PK-keyed vector hooks having already run) instead of a
+    /// full rebuild. Requires a single-column integer PK, autocommit (no active
+    /// explicit transaction), only HNSW vector indexes (IvfFlat postings are
+    /// positional), no encrypted index (positional postings), and no GIN index
+    /// (whose reader generation guard relies on the rebuild bumping it).
+    pub(super) async fn incremental_maintenance_eligible(
+        &self,
+        table_name: &str,
+        table_def: &TableDef,
+    ) -> bool {
+        // Requires a PK-keyed HNSW index. resolve_pk_column is recovery-safe
+        // (falls back to the persisted pk_column), so durable indexes qualify.
+        if self.pk_col_for_incremental(table_name, table_def).is_none() {
+            return false;
+        }
+        if self.current_session().txn_state.read().await.active {
+            return false;
+        }
+        {
+            let vi = self.vector_indexes.read();
+            for e in vi.values() {
+                if e.table_name != table_name {
+                    continue;
+                }
+                // IvfFlat postings are positional — not fast-path safe.
+                if !matches!(e.kind, VectorIndexKind::Hnsw(_)) {
+                    return false;
+                }
+                // Post-reopen the registry is empty (not persisted). Fall through
+                // to a full rebuild, which repopulates it and rebuilds the graph
+                // on a fresh node id space.
+                if e.pk_column.is_some() && e.registry.is_empty() {
+                    return false;
+                }
+            }
+        }
+        if self
+            .encrypted_indexes
+            .read()
+            .values()
+            .any(|e| e.table_name == table_name)
+        {
+            return false;
+        }
+        !self
+            .catalog
+            .get_indexes(table_name)
+            .await
+            .iter()
+            .any(|i| matches!(i.index_type, crate::catalog::IndexType::Gin))
+    }
+
     /// Add a newly inserted row to any live vector indexes on the table.
     fn update_vector_indexes_on_insert(&self, table_name: &str, row: &Row, table_def: &TableDef) {
+        let pk_col = self.pk_col_for_incremental(table_name, table_def);
+        let pk = pk_col.and_then(|pc| Self::stable_row_id(row, pc));
         let mut indexes = self.vector_indexes.write();
         // Collect WAL log entries to write after releasing the lock
         let mut wal_inserts: Vec<(String, u64, Vec<f32>)> = Vec::new();
@@ -3465,21 +4847,41 @@ impl Executor {
             if entry.table_name != table_name {
                 continue;
             }
-            if let Some(col_idx) = table_def.column_index(&entry.column_name)
-                && col_idx < row.len()
-                && let Value::Vector(v) = &row[col_idx]
-            {
-                match &mut entry.kind {
-                    VectorIndexKind::Hnsw(hnsw) => {
-                        let row_id = hnsw.len() as u64;
-                        hnsw.insert(row_id, vector::Vector::new(v.clone()));
-                        wal_inserts.push((idx_name.clone(), row_id, v.clone()));
-                    }
-                    VectorIndexKind::IvfFlat(ivf) => {
-                        if ivf.is_trained() {
-                            let row_id = ivf.len();
-                            ivf.add(row_id, v.clone());
-                        }
+            let Some(col_idx) = table_def.column_index(&entry.column_name) else {
+                continue;
+            };
+            if col_idx >= row.len() {
+                continue;
+            }
+            let Value::Vector(v) = &row[col_idx] else {
+                continue;
+            };
+            let pk_keyed = entry.pk_column.is_some();
+            // PK-keyed HNSW allocates a fresh monotonic node via the registry (so
+            // an UPDATE's re-insert never overwrites the old node in place);
+            // positional indexes append at the current length.
+            let node = if pk_keyed && matches!(entry.kind, VectorIndexKind::Hnsw(_)) {
+                match pk {
+                    Some(pk) => entry.registry.upsert(pk).0,
+                    None => match &entry.kind {
+                        VectorIndexKind::Hnsw(h) => h.len() as u64,
+                        VectorIndexKind::IvfFlat(i) => i.len() as u64,
+                    },
+                }
+            } else {
+                match &entry.kind {
+                    VectorIndexKind::Hnsw(h) => h.len() as u64,
+                    VectorIndexKind::IvfFlat(i) => i.len() as u64,
+                }
+            };
+            match &mut entry.kind {
+                VectorIndexKind::Hnsw(hnsw) => {
+                    hnsw.insert(node, vector::Vector::new(v.clone()));
+                    wal_inserts.push((idx_name.clone(), node, v.clone()));
+                }
+                VectorIndexKind::IvfFlat(ivf) => {
+                    if ivf.is_trained() {
+                        ivf.add(node as usize, v.clone());
                     }
                 }
             }
@@ -3496,12 +4898,16 @@ impl Executor {
             return;
         }
         let indexes = self.vector_indexes.read();
-        let meta: HashMap<&str, (&str, &str)> = indexes
+        let meta: HashMap<&str, (&str, &str, &str)> = indexes
             .iter()
             .map(|(name, entry)| {
                 (
                     name.as_str(),
-                    (entry.table_name.as_str(), entry.column_name.as_str()),
+                    (
+                        entry.table_name.as_str(),
+                        entry.column_name.as_str(),
+                        entry.pk_column.as_deref().unwrap_or(""),
+                    ),
                 )
             })
             .collect();
@@ -3537,18 +4943,36 @@ impl Executor {
         }
     }
 
-    /// Mark a row as deleted in any live vector indexes on the table.
-    fn remove_from_vector_indexes(&self, table_name: &str, row_position: usize) {
+    /// Mark a row as deleted in any live vector indexes on the table. HNSW keys
+    /// on the row's stable (PK) id when available; IvfFlat still keys on the
+    /// physical scan position.
+    fn remove_from_vector_indexes(
+        &self,
+        table_name: &str,
+        row: &Row,
+        row_position: usize,
+        table_def: &TableDef,
+    ) {
+        let pk = self
+            .pk_col_for_incremental(table_name, table_def)
+            .and_then(|pc| Self::stable_row_id(row, pc));
         let mut indexes = self.vector_indexes.write();
         let mut wal_deletes: Vec<(String, u64)> = Vec::new();
         for (idx_name, entry) in indexes.iter_mut() {
             if entry.table_name != table_name {
                 continue;
             }
+            // PK-keyed HNSW: look up (and drop) the node via the registry.
+            let node = if entry.pk_column.is_some() {
+                pk.and_then(|pk| entry.registry.remove(pk))
+            } else {
+                None
+            };
             match &mut entry.kind {
                 VectorIndexKind::Hnsw(hnsw) => {
-                    hnsw.mark_deleted(row_position as u64);
-                    wal_deletes.push((idx_name.clone(), row_position as u64));
+                    let id = node.unwrap_or(row_position as u64);
+                    hnsw.mark_deleted(id);
+                    wal_deletes.push((idx_name.clone(), id));
                 }
                 VectorIndexKind::IvfFlat(ivf) => {
                     ivf.mark_deleted(row_position);
@@ -3577,7 +5001,11 @@ impl Executor {
                 && col_idx < row.len()
             {
                 let plaintext = self.value_to_text_string(&row[col_idx]);
-                let row_id = entry.index.len() as u64;
+                // The appended row's scan position is the running posting count,
+                // NOT the distinct-ciphertext count (`len`): duplicate values
+                // would otherwise collide on the same id (see
+                // test_encrypted_index_insert_hook_positions_duplicates).
+                let row_id = entry.index.num_postings();
                 entry.index.insert(plaintext.as_bytes(), row_id);
             }
         }
@@ -4958,5 +6386,5 @@ pub enum ExecError {
     MemoryExceeded(String),
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod tests;

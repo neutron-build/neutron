@@ -22,6 +22,67 @@ use crate::storage::columnar_wal::ColumnarWal;
 use crate::storage::{FilterOp, StorageEngine, StorageError};
 use crate::types::{Row, Value};
 
+// ColumnData intentionally has a compact primitive physical type set. Preserve
+// exact logical scalars in its Text representation with private type tags;
+// SQL text cannot contain NUL on the PostgreSQL wire, so ordinary TEXT cannot
+// collide with this encoding.
+const NUMERIC_TEXT_TAG: &str = "\0nucleus:numeric:";
+const DATE_TEXT_TAG: &str = "\0nucleus:date:";
+const TIMESTAMP_TEXT_TAG: &str = "\0nucleus:timestamp:";
+const TIMESTAMPTZ_TEXT_TAG: &str = "\0nucleus:timestamptz:";
+const INTERVAL_TEXT_TAG: &str = "\0nucleus:interval:";
+
+fn encode_logical_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Numeric(value) => Some(format!("{NUMERIC_TEXT_TAG}{value}")),
+        Value::Date(value) => Some(format!("{DATE_TEXT_TAG}{value}")),
+        Value::Timestamp(value) => Some(format!("{TIMESTAMP_TEXT_TAG}{value}")),
+        Value::TimestampTz(value) => Some(format!("{TIMESTAMPTZ_TEXT_TAG}{value}")),
+        Value::Interval {
+            months,
+            days,
+            microseconds,
+        } => Some(format!("{INTERVAL_TEXT_TAG}{months},{days},{microseconds}")),
+        _ => None,
+    }
+}
+
+fn decode_columnar_text(value: &str) -> Value {
+    if let Some(raw) = value.strip_prefix(NUMERIC_TEXT_TAG) {
+        return Value::Numeric(raw.to_owned());
+    }
+    if let Some(raw) = value.strip_prefix(DATE_TEXT_TAG)
+        && let Ok(value) = raw.parse()
+    {
+        return Value::Date(value);
+    }
+    if let Some(raw) = value.strip_prefix(TIMESTAMP_TEXT_TAG)
+        && let Ok(value) = raw.parse()
+    {
+        return Value::Timestamp(value);
+    }
+    if let Some(raw) = value.strip_prefix(TIMESTAMPTZ_TEXT_TAG)
+        && let Ok(value) = raw.parse()
+    {
+        return Value::TimestampTz(value);
+    }
+    if let Some(raw) = value.strip_prefix(INTERVAL_TEXT_TAG) {
+        let mut parts = raw.split(',');
+        if let (Some(months), Some(days), Some(microseconds), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+            && let (Ok(months), Ok(days), Ok(microseconds)) =
+                (months.parse(), days.parse(), microseconds.parse())
+        {
+            return Value::Interval {
+                months,
+                days,
+                microseconds,
+            };
+        }
+    }
+    Value::Text(value.to_owned())
+}
+
 // ─── Write buffer ─────────────────────────────────────────────────────────────
 
 /// Pending single-row inserts are buffered per-table. When this threshold is
@@ -162,7 +223,7 @@ impl ColumnarKeyKind {
                 .parse::<bool>()
                 .map(Value::Bool)
                 .unwrap_or(Value::Text(key)),
-            ColumnarKeyKind::Text => Value::Text(key),
+            ColumnarKeyKind::Text => decode_columnar_text(&key),
         }
     }
 }
@@ -175,6 +236,11 @@ fn val_to_coldata(v: Value) -> ColumnData {
         Value::Int64(n) => ColumnData::Int64(vec![Some(n)]),
         Value::Float64(f) => ColumnData::Float64(vec![Some(f)]),
         Value::Text(s) => ColumnData::Text(vec![Some(s)]),
+        logical @ (Value::Numeric(_)
+        | Value::Date(_)
+        | Value::Timestamp(_)
+        | Value::TimestampTz(_)
+        | Value::Interval { .. }) => ColumnData::Text(vec![encode_logical_text(&logical)]),
         Value::Null => ColumnData::Text(vec![None]),
         other => ColumnData::Text(vec![Some(other.to_string())]),
     }
@@ -220,6 +286,20 @@ fn vals_to_coldata(vals: Vec<Value>) -> ColumnData {
                     Value::Int32(n) => Some(n as f64),
                     Value::Null => None,
                     _ => None,
+                })
+                .collect(),
+        ),
+        Some(
+            Value::Numeric(_)
+            | Value::Date(_)
+            | Value::Timestamp(_)
+            | Value::TimestampTz(_)
+            | Value::Interval { .. },
+        ) => ColumnData::Text(
+            vals.into_iter()
+                .map(|v| match v {
+                    Value::Null => None,
+                    other => encode_logical_text(&other),
                 })
                 .collect(),
         ),
@@ -292,7 +372,7 @@ fn coldata_get(col: &ColumnData, idx: usize) -> Value {
         ColumnData::Text(v) => v
             .get(idx)
             .and_then(|o| o.as_ref())
-            .map(|s| Value::Text(s.clone()))
+            .map(|s| decode_columnar_text(s))
             .unwrap_or(Value::Null),
     }
 }
@@ -434,6 +514,12 @@ fn eq_mask(col: &ColumnData, val: &Value) -> Vec<bool> {
         (ColumnData::Text(v), Value::Text(s)) => {
             v.iter().map(|o| o.as_deref() == Some(s.as_str())).collect()
         }
+        (ColumnData::Text(v), logical) if encode_logical_text(logical).is_some() => {
+            let encoded = encode_logical_text(logical).expect("guarded logical scalar");
+            v.iter()
+                .map(|value| value.as_deref() == Some(encoded.as_str()))
+                .collect()
+        }
         (ColumnData::Int64(v), Value::Int64(n)) => v.iter().map(|o| o == &Some(*n)).collect(),
         (ColumnData::Int32(v), Value::Int32(n)) => v.iter().map(|o| o == &Some(*n)).collect(),
         // Cross-type: Int32 stored, Int64 predicate
@@ -499,6 +585,19 @@ fn cmp_mask(col: &ColumnData, op: FilterOp, val: &Value) -> Vec<bool> {
             ColumnData::Bool(v) => v.iter().map(|o| test(o.map(|b| b as i64 as f64))).collect(),
             ColumnData::Text(_) => vec![false; col.len()],
         };
+    }
+    if let ColumnData::Text(values) = col
+        && encode_logical_text(val).is_some()
+    {
+        return values
+            .iter()
+            .map(|value| {
+                value
+                    .as_deref()
+                    .map(decode_columnar_text)
+                    .is_some_and(|value| apply_ord(value.cmp(val), op))
+            })
+            .collect();
     }
     if let (ColumnData::Text(v), Value::Text(s)) = (col, val) {
         return v
@@ -870,10 +969,13 @@ impl StorageEngine for ColumnarStorageEngine {
         }
         {
             let mut tnames = self.table_idx_names.write();
-            tnames
-                .entry(table.to_string())
-                .or_default()
-                .push(index_name.to_string());
+            let names = tnames.entry(table.to_string()).or_default();
+            // Idempotent: re-creating an existing index (e.g. a derived-state
+            // rebuild) must not double-register the name, or per-name index
+            // maintenance would insert every row twice.
+            if !names.iter().any(|n| n == index_name) {
+                names.push(index_name.to_string());
+            }
         }
         Ok(())
     }

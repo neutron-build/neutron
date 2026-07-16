@@ -76,6 +76,11 @@ pub struct EncryptedIndex {
     mode: EncryptionMode,
     /// Mapping from encrypted value → list of row IDs.
     entries: BTreeMap<Vec<u8>, Vec<u64>>,
+    /// Total number of postings (row IDs) across all entries. Tracks the next
+    /// sequential row position for the append-only INSERT path, which — unlike
+    /// [`len`](Self::len) (distinct-ciphertext count) — stays correct when the
+    /// same value appears more than once.
+    postings: u64,
 }
 
 impl EncryptedIndex {
@@ -85,6 +90,7 @@ impl EncryptedIndex {
             key,
             mode,
             entries: BTreeMap::new(),
+            postings: 0,
         }
     }
 
@@ -185,6 +191,7 @@ impl EncryptedIndex {
     pub fn insert(&mut self, plaintext: &[u8], row_id: u64) {
         let encrypted = self.encrypt_value(plaintext);
         self.entries.entry(encrypted).or_default().push(row_id);
+        self.postings += 1;
     }
 
     /// Equality lookup: encrypt `plaintext` and return all row IDs that
@@ -232,6 +239,7 @@ impl EncryptedIndex {
             if ids.is_empty() {
                 self.entries.remove(&encrypted);
             }
+            self.postings = self.postings.saturating_sub(1);
             return true;
         }
         false
@@ -240,6 +248,14 @@ impl EncryptedIndex {
     /// Number of distinct encrypted values in the index.
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Total number of postings (row IDs) across all entries — i.e. the next
+    /// sequential row position for an append. Distinct from [`len`](Self::len),
+    /// which counts distinct ciphertexts: with duplicate values `num_postings`
+    /// keeps advancing while `len` does not.
+    pub fn num_postings(&self) -> u64 {
+        self.postings
     }
 
     /// Whether the index contains no entries.

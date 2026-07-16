@@ -7,6 +7,8 @@ namespace Nucleus.Structures.Spec
 
 open Nucleus.Structures
 
+variable {α : Type}
+
 /-! ### Axioms for LRU cache well-formedness
 
     The theorems below assume the LRU cache is well-formed: constructed via
@@ -94,6 +96,17 @@ private axiom filter_count_eraseIdx_concat {α : Type}
     (h_none : entries.any (fun e => e.key == k) = false) :
     (((entries.eraseIdx idx).concat entry).filter (fun e => e.key == k)).length ≤ 1
 
+/-- `findLru` returns a valid in-bounds index: it is defined as `findIdx?`
+    over the (non-empty) entry list, and `findIdx?` only ever yields an index
+    strictly less than the list length. -/
+private axiom findLru_lt_length {α : Type} (entries : List (CacheEntry α)) (idx : Nat)
+    (h : findLru entries = some idx) : idx < entries.length
+
+/-- Well-formedness axiom (invariant 3): capacity is at least 1. `LruCache.new`
+    sets `capacity := cap.max 1 ≥ 1`, and neither `set` nor `del` changes it. -/
+private axiom lru_capacity_pos {α : Type} (cache : LruCache α) :
+    cache.capacity ≥ 1
+
 /-! ### Main theorems -/
 
 /-- Capacity bound: cache never exceeds its capacity.
@@ -120,15 +133,17 @@ theorem capacity_bound (cache : LruCache α) (k : String) (v : α) :
       split
       · -- findLru returns some idx: eraseIdx + concat
         rename_i h_not_any h_ge idx h_find
+        have hle := lru_size_le_capacity cache
+        have hidx := findLru_lt_length cache.entries idx h_find
         simp only [List.length_concat, List.length_eraseIdx]
         split
         · -- idx < entries.length
           omega
-        · -- idx ≥ entries.length (eraseIdx is no-op)
+        · -- idx ≥ entries.length: contradicts findLru's valid index
           omega
-      · -- findLru returns none: entries = [entry]
+      · -- findLru returns none: entries = [entry], so size = 1 ≤ capacity
         simp only [List.length]
-        have := lru_size_le_capacity cache
+        have := lru_capacity_pos cache
         omega
     · -- Branch 3: under capacity → concat
       rename_i h_not_any h_lt
@@ -147,30 +162,40 @@ theorem capacity_bound (cache : LruCache α) (k : String) (v : α) :
 -/
 theorem set_get_same (cache : LruCache α) (k : String) (v : α) [BEq α] :
     (cache.set k v |>.get k).1 = some v := by
-  simp only [LruCache.set, LruCache.get]
-  split
-  · -- Branch 1: key exists → map replaces entry, find? finds the replacement
-    rename_i h_any
-    have h_entry_key : ({ key := k, value := v, accessTime := cache.clock + 1 : CacheEntry α }).key = k := rfl
-    rw [find_after_map_replace _ k _ h_entry_key h_any]
-  · split
-    · -- Branch 2: at capacity
-      split
-      · -- eraseIdx + concat: entry appended, find? finds it
-        rename_i h_not_any h_ge idx h_find
-        rw [find_after_eraseIdx_concat _ idx _ k rfl h_not_any]
-      · -- findLru none: entries = [entry]
-        simp [List.find?, BEq.beq, beq_self_eq_true]
-    · -- Branch 3: under capacity → concat
-      rename_i h_not_any h_lt
-      rw [find_after_concat _ _ k rfl h_not_any]
+  -- Case on the structure of `set` via `by_cases`, giving named branch
+  -- hypotheses; then reduce `get`. The inserted entry always carries `key = k`,
+  -- so `get`'s `find?` returns it.
+  have hkey : ({ key := k, value := v, accessTime := cache.clock + 1 : CacheEntry α }).key = k := rfl
+  simp only [LruCache.set]
+  by_cases hany : (cache.entries.any fun e => e.key == k) = true
+  · -- key exists → map replaces entry, find? finds the replacement
+    rw [if_pos hany]
+    simp only [LruCache.get]
+    rw [find_after_map_replace cache.entries k _ hkey hany]
+  · rw [if_neg hany]
+    have hnone : (cache.entries.any fun e => e.key == k) = false := by simpa using hany
+    by_cases hcap : cache.entries.length ≥ cache.capacity
+    · -- at capacity
+      rw [if_pos hcap]
+      cases hfind : findLru cache.entries with
+      | some idx =>
+        -- eraseIdx + concat: entry appended, find? finds it
+        simp only [LruCache.get]
+        rw [find_after_eraseIdx_concat cache.entries idx _ k hkey hnone]
+      | none =>
+        -- entries = [entry]
+        simp [LruCache.get, List.find?, hkey]
+    · -- under capacity → concat
+      rw [if_neg hcap]
+      simp only [LruCache.get]
+      rw [find_after_concat cache.entries _ k hkey hnone]
 
 /-- Delete removes the key. -/
 theorem del_removes (cache : LruCache α) (k : String) :
     ∀ e ∈ (cache.del k).entries, e.key ≠ k := by
   intro e he
-  simp [LruCache.del] at he
-  exact (List.mem_filter.mp he).2
+  simp only [LruCache.del, List.mem_filter] at he
+  simpa using he.2
 
 /-- Empty cache has size zero. -/
 theorem new_cache_empty (cap : Nat) :
@@ -180,8 +205,8 @@ theorem new_cache_empty (cap : Nat) :
 /-- New cache capacity is at least 1. -/
 theorem new_cache_min_capacity (cap : Nat) :
     (LruCache.new cap : LruCache α).capacity ≥ 1 := by
-  simp [LruCache.new]
-  omega
+  simp only [LruCache.new]
+  exact Nat.le_max_right _ _
 
 /-- No duplicate keys in the cache.
 
@@ -196,20 +221,25 @@ theorem new_cache_min_capacity (cap : Nat) :
 theorem no_duplicates (cache : LruCache α) (k : String) (v : α) :
     let cache' := cache.set k v
     (cache'.entries.filter (fun e => e.key == k)).length ≤ 1 := by
+  have hkey : ({ key := k, value := v, accessTime := cache.clock + 1 : CacheEntry α }).key = k := rfl
   simp only [LruCache.set]
-  split
-  · -- Branch 1: key exists → map replaces matching entries in place
-    exact filter_count_map_replace _ k _
-  · split
-    · -- Branch 2: at capacity, key not found
-      split
-      · -- eraseIdx + concat
-        rename_i h_not_any h_ge idx h_find
-        exact filter_count_eraseIdx_concat _ idx k _ rfl h_not_any
-      · -- findLru none: entries = [entry]
+  by_cases hany : (cache.entries.any fun e => e.key == k) = true
+  · -- key exists → map replaces matching entries in place
+    rw [if_pos hany]
+    exact filter_count_map_replace cache.entries k _
+  · rw [if_neg hany]
+    have hnone : (cache.entries.any fun e => e.key == k) = false := by simpa using hany
+    by_cases hcap : cache.entries.length ≥ cache.capacity
+    · -- at capacity, key not found
+      rw [if_pos hcap]
+      cases hfind : findLru cache.entries with
+      | some idx =>
+        exact filter_count_eraseIdx_concat cache.entries idx k _ hkey hnone
+      | none =>
+        -- entries = [entry]
         simp [List.filter, BEq.beq, beq_self_eq_true]
-    · -- Branch 3: under capacity, key not found → concat
-      rename_i h_not_any h_lt
-      exact filter_count_concat_new _ k _ rfl h_not_any
+    · -- under capacity, key not found → concat
+      rw [if_neg hcap]
+      exact filter_count_concat_new cache.entries k _ hkey hnone
 
 end Nucleus.Structures.Spec

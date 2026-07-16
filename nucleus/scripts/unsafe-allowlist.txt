@@ -1,0 +1,17 @@
+# Production SIMD implementations and runtime dispatch (CPU feature guarded).
+src/simd/aggregates.rs
+src/simd/avx2.rs
+src/simd/avx512.rs
+src/simd/mod.rs
+src/vector/mod.rs
+
+# Low-level buffer pool, io_uring, and the embedded executor's custom waker.
+src/storage/buffer.rs
+src/storage/io_uring.rs
+src/executor/session.rs
+
+# Test/benchmark-only environment mutation, FFI, and corruption injection.
+src/bin/compete.rs
+src/config/mod.rs
+src/executor/tests/test_index.rs
+src/executor/tests/test_specialty_persistence.rs

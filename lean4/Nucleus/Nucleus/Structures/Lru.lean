@@ -7,6 +7,8 @@
 
 namespace Nucleus.Structures
 
+variable {α : Type}
+
 /-- A cache entry with a key and value. -/
 structure CacheEntry (α : Type) where
   key : String
@@ -38,9 +40,10 @@ def LruCache.get (cache : LruCache α) (k : String) :
 
 /-- Find the index of the least recently used entry. -/
 def findLru (entries : List (CacheEntry α)) : Option Nat :=
-  if entries.isEmpty then none
-  else
-    let minTime := entries.foldl (fun acc e => min acc e.accessTime) entries.head!.accessTime
+  match entries with
+  | [] => none
+  | first :: rest =>
+    let minTime := rest.foldl (fun acc e => min acc e.accessTime) first.accessTime
     entries.findIdx? (fun e => e.accessTime == minTime)
 
 /-- Insert a key-value pair, evicting LRU entry if at capacity. -/

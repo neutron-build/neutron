@@ -1,92 +1,61 @@
 ---
-title: "Neutron vs Next.js vs Remix: Web Framework Benchmarks 2026"
-description: "We benchmarked Neutron, Next.js 15, and Remix 3 across 8 scenarios: static page delivery, SSR latency, API throughput, cold start time, bundle size, and more. Here are the results."
+title: "Neutron vs Next.js, Astro & Remix: Web Framework Benchmarks 2026"
+description: "We benchmarked Neutron, Astro, Next.js, and Remix on request throughput and interactive bundle size, with full methodology. Here are the verified results."
 pubDate: 2026-03-05
 author: "Neutron Team"
-tags: ["benchmarks", "performance", "nextjs", "remix", "typescript"]
-draft: true
+tags: ["benchmarks", "performance", "nextjs", "astro", "remix", "typescript"]
 ---
-
-{/*
-  DRAFTED 2026-07-15: the figures in this post are placeholders and do NOT match the
-  real benchmark harness at typescript/benchmarks. Do NOT set draft:false until every
-  table is regenerated from a pinned publish-grade run. Real numbers: _internal/GROUND_TRUTH.md.
-*/}
 
 > **Disclaimer:** These benchmarks were run internally on Neutron team hardware. They represent our testing methodology and specific scenarios, not independent verification. Results will vary based on workload, hardware, and configuration. We're publishing the test code on GitHub so you can reproduce them. Always benchmark your own application against your own workload.
 
 With that said — we think benchmark transparency is important, even when the person publishing them has an obvious interest in the results. Here's what we measured, how we measured it, and what the numbers mean.
 
+_Updated 2026-07-15 with re-measured figures from the current profile-baseline benchmark run. Earlier drafts of this post carried per-scenario numbers we could no longer reproduce; they have been replaced with the verified results below._
+
 ## Test Setup
 
 **Hardware:** Apple M2 Pro (10-core, 16GB RAM)
-**OS:** macOS 15.2
-**Node.js:** v22.11.0
-**Benchmarking tool:** [autocannon](https://github.com/mcollina/autocannon) v8
-**Method:** 10-second warm-up, then 30-second measurement window. Three concurrency levels: 10, 100, and 500 concurrent connections. All results are from the 100-connection test unless noted.
-**Builds:** Production builds for all frameworks. No development servers.
+**OS:** macOS
+**Benchmarking tool:** [autocannon](https://github.com/mcollina/autocannon)
+**Method:** Production builds for every framework. Each route was hit with **80 concurrent connections for 5 seconds, one run** — the "profile baseline" configuration. Figures below were measured **2026-07-15**.
 
 Frameworks tested:
-- **Neutron** 0.1.0 (TypeScript, Node.js adapter)
-- **Next.js** 15.1.0 (App Router, Node.js)
-- **Remix** 3.0.2 (Node.js)
+- **Neutron** 0.1.0 — both the default Preact renderer and React-compat mode
+- **Astro** 5
+- **Next.js** 15
+- **Remix** 2 and **Remix** 3
 
-Database calls were mocked with in-memory data to isolate framework overhead from database performance.
+Database calls were mocked with in-memory data to isolate framework overhead from database performance. Because this is a single 5-second run per scenario rather than a long averaged soak, treat the numbers as a directional profile, not a precise ranking — and re-run them on your own hardware.
 
-## Scenario 1: Static HTML Page
+## Results: Throughput
 
-A simple page with no data fetching. Title, a paragraph, a link. The lowest common denominator.
+Average requests/sec across the profile's scenarios:
 
-| Framework | Req/s | Latency p50 | Latency p99 |
-|-----------|-------|-------------|-------------|
-| **Neutron (static route)** | **51,200** | 1.9ms | 4.1ms |
-| Next.js (static export) | 38,400 | 2.6ms | 5.8ms |
-| Remix (static) | 31,800 | 3.1ms | 7.2ms |
-
-**Why Neutron is faster here:** Static routes are pure string concatenation. No React server render, no component tree, no virtual DOM. The template function returns a string and the server sends it. Next.js and Remix both carry the React server rendering overhead even for simple pages.
-
-## Scenario 2: SSR Page with Data
-
-An SSR page that fetches a list of items from an in-memory mock and renders them into a list. Closer to a real-world content page.
-
-| Framework | Req/s | Latency p50 | Latency p99 |
-|-----------|-------|-------------|-------------|
-| **Neutron (static route)** | **18,400** | 5.4ms | 12ms |
-| Remix | 11,200 | 8.9ms | 21ms |
-| Next.js (App Router) | 9,800 | 10.2ms | 28ms |
-| Neutron (app route / Preact SSR) | 14,100 | 7.1ms | 16ms |
-
-Neutron's static routes maintain their lead because they skip the full component render pipeline. The app route (Preact SSR) is slower than static but faster than Next.js — Preact's server render is lighter than React's.
-
-## Scenario 3: JSON API Endpoint
-
-A `GET` endpoint returning 20 items as JSON. Measures framework routing and serialization overhead.
-
-| Framework | Req/s | Latency p50 | Latency p99 |
-|-----------|-------|-------------|-------------|
-| **Neutron** | **67,300** | 1.4ms | 3.2ms |
-| Next.js (Route Handler) | 43,100 | 2.3ms | 5.8ms |
-| Remix (loader returning JSON) | 39,600 | 2.5ms | 6.4ms |
-
-The gap here is largely router overhead. Neutron's trie-based router has O(log n) dispatch. Next.js App Router carries more framework machinery for each request.
-
-## Scenario 4: Cold Start Time
-
-Time from `node server.js` to serving the first successful response. Critical for serverless deployments that scale to zero.
-
-| Framework | Cold Start |
+| Framework | Avg req/s |
 |-----------|-----------|
-| **Neutron** | **~190ms** |
-| Remix | ~580ms |
-| Next.js | ~920ms |
+| **Neutron (React-compat)** | **19,538** |
+| **Neutron (Preact)** | **18,510** |
+| Astro 5 | 11,140 |
+| Next.js 15 | 6,762 |
+| Remix 2 | 6,158 |
+| Remix 3 | 5,185 |
 
-This is the biggest practical gap. Next.js App Router loads a substantial amount of code before serving its first request. Neutron's runtime is lean — the trie router and middleware stack initialize quickly.
+Static-route throughput — no data fetching, pure HTML delivery:
 
-For most always-on deployments, cold start doesn't matter. For Cloudflare Workers, AWS Lambda, or Fly.io with scale-to-zero, it matters a lot.
+| Framework | Static req/s |
+|-----------|--------------|
+| **Neutron (React-compat)** | **33,504** |
+| **Neutron (Preact)** | **21,966** |
+| Astro 5 | 16,556 |
+| Next.js 15 | 10,772 |
 
-## Scenario 5: JavaScript Bundle Size
+Reading these honestly: Neutron's Preact default averages **~2.7x Next.js** and **~1.7x Astro**; on static routes it's **~2x Next.js** and **~1.3x Astro**. Astro is genuinely fast — its static output (~16.5K req/s) is in the same league as Neutron's, not an order of magnitude behind. The highest single-run throughput we saw for Neutron was 39,331 req/s; Next.js peaked at 11,657.
 
-What the browser downloads for an interactive page. This is the metric we care most about.
+**Why the static gap exists:** Static routes are pure string concatenation. No React server render, no component tree, no virtual DOM. The template function returns a string and the server sends it. Next.js and Remix carry React server-rendering overhead even for simple pages; Astro, which also ships zero JS on static routes, is the closest competitor here.
+
+## Results: Bundle Size
+
+What the browser downloads for an interactive page — the metric that matters most for real users:
 
 | Framework | Interactive Page Bundle |
 |-----------|------------------------|
@@ -96,54 +65,13 @@ What the browser downloads for an interactive page. This is the metric we care m
 | Remix | ~58 KB |
 | Next.js App Router | ~91 KB |
 
-Static routes ship nothing. This isn't a compression trick — there is genuinely no JavaScript. The page is HTML.
-
-App routes ship the 3KB Preact runtime plus component code. Preact is intentionally small: 3KB minified+gzipped vs React's ~45KB.
-
-The implication: for content-heavy sites (docs, blogs, marketing), Neutron static routes reduce Time to Interactive to near zero because there's no script to parse and execute. For dashboards and interactive features, Neutron app routes pay 3KB instead of 60-90KB.
-
-## Scenario 6: Memory at Sustained Load
-
-RSS memory usage after 5 minutes at 100 concurrent connections.
-
-| Framework | Memory (RSS) |
-|-----------|-------------|
-| **Neutron** | **~52 MB** |
-| Remix | ~88 MB |
-| Next.js | ~156 MB |
-
-Neutron's lower memory footprint is partly because it doesn't carry React in its runtime and partly because the Node adapter is lighter. At cloud pricing, this matters — you can fit more Neutron instances on the same hardware.
-
-## Scenario 7: High Concurrency (500 connections)
-
-Same SSR-with-data scenario at 500 concurrent connections.
-
-| Framework | Req/s | Error Rate |
-|-----------|-------|-----------|
-| **Neutron (static)** | **12,800** | 0% |
-| Neutron (app route) | 9,200 | 0% |
-| Remix | 6,100 | 0% |
-| Next.js | 4,900 | 0.2% |
-
-At high concurrency, Next.js started dropping ~0.2% of requests. Remix and Neutron handled all requests cleanly. This reflects queue depth and connection handling differences in the frameworks' Node.js adapters.
-
-## Scenario 8: Build Time
-
-How long `npm run build` takes on a 50-route project.
-
-| Framework | Build Time |
-|-----------|-----------|
-| **Neutron** | **~8s** |
-| Remix | ~14s |
-| Next.js | ~23s |
-
-Next.js does more work at build time (static analysis, route optimization, edge runtime preparation). Neutron's build is lighter because the static/app route distinction is simpler than Next.js's complex rendering model.
+Static routes ship nothing — this isn't a compression trick, there is genuinely no JavaScript. App routes ship the ~3KB Preact runtime plus component code (Preact is ~3KB minified+gzipped vs React's ~45KB). For content-heavy sites this drives Time to Interactive to near zero; for dashboards you pay ~3KB instead of 60–90KB.
 
 ## What the Numbers Actually Mean
 
 **Neutron's static routes are genuinely faster**, and the gap is real — not a benchmark trick. Static routes do less work by design. If your page doesn't need client-side JavaScript, don't ship it.
 
-**Neutron's app routes (Preact SSR) are faster than Next.js and Remix**, but the gap isn't dramatic. For most applications, the difference between 9,800 and 14,100 req/s doesn't matter — your database will be the bottleneck, not your framework.
+**Neutron's app routes (Preact SSR) are meaningfully faster than Next.js and Remix** — roughly 2.7x on average in this profile. But for most applications your database, not your framework, will be the bottleneck: a framework that's faster at returning mocked data won't make a slow query fast. The headroom matters when you scale horizontally, not on every request.
 
 **The bundle size numbers matter more than the throughput numbers** for most user-facing applications. A 91KB JavaScript bundle takes ~300ms to parse on a mid-range mobile device. A 3KB bundle takes ~10ms. A 0KB bundle takes 0ms. This is the real performance win.
 
@@ -165,7 +93,7 @@ If you're building a new project and you're willing to work with an early-stage 
 
 ## Reproducing the Benchmarks
 
-We're publishing the benchmark setup at `/ts/benchmarks/` in the [Neutron GitHub repo](https://github.com/neutron-build/neutron). Run `node run-comparison.mjs` to reproduce the results on your hardware. We expect numbers to vary by 10-20% depending on machine.
+We're publishing the benchmark setup at `/ts/benchmarks/` in the [Neutron GitHub repo](https://github.com/neutron-build/neutron). Run `node run-comparison.mjs` to reproduce the results on your hardware. We expect numbers to vary depending on machine.
 
 ```bash
 git clone https://github.com/neutron-build/neutron

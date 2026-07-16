@@ -35,7 +35,7 @@ def stateMachineSafety (cluster : RaftCluster) : Prop :=
 
 /-- Step down: receiving a higher term causes step down. -/
 theorem step_down_updates_term (node : RaftNode) (term : Term)
-    (h : term > node.currentTerm) :
+    (_h : term > node.currentTerm) :
     (node.stepDown term).currentTerm = term := by
   simp [RaftNode.stepDown]
 

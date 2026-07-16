@@ -34,6 +34,13 @@ pub struct ServerConfig {
     /// columnar) share this budget. 0 means no limit.
     #[serde(default = "default_max_memory_mb")]
     pub max_memory_mb: usize,
+    /// Seconds a transaction may sit open with no activity before the server
+    /// rolls it back, releasing its MVCC snapshot so GC can advance (T1.3).
+    /// Mirrors Postgres `idle_in_transaction_session_timeout`. 0 disables it
+    /// (the default) — an abandoned `BEGIN` otherwise pins the GC watermark
+    /// forever and grows the database without bound.
+    #[serde(default = "default_idle_in_transaction_timeout_secs")]
+    pub idle_in_transaction_timeout_secs: u64,
 }
 
 fn default_host() -> String {
@@ -51,6 +58,9 @@ fn default_idle_timeout_secs() -> u64 {
 fn default_max_memory_mb() -> usize {
     512
 }
+fn default_idle_in_transaction_timeout_secs() -> u64 {
+    0
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -60,6 +70,7 @@ impl Default for ServerConfig {
             max_connections: default_max_connections(),
             idle_timeout_secs: default_idle_timeout_secs(),
             max_memory_mb: default_max_memory_mb(),
+            idle_in_transaction_timeout_secs: default_idle_in_transaction_timeout_secs(),
         }
     }
 }
@@ -980,6 +991,7 @@ port = 5555
                 max_connections: 42,
                 idle_timeout_secs: 99,
                 max_memory_mb: 512,
+                idle_in_transaction_timeout_secs: 0,
             },
             storage: StorageConfig {
                 data_dir: "/tmp/nucleus".to_string(),

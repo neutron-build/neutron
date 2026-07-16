@@ -8,6 +8,9 @@ namespace Nucleus.Aeneas
 /-- Log Sequence Number — monotonically increasing. -/
 abbrev LSN := Nat
 
+/-- Transaction ID / timestamp (mirrors `Aeneas.Mvcc.TxId`). -/
+abbrev TxId := Nat
+
 /-- Types of WAL records. -/
 inductive WalRecordType where
   | insert

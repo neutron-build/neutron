@@ -270,6 +270,75 @@ async fn pg_error_codes() {
 }
 
 // ============================================================================
+// Regression: constraint enforcement over the WIRE in autocommit mode.
+//
+// Guards the wire-level fast-path constraint-bypass blocker: an autocommit
+// `INSERT` over pgwire MUST enforce PRIMARY KEY / NOT NULL, not silently accept
+// violations. The rest of the suite drives the Executor directly and never
+// exercises the wire fast path, so this bug hid under green tests.
+// ============================================================================
+
+#[tokio::test]
+async fn pg_autocommit_insert_enforces_constraints() {
+    let (port, server) = start_nucleus_server().await;
+    let client = connect(port).await;
+
+    client
+        .simple_query("CREATE TABLE cons_t (id INT PRIMARY KEY, name TEXT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .simple_query("INSERT INTO cons_t VALUES (1, 'alice')")
+        .await
+        .expect("first insert");
+
+    // Duplicate primary key, autocommit — must be rejected (23505), not accepted.
+    let dup = client
+        .simple_query("INSERT INTO cons_t VALUES (1, 'bob')")
+        .await;
+    assert!(
+        dup.is_err(),
+        "duplicate primary key must be rejected, not silently accepted"
+    );
+    if let Some(db_err) = dup.unwrap_err().as_db_error() {
+        assert_eq!(
+            db_err.code(),
+            &tokio_postgres::error::SqlState::UNIQUE_VIOLATION,
+            "duplicate PK should raise unique_violation (23505)"
+        );
+    }
+
+    // NULL into a NOT NULL column, autocommit — must be rejected (23502).
+    let null_row = client
+        .simple_query("INSERT INTO cons_t VALUES (2, NULL)")
+        .await;
+    assert!(
+        null_row.is_err(),
+        "NULL into NOT NULL column must be rejected"
+    );
+    if let Some(db_err) = null_row.unwrap_err().as_db_error() {
+        assert_eq!(
+            db_err.code(),
+            &tokio_postgres::error::SqlState::NOT_NULL_VIOLATION,
+            "NULL into NOT NULL should raise not_null_violation (23502)"
+        );
+    }
+
+    // Exactly one valid row must survive.
+    let rows = client
+        .query("SELECT id FROM cons_t", &[])
+        .await
+        .expect("select");
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the first valid row should persist after both violations were rejected"
+    );
+
+    server.abort();
+}
+
+// ============================================================================
 // Test 5: Data type roundtrip — INT, FLOAT, TEXT, BOOLEAN
 // ============================================================================
 

@@ -1823,3 +1823,42 @@ async fn test_datalog_retract_and_clear() {
     };
     assert_eq!(json, "[]", "should be empty after clear");
 }
+
+#[tokio::test]
+async fn test_ts_retention_wiring_purges_old_points() {
+    // T1.3: a TS_RETENTION policy set via SQL must purge old points when the
+    // periodic task applies it. This exercises the exact call main.rs makes
+    // (`ts_store().write().apply_retention()`) against the same store the SQL
+    // function mutates — locking the wiring, not just apply_retention in isolation.
+    let ex = test_executor();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    exec(&ex, "SELECT TS_INSERT('ret_m', 1000, 1.0)").await; // ancient
+    exec(&ex, &format!("SELECT TS_INSERT('ret_m', {now_ms}, 2.0)")).await; // recent
+    assert_eq!(ex.ts_store().read().total_points(), 2);
+
+    exec(&ex, "SELECT TS_RETENTION(60000)").await; // keep only the last 60s
+    ex.ts_store().write().apply_retention();
+
+    assert_eq!(
+        ex.ts_store().read().total_points(),
+        1,
+        "old point must be purged once the periodic retention task runs; recent point kept"
+    );
+}
+
+#[tokio::test]
+async fn test_query_memory_limit_wiring() {
+    // T1.2: set_query_memory_limit drives the budget the hash-join result
+    // circuit-breaker checks (previously hardcoded to 256 MB, ignoring config).
+    // This tests the wiring the server applies at startup; 0 → unlimited.
+    let ex = test_executor();
+    ex.set_query_memory_limit(4 * 1024 * 1024);
+    assert_eq!(ex.query_memory_limit(), 4 * 1024 * 1024);
+    ex.set_query_memory_limit(64 * 1024 * 1024);
+    assert_eq!(ex.query_memory_limit(), 64 * 1024 * 1024);
+    ex.set_query_memory_limit(0);
+    assert_eq!(ex.query_memory_limit(), u64::MAX, "0 configures no limit");
+}

@@ -508,6 +508,41 @@ impl Executor {
 
         let table_def = self.get_table(&table_name).await?;
 
+        // JSONB containment has a dedicated GIN access path. Keep the full
+        // predicate in the plan so execution can recheck candidates (GIN may
+        // deliberately return false positives for nested array/object pairs).
+        if let Some(where_expr) = where_clause
+            && let Some((column_name, query_value)) = self.extract_gin_contains(where_expr)
+            && !query_value.gin_extract().is_empty()
+            && let Some(index) = self
+                .catalog
+                .get_indexes_cached(&table_name)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|idx| {
+                    matches!(idx.index_type, crate::catalog::IndexType::Gin)
+                        && idx
+                            .columns
+                            .first()
+                            .is_some_and(|column| column.eq_ignore_ascii_case(&column_name))
+                })
+        {
+            return Ok(planner::PlanNode::IndexScan {
+                table: table_name,
+                index_name: index.name.clone(),
+                estimated_rows: 10,
+                estimated_cost: planner::Cost(2.0),
+                lookup_key: Some(where_expr.to_string()),
+                lookup_key_expr: Some(where_expr.clone()),
+                range_lo: None,
+                range_lo_expr: None,
+                range_hi: None,
+                range_hi_expr: None,
+                range_predicate: None,
+                range_predicate_expr: None,
+            });
+        }
+
         // ── Fast path: single PK equality (Fix 4) ──────────────────────
         // When the WHERE clause is exactly `pk_col = literal`, skip the
         // full cost-model planning and emit an IndexScan directly. This
@@ -1087,7 +1122,7 @@ impl Executor {
         let mut seen_columns: HashSet<String> = HashSet::new();
         for constraint in &table_def.constraints {
             let (columns, index_name) = match constraint {
-                TableConstraint::PrimaryKey { columns } => {
+                TableConstraint::PrimaryKey { columns, .. } => {
                     (columns, format!("{}_pkey", table_def.name))
                 }
                 TableConstraint::Unique { name, columns } => {
@@ -1146,6 +1181,32 @@ impl Executor {
     ) -> (HashMap<String, Vec<Expr>>, Option<Expr>) {
         let relation_names = Self::collect_from_relation_names(from);
         let has_outer_join = Self::from_has_outer_join(from);
+        let mut nullable_relations = HashSet::new();
+        for table_with_joins in from {
+            let mut left_relations: HashSet<String> =
+                Self::table_factor_names(&table_with_joins.relation)
+                    .into_iter()
+                    .collect();
+            for join in &table_with_joins.joins {
+                let right_relations: HashSet<String> = Self::table_factor_names(&join.relation)
+                    .into_iter()
+                    .collect();
+                match &join.join_operator {
+                    ast::JoinOperator::Left(_) | ast::JoinOperator::LeftOuter(_) => {
+                        nullable_relations.extend(right_relations.iter().cloned());
+                    }
+                    ast::JoinOperator::Right(_) | ast::JoinOperator::RightOuter(_) => {
+                        nullable_relations.extend(left_relations.iter().cloned());
+                    }
+                    ast::JoinOperator::FullOuter(_) => {
+                        nullable_relations.extend(left_relations.iter().cloned());
+                        nullable_relations.extend(right_relations.iter().cloned());
+                    }
+                    _ => {}
+                }
+                left_relations.extend(right_relations);
+            }
+        }
         // For a single-table FROM (no joins / outer joins) an UNQUALIFIED column
         // predicate (e.g. `WHERE id = 1`) belongs unambiguously to that table, so
         // push it down too. This lets `SELECT … WHERE pk = v` use the storage
@@ -1169,17 +1230,12 @@ impl Executor {
             if refs.len() == 1
                 && let Some(name) = refs.iter().next()
                 && relation_names.contains(name)
+                && !nullable_relations.contains(name)
             {
                 by_relation
                     .entry(name.clone())
                     .or_default()
                     .push(pred.clone());
-                // For outer joins, keep pushed predicates as post-join filters too.
-                // This preserves NULL-extension semantics while still enabling
-                // relation-level pushdown.
-                if has_outer_join {
-                    remaining.push(pred);
-                }
                 continue;
             }
             // Unqualified predicate over the single FROM table → push it there.
@@ -1229,6 +1285,9 @@ impl Executor {
         cte_tables: &CteTableMap,
         pushdown: Option<&HashMap<String, Vec<Expr>>>,
     ) -> Result<Option<(Vec<ColMeta>, Vec<Row>)>, ExecError> {
+        if self.any_rls_active() {
+            return Ok(None);
+        }
         let (condition, join_type) = match &join.join_operator {
             ast::JoinOperator::Join(c) | ast::JoinOperator::Inner(c) => (c, JoinType::Inner),
             ast::JoinOperator::Left(c) | ast::JoinOperator::LeftOuter(c) => (c, JoinType::Left),
@@ -1584,6 +1643,9 @@ impl Executor {
                         let storage = self.storage_for(table);
                         let rows = storage.scan_projected(table, proj_indices).await?;
                         self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                        // Ceiling-check the projected scan against the shared
+                        // query-memory budget (see the full-scan gate below).
+                        drop(self.reserve_query_memory(Self::estimate_rows_bytes(&rows))?);
                         return Ok((proj_meta, rows));
                         // If there IS a filter, fall through to the full scan
                         // path — the filter may reference columns outside the
@@ -1644,6 +1706,15 @@ impl Executor {
                         storage.scan(table).await?
                     };
                     self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                    // Ceiling-check the materialized scan against the shared
+                    // query-memory budget: rejects a single scan too large for
+                    // the limit (the dominant single-query OOM) and throttles
+                    // concurrent large scans, since it counts other queries'
+                    // live join/copy/sort reservations. Transient — the engine
+                    // materializes rows rather than streaming, so a held
+                    // reservation across the pipeline needs the streaming
+                    // refactor; this bounds the peak entry point today.
+                    drop(self.reserve_query_memory(Self::estimate_rows_bytes(&rows))?);
 
                     if let Some(expr) = resolved_expr {
                         // ── Zone map pruning ────────────────────────────────
@@ -1703,6 +1774,36 @@ impl Executor {
                             dtype: c.data_type.clone(),
                         })
                         .collect();
+
+                    let is_gin = self
+                        .catalog
+                        .get_indexes_cached(table)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|idx| {
+                            idx.name == *index_name
+                                && matches!(idx.index_type, crate::catalog::IndexType::Gin)
+                        });
+                    if is_gin {
+                        let predicate = lookup_key_expr.as_ref().cloned().or_else(|| {
+                            lookup_key
+                                .as_ref()
+                                .and_then(|sql| Self::parse_expr_string(sql).ok())
+                        });
+                        if let Some(predicate) = predicate
+                            && let Some((_, mut rows, _, _)) =
+                                self.try_gin_index_scan(table, table, &predicate).await
+                        {
+                            rows.retain(|row| {
+                                self.eval_where_plan(&predicate, row, &meta)
+                                    .unwrap_or(false)
+                            });
+                            return Ok((meta, rows));
+                        }
+                        return Err(ExecError::Unsupported(
+                            "GIN lookup failed, falling back to AST".into(),
+                        ));
+                    }
 
                     // ── Range index scan ──────────────────────────────────────
                     // Use pre-parsed exprs if available, otherwise fall back to parsing
@@ -2463,6 +2564,17 @@ impl Executor {
                                                 .position(|(c, _)| c.eq_ignore_ascii_case(name))
                                         };
                                         if let Some(col_idx) = resolve(&col_name) {
+                                            // Storage fast aggregates operate in f64 and either
+                                            // lose NUMERIC precision or report an empty result for
+                                            // non-primitive physical columns. Exact NUMERIC work is
+                                            // handled by the checked fallback below.
+                                            if matches!(
+                                                ci.get(col_idx).map(|(_, dt)| dt),
+                                                Some(DataType::Numeric)
+                                            ) {
+                                                all_handled = false;
+                                                break;
+                                            }
                                             match func_name.as_str() {
                                                 "SUM" => {
                                                     match tbl_storage.fast_sum_f64(table, col_idx) {
@@ -2620,15 +2732,25 @@ impl Executor {
                         } else {
                             Self::resolve_plan_col_idx(&meta, &col_name)
                         };
-                        // Try SIMD fast-path for SUM/MIN/MAX on numeric columns
-                        let val = col_idx
-                            .and_then(|ci| simd_aggregate(&func_name, ci, &meta, &rows))
-                            .unwrap_or_else(|| compute_aggregate(&func_name, col_idx, &rows));
                         // Resolve the dtype from the aggregate function + the
                         // arg column's type so empty input (Value::Null) doesn't
                         // collapse the column type to TEXT.  Falls back to the
                         // value's dynamic type only when both sides are unknown.
                         let arg_dt = col_idx.and_then(|i| meta.get(i)).map(|c| c.dtype.clone());
+                        let val = if matches!(arg_dt.as_ref(), Some(DataType::Numeric))
+                            && matches!(func_name.as_str(), "SUM" | "AVG")
+                        {
+                            compute_numeric_aggregate(
+                                &func_name,
+                                col_idx.expect("NUMERIC aggregate has a column"),
+                                &rows,
+                            )?
+                        } else {
+                            // Try SIMD fast-path for primitive SUM/MIN/MAX.
+                            col_idx
+                                .and_then(|ci| simd_aggregate(&func_name, ci, &meta, &rows))
+                                .unwrap_or_else(|| compute_aggregate(&func_name, col_idx, &rows))
+                        };
                         let static_dt = match func_name.as_str() {
                             "COUNT" => Some(DataType::Int64),
                             "SUM" => match &arg_dt {
@@ -2639,6 +2761,9 @@ impl Executor {
                                 None => None,
                             },
                             "MAX" | "MIN" => arg_dt.clone(),
+                            "AVG" if matches!(arg_dt.as_ref(), Some(DataType::Numeric)) => {
+                                Some(DataType::Numeric)
+                            }
                             "AVG" | "STDDEV" | "VARIANCE" => Some(DataType::Float64),
                             _ => None,
                         };
@@ -2708,8 +2833,17 @@ impl Executor {
                                     _ => false,
                                 }
                             });
+                            let fast_value_type_ok = val_idx
+                                .and_then(|index| ci.get(index))
+                                .is_none_or(|(_, dtype)| {
+                                    matches!(
+                                        dtype,
+                                        DataType::Int32 | DataType::Int64 | DataType::Float64
+                                    )
+                                });
                             if let Some(ki) = key_idx
                                 && fast_ok
+                                && fast_value_type_ok
                             {
                                 let tbl_storage = self.storage_for(table);
                                 if let Some(groups) = tbl_storage.fast_group_by(table, ki, val_idx)
@@ -2828,6 +2962,9 @@ impl Executor {
                                 None => DataType::Float64,
                             },
                             "MAX" | "MIN" => arg_dt.unwrap_or(DataType::Float64),
+                            "AVG" if matches!(arg_dt.as_ref(), Some(DataType::Numeric)) => {
+                                DataType::Numeric
+                            }
                             "AVG" | "STDDEV" | "VARIANCE" => DataType::Float64,
                             _ => DataType::Float64,
                         };
@@ -2863,11 +3000,23 @@ impl Executor {
                                 } else {
                                     Self::resolve_plan_col_idx(&meta, &col_name)
                                 };
-                                row_out.push(compute_aggregate_refs(
-                                    &func_name,
-                                    col_idx,
-                                    &group_rows,
-                                ));
+                                let numeric = col_idx.is_some_and(|index| {
+                                    matches!(
+                                        meta.get(index).map(|column| &column.dtype),
+                                        Some(DataType::Numeric)
+                                    )
+                                });
+                                let value =
+                                    if numeric && matches!(func_name.as_str(), "SUM" | "AVG") {
+                                        compute_numeric_aggregate_refs(
+                                            &func_name,
+                                            col_idx.expect("NUMERIC aggregate has a column"),
+                                            &group_rows,
+                                        )?
+                                    } else {
+                                        compute_aggregate_refs(&func_name, col_idx, &group_rows)
+                                    };
+                                row_out.push(value);
                             }
                             result_rows.push(row_out);
                         }
@@ -2901,7 +3050,22 @@ impl Executor {
                             } else {
                                 Self::resolve_plan_col_idx(&meta, &col_name)
                             };
-                            row_out.push(compute_aggregate_refs(&func_name, col_idx, &group_rows));
+                            let numeric = col_idx.is_some_and(|index| {
+                                matches!(
+                                    meta.get(index).map(|column| &column.dtype),
+                                    Some(DataType::Numeric)
+                                )
+                            });
+                            let value = if numeric && matches!(func_name.as_str(), "SUM" | "AVG") {
+                                compute_numeric_aggregate_refs(
+                                    &func_name,
+                                    col_idx.expect("NUMERIC aggregate has a column"),
+                                    &group_rows,
+                                )?
+                            } else {
+                                compute_aggregate_refs(&func_name, col_idx, &group_rows)
+                            };
+                            row_out.push(value);
                         }
                         result_rows.push(row_out);
                     }
@@ -3023,6 +3187,26 @@ impl Executor {
                 ast::Value::Null => Ok(Value::Null),
                 _ => Ok(Value::Null),
             },
+            Expr::Interval(interval) => {
+                let value = self.eval_expr_plan(&interval.value, row, meta)?;
+                let Value::Text(raw) = value else {
+                    return Err(ExecError::Runtime(
+                        "INTERVAL value must be a string literal".into(),
+                    ));
+                };
+                parse_interval_literal(&raw, interval.leading_field.as_ref())
+            }
+            Expr::Collate { expr, collation } => {
+                validate_binary_collation(collation)?;
+                self.eval_expr_plan(expr, row, meta)
+            }
+            Expr::AtTimeZone {
+                timestamp,
+                time_zone,
+            } => eval_at_time_zone(
+                self.eval_expr_plan(timestamp, row, meta)?,
+                self.eval_expr_plan(time_zone, row, meta)?,
+            ),
             Expr::BinaryOp { left, op, right } => {
                 let lv = self.eval_expr_plan(left, row, meta)?;
                 let rv = self.eval_expr_plan(right, row, meta)?;
@@ -3045,6 +3229,22 @@ impl Executor {
                 // Postgres semantics requested by callers that don't want a
                 // hard error on unparseable text.
                 let cmp = || super::helpers::compare_values(&lv, &rv);
+                if matches!(op, ast::BinaryOperator::Plus | ast::BinaryOperator::Minus)
+                    && let Some(result) = eval_temporal_arithmetic(&lv, op, &rv)
+                {
+                    return result;
+                }
+                if matches!(
+                    op,
+                    ast::BinaryOperator::Plus
+                        | ast::BinaryOperator::Minus
+                        | ast::BinaryOperator::Multiply
+                        | ast::BinaryOperator::Divide
+                        | ast::BinaryOperator::Modulo
+                ) && let Some(result) = eval_numeric_arithmetic(&lv, op, &rv)
+                {
+                    return result;
+                }
                 match op {
                     ast::BinaryOperator::Eq => {
                         Ok(Value::Bool(cmp() == Some(std::cmp::Ordering::Equal)))
@@ -3168,6 +3368,30 @@ impl Executor {
             Expr::IsNotNull(inner) => {
                 let v = self.eval_expr_plan(inner, row, meta)?;
                 Ok(Value::Bool(v != Value::Null))
+            }
+            Expr::IsTrue(inner) => {
+                let value = self.eval_expr_plan(inner, row, meta)?;
+                Ok(Value::Bool(matches!(value, Value::Bool(true))))
+            }
+            Expr::IsNotTrue(inner) => {
+                let value = self.eval_expr_plan(inner, row, meta)?;
+                Ok(Value::Bool(!matches!(value, Value::Bool(true))))
+            }
+            Expr::IsFalse(inner) => {
+                let value = self.eval_expr_plan(inner, row, meta)?;
+                Ok(Value::Bool(matches!(value, Value::Bool(false))))
+            }
+            Expr::IsNotFalse(inner) => {
+                let value = self.eval_expr_plan(inner, row, meta)?;
+                Ok(Value::Bool(!matches!(value, Value::Bool(false))))
+            }
+            Expr::IsUnknown(inner) => {
+                let value = self.eval_expr_plan(inner, row, meta)?;
+                Ok(Value::Bool(matches!(value, Value::Null)))
+            }
+            Expr::IsNotUnknown(inner) => {
+                let value = self.eval_expr_plan(inner, row, meta)?;
+                Ok(Value::Bool(!matches!(value, Value::Null)))
             }
             Expr::Nested(inner) => self.eval_expr_plan(inner, row, meta),
             Expr::UnaryOp {
@@ -3501,6 +3725,10 @@ impl Executor {
     > {
         Box::pin(async move {
             let saved_plan_cache_key_hint = plan_cache_key;
+            // Every optimization below can bypass ordinary row materialization.
+            // Until it consumes secured scans directly, route RLS queries through
+            // the single fail-closed AST/table-factor path.
+            let rls_guarded = self.any_rls_active();
 
             // Handle CTEs (WITH clause)
             let mut cte_tables = if let Some(ref with) = query.with {
@@ -3526,7 +3754,8 @@ impl Executor {
             // no LIMIT/OFFSET. These always return exactly one row, so post-processing
             // is unnecessary. GROUP BY queries need ORDER BY handling and go through
             // the normal path (which has its own fast aggregate call).
-            if let SetExpr::Select(ref select) = *query.body
+            if !rls_guarded
+                && let SetExpr::Select(ref select) = *query.body
                 && matches!(&select.group_by, ast::GroupByExpr::Expressions(e, _) if e.is_empty())
                 && query.order_by.is_none()
                 && query.limit_clause.is_none()
@@ -3539,7 +3768,8 @@ impl Executor {
             // For `SELECT * FROM table WHERE pk = literal` (no JOINs, ORDER BY, LIMIT,
             // GROUP BY, HAVING, DISTINCT), bypass plan cache and plan executor entirely.
             // Directly calls index_lookup → saves 2 plan clones + 2 write lock acqs.
-            if let SetExpr::Select(ref select) = *query.body
+            if !rls_guarded
+                && let SetExpr::Select(ref select) = *query.body
                 && select.from.len() == 1
                 && select.from[0].joins.is_empty()
                 && select.distinct.is_none()
@@ -3608,6 +3838,7 @@ impl Executor {
                     .map(|v| !v.eq_ignore_ascii_case("off"))
                     .unwrap_or(true); // default ON
                 if use_plan
+                    && !rls_guarded
                     && let SetExpr::Select(ref select) = *query.body
                     && Self::query_eligible_for_plan(select, &query)
                 {
@@ -3830,6 +4061,9 @@ impl Executor {
                     ref mut rows,
                 } = exec_result
             {
+                // The dedup set holds a copy of each distinct row; bound it (plus
+                // the already-materialized input) against the shared budget.
+                let _mem = self.reserve_query_memory(Self::estimate_rows_bytes(rows))?;
                 match distinct {
                     ast::Distinct::Distinct => {
                         // Remove duplicate rows using HashSet for O(n) dedup
@@ -4497,6 +4731,9 @@ impl Executor {
         select: &ast::Select,
         cte_tables: &CteTableMap,
     ) -> Result<Option<ExecResult>, ExecError> {
+        if self.any_rls_active() {
+            return Ok(None);
+        }
         // Guard 1: single FROM table, no JOINs
         if select.from.len() != 1 || !select.from[0].joins.is_empty() {
             return Ok(None);
@@ -4659,6 +4896,12 @@ impl Executor {
                                 Some(i) => i,
                                 None => return Ok(None),
                             };
+                            if !matches!(
+                                col_info[ci].1,
+                                DataType::Int32 | DataType::Int64 | DataType::Float64
+                            ) {
+                                return Ok(None);
+                            }
                             items.push((col_label, FastAgg::Sum(ci)));
                         }
                         "AVG" => {
@@ -4666,6 +4909,12 @@ impl Executor {
                                 Some(i) => i,
                                 None => return Ok(None),
                             };
+                            if !matches!(
+                                col_info[ci].1,
+                                DataType::Int32 | DataType::Int64 | DataType::Float64
+                            ) {
+                                return Ok(None);
+                            }
                             items.push((col_label, FastAgg::Avg(ci)));
                         }
                         "MIN" => {
@@ -4673,6 +4922,12 @@ impl Executor {
                                 Some(i) => i,
                                 None => return Ok(None),
                             };
+                            if !matches!(
+                                col_info[ci].1,
+                                DataType::Int32 | DataType::Int64 | DataType::Float64
+                            ) {
+                                return Ok(None);
+                            }
                             items.push((col_label, FastAgg::Min(ci)));
                         }
                         "MAX" => {
@@ -4680,6 +4935,12 @@ impl Executor {
                                 Some(i) => i,
                                 None => return Ok(None),
                             };
+                            if !matches!(
+                                col_info[ci].1,
+                                DataType::Int32 | DataType::Int64 | DataType::Float64
+                            ) {
+                                return Ok(None);
+                            }
                             items.push((col_label, FastAgg::Max(ci)));
                         }
                         _ => return Ok(None),
@@ -4944,6 +5205,9 @@ impl Executor {
         };
         let col_idx = resolve_col(col_name)?;
         let val = Self::ast_expr_to_literal(lit_expr)?;
+        if matches!(val, Value::Null) {
+            return None;
+        }
         Some((col_idx, fop, val))
     }
 
@@ -4999,7 +5263,9 @@ impl Executor {
                 right,
             } => {
                 // Try right side as literal (col = literal)
-                Self::ast_expr_to_literal(right).or_else(|| Self::ast_expr_to_literal(left))
+                Self::ast_expr_to_literal(right)
+                    .or_else(|| Self::ast_expr_to_literal(left))
+                    .filter(|value| !matches!(value, Value::Null))
             }
             _ => None,
         }
@@ -5516,6 +5782,9 @@ impl Executor {
         where_expr: &Expr,
         col_meta: &[ColMeta],
     ) -> Option<(Vec<Row>, usize)> {
+        if self.rls_active(table_name) {
+            return None;
+        }
         // Returns `(matched_rows, rows_examined)`. `rows_examined` is the seq-scan
         // size the caller reports to the `rows_scanned` metric. For equality the
         // engine reports the true examined count; for range scans (which do not yet
@@ -5612,6 +5881,9 @@ impl Executor {
         cte_tables: &CteTableMap,
         order_by_cols: &[String],
     ) -> Option<ExecResult> {
+        if self.rls_active(table_name) {
+            return None;
+        }
         // Only single-table, no-join queries
         if select.from.len() != 1 || !select.from[0].joins.is_empty() {
             return None;
@@ -5820,6 +6092,9 @@ impl Executor {
         label: &str,
         where_expr: &Expr,
     ) -> IndexScanResult {
+        if self.rls_active(table_name) {
+            return None;
+        }
         let (eq_preds, range_preds, _remaining) = self.extract_index_predicates(where_expr);
         if eq_preds.is_empty() && range_preds.is_empty() {
             return None;
@@ -5877,6 +6152,74 @@ impl Executor {
         None
     }
 
+    fn extract_gin_contains(&self, expr: &Expr) -> Option<(String, crate::document::JsonValue)> {
+        match expr {
+            Expr::Nested(inner) => self.extract_gin_contains(inner),
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::And,
+                right,
+            } => self
+                .extract_gin_contains(left)
+                .or_else(|| self.extract_gin_contains(right)),
+            Expr::BinaryOp {
+                left,
+                op: ast::BinaryOperator::AtArrow,
+                right,
+            } => {
+                let column = match left.as_ref() {
+                    Expr::Identifier(ident) => ident.value.clone(),
+                    Expr::CompoundIdentifier(parts) => parts.last()?.value.clone(),
+                    _ => return None,
+                };
+                let value = self.eval_const_expr(right).ok()?;
+                Some((column, value_to_doc_json(&value)?))
+            }
+            _ => None,
+        }
+    }
+
+    /// Narrow a JSONB containment query through a live GIN posting map. The
+    /// storage scan and full predicate recheck remain authoritative, so a stale
+    /// or lossy posting representation can never manufacture a result.
+    pub(super) async fn try_gin_index_scan(
+        &self,
+        table_name: &str,
+        label: &str,
+        where_expr: &Expr,
+    ) -> IndexScanResult {
+        if self.rls_active(table_name) || self.current_session().txn_state.read().await.active {
+            return None;
+        }
+        let (column_name, query) = self.extract_gin_contains(where_expr)?;
+        if query.gin_extract().is_empty() {
+            return None;
+        }
+
+        let candidates = {
+            let indexes = self.gin_indexes.read();
+            let generation = self
+                .gin_write_gen
+                .load(std::sync::atomic::Ordering::Acquire);
+            let entry = indexes.values().find(|entry| {
+                entry.table_name == table_name
+                    && entry.column_name.eq_ignore_ascii_case(&column_name)
+                    && entry.generation == generation
+            })?;
+            entry.index.query_contains(&query)
+        };
+
+        let all_rows = self.storage_for(table_name).scan(table_name).await.ok()?;
+        self.metrics.rows_scanned.inc_by(all_rows.len() as u64);
+        let rows = all_rows
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row_id, row)| candidates.contains(&(row_id as u64)).then_some(row))
+            .collect();
+        let col_meta = self.build_col_meta_from_cache(table_name, label)?;
+        Some((col_meta, rows, Some(where_expr.clone()), None))
+    }
+
     /// SELECT execution that is CTE-aware -- delegates to load_table_factor_with_ctes.
     pub(super) async fn execute_select_inner_with_ctes(
         &self,
@@ -5894,7 +6237,9 @@ impl Executor {
         // Columnar fast-aggregate (before any row scan)
         // Intercepts COUNT(*) / SUM / AVG / GROUP BY on ColumnarStorageEngine tables.
         // Returns None if the engine doesn't support it or the pattern is unsupported.
-        if let Some(fast) = self.try_columnar_fast_aggregate(select, cte_tables)? {
+        if !self.any_rls_active()
+            && let Some(fast) = self.try_columnar_fast_aggregate(select, cte_tables)?
+        {
             return Ok(SelectResult::Projected(fast));
         }
 
@@ -5902,7 +6247,8 @@ impl Executor {
         // (SELECT list + WHERE) are covered by a single B-tree index, return
         // results directly from the index without any heap/table access.
         // This achieves 1.5-2x speedup for covering index queries.
-        if select.from.len() == 1
+        if !self.any_rls_active()
+            && select.from.len() == 1
             && select.from[0].joins.is_empty()
             && let TableFactor::Table {
                 name,
@@ -5926,35 +6272,44 @@ impl Executor {
         // Index-aware optimization (fully synchronous)
         // For simple single-table queries with WHERE equality predicates,
         // try to use a B-tree index instead of a full table scan.
-        let index_result: IndexScanResult =
-            if select.from.len() == 1 && select.from[0].joins.is_empty() {
-                if let (
-                    Some(selection),
-                    TableFactor::Table {
-                        name,
-                        alias,
-                        args: None,
-                        ..
-                    },
-                ) = (&select.selection, &select.from[0].relation)
-                {
-                    let table_name = name.to_string();
-                    let label = alias
-                        .as_ref()
-                        .map(|a| a.name.value.clone())
-                        .unwrap_or_else(|| table_name.clone());
-                    // Don't try index scan for CTEs or virtual tables
-                    if !cte_tables.contains_key(&table_name) {
-                        self.try_index_scan_sync(&table_name, &label, selection)
+        let index_result: IndexScanResult = if !self.any_rls_active()
+            && select.from.len() == 1
+            && select.from[0].joins.is_empty()
+        {
+            if let (
+                Some(selection),
+                TableFactor::Table {
+                    name,
+                    alias,
+                    args: None,
+                    ..
+                },
+            ) = (&select.selection, &select.from[0].relation)
+            {
+                let table_name = name.to_string();
+                let label = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| table_name.clone());
+                // Don't try index scan for CTEs or virtual tables
+                if !cte_tables.contains_key(&table_name) {
+                    if let Some(gin) = self
+                        .try_gin_index_scan(&table_name, &label, selection)
+                        .await
+                    {
+                        Some(gin)
                     } else {
-                        None
+                        self.try_index_scan_sync(&table_name, &label, selection)
                     }
                 } else {
                     None
                 }
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         let (col_meta, filtered, sorted_by_col) =
             if let Some((col_meta, rows, remaining_where, sorted_by)) = index_result {
@@ -5972,8 +6327,8 @@ impl Executor {
                     rows
                 };
                 (col_meta, filtered, sorted_by)
-            } else if let Some((col_meta, rows)) =
-                self.try_columnar_filtered_scan(select, cte_tables)
+            } else if !self.any_rls_active()
+                && let Some((col_meta, rows)) = self.try_columnar_filtered_scan(select, cte_tables)
             {
                 // Columnar filter pushdown: engine filtered non-matching rows before
                 // materialising -- no further WHERE evaluation needed.
@@ -6011,6 +6366,13 @@ impl Executor {
                 };
                 (col_meta, filtered, None)
             };
+
+        // Ceiling-check the materialized/filtered row set against the shared
+        // query-memory budget before the blocking operators (window / aggregate
+        // / DISTINCT / sort) consume it. This is the direct executor's scan
+        // choke point — the plan executor is gated at its own scan sites — so a
+        // large GROUP BY/ORDER BY here can't OOM the box.
+        drop(self.reserve_query_memory(Self::estimate_rows_bytes(&filtered))?);
 
         // Check for window functions
         let has_window = select.projection.iter().any(|item| match item {
@@ -6078,7 +6440,8 @@ impl Executor {
         // When FROM t1, t2 WHERE t1.pk = t2.fk AND t2.filter, defer loading t1
         // until we know the join strategy. If t2 is small and t1's join key is
         // indexed, use batch index lookups instead of scanning all of t1.
-        if from.len() == 2
+        if !self.any_rls_active()
+            && from.len() == 2
             && from[0].joins.is_empty()
             && from[1].joins.is_empty()
             && !remaining_preds.is_empty()
@@ -6283,7 +6646,10 @@ impl Executor {
                 // Index nested-loop optimization: when one side is small and the
                 // join key on the other side is indexed, replace the full table
                 // with batch index lookups — avoids scanning the large table.
-                let effective_left = if filtered_right.len() < 1000 && left_keys.len() == 1 {
+                let effective_left = if !self.any_rls_active()
+                    && filtered_right.len() < 1000
+                    && left_keys.len() == 1
+                {
                     let lk = left_keys[0];
                     let rk = right_keys[0];
                     let left_col = &col_meta[lk];
@@ -6463,6 +6829,11 @@ impl Executor {
                     .get(&table_name)
                     .cloned();
                 if let Some(mv) = mv_opt {
+                    if self.any_rls_active() {
+                        return Err(ExecError::PermissionDenied(format!(
+                            "materialized view '{table_name}' is unavailable while row-level security is active; refreshable snapshots do not yet preserve invoker-policy semantics"
+                        )));
+                    }
                     let col_meta: Vec<ColMeta> = mv
                         .columns
                         .iter()
@@ -6505,7 +6876,8 @@ impl Executor {
 
                 // For JOIN-aware AST execution, attempt indexed lookup using relation-local
                 // pushdown predicates before falling back to full table scan.
-                if let Some(where_expr) = pushdown_expr
+                if !self.rls_active(&table_name)
+                    && let Some(where_expr) = pushdown_expr
                     && let Some((col_meta, rows, remaining_where, _sorted_by)) =
                         self.try_index_scan_sync(&table_name, &label, where_expr)
                 {
@@ -6530,7 +6902,8 @@ impl Executor {
                     .collect();
 
                 // Try storage-level filtered scan for pushed-down predicates
-                if let Some(where_expr) = pushdown_expr
+                if !self.rls_active(&table_name)
+                    && let Some(where_expr) = pushdown_expr
                     && let Some((rows, examined)) =
                         self.try_storage_fast_scan(&table_name, where_expr, &col_meta)
                 {
@@ -6541,6 +6914,8 @@ impl Executor {
 
                 let mut rows = self.storage_for(&table_name).scan(&table_name).await?;
                 self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                rows =
+                    self.rls_filter_rows(&table_name, crate::security::PolicyCommand::Select, rows);
 
                 // ── Zone map pruning ────────────────────────────────────
                 // If a pushdown predicate is available, try to skip entire
@@ -6845,6 +7220,14 @@ impl Executor {
         projection: Option<&[SelectItem]>,
         top_k: Option<usize>,
     ) -> Result<(), ExecError> {
+        // A full sort holds every input row plus sort-key/index buffers; bound it
+        // against the shared query-memory budget so a huge ORDER BY returns a
+        // clean MemoryExceeded (53200) instead of OOM-ing the box. A top-k sort
+        // is already bounded to k, so it is exempt.
+        let _mem = match top_k {
+            None => Some(self.reserve_query_memory(Self::estimate_rows_bytes(rows))?),
+            Some(_) => None,
+        };
         let all_exprs: Vec<ast::OrderByExpr>;
         let exprs = match &ob.kind {
             ast::OrderByKind::Expressions(exprs) => exprs,

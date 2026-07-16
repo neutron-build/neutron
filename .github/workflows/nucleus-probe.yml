@@ -30,6 +30,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: 1
 
 jobs:
@@ -57,3 +58,11 @@ jobs:
       - name: Run probe suite (${{ steps.scale.outputs.scale }})
         run: PROBE_SCALE=${{ steps.scale.outputs.scale }} bash scripts/probe.sh
         working-directory: nucleus
+      - name: Upload failing probe commands and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nucleus-probe-failures-${{ github.run_id }}
+          path: nucleus/probe-artifacts
+          if-no-files-found: ignore
+          retention-days: 30

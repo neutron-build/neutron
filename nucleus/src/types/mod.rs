@@ -2,9 +2,28 @@
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::str::FromStr;
+
+use rust_decimal::Decimal;
+
+/// Parse the bounded exact NUMERIC representation used by Nucleus. The current
+/// physical type is rust_decimal (96-bit coefficient, scale <= 28); values
+/// outside that range reject explicitly instead of degrading to f64.
+pub(crate) fn parse_numeric(value: &str) -> Result<Decimal, String> {
+    Decimal::from_str(value.trim()).map_err(|error| format!("invalid numeric value: {error}"))
+}
+
+pub(crate) fn canonical_numeric(value: &str) -> Result<String, String> {
+    parse_numeric(value).map(|decimal| decimal.normalize().to_string())
+}
 
 /// A value in Nucleus. All data flows through this enum.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `PartialEq`/`Eq`/`Hash`/`Ord` are hand-implemented (not derived) so integer widths
+/// (`Int32`/`Int64`) are interchangeable as keys everywhere — the same logical SQL value
+/// must compare, hash, and index-encode identically regardless of width. See
+/// [`Value::as_canonical_int`].
+#[derive(Debug, Clone)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -239,6 +258,73 @@ pub fn ymd_to_days(year: i32, month: u32, day: u32) -> i32 {
     jdn - 2451545 // subtract J2000 epoch
 }
 
+/// Strict ISO date parser used by casts and write coercion.
+pub fn parse_date(value: &str) -> Result<i32, String> {
+    let parts: Vec<&str> = value.trim().split('-').collect();
+    if parts.len() != 3 {
+        return Err(format!("invalid date value: {value}"));
+    }
+    let year = parts[0]
+        .parse::<i32>()
+        .map_err(|_| format!("invalid date value: {value}"))?;
+    let month = parts[1]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid date value: {value}"))?;
+    let day = parts[2]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid date value: {value}"))?;
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return Err(format!("date field value out of range: {value}"));
+    }
+    Ok(ymd_to_days(year, month, day))
+}
+
+/// Strict ISO timestamp-without-time-zone parser with microsecond precision.
+pub fn parse_timestamp(value: &str) -> Result<i64, String> {
+    let value = value.trim();
+    let (date, time) = value
+        .split_once([' ', 'T'])
+        .map_or((value, "00:00:00"), |parts| parts);
+    let days = parse_date(date)? as i64;
+    let pieces: Vec<&str> = time.split(':').collect();
+    if pieces.len() != 3 {
+        return Err(format!("invalid timestamp value: {value}"));
+    }
+    let hour = pieces[0]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid timestamp value: {value}"))?;
+    let minute = pieces[1]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid timestamp value: {value}"))?;
+    let (second_text, fraction_text) = pieces[2]
+        .split_once('.')
+        .map_or((pieces[2], None), |(second, fraction)| {
+            (second, Some(fraction))
+        });
+    let second = second_text
+        .parse::<u32>()
+        .map_err(|_| format!("invalid timestamp value: {value}"))?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return Err(format!("timestamp field value out of range: {value}"));
+    }
+    let fraction = match fraction_text {
+        None => 0,
+        Some(text) if !text.is_empty() && text.len() <= 6 => {
+            let parsed = text
+                .parse::<u32>()
+                .map_err(|_| format!("invalid timestamp value: {value}"))?;
+            parsed * 10u32.pow(6 - text.len() as u32)
+        }
+        Some(_) => return Err(format!("timestamp precision exceeds 6 digits: {value}")),
+    };
+    days.checked_mul(86_400_000_000)
+        .and_then(|base| base.checked_add(hour as i64 * 3_600_000_000))
+        .and_then(|base| base.checked_add(minute as i64 * 60_000_000))
+        .and_then(|base| base.checked_add(second as i64 * 1_000_000))
+        .and_then(|base| base.checked_add(fraction as i64))
+        .ok_or_else(|| "timestamp value out of range".to_string())
+}
+
 /// Format microseconds since 2000-01-01 as "YYYY-MM-DD HH:MM:SS.ffffff".
 fn format_timestamp(f: &mut fmt::Formatter<'_>, us: i64) -> fmt::Result {
     let total_secs = us / 1_000_000;
@@ -329,7 +415,16 @@ impl Value {
             (Value::Int64(_), DataType::Int64) => Ok(self.clone()),
             (Value::Float64(_), DataType::Float64) => Ok(self.clone()),
             (Value::Text(_), DataType::Text) => Ok(self.clone()),
-            (Value::Numeric(_), DataType::Numeric) => Ok(self.clone()),
+            (Value::Numeric(s), DataType::Numeric) => canonical_numeric(s).map(Value::Numeric),
+            (Value::Jsonb(_), DataType::Jsonb)
+            | (Value::Date(_), DataType::Date)
+            | (Value::Timestamp(_), DataType::Timestamp)
+            | (Value::TimestampTz(_), DataType::TimestampTz)
+            | (Value::Uuid(_), DataType::Uuid)
+            | (Value::Bytea(_), DataType::Bytea)
+            | (Value::Array(_), DataType::Array(_))
+            | (Value::Vector(_), DataType::Vector(_))
+            | (Value::Interval { .. }, DataType::Interval) => Ok(self.clone()),
             // Bool conversions
             (Value::Bool(b), DataType::Int32) => Ok(Value::Int32(if *b { 1 } else { 0 })),
             (Value::Bool(b), DataType::Int64) => Ok(Value::Int64(if *b { 1 } else { 0 })),
@@ -370,7 +465,9 @@ impl Value {
                 Ok(Value::Int64(rounded as i64))
             }
             (Value::Float64(n), DataType::Text) => Ok(Value::Text(n.to_string())),
-            (Value::Float64(n), DataType::Numeric) => Ok(Value::Numeric(n.to_string())),
+            (Value::Float64(n), DataType::Numeric) => {
+                canonical_numeric(&n.to_string()).map(Value::Numeric)
+            }
             // Text conversions
             (Value::Text(s), DataType::Int32) => s
                 .parse::<i32>()
@@ -389,7 +486,16 @@ impl Value {
                 "false" | "f" | "0" | "no" | "off" => Ok(Value::Bool(false)),
                 _ => Err(format!("cannot cast '{s}' to boolean")),
             },
-            (Value::Text(s), DataType::Numeric) => Ok(Value::Numeric(s.clone())),
+            (Value::Text(s), DataType::Numeric) => canonical_numeric(s).map(Value::Numeric),
+            (Value::Text(s), DataType::Date) => parse_date(s).map(Value::Date),
+            (Value::Text(s), DataType::Timestamp) => parse_timestamp(s).map(Value::Timestamp),
+            (Value::Text(s), DataType::TimestampTz) => parse_timestamp(s).map(Value::TimestampTz),
+            (Value::Text(s), DataType::Uuid) => parse_uuid(s).map(Value::Uuid),
+            (Value::Text(s), DataType::Bytea) => Ok(Value::Bytea(s.as_bytes().to_vec())),
+            (Value::Text(s), DataType::Jsonb) => serde_json::from_str(s)
+                .map(Value::Jsonb)
+                .map_err(|error| format!("invalid JSON: {error}")),
+            (Value::Text(_), DataType::UserDefined(_)) => Ok(self.clone()),
             // Numeric conversions
             (Value::Numeric(s), DataType::Int32) => s
                 .parse::<i32>()
@@ -404,9 +510,42 @@ impl Value {
                 .map(Value::Float64)
                 .map_err(|e| e.to_string()),
             (Value::Numeric(s), DataType::Text) => Ok(Value::Text(s.clone())),
+            (Value::Date(days), DataType::Timestamp) => (*days as i64)
+                .checked_mul(86_400_000_000)
+                .map(Value::Timestamp)
+                .ok_or_else(|| "timestamp value out of range".to_string()),
+            (Value::Date(days), DataType::TimestampTz) => (*days as i64)
+                .checked_mul(86_400_000_000)
+                .map(Value::TimestampTz)
+                .ok_or_else(|| "timestamp value out of range".to_string()),
+            (Value::Timestamp(value), DataType::Date)
+            | (Value::TimestampTz(value), DataType::Date) => {
+                i32::try_from(value.div_euclid(86_400_000_000))
+                    .map(Value::Date)
+                    .map_err(|_| "date value out of range".to_string())
+            }
+            (Value::Timestamp(value), DataType::TimestampTz) => Ok(Value::TimestampTz(*value)),
+            (Value::TimestampTz(value), DataType::Timestamp) => Ok(Value::Timestamp(*value)),
             // Fallback: use Display
             (_, DataType::Text) => Ok(Value::Text(self.to_string())),
             _ => Err(format!("cannot cast {} to {target}", self.type_name())),
+        }
+    }
+
+    /// Canonical `i64` if this is an integer (`Int32`/`Int64`), else `None`.
+    ///
+    /// Integer widths are the same logical SQL value, so equality, hashing, and B-tree
+    /// index-key encoding all canonicalize through this — `Int32(n)` and `Int64(n)` must
+    /// be interchangeable as keys everywhere (`PartialEq`/`Hash` agree with `Ord`). This
+    /// is what keeps indexed lookups, UNIQUE enforcement, joins, GROUP BY, and DISTINCT
+    /// correct when the same value is stored at different widths (`VALUES` yields `Int32`,
+    /// `INSERT ... SELECT`/`generate_series` yields `Int64`).
+    #[inline]
+    pub(crate) fn as_canonical_int(&self) -> Option<i64> {
+        match self {
+            Value::Int32(n) => Some(*n as i64),
+            Value::Int64(n) => Some(*n),
+            _ => None,
         }
     }
 
@@ -455,18 +594,79 @@ impl Value {
     }
 }
 
+impl PartialEq for Value {
+    fn eq(&self, other: &Value) -> bool {
+        // Integer widths (`Int32`/`Int64`) are value-equal — the same logical SQL value —
+        // matching `Ord`. This keeps every `HashMap`/`HashSet`/`==`-keyed structure
+        // consistent with every `BTreeMap`/sort-keyed one, which is what makes indexed
+        // lookups, UNIQUE enforcement, joins, GROUP BY, and DISTINCT correct across widths.
+        // (Int↔Float stays strict here: columns are single-typed and folding floats would
+        // perturb DISTINCT/GROUP BY; the `Ord` int/float coercion is a separate legacy case.)
+        if let (Some(a), Some(b)) = (self.as_canonical_int(), other.as_canonical_int()) {
+            return a == b;
+        }
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Float64(a), Value::Float64(b)) => a == b,
+            (Value::Text(a), Value::Text(b)) => a == b,
+            (Value::Jsonb(a), Value::Jsonb(b)) => a == b,
+            (Value::Date(a), Value::Date(b)) => a == b,
+            (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
+            (Value::TimestampTz(a), Value::TimestampTz(b)) => a == b,
+            (Value::Numeric(a), Value::Numeric(b)) => match (parse_numeric(a), parse_numeric(b)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => a == b,
+            },
+            (Value::Uuid(a), Value::Uuid(b)) => a == b,
+            (Value::Bytea(a), Value::Bytea(b)) => a == b,
+            (Value::Array(a), Value::Array(b)) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => a == b,
+            (
+                Value::Interval {
+                    months: am,
+                    days: ad,
+                    microseconds: aus,
+                },
+                Value::Interval {
+                    months: bm,
+                    days: bd,
+                    microseconds: bus,
+                },
+            ) => am == bm && ad == bd && aus == bus,
+            _ => false,
+        }
+    }
+}
+
 impl Eq for Value {}
+
+/// Fixed tag mixed into integer hashes so `Int32(n)` and `Int64(n)` (which are now
+/// `PartialEq`-equal) also hash equal, independent of their enum discriminant. Any
+/// constant works — collisions with other variants are harmless; only equal-hashes-
+/// for-equal-values matters.
+const INT_HASH_TAG: u8 = 0xF1;
 
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        // Integers hash by canonical `i64` (behind a fixed tag) so `Int32(n)` and
+        // `Int64(n)` land in the same bucket — required for `Hash`/`Eq` agreement now
+        // that they are equal. Everything else keeps the discriminant-first scheme.
+        if let Some(i) = self.as_canonical_int() {
+            INT_HASH_TAG.hash(state);
+            i.hash(state);
+            return;
+        }
         core::mem::discriminant(self).hash(state);
         match self {
             Value::Null => {}
             Value::Bool(b) => b.hash(state),
-            Value::Int32(n) => n.hash(state),
-            Value::Int64(n) => n.hash(state),
+            Value::Int32(_) | Value::Int64(_) => unreachable!("integers handled above"),
             Value::Float64(f) => f.to_bits().hash(state),
-            Value::Text(s) | Value::Numeric(s) => s.hash(state),
+            Value::Text(s) => s.hash(state),
+            Value::Numeric(s) => canonical_numeric(s)
+                .unwrap_or_else(|_| s.clone())
+                .hash(state),
             Value::Jsonb(v) => format!("{v}").hash(state),
             Value::Date(d) => d.hash(state),
             Value::Timestamp(t) | Value::TimestampTz(t) => t.hash(state),
@@ -519,12 +719,10 @@ impl Ord for Value {
                 }
             }
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
-            (Value::Numeric(a), Value::Numeric(b)) => {
-                // Parse as f64 for proper numeric ordering (not lexicographic)
-                let av: f64 = a.parse().unwrap_or(f64::NAN);
-                let bv: f64 = b.parse().unwrap_or(f64::NAN);
-                av.partial_cmp(&bv).unwrap_or(Ordering::Equal)
-            }
+            (Value::Numeric(a), Value::Numeric(b)) => match (parse_numeric(a), parse_numeric(b)) {
+                (Ok(a), Ok(b)) => a.cmp(&b),
+                _ => a.cmp(b),
+            },
             (Value::Date(a), Value::Date(b)) => a.cmp(b),
             (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
             (Value::TimestampTz(a), Value::TimestampTz(b)) => a.cmp(b),
@@ -633,75 +831,77 @@ pub fn timestamp_add_interval(ts_us: i64, months: i32, days: i32, microseconds: 
 }
 
 // ============================================================================
-// Numeric (arbitrary-precision) arithmetic helpers
+// Numeric (bounded exact-decimal) arithmetic helpers
 // ============================================================================
 
-/// Add two numeric strings, returning the result as a string.
-///
-/// Uses f64 internally as a pragmatic first step; a true arbitrary-precision
-/// decimal library can replace this later.
-pub fn numeric_add(a: &str, b: &str) -> String {
-    let av: f64 = a.parse().unwrap_or(0.0);
-    let bv: f64 = b.parse().unwrap_or(0.0);
-    format_numeric(av + bv)
+fn checked_numeric_binary(
+    a: &str,
+    b: &str,
+    operation: impl FnOnce(Decimal, Decimal) -> Option<Decimal>,
+) -> Result<String, String> {
+    operation(parse_numeric(a)?, parse_numeric(b)?)
+        .map(|value| value.normalize().to_string())
+        .ok_or_else(|| "numeric value out of range".to_string())
+}
+
+/// Add two exact numeric strings.
+pub fn numeric_add(a: &str, b: &str) -> Result<String, String> {
+    checked_numeric_binary(a, b, Decimal::checked_add)
 }
 
 /// Subtract two numeric strings (a - b).
-pub fn numeric_sub(a: &str, b: &str) -> String {
-    let av: f64 = a.parse().unwrap_or(0.0);
-    let bv: f64 = b.parse().unwrap_or(0.0);
-    format_numeric(av - bv)
+pub fn numeric_sub(a: &str, b: &str) -> Result<String, String> {
+    checked_numeric_binary(a, b, Decimal::checked_sub)
 }
 
 /// Multiply two numeric strings.
-pub fn numeric_mul(a: &str, b: &str) -> String {
-    let av: f64 = a.parse().unwrap_or(0.0);
-    let bv: f64 = b.parse().unwrap_or(0.0);
-    format_numeric(av * bv)
+pub fn numeric_mul(a: &str, b: &str) -> Result<String, String> {
+    checked_numeric_binary(a, b, Decimal::checked_mul)
 }
 
 /// Divide two numeric strings (a / b), returning an error on division by zero.
 pub fn numeric_div(a: &str, b: &str) -> Result<String, String> {
-    let av: f64 = a.parse().unwrap_or(0.0);
-    let bv: f64 = b.parse().unwrap_or(0.0);
-    if bv == 0.0 {
+    let divisor = parse_numeric(b)?;
+    if divisor.is_zero() {
         return Err("division by zero".to_string());
     }
-    Ok(format_numeric(av / bv))
+    parse_numeric(a)?
+        .checked_div(divisor)
+        .map(|value| value.normalize().to_string())
+        .ok_or_else(|| "numeric value out of range".to_string())
 }
 
 /// Remainder of two numeric strings (a % b).
 pub fn numeric_rem(a: &str, b: &str) -> Result<String, String> {
-    let av: f64 = a.parse().unwrap_or(0.0);
-    let bv: f64 = b.parse().unwrap_or(0.0);
-    if bv == 0.0 {
+    let divisor = parse_numeric(b)?;
+    if divisor.is_zero() {
         return Err("division by zero".to_string());
     }
-    Ok(format_numeric(av % bv))
+    parse_numeric(a)?
+        .checked_rem(divisor)
+        .map(|value| value.normalize().to_string())
+        .ok_or_else(|| "numeric value out of range".to_string())
 }
 
 /// Negate a numeric string.
-pub fn numeric_neg(a: &str) -> String {
-    let av: f64 = a.parse().unwrap_or(0.0);
-    format_numeric(-av)
+pub fn numeric_neg(a: &str) -> Result<String, String> {
+    Decimal::ZERO
+        .checked_sub(parse_numeric(a)?)
+        .map(|value| value.normalize().to_string())
+        .ok_or_else(|| "numeric value out of range".to_string())
 }
 
 /// Absolute value of a numeric string.
-pub fn numeric_abs(a: &str) -> String {
-    let av: f64 = a.parse().unwrap_or(0.0);
-    format_numeric(av.abs())
-}
-
-/// Format an f64 as a clean numeric string.
-fn format_numeric(v: f64) -> String {
-    if v.fract() == 0.0 && v.abs() < (i64::MAX as f64) {
-        format!("{}", v as i64)
+pub fn numeric_abs(a: &str) -> Result<String, String> {
+    let value = parse_numeric(a)?;
+    let value = if value.is_sign_negative() {
+        Decimal::ZERO.checked_sub(value)
     } else {
-        let s = format!("{v:.17}");
-        let s = s.trim_end_matches('0');
-        let s = s.trim_end_matches('.');
-        s.to_string()
-    }
+        Some(value)
+    };
+    value
+        .map(|value| value.normalize().to_string())
+        .ok_or_else(|| "numeric value out of range".to_string())
 }
 
 // ============================================================================
@@ -906,22 +1106,22 @@ mod tests {
 
     #[test]
     fn test_numeric_add_positive() {
-        assert_eq!(numeric_add("1.5", "2.5"), "4");
+        assert_eq!(numeric_add("1.5", "2.5").unwrap(), "4");
     }
 
     #[test]
     fn test_numeric_add_negative() {
-        assert_eq!(numeric_add("-3", "5"), "2");
+        assert_eq!(numeric_add("-3", "5").unwrap(), "2");
     }
 
     #[test]
     fn test_numeric_sub() {
-        assert_eq!(numeric_sub("10", "3"), "7");
+        assert_eq!(numeric_sub("10", "3").unwrap(), "7");
     }
 
     #[test]
     fn test_numeric_mul() {
-        assert_eq!(numeric_mul("6", "7"), "42");
+        assert_eq!(numeric_mul("6", "7").unwrap(), "42");
     }
 
     #[test]
@@ -941,20 +1141,20 @@ mod tests {
 
     #[test]
     fn test_numeric_neg() {
-        assert_eq!(numeric_neg("42"), "-42");
-        assert_eq!(numeric_neg("-7"), "7");
+        assert_eq!(numeric_neg("42").unwrap(), "-42");
+        assert_eq!(numeric_neg("-7").unwrap(), "7");
     }
 
     #[test]
     fn test_numeric_abs() {
-        assert_eq!(numeric_abs("-42"), "42");
-        assert_eq!(numeric_abs("42"), "42");
+        assert_eq!(numeric_abs("-42").unwrap(), "42");
+        assert_eq!(numeric_abs("42").unwrap(), "42");
     }
 
     #[test]
     fn test_numeric_large_numbers() {
-        assert_eq!(numeric_add("999999999999", "1"), "1000000000000");
-        assert_eq!(numeric_mul("1000000", "1000000"), "1000000000000");
+        assert_eq!(numeric_add("999999999999", "1").unwrap(), "1000000000000");
+        assert_eq!(numeric_mul("1000000", "1000000").unwrap(), "1000000000000");
     }
 
     // ========================================================================

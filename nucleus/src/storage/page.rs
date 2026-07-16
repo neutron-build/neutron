@@ -71,7 +71,16 @@ pub const META_CHECKPOINT_LSN: usize = COMMON_HEADER_SIZE + 44; // u64
 pub const META_TABLE_DIR_START: usize = COMMON_HEADER_SIZE + 52;
 
 pub const MAGIC_BYTES: &[u8; 8] = b"NUCLEUS\0";
-pub const DB_FORMAT_VERSION: u32 = 1;
+/// On-disk database format version, stamped in the meta page (`META_DB_VERSION`)
+/// and validated on open (`DiskEngine::open_inner`).
+///
+/// - v1: original table-directory entry (name, first_page, col_types, col_names).
+/// - v2: adds a per-table `epoch` (u64) after `first_page`, so a dropped-then-
+///   recreated table's stale on-disk pages can be detected and abandoned rather
+///   than trusted (T0.3). v1 directories are read without the epoch field
+///   (defaulting to 0) and transparently upgraded to v2 on the next directory
+///   save. A stored version newer than this constant is refused on open.
+pub const DB_FORMAT_VERSION: u32 = 2;
 
 // ============================================================================
 // Overflow page layout

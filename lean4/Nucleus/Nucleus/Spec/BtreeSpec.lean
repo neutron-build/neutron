@@ -7,10 +7,12 @@ namespace Nucleus.Spec
 
 open Nucleus.Aeneas
 
+variable {α : Type}
+
 /-- A leaf's entries are sorted by key. -/
 def leafSorted (entries : List (Entry α)) : Prop :=
-  ∀ i j, i < j → j < entries.length →
-    (entries.get ⟨i, by omega⟩).key ≤ (entries.get ⟨j, by omega⟩).key
+  ∀ i j (hi : i < entries.length) (hj : j < entries.length), i < j →
+    (entries.get ⟨i, hi⟩).key ≤ (entries.get ⟨j, hj⟩).key
 
 /-- All leaves in the tree are at the same depth. -/
 def allLeavesSameDepth : BTree α → Prop

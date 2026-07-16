@@ -23,7 +23,7 @@ use tokio::net::TcpListener;
 use tokio_postgres::{Client, NoTls};
 
 #[cfg(feature = "rusqlite")]
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, params as sqlite_params};
 
 #[cfg(feature = "mongodb")]
 use mongodb::bson::{Document, doc};
@@ -32,13 +32,7 @@ use mongodb::bson::{Document, doc};
 use mongodb::IndexModel;
 
 #[cfg(feature = "bench-tools")]
-use mysql_async;
-
-#[cfg(feature = "bench-tools")]
 use mysql_async::prelude::*;
-
-#[cfg(all(feature = "bench-tools", feature = "reqwest"))]
-use reqwest;
 
 use nucleus::catalog::Catalog;
 use nucleus::executor::Executor;
@@ -1630,10 +1624,10 @@ async fn setup_cockroach_schema(client: &Client, rows: usize) {
                 sql.push(',');
             }
             first = false;
-            let user_id = ((i - 1) % rows as usize) as i32 + 1;
+            let user_id = ((i - 1) % rows) as i32 + 1;
             let amount = 10.0 + ((i % 100) as f64);
             let statuses = ["pending", "shipped", "delivered", "cancelled"];
-            let status = statuses[(i % 4) as usize];
+            let status = statuses[i % 4];
             sql.push_str(&format!("({},{},{:.2},'{}') ", i, user_id, amount, status));
         }
         client.simple_query(&sql).await.unwrap();
@@ -1957,8 +1951,8 @@ async fn setup_mongodb_schema(
     let db = client.database(db_name);
 
     // Drop existing collections
-    let _ = db.collection::<Document>("bench_users").drop(None).await;
-    let _ = db.collection::<Document>("bench_orders").drop(None).await;
+    let _ = db.collection::<Document>("bench_users").drop().await;
+    let _ = db.collection::<Document>("bench_orders").drop().await;
 
     let users_coll = db.collection::<Document>("bench_users");
     let orders_coll = db.collection::<Document>("bench_orders");
@@ -1983,7 +1977,7 @@ async fn setup_mongodb_schema(
                 "status": status,
             });
         }
-        users_coll.insert_many(users, None).await?;
+        users_coll.insert_many(users).await?;
     }
 
     // Insert orders in batches
@@ -2008,33 +2002,24 @@ async fn setup_mongodb_schema(
                 "status": status,
             });
         }
-        orders_coll.insert_many(orders, None).await?;
+        orders_coll.insert_many(orders).await?;
     }
 
     // Create indexes
     users_coll
-        .create_index(
-            IndexModel::builder().keys(doc! { "status": 1 }).build(),
-            None,
-        )
+        .create_index(IndexModel::builder().keys(doc! { "status": 1 }).build())
         .await?;
 
     users_coll
-        .create_index(IndexModel::builder().keys(doc! { "age": 1 }).build(), None)
+        .create_index(IndexModel::builder().keys(doc! { "age": 1 }).build())
         .await?;
 
     orders_coll
-        .create_index(
-            IndexModel::builder().keys(doc! { "status": 1 }).build(),
-            None,
-        )
+        .create_index(IndexModel::builder().keys(doc! { "status": 1 }).build())
         .await?;
 
     orders_coll
-        .create_index(
-            IndexModel::builder().keys(doc! { "user_id": 1 }).build(),
-            None,
-        )
+        .create_index(IndexModel::builder().keys(doc! { "user_id": 1 }).build())
         .await?;
 
     Ok(())
@@ -2053,36 +2038,36 @@ async fn bench_mongodb_query(
         "count" => {
             // Warm-up
             for _ in 0..warmup {
-                let _ = coll.count_documents(doc! {}, None).await;
+                let _ = coll.count_documents(doc! {}).await;
             }
             // Timed
             for _ in 0..n {
                 let t = Instant::now();
-                let _ = coll.count_documents(doc! {}, None).await;
+                let _ = coll.count_documents(doc! {}).await;
                 stats.record(t.elapsed());
             }
         }
         "point_query" => {
             // Warm-up
             for _ in 0..warmup {
-                let _ = coll.find_one(doc! { "_id": 5000 }, None).await;
+                let _ = coll.find_one(doc! { "_id": 5000 }).await;
             }
             // Timed
             for _ in 0..n {
                 let t = Instant::now();
-                let _ = coll.find_one(doc! { "_id": 5000 }, None).await;
+                let _ = coll.find_one(doc! { "_id": 5000 }).await;
                 stats.record(t.elapsed());
             }
         }
         "range_scan" => {
             // Warm-up
             for _ in 0..warmup {
-                let _ = coll.find(doc! { "age": { "$gt": 30 } }, None).await;
+                let _ = coll.find(doc! { "age": { "$gt": 30 } }).await;
             }
             // Timed
             for _ in 0..n {
                 let t = Instant::now();
-                let _ = coll.find(doc! { "age": { "$gt": 30 } }, None).await;
+                let _ = coll.find(doc! { "age": { "$gt": 30 } }).await;
                 stats.record(t.elapsed());
             }
         }
@@ -2090,28 +2075,22 @@ async fn bench_mongodb_query(
             // Warm-up
             for _ in 0..warmup {
                 let _ = coll
-                    .aggregate(
-                        vec![doc! { "$group": {
-                            "_id": "$status",
-                            "count": { "$sum": 1 },
-                            "avg_age": { "$avg": "$age" }
-                        }}],
-                        None,
-                    )
+                    .aggregate(vec![doc! { "$group": {
+                        "_id": "$status",
+                        "count": { "$sum": 1 },
+                        "avg_age": { "$avg": "$age" }
+                    }}])
                     .await;
             }
             // Timed
             for _ in 0..n {
                 let t = Instant::now();
                 let _ = coll
-                    .aggregate(
-                        vec![doc! { "$group": {
-                            "_id": "$status",
-                            "count": { "$sum": 1 },
-                            "avg_age": { "$avg": "$age" }
-                        }}],
-                        None,
-                    )
+                    .aggregate(vec![doc! { "$group": {
+                        "_id": "$status",
+                        "count": { "$sum": 1 },
+                        "avg_age": { "$avg": "$age" }
+                    }}])
                     .await;
                 stats.record(t.elapsed());
             }
@@ -2208,15 +2187,12 @@ async fn bench_vs_mongodb(
         let orders_coll = db.collection::<Document>("bench_orders");
         for i in 0..warmup {
             let _ = orders_coll
-                .insert_one(
-                    doc! {
-                        "_id": 600_000 + i as i32,
-                        "user_id": (i % 1000 + 1) as i32,
-                        "amount": 99.0,
-                        "status": "pending",
-                    },
-                    None,
-                )
+                .insert_one(doc! {
+                    "_id": 600_000 + i as i32,
+                    "user_id": (i % 1000 + 1) as i32,
+                    "amount": 99.0,
+                    "status": "pending",
+                })
                 .await;
         }
 
@@ -2238,15 +2214,12 @@ async fn bench_vs_mongodb(
         for i in 0..n {
             let t = Instant::now();
             let _ = orders_coll
-                .insert_one(
-                    doc! {
-                        "_id": 800_000 + i as i32,
-                        "user_id": (i % 1000 + 1) as i32,
-                        "amount": 99.0,
-                        "status": "pending",
-                    },
-                    None,
-                )
+                .insert_one(doc! {
+                    "_id": 800_000 + i as i32,
+                    "user_id": (i % 1000 + 1) as i32,
+                    "amount": 99.0,
+                    "status": "pending",
+                })
                 .await;
             ms.record(t.elapsed());
         }
@@ -2286,7 +2259,7 @@ async fn bench_vs_mongodb(
         // Warm-up
         for _ in 0..warmup {
             let _ = orders_coll
-                .update_one(doc! { "_id": 5000 }, doc! { "$inc": { "amount": 1 } }, None)
+                .update_one(doc! { "_id": 5000 }, doc! { "$inc": { "amount": 1 } })
                 .await;
         }
 
@@ -2295,7 +2268,7 @@ async fn bench_vs_mongodb(
         for _ in 0..n {
             let t = Instant::now();
             let _ = orders_coll
-                .update_one(doc! { "_id": 5000 }, doc! { "$inc": { "amount": 1 } }, None)
+                .update_one(doc! { "_id": 5000 }, doc! { "$inc": { "amount": 1 } })
                 .await;
             ms.record(t.elapsed());
         }
@@ -2327,15 +2300,12 @@ async fn bench_vs_mongodb(
         // Insert rows for timed deletes
         for i in 0..n {
             let _ = orders_coll
-                .insert_one(
-                    doc! {
-                        "_id": 2_000_000 + i as i32,
-                        "user_id": 1,
-                        "amount": 50.0,
-                        "status": "del",
-                    },
-                    None,
-                )
+                .insert_one(doc! {
+                    "_id": 2_000_000 + i as i32,
+                    "user_id": 1,
+                    "amount": 50.0,
+                    "status": "del",
+                })
                 .await;
         }
 
@@ -2350,7 +2320,7 @@ async fn bench_vs_mongodb(
         // Warm-up MongoDB deletes
         for i in 0..warmup {
             let _ = orders_coll
-                .delete_one(doc! { "_id": 2_100_000 + i as i32 }, None)
+                .delete_one(doc! { "_id": 2_100_000 + i as i32 })
                 .await;
         }
 
@@ -2370,7 +2340,7 @@ async fn bench_vs_mongodb(
         for i in 0..n {
             let t = Instant::now();
             let _ = orders_coll
-                .delete_one(doc! { "_id": 2_000_000 + i as i32 }, None)
+                .delete_one(doc! { "_id": 2_000_000 + i as i32 })
                 .await;
             ms.record(t.elapsed());
         }
@@ -2444,7 +2414,7 @@ fn setup_sqlite_schema(sqlite_path: &str, rows: usize) -> Result<(), rusqlite::E
                 } else {
                     "pending"
                 };
-                stmt.execute(params![
+                stmt.execute(sqlite_params![
                     i as i32,
                     format!("user_{i}"),
                     format!("user{i}@test.com"),
@@ -2479,7 +2449,7 @@ fn setup_sqlite_schema(sqlite_path: &str, rows: usize) -> Result<(), rusqlite::E
                 } else {
                     "delivered"
                 };
-                stmt.execute(params![
+                stmt.execute(sqlite_params![
                     i as i32,
                     user_id as i32,
                     amount,
@@ -2518,19 +2488,19 @@ fn bench_sqlite_query(conn: &Connection, sql: &str, warmup: usize, n: usize) -> 
 
     let drain = |stmt: &mut rusqlite::Statement| -> u64 {
         let mut sink = 0u64;
-        if let Ok(mut rows) = stmt.query(params![]) {
+        if let Ok(mut rows) = stmt.query(sqlite_params![]) {
             while let Ok(Some(row)) = rows.next() {
                 // Touch the first column of every row to force materialization.
-                if ncols > 0 {
-                    if let Ok(v) = row.get::<usize, rusqlite::types::Value>(0) {
-                        sink = sink.wrapping_add(match v {
-                            rusqlite::types::Value::Integer(i) => i as u64,
-                            rusqlite::types::Value::Real(f) => f as u64,
-                            rusqlite::types::Value::Text(t) => t.len() as u64,
-                            rusqlite::types::Value::Blob(b) => b.len() as u64,
-                            rusqlite::types::Value::Null => 0,
-                        });
-                    }
+                if ncols > 0
+                    && let Ok(v) = row.get::<usize, rusqlite::types::Value>(0)
+                {
+                    sink = sink.wrapping_add(match v {
+                        rusqlite::types::Value::Integer(i) => i as u64,
+                        rusqlite::types::Value::Real(f) => f as u64,
+                        rusqlite::types::Value::Text(t) => t.len() as u64,
+                        rusqlite::types::Value::Blob(b) => b.len() as u64,
+                        rusqlite::types::Value::Null => 0,
+                    });
                 }
             }
         }
@@ -2552,7 +2522,7 @@ fn bench_sqlite_query(conn: &Connection, sql: &str, warmup: usize, n: usize) -> 
 
 #[cfg(feature = "rusqlite")]
 async fn bench_vs_sqlite(
-    nc: &Client,
+    _nc: &Client,
     executor: &Arc<Executor>,
     sqlite_path: &str,
     warmup: usize,
@@ -2642,7 +2612,7 @@ async fn bench_vs_sqlite(
                     6_000_000 + i,
                     i % 1000 + 1
                 );
-                tx.execute(&sql, params![]).unwrap();
+                tx.execute(&sql, sqlite_params![]).unwrap();
             }
             tx.commit().unwrap();
         }
@@ -2671,7 +2641,7 @@ async fn bench_vs_sqlite(
                     i % 1000 + 1
                 );
                 let t = Instant::now();
-                tx.execute(&sql, params![]).unwrap();
+                tx.execute(&sql, sqlite_params![]).unwrap();
                 ss.record(t.elapsed());
             }
             tx.commit().unwrap();
@@ -2739,7 +2709,7 @@ async fn bench_vs_sqlite(
             let tx = conn.transaction().unwrap();
             for i in 0..w {
                 let id = 2_100_000 + i;
-                tx.execute(&format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({id},1,50.0,'del')"), params![]).ok();
+                tx.execute(&format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({id},1,50.0,'del')"), sqlite_params![]).ok();
             }
             tx.commit().ok();
         }
@@ -2758,7 +2728,7 @@ async fn bench_vs_sqlite(
             for i in 0..w {
                 tx.execute(
                     &format!("DELETE FROM bench_orders WHERE id = {}", 2_100_000 + i),
-                    params![],
+                    sqlite_params![],
                 )
                 .ok();
             }
@@ -2774,7 +2744,7 @@ async fn bench_vs_sqlite(
             let tx = conn.transaction().unwrap();
             for i in 0..n {
                 let id = 2_300_000 + i;
-                tx.execute(&format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({id},1,50.0,'del')"), params![]).ok();
+                tx.execute(&format!("INSERT INTO bench_orders (id, user_id, amount, status) VALUES ({id},1,50.0,'del')"), sqlite_params![]).ok();
             }
             tx.commit().ok();
         }
@@ -2799,7 +2769,7 @@ async fn bench_vs_sqlite(
                 let t = Instant::now();
                 tx.execute(
                     &format!("DELETE FROM bench_orders WHERE id = {}", 2_300_000 + i),
-                    params![],
+                    sqlite_params![],
                 )
                 .ok();
                 ss.record(t.elapsed());
@@ -2829,7 +2799,7 @@ async fn bench_vs_sqlite(
 
 // ─── Section: SurrealDB Benchmarks ─────────────────────────────────────────
 
-#[cfg(all(feature = "bench-tools", feature = "reqwest"))]
+#[cfg(feature = "bench-tools")]
 struct SurrealDbClient {
     endpoint: String,
     user: String,
@@ -2837,7 +2807,7 @@ struct SurrealDbClient {
     http_client: reqwest::Client,
 }
 
-#[cfg(all(feature = "bench-tools", feature = "reqwest"))]
+#[cfg(feature = "bench-tools")]
 impl SurrealDbClient {
     async fn new(endpoint: &str, user: &str, pass: &str) -> Self {
         Self {
@@ -2869,7 +2839,7 @@ impl SurrealDbClient {
     }
 }
 
-#[cfg(all(feature = "bench-tools", feature = "reqwest"))]
+#[cfg(feature = "bench-tools")]
 async fn setup_surreal_schema(
     client: &SurrealDbClient,
     rows: usize,
@@ -2931,7 +2901,7 @@ async fn setup_surreal_schema(
     Ok(())
 }
 
-#[cfg(all(feature = "bench-tools", feature = "reqwest"))]
+#[cfg(feature = "bench-tools")]
 async fn bench_surreal_query(
     client: &SurrealDbClient,
     sql: &str,
@@ -2952,7 +2922,7 @@ async fn bench_surreal_query(
     Ok(stats)
 }
 
-#[cfg(all(feature = "bench-tools", feature = "reqwest"))]
+#[cfg(feature = "bench-tools")]
 async fn bench_vs_surreal(
     nc: &Client,
     surreal: &SurrealDbClient,
@@ -3061,7 +3031,7 @@ async fn bench_vs_surreal(
                     800_000 + i,
                     i % 1000 + 1
                 );
-                if let Ok(_) = surreal.query(&sql).await {
+                if surreal.query(&sql).await.is_ok() {
                     let t = Instant::now();
                     surreal.query(&sql).await.ok();
                     s.record(t.elapsed());
@@ -3263,7 +3233,13 @@ async fn setup_tidb_schema(pool: &mysql_async::Pool) -> mysql_async::Result<()> 
         conn.exec_batch(
             "INSERT INTO bench_users (id, name, email, age, status) VALUES (:id, :name, :email, :age, :status)",
             values.iter().map(|(id, name, email, age, status)| {
-                (id, name, name, age, status)  // TODO: Fix mysql_async params syntax
+                mysql_async::params! {
+                    "id" => *id,
+                    "name" => name,
+                    "email" => email,
+                    "age" => *age,
+                    "status" => *status,
+                }
             }),
         ).await?;
         id = end + 1;
@@ -3291,7 +3267,12 @@ async fn setup_tidb_schema(pool: &mysql_async::Pool) -> mysql_async::Result<()> 
         conn.exec_batch(
             "INSERT INTO bench_orders (id, user_id, amount, status) VALUES (:id, :user_id, :amount, :status)",
             values.iter().map(|(id, user_id, amount, status)| {
-                (id, user_id, amount, status)  // TODO: Fix mysql_async params syntax
+                mysql_async::params! {
+                    "id" => *id,
+                    "user_id" => *user_id,
+                    "amount" => *amount,
+                    "status" => *status,
+                }
             }),
         ).await?;
         id = end + 1;
@@ -3385,10 +3366,7 @@ async fn bench_vs_tidb(
         print!("    {name:<30}");
         let ns = bench_query(nc, sql, w, n).await;
 
-        let ps = match bench_tidb_query(tidb_pool, sql, w, n).await {
-            Ok(s) => Some(s),
-            Err(_) => None,
-        };
+        let ps = bench_tidb_query(tidb_pool, sql, w, n).await.ok();
 
         let speedup = ps.as_ref().map(|p| p.avg_us() / ns.avg_us()).unwrap_or(0.0);
         println!(
@@ -3652,14 +3630,14 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
 
     // Drop existing tables
     let _ = client
-        .post(&format!(
+        .post(format!(
             "{}/?query=DROP TABLE IF EXISTS bench_users",
             base_url
         ))
         .send()
         .await?;
     let _ = client
-        .post(&format!(
+        .post(format!(
             "{}/?query=DROP TABLE IF EXISTS bench_orders",
             base_url
         ))
@@ -3676,7 +3654,7 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
     ) ENGINE = MergeTree() ORDER BY id";
 
     client
-        .post(&format!(
+        .post(format!(
             "{}/?query={}",
             base_url,
             urlencoding::encode(create_users)
@@ -3693,7 +3671,7 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
     ) ENGINE = MergeTree() ORDER BY id";
 
     client
-        .post(&format!(
+        .post(format!(
             "{}/?query={}",
             base_url,
             urlencoding::encode(create_orders)
@@ -3721,7 +3699,7 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
                 values.join(", ")
             );
             client
-                .post(&format!(
+                .post(format!(
                     "{}/?query={}",
                     base_url,
                     urlencoding::encode(&insert_users)
@@ -3739,7 +3717,7 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
             values.join(", ")
         );
         client
-            .post(&format!(
+            .post(format!(
                 "{}/?query={}",
                 base_url,
                 urlencoding::encode(&insert_users)
@@ -3771,7 +3749,7 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
                 order_values.join(", ")
             );
             client
-                .post(&format!(
+                .post(format!(
                     "{}/?query={}",
                     base_url,
                     urlencoding::encode(&insert_orders)
@@ -3789,7 +3767,7 @@ async fn setup_clickhouse_schema(base_url: &str) -> Result<(), Box<dyn std::erro
             order_values.join(", ")
         );
         client
-            .post(&format!(
+            .post(format!(
                 "{}/?query={}",
                 base_url,
                 urlencoding::encode(&insert_orders)
@@ -3814,7 +3792,7 @@ async fn bench_clickhouse_query(
     // Warm-up: run but discard results
     for _ in 0..warmup {
         let _ = client
-            .post(&format!("{}/?query={}", base_url, urlencoding::encode(sql)))
+            .post(format!("{}/?query={}", base_url, urlencoding::encode(sql)))
             .send()
             .await?;
     }
@@ -3823,7 +3801,7 @@ async fn bench_clickhouse_query(
     for _ in 0..n {
         let t = Instant::now();
         let _ = client
-            .post(&format!("{}/?query={}", base_url, urlencoding::encode(sql)))
+            .post(format!("{}/?query={}", base_url, urlencoding::encode(sql)))
             .send()
             .await?;
         stats.record(t.elapsed());
@@ -3887,34 +3865,31 @@ async fn bench_vs_clickhouse(
     for (name, sql) in &workloads {
         print!("    {name:<30}");
 
-        match bench_query(nc, sql, warmup, n).await {
-            ns => {
-                let ch = match bench_clickhouse_query(base_url, sql, warmup, n).await {
-                    Ok(stats) => stats,
-                    Err(e) => {
-                        println!(" ClickHouse error: {e}");
-                        continue;
-                    }
-                };
-
-                let speedup = ns.avg_us() / ch.avg_us();
-                println!(
-                    " Nucleus: {:>10}  ClickHouse: {:>10}  {:.1}x",
-                    format_ops(ns.ops_per_sec()),
-                    format_ops(ch.ops_per_sec()),
-                    speedup
-                );
-
-                results.push(CompeteResult {
-                    category: "SQL (ClickHouse)".into(),
-                    workload: name.to_string(),
-                    nucleus_stats: ns,
-                    competitor_name: "ClickHouse (column store)".into(),
-                    competitor_stats: Some(ch),
-                    note: Some("analytical queries".into()),
-                });
+        let ns = bench_query(nc, sql, warmup, n).await;
+        let ch = match bench_clickhouse_query(base_url, sql, warmup, n).await {
+            Ok(stats) => stats,
+            Err(e) => {
+                println!(" ClickHouse error: {e}");
+                continue;
             }
-        }
+        };
+
+        let speedup = ns.avg_us() / ch.avg_us();
+        println!(
+            " Nucleus: {:>10}  ClickHouse: {:>10}  {:.1}x",
+            format_ops(ns.ops_per_sec()),
+            format_ops(ch.ops_per_sec()),
+            speedup
+        );
+
+        results.push(CompeteResult {
+            category: "SQL (ClickHouse)".into(),
+            workload: name.to_string(),
+            nucleus_stats: ns,
+            competitor_name: "ClickHouse (column store)".into(),
+            competitor_stats: Some(ch),
+            note: Some("analytical queries".into()),
+        });
     }
 
     results
@@ -4235,7 +4210,7 @@ async fn main() {
     }
 
     // ── Section 1e: TiDB (MySQL-compatible distributed SQL) ──
-    #[cfg(FALSE)] // TODO: Fix mysql_async::params! macro issue
+    #[cfg(feature = "bench-tools")]
     if cfg.should_run("tidb") {
         println!();
         println!("  --- Section 1e: SQL vs TiDB (MySQL-compatible distributed SQL) ---");
@@ -4250,7 +4225,8 @@ async fn main() {
         if let Ok(tidb_opts) = tidb_dsn.parse::<mysql_async::Opts>() {
             let tidb_pool = mysql_async::Pool::new(tidb_opts);
             match tidb_pool.get_conn().await {
-                Ok(mut conn) => {
+                Ok(conn) => {
+                    drop(conn);
                     let t = Instant::now();
                     match setup_tidb_schema(&tidb_pool).await {
                         Ok(_) => {
@@ -4279,7 +4255,7 @@ async fn main() {
     }
 
     // ── Section 1f: SurrealDB (HTTP-based document/relational) ──
-    #[cfg(all(feature = "bench-tools", feature = "reqwest"))]
+    #[cfg(feature = "bench-tools")]
     if cfg.should_run("surreal") {
         println!();
         println!("  --- Section 1f: SQL vs SurrealDB (HTTP-based multi-model) ---");
@@ -4324,7 +4300,7 @@ async fn main() {
         let clickhouse_url = format!("http://{}:{}", cfg.clickhouse_host, cfg.clickhouse_port);
         // Test connectivity by checking if ClickHouse is available
         match reqwest::Client::new()
-            .post(&format!("{}/?query=SELECT 1", &clickhouse_url))
+            .post(format!("{}/?query=SELECT 1", clickhouse_url))
             .send()
             .await
         {

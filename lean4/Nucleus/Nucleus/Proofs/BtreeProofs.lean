@@ -8,6 +8,8 @@ namespace Nucleus.Proofs
 open Nucleus.Aeneas
 open Nucleus.Spec
 
+variable {α : Type}
+
 /-- Deleting a key produces a list not containing that key. -/
 theorem delete_key_absent (entries : List (Entry α)) (k : Nat) :
     ∀ e ∈ (entries.filter (fun e => e.key != k)),
@@ -25,7 +27,7 @@ theorem leaf_depth_zero (entries : List (Entry α)) :
 
 /-- Inserting into a leaf produces a non-empty tree. -/
 theorem insert_nonempty (k : Nat) (v : α) :
-    (BTree.leaf (α := α) []).insert k v |>.size > 0 := by
+    ((BTree.leaf (α := α) []).insert k v).size > 0 := by
   simp [BTree.insert, BTree.size]
 
 end Nucleus.Proofs

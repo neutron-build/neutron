@@ -656,6 +656,77 @@ async fn test_is_distinct_from() {
     assert_eq!(*scalar(&results[0]), Value::Bool(true));
 }
 
+#[tokio::test]
+async fn test_boolean_truth_tests_follow_three_valued_logic() {
+    let ex = test_executor();
+    let result = exec(
+        &ex,
+        "SELECT TRUE IS TRUE, FALSE IS TRUE, NULL IS TRUE, NULL IS NOT TRUE, NULL IS FALSE, NULL IS NOT FALSE, NULL IS UNKNOWN, TRUE IS NOT UNKNOWN",
+    )
+    .await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![vec![
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+        ]]
+    );
+
+    let result = exec(
+        &ex,
+        "SELECT NULL AND TRUE, NULL AND FALSE, NULL OR TRUE, NULL OR FALSE, NOT NULL, 1 BETWEEN NULL AND 2",
+    )
+    .await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![vec![
+            Value::Null,
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ]]
+    );
+}
+
+#[tokio::test]
+async fn test_binary_collation_is_explicit_and_unsupported_collations_reject() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE collated_values (value TEXT)").await;
+    exec(
+        &ex,
+        "INSERT INTO collated_values VALUES ('a'), ('B'), ('A'), ('b')",
+    )
+    .await;
+    let result = exec(
+        &ex,
+        "SELECT value COLLATE \"C\" FROM collated_values ORDER BY value COLLATE POSIX",
+    )
+    .await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![
+            vec![Value::Text("A".into())],
+            vec![Value::Text("B".into())],
+            vec![Value::Text("a".into())],
+            vec![Value::Text("b".into())],
+        ]
+    );
+    assert!(
+        ex.execute("SELECT 'a' COLLATE \"en_US.UTF-8\"")
+            .await
+            .is_err(),
+        "unsupported locale collation must reject rather than silently use binary ordering"
+    );
+}
+
 // ======================================================================
 
 // Type cast tests
@@ -672,10 +743,262 @@ async fn test_cast_to_date() {
 }
 
 #[tokio::test]
+async fn test_checked_date_timestamp_and_interval_arithmetic() {
+    let ex = test_executor();
+    let result = exec(
+        &ex,
+        "SELECT DATE '2024-01-31' + INTERVAL '1 month', DATE '2024-03-01' - DATE '2024-02-28', DATE '2024-01-01' + 2",
+    )
+    .await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![vec![
+            Value::Timestamp(crate::types::ymd_to_days(2024, 2, 29) as i64 * 86_400_000_000),
+            Value::Int32(2),
+            Value::Date(crate::types::ymd_to_days(2024, 1, 3)),
+        ]]
+    );
+
+    let result = exec(
+        &ex,
+        "SELECT TIMESTAMP '2024-01-01 23:30:00' + INTERVAL '1 day 2 hours', TIMESTAMP '2024-01-02 00:00:01' - TIMESTAMP '2024-01-01 00:00:00'",
+    )
+    .await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![vec![
+            Value::Timestamp(
+                crate::types::ymd_to_days(2024, 1, 3) as i64 * 86_400_000_000 + 5_400_000_000,
+            ),
+            Value::Interval {
+                months: 0,
+                days: 0,
+                microseconds: 86_401_000_000,
+            },
+        ]]
+    );
+
+    assert!(ex.execute("SELECT INTERVAL 'not valid'").await.is_err());
+    assert!(
+        ex.execute("SELECT DATE '2024-01-01' + INTERVAL '999999999999999999999 days'")
+            .await
+            .is_err()
+    );
+    assert!(ex.execute("SELECT DATE '2024-02-30'").await.is_err());
+    assert!(
+        ex.execute("SELECT CAST('2024-13-01' AS DATE)")
+            .await
+            .is_err()
+    );
+
+    let fractional = exec(
+        &ex,
+        "SELECT CAST('2024-01-01 00:00:00.123456' AS TIMESTAMP), CAST('1 day 00:00:00.5' AS INTERVAL)",
+    )
+    .await;
+    assert_eq!(
+        rows(&fractional[0]),
+        &vec![vec![
+            Value::Timestamp(
+                crate::types::ymd_to_days(2024, 1, 1) as i64 * 86_400_000_000 + 123_456,
+            ),
+            Value::Interval {
+                months: 0,
+                days: 1,
+                microseconds: 500_000,
+            },
+        ]]
+    );
+}
+
+#[tokio::test]
+async fn test_iana_time_zone_conversion_and_session_casts() {
+    let ex = test_executor();
+    let result = exec(
+        &ex,
+        "SELECT TIMESTAMP '2024-01-15 12:00:00' AT TIME ZONE 'America/Vancouver', (TIMESTAMP '2024-01-15 12:00:00' AT TIME ZONE 'America/Vancouver') AT TIME ZONE 'Asia/Tokyo'",
+    )
+    .await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![vec![
+            Value::TimestampTz(
+                crate::types::ymd_to_days(2024, 1, 15) as i64 * 86_400_000_000 + 72_000_000_000,
+            ),
+            Value::Timestamp(
+                crate::types::ymd_to_days(2024, 1, 16) as i64 * 86_400_000_000 + 18_000_000_000,
+            ),
+        ]]
+    );
+
+    exec(&ex, "SET timezone = 'America/Vancouver'").await;
+    let cast = exec(
+        &ex,
+        "SELECT CAST('2024-07-15 12:00:00' AS TIMESTAMP WITH TIME ZONE)",
+    )
+    .await;
+    assert_eq!(
+        scalar(&cast[0]),
+        &Value::TimestampTz(
+            crate::types::ymd_to_days(2024, 7, 15) as i64 * 86_400_000_000 + 68_400_000_000,
+        )
+    );
+
+    exec(
+        &ex,
+        "CREATE TABLE zoned_events (occurred_at TIMESTAMP WITH TIME ZONE)",
+    )
+    .await;
+    exec(
+        &ex,
+        "INSERT INTO zoned_events VALUES ('2024-07-15 12:00:00')",
+    )
+    .await;
+    let stored = exec(&ex, "SELECT occurred_at FROM zoned_events").await;
+    assert_eq!(rows(&stored[0]), rows(&cast[0]));
+
+    exec(
+        &ex,
+        "UPDATE zoned_events SET occurred_at = '2024-01-15 12:00:00'",
+    )
+    .await;
+    let updated = exec(&ex, "SELECT occurred_at FROM zoned_events").await;
+    assert_eq!(
+        scalar(&updated[0]),
+        &Value::TimestampTz(
+            crate::types::ymd_to_days(2024, 1, 15) as i64 * 86_400_000_000 + 72_000_000_000,
+        )
+    );
+
+    assert!(ex.execute("SET timezone = 'Mars/Olympus'").await.is_err());
+    assert!(
+        ex.execute("SELECT TIMESTAMP '2024-03-10 02:30:00' AT TIME ZONE 'America/Vancouver'")
+            .await
+            .is_err(),
+        "nonexistent DST local times must reject explicitly"
+    );
+}
+
+#[tokio::test]
 async fn test_cast_to_numeric() {
     let ex = test_executor();
     let results = exec(&ex, "SELECT CAST(42 AS NUMERIC)").await;
     assert_eq!(*scalar(&results[0]), Value::Numeric("42".to_string()));
+}
+
+#[tokio::test]
+async fn test_numeric_exact_comparison_aggregates_and_overflow() {
+    let ex = test_executor();
+
+    let arithmetic = exec(
+        &ex,
+        "SELECT CAST('0.1' AS NUMERIC) + CAST('0.2' AS NUMERIC), CAST('1' AS NUMERIC) / 3",
+    )
+    .await;
+    assert_eq!(
+        rows(&arithmetic[0]),
+        &vec![vec![
+            Value::Numeric("0.3".into()),
+            Value::Numeric("0.3333333333333333333333333333".into()),
+        ]]
+    );
+
+    exec(&ex, "CREATE TABLE exact_nums (id INT, value NUMERIC)").await;
+    exec(
+        &ex,
+        "INSERT INTO exact_nums VALUES (1, '0.10'), (2, '0.20'), (3, '0.20')",
+    )
+    .await;
+
+    let result = exec(
+        &ex,
+        "SELECT SUM(value), AVG(value), COUNT(DISTINCT value) FROM exact_nums",
+    )
+    .await;
+    assert_eq!(
+        rows(&result[0]),
+        &vec![vec![
+            Value::Numeric("0.5".into()),
+            Value::Numeric("0.1666666666666666666666666667".into()),
+            Value::Int64(2),
+        ]]
+    );
+
+    exec(&ex, "CREATE TABLE close_nums (id INT, value NUMERIC)").await;
+    exec(
+        &ex,
+        "INSERT INTO close_nums VALUES (1, '10000000000000000000000000.1'), (2, '10000000000000000000000000.2')",
+    )
+    .await;
+    let ordered = exec(
+        &ex,
+        "SELECT id FROM close_nums WHERE value > '10000000000000000000000000.1' ORDER BY value",
+    )
+    .await;
+    assert_eq!(rows(&ordered[0]), &vec![vec![Value::Int32(2)]]);
+
+    exec(&ex, "CREATE TABLE numeric_window (id INT, value NUMERIC)").await;
+    exec(
+        &ex,
+        "INSERT INTO numeric_window VALUES (1, '0.1'), (2, NULL), (3, '0.2')",
+    )
+    .await;
+    let windowed = exec(
+        &ex,
+        "SELECT id, SUM(value) OVER (ORDER BY id), AVG(value) OVER (ORDER BY id), COUNT(value) OVER (ORDER BY id) FROM numeric_window ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows(&windowed[0]),
+        &vec![
+            vec![
+                Value::Int32(1),
+                Value::Numeric("0.1".into()),
+                Value::Numeric("0.1".into()),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int32(2),
+                Value::Numeric("0.1".into()),
+                Value::Numeric("0.1".into()),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int32(3),
+                Value::Numeric("0.3".into()),
+                Value::Numeric("0.15".into()),
+                Value::Int64(2),
+            ],
+        ]
+    );
+
+    assert!(
+        ex.execute("INSERT INTO exact_nums VALUES (4, 'not-a-number')")
+            .await
+            .is_err()
+    );
+
+    exec(&ex, "CREATE TABLE numeric_overflow (value NUMERIC)").await;
+    exec(
+        &ex,
+        "INSERT INTO numeric_overflow VALUES ('79228162514264337593543950335'), (1)",
+    )
+    .await;
+    let overflow = ex.execute("SELECT SUM(value) FROM numeric_overflow").await;
+    assert!(
+        overflow.is_err(),
+        "NUMERIC aggregate overflow must return an error, not round or wrap: {overflow:?}"
+    );
+    assert!(
+        ex.execute("SELECT CAST('79228162514264337593543950335' AS NUMERIC) * CAST(2 AS NUMERIC)")
+            .await
+            .is_err()
+    );
+    assert!(
+        ex.execute("SELECT CAST(1 AS NUMERIC) / CAST(0 AS NUMERIC)")
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

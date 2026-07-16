@@ -1,6 +1,6 @@
 // Network model — message delivery, partitions, reordering.
 module network {
-    import types.*
+    import types.* from "./types"
 
     var messages: Set[Message]
     var partitioned: Set[(NodeId, NodeId)]

@@ -696,7 +696,7 @@ async fn test_privilege_checking_insert() {
     exec(&ex, "GRANT SELECT ON priv_test TO testuser").await;
 
     // Set session authorization to testuser
-    exec(&ex, "SET session_authorization = 'testuser'").await;
+    exec(&ex, "SET SESSION AUTHORIZATION testuser").await;
 
     // Attempt to INSERT should fail due to lack of INSERT privilege
     let result = ex.execute("INSERT INTO priv_test VALUES (1, 'test')").await;
@@ -731,7 +731,7 @@ async fn test_privilege_checking_update() {
     exec(&ex, "GRANT SELECT ON priv_test TO testuser").await;
 
     // Set session authorization to testuser
-    exec(&ex, "SET session_authorization = 'testuser'").await;
+    exec(&ex, "SET SESSION AUTHORIZATION testuser").await;
 
     // Attempt to UPDATE should fail
     let result = ex.execute("UPDATE priv_test SET name = 'updated'").await;
@@ -765,7 +765,7 @@ async fn test_privilege_checking_delete() {
     exec(&ex, "GRANT SELECT ON priv_test TO testuser").await;
 
     // Set session authorization to testuser
-    exec(&ex, "SET session_authorization = 'testuser'").await;
+    exec(&ex, "SET SESSION AUTHORIZATION testuser").await;
 
     // Attempt to DELETE should fail
     let result = ex.execute("DELETE FROM priv_test WHERE id = 1").await;
@@ -797,7 +797,7 @@ async fn test_privilege_checking_superuser() {
     exec(&ex, "CREATE ROLE superuser WITH SUPERUSER").await;
 
     // Set session authorization to superuser
-    exec(&ex, "SET session_authorization = 'superuser'").await;
+    exec(&ex, "SET SESSION AUTHORIZATION superuser").await;
 
     // Superuser should be able to do everything without explicit grants
     exec(&ex, "INSERT INTO priv_test VALUES (1, 'test')").await;
@@ -817,7 +817,7 @@ async fn test_privilege_checking_all_privilege() {
     exec(&ex, "GRANT ALL ON priv_test TO testuser").await;
 
     // Set session authorization to testuser
-    exec(&ex, "SET session_authorization = 'testuser'").await;
+    exec(&ex, "SET SESSION AUTHORIZATION testuser").await;
 
     // Should be able to do all operations with ALL privilege
     exec(&ex, "INSERT INTO priv_test VALUES (1, 'test')").await;

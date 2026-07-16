@@ -930,6 +930,36 @@ async fn test_nulls_first_last_order_by() {
         panic!("expected select");
     }
 
+    let r = exec(&ex, "SELECT val FROM ntest ORDER BY val ASC").await;
+    assert_eq!(
+        rows(&r[0])
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Value::Int32(1),
+            Value::Int32(2),
+            Value::Int32(3),
+            Value::Null,
+            Value::Null,
+        ]
+    );
+
+    let r = exec(&ex, "SELECT val FROM ntest ORDER BY val DESC").await;
+    assert_eq!(
+        rows(&r[0])
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Value::Null,
+            Value::Null,
+            Value::Int32(3),
+            Value::Int32(2),
+            Value::Int32(1),
+        ]
+    );
+
     // NULLS FIRST (explicit): NULLs at start
     let r = exec(&ex, "SELECT val FROM ntest ORDER BY val ASC NULLS FIRST").await;
     if let ExecResult::Select { rows, .. } = &r[0] {
@@ -1076,6 +1106,137 @@ async fn test_alter_table_add_primary_key_constraint() {
     // Duplicate PK should be rejected.
     let err = ex.execute("INSERT INTO t_pk1 VALUES (1, 'Bob')").await;
     assert!(err.is_err(), "expected primary key violation");
+}
+
+#[tokio::test]
+async fn test_named_primary_key_can_be_dropped() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE drop_named_pk (id INT)").await;
+    exec(
+        &ex,
+        "ALTER TABLE drop_named_pk ADD CONSTRAINT drop_named_pk_constraint PRIMARY KEY (id)",
+    )
+    .await;
+    exec(
+        &ex,
+        "ALTER TABLE drop_named_pk DROP CONSTRAINT drop_named_pk_constraint",
+    )
+    .await;
+    exec(&ex, "INSERT INTO drop_named_pk VALUES (1), (1)").await;
+    let count = exec(&ex, "SELECT COUNT(*) FROM drop_named_pk").await;
+    assert_eq!(*scalar(&count[0]), Value::Int64(2));
+}
+
+#[tokio::test]
+async fn test_inline_constraint_name_is_preserved_and_deferrable_rejects() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE inline_named (id INT CONSTRAINT inline_named_pk PRIMARY KEY)",
+    )
+    .await;
+    exec(
+        &ex,
+        "ALTER TABLE inline_named DROP CONSTRAINT inline_named_pk",
+    )
+    .await;
+    exec(&ex, "INSERT INTO inline_named VALUES (1), (1)").await;
+
+    assert!(
+        ex.execute("CREATE TABLE deferred_uq (id INT, UNIQUE (id) DEFERRABLE)")
+            .await
+            .is_err(),
+        "unsupported deferred timing must reject rather than enforce immediately"
+    );
+    assert!(
+        ex.execute("CREATE TABLE nulls_equal_uq (id INT, UNIQUE NULLS NOT DISTINCT (id))")
+            .await
+            .is_err(),
+        "unsupported NULLS NOT DISTINCT semantics must reject"
+    );
+}
+
+#[tokio::test]
+async fn test_foreign_key_dependencies_protect_target_constraint_and_column_types() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE dependency_parent (id INT PRIMARY KEY)").await;
+    exec(
+        &ex,
+        "CREATE TABLE dependency_child (pid INT REFERENCES dependency_parent(id))",
+    )
+    .await;
+
+    assert!(
+        ex.execute("ALTER TABLE dependency_parent DROP CONSTRAINT dependency_parent_pkey")
+            .await
+            .is_err()
+    );
+    assert!(
+        ex.execute("ALTER TABLE dependency_parent ALTER COLUMN id TYPE BIGINT")
+            .await
+            .is_err()
+    );
+    assert!(
+        ex.execute("ALTER TABLE dependency_child ALTER COLUMN pid TYPE BIGINT")
+            .await
+            .is_err()
+    );
+    assert!(
+        ex.execute("ALTER TABLE dependency_parent DROP CONSTRAINT dependency_parent_pkey CASCADE",)
+            .await
+            .is_err(),
+        "unsupported dependency cascades must reject explicitly"
+    );
+
+    exec(
+        &ex,
+        "ALTER TABLE dependency_child DROP CONSTRAINT dependency_child_pid_fkey",
+    )
+    .await;
+    exec(
+        &ex,
+        "ALTER TABLE dependency_parent DROP CONSTRAINT dependency_parent_pkey",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_alter_unique_and_primary_key_validate_existing_rows_atomically() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t_existing_uq (id INT, value INT)").await;
+    exec(&ex, "INSERT INTO t_existing_uq VALUES (1, 7), (2, 7)").await;
+    assert!(
+        ex.execute("ALTER TABLE t_existing_uq ADD CONSTRAINT uq_existing UNIQUE (value)")
+            .await
+            .is_err()
+    );
+    exec(&ex, "INSERT INTO t_existing_uq VALUES (3, 7)").await;
+
+    exec(&ex, "CREATE TABLE t_existing_pk (id INT, value TEXT)").await;
+    exec(
+        &ex,
+        "INSERT INTO t_existing_pk VALUES (NULL, 'a'), (NULL, 'b')",
+    )
+    .await;
+    assert!(
+        ex.execute("ALTER TABLE t_existing_pk ADD CONSTRAINT pk_existing PRIMARY KEY (id)")
+            .await
+            .is_err()
+    );
+    exec(&ex, "INSERT INTO t_existing_pk VALUES (NULL, 'c')").await;
+}
+
+#[tokio::test]
+async fn test_alter_set_not_null_validates_existing_rows_atomically() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE t_existing_nn (id INT, value TEXT)").await;
+    exec(&ex, "INSERT INTO t_existing_nn VALUES (1, NULL)").await;
+    assert!(
+        ex.execute("ALTER TABLE t_existing_nn ALTER COLUMN value SET NOT NULL")
+            .await
+            .is_err()
+    );
+    exec(&ex, "INSERT INTO t_existing_nn VALUES (2, NULL)").await;
 }
 
 #[tokio::test]

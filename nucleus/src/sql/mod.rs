@@ -255,7 +255,18 @@ pub fn convert_data_type(dt: &ast::DataType) -> Result<DataType, ParseError> {
         ast::DataType::JSONB => Ok(DataType::Jsonb),
         ast::DataType::JSON => Ok(DataType::Jsonb),
         ast::DataType::Date => Ok(DataType::Date),
-        ast::DataType::Timestamp(_, _) => Ok(DataType::Timestamp),
+        ast::DataType::Timestamp(_, timezone) => {
+            if matches!(
+                timezone,
+                ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz
+            ) {
+                Ok(DataType::TimestampTz)
+            } else {
+                Ok(DataType::Timestamp)
+            }
+        }
+        ast::DataType::TimestampNtz(_) => Ok(DataType::Timestamp),
+        ast::DataType::Interval { .. } => Ok(DataType::Interval),
         ast::DataType::Numeric(_) | ast::DataType::Decimal(_) | ast::DataType::Dec(_) => {
             Ok(DataType::Numeric)
         }
@@ -413,25 +424,26 @@ pub fn extract_constraints(
                         .any(|c| matches!(c, TableConstraint::PrimaryKey { .. }));
                     if !has_pk {
                         constraints.push(TableConstraint::PrimaryKey {
+                            name: opt.name.as_ref().map(|name| name.to_string()),
                             columns: vec![col.name.value.clone()],
                         });
                     }
                 }
                 ast::ColumnOption::Unique(_) => {
                     constraints.push(TableConstraint::Unique {
-                        name: None,
+                        name: opt.name.as_ref().map(|name| name.to_string()),
                         columns: vec![col.name.value.clone()],
                     });
                 }
                 ast::ColumnOption::Check(expr) => {
                     constraints.push(TableConstraint::Check {
-                        name: None,
+                        name: opt.name.as_ref().map(|name| name.to_string()),
                         expr: expr.to_string(),
                     });
                 }
                 ast::ColumnOption::ForeignKey(fk) => {
                     constraints.push(TableConstraint::ForeignKey {
-                        name: None,
+                        name: opt.name.as_ref().map(|name| name.to_string()),
                         columns: vec![col.name.value.clone()],
                         ref_table: fk.foreign_table.to_string(),
                         ref_columns: fk
@@ -454,6 +466,7 @@ pub fn extract_constraints(
             ast::TableConstraint::PrimaryKey(pk) => {
                 constraints.retain(|c| !matches!(c, TableConstraint::PrimaryKey { .. }));
                 constraints.push(TableConstraint::PrimaryKey {
+                    name: pk.name.as_ref().map(|name| name.to_string()),
                     columns: pk
                         .columns
                         .iter()
@@ -662,7 +675,7 @@ mod tests {
         let stmts = parse("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")?;
         if let ast::Statement::CreateTable(ct) = &stmts[0] {
             let constraints = extract_constraints(&ct.columns, &ct.constraints);
-            assert!(constraints.iter().any(|c| matches!(c, crate::catalog::TableConstraint::PrimaryKey { columns } if columns == &["id"])));
+            assert!(constraints.iter().any(|c| matches!(c, crate::catalog::TableConstraint::PrimaryKey { columns, .. } if columns == &["id"])));
         } else {
             return Err(ParseError::UnexpectedStatement("CREATE TABLE".into()));
         }

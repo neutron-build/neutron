@@ -395,6 +395,15 @@ impl ConnectionHandler {
 
     /// Execute SQL against the executor and send results back.
     async fn execute_sql(&mut self, sql: &str) -> std::io::Result<()> {
+        if self.executor.rls_configured() {
+            self.send_error(
+                error_codes::AUTH_FAILED,
+                "binary SQL is disabled while row-level security is configured because this protocol does not carry a catalog-authenticated principal",
+            )
+            .await;
+            self.send_ready().await?;
+            return Ok(());
+        }
         match self
             .executor
             .execute_with_session(self.session_id, sql)

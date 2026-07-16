@@ -1,6 +1,6 @@
 // Cluster Membership Changes — adding and removing nodes safely.
 module membership {
-    import types.*
+    import types.* from "../common/types"
 
     pure val MAX_NODES: int = 5
 
@@ -58,10 +58,14 @@ module membership {
     }
 
     action step = any {
-        1.to(MAX_NODES).exists(n => propose_add(n)),
-        1.to(MAX_NODES).exists(n => commit_add(n)),
-        1.to(MAX_NODES).exists(n => propose_remove(n)),
-        1.to(MAX_NODES).exists(n => commit_remove(n)),
+        { nondet n = 1.to(MAX_NODES).oneOf()
+          propose_add(n) },
+        { nondet n = 1.to(MAX_NODES).oneOf()
+          commit_add(n) },
+        { nondet n = 1.to(MAX_NODES).oneOf()
+          propose_remove(n) },
+        { nondet n = 1.to(MAX_NODES).oneOf()
+          commit_remove(n) },
     }
 
     // === SAFETY INVARIANTS ===

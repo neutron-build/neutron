@@ -28,18 +28,18 @@ module hot_reload {
 
     action init = all {
         server_version' = 1,
-        client_version' = (c => 0),
-        client_state' = (c => "disconnected"),
-        pending_deltas' = (c => List()),
+        client_version' = CLIENTS.mapBy(c => 0),
+        client_state' = CLIENTS.mapBy(c => "disconnected"),
+        pending_deltas' = CLIENTS.mapBy(c => List()),
         total_updates' = 0,
     }
 
     // Client connects (or reconnects)
     action connect(client: ClientId): bool = all {
         client.in(CLIENTS),
-        client_state(client) == "disconnected",
+        client_state.get(client) == "disconnected",
         // If behind server, enter syncing state
-        if (client_version(client) < server_version)
+        if (client_version.get(client) < server_version)
             all {
                 client_state' = client_state.set(client, "syncing"),
                 // Queue all missed versions
@@ -59,7 +59,7 @@ module hot_reload {
     // Server sends sync bundle to a syncing client (full state catch-up)
     action sync_full(client: ClientId): bool = all {
         client.in(CLIENTS),
-        client_state(client) == "syncing",
+        client_state.get(client) == "syncing",
         // Full sync: jump to server version
         client_version' = client_version.set(client, server_version),
         client_state' = client_state.set(client, "connected"),
@@ -71,7 +71,7 @@ module hot_reload {
     // Client disconnects
     action disconnect(client: ClientId): bool = all {
         client.in(CLIENTS),
-        client_state(client) != "disconnected",
+        client_state.get(client) != "disconnected",
         client_state' = client_state.set(client, "disconnected"),
         // Clear pending deltas
         pending_deltas' = pending_deltas.set(client, List()),
@@ -81,41 +81,49 @@ module hot_reload {
     }
 
     // Developer saves a file — server bumps version
-    action file_change: bool = all {
-        server_version < MAX_VERSION,
+    action file_change: bool = {
         val new_ver = server_version + 1
-        server_version' = new_ver,
-        // Push delta to all connected clients
-        pending_deltas' = (c =>
-            if (client_state(c) == "connected")
-                pending_deltas(c).append(new_ver)
-            else pending_deltas(c)),
-        client_state' = client_state,
-        client_version' = client_version,
-        total_updates' = total_updates,
+        all {
+            server_version < MAX_VERSION,
+            server_version' = new_ver,
+            // Push delta to all connected clients
+            pending_deltas' = CLIENTS.mapBy(c =>
+                if (client_state.get(c) == "connected")
+                    pending_deltas.get(c).append(new_ver)
+                else pending_deltas.get(c)),
+            client_state' = client_state,
+            client_version' = client_version,
+            total_updates' = total_updates,
+        }
     }
 
     // Client applies the next pending delta (must be in order)
-    action apply_delta(client: ClientId): bool = all {
-        client.in(CLIENTS),
-        client_state(client) == "connected",
-        pending_deltas(client).length() > 0,
-        val delta_ver = pending_deltas(client)[0]
-        // Delta must be exactly client_version + 1 (ordered application)
-        delta_ver == client_version(client) + 1,
-        client_version' = client_version.set(client, delta_ver),
-        pending_deltas' = pending_deltas.set(client,
-            pending_deltas(client).slice(1, pending_deltas(client).length())),
-        client_state' = client_state,
-        server_version' = server_version,
-        total_updates' = total_updates + 1,
+    action apply_delta(client: ClientId): bool = {
+        val delta_ver = pending_deltas.get(client)[0]
+        all {
+            client.in(CLIENTS),
+            client_state.get(client) == "connected",
+            pending_deltas.get(client).length() > 0,
+            // Delta must be exactly client_version + 1 (ordered application)
+            delta_ver == client_version.get(client) + 1,
+            client_version' = client_version.set(client, delta_ver),
+            pending_deltas' = pending_deltas.set(client,
+                pending_deltas.get(client).slice(1, pending_deltas.get(client).length())),
+            client_state' = client_state,
+            server_version' = server_version,
+            total_updates' = total_updates + 1,
+        }
     }
 
     action step = any {
-        CLIENTS.exists(c => connect(c)),
-        CLIENTS.exists(c => disconnect(c)),
-        CLIENTS.exists(c => sync_full(c)),
-        CLIENTS.exists(c => apply_delta(c)),
+        { nondet c = CLIENTS.oneOf()
+          connect(c) },
+        { nondet c = CLIENTS.oneOf()
+          disconnect(c) },
+        { nondet c = CLIENTS.oneOf()
+          sync_full(c) },
+        { nondet c = CLIENTS.oneOf()
+          apply_delta(c) },
         file_change,
     }
 
@@ -124,20 +132,20 @@ module hot_reload {
     // Client version never exceeds server version
     val version_monotonic: bool =
         CLIENTS.forall(c =>
-            client_version(c) <= server_version
+            client_version.get(c) <= server_version
         )
 
     // Connected clients are at most 1 version behind per pending delta
     val connected_bounded_lag: bool =
         CLIENTS.forall(c =>
-            client_state(c) == "connected" implies
-            client_version(c) + pending_deltas(c).length() <= server_version
+            client_state.get(c) == "connected" implies
+            client_version.get(c) + pending_deltas.get(c).length() <= server_version
         )
 
     // Delta ordering: pending deltas are monotonically increasing
     val delta_ordering: bool =
         CLIENTS.forall(c =>
-            val deltas = pending_deltas(c)
+            val deltas = pending_deltas.get(c)
             0.to(deltas.length() - 2).forall(i =>
                 deltas[i] < deltas[i + 1]
             )
@@ -146,16 +154,16 @@ module hot_reload {
     // No gaps: applied deltas are contiguous (version always increments by 1)
     val no_version_gaps: bool =
         CLIENTS.forall(c =>
-            val deltas = pending_deltas(c)
+            val deltas = pending_deltas.get(c)
             deltas.length() > 0 implies
-            deltas[0] == client_version(c) + 1
+            deltas[0] == client_version.get(c) + 1
         )
 
     // Syncing clients eventually reach server version (via sync_full)
     val sync_reaches_server: bool =
         CLIENTS.forall(c =>
-            client_state(c) == "syncing" implies
-            client_version(c) <= server_version
+            client_state.get(c) == "syncing" implies
+            client_version.get(c) <= server_version
         )
 
     // Server version only increases
@@ -165,15 +173,15 @@ module hot_reload {
     // Disconnected clients have no pending deltas
     val disconnected_no_pending: bool =
         CLIENTS.forall(c =>
-            client_state(c) == "disconnected" implies
-            pending_deltas(c).length() == 0
+            client_state.get(c) == "disconnected" implies
+            pending_deltas.get(c).length() == 0
         )
 
     // Valid client states
     val valid_client_states: bool =
         CLIENTS.forall(c =>
-            client_state(c) == "connected" or
-            client_state(c) == "disconnected" or
-            client_state(c) == "syncing"
+            client_state.get(c) == "connected" or
+            client_state.get(c) == "disconnected" or
+            client_state.get(c) == "syncing"
         )
 }

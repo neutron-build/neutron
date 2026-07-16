@@ -134,6 +134,12 @@ struct TableMeta {
     /// Column names, persisted so the catalog can be repopulated after a reopen
     /// (otherwise restored tables exist physically but are invisible to SQL).
     col_names: Vec<String>,
+    /// Per-table generation id (T0.3), mirrored from the catalog's `TableDef`
+    /// when the table is materialized and persisted in the directory (v2+).
+    /// On boot, a mismatch against the catalog's epoch means these pages belong
+    /// to a dropped-then-recreated predecessor and `first_page` is stale. `0`
+    /// for legacy (pre-v2) directory entries.
+    epoch: u64,
 }
 
 /// Metadata for an active index.
@@ -240,6 +246,8 @@ impl DiskEngine {
             None,
             false,
             wal::SyncMode::Fsync,
+            None,
+            None,
         )
     }
 
@@ -253,6 +261,8 @@ impl DiskEngine {
             None,
             false,
             wal::SyncMode::Fsync,
+            None,
+            None,
         )
     }
 
@@ -271,6 +281,8 @@ impl DiskEngine {
             Some(encryptor),
             false,
             wal::SyncMode::Fsync,
+            None,
+            None,
         )
     }
 
@@ -289,6 +301,8 @@ impl DiskEngine {
             Some(encryptor),
             true,
             wal::SyncMode::Fsync,
+            None,
+            None,
         )
     }
 
@@ -303,6 +317,8 @@ impl DiskEngine {
             None,
             true,
             wal::SyncMode::Fsync,
+            None,
+            None,
         )
     }
 
@@ -342,6 +358,8 @@ impl DiskEngine {
             None,
             false,
             wal::SyncMode::Fsync,
+            None,
+            None,
         )
     }
 
@@ -362,6 +380,35 @@ impl DiskEngine {
             None,
             false,
             sync_mode,
+            None,
+            None,
+        )
+    }
+
+    /// Open a segmented WAL with continuous archiving (PITR) to an explicit
+    /// directory and an explicit segment size in bytes. Distinct from
+    /// `open_segmented` (which sizes in MB and archives only if
+    /// `NUCLEUS_WAL_ARCHIVE_DIR` is set), this gives embedded/PITR callers full
+    /// control over both the archive location and rotation granularity.
+    pub fn open_segmented_archived(
+        path: &Path,
+        catalog: Arc<Catalog>,
+        pool_frames: usize,
+        max_segment_bytes: u64,
+        sync_mode: wal::SyncMode,
+        archive_dir: &Path,
+    ) -> Result<Self, StorageError> {
+        Self::open_inner(
+            path,
+            catalog,
+            pool_frames,
+            true,
+            0,
+            None,
+            false,
+            sync_mode,
+            Some(max_segment_bytes),
+            Some(archive_dir.to_path_buf()),
         )
     }
 
@@ -375,6 +422,8 @@ impl DiskEngine {
         encryptor: Option<super::encryption::PageEncryptor>,
         compression: bool,
         sync_mode: wal::SyncMode,
+        max_segment_bytes: Option<u64>,
+        archive_dir: Option<std::path::PathBuf>,
     ) -> Result<Self, StorageError> {
         let mut disk = match (&encryptor, compression) {
             (Some(enc), true) => DiskManager::open_compressed_encrypted(path, enc.clone()),
@@ -465,15 +514,17 @@ impl DiskEngine {
         // Open WAL backend — segmented or single-file
         let wal_backend: Box<dyn wal::WalBackend> = if use_segmented_wal {
             let wal_dir = path.with_extension("wal.d");
-            let max_bytes = if max_segment_size_mb > 0 {
+            let max_bytes = max_segment_bytes.unwrap_or(if max_segment_size_mb > 0 {
                 (max_segment_size_mb * 1024 * 1024) as u64
             } else {
                 64 * 1024 * 1024 // 64 MB default
-            };
-            Box::new(
-                wal::SegmentedWal::open_with_sync_mode(&wal_dir, max_bytes, sync_mode)
-                    .map_err(|e| StorageError::Io(format!("Segmented WAL open failed: {e}")))?,
-            )
+            });
+            let seg = match &archive_dir {
+                Some(ad) => wal::SegmentedWal::open_with_archive(&wal_dir, max_bytes, sync_mode, ad),
+                None => wal::SegmentedWal::open_with_sync_mode(&wal_dir, max_bytes, sync_mode),
+            }
+            .map_err(|e| StorageError::Io(format!("Segmented WAL open failed: {e}")))?;
+            Box::new(seg)
         } else {
             Box::new(
                 Wal::open_with_sync_mode(&wal_path, sync_mode)
@@ -498,20 +549,57 @@ impl DiskEngine {
             initial_pages,
         ));
 
-        // Load free list head from the meta page (or initialize for new databases).
-        let (fl_head, fl_count) = if is_new {
-            (INVALID_PAGE_ID, 0u32)
+        // Load free list head + validate the on-disk format from the meta page
+        // (or initialize for new databases). T1.1: refuse a database whose magic
+        // is foreign or whose format version is newer than this build can read,
+        // rather than silently misinterpreting the bytes.
+        let (fl_head, fl_count, stored_format_version) = if is_new {
+            (INVALID_PAGE_ID, 0u32, page::DB_FORMAT_VERSION)
         } else {
             let frame_id = pool
                 .fetch_page(0)
                 .map_err(|e| StorageError::Io(e.to_string()))?;
             let pg = pool.frame_data(frame_id);
+
+            // Magic check. Databases created before the magic stamp existed have
+            // zeros here — accept those (legacy). A non-zero mismatch is a
+            // foreign or corrupt file: refuse.
+            let magic = &pg[page::META_MAGIC..page::META_MAGIC + 8];
+            if magic != page::MAGIC_BYTES && magic.iter().any(|&b| b != 0) {
+                pool.unpin(frame_id);
+                return Err(StorageError::Io(format!(
+                    "{}: not a Nucleus database (bad magic bytes)",
+                    path.display()
+                )));
+            }
+
+            // Version check. A stored version newer than we support means an
+            // older binary must not touch a database written by a newer one.
+            let stored_version = page::read_u32(pg, page::META_DB_VERSION);
+            if stored_version > page::DB_FORMAT_VERSION {
+                pool.unpin(frame_id);
+                return Err(StorageError::Io(format!(
+                    "{}: database format version {stored_version} is newer than this \
+                     build supports (max {}); upgrade Nucleus to open it",
+                    path.display(),
+                    page::DB_FORMAT_VERSION
+                )));
+            }
+
             let head = page::read_u32(pg, META_FREE_LIST_HEAD);
             let count = page::read_u32(pg, META_FREE_PAGE_COUNT);
             pool.unpin(frame_id);
             // Backwards compat: zeroed meta page means no free list
             let head = if head == 0 { INVALID_PAGE_ID } else { head };
-            (head, count)
+            if stored_version < page::DB_FORMAT_VERSION {
+                tracing::info!(
+                    "{}: on-disk format v{stored_version} < v{}; upgrading on next \
+                     directory save",
+                    path.display(),
+                    page::DB_FORMAT_VERSION
+                );
+            }
+            (head, count, stored_version)
         };
 
         let mut engine = Self {
@@ -529,7 +617,7 @@ impl DiskEngine {
 
         // For existing databases, load the table directory from the (potentially recovered) meta page
         if !is_new {
-            engine.load_table_directory()?;
+            engine.load_table_directory(stored_format_version)?;
         }
 
         Ok(engine)
@@ -703,6 +791,8 @@ impl DiskEngine {
             dir_buf.extend_from_slice(&name_len.to_le_bytes());
             dir_buf.extend_from_slice(name_bytes);
             dir_buf.extend_from_slice(&meta.first_page.to_le_bytes());
+            // v2: per-table epoch immediately after first_page (T0.3).
+            dir_buf.extend_from_slice(&meta.epoch.to_le_bytes());
             let col_count = meta.col_types.len() as u16;
             dir_buf.extend_from_slice(&col_count.to_le_bytes());
             for ct in &meta.col_types {
@@ -757,6 +847,11 @@ impl DiskEngine {
             .fetch_page(0)
             .map_err(|e| StorageError::Io(e.to_string()))?;
         let pg = self.pool.frame_data_mut(frame_id);
+        // Stamp the current format version: the entries below are written in v2
+        // layout (with per-table epoch), so the meta page must advertise v2.
+        // This is what transparently upgrades a v1 database on its first
+        // directory save after open (T0.3 / T1.1).
+        page::write_u32(pg, page::META_DB_VERSION, page::DB_FORMAT_VERSION);
         // Zero the directory area first
         pg[META_TABLE_DIR_START..].fill(0);
 
@@ -845,7 +940,11 @@ impl DiskEngine {
 
     /// Load the table directory from the meta page (and overflow pages if present),
     /// restoring the tables HashMap.
-    fn load_table_directory(&mut self) -> Result<(), StorageError> {
+    fn load_table_directory(&mut self, format_version: u32) -> Result<(), StorageError> {
+        // `format_version` is the meta page's stored `META_DB_VERSION`. v2+
+        // directory entries carry a per-table epoch after `first_page`; v1
+        // entries do not (parsed as epoch 0). See `DB_FORMAT_VERSION`.
+        let has_epoch = format_version >= 2;
         // Read the meta page and collect directory bytes, following overflow pages.
         let meta_dir_capacity = PAGE_SIZE - META_TABLE_DIR_START - 4;
         let overflow_capacity = PAGE_SIZE - 4;
@@ -925,6 +1024,28 @@ impl DiskEngine {
             ]);
             offset += 4;
 
+            // v2: per-table epoch (u64) directly after first_page. v1 entries
+            // omit it — default to 0 (legacy/unknown generation).
+            let epoch = if has_epoch {
+                if offset + 8 > dir_data.len() {
+                    break;
+                }
+                let e = u64::from_le_bytes([
+                    dir_data[offset],
+                    dir_data[offset + 1],
+                    dir_data[offset + 2],
+                    dir_data[offset + 3],
+                    dir_data[offset + 4],
+                    dir_data[offset + 5],
+                    dir_data[offset + 6],
+                    dir_data[offset + 7],
+                ]);
+                offset += 8;
+                e
+            } else {
+                0
+            };
+
             // Read col_count + col_types
             if offset + 2 > dir_data.len() {
                 break;
@@ -980,6 +1101,7 @@ impl DiskEngine {
                     last_page: last,
                     col_types,
                     col_names,
+                    epoch,
                 },
             );
         }
@@ -1015,6 +1137,19 @@ impl DiskEngine {
                     .collect();
                 (name.clone(), cols)
             })
+            .collect()
+    }
+
+    /// Per-table epoch (generation id) of every table in the on-disk directory
+    /// (T0.3). The embedded builder pairs this with `recovered_schemas` so the
+    /// catalog it rebuilds from storage carries the same epoch the directory
+    /// holds — otherwise a nonzero directory epoch vs a default-0 catalog epoch
+    /// would look like a drop+recreate and wrongly empty the table.
+    pub fn recovered_table_epochs(&self) -> HashMap<String, u64> {
+        self.tables
+            .read()
+            .iter()
+            .map(|(name, meta)| (name.clone(), meta.epoch))
             .collect()
     }
 
@@ -1283,8 +1418,10 @@ impl DiskEngine {
         Ok((pages_scanned, dead_reclaimed, pages_freed, bytes_reclaimed))
     }
 
-    /// Get all table names.
-    fn table_names(&self) -> Vec<String> {
+    /// Get all table names currently in the on-disk directory (as opposed to
+    /// the catalog). Boot reconciliation uses this to find storage-ahead
+    /// orphans — directory tables the catalog no longer knows about (T0.3).
+    pub fn table_names(&self) -> Vec<String> {
         self.tables.read().keys().cloned().collect()
     }
 }
@@ -1312,10 +1449,31 @@ impl StorageEngine for DiskEngine {
                     .collect();
                 let col_names: Vec<String> =
                     table_def.columns.iter().map(|c| c.name.clone()).collect();
+                let cat_epoch = table_def.epoch;
                 let mut tables = self.tables.write();
                 if let Some(meta) = tables.get_mut(table) {
                     meta.col_types = col_types;
                     meta.col_names = col_names;
+                    // T0.3 epoch reconciliation: the on-disk directory records a
+                    // different generation than the catalog's current table. That
+                    // means this name was dropped and recreated but the drop's
+                    // directory flush was lost — so `first_page` points at the
+                    // *old* table's chain (or, if those pages were freed and
+                    // reused, at another table's rows). Trusting it returns wrong
+                    // data. Abandon the chain and recover the table empty. We do
+                    // NOT free the pages: they may already be owned by a live
+                    // table, so freeing would corrupt it — a small leak (until a
+                    // future full vacuum) is the safe trade against corruption.
+                    if meta.epoch != cat_epoch {
+                        tracing::warn!(
+                            "table '{table}': storage directory epoch {} != catalog epoch \
+                             {cat_epoch}; abandoning stale first_page (recovered empty)",
+                            meta.epoch
+                        );
+                        meta.first_page = INVALID_PAGE_ID;
+                        meta.last_page = INVALID_PAGE_ID;
+                        meta.epoch = cat_epoch;
+                    }
                 }
             }
             return Ok(());
@@ -1333,6 +1491,7 @@ impl StorageEngine for DiskEngine {
             .map(|c| c.data_type.clone())
             .collect();
         let col_names: Vec<String> = table_def.columns.iter().map(|c| c.name.clone()).collect();
+        let epoch = table_def.epoch;
 
         let mut tables = self.tables.write();
         tables.insert(
@@ -1342,6 +1501,9 @@ impl StorageEngine for DiskEngine {
                 last_page: INVALID_PAGE_ID,
                 col_types,
                 col_names,
+                // Stamp the catalog's current generation so a later drop+recreate
+                // (which draws a fresh epoch) is detectable on recovery (T0.3).
+                epoch,
             },
         );
         Ok(())
@@ -1818,6 +1980,18 @@ impl StorageEngine for DiskEngine {
         self.pool.wal_force_needed()
     }
 
+    async fn flush_schema(&self) -> Result<(), StorageError> {
+        // `save_table_directory` writes meta page 0 through the buffer pool,
+        // which dirties it; `wal_force_pending` then WAL-logs and group-syncs
+        // that page. Unlike `make_durable`, there is no pending-page gate — a
+        // bare CREATE/DROP dirties no data page, and skipping the force here is
+        // exactly the catalog-ahead-of-storage hole we are closing.
+        self.save_table_directory()?;
+        self.pool
+            .wal_force_pending()
+            .map_err(|e| StorageError::Io(e.to_string()))
+    }
+
     async fn checkpoint(&self) -> Result<(), StorageError> {
         self.checkpoint()
     }
@@ -1908,7 +2082,7 @@ impl StorageEngine for DiskEngine {
             let key_rids = idx.btree.range_scan(Some(&low_key), Some(&high_key)).ok()?;
             let mut rows = Vec::with_capacity(key_rids.len());
             for (key_bytes, _rid) in &key_rids {
-                if let Some(val) = deserialize_index_key(key_bytes) {
+                if let Some(val) = deserialize_index_key(key_bytes, &idx.col_type) {
                     rows.push(vec![val]);
                 }
             }
@@ -1918,7 +2092,7 @@ impl StorageEngine for DiskEngine {
             let key_rids = idx.btree.range_scan(None, None).ok()?;
             let mut rows = Vec::with_capacity(key_rids.len());
             for (key_bytes, _rid) in &key_rids {
-                if let Some(val) = deserialize_index_key(key_bytes) {
+                if let Some(val) = deserialize_index_key(key_bytes, &idx.col_type) {
                     rows.push(vec![val]);
                 }
             }
@@ -2307,22 +2481,23 @@ fn normalize_index_bound_value(value: &Value, index_type: &DataType) -> Option<V
 }
 
 fn serialize_index_key(val: &Value) -> Vec<u8> {
+    // Integers of any width (`Int32`/`Int64`) encode identically — tag 7 + the
+    // canonical i64, sign-flipped for order-preserving unsigned byte comparison — so
+    // the same logical value maps to the same key bytes regardless of the width it was
+    // stored at. This is what makes disk-engine point lookups, UNIQUE enforcement, and
+    // range scans correct across `VALUES` (Int32) vs `INSERT ... SELECT`/`generate_series`
+    // (Int64) inserts, and fixes a latent mis-ordering (the old code tagged every Int32
+    // below every Int64 regardless of value). Legacy tags 2/3 are still decoded on read
+    // for safety but are never written.
+    if let Some(i) = val.as_canonical_int() {
+        let mut buf = vec![7];
+        let u = (i as u64) ^ 0x8000_0000_0000_0000;
+        buf.extend_from_slice(&u.to_be_bytes());
+        return buf;
+    }
     match val {
         Value::Null => vec![0],
         Value::Bool(b) => vec![1, *b as u8],
-        Value::Int32(i) => {
-            let mut buf = vec![2];
-            // XOR sign bit for comparable ordering
-            let u = (*i as u32) ^ 0x8000_0000;
-            buf.extend_from_slice(&u.to_be_bytes());
-            buf
-        }
-        Value::Int64(i) => {
-            let mut buf = vec![3];
-            let u = (*i as u64) ^ 0x8000_0000_0000_0000;
-            buf.extend_from_slice(&u.to_be_bytes());
-            buf
-        }
         Value::Float64(f) => {
             let mut buf = vec![4];
             let bits = f.to_bits();
@@ -2349,24 +2524,57 @@ fn serialize_index_key(val: &Value) -> Vec<u8> {
     }
 }
 
-/// Deserialize a B-tree index key back into a Value.
-/// Inverse of `serialize_index_key`.
-fn deserialize_index_key(data: &[u8]) -> Option<Value> {
+/// Reconstruct an integer key at the index column's declared width, so an
+/// index-only scan returns the same type a heap scan would (an `INT` column
+/// yields `Int32`, not `Int64`).
+fn int_value_for_type(i: i64, col_type: &DataType) -> Value {
+    match col_type {
+        DataType::Int32 => match i32::try_from(i) {
+            Ok(v) => Value::Int32(v),
+            Err(_) => Value::Int64(i),
+        },
+        _ => Value::Int64(i),
+    }
+}
+
+/// Deserialize a B-tree index key back into a Value. Inverse of
+/// `serialize_index_key`. `col_type` is the index column's declared type, used to
+/// reconstruct integer keys at the correct width.
+fn deserialize_index_key(data: &[u8], col_type: &DataType) -> Option<Value> {
     if data.is_empty() {
         return None;
     }
     match data[0] {
         0 => Some(Value::Null),
         1 => data.get(1).map(|&b| Value::Bool(b != 0)),
+        // Canonical integer key (current format).
+        7 if data.len() >= 9 => {
+            let u = u64::from_be_bytes([
+                data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
+            ]);
+            Some(int_value_for_type(
+                (u ^ 0x8000_0000_0000_0000) as i64,
+                col_type,
+            ))
+        }
+        // Legacy Int32 (4-byte) key — never written by current code; decoded
+        // defensively so a pre-canonicalization key can't silently drop a row.
         2 if data.len() >= 5 => {
             let u = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-            Some(Value::Int32((u ^ 0x8000_0000) as i32))
+            Some(int_value_for_type(
+                ((u ^ 0x8000_0000) as i32) as i64,
+                col_type,
+            ))
         }
+        // Legacy Int64 (8-byte) key — likewise defensive.
         3 if data.len() >= 9 => {
             let u = u64::from_be_bytes([
                 data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
             ]);
-            Some(Value::Int64((u ^ 0x8000_0000_0000_0000) as i64))
+            Some(int_value_for_type(
+                (u ^ 0x8000_0000_0000_0000) as i64,
+                col_type,
+            ))
         }
         4 if data.len() >= 9 => {
             let u = u64::from_be_bytes([
@@ -2439,6 +2647,7 @@ mod tests {
                 ],
                 constraints: vec![],
                 append_only: false,
+                epoch: 0,
             })
             .await
             .unwrap();
@@ -2728,6 +2937,7 @@ mod tests {
                 ],
                 constraints: vec![],
                 append_only: false,
+                epoch: 0,
             })
             .await
             .unwrap();
@@ -3210,6 +3420,7 @@ mod tests {
             ],
             constraints: vec![],
             append_only: false,
+            epoch: 0,
         };
 
         let row = vec![
@@ -4344,6 +4555,150 @@ mod tests {
         let fast_count = engine.fast_count_all("t").unwrap();
         assert_eq!(scan_count, fast_count);
     }
+
+    // ── PITR: base snapshot + WAL archive → restore to a point in time ──────
+    //
+    // End-to-end proof that continuous archiving + restore_pitr recover the
+    // exact row set as of a chosen LSN: rows written AFTER the target must not
+    // reappear, and rows at/before it must all be present.
+    #[tokio::test]
+    async fn pitr_restores_row_set_at_target_lsn() {
+        use crate::pitr::{restore_pitr, PitrTarget};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("live");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("nucleus.db");
+        let live_wal_dir = db_path.with_extension("wal.d");
+        let archive = tmp.path().join("archive");
+
+        // Highest LSN present across the live WAL + the archive right now.
+        let max_lsn_now = |wal_dir: &std::path::Path, arch: &std::path::Path| -> u64 {
+            let mut m = 0u64;
+            for r in wal::read_wal_dir_records(wal_dir).unwrap_or_default() {
+                m = m.max(r.lsn);
+            }
+            if arch.is_dir() {
+                for s in wal::list_archive_segments(arch).unwrap_or_default() {
+                    for r in
+                        wal::read_wal_records(&wal::segment_file_path(arch, s)).unwrap_or_default()
+                    {
+                        m = m.max(r.lsn);
+                    }
+                }
+            }
+            m
+        };
+
+        // Phase 1: batch A, checkpoint, then snapshot the base (pages reflect A).
+        let base_snap = tmp.path().join("base");
+        {
+            let catalog = Arc::new(Catalog::new());
+            register_simple_table(&catalog, "t").await;
+            // Tiny segments so batches rotate and archive continuously.
+            let engine = DiskEngine::open_segmented_archived(
+                &db_path,
+                catalog.clone(),
+                DEFAULT_POOL_SIZE,
+                12_000,
+                wal::SyncMode::Fsync,
+                &archive,
+            )
+            .unwrap();
+            engine.create_table("t").await.unwrap();
+            for i in 0..40 {
+                engine.insert("t", simple_row(i, &format!("a{i}"))).await.unwrap();
+            }
+            engine.checkpoint().unwrap();
+            drop(engine);
+            // Physical base backup of the whole data dir (A only).
+            crate::backup::backup_data_dir(&data_dir, &base_snap, false, "0.1.1").unwrap();
+        }
+
+        // Phase 2: reopen, batch B, checkpoint, capture the target LSN, then
+        // batch C (must NOT survive a restore to the target).
+        let target_lsn;
+        {
+            let catalog = Arc::new(Catalog::new());
+            register_simple_table(&catalog, "t").await;
+            let engine = DiskEngine::open_segmented_archived(
+                &db_path,
+                catalog.clone(),
+                DEFAULT_POOL_SIZE,
+                12_000,
+                wal::SyncMode::Fsync,
+                &archive,
+            )
+            .unwrap();
+            engine.create_table("t").await.unwrap();
+            for i in 100..140 {
+                engine.insert("t", simple_row(i, &format!("b{i}"))).await.unwrap();
+            }
+            engine.checkpoint().unwrap();
+            target_lsn = max_lsn_now(&live_wal_dir, &archive);
+            assert!(target_lsn > 0, "expected a non-zero target LSN after batch B");
+            for i in 200..240 {
+                engine.insert("t", simple_row(i, &format!("c{i}"))).await.unwrap();
+            }
+            engine.checkpoint().unwrap();
+            drop(engine);
+        }
+
+        // Phase 3: restore to target_lsn into a clean dir, reopen, verify.
+        let restored_dir = tmp.path().join("restored");
+        let report = restore_pitr(
+            &base_snap,
+            &archive,
+            PitrTarget::Lsn(target_lsn),
+            &restored_dir,
+            "nucleus.db",
+            "0.1.1",
+            false,
+        )
+        .unwrap();
+        assert!(
+            report.restored_lsn >= target_lsn,
+            "reconstruction did not reach the target: restored {} < target {}",
+            report.restored_lsn,
+            target_lsn
+        );
+
+        let catalog = Arc::new(Catalog::new());
+        register_simple_table(&catalog, "t").await;
+        let restored_db = restored_dir.join("nucleus.db");
+        // Reopen with the segmented backend so recovery reads the reconstructed
+        // wal.d (single-file `open()` would ignore it) — matching how a
+        // segmented-WAL deployment opens in production.
+        let engine = DiskEngine::open_segmented_with_sync(
+            &restored_db,
+            catalog.clone(),
+            DEFAULT_POOL_SIZE,
+            64,
+            wal::SyncMode::Fsync,
+        )
+        .unwrap();
+        engine.create_table("t").await.unwrap();
+        let rows = engine.scan("t").await.unwrap();
+
+        let ids: std::collections::HashSet<i32> = rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Int32(n) => *n,
+                other => panic!("unexpected id value {other:?}"),
+            })
+            .collect();
+        // All of A (0..40) and B (100..140) present; none of C (200..240).
+        for i in 0..40 {
+            assert!(ids.contains(&i), "row A{i} missing after PITR restore");
+        }
+        for i in 100..140 {
+            assert!(ids.contains(&i), "row B{i} missing after PITR restore");
+        }
+        for i in 200..240 {
+            assert!(!ids.contains(&i), "row C{i} wrongly survived PITR to target");
+        }
+    }
+
 }
 
 // ============================================================================

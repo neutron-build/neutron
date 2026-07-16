@@ -62,7 +62,7 @@ Same file conventions. Same loader pattern. One mode ships 0KB of JS, the other 
 
 ### Rust — Raw Performance
 
-The Rust framework targets high-throughput APIs, WebSocket servers, and anything where latency predictability matters. Trie-based routing, composable crates, JWT auth, WebSocket, SSE — all tested across 1,200+ tests.
+The Rust framework targets high-throughput APIs, WebSocket servers, and anything where latency predictability matters. Trie-based routing, 19 composable crates, JWT auth, WebSocket, SSE — all tested across 1,200+ tests.
 
 ```rust
 // routes/api/users.rs
@@ -141,7 +141,7 @@ Neutron is early-stage software. Here's an honest accounting:
 
 **Thousands of passing tests across the stack.** The TypeScript, Rust (1,200+), and Python (400+) suites are the most substantial; Go is built with lighter coverage; Mojo is gated on the Mojo 1.0 toolchain.
 
-**Nucleus: 234,000+ lines of Rust, 2,596 tests.** WAL durability on all fourteen models. MVCC snapshot isolation in memory mode. Disk MVCC and distributed mode are in progress.
+**Nucleus: 234,621 lines of Rust, 2,596 tests.** WAL durability on 8 of the 14 models. MVCC snapshot isolation in memory mode. Disk MVCC and distributed mode are in progress.
 
 **Available now via `npm create neutron@latest`.** The TypeScript framework is the most production-ready. Rust is close behind. The others are built but have rough edges.
 

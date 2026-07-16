@@ -116,7 +116,7 @@ export default function Dashboard() {
             <h2 class="section-label" data-animate>The complete picture</h2>
             <p class="example__desc" data-animate style={{ "--animate-delay": "0.1s" } as any}>One file. Loader fetches data. Action handles the form. Component renders it. Error boundary catches failures. TypeScript connects everything.</p>
             <CodeBlock filename="routes/app/projects/[id].tsx" annotation="typeof loader → useLoaderData → component. End-to-end type safety. No codegen. No runtime validation.">
-              <pre><code>{`import type { LoaderArgs, ActionArgs } from "@neutron-build/core";
+              <pre><code>{`import type { LoaderArgs, ActionArgs, ErrorBoundaryProps } from "@neutron-build/core";
 
 export const config = { mode: "app" };
 
@@ -150,12 +150,8 @@ export default function ProjectPage() {
   );
 }
 
-export function ErrorBoundary() {
-  const error = useRouteError();
-  if (isRouteErrorResponse(error)) {
-    return <p>{error.status}: Not found.</p>;
-  }
-  return <p>Something went wrong.</p>;
+export function ErrorBoundary({ error }: ErrorBoundaryProps) {
+  return <p>Something went wrong: {error.message}</p>;
 }`}</code></pre>
             </CodeBlock>
           </div>

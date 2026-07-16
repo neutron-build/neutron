@@ -102,8 +102,13 @@ impl DatabaseBuilder {
     /// Build and return the database.
     pub fn build(self) -> Result<Database, DatabaseError> {
         let catalog = Arc::new(Catalog::new());
+        #[allow(unused_mut)]
         let mut recovered_schemas: Vec<(String, Vec<(String, crate::types::DataType)>)> =
             Vec::new();
+        #[allow(unused_mut, unused_assignments)]
+        let mut recovered_epochs: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        #[allow(unused_mut)]
         let mut data_dir: Option<std::path::PathBuf> = None;
         let storage: Arc<dyn StorageEngine> = match self.mode {
             StorageMode::Memory => Arc::new(MemoryEngine::new()),
@@ -124,6 +129,11 @@ impl DatabaseBuilder {
                 // Repopulate the catalog from the restored on-disk table directory
                 // so reopened tables are visible to SQL (the catalog starts empty).
                 recovered_schemas = engine.recovered_schemas();
+                // Carry each table's on-disk epoch into the rebuilt catalog so
+                // the two agree — otherwise reconciliation would see a nonzero
+                // directory epoch against a default-0 catalog epoch and wrongly
+                // treat every reopened table as a stale drop+recreate (T0.3).
+                recovered_epochs = engine.recovered_table_epochs();
                 Arc::new(engine)
             }
         };
@@ -140,11 +150,13 @@ impl DatabaseBuilder {
                     default_expr: None,
                 })
                 .collect();
+            let epoch = recovered_epochs.get(&name).copied().unwrap_or(0);
             let td = TableDef {
                 name,
                 columns: cols,
                 constraints: Vec::new(),
                 append_only: false,
+                epoch,
             };
             let _ = catalog.create_table_sync(td);
         }
@@ -1037,16 +1049,26 @@ impl Drop for Transaction {
     fn drop(&mut self) {
         if !self.finished {
             // Best-effort rollback on drop. We cannot run async code in Drop,
-            // so we spawn a blocking task on the executor. This is a safety net
-            // — callers should explicitly commit or rollback.
+            // so schedule it on the current server runtime when available. The
+            // core-only embedded build deliberately has no Tokio runtime feature;
+            // it uses a small executor on a helper thread instead. This is a safety
+            // net — callers should explicitly commit or rollback.
             let executor = self.executor.clone();
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Handle::try_current();
-                if let Ok(handle) = rt {
+            #[cfg(feature = "server")]
+            {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
                         let _ = executor.execute("ROLLBACK").await;
                     });
+                } else {
+                    std::thread::spawn(move || {
+                        let _ = futures::executor::block_on(executor.execute("ROLLBACK"));
+                    });
                 }
+            }
+            #[cfg(not(feature = "server"))]
+            std::thread::spawn(move || {
+                let _ = futures::executor::block_on(executor.execute("ROLLBACK"));
             });
         }
     }
@@ -1276,6 +1298,7 @@ mod tests {
         assert_eq!(affected, 3);
     }
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn embedded_disk_roundtrip() {
         let dir = std::env::temp_dir().join("nucleus_embed_test");
@@ -1760,6 +1783,7 @@ mod tests {
     // Durable MVCC crash recovery tests
     // ========================================================================
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn durable_mvcc_crash_recovery() {
         let dir = tempfile::tempdir().unwrap();
@@ -1790,6 +1814,79 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn durable_mvcc_hnsw_pk_vector_search_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        // PK values are 10/20/30 (not 0/1/2) so pk != scan position — this
+        // exposes any positional-vs-PK-id mismatch after recovery.
+        {
+            let db = Database::durable_mvcc(dir.path()).unwrap();
+            db.execute("CREATE TABLE pv (id INT PRIMARY KEY, v VECTOR(3))")
+                .await
+                .unwrap();
+            db.execute(
+                "INSERT INTO pv VALUES (10, VECTOR('[1,0,0]')), (20, VECTOR('[0,1,0]')), (30, VECTOR('[0,0,1]'))",
+            )
+            .await
+            .unwrap();
+            db.execute("CREATE INDEX pv_v ON pv USING HNSW (v)")
+                .await
+                .unwrap();
+            db.execute("DELETE FROM pv WHERE id = 20").await.unwrap();
+            db.sync().unwrap();
+            db.close();
+        }
+        {
+            let db = Database::durable_mvcc(dir.path()).unwrap();
+            let rows = db
+                .query("SELECT id FROM pv ORDER BY VECTOR_DISTANCE(v, VECTOR('[1,0,0]'), 'l2') LIMIT 3")
+                .await
+                .unwrap();
+            let ids: Vec<i64> = rows
+                .iter()
+                .filter_map(|r| match r.first() {
+                    Some(Value::Int32(n)) => Some(*n as i64),
+                    Some(Value::Int64(n)) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                ids.contains(&10),
+                "vector search after reopen must find id 10 (nearest to [1,0,0]): {ids:?}"
+            );
+            assert!(
+                !ids.contains(&20),
+                "deleted id 20 must not resurface after reopen: {ids:?}"
+            );
+
+            // DELETE after reopen exercises the incremental fast path on a
+            // recovered durable index (pk-keying preserved via the sidecar).
+            db.execute("DELETE FROM pv WHERE id = 30").await.unwrap();
+            let rows = db
+                .query("SELECT id FROM pv ORDER BY VECTOR_DISTANCE(v, VECTOR('[0,0,1]'), 'l2') LIMIT 3")
+                .await
+                .unwrap();
+            let ids: Vec<i64> = rows
+                .iter()
+                .filter_map(|r| match r.first() {
+                    Some(Value::Int32(n)) => Some(*n as i64),
+                    Some(Value::Int64(n)) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !ids.contains(&30),
+                "id 30 deleted after reopen must not appear: {ids:?}"
+            );
+            assert!(
+                ids.contains(&10),
+                "surviving id 10 must still be found after post-reopen delete: {ids:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn durable_mvcc_aborted_txn_not_recovered() {
         let dir = tempfile::tempdir().unwrap();
@@ -1816,6 +1913,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "server")]
     #[tokio::test]
     async fn durable_mvcc_committed_txn_recovered() {
         let dir = tempfile::tempdir().unwrap();

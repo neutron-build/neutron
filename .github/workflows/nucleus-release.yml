@@ -19,6 +19,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
   RUST_BACKTRACE: 1
 
 jobs:
@@ -45,6 +47,14 @@ jobs:
 
       - name: Test (lib only — skips slow stress tests)
         run: cargo test --lib -q
+        working-directory: nucleus
+
+      - name: Test core-only library
+        run: cargo test --no-default-features --lib -q
+        working-directory: nucleus
+
+      - name: Test integrations
+        run: cargo test --test '*' -q -- --test-threads=1
         working-directory: nucleus
 
   clippy:

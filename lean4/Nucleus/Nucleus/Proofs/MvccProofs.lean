@@ -14,9 +14,7 @@ theorem visible_implies_committed (snap : Snapshot) (row : RowVersion)
     (h : snap.isVisible row = true) :
     row.commitTs > 0 := by
   simp [Snapshot.isVisible] at h
-  split at h
-  · contradiction
-  · omega
+  exact Nat.pos_of_ne_zero h.1
 
 /-- Visibility is decidable — it either returns true or false. -/
 theorem visibility_decidable (snap : Snapshot) (row : RowVersion) :

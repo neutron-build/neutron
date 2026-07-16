@@ -385,6 +385,16 @@ impl Executor {
         let left_nulls: Row = left_meta.iter().map(|_| Value::Null).collect();
         let mut result_rows = Vec::new();
 
+        // Bound the build-side hash table against the shared query-memory budget.
+        // A large join build would otherwise grow unbounded and OOM the process;
+        // reserving its footprint converts that into a clean MemoryExceeded
+        // (53200). Held for the whole join; released when this returns.
+        let build_side: &[Row] = match join_type {
+            JoinType::Right => left_rows,
+            _ => right_rows,
+        };
+        let _build_mem = self.reserve_query_memory(Self::estimate_rows_bytes(build_side))?;
+
         // Build phase: hash the right side (typically smaller for INNER/LEFT joins)
         // For RIGHT join, we build on the left side instead.
         // Store extracted keys alongside row indices in the hash table to avoid
@@ -527,22 +537,13 @@ impl Executor {
             }
         }
 
-        // Check that the result set fits within the query memory budget.
-        // This acts as a circuit-breaker: if the join produces more data than
-        // the configured limit, we fail fast instead of OOM-ing.
-        // We immediately release the accounting since the budget is a
-        // concurrent-query gate, not a long-lived reservation.
+        // Peak check: the assembled result must fit within the budget alongside
+        // the build table still reserved above. The guard releases at the end of
+        // this block — the rows are handed back to the caller, which re-accounts
+        // them at the next operator — so this is a ceiling check, not a held
+        // reservation, and it surfaces the uniform MemoryExceeded (53200).
         if !result_rows.is_empty() {
-            let accounted_bytes: u64 = result_rows.iter().map(Self::estimate_row_bytes).sum();
-            self.query_memory
-                .try_allocate(accounted_bytes)
-                .map_err(|_| {
-                    ExecError::Unsupported(format!(
-                        "hash join result exceeded memory limit ({} MB)",
-                        self.query_memory.limit() / (1024 * 1024)
-                    ))
-                })?;
-            self.query_memory.deallocate(accounted_bytes);
+            let _peak = self.reserve_query_memory(Self::estimate_rows_bytes(&result_rows))?;
         }
 
         Ok(result_rows)

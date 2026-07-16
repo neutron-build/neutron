@@ -1,6 +1,6 @@
 // Online Resharding — moving data between shards while the system is live.
 module resharding {
-    import types.*
+    import types.* from "../common/types"
 
     pure val SHARDS: Set[ShardId] = Set(1, 2, 3, 4)
     pure val ALL_KEYS: Set[Key] = 1.to(100)
@@ -14,7 +14,7 @@ module resharding {
 
     action init = all {
         // Distribute keys evenly across shards
-        shard_keys' = (s =>
+        shard_keys' = SHARDS.mapBy(s =>
             if (s == 1) 1.to(25)
             else if (s == 2) 26.to(50)
             else if (s == 3) 51.to(75)
@@ -30,7 +30,7 @@ module resharding {
         src.in(SHARDS),
         tgt.in(SHARDS),
         src != tgt,
-        shard_keys(src).size() > 0,
+        shard_keys.get(src).size() > 0,
         reshard_phase' = "preparing",
         source_shard' = src,
         target_shard' = tgt,
@@ -49,10 +49,10 @@ module resharding {
     // Copy a key from source to target
     action copy_key(k: Key): bool = all {
         reshard_phase == "copying",
-        k.in(shard_keys(source_shard)),
+        k.in(shard_keys.get(source_shard)),
         shard_keys' = shard_keys
-            .set(source_shard, shard_keys(source_shard).exclude(Set(k)))
-            .set(target_shard, shard_keys(target_shard).union(Set(k))),
+            .set(source_shard, shard_keys.get(source_shard).exclude(Set(k)))
+            .set(target_shard, shard_keys.get(target_shard).union(Set(k))),
         reshard_phase' = reshard_phase,
         source_shard' = source_shard,
         target_shard' = target_shard,
@@ -68,9 +68,12 @@ module resharding {
     }
 
     action step = any {
-        SHARDS.exists(s => SHARDS.exists(t => begin_reshard(s, t))),
+        { nondet s = SHARDS.oneOf()
+          nondet t = SHARDS.oneOf()
+          begin_reshard(s, t) },
         start_copying,
-        ALL_KEYS.exists(k => copy_key(k)),
+        { nondet k = ALL_KEYS.oneOf()
+          copy_key(k) },
         finish_reshard,
     }
 
@@ -79,16 +82,16 @@ module resharding {
     // No data loss: every key is owned by exactly one shard
     val no_data_loss: bool =
         ALL_KEYS.forall(k =>
-            SHARDS.exists(s => k.in(shard_keys(s)))
+            SHARDS.exists(s => k.in(shard_keys.get(s)))
         )
 
     // No double ownership: no key owned by two shards
     val no_double_ownership: bool =
         ALL_KEYS.forall(k =>
-            SHARDS.filter(s => k.in(shard_keys(s))).size() <= 1
+            SHARDS.filter(s => k.in(shard_keys.get(s))).size() <= 1
         )
 
     // Total key count is conserved
     val key_conservation: bool =
-        SHARDS.fold(0, (acc, s) => acc + shard_keys(s).size()) == ALL_KEYS.size()
+        SHARDS.fold(0, (acc, s) => acc + shard_keys.get(s).size()) == ALL_KEYS.size()
 }

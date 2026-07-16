@@ -454,6 +454,11 @@ impl HnswIndex {
 
     /// Insert a vector into the index.
     pub fn insert(&mut self, id: u64, vector: Vector) {
+        // Re-inserting an id revives it: incremental UPDATE maintenance marks the
+        // old posting deleted then re-inserts under the same (PK-derived) id, so
+        // the id must not stay tombstoned or the updated row would vanish from
+        // search results.
+        self.deleted.remove(&id);
         let node_layer = self.random_layer();
 
         // First, add the node to the map (with empty neighbors)
@@ -810,6 +815,19 @@ impl HnswIndex {
 
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// Dimensionality of the indexed vectors (0 if the index is empty).
+    ///
+    /// All vectors in an index share one dimension, so sampling any node is
+    /// sufficient. Used when writing a WAL checkpoint snapshot, which records
+    /// `dims` as recovery metadata.
+    pub fn dims(&self) -> usize {
+        self.nodes
+            .values()
+            .next()
+            .map(|n| n.vector.dim())
+            .unwrap_or(0)
     }
 }
 

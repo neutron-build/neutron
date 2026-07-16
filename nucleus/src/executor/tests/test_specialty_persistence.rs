@@ -153,6 +153,204 @@ async fn test_ivfflat_multiple_indexes_survive_restart() {
     }
 }
 
+// ── GIN persistence via catalog rebuild ─────────────────────────────────────
+
+#[tokio::test]
+async fn test_gin_index_survives_restart_and_tracks_new_writes() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE TABLE json_docs (id INT, body JSONB)").await;
+        exec(
+            &ex,
+            r#"INSERT INTO json_docs VALUES (1, '{"kind": "before"}')"#,
+        )
+        .await;
+        exec(
+            &ex,
+            "CREATE INDEX json_docs_body_gin ON json_docs USING GIN (body)",
+        )
+        .await;
+    }
+
+    {
+        let ex = open_executor(dir.path()).await;
+        let restored = exec(
+            &ex,
+            r#"SELECT id FROM json_docs WHERE body @> '{"kind": "before"}'"#,
+        )
+        .await;
+        assert_eq!(rows(&restored[0]), &vec![vec![Value::Int32(1)]]);
+
+        exec(
+            &ex,
+            r#"INSERT INTO json_docs VALUES (2, '{"kind": "after"}')"#,
+        )
+        .await;
+        let written = exec(
+            &ex,
+            r#"SELECT id FROM json_docs WHERE body @> '{"kind": "after"}'"#,
+        )
+        .await;
+        assert_eq!(rows(&written[0]), &vec![vec![Value::Int32(2)]]);
+    }
+}
+
+// ── HNSW persistence via WAL checkpoint ─────────────────────────────────────────
+
+/// Unlike IvfFlat (rebuilt from base-table data at boot), HNSW indexes recover
+/// solely from the vector WAL. This exercises the checkpoint path directly:
+/// `checkpoint_vector_wal()` truncates the log to a single snapshot, further
+/// inserts append deltas on top, and a restart must reconstruct snapshot +
+/// deltas exactly. Asserting on the recovered index itself (not a SQL query,
+/// which could fall back to a base-table scan) makes this HNSW-specific.
+#[tokio::test]
+async fn test_hnsw_index_survives_wal_checkpoint_restart() {
+    use super::super::types::VectorIndexKind;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE TABLE embs (id INT, v VECTOR(3))").await;
+        for (i, v) in ["[1,0,0]", "[0,1,0]", "[0,0,1]", "[1,1,0]", "[0,1,1]"]
+            .iter()
+            .enumerate()
+        {
+            exec(
+                &ex,
+                &format!("INSERT INTO embs VALUES ({}, VECTOR('{}'))", i + 1, v),
+            )
+            .await;
+        }
+        exec(&ex, "CREATE INDEX idx_embs_v ON embs USING HNSW (v)").await;
+
+        // Snapshot + truncate the vector WAL, then add more vectors as deltas
+        // appended after the snapshot.
+        ex.checkpoint_vector_wal().unwrap();
+        exec(&ex, "INSERT INTO embs VALUES (6, VECTOR('[1,0,1]'))").await;
+        exec(&ex, "INSERT INTO embs VALUES (7, VECTOR('[0,0,0]'))").await;
+
+        let vi = ex.vector_indexes.read();
+        match &vi.get("idx_embs_v").expect("HNSW index must exist").kind {
+            VectorIndexKind::Hnsw(h) => {
+                assert_eq!(h.len(), 7, "index should hold all 7 vectors pre-restart");
+            }
+            _ => panic!("idx_embs_v should be an HNSW index"),
+        }
+    }
+
+    // ── Restart: HNSW recovers from snapshot + post-checkpoint deltas ──
+    {
+        let ex = open_executor(dir.path()).await;
+        let vi = ex.vector_indexes.read();
+        match &vi
+            .get("idx_embs_v")
+            .expect("HNSW index must survive restart via the checkpointed WAL")
+            .kind
+        {
+            VectorIndexKind::Hnsw(h) => {
+                assert_eq!(
+                    h.len(),
+                    7,
+                    "snapshot (5) + deltas (2) must both replay after restart"
+                );
+                assert_eq!(h.dims(), 3, "recovered index must retain its dimension");
+            }
+            _ => panic!("idx_embs_v should recover as an HNSW index"),
+        }
+    }
+}
+
+/// PK-keyed HNSW recovery: a table with an integer PRIMARY KEY keys its HNSW
+/// postings on the PK, and DELETE takes the incremental fast path (a tombstone,
+/// no full rebuild). After a restart the deleted rows must not resurface in a
+/// vector search and the survivors must still be found.
+#[tokio::test]
+async fn test_hnsw_pk_keyed_recovery_after_fastpath_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE TABLE pkv (id INT PRIMARY KEY, v VECTOR(3))").await;
+        for (i, v) in ["[1,0,0]", "[0,1,0]", "[0,0,1]", "[1,1,0]", "[0,1,1]"]
+            .iter()
+            .enumerate()
+        {
+            exec(
+                &ex,
+                &format!("INSERT INTO pkv VALUES ({}, VECTOR('{}'))", i + 1, v),
+            )
+            .await;
+        }
+        exec(&ex, "CREATE INDEX pkv_v ON pkv USING HNSW (v)").await;
+        // Incremental fast-path deletes (integer-PK table, HNSW-only, autocommit).
+        exec(&ex, "DELETE FROM pkv WHERE id = 2").await;
+        exec(&ex, "DELETE FROM pkv WHERE id = 4").await;
+        ex.checkpoint_vector_wal().unwrap();
+    }
+    {
+        let ex = open_executor(dir.path()).await;
+        let r = exec(
+            &ex,
+            "SELECT id FROM pkv ORDER BY VECTOR_DISTANCE(v, VECTOR('[0,1,0]'), 'l2') LIMIT 5",
+        )
+        .await;
+        let ids: Vec<i32> = rows(&r[0])
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(Value::Int32(v)) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !ids.contains(&2),
+            "deleted id 2 must not survive recovery: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&4),
+            "deleted id 4 must not survive recovery: {ids:?}"
+        );
+        assert!(
+            ids.contains(&1) && ids.contains(&3) && ids.contains(&5),
+            "live rows 1,3,5 must be found after recovery: {ids:?}"
+        );
+    }
+}
+
+// ── KV write durability (group-commit fsync) ────────────────────────────────────
+
+/// A KV write through the SQL scalar path must be fsync-durable before the
+/// executor returns when synchronous_commit is on: the KV WAL reads clean (its
+/// tail forced by the specialty-durability hook). With synchronous_commit off,
+/// the write applies but the fsync is deferred (bounded loss window), so the
+/// WAL stays dirty. This exercises `force_specialty_durability` end-to-end.
+#[tokio::test]
+async fn test_kv_write_is_fsync_durable_on_ack() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = open_executor(dir.path()).await;
+
+    // Default synchronous_commit = on.
+    exec(&ex, "SELECT kv_set('greeting', 'hello')").await;
+    let wal = ex
+        .kv_store()
+        .wal()
+        .expect("a persistent KV store has a WAL")
+        .clone();
+    assert!(
+        !wal.is_dirty(),
+        "kv_set must fsync the KV WAL before acking under synchronous_commit=on"
+    );
+
+    // synchronous_commit = off: the write applies but its fsync is deferred.
+    ex.set_synchronous_commit_default(false);
+    exec(&ex, "SELECT kv_set('greeting2', 'world')").await;
+    assert!(
+        wal.is_dirty(),
+        "synchronous_commit=off should defer the KV fsync, leaving the tail dirty"
+    );
+}
+
 // ── Encrypted index persistence ───────────────────────────────────────────────
 
 #[tokio::test]
