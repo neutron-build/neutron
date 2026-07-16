@@ -64,6 +64,16 @@ export default function ProductPage({
             {children}
           </div>
         </div>
+
+        <section class="product-cta" data-animate>
+          <div class="container container--narrow product-cta__inner">
+            <h2 class="product-cta__title">Start building with Neutron</h2>
+            <div class="product-cta__actions">
+              <a href="/docs" class="btn btn--primary btn--lg">Read the docs &rarr;</a>
+              <a href="https://github.com/neutron-build/neutron" class="btn btn--ghost btn--lg">View source</a>
+            </div>
+          </div>
+        </section>
       </article>
     </main>
   );
