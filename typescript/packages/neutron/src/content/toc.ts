@@ -7,7 +7,7 @@ export interface TocEntry {
 const HEADING_REGEX = /<h([1-6])(?:\s[^>]*)?>([^<]*(?:<[^/h][^>]*>[^<]*)*)<\/h\1>/gi;
 const TAG_STRIP_REGEX = /<[^>]*>/g;
 
-function slugify(text: string): string {
+export function slugify(text: string): string {
   return text
     .toLowerCase()
     .trim()
