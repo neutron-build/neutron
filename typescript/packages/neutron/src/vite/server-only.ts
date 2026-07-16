@@ -72,6 +72,36 @@ export function isServerOnlySpecifier(specifier: string): boolean {
   return SERVER_FILE_RE.test(clean);
 }
 
+// The content runtime (getCollection/getEntry/prepareContentCollections/…)
+// reads the filesystem, hashes with node:crypto, and compiles MDX — it is
+// server/build-time only and must never be bundled for the browser. Content is
+// loaded during SSR / getStaticPaths and passed to components/islands as props.
+// A component that merely *imports* a content API (e.g. a docs shell that also
+// exports a data-loading helper) otherwise drags this whole module — and its
+// node: builtins — into the client bundle and breaks the build. Matched cases:
+// the public subpath, a fully-resolved module path (npm dist, pnpm store, or
+// workspace src), and the root barrel's relative re-export of it.
+const CONTENT_MODULE_RE =
+  /(?:@neutron-build[/+]core|packages[/\\]neutron)[/\\](?:dist|src)[/\\]content[/\\]index\.[cm]?[jt]sx?$/;
+const CORE_INDEX_RE =
+  /(?:@neutron-build[/+]core|packages[/\\]neutron)[/\\](?:dist|src)[/\\]index\.[cm]?[jt]sx?$/;
+
+export function isContentModuleId(id: string, importer?: string): boolean {
+  const clean = id.split("?")[0].split("#")[0];
+  if (clean === "@neutron-build/core/content") return true;
+  if (CONTENT_MODULE_RE.test(clean)) return true;
+  // Root barrel re-export: `export … from "./content/index.js"` inside the
+  // core package's own index module.
+  if (
+    importer &&
+    /[/\\]content[/\\]index\.[cm]?[jt]sx?$/.test(clean) &&
+    CORE_INDEX_RE.test(importer.split("?")[0].split("#")[0])
+  ) {
+    return true;
+  }
+  return false;
+}
+
 // Node built-in modules (import { readFileSync } from "node:fs" — or the bare
 // "fs"/"path"/... aliases). Used ONLY when stripping the CLIENT half of a
 // route module: such an import survives only because a now-stripped server

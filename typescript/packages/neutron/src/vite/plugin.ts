@@ -20,6 +20,7 @@ import {
 } from "../core/serialization.js";
 import {
   hasServerOnlyImport,
+  isContentModuleId,
   isServerOnlySpecifier,
   stripQueryFromId,
   stripServerOnlyRouteModule,
@@ -42,6 +43,33 @@ export interface NeutronPluginOptions {
 const ROUTES_DIR_DEFAULT = "src/routes";
 export const CLIENT_ROUTE_QUERY = "neutron-client-route";
 const EMPTY_SERVER_MODULE_ID = "\0neutron:empty-server-module";
+// Client-side stub for @neutron-build/core/content. The real module is
+// server/build-time only (fs, node:crypto, MDX compiler); these no-ops satisfy
+// the named imports a client-reachable component may carry, without pulling the
+// server module into the browser bundle. The data functions throw if actually
+// called on the client — that means data wasn't loaded in a loader/getStaticPaths
+// and passed down, which is the real mistake.
+const CONTENT_CLIENT_STUB_ID = "\0neutron:content-client-stub";
+const CONTENT_CLIENT_STUB_SOURCE = `
+const serverOnly = (name) => () => {
+  throw new Error(
+    "[neutron] \\"" + name + "\\" from @neutron-build/core/content is server-only and " +
+    "cannot run in the browser. Load content in a route loader or getStaticPaths and " +
+    "pass the result to your components/islands as props."
+  );
+};
+export const getCollection = serverOnly("getCollection");
+export const getEntry = serverOnly("getEntry");
+export const prepareContentCollections = serverOnly("prepareContentCollections");
+export const sanitizeHtml = serverOnly("sanitizeHtml");
+export const defineCollection = (config) => config;
+export const setActiveMarkdownConfig = () => {};
+export const getActiveMarkdownConfig = () => undefined;
+export const z = undefined;
+export const __renderCacheStatsForTest = () => ({ renders: 0, cacheHits: 0 });
+export const __resetRenderCacheForTest = () => {};
+export default undefined;
+`;
 const DEV_TOOLBAR_MODULE_ID = "virtual:neutron/dev-toolbar";
 const DEV_TOOLBAR_RESOLVED_ID = "\0virtual:neutron/dev-toolbar";
 
@@ -429,6 +457,11 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
       if (!context?.ssr && isServerOnlySpecifier(id)) {
         return EMPTY_SERVER_MODULE_ID;
       }
+      // Keep the server-only content runtime (and its node: builtins) out of
+      // client bundles, whichever way a client-reachable module reaches it.
+      if (!context?.ssr && isContentModuleId(id, importer ?? undefined)) {
+        return CONTENT_CLIENT_STUB_ID;
+      }
 
       if (id === "virtual:neutron/routes") {
         return "\0virtual:neutron/routes";
@@ -448,6 +481,10 @@ export function neutronPlugin(options: NeutronPluginOptions = {}): Plugin {
     async load(id) {
       if (id === EMPTY_SERVER_MODULE_ID) {
         return "export default undefined;";
+      }
+
+      if (id === CONTENT_CLIENT_STUB_ID) {
+        return CONTENT_CLIENT_STUB_SOURCE;
       }
 
       if (id.includes(`?${CLIENT_ROUTE_QUERY}`)) {
