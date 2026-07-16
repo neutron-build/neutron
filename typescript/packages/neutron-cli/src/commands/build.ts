@@ -492,6 +492,39 @@ export async function build(): Promise<void> {
       const module = await loadRouteModule(route);
 
       if (!module?.default) {
+        // Dynamic resource route: getStaticPaths + a loader returning a raw
+        // Response, no component (e.g. per-page .md sources at /docs/x.md).
+        // Iterate the paths and bake each response to its resolved literal
+        // path. Only matches this specific shape, so it can't affect the
+        // no-param resource routes or component routes handled below.
+        if (route.params.length > 0 && module?.getStaticPaths && module?.loader) {
+          const result = await module.getStaticPaths();
+          const pathList = Array.isArray(result)
+            ? result
+            : (result as GetStaticPathsResult).paths;
+          for (const { params } of pathList) {
+            const resolvedPath = resolvePath(route.path, params);
+            const request = new Request("http://localhost" + resolvedPath);
+            let response: Response | undefined;
+            try {
+              const r = await module.loader({ request, params, context: {} } as LoaderArgs);
+              if (r instanceof Response) response = r;
+            } catch (error) {
+              if (error instanceof Response) response = error;
+              else throw error;
+            }
+            if (response) {
+              const body = Buffer.from(await response.arrayBuffer());
+              const outPath = getResourceOutputPath(outputDir, resolvedPath);
+              fs.mkdirSync(path.dirname(outPath), { recursive: true });
+              fs.writeFileSync(outPath, body);
+              console.log(`  ${resolvedPath} → ${path.relative(outputDir, outPath)}`);
+              renderedCount++;
+            }
+          }
+          continue;
+        }
+
         // Resource route: no component to render, but a GET loader that
         // returns a raw Response (sitemap.xml, rss feeds, JSON endpoints,
         // ...) can still be baked to a static file at its literal path.

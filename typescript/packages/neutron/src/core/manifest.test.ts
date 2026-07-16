@@ -49,6 +49,11 @@ function setupTestRoutes() {
     path.join(TEST_ROUTES_DIR, "docs", "[...slug].tsx"),
     "export default function DocsSlug() {}"
   );
+  // Catch-all with a literal-dot suffix: /docs/<slug>.md resource route.
+  fs.writeFileSync(
+    path.join(TEST_ROUTES_DIR, "docs", "[...slug][.]md.ts"),
+    "export async function getStaticPaths() { return []; }\nexport async function loader() { return new Response(''); }"
+  );
 }
 
 function cleanupTestRoutes() {
@@ -100,6 +105,14 @@ describe("manifest", () => {
     const catchAll = routes.find((r) => r.path === "/docs/*slug");
 
     expect(catchAll).toBeDefined();
+  });
+
+  it("supports a catch-all with a literal-dot suffix (/docs/<slug>.md)", () => {
+    const routes = discoverRoutes({ routesDir: TEST_ROUTES_DIR });
+    const mdRoute = routes.find((r) => r.path === "/docs/*slug.md");
+
+    expect(mdRoute).toBeDefined();
+    expect(mdRoute?.params).toContain("slug");
   });
 
   it("extracts route params", () => {
