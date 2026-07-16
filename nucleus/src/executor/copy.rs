@@ -170,6 +170,11 @@ impl Executor {
             }
         };
 
+        // COPY TO buffers the entire result set and its serialized text form in
+        // memory before handing it to the wire layer; bound that against the
+        // shared query-memory budget so a full-table export can't OOM the box.
+        let _mem = self.reserve_query_memory(Self::estimate_rows_bytes(&rows))?;
+
         let mut output = String::new();
 
         if format == "csv" {
