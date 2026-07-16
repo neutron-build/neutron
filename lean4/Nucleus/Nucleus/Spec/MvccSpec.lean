@@ -9,15 +9,12 @@ open Nucleus.Aeneas
 
 /-- Specification: snapshot isolation — visible rows were committed before snapshot. -/
 theorem snapshot_isolation (snap : Snapshot) (row : RowVersion)
-    (h_start : snap.startTs > 0)
+    (_h_start : snap.startTs > 0)
     (h_visible : snap.isVisible row = true) :
     row.commitTs > 0 ∧ row.commitTs ≤ snap.startTs := by
   simp [Snapshot.isVisible] at h_visible
-  split at h_visible <;> simp_all
-  split at h_visible <;> simp_all
-  split at h_visible <;> simp_all
-  split at h_visible <;> simp_all
-  omega
+  obtain ⟨h_committed, h_before, _⟩ := h_visible
+  exact ⟨Nat.pos_of_ne_zero h_committed, h_before⟩
 
 /-- Specification: no dirty reads — uncommitted rows are invisible. -/
 theorem no_dirty_reads (snap : Snapshot) (row : RowVersion)
@@ -29,11 +26,9 @@ theorem no_dirty_reads (snap : Snapshot) (row : RowVersion)
 theorem no_phantom_reads (snap : Snapshot) (row : RowVersion)
     (h_future : row.commitTs > snap.startTs) :
     snap.isVisible row = false := by
-  simp [Snapshot.isVisible]
+  unfold Snapshot.isVisible
   split
   · rfl
-  · split
-    · rfl
-    · omega
+  · simp [h_future]
 
 end Nucleus.Spec

@@ -142,7 +142,7 @@ theorem no_false_negatives (bf : BloomFilter) (key : List Nat) :
     Since the fold only calls `set _ true`, no bit is ever cleared.
 -/
 theorem insert_monotone (bf : BloomFilter) (key : List Nat) (pos : Nat)
-    (h : pos < bf.numBits)
+    (_h : pos < bf.numBits)
     (h_set : bf.bits.get? pos = some true) :
     (bf.insert key).bits.get? pos = some true := by
   simp only [BloomFilter.insert]
@@ -181,7 +181,7 @@ theorem new_all_false (numKeys bitsPerKey : Nat) :
 /-- Number of hash functions is at least 1. -/
 theorem min_one_hash (numKeys bitsPerKey : Nat) :
     (BloomFilter.new numKeys bitsPerKey).numHashes ≥ 1 := by
-  simp [BloomFilter.new]
-  omega
+  simp only [BloomFilter.new]
+  exact Nat.le_max_right _ _
 
 end Nucleus.Structures.Spec

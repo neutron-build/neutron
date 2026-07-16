@@ -5,6 +5,8 @@
 
 namespace Nucleus.Aeneas
 
+variable {α : Type}
+
 /-- B-tree branching factor. -/
 def B : Nat := 128
 
@@ -27,12 +29,13 @@ def BTree.get (tree : BTree α) (k : Nat) : Option α :=
     match entries.find? (fun e => e.key == k) with
     | some e => some e.value
     | none => none
-  | .internal keys children =>
-    let idx := keys.length -- simplified: find correct child
-    -- In production, binary search for the correct child index
-    match children.get? (min idx (children.length - 1)) with
-    | some child => child.get k
-    | none => none
+  | .internal _ children =>
+    -- Simplified model: descend into the first child (production binary-searches
+    -- `keys` for the correct child index). Structural recursion on the head child,
+    -- matching `BTree.insert`.
+    match children with
+    | [] => none
+    | c :: _ => c.get k
 
 /-- Insert a key-value pair into the B-tree (simplified model). -/
 def BTree.insert (tree : BTree α) (k : Nat) (v : α) : BTree α :=
@@ -51,19 +54,30 @@ def BTree.delete (tree : BTree α) (k : Nat) : BTree α :=
   match tree with
   | .leaf entries => .leaf (entries.filter (fun e => e.key != k))
   | .internal keys children =>
-    .internal keys (children.map (fun c => c.delete k))
+    .internal keys (children.attach.map (fun c => c.val.delete k))
+  termination_by sizeOf tree
+  decreasing_by
+    simp_wf
+    have := List.sizeOf_lt_of_mem c.2
+    omega
 
 /-- Count all entries in the B-tree. -/
-def BTree.size : BTree α → Nat
+def BTree.size (tree : BTree α) : Nat :=
+  match tree with
   | .leaf entries => entries.length
-  | .internal _ children => children.foldl (fun acc c => acc + c.size) 0
+  | .internal _ children => children.attach.foldl (fun acc c => acc + c.val.size) 0
+  termination_by sizeOf tree
+  decreasing_by
+    simp_wf
+    have := List.sizeOf_lt_of_mem c.2
+    omega
 
 /-- Get the depth of the B-tree. -/
 def BTree.depth : BTree α → Nat
   | .leaf _ => 0
   | .internal _ children =>
-    match children.head? with
-    | some c => 1 + c.depth
-    | none => 1
+    match children with
+    | [] => 1
+    | c :: _ => 1 + c.depth
 
 end Nucleus.Aeneas

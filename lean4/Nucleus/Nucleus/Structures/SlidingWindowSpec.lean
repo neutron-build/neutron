@@ -15,8 +15,7 @@ theorem estimated_non_negative (sw : SlidingWindow) :
 /-- Recording a request increases the estimated count. -/
 theorem record_increases_estimate (sw : SlidingWindow) :
     sw.recordRequest.estimatedCount ≥ sw.estimatedCount := by
-  simp [SlidingWindow.recordRequest, SlidingWindow.estimatedCount]
-  omega
+  simp [SlidingWindow.recordRequest, SlidingWindow.estimatedCount] <;> omega
 
 /-- A request is rejected when estimated count reaches max. -/
 theorem at_max_rejects (sw : SlidingWindow)
@@ -35,12 +34,8 @@ theorem fresh_allows (maxReqs windowSz : Nat) (h : maxReqs > 0) :
 theorem tick_offset_bounded (sw : SlidingWindow)
     (h : sw.windowOffset < sw.windowSize) :
     sw.tick.windowOffset < sw.windowSize := by
-  simp [SlidingWindow.tick]
-  split
-  · -- Rollover: offset becomes 0
-    omega
-  · -- Normal: offset increments
-    omega
+  unfold SlidingWindow.tick
+  split <;> simp_all <;> omega
 
 /-- Window rollover preserves request history. -/
 theorem rollover_preserves_count (sw : SlidingWindow)

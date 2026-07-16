@@ -2,6 +2,7 @@
   HMAC Formal Specifications — properties we prove about HMAC-SHA256.
 -/
 import Nucleus.Crypto.Hmac
+import Nucleus.Crypto.Pkce
 
 namespace Nucleus.Crypto.Spec
 

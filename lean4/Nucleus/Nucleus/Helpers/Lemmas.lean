@@ -8,7 +8,7 @@ namespace Nucleus.Helpers
 theorem filter_subset {α : Type} (l : List α) (p : α → Bool) :
     ∀ x, x ∈ l.filter p → x ∈ l := by
   intro x hx
-  exact List.mem_of_mem_filter hx
+  exact (List.mem_filter.mp hx).1
 
 /-- Filtering preserves list membership for elements satisfying the predicate. -/
 theorem mem_filter_of_mem {α : Type} (l : List α) (p : α → Bool) (x : α)

@@ -3,6 +3,8 @@
   byte comparison from `rs/crates/neutron/src/jwt.rs`.
 -/
 
+import Nucleus.Crypto.Hmac
+
 namespace Nucleus.Crypto
 
 /-- Standard (short-circuit) equality for byte lists. -/
@@ -15,11 +17,11 @@ def shortCircuitEq (a b : Block) : Bool :=
     In Lean 4, `Nat.xor` is defined via `Nat.bitwise bne` and `Nat.or` via
     `Nat.bitwise or`. The properties below hold at every bit position by the
     truth tables of XOR and OR, but proving them formally requires unfolding
-    `Nat.bitwise` and doing binary induction, which needs Mathlib's
+    `Nat.bitwise` and doing binary induction, which would need Mathlib's
     `Nat.bitwise_eq_zero_iff`, `Nat.xor_self`, etc.
 
-    We state them as axioms here since Mathlib is declared as a dependency
-    but may not be locally built. Each axiom is mathematically trivial:
+    We state them as axioms here to keep the proofs self-contained on the Lean
+    core library (no Mathlib dependency). Each axiom is mathematically trivial:
     - XOR(x, x) = 0 at every bit: b XOR b = false for b ∈ {0, 1}
     - XOR(x, y) = 0 ⟹ x = y: if all bits match, the numbers are equal
     - OR(0, x) = x: 0-bits contribute nothing to OR
@@ -50,7 +52,7 @@ private theorem zipWith_xor_self (l : List Nat) :
   induction l with
   | nil => simp
   | cons x xs ih =>
-    simp [List.zipWith, nat_xor_self, ih]
+    simp [List.zipWith, nat_xor_self, List.map_const', List.replicate_succ]
 
 /-- foldl OR over a list of zeros with zero accumulator returns zero. -/
 private theorem foldl_or_zeros (n : Nat) :
@@ -137,12 +139,11 @@ theorem constantTimeEq_correct (a b : Block)
   constructor
   · -- Forward: constantTimeEq a b = true → a = b
     intro h
-    simp only [constantTimeEq, h_len, ↓reduceIte] at h
-    -- h : (zipWith (·^^^·) a b).foldl (·|||·) 0 == 0 = true
-    -- Extract the numeric equality from BEq on Nat
+    -- Lengths match, so the guard is false and the fold-of-XOR must be zero.
     have hfold : (List.zipWith (· ^^^ ·) a b).foldl (· ||| ·) 0 = 0 := by
-      simp [BEq.beq] at h
-      exact Nat.eq_of_beq_eq_true h
+      unfold constantTimeEq at h
+      rw [if_neg (fun hne => hne h_len)] at h
+      simpa using h
     -- Every XOR element must be zero (since OR-fold is 0)
     have hall := foldl_or_zero_all_zero _ hfold
     -- Equal XOR elements means equal lists
@@ -150,10 +151,8 @@ theorem constantTimeEq_correct (a b : Block)
   · -- Backward: a = b → constantTimeEq a a = true
     intro h
     subst h
-    simp only [constantTimeEq, ↓reduceIte]
-    -- Need: (zipWith (·^^^·) a a).foldl (·|||·) 0 == 0 = true
-    -- zipWith XOR self → replicate 0, foldl OR over zeros → 0
-    rw [zipWith_xor_self, foldl_or_zeros]
+    -- Guard is false (equal lengths); zipWith XOR self → all zeros; fold OR → 0.
+    simp [constantTimeEq, List.map_const', foldl_or_zeros]
 
 /-- constantTimeEq always examines all bytes (no short-circuit).
     This is the key security property — timing is independent of
