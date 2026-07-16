@@ -228,6 +228,31 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Logical (portable SQL) dump of every table — survives format/schema
+    /// changes and replays through the constraint-safe executor, unlike the
+    /// physical `backup`. Take it against a stopped or quiesced instance.
+    Dump {
+        /// Data directory to dump from.
+        #[arg(short, long, default_value = "nucleus_data")]
+        data: PathBuf,
+
+        /// Output .sql file (writes to stdout if omitted).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Restore a logical dump produced by `nucleus dump` into a data directory
+    /// (creates it if missing) by replaying the SQL through the executor.
+    Load {
+        /// The .sql dump file to replay.
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Data directory to restore into.
+        #[arg(short, long, default_value = "nucleus_data")]
+        data: PathBuf,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -363,6 +388,12 @@ async fn main() {
         }
         Some(Commands::Restore { input, data, force }) => {
             cmd_restore(input, data, force);
+        }
+        Some(Commands::Dump { data, output }) => {
+            cmd_dump(data, output).await;
+        }
+        Some(Commands::Load { input, data }) => {
+            cmd_load(input, data).await;
         }
         None => {
             // Default: start in server mode (same as `nucleus start`)
@@ -2205,6 +2236,60 @@ fn cmd_restore(input: PathBuf, data: PathBuf, force: bool) {
         }
         Err(e) => {
             eprintln!("Restore failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn cmd_dump(data: PathBuf, output: Option<PathBuf>) {
+    let executor = match nucleus::executor::open_persistent_executor(&data).await {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Dump failed to open '{}': {e}", data.display());
+            std::process::exit(1);
+        }
+    };
+    let script = match executor.dump_logical().await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Dump failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    match output {
+        Some(path) => match std::fs::write(&path, &script) {
+            Ok(()) => println!("Logical dump written to {}", path.display()),
+            Err(e) => {
+                eprintln!("Dump failed to write '{}': {e}", path.display());
+                std::process::exit(1);
+            }
+        },
+        None => print!("{script}"),
+    }
+}
+
+async fn cmd_load(input: PathBuf, data: PathBuf) {
+    let script = match std::fs::read_to_string(&input) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Load failed to read '{}': {e}", input.display());
+            std::process::exit(1);
+        }
+    };
+    let executor = match nucleus::executor::open_persistent_executor(&data).await {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Load failed to open '{}': {e}", data.display());
+            std::process::exit(1);
+        }
+    };
+    match executor.restore_logical(&script).await {
+        Ok(()) => {
+            println!("Logical dump restored into {}", data.display());
+            println!("  Start with: nucleus start --data {}", data.display());
+        }
+        Err(e) => {
+            eprintln!("Load failed: {e}");
             std::process::exit(1);
         }
     }

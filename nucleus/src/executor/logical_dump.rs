@@ -17,6 +17,40 @@ use super::helpers::value_to_text_string_impl;
 use crate::catalog::{FkAction, IndexDef, TableConstraint, TableDef};
 use crate::types::Value;
 
+/// Open a persistent (disk-backed) executor at `data_dir` for one-shot logical
+/// maintenance (dump/restore from the CLI). Unlike `embedded::Database::open`,
+/// which reconstructs table definitions from storage metadata alone (dropping
+/// constraints), this loads `catalog.json`, so PRIMARY KEY / UNIQUE / CHECK / FK
+/// survive into a dump. Replays the WAL on open. Creates the directory if
+/// missing (so restore can target a fresh location).
+#[cfg(feature = "server")]
+pub async fn open_persistent_executor(
+    data_dir: &std::path::Path,
+) -> Result<std::sync::Arc<super::Executor>, ExecError> {
+    use crate::storage::buffered_engine::BufferedDiskEngine;
+    use crate::storage::persistence::CatalogPersistence;
+    use crate::storage::{DiskEngine, StorageEngine};
+    use std::sync::Arc;
+
+    std::fs::create_dir_all(data_dir)
+        .map_err(|e| ExecError::Runtime(format!("create data dir '{}': {e}", data_dir.display())))?;
+    let catalog = Arc::new(crate::catalog::Catalog::new());
+    let catalog_path = data_dir.join("catalog.json");
+    // Best-effort: a fresh target directory has no catalog yet.
+    let _ = CatalogPersistence::new(&catalog_path)
+        .load_catalog(&catalog)
+        .await;
+    let db_path = data_dir.join("nucleus.db");
+    let engine = Arc::new(DiskEngine::open(&db_path, catalog.clone()).map_err(ExecError::Storage)?);
+    let storage: Arc<dyn StorageEngine> = Arc::new(BufferedDiskEngine::new(engine));
+    Ok(Arc::new(super::Executor::new_with_persistence(
+        catalog,
+        storage,
+        Some(catalog_path),
+        Some(data_dir),
+    )))
+}
+
 /// Wrap `s` as a single-quoted SQL string literal, doubling embedded quotes.
 fn quote_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
