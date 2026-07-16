@@ -62,6 +62,56 @@ pub(crate) enum VectorIndexKind {
     IvfFlat(vector::IvfFlatIndex),
 }
 
+/// Maps row primary keys to stable, monotonic HNSW/IvfFlat node ids so
+/// incremental maintenance never overwrites a node in place. An UPDATE
+/// tombstones the old node and inserts the new vector under a fresh node id,
+/// keeping the graph clean (in-place overwrite corrupts edges — see the
+/// recall-harness cosine collapse that motivated this).
+///
+/// Empty for positional indexes and immediately after a reopen (it is not
+/// persisted); an empty registry makes resolve fall back to the exact
+/// brute-force scan, and the next full rebuild repopulates it from base data.
+#[derive(Clone, Default)]
+pub(crate) struct PkRegistry {
+    /// pk (bit-cast to u64) -> current live node id.
+    pub pk_to_node: std::collections::HashMap<u64, u64>,
+    /// node id -> pk, for resolving search results back to rows.
+    pub node_to_pk: std::collections::HashMap<u64, u64>,
+    /// Next node id to allocate — monotonic, never reused.
+    pub next_node: u64,
+    /// Nodes tombstoned since the last rebuild, for the compaction trigger.
+    pub tombstones: u64,
+}
+
+impl PkRegistry {
+    /// Allocate a fresh node for `pk`, tombstoning any prior node for it.
+    /// Returns (new_node, old_node_to_tombstone).
+    pub fn upsert(&mut self, pk: u64) -> (u64, Option<u64>) {
+        let old = self.pk_to_node.get(&pk).copied();
+        if let Some(o) = old {
+            self.node_to_pk.remove(&o);
+            self.tombstones += 1;
+        }
+        let node = self.next_node;
+        self.next_node += 1;
+        self.pk_to_node.insert(pk, node);
+        self.node_to_pk.insert(node, pk);
+        (node, old)
+    }
+
+    /// Drop `pk`, returning its node id to tombstone.
+    pub fn remove(&mut self, pk: u64) -> Option<u64> {
+        let node = self.pk_to_node.remove(&pk)?;
+        self.node_to_pk.remove(&node);
+        self.tombstones += 1;
+        Some(node)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.node_to_pk.is_empty()
+    }
+}
+
 /// Metadata + live data for a single vector index.
 #[derive(Clone)]
 pub(crate) struct VectorIndexEntry {
@@ -74,6 +124,9 @@ pub(crate) struct VectorIndexEntry {
     /// dropped its PK constraint — the source of truth for resolution, not the
     /// live catalog.
     pub pk_column: Option<String>,
+    /// PK -> node id registry for incremental HNSW maintenance (empty for
+    /// positional indexes and right after a reopen, until the next rebuild).
+    pub registry: PkRegistry,
 }
 
 /// A live encrypted index for a specific column.

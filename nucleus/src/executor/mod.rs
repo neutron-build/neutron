@@ -572,6 +572,9 @@ impl Executor {
                             column_name,
                             kind: VectorIndexKind::Hnsw(recovered.hnsw),
                             pk_column,
+                            // Not persisted; empty until the first rebuild after
+                            // reopen. Resolve brute-forces while it is empty.
+                            registry: PkRegistry::default(),
                         },
                     );
                 }
@@ -906,6 +909,7 @@ impl Executor {
                             column_name: col_name,
                             kind: VectorIndexKind::IvfFlat(ivf),
                             pk_column: None,
+                            registry: PkRegistry::default(),
                         },
                     );
                     tracing::info!(
@@ -1171,14 +1175,16 @@ impl Executor {
                     let pk_column = self.resolve_pk_column(table_name, &table_def);
                     let pk_col = pk_column.as_ref().and_then(|n| table_def.column_index(n));
                     let mut index = vector::HnswIndex::new(vector::HnswConfig::default());
+                    let mut registry = PkRegistry::default();
                     for (row_id, row) in rows.iter().enumerate() {
                         if let Some(Value::Vector(value)) = row.get(column_index) {
-                            // PK-keyed stable id so incremental maintenance and a
-                            // full rebuild agree on the posting id space.
-                            let id = pk_col
-                                .and_then(|pc| Self::stable_row_id(row, pc))
-                                .unwrap_or(row_id as u64);
-                            index.insert(id, vector::Vector::new(value.clone()));
+                            // Registry allocates a fresh monotonic node id per PK;
+                            // positional (no PK) uses the scan offset.
+                            let node = match pk_col.and_then(|pc| Self::stable_row_id(row, pc)) {
+                                Some(pk) => registry.upsert(pk).0,
+                                None => row_id as u64,
+                            };
+                            index.insert(node, vector::Vector::new(value.clone()));
                         }
                     }
                     vectors.push((
@@ -1188,6 +1194,7 @@ impl Executor {
                             column_name,
                             kind: VectorIndexKind::Hnsw(index),
                             pk_column,
+                            registry,
                         },
                     ));
                 }
@@ -1225,6 +1232,7 @@ impl Executor {
                             column_name,
                             kind: VectorIndexKind::IvfFlat(index),
                             pk_column: None,
+                            registry: PkRegistry::default(),
                         },
                     ));
                 }
@@ -4570,21 +4578,33 @@ impl Executor {
             }
         }
         let (entry, pk_col) = found?;
+
+        // PK-keyed HNSW resolves search results (node ids) to rows through the
+        // registry. If the registry is empty (right after a reopen, before the
+        // first rebuild repopulates it), fall back to the exact brute-force scan.
+        if pk_col.is_some() && entry.registry.is_empty() {
+            return None;
+        }
+
         let query = vector::Vector::new(query_vec.clone());
 
         let result_ids: Vec<u64> = if let Some(pc) = pk_col {
             // Valid set = PK ids present in the pre-filtered (post-WHERE) rows.
-            // Using search_filtered unconditionally also excludes any stale index
-            // posting whose row is no longer in the current scan.
+            // The HNSW search returns NODE ids; filter and resolve via the registry.
             let valid_pks: std::collections::HashSet<u64> = rows
                 .iter()
                 .filter_map(|r| Self::stable_row_id(r, pc))
                 .collect();
+            let reg = &entry.registry;
             match &entry.kind {
                 VectorIndexKind::Hnsw(hnsw) => hnsw
-                    .search_filtered(&query, k, |id| valid_pks.contains(&id))
+                    .search_filtered(&query, k, |node| {
+                        reg.node_to_pk
+                            .get(&node)
+                            .is_some_and(|pk| valid_pks.contains(pk))
+                    })
                     .into_iter()
-                    .map(|(id, _)| id)
+                    .map(|(node, _)| node)
                     .collect(),
                 VectorIndexKind::IvfFlat(_) => return None,
             }
@@ -4623,18 +4643,24 @@ impl Executor {
             }
         };
 
-        // Reorder rows into proximity order.
+        // Reorder rows into proximity order. PK path: node id -> pk -> row.
         let reordered: Vec<Row> = if let Some(pc) = pk_col {
             let mut pk_to_row: std::collections::HashMap<u64, &Row> =
                 std::collections::HashMap::with_capacity(rows.len());
             for r in rows {
-                if let Some(id) = Self::stable_row_id(r, pc) {
-                    pk_to_row.insert(id, r);
+                if let Some(pk) = Self::stable_row_id(r, pc) {
+                    pk_to_row.insert(pk, r);
                 }
             }
+            let reg = &entry.registry;
             result_ids
                 .iter()
-                .filter_map(|id| pk_to_row.get(id).map(|r| (*r).clone()))
+                .filter_map(|node| {
+                    reg.node_to_pk
+                        .get(node)
+                        .and_then(|pk| pk_to_row.get(pk))
+                        .map(|r| (*r).clone())
+                })
                 .collect()
         } else {
             result_ids
@@ -4704,6 +4730,27 @@ impl Executor {
         }
     }
 
+    /// Whether a PK-keyed HNSW index on `table_name` has accumulated enough
+    /// tombstones (from incremental delete/update) that it should be compacted by
+    /// a full rebuild. Deferred compaction bounds graph bloat and recall decay —
+    /// the equivalent of pgvector's VACUUM for HNSW.
+    pub(super) fn vector_index_needs_compaction(&self, table_name: &str) -> bool {
+        let vi = self.vector_indexes.read();
+        vi.values().any(|e| {
+            if e.table_name != table_name
+                || e.pk_column.is_none()
+                || !matches!(e.kind, VectorIndexKind::Hnsw(_))
+            {
+                return false;
+            }
+            let live = e.registry.pk_to_node.len();
+            let tombstones = e.registry.tombstones as usize;
+            // Rebuild once tombstones are material (>= 64) and exceed the live set
+            // (graph is more than half dead).
+            tombstones >= 64 && tombstones > live
+        })
+    }
+
     /// Whether DELETE/UPDATE on `table_name` may maintain derived indexes
     /// incrementally (the PK-keyed vector hooks having already run) instead of a
     /// full rebuild. Requires a single-column integer PK, autocommit (no active
@@ -4725,11 +4772,20 @@ impl Executor {
         }
         {
             let vi = self.vector_indexes.read();
-            if vi
-                .values()
-                .any(|e| e.table_name == table_name && !matches!(e.kind, VectorIndexKind::Hnsw(_)))
-            {
-                return false;
+            for e in vi.values() {
+                if e.table_name != table_name {
+                    continue;
+                }
+                // IvfFlat postings are positional — not fast-path safe.
+                if !matches!(e.kind, VectorIndexKind::Hnsw(_)) {
+                    return false;
+                }
+                // Post-reopen the registry is empty (not persisted). Fall through
+                // to a full rebuild, which repopulates it and rebuilds the graph
+                // on a fresh node id space.
+                if e.pk_column.is_some() && e.registry.is_empty() {
+                    return false;
+                }
             }
         }
         if self
@@ -4751,6 +4807,7 @@ impl Executor {
     /// Add a newly inserted row to any live vector indexes on the table.
     fn update_vector_indexes_on_insert(&self, table_name: &str, row: &Row, table_def: &TableDef) {
         let pk_col = self.pk_col_for_incremental(table_name, table_def);
+        let pk = pk_col.and_then(|pc| Self::stable_row_id(row, pc));
         let mut indexes = self.vector_indexes.write();
         // Collect WAL log entries to write after releasing the lock
         let mut wal_inserts: Vec<(String, u64, Vec<f32>)> = Vec::new();
@@ -4758,25 +4815,41 @@ impl Executor {
             if entry.table_name != table_name {
                 continue;
             }
-            if let Some(col_idx) = table_def.column_index(&entry.column_name)
-                && col_idx < row.len()
-                && let Value::Vector(v) = &row[col_idx]
-            {
-                match &mut entry.kind {
-                    VectorIndexKind::Hnsw(hnsw) => {
-                        // PK-keyed stable id when the table has an integer PK,
-                        // else fall back to a positional append id.
-                        let id = pk_col
-                            .and_then(|pc| Self::stable_row_id(row, pc))
-                            .unwrap_or_else(|| hnsw.len() as u64);
-                        hnsw.insert(id, vector::Vector::new(v.clone()));
-                        wal_inserts.push((idx_name.clone(), id, v.clone()));
-                    }
-                    VectorIndexKind::IvfFlat(ivf) => {
-                        if ivf.is_trained() {
-                            let row_id = ivf.len();
-                            ivf.add(row_id, v.clone());
-                        }
+            let Some(col_idx) = table_def.column_index(&entry.column_name) else {
+                continue;
+            };
+            if col_idx >= row.len() {
+                continue;
+            }
+            let Value::Vector(v) = &row[col_idx] else {
+                continue;
+            };
+            let pk_keyed = entry.pk_column.is_some();
+            // PK-keyed HNSW allocates a fresh monotonic node via the registry (so
+            // an UPDATE's re-insert never overwrites the old node in place);
+            // positional indexes append at the current length.
+            let node = if pk_keyed && matches!(entry.kind, VectorIndexKind::Hnsw(_)) {
+                match pk {
+                    Some(pk) => entry.registry.upsert(pk).0,
+                    None => match &entry.kind {
+                        VectorIndexKind::Hnsw(h) => h.len() as u64,
+                        VectorIndexKind::IvfFlat(i) => i.len() as u64,
+                    },
+                }
+            } else {
+                match &entry.kind {
+                    VectorIndexKind::Hnsw(h) => h.len() as u64,
+                    VectorIndexKind::IvfFlat(i) => i.len() as u64,
+                }
+            };
+            match &mut entry.kind {
+                VectorIndexKind::Hnsw(hnsw) => {
+                    hnsw.insert(node, vector::Vector::new(v.clone()));
+                    wal_inserts.push((idx_name.clone(), node, v.clone()));
+                }
+                VectorIndexKind::IvfFlat(ivf) => {
+                    if ivf.is_trained() {
+                        ivf.add(node as usize, v.clone());
                     }
                 }
             }
@@ -4848,7 +4921,7 @@ impl Executor {
         row_position: usize,
         table_def: &TableDef,
     ) {
-        let pk_id = self
+        let pk = self
             .pk_col_for_incremental(table_name, table_def)
             .and_then(|pc| Self::stable_row_id(row, pc));
         let mut indexes = self.vector_indexes.write();
@@ -4857,9 +4930,15 @@ impl Executor {
             if entry.table_name != table_name {
                 continue;
             }
+            // PK-keyed HNSW: look up (and drop) the node via the registry.
+            let node = if entry.pk_column.is_some() {
+                pk.and_then(|pk| entry.registry.remove(pk))
+            } else {
+                None
+            };
             match &mut entry.kind {
                 VectorIndexKind::Hnsw(hnsw) => {
-                    let id = pk_id.unwrap_or(row_position as u64);
+                    let id = node.unwrap_or(row_position as u64);
                     hnsw.mark_deleted(id);
                     wal_deletes.push((idx_name.clone(), id));
                 }

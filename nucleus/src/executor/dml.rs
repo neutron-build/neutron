@@ -2084,12 +2084,24 @@ impl Executor {
         // min/max bounds stale. A bare clear would leave the map to be
         // partially repopulated by later INSERTs, under-representing survivors.
         //
-        // UPDATE always takes the full-rebuild path: an in-place HNSW node
-        // overwrite (mark-deleted + re-insert under the same PK id) corrupts the
-        // graph, so a clean rebuild is required. Only DELETE (a pure tombstone)
-        // is safe to maintain incrementally.
+        // With the pk->node registry an UPDATE is now clean incrementally: the
+        // hooks above tombstoned the old node and inserted the new vector under a
+        // fresh node id (no in-place overwrite). So UPDATE takes the same fast
+        // path as DELETE when eligible; the zone map just needs an O(1) clear.
         if count > 0 {
-            self.rebuild_table_derived_state(&table_name).await;
+            if self
+                .incremental_maintenance_eligible(&table_name, &table_def)
+                .await
+            {
+                self.zone_map_index
+                    .clear_table(table_name_to_id(&table_name));
+                // Deferred compaction: rebuild once tombstones bloat the graph.
+                if self.vector_index_needs_compaction(&table_name) {
+                    self.rebuild_table_derived_state(&table_name).await;
+                }
+            } else {
+                self.rebuild_table_derived_state(&table_name).await;
+            }
         }
 
         // Fire AFTER UPDATE statement-level triggers
@@ -2334,6 +2346,10 @@ impl Executor {
                 // its pruning path falls back to the row filter when empty.
                 self.zone_map_index
                     .clear_table(table_name_to_id(&table_name));
+                // Deferred compaction: rebuild once tombstones bloat the graph.
+                if self.vector_index_needs_compaction(&table_name) {
+                    self.rebuild_table_derived_state(&table_name).await;
+                }
             } else {
                 self.rebuild_table_derived_state(&table_name).await;
             }
