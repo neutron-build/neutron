@@ -4969,7 +4969,11 @@ impl Executor {
                 && col_idx < row.len()
             {
                 let plaintext = self.value_to_text_string(&row[col_idx]);
-                let row_id = entry.index.len() as u64;
+                // The appended row's scan position is the running posting count,
+                // NOT the distinct-ciphertext count (`len`): duplicate values
+                // would otherwise collide on the same id (see
+                // test_encrypted_index_insert_hook_positions_duplicates).
+                let row_id = entry.index.num_postings();
                 entry.index.insert(plaintext.as_bytes(), row_id);
             }
         }
