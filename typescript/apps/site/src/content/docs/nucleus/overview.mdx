@@ -48,9 +48,12 @@ postgresql://neutron:password@localhost:5432/mydb
 From any language framework:
 
 ```typescript
-// TypeScript (@neutron-build/core)
-import { db } from "@neutron-build/core";
-const users = await db.query("SELECT * FROM users");
+// TypeScript (@neutron-build/nucleus)
+import { createClient, withSQL } from "@neutron-build/nucleus";
+const db = await createClient({ url: process.env.DATABASE_URL! })
+  .use(withSQL)
+  .connect();
+const users = await db.sql.query("SELECT * FROM users");
 ```
 
 ```rust
