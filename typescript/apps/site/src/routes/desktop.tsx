@@ -17,7 +17,7 @@ export default function DesktopPage() {
       title="Neutron Desktop"
       description="Tauri 2.0 with Neutron Rust underneath. System WebView for UI, embedded Nucleus for data, 12 typed plugins for OS integration. ~10 MB bundles, Rust safety, no Chromium."
       category="platform"
-      status="available"
+      status="in-progress"
       accent="var(--accent-ts)"
       heroAccentRgb="107, 107, 107"
       heroTagline="Desktop apps that don't ship a browser."
