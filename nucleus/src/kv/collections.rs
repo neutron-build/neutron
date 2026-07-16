@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
+#[cfg(feature = "server")]
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -297,6 +298,13 @@ impl ShardedCollections {
     #[cfg(feature = "server")]
     pub fn set_wal(&mut self, wal: Arc<CollectionWal>) {
         self.wal = Some(wal);
+    }
+
+    /// The attached collections WAL, if any (durable mode). Used to force
+    /// group-commit fsync at the ack boundary.
+    #[cfg(feature = "server")]
+    pub fn wal(&self) -> Option<&Arc<CollectionWal>> {
+        self.wal.as_ref()
     }
 
     /// Determine shard index for a given key.

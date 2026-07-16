@@ -1,6 +1,7 @@
 // ── Data-model and core modules (available on all targets, including WASM) ──
 pub mod advisor;
 pub mod allocator;
+pub mod backup;
 pub mod blob;
 pub mod branching;
 pub mod cache;
@@ -21,6 +22,7 @@ pub mod inference;
 pub mod kv;
 pub mod memory;
 pub mod metrics;
+pub mod pitr;
 pub mod planner;
 pub mod procedures;
 pub mod pubsub;
@@ -73,5 +75,5 @@ pub mod wire;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod integration_tests;

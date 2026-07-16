@@ -45,18 +45,20 @@ module circuit_breaker {
     }
 
     // A request fails while the breaker is closed
-    action closed_failure: bool = all {
-        state == "closed",
+    action closed_failure: bool = {
         val new_failures = failure_count + 1
-        failure_count' = new_failures,
-        success_count' = 0,
-        // Trip open if threshold reached
-        if (new_failures >= FAILURE_THRESHOLD)
-            all { state' = "open", ticks_in_open' = 0 }
-        else
-            all { state' = "closed", ticks_in_open' = 0 },
-        total_requests' = total_requests + 1,
-        total_rejected' = total_rejected,
+        all {
+            state == "closed",
+            failure_count' = new_failures,
+            success_count' = 0,
+            // Trip open if threshold reached
+            if (new_failures >= FAILURE_THRESHOLD)
+                all { state' = "open", ticks_in_open' = 0 }
+            else
+                all { state' = "closed", ticks_in_open' = 0 },
+            total_requests' = total_requests + 1,
+            total_rejected' = total_rejected,
+        }
     }
 
     // Breaker is open — reject request immediately (fail-fast)
@@ -72,32 +74,36 @@ module circuit_breaker {
     }
 
     // Time passes while open — after timeout, transition to half-open
-    action open_timeout: bool = all {
-        state == "open",
+    action open_timeout: bool = {
         val new_ticks = ticks_in_open + 1
-        ticks_in_open' = new_ticks,
-        if (new_ticks >= TIMEOUT_TICKS)
-            all { state' = "half_open", success_count' = 0 }
-        else
-            all { state' = "open", success_count' = success_count },
-        failure_count' = failure_count,
-        total_requests' = total_requests,
-        total_rejected' = total_rejected,
+        all {
+            state == "open",
+            ticks_in_open' = new_ticks,
+            if (new_ticks >= TIMEOUT_TICKS)
+                all { state' = "half_open", success_count' = 0 }
+            else
+                all { state' = "open", success_count' = success_count },
+            failure_count' = failure_count,
+            total_requests' = total_requests,
+            total_rejected' = total_rejected,
+        }
     }
 
     // A probe request succeeds in half-open
-    action half_open_success: bool = all {
-        state == "half_open",
+    action half_open_success: bool = {
         val new_successes = success_count + 1
-        success_count' = new_successes,
-        // Close the breaker if success threshold met
-        if (new_successes >= SUCCESS_THRESHOLD)
-            all { state' = "closed", failure_count' = 0 }
-        else
-            all { state' = "half_open", failure_count' = failure_count },
-        ticks_in_open' = 0,
-        total_requests' = total_requests + 1,
-        total_rejected' = total_rejected,
+        all {
+            state == "half_open",
+            success_count' = new_successes,
+            // Close the breaker if success threshold met
+            if (new_successes >= SUCCESS_THRESHOLD)
+                all { state' = "closed", failure_count' = 0 }
+            else
+                all { state' = "half_open", failure_count' = failure_count },
+            ticks_in_open' = 0,
+            total_requests' = total_requests + 1,
+            total_rejected' = total_rejected,
+        }
     }
 
     // A probe request fails in half-open — back to open

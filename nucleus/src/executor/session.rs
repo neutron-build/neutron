@@ -2,10 +2,20 @@
 
 use super::schema_types::CursorDef;
 use super::types::{CteTableMap, PreparedStmt};
+use crate::security::SecurityManager;
 use crate::types::Row;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::RwLock;
+
+/// Wall-clock milliseconds since the Unix epoch (for idle tracking).
+pub(super) fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[cfg(feature = "server")]
 tokio::task_local! {
@@ -143,6 +153,20 @@ pub(super) struct TxnState {
     pub savepoints: Vec<(String, HashMap<String, Vec<Row>>)>,
     /// Cross-model snapshots for rolling back KV/Graph/Doc/Datalog mutations.
     pub cross_model: Option<CrossModelSnapshots>,
+    /// Security catalog at BEGIN, used to make policy DDL transactional.
+    pub security_snapshot: Option<SecurityManager>,
+    /// Session-local security catalog staged by policy DDL until COMMIT.
+    pub security_pending: Option<SecurityManager>,
+    /// Security snapshots associated with SQL savepoints.
+    pub security_savepoints: Vec<(String, SecurityManager)>,
+    /// Whether this transaction changed security policy metadata.
+    pub policy_dirty: bool,
+    /// Whether relational DML changed rows that may feed a shared GIN index.
+    pub gin_dirty: bool,
+    /// Tables whose position-addressed derived indexes must be rebuilt after
+    /// COMMIT or ROLLBACK.  Vector/encrypted indexes are shared across sessions,
+    /// so an aborted transaction must repair them from committed base rows too.
+    pub derived_dirty_tables: HashSet<String>,
 }
 
 impl TxnState {
@@ -152,6 +176,12 @@ impl TxnState {
             snapshot: None,
             savepoints: Vec::new(),
             cross_model: None,
+            security_snapshot: None,
+            security_pending: None,
+            security_savepoints: Vec::new(),
+            policy_dirty: false,
+            gin_dirty: false,
+            derived_dirty_tables: HashSet::new(),
         }
     }
 }
@@ -167,9 +197,24 @@ pub struct Session {
     pub(super) prepared_stmts: RwLock<HashMap<String, Arc<PreparedStmt>>>,
     pub(super) cursors: RwLock<HashMap<String, CursorDef>>,
     pub(super) settings: parking_lot::RwLock<HashMap<String, String>>,
+    /// Principal proven by the connection authentication handshake.
+    pub(super) authenticated_user: parking_lot::RwLock<Option<String>>,
+    /// Effective role selected through the authorized SET ROLE path.
+    pub(super) current_role: parking_lot::RwLock<Option<String>>,
+    /// Tenant claim installed by a trusted boundary, never by generic SET.
+    pub(super) trusted_tenant_id: parking_lot::RwLock<Option<String>>,
     pub(super) active_ctes: parking_lot::RwLock<CteTableMap>,
     #[allow(dead_code)]
     pub(super) session_context: parking_lot::RwLock<crate::security::SessionContext>,
+    /// Wall-clock ms of the last command boundary on this session — updated when
+    /// a command starts and completes. The idle-in-transaction sweep uses it to
+    /// find sessions that have sat in an open transaction with no activity.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    pub(super) last_activity_ms: AtomicU64,
+    /// True while a command is executing on this session. The sweep skips
+    /// executing sessions so a long-running query is never mistaken for idle.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    pub(super) executing: AtomicBool,
 }
 
 impl Default for Session {
@@ -196,11 +241,36 @@ impl Session {
             prepared_stmts: RwLock::new(HashMap::new()),
             cursors: RwLock::new(HashMap::new()),
             settings: parking_lot::RwLock::new(default_settings),
+            authenticated_user: parking_lot::RwLock::new(Some("nucleus".to_string())),
+            current_role: parking_lot::RwLock::new(None),
+            trusted_tenant_id: parking_lot::RwLock::new(None),
             active_ctes: parking_lot::RwLock::new(HashMap::new()),
-            session_context: parking_lot::RwLock::new(crate::security::SessionContext::new(
-                "nucleus",
-            )),
+            // Default identity is the bootstrap superuser, so an unconfigured
+            // (single-user) deployment bypasses RLS entirely — enforcement only
+            // engages once a session assumes a non-superuser identity via
+            // SET session_authorization / SET ROLE (T2.2).
+            session_context: parking_lot::RwLock::new(
+                crate::security::SessionContext::new("nucleus").with_role("superuser"),
+            ),
+            last_activity_ms: AtomicU64::new(now_millis()),
+            executing: AtomicBool::new(false),
         }
+    }
+
+    /// Mark a command as started on this session (idle tracking).
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    pub(super) fn mark_command_start(&self) {
+        self.executing.store(true, Ordering::Relaxed);
+        self.last_activity_ms.store(now_millis(), Ordering::Relaxed);
+    }
+
+    /// Mark the current command finished; the session becomes idle from now.
+    /// Called from a drop guard so a cancelled (statement-timeout) future still
+    /// clears the flag rather than leaving the session stuck "executing".
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    pub(super) fn mark_command_end(&self) {
+        self.last_activity_ms.store(now_millis(), Ordering::Relaxed);
+        self.executing.store(false, Ordering::Relaxed);
     }
 
     /// Reset session state for connection reuse.
@@ -215,6 +285,8 @@ impl Session {
             txn.active = false;
             txn.snapshot = None;
             txn.savepoints.clear();
+            txn.gin_dirty = false;
+            txn.derived_dirty_tables.clear();
         }
         // Clear prepared statements
         self.prepared_stmts.write().await.clear();
@@ -232,5 +304,7 @@ impl Session {
             settings.insert("timezone".to_string(), "UTC".to_string());
             settings.insert("plan_execution".to_string(), "on".to_string());
         }
+        *self.current_role.write() = None;
+        *self.trusted_tenant_id.write() = None;
     }
 }

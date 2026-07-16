@@ -58,6 +58,8 @@ pub struct VectorWalState {
 pub struct VectorWal {
     path: PathBuf,
     writer: Mutex<BufWriter<File>>,
+    /// Group-commit fsync coordinator (durability of the un-checkpointed tail).
+    syncer: crate::storage::wal_util::WalSync,
 }
 
 impl VectorWal {
@@ -82,9 +84,31 @@ impl VectorWal {
             Self {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
+                syncer: crate::storage::wal_util::WalSync::new(),
             },
             state,
         ))
+    }
+
+    /// Flush + `fsync` the log, capturing (under the writer lock) the highest
+    /// append LSN the fsync covers.
+    fn sync_covering(&self) -> io::Result<u64> {
+        let mut w = self.writer.lock();
+        let covered = self.syncer.current();
+        w.flush()?;
+        w.get_ref().sync_all()?;
+        Ok(covered)
+    }
+
+    /// Group-commit sync: durable coverage of every append made before this
+    /// call; concurrent committers share fsyncs.
+    pub fn group_sync(&self) -> io::Result<()> {
+        self.syncer.group_sync(|| self.sync_covering())
+    }
+
+    /// Whether appends exist that no completed fsync covers yet.
+    pub fn is_dirty(&self) -> bool {
+        self.syncer.is_dirty()
     }
 
     /// Return the directory containing the WAL file.
@@ -112,7 +136,9 @@ impl VectorWal {
         buf.extend_from_slice(&ef.to_le_bytes());
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Log a vector insertion.
@@ -138,7 +164,9 @@ impl VectorWal {
         buf.extend_from_slice(mb);
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Log a vector deletion (soft-delete in HNSW).
@@ -151,7 +179,9 @@ impl VectorWal {
         buf.extend_from_slice(&id.to_le_bytes());
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Write the complete current state of all HNSW indexes as a single
@@ -174,24 +204,23 @@ impl VectorWal {
             payload.extend_from_slice(&serialized);
         }
 
-        // Flush existing writer, then truncate and rewrite as one SNAPSHOT entry.
-        {
-            self.writer.lock().flush()?;
-        }
+        // Serialize the complete new log body (SNAPSHOT tag + payload).
+        let mut contents = Vec::with_capacity(payload.len() + 1);
+        contents.push(TAG_SNAPSHOT);
+        contents.extend_from_slice(&payload);
 
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        let mut w = BufWriter::new(file);
-        w.write_all(&[TAG_SNAPSHOT])?;
-        w.write_all(&payload)?;
+        // Hold the writer lock across the whole checkpoint so no append can interleave
+        // between the flush and the reopen. Replace atomically — temp file + fsync +
+        // rename — so a crash mid-checkpoint leaves the old log or the new snapshot,
+        // never an empty file.
+        let mut w = self.writer.lock();
         w.flush()?;
-        drop(w);
-
-        // Re-open in append mode for future writes.
+        crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
         let file = OpenOptions::new().append(true).open(&self.path)?;
-        *self.writer.lock() = BufWriter::new(file);
+        *w = BufWriter::new(file);
+        // The snapshot was fsync'd by `atomic_replace_wal`; count it as covered.
+        let mark = self.syncer.on_append();
+        self.syncer.mark_synced(mark);
         Ok(())
     }
 }
@@ -475,6 +504,17 @@ mod tests {
             idx.insert(i as u64, Vector::new(data));
         }
         idx
+    }
+
+    #[test]
+    fn group_sync_marks_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = VectorWal::open(dir.path()).unwrap();
+        assert!(!wal.is_dirty(), "a fresh WAL has no un-fsynced appends");
+        wal.log_insert("idx", 1, &[1.0, 2.0, 3.0], "").unwrap();
+        assert!(wal.is_dirty(), "an append is uncovered until fsync");
+        wal.group_sync().unwrap();
+        assert!(!wal.is_dirty(), "group_sync fsyncs the tail");
     }
 
     // ── Test 1: Insert 50 vectors, reopen, search returns same results ──────

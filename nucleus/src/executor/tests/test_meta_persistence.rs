@@ -38,6 +38,39 @@ async fn open_executor(dir: &Path) -> Executor {
     ex
 }
 
+#[tokio::test]
+async fn test_rls_policy_and_role_verifier_survive_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE TABLE persisted_docs (id INT, owner TEXT)").await;
+        exec(
+            &ex,
+            "INSERT INTO persisted_docs VALUES (1, 'reader'), (2, 'other')",
+        )
+        .await;
+        exec(&ex, "CREATE ROLE reader LOGIN PASSWORD 'reader-secret'").await;
+        exec(&ex, "GRANT SELECT ON persisted_docs TO reader").await;
+        exec(
+            &ex,
+            "CREATE POLICY persisted_owner ON persisted_docs FOR SELECT USING (owner = CURRENT_USER)",
+        )
+        .await;
+        exec(&ex, "ALTER TABLE persisted_docs ENABLE ROW LEVEL SECURITY").await;
+    }
+
+    let ex = open_executor(dir.path()).await;
+    assert!(ex.scram_credentials("reader").await.is_some());
+    let sid = ex.create_session();
+    ex.bind_authenticated_session(sid, "reader").await.unwrap();
+    let result = ex
+        .execute_with_session(sid, "SELECT id FROM persisted_docs ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(rows(&result[0]).len(), 1);
+    assert_eq!(rows(&result[0])[0][0], Value::Int32(1));
+}
+
 // ── View persistence ──────────────────────────────────────────────────────────
 
 #[tokio::test]

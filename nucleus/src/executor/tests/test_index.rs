@@ -1,5 +1,54 @@
 use super::*;
 
+/// Incremental HNSW UPDATE via the pk->node registry: updating a row's vector
+/// must move it in the index (found near its NEW vector, not its old one)
+/// without a full rebuild. This is the case that corrupted the graph before the
+/// registry (in-place node overwrite).
+#[tokio::test]
+async fn test_hnsw_incremental_update_moves_row() {
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE uu (id INT PRIMARY KEY, v VECTOR(3))").await;
+    exec(
+        &ex,
+        "INSERT INTO uu VALUES (1, VECTOR('[1,0,0]')), (2, VECTOR('[0,1,0]')), (3, VECTOR('[0,0,1]'))",
+    )
+    .await;
+    exec(&ex, "CREATE INDEX uu_v ON uu USING hnsw (v)").await;
+
+    // Move row 2 next to [1,0,0]. Its own vector must now retrieve it.
+    exec(
+        &ex,
+        "UPDATE uu SET v = VECTOR('[0.95,0.05,0]') WHERE id = 2",
+    )
+    .await;
+    let ids = |r: &[ExecResult]| -> Vec<i32> {
+        rows(&r[0])
+            .iter()
+            .filter_map(|row| match row.first() {
+                Some(Value::Int32(n)) => Some(*n),
+                _ => None,
+            })
+            .collect()
+    };
+    let near_new = exec(
+        &ex,
+        "SELECT id FROM uu ORDER BY VECTOR_DISTANCE(v, VECTOR('[0.95,0.05,0]'), 'l2') ASC LIMIT 3",
+    )
+    .await;
+    let got = ids(&near_new);
+    assert_eq!(
+        got.first(),
+        Some(&2),
+        "row 2's updated vector must retrieve row 2 first: {got:?}"
+    );
+    // Exactly once — the old node was tombstoned, not left as a stale duplicate.
+    assert_eq!(
+        got.iter().filter(|&&x| x == 2).count(),
+        1,
+        "row 2 must appear exactly once after UPDATE: {got:?}"
+    );
+}
+
 // ================================================================
 // B-tree range index scan tests
 // ================================================================
@@ -228,6 +277,157 @@ async fn test_encrypted_index_maintained_on_insert() {
         // len() counts unique encrypted keys: 'alpha' and 'beta' = 2 unique keys
         assert_eq!(indexes.get("code_enc").unwrap().index.len(), 2);
     }
+}
+
+/// Regression: the inline INSERT hook must assign each row its true scan
+/// position, not the count of distinct ciphertexts. Two consecutive duplicate
+/// values followed by a new value used to collide (the third row got the same
+/// id as the second) because the hook keyed on `index.len()` (distinct-key
+/// count) instead of the running posting count. Plain autocommit INSERT no
+/// longer rebuilds, so this stood as a silent wrong-position result from
+/// ENCRYPTED_LOOKUP.
+#[tokio::test]
+async fn test_encrypted_index_insert_hook_positions_duplicates() {
+    unsafe {
+        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef");
+    }
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE enc_dup (id INT, code TEXT)").await;
+    exec(
+        &ex,
+        "CREATE INDEX enc_dup_code ON enc_dup USING encrypted (code)",
+    )
+    .await;
+
+    // Order matters: two duplicates then a fresh value. Positions are 0, 1, 2.
+    exec(&ex, "INSERT INTO enc_dup VALUES (1, 'dup')").await;
+    exec(&ex, "INSERT INTO enc_dup VALUES (2, 'dup')").await;
+    exec(&ex, "INSERT INTO enc_dup VALUES (3, 'uniq')").await;
+
+    let lookup = |val: &str| {
+        let ex = &ex;
+        let sql = format!("SELECT ENCRYPTED_LOOKUP('enc_dup_code', '{val}') FROM enc_dup LIMIT 1");
+        async move {
+            let result = exec(ex, &sql).await;
+            match &rows(&result[0])[0][0] {
+                Value::Text(s) => s.clone(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        }
+    };
+
+    // 'uniq' is the third row → scan position 2, not 1.
+    assert_eq!(lookup("uniq").await, "2");
+    // Both duplicates keep their distinct positions.
+    assert_eq!(lookup("dup").await, "0,1");
+}
+
+#[tokio::test]
+async fn test_encrypted_index_row_ids_rebuilt_after_delete_and_rollback() {
+    unsafe {
+        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef");
+    }
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE enc_shift (id INT, code TEXT)").await;
+    exec(
+        &ex,
+        "INSERT INTO enc_shift VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .await;
+    exec(
+        &ex,
+        "CREATE INDEX enc_shift_code ON enc_shift USING encrypted (code)",
+    )
+    .await;
+
+    exec(&ex, "DELETE FROM enc_shift WHERE id = 1").await;
+    let result = exec(
+        &ex,
+        "SELECT ENCRYPTED_LOOKUP('enc_shift_code', 'c') FROM enc_shift LIMIT 1",
+    )
+    .await;
+    assert_eq!(rows(&result[0])[0][0], Value::Text("1".into()));
+
+    exec(&ex, "BEGIN").await;
+    exec(&ex, "DELETE FROM enc_shift WHERE id = 2").await;
+    exec(&ex, "ROLLBACK").await;
+    let result = exec(
+        &ex,
+        "SELECT ENCRYPTED_LOOKUP('enc_shift_code', 'c') FROM enc_shift LIMIT 1",
+    )
+    .await;
+    assert_eq!(rows(&result[0])[0][0], Value::Text("1".into()));
+}
+
+#[tokio::test]
+async fn test_specialty_index_rebuilt_after_fk_cascade() {
+    unsafe {
+        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef");
+    }
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE enc_parent (id INT PRIMARY KEY)").await;
+    exec(
+        &ex,
+        "CREATE TABLE enc_child (id INT, pid INT REFERENCES enc_parent(id) ON DELETE CASCADE, code TEXT)",
+    )
+    .await;
+    exec(&ex, "INSERT INTO enc_parent VALUES (1), (2)").await;
+    exec(
+        &ex,
+        "INSERT INTO enc_child VALUES (10, 1, 'gone'), (20, 2, 'kept')",
+    )
+    .await;
+    exec(
+        &ex,
+        "CREATE INDEX enc_child_code ON enc_child USING encrypted (code)",
+    )
+    .await;
+
+    exec(&ex, "DELETE FROM enc_parent WHERE id = 1").await;
+    let result = exec(
+        &ex,
+        "SELECT ENCRYPTED_LOOKUP('enc_child_code', 'kept') FROM enc_child LIMIT 1",
+    )
+    .await;
+    assert_eq!(rows(&result[0])[0][0], Value::Text("0".into()));
+}
+
+#[tokio::test]
+async fn test_truncate_and_rename_preserve_index_definitions() {
+    let (ex, _tmp) = disk_executor();
+    exec(&ex, "CREATE TABLE indexed_lifecycle (id INT, value TEXT)").await;
+    exec(&ex, "CREATE INDEX lifecycle_id ON indexed_lifecycle (id)").await;
+    exec(&ex, "INSERT INTO indexed_lifecycle VALUES (1, 'old')").await;
+    exec(&ex, "TRUNCATE TABLE indexed_lifecycle").await;
+    exec(&ex, "INSERT INTO indexed_lifecycle VALUES (2, 'new')").await;
+    let result = exec(&ex, "SELECT value FROM indexed_lifecycle WHERE id = 2").await;
+    assert_eq!(rows(&result[0])[0][0], Value::Text("new".into()));
+
+    exec(
+        &ex,
+        "ALTER TABLE indexed_lifecycle RENAME TO indexed_renamed",
+    )
+    .await;
+    let result = exec(&ex, "SELECT value FROM indexed_renamed WHERE id = 2").await;
+    assert_eq!(rows(&result[0])[0][0], Value::Text("new".into()));
+    assert!(
+        ex.btree_indexes
+            .contains_key(&("indexed_renamed".into(), "id".into()))
+    );
+
+    exec(&ex, "ALTER TABLE indexed_renamed RENAME COLUMN id TO key").await;
+    let result = exec(&ex, "SELECT value FROM indexed_renamed WHERE key = 2").await;
+    assert_eq!(rows(&result[0])[0][0], Value::Text("new".into()));
+    assert!(
+        ex.btree_indexes
+            .contains_key(&("indexed_renamed".into(), "key".into()))
+    );
+
+    let error = ex
+        .execute("ALTER TABLE indexed_renamed DROP COLUMN key")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("index \"lifecycle_id\" depends"));
 }
 
 // ================================================================

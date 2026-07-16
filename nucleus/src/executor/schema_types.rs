@@ -64,9 +64,13 @@ pub(crate) enum TriggerEvent {
 #[derive(Debug, Clone)]
 pub(crate) struct RoleDef {
     pub name: String,
+    /// Encoded SCRAM-SHA-256 verifier. Raw passwords are never retained.
     pub password_hash: Option<String>,
     pub is_superuser: bool,
+    pub bypass_rls: bool,
     pub can_login: bool,
+    /// Roles this role may assume via SET ROLE (transitively inherited).
+    pub member_of: Vec<String>,
     pub privileges: HashMap<String, Vec<Privilege>>,
 }
 

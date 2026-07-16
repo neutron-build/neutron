@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
+use crate::storage::wal_util::WalSync;
 use crate::types::Value;
 
 // ─── Entry type tags ──────────────────────────────────────────────────────────
@@ -53,6 +54,8 @@ pub struct KvWalState {
 pub struct KvWal {
     path: PathBuf,
     writer: Mutex<BufWriter<File>>,
+    /// Group-commit fsync coordinator (durability of the un-checkpointed tail).
+    syncer: WalSync,
 }
 
 impl KvWal {
@@ -75,6 +78,7 @@ impl KvWal {
             Self {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
+                syncer: WalSync::new(),
             },
             state,
         ))
@@ -97,7 +101,9 @@ impl KvWal {
 
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Log a DEL operation.
@@ -110,7 +116,9 @@ impl KvWal {
 
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Log an EXPIRE operation (absolute TTL in milliseconds since epoch).
@@ -124,7 +132,9 @@ impl KvWal {
 
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
     }
 
     /// Log multiple operations in a single `write_all` + `flush` call.
@@ -168,7 +178,39 @@ impl KvWal {
         }
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
+    }
+
+    /// Flush + `fsync` the log, capturing (under the writer lock) the highest
+    /// append LSN the fsync covers. The append counter is bumped under the same
+    /// lock, so every append at or below the returned mark is on stable storage.
+    fn sync_covering(&self) -> io::Result<u64> {
+        let mut w = self.writer.lock();
+        let covered = self.syncer.current();
+        w.flush()?;
+        w.get_ref().sync_all()?;
+        Ok(covered)
+    }
+
+    /// Fsync the log unconditionally. Appends only `write`+`flush` into the OS
+    /// page cache; a durable ack requires this.
+    pub fn sync(&self) -> io::Result<()> {
+        let covered = self.sync_covering()?;
+        self.syncer.mark_synced(covered);
+        Ok(())
+    }
+
+    /// Group-commit sync: returns only once a completed fsync covers every append
+    /// made before this call. Concurrent committers share fsyncs.
+    pub fn group_sync(&self) -> io::Result<()> {
+        self.syncer.group_sync(|| self.sync_covering())
+    }
+
+    /// Whether appends exist that no completed fsync covers yet.
+    pub fn is_dirty(&self) -> bool {
+        self.syncer.is_dirty()
     }
 
     /// Write the complete current state as a single SNAPSHOT entry and
@@ -201,25 +243,24 @@ impl KvWal {
             }
         }
 
-        // Flush existing writer, then truncate file and rewrite as one entry.
-        {
-            self.writer.lock().flush()?;
-        }
+        // Serialize the complete new log body (SNAPSHOT tag + payload, no key prefix).
+        let mut contents = Vec::with_capacity(payload.len() + 1);
+        contents.push(ENTRY_SNAPSHOT);
+        contents.extend_from_slice(&payload);
 
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        let mut w = BufWriter::new(file);
-        // SNAPSHOT has no key prefix — write tag + payload directly
-        w.write_all(&[ENTRY_SNAPSHOT])?;
-        w.write_all(&payload)?;
+        // Hold the writer lock across the whole checkpoint so no append can interleave
+        // between the flush and the reopen. Replace atomically — temp file + fsync +
+        // rename — so a crash mid-checkpoint leaves the old log or the new snapshot,
+        // never an empty file.
+        let mut w = self.writer.lock();
         w.flush()?;
-        drop(w);
-
-        // Re-open in append mode for future writes.
+        crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
         let file = OpenOptions::new().append(true).open(&self.path)?;
-        *self.writer.lock() = BufWriter::new(file);
+        *w = BufWriter::new(file);
+        // The snapshot was fsync'd by `atomic_replace_wal`; count it as a
+        // covered append so the log reads clean until the next write.
+        let mark = self.syncer.on_append();
+        self.syncer.mark_synced(mark);
         Ok(())
     }
 }
@@ -456,6 +497,51 @@ mod tests {
     // 3.14/3.14159 here are arbitrary test fixtures, not PI approximations.
     #![allow(clippy::approx_constant)]
     use super::*;
+
+    #[test]
+    fn group_sync_marks_clean_and_data_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = KvWal::open(dir.path()).unwrap();
+
+        // A fresh WAL with no appends is clean.
+        assert!(!wal.is_dirty(), "no appends yet");
+
+        wal.log_set("k1", &Value::Int64(1)).unwrap();
+        wal.log_set("k2", &Value::Text("two".into())).unwrap();
+        assert!(wal.is_dirty(), "appends are not yet covered by an fsync");
+
+        wal.group_sync().unwrap();
+        assert!(!wal.is_dirty(), "group_sync fsyncs — nothing left to force");
+
+        // A redundant sync is a no-op and stays clean.
+        wal.group_sync().unwrap();
+        assert!(!wal.is_dirty());
+
+        // A further append re-dirties; the fsynced records still recover.
+        wal.log_delete("k1").unwrap();
+        assert!(wal.is_dirty(), "new appends after a sync are uncovered");
+        drop(wal);
+
+        let (_wal2, state) = KvWal::open(dir.path()).unwrap();
+        assert_eq!(state.items.len(), 1, "k1 deleted, k2 remains");
+        assert!(state.items.iter().all(|(k, _, _)| k != "k1"));
+    }
+
+    #[test]
+    fn checkpoint_leaves_wal_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = KvWal::open(dir.path()).unwrap();
+        wal.log_set("a", &Value::Int64(1)).unwrap();
+        assert!(wal.is_dirty());
+        // The checkpoint fsyncs its snapshot atomically, so the WAL must read
+        // clean afterward (its snapshot append is counted as covered).
+        wal.checkpoint(&[("a".into(), Value::Int64(1), None)])
+            .unwrap();
+        assert!(
+            !wal.is_dirty(),
+            "checkpoint durably rewrote the log — nothing left to force"
+        );
+    }
 
     #[test]
     fn test_set_replay() {

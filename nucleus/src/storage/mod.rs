@@ -12,7 +12,6 @@ pub mod buffer;
 pub mod buffered_engine;
 #[cfg(feature = "server")]
 pub mod columnar_engine;
-#[cfg(feature = "server")]
 pub mod columnar_wal;
 pub mod compression;
 #[cfg(feature = "server")]
@@ -38,8 +37,8 @@ pub mod page;
 pub mod persistence;
 pub mod tuple;
 pub mod txn;
-#[cfg(feature = "server")]
 pub mod wal;
+pub(crate) mod wal_util;
 
 use std::collections::{BTreeMap, HashMap};
 use tokio::sync::RwLock;
@@ -358,6 +357,20 @@ pub trait StorageEngine: Send + Sync {
     /// touched. Default: false (no-op engines never have pending work).
     fn durability_pending(&self) -> bool {
         false
+    }
+
+    /// Force the on-disk schema/directory (table→first-page map + free list)
+    /// durable, regardless of whether any data page is WAL-pending.
+    ///
+    /// This is the DDL commit primitive. A bare `CREATE TABLE` (or dropping an
+    /// empty table) dirties no data page, so `make_durable`'s pending-page gate
+    /// would skip forcing the directory — leaving the catalog, which is fsync'd
+    /// on every DDL, ahead of storage. On a crash there, storage would either
+    /// not know a just-created table or trust a stale first-page pointer. Called
+    /// before the catalog is persisted so storage is never behind it. Engines
+    /// without a persistent directory no-op.
+    async fn flush_schema(&self) -> Result<(), StorageError> {
+        Ok(())
     }
 
     /// Begin an explicit transaction. Engines that support MVCC will take a
@@ -783,10 +796,13 @@ impl StorageEngine for MemoryEngine {
         }
         {
             let mut tnames = self.table_idx_names.write();
-            tnames
-                .entry(table.to_string())
-                .or_default()
-                .push(index_name.to_string());
+            let names = tnames.entry(table.to_string()).or_default();
+            // Idempotent: re-creating an existing index (e.g. a derived-state
+            // rebuild) must not double-register the name, or per-name index
+            // maintenance would insert every row twice.
+            if !names.iter().any(|n| n == index_name) {
+                names.push(index_name.to_string());
+            }
         }
         Ok(())
     }
@@ -1183,6 +1199,8 @@ pub enum StorageError {
     SerializationFailure(String),
     #[error("duplicate key value violates unique constraint: {0}")]
     UniqueViolation(String),
+    #[error("transaction ID space exhausted; restart from a fresh logical backup")]
+    TransactionIdExhausted,
 }
 
 pub use mvcc::MvccStorageAdapter;

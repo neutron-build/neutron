@@ -117,7 +117,11 @@ struct RoleSer {
     #[serde(default)]
     password_hash: Option<String>,
     is_superuser: bool,
+    #[serde(default)]
+    bypass_rls: bool,
     can_login: bool,
+    #[serde(default)]
+    member_of: Vec<String>,
     /// table → ["Select", "Insert", ...]
     privileges: HashMap<String, Vec<String>>,
 }
@@ -148,6 +152,10 @@ struct MetaSnapshot {
     roles: Vec<RoleSer>,
     #[serde(default)]
     functions: Vec<FunctionSer>,
+    #[serde(default)]
+    rls: crate::security::RlsEngine,
+    #[serde(default)]
+    masking: crate::security::MaskingEngine,
 }
 
 // ── Conversion helpers ───────────────────────────────────────────────────────
@@ -201,6 +209,7 @@ impl MetaPersistence {
 
     // ── Save ─────────────────────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub fn save(
         &self,
         views: &HashMap<String, ViewDef>,
@@ -209,6 +218,7 @@ impl MetaPersistence {
         triggers: &[TriggerDef],
         roles: &HashMap<String, RoleDef>,
         functions: &HashMap<String, FunctionDef>,
+        security: &crate::security::SecurityManager,
     ) -> Result<(), String> {
         let snapshot = MetaSnapshot {
             views: views
@@ -282,7 +292,9 @@ impl MetaPersistence {
                     name: r.name.clone(),
                     password_hash: r.password_hash.clone(),
                     is_superuser: r.is_superuser,
+                    bypass_rls: r.bypass_rls,
                     can_login: r.can_login,
+                    member_of: r.member_of.clone(),
                     privileges: r
                         .privileges
                         .iter()
@@ -321,6 +333,8 @@ impl MetaPersistence {
                     .into(),
                 })
                 .collect(),
+            rls: security.rls.clone(),
+            masking: security.masking.clone(),
         };
 
         let json =
@@ -359,7 +373,11 @@ impl MetaPersistence {
             }
         };
 
-        let mut meta = LoadedMeta::default();
+        let mut meta = LoadedMeta {
+            rls: snap.rls,
+            masking: snap.masking,
+            ..LoadedMeta::default()
+        };
 
         for v in snap.views {
             meta.views.insert(
@@ -443,7 +461,9 @@ impl MetaPersistence {
                     name: r.name,
                     password_hash: r.password_hash,
                     is_superuser: r.is_superuser,
+                    bypass_rls: r.bypass_rls,
                     can_login: r.can_login,
+                    member_of: r.member_of,
                     privileges,
                 },
             );
@@ -488,4 +508,6 @@ pub struct LoadedMeta {
     pub triggers: Vec<TriggerDef>,
     pub roles: HashMap<String, RoleDef>,
     pub functions: HashMap<String, FunctionDef>,
+    pub rls: crate::security::RlsEngine,
+    pub masking: crate::security::MaskingEngine,
 }

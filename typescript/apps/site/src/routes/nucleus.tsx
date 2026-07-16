@@ -123,11 +123,10 @@ export default function NucleusPage() {
               { label: 'COUNT(*)', value: '4.2x faster', width: 71, color: '#34D399' },
               { label: 'INSERT', value: '1.6x faster', width: 27, color: '#6EE7B7' },
               { label: 'GROUP BY', value: '1.2x faster', width: 20, color: '#A7F3D0' },
-              { label: 'Point query', value: '1.1x faster', width: 18, color: '#D1FAE5' },
             ]}
           />
           <p class="nucleus-section__note container" data-animate>
-            <em>Columnar engine benchmarks measured against PostgreSQL. Other engine comparisons in progress.</em>
+            <em>Columnar (embedded) engine measured against PostgreSQL; the aggregation wins come from vectorized scans. On point queries PostgreSQL is competitive to slightly faster. These figures are for the embedded engine — accessed over the PostgreSQL wire protocol, Nucleus adds roughly 34&ndash;40&micro;s per query. Other engine comparisons in progress.</em>
           </p>
         </section>
 

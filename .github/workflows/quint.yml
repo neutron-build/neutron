@@ -1,0 +1,46 @@
+name: Quint Protocol Verification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "quint/**"
+      - ".github/workflows/quint.yml"
+  pull_request:
+    paths:
+      - "quint/**"
+      - ".github/workflows/quint.yml"
+  schedule:
+    - cron: "0 8 * * 1"
+
+jobs:
+  verify:
+    name: typecheck + simulate + conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Pin the version the specs were verified against (Quint 0.32).
+      - name: Install Quint
+        run: npm install -g @informalsystems/quint@0.32.0
+
+      - name: Cache cargo (conformance crate)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            quint/conformance/target
+          key: quint-conformance-${{ runner.os }}-${{ hashFiles('quint/conformance/Cargo.lock', 'quint/conformance/Cargo.toml') }}
+
+      # ci.sh chains: typecheck every spec -> random simulation of each runnable
+      # spec's invariants -> `quint test` conformance -> the Rust conformance
+      # crate (`cargo test`). Non-zero exit on any failure.
+      - name: Run quint CI gate
+        run: bash scripts/ci.sh
+        working-directory: quint

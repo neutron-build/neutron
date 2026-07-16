@@ -195,6 +195,101 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Back up a data directory to a portable snapshot (physical, v1).
+    ///
+    /// Take it against a STOPPED instance for a consistent snapshot. Restore
+    /// requires the same Nucleus version (physical snapshots are version-locked).
+    Backup {
+        /// Data directory to back up.
+        #[arg(short, long, default_value = "nucleus_data")]
+        data: PathBuf,
+
+        /// Destination snapshot directory.
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Overwrite the destination if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Restore a data directory from a snapshot created by `backup`.
+    Restore {
+        /// Snapshot directory produced by `nucleus backup`.
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Data directory to restore into. Must be empty unless --force.
+        #[arg(short, long, default_value = "nucleus_data")]
+        data: PathBuf,
+
+        /// Overwrite the data directory if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Logical (portable SQL) dump of every table — survives format/schema
+    /// changes and replays through the constraint-safe executor, unlike the
+    /// physical `backup`. Take it against a stopped or quiesced instance.
+    Dump {
+        /// Data directory to dump from.
+        #[arg(short, long, default_value = "nucleus_data")]
+        data: PathBuf,
+
+        /// Output .sql file (writes to stdout if omitted).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Restore a logical dump produced by `nucleus dump` into a data directory
+    /// (creates it if missing) by replaying the SQL through the executor.
+    Load {
+        /// The .sql dump file to replay.
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Data directory to restore into.
+        #[arg(short, long, default_value = "nucleus_data")]
+        data: PathBuf,
+    },
+
+    /// Point-in-time recovery: restore a physical base snapshot and replay the
+    /// archived WAL (see `NUCLEUS_WAL_ARCHIVE_DIR`) forward to a target LSN,
+    /// wall-clock time, or the latest archived point. Segmented-WAL databases
+    /// only.
+    RestorePitr {
+        /// Physical base snapshot directory (from `nucleus backup`).
+        #[arg(short, long)]
+        base: PathBuf,
+
+        /// WAL archive directory (the per-database subdirectory of
+        /// `NUCLEUS_WAL_ARCHIVE_DIR`).
+        #[arg(short, long)]
+        archive: PathBuf,
+
+        /// Data directory to restore into. Must be empty unless --force.
+        #[arg(short, long, default_value = "nucleus_data")]
+        data: PathBuf,
+
+        /// Primary data file name inside the data dir.
+        #[arg(long, default_value = "nucleus.db")]
+        db_file: String,
+
+        /// Replay through this exact LSN (inclusive). Mutually exclusive with
+        /// --time; if neither is given, replays to the latest archived point.
+        #[arg(long)]
+        lsn: Option<u64>,
+
+        /// Replay through the last segment archived at or before this Unix time
+        /// (seconds). Segment granularity.
+        #[arg(long)]
+        time: Option<u64>,
+
+        /// Overwrite the data directory if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -320,6 +415,33 @@ async fn main() {
             } else {
                 cmd_shell(&host, port).await;
             }
+        }
+        Some(Commands::Backup {
+            data,
+            output,
+            force,
+        }) => {
+            cmd_backup(data, output, force);
+        }
+        Some(Commands::Restore { input, data, force }) => {
+            cmd_restore(input, data, force);
+        }
+        Some(Commands::Dump { data, output }) => {
+            cmd_dump(data, output).await;
+        }
+        Some(Commands::Load { input, data }) => {
+            cmd_load(input, data).await;
+        }
+        Some(Commands::RestorePitr {
+            base,
+            archive,
+            data,
+            db_file,
+            lsn,
+            time,
+            force,
+        }) => {
+            cmd_restore_pitr(base, archive, data, db_file, lsn, time, force);
         }
         None => {
             // Default: start in server mode (same as `nucleus start`)
@@ -730,10 +852,63 @@ async fn cmd_start(cfg: StartConfig) {
             if compress { ", compressed" } else { "" },
         );
 
-        // Re-register tables restored from catalog so DiskEngine knows about them
+        // Re-register tables restored from catalog so DiskEngine knows about
+        // them — and let create_table reconcile epochs (a directory entry whose
+        // generation differs from the catalog's is a stale drop+recreate, whose
+        // first_page is abandoned rather than trusted; T0.3).
         for table_name in catalog.table_names().await {
             if let Err(e) = engine.create_table(&table_name).await {
                 tracing::warn!("Failed to re-register table {table_name}: {e}");
+            }
+        }
+
+        // Bidirectional reconciliation: reclaim storage-ahead orphans — tables
+        // the on-disk directory still holds but the (authoritative,
+        // persisted-last) catalog does not. Because DDL forces storage durable
+        // *before* the catalog, the only crash-window residue is storage-ahead:
+        // an uncommitted CREATE or a half-applied DROP. Dropping the orphan
+        // frees its pages and keeps the two sides convergent. This replaces the
+        // old purely one-directional re-register (which could only ever leak).
+        //
+        // SAFETY GUARD: only reclaim when the catalog is NON-empty. A missing or
+        // corrupt catalog.json loads as an empty catalog (load_catalog returns
+        // Ok with no tables), and reclaiming against that would drop EVERY
+        // storage table — turning a recoverable catalog problem into permanent
+        // data loss. An empty catalog beside populated storage is treated as
+        // "catalog needs recovery", not "everything is an orphan": leave the
+        // tables intact (they are invisible to SQL until the catalog is restored,
+        // but preserved).
+        {
+            let cataloged: std::collections::HashSet<String> =
+                catalog.table_names().await.into_iter().collect();
+            let storage_tables = engine.table_names();
+            if cataloged.is_empty() {
+                if !storage_tables.is_empty() {
+                    tracing::warn!(
+                        "reconcile: catalog is empty but storage holds {} table(s) — NOT \
+                         reclaiming (likely a missing/corrupt catalog, not orphans); tables are \
+                         preserved but invisible until the catalog is restored",
+                        storage_tables.len()
+                    );
+                }
+            } else {
+                let orphans: Vec<String> = storage_tables
+                    .into_iter()
+                    .filter(|t| !cataloged.contains(t))
+                    .collect();
+                let reclaimed = !orphans.is_empty();
+                for orphan in orphans {
+                    tracing::warn!(
+                        "reconcile: reclaiming orphan storage table '{orphan}' (absent from catalog)"
+                    );
+                    if let Err(e) = engine.drop_table(&orphan).await {
+                        tracing::warn!("reconcile: failed to reclaim orphan '{orphan}': {e}");
+                    }
+                }
+                // Persist the reclaimed directory so orphans don't reappear next boot.
+                if reclaimed && let Err(e) = engine.flush_schema().await {
+                    tracing::warn!("reconcile: failed to persist directory after reclaim: {e}");
+                }
             }
         }
 
@@ -803,6 +978,17 @@ async fn cmd_start(cfg: StartConfig) {
             .with_cluster(cluster.clone()),
     );
     tracing::info!("Cache: {} MB", config.cache.max_memory_mb);
+
+    // Query execution memory budget (T1.2): make the operator's configured
+    // memory limit the ceiling for the hash-join result circuit-breaker, instead
+    // of the hardcoded 256 MB default that ignored config. 0 → unlimited.
+    executor.set_query_memory_limit((config.server.max_memory_mb as u64) * 1024 * 1024);
+    if config.server.max_memory_mb > 0 {
+        tracing::info!(
+            "Query memory budget: {} MB (hash-join circuit-breaker)",
+            config.server.max_memory_mb
+        );
+    }
 
     // Commit-time durability default (config wal.synchronous_commit;
     // sessions override with SET synchronous_commit = on|off).
@@ -875,14 +1061,22 @@ async fn cmd_start(cfg: StartConfig) {
                 std::process::exit(1);
             }
         }
+        if resolved_auth_method != AuthMethod::ScramSha256 {
+            tracing::error!(
+                "Catalog-backed multi-user authentication requires SCRAM-SHA-256; \
+                 cleartext authentication is no longer accepted by the production server"
+            );
+            std::process::exit(1);
+        }
     }
     let resolved_password_for_resp = resolved_password.clone();
     let resolved_password_for_binary = resolved_password.clone();
-    let handler = Arc::new(NucleusHandler::with_password_and_method(
-        executor.clone(),
-        resolved_password,
-        resolved_auth_method,
-    ));
+    let handler = if let Some(ref bootstrap_password) = resolved_password {
+        executor.set_bootstrap_password(bootstrap_password).await;
+        Arc::new(NucleusHandler::with_catalog_auth(executor.clone()))
+    } else {
+        Arc::new(NucleusHandler::new(executor.clone()))
+    };
     let handler_ref = handler.clone();
     let server = Arc::new(NucleusServer::new(handler));
     let resolved_tls_client_ca = tls_client_ca.or_else(|| {
@@ -1052,7 +1246,7 @@ async fn cmd_start(cfg: StartConfig) {
     tokio::spawn(async move {
         let mut rx = apply_rx;
         while let Some(sql) = rx.recv().await {
-            if let Err(e) = executor_for_apply.execute(&sql).await {
+            if let Err(e) = executor_for_apply.apply_replicated_sql(&sql).await {
                 tracing::warn!("Failed to apply Raft-committed SQL: {e}: sql={sql}");
             }
         }
@@ -1148,6 +1342,32 @@ async fn cmd_start(cfg: StartConfig) {
         nucleus::background::Priority::Normal,
         std::time::Duration::from_secs(5),
     );
+    // Idle-in-transaction sweep (T1.3): roll back transactions left open and
+    // idle past the configured timeout so their MVCC snapshots are released and
+    // GC can advance. Only spawned when enabled (timeout > 0), so the default
+    // deployment is unchanged.
+    let idle_txn_timeout_secs = config.server.idle_in_transaction_timeout_secs;
+    if idle_txn_timeout_secs > 0 {
+        let executor_for_idle = executor.clone();
+        // Sweep on a cadence bounded to [1s, 30s] so an abandoned transaction is
+        // reclaimed promptly without busy-looping on very large timeouts.
+        let sweep_secs = idle_txn_timeout_secs.clamp(1, 30);
+        let timeout_ms = idle_txn_timeout_secs.saturating_mul(1000);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
+            loop {
+                ticker.tick().await;
+                let n = executor_for_idle
+                    .sweep_idle_in_transaction(timeout_ms)
+                    .await;
+                if n > 0 {
+                    tracing::info!("Idle-in-transaction sweep rolled back {n} transaction(s)");
+                }
+            }
+        });
+        tracing::info!("Idle-in-transaction timeout: {idle_txn_timeout_secs}s");
+    }
+
     // Set up WAL notifier for streaming replication broadcast channel.
     // The notifier bridges the storage WAL to the TCP replication transport.
     let wal_notifier = Arc::new(tokio::sync::Mutex::new(
@@ -1203,11 +1423,11 @@ async fn cmd_start(cfg: StartConfig) {
                         // what caused the 2026-06-30 observe-nucleus OOM
                         // (CDC log in memory) and was already visibly
                         // inflating kv.wal (493MB from a ~1.2GB dataset) on
-                        // that same host. Vector-index WAL checkpointing is
-                        // deliberately not wired here yet — building a
-                        // correct index snapshot needs new accessors on
-                        // HnswIndex and doesn't cover IvfFlat; see
-                        // vector/wal.rs::IndexSnapshot.
+                        // that same host. Vector, timeseries, and columnar are
+                        // checkpointed alongside the rest below; the geo WAL is
+                        // opened for recovery but never appended to (geo data
+                        // persists as ordinary SQL columns), so it needs no
+                        // checkpoint here.
                         // SQL disk engine: flush dirty pages, checkpoint the
                         // WAL, and prune fully-checkpointed segments. With
                         // synchronous_commit=on (default) acked commits are
@@ -1240,6 +1460,25 @@ async fn cmd_start(cfg: StartConfig) {
                         }
                         if let Err(e) = executor_for_workers.fts_index().read().checkpoint_wal() {
                             tracing::warn!("FTS WAL checkpoint failed: {e}");
+                        }
+                        // Vector index WAL: HNSW inserts/deletes log one record
+                        // each; snapshot every live HNSW index (IvfFlat rebuilds
+                        // from base-table data, never logged here).
+                        if let Err(e) = executor_for_workers.checkpoint_vector_wal() {
+                            tracing::warn!("Vector WAL checkpoint failed: {e}");
+                        }
+                        // TimeSeries retention (T1.3): purge points older than the
+                        // configured TS_RETENTION policy BEFORE snapshotting, so the
+                        // WAL is truncated to the retained state and old data does
+                        // not grow the store forever. No-op when no policy is set.
+                        executor_for_workers.ts_store().write().apply_retention();
+                        // TimeSeries WAL: every insert appends a record; snapshot
+                        // truncates it to the current series state.
+                        executor_for_workers.ts_store().read().snapshot();
+                        // Columnar WAL: every append/create logs a record; snapshot
+                        // truncates it to the current table state.
+                        if let Err(e) = executor_for_workers.columnar_store().write().checkpoint() {
+                            tracing::warn!("Columnar WAL checkpoint failed: {e}");
                         }
                     }
                     nucleus::background::BackgroundTask::ReplicationSync => {
@@ -1905,7 +2144,7 @@ async fn handle_cluster_message(
                 "ForwardQuery from {}: shard={shard_id} query={query}",
                 env.from
             );
-            match executor.execute(&query).await {
+            match executor.execute_principal_less_forward(&query).await {
                 Ok(results) => {
                     // Serialize result rows as JSON-encoded bytes
                     let mut encoded_rows = Vec::new();
@@ -1949,7 +2188,8 @@ async fn handle_cluster_message(
             tracing::debug!("ForwardDml from {}: sql={sql}", env.from);
             let request_id = env.id; // Preserve for send_request() correlation.
             let from = env.from;
-            let (response_msg, self_id) = match executor.execute(&sql).await {
+            let (response_msg, self_id) = match executor.execute_principal_less_forward(&sql).await
+            {
                 Ok(results) => {
                     let rows_affected: usize = results
                         .iter()
@@ -2009,6 +2249,152 @@ fn cmd_init(data: PathBuf) {
     std::fs::create_dir_all(&data).expect("failed to create data directory");
     println!("Initialized Nucleus data directory: {}", data.display());
     println!("Start with: nucleus start --data {}", data.display());
+}
+
+fn cmd_backup(data: PathBuf, output: PathBuf, force: bool) {
+    match nucleus::backup::backup_data_dir(&data, &output, force, env!("CARGO_PKG_VERSION")) {
+        Ok(manifest) => {
+            println!(
+                "Backup complete: {} -> {}",
+                data.display(),
+                output.display()
+            );
+            println!("  Nucleus version: {}", manifest.nucleus_version);
+            println!(
+                "  Restore with: nucleus restore --input {} --data <dir>",
+                output.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("Backup failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_restore_pitr(
+    base: PathBuf,
+    archive: PathBuf,
+    data: PathBuf,
+    db_file: String,
+    lsn: Option<u64>,
+    time: Option<u64>,
+    force: bool,
+) {
+    if lsn.is_some() && time.is_some() {
+        eprintln!("PITR restore: pass at most one of --lsn / --time");
+        std::process::exit(1);
+    }
+    let target = match (lsn, time) {
+        (Some(n), _) => nucleus::pitr::PitrTarget::Lsn(n),
+        (_, Some(t)) => nucleus::pitr::PitrTarget::UnixSeconds(t),
+        (None, None) => nucleus::pitr::PitrTarget::Latest,
+    };
+    match nucleus::pitr::restore_pitr(
+        &base,
+        &archive,
+        target,
+        &data,
+        &db_file,
+        env!("CARGO_PKG_VERSION"),
+        force,
+    ) {
+        Ok(report) => {
+            println!(
+                "PITR restore complete: base {} + archive {} -> {}",
+                base.display(),
+                archive.display(),
+                data.display()
+            );
+            println!(
+                "  Replayed to LSN {} ({} WAL segment(s) reconstructed)",
+                report.restored_lsn, report.segments_written
+            );
+            if report.target_lsn != u64::MAX && report.restored_lsn < report.target_lsn {
+                println!(
+                    "  Note: archive ended at LSN {} — target {} was beyond the archived history",
+                    report.restored_lsn, report.target_lsn
+                );
+            }
+            println!("  Start with: nucleus start --data {}", data.display());
+        }
+        Err(e) => {
+            eprintln!("PITR restore failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_restore(input: PathBuf, data: PathBuf, force: bool) {
+    match nucleus::backup::restore_data_dir(&input, &data, force, env!("CARGO_PKG_VERSION")) {
+        Ok(_) => {
+            println!(
+                "Restore complete: {} -> {}",
+                input.display(),
+                data.display()
+            );
+            println!("  Start with: nucleus start --data {}", data.display());
+        }
+        Err(e) => {
+            eprintln!("Restore failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn cmd_dump(data: PathBuf, output: Option<PathBuf>) {
+    let executor = match nucleus::executor::open_persistent_executor(&data).await {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Dump failed to open '{}': {e}", data.display());
+            std::process::exit(1);
+        }
+    };
+    let script = match executor.dump_logical().await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Dump failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    match output {
+        Some(path) => match std::fs::write(&path, &script) {
+            Ok(()) => println!("Logical dump written to {}", path.display()),
+            Err(e) => {
+                eprintln!("Dump failed to write '{}': {e}", path.display());
+                std::process::exit(1);
+            }
+        },
+        None => print!("{script}"),
+    }
+}
+
+async fn cmd_load(input: PathBuf, data: PathBuf) {
+    let script = match std::fs::read_to_string(&input) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Load failed to read '{}': {e}", input.display());
+            std::process::exit(1);
+        }
+    };
+    let executor = match nucleus::executor::open_persistent_executor(&data).await {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Load failed to open '{}': {e}", data.display());
+            std::process::exit(1);
+        }
+    };
+    match executor.restore_logical(&script).await {
+        Ok(()) => {
+            println!("Logical dump restored into {}", data.display());
+            println!("  Start with: nucleus start --data {}", data.display());
+        }
+        Err(e) => {
+            eprintln!("Load failed: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn cmd_version() {

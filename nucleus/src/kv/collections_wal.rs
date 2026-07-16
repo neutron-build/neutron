@@ -182,6 +182,8 @@ const COLL_GEO: u8 = 7;
 pub struct CollectionWal {
     path: PathBuf,
     writer: Mutex<BufWriter<File>>,
+    /// Group-commit fsync coordinator (durability of the un-checkpointed tail).
+    syncer: crate::storage::wal_util::WalSync,
 }
 
 impl CollectionWal {
@@ -204,6 +206,7 @@ impl CollectionWal {
             Self {
                 path,
                 writer: Mutex::new(BufWriter::new(file)),
+                syncer: crate::storage::wal_util::WalSync::new(),
             },
             collections,
         ))
@@ -219,7 +222,30 @@ impl CollectionWal {
 
         let mut w = self.writer.lock();
         w.write_all(&buf)?;
-        w.flush()
+        w.flush()?;
+        self.syncer.on_append();
+        Ok(())
+    }
+
+    /// Flush + `fsync` the log, capturing (under the writer lock) the highest
+    /// append LSN the fsync covers.
+    fn sync_covering(&self) -> io::Result<u64> {
+        let mut w = self.writer.lock();
+        let covered = self.syncer.current();
+        w.flush()?;
+        w.get_ref().sync_all()?;
+        Ok(covered)
+    }
+
+    /// Group-commit sync: durable coverage of every append made before this
+    /// call; concurrent committers share fsyncs.
+    pub fn group_sync(&self) -> io::Result<()> {
+        self.syncer.group_sync(|| self.sync_covering())
+    }
+
+    /// Whether appends exist that no completed fsync covers yet.
+    pub fn is_dirty(&self) -> bool {
+        self.syncer.is_dirty()
     }
 
     // ── List ops ────────────────────────────────────────────────────────────
@@ -352,27 +378,25 @@ impl CollectionWal {
     pub fn checkpoint(&self, collections: &ShardedCollections) -> io::Result<()> {
         let snapshot_data = serialize_snapshot(collections);
 
-        // Flush existing writer, then truncate file and rewrite.
-        {
-            self.writer.lock().flush()?;
-        }
+        // Serialize the complete new log body (SNAPSHOT tag + empty key + snapshot).
+        let mut contents: Vec<u8> = Vec::new();
+        contents.push(OP_SNAPSHOT);
+        write_string_to_writer("", &mut contents)?;
+        contents.extend_from_slice(&(snapshot_data.len() as u32).to_le_bytes());
+        contents.extend_from_slice(&snapshot_data);
 
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        let mut w = BufWriter::new(file);
-        w.write_all(&[OP_SNAPSHOT])?;
-        // Snapshot has no key — write empty key
-        write_string_to_writer("", &mut w)?;
-        w.write_all(&(snapshot_data.len() as u32).to_le_bytes())?;
-        w.write_all(&snapshot_data)?;
+        // Hold the writer lock across the whole checkpoint so no append can interleave
+        // between the flush and the reopen. Replace atomically — temp file + fsync +
+        // rename — so a crash mid-checkpoint leaves the old log or the new snapshot,
+        // never an empty file.
+        let mut w = self.writer.lock();
         w.flush()?;
-        drop(w);
-
-        // Re-open in append mode for future writes.
+        crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
         let file = OpenOptions::new().append(true).open(&self.path)?;
-        *self.writer.lock() = BufWriter::new(file);
+        *w = BufWriter::new(file);
+        // The snapshot was fsync'd by `atomic_replace_wal`; count it as covered.
+        let mark = self.syncer.on_append();
+        self.syncer.mark_synced(mark);
         Ok(())
     }
 }
@@ -773,6 +797,17 @@ mod tests {
     #![allow(clippy::approx_constant)]
     use super::*;
     use crate::types::Value;
+
+    #[test]
+    fn group_sync_marks_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _colls) = CollectionWal::open(dir.path()).unwrap();
+        assert!(!wal.is_dirty(), "a fresh WAL has no un-fsynced appends");
+        wal.log_lpush("l", &Value::Text("a".into())).unwrap();
+        assert!(wal.is_dirty(), "an append is uncovered until fsync");
+        wal.group_sync().unwrap();
+        assert!(!wal.is_dirty(), "group_sync fsyncs the tail");
+    }
 
     #[test]
     fn test_list_wal_replay() {

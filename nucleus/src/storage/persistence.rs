@@ -68,6 +68,8 @@ struct ColumnDefSer {
 #[serde(tag = "type")]
 enum TableConstraintSer {
     PrimaryKey {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         columns: Vec<String>,
     },
     Unique {
@@ -99,6 +101,9 @@ struct TableDefSer {
     constraints: Vec<TableConstraintSer>,
     #[serde(default)]
     append_only: bool,
+    /// Per-table generation id (T0.3). Absent in pre-v2 catalog files → 0.
+    #[serde(default)]
+    epoch: u64,
 }
 
 /// Serializable representation of an index definition.
@@ -118,6 +123,12 @@ struct IndexDefSer {
 struct CatalogSnapshot {
     tables: Vec<TableDefSer>,
     indexes: Vec<IndexDefSer>,
+    /// High-water mark of the per-table epoch allocator (T0.3). Persisted so a
+    /// table recreated after a restart draws a strictly higher generation id
+    /// than any predecessor. Absent in pre-v2 files → 0, then re-derived from
+    /// the loaded tables' epochs.
+    #[serde(default)]
+    next_table_epoch: u64,
 }
 
 /// Convert an internal `DataType` to its string representation for persistence.
@@ -207,7 +218,8 @@ fn string_to_index_type(s: &str) -> Result<IndexType, PersistenceError> {
 /// Convert a `TableConstraint` to its serializable form.
 fn constraint_to_ser(c: &TableConstraint) -> TableConstraintSer {
     match c {
-        TableConstraint::PrimaryKey { columns } => TableConstraintSer::PrimaryKey {
+        TableConstraint::PrimaryKey { name, columns } => TableConstraintSer::PrimaryKey {
+            name: name.clone(),
             columns: columns.clone(),
         },
         TableConstraint::Unique { name, columns } => TableConstraintSer::Unique {
@@ -239,7 +251,8 @@ fn constraint_to_ser(c: &TableConstraint) -> TableConstraintSer {
 /// Convert a serializable constraint back to the internal `TableConstraint`.
 fn ser_to_constraint(c: &TableConstraintSer) -> TableConstraint {
     match c {
-        TableConstraintSer::PrimaryKey { columns } => TableConstraint::PrimaryKey {
+        TableConstraintSer::PrimaryKey { name, columns } => TableConstraint::PrimaryKey {
+            name: name.clone(),
             columns: columns.clone(),
         },
         TableConstraintSer::Unique { name, columns } => TableConstraint::Unique {
@@ -307,6 +320,7 @@ impl CatalogPersistence {
                         .collect(),
                     constraints: t.constraints.iter().map(constraint_to_ser).collect(),
                     append_only: t.append_only,
+                    epoch: t.epoch,
                 })
                 .collect(),
             indexes: indexes
@@ -324,6 +338,7 @@ impl CatalogPersistence {
                     },
                 })
                 .collect(),
+            next_table_epoch: catalog.peek_next_table_epoch(),
         };
 
         let json = serde_json::to_string_pretty(&snapshot)
@@ -374,6 +389,7 @@ impl CatalogPersistence {
                 columns: columns?,
                 constraints,
                 append_only: t.append_only,
+                epoch: t.epoch,
             };
 
             catalog
@@ -381,6 +397,13 @@ impl CatalogPersistence {
                 .await
                 .map_err(|e| PersistenceError::Catalog(e.to_string()))?;
         }
+
+        // Restore the per-table epoch allocator (T0.3). Take the persisted
+        // high-water mark, but also lift it above every loaded table's epoch so
+        // a subsequent CREATE can never collide with an existing generation
+        // (defends against a pre-v2 file that has table epochs but no counter).
+        let max_epoch = snapshot.tables.iter().map(|t| t.epoch).max().unwrap_or(0);
+        catalog.restore_table_epoch_counter(snapshot.next_table_epoch.max(max_epoch + 1));
 
         // Load indexes
         for i in &snapshot.indexes {
@@ -836,9 +859,11 @@ mod tests {
                     },
                 ],
                 constraints: vec![TableConstraint::PrimaryKey {
+                    name: Some("users_pk".into()),
                     columns: vec!["id".into()],
                 }],
                 append_only: false,
+                epoch: 0,
             })
             .await
             .unwrap();
@@ -868,6 +893,7 @@ mod tests {
                 ],
                 constraints: vec![],
                 append_only: false,
+                epoch: 0,
             })
             .await
             .unwrap();
@@ -918,6 +944,11 @@ mod tests {
         assert_eq!(users.columns[1].name, "email");
         assert_eq!(users.columns[2].name, "active");
         assert!(users.columns[2].nullable);
+        assert!(matches!(
+            &users.constraints[0],
+            TableConstraint::PrimaryKey { name: Some(name), columns }
+                if name == "users_pk" && columns == &["id"]
+        ));
 
         // Verify orders table with Array type
         let orders = catalog2.get_table("orders").await.unwrap();
@@ -1329,6 +1360,7 @@ mod tests {
                     }],
                     constraints: vec![],
                     append_only: false,
+                    epoch: 0,
                 })
                 .await
                 .unwrap();

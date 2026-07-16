@@ -16,7 +16,7 @@ use super::helpers::*;
 use super::session::sync_block_on;
 use super::types::ColMeta;
 use super::{ExecError, ExecResult, Executor};
-use crate::types::{Row, Value};
+use crate::types::{DataType, Row, Value};
 
 // ---------------------------------------------------------------------------
 // Lazy Materialization — Phase 2C
@@ -104,11 +104,42 @@ impl Drop for ExprDepthGuard {
 }
 
 impl Executor {
+    pub(super) fn session_time_zone(&self) -> Result<chrono_tz::Tz, ExecError> {
+        let session = self.current_session();
+        let value = session
+            .settings
+            .read()
+            .get("timezone")
+            .cloned()
+            .unwrap_or_else(|| "UTC".to_string());
+        parse_time_zone(&value)
+    }
+
     /// Evaluate a constant expression (no table context).
     pub(super) fn eval_const_expr(&self, expr: &Expr) -> Result<Value, ExecError> {
         let _guard = ExprDepthGuard::enter()?;
         match expr {
             Expr::Value(val) => self.eval_value(&val.value),
+            Expr::Interval(interval) => {
+                let value = self.eval_const_expr(&interval.value)?;
+                let Value::Text(raw) = value else {
+                    return Err(ExecError::Runtime(
+                        "INTERVAL value must be a string literal".into(),
+                    ));
+                };
+                parse_interval_literal(&raw, interval.leading_field.as_ref())
+            }
+            Expr::Collate { expr, collation } => {
+                validate_binary_collation(collation)?;
+                self.eval_const_expr(expr)
+            }
+            Expr::AtTimeZone {
+                timestamp,
+                time_zone,
+            } => eval_at_time_zone(
+                self.eval_const_expr(timestamp)?,
+                self.eval_const_expr(time_zone)?,
+            ),
             Expr::UnaryOp { op, expr } => {
                 let val = self.eval_const_expr(expr)?;
                 match (op, val) {
@@ -121,6 +152,32 @@ impl Executor {
                         .map(Value::Int64)
                         .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
                     (ast::UnaryOperator::Minus, Value::Float64(n)) => Ok(Value::Float64(-n)),
+                    (ast::UnaryOperator::Minus, Value::Numeric(raw)) => {
+                        crate::types::numeric_neg(&raw)
+                            .map(Value::Numeric)
+                            .map_err(ExecError::Runtime)
+                    }
+                    (
+                        ast::UnaryOperator::Minus,
+                        Value::Interval {
+                            months,
+                            days,
+                            microseconds,
+                        },
+                    ) => Ok(Value::Interval {
+                        months: months.checked_neg().ok_or_else(|| {
+                            ExecError::Runtime("interval value out of range".into())
+                        })?,
+                        days: days.checked_neg().ok_or_else(|| {
+                            ExecError::Runtime("interval value out of range".into())
+                        })?,
+                        microseconds: microseconds.checked_neg().ok_or_else(|| {
+                            ExecError::Runtime("interval value out of range".into())
+                        })?,
+                    }),
+                    (ast::UnaryOperator::Not, Value::Bool(value)) => Ok(Value::Bool(!value)),
+                    (ast::UnaryOperator::Not, Value::Null)
+                    | (ast::UnaryOperator::Minus, Value::Null) => Ok(Value::Null),
                     _ => Err(ExecError::Unsupported("unsupported unary op".into())),
                 }
             }
@@ -157,6 +214,16 @@ impl Executor {
             | Expr::Position { .. }
             | Expr::Overlay { .. }
             | Expr::Extract { .. }
+            | Expr::Between { .. }
+            | Expr::InList { .. }
+            | Expr::IsNull(_)
+            | Expr::IsNotNull(_)
+            | Expr::IsTrue(_)
+            | Expr::IsNotTrue(_)
+            | Expr::IsFalse(_)
+            | Expr::IsNotFalse(_)
+            | Expr::IsUnknown(_)
+            | Expr::IsNotUnknown(_)
             | Expr::IsDistinctFrom(_, _)
             | Expr::IsNotDistinctFrom(_, _)
             | Expr::Array(_)
@@ -486,6 +553,22 @@ impl Executor {
         }
 
         // Arithmetic and string operations
+        if matches!(op, ast::BinaryOperator::Plus | ast::BinaryOperator::Minus)
+            && let Some(result) = eval_temporal_arithmetic(left, op, right)
+        {
+            return result;
+        }
+        if matches!(
+            op,
+            ast::BinaryOperator::Plus
+                | ast::BinaryOperator::Minus
+                | ast::BinaryOperator::Multiply
+                | ast::BinaryOperator::Divide
+                | ast::BinaryOperator::Modulo
+        ) && let Some(result) = eval_numeric_arithmetic(left, op, right)
+        {
+            return result;
+        }
         match (left, right) {
             (Value::Int32(l), Value::Int32(r)) => match op {
                 ast::BinaryOperator::Plus => l
@@ -731,6 +814,26 @@ impl Executor {
                 Ok(row[idx].clone())
             }
             Expr::Value(val) => self.eval_value(&val.value),
+            Expr::Interval(interval) => {
+                let value = self.eval_row_expr(&interval.value, row, col_meta)?;
+                let Value::Text(raw) = value else {
+                    return Err(ExecError::Runtime(
+                        "INTERVAL value must be a string literal".into(),
+                    ));
+                };
+                parse_interval_literal(&raw, interval.leading_field.as_ref())
+            }
+            Expr::Collate { expr, collation } => {
+                validate_binary_collation(collation)?;
+                self.eval_row_expr(expr, row, col_meta)
+            }
+            Expr::AtTimeZone {
+                timestamp,
+                time_zone,
+            } => eval_at_time_zone(
+                self.eval_row_expr(timestamp, row, col_meta)?,
+                self.eval_row_expr(time_zone, row, col_meta)?,
+            ),
             // Typed string literals: TIMESTAMP '2024-01-01', DATE '2024-01-01', UUID 'xxx'
             Expr::TypedString(ts) => {
                 let s = match &ts.value.value {
@@ -741,49 +844,24 @@ impl Executor {
                 };
                 match &ts.data_type {
                     ast::DataType::Timestamp(_, tz) => {
-                        if let Some((y, m, d, h, min, sec)) = parse_timestamp_parts(&s) {
-                            let days = crate::types::ymd_to_days(y, m, d) as i64;
-                            let us = days * 86400 * 1_000_000
-                                + h as i64 * 3_600_000_000
-                                + min as i64 * 60_000_000
-                                + sec as i64 * 1_000_000;
-                            if matches!(tz, ast::TimezoneInfo::WithTimeZone) {
-                                Ok(Value::TimestampTz(us))
-                            } else {
-                                Ok(Value::Timestamp(us))
-                            }
+                        let timestamp =
+                            crate::types::parse_timestamp(&s).map_err(ExecError::Runtime)?;
+                        if matches!(tz, ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz) {
+                            local_timestamp_at_time_zone(timestamp, self.session_time_zone()?)
+                                .map(Value::TimestampTz)
                         } else {
-                            Ok(Value::Text(s))
+                            Ok(Value::Timestamp(timestamp))
                         }
                     }
-                    ast::DataType::TimestampNtz(_) => {
-                        if let Some((y, m, d, h, min, sec)) = parse_timestamp_parts(&s) {
-                            let days = crate::types::ymd_to_days(y, m, d) as i64;
-                            let us = days * 86400 * 1_000_000
-                                + h as i64 * 3_600_000_000
-                                + min as i64 * 60_000_000
-                                + sec as i64 * 1_000_000;
-                            Ok(Value::Timestamp(us))
-                        } else {
-                            Ok(Value::Text(s))
-                        }
-                    }
-                    ast::DataType::Date => {
-                        let parts: Vec<&str> = s.splitn(3, '-').collect();
-                        if parts.len() >= 3
-                            && let (Ok(y), Ok(m), Ok(d)) = (
-                                parts[0].parse::<i32>(),
-                                parts[1].parse::<u32>(),
-                                parts[2].trim().parse::<u32>(),
-                            )
-                        {
-                            return Ok(Value::Date(crate::types::ymd_to_days(y, m, d)));
-                        }
-                        Ok(Value::Text(s))
-                    }
+                    ast::DataType::TimestampNtz(_) => crate::types::parse_timestamp(&s)
+                        .map(Value::Timestamp)
+                        .map_err(ExecError::Runtime),
+                    ast::DataType::Date => crate::types::parse_date(&s)
+                        .map(Value::Date)
+                        .map_err(ExecError::Runtime),
                     ast::DataType::Uuid => match crate::types::parse_uuid(&s) {
                         Ok(bytes) => Ok(Value::Uuid(bytes)),
-                        Err(_) => Ok(Value::Text(s)),
+                        Err(error) => Err(ExecError::Runtime(error)),
                     },
                     _ => Ok(Value::Text(s)),
                 }
@@ -805,6 +883,24 @@ impl Executor {
                         .map(Value::Int64)
                         .ok_or_else(|| ExecError::Runtime("integer out of range".into())),
                     (ast::UnaryOperator::Minus, Value::Float64(n)) => Ok(Value::Float64(-n)),
+                    (
+                        ast::UnaryOperator::Minus,
+                        Value::Interval {
+                            months,
+                            days,
+                            microseconds,
+                        },
+                    ) => Ok(Value::Interval {
+                        months: months.checked_neg().ok_or_else(|| {
+                            ExecError::Runtime("interval value out of range".into())
+                        })?,
+                        days: days.checked_neg().ok_or_else(|| {
+                            ExecError::Runtime("interval value out of range".into())
+                        })?,
+                        microseconds: microseconds.checked_neg().ok_or_else(|| {
+                            ExecError::Runtime("interval value out of range".into())
+                        })?,
+                    }),
                     (ast::UnaryOperator::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                     // SQL 3-valued logic: NOT NULL = NULL (unknown), not an error.
                     (ast::UnaryOperator::Not, Value::Null)
@@ -820,6 +916,30 @@ impl Executor {
             Expr::IsNotNull(inner) => {
                 let val = self.eval_row_expr(inner, row, col_meta)?;
                 Ok(Value::Bool(val != Value::Null))
+            }
+            Expr::IsTrue(inner) => {
+                let value = self.eval_row_expr(inner, row, col_meta)?;
+                Ok(Value::Bool(matches!(value, Value::Bool(true))))
+            }
+            Expr::IsNotTrue(inner) => {
+                let value = self.eval_row_expr(inner, row, col_meta)?;
+                Ok(Value::Bool(!matches!(value, Value::Bool(true))))
+            }
+            Expr::IsFalse(inner) => {
+                let value = self.eval_row_expr(inner, row, col_meta)?;
+                Ok(Value::Bool(matches!(value, Value::Bool(false))))
+            }
+            Expr::IsNotFalse(inner) => {
+                let value = self.eval_row_expr(inner, row, col_meta)?;
+                Ok(Value::Bool(!matches!(value, Value::Bool(false))))
+            }
+            Expr::IsUnknown(inner) => {
+                let value = self.eval_row_expr(inner, row, col_meta)?;
+                Ok(Value::Bool(matches!(value, Value::Null)))
+            }
+            Expr::IsNotUnknown(inner) => {
+                let value = self.eval_row_expr(inner, row, col_meta)?;
+                Ok(Value::Bool(!matches!(value, Value::Null)))
             }
             Expr::Between {
                 expr,
@@ -1394,31 +1514,41 @@ impl Executor {
                 },
                 _ => Err(ExecError::Unsupported("cannot cast to BOOLEAN".to_string())),
             },
-            ast::DataType::Date => match val {
-                Value::Date(_) => Ok(val),
-                Value::Text(s) => match parse_date_string(&s) {
-                    Some(d) => Ok(Value::Date(d)),
-                    None => Err(ExecError::Unsupported(format!("cannot cast '{s}' to DATE"))),
-                },
-                Value::Timestamp(ts) => Ok(Value::Date((ts / 1_000_000 / 86400) as i32)),
-                Value::Int32(n) => Ok(Value::Date(n)),
-                _ => Err(ExecError::Unsupported("cannot cast to DATE".to_string())),
-            },
-            ast::DataType::Timestamp(_, _) => match val {
-                Value::Timestamp(_) | Value::TimestampTz(_) => Ok(val),
-                Value::Date(d) => Ok(Value::Timestamp(d as i64 * 86400 * 1_000_000)),
-                Value::Text(s) => match parse_date_string(&s) {
-                    Some(d) => Ok(Value::Timestamp(d as i64 * 86400 * 1_000_000)),
-                    None => Err(ExecError::Unsupported(format!(
-                        "cannot cast '{s}' to TIMESTAMP"
-                    ))),
-                },
-                Value::Int64(n) => Ok(Value::Timestamp(n * 1_000_000)),
-                Value::Int32(n) => Ok(Value::Timestamp(n as i64 * 1_000_000)),
-                _ => Err(ExecError::Unsupported(
-                    "cannot cast to TIMESTAMP".to_string(),
-                )),
-            },
+            ast::DataType::Date => val.cast(&DataType::Date).map_err(ExecError::Runtime),
+            ast::DataType::Timestamp(_, timezone) => {
+                let with_timezone = matches!(
+                    timezone,
+                    ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz
+                );
+                match (val, with_timezone) {
+                    (Value::Null, _) => Ok(Value::Null),
+                    (Value::TimestampTz(value), true) => Ok(Value::TimestampTz(value)),
+                    (Value::Timestamp(value), false) => Ok(Value::Timestamp(value)),
+                    (Value::Timestamp(value), true) => {
+                        local_timestamp_at_time_zone(value, self.session_time_zone()?)
+                            .map(Value::TimestampTz)
+                    }
+                    (Value::TimestampTz(value), false) => {
+                        timestamptz_at_time_zone(value, self.session_time_zone()?)
+                            .map(Value::Timestamp)
+                    }
+                    (Value::Date(value), true) => local_timestamp_at_time_zone(
+                        value as i64 * 86_400_000_000,
+                        self.session_time_zone()?,
+                    )
+                    .map(Value::TimestampTz),
+                    (Value::Text(text), true) => {
+                        let local =
+                            crate::types::parse_timestamp(&text).map_err(ExecError::Runtime)?;
+                        local_timestamp_at_time_zone(local, self.session_time_zone()?)
+                            .map(Value::TimestampTz)
+                    }
+                    (value, false) => value.cast(&DataType::Timestamp).map_err(ExecError::Runtime),
+                    (value, true) => value
+                        .cast(&DataType::TimestampTz)
+                        .map_err(ExecError::Runtime),
+                }
+            }
             ast::DataType::Uuid => match val {
                 Value::Uuid(_) => Ok(val),
                 Value::Text(s) => {
@@ -1448,15 +1578,13 @@ impl Executor {
                 _ => Err(ExecError::Unsupported("cannot cast to BYTEA".to_string())),
             },
             ast::DataType::Numeric(_) | ast::DataType::Decimal(_) | ast::DataType::Dec(_) => {
-                match val {
-                    Value::Numeric(_) => Ok(val),
-                    Value::Int32(n) => Ok(Value::Numeric(n.to_string())),
-                    Value::Int64(n) => Ok(Value::Numeric(n.to_string())),
-                    Value::Float64(n) => Ok(Value::Numeric(n.to_string())),
-                    Value::Text(s) => Ok(Value::Numeric(s)),
-                    _ => Err(ExecError::Unsupported("cannot cast to NUMERIC".to_string())),
-                }
+                val.cast(&DataType::Numeric).map_err(ExecError::Runtime)
             }
+            ast::DataType::Interval { .. } => match val {
+                Value::Interval { .. } => Ok(val),
+                Value::Text(raw) => parse_interval_literal(&raw, None),
+                _ => Err(ExecError::Runtime("cannot cast to INTERVAL".into())),
+            },
             ast::DataType::Array(_) => {
                 // Pass through arrays
                 match val {

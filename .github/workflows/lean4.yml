@@ -1,0 +1,45 @@
+name: Lean 4 Proofs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "lean4/**"
+      - ".github/workflows/lean4.yml"
+  pull_request:
+    paths:
+      - "lean4/**"
+      - ".github/workflows/lean4.yml"
+  schedule:
+    - cron: "0 8 * * 1"
+
+jobs:
+  verify:
+    name: lake build (machine-checked proofs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # elan reads lean4/Nucleus/lean-toolchain and installs the pinned Lean
+      # (v4.14.0). The proofs have no external dependencies (no Mathlib), so the
+      # build is fully reproducible and self-contained.
+      - name: Install elan (Lean toolchain manager)
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Lake build
+        uses: actions/cache@v4
+        with:
+          path: lean4/Nucleus/.lake/build
+          key: lake-${{ runner.os }}-${{ hashFiles('lean4/Nucleus/lean-toolchain') }}-${{ hashFiles('lean4/Nucleus/**/*.lean') }}
+          restore-keys: |
+            lake-${{ runner.os }}-${{ hashFiles('lean4/Nucleus/lean-toolchain') }}-
+
+      # ci.sh runs the Aeneas translation step (which no-ops when Aeneas is not
+      # installed — CI uses the committed hand-modeled Lean files) then verifies
+      # every proof with `lake build`.
+      - name: Verify proofs
+        run: bash scripts/ci.sh
+        working-directory: lean4

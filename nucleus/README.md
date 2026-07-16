@@ -4,6 +4,25 @@ Multi-model database engine. One pgwire endpoint, multiple data models, unified 
 
 SQL, Key-Value, Columnar, Vector, Timeseries, Document, Full-Text Search, Graph, Geo, Blob, Datalog, and Pub/Sub -- all accessed through standard SQL function calls over a single PostgreSQL-compatible connection. No secondary ports, no secondary protocols, no secondary clients. Also supports the RESP (Redis) wire protocol for KV operations.
 
+## Support status
+
+Nucleus is currently a developer preview, not a production-complete database. The authoritative
+completion program and current evidence are in [DATABASE_COMPLETION.md](DATABASE_COMPLETION.md).
+Ignored local status/roadmap files are historical scratch material and are not release evidence.
+
+| Surface | Current tier |
+|---|---|
+| Single-node server and pgwire SQL | Primary development target; correctness work remains |
+| Embedded/core Rust library | Builds and tests without server features |
+| Trusted SCRAM roles and relational RLS | Implemented; broader surface and masking audit remains |
+| RESP and specialty data models | Experimental until durability, policy, and compatibility gates pass |
+| Browser/WASM | Experimental build target |
+| Native binary protocol | Unsupported stub; do not deploy or integrate against it |
+| Distributed/Raft mode | Incomplete and unsupported |
+
+Cross-model rollback works in-process, but crash-atomic commit across model-specific WALs is not yet
+claimed. Backup/PITR, full client compatibility, and operational hardening are also incomplete.
+
 ## Quick Start
 
 ```bash
@@ -233,6 +252,42 @@ nucleus/
 ## Status
 
 Active development. See `STATUS.md` for current feature status and known gaps, and `NUCLEUS-ROADMAP.md` for the implementation roadmap.
+
+Multi-user PostgreSQL-wire sessions use catalog-backed SCRAM identities and privilege-checked role
+assumption. Row-level security policy DDL and fail-closed executor enforcement are implemented; see
+[RLS_SECURITY.md](./RLS_SECURITY.md) for supported predicates, enforcement coverage, and explicit
+limitations. Column masking is not yet an enforced SQL feature.
+
+`NUMERIC`/`DECIMAL` uses checked exact decimal arithmetic for casts, comparisons, arithmetic,
+plain/grouped/window aggregates, every table engine, and durable restart. The current supported
+range is a 96-bit coefficient with at most 28 fractional digits; larger values fail with
+`numeric value out of range` rather than rounding through floating point. Declared precision and
+scale modifiers such as `NUMERIC(10,2)` are parsed but are not yet enforced as column typemods.
+
+Date and timestamp input is validated as ISO calendar data with microsecond precision. Checked
+date/timestamp/interval arithmetic, SQL three-valued boolean logic, and PostgreSQL-compatible
+default NULL ordering are enforced across the supported table engines. Session time zones and
+`AT TIME ZONE` accept canonical IANA zone names; ambiguous or nonexistent local DST times reject
+explicitly. Locale-aware collations are not implemented: the deterministic binary `C`, `POSIX`,
+and `UCS_BASIC` collations are supported, while other collation names reject instead of silently
+using binary ordering.
+
+Relational `PRIMARY KEY`, `UNIQUE`, `CHECK`, `NOT NULL`, and `FOREIGN KEY` constraints are
+immediate and persist across restart. Foreign keys require a type-compatible primary/unique target
+and support `MATCH SIMPLE` with `RESTRICT`/`NO ACTION`, `CASCADE`, `SET NULL`, and `SET DEFAULT`
+actions. Cascades are preflighted as one logical operation and enforce the child table's full
+constraint and RLS envelope. Unsupported deferred constraints, `MATCH FULL`/`MATCH PARTIAL`,
+`UNIQUE NULLS NOT DISTINCT`, and dependency `DROP ... CASCADE` reject explicitly.
+
+MVCC `VACUUM [table]` uses the oldest retained snapshot horizon, not merely the oldest currently
+active transaction ID. It preserves versions required by long snapshots, removes committed dead
+versions and aborted inserts, repairs aborted-delete tombstones, reclaims resolved transaction
+metadata, and rebuilds affected secondary-index version pointers after compaction. Idle transaction
+timeouts prevent abandoned sessions from pinning that horizon indefinitely.
+
+MVCC transaction IDs are 64-bit, monotonic, and never wrap into reserved bootstrap/invalid IDs.
+When the allocatable space is exhausted, new explicit and implicit transactions fail with a
+`transaction ID space exhausted` error; the operator must migrate through a fresh logical backup.
 
 ## License
 

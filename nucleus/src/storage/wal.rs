@@ -569,6 +569,12 @@ pub struct SegmentedWal {
     sync_mode: SyncMode,
     /// Group commit coordinator.
     committer: GroupCommitter,
+    /// Optional continuous-archiving destination (PITR). When `Some`, every
+    /// segment is copied here the moment it is sealed (rotation) and, as a
+    /// last-resort safety net, again just before `truncate_before` would delete
+    /// it — so no WAL segment is ever reclaimed without first being preserved.
+    /// `None` (the default) means no archiving and zero behavior change.
+    archive_dir: Option<std::path::PathBuf>,
 }
 
 struct ActiveSegment {
@@ -637,6 +643,11 @@ impl SegmentedWal {
             syncs: AtomicU64::new(0),
             sync_mode: SyncMode::Fsync,
             committer: GroupCommitter::new(),
+            // Opt-in continuous archiving: `NUCLEUS_WAL_ARCHIVE_DIR=<root>`
+            // enables PITR archiving into a per-WAL subdirectory of <root>
+            // (named after this WAL's directory), so multiple databases in one
+            // process never collide. Unset → no archiving.
+            archive_dir: Self::archive_dir_from_env(dir),
         })
     }
 
@@ -649,6 +660,36 @@ impl SegmentedWal {
         let mut wal = Self::open(dir, max_segment_size)?;
         wal.sync_mode = sync_mode;
         Ok(wal)
+    }
+
+    /// Open a segmented WAL with continuous archiving to an explicit directory
+    /// (bypasses the `NUCLEUS_WAL_ARCHIVE_DIR` env lookup). Primarily for
+    /// tests and embedded callers that manage their own archive layout.
+    pub fn open_with_archive(
+        dir: &Path,
+        max_segment_size: u64,
+        sync_mode: SyncMode,
+        archive_dir: &Path,
+    ) -> std::io::Result<Self> {
+        let mut wal = Self::open(dir, max_segment_size)?;
+        wal.sync_mode = sync_mode;
+        wal.archive_dir = Some(archive_dir.to_path_buf());
+        Ok(wal)
+    }
+
+    /// Resolve the per-WAL archive directory from `NUCLEUS_WAL_ARCHIVE_DIR`.
+    /// The env names an archive *root*; each WAL archives under
+    /// `<root>/<wal-dir-basename>` so distinct databases stay separated.
+    fn archive_dir_from_env(wal_dir: &Path) -> Option<std::path::PathBuf> {
+        let root = std::env::var_os("NUCLEUS_WAL_ARCHIVE_DIR")?;
+        if root.is_empty() {
+            return None;
+        }
+        let basename = wal_dir
+            .file_name()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("wal"));
+        Some(std::path::Path::new(&root).join(basename))
     }
 
     /// Log a page write. Returns the assigned LSN.
@@ -737,10 +778,63 @@ impl SegmentedWal {
         self.rotate_inner(&mut active)
     }
 
+    /// Copy a sealed segment into the archive directory (idempotent) and record
+    /// its LSN range + archive time in the archive index. This is the PITR
+    /// durability primitive: a segment that has been archived can be replayed
+    /// long after it is reclaimed from the live WAL.
+    ///
+    /// Returns `Ok(true)` when archiving is configured and the segment is now
+    /// present in the archive (freshly copied, already present, or already
+    /// reclaimed from the live dir), `Ok(false)` when no archive is configured.
+    /// The copy is staged through a temp file + atomic rename, so a crash mid
+    /// copy never leaves a truncated segment a restore would trust.
+    fn archive_segment(&self, seg_num: u64) -> std::io::Result<bool> {
+        let Some(archive) = self.archive_dir.as_ref() else {
+            return Ok(false);
+        };
+        std::fs::create_dir_all(archive)?;
+        let src = segment_path(&self.dir, seg_num);
+        if !src.exists() {
+            // Nothing to archive — already reclaimed. Treat as success so the
+            // caller (truncate_before) does not block on a vanished segment.
+            return Ok(true);
+        }
+        let src_len = std::fs::metadata(&src)?.len();
+        let dst = segment_path(archive, seg_num);
+        // Idempotent: a same-size archived copy already exists.
+        if let Ok(m) = std::fs::metadata(&dst)
+            && m.len() == src_len
+        {
+            return Ok(true);
+        }
+        let tmp = dst.with_extension("log.tmp");
+        std::fs::copy(&src, &tmp)?;
+        std::fs::rename(&tmp, &dst)?;
+        // Record the LSN range + archive time for time-based PITR. The index is
+        // an optimization; LSN-based restore reads the segment files directly,
+        // so a missing/partial index never loses recoverability.
+        if let Some((min_lsn, max_lsn)) = segment_lsn_bounds(&src) {
+            let unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut idx = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(archive.join(ARCHIVE_INDEX_NAME))?;
+            writeln!(idx, "{seg_num} {min_lsn} {max_lsn} {unix}")?;
+            idx.sync_all()?;
+        }
+        Ok(true)
+    }
+
     /// Truncate (delete) all segments whose records are fully before `before_lsn`.
     ///
     /// This reclaims disk space after checkpointing. Segments that contain any
-    /// record with LSN >= `before_lsn` are kept.
+    /// record with LSN >= `before_lsn` are kept. When continuous archiving is
+    /// enabled, a segment is archived before deletion and is NEVER deleted if
+    /// archiving fails — the "no acknowledged write is ever unrecoverable"
+    /// guarantee takes precedence over reclaiming disk.
     pub fn truncate_before(&self, before_lsn: u64) -> std::io::Result<usize> {
         let active = self.active.lock();
         let active_seg = active.segment_number;
@@ -764,6 +858,21 @@ impl SegmentedWal {
                 .unwrap_or(0);
 
             if max_seg_lsn < before_lsn {
+                // Last-resort archiving safety net: never delete an un-archived
+                // segment. If it was already archived on rotation this is a
+                // cheap idempotent no-op; if archiving fails, keep the segment.
+                if self.archive_dir.is_some() {
+                    match self.archive_segment(seg_num) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                "WAL archive of segment {seg_num} failed; \
+                                 keeping it rather than losing it: {e}"
+                            );
+                            continue;
+                        }
+                    }
+                }
                 std::fs::remove_file(&path)?;
                 removed += 1;
             }
@@ -842,6 +951,17 @@ impl SegmentedWal {
             SyncMode::Fsync => active.writer.get_ref().sync_all()?,
             SyncMode::Fdatasync => active.writer.get_ref().sync_data()?,
             SyncMode::None => {}
+        }
+
+        // Continuous archiving: preserve the just-sealed segment immediately, so
+        // PITR sees committed data without waiting for the next checkpoint. A
+        // failure here is logged, not fatal — the segment stays on disk and
+        // truncate_before will guard it (refusing to delete it un-archived).
+        if self.archive_dir.is_some() {
+            let sealed = active.segment_number;
+            if let Err(e) = self.archive_segment(sealed) {
+                tracing::warn!("WAL archive of sealed segment {sealed} failed: {e}");
+            }
         }
 
         let new_seg_num = active.segment_number + 1;
@@ -1101,9 +1221,94 @@ pub fn read_wal_dir_records(dir: &Path) -> std::io::Result<Vec<WalRecord>> {
 // Segment helpers
 // ============================================================================
 
+/// Name of the append-only archive index (one line per archived segment:
+/// `<seg_num> <min_lsn> <max_lsn> <archived_unix>`). Used to resolve
+/// time-based PITR targets; LSN-based restore reads the segment files directly.
+pub const ARCHIVE_INDEX_NAME: &str = "archive.index";
+
 /// Generate the path for a WAL segment file.
 fn segment_path(dir: &Path, segment_number: u64) -> std::path::PathBuf {
     dir.join(format!("wal-{segment_number:06}.log"))
+}
+
+/// Return the `(min_lsn, max_lsn)` spanned by a segment file, or `None` if it
+/// holds no parseable records.
+pub(crate) fn segment_lsn_bounds(path: &Path) -> Option<(u64, u64)> {
+    let records = read_wal_records(path).ok()?;
+    let mut min = u64::MAX;
+    let mut max = 0u64;
+    for r in &records {
+        min = min.min(r.lsn);
+        max = max.max(r.lsn);
+    }
+    if records.is_empty() {
+        None
+    } else {
+        Some((min, max))
+    }
+}
+
+/// List archived segment numbers in an archive directory (same naming as the
+/// live WAL). Public within the crate for the PITR restore path.
+pub(crate) fn list_archive_segments(dir: &Path) -> std::io::Result<Vec<u64>> {
+    list_segments(dir)
+}
+
+/// Copy the byte-exact prefix of `src` holding every record with `lsn <=
+/// target_lsn` into `dst`, stopping at the first record beyond the target.
+///
+/// Records are appended in strictly increasing LSN order under the WAL lock, so
+/// a prefix cut at a record boundary yields a valid, replayable segment WITHOUT
+/// re-serializing (preserving every CRC exactly). Returns the highest LSN
+/// copied, or `None` if no record qualified (nothing written).
+pub(crate) fn copy_segment_prefix_upto_lsn(
+    src: &Path,
+    dst: &Path,
+    target_lsn: u64,
+) -> std::io::Result<Option<u64>> {
+    let data = std::fs::read(src)?;
+    let mut pos: usize = 0;
+    let mut cutoff: usize = 0;
+    let mut max_copied: Option<u64> = None;
+    while pos + 4 <= data.len() {
+        let record_len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        // record_len is the FULL on-disk record size, including its own 4-byte
+        // length prefix (see read_wal_records_with_end). 0 or overrun = torn
+        // tail; stop.
+        if record_len < RECORD_HEADER_SIZE + RECORD_CRC_SIZE || pos + record_len > data.len() {
+            break;
+        }
+        // LSN sits immediately after the length prefix.
+        let lsn = u64::from_le_bytes([
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
+            data[pos + 8],
+            data[pos + 9],
+            data[pos + 10],
+            data[pos + 11],
+        ]);
+        if lsn <= target_lsn {
+            pos += record_len;
+            cutoff = pos;
+            max_copied = Some(lsn);
+        } else {
+            break;
+        }
+    }
+    if cutoff == 0 {
+        return Ok(None);
+    }
+    std::fs::write(dst, &data[..cutoff])?;
+    Ok(max_copied)
+}
+
+/// Path of a segment file inside a WAL/archive directory. Crate-visible for the
+/// PITR restore path, which reconstructs a WAL directory from the archive.
+pub(crate) fn segment_file_path(dir: &Path, segment_number: u64) -> std::path::PathBuf {
+    segment_path(dir, segment_number)
 }
 
 /// List all segment numbers in a WAL directory.

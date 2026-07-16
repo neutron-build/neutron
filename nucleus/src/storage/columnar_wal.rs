@@ -172,17 +172,12 @@ impl ColumnarWal {
         let mut writer = self.writer.lock();
         writer.flush()?;
 
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        let mut w = BufWriter::new(file);
-        write_entry(&mut w, ENTRY_SNAPSHOT, "", &payload)?;
-        w.flush()?;
-        // The snapshot replaces the entire log — it must be durable before
-        // the pre-truncate log content is considered gone.
-        w.get_ref().sync_all()?;
-        drop(w);
+        // Serialize the complete new log body, then replace atomically (temp file +
+        // fsync + rename) so a crash between the truncate and the snapshot rewrite
+        // can't leave a truncated or empty file.
+        let mut contents: Vec<u8> = Vec::new();
+        write_entry(&mut contents, ENTRY_SNAPSHOT, "", &payload)?;
+        crate::storage::wal_util::atomic_replace_wal(&self.path, &contents)?;
 
         // Re-open in append mode for future writes, and count the snapshot
         // as a covered append so coverage marks stay consistent.
@@ -248,6 +243,12 @@ fn encode_value(val: &Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
         }
+        Value::Numeric(s) => {
+            buf.push(10);
+            let b = s.as_bytes();
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
         Value::Date(d) => {
             buf.push(7);
             buf.extend_from_slice(&d.to_le_bytes());
@@ -259,6 +260,16 @@ fn encode_value(val: &Value, buf: &mut Vec<u8>) {
         Value::TimestampTz(t) => {
             buf.push(9);
             buf.extend_from_slice(&t.to_le_bytes());
+        }
+        Value::Interval {
+            months,
+            days,
+            microseconds,
+        } => {
+            buf.push(11);
+            buf.extend_from_slice(&months.to_le_bytes());
+            buf.extend_from_slice(&days.to_le_bytes());
+            buf.extend_from_slice(&microseconds.to_le_bytes());
         }
         other => {
             // Fallback: encode as Text (lossy for exotic types — sufficient for
@@ -426,6 +437,22 @@ fn decode_value(data: &[u8], pos: &mut usize) -> Option<Value> {
         7 => Some(Value::Date(read_i32(data, pos)?)),
         8 => Some(Value::Timestamp(read_i64(data, pos)?)),
         9 => Some(Value::TimestampTz(read_i64(data, pos)?)),
+        10 => {
+            let len = read_u32(data, pos)? as usize;
+            if *pos + len > data.len() {
+                return None;
+            }
+            let value = std::str::from_utf8(&data[*pos..*pos + len])
+                .ok()?
+                .to_string();
+            *pos += len;
+            Some(Value::Numeric(value))
+        }
+        11 => Some(Value::Interval {
+            months: read_i32(data, pos)?,
+            days: read_i32(data, pos)?,
+            microseconds: read_i64(data, pos)?,
+        }),
         _ => None, // Unknown tag — stop decoding row.
     }
 }

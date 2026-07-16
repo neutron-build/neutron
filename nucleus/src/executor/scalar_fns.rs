@@ -30,6 +30,49 @@ impl Executor {
     ) -> Result<Value, ExecError> {
         let args = self.extract_fn_args(func, row, col_meta)?;
 
+        // Specialty stores do not yet carry table-policy metadata. When any
+        // RLS policy is active for this principal, allowing their direct SQL
+        // functions would create an alternate read/write channel around the
+        // secured relational access path. Fail closed until a store has native
+        // policy semantics.
+        let specialty_surface = [
+            "COLUMNAR_",
+            "DOC_",
+            "FTS_",
+            "GRAPH_",
+            "CDC_",
+            "KV_",
+            "TS_",
+            "STREAM_",
+            "BLOB_",
+            "SPARSE_",
+            "LO_",
+            "DATALOG_",
+            "ENCRYPTED_",
+            "DB_BRANCH_",
+            "VERSION_",
+            "TENSOR_",
+            "PUBSUB_",
+            "PROC_",
+            "SUBSCRIPTION_",
+        ]
+        .iter()
+        .any(|prefix| fname.starts_with(prefix))
+            || matches!(
+                fname,
+                "VECTOR_SEARCH"
+                    | "VECTOR_INSERT"
+                    | "VECTOR_DELETE"
+                    | "CYPHER"
+                    | "SUBSCRIBE"
+                    | "UNSUBSCRIBE"
+            );
+        if specialty_surface && self.any_rls_active() {
+            return Err(ExecError::PermissionDenied(format!(
+                "{fname} is unavailable while row-level security is active because this specialty-store surface has no policy-aware access path"
+            )));
+        }
+
         match fname {
             // -- String functions --
             "UPPER" => {
@@ -5547,6 +5590,7 @@ fn stream_entries_to_json(entries: &[&crate::pubsub::StreamEntry]) -> String {
 /// Keep this in sync with `eval_scalar_fn`: any new arm that WRITES
 /// (kv/doc/stream/graph/fts/blob/columnar/datalog/tensor/sequence/...)
 /// must be added here with its return type.
+#[cfg(feature = "server")]
 pub(crate) fn side_effecting_return_type(name: &str) -> Option<crate::types::DataType> {
     use crate::types::DataType;
     let dt = match name {
@@ -5617,6 +5661,7 @@ pub(crate) fn side_effecting_return_type(name: &str) -> Option<crate::types::Dat
 /// columns while Execute returns one (pgx: "number of field descriptions
 /// must equal number of values" — dogfood finding #22 tail). Static typing
 /// avoids the probe entirely.
+#[cfg(feature = "server")]
 pub(crate) fn extension_scalar_return_type(name: &str) -> Option<crate::types::DataType> {
     use crate::types::DataType;
     let dt = match name {

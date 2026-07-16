@@ -19,7 +19,7 @@ use std::hash::{Hash, Hasher};
 
 use sqlparser::ast::{self, Expr, SelectItem, SetExpr, Statement, TableFactor};
 
-use crate::catalog::TableDef;
+use crate::catalog::{ColumnDef, TableDef};
 #[cfg(feature = "server")]
 use crate::reactive::ChangeType;
 use crate::sql;
@@ -52,6 +52,66 @@ fn table_name_to_id(name: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     name.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Canonicalize a value to the declared storage type before any write path
+/// reaches an engine. Columnar batches choose one physical representation per
+/// column, so a single uncoerced UPDATE value can otherwise turn neighboring
+/// values into NULL while rebuilding a batch.
+fn coerce_value_for_write(
+    value: &mut Value,
+    column: &ColumnDef,
+    session_time_zone: chrono_tz::Tz,
+) -> Result<(), ExecError> {
+    if matches!(value, Value::Null) {
+        return Ok(());
+    }
+    if matches!(column.data_type, DataType::Jsonb) {
+        if let Value::Text(text) = value {
+            let parsed = serde_json::from_str::<serde_json::Value>(text).map_err(|error| {
+                ExecError::Runtime(format!("invalid input syntax for type json: {error}"))
+            })?;
+            *value = Value::Jsonb(parsed);
+        }
+        return Ok(());
+    }
+    if matches!(column.data_type, DataType::Interval)
+        && let Value::Text(text) = value
+    {
+        *value = super::helpers::parse_interval_literal(text, None)?;
+        return Ok(());
+    }
+    if matches!(column.data_type, DataType::TimestampTz) {
+        let local = match value {
+            Value::Text(text) => Some(crate::types::parse_timestamp(text).map_err(|error| {
+                ExecError::Runtime(format!(
+                    "invalid value for column '{}' ({}): {error}",
+                    column.name, column.data_type
+                ))
+            })?),
+            Value::Timestamp(timestamp) => Some(*timestamp),
+            Value::TimestampTz(_) => None,
+            _ => None,
+        };
+        if let Some(local) = local {
+            *value = Value::TimestampTz(super::helpers::local_timestamp_at_time_zone(
+                local,
+                session_time_zone,
+            )?);
+            return Ok(());
+        }
+    }
+
+    match value.cast(&column.data_type) {
+        Ok(coerced) => *value = coerced,
+        Err(error) => {
+            return Err(ExecError::Runtime(format!(
+                "invalid value for column '{}' ({}): {error}",
+                column.name, column.data_type
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl Executor {
@@ -286,50 +346,33 @@ impl Executor {
         let mut count = 0;
         let mut returned_rows = Vec::new();
         let mut inserted_rows: Vec<Row> = Vec::new();
+        // Set when an ON CONFLICT DO UPDATE rewrites an existing row in place.
+        // That path bypasses the staged-insert index bookkeeping, so its derived
+        // indexes must be rebuilt. Plain appends maintain indexes incrementally
+        // and must NOT pay for a full rebuild.
+        let mut conflict_updated = false;
 
         for mut row in source_rows {
-            // Coerce a text-bound value landing in a numeric/bool column to the
-            // column's declared physical type at write time. A pgwire client (or
-            // a literal like `'5'`) can bind a number as text; without this the
-            // raw `Value::Text` is stored in a typed column, so a later int-bound
-            // insert leaves the column mixed-variant (Text + Int) — which breaks
-            // numeric ordering (argMax/MAX compare lexically) and trips the
-            // columnar concat invariant. The extended-protocol and fast-insert
-            // paths already coerce; this closes the gap for the general INSERT
-            // path. Unparseable text is left as-is for the type/constraint checks
-            // (and the columnar concat fallback) to handle — fail open here, not
-            // by silently zeroing.
+            // Canonicalize every value to its column's declared type at write time,
+            // so the stored representation never depends on the insert path: `VALUES`
+            // yields Int32, `INSERT ... SELECT`/`generate_series` yields Int64, and a
+            // pgwire simple-protocol client (or a literal like `'5'`) binds numbers as
+            // Text. Making "stored type == declared type" an invariant is what keeps a
+            // future raw-representation comparison path (like the disk B-tree once was)
+            // from reintroducing the integer-width silent-wrong-results class, and it
+            // also fixes mixed-variant columns (Text+Int breaking numeric ordering, the
+            // columnar concat invariant). NULL stays NULL; JSONB is normalized in the
+            // loop below. Primitive columns reject uncastable values instead of
+            // silently storing a physically mixed column.
             for (i, col) in table_def.columns.iter().enumerate() {
-                if let Some(v) = row.get_mut(i)
-                    && matches!(v, Value::Text(_))
-                    && matches!(
-                        col.data_type,
-                        DataType::Int32 | DataType::Int64 | DataType::Float64 | DataType::Bool
-                    )
-                    && let Ok(coerced) = v.cast(&col.data_type)
-                {
-                    *v = coerced;
+                if let Some(value) = row.get_mut(i) {
+                    coerce_value_for_write(value, col, self.session_time_zone()?)?;
                 }
             }
 
-            // JSONB columns: parse text into a real JSON value and reject
-            // invalid JSON the way Postgres does. Without this, an unparseable
-            // value (e.g. an empty string) is stored as raw Text in a JSONB
-            // slot and then silently dropped on read because the decode path
-            // can't parse it back — data loss by default. Valid JSON text is
-            // normalized to Value::Jsonb so writes and reads stay consistent.
-            for (i, col) in table_def.columns.iter().enumerate() {
-                if matches!(col.data_type, DataType::Jsonb)
-                    && let Some(v) = row.get_mut(i)
-                    && let Value::Text(s) = v
-                {
-                    let parsed =
-                        serde_json::from_str::<serde_json::Value>(s.as_str()).map_err(|e| {
-                            ExecError::Runtime(format!("invalid input syntax for type json: {e}"))
-                        })?;
-                    *v = Value::Jsonb(parsed);
-                }
-            }
+            // WITH CHECK is evaluated after defaults/coercions have produced the
+            // actual candidate row and before any trigger or constraint side effect.
+            self.enforce_rls_new_row(&table_name, crate::security::PolicyCommand::Insert, &row)?;
 
             // Fire BEFORE INSERT row-level triggers (only if triggers exist)
             if has_triggers {
@@ -420,6 +463,15 @@ impl Executor {
                                     i < row.len() && i < existing.len() && row[i] == existing[i]
                                 });
                                 if matches {
+                                    if !self.rls_allows_row(
+                                        &table_name,
+                                        crate::security::PolicyCommand::Update,
+                                        existing,
+                                    ) {
+                                        return Err(ExecError::PermissionDenied(format!(
+                                            "ON CONFLICT DO UPDATE is not permitted by row-level security for table '{table_name}'"
+                                        )));
+                                    }
                                     let mut updated = existing.clone();
                                     // Build combined row: [existing..., excluded(new)...]
                                     let mut combined_row = existing.clone();
@@ -439,6 +491,11 @@ impl Executor {
                                             )?;
                                         }
                                     }
+                                    self.enforce_rls_new_row(
+                                        &table_name,
+                                        crate::security::PolicyCommand::Update,
+                                        &updated,
+                                    )?;
                                     // Enforce all constraints on the updated row, as
                                     // the regular INSERT/UPDATE paths do. skip_row_idx
                                     // excludes the row being updated, so this both
@@ -470,6 +527,7 @@ impl Executor {
                                         returned_rows.push(returned);
                                     }
                                     count += 1;
+                                    conflict_updated = true;
                                     break;
                                 }
                             }
@@ -536,7 +594,7 @@ impl Executor {
                         .constraints
                         .iter()
                         .filter_map(|c| match c {
-                            TableConstraint::PrimaryKey { columns }
+                            TableConstraint::PrimaryKey { columns, .. }
                             | TableConstraint::Unique { columns, .. } => {
                                 let idxs: Vec<usize> = columns
                                     .iter()
@@ -566,6 +624,15 @@ impl Executor {
                         })?;
                 }
             }
+        }
+        if conflict_updated {
+            // ON CONFLICT DO UPDATE rewrote a row in place, bypassing the staged
+            // insert bookkeeping. Rebuild the derived indexes from base rows.
+            self.rebuild_table_derived_state(&table_name).await;
+        } else if count > 0 {
+            // Plain appends already maintained vector/encrypted indexes inline;
+            // only the GIN/FTS postings need the incremental refresh.
+            self.refresh_gin_after_write(&table_name).await;
         }
 
         // Fire AFTER INSERT statement-level triggers
@@ -736,7 +803,7 @@ impl Executor {
 
         for constraint in &table_def.constraints {
             match constraint {
-                TableConstraint::PrimaryKey { columns }
+                TableConstraint::PrimaryKey { columns, .. }
                 | TableConstraint::Unique { columns, .. } => {
                     let indices: Vec<usize> = columns
                         .iter()
@@ -969,6 +1036,19 @@ impl Executor {
         table_def: &TableDef,
         new_row: &Row,
     ) -> Result<(), ExecError> {
+        self.check_fk_constraints_except(table_def, new_row, None)
+            .await
+    }
+
+    /// Check all foreign keys except the one currently being maintained by an
+    /// `ON UPDATE CASCADE`. The new parent key is not visible until the parent
+    /// update is applied, but every unrelated foreign key must still be checked.
+    async fn check_fk_constraints_except(
+        &self,
+        table_def: &TableDef,
+        new_row: &Row,
+        skip: Option<(&str, &[String], &[String])>,
+    ) -> Result<(), ExecError> {
         use crate::catalog::TableConstraint;
 
         for constraint in &table_def.constraints {
@@ -979,6 +1059,13 @@ impl Executor {
                 ..
             } = constraint
             {
+                if skip.is_some_and(|(skip_table, skip_columns, skip_ref_columns)| {
+                    ref_table == skip_table
+                        && columns == skip_columns
+                        && ref_columns == skip_ref_columns
+                }) {
+                    continue;
+                }
                 // Resolve column indices in the source table
                 let col_indices: Vec<usize> = columns
                     .iter()
@@ -1028,6 +1115,26 @@ impl Executor {
         Ok(())
     }
 
+    /// Validate the complete child-row constraint envelope before applying an
+    /// implicit foreign-key action. Cascades are writes, so they must not bypass
+    /// NOT NULL, CHECK, ENUM, UNIQUE, or unrelated foreign keys.
+    async fn enforce_fk_action_constraints(
+        &self,
+        child_table: &str,
+        child_table_def: &TableDef,
+        row: &Row,
+        old_position: usize,
+        skip_cascaded_fk: Option<(&str, &[String], &[String])>,
+    ) -> Result<(), ExecError> {
+        Self::check_not_null_constraints(child_table_def, row)?;
+        self.check_check_constraints(child_table_def, row)?;
+        self.check_enum_constraints(child_table_def, row).await?;
+        self.check_fk_constraints_except(child_table_def, row, skip_cascaded_fk)
+            .await?;
+        self.check_unique_constraints(child_table, child_table_def, row, Some(old_position))
+            .await
+    }
+
     /// Enforce FK actions on child tables when a parent table is mutated (DELETE or UPDATE).
     ///
     /// For DELETE: `deleted_rows` contains the rows being deleted from the parent.
@@ -1040,6 +1147,7 @@ impl Executor {
         deleted_rows: &'a [Row],
         new_parent_rows: Option<&'a [(Row, Row)]>, // (old_row, new_row) pairs for UPDATE
         depth: usize,
+        apply: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ExecError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -1147,12 +1255,34 @@ impl Executor {
                                         // Update child FK columns to new parent values
                                         let mut updates = Vec::new();
                                         for &pos in &matching_positions {
+                                            if !self.rls_allows_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &child_rows[pos],
+                                            ) {
+                                                return Err(ExecError::PermissionDenied(format!(
+                                                    "foreign-key cascade would update a row hidden by row-level security on table '{child_table}'"
+                                                )));
+                                            }
                                             let mut updated_row = child_rows[pos].clone();
                                             for (ci_idx, &ci) in
                                                 child_col_indices.iter().enumerate()
                                             {
                                                 updated_row[ci] = new_vals[ci_idx].clone();
                                             }
+                                            self.enforce_rls_new_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &updated_row,
+                                            )?;
+                                            self.enforce_fk_action_constraints(
+                                                child_table,
+                                                child_table_def,
+                                                &updated_row,
+                                                pos,
+                                                Some((parent_table, columns, ref_columns)),
+                                            )
+                                            .await?;
                                             updates.push((pos, updated_row));
                                         }
                                         // Recursively check if this child table is also a parent
@@ -1162,29 +1292,81 @@ impl Executor {
                                                 (child_rows[*pos].clone(), new.clone())
                                             })
                                             .collect();
-                                        child_storage.update(child_table, &updates).await?;
                                         self.enforce_fk_on_parent_mutation(
                                             child_table,
                                             &[],
                                             Some(&cascade_pairs),
                                             depth + 1,
+                                            apply,
                                         )
                                         .await?;
+                                        if apply {
+                                            child_storage.update(child_table, &updates).await?;
+                                            self.rebuild_table_derived_state(child_table).await;
+                                        }
                                     }
                                     FkAction::SetNull => {
                                         let mut updates = Vec::new();
                                         for &pos in &matching_positions {
+                                            if !self.rls_allows_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &child_rows[pos],
+                                            ) {
+                                                return Err(ExecError::PermissionDenied(format!(
+                                                    "foreign-key action would update a row hidden by row-level security on table '{child_table}'"
+                                                )));
+                                            }
                                             let mut updated_row = child_rows[pos].clone();
                                             for &ci in &child_col_indices {
                                                 updated_row[ci] = Value::Null;
                                             }
+                                            self.enforce_rls_new_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &updated_row,
+                                            )?;
+                                            self.enforce_fk_action_constraints(
+                                                child_table,
+                                                child_table_def,
+                                                &updated_row,
+                                                pos,
+                                                None,
+                                            )
+                                            .await?;
                                             updates.push((pos, updated_row));
                                         }
-                                        child_storage.update(child_table, &updates).await?;
+                                        let action_pairs: Vec<(Row, Row)> = updates
+                                            .iter()
+                                            .map(|(pos, new)| {
+                                                (child_rows[*pos].clone(), new.clone())
+                                            })
+                                            .collect();
+                                        self.enforce_fk_on_parent_mutation(
+                                            child_table,
+                                            &[],
+                                            Some(&action_pairs),
+                                            depth + 1,
+                                            apply,
+                                        )
+                                        .await?;
+                                        if apply {
+                                            child_storage.update(child_table, &updates).await?;
+                                            self.rebuild_table_derived_state(child_table).await;
+                                        }
                                     }
                                     FkAction::SetDefault => {
                                         let mut updates = Vec::new();
                                         for &pos in &matching_positions {
+                                            if !self.rls_allows_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &child_rows[pos],
+                                            ) {
+                                                return Err(ExecError::PermissionDenied(format!(
+                                                    "foreign-key action would update a row hidden by row-level security on table '{child_table}'"
+                                                )));
+                                            }
                                             let mut updated_row = child_rows[pos].clone();
                                             for &ci in &child_col_indices {
                                                 let default_val = self.eval_column_default(
@@ -1192,9 +1374,61 @@ impl Executor {
                                                 )?;
                                                 updated_row[ci] = default_val;
                                             }
+                                            self.enforce_rls_new_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &updated_row,
+                                            )?;
+                                            let retains_old_key = child_col_indices
+                                                .iter()
+                                                .zip(old_vals.iter())
+                                                .all(|(&index, value)| {
+                                                    updated_row.get(index) == Some(*value)
+                                                });
+                                            if retains_old_key {
+                                                return Err(ExecError::ConstraintViolation(
+                                                    "ON UPDATE SET DEFAULT would retain the old referenced key"
+                                                        .into(),
+                                                ));
+                                            }
+                                            let references_pending_new_key = child_col_indices
+                                                .iter()
+                                                .zip(new_vals.iter())
+                                                .all(|(&index, value)| {
+                                                    updated_row.get(index) == Some(*value)
+                                                });
+                                            self.enforce_fk_action_constraints(
+                                                child_table,
+                                                child_table_def,
+                                                &updated_row,
+                                                pos,
+                                                references_pending_new_key.then_some((
+                                                    parent_table,
+                                                    columns,
+                                                    ref_columns,
+                                                )),
+                                            )
+                                            .await?;
                                             updates.push((pos, updated_row));
                                         }
-                                        child_storage.update(child_table, &updates).await?;
+                                        let action_pairs: Vec<(Row, Row)> = updates
+                                            .iter()
+                                            .map(|(pos, new)| {
+                                                (child_rows[*pos].clone(), new.clone())
+                                            })
+                                            .collect();
+                                        self.enforce_fk_on_parent_mutation(
+                                            child_table,
+                                            &[],
+                                            Some(&action_pairs),
+                                            depth + 1,
+                                            apply,
+                                        )
+                                        .await?;
+                                        if apply {
+                                            child_storage.update(child_table, &updates).await?;
+                                            self.rebuild_table_derived_state(child_table).await;
+                                        }
                                     }
                                 }
                             }
@@ -1229,6 +1463,27 @@ impl Executor {
                                     continue;
                                 }
 
+                                if matches!(action, FkAction::SetDefault) {
+                                    let defaults: Result<Vec<Value>, ExecError> = child_col_indices
+                                        .iter()
+                                        .map(|&index| {
+                                            self.eval_column_default(
+                                                &child_table_def.columns[index],
+                                            )
+                                        })
+                                        .collect();
+                                    if defaults?
+                                        .iter()
+                                        .zip(parent_vals.iter())
+                                        .all(|(default, parent)| default == *parent)
+                                    {
+                                        return Err(ExecError::ConstraintViolation(
+                                            "ON DELETE SET DEFAULT would retain the deleted referenced key"
+                                                .into(),
+                                        ));
+                                    }
+                                }
+
                                 match action {
                                     FkAction::Restrict | FkAction::NoAction => {
                                         return Err(ExecError::ConstraintViolation(format!(
@@ -1237,6 +1492,17 @@ impl Executor {
                                         )));
                                     }
                                     FkAction::Cascade => {
+                                        if matching_positions.iter().any(|&pos| {
+                                            !self.rls_allows_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Delete,
+                                                &child_rows[pos],
+                                            )
+                                        }) {
+                                            return Err(ExecError::PermissionDenied(format!(
+                                                "foreign-key cascade would delete a row hidden by row-level security on table '{child_table}'"
+                                            )));
+                                        }
                                         // Recursively enforce FK on grandchildren before deleting
                                         let rows_to_delete: Vec<Row> = matching_positions
                                             .iter()
@@ -1247,26 +1513,90 @@ impl Executor {
                                             &rows_to_delete,
                                             None,
                                             depth + 1,
+                                            apply,
                                         )
                                         .await?;
-                                        child_storage
-                                            .delete(child_table, &matching_positions)
-                                            .await?;
+                                        if apply {
+                                            let current_rows =
+                                                child_storage.scan(child_table).await?;
+                                            let current_positions: Vec<usize> = current_rows
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(_, row)| {
+                                                    rows_to_delete
+                                                        .iter()
+                                                        .any(|target| target == *row)
+                                                })
+                                                .map(|(position, _)| position)
+                                                .collect();
+                                            child_storage
+                                                .delete(child_table, &current_positions)
+                                                .await?;
+                                            self.rebuild_table_derived_state(child_table).await;
+                                        }
                                     }
                                     FkAction::SetNull => {
                                         let mut updates = Vec::new();
                                         for &pos in &matching_positions {
+                                            if !self.rls_allows_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &child_rows[pos],
+                                            ) {
+                                                return Err(ExecError::PermissionDenied(format!(
+                                                    "foreign-key action would update a row hidden by row-level security on table '{child_table}'"
+                                                )));
+                                            }
                                             let mut updated_row = child_rows[pos].clone();
                                             for &ci in &child_col_indices {
                                                 updated_row[ci] = Value::Null;
                                             }
+                                            self.enforce_rls_new_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &updated_row,
+                                            )?;
+                                            self.enforce_fk_action_constraints(
+                                                child_table,
+                                                child_table_def,
+                                                &updated_row,
+                                                pos,
+                                                None,
+                                            )
+                                            .await?;
                                             updates.push((pos, updated_row));
                                         }
-                                        child_storage.update(child_table, &updates).await?;
+                                        let action_pairs: Vec<(Row, Row)> = updates
+                                            .iter()
+                                            .map(|(pos, new)| {
+                                                (child_rows[*pos].clone(), new.clone())
+                                            })
+                                            .collect();
+                                        self.enforce_fk_on_parent_mutation(
+                                            child_table,
+                                            &[],
+                                            Some(&action_pairs),
+                                            depth + 1,
+                                            apply,
+                                        )
+                                        .await?;
+                                        if apply {
+                                            child_storage.update(child_table, &updates).await?;
+                                            self.rebuild_table_derived_state(child_table).await;
+                                        }
                                     }
                                     FkAction::SetDefault => {
                                         let mut updates = Vec::new();
                                         for &pos in &matching_positions {
+                                            if !self.rls_allows_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &child_rows[pos],
+                                            ) {
+                                                return Err(ExecError::PermissionDenied(format!(
+                                                    "foreign-key action would update a row hidden by row-level security on table '{child_table}'"
+                                                )));
+                                            }
                                             let mut updated_row = child_rows[pos].clone();
                                             for &ci in &child_col_indices {
                                                 let default_val = self.eval_column_default(
@@ -1274,9 +1604,39 @@ impl Executor {
                                                 )?;
                                                 updated_row[ci] = default_val;
                                             }
+                                            self.enforce_rls_new_row(
+                                                child_table,
+                                                crate::security::PolicyCommand::Update,
+                                                &updated_row,
+                                            )?;
+                                            self.enforce_fk_action_constraints(
+                                                child_table,
+                                                child_table_def,
+                                                &updated_row,
+                                                pos,
+                                                None,
+                                            )
+                                            .await?;
                                             updates.push((pos, updated_row));
                                         }
-                                        child_storage.update(child_table, &updates).await?;
+                                        let action_pairs: Vec<(Row, Row)> = updates
+                                            .iter()
+                                            .map(|(pos, new)| {
+                                                (child_rows[*pos].clone(), new.clone())
+                                            })
+                                            .collect();
+                                        self.enforce_fk_on_parent_mutation(
+                                            child_table,
+                                            &[],
+                                            Some(&action_pairs),
+                                            depth + 1,
+                                            apply,
+                                        )
+                                        .await?;
+                                        if apply {
+                                            child_storage.update(child_table, &updates).await?;
+                                            self.rebuild_table_derived_state(child_table).await;
+                                        }
                                     }
                                 }
                             }
@@ -1378,6 +1738,48 @@ impl Executor {
         }
     }
 
+    /// Repair every derived representation whose row IDs or values can become
+    /// stale after UPDATE/DELETE, FK actions, or a schema rewrite.
+    pub(super) async fn rebuild_table_derived_state(&self, table_name: &str) {
+        // TRUNCATE recreates the physical table and therefore removes its
+        // engine-local indexes while catalog definitions remain. Re-create any
+        // missing physical indexes before rebuilding their postings.
+        if let Some(table_def) = self.catalog.get_table(table_name).await {
+            for index in self.catalog.get_indexes(table_name).await {
+                if matches!(
+                    index.index_type,
+                    crate::catalog::IndexType::BTree | crate::catalog::IndexType::Hash
+                ) && !index.options.contains_key("encryption_mode")
+                    && let Some(column) = index.columns.first()
+                    && let Some(column_index) = table_def.column_index(column)
+                {
+                    let _ = self
+                        .storage_for(table_name)
+                        .create_index(table_name, &index.name, column_index)
+                        .await;
+                    self.btree_indexes
+                        .insert((table_name.to_string(), column.clone()), index.name.clone());
+                }
+            }
+        }
+        if let Err(error) = self
+            .storage_for(table_name)
+            .rebuild_table_indexes(table_name)
+            .await
+        {
+            tracing::warn!("failed to rebuild storage indexes for '{table_name}': {error}");
+        }
+        self.rebuild_zone_map(table_name).await;
+        self.refresh_gin_after_write(table_name).await;
+        self.rebuild_position_indexes_for_table(table_name).await;
+
+        let session = self.current_session();
+        let mut txn = session.txn_state.write().await;
+        if txn.active {
+            txn.derived_dirty_tables.insert(table_name.to_string());
+        }
+    }
+
     pub(super) async fn execute_update(
         &self,
         update: ast::Update,
@@ -1407,7 +1809,7 @@ impl Executor {
         let col_meta = self.table_col_meta(&table_def);
 
         // Fast path: PK/unique equality WHERE → filtered scan (avoids materializing all rows)
-        let (all_rows, pre_filtered) =
+        let (mut all_rows, pre_filtered) =
             match Self::extract_pk_eq_value(&update.selection, &table_def) {
                 Some((col_idx, eq_value)) => {
                     let matches = self
@@ -1431,6 +1833,9 @@ impl Executor {
                     (rows, false)
                 }
             };
+        all_rows.retain(|(_, row)| {
+            self.rls_allows_row(&table_name, crate::security::PolicyCommand::Update, row)
+        });
         // Resolve assignments: (column_index, value_expr)
         let mut assign_targets = Vec::new();
         for a in &update.assignments {
@@ -1452,7 +1857,7 @@ impl Executor {
         let mut has_check_constraints = false;
         for constraint in &table_def.constraints {
             match constraint {
-                crate::catalog::TableConstraint::PrimaryKey { columns }
+                crate::catalog::TableConstraint::PrimaryKey { columns, .. }
                 | crate::catalog::TableConstraint::Unique { columns, .. } => {
                     if columns
                         .iter()
@@ -1528,7 +1933,13 @@ impl Executor {
             if matches {
                 let mut new_row = row.clone();
                 for (col_idx, val_expr) in &assign_targets {
-                    new_row[*col_idx] = self.eval_row_expr(val_expr, row, &col_meta)?;
+                    let mut value = self.eval_row_expr(val_expr, row, &col_meta)?;
+                    coerce_value_for_write(
+                        &mut value,
+                        &table_def.columns[*col_idx],
+                        self.session_time_zone()?,
+                    )?;
+                    new_row[*col_idx] = value;
                 }
 
                 // Fire BEFORE UPDATE row-level triggers (old = current row, new = updated row)
@@ -1544,6 +1955,12 @@ impl Executor {
                     )
                     .await;
                 }
+
+                self.enforce_rls_new_row(
+                    &table_name,
+                    crate::security::PolicyCommand::Update,
+                    &new_row,
+                )?;
 
                 // Enforce all constraints on the updated row
                 self.enforce_constraints(
@@ -1597,7 +2014,9 @@ impl Executor {
                         .map(|old| ((*old).clone(), new_row.clone()))
                 })
                 .collect();
-            self.enforce_fk_on_parent_mutation(&table_name, &[], Some(&update_pairs), 0)
+            self.enforce_fk_on_parent_mutation(&table_name, &[], Some(&update_pairs), 0, false)
+                .await?;
+            self.enforce_fk_on_parent_mutation(&table_name, &[], Some(&update_pairs), 0, true)
                 .await?;
         }
 
@@ -1610,7 +2029,7 @@ impl Executor {
                         self.remove_from_encrypted_indexes(&table_name, old_row, *pos, &table_def);
                     }
                     if has_vector_indexes {
-                        self.remove_from_vector_indexes(&table_name, *pos);
+                        self.remove_from_vector_indexes(&table_name, old_row, *pos, &table_def);
                     }
                 }
                 if has_encrypted_indexes {
@@ -1634,7 +2053,7 @@ impl Executor {
                     .constraints
                     .iter()
                     .filter_map(|c| match c {
-                        TableConstraint::PrimaryKey { columns }
+                        TableConstraint::PrimaryKey { columns, .. }
                         | TableConstraint::Unique { columns, .. } => {
                             let idxs: Vec<usize> = columns
                                 .iter()
@@ -1664,8 +2083,25 @@ impl Executor {
         // Rebuild zone map stats — column values may have changed, making
         // min/max bounds stale. A bare clear would leave the map to be
         // partially repopulated by later INSERTs, under-representing survivors.
+        //
+        // With the pk->node registry an UPDATE is now clean incrementally: the
+        // hooks above tombstoned the old node and inserted the new vector under a
+        // fresh node id (no in-place overwrite). So UPDATE takes the same fast
+        // path as DELETE when eligible; the zone map just needs an O(1) clear.
         if count > 0 {
-            self.rebuild_zone_map(&table_name).await;
+            if self
+                .incremental_maintenance_eligible(&table_name, &table_def)
+                .await
+            {
+                self.zone_map_index
+                    .clear_table(table_name_to_id(&table_name));
+                // Deferred compaction: rebuild once tombstones bloat the graph.
+                if self.vector_index_needs_compaction(&table_name) {
+                    self.rebuild_table_derived_state(&table_name).await;
+                }
+            } else {
+                self.rebuild_table_derived_state(&table_name).await;
+            }
         }
 
         // Fire AFTER UPDATE statement-level triggers
@@ -1752,7 +2188,7 @@ impl Executor {
         let col_meta = self.table_col_meta(&table_def);
 
         // Fast path: PK/unique equality WHERE → filtered scan
-        let (all_rows, pre_filtered) =
+        let (mut all_rows, pre_filtered) =
             match Self::extract_pk_eq_value(&delete.selection, &table_def) {
                 Some((col_idx, eq_value)) => {
                     let matches = self
@@ -1774,6 +2210,9 @@ impl Executor {
                     (rows, false)
                 }
             };
+        all_rows.retain(|(_, row)| {
+            self.rls_allows_row(&table_name, crate::security::PolicyCommand::Delete, row)
+        });
 
         // Pre-check: does this table have any DELETE triggers?
         let has_triggers = {
@@ -1838,7 +2277,9 @@ impl Executor {
             .map(|(_, row)| row.clone())
             .collect();
         if !deleted_rows.is_empty() {
-            self.enforce_fk_on_parent_mutation(&table_name, &deleted_rows, None, 0)
+            self.enforce_fk_on_parent_mutation(&table_name, &deleted_rows, None, 0, false)
+                .await?;
+            self.enforce_fk_on_parent_mutation(&table_name, &deleted_rows, None, 0, true)
                 .await?;
         }
 
@@ -1870,16 +2311,25 @@ impl Executor {
                             );
                         }
                         if has_vec {
-                            self.remove_from_vector_indexes(&table_name, pos);
+                            self.remove_from_vector_indexes(&table_name, old_row, pos, &table_def);
                         }
                     }
                 }
             }
         }
 
+        let current_rows = self
+            .storage_for(&table_name)
+            .scan_physical(&table_name)
+            .await?;
+        let current_positions: Vec<usize> = current_rows
+            .iter()
+            .filter(|(_, row)| deleted_rows.iter().any(|target| target == row))
+            .map(|(position, _)| *position)
+            .collect();
         let count = self
             .storage_for(&table_name)
-            .delete(&table_name, &positions)
+            .delete(&table_name, &current_positions)
             .await?;
 
         // Rebuild zone map stats — row positions have shifted after delete, so
@@ -1887,7 +2337,22 @@ impl Executor {
         // to be partially repopulated by later INSERTs, under-representing
         // surviving rows and causing valid rows to be wrongly pruned.
         if count > 0 {
-            self.rebuild_zone_map(&table_name).await;
+            if self
+                .incremental_maintenance_eligible(&table_name, &table_def)
+                .await
+            {
+                // Fast path: the PK-keyed vector hooks above already tombstoned
+                // the deleted rows in the HNSW index. Clear the zone map (O(1));
+                // its pruning path falls back to the row filter when empty.
+                self.zone_map_index
+                    .clear_table(table_name_to_id(&table_name));
+                // Deferred compaction: rebuild once tombstones bloat the graph.
+                if self.vector_index_needs_compaction(&table_name) {
+                    self.rebuild_table_derived_state(&table_name).await;
+                }
+            } else {
+                self.rebuild_table_derived_state(&table_name).await;
+            }
         }
 
         // Fire AFTER DELETE row-level triggers for each deleted row
@@ -1972,7 +2437,7 @@ impl Executor {
             };
             // Check if this column is a single-column PK or UNIQUE
             let is_pk_or_unique = table_def.constraints.iter().any(|c| match c {
-                crate::catalog::TableConstraint::PrimaryKey { columns }
+                crate::catalog::TableConstraint::PrimaryKey { columns, .. }
                 | crate::catalog::TableConstraint::Unique { columns, .. } => {
                     columns.len() == 1 && columns[0].eq_ignore_ascii_case(&col_name)
                 }
@@ -2007,82 +2472,5 @@ impl Executor {
             return Some((col_idx, value));
         }
         None
-    }
-}
-
-/// Coerce row values to match DDL column types.
-///
-/// When SimpleProtocol sends INSERT values, all parameters arrive as text strings.
-/// The executor stores them as `Value::Text` even for BIGINT, INTEGER, BOOLEAN, etc.
-/// This function converts each value to the correct type based on the table definition,
-/// so MergeTree columns store typed data and arithmetic/comparison works correctly.
-// NOTE: not yet wired into the columnar/MergeTree INSERT path. Extended-protocol
-// params arrive as text and currently reach `columnar_engine::rows_to_batch`
-// untyped. Tracked in AUDIT_FINDINGS.md (Phase 3: coerce text params before
-// MergeTree ingest).
-#[allow(dead_code)]
-fn coerce_rows_to_schema(table_def: &TableDef, rows: Vec<Row>) -> Vec<Row> {
-    rows.into_iter()
-        .map(|row| {
-            row.into_iter()
-                .enumerate()
-                .map(|(i, val)| {
-                    if i < table_def.columns.len() {
-                        coerce_value(val, &table_def.columns[i].data_type)
-                    } else {
-                        val
-                    }
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// Coerce a single value to match the target data type.
-/// Only converts when the source is Text and the target expects a different type.
-// NOTE: only called by `coerce_rows_to_schema`, which is not yet wired in.
-#[allow(dead_code)]
-fn coerce_value(val: Value, target: &DataType) -> Value {
-    match (&val, target) {
-        // Text → Int64 (BIGINT)
-        (Value::Text(s), DataType::Int64) => {
-            if let Ok(n) = s.parse::<i64>() {
-                Value::Int64(n)
-            } else {
-                val
-            }
-        }
-        // Text → Int32 (INTEGER)
-        (Value::Text(s), DataType::Int32) => {
-            if let Ok(n) = s.parse::<i32>() {
-                Value::Int32(n)
-            } else {
-                val
-            }
-        }
-        // Text → Float64 (DOUBLE PRECISION / REAL)
-        (Value::Text(s), DataType::Float64) => {
-            if let Ok(n) = s.parse::<f64>() {
-                Value::Float64(n)
-            } else {
-                val
-            }
-        }
-        // Text → Bool (BOOLEAN)
-        (Value::Text(s), DataType::Bool) => match s.as_str() {
-            "true" | "t" | "1" | "yes" => Value::Bool(true),
-            "false" | "f" | "0" | "no" => Value::Bool(false),
-            _ => val,
-        },
-        // Text → Jsonb (parse if it looks like JSON)
-        (Value::Text(s), DataType::Jsonb) => {
-            if let Ok(j) = serde_json::from_str(s) {
-                Value::Jsonb(j)
-            } else {
-                val
-            }
-        }
-        // Already correct type or no coercion needed
-        _ => val,
     }
 }

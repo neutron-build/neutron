@@ -62,12 +62,71 @@ pub(crate) enum VectorIndexKind {
     IvfFlat(vector::IvfFlatIndex),
 }
 
+/// Maps row primary keys to stable, monotonic HNSW/IvfFlat node ids so
+/// incremental maintenance never overwrites a node in place. An UPDATE
+/// tombstones the old node and inserts the new vector under a fresh node id,
+/// keeping the graph clean (in-place overwrite corrupts edges — see the
+/// recall-harness cosine collapse that motivated this).
+///
+/// Empty for positional indexes and immediately after a reopen (it is not
+/// persisted); an empty registry makes resolve fall back to the exact
+/// brute-force scan, and the next full rebuild repopulates it from base data.
+#[derive(Clone, Default)]
+pub(crate) struct PkRegistry {
+    /// pk (bit-cast to u64) -> current live node id.
+    pub pk_to_node: std::collections::HashMap<u64, u64>,
+    /// node id -> pk, for resolving search results back to rows.
+    pub node_to_pk: std::collections::HashMap<u64, u64>,
+    /// Next node id to allocate — monotonic, never reused.
+    pub next_node: u64,
+    /// Nodes tombstoned since the last rebuild, for the compaction trigger.
+    pub tombstones: u64,
+}
+
+impl PkRegistry {
+    /// Allocate a fresh node for `pk`, tombstoning any prior node for it.
+    /// Returns (new_node, old_node_to_tombstone).
+    pub fn upsert(&mut self, pk: u64) -> (u64, Option<u64>) {
+        let old = self.pk_to_node.get(&pk).copied();
+        if let Some(o) = old {
+            self.node_to_pk.remove(&o);
+            self.tombstones += 1;
+        }
+        let node = self.next_node;
+        self.next_node += 1;
+        self.pk_to_node.insert(pk, node);
+        self.node_to_pk.insert(node, pk);
+        (node, old)
+    }
+
+    /// Drop `pk`, returning its node id to tombstone.
+    pub fn remove(&mut self, pk: u64) -> Option<u64> {
+        let node = self.pk_to_node.remove(&pk)?;
+        self.node_to_pk.remove(&node);
+        self.tombstones += 1;
+        Some(node)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.node_to_pk.is_empty()
+    }
+}
+
 /// Metadata + live data for a single vector index.
 #[derive(Clone)]
 pub(crate) struct VectorIndexEntry {
     pub table_name: String,
     pub column_name: String,
     pub kind: VectorIndexKind,
+    /// Name of the integer PRIMARY KEY column this index's postings are keyed on
+    /// (HNSW only), or None for positional keying. Persisted in the vector index
+    /// sidecar so PK-keying survives a reopen even when the recovered catalog has
+    /// dropped its PK constraint — the source of truth for resolution, not the
+    /// live catalog.
+    pub pk_column: Option<String>,
+    /// PK -> node id registry for incremental HNSW maintenance (empty for
+    /// positional indexes and right after a reopen, until the next rebuild).
+    pub registry: PkRegistry,
 }
 
 /// A live encrypted index for a specific column.
@@ -79,16 +138,15 @@ pub(crate) struct EncryptedIndexEntry {
 
 /// A live GIN (Generalized Inverted Index) for a JSONB column.
 /// Maps (path, encoded_leaf) pairs to row IDs for fast containment (`@>`) queries.
-// NOTE: the GIN index is built at CREATE INDEX time and stored in
-// `Executor::gin_indexes`, but the query planner does not yet consult it to
-// accelerate `@>` containment scans — so these fields are write-only for now.
-// Tracked in AUDIT_FINDINGS.md (Phase 3: wire up the GIN read path).
-#[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct GinIndexEntry {
     pub table_name: String,
     pub column_name: String,
-    pub col_idx: usize,
     pub index: crate::document::GinIndex,
+    /// Committed-write generation represented by this posting map. Queries
+    /// fall back to a full scan whenever it differs from the executor's
+    /// generation, preventing a concurrent rebuild from causing false negatives.
+    pub generation: u64,
 }
 
 /// Cached query result entry.

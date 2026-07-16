@@ -897,6 +897,8 @@ const WAL_INSERT_BATCH: u8 = 0x05;
 struct TsWal {
     writer: parking_lot::Mutex<Option<std::io::BufWriter<std::fs::File>>>,
     dir: std::path::PathBuf,
+    /// Group-commit fsync coordinator (durability of the un-checkpointed tail).
+    syncer: crate::storage::wal_util::WalSync,
 }
 
 impl std::fmt::Debug for TsWal {
@@ -916,11 +918,36 @@ impl TsWal {
         Ok(Self {
             writer: parking_lot::Mutex::new(Some(std::io::BufWriter::new(file))),
             dir: dir.to_path_buf(),
+            syncer: crate::storage::wal_util::WalSync::new(),
         })
     }
 
     fn wal_path(&self) -> std::path::PathBuf {
         self.dir.join("ts_wal.bin")
+    }
+
+    /// Flush + `fsync` the log, capturing (under the writer lock) the highest
+    /// append LSN the fsync covers.
+    fn sync_covering(&self) -> std::io::Result<u64> {
+        use std::io::Write;
+        let mut guard = self.writer.lock();
+        let covered = self.syncer.current();
+        if let Some(ref mut w) = *guard {
+            w.flush()?;
+            w.get_ref().sync_all()?;
+        }
+        Ok(covered)
+    }
+
+    /// Group-commit sync: durable coverage of every append made before this
+    /// call; concurrent committers share fsyncs.
+    fn group_sync(&self) -> std::io::Result<()> {
+        self.syncer.group_sync(|| self.sync_covering())
+    }
+
+    /// Whether appends exist that no completed fsync covers yet.
+    fn is_dirty(&self) -> bool {
+        self.syncer.is_dirty()
     }
 
     fn log_create_series(&self, name: &str, partition_size: u64) {
@@ -934,6 +961,8 @@ impl TsWal {
             buf.extend_from_slice(&partition_size.to_le_bytes());
             if let Err(e) = w.write_all(&buf).and_then(|_| w.flush()) {
                 tracing::error!("timeseries WAL log_create_series failed: {e}");
+            } else {
+                self.syncer.on_append();
             }
         }
     }
@@ -948,6 +977,8 @@ impl TsWal {
             buf.extend_from_slice(name_bytes);
             if let Err(e) = w.write_all(&buf).and_then(|_| w.flush()) {
                 tracing::error!("timeseries WAL log_delete_series failed: {e}");
+            } else {
+                self.syncer.on_append();
             }
         }
     }
@@ -973,6 +1004,8 @@ impl TsWal {
             }
             if let Err(e) = w.write_all(&buf).and_then(|_| w.flush()) {
                 tracing::error!("timeseries WAL log_insert failed: {e}");
+            } else {
+                self.syncer.on_append();
             }
         }
     }
@@ -1002,6 +1035,8 @@ impl TsWal {
             }
             if let Err(e) = w.write_all(&buf).and_then(|_| w.flush()) {
                 tracing::error!("timeseries WAL log_insert_batch failed: {e}");
+            } else {
+                self.syncer.on_append();
             }
         }
     }
@@ -1014,53 +1049,52 @@ impl TsWal {
         if let Some(ref mut w) = *guard {
             let _ = w.flush();
         }
-        // Truncate and rewrite
+        // Build the complete new log body (snapshot), then replace atomically.
         let wal_path = self.wal_path();
-        if let Ok(file) = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&wal_path)
-        {
-            let mut w = std::io::BufWriter::new(file);
-            // Write snapshot
-            let mut buf = vec![WAL_SNAPSHOT];
-            buf.extend_from_slice(&(series_map.len() as u32).to_le_bytes());
-            for (name, series) in series_map {
-                let name_bytes = name.as_bytes();
-                buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-                buf.extend_from_slice(name_bytes);
-                let n = series.timestamps.len();
-                buf.extend_from_slice(&(n as u32).to_le_bytes());
-                for &ts in &series.timestamps {
-                    buf.extend_from_slice(&ts.to_le_bytes());
-                }
-                for &val in &series.values {
-                    buf.extend_from_slice(&val.to_le_bytes());
-                }
-                buf.extend_from_slice(&(series.tag_columns.len() as u32).to_le_bytes());
-                for (key, col) in &series.tag_columns {
-                    let kb = key.as_bytes();
-                    buf.extend_from_slice(&(kb.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(kb);
-                    for opt in col {
-                        match opt {
-                            Some(v) => {
-                                buf.push(1);
-                                let vb = v.as_bytes();
-                                buf.extend_from_slice(&(vb.len() as u32).to_le_bytes());
-                                buf.extend_from_slice(vb);
-                            }
-                            None => buf.push(0),
+        let mut buf = vec![WAL_SNAPSHOT];
+        buf.extend_from_slice(&(series_map.len() as u32).to_le_bytes());
+        for (name, series) in series_map {
+            let name_bytes = name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            let n = series.timestamps.len();
+            buf.extend_from_slice(&(n as u32).to_le_bytes());
+            for &ts in &series.timestamps {
+                buf.extend_from_slice(&ts.to_le_bytes());
+            }
+            for &val in &series.values {
+                buf.extend_from_slice(&val.to_le_bytes());
+            }
+            buf.extend_from_slice(&(series.tag_columns.len() as u32).to_le_bytes());
+            for (key, col) in &series.tag_columns {
+                let kb = key.as_bytes();
+                buf.extend_from_slice(&(kb.len() as u32).to_le_bytes());
+                buf.extend_from_slice(kb);
+                for opt in col {
+                    match opt {
+                        Some(v) => {
+                            buf.push(1);
+                            let vb = v.as_bytes();
+                            buf.extend_from_slice(&(vb.len() as u32).to_le_bytes());
+                            buf.extend_from_slice(vb);
                         }
+                        None => buf.push(0),
                     }
                 }
             }
-            let _ = w.write_all(&buf).and_then(|_| w.flush());
-            // Reopen in append mode
-            if let Ok(file) = std::fs::OpenOptions::new().append(true).open(&wal_path) {
-                *guard = Some(std::io::BufWriter::new(file));
-            }
         }
+        // Replace atomically (temp + fsync + rename) so a crash mid-checkpoint can't
+        // leave an empty file. Best-effort on this background path: log, don't propagate.
+        if let Err(e) = crate::storage::wal_util::atomic_replace_wal(&wal_path, &buf) {
+            tracing::error!("timeseries WAL checkpoint failed: {e}");
+        }
+        // Reopen in append mode.
+        if let Ok(file) = std::fs::OpenOptions::new().append(true).open(&wal_path) {
+            *guard = Some(std::io::BufWriter::new(file));
+        }
+        // The snapshot was fsync'd by `atomic_replace_wal`; count it as covered.
+        let mark = self.syncer.on_append();
+        self.syncer.mark_synced(mark);
     }
 
     /// Replay WAL entries into a store. Returns Ok(()) on success,
@@ -1505,6 +1539,20 @@ impl TimeSeriesStore {
     pub fn snapshot(&self) {
         if let Some(ref wal) = self.wal {
             wal.checkpoint(&self.series);
+        }
+    }
+
+    /// Whether the WAL has appended inserts no completed fsync covers yet.
+    pub fn wal_is_dirty(&self) -> bool {
+        self.wal.as_ref().is_some_and(|w| w.is_dirty())
+    }
+
+    /// Group-commit fsync the WAL: make every appended insert durable before
+    /// the write is acked. No-op in memory-only mode.
+    pub fn wal_group_sync(&self) -> std::io::Result<()> {
+        match self.wal {
+            Some(ref wal) => wal.group_sync(),
+            None => Ok(()),
         }
     }
 }
@@ -2971,6 +3019,28 @@ mod tests {
         assert!((series.values[0] - 1.0).abs() < 1e-10);
         assert!((series.values[1] - 3.0).abs() < 1e-10);
         assert!((series.values[2] - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn wal_group_sync_marks_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().join("ts_gsync");
+        let mut store = TimeSeriesStore::open(&dir_path, BucketSize::Hour).unwrap();
+        assert!(
+            !store.wal_is_dirty(),
+            "a fresh WAL has no un-fsynced appends"
+        );
+        store.insert(
+            "s",
+            DataPoint {
+                timestamp: 1000,
+                tags: vec![],
+                value: 1.0,
+            },
+        );
+        assert!(store.wal_is_dirty(), "an append is uncovered until fsync");
+        store.wal_group_sync().unwrap();
+        assert!(!store.wal_is_dirty(), "group_sync fsyncs the tail");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 // Crash model — node failures and restarts.
 module crash {
-    import types.*
+    import types.* from "./types"
 
     var alive: Set[NodeId]
     var crashed_nodes: Set[NodeId]
