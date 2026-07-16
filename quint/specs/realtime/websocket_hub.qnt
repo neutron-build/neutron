@@ -12,6 +12,7 @@ module websocket_hub {
     pure val CONNS: Set[ConnId] = Set(1, 2, 3, 4)
     pure val ROOMS: Set[RoomId] = Set(1, 2)
     pure val MAX_MSGS: int = 10
+    pure val MSG_IDS: Set[MsgId] = 1.to(MAX_MSGS)
 
     // === STATE ===
 
@@ -33,12 +34,12 @@ module websocket_hub {
     // === ACTIONS ===
 
     action init = all {
-        room_members' = (r => Set()),
+        room_members' = ROOMS.mapBy(r => Set()),
         connected' = Set(),
-        pending' = (c => Set()),
-        delivered' = (c => Set()),
-        msg_sender' = (m => 0),
-        msg_room' = (m => 0),
+        pending' = CONNS.mapBy(c => Set()),
+        delivered' = CONNS.mapBy(c => Set()),
+        msg_sender' = MSG_IDS.mapBy(m => 0),
+        msg_room' = MSG_IDS.mapBy(m => 0),
         next_msg' = 1,
     }
 
@@ -60,8 +61,8 @@ module websocket_hub {
         conn.in(connected),
         connected' = connected.exclude(Set(conn)),
         // Remove from all rooms
-        room_members' = (r =>
-            room_members(r).exclude(Set(conn))),
+        room_members' = ROOMS.mapBy(r =>
+            room_members.get(r).exclude(Set(conn))),
         // Clear pending messages for this connection
         pending' = pending.set(conn, Set()),
         delivered' = delivered,
@@ -74,9 +75,9 @@ module websocket_hub {
     action join_room(conn: ConnId, room: RoomId): bool = all {
         conn.in(connected),
         room.in(ROOMS),
-        not(conn.in(room_members(room))),
+        not(conn.in(room_members.get(room))),
         room_members' = room_members.set(room,
-            room_members(room).union(Set(conn))),
+            room_members.get(room).union(Set(conn))),
         connected' = connected,
         pending' = pending,
         delivered' = delivered,
@@ -89,9 +90,9 @@ module websocket_hub {
     action leave_room(conn: ConnId, room: RoomId): bool = all {
         conn.in(connected),
         room.in(ROOMS),
-        conn.in(room_members(room)),
+        conn.in(room_members.get(room)),
         room_members' = room_members.set(room,
-            room_members(room).exclude(Set(conn))),
+            room_members.get(room).exclude(Set(conn))),
         connected' = connected,
         pending' = pending,
         delivered' = delivered,
@@ -101,33 +102,35 @@ module websocket_hub {
     }
 
     // Broadcast a message to a room (adds to pending for all members except sender)
-    action broadcast(sender: ConnId, room: RoomId): bool = all {
-        sender.in(connected),
-        room.in(ROOMS),
-        sender.in(room_members(room)),
-        next_msg <= MAX_MSGS,
+    action broadcast(sender: ConnId, room: RoomId): bool = {
         val mid = next_msg
-        // Add to pending for all other connected members of the room
-        pending' = (c =>
-            if (c.in(room_members(room)) and c != sender and c.in(connected))
-                pending(c).union(Set(mid))
-            else pending(c)),
-        msg_sender' = msg_sender.set(mid, sender),
-        msg_room' = msg_room.set(mid, room),
-        next_msg' = next_msg + 1,
-        connected' = connected,
-        room_members' = room_members,
-        delivered' = delivered,
+        all {
+            sender.in(connected),
+            room.in(ROOMS),
+            sender.in(room_members.get(room)),
+            next_msg <= MAX_MSGS,
+            // Add to pending for all other connected members of the room
+            pending' = CONNS.mapBy(c =>
+                if (c.in(room_members.get(room)) and c != sender and c.in(connected))
+                    pending.get(c).union(Set(mid))
+                else pending.get(c)),
+            msg_sender' = msg_sender.set(mid, sender),
+            msg_room' = msg_room.set(mid, room),
+            next_msg' = next_msg + 1,
+            connected' = connected,
+            room_members' = room_members,
+            delivered' = delivered,
+        }
     }
 
     // Deliver a pending message to a connection
     action deliver(conn: ConnId, mid: MsgId): bool = all {
         conn.in(connected),
-        mid.in(pending(conn)),
+        mid.in(pending.get(conn)),
         pending' = pending.set(conn,
-            pending(conn).exclude(Set(mid))),
+            pending.get(conn).exclude(Set(mid))),
         delivered' = delivered.set(conn,
-            delivered(conn).union(Set(mid))),
+            delivered.get(conn).union(Set(mid))),
         connected' = connected,
         room_members' = room_members,
         msg_sender' = msg_sender,
@@ -136,12 +139,22 @@ module websocket_hub {
     }
 
     action step = any {
-        CONNS.exists(c => connect(c)),
-        CONNS.exists(c => disconnect(c)),
-        CONNS.exists(c => ROOMS.exists(r => join_room(c, r))),
-        CONNS.exists(c => ROOMS.exists(r => leave_room(c, r))),
-        CONNS.exists(c => ROOMS.exists(r => broadcast(c, r))),
-        CONNS.exists(c => 1.to(MAX_MSGS).exists(m => deliver(c, m))),
+        { nondet c = CONNS.oneOf()
+          connect(c) },
+        { nondet c = CONNS.oneOf()
+          disconnect(c) },
+        { nondet c = CONNS.oneOf()
+          nondet r = ROOMS.oneOf()
+          join_room(c, r) },
+        { nondet c = CONNS.oneOf()
+          nondet r = ROOMS.oneOf()
+          leave_room(c, r) },
+        { nondet c = CONNS.oneOf()
+          nondet r = ROOMS.oneOf()
+          broadcast(c, r) },
+        { nondet c = CONNS.oneOf()
+          nondet m = MSG_IDS.oneOf()
+          deliver(c, m) },
     }
 
     // === SAFETY INVARIANTS ===
@@ -149,22 +162,22 @@ module websocket_hub {
     // Room members are connected
     val members_connected: bool =
         ROOMS.forall(r =>
-            room_members(r).forall(c => c.in(connected))
+            room_members.get(r).forall(c => c.in(connected))
         )
 
     // No self-delivery: sender never receives their own broadcast
     val no_self_delivery: bool =
-        1.to(MAX_MSGS).forall(m =>
+        MSG_IDS.forall(m =>
             m < next_msg implies
-            not(m.in(pending(msg_sender(m)))) and
-            not(m.in(delivered(msg_sender(m))))
+            not(m.in(pending.get(msg_sender.get(m)))) and
+            not(m.in(delivered.get(msg_sender.get(m))))
         )
 
     // Delivery completeness: every pending message for a connected
     // member will eventually be delivered (stated as: delivered ⊆ was-pending)
     val delivered_was_pending: bool =
         CONNS.forall(c =>
-            delivered(c).forall(m =>
+            delivered.get(c).forall(m =>
                 m >= 1 and m < next_msg
             )
         )
@@ -172,22 +185,22 @@ module websocket_hub {
     // No duplicate delivery: a message is in pending OR delivered, not both
     val no_duplicate_delivery: bool =
         CONNS.forall(c =>
-            pending(c).intersect(delivered(c)).size() == 0
+            pending.get(c).intersect(delivered.get(c)).size() == 0
         )
 
     // Room cleanup: empty rooms have no members
     val empty_rooms_clean: bool =
         ROOMS.forall(r =>
-            room_members(r).forall(c => c.in(CONNS))
+            room_members.get(r).forall(c => c.in(CONNS))
         )
 
     // Broadcast reaches all room members (at point of broadcast)
     // Messages only go to members who were in the room when broadcast happened
     val broadcast_scoped: bool =
         CONNS.forall(c =>
-            pending(c).union(delivered(c)).forall(m =>
+            pending.get(c).union(delivered.get(c)).forall(m =>
                 m >= 1 and m < next_msg implies
-                msg_sender(m) != c  // sender excluded
+                msg_sender.get(m) != c  // sender excluded
             )
         )
 }
