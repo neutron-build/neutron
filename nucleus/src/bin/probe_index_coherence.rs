@@ -77,6 +77,18 @@ fn vec_lit(v: &[f32]) -> String {
     format!("VECTOR('[{}]')", body.join(","))
 }
 
+/// Number of distinct encrypted `code` values. Deliberately smaller than a
+/// typical live set so multiple rows share a code — the encrypted index then
+/// sees DUPLICATE values, which is what stresses positional-id maintenance. A
+/// unique-per-row code (the old `c{id}`) never exercises the collision path
+/// where the len()-as-row-id bug lived.
+const ENC_CODE_GROUPS: i64 = 8;
+
+/// The (non-unique) encrypted code for a row id.
+fn code_for(id: i64) -> String {
+    format!("c{}", id.rem_euclid(ENC_CODE_GROUPS))
+}
+
 /// Run a statement; true on success. Panic-safe.
 fn exec(ex: &Executor, sql: &str) -> bool {
     let rt = tokio::runtime::Handle::current();
@@ -190,7 +202,7 @@ fn run_lifecycle(
         let id = next_id;
         next_id += 1;
         let val = rng.below(20) as i64;
-        let code = format!("c{id}");
+        let code = code_for(id);
         let vec = vec_for(id, salt);
         stmt!(format!(
             "INSERT INTO t VALUES ({id}, {val}, '{code}', {})",
@@ -216,7 +228,7 @@ fn run_lifecycle(
             let id = next_id;
             next_id += 1;
             let val = rng.below(20) as i64;
-            let code = format!("c{id}");
+            let code = code_for(id);
             let vec = vec_for(id, salt);
             stmt!(format!(
                 "INSERT INTO t VALUES ({id}, {val}, '{code}', {})",
@@ -387,10 +399,11 @@ fn check_vector(
     // completeness, or distance ordering): HNSW/IVFFlat are approximate, so a
     // missed or reordered result is expected recall behavior, not incoherence,
     // and IVFFlat legitimately returns nothing on a few-row untrained index.
-    // The position-staleness bug class that a full-rebuild-to-incremental
-    // refactor could reintroduce is caught EXACTLY by the encrypted-index
-    // check, which exercises the identical `rebuild_position_indexes_for_table`
-    // maintenance path but with an exact (unique-code) oracle.
+    // The position-staleness / mis-assignment bug class that a
+    // full-rebuild-to-incremental refactor could reintroduce is caught EXACTLY
+    // by the encrypted-index check, which exercises the identical
+    // `rebuild_position_indexes_for_table` maintenance path and asserts the
+    // postings are a permutation of {0..N-1} under duplicate codes.
     let _ = probe;
 }
 
@@ -407,34 +420,75 @@ fn check_encrypted(
     if model.is_empty() {
         return;
     }
-    // Positive: a live row's unique code resolves to exactly one posting.
-    let ids: Vec<i64> = model.keys().copied().collect();
-    let id = ids[rng.below(ids.len())];
-    let live_count = encrypted_count(ex, &format!("c{id}"));
-    if live_count != Some(1) {
+    // (1) Well-formedness — the strong, engine-independent invariant. Every live
+    // row is indexed exactly once at its scan position, so the postings over ALL
+    // live codes must be a permutation of {0..N-1}. Under DUPLICATE codes this
+    // catches both a collision (two rows sharing a position) and a gap (a row
+    // missing a position) — the exact corruption the len()-as-row-id insert bug
+    // produced (`c1` twice, no `c2`). A unique-code, count-only check cannot:
+    // the buggy counts were individually correct.
+    let mut live_codes: Vec<String> = model.keys().map(|id| code_for(*id)).collect();
+    live_codes.sort();
+    live_codes.dedup();
+    let mut positions: Vec<i64> = Vec::new();
+    for code in &live_codes {
+        match encrypted_positions(ex, code) {
+            Some(mut p) => positions.append(&mut p),
+            None => {
+                rep.fail(engine, iter, log, format!("encrypted lookup {code} failed"));
+                return;
+            }
+        }
+    }
+    positions.sort();
+    let expected: Vec<i64> = (0..model.len() as i64).collect();
+    if positions != expected {
         rep.fail(
             engine,
             iter,
             log,
-            format!("encrypted lookup c{id} (live): expected 1 posting, got {live_count:?}"),
+            format!(
+                "encrypted postings are not a permutation of 0..{}: got {positions:?} \
+                 (duplicate position = collision, missing position = unindexed row)",
+                model.len()
+            ),
         );
         return;
     }
-    // Negative: a deleted (and not re-live) code resolves to zero postings.
+    // (2) Per-code count: a code resolves to exactly the number of live rows that
+    // share it (now that codes are non-unique).
+    let ids: Vec<i64> = model.keys().copied().collect();
+    let probe_id = ids[rng.below(ids.len())];
+    let code = code_for(probe_id);
+    let want = model.keys().filter(|k| code_for(**k) == code).count();
+    let got = encrypted_count(ex, &code);
+    if got != Some(want) {
+        rep.fail(
+            engine,
+            iter,
+            log,
+            format!("encrypted lookup {code} (live): expected {want} postings, got {got:?}"),
+        );
+        return;
+    }
+    // (3) Negative: a code with NO live rows resolves to zero postings.
     let candidates: Vec<i64> = recently_deleted
         .iter()
         .copied()
-        .filter(|d| !model.contains_key(d))
+        .filter(|d| !model.keys().any(|k| code_for(*k) == code_for(*d)))
         .collect();
     if !candidates.is_empty() {
         let d = candidates[rng.below(candidates.len())];
-        let dead_count = encrypted_count(ex, &format!("c{d}"));
+        let dead_code = code_for(d);
+        let dead_count = encrypted_count(ex, &dead_code);
         if dead_count != Some(0) {
             rep.fail(
                 engine,
                 iter,
                 log,
-                format!("encrypted lookup c{d} (deleted): expected 0 postings, got {dead_count:?}"),
+                format!(
+                    "encrypted lookup {dead_code} (no live rows): expected 0 postings, got {dead_count:?}"
+                ),
             );
         }
     }
@@ -442,6 +496,11 @@ fn check_encrypted(
 
 /// Count postings ENCRYPTED_LOOKUP returns for `code`. None on query failure.
 fn encrypted_count(ex: &Executor, code: &str) -> Option<usize> {
+    Some(encrypted_positions(ex, code)?.len())
+}
+
+/// The row positions ENCRYPTED_LOOKUP returns for `code`. None on query failure.
+fn encrypted_positions(ex: &Executor, code: &str) -> Option<Vec<i64>> {
     let sql = format!("SELECT ENCRYPTED_LOOKUP('t_code', '{code}') FROM t LIMIT 1");
     let rows = query(ex, &sql)?;
     let cell = rows.first().and_then(|r| r.first())?;
@@ -450,7 +509,11 @@ fn encrypted_count(ex: &Executor, code: &str) -> Option<usize> {
         Value::Null => String::new(),
         other => format!("{other:?}"),
     };
-    Some(text.split(',').filter(|s| !s.trim().is_empty()).count())
+    Some(
+        text.split(',')
+            .filter_map(|s| s.trim().parse::<i64>().ok())
+            .collect(),
+    )
 }
 
 fn main_impl() {

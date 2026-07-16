@@ -217,6 +217,35 @@ fn run_case(case: &Case, n: usize, k: usize, queries: usize, seed: u64) -> Optio
             case.kind, case.metric, churned, case.churn_floor
         ));
     }
+
+    // Delete-heavy phase (HNSW only): sustained pure deletes accumulate
+    // tombstones until the compaction heuristic (tombstones >= 64 && > live)
+    // fires a rebuild — repeatedly, as the ratio keeps re-crossing. The mixed
+    // churn above rarely reaches that ratio, so this is the only phase that
+    // exercises compaction. Recall on the survivors must survive the rebuild: a
+    // compaction that dropped or mis-mapped rows would sink it. (IvfFlat deletes
+    // full-rebuild and never compact, so this phase is HNSW-specific.)
+    if case.kind == "hnsw" {
+        let live: Vec<i64> = model.keys().copied().collect();
+        // Keep a small survivor set so tombstones dominate the live set.
+        let survivors = (live.len() / 4).clamp(16, 64);
+        for id in live.iter().take(live.len().saturating_sub(survivors)) {
+            if exec(&ex, &format!("DELETE FROM vr WHERE id = {id}")) {
+                model.remove(id);
+            }
+        }
+        let compacted = measure_recall(&ex, &model, case.metric, k, queries, &mut rng);
+        println!(
+            "  {:>8} {:>6}  del-heavy recall@{k} = {:.3}  (floor {:.2})",
+            case.kind, case.metric, compacted, case.churn_floor
+        );
+        if compacted < case.churn_floor {
+            return Some(format!(
+                "{} {}: post-compaction recall {:.3} below floor {:.2}",
+                case.kind, case.metric, compacted, case.churn_floor
+            ));
+        }
+    }
     None
 }
 
