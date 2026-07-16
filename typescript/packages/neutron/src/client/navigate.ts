@@ -94,10 +94,19 @@ export function navigate(to: RouteHref): void {
     return;
   }
   const target = resolved.pathname + resolved.search;
+  // Preserve the hash in the pushed URL so anchor links survive SPA nav.
+  const targetWithHash = target + resolved.hash;
   const current = window.location.pathname + window.location.search;
 
   if (target === current) {
-    handlePopState(true, { forceRevalidate: true });
+    // Same route: if the hash changed, update it and scroll to the target;
+    // otherwise revalidate the current route in place.
+    if (resolved.hash && resolved.hash !== window.location.hash) {
+      window.history.pushState(null, "", targetWithHash);
+      scrollToHash(resolved.hash);
+    } else {
+      handlePopState(true, { forceRevalidate: true });
+    }
     return;
   }
 
@@ -109,8 +118,26 @@ export function navigate(to: RouteHref): void {
     return;
   }
 
-  window.history.pushState(null, "", target);
+  window.history.pushState(null, "", targetWithHash);
   handlePopState(true);
+  if (resolved.hash) {
+    scrollToHash(resolved.hash);
+  }
+}
+
+// Scroll to a hash target after the route renders. Two rAFs let the new DOM
+// paint first; relies on CSS scroll-margin-top for fixed-header offset (the
+// web-standard approach) rather than hardcoding an offset.
+function scrollToHash(hash: string): void {
+  if (typeof document === "undefined") return;
+  const id = decodeURIComponent(hash.replace(/^#/, ""));
+  if (!id) return;
+  requestAnimationFrame(() =>
+    requestAnimationFrame(() => {
+      const el = document.getElementById(id);
+      if (el) el.scrollIntoView();
+    })
+  );
 }
 
 export function go(delta: number): void {
