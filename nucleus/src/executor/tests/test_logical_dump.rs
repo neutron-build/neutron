@@ -82,3 +82,43 @@ async fn logical_dump_round_trips_vector_index() {
     .await;
     assert_eq!(knn.first().and_then(|r| r.first()), Some(&Value::Int32(1)));
 }
+
+/// The CLI dump/restore path: open an EXISTING on-disk database (loading
+/// catalog.json so constraints survive — the whole point of the persistent open
+/// helper vs. embedded recovery), dump it, and restore into a FRESH directory.
+#[tokio::test]
+async fn persistent_open_dump_restore_round_trip() {
+    use super::logical_dump::open_persistent_executor;
+
+    let src_dir = tempfile::tempdir().expect("tempdir");
+    let dst_dir = tempfile::tempdir().expect("tempdir");
+
+    // Populate a persistent database, then drop it (flush to disk).
+    {
+        let src = open_persistent_executor(src_dir.path()).await.expect("open src");
+        exec(&src, "CREATE TABLE acct (id INT PRIMARY KEY, owner TEXT NOT NULL, bal INT)").await;
+        exec(&src, "INSERT INTO acct VALUES (1, 'alice', 100), (2, 'bob', 250)").await;
+    }
+
+    // Reopen from disk — constraints must come back from catalog.json — and dump.
+    let reopened = open_persistent_executor(src_dir.path()).await.expect("reopen src");
+    let script = reopened.dump_logical().await.expect("dump");
+    assert!(
+        script.contains("PRIMARY KEY"),
+        "reopened dump must carry the PK constraint (catalog.json), got:\n{script}"
+    );
+
+    // Restore into a fresh persistent instance and verify data + a live PK.
+    let dst = open_persistent_executor(dst_dir.path()).await.expect("open dst");
+    dst.restore_logical(&script).await.expect("restore");
+
+    let a = all_rows(&reopened, "SELECT id, owner, bal FROM acct ORDER BY id").await;
+    let b = all_rows(&dst, "SELECT id, owner, bal FROM acct ORDER BY id").await;
+    assert_eq!(a, b, "restored rows must match");
+
+    let dup = dst.execute("INSERT INTO acct VALUES (1, 'x', 0)").await;
+    assert!(
+        matches!(dup, Err(ExecError::ConstraintViolation(_))),
+        "restored PK must reject a duplicate, got {dup:?}"
+    );
+}

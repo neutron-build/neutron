@@ -90,6 +90,8 @@ mod expr;
 mod helpers;
 mod join;
 mod logical_dump;
+#[cfg(feature = "server")]
+pub use logical_dump::open_persistent_executor;
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod meta_persistence;
 pub mod param_subst;
