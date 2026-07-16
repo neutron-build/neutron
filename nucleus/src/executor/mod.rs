@@ -89,6 +89,7 @@ mod dml;
 mod expr;
 mod helpers;
 mod join;
+mod logical_dump;
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod meta_persistence;
 pub mod param_subst;
