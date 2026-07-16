@@ -5,7 +5,20 @@ export function head() {
   return {
     title: "Neutron",
     description: "Build anything, no ceiling. TypeScript, Rust, Go, Python, Elixir, Mojo, Zig, and Julia — each at its peak. One database with 14 data models. Web, mobile, and desktop.",
-  };
+    canonical: "https://neutron.build/",
+    jsonLd: {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      name: "Neutron",
+      applicationCategory: "DeveloperApplication",
+      operatingSystem: "Cross-platform",
+      description:
+        "A multi-language full-stack framework ecosystem backed by Nucleus, a multi-model database engine.",
+      url: "https://neutron.build",
+      offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+      license: "https://opensource.org/licenses/MIT",
+    },
+  } as any;
 }
 
 export default function HomePage() {
