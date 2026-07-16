@@ -42,6 +42,7 @@ mod test_filter_lazy; // Phase 2C: Lazy materialization for WHERE clause filteri
 mod test_index;
 mod test_integration;
 mod test_jsonb;
+mod test_memory_budget; // T1.2: query memory-budget enforcement (gating)
 mod test_meta_persistence;
 mod test_module_wiring;
 mod test_multimodel;

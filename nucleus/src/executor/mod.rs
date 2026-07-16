@@ -1643,6 +1643,35 @@ impl Executor {
         bytes
     }
 
+    /// Estimate the combined in-memory footprint of a slice of rows.
+    fn estimate_rows_bytes(rows: &[Row]) -> u64 {
+        rows.iter().map(Self::estimate_row_bytes).sum()
+    }
+
+    /// Reserve `bytes` of query working-set memory against the shared budget,
+    /// returning an RAII guard that releases on drop (see
+    /// [`crate::allocator::MemoryReservation`]). Operators call this to bound the
+    /// build sides that would otherwise accumulate unbounded and OOM the process
+    /// — the guard converts that into a clean [`ExecError::MemoryExceeded`]
+    /// (SQLSTATE 53200) and, releasing on every exit path, never leaks the
+    /// reservation into later queries.
+    fn reserve_query_memory(
+        &self,
+        bytes: u64,
+    ) -> Result<crate::allocator::MemoryReservation, ExecError> {
+        self.query_memory
+            .reserve(bytes)
+            .map_err(|_| self.query_mem_err())
+    }
+
+    /// The uniform "query exceeded its memory limit" error (SQLSTATE 53200).
+    fn query_mem_err(&self) -> ExecError {
+        ExecError::MemoryExceeded(format!(
+            "query working set exceeded the memory limit ({} MB); raise server.max_memory_mb, or add a tighter filter/LIMIT",
+            self.query_memory.limit() / (1024 * 1024)
+        ))
+    }
+
     /// Set the cache tier maximum memory in bytes.
     pub fn with_cache_size(self, max_bytes: usize) -> Self {
         *self.cache.write() = CacheTier::new(max_bytes);

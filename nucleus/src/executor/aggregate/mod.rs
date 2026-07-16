@@ -49,6 +49,11 @@ impl Executor {
         rows: Vec<Row>,
         sorted_by_col: Option<&str>,
     ) -> Result<ExecResult, ExecError> {
+        // Bound this operator's working set against the shared query-memory
+        // budget: the group map holds every input row, so a huge GROUP BY would
+        // otherwise grow unbounded and OOM the box. Reserving here converts that
+        // into a clean MemoryExceeded (53200); the guard releases on return.
+        let _mem = self.reserve_query_memory(Self::estimate_rows_bytes(&rows))?;
         let group_by_exprs: &[Expr] = match &select.group_by {
             ast::GroupByExpr::Expressions(exprs, _) => exprs,
             _ => &[],

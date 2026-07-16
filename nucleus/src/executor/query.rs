@@ -1643,6 +1643,9 @@ impl Executor {
                         let storage = self.storage_for(table);
                         let rows = storage.scan_projected(table, proj_indices).await?;
                         self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                        // Ceiling-check the projected scan against the shared
+                        // query-memory budget (see the full-scan gate below).
+                        drop(self.reserve_query_memory(Self::estimate_rows_bytes(&rows))?);
                         return Ok((proj_meta, rows));
                         // If there IS a filter, fall through to the full scan
                         // path — the filter may reference columns outside the
@@ -1703,6 +1706,15 @@ impl Executor {
                         storage.scan(table).await?
                     };
                     self.metrics.rows_scanned.inc_by(rows.len() as u64);
+                    // Ceiling-check the materialized scan against the shared
+                    // query-memory budget: rejects a single scan too large for
+                    // the limit (the dominant single-query OOM) and throttles
+                    // concurrent large scans, since it counts other queries'
+                    // live join/copy/sort reservations. Transient — the engine
+                    // materializes rows rather than streaming, so a held
+                    // reservation across the pipeline needs the streaming
+                    // refactor; this bounds the peak entry point today.
+                    drop(self.reserve_query_memory(Self::estimate_rows_bytes(&rows))?);
 
                     if let Some(expr) = resolved_expr {
                         // ── Zone map pruning ────────────────────────────────
@@ -4049,6 +4061,9 @@ impl Executor {
                     ref mut rows,
                 } = exec_result
             {
+                // The dedup set holds a copy of each distinct row; bound it (plus
+                // the already-materialized input) against the shared budget.
+                let _mem = self.reserve_query_memory(Self::estimate_rows_bytes(rows))?;
                 match distinct {
                     ast::Distinct::Distinct => {
                         // Remove duplicate rows using HashSet for O(n) dedup
@@ -6352,6 +6367,13 @@ impl Executor {
                 (col_meta, filtered, None)
             };
 
+        // Ceiling-check the materialized/filtered row set against the shared
+        // query-memory budget before the blocking operators (window / aggregate
+        // / DISTINCT / sort) consume it. This is the direct executor's scan
+        // choke point — the plan executor is gated at its own scan sites — so a
+        // large GROUP BY/ORDER BY here can't OOM the box.
+        drop(self.reserve_query_memory(Self::estimate_rows_bytes(&filtered))?);
+
         // Check for window functions
         let has_window = select.projection.iter().any(|item| match item {
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
@@ -7198,6 +7220,14 @@ impl Executor {
         projection: Option<&[SelectItem]>,
         top_k: Option<usize>,
     ) -> Result<(), ExecError> {
+        // A full sort holds every input row plus sort-key/index buffers; bound it
+        // against the shared query-memory budget so a huge ORDER BY returns a
+        // clean MemoryExceeded (53200) instead of OOM-ing the box. A top-k sort
+        // is already bounded to k, so it is exempt.
+        let _mem = match top_k {
+            None => Some(self.reserve_query_memory(Self::estimate_rows_bytes(rows))?),
+            Some(_) => None,
+        };
         let all_exprs: Vec<ast::OrderByExpr>;
         let exprs = match &ob.kind {
             ast::OrderByKind::Expressions(exprs) => exprs,

@@ -143,6 +143,58 @@ impl MemoryBudget {
         self.dealloc_count.store(0, Ordering::Relaxed);
         self.denied_count.store(0, Ordering::Relaxed);
     }
+
+    /// Reserve `bytes` and return an RAII guard that releases them on drop.
+    ///
+    /// This is the safe way to account a query operator's working set: the guard
+    /// deallocates on **every** exit path (early return, `?`, panic-unwind), so an
+    /// error partway through a build never leaks reservation and starves later
+    /// queries with false rejections. Grow it in place with
+    /// [`MemoryReservation::grow`] as the structure accumulates.
+    pub fn reserve(self: &Arc<Self>, bytes: u64) -> Result<MemoryReservation, MemoryError> {
+        self.try_allocate(bytes)?;
+        Ok(MemoryReservation {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+}
+
+// ============================================================================
+// MemoryReservation (RAII)
+// ============================================================================
+
+/// An outstanding reservation against a [`MemoryBudget`]. Releases its bytes
+/// back to the budget when dropped, so operator memory is accounted for exactly
+/// as long as the structure that holds it is alive.
+pub struct MemoryReservation {
+    budget: Arc<MemoryBudget>,
+    bytes: u64,
+}
+
+impl MemoryReservation {
+    /// Reserve `extra` additional bytes on top of what this guard already holds.
+    /// On failure the guard is unchanged (still holding its prior bytes) and the
+    /// caller should surface the error — the already-reserved bytes still release
+    /// on drop.
+    pub fn grow(&mut self, extra: u64) -> Result<(), MemoryError> {
+        self.budget.try_allocate(extra)?;
+        self.bytes += extra;
+        Ok(())
+    }
+
+    /// Bytes currently reserved by this guard.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for MemoryReservation {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.budget.deallocate(self.bytes);
+        }
+    }
 }
 
 // ============================================================================
