@@ -279,6 +279,49 @@ async fn test_encrypted_index_maintained_on_insert() {
     }
 }
 
+/// Regression: the inline INSERT hook must assign each row its true scan
+/// position, not the count of distinct ciphertexts. Two consecutive duplicate
+/// values followed by a new value used to collide (the third row got the same
+/// id as the second) because the hook keyed on `index.len()` (distinct-key
+/// count) instead of the running posting count. Plain autocommit INSERT no
+/// longer rebuilds, so this stood as a silent wrong-position result from
+/// ENCRYPTED_LOOKUP.
+#[tokio::test]
+async fn test_encrypted_index_insert_hook_positions_duplicates() {
+    unsafe {
+        std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef");
+    }
+    let ex = test_executor();
+    exec(&ex, "CREATE TABLE enc_dup (id INT, code TEXT)").await;
+    exec(
+        &ex,
+        "CREATE INDEX enc_dup_code ON enc_dup USING encrypted (code)",
+    )
+    .await;
+
+    // Order matters: two duplicates then a fresh value. Positions are 0, 1, 2.
+    exec(&ex, "INSERT INTO enc_dup VALUES (1, 'dup')").await;
+    exec(&ex, "INSERT INTO enc_dup VALUES (2, 'dup')").await;
+    exec(&ex, "INSERT INTO enc_dup VALUES (3, 'uniq')").await;
+
+    let lookup = |val: &str| {
+        let ex = &ex;
+        let sql = format!("SELECT ENCRYPTED_LOOKUP('enc_dup_code', '{val}') FROM enc_dup LIMIT 1");
+        async move {
+            let result = exec(ex, &sql).await;
+            match &rows(&result[0])[0][0] {
+                Value::Text(s) => s.clone(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        }
+    };
+
+    // 'uniq' is the third row → scan position 2, not 1.
+    assert_eq!(lookup("uniq").await, "2");
+    // Both duplicates keep their distinct positions.
+    assert_eq!(lookup("dup").await, "0,1");
+}
+
 #[tokio::test]
 async fn test_encrypted_index_row_ids_rebuilt_after_delete_and_rollback() {
     unsafe {
