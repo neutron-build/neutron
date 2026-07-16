@@ -1,0 +1,25 @@
+---
+title: Quantization
+description: Quantization formats for production LLM deployment.
+---
+
+Neutron for Mojo supports the quantization formats used in production LLM deployment, from basic 4-bit to FP8. See the [overview](/docs/mojo/overview) for the project's preview status.
+
+| Format | Bits | Block Size | Use Case |
+|--------|------|------------|----------|
+| `Q4_0` | 4 | 32 | Basic 4-bit |
+| `Q4_1` | 4+min | 32 | 4-bit with offset |
+| `Q8_0` | 8 | 32 | High-quality 8-bit |
+| `Q4_K_S` | 4 | K-quant | Small K-quant |
+| `Q4_K_M` | 4 | K-quant | Most common (best quality/size) |
+| `NF4` | 4 | NormalFloat | QLoRA fine-tuning |
+| `FP8_E4M3` | 8 | — | Training (4 exp, 3 mantissa) |
+| `FP8_E5M2` | 8 | — | Inference (5 exp, 2 mantissa) |
+
+```mojo
+from neutron.quant import QuantType
+
+let qt = QuantType.Q4_K_M
+qt.bits_per_element()  # 4
+qt.block_size()        # 32
+```

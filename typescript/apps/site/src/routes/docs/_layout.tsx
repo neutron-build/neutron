@@ -282,7 +282,12 @@ const sidebar = [
   },
   {
     label: "Mojo",
-    items: [{ label: "Overview", link: "/docs/mojo/overview" }],
+    items: [
+      { label: "Overview", link: "/docs/mojo/overview" },
+      { label: "Tensors & Kernels", link: "/docs/mojo/tensors" },
+      { label: "Quantization", link: "/docs/mojo/quantization" },
+      { label: "Inference", link: "/docs/mojo/inference" },
+    ],
   },
 ];
 
