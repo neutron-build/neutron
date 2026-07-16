@@ -162,7 +162,21 @@ export async function init() {
     if (anchor.hasAttribute("download")) return;
     if (anchor.origin !== window.location.origin) return;
 
-    const href = anchor.pathname + anchor.search;
+    // Same-page hash link (e.g. #work, or /current#section): let the browser
+    // scroll to the target natively instead of swallowing the hash. Without
+    // this early return the interceptor strips the hash and re-navigates
+    // hash-less, so in-page anchors never scroll.
+    if (
+      anchor.hash &&
+      anchor.pathname === window.location.pathname &&
+      anchor.search === window.location.search
+    ) {
+      return;
+    }
+
+    // Keep the hash so navigate() can preserve it and scroll on arrival for
+    // cross-page anchor links (e.g. /about#team).
+    const href = anchor.pathname + anchor.search + anchor.hash;
     event.preventDefault();
     navigate(href as RouteHref);
   });
