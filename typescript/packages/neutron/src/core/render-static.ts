@@ -24,6 +24,19 @@ export interface StaticRenderOptions {
   appRoot?: string;
 }
 
+/**
+ * Simplified standalone static renderer, exported from the package for testing
+ * the shared SSG concerns (fragment guard, head resolution) at the core-package
+ * level — see fragment-guard.test.ts.
+ *
+ * IMPORTANT: this is NOT the production build pipeline. `neutron-ts build` runs
+ * `neutron-cli/src/commands/build.ts`, which is the real, feature-complete
+ * static-render loop. This renderer intentionally does NOT support dynamic
+ * (`getStaticPaths`) routes — it renders param routes once with empty params —
+ * and only bakes no-param resource routes. When adding build features
+ * (dynamic resource routes, per-page `.md`, etc.), edit build.ts, not this
+ * file. Kept deliberately minimal to avoid a second divergent build path.
+ */
 export async function renderStatic(options: StaticRenderOptions): Promise<void> {
   const { routesDir, outputDir, baseUrl = "" } = options;
   // Prefer explicit appRoot; otherwise process.cwd() (CLI runs from the app).
