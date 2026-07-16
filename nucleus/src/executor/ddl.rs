@@ -1417,17 +1417,22 @@ impl Executor {
                     let mut hnsw = vector::HnswIndex::new(config);
                     let pk_column = self.resolve_pk_column(&table_name, &table_def);
                     let pk_col = pk_column.as_ref().and_then(|n| table_def.column_index(n));
+                    let mut registry = crate::executor::types::PkRegistry::default();
+                    // (node, vector) pairs captured during build, for the WAL loop.
+                    let mut wal_entries: Vec<(u64, Vec<f32>)> = Vec::new();
 
-                    // Scan existing rows and insert into index (PK-keyed stable id
-                    // when the table has an integer PK, else positional).
+                    // Scan existing rows into the index. Registry allocates a fresh
+                    // monotonic node id per PK; positional (no PK) uses the offset.
                     for (row_id, row) in existing_rows.iter().enumerate() {
                         if col_idx < row.len()
                             && let Value::Vector(v) = &row[col_idx]
                         {
-                            let id = pk_col
-                                .and_then(|pc| Self::stable_row_id(row, pc))
-                                .unwrap_or(row_id as u64);
-                            hnsw.insert(id, vector::Vector::new(v.clone()));
+                            let node = match pk_col.and_then(|pc| Self::stable_row_id(row, pc)) {
+                                Some(pk) => registry.upsert(pk).0,
+                                None => row_id as u64,
+                            };
+                            hnsw.insert(node, vector::Vector::new(v.clone()));
+                            wal_entries.push((node, v.clone()));
                         }
                     }
 
@@ -1438,6 +1443,7 @@ impl Executor {
                             column_name: col_name,
                             kind: VectorIndexKind::Hnsw(hnsw),
                             pk_column,
+                            registry,
                         },
                     );
 
@@ -1457,19 +1463,12 @@ impl Executor {
                         ) {
                             eprintln!("vector WAL: failed to log create_index '{index_name}': {e}");
                         }
-                        // Log existing row vectors under the same PK-keyed id.
-                        for (row_id, row) in existing_rows.iter().enumerate() {
-                            if col_idx < row.len()
-                                && let Value::Vector(v) = &row[col_idx]
-                            {
-                                let id = pk_col
-                                    .and_then(|pc| Self::stable_row_id(row, pc))
-                                    .unwrap_or(row_id as u64);
-                                if let Err(e) = wal.log_insert(&index_name, id, v, "") {
-                                    eprintln!(
-                                        "vector WAL: failed to log insert for '{index_name}/{id}': {e}"
-                                    );
-                                }
+                        // Log existing row vectors under their assigned node ids.
+                        for (node, v) in &wal_entries {
+                            if let Err(e) = wal.log_insert(&index_name, *node, v, "") {
+                                eprintln!(
+                                    "vector WAL: failed to log insert for '{index_name}/{node}': {e}"
+                                );
                             }
                         }
                         self.save_vector_index_meta();
@@ -1514,6 +1513,7 @@ impl Executor {
                             column_name: col_name,
                             kind: VectorIndexKind::IvfFlat(ivf),
                             pk_column: None,
+                            registry: crate::executor::types::PkRegistry::default(),
                         },
                     );
                 }
