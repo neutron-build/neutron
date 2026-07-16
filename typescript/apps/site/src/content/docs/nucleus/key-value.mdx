@@ -106,11 +106,11 @@ SELECT KV_ZRANGE('leaderboard', 0, 9);
 -- Get by score range
 SELECT KV_ZRANGEBYSCORE('leaderboard', 100.0, 200.0);
 
--- Get rank
-SELECT KV_ZRANK('leaderboard', 'player2');
+-- Count members
+SELECT KV_ZCARD('leaderboard');
 
--- Get score
-SELECT KV_ZSCORE('leaderboard', 'player2');
+-- Remove a member
+SELECT KV_ZREM('leaderboard', 'player2');
 ```
 
 ## HyperLogLog

@@ -8,7 +8,7 @@ Multi-model database engine in Rust. Single binary, no external dependencies at 
 - Geo uses a **custom R-tree** (NOT H3)
 - RESP protocol module at `src/resp/`
 - KV fast path at `src/wire/kv_fast_path.rs`
-- The executor (`src/executor/mod.rs`) is the single largest file (~26K lines)
+- The executor (`src/executor/mod.rs`) is the single largest file (~5K lines)
 
 ## After Code Changes
 

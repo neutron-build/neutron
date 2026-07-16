@@ -6,7 +6,7 @@ import CodeBlock from "../components/CodeBlock";
 export function head() {
   return {
     title: "Lean 4 Proofs - Neutron",
-    description: "Machine-checked proofs for Nucleus's core algorithms. 26 proof files, zero sorry, 100% proven. MVCC, B-tree, WAL, Raft, HMAC, Bloom, LRU &mdash; verified, not just tested.",
+    description: "Machine-checked Lean 4 proofs of the algorithms behind Nucleus. 26 files, 70 theorems, zero sorry. MVCC, B-tree, WAL, Raft, HMAC, Bloom, LRU &mdash; the designs proven correct, not just tested.",
   };
 }
 
@@ -14,22 +14,22 @@ export default function LeanPage() {
   return (
     <ProductPage
       title="Lean 4 Proofs"
-      description="Machine-checked correctness proofs for the algorithms Nucleus depends on. 26 proof files, zero uses of sorry, 100% proven. When the compiler accepts the file, the algorithm is right &mdash; for all inputs, forever."
+      description="Machine-checked correctness proofs for the algorithms Nucleus is built on. 26 files, 70 theorems, zero uses of sorry. Each proof covers a Lean model of the algorithm &mdash; MVCC, B-tree, WAL, Raft and more &mdash; correct for every input, not just the cases a test happened to try."
       category="tool"
       status="available"
       accent="var(--accent-lean)"
       heroAccentRgb="59, 130, 246"
-      heroTagline="Don't test. Prove."
+      heroTagline="Don't just test. Prove."
       stats={[
-        { value: '26', label: 'Proof Files' },
+        { value: '26', label: 'Model Files' },
+        { value: '70', label: 'Theorems' },
         { value: '0', label: 'Uses of sorry' },
-        { value: '100%', label: 'Proven' },
         { value: 'Lean 4', label: 'Prover' },
       ]}
     >
       <section>
         <h2>The algorithms that can't get this wrong.</h2>
-        <p>Nucleus handles your transactions, replicates your data, and signs your tokens &mdash; tests alone aren't enough for that kind of code. Neutron's Lean 4 suite contains machine-checked proofs of the core algorithms: MVCC snapshot isolation, B-tree invariants, write-ahead log durability, Raft safety, HMAC verification, Bloom filter false-positive bounds, LRU eviction correctness, and sliding-window rate limiting. Every proof compiles with zero use of <code>sorry</code>.</p>
+        <p>Nucleus handles your transactions, replicates your data, and signs your tokens &mdash; tests alone aren't enough for that kind of code. Neutron's Lean 4 suite contains machine-checked proofs of the core algorithms: MVCC snapshot isolation, B-tree invariants, write-ahead log durability, Raft safety, HMAC verification, Bloom filter false-positive bounds, LRU eviction correctness, and sliding-window rate limiting. Every proof compiles with zero use of <code>sorry</code> &mdash; against precise Lean models of each algorithm, with a handful of foundational facts (like SHA-256 collision resistance) declared as explicit, auditable axioms.</p>
       </section>
 
       <CodeBlock filename="proofs/MVCC.lean" annotation="A sample of what's in the suite. The full file proves snapshot isolation.">
@@ -66,12 +66,12 @@ end Nucleus.MVCC`}</code></pre>
           <div class="feature-card__desc">Bloom filter false-positive bound proven. LRU eviction ordering proven. Sliding-window rate limiter proven fair.</div>
         </div>
         <div class="feature-card">
-          <div class="feature-card__title">Zero sorry</div>
-          <div class="feature-card__desc">Every theorem in the suite has a complete proof. <code>sorry</code> (the "trust me" keyword) appears nowhere. When the file compiles, the theorem is proven.</div>
+          <div class="feature-card__title">Zero sorry, axioms in the open</div>
+          <div class="feature-card__desc">No <code>sorry</code> anywhere in the suite. The facts we don't derive from scratch &mdash; bitwise identities, standard crypto assumptions &mdash; are declared as explicit axioms you can read and audit, not hidden.</div>
         </div>
         <div class="feature-card">
-          <div class="feature-card__title">Compiled to native</div>
-          <div class="feature-card__desc">Lean 4 is a programming language, not just a proof assistant. The same definitions that we prove correct compile to C and run in production.</div>
+          <div class="feature-card__title">Executable models</div>
+          <div class="feature-card__desc">Lean 4 is a real programming language, so each proof runs against an executable model of the algorithm. Nucleus implements the same design in Rust &mdash; the proof pins down what "correct" means for the hard parts.</div>
         </div>
       </FeatureGrid>
 
@@ -90,13 +90,13 @@ end Nucleus.MVCC`}</code></pre>
 
       <section>
         <h3>Where this shows up in Neutron</h3>
-        <p>Every algorithm proven here is live in Nucleus. The B-tree is the SQL index. The WAL is every durable write. Raft runs replication. HMAC signs every JWT. When your app writes to Nucleus, it's running algorithms that have machine-checked proofs of correctness sitting next to the source.</p>
+        <p>Every algorithm modeled here is one Nucleus runs. The B-tree is the SQL index. The WAL is every durable write. Raft runs replication. HMAC signs every JWT. The proofs don't certify the compiled binary &mdash; they pin down the designs it's built on, so the parts that are hardest to get right are specified and machine-checked instead of improvised.</p>
 
         <h3>What about my application code?</h3>
         <p>You don't need to write Lean to use Nucleus &mdash; the proofs are ours to maintain. For your own code, <a href="/docs/verification/overview">Neutron's verification overview</a> covers Kani (bounded model checking for Rust), Shuttle (concurrency testing), Verus (SMT verification), and Quint (protocol modeling). Different tools for different problems.</p>
 
         <h3>Part of a bigger system</h3>
-        <p>Lean sits underneath Nucleus. Your app talks to Nucleus. Nucleus runs algorithms whose correctness is proven in Lean. Three layers, one property: when a query returns a row, it's the right row.</p>
+        <p>Lean sits underneath Nucleus. Your app talks to Nucleus. Nucleus runs the algorithms whose designs are proven in Lean. The proof doesn't replace the tests on the Rust &mdash; it means the algorithm those tests exercise is known, mathematically, to be sound.</p>
       </section>
     </ProductPage>
   );

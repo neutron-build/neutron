@@ -20,7 +20,7 @@ export default function HomePage() {
           <div class="container hero__content">
             <div class="hero__text">
               <p class="hero__eyebrow" data-animate>
-                The Complete Stack
+                The full-stack framework ecosystem
               </p>
               <h1
                 class="hero__title"
@@ -67,7 +67,7 @@ export default function HomePage() {
           <div class="container">
             <div class="stats__grid">
               <div class="stats__item" data-animate>
-                <span class="stats__number">6+</span>
+                <span class="stats__number">8</span>
                 <span class="stats__label">Languages</span>
               </div>
               <div
@@ -91,8 +91,8 @@ export default function HomePage() {
                 data-animate
                 style="--animate-delay: 0.3s"
               >
-                <span class="stats__number">0</span>
-                <span class="stats__label">Compromises</span>
+                <span class="stats__number">2,596</span>
+                <span class="stats__label">Database tests</span>
               </div>
             </div>
           </div>
@@ -214,7 +214,7 @@ export default function HomePage() {
                     </span>
                   </div>
                   <p class="products__desc">
-                    High-performance backend. Trie router, middleware, JWT, WebSocket, SSE. 1,161 tests across 18 crates. Also powers Desktop via Tauri.
+                    High-performance backend. Trie router, middleware, JWT, WebSocket, SSE. 1,210 tests across 19 crates. Also powers Desktop via Tauri.
                   </p>
                   <span class="products__link">Learn more &rarr;</span>
                 </div>
@@ -228,13 +228,13 @@ export default function HomePage() {
                 <div class="products__inner">
                   <div class="products__header">
                     <span class="products__name">Mojo</span>
-                    <span class="products__badge products__badge--available">
-                      Available
+                    <span class="products__badge">
+                      Preview
                     </span>
                   </div>
                   <p class="products__desc">
-                    ML tensor library. 110+ test suites, SIMD kernels, 5
-                    quant formats, inference pipeline, training stack.
+                    ML tensor library. SIMD kernels, 6 quant formats,
+                    inference pipeline, training stack. Awaiting Mojo 1.0.
                   </p>
                   <span class="products__link">Get started &rarr;</span>
                 </div>
@@ -372,11 +372,13 @@ export default function HomePage() {
               >
                 <div class="products__inner">
                   <div class="products__header">
-                    <span class="products__name">Client / ORM</span>
-                    <span class="products__badge">Planned</span>
+                    <span class="products__name">Client</span>
+                    <span class="products__badge products__badge--available">
+                      Available
+                    </span>
                   </div>
                   <p class="products__desc">
-                    Type-safe queries for all 14 models.
+                    Type-safe queries for all 14 models. Schema-in-code ORM planned.
                   </p>
                 </div>
               </a>

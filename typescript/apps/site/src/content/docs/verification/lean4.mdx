@@ -3,7 +3,7 @@ title: Lean 4 Proofs
 description: Machine-checked algorithm proofs for Nucleus.
 ---
 
-The `lean4/` directory contains machine-checked proofs of critical Nucleus algorithms using the Lean 4 proof assistant. These proofs provide mathematical guarantees that core database algorithms are correct.
+The `lean4/` directory contains machine-checked proofs of Nucleus's core algorithms, written in the Lean 4 proof assistant. Each proof targets a Lean **model** of an algorithm — a precise, hand-written translation of the Rust design — and shows the model holds for every input, not just tested cases. This gives mathematical confidence in the algorithm *designs* Nucleus implements; it is a proof about the models, not about the compiled Rust binary itself.
 
 ## What's Verified
 
@@ -66,21 +66,33 @@ lean4/Nucleus/
 
 ## How It Works
 
-1. **Aeneas models** translate Rust types and functions into Lean 4 equivalents
+1. **Models** capture each algorithm's Rust types and functions as Lean 4 definitions. These are hand-written to mirror `nucleus/src`. (The `Aeneas/` naming reflects the long-term goal of auto-generating them with [Aeneas](https://github.com/AeneasVerif/aeneas); today they are maintained by hand.)
 2. **Specs** state the properties to prove as Lean theorems
 3. **Proofs** provide machine-checked evidence that the properties hold
 4. Lean's type checker verifies every proof step — no human trust required
 
-## Example: No False Negatives
+## Example: Empty WAL Recovery
 
 ```lean
-theorem no_false_negatives (bf : BloomFilter) (item : List UInt8) :
-    bf.insert(item).mayContain(item) = true := by
-  sorry  -- proof in progress
+-- Proofs/WalProofs.lean — proven with `simp`, no `sorry`, no axioms
+/-- An empty WAL has no recovery records. -/
+theorem empty_wal_no_recovery :
+    (WAL.mk [] 0 0).recoveryRecords = [] := by
+  simp [WAL.recoveryRecords]
 ```
 
-This theorem states: after inserting an item into a Bloom filter, `mayContain` always returns `true` for that item.
+This holds for the model by construction — Lean checks it for every case, not just the ones a test would try.
+
+## Axioms and Assumptions
+
+The suite compiles with **zero `sorry`**, but it declares **28 explicit `axiom`s** — facts assumed rather than derived from Lean's core. Being explicit about them is the point: what is assumed is stated in the open and can be audited. They fall into three groups:
+
+- **Foundational identities** — e.g. `n ^^^ n = 0`. True and mechanical; axiomatized to avoid pulling in heavy `Nat`/bitwise libraries.
+- **Standard cryptographic assumptions** — e.g. SHA-256 collision resistance (`sha256_collision_resistant`), HMAC PRF security. These are unprovable by nature; every crypto proof assumes them.
+- **Open proof obligations** — a few structural lemmas (notably in `Structures/BloomSpec.lean` and `Structures/LruSpec.lean`) are currently *assumed* rather than fully discharged. Discharging these is tracked work.
+
+So the guarantees are **modulo these axioms**. The MVCC, WAL, and Raft models are proven without any load-bearing assumptions of their own.
 
 ## Status
 
-Proofs are in active development. Some use `sorry` (proof obligation marker) for theorems that are stated but not yet fully proven. The Lean type checker ensures that completed proofs are correct.
+All 26 files compile with **0 `sorry`** across **70 theorems**. The proofs cover Lean models of the algorithms listed above; they do not (yet) prove properties of the production Rust directly. The open threads are discharging the remaining structural axioms and moving from hand-written models toward Aeneas-generated ones.

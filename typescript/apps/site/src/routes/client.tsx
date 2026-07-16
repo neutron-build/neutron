@@ -13,7 +13,7 @@ export default function ClientPage() {
   return (
     <ProductPage
       title="Nucleus Client"
-      description="The typed database client that lives in every Neutron SDK. All 14 data models through one API &mdash; SQL, KV, Vector, Graph, Time-series, and nine more &mdash; idiomatic in whichever language you reach for."
+      description="The typed database client that lives in every Neutron SDK. All 14 data models through one API &mdash; SQL, KV, Vector, Graph, Time-series, and eight more &mdash; idiomatic in whichever language you reach for."
       category="tool"
       status="available"
       accent="var(--accent-client)"

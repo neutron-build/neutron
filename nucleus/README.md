@@ -44,9 +44,8 @@ SELECT kv_del('session:abc');                         -- delete
 Column-oriented storage for analytics. Per-column vectors with vectorized aggregation. WAL-backed for durability.
 
 ```sql
-SELECT columnar_create('events', 'timestamp,user_id,action,duration');
-SELECT columnar_insert('events', '2024-01-01T00:00:00,1,click,150');
-SELECT columnar_aggregate('events', 'duration', 'avg');
+SELECT COLUMNAR_INSERT('events', '2024-01-01T00:00:00,1,click,150');
+SELECT COLUMNAR_AVG('events', 'duration');  -- also COLUMNAR_SUM / COUNT / MIN / MAX
 ```
 
 ### Vector
@@ -54,10 +53,11 @@ SELECT columnar_aggregate('events', 'duration', 'avg');
 HNSW index for approximate nearest-neighbor search. Supports cosine, L2, and inner product distance metrics. WAL-backed.
 
 ```sql
-SELECT vector_insert('embeddings', 1, '[0.1, 0.2, ...]');
-SELECT * FROM vector_search('embeddings', '[0.1, 0.2, ...]', 10);
--- with metadata filter (filter-aware traversal, no false negatives)
-SELECT * FROM vector_search('embeddings', '[0.1, 0.2, ...]', 10, '{"category": "news"}');
+-- Insert vectors into a table with a vector column, then search by distance.
+INSERT INTO embeddings (id, embedding) VALUES (1, VECTOR('[0.1, 0.2, ...]'));
+SELECT id FROM embeddings
+  ORDER BY VECTOR_DISTANCE(embedding, VECTOR('[0.1, 0.2, ...]')) LIMIT 10;
+-- metrics: VECTOR_DISTANCE (L2), VECTOR_COSINE_DISTANCE, VECTOR_INNER_PRODUCT
 ```
 
 ### Timeseries
@@ -89,9 +89,9 @@ SELECT doc_count('posts');
 Custom inverted index with BM25 ranking. Supports field boosting, phrase queries, fuzzy matching (Levenshtein), and 6-language stemmers (English, German, French, Spanish, Italian, Portuguese). WAL-backed with binary persistence.
 
 ```sql
-SELECT fts_index('articles', 1, 'Machine learning transformers explained');
-SELECT * FROM fts_search('articles', 'machine learning', 10);
-SELECT * FROM fts_search_ranked('articles', 'transformers', 10);
+SELECT FTS_INDEX('articles', 1, 'Machine learning transformers explained');
+SELECT * FROM FTS_SEARCH('articles', 'machine learning', 10);
+SELECT * FROM FTS_RANK('articles', 'transformers', 10);  -- BM25-ranked
 ```
 
 ### Graph
@@ -99,10 +99,10 @@ SELECT * FROM fts_search_ranked('articles', 'transformers', 10);
 Native graph engine with adjacency lists, CSR format for read-heavy traversals, and a Cypher query subset. Supports BFS, DFS, Dijkstra shortest path, label indexes, and property indexes. WAL-backed.
 
 ```sql
-SELECT graph_add_node(1, ARRAY['Person'], '{"name": "Alice"}');
-SELECT graph_add_edge(1, 2, 'follows', '{"since": "2024-01-01"}');
-SELECT * FROM graph_neighbors(1, 'follows');
-SELECT * FROM graph_path(1, 5, 'follows', 3);   -- shortest path, max depth 3
+SELECT GRAPH_ADD_NODE(1, ARRAY['Person'], '{"name": "Alice"}');
+SELECT GRAPH_ADD_EDGE(1, 2, 'follows', '{"since": "2024-01-01"}');
+SELECT * FROM GRAPH_NEIGHBORS(1, 'follows');
+SELECT * FROM GRAPH_SHORTEST_PATH(1, 5);   -- shortest path between two nodes
 ```
 
 ### Geo
@@ -110,9 +110,10 @@ SELECT * FROM graph_path(1, 5, 'follows', 3);   -- shortest path, max depth 3
 Custom R-tree spatial index with PostGIS-compatible function signatures. Supports point-in-radius queries, polygon containment, distance calculations (Haversine for geographic, Euclidean for Cartesian), and area computation.
 
 ```sql
-SELECT geo_insert('locations', 1, 37.7749, -122.4194);    -- (lat, lon)
-SELECT * FROM geo_radius('locations', 37.7749, -122.4194, 1000);  -- 1km radius
-SELECT * FROM geo_polygon_contains('locations', '[[...]]'); -- GeoJSON polygon
+-- Points are stored as normal columns; query with spatial functions.
+SELECT GEO_DISTANCE(37.7749, -122.4194, 34.0522, -118.2437);  -- Haversine metres
+SELECT GEO_WITHIN(37.7749, -122.4194, 37.7750, -122.4195, 1000);  -- within 1 km?
+SELECT GEO_AREA('[[...]]');  -- polygon area
 ```
 
 ### Blob/Object Store
@@ -120,10 +121,10 @@ SELECT * FROM geo_polygon_contains('locations', '[[...]]'); -- GeoJSON polygon
 Content-addressed chunk storage with deduplication (BLAKE3 hashing). Supports byte-range reads, tagging, and multi-chunk large objects. WAL-backed.
 
 ```sql
-SELECT blob_store('attachments', 'file.pdf', <binary_data>);
-SELECT blob_get('attachments', 'file.pdf');
-SELECT blob_get_range('attachments', 'file.pdf', 0, 1024);  -- first 1KB
-SELECT blob_tag('attachments', 'file.pdf', 'type', 'pdf');
+SELECT BLOB_STORE('file.pdf', '<hex-encoded-bytes>', 'application/pdf');  -- (key, data, content-type)
+SELECT BLOB_GET('file.pdf');
+SELECT BLOB_META('file.pdf');   -- size, content-type, chunk/dedup info
+SELECT BLOB_TAG('file.pdf', 'type', 'pdf');
 ```
 
 ### Datalog

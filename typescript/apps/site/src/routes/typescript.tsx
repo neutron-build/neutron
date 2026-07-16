@@ -257,19 +257,19 @@ export default function Home() {
             </p>
 
             <div class="server-performance__metrics">
-              <MetricCard value="~3,500" label="Avg Requests/sec" description="Across 8 scenarios" variant="excellent" animateDelay={0.1} />
-              <MetricCard value="8,262" label="Peak RPS" description="Static pages" variant="excellent" animateDelay={0.15} />
-              <MetricCard value="~4x" label="Faster than Next.js" description="vs ~830 RPS average" variant="good" animateDelay={0.2} />
-              <MetricCard value="~5x" label="Faster than Astro" description="vs ~634 RPS average" variant="good" animateDelay={0.25} />
+              <MetricCard value="~18,500" label="Avg Requests/sec" description="Across 8 scenarios" variant="excellent" animateDelay={0.1} />
+              <MetricCard value="~22,000" label="Static RPS" description="GET / , node track" variant="excellent" animateDelay={0.15} />
+              <MetricCard value="~2.7x" label="Faster than Next.js" description="vs ~6,800 RPS average" variant="good" animateDelay={0.2} />
+              <MetricCard value="~1.7x" label="Faster than Astro" description="vs ~11,100 RPS average" variant="good" animateDelay={0.25} />
             </div>
 
             <BenchmarkBars
               bars={[
-                { label: 'Neutron', value: '~3,500 RPS avg', width: 100, color: 'var(--accent-ts)' },
-                { label: 'Neutron (React)', value: '~2,870 RPS avg', width: 82, color: '#5A8EC6' },
-                { label: 'Next.js', value: '~830 RPS avg', width: 24, color: '#666666' },
-                { label: 'Astro', value: '~634 RPS avg', width: 18, color: '#FF5D01' },
-                { label: 'Remix 3', value: '~277 RPS avg', width: 8, color: '#888888' },
+                { label: 'Neutron', value: '~18,500 RPS avg', width: 95, color: 'var(--accent-ts)' },
+                { label: 'Neutron (React compat)', value: '~19,500 RPS avg', width: 100, color: '#5A8EC6' },
+                { label: 'Astro', value: '~11,100 RPS avg', width: 57, color: '#FF5D01' },
+                { label: 'Next.js', value: '~6,800 RPS avg', width: 35, color: '#666666' },
+                { label: 'Remix 3 (RR7)', value: '~5,200 RPS avg', width: 27, color: '#888888' },
               ]}
             />
 
@@ -283,16 +283,16 @@ export default function Home() {
               <h3>Why Neutron is Faster</h3>
               <p class="server-performance__desc">The performance gap comes from architecture, not tricks:</p>
               <div class="server-performance__breakdown">
-                <p><strong>Static routes skip the render pipeline.</strong> No React, no virtual DOM, no component tree. A static route is string concatenation. This is why static pages hit 8,262 RPS while Next.js hits 2,756.</p>
+                <p><strong>Static routes skip the render pipeline.</strong> No React, no virtual DOM, no component tree. A static route is string concatenation. This is why static pages hit ~22,000 RPS while Next.js serves ~10,800.</p>
                 <p><strong>App routes use Preact instead of React.</strong> Preact's server render is lighter — 3 KB vs ~42 KB. That means faster SSR and smaller bundles. Your database will still be the bottleneck, but you'll have more headroom.</p>
               </div>
             </div>
 
             <div class="server-performance__cost" data-animate style={{ "--animate-delay": "0.4s" } as any}>
               <h3>What This Means in Practice</h3>
-              <p class="server-performance__cost-desc">A ~4x throughput advantage means you can serve the same traffic with fewer servers. For most applications, the database is the real bottleneck — but when you do need to scale horizontally, that headroom matters.</p>
+              <p class="server-performance__cost-desc">A ~2.7x throughput advantage over Next.js means you can serve the same traffic with fewer servers. For most applications, the database is the real bottleneck — but when you do need to scale horizontally, that headroom matters.</p>
               <p class="server-performance__note">
-                All benchmarks are production builds tested with autocannon (80 concurrent connections, 5s duration). Full methodology and raw data available in the <a href="/blog/neutron-vs-nextjs-benchmarks-2026">benchmark blog post</a>. We encourage you to run the benchmarks on your own hardware.
+                All benchmarks are production builds tested with autocannon (80 concurrent connections, 5s duration). The full harness &mdash; every scenario, every framework, reproducible &mdash; is <a href="https://github.com/neutron-build/neutron/tree/main/typescript/benchmarks">open on GitHub</a>. We encourage you to run it on your own hardware.
               </p>
             </div>
           </div>
@@ -336,7 +336,7 @@ export default function Home() {
                   <span class="ecosystem__name">Rust</span>
                   <span class="ecosystem__status ecosystem__status--available">Available</span>
                 </div>
-                <p class="ecosystem__role">Systems-level performance. 1,161 tests, trie router, middleware, JWT, WebSocket, SSE.</p>
+                <p class="ecosystem__role">Systems-level performance. 1,210 tests, trie router, middleware, JWT, WebSocket, SSE.</p>
               </a>
               <a href="/mojo" class="ecosystem__row" data-animate style={{ "--row-accent": "var(--accent-mojo)", "--animate-delay": "0.25s" } as any}>
                 <div class="ecosystem__product">
@@ -350,7 +350,7 @@ export default function Home() {
                   <span class="ecosystem__name">Nucleus</span>
                   <span class="ecosystem__status ecosystem__status--available">Available</span>
                 </div>
-                <p class="ecosystem__role">14-in-1 database. 3,724 tests, PostgreSQL compatible, MVCC, columnar OLAP.</p>
+                <p class="ecosystem__role">14-in-1 database. 2,596 tests, PostgreSQL compatible, MVCC, columnar OLAP.</p>
               </a>
             </div>
           </div>
