@@ -290,3 +290,29 @@
     font-size: 1.375rem;
   }
 }
+
+/* Shared closing CTA — gives every product page a consistent end cap. */
+.product-cta {
+  border-top: 1px solid var(--border);
+  margin-top: var(--space-9);
+  padding: var(--space-9) 0;
+}
+
+.product-cta__inner {
+  text-align: center;
+}
+
+.product-cta__title {
+  font-family: var(--font-serif);
+  font-size: clamp(1.75rem, 4vw, 2.5rem);
+  font-weight: 400;
+  letter-spacing: -0.02em;
+  margin-bottom: var(--space-6);
+}
+
+.product-cta__actions {
+  display: flex;
+  gap: var(--space-4);
+  justify-content: center;
+  flex-wrap: wrap;
+}
