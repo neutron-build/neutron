@@ -1,0 +1,84 @@
+---
+title: Ecosystem Extensions
+description: Bridges to DataFrames, DifferentialEquations, Flux, CUDA, Makie, and more.
+---
+
+Neutron for Julia integrates with the scientific-computing ecosystem through package extensions. Each loads automatically when you import both `NeutronJulia` and the target package (the Julia weak-dependency pattern) — no extra setup.
+
+## DataFrames
+
+```julia
+using NeutronJulia, DataFrames
+
+rows = query(sql(client), "SELECT * FROM sales")
+df = DataFrame(rows)  # Automatic conversion
+```
+
+## DifferentialEquations
+
+Store ODE/SDE solutions directly in Nucleus TimeSeries:
+
+```julia
+using NeutronJulia, DifferentialEquations
+
+# Solve a system
+prob = ODEProblem(lorenz!, u0, tspan, p)
+sol = solve(prob, Tsit5(), saveat=0.01)
+
+# Store solution — each variable becomes a separate series
+ts = timeseries(client)
+store!(ts, sol, "lorenz:run1"; variable_names=["x", "y", "z"])
+
+# Retrieve later
+t, u = load_solution(ts, "lorenz:run1", ["x", "y", "z"])
+# t::Vector{Float64} (seconds)
+# u::Matrix{Float64} (n_vars x n_points)
+```
+
+## ModelingToolkit
+
+Symbolic variable names flow through to TimeSeries storage:
+
+```julia
+using NeutronJulia, ModelingToolkit
+
+# Variable names from an MTK system are used as series names automatically
+```
+
+## Flux (ML)
+
+Generate embeddings with Flux models and store them in Nucleus Vector:
+
+```julia
+using NeutronJulia, Flux
+
+model = Chain(Dense(768, 384), relu, Dense(384, 128))
+embedding = model(input_data)
+
+v = vector(client)
+# Store and search embeddings
+```
+
+## CUDA
+
+GPU-accelerated vector similarity search:
+
+```julia
+using NeutronJulia, CUDA
+
+# Vector operations accelerated on NVIDIA GPUs
+```
+
+## Makie
+
+Plot TimeSeries data directly:
+
+```julia
+using NeutronJulia, CairoMakie
+
+ts = timeseries(client)
+fig = plot_timeseries!(ts, "cpu_usage", start_ms, end_ms)
+save("cpu.png", fig)
+```
+
+Each extension lives in `ext/` (`NeutronJuliaDataFramesExt.jl`, `NeutronJuliaDiffEqExt.jl`, `NeutronJuliaMTKExt.jl`, `NeutronJuliaGraphsExt.jl`, `NeutronJuliaFluxExt.jl`, `NeutronJuliaCUDAExt.jl`, `NeutronJuliaMakieExt.jl`) and requires Julia 1.9+.
