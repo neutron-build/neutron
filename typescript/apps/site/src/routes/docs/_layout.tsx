@@ -1,8 +1,25 @@
+import { getCollection } from "@neutron-build/core";
+import { SearchShell } from "../../components/docs/SearchShell";
+
+interface DocEntry {
+  slug: string;
+  data: { title: string; description?: string };
+}
+
 interface DocsLayoutProps {
   children: any;
-  title?: string;
-  description?: string;
+  data?: { entries?: DocEntry[] };
   currentPath?: string;
+}
+
+// Layout loader: feed the docs collection to the client-side Search island.
+export async function loader() {
+  const docs = await getCollection("docs");
+  const entries: DocEntry[] = docs.map((d: any) => ({
+    slug: d.slug,
+    data: { title: d.data.title, description: d.data.description },
+  }));
+  return { entries };
 }
 
 const sidebar = [
@@ -293,13 +310,13 @@ const sidebar = [
 
 export default function DocsLayout({
   children,
-  title,
-  description,
+  data,
   currentPath = "",
 }: DocsLayoutProps) {
   return (
     <div class="docs-container container">
         <aside class="sidebar">
+          <SearchShell entries={data?.entries} />
           {sidebar.map((section) => (
             <div class="sidebar-section" key={section.label}>
               <h3>{section.label}</h3>
