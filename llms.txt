@@ -5,6 +5,7 @@
 - Website: https://neutron.build
 - Docs: https://neutron.build/docs
 - Full docs (single file, for ingestion): https://neutron.build/llms-full.txt
+- Any docs page is also available as raw markdown at its URL + ".md" (e.g. https://neutron.build/docs/routing/app-routes.md)
 - Source: https://github.com/neutron-build/neutron
 - License: MIT (frameworks) | BSL 1.1 → MIT on 2046-01-01 (Nucleus)
 
