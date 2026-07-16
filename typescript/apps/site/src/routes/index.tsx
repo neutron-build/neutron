@@ -246,7 +246,7 @@ export default function HomePage() {
                     </span>
                   </div>
                   <p class="products__desc">
-                    ML tensor library. SIMD kernels, 6 quant formats,
+                    ML tensor library. SIMD kernels, 8 quant formats,
                     inference pipeline, training stack. Awaiting Mojo 1.0.
                   </p>
                   <span class="products__link">Get started &rarr;</span>

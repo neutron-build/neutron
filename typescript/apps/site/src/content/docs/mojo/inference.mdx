@@ -1,0 +1,118 @@
+---
+title: Inference
+description: Neural network layers, the generation pipeline, graph fusion, and serving.
+---
+
+Neutron for Mojo ships pre-built model architectures, an end-to-end generation pipeline, an algebraic graph optimizer, and serving surfaces. See the [overview](/docs/mojo/overview) for the project's preview status.
+
+## Neural Network Layers
+
+### Models
+
+Pre-built model architectures:
+
+| Model | Description |
+|-------|-------------|
+| LLaMA | Meta's LLaMA family |
+| Phi | Microsoft Phi series |
+| Mistral | Mistral AI models |
+| GPT | GPT-2/NeoX variants |
+
+### Key Components
+
+```mojo
+from neutron.nn import Attention, KVCache, RoPE, BPETokenizer
+
+# Attention with KV cache
+let cache = KVCache(max_seq_len=4096, n_heads=32, head_dim=128)
+let output = Attention(Q, K, V, cache)
+
+# Rotary position embeddings
+let Q_rot, K_rot = RoPE(Q, K, position)
+
+# Tokenization
+let tokenizer = BPETokenizer.load("tokenizer.json")
+let tokens = tokenizer.encode("Hello, world!")
+let text = tokenizer.decode(tokens)
+```
+
+## Inference Pipeline
+
+End-to-end text generation from quantized models:
+
+```mojo
+from neutron.nn import Q4Model, q4_pipeline_generate, PipelineConfig
+
+let model = Q4Model.load("model.gguf")
+let tokenizer = BPETokenizer.load("tokenizer.json")
+
+let config = PipelineConfig(
+    max_tokens=512,
+    temperature=0.7,
+    top_p=0.9,
+    chat_template="llama",  # or "chatml"
+)
+
+let response = q4_pipeline_generate(model, tokenizer, "What is Rust?", config)
+```
+
+### Pipeline Steps
+
+1. Apply chat template (LLaMA, ChatML, etc.)
+2. Encode prompt with BPE tokenizer
+3. Create KV cache (quantized to Q8 for memory efficiency)
+4. Prefill all prompt tokens
+5. Autoregressive decode with sampling (temperature, top-p, repetition penalty)
+6. Decode output tokens back to text
+
+## E-Graph Optimizer
+
+Algebraic rewrite engine for compute graph fusion — 30+ rules:
+
+| Category | Examples |
+|----------|---------|
+| Identity | `x + 0 → x`, `x * 1 → x` |
+| Idempotence | `relu(relu(x)) → relu(x)` |
+| Involution | `transpose(transpose(x)) → x` |
+| Translation invariance | `softmax(x + c) → softmax(x)` |
+| Operator fusion | `gelu(linear(x)) → fused_linear_gelu(x)` |
+| Reassociation | `matmul(A, matmul(B, C)) → matmul(matmul(A, B), C)` |
+
+The optimizer represents the compute graph as an e-graph (equality saturation) and applies rewrite rules until no more simplifications are possible.
+
+## Serving
+
+### Text Protocol
+
+Lightweight stdin/stdout protocol for local inference:
+
+```
+REQUEST
+prompt=What is Rust?
+max_tokens=256
+temperature=0.7
+
+RESPONSE
+text=Rust is a systems programming language...
+tokens=42
+time_ms=1523
+```
+
+### HTTP Server
+
+OpenAI-compatible API:
+
+```
+POST /v1/completions
+POST /v1/chat/completions
+```
+
+Supports streaming responses.
+
+## Model I/O
+
+| Format | Read | Write | Description |
+|--------|------|-------|-------------|
+| GGUF | Yes | Yes | llama.cpp quantized models |
+| SafeTensors | Yes | Yes | HuggingFace format |
+| Checkpoints | Yes | Yes | Training checkpoints |
