@@ -197,6 +197,20 @@ impl StorageEngine for BufferedDiskEngine {
         Ok(rows)
     }
 
+    async fn scan_limit(&self, table: &str, limit: usize) -> Result<Vec<Row>, StorageError> {
+        // With a live transaction buffer the limit must be applied to the
+        // buffered view (buffered inserts/deletes shift which rows are the
+        // "first n"), so fall back to the full materialize-then-truncate path.
+        // In auto-commit mode there is no buffer, so delegate to the inner
+        // engine's early-exit scan.
+        if self.is_in_txn() {
+            let mut rows = self.scan(table).await?;
+            rows.truncate(limit);
+            return Ok(rows);
+        }
+        self.inner.scan_limit(table, limit).await
+    }
+
     fn fast_count_all(&self, table: &str) -> Option<usize> {
         let mut count = self.inner.fast_count_all(table)?;
         // Adjust for buffered transaction ops
@@ -446,6 +460,39 @@ mod tests {
 
         let rows = engine.scan("t").await.unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn scan_limit_early_exit_in_auto_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _) = setup(tmp.path().join("limit_auto.db").as_path()).await;
+        for i in 0..50 {
+            engine.insert("t", row(i, "x")).await.unwrap();
+        }
+        let full = engine.scan("t").await.unwrap();
+        let limited = engine.scan_limit("t", 5).await.unwrap();
+        assert_eq!(limited, full[..5]);
+    }
+
+    #[tokio::test]
+    async fn scan_limit_respects_buffered_view_in_txn() {
+        // Inside a transaction, scan_limit must reflect buffered inserts (it
+        // falls back to the full buffered scan then truncates), not the inner
+        // engine's early-exit which is blind to the buffer.
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _) = setup(tmp.path().join("limit_txn.db").as_path()).await;
+        engine.insert("t", row(1, "committed")).await.unwrap();
+
+        engine.begin_txn().await.unwrap();
+        engine.insert("t", row(2, "buffered")).await.unwrap();
+        engine.insert("t", row(3, "buffered")).await.unwrap();
+
+        let limited = engine.scan_limit("t", 2).await.unwrap();
+        assert_eq!(limited.len(), 2);
+        // Buffered inserts append after the committed row, so the first two are
+        // the committed row and the first buffered row.
+        assert_eq!(limited[0], row(1, "committed"));
+        assert_eq!(limited[1], row(2, "buffered"));
     }
 
     #[tokio::test]
