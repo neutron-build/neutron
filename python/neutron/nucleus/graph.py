@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any, cast
 
 from pydantic import BaseModel
 
 from neutron.nucleus._exec import Executor, require_nucleus
 from neutron.nucleus.client import Features
-
-_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
 class Node(BaseModel):
@@ -29,8 +26,8 @@ class Edge(BaseModel):
 
 
 class GraphResult(BaseModel):
-    nodes: list[Node] = []
-    edges: list[Edge] = []
+    columns: list[str] = []
+    rows: list[list[Any]] = []
 
 
 class GraphModel:
@@ -117,15 +114,19 @@ class GraphModel:
     async def query(
         self, cypher: str, params: dict[str, Any] | None = None
     ) -> GraphResult:
-        """Execute a Cypher query."""
+        """Execute a Cypher query.
+
+        The engine returns ``{"columns": [...], "rows": [[...], ...]}`` with
+        positional row values.
+        """
         self._require()
         raw = await self._exec.fetchval("SELECT GRAPH_QUERY($1)", cypher)
         if not raw:
             return GraphResult()
         data = json.loads(raw)
         return GraphResult(
-            nodes=data.get("nodes", []),
-            edges=data.get("edges", []),
+            columns=data.get("columns", []),
+            rows=data.get("rows", []),
         )
 
     async def neighbors(
@@ -134,52 +135,30 @@ class GraphModel:
         edge_type: str | None = None,
         direction: str = "both",
     ) -> list[Node]:
-        """Get neighboring nodes, optionally filtered by edge type."""
+        """Get neighboring nodes, optionally filtered by edge type.
+
+        The engine returns ``[{"neighbor_id": N, "edge_id": E, "edge_type": "T"}]``;
+        the ``edge_type`` filter is applied client-side.
+        """
         self._require()
         if direction not in ("in", "out", "both"):
             raise ValueError(
                 f"Invalid direction: {direction!r}. Must be 'in', 'out', or 'both'."
             )
-        if edge_type:
-            # Validate edge_type to prevent Cypher injection
-            if not _IDENTIFIER_RE.match(edge_type):
-                raise ValueError(
-                    f"Invalid edge type: {edge_type!r}. "
-                    f"Edge types must be valid identifiers (letters, digits, underscores)."
-                )
-            # Use Cypher to filter by edge type
-            nid = int(node_id)
-            if direction == "out":
-                cypher = f"MATCH (n)-[r:{edge_type}]->(m) WHERE id(n) = {nid} RETURN m"
-            elif direction == "in":
-                cypher = f"MATCH (n)<-[r:{edge_type}]-(m) WHERE id(n) = {nid} RETURN m"
-            else:
-                cypher = f"MATCH (n)-[r:{edge_type}]-(m) WHERE id(n) = {nid} RETURN m"
-            raw = await self._exec.fetchval("SELECT GRAPH_QUERY($1)", cypher)
-            if not raw:
-                return []
-            data = json.loads(raw)
-            rows = data.get("rows", [])
-            nodes: list[Node] = []
-            for row in rows:
-                if row:
-                    item = row[0] if isinstance(row, list) else row
-                    if isinstance(item, dict):
-                        nodes.append(
-                            Node(
-                                id=str(item.get("id", "")),
-                                properties={k: v for k, v in item.items() if k != "id"},
-                            )
-                        )
-            return nodes
-        # No edge_type filter — use GRAPH_NEIGHBORS for efficiency
         raw = await self._exec.fetchval(
             "SELECT GRAPH_NEIGHBORS($1, $2)", int(node_id), direction
         )
         if not raw:
             return []
         data = json.loads(raw)
-        return [Node(id=str(n.get("id", "")), properties=n) for n in data]
+        nodes: list[Node] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            if edge_type is not None and item.get("edge_type") != edge_type:
+                continue
+            nodes.append(Node(id=str(item.get("neighbor_id", ""))))
+        return nodes
 
     async def shortest_path(
         self, from_id: str, to_id: str, max_depth: int = 10

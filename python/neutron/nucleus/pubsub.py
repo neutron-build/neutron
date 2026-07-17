@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import re
 from collections.abc import AsyncIterator
 from typing import Any, cast
@@ -62,17 +63,19 @@ class PubSubModel:
             return 0
 
     async def channels(self, pattern: str | None = None) -> list[str]:
-        """List active channels (Nucleus only)."""
+        """List active channels (Nucleus only).
+
+        PUBSUB_CHANNELS takes no arguments and returns all channels;
+        ``pattern`` (glob) is applied client-side.
+        """
         require_nucleus(self._features, "PubSub.channels")
-        if pattern:
-            raw = await self._exec.fetchval(
-                "SELECT PUBSUB_CHANNELS($1)", pattern
-            )
-        else:
-            raw = await self._exec.fetchval("SELECT PUBSUB_CHANNELS()")
+        raw = await self._exec.fetchval("SELECT PUBSUB_CHANNELS()")
         if not raw:
             return []
-        return [c.strip() for c in raw.split(",") if c.strip()]
+        chans = [c.strip() for c in raw.split(",") if c.strip()]
+        if pattern:
+            chans = [c for c in chans if fnmatch.fnmatch(c, pattern)]
+        return chans
 
     async def subscriber_count(self, channel: str) -> int:
         """Count subscribers on a channel (Nucleus only)."""

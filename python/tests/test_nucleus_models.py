@@ -267,7 +267,7 @@ class TestVector:
         await vec.create_collection("embeddings", 1536, metric="cosine")
         calls = [c[0][0] for c in mock_conn.execute.call_args_list]
         assert any("CREATE TABLE" in c for c in calls)
-        assert any("CREATE INDEX" in c for c in calls)
+        assert any("CREATE INDEX" in c and "USING HNSW" in c for c in calls)
 
     @pytest.mark.asyncio
     async def test_delete(self, mock_conn, nucleus_features):
@@ -311,11 +311,11 @@ class TestTimeSeries:
 
     @pytest.mark.asyncio
     async def test_retention(self, mock_conn, nucleus_features):
-        mock_conn.fetchval.return_value = True
+        mock_conn.fetchval.return_value = "OK"
         ts = TimeSeriesModel(_make_exec(mock_conn), nucleus_features)
-        assert await ts.retention("cpu", 30) is True
+        assert await ts.retention(86400000) is True
         mock_conn.fetchval.assert_called_with(
-            "SELECT TS_RETENTION($1, $2)", "cpu", 30
+            "SELECT TS_RETENTION($1)", 86400000
         )
 
 
@@ -381,20 +381,41 @@ class TestGraph:
     @pytest.mark.asyncio
     async def test_query_cypher(self, mock_conn, nucleus_features):
         mock_conn.fetchval.return_value = json.dumps(
-            {"nodes": [{"id": "1", "labels": ["Person"]}], "edges": []}
+            {"columns": ["n.name"], "rows": [["Alice"]]}
         )
         graph = GraphModel(_make_exec(mock_conn), nucleus_features)
-        result = await graph.query("MATCH (n:Person) RETURN n")
-        assert len(result.nodes) == 1
+        result = await graph.query("MATCH (n:Person) RETURN n.name")
+        assert result.columns == ["n.name"]
+        assert result.rows == [["Alice"]]
 
     @pytest.mark.asyncio
     async def test_neighbors(self, mock_conn, nucleus_features):
         mock_conn.fetchval.return_value = json.dumps(
-            [{"id": 2, "name": "Bob"}, {"id": 3, "name": "Carol"}]
+            [
+                {"neighbor_id": 2, "edge_id": 10, "edge_type": "KNOWS"},
+                {"neighbor_id": 3, "edge_id": 11, "edge_type": "WORKS_WITH"},
+            ]
         )
         graph = GraphModel(_make_exec(mock_conn), nucleus_features)
         neighbors = await graph.neighbors("1")
         assert len(neighbors) == 2
+        assert neighbors[0].id == "2"
+        mock_conn.fetchval.assert_called_with(
+            "SELECT GRAPH_NEIGHBORS($1, $2)", 1, "both"
+        )
+
+    @pytest.mark.asyncio
+    async def test_neighbors_edge_type_filter(self, mock_conn, nucleus_features):
+        mock_conn.fetchval.return_value = json.dumps(
+            [
+                {"neighbor_id": 2, "edge_id": 10, "edge_type": "KNOWS"},
+                {"neighbor_id": 3, "edge_id": 11, "edge_type": "WORKS_WITH"},
+            ]
+        )
+        graph = GraphModel(_make_exec(mock_conn), nucleus_features)
+        neighbors = await graph.neighbors("1", edge_type="KNOWS")
+        assert len(neighbors) == 1
+        assert neighbors[0].id == "2"
 
     @pytest.mark.asyncio
     async def test_shortest_path(self, mock_conn, nucleus_features):
@@ -482,7 +503,10 @@ class TestGeo:
             GeoFeature(id="s1", lat=40.7, lon=-74.0, properties={"name": "Shop"}),
         )
         calls = [c[0][0] for c in mock_conn.execute.call_args_list]
-        assert any("ST_MAKEPOINT" in c for c in calls)
+        assert any("lat FLOAT8" in c for c in calls)
+        assert any("INSERT INTO shops (id, lat, lon, properties)" in c for c in calls)
+        insert_call = mock_conn.execute.call_args_list[-1]
+        assert insert_call[0][1:] == ("s1", 40.7, -74.0, '{"name": "Shop"}')
 
 
 # ============================================================
@@ -542,15 +566,23 @@ class TestBlob:
 
     @pytest.mark.asyncio
     async def test_get_meta(self, mock_conn, nucleus_features):
+        from datetime import datetime, timezone
+
         mock_conn.fetchval.return_value = json.dumps(
-            {"size": 1024, "content_type": "image/png", "tags": {"env": "prod"}}
+            {
+                "size": 1024,
+                "content_type": "image/png",
+                "created_at": 1700000000000,
+                "updated_at": 1700000001000,
+            }
         )
         blob = BlobModel(_make_exec(mock_conn), nucleus_features)
         meta = await blob.get_meta("uploads", "photo.png")
         assert meta is not None
         assert meta.size == 1024
         assert meta.content_type == "image/png"
-        assert meta.metadata["env"] == "prod"
+        assert meta.created_at == datetime.fromtimestamp(1700000000, tz=timezone.utc)
+        assert meta.updated_at == datetime.fromtimestamp(1700000001, tz=timezone.utc)
 
 
 # ============================================================
@@ -562,21 +594,22 @@ class TestCDC:
     @pytest.mark.asyncio
     async def test_read(self, mock_conn, nucleus_features):
         mock_conn.fetchval.return_value = json.dumps(
-            [{"offset": 0, "table": "users", "operation": "INSERT", "data": {"id": 1}}]
+            [{"seq": 1, "table": "users", "change": "INSERT", "ts": 1700000000000}]
         )
         cdc = CDCModel(_make_exec(mock_conn), nucleus_features)
-        events = await cdc.read(offset=0)
+        events = await cdc.read(after_seq=0)
         assert len(events) == 1
-        assert events[0].offset == 0
+        assert events[0].seq == 1
         assert events[0].table == "users"
-        assert events[0].operation == "INSERT"
-        mock_conn.fetchval.assert_called_with("SELECT CDC_READ($1)", 0)
+        assert events[0].change == "INSERT"
+        assert events[0].ts == 1700000000000
+        mock_conn.fetchval.assert_called_with("SELECT CDC_READ($1, $2)", 0, 100)
 
     @pytest.mark.asyncio
     async def test_read_empty(self, mock_conn, nucleus_features):
         mock_conn.fetchval.return_value = None
         cdc = CDCModel(_make_exec(mock_conn), nucleus_features)
-        events = await cdc.read(offset=0)
+        events = await cdc.read(after_seq=0)
         assert events == []
 
     @pytest.mark.asyncio
@@ -589,14 +622,15 @@ class TestCDC:
     @pytest.mark.asyncio
     async def test_table_read(self, mock_conn, nucleus_features):
         mock_conn.fetchval.return_value = json.dumps(
-            [{"offset": 5, "op": "UPDATE", "data": {"name": "Bob"}}]
+            [{"seq": 5, "table": "users", "change": "UPDATE", "ts": 1700000000000}]
         )
         cdc = CDCModel(_make_exec(mock_conn), nucleus_features)
-        events = await cdc.table_read("users", offset=5)
+        events = await cdc.table_read("users", after_seq=5)
         assert len(events) == 1
         assert events[0].table == "users"
+        assert events[0].change == "UPDATE"
         mock_conn.fetchval.assert_called_with(
-            "SELECT CDC_TABLE_READ($1, $2)", "users", 5
+            "SELECT CDC_TABLE_READ($1, $2, $3)", "users", 5, 100
         )
 
     @pytest.mark.asyncio
@@ -618,15 +652,15 @@ class TestCDCEventParsing:
         assert _parse_cdc_events("") == []
 
     def test_parse_single_event(self):
-        raw = json.dumps({"offset": 0, "table": "users", "operation": "INSERT", "data": {"id": 1}})
+        raw = json.dumps({"seq": 1, "table": "users", "change": "INSERT", "ts": 1})
         events = _parse_cdc_events(raw)
         assert len(events) == 1
-        assert events[0].offset == 0
+        assert events[0].seq == 1
 
     def test_parse_list(self):
         raw = json.dumps([
-            {"offset": 0, "table": "a", "operation": "INSERT", "data": {}},
-            {"offset": 1, "table": "b", "operation": "DELETE", "data": {}},
+            {"seq": 1, "table": "a", "change": "INSERT", "ts": 1},
+            {"seq": 2, "table": "b", "change": "DELETE", "ts": 2},
         ])
         events = _parse_cdc_events(raw)
         assert len(events) == 2
@@ -635,16 +669,11 @@ class TestCDCEventParsing:
         assert _parse_cdc_events("not-json{{") == []
 
     def test_cdc_event_model(self):
-        event = CDCEvent(offset=0, table="users", operation="INSERT", data={"id": 1})
-        assert event.offset == 0
+        event = CDCEvent(seq=1, table="users", change="INSERT", ts=1700000000000)
+        assert event.seq == 1
         assert event.table == "users"
-        assert event.operation == "INSERT"
-        assert event.data == {"id": 1}
-
-    def test_parse_uses_op_fallback(self):
-        raw = json.dumps([{"offset": 0, "op": "DELETE", "data": {}}])
-        events = _parse_cdc_events(raw)
-        assert events[0].operation == "DELETE"
+        assert event.change == "INSERT"
+        assert event.ts == 1700000000000
 
 
 # ============================================================
@@ -655,12 +684,18 @@ class TestCDCEventParsing:
 class TestColumnar:
     @pytest.mark.asyncio
     async def test_insert(self, mock_conn, nucleus_features):
-        mock_conn.fetchval.return_value = True
+        mock_conn.fetchval.return_value = "OK"
         col = ColumnarModel(_make_exec(mock_conn), nucleus_features)
         result = await col.insert("metrics", {"ts": 1700000000, "value": 42.5})
         assert result is True
-        sql = mock_conn.fetchval.call_args[0][0]
-        assert "COLUMNAR_INSERT" in sql
+        mock_conn.fetchval.assert_called_with(
+            "SELECT COLUMNAR_INSERT($1, $2, $3, $4, $5)",
+            "metrics",
+            "ts",
+            1700000000,
+            "value",
+            42.5,
+        )
 
     @pytest.mark.asyncio
     async def test_count(self, mock_conn, nucleus_features):
@@ -711,36 +746,36 @@ class TestColumnar:
 class TestDatalog:
     @pytest.mark.asyncio
     async def test_assert_fact(self, mock_conn, nucleus_features):
-        mock_conn.fetchval.return_value = True
+        mock_conn.fetchval.return_value = "ASSERT parent/2"
         dl = DatalogModel(_make_exec(mock_conn), nucleus_features)
-        assert await dl.assert_fact("parent(alice, bob)") is True
+        assert await dl.assert_fact("parent(alice, bob)") == "ASSERT parent/2"
         mock_conn.fetchval.assert_called_with(
             "SELECT DATALOG_ASSERT($1)", "parent(alice, bob)"
         )
 
     @pytest.mark.asyncio
     async def test_retract(self, mock_conn, nucleus_features):
-        mock_conn.fetchval.return_value = True
+        mock_conn.fetchval.return_value = "RETRACT parent/2"
         dl = DatalogModel(_make_exec(mock_conn), nucleus_features)
-        assert await dl.retract("parent(alice, bob)") is True
+        assert await dl.retract("parent(alice, bob)") == "RETRACT parent/2"
         mock_conn.fetchval.assert_called_with(
             "SELECT DATALOG_RETRACT($1)", "parent(alice, bob)"
         )
 
     @pytest.mark.asyncio
     async def test_rule(self, mock_conn, nucleus_features):
-        mock_conn.fetchval.return_value = True
+        mock_conn.fetchval.return_value = "RULE ancestor/2"
         dl = DatalogModel(_make_exec(mock_conn), nucleus_features)
-        assert await dl.rule("ancestor(X, Z)", "parent(X, Y), ancestor(Y, Z)") is True
+        result = await dl.rule("ancestor(X, Z)", "parent(X, Y), ancestor(Y, Z)")
+        assert result == "RULE ancestor/2"
         mock_conn.fetchval.assert_called_with(
-            "SELECT DATALOG_RULE($1, $2)",
-            "ancestor(X, Z)",
-            "parent(X, Y), ancestor(Y, Z)",
+            "SELECT DATALOG_RULE($1)",
+            "ancestor(X, Z) :- parent(X, Y), ancestor(Y, Z)",
         )
 
     @pytest.mark.asyncio
     async def test_query(self, mock_conn, nucleus_features):
-        mock_conn.fetchval.return_value = "alice,bob\ncarol,dave"
+        mock_conn.fetchval.return_value = '[["alice", "bob"], ["carol", "dave"]]'
         dl = DatalogModel(_make_exec(mock_conn), nucleus_features)
         results = await dl.query("ancestor(alice, ?X)")
         assert len(results) == 2
@@ -763,17 +798,17 @@ class TestDatalog:
 
     @pytest.mark.asyncio
     async def test_clear(self, mock_conn, nucleus_features):
-        mock_conn.fetchval.return_value = True
+        mock_conn.fetchval.return_value = "CLEARED parent"
         dl = DatalogModel(_make_exec(mock_conn), nucleus_features)
-        assert await dl.clear() is True
-        mock_conn.fetchval.assert_called_with("SELECT DATALOG_CLEAR()")
+        assert await dl.clear("parent") == "CLEARED parent"
+        mock_conn.fetchval.assert_called_with("SELECT DATALOG_CLEAR($1)", "parent")
 
     @pytest.mark.asyncio
     async def test_import_graph(self, mock_conn, nucleus_features):
-        mock_conn.fetchval.return_value = 25
+        mock_conn.fetchval.return_value = "IMPORTED 25 edges into edge"
         dl = DatalogModel(_make_exec(mock_conn), nucleus_features)
-        assert await dl.import_graph() == 25
-        mock_conn.fetchval.assert_called_with("SELECT DATALOG_IMPORT_GRAPH()")
+        assert await dl.import_graph("edge") == "IMPORTED 25 edges into edge"
+        mock_conn.fetchval.assert_called_with("SELECT DATALOG_IMPORT_GRAPH($1)", "edge")
 
     @pytest.mark.asyncio
     async def test_requires_nucleus(self, mock_conn, plain_features):
@@ -913,11 +948,12 @@ class TestPubSub:
 
     @pytest.mark.asyncio
     async def test_channels_with_pattern(self, mock_conn, nucleus_features):
+        # PUBSUB_CHANNELS takes no args; the pattern filter is client-side.
         mock_conn.fetchval.return_value = "events,notifications"
         ps = PubSubModel(mock_conn, _make_exec(mock_conn), nucleus_features)
         channels = await ps.channels("ev*")
-        assert "events" in channels
-        assert "notifications" in channels
+        assert channels == ["events"]
+        mock_conn.fetchval.assert_called_with("SELECT PUBSUB_CHANNELS()")
 
     @pytest.mark.asyncio
     async def test_channels_no_pattern(self, mock_conn, nucleus_features):

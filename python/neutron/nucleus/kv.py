@@ -246,12 +246,11 @@ class KVModel:
     async def scan(self, prefix: str) -> list[str]:
         """Return all keys that start with ``prefix``.
 
-        Uses a direct SQL query against the underlying KV table since
-        there is no KV_SCAN function in the Nucleus contract.
+        Uses KV_KEYS(pattern), which matches a simple glob (* wildcard)
+        and returns a JSON array of keys.
         """
         self._require()
-        rows = await self._exec.fetch(
-            "SELECT key FROM kv WHERE key LIKE $1 || '%' ORDER BY key",
-            prefix,
-        )
-        return [row["key"] for row in rows]
+        raw = await self._exec.fetchval("SELECT KV_KEYS($1)", prefix + "*")
+        if not raw:
+            return []
+        return cast("list[str]", json.loads(raw))

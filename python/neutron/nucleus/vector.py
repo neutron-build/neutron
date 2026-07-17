@@ -60,10 +60,11 @@ class VectorModel:
             f"  metadata JSONB DEFAULT '{{}}'"
             f")"
         )
+        # The engine's DDL knows HASH/GIN/GIST/HNSW/IVFFLAT; anything else
+        # (e.g. "VECTOR") silently falls back to BTree.
         await self._exec.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{safe_name}_vec "
-            f"ON {safe_name} USING VECTOR (embedding) "
-            f"WITH (metric = '{metric}')"
+            f"ON {safe_name} USING HNSW (embedding)"
         )
 
     async def insert(

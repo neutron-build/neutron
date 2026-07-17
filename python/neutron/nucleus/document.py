@@ -158,19 +158,11 @@ class DocumentModel:
             # Partial update: merge only the provided fields
             merged = {**existing_doc, **update}
             merged["_collection"] = collection
-            merged_json = json.dumps(merged)
-            # Attempt in-place update via JSONB merge; fall back to re-insert
-            try:
-                await self._exec.execute(
-                    "UPDATE documents SET data = data || $1::jsonb WHERE id = $2",
-                    json.dumps(update),
-                    doc_id,
-                )
-            except Exception:
-                # Nucleus may use a different table name; fall back to re-insert
-                # (creates a new doc with merged data — best effort without DOC_UPDATE)
-                await self._exec.fetchval("SELECT DOC_INSERT($1)", merged_json)
-            count += 1
+            ok = await self._exec.fetchval(
+                "SELECT DOC_UPDATE($1, $2)", doc_id, json.dumps(merged)
+            )
+            if ok:
+                count += 1
         return count
 
     async def delete(
@@ -181,16 +173,9 @@ class DocumentModel:
         query = json.dumps({"_collection": collection, **filter})
         raw = await self._exec.fetchval("SELECT DOC_QUERY($1)", query)
         ids = _parse_ids(raw)
-        if not ids:
-            return 0
-        # Attempt direct SQL delete; Nucleus DOC_* has no delete function
         deleted = 0
         for doc_id in ids:
-            try:
-                await self._exec.execute(
-                    "DELETE FROM documents WHERE id = $1", doc_id
-                )
+            ok = await self._exec.fetchval("SELECT DOC_DELETE($1)", doc_id)
+            if ok:
                 deleted += 1
-            except Exception:
-                pass
-        return deleted if deleted > 0 else len(ids)
+        return deleted

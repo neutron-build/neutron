@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, cast
+from typing import cast
 
 from pydantic import BaseModel
 
@@ -12,10 +12,10 @@ from neutron.nucleus.client import Features
 
 
 class CDCEvent(BaseModel):
-    offset: int
+    seq: int
     table: str = ""
-    operation: str = ""  # INSERT / UPDATE / DELETE
-    data: dict[str, Any] = {}
+    change: str = ""  # INSERT / UPDATE / DELETE
+    ts: int = 0  # timestamp in milliseconds
 
 
 class CDCModel:
@@ -23,9 +23,9 @@ class CDCModel:
 
     Usage::
 
-        events = await db.cdc.read(offset=0)
+        events = await db.cdc.read(after_seq=0)
         total = await db.cdc.count()
-        table_events = await db.cdc.table_read("users", offset=0)
+        table_events = await db.cdc.table_read("users", after_seq=0)
     """
 
     def __init__(self, executor: Executor, features: Features) -> None:
@@ -35,10 +35,10 @@ class CDCModel:
     def _require(self) -> None:
         require_nucleus(self._features, "CDC")
 
-    async def read(self, offset: int = 0) -> list[CDCEvent]:
-        """Read CDC events from the given offset."""
+    async def read(self, after_seq: int = 0, limit: int = 100) -> list[CDCEvent]:
+        """Read up to ``limit`` CDC events after the given sequence number."""
         self._require()
-        raw = await self._exec.fetchval("SELECT CDC_READ($1)", offset)
+        raw = await self._exec.fetchval("SELECT CDC_READ($1, $2)", after_seq, limit)
         return _parse_cdc_events(raw)
 
     async def count(self) -> int:
@@ -46,20 +46,19 @@ class CDCModel:
         self._require()
         return cast("int", await self._exec.fetchval("SELECT CDC_COUNT()"))
 
-    async def table_read(self, table: str, offset: int = 0) -> list[CDCEvent]:
-        """Read CDC events for a specific table from the given offset."""
+    async def table_read(
+        self, table: str, after_seq: int = 0, limit: int = 100
+    ) -> list[CDCEvent]:
+        """Read up to ``limit`` CDC events for a table after the given sequence."""
         self._require()
         raw = await self._exec.fetchval(
-            "SELECT CDC_TABLE_READ($1, $2)", table, offset
+            "SELECT CDC_TABLE_READ($1, $2, $3)", table, after_seq, limit
         )
-        events = _parse_cdc_events(raw)
-        for e in events:
-            if not e.table:
-                e.table = table
-        return events
+        return _parse_cdc_events(raw)
 
 
 def _parse_cdc_events(raw: str | None) -> list[CDCEvent]:
+    """Parse the engine's event shape: {"seq", "table", "change", "ts"}."""
     if not raw:
         return []
     try:
@@ -67,14 +66,14 @@ def _parse_cdc_events(raw: str | None) -> list[CDCEvent]:
         if not isinstance(data, list):
             data = [data]
         events: list[CDCEvent] = []
-        for i, item in enumerate(data):
+        for item in data:
             if isinstance(item, dict):
                 events.append(
                     CDCEvent(
-                        offset=item.get("offset", i),
+                        seq=item.get("seq", 0),
                         table=item.get("table", ""),
-                        operation=str(item.get("operation") or item.get("op") or ""),
-                        data=item.get("data", {}),
+                        change=str(item.get("change", "")),
+                        ts=item.get("ts", 0),
                     )
                 )
         return events

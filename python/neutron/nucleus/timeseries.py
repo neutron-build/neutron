@@ -169,37 +169,12 @@ class TimeSeriesModel:
 
         return points
 
-    async def match(
-        self, measurement: str, pattern: str, *, limit: int = 100
-    ) -> list[TimeSeriesPoint]:
-        """Match time series entries by tag pattern.
+    async def retention(self, max_age_ms: int) -> bool:
+        """Set the global retention policy for all time series.
 
-        Uses the Nucleus TS_MATCH function for tag-based filtering.
+        The engine's TS_RETENTION takes a single ``max_age_ms`` argument and
+        applies it globally — per-series retention is not supported.
         """
         self._require()
-        rows = await self._exec.fetch(
-            "SELECT * FROM TS_MATCH($1, $2, $3)", measurement, pattern, limit
-        )
-        points: list[TimeSeriesPoint] = []
-        for row in rows:
-            ts = datetime.fromtimestamp(
-                int(row.get("timestamp", 0)) / 1000, tz=timezone.utc
-            )
-            points.append(
-                TimeSeriesPoint(
-                    timestamp=ts,
-                    value=float(row.get("value", 0)),
-                    tags=dict(row.get("tags", {}) or {}),
-                )
-            )
-        return points
-
-    async def retention(self, measurement: str, days: int) -> bool:
-        """Set retention policy for a series."""
-        self._require()
-        return cast(
-            "bool",
-            await self._exec.fetchval(
-                "SELECT TS_RETENTION($1, $2)", measurement, days
-            )
-        )
+        result = await self._exec.fetchval("SELECT TS_RETENTION($1)", max_age_ms)
+        return result == "OK"

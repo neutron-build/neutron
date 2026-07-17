@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import zlib
 from typing import Any, cast
 
 from pydantic import BaseModel
@@ -39,18 +40,12 @@ class FTSModel:
         *,
         language: str = "english",
     ) -> None:
-        """Create (or ensure) a full-text search index.
+        """No-op kept for API compatibility.
 
-        Creates the backing SQL index used by FTS_INDEX/FTS_SEARCH on the
-        ``_fts_docs`` table.  Safe to call multiple times (IF NOT EXISTS).
+        Nucleus FTS maintains its own inverted index internally —
+        FTS_INDEX/FTS_SEARCH require no index creation or backing table.
         """
         self._require()
-        safe_index = "".join(c for c in index if c.isalnum() or c == "_")
-        await self._exec.execute(
-            f"CREATE INDEX IF NOT EXISTS fts_{safe_index}_idx "
-            f"ON _fts_docs USING gin(to_tsvector($1, body))",
-            language,
-        )
 
     async def index_doc(
         self, index: str, id: str, fields: dict[str, str]
@@ -59,8 +54,7 @@ class FTSModel:
         self._require()
         # Combine all fields into one text blob for FTS_INDEX
         text = " ".join(fields.values())
-        doc_id = int(id) if id.isdigit() else hash(id) & 0x7FFFFFFF
-        await self._exec.fetchval("SELECT FTS_INDEX($1, $2)", doc_id, text)
+        await self._exec.fetchval("SELECT FTS_INDEX($1, $2)", _doc_id(id), text)
 
     async def search(
         self,
@@ -95,8 +89,7 @@ class FTSModel:
     async def delete_doc(self, index: str, id: str) -> None:
         """Remove a document from the index."""
         self._require()
-        doc_id = int(id) if id.isdigit() else hash(id) & 0x7FFFFFFF
-        await self._exec.fetchval("SELECT FTS_REMOVE($1)", doc_id)
+        await self._exec.fetchval("SELECT FTS_REMOVE($1)", _doc_id(id))
 
     async def doc_count(self) -> int:
         """Count indexed documents."""
@@ -107,3 +100,12 @@ class FTSModel:
         """Count unique indexed terms."""
         self._require()
         return cast("int", await self._exec.fetchval("SELECT FTS_TERM_COUNT()"))
+
+
+def _doc_id(id: str) -> int:
+    """Map a string doc ID to a stable integer.
+
+    Uses CRC32 (not Python's per-process salted ``hash()``) so IDs are
+    stable across processes and restarts.
+    """
+    return int(id) if id.isdigit() else zlib.crc32(id.encode("utf-8")) & 0x7FFFFFFF
