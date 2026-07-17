@@ -148,7 +148,7 @@ LIMIT 10
 
 **Vector Index Creation:**
 ```sql
-CREATE INDEX idx ON table USING VECTOR (column) WITH (metric = 'cosine', ef = 200, m = 16)
+CREATE INDEX idx ON table USING HNSW (column) WITH (metric = 'cosine', ef = 200, m = 16)
 ```
 
 ### 3.3 TimeSeries
@@ -160,11 +160,12 @@ CREATE INDEX idx ON table USING VECTOR (column) WITH (metric = 'cosine', ef = 20
 | `TS_COUNT` | `TS_COUNT(series TEXT)` | BIGINT |
 | `TS_RANGE_COUNT` | `TS_RANGE_COUNT(series TEXT, start_ms BIGINT, end_ms BIGINT)` | BIGINT |
 | `TS_RANGE_AVG` | `TS_RANGE_AVG(series TEXT, start_ms BIGINT, end_ms BIGINT)` | FLOAT8 or NULL |
-| `TS_RETENTION` | `TS_RETENTION(series TEXT, days BIGINT)` | BOOLEAN |
-| `TS_MATCH` | `TS_MATCH(series TEXT, pattern TEXT)` | TEXT |
-| `TIME_BUCKET` | `TIME_BUCKET(interval TEXT, timestamp BIGINT)` | BIGINT |
+| `TS_RETENTION` | `TS_RETENTION(max_age_ms BIGINT)` | `'OK'` (global retention policy) |
+| `TIME_BUCKET` | `TIME_BUCKET(bucket_millis BIGINT, timestamp_ms BIGINT)` | BIGINT (bucket start, ms) |
 
-`TIME_BUCKET` intervals: `'second'`, `'minute'`, `'hour'`, `'day'`, `'week'`, `'month'`
+Note: `TS_MATCH(text, tsquery)` exists but is a text-search matcher returning BOOLEAN — it is
+not a series-name pattern filter. There is no raw point-range-fetch function; range reads are
+limited to `TS_RANGE_COUNT`/`TS_RANGE_AVG`.
 
 ### 3.4 Document
 
@@ -174,7 +175,12 @@ CREATE INDEX idx ON table USING VECTOR (column) WITH (metric = 'cosine', ef = 20
 | `DOC_GET` | `DOC_GET(id BIGINT)` | TEXT (JSON) or NULL |
 | `DOC_QUERY` | `DOC_QUERY(json_query TEXT)` | TEXT (comma-separated IDs) |
 | `DOC_PATH` | `DOC_PATH(id BIGINT, key1 TEXT [, key2, ...])` | value or NULL |
+| `DOC_UPDATE` | `DOC_UPDATE(id BIGINT, json TEXT)` | BOOLEAN |
+| `DOC_DELETE` | `DOC_DELETE(id BIGINT)` | BOOLEAN |
 | `DOC_COUNT` | `DOC_COUNT()` | BIGINT |
+
+There is no `documents` table — documents live in a dedicated store reachable only through
+these functions. Doc IDs are unsigned integers (text-encoded integers accepted over pgwire).
 
 Plus standard JSONB functions: `JSONB_BUILD_OBJECT`, `JSONB_BUILD_ARRAY`, `JSON_EXTRACT_PATH`, `JSON_EXTRACT_PATH_TEXT`, `JSON_SET`, `JSON_PRETTY`, `JSON_STRIP_NULLS`, etc.
 
@@ -198,8 +204,8 @@ Plus standard JSONB functions: `JSONB_BUILD_OBJECT`, `JSONB_BUILD_ARRAY`, `JSON_
 | `GRAPH_DELETE_NODE` | `GRAPH_DELETE_NODE(node_id BIGINT)` | BOOLEAN |
 | `GRAPH_DELETE_EDGE` | `GRAPH_DELETE_EDGE(edge_id BIGINT)` | BOOLEAN |
 | `GRAPH_QUERY` | `GRAPH_QUERY(cypher TEXT)` | TEXT (JSON {columns, rows}) |
-| `GRAPH_NEIGHBORS` | `GRAPH_NEIGHBORS(node_id BIGINT [, direction TEXT])` | TEXT (JSON array) |
-| `GRAPH_SHORTEST_PATH` | `GRAPH_SHORTEST_PATH(from_id BIGINT, to_id BIGINT)` | TEXT (JSON array of IDs) |
+| `GRAPH_NEIGHBORS` | `GRAPH_NEIGHBORS(node_id BIGINT [, direction TEXT])` | TEXT (JSON array of `{neighbor_id, edge_id, edge_type}`) |
+| `GRAPH_SHORTEST_PATH` | `GRAPH_SHORTEST_PATH(from_id BIGINT, to_id BIGINT)` | TEXT (JSON array of IDs) or NULL if no path |
 | `GRAPH_NODE_COUNT` | `GRAPH_NODE_COUNT()` | BIGINT |
 | `GRAPH_EDGE_COUNT` | `GRAPH_EDGE_COUNT()` | BIGINT |
 
@@ -212,8 +218,8 @@ Direction: `'out'` (default), `'in'`, `'both'`
 | `GEO_DISTANCE` / `ST_DISTANCE` | `GEO_DISTANCE(lat1, lon1, lat2, lon2)` | FLOAT8 (meters, haversine) |
 | `GEO_DISTANCE_EUCLIDEAN` / `ST_DISTANCE_EUCLIDEAN` | `(x1, y1, x2, y2)` | FLOAT8 |
 | `GEO_WITHIN` / `ST_DWITHIN` | `(lat1, lon1, lat2, lon2, radius_m)` | BOOLEAN |
-| `GEO_AREA` / `ST_AREA` | `(lon1, lat1, lon2, lat2, ...)` | FLOAT8 |
-| `ST_MAKEPOINT` | `ST_MAKEPOINT(lon, lat)` | POINT |
+| `GEO_AREA` / `ST_AREA` | `(x1, y1, x2, y2, x3, y3, ...)` — at least 3 coordinate pairs (polygon) | FLOAT8 |
+| `ST_MAKEPOINT` | `ST_MAKEPOINT(x, y)` | TEXT (WKT `'POINT(x y)'`) |
 | `ST_X` | `ST_X(point)` | FLOAT8 (longitude) |
 | `ST_Y` | `ST_Y(point)` | FLOAT8 (latitude) |
 
@@ -224,9 +230,9 @@ Direction: `'out'` (default), `'in'`, `'both'`
 | `BLOB_STORE` | `BLOB_STORE(key TEXT, data_hex TEXT [, content_type TEXT])` | BOOLEAN |
 | `BLOB_GET` | `BLOB_GET(key TEXT)` | TEXT (hex-encoded) or NULL |
 | `BLOB_DELETE` | `BLOB_DELETE(key TEXT)` | BOOLEAN |
-| `BLOB_META` | `BLOB_META(key TEXT)` | TEXT (JSON) or NULL |
+| `BLOB_META` | `BLOB_META(key TEXT)` | TEXT (JSON `{size, content_type, created_at, updated_at}`, timestamps in ms) or NULL |
 | `BLOB_TAG` | `BLOB_TAG(key TEXT, tag_key TEXT, tag_value TEXT)` | BOOLEAN |
-| `BLOB_LIST` | `BLOB_LIST([prefix TEXT])` | TEXT (JSON array) |
+| `BLOB_LIST` | `BLOB_LIST([prefix TEXT])` | TEXT (JSON array of key strings) |
 | `BLOB_COUNT` | `BLOB_COUNT()` | BIGINT |
 | `BLOB_DEDUP_RATIO` | `BLOB_DEDUP_RATIO()` | FLOAT8 |
 
@@ -240,14 +246,17 @@ Direction: `'out'` (default), `'in'`, `'both'`
 | `STREAM_XREAD` | `STREAM_XREAD(stream TEXT, last_id_ms BIGINT, count BIGINT)` | TEXT (JSON) |
 | `STREAM_XGROUP_CREATE` | `STREAM_XGROUP_CREATE(stream TEXT, group TEXT, start_id BIGINT)` | BOOLEAN |
 | `STREAM_XREADGROUP` | `STREAM_XREADGROUP(stream TEXT, group TEXT, consumer TEXT, count BIGINT)` | TEXT |
-| `STREAM_XACK` | `STREAM_XACK(stream TEXT, group TEXT, id_ms BIGINT, id_seq BIGINT)` | BOOLEAN |
+| `STREAM_XACK` | `STREAM_XACK(stream TEXT, group TEXT, id_ms BIGINT, id_seq BIGINT)` | BIGINT (count acknowledged) |
+
+Reads on a nonexistent stream return an empty string (`''`), not `'[]'` — clients must treat
+empty text as an empty result before JSON-parsing.
 
 ### 3.10 PubSub
 
 | SQL Function | Signature | Returns |
 |-------------|-----------|---------|
 | `PUBSUB_PUBLISH` | `PUBSUB_PUBLISH(channel TEXT, message TEXT)` | BIGINT (subscribers reached) |
-| `PUBSUB_CHANNELS` | `PUBSUB_CHANNELS([pattern TEXT])` | TEXT (comma-separated) |
+| `PUBSUB_CHANNELS` | `PUBSUB_CHANNELS()` | TEXT (comma-separated; any pattern argument is ignored) |
 | `PUBSUB_SUBSCRIBERS` | `PUBSUB_SUBSCRIBERS(channel TEXT)` | BIGINT |
 
 Subscriptions use PostgreSQL `LISTEN`/`NOTIFY` semantics or the `SUBSCRIBE(channel)` function.
@@ -256,7 +265,7 @@ Subscriptions use PostgreSQL `LISTEN`/`NOTIFY` semantics or the `SUBSCRIBE(chann
 
 | SQL Function | Signature | Returns |
 |-------------|-----------|---------|
-| `COLUMNAR_INSERT` | `COLUMNAR_INSERT(table TEXT, values_json TEXT)` | BOOLEAN |
+| `COLUMNAR_INSERT` | `COLUMNAR_INSERT(table TEXT, col1 TEXT, val1 ANY [, col2, val2, ...])` — variadic pairs, odd arg count ≥ 3 | `'OK'` |
 | `COLUMNAR_COUNT` | `COLUMNAR_COUNT(table TEXT)` | BIGINT |
 | `COLUMNAR_SUM` | `COLUMNAR_SUM(table TEXT, column TEXT)` | NUMERIC |
 | `COLUMNAR_AVG` | `COLUMNAR_AVG(table TEXT, column TEXT)` | FLOAT8 |
@@ -269,18 +278,18 @@ Subscriptions use PostgreSQL `LISTEN`/`NOTIFY` semantics or the `SUBSCRIBE(chann
 |-------------|-----------|---------|
 | `DATALOG_ASSERT` | `DATALOG_ASSERT(fact TEXT)` | BOOLEAN |
 | `DATALOG_RETRACT` | `DATALOG_RETRACT(fact TEXT)` | BOOLEAN |
-| `DATALOG_RULE` | `DATALOG_RULE(head TEXT, body TEXT)` | BOOLEAN |
-| `DATALOG_QUERY` | `DATALOG_QUERY(query TEXT)` | TEXT (CSV) |
-| `DATALOG_CLEAR` | `DATALOG_CLEAR()` | BOOLEAN |
-| `DATALOG_IMPORT_GRAPH` | `DATALOG_IMPORT_GRAPH()` | BIGINT |
+| `DATALOG_RULE` | `DATALOG_RULE(rule TEXT)` — whole rule as one string | TEXT (status) |
+| `DATALOG_QUERY` | `DATALOG_QUERY(query TEXT)` | TEXT (JSON array of arrays) |
+| `DATALOG_CLEAR` | `DATALOG_CLEAR(predicate TEXT)` | TEXT (status) |
+| `DATALOG_IMPORT_GRAPH` | `DATALOG_IMPORT_GRAPH(predicate TEXT)` | TEXT (status, `'IMPORTED N ...'`) |
 
 ### 3.13 CDC (Change Data Capture)
 
 | SQL Function | Signature | Returns |
 |-------------|-----------|---------|
-| `CDC_READ` | `CDC_READ(offset BIGINT)` | TEXT |
+| `CDC_READ` | `CDC_READ(after_sequence BIGINT, limit BIGINT)` | TEXT (JSON array of `{seq, table, change, ts}`) |
 | `CDC_COUNT` | `CDC_COUNT()` | BIGINT |
-| `CDC_TABLE_READ` | `CDC_TABLE_READ(table TEXT, offset BIGINT)` | TEXT |
+| `CDC_TABLE_READ` | `CDC_TABLE_READ(table TEXT, after_sequence BIGINT, limit BIGINT)` | TEXT (JSON array of `{seq, table, change, ts}`) |
 
 ## 4. OpenAPI Specification
 
