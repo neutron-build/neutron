@@ -815,6 +815,12 @@ impl NucleusHandler {
             ExecResult::CopyOut { row_count, .. } => {
                 Ok(Response::Execution(Tag::new("COPY").with_rows(row_count)))
             }
+            // The executor materializes results at its dispatch boundary before
+            // they reach the wire; streaming a result to the client directly is
+            // Phase 4 (a dedicated streaming path), not this handler.
+            ExecResult::SelectStream { .. } => unreachable!(
+                "SelectStream must be materialized before build_response (Phase 4 adds the streaming path)"
+            ),
         }
     }
 
@@ -1829,6 +1835,8 @@ impl NucleusHandler {
             }
             ExecResult::Command { tag, .. } => tag.len() as u64 + 16,
             ExecResult::CopyOut { data, .. } => data.len() as u64,
+            // Row count unknown until drained; estimate from the header only.
+            ExecResult::SelectStream { columns, .. } => columns.len() as u64 * 32,
         }
     }
 

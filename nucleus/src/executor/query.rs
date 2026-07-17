@@ -56,7 +56,9 @@ impl Executor {
             if analyze {
                 // EXPLAIN ANALYZE: actually execute the query and report actual rows + time.
                 let start = std::time::Instant::now();
-                let exec_result = self.execute_statement(stmt).await?;
+                // Materialize any streaming result so ANALYZE can report an
+                // actual row count (draining is the honest cost to measure).
+                let exec_result = self.execute_statement(stmt).await?.materialize().await?;
                 let elapsed = start.elapsed();
                 let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
 
@@ -64,6 +66,10 @@ impl Executor {
                     ExecResult::Select { rows, .. } => rows.len(),
                     ExecResult::Command { rows_affected, .. } => *rows_affected,
                     ExecResult::CopyOut { row_count, .. } => *row_count,
+                    // Materialized just above, so a stream can't reach here.
+                    ExecResult::SelectStream { .. } => unreachable!(
+                        "SelectStream materialized before EXPLAIN ANALYZE row count"
+                    ),
                 };
 
                 // Build annotated plan text with actual execution stats

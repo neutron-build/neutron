@@ -173,6 +173,10 @@ fn exec_result_to_js(r: ExecResult) -> JsResultRepr {
             affected: Some(row_count),
             message: Some(data),
         },
+        // The executor materializes results before they reach the WASM boundary.
+        ExecResult::SelectStream { .. } => unreachable!(
+            "SelectStream must be materialized before the WASM result adapter"
+        ),
     }
 }
 

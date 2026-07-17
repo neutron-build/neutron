@@ -75,6 +75,9 @@ fn run_str(ex: &Executor, sid: u64, sql: &str) -> Result<String, String> {
             }
             Some(ExecResult::Command { tag, .. }) => Ok(tag),
             Some(ExecResult::CopyOut { .. }) => Err("unexpected CopyOut".into()),
+            Some(ExecResult::SelectStream { .. }) => {
+                Err("unexpected SelectStream (results are materialized)".into())
+            }
             None => Err("no result".into()),
         },
         Ok(Err(e)) => Err(format!("{e:?}")),
