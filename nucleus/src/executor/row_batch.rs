@@ -13,9 +13,8 @@
 //! `next_batch` is `async` because the storage layer is async (`scan_chunked`
 //! streams over a tokio mpsc channel); a materialized batch simply returns ready.
 //!
-//! P0.1 introduces the trait and adapter with no non-test consumers; the
-//! `RowSource` seam in P0.2 is the first caller, at which point this allow is
-//! removed.
+//! P0.1 introduced the trait and adapter; the `ExecResult::SelectStream` seam
+//! (P0.2) is the first consumer. Streaming producers land in Phase 1.
 #![allow(dead_code)]
 
 use crate::executor::ExecError;
@@ -136,5 +135,25 @@ mod tests {
     async fn collect_equals_the_input() {
         let mut it = MaterializedBatchIter::with_batch_size(rows(10), 4);
         assert_eq!(it.collect().await.unwrap(), rows(10));
+    }
+
+    #[tokio::test]
+    async fn exec_result_selectstream_materializes_to_select() {
+        use crate::executor::ExecResult;
+        use crate::types::DataType;
+        let cols = vec![("id".to_string(), DataType::Int64)];
+        let source = Box::new(MaterializedBatchIter::with_batch_size(rows(6), 2));
+        let stream = ExecResult::SelectStream {
+            columns: cols.clone(),
+            source,
+        };
+        assert!(stream.is_stream());
+        match stream.materialize().await.unwrap() {
+            ExecResult::Select { columns, rows: r } => {
+                assert_eq!(columns, cols);
+                assert_eq!(r, rows(6));
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
     }
 }

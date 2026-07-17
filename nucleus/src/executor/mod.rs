@@ -129,17 +129,81 @@ impl Drop for CommandGuard {
 }
 
 /// The result of executing a statement.
-#[derive(Debug)]
 pub enum ExecResult {
-    /// SELECT result with column names, types, and rows.
+    /// SELECT result with column names, types, and materialized rows.
     Select {
         columns: Vec<(String, DataType)>,
         rows: Vec<Row>,
+    },
+    /// A SELECT result whose rows are pulled lazily in batches instead of being
+    /// materialized up front (the streaming-execution seam, P0.2). Producers
+    /// (streaming scans/operators) hand back one of these; consumers that are not
+    /// yet streaming-aware call [`ExecResult::materialize`] to collapse it to a
+    /// `Select`. The public [`Executor::execute`] boundary materializes so every
+    /// existing consumer is unchanged; only a future streaming wire path consumes
+    /// the batches directly.
+    SelectStream {
+        columns: Vec<(String, DataType)>,
+        source: Box<dyn row_batch::RowBatchIter>,
     },
     /// DDL/DML result with a command tag and affected row count.
     Command { tag: String, rows_affected: usize },
     /// Result of COPY ... TO STDOUT: pre-formatted copy data ready to stream.
     CopyOut { data: String, row_count: usize },
+}
+
+impl std::fmt::Debug for ExecResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecResult::Select { columns, rows } => f
+                .debug_struct("Select")
+                .field("columns", columns)
+                .field("rows", rows)
+                .finish(),
+            // The source is an opaque lazy iterator — don't (and can't) drain it
+            // to format; show its shape instead.
+            ExecResult::SelectStream { columns, .. } => f
+                .debug_struct("SelectStream")
+                .field("columns", columns)
+                .field("source", &"<lazy row stream>")
+                .finish(),
+            ExecResult::Command { tag, rows_affected } => f
+                .debug_struct("Command")
+                .field("tag", tag)
+                .field("rows_affected", rows_affected)
+                .finish(),
+            ExecResult::CopyOut { data, row_count } => f
+                .debug_struct("CopyOut")
+                .field("data", data)
+                .field("row_count", row_count)
+                .finish(),
+        }
+    }
+}
+
+impl ExecResult {
+    /// Collapse a [`ExecResult::SelectStream`] into a materialized
+    /// [`ExecResult::Select`] by draining its batch iterator; all other variants
+    /// pass through unchanged. This is the adapter every not-yet-streaming
+    /// consumer uses, and what the [`Executor::execute`] boundary applies so the
+    /// default result path is always materialized.
+    pub async fn materialize(self) -> Result<ExecResult, ExecError> {
+        match self {
+            ExecResult::SelectStream {
+                columns,
+                mut source,
+            } => {
+                let rows = source.collect().await?;
+                Ok(ExecResult::Select { columns, rows })
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Whether this result is a lazy row stream (not yet materialized).
+    pub fn is_stream(&self) -> bool {
+        matches!(self, ExecResult::SelectStream { .. })
+    }
 }
 
 /// The executor holds shared catalog/storage state and per-session state.
@@ -2492,7 +2556,9 @@ impl Executor {
                 let _guard = CommandGuard(guard_sess);
                 let mut results = Vec::new();
                 for stmt in statements {
-                    results.push(self.execute_statement(stmt).await?);
+                    // Materialization boundary (see execute_statements_dispatch).
+                    let r = self.execute_statement(stmt).await?.materialize().await?;
+                    results.push(r);
                 }
                 Ok(results)
             }),
@@ -3879,7 +3945,13 @@ impl Executor {
 
         let mut results = Vec::new();
         for stmt in statements {
-            results.push(self.execute_statement(stmt).await?);
+            // Materialization boundary: the default result path (tests, embedded,
+            // RESP, binary wire, and today's pgwire) receives fully materialized
+            // rows. A streaming producer's SelectStream is collapsed here; only a
+            // future streaming wire path (Phase 4) bypasses this to stream a huge
+            // result to the client without materializing it.
+            let r = self.execute_statement(stmt).await?.materialize().await?;
+            results.push(r);
         }
         Ok(results)
     }
@@ -3893,7 +3965,10 @@ impl Executor {
         let statements = self.parse_with_ast_cache(sql)?;
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements {
-            results.push(self.execute_statement(statement).await?);
+            // Materialization boundary (see execute_statements_dispatch): a
+            // replicated result must be materialized, never a lazy stream.
+            let r = self.execute_statement(statement).await?.materialize().await?;
+            results.push(r);
         }
         Ok(results)
     }
@@ -3929,7 +4004,13 @@ impl Executor {
         let statements = self.parse_with_ast_cache(sql)?;
         let mut results = Vec::new();
         for stmt in statements {
-            results.push(self.execute_statement(stmt).await?);
+            // Materialization boundary: the default result path (tests, embedded,
+            // RESP, binary wire, and today's pgwire) receives fully materialized
+            // rows. A streaming producer's SelectStream is collapsed here; only a
+            // future streaming wire path (Phase 4) bypasses this to stream a huge
+            // result to the client without materializing it.
+            let r = self.execute_statement(stmt).await?.materialize().await?;
+            results.push(r);
         }
         Ok(results)
     }
@@ -4330,6 +4411,9 @@ impl Executor {
                 ExecResult::CopyOut { row_count, .. } => {
                     self.metrics.rows_returned.inc_by(*row_count as u64);
                 }
+                // A streaming result's row count is not known until it drains at
+                // the consumer; it is counted there, not here.
+                ExecResult::SelectStream { .. } => {}
             }
         }
 

@@ -484,6 +484,11 @@ impl ConnectionHandler {
                     self.stream.write_all(&buf).await?;
                 }
             }
+            // The executor materializes results at its dispatch boundary before
+            // they reach the binary wire; direct streaming is Phase 4.
+            ExecResult::SelectStream { .. } => unreachable!(
+                "SelectStream must be materialized before the binary wire handler"
+            ),
         }
         Ok(())
     }
