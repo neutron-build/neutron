@@ -403,6 +403,23 @@ impl StorageEngine for LsmStorageEngine {
         Ok(rows)
     }
 
+    async fn scan_limit(&self, table: &str, limit: usize) -> Result<Vec<Row>, StorageError> {
+        // Early-exit: stop decoding once `limit` live rows are assembled. Same
+        // order as scan(), so equals scan()[..limit]. Safe here (the LSM engine
+        // records no SIREAD).
+        let tables = self.tables.read();
+        let t = tables
+            .get(table)
+            .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
+        let rows = t
+            .all_entries()
+            .into_iter()
+            .filter_map(|(_, v)| decode_row(&v))
+            .take(limit)
+            .collect();
+        Ok(rows)
+    }
+
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
         if positions.is_empty() {
             return Ok(0);
@@ -488,6 +505,20 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], Value::Int64(1));
         assert_eq!(rows[1][1], Value::Text("bob".to_string()));
+    }
+
+    #[tokio::test]
+    async fn scan_limit_early_exit_matches_prefix() {
+        let engine = LsmStorageEngine::new();
+        engine.create_table("t").await.unwrap();
+        for i in 0..50 {
+            engine.insert("t", make_row(i, "x")).await.unwrap();
+        }
+        let full = engine.scan("t").await.unwrap();
+        for n in [0usize, 1, 7, 50, 100] {
+            let lim = engine.scan_limit("t", n).await.unwrap();
+            assert_eq!(lim, full[..n.min(full.len())], "n={n}");
+        }
     }
 
     #[tokio::test]

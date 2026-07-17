@@ -734,6 +734,17 @@ impl StorageEngine for MemoryEngine {
         Ok(rows.clone())
     }
 
+    async fn scan_limit(&self, table: &str, limit: usize) -> Result<Vec<Row>, StorageError> {
+        // Early-exit: clone only the first `limit` rows instead of the whole
+        // table. Same order as scan(), so equals scan()[..limit]. Safe here (the
+        // in-memory engine records no SIREAD).
+        let tables = self.tables.read().await;
+        let rows = tables
+            .get(table)
+            .ok_or_else(|| StorageError::TableNotFound(table.to_string()))?;
+        Ok(rows.iter().take(limit).cloned().collect())
+    }
+
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
         let count = {
             let mut tables = self.tables.write().await;
