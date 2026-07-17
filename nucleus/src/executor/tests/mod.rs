@@ -52,5 +52,6 @@ mod test_query;
 mod test_rls;
 mod test_scalar_fns;
 mod test_specialty_persistence;
+mod test_spill_sweep; // B2: executor sweeps orphaned query-spill files on startup
 mod test_ssi_census; // B1: end-to-end SSI anomaly census (gate for MVCC scan changes)
 mod test_txn; // Phase 4: JSONB @> containment, GIN indexes, subscript syntax

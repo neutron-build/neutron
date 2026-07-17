@@ -101,6 +101,7 @@ mod query;
 mod row_batch;
 mod scalar_fns;
 mod schema_types;
+mod spill;
 mod session;
 mod txn;
 mod types;
@@ -709,6 +710,16 @@ impl Executor {
                 // R-tree rebuild is available via crate::geo::wal::rebuild_rtree(&state)
                 // when a GeoIndex is added to the executor. For now, store the WAL handle.
                 exec.geo_wal = Some(wal);
+            }
+
+            // Query spill directory: reclaim any files a crashed process left
+            // behind. Spill files never survive a clean shutdown (their guards
+            // unlink on drop), so anything here at startup is an orphan — the
+            // same crash-cleanup contract as the WAL temp sweep. Phase 3 will
+            // hold a live SpillManager on the executor; here we only sweep.
+            let spill_dir = dir.join("spill");
+            if let Ok(mgr) = spill::SpillManager::new(&spill_dir, u64::MAX, None) {
+                let _ = mgr.sweep_orphans();
             }
         }
 
