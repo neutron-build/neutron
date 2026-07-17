@@ -17,6 +17,10 @@ pub const Error = error{
     BufferTooShort,
     InvalidResponse,
     ServerError,
+    ConstraintViolation,
+    PermissionDenied,
+    MemoryExceeded,
+    ValueTooLarge,
 };
 
 pub const PgClient = struct {
@@ -30,6 +34,11 @@ pub const PgClient = struct {
     server_version: [64]u8,
     server_version_len: usize,
     is_nucleus: bool,
+    // Last server error (from ErrorResponse messages)
+    last_error_code: [8]u8,
+    last_error_code_len: usize,
+    last_error_message: [256]u8,
+    last_error_message_len: usize,
 
     pub const Config = struct {
         host: []const u8 = "127.0.0.1",
@@ -64,6 +73,10 @@ pub const PgClient = struct {
             .server_version = undefined,
             .server_version_len = 0,
             .is_nucleus = false,
+            .last_error_code = undefined,
+            .last_error_code_len = 0,
+            .last_error_message = undefined,
+            .last_error_message_len = 0,
         };
 
         // Send StartupMessage
@@ -163,13 +176,54 @@ pub const PgClient = struct {
                         return;
                     },
                     .error_response => |err| {
-                        _ = err;
+                        self.storeErrorResponse(err);
                         return Error.AuthenticationFailed;
                     },
                     else => {},
                 }
             }
         }
+    }
+
+    /// Store the SQLSTATE code and message of an ErrorResponse for later
+    /// inspection via lastErrorCode()/lastErrorMessage().
+    fn storeErrorResponse(self: *PgClient, err: codec.RawErrorNotice) void {
+        self.last_error_code_len = 0;
+        self.last_error_message_len = 0;
+        if (err.code()) |c| {
+            const copy_len = @min(c.len, self.last_error_code.len);
+            @memcpy(self.last_error_code[0..copy_len], c[0..copy_len]);
+            self.last_error_code_len = copy_len;
+        }
+        if (err.message()) |m| {
+            const copy_len = @min(m.len, self.last_error_message.len);
+            @memcpy(self.last_error_message[0..copy_len], m[0..copy_len]);
+            self.last_error_message_len = copy_len;
+        }
+    }
+
+    /// Store the fields of an ErrorResponse and map its SQLSTATE to an error.
+    /// Class 23 (integrity constraint) → ConstraintViolation,
+    /// 42501 (insufficient privilege, e.g. RLS denial) → PermissionDenied,
+    /// 53200 (out of memory / MemoryExceeded) → MemoryExceeded,
+    /// anything else → ServerError.
+    fn recordErrorResponse(self: *PgClient, err: codec.RawErrorNotice) Error {
+        self.storeErrorResponse(err);
+        const code = self.lastErrorCode();
+        if (std.mem.startsWith(u8, code, "23")) return Error.ConstraintViolation;
+        if (std.mem.eql(u8, code, "42501")) return Error.PermissionDenied;
+        if (std.mem.eql(u8, code, "53200")) return Error.MemoryExceeded;
+        return Error.ServerError;
+    }
+
+    /// SQLSTATE code of the last ErrorResponse (empty if none).
+    pub fn lastErrorCode(self: *const PgClient) []const u8 {
+        return self.last_error_code[0..self.last_error_code_len];
+    }
+
+    /// Message of the last ErrorResponse (empty if none).
+    pub fn lastErrorMessage(self: *const PgClient) []const u8 {
+        return self.last_error_message[0..self.last_error_message_len];
     }
 
     /// Execute a simple query. Returns the command tag string.
@@ -195,8 +249,7 @@ pub const PgClient = struct {
                     return command_tag;
                 },
                 .error_response => |err| {
-                    _ = err;
-                    return Error.ServerError;
+                    return self.recordErrorResponse(err);
                 },
                 else => {},
             }
@@ -232,9 +285,9 @@ pub const PgClient = struct {
                             var col_iter = row.iterator();
                             if (col_iter.next() catch null) |col| {
                                 if (col.value) |v| {
-                                    const copy_len = @min(v.len, QueryResult.MAX_VALUE_LEN);
-                                    @memcpy(result.rows[result.row_count].data[0..copy_len], v[0..copy_len]);
-                                    result.rows[result.row_count].len = copy_len;
+                                    if (v.len > QueryResult.MAX_VALUE_LEN) return Error.ValueTooLarge;
+                                    @memcpy(result.rows[result.row_count].data[0..v.len], v[0..v.len]);
+                                    result.rows[result.row_count].len = v.len;
                                 } else {
                                     result.rows[result.row_count].len = 0;
                                     result.rows[result.row_count].is_null = true;
@@ -251,8 +304,8 @@ pub const PgClient = struct {
                         self.transaction_status = status;
                         return result;
                     },
-                    .error_response => {
-                        return Error.ServerError;
+                    .error_response => |err| {
+                        return self.recordErrorResponse(err);
                     },
                     else => {},
                 }
@@ -291,7 +344,7 @@ pub const PgClient = struct {
                         self.transaction_status = status;
                         return PreparedStatement{ .name = name, .client = self };
                     },
-                    .error_response => return Error.ServerError,
+                    .error_response => |err| return self.recordErrorResponse(err),
                     else => {},
                 }
             }
@@ -323,6 +376,7 @@ pub const PgClient = struct {
 /// Result of a simple query — holds rows in stack-allocated buffers.
 pub const QueryResult = struct {
     pub const MAX_ROWS = 256;
+    /// Values longer than this fail with Error.ValueTooLarge (never truncated).
     pub const MAX_VALUE_LEN = 4096;
 
     pub const RowData = struct {
@@ -399,9 +453,9 @@ pub const PreparedStatement = struct {
                             var col_iter = row.iterator();
                             if (col_iter.next() catch null) |col| {
                                 if (col.value) |v| {
-                                    const copy_len = @min(v.len, QueryResult.MAX_VALUE_LEN);
-                                    @memcpy(result.rows[result.row_count].data[0..copy_len], v[0..copy_len]);
-                                    result.rows[result.row_count].len = copy_len;
+                                    if (v.len > QueryResult.MAX_VALUE_LEN) return Error.ValueTooLarge;
+                                    @memcpy(result.rows[result.row_count].data[0..v.len], v[0..v.len]);
+                                    result.rows[result.row_count].len = v.len;
                                 } else {
                                     result.rows[result.row_count].is_null = true;
                                 }
@@ -417,7 +471,7 @@ pub const PreparedStatement = struct {
                         self.client.transaction_status = status;
                         return result;
                     },
-                    .error_response => return Error.ServerError,
+                    .error_response => |err| return self.client.recordErrorResponse(err),
                     else => {},
                 }
             }

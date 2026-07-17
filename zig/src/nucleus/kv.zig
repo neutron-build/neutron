@@ -74,6 +74,8 @@ pub const KVModel = struct {
         return std.fmt.bufPrint(buf, "SELECT KV_RPOP('{s}')", .{key}) catch return error.BufferTooShort;
     }
 
+    /// SELECT KV_LRANGE('key', start, stop) — returns a JSON array of strings,
+    /// e.g. ["a","b"]. Callers must JSON-parse the result.
     pub fn lrangeSql(key: []const u8, start: i64, stop: i64, buf: []u8) ![]const u8 {
         return std.fmt.bufPrint(buf, "SELECT KV_LRANGE('{s}', {d}, {d})", .{ key, start, stop }) catch return error.BufferTooShort;
     }
@@ -105,6 +107,8 @@ pub const KVModel = struct {
         return std.fmt.bufPrint(buf, "SELECT KV_HEXISTS('{s}', '{s}')", .{ key, field }) catch return error.BufferTooShort;
     }
 
+    /// SELECT KV_HGETALL('key') — returns a JSON array of [field, value] pairs,
+    /// e.g. [["f1","v1"],["f2","v2"]]. Callers must JSON-parse the result.
     pub fn hgetallSql(key: []const u8, buf: []u8) ![]const u8 {
         return std.fmt.bufPrint(buf, "SELECT KV_HGETALL('{s}')", .{key}) catch return error.BufferTooShort;
     }
@@ -123,6 +127,8 @@ pub const KVModel = struct {
         return std.fmt.bufPrint(buf, "SELECT KV_SREM('{s}', '{s}')", .{ key, member }) catch return error.BufferTooShort;
     }
 
+    /// SELECT KV_SMEMBERS('key') — returns a JSON array of strings,
+    /// e.g. ["a","b"]. Callers must JSON-parse the result.
     pub fn smembersSql(key: []const u8, buf: []u8) ![]const u8 {
         return std.fmt.bufPrint(buf, "SELECT KV_SMEMBERS('{s}')", .{key}) catch return error.BufferTooShort;
     }
@@ -141,10 +147,16 @@ pub const KVModel = struct {
         return std.fmt.bufPrint(buf, "SELECT KV_ZADD('{s}', {d}, '{s}')", .{ key, score, member }) catch return error.BufferTooShort;
     }
 
+    /// SELECT KV_ZRANGE('key', start, stop) — returns a JSON array of
+    /// [member, score] pairs, e.g. [["m1",1.5],["m2",2.0]]. Callers must
+    /// JSON-parse the result.
     pub fn zrangeSql(key: []const u8, start: i64, stop: i64, buf: []u8) ![]const u8 {
         return std.fmt.bufPrint(buf, "SELECT KV_ZRANGE('{s}', {d}, {d})", .{ key, start, stop }) catch return error.BufferTooShort;
     }
 
+    /// SELECT KV_ZRANGEBYSCORE('key', min, max) — returns a JSON array of
+    /// [member, score] pairs, e.g. [["m1",1.5],["m2",2.0]]. Callers must
+    /// JSON-parse the result.
     pub fn zrangebyscoreSql(key: []const u8, min_score: f64, max_score: f64, buf: []u8) ![]const u8 {
         return std.fmt.bufPrint(buf, "SELECT KV_ZRANGEBYSCORE('{s}', {d}, {d})", .{ key, min_score, max_score }) catch return error.BufferTooShort;
     }
@@ -253,6 +265,8 @@ pub const KVModel = struct {
         return try self.client.execute(sql);
     }
 
+    /// Returns a JSON array of strings, e.g. ["a","b"].
+    /// Callers must JSON-parse the result.
     pub fn lrange(self: KVModel, key: []const u8, start: i64, stop: i64) !?[]const u8 {
         var buf: [512]u8 = undefined;
         const sql = try lrangeSql(key, start, stop, &buf);
