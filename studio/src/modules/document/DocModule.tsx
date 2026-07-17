@@ -150,6 +150,7 @@ export function DocModule({ name }: DocModuleProps) {
   const editMode = useSignal(false) // false = tree view, true = raw JSON editor
   const saving = useSignal(false)
   const page = useSignal(0)
+  const total = useSignal(0)
   const limit = 50
 
   // Track if the document has been modified (for tree-view inline edits)
@@ -158,7 +159,7 @@ export function DocModule({ name }: DocModuleProps) {
 
   // New document form
   const showNewDoc = useSignal(false)
-  const newDocRaw = useSignal('{\n  "_id": "",\n  \n}')
+  const newDocRaw = useSignal('{\n  \n}')
 
   // Delete confirmation
   const confirmDeleteId = useSignal<string | null>(null)
@@ -172,14 +173,30 @@ export function DocModule({ name }: DocModuleProps) {
   async function load() {
     loading.value = true
     try {
-      const r = await api.query(
-        `SELECT id, data FROM doc_find('${name}', '{}', ${limit}, ${page.value * limit})`,
-        conn.id
-      )
-      if (r.error) throw new Error(r.error)
-      docs.value = r.rows.map(row => ({
-        id: String(row[0]),
-        data: typeof row[1] === 'string' ? JSON.parse(row[1]) : row[1],
+      // Single global document store — no collection argument. DOC_QUERY with
+      // an empty filter returns a comma-separated list of all matching ids.
+      const idRes = await api.query(`SELECT DOC_QUERY('{}')`, conn.id)
+      if (idRes.error) throw new Error(idRes.error)
+      const cell = idRes.rows[0]?.[0]
+      const allIds = (cell == null || cell === '')
+        ? []
+        : String(cell).split(',').filter(Boolean)
+      allIds.sort((a, b) => Number(a) - Number(b))
+      total.value = allIds.length
+
+      const pageIds = allIds.slice(page.value * limit, page.value * limit + limit)
+      if (pageIds.length === 0) {
+        docs.value = []
+        return
+      }
+      // Fetch each document body with DOC_GET(id) in one multi-column select.
+      const cols = pageIds.map(id => `DOC_GET(${id})`).join(', ')
+      const dataRes = await api.query(`SELECT ${cols}`, conn.id)
+      if (dataRes.error) throw new Error(dataRes.error)
+      const row = (dataRes.rows[0] ?? []) as unknown[]
+      docs.value = pageIds.map((id, i) => ({
+        id,
+        data: row[i] != null ? (typeof row[i] === 'string' ? JSON.parse(row[i] as string) : row[i]) : null,
       }))
     } catch (err: unknown) {
       toast('error', err instanceof Error ? err.message : String(err))
@@ -232,7 +249,7 @@ export function DocModule({ name }: DocModuleProps) {
     try {
       const jsonStr = JSON.stringify(parsed).replace(/'/g, "''")
       await api.query(
-        `SELECT doc_update('${name}', '${d.id}', '${jsonStr}')`,
+        `SELECT DOC_UPDATE(${d.id}, '${jsonStr}')`,
         conn.id
       )
       toast('success', `Document ${d.id} saved`)
@@ -253,7 +270,7 @@ export function DocModule({ name }: DocModuleProps) {
     try {
       const jsonStr = JSON.stringify(treeData.value).replace(/'/g, "''")
       await api.query(
-        `SELECT doc_update('${name}', '${d.id}', '${jsonStr}')`,
+        `SELECT DOC_UPDATE(${d.id}, '${jsonStr}')`,
         conn.id
       )
       toast('success', `Document ${d.id} saved`)
@@ -279,11 +296,11 @@ export function DocModule({ name }: DocModuleProps) {
     try {
       const jsonStr = JSON.stringify(parsed).replace(/'/g, "''")
       await api.query(
-        `SELECT doc_insert('${name}', '${jsonStr}')`,
+        `SELECT DOC_INSERT('${jsonStr}')`,
         conn.id
       )
       showNewDoc.value = false
-      newDocRaw.value = '{\n  "_id": "",\n  \n}'
+      newDocRaw.value = '{\n  \n}'
       toast('success', 'Document created')
       await load()
     } catch (err: unknown) {
@@ -311,7 +328,7 @@ export function DocModule({ name }: DocModuleProps) {
 
   async function doDelete(id: string) {
     try {
-      await api.query(`SELECT doc_delete('${name}', '${id}')`, conn.id)
+      await api.query(`SELECT DOC_DELETE(${id})`, conn.id)
       if (selected.value?.id === id) selected.value = null
       toast('info', `Document ${id} deleted`)
       await load()
@@ -328,7 +345,7 @@ export function DocModule({ name }: DocModuleProps) {
       <div class={s.listPanel}>
         <div class={s.listHeader}>
           <span class={s.listTitle}>{name}</span>
-          <span class={s.docCount}>{docs.value.length} docs</span>
+          <span class={s.docCount}>{total.value} docs</span>
           <button class={s.newDocBtn} onClick={() => { showNewDoc.value = !showNewDoc.value }} title="New Document">+</button>
           <button class={s.refreshBtn} onClick={load} disabled={loading.value}>&#8634;</button>
           <button
@@ -396,7 +413,7 @@ export function DocModule({ name }: DocModuleProps) {
         <div class={s.pagination}>
           <button class={s.pageBtn} onClick={() => { page.value-- }} disabled={page.value === 0}>&larr;</button>
           <span class={s.pageNum}>Page {page.value + 1}</span>
-          <button class={s.pageBtn} onClick={() => { page.value++ }} disabled={docs.value.length < limit}>&rarr;</button>
+          <button class={s.pageBtn} onClick={() => { page.value++ }} disabled={(page.value + 1) * limit >= total.value}>&rarr;</button>
         </div>
       </div>
 

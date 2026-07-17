@@ -1,6 +1,6 @@
 import { useSignal, useComputed } from '@preact/signals'
 import { useEffect } from 'preact/hooks'
-import { activeConnection, schema, toast } from '../../lib/store'
+import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
 import { DataGrid } from '../../components/DataGrid'
 import type { QueryResult } from '../../lib/types'
@@ -324,10 +324,20 @@ function ScatterPlot({ points, selectedId, onSelect, hasScores }: ScatterPlotPro
   )
 }
 
+// Quote a SQL identifier (table/column) so it survives special characters.
+function qIdent(ident: string): string {
+  return `"${ident.replace(/"/g, '""')}"`
+}
+
 export function VectorModule({ name }: VectorModuleProps) {
+  // Nucleus has no named/global vector store — nearest-neighbor search runs
+  // against a user SQL table that has a VECTOR column. The user supplies the
+  // table name and the vector column.
+  const tableName = useSignal(name)
+  const vecColumn = useSignal('embedding')
   const queryVec = useSignal('')
   const k = useSignal(10)
-  const metric = useSignal<'l2' | 'cosine' | 'dot'>('cosine')
+  const metric = useSignal<'l2' | 'cosine' | 'inner'>('cosine')
   const result = useSignal<QueryResult | null>(null)
   const running = useSignal(false)
   const sampleResult = useSignal<QueryResult | null>(null)
@@ -337,16 +347,17 @@ export function VectorModule({ name }: VectorModuleProps) {
 
   const conn = activeConnection.value!
 
-  // Pull index metadata from schema
-  const indexInfo = schema.value?.vector.find(v => v.name === name)
-
-  // Load a sample of stored vectors on mount
+  // Load a sample of stored vectors on mount — a plain table scan aliasing the
+  // vector column to `embedding` so the PCA plot can pick it up.
   useEffect(() => {
     async function loadSample() {
+      const table = tableName.value.trim()
+      const col = vecColumn.value.trim()
+      if (!table || !col) return
       sampleLoading.value = true
       try {
         const r = await api.query(
-          `SELECT id, embedding FROM vector_scan('${name}', 20)`,
+          `SELECT id, ${qIdent(col)} AS embedding FROM ${qIdent(table)} LIMIT 20`,
           conn.id
         )
         sampleResult.value = r
@@ -369,13 +380,21 @@ export function VectorModule({ name }: VectorModuleProps) {
       return
     }
 
+    const table = tableName.value.trim()
+    const col = vecColumn.value.trim()
+    if (!table || !col) { toast('error', 'Set a table and vector column'); return }
+
     running.value = true
     result.value = null
     try {
+      // Real nearest-neighbor: distance over the table's VECTOR column, then
+      // ORDER BY that distance. No vector_search()/vector_scan() — those do
+      // not exist in the engine.
       const r = await api.query(
-        `SELECT id, embedding, VECTOR_DISTANCE(embedding, VECTOR('${vec}'), '${metric.value}') AS score
-         FROM vector_search('${name}', VECTOR('${vec}'), ${k.value}, '${metric.value}')
-         ORDER BY score ASC`,
+        `SELECT id, ${qIdent(col)} AS embedding, VECTOR_DISTANCE(${qIdent(col)}, VECTOR('${vec}'), '${metric.value}') AS distance
+         FROM ${qIdent(table)}
+         ORDER BY distance ASC
+         LIMIT ${k.value}`,
         conn.id
       )
       result.value = r
@@ -405,17 +424,22 @@ export function VectorModule({ name }: VectorModuleProps) {
 
   return (
     <div class={s.layout}>
-      {/* Header / index info */}
+      {/* Header / target table + column */}
       <div class={s.header}>
         <div class={s.indexInfo}>
           <span class={s.indexName}>{name}</span>
-          {indexInfo && (
-            <>
-              <span class={s.pill}>{indexInfo.dimensions}d</span>
-              <span class={s.pill}>{indexInfo.metric}</span>
-              <span class={s.pill}>{indexInfo.count.toLocaleString()} vectors</span>
-            </>
-          )}
+          <label class={s.controlLabel}>Table</label>
+          <input
+            class={s.kInput}
+            value={tableName.value}
+            onInput={e => { tableName.value = (e.target as HTMLInputElement).value }}
+          />
+          <label class={s.controlLabel}>Vector column</label>
+          <input
+            class={s.kInput}
+            value={vecColumn.value}
+            onInput={e => { vecColumn.value = (e.target as HTMLInputElement).value }}
+          />
         </div>
       </div>
 
@@ -424,7 +448,7 @@ export function VectorModule({ name }: VectorModuleProps) {
         <div class={s.searchLabel}>Query vector</div>
         <textarea
           class={s.vecInput}
-          placeholder={`[0.1, 0.2, 0.3, ...]  (${indexInfo?.dimensions ?? 'N'} dimensions)`}
+          placeholder={`[0.1, 0.2, 0.3, ...]`}
           value={queryVec.value}
           onInput={e => { queryVec.value = (e.target as HTMLTextAreaElement).value }}
           rows={3}
@@ -450,7 +474,7 @@ export function VectorModule({ name }: VectorModuleProps) {
             >
               <option value="cosine">Cosine</option>
               <option value="l2">L2</option>
-              <option value="dot">Dot product</option>
+              <option value="inner">Inner product</option>
             </select>
           </div>
           <button class={s.searchBtn} onClick={runSearch} disabled={running.value}>

@@ -1,62 +1,82 @@
 import { describe, it, expect } from 'vitest'
 
-// Tests for CDCModule: query building, filter logic
+// Tests for CDCModule real Nucleus SQL. CDC is a single GLOBAL log read via
+// UPPERCASE SCALAR functions returning JSON ({seq,table,change,ts}); there is
+// no cdc_changes()/lsn/old_data/new_data table-valued surface.
 
 type Op = 'all' | 'INSERT' | 'UPDATE' | 'DELETE'
 type RefreshInterval = 'off' | '1' | '2' | '5' | '10'
 
-function buildCDCQuery(
-  limit: number,
-  filterTable: string,
-  filterOp: Op,
-): string {
-  const tableCond = filterTable !== 'all'
-    ? `AND table_name = '${filterTable}'` : ''
-  const opCond = filterOp !== 'all'
-    ? `AND operation = '${filterOp}'` : ''
+const sqlStr = (v: string) => `'${v.replace(/'/g, "''")}'`
 
-  return `SELECT lsn, operation, table_name, old_data, new_data, changed_at
-         FROM cdc_changes(${limit})
-         WHERE 1=1 ${tableCond} ${opCond}
-         ORDER BY changed_at DESC`
+interface CdcEvent {
+  seq: number
+  table: string
+  change: string
+  ts: number
+}
+
+function buildCdcQuery(count: number, limit: number, filterTable: string): string {
+  const after = Math.max(0, count - limit)
+  return filterTable !== 'all'
+    ? `SELECT CDC_TABLE_READ(${sqlStr(filterTable)}, ${after}, ${limit})`
+    : `SELECT CDC_READ(${after}, ${limit})`
+}
+
+function parseCdcEvents(cell: unknown): CdcEvent[] {
+  if (cell == null) return []
+  const text = String(cell).trim()
+  if (text === '') return []
+  try {
+    const parsed = JSON.parse(text)
+    return Array.isArray(parsed) ? (parsed as CdcEvent[]) : []
+  } catch {
+    return []
+  }
 }
 
 describe('CDCModule — query building', () => {
-  it('should build query with no filters', () => {
-    const sql = buildCDCQuery(200, 'all', 'all')
-    expect(sql).toContain('cdc_changes(200)')
-    expect(sql).not.toContain("AND table_name")
-    expect(sql).not.toContain("AND operation")
-    expect(sql).toContain('ORDER BY changed_at DESC')
+  it('should use CDC_READ for all tables, reading the most recent window', () => {
+    // count=500, limit=200 → after = 300
+    expect(buildCdcQuery(500, 200, 'all')).toBe('SELECT CDC_READ(300, 200)')
   })
 
-  it('should add table filter', () => {
-    const sql = buildCDCQuery(200, 'users', 'all')
-    expect(sql).toContain("AND table_name = 'users'")
-    expect(sql).not.toContain("AND operation")
+  it('should clamp the after-cursor at 0 when count < limit', () => {
+    expect(buildCdcQuery(50, 200, 'all')).toBe('SELECT CDC_READ(0, 200)')
   })
 
-  it('should add operation filter', () => {
-    const sql = buildCDCQuery(100, 'all', 'INSERT')
-    expect(sql).toContain("AND operation = 'INSERT'")
-    expect(sql).not.toContain("AND table_name")
+  it('should use CDC_TABLE_READ when a table filter is set', () => {
+    expect(buildCdcQuery(300, 100, 'users')).toBe("SELECT CDC_TABLE_READ('users', 200, 100)")
+  })
+})
+
+describe('CDCModule — event JSON parsing', () => {
+  it('should parse the real {seq,table,change,ts} shape', () => {
+    const cell = JSON.stringify([
+      { seq: 1, table: 'users', change: 'INSERT', ts: 1700000000000 },
+      { seq: 2, table: 'orders', change: 'UPDATE', ts: 1700000000001 },
+    ])
+    const events = parseCdcEvents(cell)
+    expect(events.length).toBe(2)
+    expect(events[0]).toEqual({ seq: 1, table: 'users', change: 'INSERT', ts: 1700000000000 })
+    expect(events[1].change).toBe('UPDATE')
   })
 
-  it('should add both filters', () => {
-    const sql = buildCDCQuery(500, 'orders', 'UPDATE')
-    expect(sql).toContain("AND table_name = 'orders'")
-    expect(sql).toContain("AND operation = 'UPDATE'")
-    expect(sql).toContain('cdc_changes(500)')
+  it('should apply the operation filter client-side', () => {
+    const events: CdcEvent[] = [
+      { seq: 1, table: 'a', change: 'INSERT', ts: 0 },
+      { seq: 2, table: 'a', change: 'DELETE', ts: 0 },
+    ]
+    const op: Op = 'INSERT'
+    const filtered = op !== 'all' ? events.filter(e => e.change === op) : events
+    expect(filtered.length).toBe(1)
+    expect(filtered[0].seq).toBe(1)
   })
 
-  it('should support all operation types', () => {
-    const ops: Op[] = ['all', 'INSERT', 'UPDATE', 'DELETE']
-    for (const op of ops) {
-      const sql = buildCDCQuery(200, 'all', op)
-      if (op !== 'all') {
-        expect(sql).toContain(`AND operation = '${op}'`)
-      }
-    }
+  it('should treat empty/invalid cells as no events', () => {
+    expect(parseCdcEvents('')).toEqual([])
+    expect(parseCdcEvents(null)).toEqual([])
+    expect(parseCdcEvents('nope')).toEqual([])
   })
 })
 
@@ -64,11 +84,9 @@ describe('CDCModule — refresh interval', () => {
   it('should validate all refresh interval values', () => {
     const intervals: RefreshInterval[] = ['off', '1', '2', '5', '10']
     expect(intervals.length).toBe(5)
-
     for (const interval of intervals) {
       if (interval !== 'off') {
-        const ms = parseInt(interval) * 1000
-        expect(ms).toBeGreaterThan(0)
+        expect(parseInt(interval) * 1000).toBeGreaterThan(0)
       }
     }
   })
@@ -77,13 +95,10 @@ describe('CDCModule — refresh interval', () => {
     const testCases: { interval: RefreshInterval; expected: boolean }[] = [
       { interval: 'off', expected: false },
       { interval: '1', expected: true },
-      { interval: '2', expected: true },
-      { interval: '5', expected: true },
       { interval: '10', expected: true },
     ]
     for (const { interval, expected } of testCases) {
-      const isLive = interval !== 'off'
-      expect(isLive).toBe(expected)
+      expect(interval !== 'off').toBe(expected)
     }
   })
 })

@@ -44,15 +44,30 @@ export function KVModule({ name }: KVModuleProps) {
   async function load() {
     loading.value = true
     try {
-      const r = await api.query(
-        `SELECT key, value, ttl FROM kv_scan(${sqlStr(name)}, '*', 500)`,
-        conn.id
-      )
-      if (r.error) throw new Error(r.error)
-      entries.value = r.rows.map(row => ({
-        key: String(row[0]),
-        value: String(row[1]),
-        ttl: row[2] != null ? Number(row[2]) : null,
+      // The KV store is a single global keyspace — enumerate keys with
+      // KV_KEYS(pattern), which returns a JSON array of key strings.
+      const keyRes = await api.query(`SELECT KV_KEYS('*')`, conn.id)
+      if (keyRes.error) throw new Error(keyRes.error)
+      const cell = keyRes.rows[0]?.[0]
+      const keys: string[] = Array.isArray(cell)
+        ? cell.map(String)
+        : typeof cell === 'string'
+          ? (JSON.parse(cell) as string[])
+          : []
+      if (keys.length === 0) {
+        entries.value = []
+        return
+      }
+      // Fetch each key's value with KV_GET in a single multi-column select.
+      const cols = keys.map(k => `KV_GET(${sqlStr(k)})`).join(', ')
+      const valRes = await api.query(`SELECT ${cols}`, conn.id)
+      if (valRes.error) throw new Error(valRes.error)
+      const valRow = (valRes.rows[0] ?? []) as unknown[]
+      // The engine exposes no remaining-TTL read, so ttl is always null here.
+      entries.value = keys.map((k, i) => ({
+        key: k,
+        value: valRow[i] != null ? String(valRow[i]) : '',
+        ttl: null,
       }))
     } catch (err: unknown) {
       toast('error', err instanceof Error ? err.message : String(err))
@@ -99,7 +114,7 @@ export function KVModule({ name }: KVModuleProps) {
       const entry = entries.value.find(e => e.key === key)
       const ttlArg = entry?.ttl != null ? `, ${entry.ttl}` : ''
       await api.query(
-        `SELECT kv_set(${sqlStr(name)}, ${sqlStr(key)}, ${sqlStr(inlineEditValue.value)}${ttlArg})`,
+        `SELECT KV_SET(${sqlStr(key)}, ${sqlStr(inlineEditValue.value)}${ttlArg})`,
         conn.id
       )
       toast('success', `Saved ${key}`)
@@ -119,7 +134,7 @@ export function KVModule({ name }: KVModuleProps) {
     try {
       const ttlArg = editTTL.value ? `, ${parseInt(editTTL.value)}` : ''
       await api.query(
-        `SELECT kv_set(${sqlStr(name)}, ${sqlStr(e.key)}, ${sqlStr(editValue.value)}${ttlArg})`,
+        `SELECT KV_SET(${sqlStr(e.key)}, ${sqlStr(editValue.value)}${ttlArg})`,
         conn.id
       )
       toast('success', `Saved ${e.key}`)
@@ -151,7 +166,7 @@ export function KVModule({ name }: KVModuleProps) {
 
   async function doDelete(key: string) {
     try {
-      await api.query(`SELECT kv_delete(${sqlStr(name)}, ${sqlStr(key)})`, conn.id)
+      await api.query(`SELECT KV_DEL(${sqlStr(key)})`, conn.id)
       if (selected.value?.key === key) selected.value = null
       toast('info', `Deleted ${key}`)
       await load()
@@ -165,7 +180,7 @@ export function KVModule({ name }: KVModuleProps) {
     try {
       const ttlArg = newTTL.value ? `, ${parseInt(newTTL.value)}` : ''
       await api.query(
-        `SELECT kv_set(${sqlStr(name)}, ${sqlStr(newKey.value)}, ${sqlStr(newValue.value)}${ttlArg})`,
+        `SELECT KV_SET(${sqlStr(newKey.value)}, ${sqlStr(newValue.value)}${ttlArg})`,
         conn.id
       )
       newKey.value = ''

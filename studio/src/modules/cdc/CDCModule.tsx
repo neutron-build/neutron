@@ -9,8 +9,49 @@ import s from './CDCModule.module.css'
 type Op = 'all' | 'INSERT' | 'UPDATE' | 'DELETE'
 type RefreshInterval = 'off' | '1' | '2' | '5' | '10'
 
+const sqlStr = (v: string) => `'${v.replace(/'/g, "''")}'`
+
+interface CdcEvent {
+  seq: number
+  table: string
+  change: string
+  ts: number
+}
+
+// CDC is a single GLOBAL log. CDC_READ / CDC_TABLE_READ return a JSON array of
+// { seq, table, change, ts } (ts = epoch ms). There is no lsn/old_data/new_data.
+export function parseCdcEvents(cell: unknown): CdcEvent[] {
+  if (cell == null) return []
+  const text = String(cell).trim()
+  if (text === '') return []
+  try {
+    const parsed = JSON.parse(text)
+    return Array.isArray(parsed) ? (parsed as CdcEvent[]) : []
+  } catch {
+    return []
+  }
+}
+
+// The log is read forward from a sequence cursor, so to show the most recent
+// `limit` events we start after (count - limit).
+export function buildCdcQuery(count: number, limit: number, filterTable: string): string {
+  const after = Math.max(0, count - limit)
+  return filterTable !== 'all'
+    ? `SELECT CDC_TABLE_READ(${sqlStr(filterTable)}, ${after}, ${limit})`
+    : `SELECT CDC_READ(${after}, ${limit})`
+}
+
+export function eventsToResult(events: CdcEvent[]): QueryResult {
+  return {
+    columns: ['seq', 'table', 'change', 'ts'],
+    rows: events.map(e => [e.seq, e.table, e.change, new Date(e.ts).toISOString()]),
+    rowCount: events.length,
+    duration: 0,
+  }
+}
+
 export function CDCModule() {
-  const walPosition = useSignal<string | null>(null)
+  const totalCount = useSignal<number | null>(null)
   const tables = useSignal<string[]>([])
   const filterTable = useSignal('all')
   const filterOp = useSignal<Op>('all')
@@ -23,16 +64,6 @@ export function CDCModule() {
   const conn = activeConnection.value!
 
   useEffect(() => {
-    async function loadMeta() {
-      try {
-        const posR = await api.query(`SELECT cdc_wal_position()`, conn.id)
-        if (!posR.error && posR.rows.length > 0) walPosition.value = String(posR.rows[0][0])
-
-        const tabR = await api.query(`SELECT DISTINCT table_name FROM cdc_changes(${limit.value}) ORDER BY 1`, conn.id)
-        if (!tabR.error) tables.value = tabR.rows.map(r => String(r[0]))
-      } catch { /* non-critical */ }
-    }
-    loadMeta()
     loadChanges()
   }, [])
 
@@ -49,19 +80,28 @@ export function CDCModule() {
     const scrollTop = gridRef.current?.scrollTop ?? 0
     loading.value = true
     try {
-      const tableCond = filterTable.value !== 'all'
-        ? `AND table_name = '${filterTable.value}'` : ''
-      const opCond = filterOp.value !== 'all'
-        ? `AND operation = '${filterOp.value}'` : ''
+      const countR = await api.query(`SELECT CDC_COUNT()`, conn.id)
+      const count = !countR.error && countR.rows.length > 0 ? Number(countR.rows[0][0]) : 0
+      totalCount.value = count
 
-      const r = await api.query(
-        `SELECT lsn, operation, table_name, old_data, new_data, changed_at
-         FROM cdc_changes(${limit.value})
-         WHERE 1=1 ${tableCond} ${opCond}
-         ORDER BY changed_at DESC`,
-        conn.id
-      )
-      result.value = r
+      const r = await api.query(buildCdcQuery(count, limit.value, filterTable.value), conn.id)
+      if (r.error) {
+        result.value = r
+      } else {
+        const cell = r.rows.length > 0 ? r.rows[0][0] : null
+        let events = parseCdcEvents(cell)
+        // Newest first
+        events = events.slice().reverse()
+        // Populate the table filter from what we have seen
+        const seen = new Set(tables.value)
+        for (const e of events) seen.add(e.table)
+        tables.value = Array.from(seen).sort()
+        // Operation filter is applied client-side (the JSON carries `change`).
+        if (filterOp.value !== 'all') {
+          events = events.filter(e => e.change === filterOp.value)
+        }
+        result.value = eventsToResult(events)
+      }
     } catch (err: unknown) {
       toast('error', err instanceof Error ? err.message : String(err))
     } finally {
@@ -81,8 +121,8 @@ export function CDCModule() {
     <div class={s.layout}>
       <div class={s.header}>
         <span class={s.title}>Change Data Capture</span>
-        {walPosition.value && (
-          <span class={s.walPos} title="Current WAL position">LSN {walPosition.value}</span>
+        {totalCount.value != null && (
+          <span class={s.walPos} title="Total change events">{totalCount.value.toLocaleString()} events</span>
         )}
         <div class={s.refreshControl}>
           <label class={s.refreshLabel}>Auto-refresh</label>
@@ -124,7 +164,7 @@ export function CDCModule() {
         <div class={s.filterGroup}>
           <label class={s.filterLabel}>Limit</label>
           <select class={s.filterSelect} value={limit.value}
-            onChange={e => { limit.value = parseInt((e.target as HTMLSelectElement).value) }}>
+            onChange={e => { limit.value = parseInt((e.target as HTMLSelectElement).value); loadChanges() }}>
             <option value={100}>100</option>
             <option value={200}>200</option>
             <option value={500}>500</option>

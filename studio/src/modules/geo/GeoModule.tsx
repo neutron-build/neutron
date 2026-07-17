@@ -1,407 +1,77 @@
-import { useSignal, useComputed } from '@preact/signals'
-import { useEffect, useRef } from 'preact/hooks'
+import { useSignal } from '@preact/signals'
 import { activeConnection, toast } from '../../lib/store'
 import { api } from '../../lib/api'
-import { DataGrid } from '../../components/DataGrid'
-import type { QueryResult } from '../../lib/types'
-import 'maplibre-gl/dist/maplibre-gl.css'
 import s from './GeoModule.module.css'
 
 interface GeoModuleProps {
   name: string
 }
 
-type QueryType = 'radius' | 'bbox' | 'knn'
-type ViewMode = 'results' | 'map'
+type CalcType = 'distance' | 'within' | 'area'
 
-// --- Parsed point from query results ---
-interface GeoPoint {
-  id: string
-  lat: number
-  lon: number
-  extra: Record<string, unknown>
-}
+// Nucleus has NO geo store to enumerate — only scalar geometry functions.
+// This module is an honest calculator over user-entered coordinates:
+//   GEO_DISTANCE(lat1,lon1,lat2,lon2)          → meters (haversine)
+//   GEO_WITHIN(lat1,lon1,lat2,lon2,radius_m)   → bool
+//   GEO_AREA(x1,y1,x2,y2,x3,y3,...)            → polygon area (>=3 pairs)
 
-// --- Parse coordinates from query results ---
-function parseGeoPoints(result: QueryResult): GeoPoint[] {
-  const cols = result.columns.map(c => c.toLowerCase())
-  const latIdx = cols.findIndex(c => c === 'lat' || c === 'latitude' || c === 'y')
-  const lonIdx = cols.findIndex(c => c === 'lon' || c === 'lng' || c === 'longitude' || c === 'x')
-  const idIdx = cols.findIndex(c => c === 'id' || c === 'point_id' || c === 'gid')
-
-  if (latIdx < 0 || lonIdx < 0) return []
-
-  const points: GeoPoint[] = []
-  for (let i = 0; i < result.rows.length; i++) {
-    const row = result.rows[i] as unknown[]
-    const lat = Number(row[latIdx])
-    const lon = Number(row[lonIdx])
-    if (isNaN(lat) || isNaN(lon)) continue
-
-    const id = idIdx >= 0 ? String(row[idIdx]) : String(i)
-    const extra: Record<string, unknown> = {}
-    for (let c = 0; c < result.columns.length; c++) {
-      if (c !== latIdx && c !== lonIdx && c !== idIdx) {
-        extra[result.columns[c]] = row[c]
-      }
-    }
-    points.push({ id, lat, lon, extra })
+// Parse a textarea of "x,y" (or "x y") pairs, one per line, into a flat
+// coordinate argument list for GEO_AREA.
+export function parsePolygon(text: string): number[] {
+  const coords: number[] = []
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    const parts = trimmed.split(/[,\s]+/).map(Number)
+    if (parts.length < 2 || parts.some(isNaN)) continue
+    coords.push(parts[0], parts[1])
   }
-  return points
-}
-
-// --- Compute bounds from a set of points ---
-function computeBounds(points: GeoPoint[]): { minLat: number; maxLat: number; minLon: number; maxLon: number } {
-  let minLat = Infinity, maxLat = -Infinity
-  let minLon = Infinity, maxLon = -Infinity
-  for (const p of points) {
-    if (p.lat < minLat) minLat = p.lat
-    if (p.lat > maxLat) maxLat = p.lat
-    if (p.lon < minLon) minLon = p.lon
-    if (p.lon > maxLon) maxLon = p.lon
-  }
-  // Add padding (10% of range, minimum 0.001 degrees)
-  const latPad = Math.max((maxLat - minLat) * 0.1, 0.001)
-  const lonPad = Math.max((maxLon - minLon) * 0.1, 0.001)
-  return {
-    minLat: minLat - latPad,
-    maxLat: maxLat + latPad,
-    minLon: minLon - lonPad,
-    maxLon: maxLon + lonPad,
-  }
-}
-
-// --- MapLibre lazy loading (same pattern as CodeMirror in SQLEditor) ---
-let maplibreLoaded = false
-let maplibregl: typeof import('maplibre-gl')
-
-async function loadMapLibre() {
-  if (maplibreLoaded) return
-  maplibregl = await import('maplibre-gl')
-  maplibreLoaded = true
-}
-
-// --- MapLibre Map component ---
-interface MapViewProps {
-  points: GeoPoint[]
-  selectedPoint: string | null
-  onSelectPoint: (id: string) => void
-}
-
-function MapView({ points, selectedPoint, onSelectPoint }: MapViewProps) {
-  const containerRef = useRef<HTMLDivElement>(null)
-  const mapRef = useRef<import('maplibre-gl').Map | null>(null)
-  const mapReady = useSignal(false)
-  const mapError = useSignal<string | null>(null)
-
-  // Initialize map
-  useEffect(() => {
-    let cancelled = false
-
-    async function init() {
-      try {
-        await loadMapLibre()
-      } catch (err) {
-        mapError.value = 'Failed to load MapLibre GL'
-        return
-      }
-      if (cancelled || !containerRef.current) return
-
-      // Use a free tile source (OpenFreeMap / demotiles)
-      const map = new maplibregl.Map({
-        container: containerRef.current,
-        style: {
-          version: 8,
-          name: 'Neutron Dark',
-          sources: {
-            'osm-raster': {
-              type: 'raster',
-              tiles: [
-                'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-              ],
-              tileSize: 256,
-              attribution: '&copy; OpenStreetMap contributors',
-            },
-          },
-          layers: [
-            {
-              id: 'osm-raster-layer',
-              type: 'raster',
-              source: 'osm-raster',
-              paint: {
-                // Darken the tiles to match the dark UI
-                'raster-brightness-max': 0.5,
-                'raster-saturation': -0.3,
-              },
-            },
-          ],
-          // Dark background while tiles load
-          glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
-        },
-        center: [0, 20],
-        zoom: 1,
-        attributionControl: { compact: true },
-      })
-
-      mapRef.current = map
-
-      map.on('load', () => {
-        if (cancelled) return
-        mapReady.value = true
-
-        // Add source for points
-        map.addSource('query-points', {
-          type: 'geojson',
-          data: buildGeoJSON(points),
-        })
-
-        // Circle layer for points
-        map.addLayer({
-          id: 'points-circle',
-          type: 'circle',
-          source: 'query-points',
-          paint: {
-            'circle-radius': [
-              'case',
-              ['boolean', ['feature-state', 'selected'], false], 9,
-              6,
-            ],
-            'circle-color': [
-              'case',
-              ['boolean', ['feature-state', 'selected'], false],
-              '#f59e0b',
-              '#06b6d4',
-            ],
-            'circle-stroke-width': 2,
-            'circle-stroke-color': [
-              'case',
-              ['boolean', ['feature-state', 'selected'], false],
-              'rgba(255,255,255,0.9)',
-              'rgba(255,255,255,0.4)',
-            ],
-            'circle-opacity': 0.9,
-          },
-        })
-
-        // Label layer
-        map.addLayer({
-          id: 'points-label',
-          type: 'symbol',
-          source: 'query-points',
-          layout: {
-            'text-field': ['get', 'id'],
-            'text-size': 10,
-            'text-offset': [0, 1.5],
-            'text-anchor': 'top',
-            'text-font': ['Open Sans Regular'],
-          },
-          paint: {
-            'text-color': 'rgba(255,255,255,0.7)',
-            'text-halo-color': 'rgba(0,0,0,0.8)',
-            'text-halo-width': 1,
-          },
-          minzoom: 10,
-        })
-
-        // Click handler
-        map.on('click', 'points-circle', (e) => {
-          if (e.features && e.features.length > 0) {
-            const id = e.features[0].properties?.id
-            if (id) onSelectPoint(String(id))
-          }
-        })
-
-        // Cursor
-        map.on('mouseenter', 'points-circle', () => {
-          map.getCanvas().style.cursor = 'pointer'
-        })
-        map.on('mouseleave', 'points-circle', () => {
-          map.getCanvas().style.cursor = ''
-        })
-
-        // Fit bounds to points
-        if (points.length > 0) {
-          fitToPoints(map, points)
-        }
-      })
-    }
-
-    init()
-
-    return () => {
-      cancelled = true
-      if (mapRef.current) {
-        mapRef.current.remove()
-        mapRef.current = null
-      }
-    }
-  }, []) // Initialize once
-
-  // Update points data when they change
-  useEffect(() => {
-    const map = mapRef.current
-    if (!map || !mapReady.value) return
-
-    const source = map.getSource('query-points') as import('maplibre-gl').GeoJSONSource | undefined
-    if (source) {
-      source.setData(buildGeoJSON(points))
-      if (points.length > 0) {
-        fitToPoints(map, points)
-      }
-    }
-  }, [points, mapReady.value])
-
-  // Update selected point feature state
-  useEffect(() => {
-    const map = mapRef.current
-    if (!map || !mapReady.value) return
-
-    // Clear all selections
-    map.removeFeatureState({ source: 'query-points' })
-
-    // Set selected
-    if (selectedPoint) {
-      // Feature state uses numeric IDs; find index
-      const idx = points.findIndex(p => p.id === selectedPoint)
-      if (idx >= 0) {
-        map.setFeatureState(
-          { source: 'query-points', id: idx },
-          { selected: true }
-        )
-      }
-    }
-  }, [selectedPoint, mapReady.value])
-
-  // Show popup for selected point
-  useEffect(() => {
-    const map = mapRef.current
-    if (!map || !mapReady.value) return
-
-    // Remove existing popup
-    const existing = containerRef.current?.querySelector('.maplibregl-popup')
-    if (existing) existing.remove()
-
-    if (!selectedPoint) return
-
-    const pt = points.find(p => p.id === selectedPoint)
-    if (!pt) return
-
-    const extraLines = Object.entries(pt.extra)
-      .map(([k, v]) => `<b>${k}:</b> ${v === null ? 'null' : String(v)}`)
-      .join('<br/>')
-
-    new maplibregl.Popup({ closeButton: true, closeOnClick: false, className: 'neutron-popup' })
-      .setLngLat([pt.lon, pt.lat])
-      .setHTML(`
-        <div style="font-family:var(--font-mono);font-size:11px;line-height:1.6">
-          <div style="font-weight:600;margin-bottom:2px">Point ${pt.id}</div>
-          <div>${pt.lat.toFixed(6)}, ${pt.lon.toFixed(6)}</div>
-          ${extraLines ? `<div style="margin-top:4px;color:var(--text-secondary,#aaa)">${extraLines}</div>` : ''}
-        </div>
-      `)
-      .addTo(map)
-  }, [selectedPoint, mapReady.value])
-
-  return (
-    <div class={s.mapWrap}>
-      <div ref={containerRef} class={s.mapContainer} />
-      {!mapReady.value && !mapError.value && (
-        <div class={s.mapOverlay}>Loading map...</div>
-      )}
-      {mapError.value && (
-        <div class={s.mapOverlay}>{mapError.value}</div>
-      )}
-    </div>
-  )
-}
-
-function buildGeoJSON(points: GeoPoint[]): GeoJSON.FeatureCollection {
-  return {
-    type: 'FeatureCollection',
-    features: points.map((pt, i) => ({
-      type: 'Feature' as const,
-      id: i,
-      geometry: {
-        type: 'Point' as const,
-        coordinates: [pt.lon, pt.lat],
-      },
-      properties: {
-        id: pt.id,
-        lat: pt.lat,
-        lon: pt.lon,
-        ...pt.extra,
-      },
-    })),
-  }
-}
-
-function fitToPoints(map: import('maplibre-gl').Map, points: GeoPoint[]) {
-  if (points.length === 0) return
-  if (points.length === 1) {
-    map.flyTo({ center: [points[0].lon, points[0].lat], zoom: 14, duration: 800 })
-    return
-  }
-  const bounds = computeBounds(points)
-  map.fitBounds(
-    [[bounds.minLon, bounds.minLat], [bounds.maxLon, bounds.maxLat]],
-    { padding: 50, duration: 800 }
-  )
+  return coords
 }
 
 export function GeoModule({ name }: GeoModuleProps) {
-  const queryType = useSignal<QueryType>('radius')
-  const lat = useSignal('37.7749')
-  const lon = useSignal('-122.4194')
-  const radius = useSignal('10')
-  const knn = useSignal('10')
-  const minLat = useSignal('37.0')
-  const minLon = useSignal('-123.0')
-  const maxLat = useSignal('38.0')
-  const maxLon = useSignal('-122.0')
-  const result = useSignal<QueryResult | null>(null)
+  const calcType = useSignal<CalcType>('distance')
+
+  // Two-point inputs (distance + within)
+  const lat1 = useSignal('37.7749')
+  const lon1 = useSignal('-122.4194')
+  const lat2 = useSignal('34.0522')
+  const lon2 = useSignal('-118.2437')
+  const radius = useSignal('600000')
+
+  // Polygon input (area) — "x,y" per line
+  const polygon = useSignal('0,0\n4,0\n4,3\n0,3')
+
+  const result = useSignal<string | null>(null)
   const running = useSignal(false)
-  const pointCount = useSignal<number | null>(null)
-  const viewMode = useSignal<ViewMode>('map')
-  const selectedPoint = useSignal<string | null>(null)
 
   const conn = activeConnection.value!
 
-  useEffect(() => {
-    async function loadCount() {
-      try {
-        const r = await api.query(`SELECT geo_count('${name}')`, conn.id)
-        if (!r.error && r.rows.length > 0) pointCount.value = Number(r.rows[0][0])
-      } catch { /* non-critical */ }
-    }
-    loadCount()
-  }, [name])
-
-  async function runQuery() {
+  async function runCalc() {
     running.value = true
     result.value = null
-    selectedPoint.value = null
     try {
       let sql: string
-      switch (queryType.value) {
-        case 'radius':
-          sql = `SELECT id, lat, lon, distance_km
-                 FROM geo_radius('${name}', ${lat.value}, ${lon.value}, ${radius.value})`
+      switch (calcType.value) {
+        case 'distance':
+          sql = `SELECT GEO_DISTANCE(${num(lat1.value)}, ${num(lon1.value)}, ${num(lat2.value)}, ${num(lon2.value)})`
           break
-        case 'knn':
-          sql = `SELECT id, lat, lon, distance_km
-                 FROM geo_knn('${name}', ${lat.value}, ${lon.value}, ${knn.value})`
+        case 'within':
+          sql = `SELECT GEO_WITHIN(${num(lat1.value)}, ${num(lon1.value)}, ${num(lat2.value)}, ${num(lon2.value)}, ${num(radius.value)})`
           break
-        case 'bbox':
-          sql = `SELECT id, lat, lon
-                 FROM geo_bbox('${name}', ${minLat.value}, ${minLon.value}, ${maxLat.value}, ${maxLon.value})`
+        case 'area': {
+          const coords = parsePolygon(polygon.value)
+          if (coords.length < 6) {
+            throw new Error('GEO_AREA needs at least 3 coordinate pairs')
+          }
+          sql = `SELECT GEO_AREA(${coords.join(', ')})`
           break
+        }
       }
       const r = await api.query(sql!, conn.id)
-      result.value = r
-      // Auto-switch to map view when results arrive
-      if (!r.error && r.rows.length > 0) {
-        viewMode.value = 'map'
-      }
+      if (r.error) throw new Error(r.error)
+      const cell = r.rows.length > 0 ? r.rows[0][0] : null
+      result.value = formatResult(calcType.value, cell)
     } catch (err: unknown) {
       toast('error', err instanceof Error ? err.message : String(err))
     } finally {
@@ -409,105 +79,85 @@ export function GeoModule({ name }: GeoModuleProps) {
     }
   }
 
-  // Parse points from results
-  const geoPoints = useComputed(() => {
-    const r = result.value
-    if (!r || r.error) return []
-    return parseGeoPoints(r)
-  })
-
-  const hasResults = geoPoints.value.length > 0
-
   return (
     <div class={s.layout}>
       <div class={s.header}>
         <span class={s.layerName}>{name}</span>
-        {pointCount.value != null && (
-          <span class={s.ptCount}>{pointCount.value.toLocaleString()} points</span>
-        )}
+        <span class={s.ptCount}>geometry calculator</span>
       </div>
 
       <div class={s.queryPanel}>
         <div class={s.tabs}>
-          {(['radius', 'knn', 'bbox'] as QueryType[]).map(t => (
+          {(['distance', 'within', 'area'] as CalcType[]).map(t => (
             <button
               key={t}
-              class={`${s.tab} ${queryType.value === t ? s.tabActive : ''}`}
-              onClick={() => { queryType.value = t; result.value = null }}
+              class={`${s.tab} ${calcType.value === t ? s.tabActive : ''}`}
+              onClick={() => { calcType.value = t; result.value = null }}
             >
-              {t === 'radius' ? 'Point + Radius' : t === 'knn' ? 'K-Nearest' : 'Bounding Box'}
+              {t === 'distance' ? 'Distance' : t === 'within' ? 'Within Radius' : 'Polygon Area'}
             </button>
           ))}
         </div>
 
         <div class={s.fields}>
-          {(queryType.value === 'radius' || queryType.value === 'knn') && (
+          {(calcType.value === 'distance' || calcType.value === 'within') && (
             <>
-              <Field label="Latitude" value={lat.value} onChange={v => { lat.value = v }} />
-              <Field label="Longitude" value={lon.value} onChange={v => { lon.value = v }} />
-              {queryType.value === 'radius'
-                ? <Field label="Radius (km)" value={radius.value} onChange={v => { radius.value = v }} />
-                : <Field label="K neighbors" value={knn.value} onChange={v => { knn.value = v }} />
-              }
+              <Field label="Lat 1" value={lat1.value} onChange={v => { lat1.value = v }} />
+              <Field label="Lon 1" value={lon1.value} onChange={v => { lon1.value = v }} />
+              <Field label="Lat 2" value={lat2.value} onChange={v => { lat2.value = v }} />
+              <Field label="Lon 2" value={lon2.value} onChange={v => { lon2.value = v }} />
+              {calcType.value === 'within' && (
+                <Field label="Radius (m)" value={radius.value} onChange={v => { radius.value = v }} />
+              )}
             </>
           )}
-          {queryType.value === 'bbox' && (
-            <>
-              <Field label="Min Lat" value={minLat.value} onChange={v => { minLat.value = v }} />
-              <Field label="Min Lon" value={minLon.value} onChange={v => { minLon.value = v }} />
-              <Field label="Max Lat" value={maxLat.value} onChange={v => { maxLat.value = v }} />
-              <Field label="Max Lon" value={maxLon.value} onChange={v => { maxLon.value = v }} />
-            </>
+          {calcType.value === 'area' && (
+            <div class={s.field} style={{ flex: 1 }}>
+              <label class={s.fieldLabel}>Polygon points (x,y per line, &ge; 3)</label>
+              <textarea
+                class={s.fieldInput}
+                rows={5}
+                value={polygon.value}
+                onInput={e => { polygon.value = (e.target as HTMLTextAreaElement).value }}
+              />
+            </div>
           )}
-          <button class={s.runBtn} onClick={runQuery} disabled={running.value}>
-            {running.value ? 'Querying...' : 'Query'}
+          <button class={s.runBtn} onClick={runCalc} disabled={running.value}>
+            {running.value ? 'Computing...' : 'Compute'}
           </button>
         </div>
       </div>
 
       <div class={s.results}>
-        {result.value ? (
-          result.value.error ? (
-            <div class={s.error}>{result.value.error}</div>
-          ) : (
-            <>
-              <div class={s.resultToolbar}>
-                <div class={s.resultMeta}>{result.value.rowCount} points &middot; {result.value.duration}ms</div>
-                {hasResults && (
-                  <div class={s.viewToggle}>
-                    <button
-                      class={`${s.toggleBtn} ${viewMode.value === 'results' ? s.toggleActive : ''}`}
-                      onClick={() => { viewMode.value = 'results' }}
-                    >
-                      Table
-                    </button>
-                    <button
-                      class={`${s.toggleBtn} ${viewMode.value === 'map' ? s.toggleActive : ''}`}
-                      onClick={() => { viewMode.value = 'map' }}
-                    >
-                      Map
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {viewMode.value === 'results' ? (
-                <div class={s.grid}><DataGrid result={result.value} /></div>
-              ) : (
-                <MapView
-                  points={geoPoints.value}
-                  selectedPoint={selectedPoint.value}
-                  onSelectPoint={(id) => { selectedPoint.value = selectedPoint.value === id ? null : id }}
-                />
-              )}
-            </>
-          )
+        {result.value != null ? (
+          <div class={s.resultMeta}>{result.value}</div>
         ) : !running.value && (
-          <div class={s.hint}>Configure a spatial query above and click Query</div>
+          <div class={s.hint}>Enter coordinates above and click Compute</div>
         )}
       </div>
     </div>
   )
+}
+
+// Coerce a user field to a numeric literal; fall back to 0 for empty input so
+// the generated SQL is always valid.
+function num(v: string): string {
+  const n = Number(v.trim())
+  return isNaN(n) ? '0' : String(n)
+}
+
+function formatResult(type: CalcType, cell: unknown): string {
+  if (cell == null) return 'NULL'
+  if (type === 'within') {
+    const b = cell === true || cell === 'true' || cell === 't'
+    return b ? 'Within radius: true' : 'Within radius: false'
+  }
+  const n = Number(cell)
+  if (isNaN(n)) return String(cell)
+  if (type === 'distance') {
+    return `${n.toLocaleString(undefined, { maximumFractionDigits: 2 })} m (${(n / 1000).toLocaleString(undefined, { maximumFractionDigits: 3 })} km)`
+  }
+  return `Area: ${n.toLocaleString(undefined, { maximumFractionDigits: 6 })}`
 }
 
 function Field({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {

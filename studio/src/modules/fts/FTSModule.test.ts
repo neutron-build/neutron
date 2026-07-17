@@ -1,71 +1,59 @@
 import { describe, it, expect } from 'vitest'
+import { parseHits } from './FTSModule'
 
-// Tests for FTSModule utility function: highlight
+// Tests for FTSModule: JSON hit parsing + real SQL query building.
+// Nucleus FTS is global — FTS_SEARCH/FTS_FUZZY_SEARCH take no index name and
+// return a JSON array of { doc_id, score } (no snippet).
 
-function highlight(text: string, q: string): string {
-  if (!q.trim()) return text
-  const terms = q.trim().split(/\s+/).filter(Boolean)
-  const pattern = new RegExp(`(${terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'gi')
-  return text.replace(pattern, '<mark>$1</mark>')
-}
-
-describe('FTSModule — highlight', () => {
-  it('should return text unchanged when query is empty', () => {
-    expect(highlight('hello world', '')).toBe('hello world')
-    expect(highlight('hello world', '   ')).toBe('hello world')
+describe('FTSModule — parseHits', () => {
+  it('should return empty for null', () => {
+    expect(parseHits(null)).toEqual([])
+    expect(parseHits(undefined)).toEqual([])
   })
 
-  it('should highlight a single term', () => {
-    expect(highlight('hello world', 'world')).toBe('hello <mark>world</mark>')
+  it('should parse a JSON string array of doc_id/score', () => {
+    const hits = parseHits('[{"doc_id":42,"score":1.5},{"doc_id":7,"score":0.25}]')
+    expect(hits.length).toBe(2)
+    expect(hits[0].docId).toBe('42')
+    expect(hits[0].score).toBeCloseTo(1.5)
+    expect(hits[1].docId).toBe('7')
+    expect(hits[1].score).toBeCloseTo(0.25)
   })
 
-  it('should highlight multiple terms', () => {
-    const result = highlight('the quick brown fox', 'quick fox')
-    expect(result).toBe('the <mark>quick</mark> brown <mark>fox</mark>')
+  it('should accept an already-parsed array', () => {
+    const hits = parseHits([{ doc_id: 1, score: 3 }])
+    expect(hits.length).toBe(1)
+    expect(hits[0].docId).toBe('1')
+    expect(hits[0].score).toBe(3)
   })
 
-  it('should be case insensitive', () => {
-    expect(highlight('Hello World', 'hello')).toBe('<mark>Hello</mark> World')
-    expect(highlight('HELLO world', 'hello WORLD')).toBe('<mark>HELLO</mark> <mark>world</mark>')
+  it('should return empty for invalid JSON', () => {
+    expect(parseHits('not json')).toEqual([])
   })
 
-  it('should highlight multiple occurrences', () => {
-    expect(highlight('ab ab ab', 'ab')).toBe('<mark>ab</mark> <mark>ab</mark> <mark>ab</mark>')
-  })
-
-  it('should escape regex special characters in query', () => {
-    expect(highlight('a.b+c', 'a.b')).toBe('<mark>a.b</mark>+c')
-    expect(highlight('foo(bar)', '(bar)')).toBe('foo<mark>(bar)</mark>')
-  })
-
-  it('should handle overlapping matches', () => {
-    // "ab" and "bc" in "abc" -- regex alternation handles this as first match
-    const result = highlight('abc', 'ab bc')
-    // Should match 'ab' first, then 'bc' is partially consumed
-    expect(result).toContain('<mark>')
-  })
-
-  it('should not highlight when no match', () => {
-    expect(highlight('hello', 'xyz')).toBe('hello')
+  it('should return empty for a non-array cell', () => {
+    expect(parseHits('{"doc_id":1}')).toEqual([])
   })
 })
 
 describe('FTSModule — query building', () => {
-  it('should build fts_search query', () => {
-    const name = 'articles'
-    const query = "hello world"
+  it('should build FTS_SEARCH query with no index name', () => {
+    const query = 'hello world'
     const limit = 25
-    const fn = 'fts_search'
-    const sql = `SELECT id, snippet, score FROM ${fn}('${name}', '${query.replace(/'/g, "''")}', ${limit})
-         ORDER BY score DESC`
-    expect(sql).toContain("fts_search('articles'")
-    expect(sql).toContain("'hello world'")
-    expect(sql).toContain('25')
+    const sql = `SELECT FTS_SEARCH('${query.replace(/'/g, "''")}', ${limit})`
+    expect(sql).toBe("SELECT FTS_SEARCH('hello world', 25)")
   })
 
-  it('should build fts_search_fuzzy query when fuzzy enabled', () => {
-    const fn = 'fts_search_fuzzy'
-    expect(fn).toBe('fts_search_fuzzy')
+  it('should build FTS_FUZZY_SEARCH query with max distance', () => {
+    const query = 'helo'
+    const maxDistance = 2
+    const limit = 10
+    const sql = `SELECT FTS_FUZZY_SEARCH('${query.replace(/'/g, "''")}', ${maxDistance}, ${limit})`
+    expect(sql).toBe("SELECT FTS_FUZZY_SEARCH('helo', 2, 10)")
+  })
+
+  it('should build FTS_DOC_COUNT query with no args', () => {
+    expect(`SELECT FTS_DOC_COUNT()`).toBe('SELECT FTS_DOC_COUNT()')
   })
 
   it('should escape single quotes in search query', () => {

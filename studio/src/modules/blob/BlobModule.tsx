@@ -5,12 +5,15 @@ import { api } from '../../lib/api'
 import { exportCSV, exportJSON } from '../../lib/export'
 import s from './BlobModule.module.css'
 
+// Nucleus has one GLOBAL blob store keyed by string — there is no store name
+// and no per-blob hash column. Listing is: BLOB_LIST(prefix) → JSON array of
+// key strings, then BLOB_META(key) → { size, content_type, created_at,
+// updated_at } (timestamps are epoch ms). Delete is BLOB_DELETE(key).
 interface BlobEntry {
-  id: string
+  id: string          // the blob key
   size: number
   contentType: string
-  createdAt: string
-  hash: string
+  createdAt: number   // epoch ms
 }
 
 interface BlobModuleProps {
@@ -18,13 +21,14 @@ interface BlobModuleProps {
 }
 
 const BASE = '/api'
+const PAGE_SIZE = 50
 
 export function BlobModule({ name }: BlobModuleProps) {
+  const allKeys = useSignal<string[]>([])
   const blobs = useSignal<BlobEntry[]>([])
   const loading = useSignal(false)
   const selected = useSignal<BlobEntry | null>(null)
   const page = useSignal(0)
-  const limit = 50
 
   // Upload state
   const uploading = useSignal(false)
@@ -41,22 +45,19 @@ export function BlobModule({ name }: BlobModuleProps) {
 
   const conn = activeConnection.value!
 
+  // Fetch all keys, then metadata for the visible page.
   async function load() {
     loading.value = true
     try {
-      const r = await api.query(
-        `SELECT id, size, content_type, created_at, hash
-         FROM blob_list('${name}', ${limit}, ${page.value * limit})`,
-        conn.id
-      )
-      if (r.error) throw new Error(r.error)
-      blobs.value = r.rows.map(row => ({
-        id: String(row[0]),
-        size: Number(row[1]),
-        contentType: String(row[2] ?? ''),
-        createdAt: String(row[3] ?? ''),
-        hash: String(row[4] ?? ''),
-      }))
+      const listRes = await api.query(`SELECT BLOB_LIST('')`, conn.id)
+      if (listRes.error) throw new Error(listRes.error)
+      const cell = listRes.rows.length > 0 ? listRes.rows[0][0] : null
+      const keys = parseKeys(cell)
+      allKeys.value = keys
+      // Clamp page if the store shrank
+      const maxPage = Math.max(0, Math.ceil(keys.length / PAGE_SIZE) - 1)
+      if (page.value > maxPage) page.value = maxPage
+      await loadPage()
     } catch (err: unknown) {
       toast('error', err instanceof Error ? err.message : String(err))
     } finally {
@@ -64,7 +65,28 @@ export function BlobModule({ name }: BlobModuleProps) {
     }
   }
 
-  useEffect(() => { load() }, [name, page.value])
+  // Load metadata for the current page's keys.
+  async function loadPage() {
+    const start = page.value * PAGE_SIZE
+    const pageKeys = allKeys.value.slice(start, start + PAGE_SIZE)
+    const entries: BlobEntry[] = []
+    for (const key of pageKeys) {
+      try {
+        const metaRes = await api.query(
+          `SELECT BLOB_META('${key.replace(/'/g, "''")}')`,
+          conn.id
+        )
+        const metaCell = !metaRes.error && metaRes.rows.length > 0 ? metaRes.rows[0][0] : null
+        entries.push(parseMeta(key, metaCell))
+      } catch {
+        entries.push({ id: key, size: 0, contentType: '', createdAt: 0 })
+      }
+    }
+    blobs.value = entries
+  }
+
+  useEffect(() => { load() }, [name])
+  useEffect(() => { loadPage() }, [page.value])
 
   // Cleanup on unmount
   useEffect(() => {
@@ -80,7 +102,6 @@ export function BlobModule({ name }: BlobModuleProps) {
     try {
       const formData = new FormData()
       formData.append('connectionId', conn.id)
-      formData.append('store', name)
       formData.append('file', file)
 
       await new Promise<void>((resolve, reject) => {
@@ -158,7 +179,7 @@ export function BlobModule({ name }: BlobModuleProps) {
   async function downloadBlob(blob: BlobEntry) {
     downloadingId.value = blob.id
     try {
-      const res = await fetch(`${BASE}/blob/${encodeURIComponent(blob.id)}/data?connectionId=${encodeURIComponent(conn.id)}&store=${encodeURIComponent(name)}`)
+      const res = await fetch(`${BASE}/blob/${encodeURIComponent(blob.id)}/data?connectionId=${encodeURIComponent(conn.id)}`)
       if (!res.ok) {
         const text = await res.text()
         throw new Error(text || `HTTP ${res.status}`)
@@ -167,7 +188,6 @@ export function BlobModule({ name }: BlobModuleProps) {
       const url = URL.createObjectURL(data)
       const a = document.createElement('a')
       a.href = url
-      // Use content type to guess extension, fallback to blob id
       a.download = blob.id
       document.body.appendChild(a)
       a.click()
@@ -199,7 +219,7 @@ export function BlobModule({ name }: BlobModuleProps) {
 
   async function doDelete(id: string) {
     try {
-      await api.query(`SELECT blob_delete('${name}', '${id}')`, conn.id)
+      await api.query(`SELECT BLOB_DELETE('${id.replace(/'/g, "''")}')`, conn.id)
       if (selected.value?.id === id) selected.value = null
       toast('info', `Deleted blob ${id.slice(0, 8)}...`)
       await load()
@@ -207,6 +227,8 @@ export function BlobModule({ name }: BlobModuleProps) {
       toast('error', err instanceof Error ? err.message : String(err))
     }
   }
+
+  const hasNextPage = (page.value + 1) * PAGE_SIZE < allKeys.value.length
 
   return (
     <div
@@ -236,7 +258,7 @@ export function BlobModule({ name }: BlobModuleProps) {
 
       <div class={s.toolbar}>
         <span class={s.storeName}>{name}</span>
-        <span class={s.blobCount}>{blobs.value.length} blobs</span>
+        <span class={s.blobCount}>{allKeys.value.length} blobs</span>
         <button class={s.uploadBtn} onClick={openFileDialog} disabled={uploading.value} title="Upload blob">
           {uploading.value ? 'Uploading...' : 'Upload'}
         </button>
@@ -245,20 +267,19 @@ export function BlobModule({ name }: BlobModuleProps) {
           class={s.exportBtn}
           onClick={() => {
             const data = blobs.value.map(b => ({
-              id: b.id,
+              key: b.id,
               size: b.size as unknown,
               contentType: b.contentType,
-              createdAt: b.createdAt,
-              hash: b.hash,
+              createdAt: b.createdAt as unknown,
             }))
-            exportCSV(data, `blobs-${name}.csv`)
+            exportCSV(data, `blobs.csv`)
           }}
           disabled={blobs.value.length === 0}
           title="Export CSV"
         >CSV</button>
         <button
           class={s.exportBtn}
-          onClick={() => exportJSON(blobs.value, `blobs-${name}.json`)}
+          onClick={() => exportJSON(blobs.value, `blobs.json`)}
           disabled={blobs.value.length === 0}
           title="Export JSON"
         >JSON</button>
@@ -282,10 +303,9 @@ export function BlobModule({ name }: BlobModuleProps) {
 
       <div class={s.table}>
         <div class={s.thead}>
-          <span class={s.col} style={{ flex: 2 }}>ID</span>
+          <span class={s.col} style={{ flex: 2 }}>Key</span>
           <span class={s.col}>Type</span>
           <span class={s.col}>Size</span>
-          <span class={s.col}>Hash</span>
           <span class={s.col}>Created</span>
           <span class={s.colAction} />
           <span class={s.colAction} />
@@ -304,15 +324,12 @@ export function BlobModule({ name }: BlobModuleProps) {
                 onClick={() => { selected.value = selected.value?.id === b.id ? null : b }}
               >
                 <span class={s.col} style={{ flex: 2 }} title={b.id}>
-                  <span class={s.mono}>{b.id.slice(0, 16)}...</span>
+                  <span class={s.mono}>{b.id.length > 24 ? b.id.slice(0, 24) + '...' : b.id}</span>
                 </span>
                 <span class={s.col}>
-                  <span class={s.contentType}>{b.contentType || '\u2014'}</span>
+                  <span class={s.contentType}>{b.contentType || '—'}</span>
                 </span>
                 <span class={s.col}>{formatBytes(b.size)}</span>
-                <span class={s.col} title={b.hash}>
-                  <span class={s.mono}>{b.hash.slice(0, 10)}...</span>
-                </span>
                 <span class={s.col}>{fmtDate(b.createdAt)}</span>
                 <span class={s.colAction}>
                   <button
@@ -320,14 +337,14 @@ export function BlobModule({ name }: BlobModuleProps) {
                     onClick={ev => { ev.stopPropagation(); downloadBlob(b) }}
                     disabled={isDownloading}
                     title="Download"
-                  >{isDownloading ? '...' : '\u2913'}</button>
+                  >{isDownloading ? '...' : '⤓'}</button>
                 </span>
                 <span class={s.colAction}>
                   <button
                     class={`${s.deleteBtn} ${isConfirming ? s.deleteBtnConfirm : ''}`}
                     onClick={ev => requestDelete(b.id, ev)}
                     title={isConfirming ? 'Click again to confirm' : 'Delete blob'}
-                  >{isConfirming ? 'Confirm?' : '\u00d7'}</button>
+                  >{isConfirming ? 'Confirm?' : '×'}</button>
                 </span>
               </div>
             )
@@ -339,11 +356,10 @@ export function BlobModule({ name }: BlobModuleProps) {
         <div class={s.detail}>
           <div class={s.detailTitle}>Blob details</div>
           <div class={s.detailGrid}>
-            <span class={s.detailKey}>ID</span>        <span class={s.detailVal}>{selected.value.id}</span>
+            <span class={s.detailKey}>Key</span>       <span class={s.detailVal}>{selected.value.id}</span>
             <span class={s.detailKey}>Size</span>      <span class={s.detailVal}>{formatBytes(selected.value.size)} ({selected.value.size.toLocaleString()} bytes)</span>
             <span class={s.detailKey}>Type</span>      <span class={s.detailVal}>{selected.value.contentType || 'unknown'}</span>
-            <span class={s.detailKey}>Hash</span>      <span class={s.detailVal}>{selected.value.hash}</span>
-            <span class={s.detailKey}>Created</span>   <span class={s.detailVal}>{selected.value.createdAt}</span>
+            <span class={s.detailKey}>Created</span>   <span class={s.detailVal}>{fmtDate(selected.value.createdAt)}</span>
           </div>
           <div class={s.detailActions}>
             <button class={s.detailDownloadBtn} onClick={() => { if (selected.value) downloadBlob(selected.value) }} disabled={downloadingId.value === selected.value.id}>
@@ -356,10 +372,43 @@ export function BlobModule({ name }: BlobModuleProps) {
       <div class={s.pagination}>
         <button class={s.pageBtn} onClick={() => { page.value-- }} disabled={page.value === 0}>&larr; Prev</button>
         <span class={s.pageNum}>Page {page.value + 1}</span>
-        <button class={s.pageBtn} onClick={() => { page.value++ }} disabled={blobs.value.length < limit}>Next &rarr;</button>
+        <button class={s.pageBtn} onClick={() => { page.value++ }} disabled={!hasNextPage}>Next &rarr;</button>
       </div>
     </div>
   )
+}
+
+// Parse the JSON array of key strings from BLOB_LIST.
+export function parseKeys(cell: unknown): string[] {
+  if (cell == null) return []
+  let arr: unknown
+  if (typeof cell === 'string') {
+    try { arr = JSON.parse(cell) } catch { return [] }
+  } else {
+    arr = cell
+  }
+  if (!Array.isArray(arr)) return []
+  return arr.map(String)
+}
+
+// Parse a BLOB_META JSON cell into a BlobEntry (key comes from the caller).
+export function parseMeta(key: string, cell: unknown): BlobEntry {
+  const base: BlobEntry = { id: key, size: 0, contentType: '', createdAt: 0 }
+  if (cell == null) return base
+  let obj: Record<string, unknown>
+  if (typeof cell === 'string') {
+    try { obj = JSON.parse(cell) } catch { return base }
+  } else if (typeof cell === 'object') {
+    obj = cell as Record<string, unknown>
+  } else {
+    return base
+  }
+  return {
+    id: key,
+    size: Number(obj.size ?? 0),
+    contentType: String(obj.content_type ?? ''),
+    createdAt: Number(obj.created_at ?? 0),
+  }
 }
 
 function formatBytes(n: number) {
@@ -369,7 +418,8 @@ function formatBytes(n: number) {
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
-function fmtDate(val: string) {
-  if (!val) return '\u2014'
-  try { return new Date(val).toLocaleString() } catch { return val }
+// createdAt is epoch milliseconds (0 = unknown).
+function fmtDate(ms: number) {
+  if (!ms) return '—'
+  try { return new Date(ms).toLocaleString() } catch { return String(ms) }
 }

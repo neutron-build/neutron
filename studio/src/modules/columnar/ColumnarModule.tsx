@@ -6,59 +6,67 @@ import { DataGrid } from '../../components/DataGrid'
 import type { QueryResult } from '../../lib/types'
 import s from './ColumnarModule.module.css'
 
-interface ColumnStat {
-  name: string
-  type: string
-  nullPct: number
-  minVal: string
-  maxVal: string
-  distinctCount: number
-}
-
 interface ColumnarModuleProps {
   name: string
 }
 
-const QUICK_QUERIES = [
-  (t: string) => `SELECT COUNT(*) FROM columnar_scan('${t}')`,
-  (t: string) => `SELECT * FROM columnar_scan('${t}') LIMIT 100`,
-  (t: string) => `SELECT * FROM columnar_aggregate('${t}', 'count,sum,avg')`,
+const sqlStr = (v: string) => `'${v.replace(/'/g, "''")}'`
+
+// Columnar tables ARE named user tables, so row data comes from a plain scan.
+export const QUICK_QUERIES = [
+  (t: string) => `SELECT COLUMNAR_COUNT(${sqlStr(t)})`,
+  (t: string) => `SELECT * FROM ${t} LIMIT 100`,
 ]
+
+type Agg = 'SUM' | 'AVG' | 'MIN' | 'MAX'
+
+export function aggregateSql(table: string, agg: Agg, col: string): string {
+  return `SELECT COLUMNAR_${agg}(${sqlStr(table)}, ${sqlStr(col)})`
+}
+
+const NUMERIC_RE = /^-?\d+(\.\d+)?$/
+
+// COLUMNAR_INSERT(table, col1, val1, col2, val2, ...) — variadic pairs.
+// Numeric-looking values are emitted unquoted so numeric aggregates work.
+export function buildInsertSql(table: string, pairsInput: string): string {
+  const parts: string[] = [sqlStr(table)]
+  for (const pair of pairsInput.split(',')) {
+    const eq = pair.indexOf('=')
+    if (eq === -1) continue
+    const key = pair.slice(0, eq).trim()
+    const val = pair.slice(eq + 1).trim()
+    if (!key) continue
+    parts.push(sqlStr(key))
+    parts.push(NUMERIC_RE.test(val) ? val : sqlStr(val))
+  }
+  return `SELECT COLUMNAR_INSERT(${parts.join(', ')})`
+}
 
 export function ColumnarModule({ name }: ColumnarModuleProps) {
   const rowCount = useSignal<number | null>(null)
-  const colStats = useSignal<ColumnStat[]>([])
-  const query = useSignal(`SELECT * FROM columnar_scan('${name}') LIMIT 100`)
+  const query = useSignal(`SELECT * FROM ${name} LIMIT 100`)
   const result = useSignal<QueryResult | null>(null)
   const running = useSignal(false)
+
+  // Aggregate helper
+  const aggCol = useSignal('')
+
+  // Insert helper (COLUMNAR_INSERT)
+  const insertPairs = useSignal('')
+  const inserting = useSignal(false)
 
   const conn = activeConnection.value!
 
   useEffect(() => {
-    async function loadMeta() {
-      try {
-        const r = await api.query(`SELECT row_count FROM columnar_info('${name}')`, conn.id)
-        if (!r.error && r.rows.length > 0) rowCount.value = Number(r.rows[0][0])
-
-        const sr = await api.query(
-          `SELECT col_name, col_type, null_pct, min_val, max_val, distinct_count
-           FROM columnar_stats('${name}')`,
-          conn.id
-        )
-        if (!sr.error) {
-          colStats.value = sr.rows.map(r => ({
-            name: String(r[0]),
-            type: String(r[1]),
-            nullPct: Number(r[2]),
-            minVal: String(r[3] ?? ''),
-            maxVal: String(r[4] ?? ''),
-            distinctCount: Number(r[5]),
-          }))
-        }
-      } catch { /* non-critical */ }
-    }
     loadMeta()
   }, [name])
+
+  async function loadMeta() {
+    try {
+      const r = await api.query(`SELECT COLUMNAR_COUNT(${sqlStr(name)})`, conn.id)
+      if (!r.error && r.rows.length > 0) rowCount.value = Number(r.rows[0][0])
+    } catch { /* non-critical */ }
+  }
 
   async function runQuery() {
     running.value = true
@@ -73,6 +81,35 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
     }
   }
 
+  function runAggregate(agg: Agg) {
+    const col = aggCol.value.trim()
+    if (!col) {
+      toast('error', 'Column name is required')
+      return
+    }
+    query.value = aggregateSql(name, agg, col)
+    runQuery()
+  }
+
+  async function insertRow() {
+    const sql = buildInsertSql(name, insertPairs.value)
+    if (!sql.includes(',')) {
+      toast('error', 'Enter at least one col=val pair')
+      return
+    }
+    inserting.value = true
+    try {
+      await api.query(sql, conn.id)
+      toast('success', `Inserted into ${name}`)
+      insertPairs.value = ''
+      await loadMeta()
+    } catch (err: unknown) {
+      toast('error', err instanceof Error ? err.message : String(err))
+    } finally {
+      inserting.value = false
+    }
+  }
+
   return (
     <div class={s.layout}>
       <div class={s.header}>
@@ -82,38 +119,50 @@ export function ColumnarModule({ name }: ColumnarModuleProps) {
         )}
       </div>
 
-      {colStats.value.length > 0 && (
-        <div class={s.statsPanel}>
-          <div class={s.statsTitle}>Column Statistics</div>
-          <div class={s.statsTable}>
-            <div class={s.statsHeader}>
-              <span class={s.sc}>Column</span>
-              <span class={s.sc}>Type</span>
-              <span class={s.sc}>Nulls</span>
-              <span class={s.sc}>Min</span>
-              <span class={s.sc}>Max</span>
-              <span class={s.sc}>Distinct</span>
-            </div>
-            {colStats.value.map(c => (
-              <div key={c.name} class={s.statsRow}>
-                <span class={s.sc}><b class={s.mono}>{c.name}</b></span>
-                <span class={s.sc}><span class={s.typeBadge}>{c.type}</span></span>
-                <span class={s.sc}>{c.nullPct.toFixed(1)}%</span>
-                <span class={s.sc}><span class={s.mono}>{c.minVal || '—'}</span></span>
-                <span class={s.sc}><span class={s.mono}>{c.maxVal || '—'}</span></span>
-                <span class={s.sc}>{c.distinctCount.toLocaleString()}</span>
-              </div>
+      {/* Aggregates (COLUMNAR_SUM/AVG/MIN/MAX) */}
+      <div class={s.statsPanel}>
+        <div class={s.statsTitle}>Aggregate</div>
+        <div class={s.queryRow}>
+          <input
+            class={s.queryInput}
+            style={{ height: 'auto' }}
+            placeholder="column"
+            value={aggCol.value}
+            onInput={e => { aggCol.value = (e.target as HTMLInputElement).value }}
+          />
+          <div class={s.quickBtns}>
+            {(['SUM', 'AVG', 'MIN', 'MAX'] as Agg[]).map(agg => (
+              <button key={agg} class={s.quickBtn} onClick={() => runAggregate(agg)}>
+                {agg}
+              </button>
             ))}
           </div>
         </div>
-      )}
+      </div>
+
+      {/* Insert (COLUMNAR_INSERT) */}
+      <div class={s.statsPanel}>
+        <div class={s.statsTitle}>Insert row</div>
+        <div class={s.queryRow}>
+          <input
+            class={s.queryInput}
+            style={{ height: 'auto' }}
+            placeholder="col1=val1, col2=val2"
+            value={insertPairs.value}
+            onInput={e => { insertPairs.value = (e.target as HTMLInputElement).value }}
+          />
+          <button class={s.runBtn} onClick={insertRow} disabled={inserting.value}>
+            {inserting.value ? 'Inserting…' : 'Insert'}
+          </button>
+        </div>
+      </div>
 
       <div class={s.queryPanel}>
         <div class={s.queryRow}>
           <div class={s.quickBtns}>
             {QUICK_QUERIES.map((fn, i) => (
               <button key={i} class={s.quickBtn} onClick={() => { query.value = fn(name) }}>
-                {i === 0 ? 'COUNT' : i === 1 ? 'SCAN 100' : 'AGGREGATE'}
+                {i === 0 ? 'COUNT' : 'SCAN 100'}
               </button>
             ))}
           </div>

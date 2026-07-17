@@ -160,32 +160,52 @@ function autoTickFormat(start: Date, end: Date): string {
   return '%Y-%m-%d'
 }
 
+// Bucket size options, in milliseconds (the engine's TS functions are numeric
+// epoch-ms — there are no string intervals like '1h').
+const BUCKET_OPTS: { label: string; ms: number }[] = [
+  { label: '1 min', ms: 60_000 },
+  { label: '5 min', ms: 5 * 60_000 },
+  { label: '15 min', ms: 15 * 60_000 },
+  { label: '1 hr', ms: 60 * 60_000 },
+  { label: '6 hr', ms: 6 * 60 * 60_000 },
+  { label: '1 day', ms: 24 * 60 * 60_000 },
+  { label: '7 days', ms: 7 * 24 * 60 * 60_000 },
+  { label: '30 days', ms: 30 * 24 * 60 * 60_000 },
+]
+
+const MAX_BUCKETS = 500
+
 export function TSModule({ name }: TSModuleProps) {
-  const from = useSignal('')
-  const to = useSignal('')
-  const aggFn = useSignal<'avg' | 'sum' | 'min' | 'max' | 'count'>('avg')
-  const bucket = useSignal('1h')
+  const now = Date.now()
+  // Range is expressed as epoch-milliseconds (numeric), matching the engine.
+  const startMs = useSignal(String(now - 60 * 60_000))
+  const endMs = useSignal(String(now))
+  // Only avg and count have engine primitives (TS_RANGE_AVG / TS_RANGE_COUNT).
+  const aggFn = useSignal<'avg' | 'count'>('avg')
+  const bucketMs = useSignal(60 * 60_000)
   const result = useSignal<QueryResult | null>(null)
   const running = useSignal(false)
   const sparkValues = useSignal<number[]>([])
   const bucketLabels = useSignal<string[]>([])
-  const stats = useSignal<{ count: number; min: number; max: number; avg: number } | null>(null)
+  const stats = useSignal<{ count: number; last: number | null } | null>(null)
   const viewMode = useSignal<ViewMode>('chart')
 
   const conn = activeConnection.value!
 
-  // Load quick stats on mount
+  // Load quick stats on mount: total point count and the last value.
   useEffect(() => {
     async function loadStats() {
       try {
         const r = await api.query(
-          `SELECT COUNT(*), MIN(value), MAX(value), AVG(value)
-           FROM ts_range('${name}', '-inf', '+inf')`,
+          `SELECT TS_COUNT(${sqlStr(name)}), TS_LAST(${sqlStr(name)})`,
           conn.id
         )
         if (!r.error && r.rows.length > 0) {
-          const [count, min, max, avg] = r.rows[0] as number[]
-          stats.value = { count, min, max, avg }
+          const [count, last] = r.rows[0] as unknown[]
+          stats.value = {
+            count: Number(count),
+            last: last != null ? Number(last) : null,
+          }
         }
       } catch { /* non-critical */ }
     }
@@ -193,25 +213,50 @@ export function TSModule({ name }: TSModuleProps) {
   }, [name])
 
   async function runQuery() {
+    const start = Number(startMs.value)
+    const end = Number(endMs.value)
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+      toast('error', 'Enter a valid epoch-ms range (end > start)')
+      return
+    }
+    const size = bucketMs.value
+    const bucketCount = Math.ceil((end - start) / size)
+    if (bucketCount > MAX_BUCKETS) {
+      toast('error', `Range yields ${bucketCount} buckets (max ${MAX_BUCKETS}); widen the bucket size`)
+      return
+    }
+
     running.value = true
     result.value = null
     sparkValues.value = []
     bucketLabels.value = []
     try {
-      const fromClause = from.value ? `'${from.value}'` : "'-inf'"
-      const toClause = to.value ? `'${to.value}'` : "'+inf'"
-      const r = await api.query(
-        `SELECT time_bucket('${bucket.value}', ts) AS bucket,
-                ${aggFn.value}(value) AS value
-         FROM ts_range('${name}', ${fromClause}, ${toClause})
-         GROUP BY 1 ORDER BY 1`,
-        conn.id
-      )
-      result.value = r
-      if (!r.error && r.rows.length > 0) {
-        bucketLabels.value = r.rows.map(row => String(row[0]))
-        sparkValues.value = r.rows.map(row => Number(row[1])).filter(v => !isNaN(v))
+      // The engine has no raw-point fetch and no server-side bucketing over a
+      // series, so we build each bucket window client-side and aggregate it
+      // with the real range function, batched into one multi-column select.
+      const fn = aggFn.value === 'count' ? 'TS_RANGE_COUNT' : 'TS_RANGE_AVG'
+      const windows: number[] = []
+      for (let b = start; b < end; b += size) windows.push(b)
+      const cols = windows
+        .map(b => `${fn}(${sqlStr(name)}, ${b}, ${Math.min(b + size, end)})`)
+        .join(', ')
+      const r = await api.query(`SELECT ${cols}`, conn.id)
+      if (r.error) throw new Error(r.error)
+      const row = (r.rows[0] ?? []) as unknown[]
+
+      // Present the batched scalar row as a bucket/value grid for the DataGrid.
+      const gridRows: unknown[][] = windows.map((b, i) => [
+        new Date(b).toISOString(),
+        row[i] != null ? Number(row[i]) : null,
+      ])
+      result.value = {
+        columns: ['bucket', aggFn.value === 'count' ? 'count' : 'avg'],
+        rows: gridRows,
+        rowCount: gridRows.length,
+        duration: r.duration,
       }
+      bucketLabels.value = windows.map(b => new Date(b).toISOString())
+      sparkValues.value = windows.map((_, i) => Number(row[i])).filter(v => !isNaN(v))
     } catch (err: unknown) {
       toast('error', err instanceof Error ? err.message : String(err))
     } finally {
@@ -228,9 +273,9 @@ export function TSModule({ name }: TSModuleProps) {
         {stats.value && (
           <div class={s.statPills}>
             <span class={s.statPill}>{stats.value.count.toLocaleString()} pts</span>
-            <span class={s.statPill}>min {fmt(stats.value.min)}</span>
-            <span class={s.statPill}>max {fmt(stats.value.max)}</span>
-            <span class={s.statPill}>avg {fmt(stats.value.avg)}</span>
+            {stats.value.last != null && (
+              <span class={s.statPill}>last {fmt(stats.value.last)}</span>
+            )}
           </div>
         )}
       </div>
@@ -238,37 +283,29 @@ export function TSModule({ name }: TSModuleProps) {
       <div class={s.queryPanel}>
         <div class={s.queryRow}>
           <div class={s.fieldGroup}>
-            <label class={s.fieldLabel}>From</label>
-            <input class={s.fieldInput} type="datetime-local" value={from.value}
-              onInput={e => { from.value = (e.target as HTMLInputElement).value }} />
+            <label class={s.fieldLabel}>Start (epoch ms)</label>
+            <input class={s.fieldInput} type="number" value={startMs.value}
+              onInput={e => { startMs.value = (e.target as HTMLInputElement).value }} />
           </div>
           <div class={s.fieldGroup}>
-            <label class={s.fieldLabel}>To</label>
-            <input class={s.fieldInput} type="datetime-local" value={to.value}
-              onInput={e => { to.value = (e.target as HTMLInputElement).value }} />
+            <label class={s.fieldLabel}>End (epoch ms)</label>
+            <input class={s.fieldInput} type="number" value={endMs.value}
+              onInput={e => { endMs.value = (e.target as HTMLInputElement).value }} />
           </div>
           <div class={s.fieldGroup}>
             <label class={s.fieldLabel}>Bucket</label>
-            <select class={s.fieldSelect} value={bucket.value}
-              onChange={e => { bucket.value = (e.target as HTMLSelectElement).value }}>
-              <option value="1m">1 min</option>
-              <option value="5m">5 min</option>
-              <option value="15m">15 min</option>
-              <option value="1h">1 hr</option>
-              <option value="6h">6 hr</option>
-              <option value="1d">1 day</option>
-              <option value="7d">7 days</option>
-              <option value="30d">30 days</option>
+            <select class={s.fieldSelect} value={String(bucketMs.value)}
+              onChange={e => { bucketMs.value = Number((e.target as HTMLSelectElement).value) }}>
+              {BUCKET_OPTS.map(o => (
+                <option key={o.ms} value={String(o.ms)}>{o.label}</option>
+              ))}
             </select>
           </div>
           <div class={s.fieldGroup}>
             <label class={s.fieldLabel}>Agg</label>
             <select class={s.fieldSelect} value={aggFn.value}
-              onChange={e => { aggFn.value = (e.target as HTMLSelectElement).value as any }}>
+              onChange={e => { aggFn.value = (e.target as HTMLSelectElement).value as 'avg' | 'count' }}>
               <option value="avg">avg</option>
-              <option value="sum">sum</option>
-              <option value="min">min</option>
-              <option value="max">max</option>
               <option value="count">count</option>
             </select>
           </div>
@@ -329,6 +366,10 @@ export function TSModule({ name }: TSModuleProps) {
       </div>
     </div>
   )
+}
+
+function sqlStr(s: string) {
+  return `'${s.replace(/'/g, "''")}'`
 }
 
 function fmt(n: number) {
