@@ -30,6 +30,13 @@ export interface GraphResult {
   rows: Record<string, unknown>[];
 }
 
+/** An adjacency entry as returned by GRAPH_NEIGHBORS. */
+export interface GraphNeighbor {
+  neighborId: number;
+  edgeId: number;
+  edgeType: string;
+}
+
 // ---------------------------------------------------------------------------
 // GraphModel interface
 // ---------------------------------------------------------------------------
@@ -50,8 +57,8 @@ export interface GraphModel {
   /** Execute a Cypher query with optional parameters. */
   query(cypher: string, params?: Record<string, unknown>): Promise<GraphResult>;
 
-  /** Find neighboring nodes, optionally filtered by edge type and direction. */
-  neighbors(nodeId: number, edgeType?: string, direction?: Direction): Promise<GraphNode[]>;
+  /** Find adjacent nodes, optionally filtered by edge type and direction. */
+  neighbors(nodeId: number, edgeType?: string, direction?: Direction): Promise<GraphNeighbor[]>;
 
   /** Find the shortest path between two nodes. Returns node IDs along the path. */
   shortestPath(fromId: number, toId: number, maxDepth?: number): Promise<number[]>;
@@ -133,16 +140,22 @@ class GraphModelImpl implements GraphModel {
     return JSON.parse(raw) as GraphResult;
   }
 
-  async neighbors(nodeId: number, edgeType?: string, direction: Direction = 'out'): Promise<GraphNode[]> {
+  async neighbors(nodeId: number, edgeType?: string, direction: Direction = 'out'): Promise<GraphNeighbor[]> {
     this.require();
     const raw = await this.transport.fetchval<string>('SELECT GRAPH_NEIGHBORS($1, $2)', [nodeId, direction]);
     if (!raw) return [];
-    const nodes = JSON.parse(raw) as GraphNode[];
+    // Engine emits [{"neighbor_id":N,"edge_id":E,"edge_type":"T"}].
+    const entries = JSON.parse(raw) as Array<{ neighbor_id: number; edge_id: number; edge_type: string }>;
+    const neighbors = entries.map((e) => ({
+      neighborId: e.neighbor_id,
+      edgeId: e.edge_id,
+      edgeType: e.edge_type,
+    }));
 
     if (edgeType) {
-      return nodes.filter((n) => n.properties?._edge_type === edgeType);
+      return neighbors.filter((n) => n.edgeType === edgeType);
     }
-    return nodes;
+    return neighbors;
   }
 
   async shortestPath(fromId: number, toId: number, maxDepth?: number): Promise<number[]> {

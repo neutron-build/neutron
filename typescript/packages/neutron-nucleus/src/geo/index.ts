@@ -166,7 +166,8 @@ class GeoModelImpl implements GeoModel {
     this.require();
     assertIdentifier(layer, 'layer name');
 
-    // Build GeoJSON polygon ([lon, lat] coordinate order)
+    // Build WKT polygon ('POLYGON((x y, x y, ...))' with x=lon, y=lat) —
+    // the engine's ST_CONTAINS(polygon_wkt, point_wkt) takes WKT text.
     const coords = polygon.map(([lat, lon]) => [lon, lat]);
     // Close the ring if not already closed
     if (
@@ -175,18 +176,16 @@ class GeoModelImpl implements GeoModel {
     ) {
       coords.push([...coords[0]]);
     }
-    const geoJson = JSON.stringify({
-      type: 'Polygon',
-      coordinates: [coords],
-    });
+    const wkt = `POLYGON((${coords.map(([x, y]) => `${x} ${y}`).join(', ')}))`;
 
+    // ST_MAKEPOINT(x, y) returns 'POINT(x y)' text, which ST_CONTAINS accepts.
     const sql =
       `SELECT id, lat, lon, properties FROM ${layer} ` +
-      `WHERE ST_CONTAINS(ST_GEOMFROMGEOJSON($1), ST_MAKEPOINT(lon, lat))`;
+      `WHERE ST_CONTAINS($1, ST_MAKEPOINT(lon, lat))`;
 
     const result = await this.transport.query<{
       id: string; lat: number; lon: number; properties: string;
-    }>(sql, [geoJson]);
+    }>(sql, [wkt]);
 
     return result.rows.map((r) => ({
       id: r.id,

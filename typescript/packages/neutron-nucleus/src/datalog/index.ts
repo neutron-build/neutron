@@ -19,7 +19,7 @@ export interface DatalogModel {
   /** Define a rule with a head and body. */
   rule(head: string, body: string): Promise<boolean>;
 
-  /** Evaluate a Datalog query pattern. Returns results as CSV text. */
+  /** Evaluate a Datalog query pattern. Returns a JSON array of result tuples (e.g. `[["alice", "bob"]]`). */
   query(pattern: string): Promise<string>;
 
   /** Clear all facts and rules. */
