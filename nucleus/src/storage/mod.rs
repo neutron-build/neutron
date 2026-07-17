@@ -37,6 +37,7 @@ pub mod page;
 pub mod persistence;
 pub mod tuple;
 pub mod txn;
+pub mod value_codec;
 pub mod wal;
 pub(crate) mod wal_util;
 

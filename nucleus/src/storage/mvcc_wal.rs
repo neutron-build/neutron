@@ -220,7 +220,7 @@ fn encode_record(rec: &MvccWalRecord) -> Vec<u8> {
             write_str(&mut buf, table);
             write_u64(&mut buf, *txn_id);
             write_u32(&mut buf, *version_idx);
-            write_row(&mut buf, row);
+            crate::storage::value_codec::write_row(&mut buf, row);
         }
         MvccWalRecord::Delete {
             table,
@@ -244,7 +244,7 @@ fn encode_record(rec: &MvccWalRecord) -> Vec<u8> {
             write_u64(&mut buf, *txn_id);
             write_u32(&mut buf, *old_version_idx);
             write_u32(&mut buf, *new_version_idx);
-            write_row(&mut buf, new_row);
+            crate::storage::value_codec::write_row(&mut buf, new_row);
         }
         MvccWalRecord::Begin { txn_id } => {
             buf.push(TAG_BEGIN);
@@ -263,243 +263,6 @@ fn encode_record(rec: &MvccWalRecord) -> Vec<u8> {
         }
     }
     buf
-}
-
-// ── Value encoding ───────────────────────────────────────────────────────────
-
-const VAL_NULL: u8 = 0;
-const VAL_BOOL: u8 = 1;
-const VAL_INT32: u8 = 2;
-const VAL_INT64: u8 = 3;
-const VAL_FLOAT64: u8 = 4;
-const VAL_TEXT: u8 = 5;
-const VAL_BYTEA: u8 = 6;
-const VAL_DATE: u8 = 7;
-const VAL_TIMESTAMP: u8 = 8;
-const VAL_TIMESTAMPTZ: u8 = 9;
-const VAL_NUMERIC: u8 = 10;
-const VAL_UUID: u8 = 11;
-const VAL_JSONB: u8 = 12;
-const VAL_VECTOR: u8 = 13;
-const VAL_INTERVAL: u8 = 14;
-const VAL_ARRAY: u8 = 15;
-
-fn write_value(buf: &mut Vec<u8>, val: &Value) {
-    match val {
-        Value::Null => buf.push(VAL_NULL),
-        Value::Bool(b) => {
-            buf.push(VAL_BOOL);
-            buf.push(if *b { 1 } else { 0 });
-        }
-        Value::Int32(n) => {
-            buf.push(VAL_INT32);
-            buf.extend_from_slice(&n.to_le_bytes());
-        }
-        Value::Int64(n) => {
-            buf.push(VAL_INT64);
-            buf.extend_from_slice(&n.to_le_bytes());
-        }
-        Value::Float64(f) => {
-            buf.push(VAL_FLOAT64);
-            buf.extend_from_slice(&f.to_le_bytes());
-        }
-        Value::Text(s) => {
-            buf.push(VAL_TEXT);
-            write_str(buf, s);
-        }
-        Value::Bytea(b) => {
-            buf.push(VAL_BYTEA);
-            write_u32(buf, b.len() as u32);
-            buf.extend_from_slice(b);
-        }
-        Value::Date(d) => {
-            buf.push(VAL_DATE);
-            buf.extend_from_slice(&d.to_le_bytes());
-        }
-        Value::Timestamp(t) => {
-            buf.push(VAL_TIMESTAMP);
-            buf.extend_from_slice(&t.to_le_bytes());
-        }
-        Value::TimestampTz(t) => {
-            buf.push(VAL_TIMESTAMPTZ);
-            buf.extend_from_slice(&t.to_le_bytes());
-        }
-        Value::Numeric(s) => {
-            buf.push(VAL_NUMERIC);
-            write_str(buf, s);
-        }
-        Value::Uuid(bytes) => {
-            buf.push(VAL_UUID);
-            buf.extend_from_slice(bytes);
-        }
-        Value::Jsonb(j) => {
-            buf.push(VAL_JSONB);
-            write_str(buf, &j.to_string());
-        }
-        Value::Vector(v) => {
-            buf.push(VAL_VECTOR);
-            write_u32(buf, v.len() as u32);
-            for f in v {
-                buf.extend_from_slice(&f.to_le_bytes());
-            }
-        }
-        Value::Interval {
-            months,
-            days,
-            microseconds,
-        } => {
-            buf.push(VAL_INTERVAL);
-            buf.extend_from_slice(&months.to_le_bytes());
-            buf.extend_from_slice(&days.to_le_bytes());
-            buf.extend_from_slice(&microseconds.to_le_bytes());
-        }
-        Value::Array(arr) => {
-            buf.push(VAL_ARRAY);
-            write_u32(buf, arr.len() as u32);
-            for v in arr {
-                write_value(buf, v);
-            }
-        }
-    }
-}
-
-fn read_value(data: &[u8], pos: &mut usize) -> Option<Value> {
-    let tag = *data.get(*pos)?;
-    *pos += 1;
-    match tag {
-        VAL_NULL => Some(Value::Null),
-        VAL_BOOL => {
-            let b = *data.get(*pos)?;
-            *pos += 1;
-            Some(Value::Bool(b != 0))
-        }
-        VAL_INT32 => {
-            let b = data.get(*pos..*pos + 4)?;
-            *pos += 4;
-            Some(Value::Int32(i32::from_le_bytes([b[0], b[1], b[2], b[3]])))
-        }
-        VAL_INT64 => {
-            let b = data.get(*pos..*pos + 8)?;
-            *pos += 8;
-            Some(Value::Int64(i64::from_le_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ])))
-        }
-        VAL_FLOAT64 => {
-            let b = data.get(*pos..*pos + 8)?;
-            *pos += 8;
-            Some(Value::Float64(f64::from_le_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ])))
-        }
-        VAL_TEXT => {
-            let s = read_str(data, pos)?;
-            Some(Value::Text(s))
-        }
-        VAL_BYTEA => {
-            let len = read_u32_val(data, pos)? as usize;
-            if *pos + len > data.len() {
-                return None;
-            }
-            let b = data[*pos..*pos + len].to_vec();
-            *pos += len;
-            Some(Value::Bytea(b))
-        }
-        VAL_DATE => {
-            let b = data.get(*pos..*pos + 4)?;
-            *pos += 4;
-            Some(Value::Date(i32::from_le_bytes([b[0], b[1], b[2], b[3]])))
-        }
-        VAL_TIMESTAMP => {
-            let b = data.get(*pos..*pos + 8)?;
-            *pos += 8;
-            Some(Value::Timestamp(i64::from_le_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ])))
-        }
-        VAL_TIMESTAMPTZ => {
-            let b = data.get(*pos..*pos + 8)?;
-            *pos += 8;
-            Some(Value::TimestampTz(i64::from_le_bytes([
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-            ])))
-        }
-        VAL_NUMERIC => {
-            let s = read_str(data, pos)?;
-            Some(Value::Numeric(s))
-        }
-        VAL_UUID => {
-            let b = data.get(*pos..*pos + 16)?;
-            *pos += 16;
-            let mut arr = [0u8; 16];
-            arr.copy_from_slice(b);
-            Some(Value::Uuid(arr))
-        }
-        VAL_JSONB => {
-            let s = read_str(data, pos)?;
-            // A malformed stored JSONB value must not drop the whole row
-            // (data loss). Fall back to JSON null; the insert path now rejects
-            // invalid JSON up front, so this only guards legacy/foreign rows.
-            let v: serde_json::Value = serde_json::from_str(&s).unwrap_or(serde_json::Value::Null);
-            Some(Value::Jsonb(v))
-        }
-        VAL_VECTOR => {
-            let count = read_u32_val(data, pos)? as usize;
-            let byte_len = count * 4;
-            if *pos + byte_len > data.len() {
-                return None;
-            }
-            let mut v = Vec::with_capacity(count);
-            for _ in 0..count {
-                let b = data.get(*pos..*pos + 4)?;
-                *pos += 4;
-                v.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-            }
-            Some(Value::Vector(v))
-        }
-        VAL_INTERVAL => {
-            let mb = data.get(*pos..*pos + 4)?;
-            *pos += 4;
-            let months = i32::from_le_bytes([mb[0], mb[1], mb[2], mb[3]]);
-            let db = data.get(*pos..*pos + 4)?;
-            *pos += 4;
-            let days = i32::from_le_bytes([db[0], db[1], db[2], db[3]]);
-            let ub = data.get(*pos..*pos + 8)?;
-            *pos += 8;
-            let microseconds =
-                i64::from_le_bytes([ub[0], ub[1], ub[2], ub[3], ub[4], ub[5], ub[6], ub[7]]);
-            Some(Value::Interval {
-                months,
-                days,
-                microseconds,
-            })
-        }
-        VAL_ARRAY => {
-            let count = read_u32_val(data, pos)? as usize;
-            let mut arr = Vec::with_capacity(count);
-            for _ in 0..count {
-                arr.push(read_value(data, pos)?);
-            }
-            Some(Value::Array(arr))
-        }
-        _ => None,
-    }
-}
-
-fn write_row(buf: &mut Vec<u8>, row: &[Value]) {
-    write_u32(buf, row.len() as u32);
-    for val in row {
-        write_value(buf, val);
-    }
-}
-
-fn read_row(data: &[u8], pos: &mut usize) -> Option<Vec<Value>> {
-    let count = read_u32_val(data, pos)? as usize;
-    let mut row = Vec::with_capacity(count);
-    for _ in 0..count {
-        row.push(read_value(data, pos)?);
-    }
-    Some(row)
 }
 
 // ── Primitive helpers ────────────────────────────────────────────────────────
@@ -765,7 +528,7 @@ fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
             let table = read_str(data, &mut pos)?;
             let txn_id = read_u64_val(data, &mut pos)?;
             let version_idx = read_u32_val(data, &mut pos)?;
-            let row = read_row(data, &mut pos)?;
+            let row = crate::storage::value_codec::read_row(data, &mut pos)?;
             Some(MvccWalRecord::Insert {
                 table,
                 txn_id,
@@ -788,7 +551,7 @@ fn decode_record(data: &[u8]) -> Option<MvccWalRecord> {
             let txn_id = read_u64_val(data, &mut pos)?;
             let old_version_idx = read_u32_val(data, &mut pos)?;
             let new_version_idx = read_u32_val(data, &mut pos)?;
-            let new_row = read_row(data, &mut pos)?;
+            let new_row = crate::storage::value_codec::read_row(data, &mut pos)?;
             Some(MvccWalRecord::Update {
                 table,
                 txn_id,
