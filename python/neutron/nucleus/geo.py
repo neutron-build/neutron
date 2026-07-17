@@ -107,24 +107,29 @@ class GeoModel:
         return cast("float", await self._exec.fetchval("SELECT ST_Y($1)", point))
 
     async def insert(self, layer: str, feature: GeoFeature) -> None:
-        """Insert a geo feature into a layer."""
+        """Insert a geo feature into a layer.
+
+        Layers are plain tables with FLOAT8 lat/lon columns — the engine
+        has no POINT column type.
+        """
         self._require()
         table = _safe(layer)
         await self._exec.execute(
             f"CREATE TABLE IF NOT EXISTS {table} ("
             f"  id TEXT PRIMARY KEY,"
-            f"  location POINT,"
+            f"  lat FLOAT8,"
+            f"  lon FLOAT8,"
             f"  properties JSONB DEFAULT '{{}}'"
             f")"
         )
         await self._exec.execute(
-            f"INSERT INTO {table} (id, location, properties) "
-            f"VALUES ($1, ST_MAKEPOINT($2, $3), $4::jsonb) "
+            f"INSERT INTO {table} (id, lat, lon, properties) "
+            f"VALUES ($1, $2, $3, $4::jsonb) "
             f"ON CONFLICT (id) DO UPDATE SET "
-            f"location = ST_MAKEPOINT($2, $3), properties = $4::jsonb",
+            f"lat = $2, lon = $3, properties = $4::jsonb",
             feature.id,
-            feature.lon,
             feature.lat,
+            feature.lon,
             json.dumps(feature.properties),
         )
 
@@ -141,10 +146,10 @@ class GeoModel:
         self._require()
         table = _safe(layer)
         rows = await self._exec.fetch(
-            f"SELECT id, ST_Y(location) AS lat, ST_X(location) AS lon, properties "
+            f"SELECT id, lat, lon, properties "
             f"FROM {table} "
-            f"WHERE GEO_WITHIN(ST_Y(location), ST_X(location), $1, $2, $3) "
-            f"ORDER BY GEO_DISTANCE(ST_Y(location), ST_X(location), $1, $2) "
+            f"WHERE GEO_WITHIN(lat, lon, $1, $2, $3) "
+            f"ORDER BY GEO_DISTANCE(lat, lon, $1, $2) "
             f"LIMIT $4",
             lat,
             lon,
@@ -163,10 +168,10 @@ class GeoModel:
         self._require()
         table = _safe(layer)
         rows = await self._exec.fetch(
-            f"SELECT id, ST_Y(location) AS lat, ST_X(location) AS lon, properties "
+            f"SELECT id, lat, lon, properties "
             f"FROM {table} "
-            f"WHERE ST_Y(location) BETWEEN $1 AND $3 "
-            f"AND ST_X(location) BETWEEN $2 AND $4",
+            f"WHERE lat BETWEEN $1 AND $3 "
+            f"AND lon BETWEEN $2 AND $4",
             sw[0],
             sw[1],
             ne[0],
@@ -181,52 +186,26 @@ class GeoModel:
     ) -> list[GeoFeature]:
         """Find features within a polygon (list of (lat, lon) tuples).
 
-        Uses a bounding-box pre-filter in SQL then applies an exact
-        ray-casting point-in-polygon test in Python.
+        Uses the engine's ST_CONTAINS(polygon_wkt, point_wkt), where WKT
+        coordinates are (x y) = (lon lat).
         """
         self._require()
         table = _safe(layer)
-        lats = [p[0] for p in polygon]
-        lons = [p[1] for p in polygon]
-        # Bounding-box pre-filter (cheap SQL pass)
+        coords = list(polygon)
+        if coords and coords[0] != coords[-1]:
+            coords.append(coords[0])
+        wkt = "POLYGON((" + ", ".join(f"{p[1]} {p[0]}" for p in coords) + "))"
         rows = await self._exec.fetch(
-            f"SELECT id, ST_Y(location) AS lat, ST_X(location) AS lon, properties "
+            f"SELECT id, lat, lon, properties "
             f"FROM {table} "
-            f"WHERE ST_Y(location) BETWEEN $1 AND $2 "
-            f"AND ST_X(location) BETWEEN $3 AND $4",
-            min(lats),
-            max(lats),
-            min(lons),
-            max(lons),
+            f"WHERE ST_CONTAINS($1, ST_MAKEPOINT(lon, lat))",
+            wkt,
         )
-        # Exact point-in-polygon test using ray-casting algorithm
-        candidates = [_row_to_feature(row) for row in rows]
-        return [f for f in candidates if _point_in_polygon(f.lat, f.lon, polygon)]
+        return [_row_to_feature(row) for row in rows]
 
 
 def _safe(name: str) -> str:
     return "".join(c for c in name if c.isalnum() or c == "_")
-
-
-def _point_in_polygon(
-    lat: float, lon: float, polygon: list[tuple[float, float]]
-) -> bool:
-    """Ray-casting algorithm for point-in-polygon containment.
-
-    ``polygon`` is a list of (lat, lon) tuples forming a closed polygon.
-    """
-    n = len(polygon)
-    inside = False
-    j = n - 1
-    for i in range(n):
-        lat_i, lon_i = polygon[i]
-        lat_j, lon_j = polygon[j]
-        if (lon_i > lon) != (lon_j > lon):
-            intersect_lat = (lat_j - lat_i) * (lon - lon_i) / (lon_j - lon_i) + lat_i
-            if lat < intersect_lat:
-                inside = not inside
-        j = i
-    return inside
 
 
 def _row_to_feature(row: Any) -> GeoFeature:

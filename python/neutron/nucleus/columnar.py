@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any, cast
 
 from neutron.nucleus._exec import Executor, require_nucleus
@@ -27,14 +26,21 @@ class ColumnarModel:
         require_nucleus(self._features, "Columnar")
 
     async def insert(self, table: str, values: dict[str, Any]) -> bool:
-        """Insert a row into a columnar table."""
+        """Insert a row into a columnar table.
+
+        COLUMNAR_INSERT is variadic: (table, col1, val1, col2, val2, ...)
+        and returns the text 'OK' on success.
+        """
         self._require()
-        return cast(
-            "bool",
-            await self._exec.fetchval(
-                "SELECT COLUMNAR_INSERT($1, $2)", table, json.dumps(values)
-            )
+        args: list[Any] = [table]
+        for column, value in values.items():
+            args.append(column)
+            args.append(value)
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(args)))
+        result = await self._exec.fetchval(
+            f"SELECT COLUMNAR_INSERT({placeholders})", *args
         )
+        return result == "OK"
 
     async def count(self, table: str) -> int:
         """Return the row count of a columnar table."""

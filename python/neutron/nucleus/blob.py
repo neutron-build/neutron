@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, cast
 
 from pydantic import BaseModel
@@ -17,7 +17,7 @@ class BlobMeta(BaseModel):
     size: int = 0
     content_type: str | None = None
     created_at: datetime | None = None
-    metadata: dict[str, str] = {}
+    updated_at: datetime | None = None
 
 
 class BlobModel:
@@ -76,7 +76,11 @@ class BlobModel:
         return bytes.fromhex(raw)
 
     async def get_meta(self, bucket: str, key: str) -> BlobMeta | None:
-        """Get blob metadata without downloading data."""
+        """Get blob metadata without downloading data.
+
+        The engine's BLOB_META returns {"size", "content_type",
+        "created_at", "updated_at"} with timestamps in milliseconds.
+        """
         self._require()
         full_key = f"{bucket}/{key}"
         raw = await self._exec.fetchval("SELECT BLOB_META($1)", full_key)
@@ -86,8 +90,9 @@ class BlobModel:
         return BlobMeta(
             key=key,
             size=meta.get("size", 0),
-            content_type=meta.get("content_type"),
-            metadata=meta.get("tags", {}),
+            content_type=meta.get("content_type") or None,
+            created_at=_ms_to_datetime(meta.get("created_at")),
+            updated_at=_ms_to_datetime(meta.get("updated_at")),
         )
 
     async def delete(self, bucket: str, key: str) -> bool:
@@ -152,3 +157,9 @@ class BlobModel:
         meta = await self.get_meta(src_bucket, src_key)
         content_type = meta.content_type if meta else None
         await self.put(dst_bucket, dst_key, data, content_type=content_type)
+
+
+def _ms_to_datetime(ms: int | None) -> datetime | None:
+    if ms is None:
+        return None
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)

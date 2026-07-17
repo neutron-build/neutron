@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import cast
 
 from neutron.nucleus._exec import Executor, require_nucleus
@@ -25,45 +26,48 @@ class DatalogModel:
     def _require(self) -> None:
         require_nucleus(self._features, "Datalog")
 
-    async def assert_fact(self, fact: str) -> bool:
-        """Assert a Datalog fact."""
+    async def assert_fact(self, fact: str) -> str:
+        """Assert a Datalog fact. Returns the engine's status message."""
         self._require()
-        return cast("bool", await self._exec.fetchval("SELECT DATALOG_ASSERT($1)", fact))
+        return cast("str", await self._exec.fetchval("SELECT DATALOG_ASSERT($1)", fact))
 
-    async def retract(self, fact: str) -> bool:
-        """Retract (remove) a previously asserted fact."""
+    async def retract(self, fact: str) -> str:
+        """Retract (remove) a previously asserted fact. Returns the engine's status message."""
         self._require()
-        return cast("bool", await self._exec.fetchval("SELECT DATALOG_RETRACT($1)", fact))
+        return cast("str", await self._exec.fetchval("SELECT DATALOG_RETRACT($1)", fact))
 
-    async def rule(self, head: str, body: str) -> bool:
-        """Add a Datalog inference rule: ``head :- body``."""
+    async def rule(self, head: str, body: str) -> str:
+        """Add a Datalog inference rule: ``head :- body``.
+
+        The engine takes the whole rule as one string; head and body are
+        joined here. Returns the engine's status message.
+        """
         self._require()
         return cast(
-            "bool",
-            await self._exec.fetchval(
-                "SELECT DATALOG_RULE($1, $2)", head, body
-            )
+            "str",
+            await self._exec.fetchval("SELECT DATALOG_RULE($1)", f"{head} :- {body}")
         )
 
     async def query(self, query: str) -> list[list[str]]:
-        """Execute a Datalog query. Returns rows as lists of strings (CSV parsed)."""
+        """Execute a Datalog query.
+
+        The engine returns a JSON array of arrays, e.g. ``[["alice","bob"]]``.
+        """
         self._require()
         raw = await self._exec.fetchval("SELECT DATALOG_QUERY($1)", query)
         if not raw:
             return []
-        rows: list[list[str]] = []
-        for line in raw.splitlines():
-            line = line.strip()
-            if line:
-                rows.append([cell.strip() for cell in line.split(",")])
-        return rows
+        return cast("list[list[str]]", json.loads(raw))
 
-    async def clear(self) -> bool:
-        """Clear all facts and rules."""
+    async def clear(self, predicate: str) -> str:
+        """Clear all facts and rules for a predicate. Returns the engine's status message."""
         self._require()
-        return cast("bool", await self._exec.fetchval("SELECT DATALOG_CLEAR()"))
+        return cast("str", await self._exec.fetchval("SELECT DATALOG_CLEAR($1)", predicate))
 
-    async def import_graph(self) -> int:
-        """Import the current graph data as Datalog facts. Returns fact count."""
+    async def import_graph(self, predicate: str) -> str:
+        """Import graph edges as facts: ``predicate(from_id, edge_type, to_id)``.
+
+        Returns the engine's status message (``IMPORTED N edges into <predicate>``).
+        """
         self._require()
-        return cast("int", await self._exec.fetchval("SELECT DATALOG_IMPORT_GRAPH()"))
+        return cast("str", await self._exec.fetchval("SELECT DATALOG_IMPORT_GRAPH($1)", predicate))
