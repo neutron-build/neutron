@@ -32,6 +32,10 @@ const LABEL_COLORS = [
   '#ec4899', '#06b6d4', '#f97316', '#14b8a6', '#a855f7',
 ]
 
+function sqlStr(s: string): string {
+  return `'${s.replace(/'/g, "''")}'`
+}
+
 function colorForLabel(label: string, labelMap: Map<string, number>): string {
   if (!labelMap.has(label)) {
     labelMap.set(label, labelMap.size)
@@ -223,8 +227,9 @@ export function GraphModule({ name }: GraphModuleProps) {
   useEffect(() => {
     async function loadStats() {
       try {
+        // Single global graph — counts are scalar functions, no graph name.
         const r = await api.query(
-          `SELECT node_count, edge_count FROM graph_info('${name}')`,
+          `SELECT GRAPH_NODE_COUNT(), GRAPH_EDGE_COUNT()`,
           conn.id
         )
         if (!r.error && r.rows.length > 0) {
@@ -241,12 +246,20 @@ export function GraphModule({ name }: GraphModuleProps) {
     running.value = true
     result.value = null
     try {
-      const safeQ = q.replace(/'/g, "''")
-      const r = await api.query(
-        `SELECT * FROM cypher_query('${name}', '${safeQ}')`,
-        conn.id
-      )
-      result.value = r
+      // GRAPH_QUERY is a scalar returning JSON {columns, rows}; parse it into a
+      // QueryResult shape for the grid and the graph visualization.
+      const r = await api.query(`SELECT GRAPH_QUERY(${sqlStr(q)})`, conn.id)
+      if (r.error) throw new Error(r.error)
+      const cell = r.rows[0]?.[0]
+      const parsed = (cell == null || cell === '')
+        ? { columns: [], rows: [] }
+        : JSON.parse(String(cell)) as { columns: string[]; rows: unknown[][] }
+      result.value = {
+        columns: parsed.columns ?? [],
+        rows: (parsed.rows ?? []) as unknown[][],
+        rowCount: parsed.rows?.length ?? 0,
+        duration: r.duration,
+      }
     } catch (err: unknown) {
       toast('error', err instanceof Error ? err.message : String(err))
     } finally {

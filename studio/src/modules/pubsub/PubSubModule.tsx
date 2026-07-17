@@ -5,6 +5,11 @@ import { api } from '../../lib/api'
 import { exportCSV, exportJSON } from '../../lib/export'
 import s from './PubSubModule.module.css'
 
+// Nucleus pub/sub over SQL is publish-only: PUBSUB_PUBLISH(channel, message)
+// returns the subscriber count reached, PUBSUB_SUBSCRIBERS(channel) returns the
+// current count, and PUBSUB_CHANNELS() (no args) returns a comma-separated list
+// of active channels. There is NO SQL poll for messages — real subscription is
+// LISTEN/NOTIFY on a live connection, which this query UI cannot hold open.
 interface PubSubMessage {
   id: string
   payload: string
@@ -15,29 +20,37 @@ interface PubSubModuleProps {
   name: string
 }
 
+// Split the comma-separated channel list returned by PUBSUB_CHANNELS().
+export function parseChannels(cell: unknown): string[] {
+  if (cell == null) return []
+  return String(cell).split(',').map(c => c.trim()).filter(Boolean)
+}
+
 export function PubSubModule({ name }: PubSubModuleProps) {
   const messages = useSignal<PubSubMessage[]>([])
   const payload = useSignal('')
   const publishing = useSignal(false)
   const subscriberCount = useSignal<number | null>(null)
-  const subscribed = useSignal(false)
+  const channels = useSignal<string[]>([])
   const pinToBottom = useSignal(true)
   const listRef = useRef<HTMLDivElement>(null)
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const conn = activeConnection.value!
 
+  async function refreshInfo() {
+    try {
+      const subRes = await api.query(
+        `SELECT PUBSUB_SUBSCRIBERS('${name.replace(/'/g, "''")}')`,
+        conn.id
+      )
+      if (!subRes.error && subRes.rows.length > 0) subscriberCount.value = Number(subRes.rows[0][0])
+      const chanRes = await api.query(`SELECT PUBSUB_CHANNELS()`, conn.id)
+      if (!chanRes.error && chanRes.rows.length > 0) channels.value = parseChannels(chanRes.rows[0][0])
+    } catch { /* non-critical */ }
+  }
+
   useEffect(() => {
-    async function loadInfo() {
-      try {
-        const r = await api.query(
-          `SELECT subscriber_count FROM pubsub_info('${name}')`,
-          conn.id
-        )
-        if (!r.error && r.rows.length > 0) subscriberCount.value = Number(r.rows[0][0])
-      } catch { /* non-critical */ }
-    }
-    loadInfo()
+    refreshInfo()
   }, [name])
 
   // Auto-scroll when pinned and new messages arrive
@@ -47,76 +60,25 @@ export function PubSubModule({ name }: PubSubModuleProps) {
     }
   }, [messages.value.length, pinToBottom.value])
 
-  // Subscribe polling: poll every 2 seconds for new messages
-  useEffect(() => {
-    if (!subscribed.value) {
-      if (pollRef.current) {
-        clearInterval(pollRef.current)
-        pollRef.current = null
-      }
-      return
-    }
-
-    async function poll() {
-      try {
-        const r = await api.query(
-          `SELECT id, payload, received_at FROM pubsub_poll('${name}', 50)`,
-          conn.id
-        )
-        if (!r.error && r.rows.length > 0) {
-          const newMsgs = r.rows.map(row => ({
-            id: String(row[0]),
-            payload: String(row[1]),
-            receivedAt: String(row[2]),
-          }))
-          // Deduplicate by id
-          const existingIds = new Set(messages.value.map(m => m.id))
-          const fresh = newMsgs.filter(m => !existingIds.has(m.id))
-          if (fresh.length > 0) {
-            messages.value = [...messages.value, ...fresh]
-          }
-        }
-      } catch {
-        // Poll failures are non-critical; keep trying
-      }
-    }
-
-    poll()
-    pollRef.current = setInterval(poll, 2000)
-    return () => {
-      if (pollRef.current) {
-        clearInterval(pollRef.current)
-        pollRef.current = null
-      }
-    }
-  }, [subscribed.value, name])
-
-  // Clean up on unmount
-  useEffect(() => {
-    return () => {
-      if (pollRef.current) {
-        clearInterval(pollRef.current)
-        pollRef.current = null
-      }
-    }
-  }, [])
-
   async function publish() {
     const msg = payload.value.trim()
     if (!msg) return
     publishing.value = true
     try {
-      await api.query(
-        `SELECT pubsub_publish('${name}', '${msg.replace(/'/g, "''")}')`,
+      const r = await api.query(
+        `SELECT PUBSUB_PUBLISH('${name.replace(/'/g, "''")}', '${msg.replace(/'/g, "''")}')`,
         conn.id
       )
+      if (r.error) throw new Error(r.error)
+      const reached = r.rows.length > 0 ? Number(r.rows[0][0]) : 0
       // Record locally so the user can see what they sent
       messages.value = [
         ...messages.value,
         { id: crypto.randomUUID(), payload: msg, receivedAt: new Date().toISOString() },
       ]
       payload.value = ''
-      toast('success', `Published to ${name}`)
+      toast('success', `Published to ${name} (${reached} subscriber${reached !== 1 ? 's' : ''})`)
+      refreshInfo()
     } catch (err: unknown) {
       toast('error', err instanceof Error ? err.message : String(err))
     } finally {
@@ -133,13 +95,6 @@ export function PubSubModule({ name }: PubSubModuleProps) {
 
   function clearLog() {
     messages.value = []
-  }
-
-  function toggleSubscribe() {
-    subscribed.value = !subscribed.value
-    if (subscribed.value) {
-      toast('info', `Subscribed to ${name}`)
-    }
   }
 
   function handleExportCSV() {
@@ -165,16 +120,12 @@ export function PubSubModule({ name }: PubSubModuleProps) {
         {messages.value.length > 0 && (
           <span class={s.msgBadge}>{messages.value.length}</span>
         )}
-        {subscribed.value && <span class={s.liveTag}>LIVE</span>}
       </div>
 
-      {/* Toolbar: subscribe, pin, export, clear */}
+      {/* Toolbar: refresh, pin, export, clear */}
       <div class={s.toolbar}>
-        <button
-          class={subscribed.value ? s.subscribeBtnActive : s.subscribeBtn}
-          onClick={toggleSubscribe}
-        >
-          {subscribed.value ? '■ Unsubscribe' : '▶ Subscribe'}
+        <button class={s.subscribeBtn} onClick={refreshInfo}>
+          Refresh
         </button>
         <label class={s.pinLabel}>
           <input
@@ -196,12 +147,14 @@ export function PubSubModule({ name }: PubSubModuleProps) {
         </button>
       </div>
 
+      {channels.value.length > 0 && (
+        <div class={s.empty}>Active channels: {channels.value.join(', ')}</div>
+      )}
+
       <div class={s.messageList} ref={listRef}>
         {messages.value.length === 0 && (
           <div class={s.empty}>
-            {subscribed.value
-              ? 'Listening for messages...'
-              : 'Click Subscribe to start receiving messages, or publish one below.'}
+            Publish a message below. Live subscription uses LISTEN/NOTIFY, which the SQL query UI cannot hold open — only sent messages are logged here.
           </div>
         )}
         {messages.value.map(m => (

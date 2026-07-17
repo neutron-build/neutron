@@ -1,71 +1,79 @@
 import { describe, it, expect } from 'vitest'
 
-// Tests for ColumnarModule: quick queries, column stat parsing
+// Tests for ColumnarModule real Nucleus SQL. Columnar operates on NAMED user
+// tables (regular tables), so row data comes from a plain scan while the
+// aggregates and inserts are UPPERCASE SCALAR functions.
+
+const sqlStr = (v: string) => `'${v.replace(/'/g, "''")}'`
+
+const QUICK_QUERIES = [
+  (t: string) => `SELECT COLUMNAR_COUNT(${sqlStr(t)})`,
+  (t: string) => `SELECT * FROM ${t} LIMIT 100`,
+]
+
+type Agg = 'SUM' | 'AVG' | 'MIN' | 'MAX'
+
+function aggregateSql(table: string, agg: Agg, col: string): string {
+  return `SELECT COLUMNAR_${agg}(${sqlStr(table)}, ${sqlStr(col)})`
+}
+
+const NUMERIC_RE = /^-?\d+(\.\d+)?$/
+
+function buildInsertSql(table: string, pairsInput: string): string {
+  const parts: string[] = [sqlStr(table)]
+  for (const pair of pairsInput.split(',')) {
+    const eq = pair.indexOf('=')
+    if (eq === -1) continue
+    const key = pair.slice(0, eq).trim()
+    const val = pair.slice(eq + 1).trim()
+    if (!key) continue
+    parts.push(sqlStr(key))
+    parts.push(NUMERIC_RE.test(val) ? val : sqlStr(val))
+  }
+  return `SELECT COLUMNAR_INSERT(${parts.join(', ')})`
+}
 
 describe('ColumnarModule — QUICK_QUERIES', () => {
-  const QUICK_QUERIES = [
-    (t: string) => `SELECT COUNT(*) FROM columnar_scan('${t}')`,
-    (t: string) => `SELECT * FROM columnar_scan('${t}') LIMIT 100`,
-    (t: string) => `SELECT * FROM columnar_aggregate('${t}', 'count,sum,avg')`,
-  ]
-
-  it('should generate COUNT query', () => {
-    expect(QUICK_QUERIES[0]('analytics')).toBe("SELECT COUNT(*) FROM columnar_scan('analytics')")
+  it('should generate COLUMNAR_COUNT query', () => {
+    expect(QUICK_QUERIES[0]('analytics')).toBe("SELECT COLUMNAR_COUNT('analytics')")
   })
 
-  it('should generate SCAN query with LIMIT', () => {
-    expect(QUICK_QUERIES[1]('sales')).toBe("SELECT * FROM columnar_scan('sales') LIMIT 100")
-  })
-
-  it('should generate AGGREGATE query', () => {
-    expect(QUICK_QUERIES[2]('metrics')).toBe("SELECT * FROM columnar_aggregate('metrics', 'count,sum,avg')")
+  it('should generate a plain-table SCAN query (columnar tables are regular tables)', () => {
+    expect(QUICK_QUERIES[1]('sales')).toBe('SELECT * FROM sales LIMIT 100')
   })
 })
 
-describe('ColumnarModule — column stat parsing', () => {
-  interface ColumnStat {
-    name: string
-    type: string
-    nullPct: number
-    minVal: string
-    maxVal: string
-    distinctCount: number
-  }
-
-  function parseColStats(rows: unknown[][]): ColumnStat[] {
-    return rows.map(r => ({
-      name: String(r[0]),
-      type: String(r[1]),
-      nullPct: Number(r[2]),
-      minVal: String(r[3] ?? ''),
-      maxVal: String(r[4] ?? ''),
-      distinctCount: Number(r[5]),
-    }))
-  }
-
-  it('should parse column statistics from query result', () => {
-    const rows: unknown[][] = [
-      ['id', 'bigint', 0, '1', '1000', 1000],
-      ['value', 'double', 5.2, '0.01', '99.9', 500],
-      ['label', 'text', 15, null, null, 10],
-    ]
-    const stats = parseColStats(rows)
-    expect(stats.length).toBe(3)
-    expect(stats[0]).toEqual({ name: 'id', type: 'bigint', nullPct: 0, minVal: '1', maxVal: '1000', distinctCount: 1000 })
-    expect(stats[1].nullPct).toBe(5.2)
-    expect(stats[2].minVal).toBe('')
-    expect(stats[2].maxVal).toBe('')
+describe('ColumnarModule — aggregates', () => {
+  it('should build COLUMNAR_SUM query', () => {
+    expect(aggregateSql('metrics', 'SUM', 'value')).toBe("SELECT COLUMNAR_SUM('metrics', 'value')")
   })
 
-  it('should handle empty results', () => {
-    expect(parseColStats([])).toEqual([])
+  it('should support all aggregate functions', () => {
+    for (const agg of ['SUM', 'AVG', 'MIN', 'MAX'] as Agg[]) {
+      expect(aggregateSql('t', agg, 'c')).toBe(`SELECT COLUMNAR_${agg}('t', 'c')`)
+    }
   })
 })
 
-describe('ColumnarModule — info parsing', () => {
-  it('should parse row count from columnar_info result', () => {
+describe('ColumnarModule — COLUMNAR_INSERT', () => {
+  it('should build variadic col/val pairs, quoting text and leaving numbers bare', () => {
+    expect(buildInsertSql('sales', 'name=alice, age=30')).toBe(
+      "SELECT COLUMNAR_INSERT('sales', 'name', 'alice', 'age', 30)"
+    )
+  })
+
+  it('should keep negative and decimal numbers unquoted', () => {
+    expect(buildInsertSql('t', 'x=-1.5')).toBe("SELECT COLUMNAR_INSERT('t', 'x', -1.5)")
+  })
+
+  it('should ignore malformed pairs without an equals sign', () => {
+    expect(buildInsertSql('t', 'garbage')).toBe("SELECT COLUMNAR_INSERT('t')")
+  })
+})
+
+describe('ColumnarModule — count parsing', () => {
+  it('should parse row count from COLUMNAR_COUNT result', () => {
     const rows: unknown[][] = [[500000]]
-    const rowCount = Number(rows[0][0])
-    expect(rowCount).toBe(500000)
+    expect(Number(rows[0][0])).toBe(500000)
   })
 })

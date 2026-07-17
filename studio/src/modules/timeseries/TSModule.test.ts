@@ -103,26 +103,40 @@ describe('TSModule — Sparkline logic', () => {
   })
 })
 
+function sqlStr(s: string): string {
+  return `'${s.replace(/'/g, "''")}'`
+}
+
 describe('TSModule — query building', () => {
-  it('should build time range query without date filters', () => {
+  // Summary uses the real scalar TS_COUNT / TS_LAST (no store-name-less
+  // ts_range table function, which does not exist).
+  it('should build the summary query', () => {
     const name = 'cpu'
-    const bucket = '1h'
-    const aggFn = 'avg'
-    const sql = `SELECT time_bucket('${bucket}', ts) AS bucket,
-                ${aggFn}(value) AS value
-         FROM ts_range('${name}', '-inf', '+inf')
-         GROUP BY 1 ORDER BY 1`
-    expect(sql).toContain("ts_range('cpu'")
-    expect(sql).toContain("time_bucket('1h'")
-    expect(sql).toContain('avg(value)')
+    const sql = `SELECT TS_COUNT(${sqlStr(name)}), TS_LAST(${sqlStr(name)})`
+    expect(sql).toBe("SELECT TS_COUNT('cpu'), TS_LAST('cpu')")
   })
 
-  it('should build time range query with date filters', () => {
-    const from = '2025-01-01T00:00'
-    const to = '2025-12-31T23:59'
-    const fromClause = `'${from}'`
-    const toClause = `'${to}'`
-    expect(fromClause).toBe("'2025-01-01T00:00'")
-    expect(toClause).toBe("'2025-12-31T23:59'")
+  // Bucketed aggregates are built client-side from TS_RANGE_AVG windows with
+  // numeric epoch-ms bounds, batched into one multi-column select.
+  it('should build a batched TS_RANGE_AVG bucket query', () => {
+    const name = 'cpu'
+    const start = 0
+    const size = 60_000
+    const end = 180_000
+    const windows: number[] = []
+    for (let b = start; b < end; b += size) windows.push(b)
+    const cols = windows
+      .map(b => `TS_RANGE_AVG(${sqlStr(name)}, ${b}, ${Math.min(b + size, end)})`)
+      .join(', ')
+    const sql = `SELECT ${cols}`
+    expect(sql).toBe(
+      "SELECT TS_RANGE_AVG('cpu', 0, 60000), TS_RANGE_AVG('cpu', 60000, 120000), TS_RANGE_AVG('cpu', 120000, 180000)"
+    )
+  })
+
+  it('should build TS_RANGE_COUNT windows for the count aggregate', () => {
+    const name = 'cpu'
+    const sql = `TS_RANGE_COUNT(${sqlStr(name)}, ${0}, ${60_000})`
+    expect(sql).toBe("TS_RANGE_COUNT('cpu', 0, 60000)")
   })
 })

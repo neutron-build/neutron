@@ -93,33 +93,37 @@ describe('KVModule — filter logic', () => {
 })
 
 describe('KVModule — query building', () => {
-  it('should build kv_scan query', () => {
-    const name = 'cache'
-    const query = `SELECT key, value, ttl FROM kv_scan(${sqlStr(name)}, '*', 500)`
-    expect(query).toBe("SELECT key, value, ttl FROM kv_scan('cache', '*', 500)")
+  // The KV store is a single global keyspace: no store-name argument.
+  it('should build KV_KEYS enumeration query', () => {
+    const query = `SELECT KV_KEYS('*')`
+    expect(query).toBe("SELECT KV_KEYS('*')")
   })
 
-  it('should build kv_set query without TTL', () => {
-    const name = 'cache'
+  it('should build a KV_GET value fetch query', () => {
+    const keys = ['mykey', "key'q"]
+    const cols = keys.map(k => `KV_GET(${sqlStr(k)})`).join(', ')
+    const query = `SELECT ${cols}`
+    expect(query).toBe("SELECT KV_GET('mykey'), KV_GET('key''q')")
+  })
+
+  it('should build KV_SET query without TTL', () => {
     const key = 'mykey'
     const value = 'myvalue'
-    const query = `SELECT kv_set(${sqlStr(name)}, ${sqlStr(key)}, ${sqlStr(value)})`
-    expect(query).toBe("SELECT kv_set('cache', 'mykey', 'myvalue')")
+    const query = `SELECT KV_SET(${sqlStr(key)}, ${sqlStr(value)})`
+    expect(query).toBe("SELECT KV_SET('mykey', 'myvalue')")
   })
 
-  it('should build kv_set query with TTL', () => {
-    const name = 'cache'
+  it('should build KV_SET query with TTL', () => {
     const key = 'mykey'
     const value = 'myvalue'
     const ttl = 300
-    const query = `SELECT kv_set(${sqlStr(name)}, ${sqlStr(key)}, ${sqlStr(value)}, ${ttl})`
-    expect(query).toBe("SELECT kv_set('cache', 'mykey', 'myvalue', 300)")
+    const query = `SELECT KV_SET(${sqlStr(key)}, ${sqlStr(value)}, ${ttl})`
+    expect(query).toBe("SELECT KV_SET('mykey', 'myvalue', 300)")
   })
 
-  it('should build kv_delete query', () => {
-    const name = 'cache'
+  it('should build KV_DEL query', () => {
     const key = "key'with'quotes"
-    const query = `SELECT kv_delete(${sqlStr(name)}, ${sqlStr(key)})`
-    expect(query).toBe("SELECT kv_delete('cache', 'key''with''quotes')")
+    const query = `SELECT KV_DEL(${sqlStr(key)})`
+    expect(query).toBe("SELECT KV_DEL('key''with''quotes')")
   })
 })

@@ -13,11 +13,65 @@ parent(bob, charlie).
 ancestor(X, Y) :- parent(X, Y).
 ancestor(X, Z) :- parent(X, Y), ancestor(Y, Z).
 ?- ancestor(alice, Who).`,
-  `-- List all predicates
-?- predicate(Name, Arity).`,
-  `-- List all rules
-?- rule(Head, Body).`,
+  `-- Graph reachability
+edge(1, 2).
+edge(2, 3).
+path(X, Y) :- edge(X, Y).
+path(X, Z) :- edge(X, Y), path(Y, Z).
+?- path(1, Where).`,
+  `-- Query existing facts
+?- parent(X, Y).`,
 ]
+
+const sqlStr = (v: string) => `'${v.replace(/'/g, "''")}'`
+
+interface ParsedProgram {
+  asserts: string[]
+  rules: string[]
+  queries: string[]
+}
+
+// Datalog is a GLOBAL engine. There is no table-valued evaluator; each line is
+// a separate scalar call: facts → DATALOG_ASSERT, rules → DATALOG_RULE,
+// `?-` goals → DATALOG_QUERY. Statement text carries no leading `?-` or
+// trailing `.` when handed to the engine.
+export function parseDatalogProgram(program: string): ParsedProgram {
+  const out: ParsedProgram = { asserts: [], rules: [], queries: [] }
+  for (const raw of program.split('\n')) {
+    let line = raw.trim()
+    if (line === '' || line.startsWith('--')) continue
+    if (line.endsWith('.')) line = line.slice(0, -1).trim()
+    if (line.startsWith('?-')) {
+      const q = line.slice(2).trim()
+      if (q) out.queries.push(q)
+    } else if (line.includes(':-')) {
+      out.rules.push(line)
+    } else {
+      out.asserts.push(line)
+    }
+  }
+  return out
+}
+
+// DATALOG_QUERY returns a JSON array of tuples (arrays of strings), e.g.
+// [["alice","bob"],["bob","charlie"]].
+export function parseQueryTuples(cell: unknown): string[][] {
+  if (cell == null) return []
+  const text = String(cell).trim()
+  if (text === '') return []
+  try {
+    const parsed = JSON.parse(text)
+    return Array.isArray(parsed) ? (parsed as string[][]) : []
+  } catch {
+    return []
+  }
+}
+
+export function tuplesToResult(tuples: string[][]): QueryResult {
+  const maxArity = tuples.reduce((m, t) => Math.max(m, t.length), 0)
+  const columns = Array.from({ length: maxArity }, (_, i) => `col${i}`)
+  return { columns, rows: tuples, rowCount: tuples.length, duration: 0 }
+}
 
 export function DatalogModule() {
   const program = useSignal(EXAMPLE_PROGRAMS[0])
@@ -37,13 +91,28 @@ export function DatalogModule() {
     if (!prog) return
     running.value = true
     result.value = null
+    const started = performance.now()
     try {
-      const escaped = prog.replace(/'/g, "''")
-      const r = await api.query(
-        `SELECT * FROM datalog_eval('${escaped}')`,
-        conn.id
-      )
-      result.value = r
+      const parsed = parseDatalogProgram(prog)
+      for (const fact of parsed.asserts) {
+        await api.query(`SELECT DATALOG_ASSERT(${sqlStr(fact)})`, conn.id)
+      }
+      for (const rule of parsed.rules) {
+        await api.query(`SELECT DATALOG_RULE(${sqlStr(rule)})`, conn.id)
+      }
+      const tuples: string[][] = []
+      for (const q of parsed.queries) {
+        const r = await api.query(`SELECT DATALOG_QUERY(${sqlStr(q)})`, conn.id)
+        if (r.error) {
+          result.value = r
+          return
+        }
+        const cell = r.rows.length > 0 ? r.rows[0][0] : null
+        tuples.push(...parseQueryTuples(cell))
+      }
+      const res = tuplesToResult(tuples)
+      res.duration = Math.round(performance.now() - started)
+      result.value = res
     } catch (err: unknown) {
       toast('error', err instanceof Error ? err.message : String(err))
     } finally {
