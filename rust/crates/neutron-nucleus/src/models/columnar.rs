@@ -18,23 +18,62 @@ impl ColumnarModel {
     }
 
     /// Insert a row into a columnar table. Values is a JSON object of column->value.
+    ///
+    /// `COLUMNAR_INSERT` is variadic: `(table, col1, val1, col2, val2, ...)`.
     pub async fn insert(
         &self,
         table: &str,
         values: &serde_json::Value,
-    ) -> Result<bool, NucleusError> {
+    ) -> Result<(), NucleusError> {
         if !is_valid_identifier(table) {
             return Err(NucleusError::InvalidIdentifier(table.to_string()));
         }
-        let values_str =
-            serde_json::to_string(values).map_err(|e| NucleusError::Serde(e.to_string()))?;
+        let obj = values
+            .as_object()
+            .ok_or_else(|| NucleusError::Serde("values must be a JSON object".to_string()))?;
+        if obj.is_empty() {
+            return Err(NucleusError::Serde(
+                "values must contain at least one column".to_string(),
+            ));
+        }
+
+        // Build: SELECT COLUMNAR_INSERT($1, $2, $3, $4, $5, ...)
+        let mut params: Vec<String> = vec!["$1".to_string()];
+        for (i, _) in obj.iter().enumerate() {
+            params.push(format!("${}", i * 2 + 2));
+            params.push(format!("${}", i * 2 + 3));
+        }
+        let sql = format!("SELECT COLUMNAR_INSERT({})", params.join(", "));
+
+        // Owned, typed parameter values (col name, then value).
+        let mut owned: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> = Vec::new();
+        owned.push(Box::new(table.to_string()));
+        for (col, val) in obj {
+            owned.push(Box::new(col.clone()));
+            match val {
+                serde_json::Value::Bool(b) => owned.push(Box::new(*b)),
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        owned.push(Box::new(i));
+                    } else {
+                        owned.push(Box::new(n.as_f64().unwrap_or(f64::NAN)));
+                    }
+                }
+                serde_json::Value::String(s) => owned.push(Box::new(s.clone())),
+                serde_json::Value::Null => owned.push(Box::new(Option::<String>::None)),
+                other => owned.push(Box::new(other.to_string())),
+            }
+        }
+        let query_params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            owned.iter().map(|b| b.as_ref()).collect();
+
         let conn = self.pool.get().await?;
-        let row = conn
-            .client()
-            .query_one("SELECT COLUMNAR_INSERT($1, $2)", &[&table, &values_str])
+        // Engine returns the text 'OK'.
+        conn.client()
+            .query_one(&sql, &query_params)
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(())
     }
 
     /// Return the number of rows in a columnar table.

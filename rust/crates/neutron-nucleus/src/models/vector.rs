@@ -105,7 +105,7 @@ impl VectorModel {
             .map_err(NucleusError::Query)?;
 
         let index_sql = format!(
-            "CREATE INDEX IF NOT EXISTS idx_{}_embedding ON {} USING VECTOR (embedding) WITH (metric = '{}')",
+            "CREATE INDEX IF NOT EXISTS idx_{}_embedding ON {} USING HNSW (embedding) WITH (metric = '{}')",
             name, name, metric.as_str()
         );
         conn.client()
