@@ -12,6 +12,14 @@ defmodule Nucleus.Models.DocumentTest do
       assert function_exported?(Document, :get, 2)
     end
 
+    test "exports update/3" do
+      assert function_exported?(Document, :update, 3)
+    end
+
+    test "exports delete/2" do
+      assert function_exported?(Document, :delete, 2)
+    end
+
     test "exports query/2" do
       assert function_exported?(Document, :query, 2)
     end

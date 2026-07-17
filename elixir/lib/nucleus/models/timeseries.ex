@@ -84,37 +84,24 @@ defmodule Nucleus.Models.TimeSeries do
     end
   end
 
-  @doc "Sets a retention policy on a series (auto-delete after N days)."
-  @spec retention(client(), String.t(), integer()) :: {:ok, boolean()} | {:error, term()}
-  def retention(client, series, days) do
+  @doc "Sets the global retention policy (auto-delete points older than `max_age_ms`)."
+  @spec retention(client(), integer()) :: :ok | {:error, term()}
+  def retention(client, max_age_ms) do
     with :ok <- Nucleus.Client.require_nucleus(client, "TimeSeries.retention") do
-      case Nucleus.Client.query(client, "SELECT TS_RETENTION($1, $2)", [series, days]) do
-        {:ok, %{rows: [[val]]}} -> {:ok, val}
-        {:error, _} = error -> error
-      end
-    end
-  end
-
-  @doc "Pattern matching on a time series."
-  @spec match(client(), String.t(), String.t()) :: {:ok, String.t()} | {:error, term()}
-  def match(client, series, pattern) do
-    with :ok <- Nucleus.Client.require_nucleus(client, "TimeSeries.match") do
-      case Nucleus.Client.query(client, "SELECT TS_MATCH($1, $2)", [series, pattern]) do
-        {:ok, %{rows: [[val]]}} -> {:ok, val}
+      case Nucleus.Client.query(client, "SELECT TS_RETENTION($1)", [max_age_ms]) do
+        {:ok, _} -> :ok
         {:error, _} = error -> error
       end
     end
   end
 
   @doc """
-  Aggregates data points into time buckets.
-
-  Intervals: `"second"`, `"minute"`, `"hour"`, `"day"`, `"week"`, `"month"`.
+  Truncates a timestamp (ms) down to its bucket of `bucket_ms` milliseconds.
   """
-  @spec time_bucket(client(), String.t(), integer()) :: {:ok, integer()} | {:error, term()}
-  def time_bucket(client, interval, timestamp) do
+  @spec time_bucket(client(), integer(), integer()) :: {:ok, integer()} | {:error, term()}
+  def time_bucket(client, bucket_ms, timestamp) do
     with :ok <- Nucleus.Client.require_nucleus(client, "TimeSeries.time_bucket") do
-      case Nucleus.Client.query(client, "SELECT TIME_BUCKET($1, $2)", [interval, timestamp]) do
+      case Nucleus.Client.query(client, "SELECT TIME_BUCKET($1, $2)", [bucket_ms, timestamp]) do
         {:ok, %{rows: [[val]]}} -> {:ok, val}
         {:error, _} = error -> error
       end

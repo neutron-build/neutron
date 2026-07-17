@@ -107,10 +107,19 @@ defmodule Nucleus.Client do
     }
   end
 
-  @doc "Executes a raw SQL query, returning `{:ok, %Postgrex.Result{}}` or `{:error, term()}`."
+  @doc """
+  Executes a raw SQL query, returning `{:ok, %Postgrex.Result{}}` or `{:error, term()}`.
+
+  Inside `Nucleus.Repo.transaction/2`, queries run on the transaction's
+  checked-out connection (stashed in the process dictionary) so they are
+  actually part of the transaction.
+  """
   @spec query(t(), String.t(), list()) :: {:ok, Postgrex.Result.t()} | {:error, term()}
   def query(client, sql, params \\ []) do
-    GenServer.call(client, {:query, sql, params})
+    case Process.get(:nucleus_tx_conn) do
+      nil -> GenServer.call(client, {:query, sql, params})
+      conn -> Postgrex.query(conn, sql, params)
+    end
   end
 
   @doc "Executes a raw SQL query, raising on error."

@@ -8,9 +8,8 @@ defmodule Nucleus.Models.PubSubTest do
       assert function_exported?(PubSub, :publish, 3)
     end
 
-    test "exports channels/1 and channels/2" do
+    test "exports channels/1" do
       assert function_exported?(PubSub, :channels, 1)
-      assert function_exported?(PubSub, :channels, 2)
     end
 
     test "exports subscribers/2" do

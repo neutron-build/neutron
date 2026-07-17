@@ -40,6 +40,30 @@ defmodule Nucleus.Models.Document do
     end
   end
 
+  @doc "Replaces a document by ID. Returns `{:ok, true}` if the document existed."
+  @spec update(client(), integer(), map() | String.t()) :: {:ok, boolean()} | {:error, term()}
+  def update(client, id, document) do
+    with :ok <- Nucleus.Client.require_nucleus(client, "Document.update") do
+      json = if is_binary(document), do: document, else: Jason.encode!(document)
+
+      case Nucleus.Client.query(client, "SELECT DOC_UPDATE($1, $2)", [id, json]) do
+        {:ok, %{rows: [[val]]}} -> {:ok, val}
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  @doc "Deletes a document by ID. Returns `{:ok, true}` if the document existed."
+  @spec delete(client(), integer()) :: {:ok, boolean()} | {:error, term()}
+  def delete(client, id) do
+    with :ok <- Nucleus.Client.require_nucleus(client, "Document.delete") do
+      case Nucleus.Client.query(client, "SELECT DOC_DELETE($1)", [id]) do
+        {:ok, %{rows: [[val]]}} -> {:ok, val}
+        {:error, _} = error -> error
+      end
+    end
+  end
+
   @doc "Queries documents by a JSON query expression. Returns matching document IDs."
   @spec query(client(), map() | String.t()) :: {:ok, [integer()]} | {:error, term()}
   def query(client, query_expr) do
