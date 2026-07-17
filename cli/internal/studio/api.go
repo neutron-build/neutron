@@ -344,7 +344,8 @@ func (s *Server) handleFeatures(w http.ResponseWriter, r *http.Request) {
 	}
 	isNucleus, version, _ := client.IsNucleus(r.Context())
 
-	// Attempt per-model feature detection from NUCLEUS_FEATURES()
+	// Nucleus has no feature-flag function; NucleusFeatures reports the fixed
+	// set of models every Nucleus build ships.
 	models := nucleusModels(isNucleus)
 	var featureMap map[string]bool
 	if isNucleus {

@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
-	"github.com/neutron-build/neutron/cli/internal/db"
 	"github.com/jackc/pgx/v5"
+	"github.com/neutron-build/neutron/cli/internal/db"
 )
 
 // toolHandler is a function that executes a single MCP tool.
@@ -34,10 +35,10 @@ var toolHandlers = map[string]toolHandler{
 	"cypher_query":        handleCypherQuery,
 	"doc_find":            handleDocFind,
 	"ts_range":            handleTSRange,
-	"geo_radius":          handleGeoRadius,
+	"geo_distance":        handleGeoDistance,
 	"blob_list":           handleBlobList,
 	"stream_range":        handleStreamRange,
-	"datalog_eval":        handleDatalogEval,
+	"datalog_query":       handleDatalogQuery,
 	"cdc_changes":         handleCDCChanges,
 	"pubsub_list":         handlePubSubList,
 	"search_docs":         handleSearchDocs,
@@ -61,7 +62,7 @@ func toolList() []toolDef {
 		},
 		{
 			Name:        "list_nucleus_models",
-			Description: "List all non-SQL Nucleus collections: KV stores, vector indexes, FTS indexes, document stores, graph stores, time series streams, blob stores, and pub/sub channels.",
+			Description: "List the Nucleus data models and their sizes. Nucleus stores are global and unnamed (one store per model); this reports the counts the engine exposes (KV keys, documents, FTS docs, blobs, graph nodes, CDC events, pub/sub channels). Models without a count function are listed for reference.",
 			InputSchema: schema(props{}, nil),
 		},
 		{
@@ -74,118 +75,110 @@ func toolList() []toolDef {
 		},
 		{
 			Name:        "kv_get",
-			Description: "Get the value for a single key from a Nucleus KV store.",
+			Description: "Get the value for a single key from the Nucleus KV store (a single global keyspace).",
 			InputSchema: schema(props{
-				"store": strProp("KV store name"),
-				"key":   strProp("Key to retrieve"),
-			}, []string{"store", "key"}),
+				"key": strProp("Key to retrieve"),
+			}, []string{"key"}),
 		},
 		{
 			Name:        "kv_scan",
-			Description: "Scan keys in a Nucleus KV store, optionally filtered by prefix. Returns key, value, and TTL.",
+			Description: "List keys in the Nucleus KV store, optionally filtered by prefix. Returns a JSON array of matching keys.",
 			InputSchema: schema(props{
-				"store":  strProp("KV store name"),
 				"prefix": strProp("Key prefix filter (optional, empty = all keys)"),
-				"limit":  numProp("Maximum keys to return (default 50)"),
-			}, []string{"store"}),
+			}, nil),
 		},
 		{
 			Name:        "fts_search",
-			Description: "Full-text search across a Nucleus FTS index using BM25 ranking. Supports fuzzy matching.",
+			Description: "Full-text search over the Nucleus FTS index using BM25 ranking. Returns a JSON array of {doc_id, score}. Set fuzzy for edit-distance matching.",
 			InputSchema: schema(props{
-				"index": strProp("FTS index name"),
-				"query": strProp("Search query text"),
-				"fuzzy": boolProp("Enable fuzzy matching (default false)"),
-				"limit": numProp("Maximum results (default 20)"),
-			}, []string{"index", "query"}),
+				"query":        strProp("Search query text"),
+				"fuzzy":        boolProp("Enable fuzzy (edit-distance) matching (default false)"),
+				"max_distance": numProp("Max edit distance when fuzzy (default 2)"),
+				"limit":        numProp("Maximum results (default 20)"),
+			}, []string{"query"}),
 		},
 		{
 			Name:        "vector_search",
-			Description: "Semantic similarity search in a Nucleus vector index. Provide the query vector as a JSON array of floats, e.g. [0.1, 0.2, 0.3].",
+			Description: "Nearest-neighbor search over a vector column of a SQL table, ordered by VECTOR_DISTANCE. Provide the query vector as a JSON array of floats, e.g. [0.1, 0.2, 0.3].",
 			InputSchema: schema(props{
-				"index":  strProp("Vector index name"),
-				"vector": strProp("Query vector as JSON array, e.g. [0.1, 0.2, ...]"),
-				"k":      numProp("Number of nearest neighbors to return (default 10)"),
-				"metric": strProp("Distance metric: cosine, l2, or dot (default cosine)"),
-			}, []string{"index", "vector"}),
+				"table":     strProp("Table containing the vector column"),
+				"column":    strProp("Vector column name"),
+				"vector":    strProp("Query vector as JSON array, e.g. [0.1, 0.2, ...]"),
+				"id_column": strProp("Identifier column to return (default 'id')"),
+				"k":         numProp("Number of nearest neighbors to return (default 10)"),
+				"metric":    strProp("Distance metric: cosine, l2, or inner (default cosine)"),
+			}, []string{"table", "column", "vector"}),
 		},
 		{
 			Name:        "cypher_query",
-			Description: "Run a Cypher graph query against a Nucleus graph store. Returns nodes and relationships.",
+			Description: "Run a Cypher query against the Nucleus graph store (a single global graph). Returns a JSON object with columns and rows.",
 			InputSchema: schema(props{
-				"graph": strProp("Graph store name"),
 				"query": strProp("Cypher query, e.g. MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 25"),
-			}, []string{"graph", "query"}),
+			}, []string{"query"}),
 		},
 		{
 			Name:        "doc_find",
-			Description: "Query a Nucleus document store using a JSON filter expression.",
+			Description: "Query the Nucleus document store with a JSON filter expression. Returns the matching documents.",
 			InputSchema: schema(props{
-				"collection": strProp("Document collection name"),
-				"filter":     strProp("JSON filter expression, e.g. {\"status\": \"active\"} (empty = all docs)"),
-				"limit":      numProp("Maximum documents to return (default 20)"),
-			}, []string{"collection"}),
+				"filter": strProp("JSON filter expression, e.g. {\"status\": \"active\"} (empty = all docs)"),
+				"limit":  numProp("Maximum documents to return (default 20)"),
+			}, nil),
 		},
 		{
 			Name:        "ts_range",
-			Description: "Query a Nucleus time series stream over a time range with optional bucketing and aggregation.",
+			Description: "Aggregate a Nucleus time series over an epoch-millisecond window. The engine exposes range average and count only (no raw point fetch).",
 			InputSchema: schema(props{
-				"stream": strProp("Time series stream name"),
-				"start":  strProp("Start time in ISO 8601 or relative format, e.g. '2024-01-01' or 'now-1h'"),
-				"end":    strProp("End time (default: now)"),
-				"bucket": strProp("Bucket interval e.g. '1m', '1h', '1d' (optional, raw points if omitted)"),
-				"agg":    strProp("Aggregation function: avg, sum, min, max, count (default avg)"),
-				"limit":  numProp("Maximum points (default 500)"),
-			}, []string{"stream", "start"}),
+				"series":   strProp("Time series name"),
+				"start_ms": numProp("Range start, epoch milliseconds (default 0)"),
+				"end_ms":   numProp("Range end, epoch milliseconds (required)"),
+				"agg":      strProp("Aggregation: avg or count (default avg)"),
+			}, []string{"series", "end_ms"}),
 		},
 		{
-			Name:        "geo_radius",
-			Description: "Find points within a radius of a given latitude/longitude in a Nucleus geo store.",
+			Name:        "geo_distance",
+			Description: "Compute the haversine distance in meters between two latitude/longitude points using the Nucleus GEO_DISTANCE function.",
 			InputSchema: schema(props{
-				"store":  strProp("Geo store name"),
-				"lat":    numProp("Center latitude"),
-				"lon":    numProp("Center longitude"),
-				"radius": numProp("Search radius in meters"),
-				"limit":  numProp("Maximum results (default 20)"),
-			}, []string{"store", "lat", "lon", "radius"}),
+				"lat1": numProp("First point latitude"),
+				"lon1": numProp("First point longitude"),
+				"lat2": numProp("Second point latitude"),
+				"lon2": numProp("Second point longitude"),
+			}, []string{"lat1", "lon1", "lat2", "lon2"}),
 		},
 		{
 			Name:        "blob_list",
-			Description: "List blobs in a Nucleus blob store with their size, content type, and content hash.",
+			Description: "List keys in the Nucleus blob store, optionally filtered by prefix. Returns a JSON array of key strings.",
 			InputSchema: schema(props{
-				"store": strProp("Blob store name"),
-				"limit": numProp("Maximum blobs to return (default 50)"),
-			}, []string{"store"}),
+				"prefix": strProp("Key prefix filter (optional, empty = all blobs)"),
+			}, nil),
 		},
 		{
 			Name:        "stream_range",
-			Description: "Read entries from a Nucleus stream (append-only log) between two entry IDs.",
+			Description: "Read entries from a Nucleus stream (append-only log) over an epoch-millisecond window. Returns a JSON array of entries.",
 			InputSchema: schema(props{
-				"stream": strProp("Stream name"),
-				"from":   strProp("Start entry ID (default '0-0' for beginning)"),
-				"to":     strProp("End entry ID (default '+' for latest)"),
-				"limit":  numProp("Maximum entries to return (default 50)"),
-			}, []string{"stream"}),
+				"stream":   strProp("Stream name"),
+				"start_ms": numProp("Range start, epoch milliseconds (default 0)"),
+				"end_ms":   numProp("Range end, epoch milliseconds (required)"),
+				"limit":    numProp("Maximum entries to return (default 50)"),
+			}, []string{"stream", "end_ms"}),
 		},
 		{
-			Name:        "datalog_eval",
-			Description: "Evaluate a Datalog program against the Nucleus datalog engine. Write facts and rules, then query with ?-.",
+			Name:        "datalog_query",
+			Description: "Evaluate a query against the Nucleus datalog engine. Returns a JSON array of result tuples. Use query_sql with DATALOG_ASSERT/DATALOG_RULE to load facts and rules first.",
 			InputSchema: schema(props{
-				"program": strProp("Datalog program text with facts, rules, and a ?- query"),
-			}, []string{"program"}),
+				"query": strProp("Datalog query, e.g. ancestor(alice, ?X)"),
+			}, []string{"query"}),
 		},
 		{
 			Name:        "cdc_changes",
-			Description: "Retrieve recent change data capture (CDC) events from the Nucleus WAL. Filter by table and operation type.",
+			Description: "Read change data capture (CDC) events from the Nucleus log after a given sequence. Returns a JSON array of {seq, table, change, ts}.",
 			InputSchema: schema(props{
-				"table":     strProp("Table name filter (optional, empty = all tables)"),
-				"operation": strProp("Operation filter: INSERT, UPDATE, DELETE (optional, empty = all)"),
-				"limit":     numProp("Maximum events to return (default 50)"),
+				"after_sequence": numProp("Return events after this sequence number (default 0)"),
+				"limit":          numProp("Maximum events to return (default 50)"),
 			}, nil),
 		},
 		{
 			Name:        "pubsub_list",
-			Description: "List all active pub/sub channels in the Nucleus database.",
+			Description: "List active pub/sub channels in the Nucleus database (comma-separated).",
 			InputSchema: schema(props{}, nil),
 		},
 		{
@@ -249,23 +242,17 @@ func handleDescribeTable(ctx context.Context, client *db.Client, args map[string
 		return "", fmt.Errorf("table argument is required")
 	}
 
+	// Nucleus does not implement information_schema.table_constraints /
+	// key_column_usage / character_maximum_length; use information_schema.columns
+	// and resolve primary keys best-effort from the pg_catalog virtual tables.
 	rows, err := client.Query(ctx, `
 		SELECT
 			c.column_name,
 			c.data_type,
-			c.character_maximum_length,
+			c.udt_name,
 			c.is_nullable,
-			c.column_default,
-			CASE WHEN pk.column_name IS NOT NULL THEN true ELSE false END AS is_primary_key
+			c.column_default
 		FROM information_schema.columns c
-		LEFT JOIN (
-			SELECT ku.column_name
-			FROM information_schema.table_constraints tc
-			JOIN information_schema.key_column_usage ku
-				ON tc.constraint_name = ku.constraint_name
-			WHERE tc.constraint_type = 'PRIMARY KEY'
-			  AND ku.table_name = $1
-		) pk ON pk.column_name = c.column_name
 		WHERE c.table_name = $1
 		  AND c.table_schema NOT IN ('pg_catalog','information_schema')
 		ORDER BY c.ordinal_position
@@ -273,44 +260,121 @@ func handleDescribeTable(ctx context.Context, client *db.Client, args map[string
 	if err != nil {
 		return "", fmt.Errorf("describe table: %w", err)
 	}
-	return rowsToJSON(rows)
+	defer rows.Close()
+
+	pk := mcpPKColumns(ctx, client, table)
+
+	type colInfo struct {
+		Name         string  `json:"column_name"`
+		DataType     string  `json:"data_type"`
+		UDTName      string  `json:"udt_name"`
+		IsNullable   string  `json:"is_nullable"`
+		Default      *string `json:"column_default"`
+		IsPrimaryKey bool    `json:"is_primary_key"`
+	}
+	var cols []colInfo
+	for rows.Next() {
+		var c colInfo
+		if err := rows.Scan(&c.Name, &c.DataType, &c.UDTName, &c.IsNullable, &c.Default); err != nil {
+			continue
+		}
+		c.IsPrimaryKey = pk[c.Name]
+		cols = append(cols, c)
+	}
+	if cols == nil {
+		cols = []colInfo{}
+	}
+	b, err := json.MarshalIndent(cols, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// mcpPKColumns resolves primary-key column names via pg_class -> pg_index ->
+// pg_attribute (virtual tables both Nucleus and Postgres implement).
+// Best-effort: empty on any error.
+func mcpPKColumns(ctx context.Context, client *db.Client, table string) map[string]bool {
+	pk := map[string]bool{}
+
+	var oid int32
+	if err := client.QueryRow(ctx, `SELECT oid FROM pg_catalog.pg_class WHERE relname = $1`, table).Scan(&oid); err != nil {
+		return pk
+	}
+	var indkey string
+	if err := client.QueryRow(ctx, `SELECT indkey FROM pg_catalog.pg_index WHERE indisprimary AND indrelid = $1`, oid).Scan(&indkey); err != nil {
+		return pk
+	}
+	positions := map[int]bool{}
+	for _, f := range strings.Fields(indkey) {
+		if p, err := strconv.Atoi(f); err == nil {
+			positions[p] = true
+		}
+	}
+	if len(positions) == 0 {
+		return pk
+	}
+	rows, err := client.Query(ctx, `SELECT attname, attnum FROM pg_catalog.pg_attribute WHERE attrelid = $1`, oid)
+	if err != nil {
+		return pk
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		var num int
+		if rows.Scan(&name, &num) == nil && positions[num] {
+			pk[name] = true
+		}
+	}
+	return pk
 }
 
 func handleListNucleusModels(ctx context.Context, client *db.Client, _ map[string]any) (string, error) {
+	// Nucleus stores are global and unnamed (one store per model). There is no
+	// enumeration function; report each model with the counts the engine exposes.
 	type modelResult struct {
 		Model string `json:"model"`
-		Name  string `json:"name"`
-	}
-	var results []modelResult
-
-	queries := []struct {
-		model string
-		sql   string
-		col   string
-	}{
-		{"kv", "SELECT store_name FROM kv_stores()", "store_name"},
-		{"vector", "SELECT index_name FROM vector_indexes()", "index_name"},
-		{"fts", "SELECT index_name FROM fts_indexes()", "index_name"},
-		{"document", "SELECT collection_name FROM doc_collections()", "collection_name"},
-		{"graph", "SELECT graph_name FROM graph_stores()", "graph_name"},
-		{"timeseries", "SELECT stream_name FROM ts_streams()", "stream_name"},
-		{"blob", "SELECT store_name FROM blob_stores()", "store_name"},
-		{"geo", "SELECT store_name FROM geo_stores()", "store_name"},
-		{"streams", "SELECT stream_name FROM stream_list()", "stream_name"},
+		Count *int64 `json:"count,omitempty"`
+		Note  string `json:"note,omitempty"`
 	}
 
-	for _, q := range queries {
-		rows, err := client.Query(ctx, q.sql)
-		if err != nil {
-			continue // model may not exist; silent skip
+	scalarCount := func(sql string) *int64 {
+		var n int64
+		if err := client.QueryRow(ctx, sql).Scan(&n); err != nil {
+			return nil
 		}
-		for rows.Next() {
-			var name string
-			if err := rows.Scan(&name); err == nil {
-				results = append(results, modelResult{Model: q.model, Name: name})
+		return &n
+	}
+
+	results := []modelResult{
+		{Model: "kv", Count: scalarCount(`SELECT KV_DBSIZE()`)},
+		{Model: "document", Count: scalarCount(`SELECT DOC_COUNT()`)},
+		{Model: "fts", Count: scalarCount(`SELECT FTS_DOC_COUNT()`)},
+		{Model: "blob", Count: scalarCount(`SELECT BLOB_COUNT()`)},
+		{Model: "cdc", Count: scalarCount(`SELECT CDC_COUNT()`)},
+	}
+
+	nodes := scalarCount(`SELECT GRAPH_NODE_COUNT()`)
+	edges := scalarCount(`SELECT GRAPH_EDGE_COUNT()`)
+	if nodes != nil || edges != nil {
+		results = append(results, modelResult{Model: "graph", Count: nodes, Note: "node count; see GRAPH_EDGE_COUNT() for edges"})
+	}
+
+	// pubsub channels are enumerable via a comma-separated scalar.
+	var channels string
+	if err := client.QueryRow(ctx, `SELECT PUBSUB_CHANNELS()`).Scan(&channels); err == nil {
+		n := int64(0)
+		for _, c := range strings.Split(channels, ",") {
+			if strings.TrimSpace(c) != "" {
+				n++
 			}
 		}
-		rows.Close()
+		results = append(results, modelResult{Model: "pubsub", Count: &n})
+	}
+
+	// Models with no enumeration/count surface in the engine.
+	for _, m := range []string{"vector", "timeseries", "geo", "columnar", "datalog", "streams"} {
+		results = append(results, modelResult{Model: m, Note: "no engine enumeration; access by name via the model tools"})
 	}
 
 	b, err := json.MarshalIndent(results, "", "  ")
@@ -349,71 +413,86 @@ func handleQuerySQL(ctx context.Context, client *db.Client, args map[string]any)
 	return rowsToJSON(rows)
 }
 
-func handleKVGet(ctx context.Context, client *db.Client, args map[string]any) (string, error) {
-	store, _ := args["store"].(string)
-	key, _ := args["key"].(string)
-	if store == "" || key == "" {
-		return "", fmt.Errorf("store and key arguments are required")
-	}
-	rows, err := client.Query(ctx, "SELECT kv_get($1, $2) AS value", store, key)
-	if err != nil {
+// scalarText runs a query returning a single text/JSON scalar and returns it.
+// A NULL result is rendered as "null".
+func scalarText(ctx context.Context, client *db.Client, sql string, args ...any) (string, error) {
+	var v *string
+	if err := client.QueryRow(ctx, sql, args...).Scan(&v); err != nil {
 		return "", err
 	}
-	return rowsToJSON(rows)
+	if v == nil {
+		return "null", nil
+	}
+	return *v, nil
+}
+
+func handleKVGet(ctx context.Context, client *db.Client, args map[string]any) (string, error) {
+	key, _ := args["key"].(string)
+	if key == "" {
+		return "", fmt.Errorf("key argument is required")
+	}
+	// Nucleus KV is a single global keyspace: KV_GET(key).
+	return scalarText(ctx, client, "SELECT KV_GET($1)", key)
 }
 
 func handleKVScan(ctx context.Context, client *db.Client, args map[string]any) (string, error) {
-	store, _ := args["store"].(string)
-	if store == "" {
-		return "", fmt.Errorf("store argument is required")
-	}
 	prefix, _ := args["prefix"].(string)
-	limit := intArg(args, "limit", 50)
-
-	rows, err := client.Query(ctx, "SELECT key, value, ttl FROM kv_scan($1, $2) LIMIT $3", store, prefix, limit)
-	if err != nil {
-		return "", err
-	}
-	return rowsToJSON(rows)
+	// KV_KEYS(pattern) returns a JSON array of matching keys. A trailing '*' makes
+	// the prefix a glob; an empty prefix lists all keys.
+	pattern := prefix + "*"
+	return scalarText(ctx, client, "SELECT KV_KEYS($1)", pattern)
 }
 
 func handleFTSSearch(ctx context.Context, client *db.Client, args map[string]any) (string, error) {
-	index, _ := args["index"].(string)
 	query, _ := args["query"].(string)
-	if index == "" || query == "" {
-		return "", fmt.Errorf("index and query arguments are required")
+	if query == "" {
+		return "", fmt.Errorf("query argument is required")
 	}
 	fuzzy, _ := args["fuzzy"].(bool)
 	limit := intArg(args, "limit", 20)
 
-	var rows pgx.Rows
-	var err error
+	// FTS is a single global index; results are a JSON array of {doc_id, score}.
 	if fuzzy {
-		rows, err = client.Query(ctx, "SELECT id, rank, snippet FROM fts_search($1, $2, true) LIMIT $3", index, query, limit)
-	} else {
-		rows, err = client.Query(ctx, "SELECT id, rank, snippet FROM fts_search($1, $2) LIMIT $3", index, query, limit)
+		maxDist := intArg(args, "max_distance", 2)
+		return scalarText(ctx, client, "SELECT FTS_FUZZY_SEARCH($1, $2, $3)", query, maxDist, limit)
 	}
-	if err != nil {
-		return "", err
-	}
-	return rowsToJSON(rows)
+	return scalarText(ctx, client, "SELECT FTS_SEARCH($1, $2)", query, limit)
 }
 
 func handleVectorSearch(ctx context.Context, client *db.Client, args map[string]any) (string, error) {
-	index, _ := args["index"].(string)
+	table, _ := args["table"].(string)
+	column, _ := args["column"].(string)
 	vector, _ := args["vector"].(string)
-	if index == "" || vector == "" {
-		return "", fmt.Errorf("index and vector arguments are required")
+	if table == "" || column == "" || vector == "" {
+		return "", fmt.Errorf("table, column, and vector arguments are required")
+	}
+	if !isSafeIdent(table) || !isSafeIdent(column) {
+		return "", fmt.Errorf("table and column must be simple identifiers")
+	}
+	idCol, _ := args["id_column"].(string)
+	if idCol == "" {
+		idCol = "id"
+	}
+	if !isSafeIdent(idCol) {
+		return "", fmt.Errorf("id_column must be a simple identifier")
 	}
 	k := intArg(args, "k", 10)
 	metric, _ := args["metric"].(string)
-	if metric == "" {
+	switch metric {
+	case "", "cosine":
 		metric = "cosine"
+	case "l2", "inner":
+		// accepted
+	default:
+		return "", fmt.Errorf("metric must be one of: cosine, l2, inner")
 	}
 
-	rows, err := client.Query(ctx,
-		"SELECT id, distance FROM vector_search($1, VECTOR($2), $3, $4) LIMIT $3",
-		index, vector, k, metric)
+	// Nucleus has no vector_search table function; the real pattern is an ORDER BY
+	// on VECTOR_DISTANCE with a VECTOR('[...]') literal wrapping the query vector.
+	sql := fmt.Sprintf(
+		"SELECT %s AS id, VECTOR_DISTANCE(%s, VECTOR($1), $2) AS distance FROM %s ORDER BY distance LIMIT $3",
+		idCol, column, table)
+	rows, err := client.Query(ctx, sql, vector, metric, k)
 	if err != nil {
 		return "", err
 	}
@@ -421,103 +500,103 @@ func handleVectorSearch(ctx context.Context, client *db.Client, args map[string]
 }
 
 func handleCypherQuery(ctx context.Context, client *db.Client, args map[string]any) (string, error) {
-	graph, _ := args["graph"].(string)
 	query, _ := args["query"].(string)
-	if graph == "" || query == "" {
-		return "", fmt.Errorf("graph and query arguments are required")
+	if query == "" {
+		return "", fmt.Errorf("query argument is required")
 	}
-	rows, err := client.Query(ctx, "SELECT * FROM cypher_query($1, $2)", graph, query)
-	if err != nil {
-		return "", err
-	}
-	return rowsToJSON(rows)
+	// Single global graph store: GRAPH_QUERY(cypher) -> JSON {columns, rows}.
+	return scalarText(ctx, client, "SELECT GRAPH_QUERY($1)", query)
 }
 
 func handleDocFind(ctx context.Context, client *db.Client, args map[string]any) (string, error) {
-	collection, _ := args["collection"].(string)
-	if collection == "" {
-		return "", fmt.Errorf("collection argument is required")
-	}
 	filter, _ := args["filter"].(string)
 	if filter == "" {
 		filter = "{}"
 	}
 	limit := intArg(args, "limit", 20)
 
-	rows, err := client.Query(ctx, "SELECT id, data FROM doc_find($1, $2::jsonb) LIMIT $3", collection, filter, limit)
+	// DOC_QUERY returns a comma-separated list of matching document IDs; fetch
+	// each with DOC_GET (bounded by limit).
+	var ids string
+	if err := client.QueryRow(ctx, "SELECT DOC_QUERY($1)", filter).Scan(&ids); err != nil {
+		return "", err
+	}
+	type doc struct {
+		ID   string          `json:"id"`
+		Data json.RawMessage `json:"data"`
+	}
+	var docs []doc
+	for _, id := range strings.Split(ids, ",") {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if len(docs) >= limit {
+			break
+		}
+		var data *string
+		if err := client.QueryRow(ctx, "SELECT DOC_GET($1)", id).Scan(&data); err != nil {
+			continue
+		}
+		d := doc{ID: id}
+		if data != nil {
+			d.Data = json.RawMessage(*data)
+		}
+		docs = append(docs, d)
+	}
+	if docs == nil {
+		docs = []doc{}
+	}
+	b, err := json.MarshalIndent(docs, "", "  ")
 	if err != nil {
 		return "", err
 	}
-	return rowsToJSON(rows)
+	return string(b), nil
 }
 
 func handleTSRange(ctx context.Context, client *db.Client, args map[string]any) (string, error) {
-	stream, _ := args["stream"].(string)
-	start, _ := args["start"].(string)
-	if stream == "" || start == "" {
-		return "", fmt.Errorf("stream and start arguments are required")
+	series, _ := args["series"].(string)
+	if series == "" {
+		return "", fmt.Errorf("series argument is required")
 	}
-	end, _ := args["end"].(string)
-	if end == "" {
-		end = "now"
+	startMS := intArg(args, "start_ms", 0)
+	endMS := intArg(args, "end_ms", 0)
+	if endMS == 0 {
+		return "", fmt.Errorf("end_ms argument is required (epoch milliseconds)")
 	}
-	bucket, _ := args["bucket"].(string)
 	agg, _ := args["agg"].(string)
 	if agg == "" {
 		agg = "avg"
 	}
-	limit := intArg(args, "limit", 500)
 
-	var rows pgx.Rows
-	var err error
-	if bucket != "" {
-		rows, err = client.Query(ctx,
-			"SELECT time_bucket, "+agg+"_value FROM ts_range($1, $2::timestamptz, $3::timestamptz, $4) LIMIT $5",
-			stream, start, end, bucket, limit)
-	} else {
-		rows, err = client.Query(ctx,
-			"SELECT ts, value FROM ts_range($1, $2::timestamptz, $3::timestamptz) LIMIT $4",
-			stream, start, end, limit)
+	// The engine exposes range aggregates only (no raw point fetch): TS_RANGE_AVG
+	// and TS_RANGE_COUNT over an epoch-millisecond window.
+	switch agg {
+	case "avg":
+		return scalarText(ctx, client, "SELECT TS_RANGE_AVG($1, $2, $3)::text", series, startMS, endMS)
+	case "count":
+		return scalarText(ctx, client, "SELECT TS_RANGE_COUNT($1, $2, $3)::text", series, startMS, endMS)
+	default:
+		return "", fmt.Errorf("agg must be one of: avg, count (the engine exposes no other range aggregate)")
 	}
-	if err != nil {
-		return "", err
-	}
-	return rowsToJSON(rows)
 }
 
-func handleGeoRadius(ctx context.Context, client *db.Client, args map[string]any) (string, error) {
-	store, _ := args["store"].(string)
-	lat, latOK := args["lat"].(float64)
-	lon, lonOK := args["lon"].(float64)
-	radius, radOK := args["radius"].(float64)
-	if store == "" || !latOK || !lonOK || !radOK {
-		return "", fmt.Errorf("store, lat, lon, and radius arguments are required")
+func handleGeoDistance(ctx context.Context, client *db.Client, args map[string]any) (string, error) {
+	lat1, ok1 := args["lat1"].(float64)
+	lon1, ok2 := args["lon1"].(float64)
+	lat2, ok3 := args["lat2"].(float64)
+	lon2, ok4 := args["lon2"].(float64)
+	if !ok1 || !ok2 || !ok3 || !ok4 {
+		return "", fmt.Errorf("lat1, lon1, lat2, and lon2 arguments are required")
 	}
-	limit := intArg(args, "limit", 20)
-
-	rows, err := client.Query(ctx,
-		"SELECT id, lat, lon, distance FROM geo_radius($1, $2, $3, $4) LIMIT $5",
-		store, lat, lon, radius, limit)
-	if err != nil {
-		return "", err
-	}
-	return rowsToJSON(rows)
+	// GEO_DISTANCE returns the haversine distance in meters between two points.
+	return scalarText(ctx, client, "SELECT GEO_DISTANCE($1, $2, $3, $4)::text", lat1, lon1, lat2, lon2)
 }
 
 func handleBlobList(ctx context.Context, client *db.Client, args map[string]any) (string, error) {
-	store, _ := args["store"].(string)
-	if store == "" {
-		return "", fmt.Errorf("store argument is required")
-	}
-	limit := intArg(args, "limit", 50)
-
-	rows, err := client.Query(ctx,
-		"SELECT id, size_bytes, content_type, hash, created_at FROM blob_list($1) LIMIT $2",
-		store, limit)
-	if err != nil {
-		return "", err
-	}
-	return rowsToJSON(rows)
+	prefix, _ := args["prefix"].(string)
+	// BLOB_LIST([prefix]) returns a JSON array of key strings.
+	return scalarText(ctx, client, "SELECT BLOB_LIST($1)", prefix)
 }
 
 func handleStreamRange(ctx context.Context, client *db.Client, args map[string]any) (string, error) {
@@ -525,57 +604,56 @@ func handleStreamRange(ctx context.Context, client *db.Client, args map[string]a
 	if stream == "" {
 		return "", fmt.Errorf("stream argument is required")
 	}
-	from, _ := args["from"].(string)
-	if from == "" {
-		from = "0-0"
+	startMS := intArg(args, "start_ms", 0)
+	endMS := intArg(args, "end_ms", 0)
+	if endMS == 0 {
+		return "", fmt.Errorf("end_ms argument is required (epoch milliseconds)")
 	}
-	to, _ := args["to"].(string)
-	if to == "" {
-		to = "+"
-	}
-	limit := intArg(args, "limit", 50)
-
-	rows, err := client.Query(ctx,
-		"SELECT id, data FROM stream_range($1, $2, $3) LIMIT $4",
-		stream, from, to, limit)
-	if err != nil {
-		return "", err
-	}
-	return rowsToJSON(rows)
+	count := intArg(args, "limit", 50)
+	// STREAM_XRANGE(stream, start_ms, end_ms, count) -> JSON array of entries.
+	return scalarText(ctx, client, "SELECT STREAM_XRANGE($1, $2, $3, $4)", stream, startMS, endMS, count)
 }
 
-func handleDatalogEval(ctx context.Context, client *db.Client, args map[string]any) (string, error) {
-	program, _ := args["program"].(string)
-	if program == "" {
-		return "", fmt.Errorf("program argument is required")
+func handleDatalogQuery(ctx context.Context, client *db.Client, args map[string]any) (string, error) {
+	query, _ := args["query"].(string)
+	if query == "" {
+		return "", fmt.Errorf("query argument is required")
 	}
-	rows, err := client.Query(ctx, "SELECT * FROM datalog_eval($1)", program)
-	if err != nil {
-		return "", err
-	}
-	return rowsToJSON(rows)
+	// DATALOG_QUERY(text) returns a JSON array of result tuples.
+	return scalarText(ctx, client, "SELECT DATALOG_QUERY($1)", query)
 }
 
 func handleCDCChanges(ctx context.Context, client *db.Client, args map[string]any) (string, error) {
-	table, _ := args["table"].(string)
-	operation, _ := args["operation"].(string)
+	afterSeq := intArg(args, "after_sequence", 0)
 	limit := intArg(args, "limit", 50)
-
-	rows, err := client.Query(ctx,
-		"SELECT table_name, operation, changed_at, old_data, new_data FROM cdc_changes($1, $2) LIMIT $3",
-		table, operation, limit)
-	if err != nil {
-		return "", err
-	}
-	return rowsToJSON(rows)
+	// CDC_READ(after_sequence, limit) -> JSON array of {seq, table, change, ts}.
+	return scalarText(ctx, client, "SELECT CDC_READ($1, $2)", afterSeq, limit)
 }
 
 func handlePubSubList(ctx context.Context, client *db.Client, _ map[string]any) (string, error) {
-	rows, err := client.Query(ctx, "SELECT channel, subscriber_count FROM pubsub_channels()")
-	if err != nil {
-		return "", err
+	// PUBSUB_CHANNELS() returns a comma-separated list of active channels.
+	return scalarText(ctx, client, "SELECT PUBSUB_CHANNELS()")
+}
+
+// isSafeIdent reports whether s is a simple SQL identifier (letters, digits,
+// underscore, not starting with a digit) — used where a name is interpolated
+// into SQL because it cannot be a bind parameter.
+func isSafeIdent(s string) bool {
+	if s == "" {
+		return false
 	}
-	return rowsToJSON(rows)
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '_':
+		case r >= '0' && r <= '9':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // --- Schema export ---

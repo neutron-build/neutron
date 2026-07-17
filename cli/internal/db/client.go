@@ -56,16 +56,9 @@ func (c *Client) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row 
 
 // IsNucleus checks if the connected database is Nucleus.
 // Returns isNucleus, version string, error.
-// Detection uses SELECT NUCLEUS_VERSION() — if it succeeds, the server is Nucleus.
-// Falls back to parsing SELECT VERSION() for older Nucleus builds.
+// Detection parses SELECT VERSION() for the "Nucleus" marker — Nucleus embeds
+// its name and version there (there is no separate NUCLEUS_VERSION() function).
 func (c *Client) IsNucleus(ctx context.Context) (bool, string, error) {
-	// Primary detection: NUCLEUS_VERSION() is only available on Nucleus
-	var nucleusVer string
-	if err := c.pool.QueryRow(ctx, "SELECT NUCLEUS_VERSION()").Scan(&nucleusVer); err == nil {
-		return true, nucleusVer, nil
-	}
-
-	// Fallback: parse the standard VERSION() string
 	var version string
 	err := c.pool.QueryRow(ctx, "SELECT VERSION()").Scan(&version)
 	if err != nil {
@@ -79,22 +72,29 @@ func (c *Client) IsNucleus(ctx context.Context) (bool, string, error) {
 	return false, version, nil
 }
 
-// NucleusFeatures returns per-model feature flags from the connected Nucleus.
-// Returns nil if not connected to Nucleus or the function is unavailable.
+// nucleusModels is the fixed set of models every Nucleus build ships. Nucleus
+// exposes no runtime feature-flag function, so all models are assumed present
+// when connected to Nucleus.
+var nucleusModels = []string{
+	"sql", "kv", "vector", "timeseries", "document", "graph",
+	"fts", "geo", "blob", "streams", "columnar", "datalog", "cdc", "pubsub",
+}
+
+// NucleusFeatures returns per-model feature flags for the connected Nucleus.
+// Nucleus has no feature-flag function, so this returns all models enabled.
+// Returns nil if not connected to Nucleus.
 func (c *Client) NucleusFeatures(ctx context.Context) (map[string]bool, error) {
-	rows, err := c.pool.Query(ctx, "SELECT NUCLEUS_FEATURES()")
+	isNucleus, _, err := c.IsNucleus(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	if !isNucleus {
+		return nil, nil
+	}
 
-	features := make(map[string]bool)
-	for rows.Next() {
-		var feature string
-		if err := rows.Scan(&feature); err != nil {
-			continue
-		}
-		features[feature] = true
+	features := make(map[string]bool, len(nucleusModels))
+	for _, m := range nucleusModels {
+		features[m] = true
 	}
 	return features, nil
 }
