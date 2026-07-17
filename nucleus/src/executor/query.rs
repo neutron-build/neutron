@@ -1960,6 +1960,11 @@ impl Executor {
 
                 planner::PlanNode::Sort { input, keys, .. } => {
                     let (meta, mut rows) = self.execute_plan_node(input, cte_tables).await?;
+                    // Bound the in-place sort buffer against the query memory budget
+                    // (held for the duration of the sort). Clean MemoryExceeded
+                    // instead of an OOM when a limit is configured; no-op when
+                    // unlimited (the T1.2 default).
+                    let _sort_mem = self.reserve_query_memory(Self::estimate_rows_bytes(&rows))?;
                     // Parse sort keys: "col_name ASC|DESC [NULLS FIRST|LAST]"
                     for key_str in keys.iter().rev() {
                         // Strip optional NULLS FIRST/LAST suffix
@@ -2398,6 +2403,14 @@ impl Executor {
                     let (right_meta, right_rows) =
                         self.execute_plan_node(right, cte_tables).await?;
 
+                    // Both input sides are held live for the whole nested loop; the
+                    // per-side scan checks are transient, so account the combined
+                    // footprint here.
+                    let _inputs_mem = self.reserve_query_memory(
+                        Self::estimate_rows_bytes(&left_rows)
+                            .saturating_add(Self::estimate_rows_bytes(&right_rows)),
+                    )?;
+
                     // Guard against cartesian explosion.
                     let product = left_rows.len().saturating_mul(right_rows.len());
                     if product > Self::MAX_CROSS_JOIN_ROWS {
@@ -2435,6 +2448,8 @@ impl Executor {
                             }
                         }
                     }
+                    // Peak-check the materialized join output.
+                    drop(self.reserve_query_memory(Self::estimate_rows_bytes(&result_rows))?);
                     Ok((combined_meta, result_rows))
                 }
 
@@ -2447,6 +2462,13 @@ impl Executor {
                     let (left_meta, left_rows) = self.execute_plan_node(left, cte_tables).await?;
                     let (right_meta, right_rows) =
                         self.execute_plan_node(right, cte_tables).await?;
+
+                    // Both sides (plus the right-side hash table) are held live for
+                    // the whole join; account the combined input footprint here.
+                    let _inputs_mem = self.reserve_query_memory(
+                        Self::estimate_rows_bytes(&left_rows)
+                            .saturating_add(Self::estimate_rows_bytes(&right_rows)),
+                    )?;
 
                     let mut combined_meta = left_meta.clone();
                     combined_meta.extend(right_meta.clone());
@@ -2497,6 +2519,10 @@ impl Executor {
                                         }
                                     }
                                 }
+                                // Peak-check the materialized join output.
+                                drop(self.reserve_query_memory(Self::estimate_rows_bytes(
+                                    &result_rows,
+                                ))?);
                                 return Ok((combined_meta, result_rows));
                             }
                         }
@@ -2518,6 +2544,8 @@ impl Executor {
                             result_rows.push(combined);
                         }
                     }
+                    // Peak-check the materialized join output.
+                    drop(self.reserve_query_memory(Self::estimate_rows_bytes(&result_rows))?);
                     Ok((combined_meta, result_rows))
                 }
 
@@ -3897,6 +3925,9 @@ impl Executor {
                             if let Some(ast::Distinct::Distinct) = &select.distinct
                                 && let ExecResult::Select { ref mut rows, .. } = exec_result
                             {
+                                // The dedup set clones every distinct row; bound it.
+                                let _distinct_mem =
+                                    self.reserve_query_memory(Self::estimate_rows_bytes(rows))?;
                                 let mut seen: HashSet<Vec<Value>> = HashSet::new();
                                 rows.retain(|row| seen.insert(row.clone()));
                             }
@@ -4188,6 +4219,8 @@ impl Executor {
                         }
                     };
 
+                    // Peak-check the materialized set-operation output.
+                    drop(self.reserve_query_memory(Self::estimate_rows_bytes(&combined_rows))?);
                     Ok(SelectResult::Projected(ExecResult::Select {
                         columns: left_cols,
                         rows: combined_rows,
