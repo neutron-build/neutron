@@ -28,7 +28,15 @@ _float(result)::Union{Float64, Nothing} = begin
 end
 
 # Split a comma-separated string into a vector, returning empty vector for missing/empty.
+# Only for functions that still comma-join (e.g. PUBSUB_CHANNELS) — the KV collection
+# functions return JSON arrays; use _json_strings for those.
 function _split_csv(raw)::Vector{String}
     (ismissing(raw) || raw === nothing || isempty(raw)) && return String[]
     return split(raw, ",")
+end
+
+# Parse a JSON array of strings, returning empty vector for missing/empty.
+function _json_strings(raw)::Vector{String}
+    (ismissing(raw) || raw === nothing || isempty(raw)) && return String[]
+    return JSON3.read(raw, Vector{String})
 end

@@ -120,7 +120,7 @@ end
 function lrange(m::KVModel, key::String, start::Int, stop::Int)::Vector{String}
     require_nucleus(m.features, "KV")
     result = LibPQ.execute(m.conn, "SELECT KV_LRANGE(\$1, \$2, \$3)", [key, start, stop])
-    return _split_csv(first(result)[1])
+    return _json_strings(first(result)[1])
 end
 
 """KV_LLEN(key) → Int64"""
@@ -175,9 +175,9 @@ function hgetall(m::KVModel, key::String)::Dict{String, String}
     require_nucleus(m.features, "KV")
     result = LibPQ.execute(m.conn, "SELECT KV_HGETALL(\$1)", [key])
     raw = first(result)[1]
-    ismissing(raw) && return Dict{String, String}()
-    pairs_raw = split(raw, ",")
-    return Dict(split(p, "=")[1] => split(p, "=")[2] for p in pairs_raw if occursin("=", p))
+    (ismissing(raw) || isempty(raw)) && return Dict{String, String}()
+    # Engine returns a JSON array of [field, value] pairs.
+    return Dict(String(p[1]) => String(p[2]) for p in JSON3.read(raw, Vector{Vector{String}}))
 end
 
 """KV_HLEN(key) → Int64"""
@@ -207,9 +207,7 @@ end
 function smembers(m::KVModel, key::String)::Set{String}
     require_nucleus(m.features, "KV")
     result = LibPQ.execute(m.conn, "SELECT KV_SMEMBERS(\$1)", [key])
-    raw = first(result)[1]
-    ismissing(raw) && return Set{String}()
-    return Set(split(raw, ","))
+    return Set(_json_strings(first(result)[1]))
 end
 
 """KV_SISMEMBER(key, member) → Bool"""
@@ -235,19 +233,26 @@ function zadd!(m::KVModel, key::String, score::Float64, member::String)::Bool
     return _bool(result)
 end
 
-"""KV_ZRANGE(key, start, stop) → Vector{String}"""
+"""KV_ZRANGE(key, start, stop) → Vector{String} of "member:score" entries"""
 function zrange(m::KVModel, key::String, start::Int, stop::Int)::Vector{String}
     require_nucleus(m.features, "KV")
     result = LibPQ.execute(m.conn, "SELECT KV_ZRANGE(\$1, \$2, \$3)", [key, start, stop])
-    return _split_csv(first(result)[1])
+    return _zentries(first(result)[1])
 end
 
-"""KV_ZRANGEBYSCORE(key, min, max) → Vector{String}"""
+"""KV_ZRANGEBYSCORE(key, min, max) → Vector{String} of "member:score" entries"""
 function zrangebyscore(m::KVModel, key::String, min_score::Float64, max_score::Float64)::Vector{String}
     require_nucleus(m.features, "KV")
     result = LibPQ.execute(m.conn, "SELECT KV_ZRANGEBYSCORE(\$1, \$2, \$3)",
                            [key, min_score, max_score])
-    return _split_csv(first(result)[1])
+    return _zentries(first(result)[1])
+end
+
+# Engine returns a JSON array of [member, score] pairs; format as "member:score"
+# to match the other SDKs' return shape.
+function _zentries(raw)::Vector{String}
+    (ismissing(raw) || raw === nothing || isempty(raw)) && return String[]
+    return [string(p[1], ":", Float64(p[2])) for p in JSON3.read(raw, Vector{Vector{Any}})]
 end
 
 """KV_ZREM(key, member) → Bool"""

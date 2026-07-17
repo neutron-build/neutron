@@ -75,6 +75,23 @@ end
     @test to_vector_literal(Float64[]) == "[]"
 end
 
+@testset "KV collection result parsing (engine JSON formats)" begin
+    # KV_LRANGE / KV_SMEMBERS: JSON array of strings
+    @test NeutronJulia._json_strings("[\"a\",\"b\"]") == ["a", "b"]
+    @test NeutronJulia._json_strings("[\"has,comma\",\"b\"]") == ["has,comma", "b"]
+    @test NeutronJulia._json_strings("[]") == String[]
+    @test NeutronJulia._json_strings(missing) == String[]
+
+    # KV_ZRANGE / KV_ZRANGEBYSCORE: JSON array of [member, score] pairs
+    @test NeutronJulia._zentries("[[\"a\",1.5],[\"b\",2.0]]") == ["a:1.5", "b:2.0"]
+    @test NeutronJulia._zentries("[]") == String[]
+    @test NeutronJulia._zentries(missing) == String[]
+
+    # PUBSUB_CHANNELS still comma-joins
+    @test NeutronJulia._split_csv("ch1,ch2") == ["ch1", "ch2"]
+    @test NeutronJulia._split_csv(missing) == String[]
+end
+
 @testset "Value types" begin
     pt = TimeSeriesPoint(Int64(1_700_000_000_000), 23.5)
     @test pt.timestamp_ms == 1_700_000_000_000
