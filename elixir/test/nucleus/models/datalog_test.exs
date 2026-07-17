@@ -20,12 +20,12 @@ defmodule Nucleus.Models.DatalogTest do
       assert function_exported?(Datalog, :query, 2)
     end
 
-    test "exports clear/1" do
-      assert function_exported?(Datalog, :clear, 1)
+    test "exports clear/2" do
+      assert function_exported?(Datalog, :clear, 2)
     end
 
-    test "exports import_graph/1" do
-      assert function_exported?(Datalog, :import_graph, 1)
+    test "exports import_graph/2" do
+      assert function_exported?(Datalog, :import_graph, 2)
     end
   end
 end

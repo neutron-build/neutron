@@ -64,17 +64,22 @@ defmodule Nucleus.Models.Geo do
     end
   end
 
-  @doc "Calculates the area of a bounding box."
-  @spec area(client(), float(), float(), float(), float()) ::
-          {:ok, float()} | {:error, term()}
-  def area(client, lon1, lat1, lon2, lat2) do
+  @doc """
+  Calculates the area of a polygon given as a list of at least 3 `{lat, lon}` points.
+  """
+  @spec area(client(), [{number(), number()}]) :: {:ok, float()} | {:error, term()}
+  def area(client, points) when is_list(points) and length(points) >= 3 do
     with :ok <- Nucleus.Client.require_nucleus(client, "Geo.area") do
-      case Nucleus.Client.query(client, "SELECT GEO_AREA($1, $2, $3, $4)", [
-             lon1,
-             lat1,
-             lon2,
-             lat2
-           ]) do
+      # Engine signature is variadic: GEO_AREA(lat1, lon1, lat2, lon2, ...)
+      flat = Enum.flat_map(points, fn {lat, lon} -> [lat, lon] end)
+
+      placeholders =
+        flat
+        |> Enum.with_index(1)
+        |> Enum.map(fn {_, i} -> "$#{i}" end)
+        |> Enum.join(", ")
+
+      case Nucleus.Client.query(client, "SELECT GEO_AREA(#{placeholders})", flat) do
         {:ok, %{rows: [[val]]}} -> {:ok, val}
         {:error, _} = error -> error
       end

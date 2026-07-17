@@ -24,18 +24,11 @@ defmodule Nucleus.Models.PubSub do
     end
   end
 
-  @doc "Lists active channels, optionally filtered by pattern."
-  @spec channels(client(), String.t() | nil) :: {:ok, [String.t()]} | {:error, term()}
-  def channels(client, pattern \\ nil) do
+  @doc "Lists active channels. The engine's PUBSUB_CHANNELS takes no pattern; all channels are returned."
+  @spec channels(client()) :: {:ok, [String.t()]} | {:error, term()}
+  def channels(client) do
     with :ok <- Nucleus.Client.require_nucleus(client, "PubSub.channels") do
-      result =
-        if pattern do
-          Nucleus.Client.query(client, "SELECT PUBSUB_CHANNELS($1)", [pattern])
-        else
-          Nucleus.Client.query(client, "SELECT PUBSUB_CHANNELS()", [])
-        end
-
-      case result do
+      case Nucleus.Client.query(client, "SELECT PUBSUB_CHANNELS()", []) do
         {:ok, %{rows: [[raw]]}} when is_binary(raw) and raw != "" ->
           {:ok, String.split(raw, ",")}
 

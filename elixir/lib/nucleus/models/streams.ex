@@ -134,9 +134,9 @@ defmodule Nucleus.Models.Streams do
     end
   end
 
-  @doc "Acknowledges processing of a stream entry in a consumer group."
+  @doc "Acknowledges processing of a stream entry in a consumer group. Returns the acknowledged count."
   @spec xack(client(), String.t(), String.t(), integer(), integer()) ::
-          {:ok, boolean()} | {:error, term()}
+          {:ok, integer()} | {:error, term()}
   def xack(client, stream, group, id_ms, id_seq) do
     with :ok <- Nucleus.Client.require_nucleus(client, "Streams.xack") do
       case Nucleus.Client.query(client, "SELECT STREAM_XACK($1, $2, $3, $4)", [

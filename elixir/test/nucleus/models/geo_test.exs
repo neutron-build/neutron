@@ -16,8 +16,8 @@ defmodule Nucleus.Models.GeoTest do
       assert function_exported?(Geo, :within?, 6)
     end
 
-    test "exports area/5" do
-      assert function_exported?(Geo, :area, 5)
+    test "exports area/2" do
+      assert function_exported?(Geo, :area, 2)
     end
 
     test "exports make_point/3" do

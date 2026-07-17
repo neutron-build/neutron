@@ -15,13 +15,22 @@ defmodule Nucleus.Models.Columnar do
   @type client :: Nucleus.Client.t()
 
   @doc "Inserts a row into a columnar table."
-  @spec insert(client(), String.t(), map()) :: {:ok, boolean()} | {:error, term()}
-  def insert(client, table, values) when is_map(values) do
+  @spec insert(client(), String.t(), map()) :: :ok | {:error, term()}
+  def insert(client, table, values) when is_map(values) and map_size(values) > 0 do
     with :ok <- Nucleus.Client.require_nucleus(client, "Columnar.insert") do
-      json = Jason.encode!(values)
+      # Engine signature is variadic: COLUMNAR_INSERT(table, col1, val1, col2, val2, ...)
+      flat = Enum.flat_map(values, fn {k, v} -> [to_string(k), v] end)
 
-      case Nucleus.Client.query(client, "SELECT COLUMNAR_INSERT($1, $2)", [table, json]) do
-        {:ok, %{rows: [[val]]}} -> {:ok, val}
+      placeholders =
+        flat
+        |> Enum.with_index(2)
+        |> Enum.map(fn {_, i} -> "$#{i}" end)
+        |> Enum.join(", ")
+
+      sql = "SELECT COLUMNAR_INSERT($1, #{placeholders})"
+
+      case Nucleus.Client.query(client, sql, [table | flat]) do
+        {:ok, _} -> :ok
         {:error, _} = error -> error
       end
     end

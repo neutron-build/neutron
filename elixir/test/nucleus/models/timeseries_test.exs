@@ -24,12 +24,8 @@ defmodule Nucleus.Models.TimeSeriesTest do
       assert function_exported?(TimeSeries, :range_avg, 4)
     end
 
-    test "exports retention/3" do
-      assert function_exported?(TimeSeries, :retention, 3)
-    end
-
-    test "exports match/3" do
-      assert function_exported?(TimeSeries, :match, 3)
+    test "exports retention/2" do
+      assert function_exported?(TimeSeries, :retention, 2)
     end
 
     test "exports time_bucket/3" do

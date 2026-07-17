@@ -215,8 +215,8 @@ defmodule Nucleus.Models.KV do
   def lrange(client, key, start, stop) do
     with :ok <- Nucleus.Client.require_nucleus(client, "KV.lrange") do
       case Nucleus.Client.query(client, "SELECT KV_LRANGE($1, $2, $3)", [key, start, stop]) do
-        {:ok, %{rows: [[raw]]}} when is_binary(raw) and raw != "" ->
-          {:ok, String.split(raw, ",")}
+        {:ok, %{rows: [[raw]]}} when is_binary(raw) ->
+          {:ok, decode_json_list(raw)}
 
         {:ok, _} ->
           {:ok, []}
@@ -303,15 +303,14 @@ defmodule Nucleus.Models.KV do
   def hgetall(client, key) do
     with :ok <- Nucleus.Client.require_nucleus(client, "KV.hgetall") do
       case Nucleus.Client.query(client, "SELECT KV_HGETALL($1)", [key]) do
-        {:ok, %{rows: [[raw]]}} when is_binary(raw) and raw != "" ->
+        {:ok, %{rows: [[raw]]}} when is_binary(raw) ->
+          # Engine returns a JSON array of [field, value] pairs.
           result =
             raw
-            |> String.split(",")
-            |> Enum.reduce(%{}, fn pair, acc ->
-              case String.split(pair, "=", parts: 2) do
-                [k, v] -> Map.put(acc, k, v)
-                _ -> acc
-              end
+            |> decode_json_list()
+            |> Enum.reduce(%{}, fn
+              [k, v], acc -> Map.put(acc, k, v)
+              _, acc -> acc
             end)
 
           {:ok, result}
@@ -365,8 +364,8 @@ defmodule Nucleus.Models.KV do
   def smembers(client, key) do
     with :ok <- Nucleus.Client.require_nucleus(client, "KV.smembers") do
       case Nucleus.Client.query(client, "SELECT KV_SMEMBERS($1)", [key]) do
-        {:ok, %{rows: [[raw]]}} when is_binary(raw) and raw != "" ->
-          {:ok, String.split(raw, ",")}
+        {:ok, %{rows: [[raw]]}} when is_binary(raw) ->
+          {:ok, decode_json_list(raw)}
 
         {:ok, _} ->
           {:ok, []}
@@ -412,14 +411,14 @@ defmodule Nucleus.Models.KV do
     end
   end
 
-  @doc "Returns members in a sorted set between start and stop ranks."
+  @doc "Returns members in a sorted set between start and stop ranks, as \"member:score\" strings."
   @spec zrange(client(), String.t(), integer(), integer()) ::
           {:ok, [String.t()]} | {:error, term()}
   def zrange(client, key, start, stop) do
     with :ok <- Nucleus.Client.require_nucleus(client, "KV.zrange") do
       case Nucleus.Client.query(client, "SELECT KV_ZRANGE($1, $2, $3)", [key, start, stop]) do
-        {:ok, %{rows: [[raw]]}} when is_binary(raw) and raw != "" ->
-          {:ok, String.split(raw, ",")}
+        {:ok, %{rows: [[raw]]}} when is_binary(raw) ->
+          {:ok, decode_scored_list(raw)}
 
         {:ok, _} ->
           {:ok, []}
@@ -430,14 +429,14 @@ defmodule Nucleus.Models.KV do
     end
   end
 
-  @doc "Returns members with scores between min and max."
+  @doc "Returns members with scores between min and max, as \"member:score\" strings."
   @spec zrangebyscore(client(), String.t(), float(), float()) ::
           {:ok, [String.t()]} | {:error, term()}
   def zrangebyscore(client, key, min, max) do
     with :ok <- Nucleus.Client.require_nucleus(client, "KV.zrangebyscore") do
       case Nucleus.Client.query(client, "SELECT KV_ZRANGEBYSCORE($1, $2, $3)", [key, min, max]) do
-        {:ok, %{rows: [[raw]]}} when is_binary(raw) and raw != "" ->
-          {:ok, String.split(raw, ",")}
+        {:ok, %{rows: [[raw]]}} when is_binary(raw) ->
+          {:ok, decode_scored_list(raw)}
 
         {:ok, _} ->
           {:ok, []}
@@ -492,5 +491,25 @@ defmodule Nucleus.Models.KV do
         {:error, _} = error -> error
       end
     end
+  end
+
+  # --- Internal ---
+
+  # Engine collection functions return a JSON array as text.
+  defp decode_json_list(raw) do
+    case Jason.decode(raw) do
+      {:ok, list} when is_list(list) -> list
+      _ -> []
+    end
+  end
+
+  # Engine sorted-set functions return a JSON array of [member, score] pairs.
+  defp decode_scored_list(raw) do
+    raw
+    |> decode_json_list()
+    |> Enum.flat_map(fn
+      [member, score] -> ["#{member}:#{score}"]
+      _ -> []
+    end)
   end
 end
