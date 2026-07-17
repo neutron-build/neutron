@@ -899,14 +899,14 @@ describe("withFTS plugin", () => {
   });
 
   it("search sends FTS_SEARCH", async () => {
-    transport.onFetchval("SELECT FTS_SEARCH", '[{"docId":1,"score":0.95}]');
+    transport.onFetchval("SELECT FTS_SEARCH", '[{"doc_id":1,"score":0.95}]');
     const results = await fts.search("hello");
     assert.equal(results.length, 1);
     assert.equal(results[0].docId, 1);
   });
 
   it("search with fuzzy sends FTS_FUZZY_SEARCH", async () => {
-    transport.onFetchval("SELECT FTS_FUZZY_SEARCH", '[{"docId":1,"score":0.8}]');
+    transport.onFetchval("SELECT FTS_FUZZY_SEARCH", '[{"doc_id":1,"score":0.8}]');
     const results = await fts.search("hllo", { fuzzyDistance: 1 });
     assert.equal(results.length, 1);
   });
@@ -1021,10 +1021,10 @@ describe("withBlob plugin", () => {
   it("get returns data and meta", async () => {
     transport.onFetchval("SELECT BLOB_GET", "48656c6c6f");
     transport.onFetchval("SELECT BLOB_META", JSON.stringify({
-      key: "bucket/file.bin",
       size: 5,
       content_type: "application/octet-stream",
-      created_at: "2024-01-01T00:00:00Z",
+      created_at: 1704067200000,
+      updated_at: 1704067200000,
     }));
     const result = await blob.get("bucket", "file.bin");
     assert.ok(result);
@@ -1099,8 +1099,8 @@ describe("withTimeSeries plugin", () => {
   });
 
   it("retention sends TS_RETENTION", async () => {
-    transport.onFetchval("SELECT TS_RETENTION", true);
-    const result = await ts.retention("cpu", 30);
+    transport.onFetchval("SELECT TS_RETENTION", "OK");
+    const result = await ts.retention(30);
     assert.equal(result, true);
   });
 
@@ -1177,10 +1177,16 @@ describe("withColumnar plugin", () => {
     assert.equal(withColumnar.name, "columnar");
   });
 
-  it("insert sends COLUMNAR_INSERT", async () => {
-    transport.onFetchval("SELECT COLUMNAR_INSERT", true);
+  it("insert sends COLUMNAR_INSERT with variadic col/val args", async () => {
+    transport.onFetchval("SELECT COLUMNAR_INSERT", "OK");
     const result = await columnar.insert("events", { type: "click" });
     assert.equal(result, true);
+    const params = transport.calls[0].args[1] as unknown[];
+    assert.deepEqual(params, ["events", "type", "click"]);
+  });
+
+  it("insert rejects an empty values object", async () => {
+    await assert.rejects(() => columnar.insert("events", {}), /at least one column/);
   });
 
   it("count sends COLUMNAR_COUNT", async () => {
@@ -1247,9 +1253,9 @@ describe("withDatalog plugin", () => {
   });
 
   it("query sends DATALOG_QUERY", async () => {
-    transport.onFetchval("SELECT DATALOG_QUERY", "alice,bob");
+    transport.onFetchval("SELECT DATALOG_QUERY", '[["alice"], ["bob"]]');
     const result = await datalog.query("parent(X, bob)");
-    assert.equal(result, "alice,bob");
+    assert.equal(result, '[["alice"], ["bob"]]');
   });
 
   it("clear sends DATALOG_CLEAR", async () => {
@@ -1287,10 +1293,14 @@ describe("withCDC plugin", () => {
     assert.equal(withCDC.name, "cdc");
   });
 
-  it("read sends CDC_READ", async () => {
-    transport.onFetchval("SELECT CDC_READ", '[{"op":"insert"}]');
-    const result = await cdc.read(0);
-    assert.equal(result, '[{"op":"insert"}]');
+  it("read sends CDC_READ with after_sequence and limit", async () => {
+    transport.onFetchval("SELECT CDC_READ", '[{"seq":1,"table":"users","change":"INSERT","ts":1704067200000}]');
+    const events = await cdc.read(0);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].seq, 1);
+    assert.equal(events[0].change, "INSERT");
+    const params = transport.calls[0].args[1] as unknown[];
+    assert.deepEqual(params, [0, 100]);
   });
 
   it("count sends CDC_COUNT", async () => {
@@ -1301,8 +1311,10 @@ describe("withCDC plugin", () => {
 
   it("tableRead sends CDC_TABLE_READ", async () => {
     transport.onFetchval("SELECT CDC_TABLE_READ", "[]");
-    const result = await cdc.tableRead("users", 0);
-    assert.equal(result, "[]");
+    const events = await cdc.tableRead("users", 0);
+    assert.deepEqual(events, []);
+    const params = transport.calls[0].args[1] as unknown[];
+    assert.deepEqual(params, ["users", 0, 100]);
   });
 
   it("throws on PostgreSQL", async () => {

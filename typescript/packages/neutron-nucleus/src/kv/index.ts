@@ -76,8 +76,8 @@ export interface KVModel {
   /** Delete all keys. */
   flushDB(): Promise<void>;
 
-  /** Scan keys matching a pattern. Returns matching key-value pairs. */
-  scan(pattern: string, count?: number): Promise<Array<{ key: string; value: string }>>;
+  /** Scan keys matching a glob pattern (`*` wildcard). Returns matching keys, sorted. */
+  scan(pattern: string, count?: number): Promise<string[]>;
 
   // -- Lists -----------------------------------------------------------------
 
@@ -270,13 +270,12 @@ class KVModelImpl implements KVModel {
     await this.transport.execute('SELECT KV_FLUSHDB()');
   }
 
-  async scan(pattern: string, count = 100): Promise<Array<{ key: string; value: string }>> {
+  async scan(pattern: string, count = 100): Promise<string[]> {
     this.require();
-    const result = await this.transport.query<{ key: string; value: string }>(
-      'SELECT KV_SCAN($1, $2)',
-      [pattern, count],
-    );
-    return result.rows;
+    const raw = await this.transport.fetchval<string>('SELECT KV_KEYS($1)', [pattern]);
+    if (!raw) return [];
+    const keys = JSON.parse(raw) as string[];
+    return keys.slice(0, count);
   }
 
   // -- Lists -----------------------------------------------------------------

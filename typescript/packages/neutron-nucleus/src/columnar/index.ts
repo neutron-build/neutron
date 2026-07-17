@@ -46,8 +46,18 @@ class ColumnarModelImpl implements ColumnarModel {
   async insert(table: string, values: Record<string, unknown>): Promise<boolean> {
     this.require();
     assertIdentifier(table, 'table name');
-    const valuesJson = JSON.stringify(values);
-    return (await this.transport.fetchval<boolean>('SELECT COLUMNAR_INSERT($1, $2)', [table, valuesJson])) ?? false;
+    const entries = Object.entries(values);
+    if (entries.length === 0) {
+      throw new Error('COLUMNAR_INSERT requires at least one column/value pair');
+    }
+    // Engine signature is variadic: COLUMNAR_INSERT(table, col1, val1, col2, val2, ...)
+    const args: unknown[] = [table];
+    for (const [col, val] of entries) {
+      args.push(col, val);
+    }
+    const placeholders = args.map((_, i) => `$${i + 1}`).join(', ');
+    const result = await this.transport.fetchval<string>(`SELECT COLUMNAR_INSERT(${placeholders})`, args);
+    return result === 'OK';
   }
 
   async count(table: string): Promise<number> {

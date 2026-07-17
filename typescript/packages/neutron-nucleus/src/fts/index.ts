@@ -12,7 +12,6 @@ import { requireNucleus } from '../helpers.js';
 export interface FTSResult {
   docId: number;
   score: number;
-  highlight?: Record<string, string>;
 }
 
 export interface FTSSearchOptions {
@@ -20,10 +19,6 @@ export interface FTSSearchOptions {
   fuzzyDistance?: number;
   /** Maximum number of results (default 10). */
   limit?: number;
-  /** Fields to highlight in results. */
-  highlight?: string[];
-  /** Fields to compute facet counts for. */
-  facets?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -46,7 +41,12 @@ export interface FTSModel {
   /** Return the number of indexed terms. */
   termCount(): Promise<number>;
 
-  /** Create a named FTS index with the given configuration. */
+  /**
+   * No-op kept for API compatibility.
+   *
+   * The engine maintains a single global FTS index — there is no named-index
+   * creation. Documents are indexed directly via `index(docId, text)`.
+   */
   createIndex(name: string, config: Record<string, unknown>): Promise<void>;
 }
 
@@ -85,16 +85,9 @@ class FTSModelImpl implements FTSModel {
     }
 
     if (!raw) return [];
-    const results = JSON.parse(raw) as FTSResult[];
-
-    // Ensure highlight map is present when requested
-    if (opts.highlight && opts.highlight.length > 0) {
-      for (const r of results) {
-        if (!r.highlight) r.highlight = {};
-      }
-    }
-
-    return results;
+    // Engine emits [{"doc_id":N,"score":S}] — map to the camelCase public type.
+    const results = JSON.parse(raw) as Array<{ doc_id: number; score: number }>;
+    return results.map((r) => ({ docId: r.doc_id, score: r.score }));
   }
 
   async remove(docId: number): Promise<boolean> {
@@ -112,10 +105,10 @@ class FTSModelImpl implements FTSModel {
     return (await this.transport.fetchval<number>('SELECT FTS_TERM_COUNT()')) ?? 0;
   }
 
-  async createIndex(name: string, config: Record<string, unknown>): Promise<void> {
+  async createIndex(_name: string, _config: Record<string, unknown>): Promise<void> {
     this.require();
-    const configJson = JSON.stringify(config);
-    await this.transport.execute('SELECT FTS_INDEX($1, $2)', [name, configJson]);
+    // No-op: the engine has a single global FTS index (FTS_INDEX indexes a
+    // document, it does not create a named index).
   }
 }
 

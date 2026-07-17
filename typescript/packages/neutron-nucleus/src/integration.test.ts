@@ -487,15 +487,42 @@ describe("Integration: TimeSeries model SQL functions", () => {
   });
 
   it("TS_RETENTION sets retention policy", async () => {
-    transport.whenFetchval("TS_RETENTION", true);
-    const ok = await ts.retention("logs", 90);
+    transport.whenFetchval("TS_RETENTION", "OK");
+    const ok = await ts.retention(90);
     assert.equal(ok, true);
+    const calls = transport.sqlCalls("TS_RETENTION");
+    assert.equal(calls[0].params![0], 90 * 86_400_000);
   });
 
   it("TIME_BUCKET truncates timestamp", async () => {
     transport.whenFetchval("TIME_BUCKET", 1704067200000);
     const bucket = await ts.timeBucket("hour", new Date("2024-01-01T12:34:56Z"));
     assert.equal(bucket, 1704067200000);
+    const calls = transport.sqlCalls("TIME_BUCKET");
+    assert.equal(calls[0].params![0], 3_600_000);
+  });
+
+  it("query without downsample throws NotSupported (no raw point fetch)", async () => {
+    await assert.rejects(
+      () => ts.query("cpu", new Date(0), new Date(1000)),
+      /no raw point-range fetch/
+    );
+  });
+
+  it("aggregate rejects unsupported aggregation functions", async () => {
+    await assert.rejects(
+      () => ts.aggregate("cpu", new Date(0), new Date(1000), "hour", "sum"),
+      /TS_RANGE_AVG and TS_RANGE_COUNT/
+    );
+  });
+
+  it("aggregate buckets a range with TS_RANGE_AVG", async () => {
+    transport.whenFetchval("TS_RANGE_AVG", 42.5);
+    const points = await ts.aggregate("cpu", new Date(0), new Date(7_199_999), "hour", "avg");
+    assert.equal(points.length, 2);
+    assert.equal(points[0].value, 42.5);
+    assert.equal(points[0].timestamp.getTime(), 0);
+    assert.equal(points[1].timestamp.getTime(), 3_600_000);
   });
 
   it("validates aggregation function", async () => {
@@ -620,13 +647,26 @@ describe("Integration: Graph model SQL functions", () => {
     assert.deepEqual(path, [1, 5, 3, 7]);
   });
 
-  it("GRAPH_NEIGHBORS returns adjacent nodes", async () => {
+  it("GRAPH_NEIGHBORS returns adjacency entries", async () => {
     transport.whenFetchval("GRAPH_NEIGHBORS", JSON.stringify([
-      { id: 2, labels: ["Person"], properties: { name: "Bob" } },
+      { neighbor_id: 2, edge_id: 10, edge_type: "KNOWS" },
+      { neighbor_id: 3, edge_id: 11, edge_type: "WORKS_WITH" },
     ]));
     const neighbors = await graph.neighbors(1);
+    assert.equal(neighbors.length, 2);
+    assert.equal(neighbors[0].neighborId, 2);
+    assert.equal(neighbors[0].edgeId, 10);
+    assert.equal(neighbors[0].edgeType, "KNOWS");
+  });
+
+  it("GRAPH_NEIGHBORS filters by edge type", async () => {
+    transport.whenFetchval("GRAPH_NEIGHBORS", JSON.stringify([
+      { neighbor_id: 2, edge_id: 10, edge_type: "KNOWS" },
+      { neighbor_id: 3, edge_id: 11, edge_type: "WORKS_WITH" },
+    ]));
+    const neighbors = await graph.neighbors(1, "KNOWS");
     assert.equal(neighbors.length, 1);
-    assert.equal(neighbors[0].id, 2);
+    assert.equal(neighbors[0].neighborId, 2);
   });
 
   it("GRAPH_NODE_COUNT returns total nodes", async () => {
@@ -666,8 +706,8 @@ describe("Integration: FTS model SQL functions", () => {
 
   it("FTS_SEARCH returns results", async () => {
     transport.whenFetchval("FTS_SEARCH", JSON.stringify([
-      { docId: 1, score: 0.95 },
-      { docId: 5, score: 0.72 },
+      { doc_id: 1, score: 0.95 },
+      { doc_id: 5, score: 0.72 },
     ]));
     const results = await fts.search("hello world");
     assert.equal(results.length, 2);
@@ -676,7 +716,7 @@ describe("Integration: FTS model SQL functions", () => {
 
   it("FTS_FUZZY_SEARCH supports fuzzy matching", async () => {
     transport.whenFetchval("FTS_FUZZY_SEARCH", JSON.stringify([
-      { docId: 1, score: 0.8 },
+      { doc_id: 1, score: 0.8 },
     ]));
     const results = await fts.search("helo", { fuzzyDistance: 2 });
     assert.equal(results.length, 1);
@@ -786,8 +826,8 @@ describe("Integration: Blob model SQL functions", () => {
   it("BLOB_GET retrieves binary data", async () => {
     transport.whenFetchval("BLOB_GET", "48656c6c6f");
     transport.whenFetchval("BLOB_META", JSON.stringify({
-      key: "images/logo.png", size: 5, content_type: "image/png",
-      created_at: "2024-01-01T00:00:00Z",
+      size: 5, content_type: "image/png",
+      created_at: 1704067200000, updated_at: 1704067200000,
     }));
     const result = await blob.get("images", "logo.png");
     assert.ok(result !== null);
@@ -894,10 +934,17 @@ describe("Integration: Streams model SQL functions", () => {
     assert.equal(ok, true);
   });
 
-  it("STREAM_XACK acknowledges entry", async () => {
-    transport.whenFetchval("STREAM_XACK", true);
-    const ok = await streams.xack("events", "workers", 100, 0);
-    assert.equal(ok, true);
+  it("STREAM_XACK returns acknowledged count", async () => {
+    transport.whenFetchval("STREAM_XACK", 1);
+    const acked = await streams.xack("events", "workers", 100, 0);
+    assert.equal(acked, 1);
+  });
+
+  it("xadd rejects an empty fields object", async () => {
+    await assert.rejects(
+      () => streams.xadd("events", {}),
+      /at least one field/
+    );
   });
 
   it("throws NucleusFeatureError on plain Postgres", async () => {
@@ -919,10 +966,12 @@ describe("Integration: Columnar model SQL functions", () => {
     columnar = withColumnar.init(transport, nucleusFeatures()).columnar;
   });
 
-  it("COLUMNAR_INSERT inserts a row", async () => {
-    transport.whenFetchval("COLUMNAR_INSERT", true);
+  it("COLUMNAR_INSERT inserts a row with variadic col/val pairs", async () => {
+    transport.whenFetchval("COLUMNAR_INSERT", "OK");
     const ok = await columnar.insert("analytics", { page: "/home", views: 100 });
     assert.equal(ok, true);
+    const calls = transport.sqlCalls("COLUMNAR_INSERT");
+    assert.deepEqual(calls[0].params, ["analytics", "page", "/home", "views", 100]);
   });
 
   it("COLUMNAR_COUNT returns row count", async () => {
@@ -982,7 +1031,7 @@ describe("Integration: Datalog model SQL functions", () => {
   });
 
   it("DATALOG_QUERY evaluates a pattern", async () => {
-    transport.whenFetchval("DATALOG_QUERY", "X=alice,Y=charlie");
+    transport.whenFetchval("DATALOG_QUERY", '[["alice", "charlie"]]');
     const result = await datalog.query("grandparent(X, Y)?");
     assert.ok(result.includes("alice"));
   });
@@ -1018,10 +1067,19 @@ describe("Integration: CDC model SQL functions", () => {
     cdc = withCDC.init(transport, nucleusFeatures()).cdc;
   });
 
-  it("CDC_READ returns events from offset", async () => {
-    transport.whenFetchval("CDC_READ", '[{"op":"INSERT","table":"users"}]');
-    const raw = await cdc.read(0);
-    assert.ok(raw.includes("INSERT"));
+  it("CDC_READ returns parsed events after a sequence", async () => {
+    transport.whenFetchval("CDC_READ", JSON.stringify([
+      { seq: 1, table: "users", change: "INSERT", ts: 1704067200000 },
+      { seq: 2, table: "users", change: "DELETE", ts: 1704067201000 },
+    ]));
+    const events = await cdc.read(0);
+    assert.equal(events.length, 2);
+    assert.equal(events[0].seq, 1);
+    assert.equal(events[0].table, "users");
+    assert.equal(events[0].change, "INSERT");
+    assert.equal(events[1].change, "DELETE");
+    const calls = transport.sqlCalls("CDC_READ");
+    assert.deepEqual(calls[0].params, [0, 100]);
   });
 
   it("CDC_COUNT returns event count", async () => {
@@ -1030,9 +1088,14 @@ describe("Integration: CDC model SQL functions", () => {
   });
 
   it("CDC_TABLE_READ returns table-specific events", async () => {
-    transport.whenFetchval("CDC_TABLE_READ", '[{"op":"UPDATE"}]');
-    const raw = await cdc.tableRead("users", 0);
-    assert.ok(raw.includes("UPDATE"));
+    transport.whenFetchval("CDC_TABLE_READ", JSON.stringify([
+      { seq: 3, table: "users", change: "UPDATE", ts: 1704067202000 },
+    ]));
+    const events = await cdc.tableRead("users", 0);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].change, "UPDATE");
+    const calls = transport.sqlCalls("CDC_TABLE_READ");
+    assert.deepEqual(calls[0].params, ["users", 0, 100]);
   });
 
   it("throws NucleusFeatureError on plain Postgres", async () => {

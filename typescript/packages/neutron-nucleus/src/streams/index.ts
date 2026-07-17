@@ -37,8 +37,8 @@ export interface StreamsModel {
   /** Read entries from a consumer group. */
   xreadGroup(stream: string, group: string, consumer: string, count: number): Promise<StreamEntry[]>;
 
-  /** Acknowledge processing of an entry in a consumer group. */
-  xack(stream: string, group: string, idMs: number, idSeq: number): Promise<boolean>;
+  /** Acknowledge processing of an entry in a consumer group. Returns the number of entries acknowledged. */
+  xack(stream: string, group: string, idMs: number, idSeq: number): Promise<number>;
 }
 
 // ---------------------------------------------------------------------------
@@ -57,6 +57,9 @@ class StreamsModelImpl implements StreamsModel {
 
   async xadd(stream: string, fields: Record<string, unknown>): Promise<string> {
     this.require();
+    if (Object.keys(fields).length === 0) {
+      throw new Error('xadd requires at least one field/value pair (STREAM_XADD(stream, field1, value1, ...))');
+    }
     // Build variadic args: stream, k1, v1, k2, v2, ...
     const args: unknown[] = [stream];
     for (const [k, v] of Object.entries(fields)) {
@@ -108,12 +111,12 @@ class StreamsModelImpl implements StreamsModel {
     return JSON.parse(raw) as StreamEntry[];
   }
 
-  async xack(stream: string, group: string, idMs: number, idSeq: number): Promise<boolean> {
+  async xack(stream: string, group: string, idMs: number, idSeq: number): Promise<number> {
     this.require();
     return (
-      (await this.transport.fetchval<boolean>('SELECT STREAM_XACK($1, $2, $3, $4)', [
+      (await this.transport.fetchval<number>('SELECT STREAM_XACK($1, $2, $3, $4)', [
         stream, group, idMs, idSeq,
-      ])) ?? false
+      ])) ?? 0
     );
   }
 }

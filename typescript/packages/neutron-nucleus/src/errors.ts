@@ -72,6 +72,14 @@ export class NucleusFeatureError extends NucleusError {
   }
 }
 
+/** Thrown when an operation has no corresponding engine surface. */
+export class NucleusNotSupportedError extends NucleusError {
+  constructor(message: string, options?: NucleusErrorOptions) {
+    super('NOT_SUPPORTED', message, options);
+    this.name = 'NucleusNotSupportedError';
+  }
+}
+
 /** Thrown when the server rejects the request for authentication reasons. */
 export class NucleusAuthError extends NucleusError {
   constructor(message: string, options?: NucleusErrorOptions) {

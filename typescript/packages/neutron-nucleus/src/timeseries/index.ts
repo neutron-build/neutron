@@ -4,6 +4,7 @@
 
 import type { Transport, NucleusPlugin, NucleusFeatures } from '../types.js';
 import { requireNucleus } from '../helpers.js';
+import { NucleusNotSupportedError } from '../errors.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -18,6 +19,16 @@ export interface TimeSeriesPoint {
 export type AggFunc = 'sum' | 'avg' | 'min' | 'max' | 'count' | 'first' | 'last';
 
 export type BucketInterval = 'second' | 'minute' | 'hour' | 'day' | 'week' | 'month';
+
+/** Fixed bucket sizes in milliseconds ('month' approximated as 30 days). */
+const BUCKET_MS: Record<BucketInterval, number> = {
+  second: 1_000,
+  minute: 60_000,
+  hour: 3_600_000,
+  day: 86_400_000,
+  week: 604_800_000,
+  month: 2_592_000_000,
+};
 
 export interface TimeSeriesQueryOptions {
   /** Filter by tags. */
@@ -51,19 +62,37 @@ export interface TimeSeriesModel {
   /** Average value in a time range. */
   rangeAvg(measurement: string, from: Date, to: Date): Promise<number | null>;
 
-  /** Set the data retention period (in days). */
-  retention(measurement: string, days: number): Promise<boolean>;
+  /**
+   * Set the data retention period (in days).
+   *
+   * The engine retention policy is global across all series, not
+   * per-measurement (`TS_RETENTION(max_age_ms)`).
+   */
+  retention(days: number): Promise<boolean>;
 
-  /** Match series names against a pattern. */
-  match(measurement: string, pattern: string): Promise<string>;
+  /** Check whether a text matches a full-text query (`TS_MATCH(text, query)`). */
+  match(text: string, query: string): Promise<boolean>;
 
-  /** Truncate a timestamp to a bucket boundary. */
+  /** Truncate a timestamp to a bucket boundary ('month' approximated as 30 days). */
   timeBucket(interval: BucketInterval, timestamp: Date): Promise<number>;
 
-  /** Query raw data points in a time range. */
+  /**
+   * Query raw data points in a time range.
+   *
+   * NOT SUPPORTED: the engine exposes no raw point-range fetch (only
+   * TS_LAST/TS_COUNT/TS_RANGE_COUNT/TS_RANGE_AVG). Always throws
+   * NucleusNotSupportedError unless `opts.downsample` is given, in which
+   * case the call is delegated to `aggregate()`.
+   */
   query(measurement: string, from: Date, to: Date, opts?: TimeSeriesQueryOptions): Promise<TimeSeriesPoint[]>;
 
-  /** Aggregate data points into time buckets. */
+  /**
+   * Aggregate data points into time buckets.
+   *
+   * Only 'avg' and 'count' are supported — the engine's range surface is
+   * TS_RANGE_AVG and TS_RANGE_COUNT; other aggregation functions throw
+   * NucleusNotSupportedError.
+   */
   aggregate(
     measurement: string,
     from: Date,
@@ -121,20 +150,24 @@ class TimeSeriesModelImpl implements TimeSeriesModel {
     ]);
   }
 
-  async retention(measurement: string, days: number): Promise<boolean> {
+  async retention(days: number): Promise<boolean> {
     this.require();
-    return (await this.transport.fetchval<boolean>('SELECT TS_RETENTION($1, $2)', [measurement, days])) ?? false;
+    const maxAgeMs = days * 86_400_000;
+    const result = await this.transport.fetchval<string>('SELECT TS_RETENTION($1)', [maxAgeMs]);
+    return result === 'OK';
   }
 
-  async match(measurement: string, pattern: string): Promise<string> {
+  async match(text: string, query: string): Promise<boolean> {
     this.require();
-    return (await this.transport.fetchval<string>('SELECT TS_MATCH($1, $2)', [measurement, pattern])) ?? '';
+    return (await this.transport.fetchval<boolean>('SELECT TS_MATCH($1, $2)', [text, query])) ?? false;
   }
 
   async timeBucket(interval: BucketInterval, timestamp: Date): Promise<number> {
     this.require();
     return (
-      (await this.transport.fetchval<number>('SELECT TIME_BUCKET($1, $2)', [interval, timestamp.getTime()])) ?? 0
+      (await this.transport.fetchval<number>('SELECT TIME_BUCKET($1, $2)', [
+        BUCKET_MS[interval], timestamp.getTime(),
+      ])) ?? 0
     );
   }
 
@@ -151,35 +184,11 @@ class TimeSeriesModelImpl implements TimeSeriesModel {
       return this.aggregate(measurement, from, to, opts.downsample.interval, opts.downsample.fn);
     }
 
-    const fromMs = from.getTime();
-    const toMs = to.getTime();
-
-    let sql: string;
-    let params: unknown[];
-
-    if (opts.tags && Object.keys(opts.tags).length > 0) {
-      const tagsJson = JSON.stringify(opts.tags);
-      sql =
-        `SELECT COALESCE((SELECT json_agg(row_to_json(t)) FROM (` +
-        `SELECT timestamp_ms, value FROM ts_data WHERE series = $1 AND timestamp_ms >= $2 AND timestamp_ms <= $3 AND tags @> $4::jsonb ORDER BY timestamp_ms` +
-        `) t), '[]')`;
-      params = [measurement, fromMs, toMs, tagsJson];
-    } else {
-      sql =
-        `SELECT COALESCE((SELECT json_agg(row_to_json(t)) FROM (` +
-        `SELECT timestamp_ms, value FROM ts_data WHERE series = $1 AND timestamp_ms >= $2 AND timestamp_ms <= $3 ORDER BY timestamp_ms` +
-        `) t), '[]')`;
-      params = [measurement, fromMs, toMs];
-    }
-
-    const raw = await this.transport.fetchval<string>(sql, params);
-    if (!raw) return [];
-
-    const points = JSON.parse(raw) as Array<{ timestamp_ms: number; value: number }>;
-    return points.map((p) => ({
-      timestamp: new Date(p.timestamp_ms),
-      value: p.value,
-    }));
+    throw new NucleusNotSupportedError(
+      'timeseries.query: the engine has no raw point-range fetch. ' +
+        'Available surfaces are last(), count(), rangeCount(), rangeAvg(), and ' +
+        'aggregate() with avg/count. Pass opts.downsample to aggregate instead.',
+    );
   }
 
   async aggregate(
@@ -195,22 +204,32 @@ class TimeSeriesModelImpl implements TimeSeriesModel {
     if (!VALID_AGG_FUNCS.includes(fn)) {
       throw new Error(`Invalid aggregation function: ${fn}. Must be one of: ${VALID_AGG_FUNCS.join(', ')}`);
     }
+    if (fn !== 'avg' && fn !== 'count') {
+      throw new NucleusNotSupportedError(
+        `timeseries.aggregate: the engine only exposes TS_RANGE_AVG and TS_RANGE_COUNT; '${fn}' is not supported.`,
+      );
+    }
 
-    const sql =
-      `SELECT COALESCE((SELECT json_agg(row_to_json(t)) FROM (` +
-      `SELECT TIME_BUCKET($1, timestamp_ms) AS bucket_ms, ${fn}(value) AS value ` +
-      `FROM ts_data WHERE series = $2 AND timestamp_ms >= $3 AND timestamp_ms <= $4 ` +
-      `GROUP BY bucket_ms ORDER BY bucket_ms` +
-      `) t), '[]')`;
+    const bucketMs = BUCKET_MS[interval];
+    const fromMs = from.getTime();
+    const toMs = to.getTime();
+    const firstBucket = Math.floor(fromMs / bucketMs) * bucketMs;
+    const bucketCount = Math.floor((toMs - firstBucket) / bucketMs) + 1;
+    if (bucketCount > 10_000) {
+      throw new Error(`timeseries.aggregate: range spans ${bucketCount} buckets (max 10000)`);
+    }
 
-    const raw = await this.transport.fetchval<string>(sql, [interval, measurement, from.getTime(), to.getTime()]);
-    if (!raw) return [];
-
-    const points = JSON.parse(raw) as Array<{ bucket_ms: number; value: number }>;
-    return points.map((p) => ({
-      timestamp: new Date(p.bucket_ms),
-      value: p.value,
-    }));
+    const fnSql = fn === 'avg' ? 'SELECT TS_RANGE_AVG($1, $2, $3)' : 'SELECT TS_RANGE_COUNT($1, $2, $3)';
+    const points: TimeSeriesPoint[] = [];
+    for (let bucket = firstBucket; bucket <= toMs; bucket += bucketMs) {
+      const start = Math.max(bucket, fromMs);
+      const end = Math.min(bucket + bucketMs - 1, toMs);
+      const value = await this.transport.fetchval<number>(fnSql, [measurement, start, end]);
+      if (value === null) continue; // TS_RANGE_AVG returns NULL for empty buckets
+      if (fn === 'count' && value === 0) continue;
+      points.push({ timestamp: new Date(bucket), value });
+    }
+    return points;
   }
 }
 

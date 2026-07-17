@@ -14,7 +14,7 @@ export interface BlobMeta {
   size: number;
   contentType: string;
   createdAt: Date;
-  metadata?: Record<string, string>;
+  updatedAt: Date;
 }
 
 export interface BlobPutOptions {
@@ -44,8 +44,8 @@ export interface BlobModel {
   /** Tag a blob with a key/value pair. */
   tag(bucket: string, key: string, tagKey: string, tagValue: string): Promise<boolean>;
 
-  /** List blobs matching a prefix. */
-  list(bucket: string, prefix: string): Promise<BlobMeta[]>;
+  /** List blob keys matching a prefix (keys are returned relative to the bucket). */
+  list(bucket: string, prefix: string): Promise<string[]>;
 
   /** Check if a blob exists. */
   exists(bucket: string, key: string): Promise<boolean>;
@@ -86,21 +86,22 @@ function fromHex(hex: string): Uint8Array {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+// Engine BLOB_META emits {"size":N,"content_type":"...","created_at":MS,"updated_at":MS}
+// (timestamps are epoch-millisecond integers; the key is not included).
 interface RawBlobMeta {
-  key: string;
   size: number;
   content_type: string;
-  created_at: string;
-  metadata?: Record<string, string>;
+  created_at: number;
+  updated_at: number;
 }
 
-function parseBlobMeta(raw: RawBlobMeta): BlobMeta {
+function parseBlobMeta(key: string, raw: RawBlobMeta): BlobMeta {
   return {
-    key: raw.key,
+    key,
     size: raw.size,
     contentType: raw.content_type,
     createdAt: new Date(raw.created_at),
-    metadata: raw.metadata,
+    updatedAt: new Date(raw.updated_at),
   };
 }
 
@@ -154,7 +155,7 @@ class BlobModelImpl implements BlobModel {
     const fullKey = `${bucket}/${key}`;
     const raw = await this.transport.fetchval<string>('SELECT BLOB_META($1)', [fullKey]);
     if (!raw) return null;
-    return parseBlobMeta(JSON.parse(raw) as RawBlobMeta);
+    return parseBlobMeta(key, JSON.parse(raw) as RawBlobMeta);
   }
 
   async tag(bucket: string, key: string, tagKey: string, tagValue: string): Promise<boolean> {
@@ -163,13 +164,14 @@ class BlobModelImpl implements BlobModel {
     return (await this.transport.fetchval<boolean>('SELECT BLOB_TAG($1, $2, $3)', [fullKey, tagKey, tagValue])) ?? false;
   }
 
-  async list(bucket: string, prefix: string): Promise<BlobMeta[]> {
+  async list(bucket: string, prefix: string): Promise<string[]> {
     this.require();
     const fullPrefix = `${bucket}/${prefix}`;
     const raw = await this.transport.fetchval<string>('SELECT BLOB_LIST($1)', [fullPrefix]);
     if (!raw) return [];
-    const items = JSON.parse(raw) as RawBlobMeta[];
-    return items.map(parseBlobMeta);
+    // Engine emits a JSON array of full key strings; strip the bucket prefix.
+    const keys = JSON.parse(raw) as string[];
+    return keys.map((k) => (k.startsWith(`${bucket}/`) ? k.slice(bucket.length + 1) : k));
   }
 
   async exists(bucket: string, key: string): Promise<boolean> {

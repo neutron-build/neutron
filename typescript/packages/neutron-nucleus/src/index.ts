@@ -22,6 +22,7 @@ export {
   NucleusConflictError,
   NucleusTransactionError,
   NucleusFeatureError,
+  NucleusNotSupportedError,
   NucleusAuthError,
 } from './errors.js';
 
@@ -54,7 +55,7 @@ export { withDocument } from './document/index.js';
 export type { DocumentModel, DocFindOptions } from './document/index.js';
 
 export { withGraph } from './graph/index.js';
-export type { GraphModel, GraphNode, GraphEdge, GraphResult, Direction } from './graph/index.js';
+export type { GraphModel, GraphNode, GraphEdge, GraphResult, GraphNeighbor, Direction } from './graph/index.js';
 
 export { withFTS } from './fts/index.js';
 export type { FTSModel, FTSResult, FTSSearchOptions } from './fts/index.js';
@@ -78,4 +79,4 @@ export { withDatalog } from './datalog/index.js';
 export type { DatalogModel } from './datalog/index.js';
 
 export { withCDC } from './cdc/index.js';
-export type { CDCModel } from './cdc/index.js';
+export type { CDCModel, CDCEvent } from './cdc/index.js';
