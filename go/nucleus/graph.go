@@ -51,10 +51,18 @@ type Edge struct {
 	Properties map[string]any `json:"properties,omitempty"`
 }
 
-// GraphResult holds query results.
+// GraphResult holds query results. Rows are positional: each row is a
+// slice of values aligned with Columns.
 type GraphResult struct {
-	Columns []string         `json:"columns"`
-	Rows    []map[string]any `json:"rows"`
+	Columns []string `json:"columns"`
+	Rows    [][]any  `json:"rows"`
+}
+
+// Neighbor is one entry returned by GRAPH_NEIGHBORS.
+type Neighbor struct {
+	NeighborID int64  `json:"neighbor_id"`
+	EdgeID     int64  `json:"edge_id"`
+	EdgeType   string `json:"edge_type"`
 }
 
 // AddNode creates a new graph node and returns its ID.
@@ -117,23 +125,18 @@ func (g *GraphModel) DeleteEdge(ctx context.Context, edgeID int64) (bool, error)
 	return ok, wrapErr("graph delete_edge", err)
 }
 
-// Query executes a Cypher query with optional parameters and returns the result.
+// Query executes a Cypher query and returns the result.
+// The engine's GRAPH_QUERY takes only the Cypher text; parameters are not
+// supported, so a non-empty params map is rejected.
 func (g *GraphModel) Query(ctx context.Context, cypher string, params map[string]any) (*GraphResult, error) {
 	if err := g.client.requireNucleus("Graph.Query"); err != nil {
 		return nil, err
 	}
-	// If params are provided, serialize them as JSON and pass as second argument
-	var raw string
-	var err error
 	if len(params) > 0 {
-		paramsJSON, merr := json.Marshal(params)
-		if merr != nil {
-			return nil, fmt.Errorf("nucleus: graph marshal params: %w", merr)
-		}
-		err = g.pool.QueryRow(ctx, "SELECT GRAPH_QUERY($1, $2)", cypher, string(paramsJSON)).Scan(&raw)
-	} else {
-		err = g.pool.QueryRow(ctx, "SELECT GRAPH_QUERY($1)", cypher).Scan(&raw)
+		return nil, fmt.Errorf("nucleus: graph query: parameters are not supported by GRAPH_QUERY; interpolate values into the cypher text")
 	}
+	var raw string
+	err := g.pool.QueryRow(ctx, "SELECT GRAPH_QUERY($1)", cypher).Scan(&raw)
 	if err != nil {
 		return nil, wrapErr("graph query", err)
 	}
@@ -144,10 +147,10 @@ func (g *GraphModel) Query(ctx context.Context, cypher string, params map[string
 	return &result, nil
 }
 
-// Neighbors returns neighboring nodes of a given node.
-// edgeType filters by edge type; pass empty string for all edge types.
-// The results are filtered client-side when edgeType is specified.
-func (g *GraphModel) Neighbors(ctx context.Context, nodeID int64, edgeType string, direction Direction) ([]Node, error) {
+// Neighbors returns the neighbors of a given node as
+// {neighbor_id, edge_id, edge_type} entries.
+// edgeType filters by edge type client-side; pass empty string for all edge types.
+func (g *GraphModel) Neighbors(ctx context.Context, nodeID int64, edgeType string, direction Direction) ([]Neighbor, error) {
 	if err := g.client.requireNucleus("Graph.Neighbors"); err != nil {
 		return nil, err
 	}
@@ -156,44 +159,39 @@ func (g *GraphModel) Neighbors(ctx context.Context, nodeID int64, edgeType strin
 	if err != nil {
 		return nil, wrapErr("graph neighbors", err)
 	}
-	var nodes []Node
-	if err := json.Unmarshal([]byte(raw), &nodes); err != nil {
+	var neighbors []Neighbor
+	if err := json.Unmarshal([]byte(raw), &neighbors); err != nil {
 		return nil, fmt.Errorf("nucleus: graph neighbors unmarshal: %w", err)
 	}
 	// Client-side filtering by edge type if specified
 	if edgeType != "" {
-		var filtered []Node
-		for _, n := range nodes {
-			// Nodes returned from GRAPH_NEIGHBORS may include edge info in properties
-			if et, ok := n.Properties["_edge_type"]; ok && et == edgeType {
-				filtered = append(filtered, n)
-			} else if edgeType == "" {
+		var filtered []Neighbor
+		for _, n := range neighbors {
+			if n.EdgeType == edgeType {
 				filtered = append(filtered, n)
 			}
 		}
 		return filtered, nil
 	}
-	return nodes, nil
+	return neighbors, nil
 }
 
-// ShortestPath returns the shortest path between two nodes as a list of node IDs.
-// maxDepth limits the search depth; pass 0 for no limit.
-func (g *GraphModel) ShortestPath(ctx context.Context, fromID, toID int64, maxDepth int) ([]int64, error) {
+// ShortestPath returns the shortest path between two nodes as a list of
+// node IDs. Returns nil if no path exists (the engine returns SQL NULL).
+func (g *GraphModel) ShortestPath(ctx context.Context, fromID, toID int64) ([]int64, error) {
 	if err := g.client.requireNucleus("Graph.ShortestPath"); err != nil {
 		return nil, err
 	}
-	var raw string
-	var err error
-	if maxDepth > 0 {
-		err = g.pool.QueryRow(ctx, "SELECT GRAPH_SHORTEST_PATH($1, $2, $3)", fromID, toID, maxDepth).Scan(&raw)
-	} else {
-		err = g.pool.QueryRow(ctx, "SELECT GRAPH_SHORTEST_PATH($1, $2)", fromID, toID).Scan(&raw)
-	}
+	var raw *string
+	err := g.pool.QueryRow(ctx, "SELECT GRAPH_SHORTEST_PATH($1, $2)", fromID, toID).Scan(&raw)
 	if err != nil {
 		return nil, wrapErr("graph shortest_path", err)
 	}
+	if raw == nil {
+		return nil, nil
+	}
 	var ids []int64
-	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
+	if err := json.Unmarshal([]byte(*raw), &ids); err != nil {
 		return nil, fmt.Errorf("nucleus: graph shortest_path unmarshal: %w", err)
 	}
 	return ids, nil

@@ -2,9 +2,7 @@ package nucleus
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -111,11 +109,16 @@ func applyTSOpts(opts []TSOption) tsOpts {
 }
 
 // Write inserts time-series data points into a measurement (series).
+// The engine's TS_INSERT has no tags parameter, so points with Tags set
+// are rejected rather than silently dropping the tags.
 func (ts *TimeSeriesModel) Write(ctx context.Context, measurement string, points []TimeSeriesPoint) error {
 	if err := ts.client.requireNucleus("TimeSeries.Write"); err != nil {
 		return err
 	}
 	for _, p := range points {
+		if len(p.Tags) > 0 {
+			return fmt.Errorf("nucleus: ts write: tags are not supported by TS_INSERT")
+		}
 		tsMs := p.Timestamp.UnixMilli()
 		_, err := ts.pool.Exec(ctx, "SELECT TS_INSERT($1, $2, $3)", measurement, tsMs, p.Value)
 		if err != nil {
@@ -167,24 +170,25 @@ func (ts *TimeSeriesModel) RangeAvg(ctx context.Context, measurement string, fro
 	return val, wrapErr("ts range_avg", err)
 }
 
-// Retention sets the data retention period for a series.
-func (ts *TimeSeriesModel) Retention(ctx context.Context, measurement string, days int64) (bool, error) {
+// Retention sets the global data retention policy. The engine's
+// TS_RETENTION takes a single max-age argument and applies to all series.
+func (ts *TimeSeriesModel) Retention(ctx context.Context, maxAge time.Duration) (bool, error) {
 	if err := ts.client.requireNucleus("TimeSeries.Retention"); err != nil {
 		return false, err
 	}
-	var ok bool
-	err := ts.pool.QueryRow(ctx, "SELECT TS_RETENTION($1, $2)", measurement, days).Scan(&ok)
-	return ok, wrapErr("ts retention", err)
+	var result string
+	err := ts.pool.QueryRow(ctx, "SELECT TS_RETENTION($1)", maxAge.Milliseconds()).Scan(&result)
+	return result == "OK", wrapErr("ts retention", err)
 }
 
-// Match finds series names matching a pattern.
-func (ts *TimeSeriesModel) Match(ctx context.Context, measurement, pattern string) (string, error) {
+// Match reports whether text matches a full-text query (engine TS_MATCH).
+func (ts *TimeSeriesModel) Match(ctx context.Context, text, query string) (bool, error) {
 	if err := ts.client.requireNucleus("TimeSeries.Match"); err != nil {
-		return "", err
+		return false, err
 	}
-	var result string
-	err := ts.pool.QueryRow(ctx, "SELECT TS_MATCH($1, $2)", measurement, pattern).Scan(&result)
-	return result, wrapErr("ts match", err)
+	var ok bool
+	err := ts.pool.QueryRow(ctx, "SELECT TS_MATCH($1, $2)", text, query).Scan(&ok)
+	return ok, wrapErr("ts match", err)
 }
 
 // TimeBucket truncates a timestamp to a bucket boundary.
@@ -198,15 +202,11 @@ func (ts *TimeSeriesModel) TimeBucket(ctx context.Context, interval string, time
 	return bucket, wrapErr("ts time_bucket", err)
 }
 
-// tsRawPoint is the internal representation of a time series point from Nucleus.
-type tsRawPoint struct {
-	TimestampMs int64   `json:"timestamp_ms"`
-	Value       float64 `json:"value"`
-}
-
-// Query retrieves raw data points in a time range.
-// Supports WithTags for filtering and WithDownsample for aggregation.
-// If WithDownsample is specified, the query delegates to Aggregate.
+// Query retrieves data points in a time range.
+// The engine exposes no raw point-range fetch (only TS_COUNT, TS_LAST,
+// TS_RANGE_COUNT and TS_RANGE_AVG), so raw point retrieval is not
+// supported. If WithDownsample is specified, the query delegates to
+// Aggregate; WithTags is not supported by the engine.
 func (ts *TimeSeriesModel) Query(ctx context.Context, measurement string, from, to time.Time, opts ...TSOption) ([]TimeSeriesPoint, error) {
 	if err := ts.client.requireNucleus("TimeSeries.Query"); err != nil {
 		return nil, err
@@ -214,100 +214,75 @@ func (ts *TimeSeriesModel) Query(ctx context.Context, measurement string, from, 
 
 	o := applyTSOpts(opts)
 
+	if len(o.tags) > 0 {
+		return nil, fmt.Errorf("nucleus: ts query: tag filtering is not supported by the engine")
+	}
+
 	// If downsample is requested, delegate to Aggregate
 	if o.downsample != nil {
 		return ts.Aggregate(ctx, measurement, from, to, o.downsample.window, o.downsample.fn)
 	}
 
-	// Build tag filter as JSON if tags are provided
-	var tagsArg string
-	if len(o.tags) > 0 {
-		tagsJSON, err := json.Marshal(o.tags)
-		if err != nil {
-			return nil, fmt.Errorf("nucleus: ts query marshal tags: %w", err)
-		}
-		tagsArg = string(tagsJSON)
-	}
-
-	// Use TS_RANGE_COUNT first to check if there are data points,
-	// then query the underlying time series table for raw data.
-	// Nucleus stores time series data as (series, timestamp_ms, value) tuples.
-	var raw string
-	var err error
-	if tagsArg != "" {
-		err = ts.pool.QueryRow(ctx,
-			"SELECT COALESCE((SELECT json_agg(row_to_json(t)) FROM (SELECT timestamp_ms, value FROM ts_data WHERE series = $1 AND timestamp_ms >= $2 AND timestamp_ms <= $3 AND tags @> $4::jsonb ORDER BY timestamp_ms) t), '[]')",
-			measurement, from.UnixMilli(), to.UnixMilli(), tagsArg).Scan(&raw)
-	} else {
-		err = ts.pool.QueryRow(ctx,
-			"SELECT COALESCE((SELECT json_agg(row_to_json(t)) FROM (SELECT timestamp_ms, value FROM ts_data WHERE series = $1 AND timestamp_ms >= $2 AND timestamp_ms <= $3 ORDER BY timestamp_ms) t), '[]')",
-			measurement, from.UnixMilli(), to.UnixMilli()).Scan(&raw)
-	}
-	if err != nil {
-		return nil, wrapErr("ts query", err)
-	}
-
-	var rawPoints []tsRawPoint
-	if err := json.Unmarshal([]byte(raw), &rawPoints); err != nil {
-		return nil, fmt.Errorf("nucleus: ts query unmarshal: %w", err)
-	}
-
-	points := make([]TimeSeriesPoint, len(rawPoints))
-	for i, rp := range rawPoints {
-		points[i] = TimeSeriesPoint{
-			Timestamp: time.UnixMilli(rp.TimestampMs),
-			Value:     rp.Value,
-		}
-	}
-	return points, nil
+	return nil, fmt.Errorf("nucleus: ts query: raw point retrieval is not supported by the engine; use RangeCount, RangeAvg, Last, or WithDownsample")
 }
 
-// Aggregate queries with downsampling into time buckets.
-// Uses TIME_BUCKET to group data points and applies the aggregation function.
+// maxAggregateBuckets caps the number of per-bucket engine calls Aggregate
+// will issue for a single query.
+const maxAggregateBuckets = 10000
+
+// Aggregate downsamples a time range into fixed-width windows.
+// The engine exposes only TS_RANGE_COUNT and TS_RANGE_AVG, so only
+// Count and Avg are supported; one engine call is issued per window.
+// Windows with no data are omitted.
 func (ts *TimeSeriesModel) Aggregate(ctx context.Context, measurement string, from, to time.Time, window time.Duration, fn AggFunc) ([]TimeSeriesPoint, error) {
 	if err := ts.client.requireNucleus("TimeSeries.Aggregate"); err != nil {
 		return nil, err
 	}
 
-	interval := windowToInterval(window)
-	aggFn := fn.String()
-
-	// Validate aggregation function against allowlist to prevent SQL injection
-	if !validAggFuncs[strings.ToLower(aggFn)] {
-		return nil, fmt.Errorf("nucleus: invalid aggregation function: %s", aggFn)
+	if fn != Count && fn != Avg {
+		return nil, fmt.Errorf("nucleus: ts aggregate: %s is not supported by the engine (only count and avg)", fn.String())
+	}
+	if window <= 0 {
+		return nil, fmt.Errorf("nucleus: ts aggregate: window must be positive")
 	}
 
-	// Build aggregation query using TIME_BUCKET
-	q := fmt.Sprintf(
-		`SELECT COALESCE((SELECT json_agg(row_to_json(t)) FROM (
-			SELECT TIME_BUCKET($1, timestamp_ms) AS bucket_ms, %s(value) AS value
-			FROM ts_data
-			WHERE series = $2 AND timestamp_ms >= $3 AND timestamp_ms <= $4
-			GROUP BY bucket_ms
-			ORDER BY bucket_ms
-		) t), '[]')`, aggFn)
-
-	var raw string
-	err := ts.pool.QueryRow(ctx, q, interval, measurement, from.UnixMilli(), to.UnixMilli()).Scan(&raw)
-	if err != nil {
-		return nil, wrapErr("ts aggregate", err)
+	fromMs := from.UnixMilli()
+	toMs := to.UnixMilli()
+	windowMs := window.Milliseconds()
+	if toMs < fromMs {
+		return nil, fmt.Errorf("nucleus: ts aggregate: to precedes from")
+	}
+	if (toMs-fromMs)/windowMs >= maxAggregateBuckets {
+		return nil, fmt.Errorf("nucleus: ts aggregate: range/window yields more than %d buckets", maxAggregateBuckets)
 	}
 
-	type aggPoint struct {
-		BucketMs int64   `json:"bucket_ms"`
-		Value    float64 `json:"value"`
-	}
-
-	var rawPoints []aggPoint
-	if err := json.Unmarshal([]byte(raw), &rawPoints); err != nil {
-		return nil, fmt.Errorf("nucleus: ts aggregate unmarshal: %w", err)
-	}
-
-	points := make([]TimeSeriesPoint, len(rawPoints))
-	for i, rp := range rawPoints {
-		points[i] = TimeSeriesPoint{
-			Timestamp: time.UnixMilli(rp.BucketMs),
-			Value:     rp.Value,
+	var points []TimeSeriesPoint
+	for start := fromMs; start <= toMs; start += windowMs {
+		end := start + windowMs - 1
+		if end > toMs {
+			end = toMs
+		}
+		switch fn {
+		case Count:
+			var n int64
+			err := ts.pool.QueryRow(ctx, "SELECT TS_RANGE_COUNT($1, $2, $3)",
+				measurement, start, end).Scan(&n)
+			if err != nil {
+				return nil, wrapErr("ts aggregate", err)
+			}
+			if n > 0 {
+				points = append(points, TimeSeriesPoint{Timestamp: time.UnixMilli(start), Value: float64(n)})
+			}
+		case Avg:
+			var val *float64
+			err := ts.pool.QueryRow(ctx, "SELECT TS_RANGE_AVG($1, $2, $3)",
+				measurement, start, end).Scan(&val)
+			if err != nil {
+				return nil, wrapErr("ts aggregate", err)
+			}
+			if val != nil {
+				points = append(points, TimeSeriesPoint{Timestamp: time.UnixMilli(start), Value: *val})
+			}
 		}
 	}
 	return points, nil

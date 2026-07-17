@@ -72,8 +72,8 @@ func TestEdgeStructFull(t *testing.T) {
 func TestGraphResultStruct(t *testing.T) {
 	r := GraphResult{
 		Columns: []string{"name", "age"},
-		Rows: []map[string]any{
-			{"name": "Alice", "age": 30},
+		Rows: [][]any{
+			{"Alice", 30},
 		},
 	}
 	if len(r.Columns) != 2 {
@@ -106,7 +106,7 @@ func TestGraphRequiresNucleus(t *testing.T) {
 		{"DeleteEdge", func() error { _, err := g.DeleteEdge(context.Background(), 1); return err }},
 		{"Query", func() error { _, err := g.Query(context.Background(), "q", nil); return err }},
 		{"Neighbors", func() error { _, err := g.Neighbors(context.Background(), 1, "", Outgoing); return err }},
-		{"ShortestPath", func() error { _, err := g.ShortestPath(context.Background(), 1, 2, 0); return err }},
+		{"ShortestPath", func() error { _, err := g.ShortestPath(context.Background(), 1, 2); return err }},
 		{"NodeCount", func() error { _, err := g.NodeCount(context.Background()); return err }},
 		{"EdgeCount", func() error { _, err := g.EdgeCount(context.Background()); return err }},
 	}

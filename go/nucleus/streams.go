@@ -60,6 +60,10 @@ func (s *StreamModel) XRange(ctx context.Context, stream string, startMs, endMs 
 	if err != nil {
 		return nil, wrapErr("stream xrange", err)
 	}
+	// The engine returns an empty string for a missing stream
+	if raw == "" {
+		return nil, nil
+	}
 	var entries []StreamEntry
 	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
 		return nil, fmt.Errorf("nucleus: stream xrange unmarshal: %w", err)
@@ -77,6 +81,10 @@ func (s *StreamModel) XRead(ctx context.Context, stream string, lastIDMs int64, 
 		stream, lastIDMs, count).Scan(&raw)
 	if err != nil {
 		return nil, wrapErr("stream xread", err)
+	}
+	// The engine returns an empty string for a missing stream
+	if raw == "" {
+		return nil, nil
 	}
 	var entries []StreamEntry
 	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
@@ -107,6 +115,10 @@ func (s *StreamModel) XReadGroup(ctx context.Context, stream, group, consumer st
 	if err != nil {
 		return nil, wrapErr("stream xreadgroup", err)
 	}
+	// The engine returns an empty string for a missing stream
+	if raw == "" {
+		return nil, nil
+	}
 	var entries []StreamEntry
 	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
 		return nil, fmt.Errorf("nucleus: stream xreadgroup unmarshal: %w", err)
@@ -115,12 +127,13 @@ func (s *StreamModel) XReadGroup(ctx context.Context, stream, group, consumer st
 }
 
 // XAck acknowledges processing of a stream entry in a consumer group.
-func (s *StreamModel) XAck(ctx context.Context, stream, group string, idMs, idSeq int64) (bool, error) {
+// Returns the number of entries acknowledged (0 or 1).
+func (s *StreamModel) XAck(ctx context.Context, stream, group string, idMs, idSeq int64) (int64, error) {
 	if err := s.client.requireNucleus("Streams.XAck"); err != nil {
-		return false, err
+		return 0, err
 	}
-	var ok bool
+	var count int64
 	err := s.pool.QueryRow(ctx, "SELECT STREAM_XACK($1, $2, $3, $4)",
-		stream, group, idMs, idSeq).Scan(&ok)
-	return ok, wrapErr("stream xack", err)
+		stream, group, idMs, idSeq).Scan(&count)
+	return count, wrapErr("stream xack", err)
 }

@@ -22,7 +22,17 @@ type BlobMeta struct {
 	Size        int64             `json:"size"`
 	ContentType string            `json:"content_type"`
 	CreatedAt   time.Time         `json:"created_at"`
+	UpdatedAt   time.Time         `json:"updated_at"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
+}
+
+// blobMetaWire matches the BLOB_META JSON shape: timestamps are integer
+// milliseconds since the Unix epoch.
+type blobMetaWire struct {
+	Size        int64  `json:"size"`
+	ContentType string `json:"content_type"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
 }
 
 // BlobOption configures blob operations.
@@ -98,7 +108,10 @@ func (b *BlobModel) Get(ctx context.Context, bucket, key string) (io.ReadCloser,
 		return nil, nil, fmt.Errorf("nucleus: blob decode hex: %w", err)
 	}
 
-	meta, _ := b.Meta(ctx, bucket, key)
+	meta, err := b.Meta(ctx, bucket, key)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	return io.NopCloser(bytes.NewReader(data)), meta, nil
 }
@@ -128,11 +141,17 @@ func (b *BlobModel) Meta(ctx context.Context, bucket, key string) (*BlobMeta, er
 	if raw == nil {
 		return nil, nil
 	}
-	var meta BlobMeta
-	if err := json.Unmarshal([]byte(*raw), &meta); err != nil {
+	var wire blobMetaWire
+	if err := json.Unmarshal([]byte(*raw), &wire); err != nil {
 		return nil, fmt.Errorf("nucleus: blob meta unmarshal: %w", err)
 	}
-	return &meta, nil
+	return &BlobMeta{
+		Key:         fullKey,
+		Size:        wire.Size,
+		ContentType: wire.ContentType,
+		CreatedAt:   time.UnixMilli(wire.CreatedAt),
+		UpdatedAt:   time.UnixMilli(wire.UpdatedAt),
+	}, nil
 }
 
 // Tag sets a metadata tag on a blob.
@@ -146,8 +165,9 @@ func (b *BlobModel) Tag(ctx context.Context, bucket, key, tagKey, tagValue strin
 	return ok, wrapErr("blob tag", err)
 }
 
-// List returns metadata for all blobs matching a prefix.
-func (b *BlobModel) List(ctx context.Context, bucket, prefix string) ([]BlobMeta, error) {
+// List returns the keys of all blobs matching a prefix.
+// BLOB_LIST returns a JSON array of key strings; use Meta for per-blob metadata.
+func (b *BlobModel) List(ctx context.Context, bucket, prefix string) ([]string, error) {
 	if err := b.client.requireNucleus("Blob.List"); err != nil {
 		return nil, err
 	}
@@ -157,11 +177,11 @@ func (b *BlobModel) List(ctx context.Context, bucket, prefix string) ([]BlobMeta
 	if err != nil {
 		return nil, wrapErr("blob list", err)
 	}
-	var metas []BlobMeta
-	if err := json.Unmarshal([]byte(raw), &metas); err != nil {
+	var keys []string
+	if err := json.Unmarshal([]byte(raw), &keys); err != nil {
 		return nil, fmt.Errorf("nucleus: blob list unmarshal: %w", err)
 	}
-	return metas, nil
+	return keys, nil
 }
 
 // Exists checks if a blob exists.
