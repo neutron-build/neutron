@@ -1630,6 +1630,59 @@ impl StorageEngine for DiskEngine {
         Ok(rows)
     }
 
+    /// Early-exit LIMIT scan: read pages in scan order and stop the moment
+    /// `limit` rows have been collected, so `SELECT * FROM t LIMIT n` never
+    /// fetches or deserializes the tail of a large table. Same row order as
+    /// `scan`, so results are identical to `scan(..)` truncated to `limit`.
+    /// Safe to override here (the disk engine records no SIREAD, so trimming
+    /// the read set changes no serializability semantics).
+    async fn scan_limit(&self, table: &str, limit: usize) -> Result<Vec<Row>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let col_types = self.col_types(table)?;
+        let pages = self.table_pages(table)?;
+        let mut rows = Vec::with_capacity(limit.min(1024));
+
+        // Bounded prefetch: with an early exit we usually touch only the first
+        // pages, so seed one window and refill only if we keep going.
+        const PREFETCH_WINDOW: usize = 64;
+        if pages.len() > 1 {
+            let first_batch = &pages[..pages.len().min(PREFETCH_WINDOW)];
+            self.pool.prefetch_pages(first_batch);
+        }
+
+        for (i, &page_id) in pages.iter().enumerate() {
+            let next_batch_start = i + PREFETCH_WINDOW;
+            if i > 0 && i % PREFETCH_WINDOW == 0 && next_batch_start < pages.len() {
+                let end = (next_batch_start + PREFETCH_WINDOW).min(pages.len());
+                self.pool.prefetch_pages(&pages[next_batch_start..end]);
+            }
+
+            let frame_id = self
+                .pool
+                .fetch_page(page_id)
+                .map_err(|e| StorageError::Io(e.to_string()))?;
+            let pg = self.pool.frame_data(frame_id);
+            for (_slot_idx, tuple_data) in page::iter_tuples(pg) {
+                match tuple::deserialize_row(tuple_data, &col_types) {
+                    Some(row) => rows.push(row),
+                    None => tracing::error!(
+                        target: "nucleus::storage",
+                        "failed to deserialize tuple on page {page_id} (slot {_slot_idx}); row omitted from scan"
+                    ),
+                }
+                if rows.len() >= limit {
+                    self.pool.unpin(frame_id);
+                    return Ok(rows);
+                }
+            }
+            self.pool.unpin(frame_id);
+        }
+
+        Ok(rows)
+    }
+
     async fn scan_projected(
         &self,
         table: &str,
@@ -4523,6 +4576,28 @@ mod tests {
         engine.insert("t", simple_row(1, "x")).await.unwrap();
         let rows = engine.scan_limit("t", 0).await.unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_limit_early_exit_matches_full_scan_prefix() {
+        // The early-exit override must return exactly the first `n` rows of a
+        // full scan, in the same order, across page boundaries (>1 page).
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, catalog) = setup_engine(tmp.path()).await;
+        register_simple_table(&catalog, "t").await;
+        engine.create_table("t").await.unwrap();
+
+        let pad = "p".repeat(256); // ~260 B/row so 500 rows span many 16 KB pages
+        for i in 0..500 {
+            engine.insert("t", simple_row(i, &pad)).await.unwrap();
+        }
+        let full = engine.scan("t").await.unwrap();
+        assert!(engine.table_pages("t").unwrap().len() > 1, "need multiple pages");
+        for n in [1usize, 7, 63, 64, 65, 300, 500] {
+            let limited = engine.scan_limit("t", n).await.unwrap();
+            assert_eq!(limited.len(), n.min(full.len()), "n={n}");
+            assert_eq!(limited, full[..n.min(full.len())], "prefix mismatch n={n}");
+        }
     }
 
     // ── count_live_tuples ───────────────────────────────────────────
