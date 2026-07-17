@@ -5,12 +5,87 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/neutron-build/neutron/cli/internal/db"
 )
+
+// pkColumnSet returns the set of primary-key column names for a table.
+// On Nucleus (which implements neither information_schema.table_constraints nor
+// key_column_usage) it resolves them best-effort via pg_class/pg_index/
+// pg_attribute; on plain Postgres it uses the standard catalog. Returns an
+// empty set on any error so callers can degrade to "no PK flags".
+func pkColumnSet(ctx context.Context, client *db.Client, schema, table string, isNucleus bool) map[string]bool {
+	if isNucleus {
+		return nucleusPKColumns(ctx, client, table)
+	}
+	pk := map[string]bool{}
+	rows, err := client.Query(ctx, `
+		SELECT ku.column_name
+		FROM information_schema.table_constraints tc
+		JOIN information_schema.key_column_usage ku
+			ON tc.constraint_name = ku.constraint_name
+			AND tc.table_schema = ku.table_schema
+			AND tc.table_name = ku.table_name
+		WHERE tc.constraint_type = 'PRIMARY KEY'
+		  AND tc.table_schema = $1 AND tc.table_name = $2
+	`, schema, table)
+	if err != nil {
+		return pk
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if rows.Scan(&name) == nil {
+			pk[name] = true
+		}
+	}
+	return pk
+}
+
+// nucleusPKColumns resolves primary-key column names for a Nucleus table via
+// the pg_catalog virtual tables (pg_class -> pg_index -> pg_attribute), fetched
+// separately and joined in Go to avoid relying on cross-virtual-table joins.
+func nucleusPKColumns(ctx context.Context, client *db.Client, table string) map[string]bool {
+	pk := map[string]bool{}
+
+	var oid int32
+	if err := client.QueryRow(ctx, `SELECT oid FROM pg_catalog.pg_class WHERE relname = $1`, table).Scan(&oid); err != nil {
+		return pk
+	}
+
+	var indkey string
+	if err := client.QueryRow(ctx, `SELECT indkey FROM pg_catalog.pg_index WHERE indisprimary AND indrelid = $1`, oid).Scan(&indkey); err != nil {
+		return pk
+	}
+	positions := map[int]bool{}
+	for _, f := range strings.Fields(indkey) {
+		if p, err := strconv.Atoi(f); err == nil {
+			positions[p] = true
+		}
+	}
+	if len(positions) == 0 {
+		return pk
+	}
+
+	rows, err := client.Query(ctx, `SELECT attname, attnum FROM pg_catalog.pg_attribute WHERE attrelid = $1`, oid)
+	if err != nil {
+		return pk
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		var num int
+		if rows.Scan(&name, &num) == nil && positions[num] {
+			pk[name] = true
+		}
+	}
+	return pk
+}
 
 // ColumnDetail is the detailed schema info returned by /api/columns.
 type ColumnDetail struct {
@@ -62,28 +137,25 @@ func (s *Server) handleColumns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	isNucleus, _, _ := client.IsNucleus(r.Context())
+	pkSet := pkColumnSet(r.Context(), client, schemaName, tableName, isNucleus)
+
+	// Nucleus does not implement information_schema.character_maximum_length;
+	// select it only on plain Postgres.
+	maxLenExpr := "c.character_maximum_length"
+	if isNucleus {
+		maxLenExpr = "NULL::integer"
+	}
 	rows, err := client.Query(r.Context(), `
 		SELECT
 			c.column_name,
 			c.data_type,
 			c.udt_name,
-			c.character_maximum_length,
+			`+maxLenExpr+` AS character_maximum_length,
 			(c.is_nullable = 'YES') AS is_nullable,
 			c.column_default,
-			c.ordinal_position,
-			COALESCE(pk.is_pk, false) AS is_primary_key
+			c.ordinal_position
 		FROM information_schema.columns c
-		LEFT JOIN (
-			SELECT ku.column_name, true AS is_pk
-			FROM information_schema.table_constraints tc
-			JOIN information_schema.key_column_usage ku
-				ON tc.constraint_name = ku.constraint_name
-				AND tc.table_schema = ku.table_schema
-				AND tc.table_name = ku.table_name
-			WHERE tc.constraint_type = 'PRIMARY KEY'
-			  AND tc.table_schema = $1
-			  AND tc.table_name = $2
-		) pk ON pk.column_name = c.column_name
 		WHERE c.table_schema = $1 AND c.table_name = $2
 		ORDER BY c.ordinal_position
 	`, schemaName, tableName)
@@ -103,9 +175,8 @@ func (s *Server) handleColumns(w http.ResponseWriter, r *http.Request) {
 			nullable bool
 			defVal   *string
 			ordinal  int
-			isPK     bool
 		)
-		if err := rows.Scan(&name, &dataType, &udtName, &maxLen, &nullable, &defVal, &ordinal, &isPK); err != nil {
+		if err := rows.Scan(&name, &dataType, &udtName, &maxLen, &nullable, &defVal, &ordinal); err != nil {
 			continue
 		}
 		cols = append(cols, ColumnDetail{
@@ -113,7 +184,7 @@ func (s *Server) handleColumns(w http.ResponseWriter, r *http.Request) {
 			DataType:     resolveDisplayType(dataType, udtName, maxLen),
 			IsNullable:   nullable,
 			Default:      defVal,
-			IsPrimaryKey: isPK,
+			IsPrimaryKey: pkSet[name],
 			Ordinal:      ordinal,
 		})
 	}
@@ -255,20 +326,13 @@ func (s *Server) handleCodegen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	isNucleus, _, _ := client.IsNucleus(r.Context())
+	pkSet := pkColumnSet(r.Context(), client, schemaName, tableName, isNucleus)
+
 	rows, err := client.Query(r.Context(), `
 		SELECT c.column_name, c.data_type, c.udt_name,
-		       (c.is_nullable = 'YES'), COALESCE(pk.is_pk, false)
+		       (c.is_nullable = 'YES')
 		FROM information_schema.columns c
-		LEFT JOIN (
-			SELECT ku.column_name, true AS is_pk
-			FROM information_schema.table_constraints tc
-			JOIN information_schema.key_column_usage ku
-				ON tc.constraint_name = ku.constraint_name
-				AND tc.table_schema = ku.table_schema
-				AND tc.table_name = ku.table_name
-			WHERE tc.constraint_type = 'PRIMARY KEY'
-			  AND tc.table_schema = $1 AND tc.table_name = $2
-		) pk ON pk.column_name = c.column_name
 		WHERE c.table_schema = $1 AND c.table_name = $2
 		ORDER BY c.ordinal_position
 	`, schemaName, tableName)
@@ -281,9 +345,10 @@ func (s *Server) handleCodegen(w http.ResponseWriter, r *http.Request) {
 	var cols []colInfo
 	for rows.Next() {
 		var c colInfo
-		if err := rows.Scan(&c.name, &c.dataType, &c.udtName, &c.nullable, &c.isPK); err != nil {
+		if err := rows.Scan(&c.name, &c.dataType, &c.udtName, &c.nullable); err != nil {
 			continue
 		}
+		c.isPK = pkSet[c.name]
 		cols = append(cols, c)
 	}
 
@@ -716,21 +781,14 @@ type Querier interface {
 
 // FetchColsForTable queries column metadata from a database table.
 // It returns the column information needed for code generation.
+// Primary-key flags are resolved best-effort via pg_index/pg_class/pg_attribute,
+// which both Nucleus and Postgres implement (Nucleus does not implement
+// information_schema.table_constraints / key_column_usage).
 func FetchColsForTable(ctx context.Context, querier Querier, schema, table string) ([]colInfo, error) {
 	rows, err := querier.Query(ctx, `
 		SELECT c.column_name, c.data_type, c.udt_name,
-		       (c.is_nullable = 'YES'), COALESCE(pk.is_pk, false)
+		       (c.is_nullable = 'YES')
 		FROM information_schema.columns c
-		LEFT JOIN (
-			SELECT ku.column_name, true AS is_pk
-			FROM information_schema.table_constraints tc
-			JOIN information_schema.key_column_usage ku
-				ON tc.constraint_name = ku.constraint_name
-				AND tc.table_schema = ku.table_schema
-				AND tc.table_name = ku.table_name
-			WHERE tc.constraint_type = 'PRIMARY KEY'
-			  AND tc.table_schema = $1 AND tc.table_name = $2
-		) pk ON pk.column_name = c.column_name
 		WHERE c.table_schema = $1 AND c.table_name = $2
 		ORDER BY c.ordinal_position
 	`, schema, table)
@@ -742,11 +800,73 @@ func FetchColsForTable(ctx context.Context, querier Querier, schema, table strin
 	var cols []colInfo
 	for rows.Next() {
 		var c colInfo
-		if err := rows.Scan(&c.name, &c.dataType, &c.udtName, &c.nullable, &c.isPK); err != nil {
+		if err := rows.Scan(&c.name, &c.dataType, &c.udtName, &c.nullable); err != nil {
 			continue
 		}
 		cols = append(cols, c)
 	}
 
+	pk := pkColumnsViaQuerier(ctx, querier, table)
+	for i := range cols {
+		if pk[cols[i].name] {
+			cols[i].isPK = true
+		}
+	}
 	return cols, nil
+}
+
+// pkColumnsViaQuerier resolves primary-key column names using only a Querier,
+// via pg_class -> pg_index -> pg_attribute. Best-effort: empty on any error.
+func pkColumnsViaQuerier(ctx context.Context, querier Querier, table string) map[string]bool {
+	pk := map[string]bool{}
+
+	oidRows, err := querier.Query(ctx, `SELECT oid FROM pg_catalog.pg_class WHERE relname = $1`, table)
+	if err != nil {
+		return pk
+	}
+	var oid int32
+	found := false
+	for oidRows.Next() {
+		if oidRows.Scan(&oid) == nil {
+			found = true
+		}
+	}
+	oidRows.Close()
+	if !found {
+		return pk
+	}
+
+	idxRows, err := querier.Query(ctx, `SELECT indkey FROM pg_catalog.pg_index WHERE indisprimary AND indrelid = $1`, oid)
+	if err != nil {
+		return pk
+	}
+	positions := map[int]bool{}
+	for idxRows.Next() {
+		var indkey string
+		if idxRows.Scan(&indkey) == nil {
+			for _, f := range strings.Fields(indkey) {
+				if p, err := strconv.Atoi(f); err == nil {
+					positions[p] = true
+				}
+			}
+		}
+	}
+	idxRows.Close()
+	if len(positions) == 0 {
+		return pk
+	}
+
+	attRows, err := querier.Query(ctx, `SELECT attname, attnum FROM pg_catalog.pg_attribute WHERE attrelid = $1`, oid)
+	if err != nil {
+		return pk
+	}
+	defer attRows.Close()
+	for attRows.Next() {
+		var name string
+		var num int
+		if attRows.Scan(&name, &num) == nil && positions[num] {
+			pk[name] = true
+		}
+	}
+	return pk
 }

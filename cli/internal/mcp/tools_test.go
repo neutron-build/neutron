@@ -12,9 +12,9 @@ func TestToolList(t *testing.T) {
 		t.Fatal("toolList() returned empty")
 	}
 
-	// Should have exactly 17 tools
-	if len(tools) != 17 {
-		t.Errorf("toolList() returned %d tools, want 17", len(tools))
+	// Should have exactly 19 tools
+	if len(tools) != 19 {
+		t.Errorf("toolList() returned %d tools, want 19", len(tools))
 	}
 }
 
@@ -23,9 +23,9 @@ func TestToolListNames(t *testing.T) {
 		"list_tables", "describe_table", "list_nucleus_models",
 		"query_sql", "kv_get", "kv_scan", "fts_search",
 		"vector_search", "cypher_query", "doc_find",
-		"ts_range", "geo_radius", "blob_list",
-		"stream_range", "datalog_eval", "cdc_changes",
-		"pubsub_list",
+		"ts_range", "geo_distance", "blob_list",
+		"stream_range", "datalog_query", "cdc_changes",
+		"pubsub_list", "search_docs", "get_doc",
 	}
 
 	tools := toolList()
@@ -71,8 +71,8 @@ func TestToolHandlersRegistered(t *testing.T) {
 }
 
 func TestToolHandlerCount(t *testing.T) {
-	if len(toolHandlers) != 17 {
-		t.Errorf("toolHandlers has %d entries, want 17", len(toolHandlers))
+	if len(toolHandlers) != 19 {
+		t.Errorf("toolHandlers has %d entries, want 19", len(toolHandlers))
 	}
 }
 
@@ -91,8 +91,8 @@ func TestDumpSchemaOpenAI(t *testing.T) {
 		t.Fatalf("DumpSchema(openai) returned invalid JSON: %v", err)
 	}
 
-	if len(result) != 17 {
-		t.Errorf("OpenAI schema has %d tools, want 17", len(result))
+	if len(result) != 19 {
+		t.Errorf("OpenAI schema has %d tools, want 19", len(result))
 	}
 
 	// Each entry should have type=function
@@ -241,8 +241,8 @@ func TestBoolProp(t *testing.T) {
 
 func TestOpenAIToolDefs(t *testing.T) {
 	defs := openAIToolDefs()
-	if len(defs) != 17 {
-		t.Errorf("openAIToolDefs() returned %d defs, want 17", len(defs))
+	if len(defs) != 19 {
+		t.Errorf("openAIToolDefs() returned %d defs, want 19", len(defs))
 	}
 
 	for _, def := range defs {

@@ -3,8 +3,9 @@ package studio
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/neutron-build/neutron/cli/internal/db"
 )
 
@@ -73,7 +74,7 @@ func FetchSchema(ctx context.Context, client *db.Client, isNucleus bool) (*Schem
 		Columnar:   []ColumnarTable{},
 	}
 
-	if err := fetchSQLTables(ctx, client, sc); err != nil {
+	if err := fetchSQLTables(ctx, client, sc, isNucleus); err != nil {
 		return nil, fmt.Errorf("sql schema: %w", err)
 	}
 
@@ -84,7 +85,7 @@ func FetchSchema(ctx context.Context, client *db.Client, isNucleus bool) (*Schem
 	return sc, nil
 }
 
-func fetchSQLTables(ctx context.Context, client *db.Client, sc *Schema) error {
+func fetchSQLTables(ctx context.Context, client *db.Client, sc *Schema, isNucleus bool) error {
 	// Get tables grouped by schema (exclude system schemas)
 	rows, err := client.Query(ctx, `
 		SELECT t.table_schema, t.table_name
@@ -110,8 +111,14 @@ func fetchSQLTables(ctx context.Context, client *db.Client, sc *Schema) error {
 		order = append(order, key)
 	}
 
-	if err := fetchColumns(ctx, client, tables); err != nil {
-		return err
+	if isNucleus {
+		if err := fetchColumnsNucleus(ctx, client, tables); err != nil {
+			return err
+		}
+	} else {
+		if err := fetchColumns(ctx, client, tables); err != nil {
+			return err
+		}
 	}
 
 	for _, k := range order {
@@ -174,142 +181,204 @@ func fetchColumns(ctx context.Context, client *db.Client, tables map[string]*SQL
 	return nil
 }
 
-// fetchNucleusModels queries Nucleus SQL functions for each data model.
-// All errors are silently ignored — if a model isn't available it stays empty.
+// fetchColumnsNucleus loads columns for Nucleus, which does not implement
+// information_schema.table_constraints / key_column_usage. Columns come from
+// information_schema.columns; primary-key flags are a best-effort enrichment
+// via pg_index (indisprimary), so a failure there still yields the columns.
+func fetchColumnsNucleus(ctx context.Context, client *db.Client, tables map[string]*SQLTable) error {
+	rows, err := client.Query(ctx, `
+		SELECT
+			c.table_schema,
+			c.table_name,
+			c.column_name,
+			c.udt_name,
+			c.is_nullable = 'YES',
+			c.column_default,
+			c.ordinal_position
+		FROM information_schema.columns c
+		WHERE c.table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
+		ORDER BY c.table_schema, c.table_name, c.ordinal_position
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	// Track (table key, 1-based ordinal) -> column pointer for PK enrichment.
+	type colRef struct {
+		table *SQLTable
+		idx   int
+	}
+	byPos := map[string]map[int]colRef{}
+
+	for rows.Next() {
+		var tschema, tname, colName, colType string
+		var nullable bool
+		var def *string
+		var ordinal int
+		if err := rows.Scan(&tschema, &tname, &colName, &colType, &nullable, &def, &ordinal); err != nil {
+			continue
+		}
+		key := tschema + "." + tname
+		t, ok := tables[key]
+		if !ok {
+			continue
+		}
+		col := SQLColumn{Name: colName, Type: colType, Nullable: nullable}
+		if def != nil {
+			col.Default = *def
+		}
+		t.Columns = append(t.Columns, col)
+		if byPos[key] == nil {
+			byPos[key] = map[int]colRef{}
+		}
+		byPos[key][ordinal] = colRef{table: t, idx: len(t.Columns) - 1}
+	}
+	rows.Close()
+
+	markNucleusPrimaryKeys(ctx, client, tables, func(tableName string, positions []int) {
+		// Nucleus tables live in a single schema; match by table name.
+		for key, posMap := range byPos {
+			if !hasTableName(key, tableName) {
+				continue
+			}
+			for _, p := range positions {
+				if ref, ok := posMap[p]; ok {
+					ref.table.Columns[ref.idx].IsPrimaryKey = true
+				}
+			}
+		}
+	})
+	return nil
+}
+
+func hasTableName(key, tableName string) bool {
+	// key is "schema.table"
+	if i := len(key) - len(tableName) - 1; i >= 0 && key[i+1:] == tableName && key[i] == '.' {
+		return true
+	}
+	return key == tableName
+}
+
+// markNucleusPrimaryKeys reads primary-key column positions from pg_index and
+// pg_class (both virtual tables Nucleus implements) and reports them per table.
+// Entirely best-effort: any error leaves columns without PK flags.
+func markNucleusPrimaryKeys(ctx context.Context, client *db.Client, _ map[string]*SQLTable, mark func(string, []int)) {
+	// pg_class maps oid -> relname; pg_index carries indrelid + indkey + indisprimary.
+	classRows, err := client.Query(ctx, `SELECT oid, relname FROM pg_catalog.pg_class`)
+	if err != nil {
+		return
+	}
+	oidToName := map[int32]string{}
+	for classRows.Next() {
+		var oid int32
+		var name string
+		if err := classRows.Scan(&oid, &name); err == nil {
+			oidToName[oid] = name
+		}
+	}
+	classRows.Close()
+
+	idxRows, err := client.Query(ctx, `SELECT indrelid, indkey FROM pg_catalog.pg_index WHERE indisprimary`)
+	if err != nil {
+		return
+	}
+	defer idxRows.Close()
+	for idxRows.Next() {
+		var indrelid int32
+		var indkey string
+		if err := idxRows.Scan(&indrelid, &indkey); err != nil {
+			continue
+		}
+		name, ok := oidToName[indrelid]
+		if !ok {
+			continue
+		}
+		var positions []int
+		for _, f := range strings.Fields(indkey) {
+			if p, err := strconv.Atoi(f); err == nil && p > 0 {
+				positions = append(positions, p)
+			}
+		}
+		if len(positions) > 0 {
+			mark(name, positions)
+		}
+	}
+}
+
+// fetchNucleusModels populates each model from the real Nucleus scalar
+// functions. Nucleus stores are global and unnamed (one store per model), so
+// each populated model surfaces as a single node keyed by the model name.
+// Models with no enumeration or count function (vector, timeseries, geo,
+// columnar, datalog) have no engine surface to list and stay empty.
+// Errors are best-effort: a failing model leaves its list empty.
 func fetchNucleusModels(ctx context.Context, client *db.Client, sc *Schema) {
 	fetchKV(ctx, client, sc)
-	fetchVector(ctx, client, sc)
-	fetchTimeSeries(ctx, client, sc)
 	fetchDocument(ctx, client, sc)
 	fetchGraph(ctx, client, sc)
 	fetchFTS(ctx, client, sc)
-	fetchGeo(ctx, client, sc)
 	fetchBlob(ctx, client, sc)
 	fetchPubSub(ctx, client, sc)
-	fetchStreams(ctx, client, sc)
-	fetchColumnar(ctx, client, sc)
-	fetchDatalog(ctx, client, sc)
+	fetchCDC(ctx, client, sc)
 }
 
-func queryRows[T any](ctx context.Context, client *db.Client, sql string, scan func(pgx.Rows) (T, error)) []T {
-	rows, err := client.Query(ctx, sql)
-	if err != nil {
-		return nil
+// scalarInt64 runs a single-row single-column query returning an int64.
+func scalarInt64(ctx context.Context, c *db.Client, sql string) (int64, bool) {
+	var n int64
+	if err := c.QueryRow(ctx, sql).Scan(&n); err != nil {
+		return 0, false
 	}
-	defer rows.Close()
-	var out []T
-	for rows.Next() {
-		v, err := scan(rows)
-		if err == nil {
-			out = append(out, v)
-		}
-	}
-	return out
+	return n, true
 }
 
 func fetchKV(ctx context.Context, c *db.Client, sc *Schema) {
-	sc.KV = queryRows(ctx, c, `SELECT name, key_count FROM nucleus_kv_stores()`,
-		func(r pgx.Rows) (KVStore, error) {
-			var v KVStore
-			return v, r.Scan(&v.Name, &v.KeyCount)
-		})
-	if sc.KV == nil { sc.KV = []KVStore{} }
-}
-
-func fetchVector(ctx context.Context, c *db.Client, sc *Schema) {
-	sc.Vector = queryRows(ctx, c, `SELECT name, dimensions, metric, count FROM nucleus_vector_indexes()`,
-		func(r pgx.Rows) (VectorIndex, error) {
-			var v VectorIndex
-			return v, r.Scan(&v.Name, &v.Dimensions, &v.Metric, &v.Count)
-		})
-	if sc.Vector == nil { sc.Vector = []VectorIndex{} }
-}
-
-func fetchTimeSeries(ctx context.Context, c *db.Client, sc *Schema) {
-	sc.TimeSeries = queryRows(ctx, c, `SELECT name, count FROM nucleus_timeseries_metrics()`,
-		func(r pgx.Rows) (TSMetric, error) {
-			var v TSMetric
-			return v, r.Scan(&v.Name, &v.Count)
-		})
-	if sc.TimeSeries == nil { sc.TimeSeries = []TSMetric{} }
+	if n, ok := scalarInt64(ctx, c, `SELECT KV_DBSIZE()`); ok {
+		sc.KV = []KVStore{{Name: "keyspace", KeyCount: n}}
+	}
 }
 
 func fetchDocument(ctx context.Context, c *db.Client, sc *Schema) {
-	sc.Document = queryRows(ctx, c, `SELECT name, count FROM nucleus_doc_collections()`,
-		func(r pgx.Rows) (DocCollection, error) {
-			var v DocCollection
-			return v, r.Scan(&v.Name, &v.Count)
-		})
-	if sc.Document == nil { sc.Document = []DocCollection{} }
+	if n, ok := scalarInt64(ctx, c, `SELECT DOC_COUNT()`); ok {
+		sc.Document = []DocCollection{{Name: "documents", Count: n}}
+	}
 }
 
 func fetchGraph(ctx context.Context, c *db.Client, sc *Schema) {
-	sc.Graph = queryRows(ctx, c, `SELECT name, node_count, edge_count FROM nucleus_graph_stores()`,
-		func(r pgx.Rows) (GraphStore, error) {
-			var v GraphStore
-			return v, r.Scan(&v.Name, &v.NodeCount, &v.EdgeCount)
-		})
-	if sc.Graph == nil { sc.Graph = []GraphStore{} }
+	nodes, okN := scalarInt64(ctx, c, `SELECT GRAPH_NODE_COUNT()`)
+	edges, okE := scalarInt64(ctx, c, `SELECT GRAPH_EDGE_COUNT()`)
+	if okN || okE {
+		sc.Graph = []GraphStore{{Name: "graph", NodeCount: nodes, EdgeCount: edges}}
+	}
 }
 
 func fetchFTS(ctx context.Context, c *db.Client, sc *Schema) {
-	sc.FTS = queryRows(ctx, c, `SELECT name, doc_count FROM nucleus_fts_indexes()`,
-		func(r pgx.Rows) (FTSIndex, error) {
-			var v FTSIndex
-			return v, r.Scan(&v.Name, &v.DocCount)
-		})
-	if sc.FTS == nil { sc.FTS = []FTSIndex{} }
-}
-
-func fetchGeo(ctx context.Context, c *db.Client, sc *Schema) {
-	sc.Geo = queryRows(ctx, c, `SELECT name, point_count FROM nucleus_geo_layers()`,
-		func(r pgx.Rows) (GeoLayer, error) {
-			var v GeoLayer
-			return v, r.Scan(&v.Name, &v.PointCount)
-		})
-	if sc.Geo == nil { sc.Geo = []GeoLayer{} }
+	if n, ok := scalarInt64(ctx, c, `SELECT FTS_DOC_COUNT()`); ok {
+		sc.FTS = []FTSIndex{{Name: "fts", DocCount: n}}
+	}
 }
 
 func fetchBlob(ctx context.Context, c *db.Client, sc *Schema) {
-	sc.Blob = queryRows(ctx, c, `SELECT name, blob_count FROM nucleus_blob_stores()`,
-		func(r pgx.Rows) (BlobStore, error) {
-			var v BlobStore
-			return v, r.Scan(&v.Name, &v.BlobCount)
-		})
-	if sc.Blob == nil { sc.Blob = []BlobStore{} }
+	if n, ok := scalarInt64(ctx, c, `SELECT BLOB_COUNT()`); ok {
+		sc.Blob = []BlobStore{{Name: "blobs", BlobCount: n}}
+	}
 }
 
 func fetchPubSub(ctx context.Context, c *db.Client, sc *Schema) {
-	sc.PubSub = queryRows(ctx, c, `SELECT name FROM nucleus_pubsub_channels()`,
-		func(r pgx.Rows) (PubSubChannel, error) {
-			var v PubSubChannel
-			return v, r.Scan(&v.Name)
-		})
-	if sc.PubSub == nil { sc.PubSub = []PubSubChannel{} }
+	// PUBSUB_CHANNELS() returns a comma-separated list of active channels.
+	var raw string
+	if err := c.QueryRow(ctx, `SELECT PUBSUB_CHANNELS()`).Scan(&raw); err != nil {
+		return
+	}
+	for _, name := range strings.Split(raw, ",") {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			sc.PubSub = append(sc.PubSub, PubSubChannel{Name: name})
+		}
+	}
 }
 
-func fetchStreams(ctx context.Context, c *db.Client, sc *Schema) {
-	sc.Streams = queryRows(ctx, c, `SELECT name, length FROM nucleus_streams()`,
-		func(r pgx.Rows) (Stream, error) {
-			var v Stream
-			return v, r.Scan(&v.Name, &v.Length)
-		})
-	if sc.Streams == nil { sc.Streams = []Stream{} }
-}
-
-func fetchColumnar(ctx context.Context, c *db.Client, sc *Schema) {
-	sc.Columnar = queryRows(ctx, c, `SELECT name, row_count FROM nucleus_columnar_tables()`,
-		func(r pgx.Rows) (ColumnarTable, error) {
-			var v ColumnarTable
-			return v, r.Scan(&v.Name, &v.RowCount)
-		})
-	if sc.Columnar == nil { sc.Columnar = []ColumnarTable{} }
-}
-
-func fetchDatalog(ctx context.Context, c *db.Client, sc *Schema) {
-	var d DatalogStore
-	row := c.QueryRow(ctx, `SELECT predicate_count, rule_count FROM nucleus_datalog_stats()`)
-	if err := row.Scan(&d.PredicateCount, &d.RuleCount); err == nil {
-		sc.Datalog = &d
+func fetchCDC(ctx context.Context, c *db.Client, sc *Schema) {
+	if _, ok := scalarInt64(ctx, c, `SELECT CDC_COUNT()`); ok {
+		sc.CDC = true
 	}
 }
