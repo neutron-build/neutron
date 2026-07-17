@@ -98,6 +98,7 @@ pub mod param_subst;
 mod policy;
 mod project;
 mod query;
+mod row_batch;
 mod scalar_fns;
 mod schema_types;
 mod session;
