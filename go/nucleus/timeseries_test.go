@@ -120,7 +120,7 @@ func TestTSRequiresNucleus(t *testing.T) {
 			_, err := ts.RangeAvg(context.Background(), "m", now, now)
 			return err
 		}},
-		{"Retention", func() error { _, err := ts.Retention(context.Background(), "m", 30); return err }},
+		{"Retention", func() error { _, err := ts.Retention(context.Background(), 30*24*time.Hour); return err }},
 		{"Match", func() error { _, err := ts.Match(context.Background(), "m", "*"); return err }},
 		{"TimeBucket", func() error { _, err := ts.TimeBucket(context.Background(), "hour", now); return err }},
 		{"Query", func() error { _, err := ts.Query(context.Background(), "m", now, now); return err }},

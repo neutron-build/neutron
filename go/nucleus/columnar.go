@@ -2,8 +2,9 @@ package nucleus
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 )
 
 // ColumnarModel provides columnar analytics operations over Nucleus SQL functions.
@@ -13,6 +14,8 @@ type ColumnarModel struct {
 }
 
 // Insert inserts a row into a columnar table. values is a map of column->value.
+// COLUMNAR_INSERT is variadic: (table, col1, val1, col2, val2, ...) and
+// returns the text 'OK'.
 func (c *ColumnarModel) Insert(ctx context.Context, table string, values map[string]any) (bool, error) {
 	if err := c.client.requireNucleus("Columnar.Insert"); err != nil {
 		return false, err
@@ -20,13 +23,30 @@ func (c *ColumnarModel) Insert(ctx context.Context, table string, values map[str
 	if !isValidIdentifier(table) {
 		return false, fmt.Errorf("nucleus: columnar insert: invalid table name %q", table)
 	}
-	valuesJSON, err := json.Marshal(values)
-	if err != nil {
-		return false, fmt.Errorf("nucleus: columnar marshal values: %w", err)
+	if len(values) == 0 {
+		return false, fmt.Errorf("nucleus: columnar insert: at least one column is required")
 	}
-	var ok bool
-	err = c.pool.QueryRow(ctx, "SELECT COLUMNAR_INSERT($1, $2)", table, string(valuesJSON)).Scan(&ok)
-	return ok, wrapErr("columnar insert", err)
+	cols := make([]string, 0, len(values))
+	for col := range values {
+		cols = append(cols, col)
+	}
+	sort.Strings(cols)
+	args := make([]any, 0, 1+len(values)*2)
+	args = append(args, table)
+	for _, col := range cols {
+		args = append(args, col, values[col])
+	}
+	placeholders := make([]string, len(args))
+	for i := range args {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+	q := "SELECT COLUMNAR_INSERT(" + strings.Join(placeholders, ", ") + ")"
+	var result string
+	err := c.pool.QueryRow(ctx, q, args...).Scan(&result)
+	if err != nil {
+		return false, wrapErr("columnar insert", err)
+	}
+	return result == "OK", nil
 }
 
 // Count returns the number of rows in a columnar table.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // GeoModel provides geospatial operations over Nucleus SQL functions.
@@ -207,32 +208,26 @@ func (g *GeoModel) WithinPolygon(ctx context.Context, layer string, polygon [][2
 		return nil, fmt.Errorf("nucleus: geo within_polygon: invalid layer name %q", layer)
 	}
 
-	// Use a spatial query that checks point-in-polygon
-	// The polygon coordinates are passed as a parameter
+	// Use a spatial query that checks point-in-polygon.
+	// The engine's ST_CONTAINS takes WKT text: (polygon_wkt, point_wkt).
+	// ST_MAKEPOINT(lon, lat) yields 'POINT(lon lat)' text.
 	q := fmt.Sprintf(
 		`SELECT id, lat, lon, properties FROM %s
-		 WHERE ST_CONTAINS(ST_GEOMFROMGEOJSON($1), ST_MAKEPOINT(lon, lat))`,
+		 WHERE ST_CONTAINS($1, ST_MAKEPOINT(lon, lat))`,
 		layer)
 
-	// Build GeoJSON polygon with [lon, lat] coordinate order
-	coords := make([][]float64, len(polygon))
-	for i, p := range polygon {
-		coords[i] = []float64{p[1], p[0]} // GeoJSON is [lon, lat]
+	// Build a WKT POLYGON with "lon lat" coordinate order to match the points
+	coords := make([]string, 0, len(polygon)+1)
+	for _, p := range polygon {
+		coords = append(coords, fmt.Sprintf("%v %v", p[1], p[0])) // WKT is "x y" = "lon lat"
 	}
 	// Close the ring if not already closed
-	if len(coords) > 0 && (coords[0][0] != coords[len(coords)-1][0] || coords[0][1] != coords[len(coords)-1][1]) {
+	if len(coords) > 0 && coords[0] != coords[len(coords)-1] {
 		coords = append(coords, coords[0])
 	}
-	geoJSON := map[string]any{
-		"type":        "Polygon",
-		"coordinates": []any{coords},
-	}
-	geoJSONBytes, err := json.Marshal(geoJSON)
-	if err != nil {
-		return nil, fmt.Errorf("nucleus: geo marshal geojson: %w", err)
-	}
+	polygonWKT := "POLYGON((" + strings.Join(coords, ", ") + "))"
 
-	rows, err := g.pool.Query(ctx, q, string(geoJSONBytes))
+	rows, err := g.pool.Query(ctx, q, polygonWKT)
 	if err != nil {
 		return nil, wrapErr("geo within_polygon", err)
 	}

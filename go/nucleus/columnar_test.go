@@ -99,26 +99,52 @@ func TestColumnarInvalidIdentifier(t *testing.T) {
 
 func TestColumnarInsert(t *testing.T) {
 	var capturedSQL string
+	var capturedArgs []any
 	q := &mockCDCQuerier{
 		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
 			capturedSQL = sql
+			capturedArgs = args
 			return &mockCDCRow{scanFn: func(dest ...any) error {
-				*(dest[0].(*bool)) = true
+				// COLUMNAR_INSERT returns the text 'OK'
+				*(dest[0].(*string)) = "OK"
 				return nil
 			}}
 		},
 	}
 
 	c := &ColumnarModel{pool: q, client: nucleusClient()}
-	ok, err := c.Insert(context.Background(), "metrics", map[string]any{"value": 42})
+	ok, err := c.Insert(context.Background(), "metrics", map[string]any{"value": 42, "host": "srv1"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !ok {
 		t.Error("expected true")
 	}
-	if !strings.Contains(capturedSQL, "COLUMNAR_INSERT") {
+	// Variadic form: (table, col1, val1, col2, val2, ...)
+	if capturedSQL != "SELECT COLUMNAR_INSERT($1, $2, $3, $4, $5)" {
 		t.Errorf("SQL = %q", capturedSQL)
+	}
+	if len(capturedArgs) != 5 {
+		t.Fatalf("args len = %d, want 5", len(capturedArgs))
+	}
+	if capturedArgs[0] != "metrics" {
+		t.Errorf("args[0] = %v, want metrics", capturedArgs[0])
+	}
+	// Columns are passed in sorted order as name/value pairs
+	if capturedArgs[1] != "host" || capturedArgs[2] != "srv1" {
+		t.Errorf("args[1:3] = %v %v, want host srv1", capturedArgs[1], capturedArgs[2])
+	}
+	if capturedArgs[3] != "value" || capturedArgs[4] != 42 {
+		t.Errorf("args[3:5] = %v %v, want value 42", capturedArgs[3], capturedArgs[4])
+	}
+}
+
+func TestColumnarInsertEmptyValues(t *testing.T) {
+	q := &mockCDCQuerier{}
+	c := &ColumnarModel{pool: q, client: nucleusClient()}
+	_, err := c.Insert(context.Background(), "metrics", nil)
+	if err == nil {
+		t.Fatal("expected error for empty values")
 	}
 }
 

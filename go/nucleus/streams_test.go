@@ -167,6 +167,27 @@ func TestStreamXRange(t *testing.T) {
 	}
 }
 
+func TestStreamXRangeMissingStream(t *testing.T) {
+	q := &mockCDCQuerier{
+		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+			return &mockCDCRow{scanFn: func(dest ...any) error {
+				// The engine returns an empty string for a missing stream
+				*(dest[0].(*string)) = ""
+				return nil
+			}}
+		},
+	}
+
+	s := &StreamModel{pool: q, client: nucleusClient()}
+	entries, err := s.XRange(context.Background(), "missing", 0, 1000, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("entries len = %d, want 0", len(entries))
+	}
+}
+
 func TestStreamXRangeUnmarshalError(t *testing.T) {
 	q := &mockCDCQuerier{
 		queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
@@ -269,19 +290,20 @@ func TestStreamXAck(t *testing.T) {
 			capturedSQL = sql
 			capturedArgs = args
 			return &mockCDCRow{scanFn: func(dest ...any) error {
-				*(dest[0].(*bool)) = true
+				// STREAM_XACK returns an integer count of acknowledged entries
+				*(dest[0].(*int64)) = 1
 				return nil
 			}}
 		},
 	}
 
 	s := &StreamModel{pool: q, client: nucleusClient()}
-	ok, err := s.XAck(context.Background(), "events", "workers", 400, 0)
+	count, err := s.XAck(context.Background(), "events", "workers", 400, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !ok {
-		t.Error("expected true")
+	if count != 1 {
+		t.Errorf("count = %d, want 1", count)
 	}
 	if capturedSQL != "SELECT STREAM_XACK($1, $2, $3, $4)" {
 		t.Errorf("SQL = %q", capturedSQL)

@@ -317,24 +317,27 @@ func (d *DocumentModel) Update(ctx context.Context, collection string, filter ma
 	for _, id := range ids {
 		// Get current doc
 		doc, err := d.Get(ctx, id)
-		if err != nil || doc == nil {
+		if err != nil {
+			return count, err
+		}
+		if doc == nil {
 			continue
 		}
 		// Apply updates
 		for k, v := range update {
 			doc[k] = v
 		}
-		// Re-serialize and store
+		// Re-serialize and replace in place via DOC_UPDATE
 		data, err := json.Marshal(doc)
 		if err != nil {
-			continue
+			return count, fmt.Errorf("nucleus: doc marshal: %w", err)
 		}
-		// Use DOC_INSERT to replace (Nucleus DOC_INSERT with existing ID upserts)
-		// Alternatively, update via SQL on the underlying documents table
-		_, err = d.pool.Exec(ctx,
-			"UPDATE documents SET data = $1::jsonb WHERE id = $2",
-			string(data), id)
-		if err == nil {
+		var ok bool
+		err = d.pool.QueryRow(ctx, "SELECT DOC_UPDATE($1, $2)", id, string(data)).Scan(&ok)
+		if err != nil {
+			return count, wrapErr("doc update", err)
+		}
+		if ok {
 			count++
 		}
 	}
@@ -357,8 +360,12 @@ func (d *DocumentModel) Delete(ctx context.Context, collection string, filter ma
 
 	var count int64
 	for _, id := range ids {
-		_, err := d.pool.Exec(ctx, "DELETE FROM documents WHERE id = $1", id)
-		if err == nil {
+		var ok bool
+		err := d.pool.QueryRow(ctx, "SELECT DOC_DELETE($1)", id).Scan(&ok)
+		if err != nil {
+			return count, wrapErr("doc delete", err)
+		}
+		if ok {
 			count++
 		}
 	}
