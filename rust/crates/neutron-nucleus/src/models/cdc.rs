@@ -13,13 +13,13 @@ impl CdcModel {
         Self { pool }
     }
 
-    /// Read CDC events starting from the given offset.
+    /// Read up to `limit` CDC events after the given sequence number.
     /// Returns raw CDC event data as a JSON string.
-    pub async fn read(&self, offset: i64) -> Result<String, NucleusError> {
+    pub async fn read(&self, after_sequence: i64, limit: i64) -> Result<String, NucleusError> {
         let conn = self.pool.get().await?;
         let row = conn
             .client()
-            .query_one("SELECT CDC_READ($1)", &[&offset])
+            .query_one("SELECT CDC_READ($1, $2)", &[&after_sequence, &limit])
             .await
             .map_err(NucleusError::Query)?;
         Ok(row.get::<_, String>(0))
@@ -36,12 +36,21 @@ impl CdcModel {
         Ok(row.get::<_, i64>(0))
     }
 
-    /// Read CDC events for a specific table starting from the given offset.
-    pub async fn table_read(&self, table: &str, offset: i64) -> Result<String, NucleusError> {
+    /// Read up to `limit` CDC events for a specific table after the given
+    /// sequence number.
+    pub async fn table_read(
+        &self,
+        table: &str,
+        after_sequence: i64,
+        limit: i64,
+    ) -> Result<String, NucleusError> {
         let conn = self.pool.get().await?;
         let row = conn
             .client()
-            .query_one("SELECT CDC_TABLE_READ($1, $2)", &[&table, &offset])
+            .query_one(
+                "SELECT CDC_TABLE_READ($1, $2, $3)",
+                &[&table, &after_sequence, &limit],
+            )
             .await
             .map_err(NucleusError::Query)?;
         Ok(row.get::<_, String>(0))

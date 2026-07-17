@@ -1,5 +1,5 @@
 //! Time-series model — TS_INSERT, TS_LAST, TS_COUNT, TS_RANGE_COUNT,
-//! TS_RANGE_AVG, TS_RETENTION, TS_MATCH, TIME_BUCKET.
+//! TS_RANGE_AVG, TS_RETENTION, TIME_BUCKET.
 
 use crate::error::NucleusError;
 use crate::pool::NucleusPool;
@@ -92,26 +92,18 @@ impl TimeSeriesModel {
         Ok(row.get::<_, Option<f64>>(0))
     }
 
-    /// Set the data retention period for a series.
-    pub async fn retention(&self, series: &str, days: i64) -> Result<bool, NucleusError> {
+    /// Set the global time-series retention policy.
+    ///
+    /// `TS_RETENTION` takes a single argument: the maximum data-point age in
+    /// milliseconds, applied across all series. The engine returns the text
+    /// `'OK'`.
+    pub async fn retention(&self, max_age_ms: i64) -> Result<(), NucleusError> {
         let conn = self.pool.get().await?;
-        let row = conn
-            .client()
-            .query_one("SELECT TS_RETENTION($1, $2)", &[&series, &days])
+        conn.client()
+            .query_one("SELECT TS_RETENTION($1)", &[&max_age_ms])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
-    }
-
-    /// Find series names matching a pattern.
-    pub async fn match_series(&self, series: &str, pattern: &str) -> Result<String, NucleusError> {
-        let conn = self.pool.get().await?;
-        let row = conn
-            .client()
-            .query_one("SELECT TS_MATCH($1, $2)", &[&series, &pattern])
-            .await
-            .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, String>(0))
+        Ok(())
     }
 
     /// Truncate a timestamp to a bucket boundary.

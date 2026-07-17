@@ -1,4 +1,5 @@
-//! Document/JSON model — DOC_INSERT, DOC_GET, DOC_QUERY, DOC_PATH, DOC_COUNT.
+//! Document/JSON model — DOC_INSERT, DOC_GET, DOC_UPDATE, DOC_DELETE,
+//! DOC_QUERY, DOC_PATH, DOC_COUNT.
 
 use serde_json;
 
@@ -45,6 +46,31 @@ impl DocumentModel {
             }
             None => Ok(None),
         }
+    }
+
+    /// Replace a document by ID, preserving its ID. Returns `true` if the
+    /// document existed.
+    pub async fn update(&self, id: i64, doc: &serde_json::Value) -> Result<bool, NucleusError> {
+        let json_str =
+            serde_json::to_string(doc).map_err(|e| NucleusError::Serde(e.to_string()))?;
+        let conn = self.pool.get().await?;
+        let row = conn
+            .client()
+            .query_one("SELECT DOC_UPDATE($1, $2)", &[&id, &json_str])
+            .await
+            .map_err(NucleusError::Query)?;
+        Ok(row.get::<_, bool>(0))
+    }
+
+    /// Delete a document by ID. Returns `true` if the document existed.
+    pub async fn delete(&self, id: i64) -> Result<bool, NucleusError> {
+        let conn = self.pool.get().await?;
+        let row = conn
+            .client()
+            .query_one("SELECT DOC_DELETE($1)", &[&id])
+            .await
+            .map_err(NucleusError::Query)?;
+        Ok(row.get::<_, bool>(0))
     }
 
     /// Query documents matching a JSON filter. Returns matching document IDs.

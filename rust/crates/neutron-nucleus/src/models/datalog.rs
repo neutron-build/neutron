@@ -15,39 +15,43 @@ impl DatalogModel {
     }
 
     /// Assert a fact into the Datalog knowledge base.
-    pub async fn assert_fact(&self, fact: &str) -> Result<bool, NucleusError> {
+    /// Returns the engine's status message.
+    pub async fn assert_fact(&self, fact: &str) -> Result<String, NucleusError> {
         let conn = self.pool.get().await?;
         let row = conn
             .client()
             .query_one("SELECT DATALOG_ASSERT($1)", &[&fact])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get::<_, String>(0))
     }
 
     /// Retract a fact from the Datalog knowledge base.
-    pub async fn retract(&self, fact: &str) -> Result<bool, NucleusError> {
+    /// Returns the engine's status message.
+    pub async fn retract(&self, fact: &str) -> Result<String, NucleusError> {
         let conn = self.pool.get().await?;
         let row = conn
             .client()
             .query_one("SELECT DATALOG_RETRACT($1)", &[&fact])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get::<_, String>(0))
     }
 
-    /// Define a Datalog rule with a head and body.
-    pub async fn rule(&self, head: &str, body: &str) -> Result<bool, NucleusError> {
+    /// Define a Datalog rule. The head and body are joined into the engine's
+    /// single-string `head :- body` form. Returns the engine's status message.
+    pub async fn rule(&self, head: &str, body: &str) -> Result<String, NucleusError> {
         let conn = self.pool.get().await?;
+        let rule = format!("{head} :- {body}");
         let row = conn
             .client()
-            .query_one("SELECT DATALOG_RULE($1, $2)", &[&head, &body])
+            .query_one("SELECT DATALOG_RULE($1)", &[&rule])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get::<_, String>(0))
     }
 
-    /// Evaluate a Datalog query. Returns results as CSV text.
+    /// Evaluate a Datalog query. Returns results as a JSON array of arrays.
     pub async fn query(&self, pattern: &str) -> Result<String, NucleusError> {
         let conn = self.pool.get().await?;
         let row = conn
@@ -58,26 +62,27 @@ impl DatalogModel {
         Ok(row.get::<_, String>(0))
     }
 
-    /// Clear all facts and rules from the Datalog knowledge base.
-    pub async fn clear(&self) -> Result<bool, NucleusError> {
+    /// Clear all facts and rules for a predicate.
+    /// Returns the engine's status message.
+    pub async fn clear(&self, predicate: &str) -> Result<String, NucleusError> {
         let conn = self.pool.get().await?;
         let row = conn
             .client()
-            .query_one("SELECT DATALOG_CLEAR()", &[])
+            .query_one("SELECT DATALOG_CLEAR($1)", &[&predicate])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get::<_, String>(0))
     }
 
-    /// Import graph data into the Datalog knowledge base.
-    /// Returns the number of facts imported.
-    pub async fn import_graph(&self) -> Result<i64, NucleusError> {
+    /// Import all graph edges as facts: `predicate(from_id, edge_type, to_id)`.
+    /// Returns the engine's status message (`IMPORTED N edges into <predicate>`).
+    pub async fn import_graph(&self, predicate: &str) -> Result<String, NucleusError> {
         let conn = self.pool.get().await?;
         let row = conn
             .client()
-            .query_one("SELECT DATALOG_IMPORT_GRAPH()", &[])
+            .query_one("SELECT DATALOG_IMPORT_GRAPH($1)", &[&predicate])
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, i64>(0))
+        Ok(row.get::<_, String>(0))
     }
 }

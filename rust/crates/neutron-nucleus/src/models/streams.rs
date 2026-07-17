@@ -20,6 +20,15 @@ pub struct StreamModel {
     pool: NucleusPool,
 }
 
+/// Parse a stream-entries JSON payload. The engine returns an empty string
+/// (not `[]`) when the stream does not exist — treat that as no entries.
+fn parse_entries(raw: &str) -> Result<Vec<StreamEntry>, NucleusError> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(raw).map_err(|e| NucleusError::Serde(e.to_string()))
+}
+
 impl StreamModel {
     pub(crate) fn new(pool: NucleusPool) -> Self {
         Self { pool }
@@ -85,9 +94,7 @@ impl StreamModel {
             .await
             .map_err(NucleusError::Query)?;
         let raw: String = row.get(0);
-        let entries: Vec<StreamEntry> =
-            serde_json::from_str(&raw).map_err(|e| NucleusError::Serde(e.to_string()))?;
-        Ok(entries)
+        parse_entries(&raw)
     }
 
     /// Read new entries from a stream after the given ID.
@@ -107,9 +114,7 @@ impl StreamModel {
             .await
             .map_err(NucleusError::Query)?;
         let raw: String = row.get(0);
-        let entries: Vec<StreamEntry> =
-            serde_json::from_str(&raw).map_err(|e| NucleusError::Serde(e.to_string()))?;
-        Ok(entries)
+        parse_entries(&raw)
     }
 
     /// Create a consumer group on a stream.
@@ -149,19 +154,18 @@ impl StreamModel {
             .await
             .map_err(NucleusError::Query)?;
         let raw: String = row.get(0);
-        let entries: Vec<StreamEntry> =
-            serde_json::from_str(&raw).map_err(|e| NucleusError::Serde(e.to_string()))?;
-        Ok(entries)
+        parse_entries(&raw)
     }
 
     /// Acknowledge processing of a stream entry in a consumer group.
+    /// Returns the number of entries acknowledged.
     pub async fn xack(
         &self,
         stream: &str,
         group: &str,
         id_ms: i64,
         id_seq: i64,
-    ) -> Result<bool, NucleusError> {
+    ) -> Result<i64, NucleusError> {
         let conn = self.pool.get().await?;
         let row = conn
             .client()
@@ -171,7 +175,7 @@ impl StreamModel {
             )
             .await
             .map_err(NucleusError::Query)?;
-        Ok(row.get::<_, bool>(0))
+        Ok(row.get::<_, i64>(0))
     }
 }
 
@@ -231,6 +235,17 @@ mod tests {
         let cloned = entry.clone();
         assert_eq!(cloned.id, "1-0");
         assert_eq!(cloned.fields["x"], 1);
+    }
+
+    #[test]
+    fn parse_entries_empty_string_is_empty() {
+        // Engine returns "" (not "[]") for a missing stream.
+        assert!(parse_entries("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_entries_empty_array() {
+        assert!(parse_entries("[]").unwrap().is_empty());
     }
 
     #[test]

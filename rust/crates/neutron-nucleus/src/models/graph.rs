@@ -25,14 +25,13 @@ impl Direction {
     }
 }
 
-/// A graph node.
+/// A neighbor entry returned by GRAPH_NEIGHBORS:
+/// `{"neighbor_id":N,"edge_id":N,"edge_type":"..."}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Node {
-    pub id: i64,
-    #[serde(default)]
-    pub labels: Vec<String>,
-    #[serde(default)]
-    pub properties: serde_json::Value,
+pub struct Neighbor {
+    pub neighbor_id: i64,
+    pub edge_id: i64,
+    pub edge_type: String,
 }
 
 /// A graph query result.
@@ -142,12 +141,12 @@ impl GraphModel {
         Ok(result)
     }
 
-    /// Return neighboring nodes of a given node.
+    /// Return the neighbors of a given node.
     pub async fn neighbors(
         &self,
         node_id: i64,
         direction: Direction,
-    ) -> Result<Vec<Node>, NucleusError> {
+    ) -> Result<Vec<Neighbor>, NucleusError> {
         let dir = direction.as_str().to_string();
         let conn = self.pool.get().await?;
         let row = conn
@@ -156,12 +155,13 @@ impl GraphModel {
             .await
             .map_err(NucleusError::Query)?;
         let raw: String = row.get(0);
-        let nodes: Vec<Node> =
+        let neighbors: Vec<Neighbor> =
             serde_json::from_str(&raw).map_err(|e| NucleusError::Serde(e.to_string()))?;
-        Ok(nodes)
+        Ok(neighbors)
     }
 
-    /// Find the shortest path between two nodes. Returns a list of node IDs.
+    /// Find the shortest path between two nodes. Returns a list of node IDs,
+    /// or an empty list when no path exists (the engine returns SQL NULL).
     pub async fn shortest_path(&self, from_id: i64, to_id: i64) -> Result<Vec<i64>, NucleusError> {
         let conn = self.pool.get().await?;
         let row = conn
@@ -169,10 +169,15 @@ impl GraphModel {
             .query_one("SELECT GRAPH_SHORTEST_PATH($1, $2)", &[&from_id, &to_id])
             .await
             .map_err(NucleusError::Query)?;
-        let raw: String = row.get(0);
-        let ids: Vec<i64> =
-            serde_json::from_str(&raw).map_err(|e| NucleusError::Serde(e.to_string()))?;
-        Ok(ids)
+        let raw: Option<String> = row.get(0);
+        match raw {
+            Some(s) => {
+                let ids: Vec<i64> =
+                    serde_json::from_str(&s).map_err(|e| NucleusError::Serde(e.to_string()))?;
+                Ok(ids)
+            }
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Return the total number of nodes.
@@ -240,42 +245,33 @@ mod tests {
         assert_eq!(format!("{:?}", Direction::Both), "Both");
     }
 
-    // --- Node serde ---
+    // --- Neighbor serde ---
 
     #[test]
-    fn node_serialize_deserialize() {
-        let node = Node {
-            id: 42,
-            labels: vec!["Person".to_string(), "Employee".to_string()],
-            properties: serde_json::json!({"name": "Alice", "age": 30}),
+    fn neighbor_serialize_deserialize() {
+        let neighbor = Neighbor {
+            neighbor_id: 42,
+            edge_id: 7,
+            edge_type: "KNOWS".to_string(),
         };
-        let json = serde_json::to_string(&node).unwrap();
-        let deserialized: Node = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.id, 42);
-        assert_eq!(deserialized.labels, vec!["Person", "Employee"]);
-        assert_eq!(deserialized.properties["name"], "Alice");
+        let json = serde_json::to_string(&neighbor).unwrap();
+        let deserialized: Neighbor = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.neighbor_id, 42);
+        assert_eq!(deserialized.edge_id, 7);
+        assert_eq!(deserialized.edge_type, "KNOWS");
     }
 
     #[test]
-    fn node_default_labels_and_properties() {
-        // labels and properties both have #[serde(default)]
-        let json = r#"{"id": 1}"#;
-        let node: Node = serde_json::from_str(json).unwrap();
-        assert_eq!(node.id, 1);
-        assert!(node.labels.is_empty());
-        assert!(node.properties.is_null());
-    }
-
-    #[test]
-    fn node_clone() {
-        let node = Node {
-            id: 1,
-            labels: vec!["Test".into()],
-            properties: serde_json::json!({}),
+    fn neighbor_clone() {
+        let neighbor = Neighbor {
+            neighbor_id: 1,
+            edge_id: 2,
+            edge_type: "LINKS".to_string(),
         };
-        let cloned = node.clone();
-        assert_eq!(cloned.id, 1);
-        assert_eq!(cloned.labels, vec!["Test"]);
+        let cloned = neighbor.clone();
+        assert_eq!(cloned.neighbor_id, 1);
+        assert_eq!(cloned.edge_id, 2);
+        assert_eq!(cloned.edge_type, "LINKS");
     }
 
     // --- GraphResult serde ---
@@ -308,14 +304,15 @@ mod tests {
     }
 
     #[test]
-    fn node_vec_deserialize() {
+    fn neighbor_vec_deserialize() {
+        // Real engine GRAPH_NEIGHBORS shape.
         let json = r#"[
-            {"id": 1, "labels": ["Person"], "properties": {"name": "Alice"}},
-            {"id": 2, "labels": ["Person"], "properties": {"name": "Bob"}}
+            {"neighbor_id":1,"edge_id":10,"edge_type":"KNOWS"},
+            {"neighbor_id":2,"edge_id":11,"edge_type":"WORKS_WITH"}
         ]"#;
-        let nodes: Vec<Node> = serde_json::from_str(json).unwrap();
-        assert_eq!(nodes.len(), 2);
-        assert_eq!(nodes[0].id, 1);
-        assert_eq!(nodes[1].properties["name"], "Bob");
+        let neighbors: Vec<Neighbor> = serde_json::from_str(json).unwrap();
+        assert_eq!(neighbors.len(), 2);
+        assert_eq!(neighbors[0].neighbor_id, 1);
+        assert_eq!(neighbors[1].edge_type, "WORKS_WITH");
     }
 }

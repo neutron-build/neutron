@@ -8,13 +8,25 @@ use crate::error::NucleusError;
 use crate::pool::NucleusPool;
 
 /// Metadata about a stored blob.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BlobMeta {
     pub key: String,
     pub size: i64,
     pub content_type: String,
-    #[serde(default)]
-    pub metadata: serde_json::Value,
+    /// Creation time in milliseconds since the Unix epoch.
+    pub created_at: i64,
+    /// Last update time in milliseconds since the Unix epoch.
+    pub updated_at: i64,
+}
+
+/// Wire shape returned by BLOB_META:
+/// `{"size":N,"content_type":"...","created_at":MS,"updated_at":MS}`.
+#[derive(Deserialize)]
+struct BlobMetaWire {
+    size: i64,
+    content_type: String,
+    created_at: i64,
+    updated_at: i64,
 }
 
 /// Handle for blob storage operations.
@@ -91,9 +103,15 @@ impl BlobModel {
         let raw: Option<String> = row.get(0);
         match raw {
             Some(s) => {
-                let meta: BlobMeta =
+                let wire: BlobMetaWire =
                     serde_json::from_str(&s).map_err(|e| NucleusError::Serde(e.to_string()))?;
-                Ok(Some(meta))
+                Ok(Some(BlobMeta {
+                    key: key.to_string(),
+                    size: wire.size,
+                    content_type: wire.content_type,
+                    created_at: wire.created_at,
+                    updated_at: wire.updated_at,
+                }))
             }
             None => Ok(None),
         }
@@ -115,8 +133,8 @@ impl BlobModel {
         Ok(row.get::<_, bool>(0))
     }
 
-    /// List blobs matching an optional prefix.
-    pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<BlobMeta>, NucleusError> {
+    /// List blob keys matching an optional prefix.
+    pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>, NucleusError> {
         let conn = self.pool.get().await?;
         let row = if let Some(pfx) = prefix {
             conn.client()
@@ -130,9 +148,9 @@ impl BlobModel {
                 .map_err(NucleusError::Query)?
         };
         let raw: String = row.get(0);
-        let metas: Vec<BlobMeta> =
+        let keys: Vec<String> =
             serde_json::from_str(&raw).map_err(|e| NucleusError::Serde(e.to_string()))?;
-        Ok(metas)
+        Ok(keys)
     }
 
     /// Return the total number of stored blobs.
@@ -270,43 +288,33 @@ mod tests {
         assert_eq!(decoded, all_bytes);
     }
 
-    // --- BlobMeta serde ---
+    // --- BlobMeta wire format ---
 
     #[test]
-    fn blob_meta_serialize_deserialize() {
-        let meta = BlobMeta {
-            key: "images/photo.png".to_string(),
-            size: 1024,
-            content_type: "image/png".to_string(),
-            metadata: serde_json::json!({"width": 800, "height": 600}),
-        };
-        let json = serde_json::to_string(&meta).unwrap();
-        let deserialized: BlobMeta = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.key, "images/photo.png");
-        assert_eq!(deserialized.size, 1024);
-        assert_eq!(deserialized.content_type, "image/png");
-        assert_eq!(deserialized.metadata["width"], 800);
+    fn blob_meta_wire_deserialize() {
+        // Real engine BLOB_META shape: no "key", integer ms timestamps.
+        let json = r#"{"size":1024,"content_type":"image/png","created_at":1700000000000,"updated_at":1700000000001}"#;
+        let wire: BlobMetaWire = serde_json::from_str(json).unwrap();
+        assert_eq!(wire.size, 1024);
+        assert_eq!(wire.content_type, "image/png");
+        assert_eq!(wire.created_at, 1_700_000_000_000);
+        assert_eq!(wire.updated_at, 1_700_000_000_001);
     }
 
     #[test]
-    fn blob_meta_default_metadata() {
-        // metadata field has #[serde(default)], so it can be missing from JSON
-        let json = r#"{"key":"test","size":100,"content_type":"text/plain"}"#;
-        let meta: BlobMeta = serde_json::from_str(json).unwrap();
-        assert_eq!(meta.key, "test");
-        assert_eq!(meta.size, 100);
-        assert!(meta.metadata.is_null());
+    fn blob_meta_wire_empty_content_type() {
+        // Engine emits "" when the blob has no content type.
+        let json = r#"{"size":0,"content_type":"","created_at":0,"updated_at":0}"#;
+        let wire: BlobMetaWire = serde_json::from_str(json).unwrap();
+        assert_eq!(wire.size, 0);
+        assert!(wire.content_type.is_empty());
     }
 
     #[test]
-    fn blob_meta_vec_deserialize() {
-        let json = r#"[
-            {"key":"a","size":10,"content_type":"text/plain"},
-            {"key":"b","size":20,"content_type":"image/png"}
-        ]"#;
-        let metas: Vec<BlobMeta> = serde_json::from_str(json).unwrap();
-        assert_eq!(metas.len(), 2);
-        assert_eq!(metas[0].key, "a");
-        assert_eq!(metas[1].key, "b");
+    fn blob_list_keys_deserialize() {
+        // Real engine BLOB_LIST shape: JSON array of key strings.
+        let json = r#"["images/a.png","images/b.png"]"#;
+        let keys: Vec<String> = serde_json::from_str(json).unwrap();
+        assert_eq!(keys, vec!["images/a.png", "images/b.png"]);
     }
 }
