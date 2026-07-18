@@ -702,6 +702,130 @@ impl Executor {
     // Plan-driven execution
     // ========================================================================
 
+    /// Streaming producer for the trivially-safe scan shape (Phase 1.1).
+    ///
+    /// Returns `Some(SelectStream)` only for a bare `SELECT * FROM <base table>`
+    /// with no WHERE / join / GROUP BY / HAVING / DISTINCT / ORDER BY / LIMIT /
+    /// OFFSET / FETCH / CTE, and only when the session opted in via
+    /// `SET stream_results = on`. Every other shape returns `None` and falls
+    /// through to the normal materialized path.
+    ///
+    /// Correctness: this streams `scan_chunked`, which bottoms out in the engine
+    /// `scan()` — recording SIREAD on all visible rows, exactly the read set the
+    /// materialized path records for this (predicate-free) shape. No matched-only
+    /// fast scan is involved, so the read set can only be ≥ conservative, never
+    /// under-recorded. It uses `storage_for(table)` so multi-engine routing and
+    /// per-table column schema match the normal path byte-for-byte.
+    ///
+    /// Called ONLY from the top-level `Statement::Query` dispatch (never the
+    /// reentrant `execute_query`), so a nested subquery/CTE body is never turned
+    /// into a stream — nested consumers require materialized rows.
+    #[cfg(feature = "server")]
+    pub(super) async fn try_streaming_scan(
+        &self,
+        query: &ast::Query,
+    ) -> Result<Option<ExecResult>, ExecError> {
+        // RLS queries stay on the fail-closed materialized path.
+        if self.any_rls_active() {
+            return Ok(None);
+        }
+        // Opt-in only — default OFF keeps every existing session materialized.
+        let stream_on = self
+            .current_session()
+            .settings
+            .read()
+            .get("stream_results")
+            .map(|v| v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !stream_on {
+            return Ok(None);
+        }
+
+        // No CTEs / ORDER BY / LIMIT / OFFSET / FETCH at the query level.
+        if query.with.is_some()
+            || query.order_by.is_some()
+            || query.limit_clause.is_some()
+            || query.fetch.is_some()
+        {
+            return Ok(None);
+        }
+
+        let SetExpr::Select(select) = &*query.body else {
+            return Ok(None);
+        };
+
+        // Exactly one *plain* wildcard — `* EXCEPT/REPLACE/RENAME/ILIKE/EXCLUDE`
+        // would change the column set, so it is not a bare scan.
+        let plain_star = select.projection.len() == 1
+            && matches!(&select.projection[0], SelectItem::Wildcard(opts)
+                if opts.opt_ilike.is_none()
+                    && opts.opt_exclude.is_none()
+                    && opts.opt_except.is_none()
+                    && opts.opt_replace.is_none()
+                    && opts.opt_rename.is_none());
+        if !plain_star {
+            return Ok(None);
+        }
+
+        // Single base table, no joins, and none of the row-shaping clauses.
+        if select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+            || select.selection.is_some()
+            || select.having.is_some()
+            || select.distinct.is_some()
+            || !matches!(&select.group_by, ast::GroupByExpr::Expressions(e, _) if e.is_empty())
+        {
+            return Ok(None);
+        }
+
+        let table_name = match &select.from[0].relation {
+            TableFactor::Table {
+                name, alias, args, ..
+            } if alias.is_none() && args.is_none() => name.to_string(),
+            _ => return Ok(None),
+        };
+        if table_name.is_empty() {
+            return Ok(None);
+        }
+        // A name shadowed by a DML-context CTE (WITH ... INSERT/UPDATE/DELETE)
+        // is not a base table — let the normal path resolve it.
+        if self
+            .current_session()
+            .active_ctes
+            .read()
+            .contains_key(&table_name)
+        {
+            return Ok(None);
+        }
+        // Views/MVs are not base tables — the normal path expands them.
+        if self.views.read().await.contains_key(&table_name)
+            || self
+                .materialized_views
+                .read()
+                .await
+                .contains_key(&table_name)
+        {
+            return Ok(None);
+        }
+        // Unknown table: let the normal path raise the proper error.
+        let Ok(table_def) = self.get_table(&table_name).await else {
+            return Ok(None);
+        };
+
+        let columns: Vec<(String, DataType)> = table_def
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.data_type.clone()))
+            .collect();
+        let storage = self.storage_for(&table_name);
+        let source = Box::new(super::scan_stream::ChunkedScanIter::new(
+            storage,
+            table_name,
+            super::scan_stream::DEFAULT_STREAM_BATCH_ROWS,
+        ));
+        Ok(Some(ExecResult::SelectStream { columns, source }))
+    }
+
     /// Check if a SELECT query is safe enough for plan-driven execution.
     /// Returns false for subqueries and expression features we still cannot
     /// evaluate correctly in the plan path.

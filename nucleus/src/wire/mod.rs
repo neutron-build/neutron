@@ -815,12 +815,85 @@ impl NucleusHandler {
             ExecResult::CopyOut { row_count, .. } => {
                 Ok(Response::Execution(Tag::new("COPY").with_rows(row_count)))
             }
-            // The executor materializes results at its dispatch boundary before
-            // they reach the wire; streaming a result to the client directly is
-            // Phase 4 (a dedicated streaming path), not this handler.
-            ExecResult::SelectStream { .. } => unreachable!(
-                "SelectStream must be materialized before build_response (Phase 4 adds the streaming path)"
-            ),
+            // Streaming SELECT: pull batches lazily from the producer and encode
+            // rows as they arrive, so peak memory is O(batch) and the first row
+            // reaches the client without materializing the whole result. Reaches
+            // the wire only when the session opted in (SET stream_results = on);
+            // otherwise the dispatch boundary materialized it into `Select` above.
+            // The per-row encoding is identical to the `Select` arm.
+            ExecResult::SelectStream { columns, source } => {
+                let schema: Vec<FieldInfo> = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, dt))| {
+                        FieldInfo::new(
+                            name.clone(),
+                            None,
+                            None,
+                            data_type_to_pg(dt),
+                            formats.map_or(FieldFormat::Text, |f| requested_format(f, i)),
+                        )
+                    })
+                    .collect();
+                let schema = Arc::new(schema);
+                let col_types: Arc<Vec<DataType>> =
+                    Arc::new(columns.iter().map(|(_, dt)| dt.clone()).collect());
+
+                struct StreamState {
+                    source: Box<dyn crate::executor::row_batch::RowBatchIter>,
+                    buf: std::vec::IntoIter<crate::types::Row>,
+                    done: bool,
+                }
+                let init = StreamState {
+                    source,
+                    buf: Vec::new().into_iter(),
+                    done: false,
+                };
+                let schema_ref = Arc::clone(&schema);
+                let data_row_stream = stream::unfold(init, move |mut st| {
+                    let schema = Arc::clone(&schema_ref);
+                    let col_types = Arc::clone(&col_types);
+                    async move {
+                        if st.done {
+                            return None;
+                        }
+                        loop {
+                            if let Some(row) = st.buf.next() {
+                                let mut encoder = DataRowEncoder::new(Arc::clone(&schema));
+                                let encoded = (|| {
+                                    for (i, value) in row.iter().enumerate() {
+                                        match col_types.get(i) {
+                                            Some(dt) => encode_value_typed(&mut encoder, value, dt)?,
+                                            None => encode_value(&mut encoder, value)?,
+                                        }
+                                    }
+                                    encoder.finish()
+                                })();
+                                return Some((encoded, st));
+                            }
+                            // Buffer drained — pull the next batch.
+                            match st.source.next_batch().await {
+                                Ok(Some(batch)) => {
+                                    st.buf = batch.into_iter();
+                                    continue;
+                                }
+                                Ok(None) => {
+                                    // End of stream — unfold stops on None, so no
+                                    // need to flip `done` (st is dropped here).
+                                    return None;
+                                }
+                                Err(e) => {
+                                    // Surface the producer error as one stream error,
+                                    // then stop.
+                                    st.done = true;
+                                    return Some((Err(exec_error_to_pgwire(e)), st));
+                                }
+                            }
+                        }
+                    }
+                });
+                Ok(Response::Query(QueryResponse::new(schema, data_row_stream)))
+            }
         }
     }
 
@@ -3871,6 +3944,32 @@ mod tests {
         match response.unwrap() {
             Response::Query(_) => {} // Expected
             _ => panic!("Expected Query response"),
+        }
+    }
+
+    /// Phase 1.1: a SelectStream must build a streaming Query response (the arm
+    /// that previously `unreachable!`d). Rows/columns correctness is covered by
+    /// the executor-level streaming-vs-materialized equivalence tests; the
+    /// encoder here is byte-identical to the Select arm.
+    #[tokio::test]
+    async fn build_response_streams_select_stream() {
+        let columns = vec![
+            ("id".to_string(), DataType::Int32),
+            ("name".to_string(), DataType::Text),
+        ];
+        let rows = vec![
+            vec![Value::Int32(1), Value::Text("alice".into())],
+            vec![Value::Int32(2), Value::Text("bob".into())],
+        ];
+        let source = Box::new(
+            crate::executor::row_batch::MaterializedBatchIter::with_batch_size(rows, 1),
+        );
+        let result = ExecResult::SelectStream { columns, source };
+        let response = NucleusHandler::build_response(result, None);
+        assert!(response.is_ok());
+        match response.unwrap() {
+            Response::Query(_) => {}
+            _ => panic!("Expected streaming Query response"),
         }
     }
 
