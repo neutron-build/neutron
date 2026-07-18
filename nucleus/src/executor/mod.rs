@@ -98,8 +98,9 @@ pub mod param_subst;
 mod policy;
 mod project;
 mod query;
-mod row_batch;
+pub(crate) mod row_batch;
 mod scalar_fns;
+mod scan_stream;
 mod schema_types;
 mod spill;
 mod session;
@@ -3954,14 +3955,21 @@ impl Executor {
             }
         }
 
+        // A SelectStream may pass through to the wire only for a single-statement
+        // simple-query batch (the pgwire simple protocol streams it row-by-row).
+        // Multi-statement batches materialize each result so two concurrent
+        // producers never race on the session, and every non-wire consumer
+        // (tests, embedded, RESP, binary wire) still materializes because the
+        // producer only emits a stream when the session opted in (stream_results).
+        let single = statements.len() == 1;
         let mut results = Vec::new();
         for stmt in statements {
-            // Materialization boundary: the default result path (tests, embedded,
-            // RESP, binary wire, and today's pgwire) receives fully materialized
-            // rows. A streaming producer's SelectStream is collapsed here; only a
-            // future streaming wire path (Phase 4) bypasses this to stream a huge
-            // result to the client without materializing it.
-            let r = self.execute_statement(stmt).await?.materialize().await?;
+            let r = self.execute_statement(stmt).await?;
+            let r = if single && r.is_stream() {
+                r
+            } else {
+                r.materialize().await?
+            };
             results.push(r);
         }
         Ok(results)
@@ -4130,6 +4138,18 @@ impl Executor {
 
         let result = match stmt {
             Statement::Query(query) => {
+                // Streaming scan (Phase 1.1, opt-in via SET stream_results = on):
+                // for a bare `SELECT * FROM <base table>` hand back a lazy
+                // SelectStream the pgwire path streams row-by-row. Decided HERE at
+                // the top-level dispatch (never the reentrant execute_query) and
+                // BEFORE the result cache, so nested subqueries never stream and a
+                // streamed query bypasses the materialized cache. Non-wire
+                // consumers collapse it at the materialization boundary.
+                #[cfg(feature = "server")]
+                if let Some(stream) = self.try_streaming_scan(&query).await? {
+                    return Ok(stream);
+                }
+
                 // Query result cache: check for a cached result before executing.
                 // Only cache deterministic SELECT queries (no RANDOM(), NOW(), etc.)
                 // and only outside of transactions.
