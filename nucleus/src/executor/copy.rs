@@ -4,7 +4,7 @@
 
 use super::helpers::{value_to_csv_string_impl, value_to_text_string_impl};
 use super::{ExecError, ExecResult, Executor};
-use crate::types::{DataType, Value};
+use crate::types::{DataType, Row, Value};
 use sqlparser::ast;
 
 impl Executor {
@@ -135,16 +135,14 @@ impl Executor {
         delimiter: char,
         include_header: bool,
     ) -> Result<ExecResult, ExecError> {
+        let is_csv = format == "csv";
         let (columns, rows) = match &source {
             ast::CopySource::Table {
                 table_name,
                 columns,
             } => {
-                let table_def = self.get_table(&table_name.to_string()).await?;
                 let table = table_name.to_string();
-                let all_rows = self.storage.scan(&table).await?;
-                let all_rows =
-                    self.rls_filter_rows(&table, crate::security::PolicyCommand::Select, all_rows);
+                let table_def = self.get_table(&table).await?;
 
                 let col_names: Vec<String> = if columns.is_empty() {
                     table_def.columns.iter().map(|c| c.name.clone()).collect()
@@ -152,6 +150,31 @@ impl Executor {
                     columns.iter().map(|c| c.value.clone()).collect()
                 };
 
+                // Streaming COPY TO (opt-in via SET stream_results = on): for a
+                // full-column, non-RLS table export, stream formatted chunks
+                // instead of buffering the whole table as a Vec<Row> AND a String.
+                // Output is byte-identical to the materialized path (shared
+                // formatters). RLS or an explicit column subset falls back below.
+                #[cfg(feature = "server")]
+                if columns.is_empty() && !self.any_rls_active() && self.stream_results_enabled() {
+                    let storage = self.storage_for(&table);
+                    let source_iter = Box::new(super::scan_stream::ChunkedScanIter::new(
+                        storage,
+                        table,
+                        super::scan_stream::DEFAULT_STREAM_BATCH_ROWS,
+                    ));
+                    return Ok(ExecResult::CopyOutStream {
+                        source: source_iter,
+                        columns: col_names,
+                        is_csv,
+                        delimiter,
+                        include_header,
+                    });
+                }
+
+                let all_rows = self.storage.scan(&table).await?;
+                let all_rows =
+                    self.rls_filter_rows(&table, crate::security::PolicyCommand::Select, all_rows);
                 (col_names, all_rows)
             }
             ast::CopySource::Query(query) => {
@@ -176,35 +199,11 @@ impl Executor {
         let _mem = self.reserve_query_memory(Self::estimate_rows_bytes(&rows))?;
 
         let mut output = String::new();
-
-        if format == "csv" {
-            // CSV format
-            if include_header {
-                output.push_str(&self.format_csv_row(
-                    &columns.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                    delimiter,
-                ));
-                output.push('\n');
-            }
-
-            for row in &rows {
-                let row_strings: Vec<String> =
-                    row.iter().map(|v| self.value_to_csv_string(v)).collect();
-                let row_refs: Vec<&str> = row_strings.iter().map(|s| s.as_str()).collect();
-                output.push_str(&self.format_csv_row(&row_refs, delimiter));
-                output.push('\n');
-            }
-        } else {
-            // Text format (tab-delimited)
-            for row in &rows {
-                let row_strings: Vec<String> =
-                    row.iter().map(|v| self.value_to_text_string(v)).collect();
-                output.push_str(&row_strings.join(&delimiter.to_string()));
-                output.push('\n');
-            }
+        if include_header {
+            output.push_str(&format_copy_header(&columns, is_csv, delimiter));
         }
+        output.push_str(&format_copy_body(&rows, is_csv, delimiter));
 
-        // Return a CopyOut result carrying the formatted data for the wire layer.
         let row_count = rows.len();
         Ok(ExecResult::CopyOut {
             data: output,
@@ -246,29 +245,6 @@ impl Executor {
         fields
     }
 
-    pub(super) fn format_csv_row(&self, fields: &[&str], delimiter: char) -> String {
-        fields
-            .iter()
-            .map(|field| {
-                // Quote field if it contains delimiter, quote, or newline
-                if field.contains(delimiter)
-                    || field.contains('"')
-                    || field.contains('\n')
-                    || field.contains('\r')
-                {
-                    format!("\"{}\"", field.replace('"', "\"\""))
-                } else {
-                    field.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(&delimiter.to_string())
-    }
-
-    pub(super) fn value_to_csv_string(&self, value: &Value) -> String {
-        value_to_csv_string_impl(value)
-    }
-
     pub(super) fn value_to_text_string(&self, value: &Value) -> String {
         value_to_text_string_impl(value)
     }
@@ -299,4 +275,64 @@ impl Executor {
             },
         }
     }
+}
+
+// ── Shared COPY TO formatting (used by both the materialized and streaming
+// paths so their byte output is identical) ───────────────────────────────────
+
+/// CSV-quote one field, matching `Executor::format_csv_row`: quote only if the
+/// field contains the delimiter, a quote, or a newline; double embedded quotes.
+fn csv_quote(field: &str, delimiter: char) -> String {
+    if field.contains(delimiter)
+        || field.contains('"')
+        || field.contains('\n')
+        || field.contains('\r')
+    {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// The header line for a COPY TO. Only CSV emits a header; text format never
+/// does (matching the historical behavior). Returns "" when not applicable.
+pub(crate) fn format_copy_header(columns: &[String], is_csv: bool, delimiter: char) -> String {
+    if !is_csv {
+        return String::new();
+    }
+    let line = columns
+        .iter()
+        .map(|c| csv_quote(c, delimiter))
+        .collect::<Vec<_>>()
+        .join(&delimiter.to_string());
+    format!("{line}\n")
+}
+
+/// Format a batch of rows to CSV or tab/text form (no header). Byte-identical to
+/// the materialized `execute_copy_to` row loop.
+pub(crate) fn format_copy_body(rows: &[Row], is_csv: bool, delimiter: char) -> String {
+    let mut out = String::new();
+    let d = delimiter.to_string();
+    if is_csv {
+        for row in rows {
+            let line = row
+                .iter()
+                .map(|v| csv_quote(&value_to_csv_string_impl(v), delimiter))
+                .collect::<Vec<_>>()
+                .join(&d);
+            out.push_str(&line);
+            out.push('\n');
+        }
+    } else {
+        for row in rows {
+            let line = row
+                .iter()
+                .map(value_to_text_string_impl)
+                .collect::<Vec<_>>()
+                .join(&d);
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
 }

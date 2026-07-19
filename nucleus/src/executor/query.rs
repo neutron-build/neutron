@@ -67,9 +67,9 @@ impl Executor {
                     ExecResult::Command { rows_affected, .. } => *rows_affected,
                     ExecResult::CopyOut { row_count, .. } => *row_count,
                     // Materialized just above, so a stream can't reach here.
-                    ExecResult::SelectStream { .. } => unreachable!(
-                        "SelectStream materialized before EXPLAIN ANALYZE row count"
-                    ),
+                    ExecResult::SelectStream { .. } | ExecResult::CopyOutStream { .. } => {
+                        unreachable!("stream materialized before EXPLAIN ANALYZE row count")
+                    }
                 };
 
                 // Build annotated plan text with actual execution stats
@@ -731,14 +731,7 @@ impl Executor {
             return Ok(None);
         }
         // Opt-in only — default OFF keeps every existing session materialized.
-        let stream_on = self
-            .current_session()
-            .settings
-            .read()
-            .get("stream_results")
-            .map(|v| v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if !stream_on {
+        if !self.stream_results_enabled() {
             return Ok(None);
         }
 

@@ -83,7 +83,7 @@ pub(crate) fn decode_scram_verifier(encoded: &str) -> Option<(Vec<u8>, Vec<u8>)>
 mod admin;
 mod aggregate;
 mod cache;
-mod copy;
+pub(crate) mod copy;
 mod ddl;
 mod dml;
 mod expr;
@@ -152,6 +152,17 @@ pub enum ExecResult {
     Command { tag: String, rows_affected: usize },
     /// Result of COPY ... TO STDOUT: pre-formatted copy data ready to stream.
     CopyOut { data: String, row_count: usize },
+    /// Streaming COPY ... TO STDOUT: rows are pulled in batches and formatted on
+    /// the fly, so a full-table export never buffers the whole table. The pgwire
+    /// path formats + sends CopyData per batch; non-wire consumers collapse it to
+    /// a `CopyOut` via [`ExecResult::materialize`]. Byte-identical to `CopyOut`.
+    CopyOutStream {
+        source: Box<dyn row_batch::RowBatchIter>,
+        columns: Vec<String>,
+        is_csv: bool,
+        delimiter: char,
+        include_header: bool,
+    },
 }
 
 impl std::fmt::Debug for ExecResult {
@@ -179,6 +190,14 @@ impl std::fmt::Debug for ExecResult {
                 .field("data", data)
                 .field("row_count", row_count)
                 .finish(),
+            ExecResult::CopyOutStream {
+                columns, is_csv, ..
+            } => f
+                .debug_struct("CopyOutStream")
+                .field("columns", columns)
+                .field("is_csv", is_csv)
+                .field("source", &"<lazy row stream>")
+                .finish(),
         }
     }
 }
@@ -198,13 +217,36 @@ impl ExecResult {
                 let rows = source.collect().await?;
                 Ok(ExecResult::Select { columns, rows })
             }
+            ExecResult::CopyOutStream {
+                mut source,
+                columns,
+                is_csv,
+                delimiter,
+                include_header,
+            } => {
+                let rows = source.collect().await?;
+                let mut data = String::new();
+                if include_header {
+                    data.push_str(&copy::format_copy_header(&columns, is_csv, delimiter));
+                }
+                data.push_str(&copy::format_copy_body(&rows, is_csv, delimiter));
+                Ok(ExecResult::CopyOut {
+                    data,
+                    row_count: rows.len(),
+                })
+            }
             other => Ok(other),
         }
     }
 
-    /// Whether this result is a lazy row stream (not yet materialized).
+    /// Whether this result is a lazy stream (SELECT or COPY) not yet materialized.
+    /// The dispatch boundary passes these through to the wire for a single-
+    /// statement batch; every other consumer materializes them.
     pub fn is_stream(&self) -> bool {
-        matches!(self, ExecResult::SelectStream { .. })
+        matches!(
+            self,
+            ExecResult::SelectStream { .. } | ExecResult::CopyOutStream { .. }
+        )
     }
 }
 
@@ -2215,6 +2257,19 @@ impl Executor {
     #[cfg(feature = "server")]
     pub fn rls_configured(&self) -> bool {
         self.security.read().rls.any_enabled()
+    }
+
+    /// Whether the current session opted into streaming results via
+    /// `SET stream_results = on`. Default OFF. Gates the streaming scan/COPY
+    /// producers so existing sessions are byte-for-byte unchanged.
+    #[cfg(feature = "server")]
+    pub(super) fn stream_results_enabled(&self) -> bool {
+        self.current_session()
+            .settings
+            .read()
+            .get("stream_results")
+            .map(|v| v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
     }
 
     #[cfg(feature = "server")]
@@ -4444,7 +4499,7 @@ impl Executor {
                 }
                 // A streaming result's row count is not known until it drains at
                 // the consumer; it is counted there, not here.
-                ExecResult::SelectStream { .. } => {}
+                ExecResult::SelectStream { .. } | ExecResult::CopyOutStream { .. } => {}
             }
         }
 

@@ -178,6 +178,69 @@ async fn missing_table_still_errors_when_streaming() {
     );
 }
 
+/// Streaming COPY TO STDOUT must produce byte-identical output (and row count)
+/// to the materialized path, across text and CSV (with/without header).
+#[tokio::test]
+async fn copy_to_streaming_matches_materialized() {
+    let ex = test_executor();
+    let sid = ex.create_session();
+    seed(&ex, sid, 3000).await; // > batch size, multiple batches
+
+    async fn copy_out(ex: &Executor, sid: u64, sql: &str) -> (String, usize) {
+        let mut results = ex.execute_with_session(sid, sql).await.unwrap();
+        let r = results.pop().unwrap();
+        match r.materialize().await.unwrap() {
+            ExecResult::CopyOut { data, row_count } => (data, row_count),
+            other => panic!("expected CopyOut, got {other:?}"),
+        }
+    }
+
+    for sql in [
+        "COPY t TO STDOUT",
+        "COPY t TO STDOUT WITH (FORMAT csv)",
+        "COPY t TO STDOUT WITH (FORMAT csv, HEADER true)",
+    ] {
+        // Materialized ground truth.
+        ex.execute_with_session(sid, "SET stream_results = off")
+            .await
+            .unwrap();
+        let (base_data, base_n) = copy_out(&ex, sid, sql).await;
+
+        // Streamed: the result must be a lazy stream, and collapse to identical bytes.
+        ex.execute_with_session(sid, "SET stream_results = on")
+            .await
+            .unwrap();
+        let mut results = ex.execute_with_session(sid, sql).await.unwrap();
+        let r = results.pop().unwrap();
+        assert!(r.is_stream(), "COPY should stream when opted in: {sql}");
+        let (stream_data, stream_n) = match r.materialize().await.unwrap() {
+            ExecResult::CopyOut { data, row_count } => (data, row_count),
+            other => panic!("expected CopyOut after materialize, got {other:?}"),
+        };
+
+        assert_eq!(stream_data, base_data, "COPY output mismatch for: {sql}");
+        assert_eq!(stream_n, base_n, "COPY row count mismatch for: {sql}");
+    }
+}
+
+/// COPY with an explicit column subset falls back to the materialized path
+/// (the streaming producer only handles full-row exports).
+#[tokio::test]
+async fn copy_with_column_subset_does_not_stream() {
+    let ex = test_executor();
+    let sid = ex.create_session();
+    seed(&ex, sid, 10).await;
+    ex.execute_with_session(sid, "SET stream_results = on")
+        .await
+        .unwrap();
+    let mut results = ex
+        .execute_with_session(sid, "COPY t (id) TO STDOUT")
+        .await
+        .unwrap();
+    let r = results.pop().unwrap();
+    assert!(!r.is_stream(), "column-subset COPY must not stream");
+}
+
 #[tokio::test]
 async fn multi_statement_batch_does_not_stream() {
     let ex = test_executor();
