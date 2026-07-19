@@ -1304,6 +1304,10 @@ impl StartupHandler for NucleusHandler {
                 } else {
                     self.executor.create_session()
                 };
+                // The simple-query loop drains a streaming COPY inline (CopyData
+                // per batch), so this consumer can handle a lazy stream — let COPY
+                // TO STDOUT stream by default for it (bounded-memory export).
+                self.executor.mark_session_stream_capable(session_id);
                 let addr = client.socket_addr().to_string();
                 self.session_registry.write().insert(addr, session_id);
 
@@ -1814,6 +1818,14 @@ impl ExtendedQueryHandler for NucleusHandler {
         // The extended protocol returns a single Response per Execute.
         // If there are multiple statements, take the last result.
         if let Some(mut result) = results.into_iter().last() {
+            // The extended protocol returns a single Response via build_response,
+            // which has no inline COPY path and cannot serialize a streaming COPY
+            // (that is sent as CopyData in the simple-query loop). Collapse a
+            // streaming COPY to its materialized CopyOut here so extended-protocol
+            // COPY TO STDOUT keeps working when the session is stream-capable.
+            if matches!(result, ExecResult::CopyOutStream { .. }) {
+                result = result.materialize().await.map_err(exec_error_to_pgwire)?;
+            }
             // Respect max_rows from the Execute message. When max_rows > 0,
             // the client only wants that many rows. (Full cursor/PortalSuspended
             // support would require pgwire to expose that response variant.)

@@ -215,6 +215,13 @@ pub struct Session {
     /// executing sessions so a long-running query is never mistaken for idle.
     #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub(super) executing: AtomicBool,
+    /// True when this session's consumer can lazily drain a streaming result
+    /// (the pgwire simple-query loop). COPY TO STDOUT then streams by default;
+    /// embedded/RESP/binary consumers leave it false and always materialize, so
+    /// the ExecResult contract they see is unchanged. SELECT streaming stays
+    /// separately gated on the explicit `stream_results` setting.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    pub(super) stream_capable_consumer: AtomicBool,
 }
 
 impl Default for Session {
@@ -254,6 +261,7 @@ impl Session {
             ),
             last_activity_ms: AtomicU64::new(now_millis()),
             executing: AtomicBool::new(false),
+            stream_capable_consumer: AtomicBool::new(false),
         }
     }
 

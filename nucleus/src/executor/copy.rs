@@ -150,13 +150,15 @@ impl Executor {
                     columns.iter().map(|c| c.value.clone()).collect()
                 };
 
-                // Streaming COPY TO (opt-in via SET stream_results = on): for a
-                // full-column, non-RLS table export, stream formatted chunks
-                // instead of buffering the whole table as a Vec<Row> AND a String.
-                // Output is byte-identical to the materialized path (shared
-                // formatters). RLS or an explicit column subset falls back below.
+                // Streaming COPY TO: for a full-column, non-RLS table export,
+                // stream formatted chunks instead of buffering the whole table as
+                // a Vec<Row> AND a String. On by default for a stream-capable wire
+                // consumer (see copy_streaming_enabled); embedded/RESP/binary
+                // callers materialize below. Output is byte-identical to the
+                // materialized path (shared formatters). RLS or an explicit column
+                // subset falls back below.
                 #[cfg(feature = "server")]
-                if columns.is_empty() && !self.any_rls_active() && self.stream_results_enabled() {
+                if columns.is_empty() && !self.any_rls_active() && self.copy_streaming_enabled() {
                     let storage = self.storage_for(&table);
                     let source_iter = Box::new(super::scan_stream::ChunkedScanIter::new(
                         storage,
