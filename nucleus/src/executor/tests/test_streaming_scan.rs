@@ -241,6 +241,52 @@ async fn copy_with_column_subset_does_not_stream() {
     assert!(!r.is_stream(), "column-subset COPY must not stream");
 }
 
+/// A stream-capable consumer (the pgwire simple-query loop marks its session so)
+/// streams COPY TO STDOUT by DEFAULT — no `SET stream_results = on` needed —
+/// while a plain embedded session materializes. This is the wire default flip.
+#[tokio::test]
+async fn copy_streams_by_default_for_stream_capable_consumer() {
+    let ex = test_executor();
+
+    // Embedded session (flag unset): COPY materializes, unchanged contract.
+    let embedded = ex.create_session();
+    seed(&ex, embedded, 3000).await;
+    let mut r = ex
+        .execute_with_session(embedded, "COPY t TO STDOUT")
+        .await
+        .unwrap();
+    assert!(
+        !r.pop().unwrap().is_stream(),
+        "embedded consumer must materialize COPY by default"
+    );
+
+    // Stream-capable session (as pgwire marks it): COPY streams with no SET.
+    let wire = ex.create_session();
+    ex.mark_session_stream_capable(wire);
+    let mut r = ex
+        .execute_with_session(wire, "COPY t TO STDOUT")
+        .await
+        .unwrap();
+    let streamed = r.pop().unwrap();
+    assert!(
+        streamed.is_stream(),
+        "stream-capable consumer must stream COPY by default"
+    );
+
+    // An explicit opt-out overrides the default even for a wire consumer.
+    ex.execute_with_session(wire, "SET stream_results = off")
+        .await
+        .unwrap();
+    let mut r = ex
+        .execute_with_session(wire, "COPY t TO STDOUT")
+        .await
+        .unwrap();
+    assert!(
+        !r.pop().unwrap().is_stream(),
+        "SET stream_results = off must force the materialized COPY path"
+    );
+}
+
 #[tokio::test]
 async fn multi_statement_batch_does_not_stream() {
     let ex = test_executor();

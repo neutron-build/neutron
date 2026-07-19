@@ -2272,6 +2272,34 @@ impl Executor {
             .unwrap_or(false)
     }
 
+    /// Whether COPY TO STDOUT should stream (vs materialize the whole table).
+    /// Unlike SELECT streaming this is ON by default — but only for a wire
+    /// consumer that can lazily drain the result (pgwire, which marks the session
+    /// stream-capable). Embedded/RESP/binary callers leave the flag false and so
+    /// keep receiving a materialized `CopyOut`, preserving their result contract.
+    /// An explicit `SET stream_results = on|off` overrides in either direction, so
+    /// the setting remains a per-session escape hatch on the wire.
+    #[cfg(feature = "server")]
+    pub(super) fn copy_streaming_enabled(&self) -> bool {
+        let session = self.current_session();
+        if let Some(v) = session.settings.read().get("stream_results") {
+            return v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true") || v == "1";
+        }
+        session
+            .stream_capable_consumer
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Mark a session's consumer as able to lazily drain a streaming result, so
+    /// COPY TO STDOUT streams by default for it. Called by the pgwire layer at
+    /// connection setup; never by embedded/RESP/binary paths.
+    #[cfg(feature = "server")]
+    pub fn mark_session_stream_capable(&self, session_id: u64) {
+        self.get_session(session_id)
+            .stream_capable_consumer
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     #[cfg(feature = "server")]
     pub async fn execute_principal_less_forward(
         &self,
