@@ -722,6 +722,57 @@ impl Executor {
     /// Called ONLY from the top-level `Statement::Query` dispatch (never the
     /// reentrant `execute_query`), so a nested subquery/CTE body is never turned
     /// into a stream — nested consumers require materialized rows.
+    /// Parse a query's `LIMIT`/`OFFSET` for a streaming path: `Ok(Some((skip,
+    /// limit)))` for static integer bounds, `Ok(None)` when a parameter /
+    /// expression / ClickHouse `LIMIT ... BY` bound means the caller must fall
+    /// back to the materialized path. Shared by the streaming scan and streaming
+    /// aggregate producers.
+    #[cfg(feature = "server")]
+    pub(super) fn streaming_limit_offset(
+        &self,
+        query: &ast::Query,
+    ) -> Result<Option<(usize, Option<usize>)>, ExecError> {
+        let parsed = match &query.limit_clause {
+            None => (0, None),
+            Some(ast::LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            }) => {
+                if !limit_by.is_empty() {
+                    return Ok(None); // LIMIT ... BY (ClickHouse) not handled here
+                }
+                let off = match offset {
+                    Some(o) => match self.expr_to_usize(&o.value) {
+                        Ok(n) => n,
+                        Err(_) => return Ok(None),
+                    },
+                    None => 0,
+                };
+                let lim = match limit {
+                    Some(e) => match self.expr_to_usize(e) {
+                        Ok(n) => Some(n),
+                        Err(_) => return Ok(None),
+                    },
+                    None => None,
+                };
+                (off, lim)
+            }
+            Some(ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
+                let off = match self.expr_to_usize(offset) {
+                    Ok(n) => n,
+                    Err(_) => return Ok(None),
+                };
+                let lim = match self.expr_to_usize(limit) {
+                    Ok(n) => Some(n),
+                    Err(_) => return Ok(None),
+                };
+                (off, lim)
+            }
+        };
+        Ok(Some(parsed))
+    }
+
     #[cfg(feature = "server")]
     pub(super) async fn try_streaming_scan(
         &self,
@@ -852,43 +903,9 @@ impl Executor {
 
         // LIMIT / OFFSET: only static integer bounds stream; a parameter or
         // expression bound falls back to the materialized path.
-        let (skip, limit): (usize, Option<usize>) = match &query.limit_clause {
-            None => (0, None),
-            Some(ast::LimitClause::LimitOffset {
-                limit,
-                offset,
-                limit_by,
-            }) => {
-                if !limit_by.is_empty() {
-                    return Ok(None); // LIMIT ... BY (ClickHouse) not handled here
-                }
-                let off = match offset {
-                    Some(o) => match self.expr_to_usize(&o.value) {
-                        Ok(n) => n,
-                        Err(_) => return Ok(None),
-                    },
-                    None => 0,
-                };
-                let lim = match limit {
-                    Some(e) => match self.expr_to_usize(e) {
-                        Ok(n) => Some(n),
-                        Err(_) => return Ok(None),
-                    },
-                    None => None,
-                };
-                (off, lim)
-            }
-            Some(ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
-                let off = match self.expr_to_usize(offset) {
-                    Ok(n) => n,
-                    Err(_) => return Ok(None),
-                };
-                let lim = match self.expr_to_usize(limit) {
-                    Ok(n) => Some(n),
-                    Err(_) => return Ok(None),
-                };
-                (off, lim)
-            }
+        let (skip, limit): (usize, Option<usize>) = match self.streaming_limit_offset(query)? {
+            Some(v) => v,
+            None => return Ok(None),
         };
 
         // ORDER BY keys: stream only when every key is a bare column identifier

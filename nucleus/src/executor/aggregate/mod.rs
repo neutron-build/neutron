@@ -395,7 +395,7 @@ impl Executor {
 
     /// Extract GROUPING SETS / CUBE / ROLLUP from GROUP BY expressions.
     /// Returns None if normal GROUP BY, Some(sets) if grouping sets are found.
-    fn extract_grouping_sets(&self, exprs: &[Expr]) -> Option<Vec<Vec<Expr>>> {
+    pub(super) fn extract_grouping_sets(&self, exprs: &[Expr]) -> Option<Vec<Vec<Expr>>> {
         for expr in exprs {
             match expr {
                 Expr::GroupingSets(sets) => {
