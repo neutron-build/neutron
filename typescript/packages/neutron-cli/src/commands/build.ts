@@ -18,6 +18,8 @@ import {
   vitePreactAliases,
   mergeSeoMetaInput,
   renderDocumentHead,
+  buildHtmlOpenTag,
+  buildBodyOpenTag,
   setActiveMarkdownConfig,
   assertRenderedFragment,
 } from "@neutron-build/core";
@@ -433,7 +435,7 @@ export async function build(): Promise<void> {
     params: Record<string, string>,
     loaderData: unknown,
     pathname: string
-  ): Promise<string> {
+  ): Promise<{ headHtml: string; seo: SeoMetaInput | null }> {
     const allRoutes = [...layoutChain].reverse();
     allRoutes.push(route);
 
@@ -477,7 +479,10 @@ export async function build(): Promise<void> {
       mergedSeo = mergeSeoMetaInput(mergedSeo, resolved);
     }
 
-    return renderDocumentHead(pathname, mergedSeo, headFragments);
+    return {
+      headHtml: renderDocumentHead(pathname, mergedSeo, headFragments),
+      seo: mergedSeo,
+    };
   }
 
   // Render static routes
@@ -614,7 +619,7 @@ export async function build(): Promise<void> {
           // document). A full-document render would nest a second document
           // inside #app — reject it before the page is written.
           assertRenderedFragment(html, layoutChain[0]?.file ?? route.file);
-          const headHtml = await resolveRouteHeadHtml(
+          const { headHtml, seo } = await resolveRouteHeadHtml(
             route,
             layoutChain,
             request,
@@ -630,7 +635,8 @@ export async function build(): Promise<void> {
             clientEntryScriptSrc,
             headHtml,
             clientCssFiles,
-            islandsEntryScriptSrc
+            islandsEntryScriptSrc,
+            seo
           );
 
           const outPath = getOutputPath(outputDir, resolvedPath);
@@ -695,7 +701,7 @@ export async function build(): Promise<void> {
       // document). A full-document render would nest a second document inside
       // #app — reject it before the page is written.
       assertRenderedFragment(html, layoutChain[0]?.file ?? route.file);
-      const headHtml = await resolveRouteHeadHtml(
+      const { headHtml, seo } = await resolveRouteHeadHtml(
         route,
         layoutChain,
         request,
@@ -711,7 +717,8 @@ export async function build(): Promise<void> {
         clientEntryScriptSrc,
         headHtml,
         clientCssFiles,
-        islandsEntryScriptSrc
+        islandsEntryScriptSrc,
+        seo
       );
 
       const outPath = getOutputPath(outputDir, route.path);
@@ -804,7 +811,8 @@ function wrapHtml(
   clientEntryScriptSrc: string | null = null,
   headHtml: string = renderDocumentHead(routePath, null),
   cssFiles: string[] = [],
-  islandsEntryScriptSrc: string | null = null
+  islandsEntryScriptSrc: string | null = null,
+  seo: SeoMetaInput | null = null
 ): string {
   // Detect islands in content — only load client runtime if interactive islands exist
   const hasIslands = content.includes("<neutron-island");
@@ -821,12 +829,12 @@ function wrapHtml(
     .join("\n");
 
   return `<!DOCTYPE html>
-<html lang="en">
+${buildHtmlOpenTag(seo?.htmlAttrs)}
 <head>
 ${headHtml}
 ${cssLinks}
 </head>
-<body>
+${buildBodyOpenTag(seo?.bodyAttrs)}
 <div id="app">${content}</div>
 ${clientScript}
 </body>

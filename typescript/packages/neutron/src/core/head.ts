@@ -33,15 +33,28 @@ export interface ResolveHeadHtmlOptions {
   nonce?: string;
 }
 
+/** Resolved document head: rendered <head> HTML plus the merged SEO input. */
+export interface ResolvedHeadDocument {
+  headHtml: string;
+  /**
+   * The merged SeoMetaInput from the route chain, or null if no route returned
+   * structured head data. Callers that own the document shell need this for
+   * htmlAttrs/bodyAttrs — the <html>/<body> open tags live outside headHtml.
+   */
+  seo: SeoMetaInput | null;
+}
+
 /**
  * Walk the ordered route chain (outermost layout first, page route last),
  * invoke each module's head() export, merge structured SeoMetaInput and collect
- * raw-string fragments, then render the final <head> HTML.
+ * raw-string fragments, then render the final <head> HTML. Returns the merged
+ * SEO input alongside the HTML so document-shell owners can render
+ * htmlAttrs/bodyAttrs on the <html>/<body> open tags.
  */
-export async function resolveHeadHtml(
+export async function resolveHeadDocument(
   entries: HeadRouteEntry[],
   options: ResolveHeadHtmlOptions
-): Promise<string> {
+): Promise<ResolvedHeadDocument> {
   let mergedSeo: SeoMetaInput | null = null;
   const headFragments: string[] = [];
 
@@ -74,5 +87,19 @@ export async function resolveHeadHtml(
     mergedSeo = mergeSeoMetaInput(mergedSeo, resolved);
   }
 
-  return renderDocumentHead(options.pathname, mergedSeo, headFragments, options.nonce);
+  return {
+    headHtml: renderDocumentHead(options.pathname, mergedSeo, headFragments, options.nonce),
+    seo: mergedSeo,
+  };
+}
+
+/**
+ * Like resolveHeadDocument, but returns only the rendered <head> HTML. Kept
+ * for callers that don't own the document shell.
+ */
+export async function resolveHeadHtml(
+  entries: HeadRouteEntry[],
+  options: ResolveHeadHtmlOptions
+): Promise<string> {
+  return (await resolveHeadDocument(entries, options)).headHtml;
 }
