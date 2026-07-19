@@ -110,6 +110,21 @@ fn hash_group_key(key: &[Value], seed: u64) -> u64 {
     h.finish()
 }
 
+/// Hash a projected row for DISTINCT partitioning, seeded per level. Uses
+/// `Value`'s natural `Hash`, which honors the Hash/Eq contract for the strict
+/// `Value::Eq` that the dedup `HashSet` (and the materialized DISTINCT path) use:
+/// equal rows hash equally, so every copy of a distinct row shares a partition
+/// and is deduped there. Near-but-unequal values may collide into one partition —
+/// harmless, since the strict-Eq `HashSet` keeps them apart within it. (Unlike
+/// [`hash_group_key`], no width unification is needed: DISTINCT never merges rows
+/// the way the aggregate's i64 fast path merges integer widths.)
+fn hash_row_strict(row: &[Value], seed: u64) -> u64 {
+    let mut h = DefaultHasher::new();
+    seed.hash(&mut h);
+    row.hash(&mut h);
+    h.finish()
+}
+
 /// Routes rows to `FANOUT` partition spill runs by group-key hash. Rows are
 /// buffered per partition and flushed as a block to each partition's run once the
 /// total buffered bytes reach the memory budget, so the partition phase's peak
@@ -146,9 +161,23 @@ impl Partitioner {
     }
 
     /// Route one row (whose already-computed group key is `key`) into its
-    /// partition buffer, flushing all buffers to disk when the budget is reached.
+    /// partition by the width-unified group hash (for streaming aggregate).
     fn route(&mut self, key: &[Value], row: Row) -> Result<(), SpillError> {
         let p = (hash_group_key(key, self.seed) % FANOUT as u64) as usize;
+        self.push(p, row)
+    }
+
+    /// Route a projected row into its partition by the strict row hash (for
+    /// streaming DISTINCT). Equal rows co-locate so the per-partition dedup sees
+    /// every copy of a distinct row.
+    fn route_distinct(&mut self, row: Row) -> Result<(), SpillError> {
+        let p = (hash_row_strict(&row, self.seed) % FANOUT as u64) as usize;
+        self.push(p, row)
+    }
+
+    /// Append `row` to partition `p`'s buffer, flushing all buffers to disk when
+    /// the budget is reached.
+    fn push(&mut self, p: usize, row: Row) -> Result<(), SpillError> {
         let bytes = estimate_row_bytes(&row);
         self.part_bytes[p] += bytes;
         self.buffered_bytes += bytes;
@@ -409,6 +438,186 @@ impl Executor {
         }))
     }
 
+    /// Streaming producer for the bounded-memory `SELECT DISTINCT` shape.
+    ///
+    /// Returns `Some(SelectStream)` for a predicate-free `SELECT DISTINCT
+    /// <*|bare cols> FROM <base table> [LIMIT n] [OFFSET m]` — under the same
+    /// opt-in + memory-limit + spill gate as the streaming aggregate. Dedup is by
+    /// STRICT row equality (a `HashSet<Vec<Value>>`, exactly the materialized
+    /// DISTINCT path), so it is NOT routed through GROUP BY (whose i64 fast path
+    /// would coarsen integer widths). Every other shape returns `None`.
+    pub(super) async fn try_streaming_distinct(
+        &self,
+        query: &ast::Query,
+    ) -> Result<Option<ExecResult>, ExecError> {
+        if self.any_rls_active() || !self.stream_results_enabled() {
+            return Ok(None);
+        }
+        let budget = self.query_memory_limit();
+        if budget == 0 || budget == u64::MAX {
+            return Ok(None);
+        }
+        let Some(spill) = self.sort_spill_ctx("distinct") else {
+            return Ok(None);
+        };
+        // No CTEs / FETCH / ORDER BY (output order over the deduped set is a
+        // follow-up).
+        if query.with.is_some() || query.fetch.is_some() || query.order_by.is_some() {
+            return Ok(None);
+        }
+        let SetExpr::Select(select) = &*query.body else {
+            return Ok(None);
+        };
+        // Plain `DISTINCT` only (not `DISTINCT ON`, whose first-row-per-key
+        // semantics need ORDER BY), and none of the row-shaping clauses this path
+        // does not handle.
+        if !matches!(&select.distinct, Some(ast::Distinct::Distinct)) {
+            return Ok(None);
+        }
+        if select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+            || select.selection.is_some()
+            || select.having.is_some()
+            || !matches!(&select.group_by, ast::GroupByExpr::Expressions(e, _) if e.is_empty())
+        {
+            return Ok(None);
+        }
+        let has_window = select.projection.iter().any(|item| match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                contains_window_function(e)
+            }
+            _ => false,
+        });
+        if has_window {
+            return Ok(None);
+        }
+
+        // Resolve the base table (same rules as the streaming scan/aggregate).
+        let table_name = match &select.from[0].relation {
+            TableFactor::Table {
+                name, alias, args, ..
+            } if alias.is_none() && args.is_none() => name.to_string(),
+            _ => return Ok(None),
+        };
+        if table_name.is_empty() {
+            return Ok(None);
+        }
+        if self
+            .current_session()
+            .active_ctes
+            .read()
+            .contains_key(&table_name)
+        {
+            return Ok(None);
+        }
+        if self.views.read().await.contains_key(&table_name)
+            || self
+                .materialized_views
+                .read()
+                .await
+                .contains_key(&table_name)
+        {
+            return Ok(None);
+        }
+        let Ok(table_def) = self.get_table(&table_name).await else {
+            return Ok(None);
+        };
+
+        // Projection: `*` or bare columns only (computed projections fall back).
+        let Some((columns, proj_indices)) = self.resolve_bare_projection(select, &table_def) else {
+            return Ok(None);
+        };
+        let (skip, limit) = match self.streaming_limit_offset(query)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        // Phase 1: project each scanned row to the output shape and partition it by
+        // the strict row hash.
+        let storage = self.storage_for(&table_name);
+        let mut scan: Box<dyn RowBatchIter> = Box::new(super::scan_stream::ChunkedScanIter::new(
+            storage,
+            table_name,
+            super::scan_stream::DEFAULT_STREAM_BATCH_ROWS,
+        ));
+        let mut partitioner = Partitioner::new(&spill, 0, budget);
+        while let Some(batch) = scan.next_batch().await? {
+            for row in batch {
+                let projected = match &proj_indices {
+                    None => row,
+                    Some(indices) => indices
+                        .iter()
+                        .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+                        .collect(),
+                };
+                partitioner
+                    .route_distinct(projected)
+                    .map_err(spill_to_exec_err)?;
+            }
+        }
+        let partitions = partitioner.finish().map_err(spill_to_exec_err)?;
+
+        // Phase 2: dedup each partition (recursively re-partitioning any still over
+        // budget). A key's every copy shares a partition, so per-partition dedup is
+        // exact — the union is the global distinct set.
+        let mut rows: Vec<Row> = Vec::new();
+        for (reader, part_bytes) in partitions {
+            rows.extend(self.distinct_partition(reader, part_bytes, budget, &spill, 0)?);
+        }
+
+        if skip > 0 {
+            if skip >= rows.len() {
+                rows.clear();
+            } else {
+                rows.drain(0..skip);
+            }
+        }
+        if let Some(lim) = limit {
+            rows.truncate(lim);
+        }
+
+        Ok(Some(ExecResult::SelectStream {
+            columns,
+            source: Box::new(MaterializedBatchIter::new(rows)),
+        }))
+    }
+
+    /// Dedup one DISTINCT partition, recursively re-partitioning (fresh seed) while
+    /// its raw size exceeds the budget and recursion budget remains. The base case
+    /// streams blocks into a strict `HashSet`, so its memory is `O(distinct rows in
+    /// the partition)` — bounded even for a partition dominated by duplicates.
+    fn distinct_partition(
+        &self,
+        mut reader: SpillReader,
+        part_bytes: u64,
+        budget: u64,
+        ctx: &SpillCtx,
+        depth: usize,
+    ) -> Result<Vec<Row>, ExecError> {
+        if part_bytes <= budget || depth >= MAX_DEPTH {
+            let mut seen: std::collections::HashSet<Row> = std::collections::HashSet::new();
+            while let Some(block) = reader.read_batch().map_err(spill_to_exec_err)? {
+                for row in block {
+                    seen.insert(row);
+                }
+            }
+            Ok(seen.into_iter().collect())
+        } else {
+            let seed = depth as u64 + 1;
+            let mut sub = Partitioner::new(ctx, seed, budget);
+            while let Some(block) = reader.read_batch().map_err(spill_to_exec_err)? {
+                for row in block {
+                    sub.route_distinct(row).map_err(spill_to_exec_err)?;
+                }
+            }
+            let mut out = Vec::new();
+            for (sub_reader, sub_bytes) in sub.finish().map_err(spill_to_exec_err)? {
+                out.extend(self.distinct_partition(sub_reader, sub_bytes, budget, ctx, depth + 1)?);
+            }
+            Ok(out)
+        }
+    }
+
     /// Compute a group key (`Vec<Value>`) for a row — identical to the key
     /// `execute_aggregate` builds, so partitioning and grouping agree.
     fn eval_group_key(
@@ -598,5 +807,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = Partitioner::new(&ctx(dir.path()), 0, 512);
         assert!(p.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn strict_row_hash_matches_equal_rows() {
+        // The only contract the dedup HashSet relies on: equal rows hash equally.
+        // (Whether near-but-unequal values like Int32(5)/Int64(5) collide in a
+        // partition is irrelevant — the strict-Eq HashSet disambiguates within it.)
+        assert_eq!(
+            hash_row_strict(&[Value::Int64(5), Value::Text("a".into())], 2),
+            hash_row_strict(&[Value::Int64(5), Value::Text("a".into())], 2)
+        );
+        assert_ne!(
+            hash_row_strict(&[Value::Int64(5)], 0),
+            hash_row_strict(&[Value::Int64(6)], 0)
+        );
+    }
+
+    #[test]
+    fn distinct_route_colocates_every_copy_of_a_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Partitioner::new(&ctx(dir.path()), 0, 512);
+        for i in 0..1000i64 {
+            let v = i % 20; // 20 distinct rows, each repeated ~50×
+            p.route_distinct(vec![Value::Int64(v), Value::Text(format!("r{v}"))])
+                .unwrap();
+        }
+        let mut row_parts: std::collections::HashMap<i64, std::collections::HashSet<usize>> =
+            std::collections::HashMap::new();
+        for (part_idx, row) in drain_partitions(p.finish().unwrap()) {
+            if let Value::Int64(v) = row[0] {
+                row_parts.entry(v).or_default().insert(part_idx);
+            }
+        }
+        assert_eq!(row_parts.len(), 20);
+        for (v, parts) in row_parts {
+            assert_eq!(parts.len(), 1, "row {v} was split across partitions");
+        }
     }
 }
