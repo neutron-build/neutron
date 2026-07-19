@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveHeadHtml, type HeadRouteEntry } from "./head.js";
+import { resolveHeadHtml, resolveHeadDocument, type HeadRouteEntry } from "./head.js";
 import type { Route, RouteModule } from "./types.js";
 
 function route(id: string, path = "/"): Route {
@@ -96,5 +96,45 @@ describe("resolveHeadHtml", () => {
 
     const withoutNonce = await resolveHeadHtml([entry("page", page)], baseOptions);
     expect(withoutNonce).not.toContain("nonce=");
+  });
+});
+
+describe("resolveHeadDocument", () => {
+  it("returns the merged SEO alongside the head HTML", async () => {
+    const layout: RouteModule = {
+      head: () => ({ htmlAttrs: { lang: "en-CA" }, title: "Site" }),
+    };
+    const page: RouteModule = {
+      head: () => ({ bodyAttrs: { "data-page": "home" } }),
+    };
+    const { headHtml, seo } = await resolveHeadDocument(
+      [entry("layout", layout), entry("page", page)],
+      baseOptions
+    );
+    expect(headHtml).toContain("<title>Site</title>");
+    expect(seo?.htmlAttrs).toEqual({ lang: "en-CA" });
+    expect(seo?.bodyAttrs).toEqual({ "data-page": "home" });
+  });
+
+  it("returns null SEO when no route emits structured head data", async () => {
+    const { seo } = await resolveHeadDocument(
+      [entry("page", { default: () => null })],
+      baseOptions
+    );
+    expect(seo).toBeNull();
+  });
+
+  it("lets the page override layout htmlAttrs per-attribute", async () => {
+    const layout: RouteModule = {
+      head: () => ({ htmlAttrs: { lang: "en", "data-theme": "light" } }),
+    };
+    const page: RouteModule = {
+      head: () => ({ htmlAttrs: { lang: "fr" } }),
+    };
+    const { seo } = await resolveHeadDocument(
+      [entry("layout", layout), entry("page", page)],
+      baseOptions
+    );
+    expect(seo?.htmlAttrs).toEqual({ lang: "fr", "data-theme": "light" });
   });
 });
