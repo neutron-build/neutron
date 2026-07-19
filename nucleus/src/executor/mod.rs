@@ -98,6 +98,7 @@ pub mod param_subst;
 mod policy;
 mod project;
 mod external_sort;
+mod hash_aggregate;
 mod query;
 pub(crate) mod row_batch;
 mod scalar_fns;
@@ -4275,6 +4276,16 @@ impl Executor {
                 // consumers collapse it at the materialization boundary.
                 #[cfg(feature = "server")]
                 if let Some(stream) = self.try_streaming_scan(&query).await? {
+                    return Ok(stream);
+                }
+
+                // Streaming GROUP BY (opt-in + memory limit + spill): bounded-
+                // memory hash aggregation that partitions the input so a large
+                // GROUP BY completes under a budget where the materialized path
+                // would return MemoryExceeded. Falls through (None) for every
+                // shape it does not handle, and never engages without a limit.
+                #[cfg(feature = "server")]
+                if let Some(stream) = self.try_streaming_aggregate(&query).await? {
                     return Ok(stream);
                 }
 
