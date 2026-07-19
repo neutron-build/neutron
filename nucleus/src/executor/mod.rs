@@ -97,6 +97,7 @@ mod meta_persistence;
 pub mod param_subst;
 mod policy;
 mod project;
+mod external_sort;
 mod query;
 pub(crate) mod row_batch;
 mod scalar_fns;
@@ -291,6 +292,16 @@ pub struct Executor {
     cdc_wal: Option<crate::reactive::cdc_wal::CdcWal>,
     /// Optional geo WAL for durable R-tree persistence.
     geo_wal: Option<crate::geo::wal::GeoWal>,
+    /// Live spill manager for bounded-memory blocking operators (external sort,
+    /// Phase 3). `Some` once a data dir is configured; the spill directory is
+    /// swept of crash orphans at construction. Holds the at-rest encryptor when
+    /// the deployment is encrypted so sensitive runs spill ciphertext.
+    #[cfg(feature = "server")]
+    spill_manager: Option<Arc<spill::SpillManager>>,
+    /// True when the storage is encrypted at rest — streamed sort runs are then
+    /// marked `Sensitive` so they spill encrypted (fail-closed without a key).
+    #[cfg(feature = "server")]
+    at_rest_encrypted: bool,
     /// Fault isolation health registry (Principle 6).
     health_registry: Arc<parking_lot::RwLock<HealthRegistry>>,
     /// Live encrypted indexes keyed by index name.
@@ -509,6 +520,10 @@ impl Executor {
             #[cfg(feature = "server")]
             cdc_wal: None,
             geo_wal: None,
+            #[cfg(feature = "server")]
+            spill_manager: None,
+            #[cfg(feature = "server")]
+            at_rest_encrypted: false,
             health_registry: Arc::new(parking_lot::RwLock::new(health)),
             encrypted_indexes: parking_lot::RwLock::new(HashMap::new()),
             graph_store: parking_lot::RwLock::new(GraphStore::new()),
@@ -756,13 +771,18 @@ impl Executor {
             }
 
             // Query spill directory: reclaim any files a crashed process left
-            // behind. Spill files never survive a clean shutdown (their guards
-            // unlink on drop), so anything here at startup is an orphan — the
-            // same crash-cleanup contract as the WAL temp sweep. Phase 3 will
-            // hold a live SpillManager on the executor; here we only sweep.
+            // behind (spill files never survive a clean shutdown — their guards
+            // unlink on drop — so anything here at startup is an orphan, the same
+            // crash-cleanup contract as the WAL temp sweep), then keep the manager
+            // live on the executor so blocking operators (external sort, Phase 3)
+            // can spill. Created without an encryptor; an encrypted deployment
+            // upgrades it via `with_spill_encryptor` so sensitive runs spill
+            // ciphertext. u64::MAX ceiling for now (a configurable disk budget is
+            // a follow-up); the budget still tracks usage, it just never denies.
             let spill_dir = dir.join("spill");
             if let Ok(mgr) = spill::SpillManager::new(&spill_dir, u64::MAX, None) {
                 let _ = mgr.sweep_orphans();
+                exec.spill_manager = Some(std::sync::Arc::new(mgr));
             }
         }
 
@@ -1463,6 +1483,48 @@ impl Executor {
         self
     }
 
+    /// Equip the spill manager with the at-rest encryptor (builder form). Called
+    /// by the server bootstrap when `--encrypt` is on, so blocking operators that
+    /// spill rows from encrypted storage write ciphertext, and mark the deployment
+    /// encrypted so streamed sort runs are treated as `Sensitive`. No-op if no
+    /// spill directory was configured.
+    #[cfg(feature = "server")]
+    pub fn with_spill_encryptor(
+        mut self,
+        encryptor: crate::storage::encryption::PageEncryptor,
+    ) -> Self {
+        self.at_rest_encrypted = true;
+        if let Some(old) = self.spill_manager.take() {
+            // Rebuild the manager over the same directory, now with the key. The
+            // orphan sweep already ran at construction; the dir path is stable.
+            if let Ok(mgr) = spill::SpillManager::new(old.dir(), u64::MAX, Some(encryptor)) {
+                self.spill_manager = Some(std::sync::Arc::new(mgr));
+            } else {
+                self.spill_manager = Some(old);
+            }
+        }
+        self
+    }
+
+    /// Build the spill context for a streamed blocking operator, or `None` when no
+    /// spill directory is configured (spill disabled → operator stays in memory,
+    /// bounded by the run budget, or returns MemoryExceeded). Runs are marked
+    /// `Sensitive` iff the deployment is encrypted at rest.
+    #[cfg(feature = "server")]
+    fn sort_spill_ctx(&self, owner: &str) -> Option<external_sort::SpillCtx> {
+        let manager = std::sync::Arc::clone(self.spill_manager.as_ref()?);
+        let sensitivity = if self.at_rest_encrypted {
+            spill::Sensitivity::Sensitive
+        } else {
+            spill::Sensitivity::Plain
+        };
+        Some(external_sort::SpillCtx {
+            manager,
+            sensitivity,
+            owner: owner.to_string(),
+        })
+    }
+
     /// Set the query execution memory budget after construction (T1.2). The
     /// executor is shared behind an `Arc` by the time config is applied, so the
     /// consuming builder above can't be used; this drives the same budget the
@@ -1743,26 +1805,9 @@ impl Executor {
 
     /// Estimate memory consumption of a row (rough, fast).
     fn estimate_row_bytes(row: &Row) -> u64 {
-        let mut bytes: u64 = 24; // Vec overhead
-        for v in row {
-            bytes += match v {
-                Value::Null | Value::Bool(_) => 1,
-                Value::Int32(_) | Value::Date(_) => 4,
-                Value::Int64(_)
-                | Value::Float64(_)
-                | Value::Timestamp(_)
-                | Value::TimestampTz(_) => 8,
-                Value::Text(s) => 24 + s.len() as u64,
-                Value::Numeric(s) => 24 + s.len() as u64,
-                Value::Uuid(_) => 16,
-                Value::Bytea(b) => 24 + b.len() as u64,
-                Value::Array(a) => 24 + a.len() as u64 * 16,
-                Value::Vector(v) => 24 + v.len() as u64 * 4,
-                Value::Jsonb(_) => 64,
-                Value::Interval { .. } => 16,
-            };
-        }
-        bytes
+        // Single source of truth in helpers so the streaming external sort's run
+        // sizing accounts bytes identically to the query-memory budget.
+        helpers::estimate_row_bytes(row)
     }
 
     /// Estimate the combined in-memory footprint of a slice of rows.

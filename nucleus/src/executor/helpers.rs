@@ -534,6 +534,86 @@ fn parse_uuid_text(s: &str) -> Option<[u8; 16]> {
 
 /// Compare two values for ORDER BY, respecting NULLS FIRST / NULLS LAST and ASC / DESC.
 /// PostgreSQL default: NULLS LAST for ASC, NULLS FIRST for DESC.
+/// Estimate the in-memory footprint of one row (mirrors the cost model the
+/// query-memory budget reserves against). Shared by `Executor::estimate_row_bytes`
+/// and the streaming external sort so their byte accounting can never drift.
+pub(super) fn estimate_row_bytes(row: &Row) -> u64 {
+    let mut bytes: u64 = 24; // Vec overhead
+    for v in row {
+        bytes += match v {
+            Value::Null | Value::Bool(_) => 1,
+            Value::Int32(_) | Value::Date(_) => 4,
+            Value::Int64(_)
+            | Value::Float64(_)
+            | Value::Timestamp(_)
+            | Value::TimestampTz(_) => 8,
+            Value::Text(s) => 24 + s.len() as u64,
+            Value::Numeric(s) => 24 + s.len() as u64,
+            Value::Uuid(_) => 16,
+            Value::Bytea(b) => 24 + b.len() as u64,
+            Value::Array(a) => 24 + a.len() as u64 * 16,
+            Value::Vector(v) => 24 + v.len() as u64 * 4,
+            Value::Jsonb(_) => 64,
+            Value::Interval { .. } => 16,
+        };
+    }
+    bytes
+}
+
+/// Compare two values for ORDER BY on one key. This is the single source of truth
+/// for sort-key ordering — byte-identical to the plan-path Sort arm's per-key
+/// comparison (NULLS placement first, then `Value::cmp` reversed for DESC) — so
+/// the materialized in-place sort and the streaming external sort produce
+/// identical row order. `desc`/`nulls_first` follow the SQL defaults resolved by
+/// the caller (ASC→NULLS LAST, DESC→NULLS FIRST).
+pub(super) fn cmp_sort_key(
+    a: &Value,
+    b: &Value,
+    desc: bool,
+    nulls_first: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let a_null = matches!(a, Value::Null);
+    let b_null = matches!(b, Value::Null);
+    match (a_null, b_null) {
+        (true, true) => Ordering::Equal,
+        (true, false) => {
+            if nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (false, true) => {
+            if nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (false, false) => {
+            let cmp = a.cmp(b);
+            if desc { cmp.reverse() } else { cmp }
+        }
+    }
+}
+
+/// Multi-key row comparison for ORDER BY: compare `a` and `b` by each
+/// `(col_idx, desc, nulls_first)` key in order, first non-equal key decides.
+/// Combined with a stable sort/merge this reproduces the plan-path Sort arm's
+/// repeated per-key stable sort exactly.
+pub(super) fn cmp_row_sort_keys(a: &Row, b: &Row, keys: &[(usize, bool, bool)]) -> std::cmp::Ordering {
+    for &(idx, desc, nulls_first) in keys {
+        let va = a.get(idx).unwrap_or(&Value::Null);
+        let vb = b.get(idx).unwrap_or(&Value::Null);
+        let ord = cmp_sort_key(va, vb, desc, nulls_first);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 pub(super) fn cmp_with_nulls(
     va: &Value,
     vb: &Value,

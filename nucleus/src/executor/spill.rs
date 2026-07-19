@@ -271,6 +271,11 @@ impl SpillManager {
         &self.budget
     }
 
+    /// The spill directory this manager owns.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Delete every spill file left in the directory. Since spill files never
     /// survive a clean shutdown (writer/reader guards unlink on drop), any file
     /// matching the spill naming scheme at startup is an orphan from a crashed
