@@ -96,6 +96,99 @@ fn spawn_producer(
     }
 }
 
+/// Streaming projection (Phase 2): narrows each row to `indices`, in that order.
+/// Column count/order is unaffected by row count, so this composes freely with
+/// [`LimitBatchIter`]. Missing indices (should not happen for a validated
+/// projection) yield NULL rather than panicking.
+pub(super) struct ProjectBatchIter {
+    inner: Box<dyn RowBatchIter>,
+    indices: Vec<usize>,
+}
+
+impl ProjectBatchIter {
+    pub(super) fn new(inner: Box<dyn RowBatchIter>, indices: Vec<usize>) -> Self {
+        Self { inner, indices }
+    }
+}
+
+#[async_trait::async_trait]
+impl RowBatchIter for ProjectBatchIter {
+    async fn next_batch(&mut self) -> Result<Option<Vec<Row>>, ExecError> {
+        match self.inner.next_batch().await? {
+            Some(batch) => Ok(Some(
+                batch
+                    .into_iter()
+                    .map(|row| {
+                        self.indices
+                            .iter()
+                            .map(|&i| row.get(i).cloned().unwrap_or(crate::types::Value::Null))
+                            .collect()
+                    })
+                    .collect(),
+            )),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Streaming OFFSET + LIMIT (Phase 2): skips `skip` rows then yields at most
+/// `remaining` rows across batches, returning `None` as soon as the limit is
+/// reached. Reaching the limit drops the upstream iterator, so a streaming disk
+/// scan stops fetching pages early — the streaming form of the LIMIT early-exit.
+pub(super) struct LimitBatchIter {
+    inner: Box<dyn RowBatchIter>,
+    skip: usize,
+    /// `None` = unbounded (OFFSET with no LIMIT); `Some(n)` = at most n more rows.
+    remaining: Option<usize>,
+}
+
+impl LimitBatchIter {
+    pub(super) fn new(inner: Box<dyn RowBatchIter>, skip: usize, limit: Option<usize>) -> Self {
+        Self {
+            inner,
+            skip,
+            remaining: limit,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RowBatchIter for LimitBatchIter {
+    async fn next_batch(&mut self) -> Result<Option<Vec<Row>>, ExecError> {
+        loop {
+            if self.remaining == Some(0) {
+                return Ok(None);
+            }
+            let mut batch = match self.inner.next_batch().await? {
+                Some(b) => b,
+                None => return Ok(None),
+            };
+            // Apply the remaining OFFSET, consuming whole batches if needed.
+            if self.skip > 0 {
+                if self.skip >= batch.len() {
+                    self.skip -= batch.len();
+                    continue;
+                }
+                batch.drain(0..self.skip);
+                self.skip = 0;
+            }
+            // Apply the LIMIT.
+            if let Some(rem) = self.remaining {
+                if batch.len() >= rem {
+                    batch.truncate(rem);
+                    self.remaining = Some(0);
+                } else {
+                    self.remaining = Some(rem - batch.len());
+                }
+            }
+            if batch.is_empty() {
+                continue;
+            }
+            return Ok(Some(batch));
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl RowBatchIter for ChunkedScanIter {
     async fn next_batch(&mut self) -> Result<Option<Vec<Row>>, ExecError> {
@@ -205,5 +298,69 @@ mod tests {
         let storage: Arc<dyn StorageEngine> = engine;
         let mut it = ChunkedScanIter::new(storage, "does_not_exist".to_string(), 512);
         assert!(it.next_batch().await.is_err());
+    }
+
+    use super::super::row_batch::MaterializedBatchIter;
+
+    fn ints(vals: &[i64]) -> Vec<Row> {
+        vals.iter()
+            .map(|&i| vec![Value::Int64(i), Value::Text(format!("v{i}"))])
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn projection_narrows_columns_in_order() {
+        // Project [col1, col0] (reversed) over 2-column rows.
+        let src = Box::new(MaterializedBatchIter::with_batch_size(ints(&[1, 2, 3]), 2));
+        let mut p = ProjectBatchIter::new(src, vec![1, 0]);
+        let out = p.collect().await.unwrap();
+        assert_eq!(
+            out,
+            vec![
+                vec![Value::Text("v1".into()), Value::Int64(1)],
+                vec![Value::Text("v2".into()), Value::Int64(2)],
+                vec![Value::Text("v3".into()), Value::Int64(3)],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_offset_across_batches() {
+        // 10 rows in batches of 3; OFFSET 2 LIMIT 5 -> rows 2..7.
+        let src = Box::new(MaterializedBatchIter::with_batch_size(
+            ints(&(0..10).collect::<Vec<_>>()),
+            3,
+        ));
+        let mut l = LimitBatchIter::new(src, 2, Some(5));
+        let out = l.collect().await.unwrap();
+        let ids: Vec<i64> = out
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int64(n) => n,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(ids, vec![2, 3, 4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn limit_zero_yields_nothing() {
+        let src = Box::new(MaterializedBatchIter::new(ints(&[1, 2, 3])));
+        let mut l = LimitBatchIter::new(src, 0, Some(0));
+        assert!(l.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn offset_past_end_is_empty() {
+        let src = Box::new(MaterializedBatchIter::new(ints(&[1, 2, 3])));
+        let mut l = LimitBatchIter::new(src, 100, None);
+        assert!(l.collect().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn offset_only_no_limit() {
+        let src = Box::new(MaterializedBatchIter::with_batch_size(ints(&[1, 2, 3, 4]), 2));
+        let mut l = LimitBatchIter::new(src, 1, None);
+        assert_eq!(l.collect().await.unwrap().len(), 3);
     }
 }

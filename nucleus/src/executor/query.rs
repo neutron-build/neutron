@@ -702,13 +702,14 @@ impl Executor {
     // Plan-driven execution
     // ========================================================================
 
-    /// Streaming producer for the trivially-safe scan shape (Phase 1.1).
+    /// Streaming producer for the safe scan shape (Phase 1.1 + Phase 2 project/limit).
     ///
-    /// Returns `Some(SelectStream)` only for a bare `SELECT * FROM <base table>`
-    /// with no WHERE / join / GROUP BY / HAVING / DISTINCT / ORDER BY / LIMIT /
-    /// OFFSET / FETCH / CTE, and only when the session opted in via
-    /// `SET stream_results = on`. Every other shape returns `None` and falls
-    /// through to the normal materialized path.
+    /// Returns `Some(SelectStream)` for `SELECT <*|bare columns> FROM <base table>
+    /// [LIMIT n] [OFFSET m]` — no WHERE / join / GROUP BY / HAVING / DISTINCT /
+    /// ORDER BY / FETCH / CTE, and only when the session opted in via
+    /// `SET stream_results = on`. Projection and OFFSET/LIMIT are applied by
+    /// streaming adapters over the scan. Every other shape returns `None` and
+    /// falls through to the normal materialized path.
     ///
     /// Correctness: this streams `scan_chunked`, which bottoms out in the engine
     /// `scan()` — recording SIREAD on all visible rows, exactly the read set the
@@ -741,12 +742,9 @@ impl Executor {
             return Ok(None);
         }
 
-        // No CTEs / ORDER BY / LIMIT / OFFSET / FETCH at the query level.
-        if query.with.is_some()
-            || query.order_by.is_some()
-            || query.limit_clause.is_some()
-            || query.fetch.is_some()
-        {
+        // No CTEs / ORDER BY / FETCH. LIMIT/OFFSET are allowed (applied by a
+        // streaming adapter); ORDER BY is not (streaming can't sort).
+        if query.with.is_some() || query.order_by.is_some() || query.fetch.is_some() {
             return Ok(None);
         }
 
@@ -754,20 +752,8 @@ impl Executor {
             return Ok(None);
         };
 
-        // Exactly one *plain* wildcard — `* EXCEPT/REPLACE/RENAME/ILIKE/EXCLUDE`
-        // would change the column set, so it is not a bare scan.
-        let plain_star = select.projection.len() == 1
-            && matches!(&select.projection[0], SelectItem::Wildcard(opts)
-                if opts.opt_ilike.is_none()
-                    && opts.opt_exclude.is_none()
-                    && opts.opt_except.is_none()
-                    && opts.opt_replace.is_none()
-                    && opts.opt_rename.is_none());
-        if !plain_star {
-            return Ok(None);
-        }
-
-        // Single base table, no joins, and none of the row-shaping clauses.
+        // Single base table, no joins, and none of the row-shaping clauses that
+        // this streaming path does not handle (predicate/grouping/distinct).
         if select.from.len() != 1
             || !select.from[0].joins.is_empty()
             || select.selection.is_some()
@@ -812,17 +798,114 @@ impl Executor {
             return Ok(None);
         };
 
-        let columns: Vec<(String, DataType)> = table_def
-            .columns
-            .iter()
-            .map(|c| (c.name.clone(), c.data_type.clone()))
-            .collect();
+        // Projection: either a plain `*` (all columns) or a list of bare column
+        // identifiers. Anything computed (expressions, functions, qualified refs,
+        // `* EXCEPT`, …) falls back to the materialized path.
+        let (columns, proj_indices): (Vec<(String, DataType)>, Option<Vec<usize>>) = {
+            let is_plain_star = select.projection.len() == 1
+                && matches!(&select.projection[0], SelectItem::Wildcard(opts)
+                    if opts.opt_ilike.is_none()
+                        && opts.opt_exclude.is_none()
+                        && opts.opt_except.is_none()
+                        && opts.opt_replace.is_none()
+                        && opts.opt_rename.is_none());
+            if is_plain_star {
+                (
+                    table_def
+                        .columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.data_type.clone()))
+                        .collect(),
+                    None,
+                )
+            } else {
+                let mut cols = Vec::with_capacity(select.projection.len());
+                let mut indices = Vec::with_capacity(select.projection.len());
+                for item in &select.projection {
+                    // Accept `col` and `col AS alias`; reject everything else.
+                    let (ident, out_alias) = match item {
+                        SelectItem::UnnamedExpr(Expr::Identifier(id)) => (id, None),
+                        SelectItem::ExprWithAlias {
+                            expr: Expr::Identifier(id),
+                            alias,
+                        } => (id, Some(alias.value.clone())),
+                        _ => return Ok(None),
+                    };
+                    let Some(idx) = table_def
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
+                    else {
+                        // Unresolved column: let the normal path raise the error.
+                        return Ok(None);
+                    };
+                    let col = &table_def.columns[idx];
+                    // Unaliased output name is the catalog column name (as the
+                    // materialized path emits it); an explicit alias overrides it.
+                    cols.push((out_alias.unwrap_or_else(|| col.name.clone()), col.data_type.clone()));
+                    indices.push(idx);
+                }
+                (cols, Some(indices))
+            }
+        };
+
+        // LIMIT / OFFSET: only static integer bounds stream; a parameter or
+        // expression bound falls back to the materialized path.
+        let (skip, limit): (usize, Option<usize>) = match &query.limit_clause {
+            None => (0, None),
+            Some(ast::LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            }) => {
+                if !limit_by.is_empty() {
+                    return Ok(None); // LIMIT ... BY (ClickHouse) not handled here
+                }
+                let off = match offset {
+                    Some(o) => match self.expr_to_usize(&o.value) {
+                        Ok(n) => n,
+                        Err(_) => return Ok(None),
+                    },
+                    None => 0,
+                };
+                let lim = match limit {
+                    Some(e) => match self.expr_to_usize(e) {
+                        Ok(n) => Some(n),
+                        Err(_) => return Ok(None),
+                    },
+                    None => None,
+                };
+                (off, lim)
+            }
+            Some(ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
+                let off = match self.expr_to_usize(offset) {
+                    Ok(n) => n,
+                    Err(_) => return Ok(None),
+                };
+                let lim = match self.expr_to_usize(limit) {
+                    Ok(n) => Some(n),
+                    Err(_) => return Ok(None),
+                };
+                (off, lim)
+            }
+        };
+
+        // Compose the pipeline: scan -> [OFFSET/LIMIT] -> [projection].
+        // LIMIT is applied over full rows (inner) and projection narrows columns
+        // (outer); order between them does not affect the result.
         let storage = self.storage_for(&table_name);
-        let source = Box::new(super::scan_stream::ChunkedScanIter::new(
-            storage,
-            table_name,
-            super::scan_stream::DEFAULT_STREAM_BATCH_ROWS,
-        ));
+        let mut source: Box<dyn super::row_batch::RowBatchIter> =
+            Box::new(super::scan_stream::ChunkedScanIter::new(
+                storage,
+                table_name,
+                super::scan_stream::DEFAULT_STREAM_BATCH_ROWS,
+            ));
+        if skip > 0 || limit.is_some() {
+            source = Box::new(super::scan_stream::LimitBatchIter::new(source, skip, limit));
+        }
+        if let Some(indices) = proj_indices {
+            source = Box::new(super::scan_stream::ProjectBatchIter::new(source, indices));
+        }
         Ok(Some(ExecResult::SelectStream { columns, source }))
     }
 
