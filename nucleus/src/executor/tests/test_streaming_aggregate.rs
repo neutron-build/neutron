@@ -232,7 +232,6 @@ async fn streaming_aggregate_engages_only_when_warranted() {
         "SELECT k, COUNT(*) FROM t WHERE v > 10 GROUP BY k", // predicate
         "SELECT k, COUNT(*) FROM t GROUP BY k ORDER BY k",   // ORDER BY over output
         "SELECT COUNT(*) FROM t",                            // no GROUP BY
-        "SELECT DISTINCT k FROM t",                          // DISTINCT
         "SELECT k, COUNT(*) FROM t GROUP BY ROLLUP(k)",      // grouping set
     ] {
         ex.query_cache_invalidate_all();
@@ -267,4 +266,164 @@ async fn no_spill_dir_keeps_group_by_materialized() {
     assert!(!r.is_stream(), "no spill dir → must not stream the aggregate");
     let (_, rows) = drain(r).await;
     assert_eq!(rows.len(), 2);
+}
+
+// ============================================================================
+// Streaming DISTINCT (dedup by strict row equality, partition + spill).
+// ============================================================================
+
+/// Seed `n` rows into `d(k BIGINT, name TEXT, payload TEXT)` with `distinct_rows`
+/// distinct (k, name) pairs — i.e. heavy duplication so DISTINCT is a real
+/// reduction — and a padded payload so the working set dwarfs a small budget.
+async fn seed_distinct(ex: &Executor, sid: u64, n: usize, distinct_rows: i64) {
+    ex.execute_with_session(sid, "CREATE TABLE d (k BIGINT, name TEXT, payload TEXT)")
+        .await
+        .unwrap();
+    let pad = "y".repeat(180);
+    let mut vals = String::new();
+    for i in 0..n {
+        if i > 0 {
+            vals.push(',');
+        }
+        let k = (i as i64) % distinct_rows;
+        vals.push_str(&format!("({k}, 'n{k}', '{pad}')"));
+    }
+    ex.execute_with_session(sid, &format!("INSERT INTO d VALUES {vals}"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn streaming_distinct_spills_and_matches_materialized() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = persistent_executor(dir.path());
+    let sid = ex.create_session();
+    seed_distinct(&ex, sid, 3000, 40).await; // 40 distinct (k,name), ~600 KB raw
+
+    let cases = [
+        "SELECT DISTINCT k FROM d",
+        "SELECT DISTINCT k, name FROM d",
+        "SELECT DISTINCT name AS n FROM d",
+        "SELECT DISTINCT k, name FROM d LIMIT 7",
+    ];
+
+    for sql in cases {
+        ex.set_query_memory_limit(0);
+        ex.execute_with_session(sid, "SET stream_results = off")
+            .await
+            .unwrap();
+        ex.query_cache_invalidate_all();
+        let (base_cols, base_rows) = drain(one_result(&ex, sid, sql).await).await;
+
+        ex.query_cache_invalidate_all();
+        ex.set_query_memory_limit(48 * 1024);
+        ex.execute_with_session(sid, "SET stream_results = on")
+            .await
+            .unwrap();
+        let streamed = one_result(&ex, sid, sql).await;
+        assert!(streamed.is_stream(), "DISTINCT should stream: {sql}");
+        let (stream_cols, stream_rows) = drain(streamed).await;
+
+        assert_eq!(stream_cols, base_cols, "columns mismatch for: {sql}");
+        if sql.contains("LIMIT") {
+            assert_eq!(stream_rows.len(), 7, "LIMIT row count for: {sql}");
+            ex.set_query_memory_limit(0);
+            ex.execute_with_session(sid, "SET stream_results = off")
+                .await
+                .unwrap();
+            ex.query_cache_invalidate_all();
+            let (_, full) =
+                drain(one_result(&ex, sid, "SELECT DISTINCT k, name FROM d").await).await;
+            let full_set: std::collections::HashSet<String> =
+                as_multiset(&full).into_iter().collect();
+            for r in &stream_rows {
+                assert!(full_set.contains(&format!("{r:?}")), "spurious distinct row: {sql}");
+            }
+        } else {
+            assert_eq!(
+                as_multiset(&stream_rows),
+                as_multiset(&base_rows),
+                "distinct set mismatch for: {sql}"
+            );
+        }
+    }
+
+    let leftover = std::fs::read_dir(dir.path().join("spill"))
+        .map(|rd| rd.count())
+        .unwrap_or(0);
+    assert_eq!(leftover, 0, "spill files must be reclaimed after DISTINCT");
+}
+
+/// High distinct-cardinality with a tiny budget forces recursive re-partitioning;
+/// the deduped set must still equal the materialized DISTINCT.
+#[tokio::test]
+async fn streaming_distinct_high_cardinality_recurses_and_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = persistent_executor(dir.path());
+    let sid = ex.create_session();
+    seed_distinct(&ex, sid, 4000, 1000).await; // 1000 distinct rows
+
+    let sql = "SELECT DISTINCT k, name FROM d";
+
+    ex.set_query_memory_limit(0);
+    ex.execute_with_session(sid, "SET stream_results = off")
+        .await
+        .unwrap();
+    let (base_cols, base_rows) = drain(one_result(&ex, sid, sql).await).await;
+    assert_eq!(base_rows.len(), 1000, "sanity: 1000 distinct rows");
+
+    ex.query_cache_invalidate_all();
+    ex.set_query_memory_limit(8 * 1024);
+    ex.execute_with_session(sid, "SET stream_results = on")
+        .await
+        .unwrap();
+    let streamed = one_result(&ex, sid, sql).await;
+    assert!(streamed.is_stream());
+    let (stream_cols, stream_rows) = drain(streamed).await;
+
+    assert_eq!(stream_cols, base_cols);
+    assert_eq!(stream_rows.len(), 1000, "all distinct rows present after recursion");
+    assert_eq!(as_multiset(&stream_rows), as_multiset(&base_rows));
+
+    let leftover = std::fs::read_dir(dir.path().join("spill"))
+        .map(|rd| rd.count())
+        .unwrap_or(0);
+    assert_eq!(leftover, 0, "spill files reclaimed after DISTINCT recursion");
+}
+
+/// The streaming DISTINCT must decline shapes it does not handle (falling through
+/// to the materialized path): no budget, DISTINCT ON, WHERE, computed projection,
+/// ORDER BY.
+#[tokio::test]
+async fn streaming_distinct_engages_only_when_warranted() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = persistent_executor(dir.path());
+    let sid = ex.create_session();
+    seed_distinct(&ex, sid, 200, 10).await;
+    ex.execute_with_session(sid, "SET stream_results = on")
+        .await
+        .unwrap();
+
+    // No budget: does not stream.
+    ex.set_query_memory_limit(0);
+    assert!(
+        !one_result(&ex, sid, "SELECT DISTINCT k FROM d")
+            .await
+            .is_stream(),
+        "DISTINCT must not stream without a memory budget"
+    );
+
+    ex.set_query_memory_limit(48 * 1024);
+    for sql in [
+        "SELECT DISTINCT ON (k) k, name FROM d ORDER BY k", // DISTINCT ON
+        "SELECT DISTINCT k FROM d WHERE k > 2",             // predicate
+        "SELECT DISTINCT k + 1 FROM d",                     // computed projection
+        "SELECT DISTINCT k FROM d ORDER BY k",              // ORDER BY over output
+    ] {
+        ex.query_cache_invalidate_all();
+        if let Ok(mut results) = ex.execute_with_session(sid, sql).await {
+            let r = results.pop().unwrap();
+            assert!(!r.is_stream(), "shape must not stream via DISTINCT: {sql}");
+        }
+    }
 }

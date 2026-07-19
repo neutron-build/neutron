@@ -4289,6 +4289,15 @@ impl Executor {
                     return Ok(stream);
                 }
 
+                // Streaming DISTINCT (opt-in + memory limit + spill): bounded-
+                // memory dedup that partitions projected rows by strict row hash,
+                // so a large SELECT DISTINCT completes under a budget. Falls
+                // through (None) for every shape it does not handle.
+                #[cfg(feature = "server")]
+                if let Some(stream) = self.try_streaming_distinct(&query).await? {
+                    return Ok(stream);
+                }
+
                 // Query result cache: check for a cached result before executing.
                 // Only cache deterministic SELECT queries (no RANDOM(), NOW(), etc.)
                 // and only outside of transactions.

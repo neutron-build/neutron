@@ -773,6 +773,64 @@ impl Executor {
         Ok(Some(parsed))
     }
 
+    /// Resolve a SELECT projection for a streaming path over `table_def`: either a
+    /// plain `*` (returns `(all columns, None)` — no narrowing) or a list of bare
+    /// column identifiers / `col AS alias` (returns `(output columns, Some(source
+    /// indices))`). Returns `None` for anything computed (expressions, functions,
+    /// qualified refs, `* EXCEPT/REPLACE/…`, or an unresolved column) so the caller
+    /// falls back to the materialized path. Shared by the streaming scan and
+    /// streaming DISTINCT producers.
+    #[cfg(feature = "server")]
+    pub(super) fn resolve_bare_projection(
+        &self,
+        select: &ast::Select,
+        table_def: &crate::catalog::TableDef,
+    ) -> Option<super::types::StreamProjection> {
+        let is_plain_star = select.projection.len() == 1
+            && matches!(&select.projection[0], SelectItem::Wildcard(opts)
+                if opts.opt_ilike.is_none()
+                    && opts.opt_exclude.is_none()
+                    && opts.opt_except.is_none()
+                    && opts.opt_replace.is_none()
+                    && opts.opt_rename.is_none());
+        if is_plain_star {
+            return Some((
+                table_def
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.data_type.clone()))
+                    .collect(),
+                None,
+            ));
+        }
+        let mut cols = Vec::with_capacity(select.projection.len());
+        let mut indices = Vec::with_capacity(select.projection.len());
+        for item in &select.projection {
+            // Accept `col` and `col AS alias`; reject everything else.
+            let (ident, out_alias) = match item {
+                SelectItem::UnnamedExpr(Expr::Identifier(id)) => (id, None),
+                SelectItem::ExprWithAlias {
+                    expr: Expr::Identifier(id),
+                    alias,
+                } => (id, Some(alias.value.clone())),
+                _ => return None,
+            };
+            let idx = table_def
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(&ident.value))?;
+            let col = &table_def.columns[idx];
+            // Unaliased output name is the catalog column name (as the materialized
+            // path emits it); an explicit alias overrides it.
+            cols.push((
+                out_alias.unwrap_or_else(|| col.name.clone()),
+                col.data_type.clone(),
+            ));
+            indices.push(idx);
+        }
+        Some((cols, Some(indices)))
+    }
+
     #[cfg(feature = "server")]
     pub(super) async fn try_streaming_scan(
         &self,
@@ -851,54 +909,9 @@ impl Executor {
         };
 
         // Projection: either a plain `*` (all columns) or a list of bare column
-        // identifiers. Anything computed (expressions, functions, qualified refs,
-        // `* EXCEPT`, …) falls back to the materialized path.
-        let (columns, proj_indices): (Vec<(String, DataType)>, Option<Vec<usize>>) = {
-            let is_plain_star = select.projection.len() == 1
-                && matches!(&select.projection[0], SelectItem::Wildcard(opts)
-                    if opts.opt_ilike.is_none()
-                        && opts.opt_exclude.is_none()
-                        && opts.opt_except.is_none()
-                        && opts.opt_replace.is_none()
-                        && opts.opt_rename.is_none());
-            if is_plain_star {
-                (
-                    table_def
-                        .columns
-                        .iter()
-                        .map(|c| (c.name.clone(), c.data_type.clone()))
-                        .collect(),
-                    None,
-                )
-            } else {
-                let mut cols = Vec::with_capacity(select.projection.len());
-                let mut indices = Vec::with_capacity(select.projection.len());
-                for item in &select.projection {
-                    // Accept `col` and `col AS alias`; reject everything else.
-                    let (ident, out_alias) = match item {
-                        SelectItem::UnnamedExpr(Expr::Identifier(id)) => (id, None),
-                        SelectItem::ExprWithAlias {
-                            expr: Expr::Identifier(id),
-                            alias,
-                        } => (id, Some(alias.value.clone())),
-                        _ => return Ok(None),
-                    };
-                    let Some(idx) = table_def
-                        .columns
-                        .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
-                    else {
-                        // Unresolved column: let the normal path raise the error.
-                        return Ok(None);
-                    };
-                    let col = &table_def.columns[idx];
-                    // Unaliased output name is the catalog column name (as the
-                    // materialized path emits it); an explicit alias overrides it.
-                    cols.push((out_alias.unwrap_or_else(|| col.name.clone()), col.data_type.clone()));
-                    indices.push(idx);
-                }
-                (cols, Some(indices))
-            }
+        // identifiers. Anything computed falls back to the materialized path.
+        let Some((columns, proj_indices)) = self.resolve_bare_projection(select, &table_def) else {
+            return Ok(None);
         };
 
         // LIMIT / OFFSET: only static integer bounds stream; a parameter or
