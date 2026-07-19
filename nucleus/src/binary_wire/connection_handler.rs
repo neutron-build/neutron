@@ -434,6 +434,13 @@ impl ConnectionHandler {
 
     /// Send an ExecResult as binary protocol frames.
     async fn send_exec_result(&mut self, result: ExecResult) -> std::io::Result<()> {
+        // The binary wire has no streaming frame path; collapse any lazy stream
+        // to its materialized form first (a no-op for non-streams). This makes
+        // the stream arms below genuinely unreachable rather than a latent panic.
+        let result = result
+            .materialize()
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         match result {
             ExecResult::Select { columns, rows } => {
                 // Send column metadata
@@ -486,8 +493,8 @@ impl ConnectionHandler {
             }
             // The executor materializes results at its dispatch boundary before
             // they reach the binary wire; direct streaming is Phase 4.
-            ExecResult::SelectStream { .. } => unreachable!(
-                "SelectStream must be materialized before the binary wire handler"
+            ExecResult::SelectStream { .. } | ExecResult::CopyOutStream { .. } => unreachable!(
+                "streams are materialized at the top of send_exec_result"
             ),
         }
         Ok(())

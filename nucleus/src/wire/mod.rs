@@ -894,6 +894,12 @@ impl NucleusHandler {
                 });
                 Ok(Response::Query(QueryResponse::new(schema, data_row_stream)))
             }
+            // Streaming COPY is intercepted and sent inline in the simple-query
+            // loop (it needs the client sink); a non-wire caller materializes it
+            // to CopyOut first, so build_response never legitimately sees it.
+            ExecResult::CopyOutStream { .. } => Err(PgWireError::ApiError(
+                "streaming COPY must be sent inline, not via build_response".into(),
+            )),
         }
     }
 
@@ -1561,6 +1567,67 @@ impl SimpleQueryHandler for NucleusHandler {
                 self.flush_pending_notifications(client).await?;
                 return Ok(vec![]);
             }
+            // Streaming COPY TO STDOUT: pull row batches and format+send each as
+            // CopyData, so a full-table export never buffers the whole table.
+            // Byte-identical to the materialized CopyOut path (shared formatters).
+            if let crate::executor::ExecResult::CopyOutStream {
+                mut source,
+                columns,
+                is_csv,
+                delimiter,
+                include_header,
+            } = result
+            {
+                use crate::executor::copy::{format_copy_body, format_copy_header};
+                use pgwire::api::copy::send_copy_out_response;
+                const CHUNK_SIZE: usize = 65_536;
+                send_copy_out_response(client, CopyResponse::new(0, 0, vec![])).await?;
+
+                // Emit the CSV header (if any) as the first CopyData payload.
+                if include_header {
+                    let header = format_copy_header(&columns, is_csv, delimiter);
+                    if !header.is_empty() {
+                        bytes_estimate += header.len() as u64;
+                        for chunk in header.into_bytes().chunks(CHUNK_SIZE) {
+                            client
+                                .send(PgWireBackendMessage::CopyData(CopyData::new(
+                                    bytes::Bytes::copy_from_slice(chunk),
+                                )))
+                                .await?;
+                        }
+                    }
+                }
+                let mut row_count = 0usize;
+                loop {
+                    match source.next_batch().await {
+                        Ok(Some(batch)) => {
+                            row_count += batch.len();
+                            let payload = format_copy_body(&batch, is_csv, delimiter);
+                            bytes_estimate += payload.len() as u64;
+                            for chunk in payload.into_bytes().chunks(CHUNK_SIZE) {
+                                client
+                                    .send(PgWireBackendMessage::CopyData(CopyData::new(
+                                        bytes::Bytes::copy_from_slice(chunk),
+                                    )))
+                                    .await?;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => return Err(exec_error_to_pgwire(e)),
+                    }
+                }
+                client
+                    .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
+                    .await?;
+                client
+                    .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                        format!("COPY {row_count}"),
+                    )))
+                    .await?;
+                self.executor.metrics().bytes_sent.inc_by(bytes_estimate);
+                self.flush_pending_notifications(client).await?;
+                return Ok(vec![]);
+            }
             // Approximate wire bytes: count rows * avg 64 bytes per row + header
             bytes_estimate += Self::estimate_result_bytes(&result);
             responses.push(Self::build_response(result, None)?);
@@ -1910,6 +1977,7 @@ impl NucleusHandler {
             ExecResult::CopyOut { data, .. } => data.len() as u64,
             // Row count unknown until drained; estimate from the header only.
             ExecResult::SelectStream { columns, .. } => columns.len() as u64 * 32,
+            ExecResult::CopyOutStream { columns, .. } => columns.len() as u64 * 32,
         }
     }
 
