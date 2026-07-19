@@ -2,7 +2,7 @@
 //! results identical to the materialized path for the bare-scan shape, and must
 //! NOT engage for any other shape.
 
-use super::super::{ExecResult, Executor};
+use super::super::{ExecError, ExecResult, Executor};
 use super::test_executor;
 use crate::types::Row;
 
@@ -89,7 +89,9 @@ async fn unsupported_shapes_do_not_stream() {
     // distinct/CTE, computed or qualified projections). The materialized path runs.
     for sql in [
         "SELECT * FROM t WHERE id > 5",      // predicate
-        "SELECT * FROM t ORDER BY id",       // sort
+        "SELECT * FROM t ORDER BY id LIMIT 5", // sort + LIMIT (top-K fast path)
+        "SELECT * FROM t ORDER BY id + 1",   // computed sort key
+        "SELECT * FROM t ORDER BY 1",        // positional sort key
         "SELECT DISTINCT * FROM t",          // distinct
         "SELECT COUNT(*) FROM t",            // aggregate
         "SELECT * FROM t GROUP BY id, name", // group by
@@ -303,4 +305,135 @@ async fn multi_statement_batch_does_not_stream() {
         .unwrap();
     assert_eq!(results.len(), 2);
     assert!(results.iter().all(|r| !r.is_stream()));
+}
+
+/// Streaming ORDER BY (no LIMIT, bare source-column keys) must be byte-identical
+/// to the materialized sort — the streamed external sort is the ground truth's
+/// twin. Exercises stability (duplicate keys), NULLS placement, DESC, multi-key,
+/// and sorting by a non-projected column.
+#[tokio::test]
+async fn streaming_order_by_matches_materialized() {
+    let ex = test_executor();
+    let sid = ex.create_session();
+    ex.execute_with_session(sid, "CREATE TABLE s (id BIGINT, grp BIGINT, name TEXT)")
+        .await
+        .unwrap();
+    let mut vals = String::new();
+    for i in 0..3000 {
+        if i > 0 {
+            vals.push(',');
+        }
+        // grp: few distinct values (dups) + periodic NULLs; name distinct.
+        let grp = if i % 50 == 0 {
+            "NULL".to_string()
+        } else {
+            (i % 13).to_string()
+        };
+        vals.push_str(&format!("({i}, {grp}, 'n{i}')"));
+    }
+    ex.execute_with_session(sid, &format!("INSERT INTO s VALUES {vals}"))
+        .await
+        .unwrap();
+
+    let cases = [
+        "SELECT * FROM s ORDER BY id",
+        "SELECT * FROM s ORDER BY id DESC",
+        "SELECT * FROM s ORDER BY grp",            // dups + NULLs, ASC → NULLS LAST
+        "SELECT * FROM s ORDER BY grp DESC",       // dups + NULLs, DESC → NULLS FIRST
+        "SELECT * FROM s ORDER BY grp NULLS FIRST", // explicit NULLS placement
+        "SELECT * FROM s ORDER BY grp, id",        // multi-key: stable within grp
+        "SELECT * FROM s ORDER BY grp DESC, id ASC",
+        "SELECT name, id FROM s ORDER BY grp, id", // sort by non-projected column
+        "SELECT id AS x FROM s ORDER BY id",       // aliased projection + source-col key
+    ];
+    for sql in cases {
+        ex.execute_with_session(sid, "SET stream_results = off")
+            .await
+            .unwrap();
+        let base = one_result(&ex, sid, sql).await;
+        assert!(!base.is_stream(), "baseline must materialize: {sql}");
+        let (base_cols, base_rows) = drain(base).await;
+
+        ex.execute_with_session(sid, "SET stream_results = on")
+            .await
+            .unwrap();
+        let streamed = one_result(&ex, sid, sql).await;
+        assert!(streamed.is_stream(), "ORDER BY should stream: {sql}");
+        let (stream_cols, stream_rows) = drain(streamed).await;
+
+        assert_eq!(stream_cols, base_cols, "columns mismatch for: {sql}");
+        assert_eq!(stream_rows, base_rows, "rows mismatch for: {sql}");
+    }
+}
+
+/// The real T1.2 payoff: with a memory limit far below the working set and a
+/// spill directory configured, a streaming ORDER BY must SPILL and complete with
+/// the correct sorted output — where the materialized path returns MemoryExceeded.
+#[tokio::test]
+async fn streaming_order_by_spills_under_memory_limit_and_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = std::sync::Arc::new(crate::catalog::Catalog::new());
+    let storage: std::sync::Arc<dyn crate::storage::StorageEngine> =
+        std::sync::Arc::new(crate::storage::MemoryEngine::new());
+    let ex = Executor::new_with_persistence(catalog, storage, None, Some(dir.path()));
+    let sid = ex.create_session();
+
+    ex.execute_with_session(sid, "CREATE TABLE s (id BIGINT, grp BIGINT, payload TEXT)")
+        .await
+        .unwrap();
+    let pad = "x".repeat(200); // ~230 bytes/row → working set ≫ the tiny limit
+    let mut vals = String::new();
+    for i in 0..2000 {
+        if i > 0 {
+            vals.push(',');
+        }
+        vals.push_str(&format!("({i}, {}, '{pad}')", (i * 7) % 23));
+    }
+    ex.execute_with_session(sid, &format!("INSERT INTO s VALUES {vals}"))
+        .await
+        .unwrap();
+
+    // Ground truth: unlimited, materialized.
+    ex.set_query_memory_limit(0);
+    ex.execute_with_session(sid, "SET stream_results = off")
+        .await
+        .unwrap();
+    let (base_cols, base_rows) =
+        drain(one_result(&ex, sid, "SELECT * FROM s ORDER BY grp, id").await).await;
+
+    // The same materialized query under the tiny limit must be rejected — proving
+    // the working set really exceeds it (so the streamed run genuinely spills).
+    // The ground-truth run cached that result set; drop it so this re-run actually
+    // re-executes the sort (streamed queries bypass the cache, so they don't need
+    // this — but the materialized re-run would otherwise get a cache hit).
+    ex.query_cache_invalidate_all();
+    ex.set_query_memory_limit(32 * 1024);
+    let rejected = ex
+        .execute_with_session(sid, "SELECT * FROM s ORDER BY grp, id")
+        .await;
+    assert!(
+        matches!(rejected, Err(ExecError::MemoryExceeded(_))),
+        "materialized sort must exceed the tiny budget, got {rejected:?}"
+    );
+
+    // Streaming under the same tiny limit: spills sorted runs and completes with
+    // the identical row order.
+    ex.execute_with_session(sid, "SET stream_results = on")
+        .await
+        .unwrap();
+    let streamed = one_result(&ex, sid, "SELECT * FROM s ORDER BY grp, id").await;
+    assert!(streamed.is_stream(), "ORDER BY should stream");
+    let (stream_cols, stream_rows) = drain(streamed).await;
+
+    assert_eq!(stream_cols, base_cols);
+    assert_eq!(
+        stream_rows, base_rows,
+        "spilled streaming sort must equal the materialized sort"
+    );
+
+    // Spill files are cleaned up when the merge readers drop.
+    let spill_files = std::fs::read_dir(dir.path().join("spill"))
+        .map(|rd| rd.count())
+        .unwrap_or(0);
+    assert_eq!(spill_files, 0, "spill files must be reclaimed after the query");
 }

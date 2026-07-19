@@ -705,11 +705,12 @@ impl Executor {
     /// Streaming producer for the safe scan shape (Phase 1.1 + Phase 2 project/limit).
     ///
     /// Returns `Some(SelectStream)` for `SELECT <*|bare columns> FROM <base table>
-    /// [LIMIT n] [OFFSET m]` — no WHERE / join / GROUP BY / HAVING / DISTINCT /
-    /// ORDER BY / FETCH / CTE, and only when the session opted in via
+    /// [ORDER BY <source cols>] [LIMIT n] [OFFSET m]` — no WHERE / join / GROUP BY
+    /// / HAVING / DISTINCT / FETCH / CTE, and only when the session opted in via
     /// `SET stream_results = on`. Projection and OFFSET/LIMIT are applied by
-    /// streaming adapters over the scan. Every other shape returns `None` and
-    /// falls through to the normal materialized path.
+    /// streaming adapters over the scan; a bare-column ORDER BY (without LIMIT) is
+    /// applied by the streaming external sort (spilling under a memory limit).
+    /// Every other shape returns `None` and falls through to the materialized path.
     ///
     /// Correctness: this streams `scan_chunked`, which bottoms out in the engine
     /// `scan()` — recording SIREAD on all visible rows, exactly the read set the
@@ -735,9 +736,16 @@ impl Executor {
             return Ok(None);
         }
 
-        // No CTEs / ORDER BY / FETCH. LIMIT/OFFSET are allowed (applied by a
-        // streaming adapter); ORDER BY is not (streaming can't sort).
-        if query.with.is_some() || query.order_by.is_some() || query.fetch.is_some() {
+        // No CTEs / FETCH. LIMIT/OFFSET are allowed (applied by a streaming
+        // adapter). ORDER BY is allowed ONLY when it has no LIMIT/OFFSET (a full
+        // sort, handled by the streaming external sort below) — ORDER BY + LIMIT
+        // is left to the materialized top-K fast path, which is already bounded
+        // and cheaper than a full sort. The sort keys are validated further down.
+        if query.with.is_some() || query.fetch.is_some() {
+            return Ok(None);
+        }
+        let has_order_by = query.order_by.is_some();
+        if has_order_by && query.limit_clause.is_some() {
             return Ok(None);
         }
 
@@ -883,9 +891,45 @@ impl Executor {
             }
         };
 
-        // Compose the pipeline: scan -> [OFFSET/LIMIT] -> [projection].
-        // LIMIT is applied over full rows (inner) and projection narrows columns
-        // (outer); order between them does not affect the result.
+        // ORDER BY keys: stream only when every key is a bare column identifier
+        // resolving to a SOURCE column (the sort runs on full source rows, before
+        // projection). Positional / aliased / computed keys and ORDER BY ALL fall
+        // back to the materialized path (which resolves those against the output).
+        let sort_cols: Vec<(usize, bool, bool)> = match &query.order_by {
+            None => Vec::new(),
+            Some(ob) => {
+                let exprs = match &ob.kind {
+                    ast::OrderByKind::Expressions(exprs) => exprs,
+                    ast::OrderByKind::All(_) => return Ok(None),
+                };
+                let mut cols = Vec::with_capacity(exprs.len());
+                for obe in exprs {
+                    if obe.with_fill.is_some() {
+                        return Ok(None); // WITH FILL (ClickHouse) unsupported here
+                    }
+                    let Expr::Identifier(id) = &obe.expr else {
+                        return Ok(None);
+                    };
+                    let Some(idx) = table_def
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(&id.value))
+                    else {
+                        return Ok(None);
+                    };
+                    let asc = obe.options.asc.unwrap_or(true);
+                    // SQL default NULLS placement: ASC→LAST, DESC→FIRST.
+                    let nulls_first = obe.options.nulls_first.unwrap_or(!asc);
+                    cols.push((idx, !asc, nulls_first));
+                }
+                cols
+            }
+        };
+
+        // Compose the pipeline: scan -> [external sort] -> [OFFSET/LIMIT] ->
+        // [projection]. The sort (when present) runs over full source rows before
+        // projection narrows columns; ORDER BY excludes LIMIT/OFFSET here (guarded
+        // above) so those adapters never combine with the sort.
         let storage = self.storage_for(&table_name);
         let mut source: Box<dyn super::row_batch::RowBatchIter> =
             Box::new(super::scan_stream::ChunkedScanIter::new(
@@ -893,6 +937,17 @@ impl Executor {
                 table_name,
                 super::scan_stream::DEFAULT_STREAM_BATCH_ROWS,
             ));
+        if !sort_cols.is_empty() {
+            // Per-run byte budget from the session memory limit (u64::MAX =
+            // unlimited → 0 = never spill, a single in-memory run). Spill context
+            // is None when no spill dir is configured (operator stays in memory).
+            let mem_limit = self.query_memory_limit();
+            let run_budget = if mem_limit == u64::MAX { 0 } else { mem_limit };
+            let spill = self.sort_spill_ctx("order_by");
+            source = Box::new(super::external_sort::ExternalSortIter::new(
+                source, sort_cols, run_budget, spill,
+            ));
+        }
         if skip > 0 || limit.is_some() {
             source = Box::new(super::scan_stream::LimitBatchIter::new(source, skip, limit));
         }
@@ -2199,30 +2254,11 @@ impl Executor {
                         // Default NULLS placement: ASC→NULLS LAST, DESC→NULLS FIRST (SQL standard)
                         let nulls_first = nulls_first.unwrap_or(desc);
                         if let Some(idx) = Self::resolve_plan_col_idx(&meta, col_name) {
+                            // Shared per-key comparison (see helpers::cmp_sort_key)
+                            // so this in-place sort and the streaming external sort
+                            // order rows identically.
                             rows.sort_by(|a, b| {
-                                let a_null = a[idx] == Value::Null;
-                                let b_null = b[idx] == Value::Null;
-                                match (a_null, b_null) {
-                                    (true, true) => std::cmp::Ordering::Equal,
-                                    (true, false) => {
-                                        if nulls_first {
-                                            std::cmp::Ordering::Less
-                                        } else {
-                                            std::cmp::Ordering::Greater
-                                        }
-                                    }
-                                    (false, true) => {
-                                        if nulls_first {
-                                            std::cmp::Ordering::Greater
-                                        } else {
-                                            std::cmp::Ordering::Less
-                                        }
-                                    }
-                                    (false, false) => {
-                                        let cmp = a[idx].cmp(&b[idx]);
-                                        if desc { cmp.reverse() } else { cmp }
-                                    }
-                                }
+                                super::helpers::cmp_sort_key(&a[idx], &b[idx], desc, nulls_first)
                             });
                         }
                     }

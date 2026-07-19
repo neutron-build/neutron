@@ -712,10 +712,13 @@ async fn cmd_start(cfg: StartConfig) {
 
     // Keep a separate Arc<DiskEngine> for shutdown flushing
     let disk_engine: Option<Arc<DiskEngine>>;
+    // At-rest key copy for the query spill manager (external sort), if encrypted.
+    let spill_encryptor: Option<nucleus::storage::encryption::PageEncryptor>;
 
     let storage: Arc<dyn StorageEngine> = if memory {
         tracing::info!("Storage: in-memory with MVCC snapshot isolation");
         disk_engine = None;
+        spill_encryptor = None;
         Arc::new(MvccStorageAdapter::new())
     } else {
         // Ensure data directory exists
@@ -816,6 +819,9 @@ async fn cmd_start(cfg: StartConfig) {
             tracing::info!("Compression: LZ4 page-level compression enabled");
         }
 
+        // Keep a copy of the at-rest key for the query spill manager so blocking
+        // operators (external sort) spill ciphertext, not plaintext.
+        spill_encryptor = encryptor.clone();
         let engine = Arc::new(match (encryptor, compress, use_segmented_wal) {
             (Some(enc), true, _) => {
                 DiskEngine::open_compressed_encrypted(&db_path, catalog.clone(), enc)
@@ -968,15 +974,18 @@ async fn cmd_start(cfg: StartConfig) {
     };
     let cache_bytes = config.cache.max_memory_mb * 1024 * 1024;
     let store_dir = if memory { None } else { Some(data.as_path()) };
-    let executor = Arc::new(
-        Executor::new_with_persistence(catalog, storage, catalog_path, store_dir)
-            .with_cache_size(cache_bytes)
-            .with_allocator_budget(config.server.max_memory_mb * 1024 * 1024)
-            .with_metrics(metrics.clone())
-            .with_replication(replication.clone())
-            .with_conn_pool(conn_pool.clone())
-            .with_cluster(cluster.clone()),
-    );
+    let mut executor_build = Executor::new_with_persistence(catalog, storage, catalog_path, store_dir)
+        .with_cache_size(cache_bytes)
+        .with_allocator_budget(config.server.max_memory_mb * 1024 * 1024)
+        .with_metrics(metrics.clone())
+        .with_replication(replication.clone())
+        .with_conn_pool(conn_pool.clone())
+        .with_cluster(cluster.clone());
+    if let Some(enc) = spill_encryptor {
+        // Encrypted deployment: spill runs must be ciphertext (fail-closed).
+        executor_build = executor_build.with_spill_encryptor(enc);
+    }
+    let executor = Arc::new(executor_build);
     tracing::info!("Cache: {} MB", config.cache.max_memory_mb);
 
     // Query execution memory budget (T1.2): make the operator's configured
