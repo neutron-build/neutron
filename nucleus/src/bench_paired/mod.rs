@@ -51,6 +51,13 @@ impl Rng {
     fn unit_f32(&mut self) -> f32 {
         (self.below(20_000) as f32) / 10_000.0 - 1.0
     }
+    /// Approximately-Gaussian f32 (mean 0), scaled by `sd`. Sum of 4 uniforms
+    /// (central-limit) so cluster noise looks like real embedding jitter rather
+    /// than a uniform box.
+    fn gauss_f32(&mut self, sd: f32) -> f32 {
+        let s: f32 = (0..4).map(|_| self.unit_f32()).sum();
+        s * 0.5 * sd
+    }
     /// Uniform f64 in [1.0, 10.0] — positive edge weights for Dijkstra.
     fn weight(&mut self) -> f64 {
         1.0 + (self.below(9_000) as f64) / 1_000.0
@@ -83,10 +90,71 @@ fn rand_vector(rng: &mut Rng, dim: usize) -> Vector {
     Vector::new((0..dim).map(|_| rng.unit_f32()).collect())
 }
 
-/// Build an HNSW index of `n` random `dim`-vectors, then run `queries` KNN
-/// probes timing the index path and, on the SAME query, computing recall@k
-/// against an exact brute-force scan.
+/// Data distribution for the vector benchmark.
+///
+/// `Uniform` (i.i.d. uniform coords) is the ANN-recall *worst case*: in high
+/// dimension all pairwise distances concentrate, so the true top-k is barely
+/// nearer than random and any graph-navigation slip drops a true neighbour.
+/// `Clustered` mimics real embeddings — points sit near a handful of centres
+/// with low-intrinsic-dimension structure, which is the regime HNSW targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorDist {
+    Uniform,
+    Clustered,
+}
+
+/// Generate `n` vectors under `dist`. For `Clustered`, points are drawn around
+/// `n/50`-ish centres with Gaussian jitter (sd 0.10) so within-cluster nearest
+/// neighbours are unambiguous — the structure real embeddings have.
+fn gen_vectors(rng: &mut Rng, n: usize, dim: usize, dist: VectorDist) -> Vec<Vector> {
+    match dist {
+        VectorDist::Uniform => (0..n).map(|_| rand_vector(rng, dim)).collect(),
+        VectorDist::Clustered => {
+            let n_clusters = (n / 50).clamp(4, 256);
+            let centers: Vec<Vec<f32>> = (0..n_clusters)
+                .map(|_| (0..dim).map(|_| rng.unit_f32()).collect())
+                .collect();
+            (0..n)
+                .map(|_| {
+                    let c = &centers[rng.below(n_clusters)];
+                    Vector::new((0..dim).map(|d| c[d] + rng.gauss_f32(0.10)).collect())
+                })
+                .collect()
+        }
+    }
+}
+
+/// Draw a query from the same distribution as the corpus, so recall is measured
+/// in-distribution (an out-of-distribution query is a different, easier check).
+fn gen_query(rng: &mut Rng, dim: usize, dist: VectorDist, corpus: &[Vector]) -> Vector {
+    match dist {
+        VectorDist::Uniform => rand_vector(rng, dim),
+        VectorDist::Clustered => {
+            // Perturb a random existing point → lands inside a real cluster.
+            let base = &corpus[rng.below(corpus.len().max(1))];
+            Vector::new(base.data.iter().map(|x| x + rng.gauss_f32(0.10)).collect())
+        }
+    }
+}
+
+/// Build an HNSW index of `n` `dim`-vectors under the default (uniform)
+/// distribution, then run `queries` KNN probes timing the index path and, on
+/// the SAME query, computing recall@k against an exact brute-force scan.
 pub fn bench_vector(n: usize, dim: usize, k: usize, queries: usize, seed: u64) -> VectorBenchResult {
+    bench_vector_dist(n, dim, k, queries, seed, VectorDist::Uniform)
+}
+
+/// Same as [`bench_vector`] but choosing the corpus/query distribution — used to
+/// separate the data artifact (uniform worst case) from real engine recall
+/// (clustered, embedding-like).
+pub fn bench_vector_dist(
+    n: usize,
+    dim: usize,
+    k: usize,
+    queries: usize,
+    seed: u64,
+    dist: VectorDist,
+) -> VectorBenchResult {
     let mut rng = Rng::new(seed);
     let config = HnswConfig {
         m: 16,
@@ -96,11 +164,11 @@ pub fn bench_vector(n: usize, dim: usize, k: usize, queries: usize, seed: u64) -
         metric: DistanceMetric::L2,
     };
     let mut index = HnswIndex::new(config);
+    let corpus = gen_vectors(&mut rng, n, dim, dist);
     let mut reference: Vec<(u64, Vector)> = Vec::with_capacity(n);
-    for id in 0..n as u64 {
-        let v = rand_vector(&mut rng, dim);
-        index.insert(id, v.clone());
-        reference.push((id, v));
+    for (id, v) in corpus.iter().enumerate() {
+        index.insert(id as u64, v.clone());
+        reference.push((id as u64, v.clone()));
     }
 
     let mut recall_sum = 0.0f64;
@@ -109,7 +177,7 @@ pub fn bench_vector(n: usize, dim: usize, k: usize, queries: usize, seed: u64) -
     let mut brute_nanos = 0u128;
 
     for _ in 0..queries {
-        let q = rand_vector(&mut rng, dim);
+        let q = gen_query(&mut rng, dim, dist, &corpus);
 
         let t0 = Instant::now();
         let got = index.search(&q, k);
@@ -470,6 +538,36 @@ mod tests {
                 r.min_recall
             );
             assert!(r.hnsw_avg_us > 0.0 && r.qps > 0.0);
+        }
+    }
+
+    /// Recall floor on CLUSTERED (embedding-like) data. This is the regression
+    /// guard for the neighbour-selection bug: with simple take-M-closest
+    /// selection the HNSW graph had no inter-cluster bridge edges, so greedy
+    /// search dead-ended in the wrong cluster and returned as few as ZERO of the
+    /// true top-k (avg recall 0.37-0.77, min 0.0) — while uniform data, which the
+    /// old test used, looked "only" mediocre and hid it. With the diversifying
+    /// heuristic (Alg. 4) clustered recall is essentially perfect, so the floor
+    /// is deliberately high: a regression here means bridges are being starved
+    /// again. Structured queries are the real-world case, so this must hold.
+    #[test]
+    fn vector_recall_floor_clustered_high_bar() {
+        for seed in [1u64, 7, 42, 12345] {
+            for &(n, dim, k) in &[(1000usize, 64usize, 10usize), (5000, 128, 10)] {
+                let r = bench_vector_dist(n, dim, k, 50, seed, VectorDist::Clustered);
+                assert!(
+                    r.avg_recall >= 0.98,
+                    "seed {seed} n{n} d{dim}: clustered avg recall@{} = {:.3} below 0.98 — \
+                     inter-cluster bridge edges are being starved (neighbour-selection regression)",
+                    r.k, r.avg_recall
+                );
+                assert!(
+                    r.min_recall >= 0.80,
+                    "seed {seed} n{n} d{dim}: clustered min single-query recall {:.3} below 0.80 — \
+                     some query is dead-ending in the wrong cluster",
+                    r.min_recall
+                );
+            }
         }
     }
 
