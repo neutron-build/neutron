@@ -230,7 +230,7 @@ async fn streaming_aggregate_engages_only_when_warranted() {
     ex.set_query_memory_limit(48 * 1024);
     for sql in [
         "SELECT k, COUNT(*) FROM t WHERE v > 10 GROUP BY k", // predicate
-        "SELECT k, COUNT(*) FROM t GROUP BY k ORDER BY k",   // ORDER BY over output
+        "SELECT k, COUNT(*) FROM t GROUP BY k ORDER BY k + 1", // computed ORDER BY key (unresolvable)
         "SELECT COUNT(*) FROM t",                            // no GROUP BY
         "SELECT k, COUNT(*) FROM t GROUP BY ROLLUP(k)",      // grouping set
     ] {
@@ -242,6 +242,85 @@ async fn streaming_aggregate_engages_only_when_warranted() {
             let r = results.pop().unwrap();
             assert!(!r.is_stream(), "shape must not stream via aggregate: {sql}");
         }
+    }
+}
+
+/// ORDER BY over the aggregate OUTPUT streams (external sort over the emitted
+/// groups) and matches the materialized path EXACTLY (order is now deterministic).
+/// Covers a named aggregate key, a positional key, and top-N (ORDER BY + LIMIT).
+#[tokio::test]
+async fn streaming_aggregate_order_by_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = persistent_executor(dir.path());
+    let sid = ex.create_session();
+    seed(&ex, sid, 3000, 30).await;
+
+    // Uniform group sizes ⇒ COUNT is fully tied, so include a unique tiebreaker
+    // (k) to make the order deterministic for an exact comparison.
+    for sql in [
+        "SELECT k, COUNT(*) AS c FROM t GROUP BY k ORDER BY c DESC, k",
+        "SELECT k, COUNT(*) FROM t GROUP BY k ORDER BY k",
+        "SELECT k, COUNT(*) AS c FROM t GROUP BY k ORDER BY 2 DESC, 1", // positional
+        "SELECT k, COUNT(*) AS c FROM t GROUP BY k ORDER BY c DESC, k LIMIT 5", // top-N
+    ] {
+        ex.set_query_memory_limit(0);
+        ex.execute_with_session(sid, "SET stream_results = off")
+            .await
+            .unwrap();
+        ex.query_cache_invalidate_all();
+        let (base_cols, base_rows) = drain(one_result(&ex, sid, sql).await).await;
+
+        ex.query_cache_invalidate_all();
+        ex.set_query_memory_limit(48 * 1024);
+        ex.execute_with_session(sid, "SET stream_results = on")
+            .await
+            .unwrap();
+        let streamed = one_result(&ex, sid, sql).await;
+        assert!(streamed.is_stream(), "ORDER BY over aggregate output should stream: {sql}");
+        let (stream_cols, stream_rows) = drain(streamed).await;
+
+        assert_eq!(stream_cols, base_cols, "columns mismatch: {sql}");
+        // ORDER BY fixes the order — compare exactly, not as a multiset.
+        assert_eq!(stream_rows, base_rows, "ordered rows mismatch: {sql}");
+    }
+
+    let leftover = std::fs::read_dir(dir.path().join("spill"))
+        .map(|rd| rd.count())
+        .unwrap_or(0);
+    assert_eq!(leftover, 0, "spill reclaimed after ORDER BY aggregate");
+}
+
+/// ORDER BY over the DISTINCT output streams and matches the materialized order.
+#[tokio::test]
+async fn streaming_distinct_order_by_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let ex = persistent_executor(dir.path());
+    let sid = ex.create_session();
+    seed_distinct(&ex, sid, 3000, 40).await;
+
+    for sql in [
+        "SELECT DISTINCT k FROM d ORDER BY k DESC",
+        "SELECT DISTINCT k, name FROM d ORDER BY k",
+        "SELECT DISTINCT k FROM d ORDER BY k LIMIT 6",
+    ] {
+        ex.set_query_memory_limit(0);
+        ex.execute_with_session(sid, "SET stream_results = off")
+            .await
+            .unwrap();
+        ex.query_cache_invalidate_all();
+        let (base_cols, base_rows) = drain(one_result(&ex, sid, sql).await).await;
+
+        ex.query_cache_invalidate_all();
+        ex.set_query_memory_limit(48 * 1024);
+        ex.execute_with_session(sid, "SET stream_results = on")
+            .await
+            .unwrap();
+        let streamed = one_result(&ex, sid, sql).await;
+        assert!(streamed.is_stream(), "ORDER BY over DISTINCT output should stream: {sql}");
+        let (stream_cols, stream_rows) = drain(streamed).await;
+
+        assert_eq!(stream_cols, base_cols, "columns mismatch: {sql}");
+        assert_eq!(stream_rows, base_rows, "ordered rows mismatch: {sql}");
     }
 }
 
@@ -418,7 +497,7 @@ async fn streaming_distinct_engages_only_when_warranted() {
         "SELECT DISTINCT ON (k) k, name FROM d ORDER BY k", // DISTINCT ON
         "SELECT DISTINCT k FROM d WHERE k > 2",             // predicate
         "SELECT DISTINCT k + 1 FROM d",                     // computed projection
-        "SELECT DISTINCT k FROM d ORDER BY k",              // ORDER BY over output
+        "SELECT DISTINCT k FROM d ORDER BY name",           // ORDER BY a non-output column (unresolvable)
     ] {
         ex.query_cache_invalidate_all();
         if let Ok(mut results) = ex.execute_with_session(sid, sql).await {

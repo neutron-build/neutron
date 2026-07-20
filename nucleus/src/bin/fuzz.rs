@@ -454,9 +454,40 @@ fn gen_query(schema: &Schema, rng: &mut Rng, rows: usize) -> (String, bool) {
             } else {
                 String::new()
             };
-            // DISTINCT rows are a set → compare unordered, skip ORDER BY/LIMIT
-            // (ORDER BY a computed/della column is not always deterministic).
+            // DISTINCT rows are a set → compare unordered by default. BUT a DISTINCT
+            // over NOT-NULL columns ordered by *all* of those columns has no ties, so
+            // the order (and a following LIMIT) is deterministic and can be compared
+            // ORDERED against SQLite — exercising the SELECT → DISTINCT → ORDER BY →
+            // LIMIT pipeline (dedup must precede ORDER BY/LIMIT), a combo the plain
+            // arm below never generates.
             if distinct {
+                let nn = schema.nn_cols();
+                if !nn.is_empty() && rng.chance(60) {
+                    let take = (1 + rng.below(3)).min(nn.len());
+                    let mut names: Vec<String> = nn.iter().map(|c| c.name.to_string()).collect();
+                    for i in 0..take {
+                        let j = i + rng.below(names.len() - i);
+                        names.swap(i, j);
+                    }
+                    names.truncate(take);
+                    let dproj = names.join(", ");
+                    let order_keys: Vec<String> = names
+                        .iter()
+                        .map(|nm| format!("{nm} {}", if rng.chance(50) { "ASC" } else { "DESC" }))
+                        .collect();
+                    let limit = if rng.chance(50) {
+                        format!(" LIMIT {}", rng.int(1, rows.max(1) as i64))
+                    } else {
+                        String::new()
+                    };
+                    return (
+                        format!(
+                            "SELECT DISTINCT {dproj} FROM t{w} ORDER BY {}{limit}",
+                            order_keys.join(", ")
+                        ),
+                        true, // ordered comparison
+                    );
+                }
                 return (format!("SELECT DISTINCT {proj} FROM t{w}"), false);
             }
             let has_order = rng.chance(70);

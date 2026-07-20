@@ -171,6 +171,8 @@ impl DatabaseBuilder {
         } else {
             Arc::new(Executor::new(catalog.clone(), storage.clone()))
         };
+        // Let streaming producers recover an owned Arc across the drain boundary.
+        executor.install_self_ref();
         Ok(Database {
             executor,
             _catalog: catalog,

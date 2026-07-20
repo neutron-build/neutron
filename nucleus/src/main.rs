@@ -986,6 +986,9 @@ async fn cmd_start(cfg: StartConfig) {
         executor_build = executor_build.with_spill_encryptor(enc);
     }
     let executor = Arc::new(executor_build);
+    // Install the weak self-reference so streaming producers can hold an owned
+    // Arc<Executor> across the wire-drain boundary (streaming WHERE filter, etc.).
+    executor.install_self_ref();
     tracing::info!("Cache: {} MB", config.cache.max_memory_mb);
 
     // Query execution memory budget (T1.2): make the operator's configured

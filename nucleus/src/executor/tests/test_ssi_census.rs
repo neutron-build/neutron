@@ -195,6 +195,66 @@ async fn read_only_transaction_does_not_abort_a_writer() {
 }
 
 #[tokio::test]
+async fn write_skew_via_streaming_filtered_scan_reads() {
+    // THE gate for the streaming WHERE filter. The read side streams a full scan
+    // with a WHERE that matches NOTHING (`id = 99`): the filter reads (and must
+    // record SIREAD on) every visible row, then emits none. A matched-only scan
+    // would record an EMPTY read set here and let the write-skew slip through
+    // undetected. Because this filter is a post-scan filter over the full-relation
+    // scan, the conservative read set is preserved and the second committer aborts.
+    //
+    // The stream is drained (`materialize`) before the writes, replicating the wire
+    // flow where a query's rows are fully sent before the next command arrives — so
+    // the producer's SIREAD is recorded under this transaction before COMMIT.
+    let ex = {
+        let catalog = Arc::new(Catalog::new());
+        let storage: Arc<dyn StorageEngine> = Arc::new(crate::storage::MvccStorageAdapter::new());
+        let ex = Arc::new(Executor::new(catalog, storage));
+        ex.install_self_ref(); // the filter needs an owning Arc to engage
+        ex
+    };
+    seed_accounts(&ex).await;
+    let t1 = ex.create_session();
+    let t2 = ex.create_session();
+    for s in [t1, t2] {
+        ex.execute_with_session(s, "SET stream_results = on")
+            .await
+            .unwrap();
+    }
+
+    ex.execute_with_session(t1, BEGIN_SER).await.unwrap();
+    ex.execute_with_session(t2, BEGIN_SER).await.unwrap();
+
+    // Streaming filtered reads — match nothing, but read (SIREAD) the whole table.
+    for s in [t1, t2] {
+        let mut rs = ex
+            .execute_with_session(s, "SELECT balance FROM accounts WHERE id = 99")
+            .await
+            .unwrap();
+        let r = rs.pop().unwrap();
+        assert!(r.is_stream(), "the filtered read must actually stream");
+        // Drain the stream so the full-relation scan (and its SIREAD) completes.
+        let _ = r.materialize().await.unwrap();
+    }
+
+    ex.execute_with_session(t1, "UPDATE accounts SET balance = 0 WHERE id = 1")
+        .await
+        .unwrap();
+    ex.execute_with_session(t2, "UPDATE accounts SET balance = 0 WHERE id = 2")
+        .await
+        .unwrap();
+
+    let c1 = ex.execute_with_session(t1, "COMMIT").await;
+    let c2 = ex.execute_with_session(t2, "COMMIT").await;
+
+    assert!(c1.is_ok(), "first committer should win, got {c1:?}");
+    assert!(
+        is_serialization_failure(&c2),
+        "streaming filtered scan must keep the conservative full-relation SIREAD; got {c2:?}"
+    );
+}
+
+#[tokio::test]
 async fn lost_update_same_row_is_prevented() {
     // Two transactions read the same row then both write it (read-modify-write).
     // A serializable engine must not silently lose one update: the second

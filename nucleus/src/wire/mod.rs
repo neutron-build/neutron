@@ -3645,7 +3645,9 @@ mod tests {
         let catalog = Arc::new(crate::catalog::Catalog::new());
         let storage: Arc<dyn crate::storage::StorageEngine> =
             Arc::new(crate::storage::MemoryEngine::new());
-        Arc::new(Executor::new(catalog, storage))
+        let ex = Arc::new(Executor::new(catalog, storage));
+        ex.install_self_ref();
+        ex
     }
 
     #[test]
@@ -4260,7 +4262,9 @@ mod security_tests {
         let catalog = Arc::new(crate::catalog::Catalog::new());
         let storage: Arc<dyn crate::storage::StorageEngine> =
             Arc::new(crate::storage::MemoryEngine::new());
-        Arc::new(Executor::new(catalog, storage))
+        let ex = Arc::new(Executor::new(catalog, storage));
+        ex.install_self_ref();
+        ex
     }
 
     #[test]
