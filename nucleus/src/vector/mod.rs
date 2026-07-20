@@ -744,6 +744,15 @@ impl HnswIndex {
     /// Search for the k nearest neighbors of a query vector.
     /// Returns (id, distance) pairs sorted by distance ascending.
     pub fn search(&self, query: &Vector, k: usize) -> Vec<(u64, f32)> {
+        self.search_ef(query, k, self.config.ef_search)
+    }
+
+    /// Like [`search`] but with an explicit layer-0 beam width `ef` for this one
+    /// query, overriding the configured default. `ef` is the recall/latency
+    /// dial: a larger beam explores more of the graph before committing to the
+    /// top-k, so recall rises (toward exact) at the cost of more distance
+    /// evaluations. The effective beam is always at least `k`.
+    pub fn search_ef(&self, query: &Vector, k: usize, ef: usize) -> Vec<(u64, f32)> {
         if self.nodes.is_empty() || self.entry_point.is_none() {
             return vec![];
         }
@@ -760,7 +769,7 @@ impl HnswIndex {
         }
 
         // Phase 2: ef-bounded search at layer 0
-        let candidates = self.search_layer(current, query, self.config.ef_search.max(k), 0);
+        let candidates = self.search_layer(current, query, ef.max(k), 0);
 
         candidates
             .into_iter()
