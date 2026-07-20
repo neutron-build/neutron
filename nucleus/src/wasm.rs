@@ -41,6 +41,7 @@ impl NucleusWasm {
         let catalog = Arc::new(Catalog::new());
         let storage: Arc<dyn StorageEngine> = Arc::new(MemoryEngine::new());
         let executor = Arc::new(Executor::new(catalog.clone(), storage.clone()));
+        executor.install_self_ref();
         Self {
             executor,
             _catalog: catalog,
@@ -54,6 +55,7 @@ impl NucleusWasm {
         let catalog = Arc::new(Catalog::new());
         let storage: Arc<dyn StorageEngine> = Arc::new(MvccStorageAdapter::new());
         let executor = Arc::new(Executor::new(catalog.clone(), storage.clone()));
+        executor.install_self_ref();
         Self {
             executor,
             _catalog: catalog,

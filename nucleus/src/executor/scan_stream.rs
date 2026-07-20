@@ -31,9 +31,12 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use sqlparser::ast::Expr;
+
 use super::row_batch::RowBatchIter;
 use super::session::{CURRENT_SESSION, Session};
-use crate::executor::ExecError;
+use super::types::ColMeta;
+use crate::executor::{ExecError, Executor};
 use crate::storage::{STORAGE_SESSION_ID, StorageEngine, StorageError};
 use crate::types::Row;
 
@@ -185,6 +188,101 @@ impl RowBatchIter for LimitBatchIter {
                 continue;
             }
             return Ok(Some(batch));
+        }
+    }
+}
+
+/// Streaming WHERE filter (Phase 1.2 read-side) — evaluates the query predicate
+/// on each streamed SOURCE row, forwarding only matches.
+///
+/// ## SIREAD safety — the whole reason this is a post-scan filter
+/// It runs on top of the *full-relation* streaming scan and never pushes the
+/// predicate into a matched-only scan, so the transaction still reads (and records
+/// SIREAD on) every visible row of the relation, exactly as a materialized full
+/// scan would. Streaming can therefore only *over*-record the read set, never
+/// under-record it — no write-skew / phantom surface is opened. A true
+/// predicate-pushed, snapshot-pinned scan that narrows the SIREAD set is the
+/// deferred, hazardous part of Phase 1.2 and is deliberately NOT done here.
+///
+/// ## Session scope + why an owned `Arc<Executor>`
+/// The wire layer drains the stream *after* `execute` returns — outside the
+/// query's `CURRENT_SESSION` scope — and `eval_where` is a `&self` method that can
+/// consult session state. So this captures the session task-locals in the
+/// foreground (like [`ChunkedScanIter`]) and re-establishes them around each
+/// synchronous `eval_where`, and it holds an owned `Arc<Executor>` recovered from
+/// the executor's weak self-ref. The streaming producer declines (falls back to
+/// the materialized path) when no self-ref is installed, or when the predicate
+/// contains a subquery (whose `sync_block_on` must not run inside the async drain).
+pub(super) struct FilterBatchIter {
+    inner: Box<dyn RowBatchIter>,
+    executor: Arc<Executor>,
+    predicate: Expr,
+    col_meta: Vec<ColMeta>,
+    session: Option<Arc<Session>>,
+    sess_id: Option<u64>,
+}
+
+impl FilterBatchIter {
+    pub(super) fn new(
+        inner: Box<dyn RowBatchIter>,
+        executor: Arc<Executor>,
+        predicate: Expr,
+        col_meta: Vec<ColMeta>,
+    ) -> Self {
+        // Capture the foreground session task-locals so the deferred filter eval
+        // runs against the same session/transaction as the query.
+        let session = CURRENT_SESSION.try_with(|s| s.clone()).ok();
+        let sess_id = STORAGE_SESSION_ID.try_with(|id| *id).ok();
+        Self {
+            inner,
+            executor,
+            predicate,
+            col_meta,
+            session,
+            sess_id,
+        }
+    }
+
+    /// Evaluate the predicate over one batch under the re-established session
+    /// scope, returning only the matching rows (in order). A predicate that errors
+    /// on a row propagates — the query fails as it would on the materialized path.
+    fn filter_batch(&self, batch: Vec<Row>) -> Result<Vec<Row>, ExecError> {
+        let eval = move || -> Result<Vec<Row>, ExecError> {
+            let mut out = Vec::new();
+            for row in batch {
+                if self
+                    .executor
+                    .eval_where(&self.predicate, &row, &self.col_meta)?
+                {
+                    out.push(row);
+                }
+            }
+            Ok(out)
+        };
+        match (self.session.clone(), self.sess_id) {
+            (Some(s), Some(id)) => {
+                CURRENT_SESSION.sync_scope(s, || STORAGE_SESSION_ID.sync_scope(id, eval))
+            }
+            (Some(s), None) => CURRENT_SESSION.sync_scope(s, eval),
+            (None, Some(id)) => STORAGE_SESSION_ID.sync_scope(id, eval),
+            (None, None) => eval(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RowBatchIter for FilterBatchIter {
+    async fn next_batch(&mut self) -> Result<Option<Vec<Row>>, ExecError> {
+        // Skip fully-filtered batches (never yield an empty batch) — pull until a
+        // batch has a match or the upstream is exhausted.
+        loop {
+            let Some(batch) = self.inner.next_batch().await? else {
+                return Ok(None);
+            };
+            let filtered = self.filter_batch(batch)?;
+            if !filtered.is_empty() {
+                return Ok(Some(filtered));
+            }
         }
     }
 }

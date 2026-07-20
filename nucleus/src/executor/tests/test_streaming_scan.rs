@@ -85,10 +85,12 @@ async fn unsupported_shapes_do_not_stream() {
         .await
         .unwrap();
 
-    // Shapes the streaming path deliberately declines (predicate/sort/grouping/
+    // Shapes the streaming path deliberately declines (sort+LIMIT/grouping/
     // distinct/CTE, computed or qualified projections). The materialized path runs.
+    // (A WHERE predicate DOES stream, but only when an owning Arc self-ref is
+    // installed — `test_executor` is by-value, so it declines here too.)
     for sql in [
-        "SELECT * FROM t WHERE id > 5",      // predicate
+        "SELECT * FROM t WHERE id > 5",      // predicate — no self-ref ⇒ declines
         "SELECT * FROM t ORDER BY id LIMIT 5", // sort + LIMIT (top-K fast path)
         "SELECT * FROM t ORDER BY id + 1",   // computed sort key
         "SELECT * FROM t ORDER BY 1",        // positional sort key

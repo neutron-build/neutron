@@ -831,6 +831,93 @@ impl Executor {
         Some((cols, Some(indices)))
     }
 
+    /// Whether a WHERE predicate is safe to evaluate in the streaming filter.
+    /// Returns `false` if a subquery (`(SELECT …)`, `EXISTS`, `IN (SELECT …)`) is
+    /// reachable through the boolean/comparison structure — its `sync_block_on`
+    /// should not run inside the async wire-drain, and per-row correlated
+    /// evaluation is better left to the materialized path. Recurses through the
+    /// operators a WHERE clause is built from; a subquery buried inside a function
+    /// argument is not reached here and simply isn't declined (still correct — the
+    /// filter would evaluate it, `sync_block_on` being drain-safe — just not the
+    /// clean fall-back). Everything else `eval_where` handles as pure evaluation.
+    #[cfg(feature = "server")]
+    fn where_predicate_streamable(expr: &Expr) -> bool {
+        match expr {
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => false,
+            Expr::BinaryOp { left, right, .. } => {
+                Self::where_predicate_streamable(left) && Self::where_predicate_streamable(right)
+            }
+            Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::IsNull(expr)
+            | Expr::IsNotNull(expr) | Expr::IsTrue(expr) | Expr::IsFalse(expr)
+            | Expr::IsNotTrue(expr) | Expr::IsNotFalse(expr) => {
+                Self::where_predicate_streamable(expr)
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                Self::where_predicate_streamable(expr)
+                    && Self::where_predicate_streamable(low)
+                    && Self::where_predicate_streamable(high)
+            }
+            Expr::InList { expr, list, .. } => {
+                Self::where_predicate_streamable(expr)
+                    && list.iter().all(Self::where_predicate_streamable)
+            }
+            Expr::Like { expr, pattern, .. }
+            | Expr::ILike { expr, pattern, .. }
+            | Expr::SimilarTo { expr, pattern, .. } => {
+                Self::where_predicate_streamable(expr) && Self::where_predicate_streamable(pattern)
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                operand
+                    .as_ref()
+                    .is_none_or(|e| Self::where_predicate_streamable(e))
+                    && conditions.iter().all(|cw| {
+                        Self::where_predicate_streamable(&cw.condition)
+                            && Self::where_predicate_streamable(&cw.result)
+                    })
+                    && else_result
+                        .as_ref()
+                        .is_none_or(|e| Self::where_predicate_streamable(e))
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether an ordered/equality index could serve `pred` on `table` — i.e. the
+    /// predicate references the leading column of some BTree/Hash index. When it
+    /// can, the streaming full-scan filter declines so the materialized path's
+    /// (bounded, faster) index scan runs instead. Best-effort: `collect_column_refs`
+    /// only reaches columns in comparison/boolean positions, which is exactly where
+    /// an index-eligible predicate puts them.
+    #[cfg(feature = "server")]
+    async fn predicate_could_use_index(&self, table: &str, pred: &Expr) -> bool {
+        let mut cols = Vec::new();
+        self.collect_column_refs(pred, &mut cols);
+        if cols.is_empty() {
+            return false;
+        }
+        let referenced: std::collections::HashSet<String> = cols.into_iter().collect();
+        for idx in self.catalog.get_indexes(table).await {
+            if matches!(
+                idx.index_type,
+                crate::catalog::IndexType::BTree | crate::catalog::IndexType::Hash
+            ) && idx
+                .columns
+                .first()
+                .is_some_and(|c| referenced.contains(&c.to_lowercase()))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     #[cfg(feature = "server")]
     pub(super) async fn try_streaming_scan(
         &self,
@@ -863,10 +950,11 @@ impl Executor {
         };
 
         // Single base table, no joins, and none of the row-shaping clauses that
-        // this streaming path does not handle (predicate/grouping/distinct).
+        // this streaming path does not handle (grouping/distinct). A WHERE
+        // predicate IS handled — by a post-scan streaming filter (below) that keeps
+        // the conservative full-relation SIREAD.
         if select.from.len() != 1
             || !select.from[0].joins.is_empty()
-            || select.selection.is_some()
             || select.having.is_some()
             || select.distinct.is_some()
             || !matches!(&select.group_by, ast::GroupByExpr::Expressions(e, _) if e.is_empty())
@@ -914,6 +1002,39 @@ impl Executor {
             return Ok(None);
         };
 
+        // WHERE: a predicate is streamed by a post-scan filter over the FULL scan
+        // (conservative SIREAD preserved). Decline — leaving it to the materialized
+        // path — when (a) no owning Arc is installed (the filter must hold one to
+        // call eval_where across the wire-drain boundary), (b) the predicate has a
+        // subquery (its sync_block_on should not run inside the async drain), or
+        // (c) an index could serve the predicate (the materialized index scan is
+        // bounded and faster — don't preempt it with a full scan).
+        let where_filter: Option<(std::sync::Arc<Executor>, Expr, Vec<ColMeta>)> =
+            match &select.selection {
+                None => None,
+                Some(pred) => {
+                    let Some(arc) = self.arc_self() else {
+                        return Ok(None);
+                    };
+                    if !Self::where_predicate_streamable(pred) {
+                        return Ok(None);
+                    }
+                    if self.predicate_could_use_index(&table_name, pred).await {
+                        return Ok(None);
+                    }
+                    let col_meta: Vec<ColMeta> = table_def
+                        .columns
+                        .iter()
+                        .map(|c| ColMeta {
+                            table: Some(table_name.clone()),
+                            name: c.name.clone(),
+                            dtype: c.data_type.clone(),
+                        })
+                        .collect();
+                    Some((arc, pred.clone(), col_meta))
+                }
+            };
+
         // LIMIT / OFFSET: only static integer bounds stream; a parameter or
         // expression bound falls back to the materialized path.
         let (skip, limit): (usize, Option<usize>) = match self.streaming_limit_offset(query)? {
@@ -956,10 +1077,11 @@ impl Executor {
             }
         };
 
-        // Compose the pipeline: scan -> [external sort] -> [OFFSET/LIMIT] ->
-        // [projection]. The sort (when present) runs over full source rows before
-        // projection narrows columns; ORDER BY excludes LIMIT/OFFSET here (guarded
-        // above) so those adapters never combine with the sort.
+        // Compose the pipeline: scan -> [WHERE filter] -> [external sort] ->
+        // [OFFSET/LIMIT] -> [projection]. WHERE runs first, on full source rows
+        // (before the sort and before projection narrows columns), matching SQL
+        // evaluation order; ORDER BY excludes LIMIT/OFFSET here (guarded above) so
+        // those adapters never combine with the sort.
         let storage = self.storage_for(&table_name);
         let mut source: Box<dyn super::row_batch::RowBatchIter> =
             Box::new(super::scan_stream::ChunkedScanIter::new(
@@ -967,6 +1089,11 @@ impl Executor {
                 table_name,
                 super::scan_stream::DEFAULT_STREAM_BATCH_ROWS,
             ));
+        if let Some((arc, pred, col_meta)) = where_filter {
+            source = Box::new(super::scan_stream::FilterBatchIter::new(
+                source, arc, pred, col_meta,
+            ));
+        }
         if !sort_cols.is_empty() {
             // Per-run byte budget from the session memory limit (u64::MAX =
             // unlimited → 0 = never spill, a single in-memory run). Spill context
@@ -1000,6 +1127,15 @@ impl Executor {
         }
         // No DISTINCT ON (plain DISTINCT is ok)
         if let Some(ast::Distinct::On(_)) = &select.distinct {
+            return false;
+        }
+        // DISTINCT + LIMIT: the plan path executes the plan (which already applies
+        // the Limit — and, with ORDER BY, the Sort) and only THEN dedups the result,
+        // i.e. LIMIT-before-DISTINCT. SQL requires DISTINCT before ORDER BY/LIMIT, so
+        // this would return too few rows (e.g. `SELECT DISTINCT k ... ORDER BY k
+        // LIMIT 6` collapsing 6 equal leading rows to 1). Route to the AST path,
+        // which dedups before ordering/limiting.
+        if select.distinct.is_some() && query.limit_clause.is_some() {
             return false;
         }
         // Projection expressions must be evaluable by the plan path.
@@ -4210,8 +4346,8 @@ impl Executor {
             }
 
             // --- AST-based execution fallback ---
-            let order_by = query.order_by;
-            let limit_clause = query.limit_clause;
+            let mut order_by = query.order_by;
+            let mut limit_clause = query.limit_clause;
 
             // Extract DISTINCT info from select body before consuming it
             let distinct_mode = if let SetExpr::Select(ref select) = *query.body {
@@ -4240,6 +4376,25 @@ impl Executor {
                     _ => Vec::new(),
                 },
                 None => Vec::new(),
+            };
+
+            // Plain DISTINCT + LIMIT ordering fix. SQL evaluates SELECT → DISTINCT →
+            // ORDER BY → LIMIT, but the branches below apply ORDER BY/LIMIT before the
+            // DISTINCT dedup pass — so a plain `DISTINCT … LIMIT n` would truncate to n
+            // rows and only then dedup, returning too few (e.g. `DISTINCT k ORDER BY k
+            // LIMIT 6` collapsing six equal leading rows to one). When both are present
+            // for a plain DISTINCT, defer ORDER BY/LIMIT until after dedup (resolving
+            // ORDER BY against the OUTPUT columns, as SQL requires for DISTINCT). Note
+            // `order_by_cols` above is intentionally still derived from the original
+            // ORDER BY so column-dropping fast paths keep the keys they need.
+            // DISTINCT ON is unaffected: its first-row-per-key semantics require the
+            // ORDER BY to run first, which the un-deferred path preserves.
+            let defer_distinct = matches!(&distinct_mode, Some(ast::Distinct::Distinct))
+                && limit_clause.is_some();
+            let (deferred_order, deferred_limit) = if defer_distinct {
+                (order_by.take(), limit_clause.take())
+            } else {
+                (None, None)
             };
 
             let result = self
@@ -4403,6 +4558,24 @@ impl Executor {
                         });
                     }
                     ast::Distinct::All => {} // No deduplication
+                }
+            }
+
+            // Deferred ORDER BY + LIMIT for plain DISTINCT (applied AFTER dedup, over
+            // the output columns) — see `defer_distinct`. This is the tail of the
+            // SELECT → DISTINCT → ORDER BY → LIMIT pipeline.
+            if defer_distinct
+                && let ExecResult::Select {
+                    ref columns,
+                    ref mut rows,
+                } = exec_result
+            {
+                if let Some(ob) = deferred_order {
+                    let top_k = self.extract_top_k(deferred_limit.as_ref());
+                    self.apply_order_by(rows, columns, &ob, None, None, top_k)?;
+                }
+                if let Some(lc) = deferred_limit {
+                    self.apply_limit_offset(rows, &lc)?;
                 }
             }
 

@@ -259,6 +259,15 @@ impl ExecResult {
 /// connection should call [`create_session`] on connect and [`drop_session`] on
 /// disconnect. The wire handler does this automatically.
 pub struct Executor {
+    /// A weak self-reference, installed once the executor is wrapped in an `Arc`
+    /// (see [`Executor::install_self_ref`]). Streaming iterators are drained by the
+    /// wire layer *after* `execute` returns, so a lazy producer that must call back
+    /// into the executor (e.g. a streaming WHERE filter evaluating `eval_where`, or
+    /// a per-partition emitter) needs an owned `Arc<Executor>` to hold across that
+    /// boundary. `&self` methods reach it through [`Executor::arc_self`]. Left unset
+    /// for by-value/embedded constructions, where those producers simply decline
+    /// and fall back to the materialized path.
+    self_ref: std::sync::OnceLock<std::sync::Weak<Executor>>,
     catalog: Arc<Catalog>,
     views: RwLock<HashMap<String, ViewDef>>,
     sequences: parking_lot::RwLock<HashMap<String, parking_lot::Mutex<SequenceDef>>>,
@@ -497,6 +506,7 @@ impl Executor {
         health.register("memory");
 
         Self {
+            self_ref: std::sync::OnceLock::new(),
             catalog,
             storage,
             table_engines: parking_lot::RwLock::new(HashMap::new()),
@@ -1542,6 +1552,24 @@ impl Executor {
     /// Current query execution memory budget in bytes.
     pub fn query_memory_limit(&self) -> u64 {
         self.query_memory.limit()
+    }
+
+    /// Record a weak self-reference so `&self` methods can recover an owned
+    /// `Arc<Executor>` (see [`Executor::arc_self`]). Call this once, right after the
+    /// executor is wrapped in an `Arc` at a server/embedded entry point. Idempotent;
+    /// a second call is ignored (the `OnceLock` keeps the first).
+    pub fn install_self_ref(self: &Arc<Self>) {
+        let _ = self.self_ref.set(Arc::downgrade(self));
+    }
+
+    /// Recover the owning `Arc<Executor>` if one was installed via
+    /// [`install_self_ref`](Self::install_self_ref). Returns `None` for a by-value
+    /// or not-yet-installed executor, in which case callers that need an owned
+    /// handle (streaming producers that outlive the `execute` call) decline and let
+    /// the materialized path run. `Weak::upgrade` also yields `None` if the executor
+    /// is mid-drop, so a stream can never resurrect a dying executor.
+    pub(super) fn arc_self(&self) -> Option<Arc<Self>> {
+        self.self_ref.get().and_then(std::sync::Weak::upgrade)
     }
 
     // =========================================================================
@@ -4295,6 +4323,16 @@ impl Executor {
                 // through (None) for every shape it does not handle.
                 #[cfg(feature = "server")]
                 if let Some(stream) = self.try_streaming_distinct(&query).await? {
+                    return Ok(stream);
+                }
+
+                // Streaming JOIN (opt-in + memory limit + spill): a bounded-memory
+                // Grace hash join that partitions both sides on the join key so a
+                // large two-table equi-join completes under a budget where the
+                // materialized hash-join build would return MemoryExceeded. Falls
+                // through (None) for every shape it does not handle.
+                #[cfg(feature = "server")]
+                if let Some(stream) = self.try_streaming_join(&query).await? {
                     return Ok(stream);
                 }
 
