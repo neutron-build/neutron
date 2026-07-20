@@ -307,6 +307,14 @@ name = "probe_vector_recall"
 path = "src/bin/probe_vector_recall.rs"
 required-features = ["server"]
 
+# Correctness-paired benchmark harness (vector recall / FTS set-equality /
+# graph BFS+Dijkstra) — every latency number ships with a correctness number
+# measured on the same run against an inline reference. No external DB needed.
+[[bin]]
+name = "bench_paired"
+path = "src/bin/bench_paired.rs"
+required-features = ["server"]
+
 [[bench]]
 name = "query_bench"
 harness = false

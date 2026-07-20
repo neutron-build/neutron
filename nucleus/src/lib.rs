@@ -2,6 +2,7 @@
 pub mod advisor;
 pub mod allocator;
 pub mod backup;
+pub mod bench_paired;
 pub mod blob;
 pub mod branching;
 pub mod cache;
