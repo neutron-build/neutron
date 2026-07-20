@@ -519,6 +519,91 @@ pub fn bench_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vector::{DistanceMetric, HnswConfig, HnswIndex, exact_search};
+
+    /// Diagnostic (ignored — run on demand, prints, asserts nothing costly):
+    /// `cargo test --lib -- --ignored --nocapture ef_search_sweep`
+    ///
+    /// Answers "does the UNIFORM path have real recall headroom, or is it just
+    /// the search-effort dial set low against genuinely hard (distance-
+    /// concentrated) data?" by sweeping the layer-0 beam width `ef` over ONE
+    /// built graph and reporting two numbers per ef:
+    ///
+    /// - `recall@k`: ID-set overlap with the exact top-k (what we floor on).
+    /// - `dist_ratio`: mean(returned_i_dist / true_i_dist) over the k ranks,
+    ///   `>= 1.0`, where 1.0 == returned neighbours are exactly as close as the
+    ///   true ones. On concentrated data recall under-counts quality: an
+    ///   equidistant tie-swap reads as a "miss" (recall < 1) while dist_ratio
+    ///   stays ~1.000.
+    ///
+    /// Reading: if recall climbs toward 1.0 as ef grows -> graph is navigable,
+    /// the "headroom" is the recall/latency knob (raise ef or the default).
+    /// If recall plateaus well below 1.0 AND dist_ratio stays > ~1.0 -> a
+    /// build-side connectivity deficiency worth chasing. If recall plateaus but
+    /// dist_ratio ~1.000 -> the misses are tie-swaps, i.e. no real headroom.
+    #[test]
+    #[ignore = "diagnostic; prints an ef sweep, run with --ignored --nocapture"]
+    fn ef_search_sweep_uniform() {
+        let seed = 42u64;
+        for &(n, dim, k) in &[(5_000usize, 128usize, 10usize), (10_000, 128, 20)] {
+            let mut rng = Rng::new(seed);
+            let config = HnswConfig {
+                m: 16,
+                m_max0: 32,
+                ef_construction: 200,
+                ef_search: 64, // overridden per-query below
+                metric: DistanceMetric::L2,
+            };
+            let mut index = HnswIndex::new(config);
+            let corpus = gen_vectors(&mut rng, n, dim, VectorDist::Uniform);
+            let reference: Vec<(u64, Vector)> =
+                corpus.iter().enumerate().map(|(i, v)| (i as u64, v.clone())).collect();
+            for (id, v) in corpus.iter().enumerate() {
+                index.insert(id as u64, v.clone());
+            }
+
+            let queries: Vec<Vector> =
+                (0..100).map(|_| gen_query(&mut rng, dim, VectorDist::Uniform, &corpus)).collect();
+
+            println!("\n== uniform n={n} dim={dim} k={k} (build ef_c=200) ==");
+            println!("   {:>5} {:>8} {:>10} {:>10}", "ef", "recall", "dist_ratio", "avg_us");
+            for &ef in &[16usize, 32, 64, 128, 256, 512, 1024] {
+                let mut recall_sum = 0.0f64;
+                let mut ratio_sum = 0.0f64;
+                let mut nanos = 0u128;
+                for q in &queries {
+                    let t0 = Instant::now();
+                    let got = index.search_ef(q, k, ef);
+                    nanos += t0.elapsed().as_nanos();
+                    let truth = exact_search(&reference, q, k, DistanceMetric::L2);
+                    let truth_ids: HashSet<u64> = truth.iter().map(|(id, _)| *id).collect();
+                    let hits = got.iter().filter(|(id, _)| truth_ids.contains(id)).count();
+                    recall_sum += hits as f64 / k.max(1) as f64;
+                    // Rank-aligned distance ratio: returned i-th vs true i-th.
+                    let mut per_q = 0.0f64;
+                    let mut counted = 0usize;
+                    for i in 0..k.min(got.len()).min(truth.len()) {
+                        let td = truth[i].1 as f64;
+                        if td > 0.0 {
+                            per_q += got[i].1 as f64 / td;
+                            counted += 1;
+                        }
+                    }
+                    if counted > 0 {
+                        ratio_sum += per_q / counted as f64;
+                    }
+                }
+                let qn = queries.len() as f64;
+                println!(
+                    "   {:>5} {:>8.3} {:>10.4} {:>10.1}",
+                    ef,
+                    recall_sum / qn,
+                    ratio_sum / qn,
+                    (nanos as f64 / qn) / 1000.0
+                );
+            }
+        }
+    }
 
     /// HNSW must recover the true nearest neighbors: mean recall@k stays high
     /// and no single query collapses. If an index refactor returned wrong rows
