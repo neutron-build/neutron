@@ -140,33 +140,59 @@ fn gen_query(rng: &mut Rng) -> String {
             };
             format!("SELECT {proj} FROM t{w}{order}")
         }
-        // GROUP BY (COUNT/MIN/MAX only) + optional ORDER BY output + LIMIT.
+        // GROUP BY (COUNT/MIN/MAX only) + optional ORDER BY output + LIMIT/OFFSET.
+        // Emits 1..3 aggregates (exercises the streaming aggregate accumulating
+        // several functions per group), orders by either an aggregate OR a group
+        // column, and can apply OFFSET (the streaming skip adapter). Every
+        // ORDER-BY variant ends with ALL group columns, so it is a TOTAL order
+        // (group keys are unique per row) — that is what makes LIMIT/OFFSET a
+        // deterministic window comparable as a multiset.
         1 => {
             let gcols = { let n = 1 + rng.below(2); pick_cols(rng, &["a", "g", "s"], n) };
             let g = gcols.join(", ");
-            let agg = match rng.below(4) {
-                0 => "COUNT(*) AS c".to_string(),
-                1 => format!("COUNT({}) AS c", rng.pick(&COLS)),
-                2 => format!("MIN({}) AS c", rng.pick(&["a", "b", "g", "id"])),
-                _ => format!("MAX({}) AS c", rng.pick(&["a", "b", "g", "id"])),
-            };
-            let order = if rng.chance(55) {
-                // Order by an output name or ordinal (deterministic tiebreak by all
-                // group cols keeps ties from making the multiset compare ambiguous —
-                // multiset compare is order-independent anyway).
+            let naggs = 1 + rng.below(3);
+            let aggs: Vec<String> = (0..naggs)
+                .map(|i| {
+                    let a = match rng.below(4) {
+                        0 => "COUNT(*)".to_string(),
+                        1 => format!("COUNT({})", rng.pick(&COLS)),
+                        2 => format!("MIN({})", rng.pick(&["a", "b", "g", "id"])),
+                        _ => format!("MAX({})", rng.pick(&["a", "b", "g", "id"])),
+                    };
+                    format!("{a} AS c{i}")
+                })
+                .collect();
+            let agg = aggs.join(", ");
+            let order = if rng.chance(60) {
+                // Lead by the first aggregate output OR by a group column; always
+                // tiebreak by every group column → total order.
                 let dir = if rng.chance(50) { "ASC" } else { "DESC" };
-                format!(" ORDER BY c {dir}, {g}")
+                let lead = if rng.chance(50) {
+                    format!("c0 {dir}, ")
+                } else {
+                    String::new()
+                };
+                format!(" ORDER BY {lead}{g}")
             } else {
                 String::new()
             };
-            let lim = if !order.is_empty() && rng.chance(50) {
+            // OFFSET (with or without LIMIT) is only deterministic under a total
+            // order, so gate both on a present ORDER BY.
+            let lim = if !order.is_empty() && rng.chance(55) {
                 format!(" LIMIT {}", 1 + rng.below(8))
             } else {
                 String::new()
             };
-            format!("SELECT {g}, {agg} FROM t GROUP BY {g}{order}{lim}")
+            let off = if !order.is_empty() && rng.chance(45) {
+                format!(" OFFSET {}", rng.below(5))
+            } else {
+                String::new()
+            };
+            format!("SELECT {g}, {agg} FROM t GROUP BY {g}{order}{lim}{off}")
         }
-        // DISTINCT + optional ORDER BY output + LIMIT.
+        // DISTINCT + optional ORDER BY output + LIMIT/OFFSET. ORDER BY over all
+        // projected (== deduped) columns is a total order, so LIMIT and OFFSET
+        // both yield a deterministic, multiset-comparable window.
         2 => {
             let cols = { let n = 1 + rng.below(3); pick_cols(rng, &COLS, n) };
             let c = cols.join(", ");
@@ -181,7 +207,12 @@ fn gen_query(rng: &mut Rng) -> String {
             } else {
                 String::new()
             };
-            format!("SELECT DISTINCT {c} FROM t{order}{lim}")
+            let off = if !order.is_empty() && rng.chance(45) {
+                format!(" OFFSET {}", rng.below(5))
+            } else {
+                String::new()
+            };
+            format!("SELECT DISTINCT {c} FROM t{order}{lim}{off}")
         }
         // Two-table equi self-join.
         _ => {
