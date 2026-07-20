@@ -274,6 +274,9 @@ impl Executor {
             ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => {
                 Ok(Value::Text(s.clone()))
             }
+            // E'...' escape-string literal (psql sends E'\n' in \l). The
+            // sqlparser tokenizer has already decoded the backslash escapes.
+            ast::Value::EscapedStringLiteral(s) => Ok(Value::Text(s.clone())),
             ast::Value::Boolean(b) => Ok(Value::Bool(*b)),
             ast::Value::Null => Ok(Value::Null),
             _ => Err(ExecError::Unsupported(format!("value: {val}"))),
@@ -508,6 +511,38 @@ impl Executor {
                 return Ok(Value::Bool(matches!(
                     compare_values(left, right),
                     Some(Ordering::Greater | Ordering::Equal)
+                )));
+            }
+            // POSIX regex operators (~, !~, ~*, !~*) — psql meta-commands
+            // filter catalogs with these (`nspname !~ '^pg_'`), and psql also
+            // spells them as OPERATOR(pg_catalog.~), handled below.
+            ast::BinaryOperator::PGRegexMatch => {
+                return eval_regex_match(left, right, false, false);
+            }
+            ast::BinaryOperator::PGRegexNotMatch => {
+                return eval_regex_match(left, right, true, false);
+            }
+            ast::BinaryOperator::PGRegexIMatch => {
+                return eval_regex_match(left, right, false, true);
+            }
+            ast::BinaryOperator::PGRegexNotIMatch => {
+                return eval_regex_match(left, right, true, true);
+            }
+            ast::BinaryOperator::PGCustomBinaryOperator(parts) => {
+                // OPERATOR(pg_catalog.~) etc. — resolve the schema-qualified
+                // spelling to the same regex semantics.
+                if let Some(op_name) = parts.last() {
+                    match op_name.as_str() {
+                        "~" => return eval_regex_match(left, right, false, false),
+                        "!~" => return eval_regex_match(left, right, true, false),
+                        "~*" => return eval_regex_match(left, right, false, true),
+                        "!~*" => return eval_regex_match(left, right, true, true),
+                        _ => {}
+                    }
+                }
+                return Err(ExecError::Unsupported(format!(
+                    "custom operator OPERATOR({})",
+                    parts.join(".")
                 )));
             }
             // JSONB operators
@@ -1446,6 +1481,18 @@ impl Executor {
 
     pub(super) fn eval_cast(&self, val: Value, target: &ast::DataType) -> Result<Value, ExecError> {
         match target {
+            // '<catalog name>'::regclass — psql meta-commands (\dx notably) use
+            // this to reference system catalogs by name. Resolve the fixed
+            // pg_catalog OIDs; unknown names (incl. user tables, which would
+            // need async catalog access) yield NULL rather than an error so a
+            // LEFT JOIN comparison degrades to no-match, matching what the
+            // meta-command needs.
+            ast::DataType::Regclass => Ok(match &val {
+                Value::Text(s) => regclass_oid(s).map(Value::Int32).unwrap_or(Value::Null),
+                Value::Int32(_) => val,
+                Value::Int64(n) => Value::Int32(*n as i32),
+                _ => Value::Null,
+            }),
             ast::DataType::JSONB | ast::DataType::JSON => match val {
                 Value::Text(s) => {
                     let v: serde_json::Value = serde_json::from_str(&s)
@@ -1619,6 +1666,58 @@ impl Executor {
             },
             _ => Err(ExecError::Unsupported(format!("cast to {target}"))),
         }
+    }
+}
+
+/// POSIX regex match for the `~` / `!~` / `~*` / `!~*` operators. NULL operand
+/// yields NULL (SQL three-valued logic); a malformed pattern is a loud error,
+/// matching Postgres.
+pub(super) fn eval_regex_match(
+    left: &Value,
+    right: &Value,
+    negated: bool,
+    case_insensitive: bool,
+) -> Result<Value, ExecError> {
+    let (s, pat) = match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+        (Value::Text(s), Value::Text(p)) => (s.clone(), p.clone()),
+        (l, Value::Text(p)) => (l.to_string(), p.clone()),
+        _ => {
+            return Err(ExecError::Unsupported(
+                "regex match requires a text pattern".into(),
+            ));
+        }
+    };
+    let pattern = if case_insensitive {
+        format!("(?i){pat}")
+    } else {
+        pat
+    };
+    let re = regex::Regex::new(&pattern)
+        .map_err(|e| ExecError::Unsupported(format!("invalid regular expression: {e}")))?;
+    let matched = re.is_match(&s);
+    Ok(Value::Bool(matched != negated))
+}
+
+/// Resolve a `::regclass` cast of a system-catalog name to its fixed
+/// PostgreSQL OID. Accepts an optional `pg_catalog.` prefix and surrounding
+/// quotes. Returns `None` for anything else (user tables would need async
+/// catalog access; callers map that to NULL).
+pub(super) fn regclass_oid(name: &str) -> Option<i32> {
+    let n = name.trim().trim_matches('\'').trim_matches('"');
+    let n = n.strip_prefix("pg_catalog.").unwrap_or(n);
+    match n {
+        "pg_type" => Some(1247),
+        "pg_attribute" => Some(1249),
+        "pg_proc" => Some(1255),
+        "pg_class" => Some(1259),
+        "pg_authid" => Some(1260),
+        "pg_database" => Some(1262),
+        "pg_description" => Some(2609),
+        "pg_index" => Some(2610),
+        "pg_namespace" => Some(2615),
+        "pg_extension" => Some(3079),
+        _ => None,
     }
 }
 
