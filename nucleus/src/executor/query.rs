@@ -6202,6 +6202,18 @@ impl Executor {
         if col1 != col2 {
             return None;
         }
+        // The coarse `[lo, hi]` range this produces is scanned INCLUSIVELY and
+        // relies on a post-scan recheck to enforce strict (`<` / `>`) bounds. That
+        // recheck is not reliably applied on this two-sided path — it silently
+        // leaked the excluded boundary row (e.g. `a > 0 AND a <= 3` returned rows
+        // with `a = 0`), most visibly under ORDER BY on the (unprojected) range
+        // column. So only take this fast path when BOTH bounds are inclusive
+        // (`>=` / `<=`), which makes the coarse range exactly equal the predicate;
+        // a strict bound falls through to the general per-row filter, which applies
+        // the exact predicate.
+        if Self::is_strict_inequality(left) || Self::is_strict_inequality(right) {
+            return None;
+        }
         // One must be a lower bound and one an upper bound
         if is_lower1 && !is_lower2 {
             Some((col1, val1, val2))
@@ -6210,6 +6222,18 @@ impl Executor {
         } else {
             None
         }
+    }
+
+    /// Whether `expr` is a strict inequality comparison (`<` or `>`) — used to keep
+    /// the inclusive coarse-range fast path off strict bounds it can't represent.
+    fn is_strict_inequality(expr: &Expr) -> bool {
+        matches!(
+            expr,
+            Expr::BinaryOp {
+                op: ast::BinaryOperator::Lt | ast::BinaryOperator::Gt,
+                ..
+            }
+        )
     }
 
     /// Extract a single bound from `col >= val`, `col > val`, `col <= val`, `col < val`.
