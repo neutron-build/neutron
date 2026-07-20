@@ -502,12 +502,10 @@ impl HnswIndex {
             } else {
                 self.config.m
             };
-            let selected: Vec<u64> = candidates
-                .into_iter()
-                .filter(|c| c.id != id) // Don't connect to self
-                .take(m)
-                .map(|c| c.id)
-                .collect();
+            // Don't connect to self, then pick M diverse neighbours (Alg. 4)
+            // rather than the M closest — bridge edges keep the graph navigable.
+            let pool: Vec<Candidate> = candidates.into_iter().filter(|c| c.id != id).collect();
+            let selected: Vec<u64> = self.select_neighbors_heuristic(&pool, m);
 
             // Add bidirectional connections
             for &neighbor_id in &selected {
@@ -539,6 +537,58 @@ impl HnswIndex {
             self.entry_point = Some(id);
             self.max_layer = node_layer;
         }
+    }
+
+    /// Diversifying neighbour selection — HNSW paper Algorithm 4
+    /// (SELECT-NEIGHBORS-HEURISTIC). Given candidates sorted ascending by their
+    /// distance to `base` (each `Candidate.dist` is dist(candidate, base)),
+    /// keep a candidate only if it is closer to `base` than to every neighbour
+    /// already kept. This drops redundant same-direction links and preserves
+    /// long-range "bridge" edges, which is what keeps the graph navigable —
+    /// naive take-M-closest starves inter-cluster bridges and collapses recall
+    /// on structured (embedding-like) data.
+    ///
+    /// If the heuristic under-fills `m` slots (it can be aggressive), the
+    /// remaining slots are back-filled with the nearest not-yet-kept candidates
+    /// (the paper's `keepPrunedConnections`) so nodes stay well-connected.
+    /// `candidates[i].dist` must already be dist(candidate_i, base); the base
+    /// vector itself is not needed here because those distances are precomputed.
+    fn select_neighbors_heuristic(&self, candidates: &[Candidate], m: usize) -> Vec<u64> {
+        if m == 0 {
+            return Vec::new();
+        }
+        let mut kept: Vec<(u64, &Vector)> = Vec::with_capacity(m);
+        for c in candidates {
+            if kept.len() >= m {
+                break;
+            }
+            let cand_vec = match self.nodes.get(&c.id) {
+                Some(node) => &node.vector,
+                None => continue,
+            };
+            // Keep iff candidate is nearer to `base` than to any kept neighbour.
+            let diverse = kept
+                .iter()
+                .all(|(_, kv)| c.dist < distance(cand_vec, kv, self.config.metric));
+            if diverse {
+                kept.push((c.id, cand_vec));
+            }
+        }
+        // Back-fill toward `m` with the nearest candidates we skipped.
+        if kept.len() < m {
+            for c in candidates {
+                if kept.len() >= m {
+                    break;
+                }
+                if kept.iter().any(|(id, _)| *id == c.id) {
+                    continue;
+                }
+                if let Some(node) = self.nodes.get(&c.id) {
+                    kept.push((c.id, &node.vector));
+                }
+            }
+        }
+        kept.into_iter().map(|(id, _)| id).collect()
     }
 
     /// Greedy search at a single layer — find the closest node to query.
@@ -666,16 +716,19 @@ impl HnswIndex {
             return;
         };
 
-        // Score all neighbors
-        let mut scored: Vec<(u64, f32)> = neighbors
+        // Score all neighbours by distance to this node, sort ascending, then
+        // prune with the diversifying heuristic (not plain take-closest) so the
+        // surviving edges keep their spread of directions — otherwise repeated
+        // pruning strips every bridge and the node ends up locked to one cluster.
+        let mut scored: Vec<Candidate> = neighbors
             .into_iter()
-            .map(|nid| (nid, self.dist(nid, &vector)))
+            .map(|nid| Candidate { id: nid, dist: self.dist(nid, &vector) })
             .collect();
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-        scored.truncate(max_conn);
+        scored.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+        let pruned = self.select_neighbors_heuristic(&scored, max_conn);
 
         if let Some(node) = self.nodes.get_mut(&node_id) {
-            node.neighbors[layer] = scored.into_iter().map(|(id, _)| id).collect();
+            node.neighbors[layer] = pruned;
         }
     }
 

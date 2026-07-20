@@ -13,7 +13,7 @@
 //! (see `nucleus::bench_paired` tests); this bin exists to surface the raw
 //! latency/throughput/recall numbers a human wants to eyeball.
 
-use nucleus::bench_paired::{bench_fts, bench_graph, bench_vector};
+use nucleus::bench_paired::{VectorDist, bench_fts, bench_graph, bench_vector_dist};
 
 fn main() {
     let seed: u64 = std::env::args()
@@ -24,22 +24,31 @@ fn main() {
     println!("bench_paired — Nucleus-only (no external reference DB in this environment)\n");
 
     // ---- Vector (HNSW) ----
+    // Two distributions, because they answer different questions:
+    //   uniform   = ANN worst case (distance concentration) → pessimistic floor
+    //   clustered = embedding-like structure → representative real-world recall
     println!("VECTOR (HNSW KNN) — latency paired with recall@k vs exact brute force");
     println!(
-        "  {:>6} {:>4} {:>3} {:>7} {:>10} {:>11} {:>10} {:>9} {:>9}",
-        "n", "dim", "k", "queries", "hnsw_us", "brute_us", "qps", "recall", "min_rec"
+        "  {:>9} {:>6} {:>4} {:>3} {:>7} {:>10} {:>11} {:>10} {:>9} {:>9}",
+        "dist", "n", "dim", "k", "queries", "hnsw_us", "brute_us", "qps", "recall", "min_rec"
     );
-    for &(n, dim, k) in &[
-        (1_000usize, 64usize, 10usize),
-        (5_000, 64, 10),
-        (5_000, 128, 10),
-        (10_000, 128, 20),
+    for &(dist, label) in &[
+        (VectorDist::Uniform, "uniform"),
+        (VectorDist::Clustered, "clustered"),
     ] {
-        let r = bench_vector(n, dim, k, 100, seed);
-        println!(
-            "  {:>6} {:>4} {:>3} {:>7} {:>10.1} {:>11.1} {:>10.0} {:>9.3} {:>9.3}",
-            r.n, r.dim, r.k, r.queries, r.hnsw_avg_us, r.brute_avg_us, r.qps, r.avg_recall, r.min_recall
-        );
+        for &(n, dim, k) in &[
+            (1_000usize, 64usize, 10usize),
+            (5_000, 64, 10),
+            (5_000, 128, 10),
+            (10_000, 128, 20),
+        ] {
+            let r = bench_vector_dist(n, dim, k, 100, seed, dist);
+            println!(
+                "  {:>9} {:>6} {:>4} {:>3} {:>7} {:>10.1} {:>11.1} {:>10.0} {:>9.3} {:>9.3}",
+                label,
+                r.n, r.dim, r.k, r.queries, r.hnsw_avg_us, r.brute_avg_us, r.qps, r.avg_recall, r.min_recall
+            );
+        }
     }
 
     // ---- FTS ----
