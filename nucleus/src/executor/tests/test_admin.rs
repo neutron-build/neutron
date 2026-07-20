@@ -1000,3 +1000,110 @@ fn test_follower_read_stale_data() {
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("stale"));
 }
+
+// ======================================================================
+// CREATE / DROP EXTENSION (catalog-tracked no-ops)
+// ======================================================================
+
+fn command_tag(result: &ExecResult) -> &str {
+    match result {
+        ExecResult::Command { tag, .. } => tag,
+        _ => panic!("expected command result"),
+    }
+}
+
+#[tokio::test]
+async fn test_create_extension_noop() {
+    let ex = test_executor();
+    let results = exec(&ex, "CREATE EXTENSION \"uuid-ossp\"").await;
+    assert_eq!(command_tag(&results[0]), "CREATE EXTENSION");
+}
+
+#[tokio::test]
+async fn test_create_extension_with_schema_and_version() {
+    let ex = test_executor();
+    let results = exec(
+        &ex,
+        "CREATE EXTENSION pgcrypto WITH SCHEMA public VERSION '1.3'",
+    )
+    .await;
+    assert_eq!(command_tag(&results[0]), "CREATE EXTENSION");
+    // Version is tracked truthfully for introspection.
+    let sel = exec(
+        &ex,
+        "SELECT extversion FROM pg_extension WHERE extname = 'pgcrypto'",
+    )
+    .await;
+    assert_eq!(scalar(&sel[0]), &Value::Text("1.3".into()));
+}
+
+#[tokio::test]
+async fn test_create_extension_if_not_exists_idempotent() {
+    let ex = test_executor();
+    exec(&ex, "CREATE EXTENSION vector").await;
+    // Second create WITHOUT IF NOT EXISTS must error (extension already exists).
+    assert!(ex.execute("CREATE EXTENSION vector").await.is_err());
+    // With IF NOT EXISTS it is a silent no-op.
+    let results = exec(&ex, "CREATE EXTENSION IF NOT EXISTS vector").await;
+    assert_eq!(command_tag(&results[0]), "CREATE EXTENSION");
+    // Still exactly one row for it in the catalog (no duplicate).
+    let sel = exec(
+        &ex,
+        "SELECT count(*) FROM pg_extension WHERE extname = 'vector'",
+    )
+    .await;
+    assert_eq!(scalar(&sel[0]), &Value::Int64(1));
+}
+
+#[tokio::test]
+async fn test_pg_extension_introspection() {
+    let ex = test_executor();
+    // A fresh cluster ships plpgsql, matching Postgres.
+    let sel = exec(&ex, "SELECT extname FROM pg_extension WHERE extname = 'plpgsql'").await;
+    assert_eq!(rows(&sel[0]).len(), 1);
+
+    exec(&ex, "CREATE EXTENSION IF NOT EXISTS pg_trgm").await;
+    let sel = exec(&ex, "SELECT extname, extversion FROM pg_extension ORDER BY extname").await;
+    let names: Vec<String> = rows(&sel[0])
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.clone(),
+            other => panic!("expected text extname, got {other:?}"),
+        })
+        .collect();
+    assert!(names.contains(&"pg_trgm".to_string()));
+    assert!(names.contains(&"plpgsql".to_string()));
+}
+
+#[tokio::test]
+async fn test_drop_extension() {
+    let ex = test_executor();
+    exec(&ex, "CREATE EXTENSION IF NOT EXISTS hstore").await;
+    let results = exec(&ex, "DROP EXTENSION hstore").await;
+    assert_eq!(command_tag(&results[0]), "DROP EXTENSION");
+    let sel = exec(
+        &ex,
+        "SELECT count(*) FROM pg_extension WHERE extname = 'hstore'",
+    )
+    .await;
+    assert_eq!(scalar(&sel[0]), &Value::Int64(0));
+
+    // Dropping a missing extension errors unless IF EXISTS is given.
+    assert!(ex.execute("DROP EXTENSION hstore").await.is_err());
+    let results = exec(&ex, "DROP EXTENSION IF EXISTS hstore").await;
+    assert_eq!(command_tag(&results[0]), "DROP EXTENSION");
+}
+
+#[tokio::test]
+async fn test_create_extension_rejects_unsupported() {
+    let ex = test_executor();
+    // Procedural-language and FDW extensions imply behavior Nucleus cannot
+    // honestly provide, so they are rejected loudly rather than accepted.
+    let err = ex
+        .execute("CREATE EXTENSION plpython3u")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("procedural-language"), "got: {err}");
+    assert!(ex.execute("CREATE EXTENSION postgres_fdw").await.is_err());
+}

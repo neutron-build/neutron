@@ -2,15 +2,27 @@
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::str::FromStr;
 
 use rust_decimal::Decimal;
 
 /// Parse the bounded exact NUMERIC representation used by Nucleus. The current
 /// physical type is rust_decimal (96-bit coefficient, scale <= 28); values
 /// outside that range reject explicitly instead of degrading to f64.
+///
+/// This uses `from_str_exact` rather than `from_str` so that a value with more
+/// fractional digits than the 28-place scale ceiling FAILS LOUDLY instead of
+/// being silently rounded (a silent-wrong-result): `from_str` rounds excess
+/// precision away, whereas `from_str_exact` returns `Underflow`. Magnitude that
+/// overflows the 96-bit coefficient is rejected by both.
 pub(crate) fn parse_numeric(value: &str) -> Result<Decimal, String> {
-    Decimal::from_str(value.trim()).map_err(|error| format!("invalid numeric value: {error}"))
+    let trimmed = value.trim();
+    Decimal::from_str_exact(trimmed).map_err(|error| match error {
+        rust_decimal::Error::Underflow => format!(
+            "numeric value '{trimmed}' exceeds NUMERIC precision ceiling: Nucleus stores \
+             NUMERIC as a 96-bit coefficient with scale <= 28 (max 28 fractional digits)"
+        ),
+        other => format!("invalid numeric value: {other}"),
+    })
 }
 
 pub(crate) fn canonical_numeric(value: &str) -> Result<String, String> {
@@ -1155,6 +1167,43 @@ mod tests {
     fn test_numeric_large_numbers() {
         assert_eq!(numeric_add("999999999999", "1").unwrap(), "1000000000000");
         assert_eq!(numeric_mul("1000000", "1000000").unwrap(), "1000000000000");
+    }
+
+    #[test]
+    fn test_numeric_within_ceiling_is_exact() {
+        // Exactly 28 fractional digits is the ceiling and must round-trip exactly.
+        let v = "0.1234567890123456789012345678";
+        assert_eq!(canonical_numeric(v).unwrap(), v);
+    }
+
+    #[test]
+    fn test_numeric_excess_precision_fails_loudly() {
+        // 35 fractional digits exceeds the scale<=28 ceiling. Previously this was
+        // silently ROUNDED by Decimal::from_str; it must now reject with a clear
+        // error rather than return a truncated (wrong) value.
+        let v = "0.12345678901234567890123456789012345";
+        let err = parse_numeric(v).unwrap_err();
+        assert!(
+            err.contains("precision ceiling"),
+            "expected precision-ceiling error, got: {err}"
+        );
+        assert!(canonical_numeric(v).is_err());
+    }
+
+    #[test]
+    fn test_numeric_magnitude_overflow_fails_loudly() {
+        // A coefficient beyond the 96-bit range must also reject, not wrap.
+        let v = "179769313486231590000000000000000000000000000";
+        assert!(parse_numeric(v).is_err());
+    }
+
+    #[test]
+    fn test_numeric_within_ceiling_negative_and_trailing() {
+        // Negative high-scale value at the ceiling round-trips exactly.
+        assert_eq!(
+            canonical_numeric("-0.1234567890123456789012345678").unwrap(),
+            "-0.1234567890123456789012345678"
+        );
     }
 
     // ========================================================================

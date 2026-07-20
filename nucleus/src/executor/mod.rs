@@ -289,6 +289,9 @@ pub struct Executor {
     materialized_views: RwLock<HashMap<String, MaterializedViewDef>>,
     /// Schemas (namespaces).
     schemas: RwLock<HashSet<String>>,
+    /// Installed extensions tracked as catalog no-ops (name → definition).
+    /// Seeded with `plpgsql`, matching a fresh Postgres cluster.
+    extensions: parking_lot::RwLock<HashMap<String, ExtensionDef>>,
     /// Path to the catalog JSON file for persistence (None = no persistence).
     catalog_path: Option<std::path::PathBuf>,
     /// Live vector indexes keyed by index name.
@@ -523,6 +526,18 @@ impl Executor {
                 let mut s = HashSet::new();
                 s.insert("public".to_string());
                 s
+            }),
+            extensions: parking_lot::RwLock::new({
+                let mut m = HashMap::new();
+                m.insert(
+                    "plpgsql".to_string(),
+                    ExtensionDef {
+                        name: "plpgsql".to_string(),
+                        schema: "pg_catalog".to_string(),
+                        version: "1.0".to_string(),
+                    },
+                );
+                m
             }),
             catalog_path: None,
             vector_indexes: parking_lot::RwLock::new(HashMap::new()),
@@ -4542,6 +4557,8 @@ impl Executor {
                     rows_affected: 0,
                 })
             }
+            Statement::CreateExtension(ext) => self.execute_create_extension(&ext),
+            Statement::DropExtension(ext) => self.execute_drop_extension(&ext),
             Statement::Call(func) => self.execute_call(func).await,
             Statement::Vacuum(ref vacuum_stmt) => self.execute_vacuum(vacuum_stmt).await,
             Statement::Discard { object_type } => self.execute_discard(object_type).await,
@@ -5661,6 +5678,92 @@ impl Executor {
     }
 
     // ========================================================================
+    // Extensions (CREATE/DROP EXTENSION as catalog-tracked no-ops)
+    // ========================================================================
+
+    /// Extensions whose behavior Nucleus genuinely cannot honor. Accepting these
+    /// silently would be a lie that leads to later runtime failures, so they are
+    /// rejected with a clear message. Everything else is accepted as a no-op:
+    /// Nucleus already provides vector/FTS/crypto/uuid/trigram/etc. natively, and
+    /// unblocking real ORMs/migration tools is the goal.
+    fn extension_is_unsupported(name: &str) -> Option<&'static str> {
+        match name.to_ascii_lowercase().as_str() {
+            // Procedural-language handlers execute foreign code we do not run.
+            "plpython3u" | "plpythonu" | "plperl" | "plperlu" | "plv8" | "plr" | "pltcl"
+            | "pltclu" => Some("procedural-language extensions are not supported: Nucleus does \
+                 not execute PL/Python, PL/Perl, PL/v8, PL/R, or PL/Tcl code"),
+            // Foreign-data / cross-database links reach systems we cannot proxy.
+            "postgres_fdw" | "dblink" | "file_fdw" | "mysql_fdw" | "oracle_fdw" | "tds_fdw" => {
+                Some("foreign-data-wrapper extensions are not supported: Nucleus cannot proxy \
+                 external data sources")
+            }
+            _ => None,
+        }
+    }
+
+    fn execute_create_extension(
+        &self,
+        ext: &ast::CreateExtension,
+    ) -> Result<ExecResult, ExecError> {
+        let name = ext.name.value.clone();
+        if let Some(reason) = Self::extension_is_unsupported(&name) {
+            return Err(ExecError::Unsupported(format!(
+                "CREATE EXTENSION \"{name}\": {reason}"
+            )));
+        }
+        let mut extensions = self.extensions.write();
+        if extensions.contains_key(&name) {
+            if ext.if_not_exists {
+                return Ok(ExecResult::Command {
+                    tag: "CREATE EXTENSION".into(),
+                    rows_affected: 0,
+                });
+            }
+            return Err(ExecError::Unsupported(format!(
+                "extension \"{name}\" already exists"
+            )));
+        }
+        let schema = ext
+            .schema
+            .as_ref()
+            .map(|s| s.value.clone())
+            .unwrap_or_else(|| "public".to_string());
+        let version = ext
+            .version
+            .as_ref()
+            .map(|v| v.value.clone())
+            .unwrap_or_else(|| "1.0".to_string());
+        extensions.insert(
+            name.clone(),
+            ExtensionDef {
+                name,
+                schema,
+                version,
+            },
+        );
+        Ok(ExecResult::Command {
+            tag: "CREATE EXTENSION".into(),
+            rows_affected: 0,
+        })
+    }
+
+    fn execute_drop_extension(&self, ext: &ast::DropExtension) -> Result<ExecResult, ExecError> {
+        let mut extensions = self.extensions.write();
+        for ident in &ext.names {
+            let name = &ident.value;
+            if extensions.remove(name).is_none() && !ext.if_exists {
+                return Err(ExecError::Unsupported(format!(
+                    "extension \"{name}\" does not exist"
+                )));
+            }
+        }
+        Ok(ExecResult::Command {
+            tag: "DROP EXTENSION".into(),
+            rows_affected: 0,
+        })
+    }
+
+    // ========================================================================
     // Virtual tables (information_schema, pg_catalog)
     // ========================================================================
 
@@ -6070,6 +6173,63 @@ impl Executor {
                         Value::Text("information_schema".into()),
                     ],
                 ];
+                Ok(Some((cols, rows)))
+            }
+            "pg_catalog.pg_extension" | "pg_extension" => {
+                let cols = vec![
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "oid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "extname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "extowner".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "extnamespace".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "extrelocatable".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "extversion".into(),
+                        dtype: DataType::Text,
+                    },
+                ];
+                let mut entries: Vec<(String, String)> = {
+                    let exts = self.extensions.read();
+                    exts.values()
+                        .map(|e| (e.name.clone(), e.version.clone()))
+                        .collect()
+                };
+                entries.sort();
+                let rows: Vec<Row> = entries
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (name, version))| {
+                        // Deterministic synthetic OID above the reserved range.
+                        vec![
+                            Value::Int32(16384 + i as i32),
+                            Value::Text(name),
+                            Value::Int32(10),
+                            Value::Int32(2200),
+                            Value::Bool(true),
+                            Value::Text(version),
+                        ]
+                    })
+                    .collect();
                 Ok(Some((cols, rows)))
             }
             "pg_catalog.pg_proc" | "pg_proc" => {
