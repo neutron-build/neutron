@@ -4939,6 +4939,20 @@ impl Executor {
 
         let query = vector::Vector::new(query_vec.clone());
 
+        // Per-session recall/latency dial, pgvector-compatible spelling:
+        //   SET hnsw.ef_search = 100;   (also accepted: SET hnsw_ef_search = 100)
+        // When set, it overrides the index's configured ef_search for this
+        // query's layer-0 beam width. Clamped so a typo can't wedge a scan.
+        let ef_override: Option<usize> = {
+            let session = self.current_session();
+            let settings = session.settings.read();
+            settings
+                .get("hnsw.ef_search")
+                .or_else(|| settings.get("hnsw_ef_search"))
+                .and_then(|v| v.trim().trim_matches('\'').trim_matches('"').parse::<usize>().ok())
+                .map(|v| v.clamp(1, 65_536))
+        };
+
         let result_ids: Vec<u64> = if let Some(pc) = pk_col {
             // Valid set = PK ids present in the pre-filtered (post-WHERE) rows.
             // The HNSW search returns NODE ids; filter and resolve via the registry.
@@ -4948,15 +4962,20 @@ impl Executor {
                 .collect();
             let reg = &entry.registry;
             match &entry.kind {
-                VectorIndexKind::Hnsw(hnsw) => hnsw
-                    .search_filtered(&query, k, |node| {
+                VectorIndexKind::Hnsw(hnsw) => {
+                    let flt = |node: u64| {
                         reg.node_to_pk
                             .get(&node)
                             .is_some_and(|pk| valid_pks.contains(pk))
-                    })
+                    };
+                    match ef_override {
+                        Some(ef) => hnsw.search_filtered_ef(&query, k, ef, flt),
+                        None => hnsw.search_filtered(&query, k, flt),
+                    }
                     .into_iter()
                     .map(|(node, _)| node)
-                    .collect(),
+                    .collect()
+                }
                 VectorIndexKind::IvfFlat(_) => return None,
             }
         } else {
@@ -4965,15 +4984,22 @@ impl Executor {
             match &entry.kind {
                 VectorIndexKind::Hnsw(hnsw) => {
                     if valid_row_ids.len() < rows.len() || valid_row_ids.len() < hnsw.len() {
-                        hnsw.search_filtered(&query, k, |id| valid_row_ids.contains(&id))
-                            .into_iter()
-                            .map(|(id, _)| id)
-                            .collect()
+                        let flt = |id: u64| valid_row_ids.contains(&id);
+                        match ef_override {
+                            Some(ef) => hnsw.search_filtered_ef(&query, k, ef, flt),
+                            None => hnsw.search_filtered(&query, k, flt),
+                        }
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect()
                     } else {
-                        hnsw.search(&query, k)
-                            .into_iter()
-                            .map(|(id, _)| id)
-                            .collect()
+                        match ef_override {
+                            Some(ef) => hnsw.search_ef(&query, k, ef),
+                            None => hnsw.search(&query, k),
+                        }
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect()
                     }
                 }
                 VectorIndexKind::IvfFlat(ivf) => {

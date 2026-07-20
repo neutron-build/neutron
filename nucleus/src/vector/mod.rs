@@ -794,6 +794,22 @@ impl HnswIndex {
     where
         F: Fn(u64) -> bool,
     {
+        self.search_filtered_ef(query, k, self.config.ef_search, filter)
+    }
+
+    /// Like [`search_filtered`] but with an explicit base beam width `ef` for
+    /// this one query (the oversampling multipliers and guaranteed-recall
+    /// fallbacks apply on top of it, exactly as with the configured default).
+    pub fn search_filtered_ef<F>(
+        &self,
+        query: &Vector,
+        k: usize,
+        ef: usize,
+        filter: F,
+    ) -> Vec<(u64, f32)>
+    where
+        F: Fn(u64) -> bool,
+    {
         if self.nodes.is_empty() || self.entry_point.is_none() || k == 0 {
             return vec![];
         }
@@ -811,7 +827,7 @@ impl HnswIndex {
 
         // Phase 2: Oversampling search at layer 0.
         // Start with 4x oversampling and increase if needed.
-        let base_ef = self.config.ef_search.max(k);
+        let base_ef = ef.max(k);
         for oversample in [4, 8, 16] {
             let ef = base_ef * oversample;
             let candidates = self.search_layer(current, query, ef, 0);
