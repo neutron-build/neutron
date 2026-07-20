@@ -58,5 +58,6 @@ mod test_streaming_aggregate; // Grace hash aggregation: bounded-memory GROUP BY
 mod test_streaming_join; // Grace hash join: bounded-memory two-table equi-JOIN with spill
 mod test_streaming_filter; // Phase 1.2 read-side: streaming WHERE filter (SIREAD-safe full scan)
 mod test_streaming_lazy; // Lazy per-partition/pair output emitters for the Grace operators
+mod test_streaming_metamorphic; // streaming ≡ materialized over random queries (transitive SQLite oracle)
 mod test_streaming_scan; // Phase 1.1: opt-in streaming scan (SET stream_results = on)
 mod test_txn; // Phase 4: JSONB @> containment, GIN indexes, subscript syntax
