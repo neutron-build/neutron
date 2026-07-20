@@ -1075,6 +1075,134 @@ async fn test_pg_extension_introspection() {
     assert!(names.contains(&"plpgsql".to_string()));
 }
 
+/// psql's \dx sends this exact query shape: pg_extension joined to
+/// pg_namespace (schema name) and LEFT JOINed to pg_description through a
+/// '::regclass' classoid comparison. All three pieces — pg_description, the
+/// regclass cast, and the joins — must work together for raw \dx to render.
+#[tokio::test]
+async fn test_psql_dx_query_shape() {
+    let ex = test_executor();
+    exec(&ex, "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"").await;
+
+    let sel = exec(
+        &ex,
+        "SELECT e.extname AS \"Name\", e.extversion AS \"Version\", \
+                n.nspname AS \"Schema\", c.description AS \"Description\" \
+         FROM pg_catalog.pg_extension e \
+         LEFT JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
+         LEFT JOIN pg_catalog.pg_description c ON c.objoid = e.oid \
+              AND c.classoid = 'pg_catalog.pg_extension'::regclass \
+         ORDER BY 1",
+    )
+    .await;
+    let got = rows(&sel[0]);
+    // plpgsql (seed) + uuid-ossp, alphabetical.
+    assert_eq!(got.len(), 2, "both extensions must render: {got:?}");
+    assert_eq!(got[0][0], Value::Text("plpgsql".into()));
+    assert_eq!(got[1][0], Value::Text("uuid-ossp".into()));
+    // Schema resolves through the pg_namespace join.
+    assert_eq!(got[1][2], Value::Text("public".into()));
+    // No COMMENT ON support -> description is NULL, like uncommented PG objects.
+    assert_eq!(got[0][3], Value::Null);
+
+    // The regclass cast itself resolves the fixed catalog OID.
+    let cast = exec(&ex, "SELECT 'pg_catalog.pg_extension'::regclass").await;
+    assert_eq!(rows(&cast[0])[0][0], Value::Int32(3079));
+    // Unknown name degrades to NULL, not an error.
+    let unknown = exec(&ex, "SELECT 'no_such_catalog'::regclass").await;
+    assert_eq!(rows(&unknown[0])[0][0], Value::Null);
+}
+
+/// psql's \d <relation> pipeline, verified live against psql 17 (2026-07-20)
+/// and pinned here: the pg_class detail row, the pg_attribute column query
+/// (format_type + scalar subqueries over pg_attrdef/pg_collation), and the
+/// index listing (pg_index + pg_constraint LEFT JOIN + pg_get_indexdef).
+#[tokio::test]
+async fn test_psql_describe_table_pipeline() {
+    let ex = test_executor();
+    exec(
+        &ex,
+        "CREATE TABLE dsc (id INT PRIMARY KEY, name TEXT, v VECTOR(3))",
+    )
+    .await;
+
+    // Query 1: relation lookup by regex (OPERATOR(pg_catalog.~) + COLLATE).
+    let lookup = exec(
+        &ex,
+        "SELECT c.oid, n.nspname, c.relname \
+         FROM pg_catalog.pg_class c \
+         LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relname OPERATOR(pg_catalog.~) '^(dsc)$' COLLATE pg_catalog.default \
+           AND pg_catalog.pg_table_is_visible(c.oid) \
+         ORDER BY 2, 3",
+    )
+    .await;
+    let found = rows(&lookup[0]);
+    assert_eq!(found.len(), 1, "regex relation lookup must find dsc: {found:?}");
+    let oid = match &found[0][0] {
+        Value::Int32(n) => *n,
+        other => panic!("expected int oid, got {other:?}"),
+    };
+
+    // Query 2: the detail row (subset of psql's column list).
+    let detail = exec(
+        &ex,
+        &format!(
+            "SELECT c.relchecks, c.relkind, c.relhasindex, c.relrowsecurity, \
+                    c.relpersistence, c.reltoastrelid \
+             FROM pg_catalog.pg_class c WHERE c.oid = '{oid}'"
+        ),
+    )
+    .await;
+    let d = rows(&detail[0]);
+    assert_eq!(d.len(), 1);
+    assert_eq!(d[0][1], Value::Text("r".into()));
+    assert_eq!(d[0][2], Value::Bool(true), "PK table must report relhasindex");
+
+    // Query 3: columns with format_type — vector renders with its dimension.
+    let cols = exec(
+        &ex,
+        &format!(
+            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull \
+             FROM pg_catalog.pg_attribute a \
+             WHERE a.attrelid = '{oid}' AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum"
+        ),
+    )
+    .await;
+    let c = rows(&cols[0]);
+    assert_eq!(c.len(), 3);
+    assert_eq!(c[0][1], Value::Text("integer".into()));
+    assert_eq!(c[0][2], Value::Bool(true), "PK column is NOT NULL");
+    assert_eq!(c[1][1], Value::Text("text".into()));
+    assert_eq!(c[2][1], Value::Text("vector(3)".into()), "vector typmod must render");
+
+    // Query 4: index listing — pg_get_indexdef synthesizes a real definition.
+    let idx = exec(
+        &ex,
+        &format!(
+            "SELECT c2.relname, i.indisprimary, i.indisunique, \
+                    pg_catalog.pg_get_indexdef(i.indexrelid, 0, true) \
+             FROM pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_index i \
+             LEFT JOIN pg_catalog.pg_constraint con \
+               ON (conrelid = i.indrelid AND conindid = i.indexrelid AND contype IN ('p','u','x')) \
+             WHERE c.oid = '{oid}' AND c.oid = i.indrelid AND i.indexrelid = c2.oid \
+             ORDER BY i.indisprimary DESC, c2.relname"
+        ),
+    )
+    .await;
+    let ix = rows(&idx[0]);
+    assert_eq!(ix.len(), 1, "PK index must list: {ix:?}");
+    assert_eq!(ix[0][1], Value::Bool(true), "index is primary");
+    match &ix[0][3] {
+        Value::Text(def) => assert!(
+            def.contains("USING btree (id)"),
+            "indexdef must synthesize USING clause: {def}"
+        ),
+        other => panic!("pg_get_indexdef must return text, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn test_drop_extension() {
     let ex = test_executor();

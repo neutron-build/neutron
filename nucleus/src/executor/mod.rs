@@ -961,6 +961,10 @@ impl Executor {
         if !loaded.functions.is_empty() {
             *self.functions.write() = loaded.functions;
         }
+        if !loaded.extensions.is_empty() {
+            // Snapshot includes the plpgsql seed, so overwrite is lossless.
+            *self.extensions.write() = loaded.extensions;
+        }
         {
             let mut security = self.security.write();
             security.rls = loaded.rls;
@@ -2785,6 +2789,7 @@ impl Executor {
                 .collect()
         };
         let functions_snap: HashMap<String, FunctionDef> = self.functions.read().clone();
+        let extensions_snap: HashMap<String, ExtensionDef> = self.extensions.read().clone();
         let security_snap = self.security.read().clone_policy_state();
         // Now take async locks.
         let meta_pers = meta_persistence::MetaPersistence::alongside_catalog(path);
@@ -2800,6 +2805,7 @@ impl Executor {
                 &triggers,
                 &roles,
                 &functions_snap,
+                &extensions_snap,
                 &security_snap,
             )
             .map_err(|e| ExecError::Runtime(format!("metadata persistence failed: {e}")))?;
@@ -4231,6 +4237,8 @@ impl Executor {
                 | Statement::CreateTrigger(_)
                 | Statement::CreatePolicy(_)
                 | Statement::DropPolicy(_)
+                | Statement::CreateExtension(_)
+                | Statement::DropExtension(_)
         );
         let is_policy_ddl = match &stmt {
             Statement::CreatePolicy(_) | Statement::DropPolicy(_) => true,
@@ -6049,6 +6057,31 @@ impl Executor {
                         name: "datcollate".into(),
                         dtype: DataType::Text,
                     },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "datctype".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "datlocprovider".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "daticulocale".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "daticurules".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "datacl".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
                 let rows = vec![vec![
                     Value::Int32(1),
@@ -6056,6 +6089,11 @@ impl Executor {
                     Value::Int32(10),
                     Value::Int32(6), // UTF8 encoding id
                     Value::Text("en_US.UTF-8".into()),
+                    Value::Text("en_US.UTF-8".into()),
+                    Value::Text("c".into()), // libc locale provider
+                    Value::Null,
+                    Value::Null,
+                    Value::Null, // no ACLs — renders as default privileges
                 ]];
                 Ok(Some((cols, rows)))
             }
@@ -6092,6 +6130,11 @@ impl Executor {
                         name: "typcategory".into(),
                         dtype: DataType::Text,
                     },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "typcollation".into(),
+                        dtype: DataType::Int32,
+                    },
                 ];
                 let mut seen = std::collections::HashSet::new();
                 let mut rows = Vec::new();
@@ -6107,6 +6150,8 @@ impl Executor {
                                 Value::Int32(typlen),
                                 Value::Text(typtype.into()),
                                 Value::Text(typcategory.into()),
+                                // No collation support: 0 = not collatable.
+                                Value::Int32(0),
                             ]);
                         }
                     }
@@ -6120,6 +6165,7 @@ impl Executor {
                             Value::Int32(*len),
                             Value::Text((*tt).into()),
                             Value::Text((*cat).into()),
+                            Value::Int32(0),
                         ]);
                     }
                 }
@@ -6154,16 +6200,110 @@ impl Executor {
                         name: "reltuples".into(),
                         dtype: DataType::Float64,
                     },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relowner".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relam".into(),
+                        dtype: DataType::Int32,
+                    },
+                    // Detail columns psql's \d <relation> selects. Constant for
+                    // Nucleus (no TOAST/rules/partitions/tablespaces) except
+                    // relhasindex/relrowsecurity, which are computed truthfully.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relchecks".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relhasindex".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relhasrules".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relhastriggers".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relrowsecurity".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relforcerowsecurity".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relispartition".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "reltablespace".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "reloftype".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relpersistence".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relreplident".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "reltoastrelid".into(),
+                        dtype: DataType::Int32,
+                    },
                 ];
+                let rls_tables: std::collections::HashSet<String> = {
+                    let sec = self.security.read();
+                    sec.rls.enabled_tables().into_iter().collect()
+                };
                 let mut rows = Vec::new();
                 for (i, t) in tables.iter().enumerate() {
                     let oid = 16384 + i as i32;
+                    let has_index = indexes.iter().any(|ix| ix.table_name == t.name);
+                    let rls_on = rls_tables.contains(&t.name);
                     rows.push(vec![
                         Value::Int32(oid),
                         Value::Text(t.name.clone()),
                         Value::Int32(2200),
                         Value::Text("r".into()),
                         Value::Float64(-1.0),
+                        Value::Int32(10),
+                        // Tables use the default (heap) access method.
+                        Value::Int32(2),
+                        Value::Int32(0),
+                        Value::Bool(has_index),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Bool(rls_on),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Int32(0),
+                        Value::Int32(0),
+                        Value::Text("p".into()),
+                        Value::Text("d".into()),
+                        Value::Int32(0),
                     ]);
                 }
                 for (i, idx) in indexes.iter().enumerate() {
@@ -6174,8 +6314,51 @@ impl Executor {
                         Value::Int32(2200),
                         Value::Text("i".into()),
                         Value::Float64(0.0),
+                        Value::Int32(10),
+                        Value::Int32(403),
+                        Value::Int32(0),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Bool(false),
+                        Value::Int32(0),
+                        Value::Int32(0),
+                        Value::Text("p".into()),
+                        Value::Text("n".into()),
+                        Value::Int32(0),
                     ]);
                 }
+                Ok(Some((cols, rows)))
+            }
+            "pg_catalog.pg_am" | "pg_am" => {
+                // Access methods — psql's \dt joins this (c.relam = am.oid).
+                let cols = vec![
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "oid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "amname".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "amtype".into(),
+                        dtype: DataType::Text,
+                    },
+                ];
+                let rows = vec![
+                    vec![Value::Int32(2), Value::Text("heap".into()), Value::Text("t".into())],
+                    vec![Value::Int32(403), Value::Text("btree".into()), Value::Text("i".into())],
+                    vec![Value::Int32(405), Value::Text("hash".into()), Value::Text("i".into())],
+                    vec![Value::Int32(783), Value::Text("gist".into()), Value::Text("i".into())],
+                    vec![Value::Int32(2742), Value::Text("gin".into()), Value::Text("i".into())],
+                    vec![Value::Int32(3580), Value::Text("brin".into()), Value::Text("i".into())],
+                ];
                 Ok(Some((cols, rows)))
             }
             "pg_catalog.pg_namespace" | "pg_namespace" => {
@@ -6190,13 +6373,27 @@ impl Executor {
                         name: "nspname".into(),
                         dtype: DataType::Text,
                     },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "nspowner".into(),
+                        dtype: DataType::Int32,
+                    },
                 ];
                 let rows = vec![
-                    vec![Value::Int32(11), Value::Text("pg_catalog".into())],
-                    vec![Value::Int32(2200), Value::Text("public".into())],
+                    vec![
+                        Value::Int32(11),
+                        Value::Text("pg_catalog".into()),
+                        Value::Int32(10),
+                    ],
+                    vec![
+                        Value::Int32(2200),
+                        Value::Text("public".into()),
+                        Value::Int32(10),
+                    ],
                     vec![
                         Value::Int32(13100),
                         Value::Text("information_schema".into()),
+                        Value::Int32(10),
                     ],
                 ];
                 Ok(Some((cols, rows)))
@@ -6257,6 +6454,35 @@ impl Executor {
                     })
                     .collect();
                 Ok(Some((cols, rows)))
+            }
+            "pg_catalog.pg_description" | "pg_description" => {
+                // Object comments. Nucleus has no COMMENT ON yet, so the
+                // catalog exists (psql's \dx, \d+ etc. LEFT JOIN it) but is
+                // empty — every description renders as NULL, which is exactly
+                // how an uncommented object renders in Postgres.
+                let cols = vec![
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "objoid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "classoid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "objsubid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "description".into(),
+                        dtype: DataType::Text,
+                    },
+                ];
+                Ok(Some((cols, Vec::new())))
             }
             "pg_catalog.pg_proc" | "pg_proc" => {
                 let functions = self.functions.read();
@@ -6367,6 +6593,26 @@ impl Executor {
                         name: "rolcanlogin".into(),
                         dtype: DataType::Bool,
                     },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "rolconnlimit".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "rolvaliduntil".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "rolreplication".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "rolbypassrls".into(),
+                        dtype: DataType::Bool,
+                    },
                 ];
                 let rows: Vec<Row> = roles
                     .values()
@@ -6380,6 +6626,11 @@ impl Executor {
                             Value::Bool(r.is_superuser),
                             Value::Bool(r.is_superuser),
                             Value::Bool(r.can_login),
+                            // No per-role connection limits: -1 = unlimited.
+                            Value::Int32(-1),
+                            Value::Null,
+                            Value::Bool(false),
+                            Value::Bool(r.is_superuser),
                         ]
                     })
                     .collect();
@@ -6413,6 +6664,39 @@ impl Executor {
                         name: "attnotnull".into(),
                         dtype: DataType::Bool,
                     },
+                    // Columns psql's \d <relation> selects. Nucleus has no
+                    // typmods, defaults-in-catalog, per-column collations,
+                    // identity/generated columns, or dropped-column slots.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "atttypmod".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "atthasdef".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attcollation".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attidentity".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attgenerated".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attisdropped".into(),
+                        dtype: DataType::Bool,
+                    },
                 ];
                 let mut rows = Vec::new();
                 for (ti, t) in tables.iter().enumerate() {
@@ -6425,10 +6709,231 @@ impl Executor {
                             Value::Int32(type_oid),
                             Value::Int32((ci + 1) as i32),
                             Value::Bool(!c.nullable),
+                            Value::Int32(match &c.data_type {
+                                // Encode vector dimension the way pgvector does
+                                // (typmod = dim), so format_type can render it.
+                                DataType::Vector(d) => *d as i32,
+                                _ => -1,
+                            }),
+                            Value::Bool(false),
+                            Value::Int32(0),
+                            Value::Text(String::new()),
+                            Value::Text(String::new()),
+                            Value::Bool(false),
                         ]);
                     }
                 }
                 Ok(Some((cols, rows)))
+            }
+            "pg_catalog.pg_attrdef" | "pg_attrdef" => {
+                // Column defaults. Nucleus stores defaults in table metadata,
+                // not a separate catalog — empty relation so \d's scalar
+                // subquery resolves (atthasdef=false keeps it unreached).
+                let cols = vec![
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "adrelid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "adnum".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "adbin".into(),
+                        dtype: DataType::Text,
+                    },
+                ];
+                Ok(Some((cols, Vec::new())))
+            }
+            "pg_catalog.pg_policy" | "pg_policy" => {
+                // Row-level-security policies, populated from the live RLS
+                // engine so \d on a policied table lists its policies. polqual
+                // renders NULL (predicates aren't stored as node trees) and
+                // polroles is always "{0}" (= all roles) — psql's role-name
+                // resolution path uses array machinery Nucleus doesn't have.
+                let tables = self.catalog.list_tables().await;
+                let table_oid: HashMap<String, i32> = tables
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| (t.name.clone(), 16384 + i as i32))
+                    .collect();
+                let cols = [
+                    ("oid", DataType::Int32),
+                    ("polname", DataType::Text),
+                    ("polrelid", DataType::Int32),
+                    ("polcmd", DataType::Text),
+                    ("polpermissive", DataType::Bool),
+                    ("polroles", DataType::Text),
+                    ("polqual", DataType::Text),
+                    ("polwithcheck", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                let sec = self.security.read();
+                let rows: Vec<Row> = sec
+                    .rls
+                    .all_policies()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let cmd = match p.command {
+                            crate::security::PolicyCommand::Select => "r",
+                            crate::security::PolicyCommand::Insert => "a",
+                            crate::security::PolicyCommand::Update => "w",
+                            crate::security::PolicyCommand::Delete => "d",
+                            crate::security::PolicyCommand::All => "*",
+                        };
+                        vec![
+                            Value::Int32(16000 + i as i32),
+                            Value::Text(p.name.clone()),
+                            Value::Int32(table_oid.get(&p.table).copied().unwrap_or(0)),
+                            Value::Text(cmd.into()),
+                            Value::Bool(true),
+                            Value::Text("{0}".into()),
+                            Value::Null,
+                            Value::Null,
+                        ]
+                    })
+                    .collect();
+                Ok(Some((cols, rows)))
+            }
+            "pg_catalog.pg_statistic_ext" | "pg_statistic_ext" => {
+                // Extended statistics — Nucleus has none; empty relation so
+                // \d's stats query resolves and returns nothing.
+                let cols = [
+                    ("oid", DataType::Int32),
+                    ("stxrelid", DataType::Int32),
+                    ("stxname", DataType::Text),
+                    ("stxnamespace", DataType::Int32),
+                    ("stxkeys", DataType::Text),
+                    ("stxkind", DataType::Text),
+                    ("stxstattarget", DataType::Int32),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            "pg_catalog.pg_publication" | "pg_publication" => {
+                // Logical-replication publications — none; empty so \d's
+                // publication listing resolves.
+                let cols = [
+                    ("oid", DataType::Int32),
+                    ("pubname", DataType::Text),
+                    ("puballtables", DataType::Bool),
+                    ("pubinsert", DataType::Bool),
+                    ("pubupdate", DataType::Bool),
+                    ("pubdelete", DataType::Bool),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            "pg_catalog.pg_publication_rel" | "pg_publication_rel" => {
+                let cols = [
+                    ("oid", DataType::Int32),
+                    ("prpubid", DataType::Int32),
+                    ("prrelid", DataType::Int32),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            "pg_catalog.pg_publication_namespace" | "pg_publication_namespace" => {
+                let cols = [
+                    ("oid", DataType::Int32),
+                    ("pnpubid", DataType::Int32),
+                    ("pnnspid", DataType::Int32),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            "pg_catalog.pg_inherits" | "pg_inherits" => {
+                // Table inheritance / partition parentage — none; empty so
+                // \d's child/parent listing resolves.
+                let cols = [
+                    ("inhrelid", DataType::Int32),
+                    ("inhparent", DataType::Int32),
+                    ("inhseqno", DataType::Int32),
+                    ("inhdetachpending", DataType::Bool),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            "pg_catalog.pg_constraint" | "pg_constraint" => {
+                // Constraints. Nucleus enforces PK/NOT NULL through table
+                // metadata, not a constraint catalog — empty relation so \d's
+                // LEFT JOIN resolves (index lines render without con* rows).
+                let names = [
+                    ("oid", DataType::Int32),
+                    ("conname", DataType::Text),
+                    ("conrelid", DataType::Int32),
+                    ("conindid", DataType::Int32),
+                    ("contype", DataType::Text),
+                    ("condeferrable", DataType::Bool),
+                    ("condeferred", DataType::Bool),
+                    ("convalidated", DataType::Bool),
+                ];
+                let cols = names
+                    .into_iter()
+                    .map(|(n, dt)| ColMeta {
+                        table: Some(label.into()),
+                        name: n.into(),
+                        dtype: dt,
+                    })
+                    .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            "pg_catalog.pg_collation" | "pg_collation" => {
+                // Collations. Nucleus compares text bytewise; no per-column
+                // collations exist, so the catalog is empty.
+                let cols = vec![
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "oid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "collname".into(),
+                        dtype: DataType::Text,
+                    },
+                ];
+                Ok(Some((cols, Vec::new())))
             }
             "pg_catalog.pg_index" | "pg_index" => {
                 let tables = self.catalog.list_tables().await;
@@ -6458,6 +6963,21 @@ impl Executor {
                         table: Some(label.into()),
                         name: "indkey".into(),
                         dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indisclustered".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indisvalid".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indisreplident".into(),
+                        dtype: DataType::Bool,
                     },
                 ];
                 let table_oid_map: HashMap<String, i32> = tables
@@ -6496,6 +7016,9 @@ impl Executor {
                         Value::Bool(idx.unique),
                         Value::Bool(is_primary),
                         Value::Text(indkey),
+                        Value::Bool(false),
+                        Value::Bool(true),
+                        Value::Bool(false),
                     ]);
                 }
                 Ok(Some((cols, rows)))

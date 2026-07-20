@@ -71,6 +71,54 @@ async fn test_rls_policy_and_role_verifier_survive_restart() {
     assert_eq!(rows(&result[0])[0][0], Value::Int32(1));
 }
 
+// ── Extension persistence ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_extension_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Session 1: install extensions (an ORM's migration bootstrap).
+    {
+        let ex = open_executor(dir.path()).await;
+        exec(&ex, "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"").await;
+        exec(&ex, "CREATE EXTENSION vector WITH SCHEMA public VERSION '0.7.0'").await;
+        let r = exec(
+            &ex,
+            "SELECT extname FROM pg_extension ORDER BY extname",
+        )
+        .await;
+        // plpgsql (seed) + uuid-ossp + vector
+        assert_eq!(rows(&r[0]).len(), 3);
+    } // drop executor — simulate restart
+
+    // Session 2: the installed set (and version metadata) survives.
+    {
+        let ex = open_executor(dir.path()).await;
+        let r = exec(
+            &ex,
+            "SELECT extname, extversion FROM pg_extension ORDER BY extname",
+        )
+        .await;
+        let got = rows(&r[0]);
+        assert_eq!(got.len(), 3, "extension catalog should survive restart");
+        assert_eq!(got[2][0], Value::Text("vector".into()));
+        assert_eq!(got[2][1], Value::Text("0.7.0".into()));
+        // IF NOT EXISTS stays idempotent against the reloaded catalog.
+        exec(&ex, "CREATE EXTENSION IF NOT EXISTS vector").await;
+        // DROP persists too.
+        exec(&ex, "DROP EXTENSION \"uuid-ossp\"").await;
+    }
+
+    // Session 3: the DROP survived as well.
+    {
+        let ex = open_executor(dir.path()).await;
+        let r = exec(&ex, "SELECT extname FROM pg_extension ORDER BY extname").await;
+        let names: Vec<_> = rows(&r[0]).iter().map(|row| row[0].clone()).collect();
+        assert_eq!(names.len(), 2, "dropped extension must stay dropped: {names:?}");
+        assert!(!names.contains(&Value::Text("uuid-ossp".into())));
+    }
+}
+
 // ── View persistence ──────────────────────────────────────────────────────────
 
 #[tokio::test]

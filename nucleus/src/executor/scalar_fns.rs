@@ -73,6 +73,13 @@ impl Executor {
             )));
         }
 
+        // psql and ORMs schema-qualify builtin calls (pg_catalog.array_length,
+        // pg_catalog.pg_get_userbyid, …). The prefix never changes semantics —
+        // every builtin lives in pg_catalog — so strip it once here instead of
+        // duplicating a "PG_CATALOG.X" alternate on every match arm. (Arms that
+        // still spell out both forms predate this and are harmlessly redundant.)
+        let fname = fname.strip_prefix("PG_CATALOG.").unwrap_or(fname);
+
         match fname {
             // -- String functions --
             "UPPER" => {
@@ -1945,37 +1952,52 @@ impl Executor {
                 Ok(Value::Null)
             }
             "FORMAT_TYPE" => {
-                // Map common PostgreSQL type OIDs to type names
+                // format_type(type_oid[, typmod]) -> SQL display name; psql's
+                // \d uses this for the Type column. Typmod is honoured where
+                // it matters: vector dimension (pgvector encoding) and varchar
+                // length. NULL oid -> NULL.
                 if args.is_empty() {
                     return Err(ExecError::Unsupported(
                         "FORMAT_TYPE requires at least 1 arg".into(),
                     ));
                 }
+                if matches!(args[0], Value::Null) {
+                    return Ok(Value::Null);
+                }
                 let oid = value_to_i64(&args[0])?;
-                let type_name = match oid {
-                    16 => "boolean",
-                    20 => "bigint",
-                    21 => "smallint",
-                    23 => "integer",
-                    25 => "text",
-                    700 => "real",
-                    701 => "double precision",
-                    1043 => "character varying",
-                    1082 => "date",
-                    1114 => "timestamp without time zone",
-                    1184 => "timestamp with time zone",
-                    1700 => "numeric",
-                    2950 => "uuid",
-                    3802 => "jsonb",
-                    17 => "bytea",
-                    1042 => "character",
-                    1005 => "smallint[]",
-                    1007 => "integer[]",
-                    1009 => "text[]",
-                    1016 => "bigint[]",
-                    _ => "unknown",
+                let typmod = match args.get(1) {
+                    Some(Value::Int32(n)) => *n,
+                    Some(Value::Int64(n)) => *n as i32,
+                    _ => -1,
                 };
-                Ok(Value::Text(type_name.to_string()))
+                let type_name = match oid {
+                    16 => "boolean".to_string(),
+                    20 => "bigint".to_string(),
+                    21 => "smallint".to_string(),
+                    23 => "integer".to_string(),
+                    25 => "text".to_string(),
+                    700 => "real".to_string(),
+                    701 => "double precision".to_string(),
+                    1043 if typmod > 4 => format!("character varying({})", typmod - 4),
+                    1043 => "character varying".to_string(),
+                    1082 => "date".to_string(),
+                    1114 => "timestamp without time zone".to_string(),
+                    1184 => "timestamp with time zone".to_string(),
+                    1186 => "interval".to_string(),
+                    1700 => "numeric".to_string(),
+                    2950 => "uuid".to_string(),
+                    3802 => "jsonb".to_string(),
+                    17 => "bytea".to_string(),
+                    1042 => "character".to_string(),
+                    1005 => "smallint[]".to_string(),
+                    1007 => "integer[]".to_string(),
+                    1009 => "text[]".to_string(),
+                    1016 => "bigint[]".to_string(),
+                    16385 if typmod > 0 => format!("vector({typmod})"),
+                    16385 => "vector".to_string(),
+                    _ => "unknown".to_string(),
+                };
+                Ok(Value::Text(type_name))
             }
             "PG_GET_EXPR" => {
                 // Return first arg as text
@@ -2078,13 +2100,65 @@ impl Executor {
                 // Always return "nucleus" regardless of OID
                 Ok(Value::Text("nucleus".to_string()))
             }
-            "PG_CATALOG.PG_GET_CONSTRAINTDEF" | "PG_GET_CONSTRAINTDEF" => {
+            "PG_GET_CONSTRAINTDEF" => {
                 // Stub: returns NULL
                 Ok(Value::Null)
             }
-            "PG_CATALOG.PG_GET_INDEXDEF" | "PG_GET_INDEXDEF" => {
-                // Stub: returns NULL
-                Ok(Value::Null)
+            "PG_GET_INDEXDEF" => {
+                // pg_get_indexdef(index_oid[, colno, pretty]) — synthesize the
+                // definition from the catalog (psql's \d parses the part after
+                // "USING" for its Indexes section). Unknown OID -> NULL.
+                let oid = match args.first() {
+                    Some(Value::Int32(n)) => *n as i64,
+                    Some(Value::Int64(n)) => *n,
+                    _ => return Ok(Value::Null),
+                };
+                let tables = sync_block_on(self.catalog.list_tables());
+                let indexes = sync_block_on(self.catalog.get_all_indexes());
+                // Index OIDs are assigned positionally after table OIDs
+                // (16384 + tables.len() + i) — must match pg_class/pg_index.
+                let pos = oid - 16384 - tables.len() as i64;
+                if pos < 0 || pos as usize >= indexes.len() {
+                    return Ok(Value::Null);
+                }
+                let idx = &indexes[pos as usize];
+                let unique = if idx.unique { "UNIQUE " } else { "" };
+                Ok(Value::Text(format!(
+                    "CREATE {}INDEX {} ON public.{} USING btree ({})",
+                    unique,
+                    idx.name,
+                    idx.table_name,
+                    idx.columns.join(", ")
+                )))
+            }
+            "ARRAY_TO_STRING" => {
+                // array_to_string(array, sep [, null_string]) — used by \l on
+                // datacl. NULL array → NULL, matching Postgres.
+                if args.len() < 2 || args.len() > 3 {
+                    return Err(ExecError::Unsupported(
+                        "ARRAY_TO_STRING requires 2 or 3 arguments".into(),
+                    ));
+                }
+                match (&args[0], &args[1]) {
+                    (Value::Null, _) => Ok(Value::Null),
+                    (Value::Array(vals), Value::Text(sep)) => {
+                        let null_str = match args.get(2) {
+                            Some(Value::Text(s)) => Some(s.clone()),
+                            _ => None,
+                        };
+                        let parts: Vec<String> = vals
+                            .iter()
+                            .filter_map(|v| match v {
+                                Value::Null => null_str.clone(),
+                                other => Some(other.to_string()),
+                            })
+                            .collect();
+                        Ok(Value::Text(parts.join(sep)))
+                    }
+                    _ => Err(ExecError::Unsupported(
+                        "ARRAY_TO_STRING requires (array, text) arguments".into(),
+                    )),
+                }
             }
 
             // -- Array functions --

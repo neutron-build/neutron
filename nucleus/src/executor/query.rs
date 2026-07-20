@@ -3618,7 +3618,8 @@ impl Executor {
                         Ok(Value::Text(n.clone()))
                     }
                 }
-                ast::Value::SingleQuotedString(s) => Ok(Value::Text(s.clone())),
+                ast::Value::SingleQuotedString(s)
+                | ast::Value::EscapedStringLiteral(s) => Ok(Value::Text(s.clone())),
                 ast::Value::Boolean(b) => Ok(Value::Bool(*b)),
                 ast::Value::Null => Ok(Value::Null),
                 _ => Ok(Value::Null),
@@ -3682,6 +3683,31 @@ impl Executor {
                     return result;
                 }
                 match op {
+                    // POSIX regex operators (see expr::eval_regex_match).
+                    ast::BinaryOperator::PGRegexMatch => {
+                        super::expr::eval_regex_match(&lv, &rv, false, false)
+                    }
+                    ast::BinaryOperator::PGRegexNotMatch => {
+                        super::expr::eval_regex_match(&lv, &rv, true, false)
+                    }
+                    ast::BinaryOperator::PGRegexIMatch => {
+                        super::expr::eval_regex_match(&lv, &rv, false, true)
+                    }
+                    ast::BinaryOperator::PGRegexNotIMatch => {
+                        super::expr::eval_regex_match(&lv, &rv, true, true)
+                    }
+                    ast::BinaryOperator::PGCustomBinaryOperator(parts) => {
+                        match parts.last().map(String::as_str) {
+                            Some("~") => super::expr::eval_regex_match(&lv, &rv, false, false),
+                            Some("!~") => super::expr::eval_regex_match(&lv, &rv, true, false),
+                            Some("~*") => super::expr::eval_regex_match(&lv, &rv, false, true),
+                            Some("!~*") => super::expr::eval_regex_match(&lv, &rv, true, true),
+                            _ => Err(ExecError::Unsupported(format!(
+                                "custom operator OPERATOR({})",
+                                parts.join(".")
+                            ))),
+                        }
+                    }
                     ast::BinaryOperator::Eq => {
                         Ok(Value::Bool(cmp() == Some(std::cmp::Ordering::Equal)))
                     }
@@ -4079,6 +4105,15 @@ impl Executor {
     /// Cast a Value to the specified SQL data type (best effort for plan path).
     pub(super) fn plan_cast_value(&self, v: Value, target: &ast::DataType) -> Value {
         match target {
+            // See eval_cast: system-catalog name → fixed OID, else NULL.
+            ast::DataType::Regclass => match &v {
+                Value::Text(s) => super::expr::regclass_oid(s)
+                    .map(Value::Int32)
+                    .unwrap_or(Value::Null),
+                Value::Int32(_) => v,
+                Value::Int64(n) => Value::Int32(*n as i32),
+                _ => Value::Null,
+            },
             ast::DataType::Int(_) | ast::DataType::Integer(_) | ast::DataType::Int4(_) => {
                 match &v {
                     Value::Int32(_) => v,
@@ -9215,7 +9250,9 @@ impl Executor {
                         None
                     }
                 }
-                ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s) => {
+                ast::Value::SingleQuotedString(s)
+                | ast::Value::DoubleQuotedString(s)
+                | ast::Value::EscapedStringLiteral(s) => {
                     Some(Value::Text(s.clone()))
                 }
                 ast::Value::Boolean(b) => Some(Value::Bool(*b)),
