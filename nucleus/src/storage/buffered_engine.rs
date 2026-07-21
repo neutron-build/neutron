@@ -462,6 +462,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn per_session_transactions_are_isolated() {
+        // Regression (ORM harness / SQLAlchemy): the engine used ONE global
+        // txn buffer, so (a) a session that disconnected mid-transaction
+        // blocked every later BEGIN with "transaction already active", and
+        // (b) OTHER sessions' autocommit writes were silently buffered into
+        // the orphaned transaction and lost. Buffers are per-session now.
+        use crate::storage::STORAGE_SESSION_ID;
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _) = setup(tmp.path().join("sessions.db").as_path()).await;
+
+        // Session 1 opens a transaction and buffers a row… then "disconnects".
+        STORAGE_SESSION_ID
+            .scope(1, async {
+                engine.begin_txn().await.unwrap();
+                engine.insert("t", row(10, "orphan")).await.unwrap();
+            })
+            .await;
+
+        // Session 2: BEGIN must succeed (own buffer), and its autocommit-style
+        // committed txn must be independent of session 1's open buffer.
+        STORAGE_SESSION_ID
+            .scope(2, async {
+                engine.begin_txn().await.unwrap();
+                engine.insert("t", row(20, "s2")).await.unwrap();
+                engine.commit_txn().await.unwrap();
+            })
+            .await;
+
+        // Session 3 (no txn): a plain write passes straight through and is
+        // NOT swallowed by session 1's still-open buffer.
+        STORAGE_SESSION_ID
+            .scope(3, async {
+                engine.insert("t", row(30, "s3")).await.unwrap();
+            })
+            .await;
+
+        // Outside any buffering session: only committed rows are visible.
+        let rows = engine.scan("t").await.unwrap();
+        let ids: Vec<i32> = rows
+            .iter()
+            .filter_map(|r| match r.first() {
+                Some(Value::Int32(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert!(ids.contains(&20) && ids.contains(&30), "committed rows visible: {ids:?}");
+        assert!(!ids.contains(&10), "orphaned buffered row must not be visible: {ids:?}");
+
+        // Disconnect cleanup releases session 1's orphan; a fresh BEGIN on the
+        // same id succeeds and the orphaned row is gone for good.
+        engine.drop_storage_session(1);
+        STORAGE_SESSION_ID
+            .scope(1, async {
+                engine.begin_txn().await.unwrap();
+                engine.abort_txn().await.unwrap();
+            })
+            .await;
+        let rows = engine.scan("t").await.unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
     async fn auto_commit_passthrough() {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, _) = setup(tmp.path().join("auto.db").as_path()).await;
