@@ -165,11 +165,6 @@ path = "src/bin/probe_recover_engines.rs"
 required-features = ["server", "rusqlite"]
 
 [[bin]]
-name = "probe_pgwire"
-path = "src/bin/probe_pgwire.rs"
-required-features = ["server", "rusqlite"]
-
-[[bin]]
 name = "probe_concurrency_threads"
 path = "src/bin/probe_concurrency_threads.rs"
 required-features = ["server", "rusqlite"]
