@@ -41,7 +41,7 @@ impl Executor {
 
         // Privilege check: COPY FROM requires INSERT, COPY TO requires SELECT
         if let ast::CopySource::Table { table_name, .. } = &source {
-            let tbl = table_name.to_string();
+            let tbl = crate::sql::object_name_key(table_name);
             let required = if to { "SELECT" } else { "INSERT" };
             if !self.check_privilege(&tbl, required).await {
                 return Err(ExecError::PermissionDenied(format!(
@@ -70,7 +70,7 @@ impl Executor {
         values: Vec<Option<String>>,
     ) -> Result<ExecResult, ExecError> {
         let table_name = match &source {
-            ast::CopySource::Table { table_name, .. } => table_name.to_string(),
+            ast::CopySource::Table { table_name, .. } => crate::sql::object_name_key(table_name),
             ast::CopySource::Query(_) => {
                 return Err(ExecError::Unsupported(
                     "COPY FROM with query not supported".into(),
@@ -141,7 +141,7 @@ impl Executor {
                 table_name,
                 columns,
             } => {
-                let table = table_name.to_string();
+                let table = crate::sql::object_name_key(table_name);
                 let table_def = self.get_table(&table).await?;
 
                 let col_names: Vec<String> = if columns.is_empty() {

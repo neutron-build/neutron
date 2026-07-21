@@ -12,11 +12,20 @@
 //! - Scan isolation: uncommitted writes are visible within the transaction
 //!   but not to other sessions
 //!
+//! Transactions are PER-SESSION, keyed by the `STORAGE_SESSION_ID` task-local:
+//! each connection gets its own buffer, so an abandoned transaction on one
+//! connection can neither block another connection's BEGIN nor swallow its
+//! writes. (The original single-global-buffer design did both: a client that
+//! disconnected mid-transaction left the buffer active forever, and every
+//! later connection's writes were silently buffered into the orphan and lost.)
+//!
 //! Limitations:
-//! - Single active transaction at a time (StorageEngine trait has no session ID)
-//! - No full MVCC snapshot isolation between concurrent sessions
+//! - No full MVCC snapshot isolation between concurrent sessions (buffered
+//!   writes are invisible to others, but reads see the inner engine's latest
+//!   committed state rather than a stable snapshot)
 //! - Buffered data is in memory — very large transactions may use significant RAM
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -59,18 +68,32 @@ impl TxnBuffer {
     }
 }
 
-/// Wraps [`DiskEngine`] with transaction write buffering.
+/// Wraps [`DiskEngine`] with per-session transaction write buffering.
 pub struct BufferedDiskEngine {
     inner: Arc<DiskEngine>,
-    /// Current transaction buffer. `Some` = explicit transaction active.
-    txn_buf: RwLock<Option<TxnBuffer>>,
+    /// Per-session transaction buffers, keyed by storage session id.
+    /// An entry exists iff that session has an explicit transaction open.
+    txn_bufs: RwLock<HashMap<u64, TxnBuffer>>,
+}
+
+/// The storage session id of the current execution context (0 = default /
+/// embedded).
+fn current_session_id() -> u64 {
+    #[cfg(feature = "server")]
+    {
+        super::STORAGE_SESSION_ID.try_with(|&id| id).unwrap_or(0)
+    }
+    #[cfg(not(feature = "server"))]
+    {
+        super::get_storage_session_id()
+    }
 }
 
 impl BufferedDiskEngine {
     pub fn new(inner: Arc<DiskEngine>) -> Self {
         Self {
             inner,
-            txn_buf: RwLock::new(None),
+            txn_bufs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -80,7 +103,7 @@ impl BufferedDiskEngine {
     }
 
     fn is_in_txn(&self) -> bool {
-        self.txn_buf.read().is_some()
+        self.txn_bufs.read().contains_key(&current_session_id())
     }
 
     /// Apply all buffered operations to the underlying engine.
@@ -111,54 +134,44 @@ impl BufferedDiskEngine {
 #[async_trait::async_trait]
 impl StorageEngine for BufferedDiskEngine {
     async fn create_table(&self, table: &str) -> Result<(), StorageError> {
-        if self.is_in_txn() {
-            let mut buf = self.txn_buf.write();
-            if let Some(ref mut txn) = *buf {
-                txn.ops.push(BufferedOp::CreateTable {
-                    table: table.to_string(),
-                });
-            }
-            Ok(())
-        } else {
-            self.inner.create_table(table).await
+        if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
+            txn.ops.push(BufferedOp::CreateTable {
+                table: table.to_string(),
+            });
+            return Ok(());
         }
+        self.inner.create_table(table).await
     }
 
     async fn drop_table(&self, table: &str) -> Result<(), StorageError> {
-        if self.is_in_txn() {
-            let mut buf = self.txn_buf.write();
-            if let Some(ref mut txn) = *buf {
-                txn.ops.push(BufferedOp::DropTable {
-                    table: table.to_string(),
-                });
-            }
-            Ok(())
-        } else {
-            self.inner.drop_table(table).await
+        if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
+            txn.ops.push(BufferedOp::DropTable {
+                table: table.to_string(),
+            });
+            return Ok(());
         }
+        self.inner.drop_table(table).await
     }
 
     async fn insert(&self, table: &str, row: Row) -> Result<(), StorageError> {
-        if self.is_in_txn() {
-            let mut buf = self.txn_buf.write();
-            if let Some(ref mut txn) = *buf {
-                txn.ops.push(BufferedOp::Insert {
-                    table: table.to_string(),
-                    row,
-                });
-            }
-            Ok(())
-        } else {
-            self.inner.insert(table, row).await
+        if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
+            txn.ops.push(BufferedOp::Insert {
+                table: table.to_string(),
+                row,
+            });
+            return Ok(());
         }
+        self.inner.insert(table, row).await
     }
 
     async fn scan(&self, table: &str) -> Result<Vec<Row>, StorageError> {
         let mut rows = self.inner.scan(table).await?;
 
-        // If in a transaction, apply buffered ops to produce a consistent view.
-        let buf = self.txn_buf.read();
-        if let Some(ref txn) = *buf {
+        // If this session is in a transaction, apply ITS buffered ops so it
+        // reads its own uncommitted writes (other sessions' buffers stay
+        // invisible).
+        let bufs = self.txn_bufs.read();
+        if let Some(txn) = bufs.get(&current_session_id()) {
             for op in &txn.ops {
                 match op {
                     BufferedOp::Insert { table: t, row } if t == table => {
@@ -213,9 +226,9 @@ impl StorageEngine for BufferedDiskEngine {
 
     fn fast_count_all(&self, table: &str) -> Option<usize> {
         let mut count = self.inner.fast_count_all(table)?;
-        // Adjust for buffered transaction ops
-        let buf = self.txn_buf.read();
-        if let Some(ref txn) = *buf {
+        // Adjust for this session's buffered transaction ops
+        let bufs = self.txn_bufs.read();
+        if let Some(txn) = bufs.get(&current_session_id()) {
             for op in &txn.ops {
                 match op {
                     BufferedOp::Insert { table: t, .. } if t == table => count += 1,
@@ -233,35 +246,25 @@ impl StorageEngine for BufferedDiskEngine {
     }
 
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
-        if self.is_in_txn() {
-            let count = positions.len();
-            let mut buf = self.txn_buf.write();
-            if let Some(ref mut txn) = *buf {
-                txn.ops.push(BufferedOp::Delete {
-                    table: table.to_string(),
-                    positions: positions.to_vec(),
-                });
-            }
-            Ok(count)
-        } else {
-            self.inner.delete(table, positions).await
+        if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
+            txn.ops.push(BufferedOp::Delete {
+                table: table.to_string(),
+                positions: positions.to_vec(),
+            });
+            return Ok(positions.len());
         }
+        self.inner.delete(table, positions).await
     }
 
     async fn update(&self, table: &str, updates: &[(usize, Row)]) -> Result<usize, StorageError> {
-        if self.is_in_txn() {
-            let count = updates.len();
-            let mut buf = self.txn_buf.write();
-            if let Some(ref mut txn) = *buf {
-                txn.ops.push(BufferedOp::Update {
-                    table: table.to_string(),
-                    updates: updates.to_vec(),
-                });
-            }
-            Ok(count)
-        } else {
-            self.inner.update(table, updates).await
+        if let Some(txn) = self.txn_bufs.write().get_mut(&current_session_id()) {
+            txn.ops.push(BufferedOp::Update {
+                table: table.to_string(),
+                updates: updates.to_vec(),
+            });
+            return Ok(updates.len());
         }
+        self.inner.update(table, updates).await
     }
 
     async fn sync_schema(&self, table: &str) -> Result<(), StorageError> {
@@ -275,18 +278,19 @@ impl StorageEngine for BufferedDiskEngine {
     // -- Transaction lifecycle --
 
     async fn begin_txn(&self) -> Result<(), StorageError> {
-        let mut buf = self.txn_buf.write();
-        if buf.is_some() {
+        let id = current_session_id();
+        let mut bufs = self.txn_bufs.write();
+        if bufs.contains_key(&id) {
             return Err(StorageError::Io("transaction already active".into()));
         }
-        *buf = Some(TxnBuffer::new());
+        bufs.insert(id, TxnBuffer::new());
         Ok(())
     }
 
     async fn commit_txn(&self) -> Result<(), StorageError> {
         let ops = {
-            let mut buf = self.txn_buf.write();
-            match buf.take() {
+            let mut bufs = self.txn_bufs.write();
+            match bufs.remove(&current_session_id()) {
                 Some(txn) => txn.ops,
                 None => return Ok(()), // no active txn — no-op
             }
@@ -300,9 +304,16 @@ impl StorageEngine for BufferedDiskEngine {
     }
 
     async fn abort_txn(&self) -> Result<(), StorageError> {
-        let mut buf = self.txn_buf.write();
-        *buf = None; // discard all buffered operations
+        // Discard this session's buffered operations.
+        self.txn_bufs.write().remove(&current_session_id());
         Ok(())
+    }
+
+    fn drop_storage_session(&self, id: u64) {
+        // A client that disconnects mid-transaction must not leave an orphaned
+        // buffer behind — it would hold "transaction already active" against
+        // the session id forever.
+        self.txn_bufs.write().remove(&id);
     }
 
     fn supports_mvcc(&self) -> bool {

@@ -504,7 +504,7 @@ impl Executor {
         where_clause: &Option<Expr>,
     ) -> Result<planner::PlanNode, ExecError> {
         let table_name = match table_factor {
-            TableFactor::Table { name, .. } => name.to_string(),
+            TableFactor::Table { name, .. } => crate::sql::object_name_key(name),
             _ => {
                 return Err(ExecError::Unsupported(
                     "subqueries in FROM not planned yet".into(),
@@ -744,14 +744,14 @@ impl Executor {
                 }
                 let off = match offset {
                     Some(o) => match self.expr_to_usize(&o.value) {
-                        Ok(n) => n,
+                        Ok(n) => n.unwrap_or(0),
                         Err(_) => return Ok(None),
                     },
                     None => 0,
                 };
                 let lim = match limit {
                     Some(e) => match self.expr_to_usize(e) {
-                        Ok(n) => Some(n),
+                        Ok(n) => n,
                         Err(_) => return Ok(None),
                     },
                     None => None,
@@ -760,11 +760,11 @@ impl Executor {
             }
             Some(ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
                 let off = match self.expr_to_usize(offset) {
-                    Ok(n) => n,
+                    Ok(n) => n.unwrap_or(0),
                     Err(_) => return Ok(None),
                 };
                 let lim = match self.expr_to_usize(limit) {
-                    Ok(n) => Some(n),
+                    Ok(n) => n,
                     Err(_) => return Ok(None),
                 };
                 (off, lim)
@@ -965,7 +965,7 @@ impl Executor {
         let table_name = match &select.from[0].relation {
             TableFactor::Table {
                 name, alias, args, ..
-            } if alias.is_none() && args.is_none() => name.to_string(),
+            } if alias.is_none() && args.is_none() => crate::sql::object_name_key(name),
             _ => return Ok(None),
         };
         if table_name.is_empty() {
@@ -1199,7 +1199,7 @@ impl Executor {
                 let base_alias = if let TableFactor::Table { alias, name, .. } = &from.relation {
                     alias
                         .as_ref()
-                        .map(|a| a.name.value.as_str() != name.to_string().as_str())
+                        .map(|a| a.name.value != crate::sql::object_name_key(name))
                         .unwrap_or(false)
                 } else {
                     false
@@ -1208,7 +1208,7 @@ impl Executor {
                     if let TableFactor::Table { alias, name, .. } = &j.relation {
                         alias
                             .as_ref()
-                            .map(|a| a.name.value.as_str() != name.to_string().as_str())
+                            .map(|a| a.name.value != crate::sql::object_name_key(name))
                             .unwrap_or(false)
                     } else {
                         false
@@ -1405,7 +1405,7 @@ impl Executor {
     pub(super) fn table_factor_names(factor: &TableFactor) -> HashSet<String> {
         let mut names = HashSet::new();
         if let TableFactor::Table { name, alias, .. } = factor {
-            names.insert(name.to_string().to_lowercase());
+            names.insert(crate::sql::object_name_key(name).to_lowercase());
             if let Some(a) = alias {
                 names.insert(a.name.value.to_lowercase());
             }
@@ -1424,14 +1424,14 @@ impl Executor {
             } = &twj.relation
                 && a.name.value.to_lowercase() == lower
             {
-                return name.to_string();
+                return crate::sql::object_name_key(name);
             }
             if let TableFactor::Table {
                 name, alias: None, ..
             } = &twj.relation
-                && name.to_string().to_lowercase() == lower
+                && crate::sql::object_name_key(name).to_lowercase() == lower
             {
-                return name.to_string();
+                return crate::sql::object_name_key(name);
             }
             for join in &twj.joins {
                 if let TableFactor::Table {
@@ -1441,7 +1441,7 @@ impl Executor {
                 } = &join.relation
                     && a.name.value.to_lowercase() == lower
                 {
-                    return name.to_string();
+                    return crate::sql::object_name_key(name);
                 }
             }
         }
@@ -1733,7 +1733,7 @@ impl Executor {
                 args: None,
                 ..
             } => {
-                let table_name = name.to_string();
+                let table_name = crate::sql::object_name_key(name);
                 let label = alias
                     .as_ref()
                     .map(|a| a.name.value.clone())
@@ -2191,6 +2191,21 @@ impl Executor {
                     range_predicate_expr,
                     ..
                 } => {
+                    // Committed indexes cannot see this transaction's own
+                    // uncommitted writes — bail to the AST/seq-scan path,
+                    // which reads through the session's MVCC snapshot (same
+                    // contract as try_index_scan_sync / try_gin_index_scan).
+                    if self
+                        .current_session()
+                        .txn_state
+                        .try_read()
+                        .map(|t| t.active)
+                        .unwrap_or(true)
+                    {
+                        return Err(ExecError::Unsupported(
+                            "index scan bypassed inside transaction".into(),
+                        ));
+                    }
                     let table_def = self.get_table(table).await?;
                     let meta: Vec<ColMeta> = table_def
                         .columns
@@ -3519,8 +3534,25 @@ impl Executor {
             return Some(idx);
         }
 
-        let unqualified = col_spec
-            .trim()
+        // Qualified reference: honour the table part first. Dropping it and
+        // matching by bare column name (the old behavior) silently bound
+        // `users.name` to the first `name` column of a join — a wrong-RESULT
+        // bug whenever two joined tables share a column name.
+        let trimmed = col_spec.trim();
+        if let Some(dot) = trimmed.rfind('.') {
+            let table = trimmed[..dot].trim().trim_matches('"');
+            let col = trimmed[dot + 1..].trim().trim_matches('"');
+            if let Some(idx) = meta.iter().position(|c| {
+                c.name.eq_ignore_ascii_case(col)
+                    && c.table
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case(table))
+            }) {
+                return Some(idx);
+            }
+        }
+
+        let unqualified = trimmed
             .split('.')
             .next_back()
             .unwrap_or(col_spec)
@@ -3587,13 +3619,16 @@ impl Executor {
                 let col_name = parts.last().map(|i| i.value.as_str()).unwrap_or("");
                 if parts.len() >= 2 {
                     let table_qual = parts[parts.len() - 2].value.as_str();
-                    // First try exact table+column match
+                    // First try exact table+column match (a dotted label like
+                    // "pg_catalog.pg_class" also matches its final segment).
                     if let Some(idx) = meta.iter().position(|c| {
                         c.name.eq_ignore_ascii_case(col_name)
-                            && c.table
-                                .as_deref()
-                                .map(|t| t.eq_ignore_ascii_case(table_qual))
-                                .unwrap_or(false)
+                            && c.table.as_deref().is_some_and(|t| {
+                                t.eq_ignore_ascii_case(table_qual)
+                                    || t.rsplit('.')
+                                        .next()
+                                        .is_some_and(|l| l.eq_ignore_ascii_case(table_qual))
+                            })
                     }) {
                         return Ok(row.get(idx).cloned().unwrap_or(Value::Null));
                     }
@@ -4257,7 +4292,7 @@ impl Executor {
                     && let Some((col, _)) = planner::is_equality_predicate(preds[0])
                 {
                     let table_name = match &select.from[0].relation {
-                        TableFactor::Table { name, .. } => name.to_string(),
+                        TableFactor::Table { name, .. } => crate::sql::object_name_key(name),
                         _ => String::new(),
                     };
                     if !table_name.is_empty()
@@ -5255,7 +5290,7 @@ impl Executor {
         let table_name = match &select.from[0].relation {
             TableFactor::Table {
                 name, args: None, ..
-            } => name.to_string(),
+            } => crate::sql::object_name_key(name),
             _ => return Ok(None),
         };
         // Guard 3: not a CTE
@@ -6142,7 +6177,7 @@ impl Executor {
                 args: None,
                 ..
             } => {
-                let t = name.to_string();
+                let t = crate::sql::object_name_key(name);
                 let l = alias
                     .as_ref()
                     .map(|a| a.name.value.clone())
@@ -6421,6 +6456,17 @@ impl Executor {
         if self.rls_active(table_name) {
             return None;
         }
+        // Committed indexes cannot see this transaction's own uncommitted
+        // writes — same contract as try_index_scan_sync/try_gin_index_scan.
+        if self
+            .current_session()
+            .txn_state
+            .try_read()
+            .map(|t| t.active)
+            .unwrap_or(true)
+        {
+            return None;
+        }
         // Only single-table, no-join queries
         if select.from.len() != 1 || !select.from[0].joins.is_empty() {
             return None;
@@ -6632,6 +6678,20 @@ impl Executor {
         if self.rls_active(table_name) {
             return None;
         }
+        // Inside an explicit transaction the committed index cannot see the
+        // txn's own uncommitted writes — an indexed point lookup right after
+        // an INSERT in the same BEGIN..COMMIT returned nothing (Prisma's
+        // nested-create reload hit exactly this). Fall back to the seq scan,
+        // which reads through the session's MVCC snapshot.
+        if self
+            .current_session()
+            .txn_state
+            .try_read()
+            .map(|t| t.active)
+            .unwrap_or(true)
+        {
+            return None;
+        }
         let (eq_preds, range_preds, _remaining) = self.extract_index_predicates(where_expr);
         if eq_preds.is_empty() && range_preds.is_empty() {
             return None;
@@ -6794,7 +6854,7 @@ impl Executor {
                 ..
             } = &select.from[0].relation
         {
-            let table_name = name.to_string();
+            let table_name = crate::sql::object_name_key(name);
             let label = alias
                 .as_ref()
                 .map(|a| a.name.value.clone())
@@ -6823,7 +6883,7 @@ impl Executor {
                 },
             ) = (&select.selection, &select.from[0].relation)
             {
-                let table_name = name.to_string();
+                let table_name = crate::sql::object_name_key(name);
                 let label = alias
                     .as_ref()
                     .map(|a| a.name.value.clone())
@@ -6985,14 +7045,14 @@ impl Executor {
         {
             // Build col_meta for left (from[0]) without loading rows
             let left_table_name = if let TableFactor::Table { name, .. } = &from[0].relation {
-                Some(name.to_string())
+                Some(crate::sql::object_name_key(name))
             } else {
                 None
             };
             let left_label = if let TableFactor::Table { alias: Some(a), .. } = &from[0].relation {
                 a.name.value.clone()
             } else if let TableFactor::Table { name, .. } = &from[0].relation {
-                name.to_string()
+                crate::sql::object_name_key(name)
             } else {
                 String::new()
             };
@@ -7324,7 +7384,7 @@ impl Executor {
             TableFactor::Table {
                 name, alias, args, ..
             } => {
-                let table_name = name.to_string();
+                let table_name = crate::sql::object_name_key(name);
                 let alias_str = alias.as_ref().map(|a| a.name.value.clone());
                 let label = alias_str.unwrap_or_else(|| table_name.clone());
 
@@ -8083,7 +8143,7 @@ impl Executor {
         };
 
         let offset = match offset_expr {
-            Some(expr) => self.expr_to_usize(expr)?,
+            Some(expr) => self.expr_to_usize(expr)?.unwrap_or(0),
             None => 0,
         };
 
@@ -8095,19 +8155,24 @@ impl Executor {
             }
         }
 
-        if let Some(expr) = limit_expr {
-            let limit = self.expr_to_usize(expr)?;
+        if let Some(expr) = limit_expr
+            && let Some(limit) = self.expr_to_usize(expr)?
+        {
             rows.truncate(limit);
         }
 
         Ok(())
     }
 
-    pub(super) fn expr_to_usize(&self, expr: &Expr) -> Result<usize, ExecError> {
+    /// LIMIT/OFFSET operand evaluation. `None` = no bound: Postgres treats
+    /// `LIMIT NULL` as LIMIT ALL and `OFFSET NULL` as OFFSET 0 (Prisma's
+    /// findUnique emits exactly that shape).
+    pub(super) fn expr_to_usize(&self, expr: &Expr) -> Result<Option<usize>, ExecError> {
         let val = self.eval_const_expr(expr)?;
         match val {
-            Value::Int32(n) if n >= 0 => Ok(n as usize),
-            Value::Int64(n) if n >= 0 => Ok(n as usize),
+            Value::Int32(n) if n >= 0 => Ok(Some(n as usize)),
+            Value::Int64(n) if n >= 0 => Ok(Some(n as usize)),
+            Value::Null => Ok(None),
             _ => Err(ExecError::Unsupported(
                 "LIMIT/OFFSET must be non-negative integer".into(),
             )),
@@ -8125,9 +8190,10 @@ impl Executor {
             }
             ast::LimitClause::OffsetCommaLimit { offset, limit } => (Some(limit), Some(offset)),
         };
-        let limit = self.expr_to_usize(limit_expr?).ok()?;
+        let limit = self.expr_to_usize(limit_expr?).ok()??;
         let offset = offset_expr
             .and_then(|e| self.expr_to_usize(e).ok())
+            .flatten()
             .unwrap_or(0);
         // checked_add: a wrapped limit+offset could pass the later `k < rows.len()`
         // check and corrupt the top-K optimization. On overflow, skip top-K.

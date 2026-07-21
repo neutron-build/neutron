@@ -848,6 +848,13 @@ impl Executor {
                 let idx = self.resolve_column(col_meta, Some(&parts[0].value), &parts[1].value)?;
                 Ok(row[idx].clone())
             }
+            // schema.table.column — Prisma qualifies RETURNING columns as
+            // "public"."users"."id". The schema part carries no information
+            // (single-schema engine); resolve on table.column.
+            Expr::CompoundIdentifier(parts) if parts.len() == 3 => {
+                let idx = self.resolve_column(col_meta, Some(&parts[1].value), &parts[2].value)?;
+                Ok(row[idx].clone())
+            }
             Expr::Value(val) => self.eval_value(&val.value),
             Expr::Interval(interval) => {
                 let value = self.eval_row_expr(&interval.value, row, col_meta)?;
@@ -1337,16 +1344,18 @@ impl Executor {
                 ..
             } => {
                 let l = self.eval_row_expr(left, row, col_meta)?;
-                // Right side should evaluate to an array or subquery
+                // Right side should evaluate to an array or subquery. A text
+                // value in Postgres array-literal form ('{a,b}') also counts —
+                // that is how array PARAMETERS arrive after wire substitution.
                 let r = self.eval_row_expr(right, row, col_meta)?;
-                match r {
-                    Value::Array(vals) => {
+                match coerce_to_array(r) {
+                    Some(vals) => {
                         let found = vals.iter().any(|v| {
                             self.eval_binary_op(&l, compare_op, v).ok() == Some(Value::Bool(true))
                         });
                         Ok(Value::Bool(found))
                     }
-                    _ => Err(ExecError::Unsupported(
+                    None => Err(ExecError::Unsupported(
                         "ANY requires array or subquery".into(),
                     )),
                 }
@@ -1359,14 +1368,14 @@ impl Executor {
             } => {
                 let l = self.eval_row_expr(left, row, col_meta)?;
                 let r = self.eval_row_expr(right, row, col_meta)?;
-                match r {
-                    Value::Array(vals) => {
+                match coerce_to_array(r) {
+                    Some(vals) => {
                         let all_match = vals.iter().all(|v| {
                             self.eval_binary_op(&l, compare_op, v).ok() == Some(Value::Bool(true))
                         });
                         Ok(Value::Bool(all_match))
                     }
-                    _ => Err(ExecError::Unsupported(
+                    None => Err(ExecError::Unsupported(
                         "ALL requires array or subquery".into(),
                     )),
                 }
@@ -1479,6 +1488,29 @@ impl Executor {
     // Type casting
     // ========================================================================
 
+    /// Reverse regclass resolution: OID -> relation name. Synthetic user-table
+    /// OIDs (16384 + catalog position) resolve through the sync catalog
+    /// snapshot; fixed system-catalog OIDs resolve through the static map.
+    fn regclass_name(&self, oid: i32) -> Option<String> {
+        if oid >= 16384 {
+            let tables = self.catalog.list_tables_sync()?;
+            return tables.get((oid - 16384) as usize).map(|t| t.name.clone());
+        }
+        match oid {
+            1247 => Some("pg_type".into()),
+            1249 => Some("pg_attribute".into()),
+            1255 => Some("pg_proc".into()),
+            1259 => Some("pg_class".into()),
+            1260 => Some("pg_authid".into()),
+            1262 => Some("pg_database".into()),
+            2609 => Some("pg_description".into()),
+            2610 => Some("pg_index".into()),
+            2615 => Some("pg_namespace".into()),
+            3079 => Some("pg_extension".into()),
+            _ => None,
+        }
+    }
+
     pub(super) fn eval_cast(&self, val: Value, target: &ast::DataType) -> Result<Value, ExecError> {
         match target {
             // '<catalog name>'::regclass — psql meta-commands (\dx notably) use
@@ -1488,11 +1520,46 @@ impl Executor {
             // LEFT JOIN comparison degrades to no-match, matching what the
             // meta-command needs.
             ast::DataType::Regclass => Ok(match &val {
-                Value::Text(s) => regclass_oid(s).map(Value::Int32).unwrap_or(Value::Null),
-                Value::Int32(_) => val,
-                Value::Int64(n) => Value::Int32(*n as i32),
+                Value::Text(s) => regclass_oid(s).map(Value::Int32).unwrap_or_else(|| {
+                    // User table: resolve the synthetic OID (16384 + catalog
+                    // position — the same assignment the virtual pg_catalog
+                    // arms use). Quotes are stripped wholesale: real Nucleus
+                    // names never contain '"', but introspection SQL passes
+                    // spellings like '"public"."post_tags"'.
+                    let bare = s.replace('"', "");
+                    let bare = bare.strip_prefix("public.").unwrap_or(&bare);
+                    self.catalog
+                        .list_tables_sync()
+                        .and_then(|ts| ts.iter().position(|t| t.name == bare))
+                        .map(|i| Value::Int32(16384 + i as i32))
+                        .unwrap_or(Value::Null)
+                }),
+                // OID -> regclass renders as the relation NAME (Postgres
+                // displays regclass as text). A later ::text cast is then the
+                // identity, which is exactly what introspection queries like
+                // `attrelid::regclass::text` need. Unknown OIDs stay numeric.
+                Value::Int32(n) => self
+                    .regclass_name(*n)
+                    .map(Value::Text)
+                    .unwrap_or(val.clone()),
+                Value::Int64(n) => self
+                    .regclass_name(*n as i32)
+                    .map(Value::Text)
+                    .unwrap_or(Value::Int32(*n as i32)),
                 _ => Value::Null,
             }),
+            // '<type name>'::regtype — sqlparser has no first-class REGTYPE, so
+            // it arrives as a custom type. Resolves to the type OID.
+            ast::DataType::Custom(name, _)
+                if name.to_string().eq_ignore_ascii_case("regtype") =>
+            {
+                Ok(match &val {
+                    Value::Text(s) => regtype_oid(s).map(Value::Int32).unwrap_or(Value::Null),
+                    Value::Int32(_) => val,
+                    Value::Int64(n) => Value::Int32(*n as i32),
+                    _ => Value::Null,
+                })
+            }
             ast::DataType::JSONB | ast::DataType::JSON => match val {
                 Value::Text(s) => {
                     let v: serde_json::Value = serde_json::from_str(&s)
@@ -1636,11 +1703,33 @@ impl Executor {
                 Value::Text(raw) => parse_interval_literal(&raw, None),
                 _ => Err(ExecError::Runtime("cannot cast to INTERVAL".into())),
             },
-            ast::DataType::Array(_) => {
-                // Pass through arrays
-                match val {
-                    Value::Array(_) => Ok(val),
-                    _ => Ok(Value::Array(vec![val])),
+            ast::DataType::Array(elem_def) => {
+                // A text literal in Postgres array syntax ('{a,b,c}') casts
+                // element-wise to the target element type. Anything else keeps
+                // the old pass-through behavior.
+                let elem_type = match elem_def {
+                    ast::ArrayElemTypeDef::AngleBracket(t)
+                    | ast::ArrayElemTypeDef::SquareBracket(t, _)
+                    | ast::ArrayElemTypeDef::Parenthesis(t) => Some(t.as_ref()),
+                    ast::ArrayElemTypeDef::None => None,
+                };
+                match (&val, elem_type) {
+                    (Value::Text(s), Some(et)) if s.trim().starts_with('{') => {
+                        let inner = s.trim().trim_start_matches('{').trim_end_matches('}');
+                        let mut out = Vec::new();
+                        for part in inner.split(',') {
+                            let part = part.trim().trim_matches('"');
+                            if part.is_empty() {
+                                continue;
+                            }
+                            out.push(self.eval_cast(Value::Text(part.to_string()), et)?);
+                        }
+                        Ok(Value::Array(out))
+                    }
+                    _ => match val {
+                        Value::Array(_) => Ok(val),
+                        _ => Ok(Value::Array(vec![val])),
+                    },
                 }
             }
             ast::DataType::Char(_) | ast::DataType::Character(_) => {
@@ -1723,6 +1812,96 @@ pub(super) fn regclass_oid(name: &str) -> Option<i32> {
         "pg_extension" => Some(3079),
         _ => None,
     }
+}
+
+/// Resolve a `::regtype` cast of a type name to its PostgreSQL type OID.
+/// Covers the names ORM introspection actually passes; unknown names map to
+/// None (callers yield NULL, so comparisons degrade to no-match).
+pub(super) fn regtype_oid(name: &str) -> Option<i32> {
+    let n = name.trim().trim_matches('\'').trim_matches('"').to_ascii_lowercase();
+    let n = n.strip_prefix("pg_catalog.").unwrap_or(&n);
+    match n {
+        "bool" | "boolean" => Some(16),
+        "bytea" => Some(17),
+        "int8" | "bigint" => Some(20),
+        "int2" | "smallint" => Some(21),
+        "int" | "int4" | "integer" => Some(23),
+        "text" => Some(25),
+        "json" => Some(114),
+        "float4" | "real" => Some(700),
+        "float8" | "double precision" => Some(701),
+        "varchar" | "character varying" => Some(1043),
+        "date" => Some(1082),
+        "time" => Some(1083),
+        "timestamp" => Some(1114),
+        "timestamptz" | "timestamp with time zone" => Some(1184),
+        "interval" => Some(1186),
+        "numeric" | "decimal" => Some(1700),
+        "uuid" => Some(2950),
+        "jsonb" => Some(3802),
+        _ => None,
+    }
+}
+
+/// Treat a value as an array for ANY/ALL: real arrays pass through; a text
+/// value in Postgres array-literal form is parsed element-wise (quoted
+/// elements unescaped, unquoted NULL -> Null, numeric-looking elements
+/// coerced so int comparisons work). Everything else is None.
+fn coerce_to_array(v: Value) -> Option<Vec<Value>> {
+    match v {
+        Value::Array(vals) => Some(vals),
+        Value::Text(s) if s.trim().starts_with('{') && s.trim().ends_with('}') => {
+            Some(parse_pg_array_literal(s.trim()))
+        }
+        _ => None,
+    }
+}
+
+/// Parse a one-dimensional Postgres array literal ('{a,"b,c",NULL}').
+pub(super) fn parse_pg_array_literal(s: &str) -> Vec<Value> {
+    let inner = &s[1..s.len() - 1];
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut was_quoted = false;
+    let mut chars = inner.chars().peekable();
+    let push = |cur: &mut String, was_quoted: bool, out: &mut Vec<Value>| {
+        let raw = std::mem::take(cur);
+        let trimmed = if was_quoted { raw } else { raw.trim().to_string() };
+        if trimmed.is_empty() && !was_quoted {
+            return;
+        }
+        if !was_quoted && trimmed.eq_ignore_ascii_case("null") {
+            out.push(Value::Null);
+        } else if !was_quoted && let Ok(n) = trimmed.parse::<i64>() {
+            out.push(Value::Int64(n));
+        } else if !was_quoted && let Ok(f) = trimmed.parse::<f64>() {
+            out.push(Value::Float64(f));
+        } else {
+            out.push(Value::Text(trimmed));
+        }
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if !in_quotes => {
+                in_quotes = true;
+                was_quoted = true;
+            }
+            '"' if in_quotes => in_quotes = false,
+            '\\' if in_quotes => {
+                if let Some(esc) = chars.next() {
+                    cur.push(esc);
+                }
+            }
+            ',' if !in_quotes => {
+                push(&mut cur, was_quoted, &mut out);
+                was_quoted = false;
+            }
+            _ => cur.push(c),
+        }
+    }
+    push(&mut cur, was_quoted, &mut out);
+    out
 }
 
 #[cfg(test)]

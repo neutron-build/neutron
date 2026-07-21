@@ -124,7 +124,7 @@ impl Executor {
         insert: ast::Insert,
     ) -> Result<ExecResult, ExecError> {
         let table_name = match insert.table {
-            ast::TableObject::TableName(name) => name.to_string(),
+            ast::TableObject::TableName(name) => crate::sql::object_name_key(&name),
             _ => {
                 return Err(ExecError::Unsupported(
                     "table functions not supported".into(),
@@ -479,7 +479,7 @@ impl Executor {
                                     for assign in &do_update.assignments {
                                         let col_name = match &assign.target {
                                             ast::AssignmentTarget::ColumnName(name) => {
-                                                name.to_string()
+                                                crate::sql::object_name_last(name)
                                             }
                                             _ => continue,
                                         };
@@ -679,13 +679,11 @@ impl Executor {
             }
         }
 
-        if returning.is_some() && !returned_rows.is_empty() {
-            let columns: Vec<(String, DataType)> = col_meta
-                .iter()
-                .map(|c| (c.name.clone(), c.dtype.clone()))
-                .collect();
+        if let Some(items) = returning.as_ref()
+            && !returned_rows.is_empty()
+        {
             Ok(ExecResult::Select {
-                columns,
+                columns: Self::returning_result_columns(items, &col_meta),
                 rows: returned_rows,
             })
         } else {
@@ -694,6 +692,56 @@ impl Executor {
                 rows_affected: count,
             })
         }
+    }
+
+    /// Column descriptors for a RETURNING result, aligned 1:1 with what
+    /// `eval_returning` emits per row. Advertising the whole table's columns
+    /// (the old behavior) desynced RowDescription from DataRow for any
+    /// RETURNING list that wasn't `*` — psql/tokio-postgres/Prisma all reject
+    /// or crash on the arity mismatch.
+    fn returning_result_columns(
+        returning: &[SelectItem],
+        col_meta: &[ColMeta],
+    ) -> Vec<(String, DataType)> {
+        let mut out = Vec::new();
+        for item in returning {
+            match item {
+                SelectItem::Wildcard(_) => {
+                    out.extend(col_meta.iter().map(|c| (c.name.clone(), c.dtype.clone())));
+                }
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    let alias = if let SelectItem::ExprWithAlias { alias, .. } = item {
+                        Some(alias.value.clone())
+                    } else {
+                        None
+                    };
+                    let (name, dtype) = match expr {
+                        Expr::Identifier(id) => {
+                            let dt = col_meta
+                                .iter()
+                                .find(|c| c.name == id.value)
+                                .map(|c| c.dtype.clone());
+                            (id.value.clone(), dt.unwrap_or(DataType::Text))
+                        }
+                        Expr::CompoundIdentifier(parts) => {
+                            let col = parts
+                                .last()
+                                .map(|p| p.value.clone())
+                                .unwrap_or_default();
+                            let dt = col_meta
+                                .iter()
+                                .find(|c| c.name == col)
+                                .map(|c| c.dtype.clone());
+                            (col, dt.unwrap_or(DataType::Text))
+                        }
+                        other => (other.to_string(), DataType::Text),
+                    };
+                    out.push((alias.unwrap_or(name), dtype));
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Evaluate RETURNING clause expressions against a row.
@@ -1785,7 +1833,7 @@ impl Executor {
         update: ast::Update,
     ) -> Result<ExecResult, ExecError> {
         let table_name = match &update.table.relation {
-            TableFactor::Table { name, .. } => name.to_string(),
+            TableFactor::Table { name, .. } => crate::sql::object_name_key(name),
             _ => return Err(ExecError::Unsupported("complex UPDATE target".into())),
         };
 
@@ -1840,7 +1888,7 @@ impl Executor {
         let mut assign_targets = Vec::new();
         for a in &update.assignments {
             let col_name = match &a.target {
-                ast::AssignmentTarget::ColumnName(name) => name.to_string(),
+                ast::AssignmentTarget::ColumnName(name) => crate::sql::object_name_last(name),
                 _ => {
                     return Err(ExecError::Unsupported("tuple assignment".into()));
                 }
@@ -2137,13 +2185,11 @@ impl Executor {
         #[cfg(not(feature = "server"))]
         drop(updates);
 
-        if update.returning.is_some() && !returned_rows.is_empty() {
-            let columns: Vec<(String, DataType)> = col_meta
-                .iter()
-                .map(|c| (c.name.clone(), c.dtype.clone()))
-                .collect();
+        if let Some(items) = update.returning.as_ref()
+            && !returned_rows.is_empty()
+        {
             Ok(ExecResult::Select {
-                columns,
+                columns: Self::returning_result_columns(items, &col_meta),
                 rows: returned_rows,
             })
         } else {
@@ -2165,7 +2211,7 @@ impl Executor {
             return Err(ExecError::Unsupported("DELETE without FROM".into()));
         }
         let table_name = match &tables_with_joins[0].relation {
-            TableFactor::Table { name, .. } => name.to_string(),
+            TableFactor::Table { name, .. } => crate::sql::object_name_key(name),
             _ => return Err(ExecError::Unsupported("complex DELETE target".into())),
         };
 
@@ -2395,13 +2441,11 @@ impl Executor {
             &col_meta,
         );
 
-        if delete.returning.is_some() && !returned_rows.is_empty() {
-            let columns: Vec<(String, DataType)> = col_meta
-                .iter()
-                .map(|c| (c.name.clone(), c.dtype.clone()))
-                .collect();
+        if let Some(items) = delete.returning.as_ref()
+            && !returned_rows.is_empty()
+        {
             Ok(ExecResult::Select {
-                columns,
+                columns: Self::returning_result_columns(items, &col_meta),
                 rows: returned_rows,
             })
         } else {

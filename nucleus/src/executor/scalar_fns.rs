@@ -1942,6 +1942,60 @@ impl Executor {
 
             // -- PostgreSQL system/catalog functions --
             "PG_BACKEND_PID" => Ok(Value::Int32(std::process::id() as i32)),
+            "CURRENT_SETTING" => {
+                // current_setting(name [, missing_ok]) — session overrides
+                // first, then the same static defaults SHOW reports. Prisma's
+                // schema engine calls this during connection setup.
+                let Some(Value::Text(name)) = args.first() else {
+                    return Err(ExecError::Unsupported(
+                        "current_setting requires a setting name".into(),
+                    ));
+                };
+                let missing_ok = matches!(args.get(1), Some(Value::Bool(true)));
+                let key = name.to_lowercase();
+                let sess = self.current_session();
+                let user_val = sess.settings.read().get(&key).cloned();
+                let value = user_val.or_else(|| {
+                    Some(match key.as_str() {
+                        "server_version" => "16.0 (Nucleus)".into(),
+                        "server_version_num" => "160000".into(),
+                        "server_encoding" | "client_encoding" => "UTF8".into(),
+                        "standard_conforming_strings" => "on".into(),
+                        "timezone" => "UTC".into(),
+                        "datestyle" => "ISO, MDY".into(),
+                        "integer_datetimes" => "on".into(),
+                        "intervalstyle" => "postgres".into(),
+                        "search_path" => "\"$user\", public".into(),
+                        "max_connections" => "100".into(),
+                        "transaction_isolation" | "default_transaction_isolation" => {
+                            "read committed".into()
+                        }
+                        "max_index_keys" => "32".into(),
+                        "lc_collate" => "C".into(),
+                        "lc_ctype" => "en_US.UTF-8".into(),
+                        _ => return None,
+                    })
+                });
+                match value {
+                    Some(v) => Ok(Value::Text(v)),
+                    None if missing_ok => Ok(Value::Null),
+                    None => Err(ExecError::Unsupported(format!(
+                        "unrecognized configuration parameter \"{name}\""
+                    ))),
+                }
+            }
+            "PG_GET_FUNCTIONDEF" => {
+                // Function-definition SQL isn't reconstructable from the
+                // registry's stored body alone; NULL keeps introspection
+                // queries running (they fall back to prosrc).
+                Ok(Value::Null)
+            }
+            "PG_GET_SERIAL_SEQUENCE" => {
+                // No sequence objects exist; NULL matches Postgres for a
+                // column with no owned sequence. ORM introspection (drizzle)
+                // calls this per column to detect serial columns.
+                Ok(Value::Null)
+            }
             "TXID_CURRENT" => Ok(Value::Int64(1)),
             "OBJ_DESCRIPTION" => {
                 // Stub: always returns NULL

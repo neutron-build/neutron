@@ -808,6 +808,19 @@ impl NucleusHandler {
                 } else {
                     tag.as_str()
                 };
+                // Transaction boundaries must use the dedicated Response
+                // variants: pgwire derives the ReadyForQuery status byte
+                // ('I'/'T') from them. A plain Execution response left the
+                // status at Idle after BEGIN, so clients that track
+                // transaction state (psycopg, Prisma's quaint) believed no
+                // transaction was open, re-issued BEGIN, and their COMMIT
+                // never fired — buffered transactional writes were lost.
+                if tag.eq_ignore_ascii_case("BEGIN") {
+                    return Ok(Response::TransactionStart(Tag::new("BEGIN")));
+                }
+                if tag.eq_ignore_ascii_case("COMMIT") || tag.eq_ignore_ascii_case("ROLLBACK") {
+                    return Ok(Response::TransactionEnd(Tag::new(wire_tag)));
+                }
                 Ok(Response::Execution(
                     Tag::new(wire_tag).with_rows(rows_affected),
                 ))
@@ -911,6 +924,20 @@ impl NucleusHandler {
             .get(&addr)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Mirror the executor's per-session transaction state into the wire
+    /// client so ReadyForQuery reports 'T' inside BEGIN..COMMIT. Clients that
+    /// verify transaction state (Prisma's quaint) refuse to proceed when a
+    /// BEGIN is acknowledged with an idle status.
+    fn sync_transaction_status(&self, client: &mut impl ClientInfo, session_id: u64) {
+        use pgwire::messages::response::TransactionStatus;
+        let status = if self.executor.session_in_transaction(session_id) {
+            TransactionStatus::Transaction
+        } else {
+            TransactionStatus::Idle
+        };
+        client.set_transaction_status(status);
     }
 
     /// Execute a SQL query through the executor within the given session,
@@ -1644,6 +1671,10 @@ impl SimpleQueryHandler for NucleusHandler {
         // ── Flush pending notifications before ReadyForQuery ────────────
         self.flush_pending_notifications(client).await?;
 
+        // ReadyForQuery must report 'T' inside an open transaction — clients
+        // that verify BEGIN took effect (Prisma's quaint) abort otherwise.
+        self.sync_transaction_status(client, session_id);
+
         Ok(responses)
     }
 }
@@ -1684,7 +1715,14 @@ impl ExtendedQueryHandler for NucleusHandler {
         // For SELECT statements, we can execute with dummy values to get the
         // schema. For non-SELECT statements, return no data.
         let fields = if is_select_query(sql) {
-            match self.describe_select_columns(sql, None).await {
+            // Statement-level Describe happens BEFORE Bind, so placeholders
+            // are unbound. Probe with NULL in their place — NULL comparisons
+            // yield no rows but the result SCHEMA is identical, which is all
+            // Describe needs. (Prisma describes statements, not portals; the
+            // old probe executed `$1` literally, errored, and advertised zero
+            // fields — its query engine then panicked on the arity mismatch.)
+            let probe_sql = replace_placeholders_with_null(sql);
+            match self.describe_select_columns(&probe_sql, None).await {
                 Ok(cols) => cols,
                 Err(e) => {
                     tracing::warn!("Failed to describe SELECT columns: {e}");
@@ -1692,7 +1730,7 @@ impl ExtendedQueryHandler for NucleusHandler {
                 }
             }
         } else {
-            Vec::new()
+            describe_returning_fields(stmt.statement.ast.as_deref(), &self.executor, None)
         };
 
         Ok(DescribeStatementResponse::new(param_types, fields))
@@ -1727,7 +1765,11 @@ impl ExtendedQueryHandler for NucleusHandler {
                 }
             }
         } else {
-            Vec::new()
+            describe_returning_fields(
+                portal.statement.statement.ast.as_deref(),
+                &self.executor,
+                Some(&portal.result_column_format),
+            )
         };
 
         Ok(DescribePortalResponse::new(fields))
@@ -1841,9 +1883,11 @@ impl ExtendedQueryHandler for NucleusHandler {
             }
             // Flush pending notifications before the response (before ReadyForQuery).
             self.flush_pending_notifications(client).await?;
+            self.sync_transaction_status(client, session_id);
             Self::build_response(result, Some(&portal.result_column_format))
         } else {
             self.flush_pending_notifications(client).await?;
+            self.sync_transaction_status(client, session_id);
             Ok(Response::EmptyQuery)
         }
     }
@@ -2683,8 +2727,82 @@ fn decode_binary_param_typed(oid: u32, bytes: &[u8]) -> Option<DecodedParam> {
             s.push_str(" seconds");
             Some(DecodedParam::Text(s))
         }
+        // Arrays of the common element types (text[]/varchar[], int2/4/8[],
+        // bool[], uuid[], float4/8[]) — decoded to the Postgres array-literal
+        // text form ('{a,b}') that the executor's ANY/ALL and array casts
+        // accept. Layout: i32 ndim, i32 dataoffset, u32 elemtype, then per
+        // dim (i32 len, i32 lower bound), then per element i32 len + payload.
+        1009 | 1015 | 1005 | 1007 | 1016 | 1000 | 2951 | 1021 | 1022 => {
+            decode_binary_array(bytes).map(DecodedParam::Text)
+        }
         _ => None,
     }
+}
+
+/// Decode a binary one-dimensional array parameter into `{...}` literal text.
+/// Elements are rendered by element OID; embedded quotes/backslashes in text
+/// elements are escaped per the array-literal grammar. NULL elements render
+/// as unquoted NULL. Multi-dimensional arrays are refused (None → fail-loud).
+fn decode_binary_array(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    let ndim = i32::from_be_bytes(bytes[0..4].try_into().ok()?);
+    let elem_oid = u32::from_be_bytes(bytes[8..12].try_into().ok()?);
+    if ndim == 0 {
+        return Some("{}".into());
+    }
+    if ndim != 1 || bytes.len() < 20 {
+        return None;
+    }
+    let count = i32::from_be_bytes(bytes[12..16].try_into().ok()?);
+    let mut off = 20;
+    let mut parts: Vec<String> = Vec::with_capacity(count.max(0) as usize);
+    for _ in 0..count {
+        if bytes.len() < off + 4 {
+            return None;
+        }
+        let len = i32::from_be_bytes(bytes[off..off + 4].try_into().ok()?);
+        off += 4;
+        if len < 0 {
+            parts.push("NULL".into());
+            continue;
+        }
+        let len = len as usize;
+        if bytes.len() < off + len {
+            return None;
+        }
+        let payload = &bytes[off..off + len];
+        off += len;
+        let rendered = match elem_oid {
+            16 => (payload == [1u8]).then(|| "t".to_string()).or(Some("f".to_string()))?,
+            21 => i16::from_be_bytes(payload.try_into().ok()?).to_string(),
+            23 => i32::from_be_bytes(payload.try_into().ok()?).to_string(),
+            20 => i64::from_be_bytes(payload.try_into().ok()?).to_string(),
+            700 => f32::from_be_bytes(payload.try_into().ok()?).to_string(),
+            701 => f64::from_be_bytes(payload.try_into().ok()?).to_string(),
+            2950 => {
+                if payload.len() != 16 {
+                    return None;
+                }
+                let h: Vec<String> = payload.iter().map(|b| format!("{b:02x}")).collect();
+                format!(
+                    "{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}",
+                    h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11],
+                    h[12], h[13], h[14], h[15]
+                )
+            }
+            // text / varchar
+            25 | 1043 => {
+                let s = std::str::from_utf8(payload).ok()?;
+                let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{escaped}\"")
+            }
+            _ => return None,
+        };
+        parts.push(rendered);
+    }
+    Some(format!("{{{}}}", parts.join(",")))
 }
 
 /// Decode PostgreSQL's binary NUMERIC wire format into an exact decimal
@@ -2913,6 +3031,145 @@ fn decode_pg_param(
 /// clauses), or another `Cast`.  Anything we cannot resolve stays `None`,
 /// which the caller turns into `Type::TEXT` — preserving the pre-fix
 /// behavior so we do not regress queries we could not infer before.
+/// FieldInfos for the RETURNING list of an INSERT/UPDATE/DELETE statement —
+/// Describe used to advertise ZERO fields for these, which crashes clients
+/// that build their row decoder from the describe response (Prisma's query
+/// engine panics with "index out of bounds: the len is 0").
+/// Replace `$N` placeholders with NULL for schema-probe execution. Skips
+/// dollar signs inside single-quoted literals and dollar-quoted strings are
+/// not handled (a describe probe of such SQL degrades to the error path, the
+/// same behavior as before).
+fn replace_placeholders_with_null(sql: &str) -> String {
+    let mut out = Vec::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut in_str = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            out.push(c);
+            if c == b'\'' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_str = true;
+                out.push(c);
+                i += 1;
+            }
+            b'$' if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() => {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                out.extend_from_slice(b"NULL");
+                i = j;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    // Byte-level edits only touched ASCII, so this cannot fail for valid input.
+    String::from_utf8(out).unwrap_or_else(|_| sql.to_string())
+}
+
+fn describe_returning_fields(
+    ast: Option<&[sqlparser::ast::Statement]>,
+    executor: &Arc<Executor>,
+    formats: Option<&Format>,
+) -> Vec<FieldInfo> {
+    use sqlparser::ast::{Expr, FromTable, SelectItem, Statement, TableFactor, TableObject};
+    let Some(stmt) = ast.and_then(|stmts| stmts.first()) else {
+        return Vec::new();
+    };
+    let (table_name, returning): (String, &Vec<SelectItem>) = match stmt {
+        Statement::Insert(i) => {
+            let Some(r) = &i.returning else {
+                return Vec::new();
+            };
+            let TableObject::TableName(n) = &i.table else {
+                return Vec::new();
+            };
+            (crate::sql::object_name_key(n), r)
+        }
+        Statement::Update(u) => {
+            let Some(r) = &u.returning else {
+                return Vec::new();
+            };
+            let TableFactor::Table { name, .. } = &u.table.relation else {
+                return Vec::new();
+            };
+            (crate::sql::object_name_key(name), r)
+        }
+        Statement::Delete(d) => {
+            let Some(r) = &d.returning else {
+                return Vec::new();
+            };
+            let (FromTable::WithFromKeyword(twjs) | FromTable::WithoutKeyword(twjs)) = &d.from;
+            let Some(TableFactor::Table { name, .. }) = twjs.first().map(|t| &t.relation) else {
+                return Vec::new();
+            };
+            (crate::sql::object_name_key(name), r)
+        }
+        _ => return Vec::new(),
+    };
+    let Some(def) = executor.catalog().get_table_cached(&table_name) else {
+        return Vec::new();
+    };
+    let col_type = |col: &str| {
+        def.columns
+            .iter()
+            .find(|c| c.name == col)
+            .map(|c| data_type_to_pg(&c.data_type))
+            .unwrap_or(Type::TEXT)
+    };
+    let mut out = Vec::new();
+    for item in returning {
+        match item {
+            SelectItem::Wildcard(_) => {
+                for c in &def.columns {
+                    out.push((c.name.clone(), data_type_to_pg(&c.data_type)));
+                }
+            }
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                let alias = if let SelectItem::ExprWithAlias { alias, .. } = item {
+                    Some(alias.value.clone())
+                } else {
+                    None
+                };
+                let (name, ty) = match expr {
+                    Expr::Identifier(id) => (id.value.clone(), col_type(&id.value)),
+                    Expr::CompoundIdentifier(parts) => {
+                        let col = parts.last().map(|p| p.value.clone()).unwrap_or_default();
+                        let ty = col_type(&col);
+                        (col, ty)
+                    }
+                    other => (other.to_string(), Type::TEXT),
+                };
+                out.push((alias.unwrap_or(name), ty));
+            }
+            _ => {}
+        }
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(i, (name, ty))| {
+            FieldInfo::new(
+                name,
+                None,
+                None,
+                ty,
+                formats.map_or(FieldFormat::Text, |f| requested_format(f, i)),
+            )
+        })
+        .collect()
+}
+
 fn infer_param_types_from_ast(
     stmts: &[sqlparser::ast::Statement],
     executor: &Arc<Executor>,
@@ -2927,32 +3184,7 @@ fn infer_param_types_from_ast(
 
         match stmt {
             Statement::Query(q) => {
-                if let SetExpr::Select(select) = q.body.as_ref() {
-                    for item in &select.projection {
-                        if let sqlparser::ast::SelectItem::UnnamedExpr(e)
-                        | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } = item
-                        {
-                            walk_expr_for_params(e, &tables, &mut result);
-                        }
-                    }
-                    if let Some(ref w) = select.selection {
-                        walk_expr_for_params(w, &tables, &mut result);
-                    }
-                    if let Some(ref h) = select.having {
-                        walk_expr_for_params(h, &tables, &mut result);
-                    }
-                }
-                if let Some(ref limit_clause) = q.limit_clause {
-                    use sqlparser::ast::LimitClause;
-                    if let LimitClause::LimitOffset { limit, offset, .. } = limit_clause {
-                        if let Some(e) = limit {
-                            mark_param(e, Type::INT8, &mut result);
-                        }
-                        if let Some(off) = offset {
-                            mark_param(&off.value, Type::INT8, &mut result);
-                        }
-                    }
-                }
+                walk_query_for_params(q, &tables, &mut result);
             }
             Statement::Insert(insert) => {
                 if let Some(source) = &insert.source
@@ -3103,6 +3335,72 @@ fn column_type_in_tables(
 
 /// Recursively walk an expression looking for `$N` placeholders and infer
 /// each one\'s pgwire `Type` from the surrounding AST.
+/// Recursive Query walker: projection/WHERE/HAVING exprs, LIMIT/OFFSET, and —
+/// crucially for ORM introspection SQL — derived tables in FROM and join ON
+/// constraints, which the old top-level-only walk never reached (Prisma binds
+/// `= ANY($1)` inside a FROM (SELECT ...) subquery).
+fn walk_query_for_params(
+    q: &sqlparser::ast::Query,
+    tables: &[Arc<crate::catalog::TableDef>],
+    result: &mut [Option<Type>],
+) {
+    use sqlparser::ast::{JoinConstraint, JoinOperator, SetExpr, TableFactor};
+    fn walk_factor(
+        f: &TableFactor,
+        tables: &[Arc<crate::catalog::TableDef>],
+        result: &mut [Option<Type>],
+    ) {
+        if let TableFactor::Derived { subquery, .. } = f {
+            walk_query_for_params(subquery, tables, result);
+        }
+    }
+    if let SetExpr::Select(select) = q.body.as_ref() {
+        for item in &select.projection {
+            if let sqlparser::ast::SelectItem::UnnamedExpr(e)
+            | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } = item
+            {
+                walk_expr_for_params(e, tables, result);
+            }
+        }
+        if let Some(ref w) = select.selection {
+            walk_expr_for_params(w, tables, result);
+        }
+        if let Some(ref h) = select.having {
+            walk_expr_for_params(h, tables, result);
+        }
+        for twj in &select.from {
+            walk_factor(&twj.relation, tables, result);
+            for j in &twj.joins {
+                walk_factor(&j.relation, tables, result);
+                let constraint = match &j.join_operator {
+                    JoinOperator::Inner(c)
+                    | JoinOperator::Join(c)
+                    | JoinOperator::Left(c)
+                    | JoinOperator::LeftOuter(c)
+                    | JoinOperator::Right(c)
+                    | JoinOperator::RightOuter(c)
+                    | JoinOperator::FullOuter(c) => Some(c),
+                    _ => None,
+                };
+                if let Some(JoinConstraint::On(e)) = constraint {
+                    walk_expr_for_params(e, tables, result);
+                }
+            }
+        }
+    }
+    if let Some(ref limit_clause) = q.limit_clause {
+        use sqlparser::ast::LimitClause;
+        if let LimitClause::LimitOffset { limit, offset, .. } = limit_clause {
+            if let Some(e) = limit {
+                mark_param(e, Type::INT8, result);
+            }
+            if let Some(off) = offset {
+                mark_param(&off.value, Type::INT8, result);
+            }
+        }
+    }
+}
+
 fn walk_expr_for_params(
     expr: &sqlparser::ast::Expr,
     tables: &[Arc<crate::catalog::TableDef>],
@@ -3172,6 +3470,27 @@ fn walk_expr_for_params(
                 walk_expr_for_params(item, tables, out);
             }
         }
+        // `x = ANY($1)` / `x = ALL($1)` — the parameter is an ARRAY of x's
+        // element type. Without this, ParameterDescription said TEXT and
+        // array-binding drivers (Prisma's quaint) refused to serialize.
+        Expr::AnyOp {
+            left,
+            right,
+            ..
+        }
+        | Expr::AllOp {
+            left,
+            right,
+            ..
+        } => {
+            // The right side of ANY/ALL is definitionally an array, so even
+            // when the element type can't be resolved (virtual catalogs are
+            // not in the TableDef list) default to text[] rather than text.
+            let elem = expr_pg_type(left, tables).unwrap_or(Type::TEXT);
+            mark_param(right, scalar_to_array_type(&elem), out);
+            walk_expr_for_params(left, tables, out);
+            walk_expr_for_params(right, tables, out);
+        }
         Expr::Function(func) => {
             // Known Nucleus scalar extensions: advertise proper types for
             // their placeholder args instead of the blanket TEXT default.
@@ -3217,8 +3536,11 @@ fn expr_pg_type(
         Expr::Identifier(ident) => {
             column_type_in_tables(tables, &ident.value).map(|dt| data_type_to_pg(&dt))
         }
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            column_type_in_tables(tables, &parts[1].value).map(|dt| data_type_to_pg(&dt))
+        // table.column or schema.table.column (Prisma qualifies all columns
+        // three-part) — the column is always the last segment.
+        Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
+            column_type_in_tables(tables, &parts.last().unwrap().value)
+                .map(|dt| data_type_to_pg(&dt))
         }
         Expr::Cast { data_type, .. } => crate::sql::convert_data_type(data_type)
             .ok()
@@ -3255,6 +3577,27 @@ fn is_select_query(sql: &str) -> bool {
 }
 
 /// Map Nucleus DataType to Postgres wire type.
+/// Array pg type whose element type is `t` — for `= ANY($n)` parameter
+/// inference. Unknown element types degrade to text[].
+fn scalar_to_array_type(t: &Type) -> Type {
+    match *t {
+        Type::BOOL => Type::BOOL_ARRAY,
+        Type::INT2 => Type::INT2_ARRAY,
+        Type::INT4 => Type::INT4_ARRAY,
+        Type::INT8 => Type::INT8_ARRAY,
+        Type::FLOAT4 => Type::FLOAT4_ARRAY,
+        Type::FLOAT8 => Type::FLOAT8_ARRAY,
+        Type::NUMERIC => Type::NUMERIC_ARRAY,
+        Type::VARCHAR => Type::VARCHAR_ARRAY,
+        Type::UUID => Type::UUID_ARRAY,
+        Type::DATE => Type::DATE_ARRAY,
+        Type::TIMESTAMP => Type::TIMESTAMP_ARRAY,
+        Type::TIMESTAMPTZ => Type::TIMESTAMPTZ_ARRAY,
+        Type::BYTEA => Type::BYTEA_ARRAY,
+        _ => Type::TEXT_ARRAY,
+    }
+}
+
 fn data_type_to_pg(dt: &DataType) -> Type {
     match dt {
         DataType::Bool => Type::BOOL,
@@ -3329,17 +3672,46 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
         Value::Float64(n) => encoder.encode_field(&Some(*n)),
         Value::Text(s) => encoder.encode_field(&Some(s.as_str())),
         Value::Jsonb(v) => encoder.encode_field(&Some(v.to_string().as_str())),
-        // New types: encode as text representation for wire protocol
-        Value::Date(_)
-        | Value::Timestamp(_)
-        | Value::TimestampTz(_)
-        | Value::Numeric(_)
+        // Temporal/decimal/bytea values encode through their native
+        // postgres-types impls so BINARY-format result columns carry real
+        // binary payloads (a text string under a binary RowDescription made
+        // Prisma/pgx misdecode timestamps). Text-format columns still render
+        // through ToSqlText, so text clients are unchanged.
+        Value::Timestamp(us) => {
+            let ts = pg_epoch_naive() + chrono::Duration::microseconds(*us);
+            encoder.encode_field(&Some(ts))
+        }
+        Value::TimestampTz(us) => {
+            let ts = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                pg_epoch_naive() + chrono::Duration::microseconds(*us),
+                chrono::Utc,
+            );
+            encoder.encode_field(&Some(ts))
+        }
+        Value::Date(days) => {
+            let d = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap()
+                + chrono::Duration::days(i64::from(*days));
+            encoder.encode_field(&Some(d))
+        }
+        Value::Bytea(b) => encoder.encode_field(&Some(b.as_slice())),
+        // Numeric stays text-rendered (its string form is exact and NUMERIC
+        // binary is only requested by drivers that also accept text); same
+        // for uuid/array/vector/interval, which have no enabled native impl.
+        Value::Numeric(_)
         | Value::Uuid(_)
-        | Value::Bytea(_)
         | Value::Array(_)
         | Value::Vector(_)
         | Value::Interval { .. } => encoder.encode_field(&Some(value.to_string().as_str())),
     }
+}
+
+/// 2000-01-01T00:00:00 — the PostgreSQL timestamp epoch Nucleus stores
+/// microsecond offsets against.
+fn pg_epoch_naive() -> chrono::NaiveDateTime {
+    chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
 }
 
 /// Map a Postgres wire type OID to Nucleus DataType (best effort).

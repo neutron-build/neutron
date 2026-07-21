@@ -519,7 +519,7 @@ impl Executor {
         &self,
         create: ast::CreateTable,
     ) -> Result<ExecResult, ExecError> {
-        let table_name = create.name.to_string();
+        let table_name = crate::sql::object_name_key(&create.name);
         let mut columns = sql::extract_columns(&create.columns)?;
         let mut constraints = sql::extract_constraints(&create.columns, &create.constraints);
         let primary_key_declarations = create
@@ -1037,7 +1037,7 @@ impl Executor {
         match object_type {
             ast::ObjectType::Table => {
                 for name in &names {
-                    let table_name = name.to_string();
+                    let table_name = crate::sql::object_name_key(name);
                     // Check for dependent views before dropping.
                     {
                         let deps = self.view_deps.read();
@@ -1234,7 +1234,7 @@ impl Executor {
             .name
             .map(|n| n.to_string())
             .unwrap_or_else(|| "unnamed_idx".to_string());
-        let table_name = create_index.table_name.to_string();
+        let table_name = crate::sql::object_name_key(&create_index.table_name);
 
         // Verify table exists and reject duplicate names before constructing
         // any live index state. Otherwise `IF NOT EXISTS` could overwrite an
@@ -1262,7 +1262,7 @@ impl Executor {
         let columns: Vec<String> = create_index
             .columns
             .iter()
-            .map(|col| col.column.expr.to_string())
+            .map(crate::sql::index_column_name)
             .collect();
 
         // Determine index type from USING clause
@@ -1616,7 +1616,7 @@ impl Executor {
     ) -> Result<ExecResult, ExecError> {
         self.require_security_admin("truncate tables")?;
         for target in &truncate.table_names {
-            let table_name = target.name.to_string();
+            let table_name = crate::sql::object_name_key(&target.name);
             // Route to the table's actual engine (T0.3): a columnar/mergetree/lsm
             // table's rows live in its per-table override engine, not the base
             // heap. Truncating `self.storage` for such a table dropped/recreated
@@ -1663,7 +1663,7 @@ impl Executor {
         &self,
         alter_table: ast::AlterTable,
     ) -> Result<ExecResult, ExecError> {
-        let table_name = alter_table.name.to_string();
+        let table_name = crate::sql::object_name_key(&alter_table.name);
         let table_def = self.get_table(&table_name).await?;
 
         for op in &alter_table.operations {
@@ -2219,7 +2219,7 @@ impl Executor {
                             let columns: Vec<String> = pk
                                 .columns
                                 .iter()
-                                .map(|c| c.column.expr.to_string())
+                                .map(crate::sql::index_column_name)
                                 .collect();
                             // Validate columns exist.
                             for col_name in &columns {
@@ -2269,7 +2269,7 @@ impl Executor {
                             let columns: Vec<String> = u
                                 .columns
                                 .iter()
-                                .map(|c| c.column.expr.to_string())
+                                .map(crate::sql::index_column_name)
                                 .collect();
                             // Validate columns exist.
                             for col_name in &columns {
@@ -2344,7 +2344,7 @@ impl Executor {
                             let constraint_name = fk.name.as_ref().map(|n| n.to_string());
                             let columns: Vec<String> =
                                 fk.columns.iter().map(|c| c.value.clone()).collect();
-                            let ref_table = fk.foreign_table.to_string();
+                            let ref_table = crate::sql::object_name_key(&fk.foreign_table);
                             let ref_columns: Vec<String> = fk
                                 .referred_columns
                                 .iter()
@@ -3154,7 +3154,7 @@ impl Executor {
     ) -> Result<ExecResult, ExecError> {
         let (pages_scanned, dead_reclaimed, pages_freed, bytes_reclaimed) =
             if let Some(ref table_name) = vacuum_stmt.table_name {
-                let table = table_name.to_string().to_lowercase();
+                let table = crate::sql::object_name_key(table_name).to_lowercase();
                 self.storage.vacuum(&table).await?
             } else {
                 self.storage.vacuum_all().await?
