@@ -1391,10 +1391,15 @@ impl QueryPlanner {
                         } else {
                             None
                         };
-                        if let Some(ref pc) = pred_col
-                            && !col.eq_ignore_ascii_case(pc)
-                        {
-                            continue;
+                        match pred_col {
+                            Some(ref pc) if col.eq_ignore_ascii_case(pc) => {}
+                            // Wrong column — this index cannot serve the predicate.
+                            Some(_) => continue,
+                            // No extractable column (e.g. a literal-only predicate
+                            // like `1 = 1`): NO index can serve it. Treating None
+                            // as "matches" made `WHERE 1=1` plan a PK point lookup
+                            // with the literal as the key — zero rows, silently.
+                            None => continue,
                         }
                         let selectivity = stats.equality_selectivity(Some(col));
                         let idx_cost = access.estimate_cost(row_count, selectivity);

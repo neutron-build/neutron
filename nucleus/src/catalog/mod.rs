@@ -355,6 +355,16 @@ impl Catalog {
         tables.values().cloned().collect()
     }
 
+    /// Non-blocking snapshot of every table, in the same iteration order as
+    /// `list_tables` for an unchanged map — the order the virtual pg_catalog
+    /// arms use to assign synthetic relation OIDs (16384 + index). Returns
+    /// `None` if the map is write-locked right now (callers degrade to NULL,
+    /// same contract as the other `_cached` accessors).
+    pub fn list_tables_sync(&self) -> Option<Vec<Arc<TableDef>>> {
+        let guard = self.tables.try_read().ok()?;
+        Some(guard.values().cloned().collect())
+    }
+
     // ── Sync metadata cache (session-level fast path) ──────────────────────
     //
     // These methods read from the `parking_lot::RwLock`-backed sync cache,

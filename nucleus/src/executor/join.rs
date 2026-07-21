@@ -333,12 +333,15 @@ impl Executor {
                 let name = ident.value.to_lowercase();
                 meta.iter().position(|c| c.name.to_lowercase() == name)
             }
-            Expr::CompoundIdentifier(idents) if idents.len() == 2 => {
-                let table = idents[0].value.to_lowercase();
-                let col = idents[1].value.to_lowercase();
+            Expr::CompoundIdentifier(idents) if idents.len() >= 2 => {
+                let table = idents[idents.len() - 2].value.to_lowercase();
+                let col = idents.last().unwrap().value.to_lowercase();
                 meta.iter().position(|c| {
                     c.name.to_lowercase() == col
-                        && c.table.as_ref().map(|t| t.to_lowercase()) == Some(table.clone())
+                        && c.table.as_deref().is_some_and(|t| {
+                            let tl = t.to_lowercase();
+                            tl == table || tl.rsplit('.').next() == Some(table.as_str())
+                        })
                 })
             }
             _ => None,

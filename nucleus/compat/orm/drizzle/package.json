@@ -1,0 +1,17 @@
+{
+  "name": "nucleus-orm-compat-drizzle",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "drizzle-orm": "^0.44.0",
+    "postgres": "^3.4.5"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31.0"
+  },
+  "allowScripts": {
+    "esbuild@0.18.20": true,
+    "esbuild@0.25.12": true,
+    "esbuild@0.28.1": true
+  }
+}

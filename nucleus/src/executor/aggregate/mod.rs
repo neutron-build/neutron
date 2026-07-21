@@ -37,6 +37,31 @@ fn agg_column_type(val: &Value, expr: &Expr, col_meta: &[ColMeta]) -> DataType {
     }
 }
 
+/// Column descriptors derived statically from the projection — used when a
+/// GROUP BY produced ZERO groups, where the per-group loop never ran and the
+/// old code emitted an empty column list. A derived table over such a result
+/// then had no columns at all, so outer references like `alias.col` failed
+/// with "column does not exist" (SQLAlchemy's domain-reflection subquery over
+/// the empty pg_constraint hit exactly this).
+fn agg_static_columns(
+    projection: &[SelectItem],
+    col_meta: &[ColMeta],
+) -> Vec<(String, DataType)> {
+    let mut cols = Vec::new();
+    for item in projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) => {
+                cols.push((format!("{expr}"), infer_expr_type(expr, col_meta)));
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                cols.push((alias.value.clone(), infer_expr_type(expr, col_meta)));
+            }
+            _ => {}
+        }
+    }
+    cols
+}
+
 impl Executor {
     // ========================================================================
     // Aggregation: GROUP BY, HAVING, aggregate functions
@@ -181,7 +206,8 @@ impl Executor {
         }
 
         Ok(ExecResult::Select {
-            columns: result_columns.unwrap_or_default(),
+            columns: result_columns
+                .unwrap_or_else(|| agg_static_columns(&select.projection, col_meta)),
             rows: result_rows,
         })
     }
@@ -309,7 +335,8 @@ impl Executor {
         }
 
         Ok(ExecResult::Select {
-            columns: result_columns.unwrap_or_default(),
+            columns: result_columns
+                .unwrap_or_else(|| agg_static_columns(&select.projection, col_meta)),
             rows: result_rows,
         })
     }
@@ -388,7 +415,8 @@ impl Executor {
         }
 
         Ok(ExecResult::Select {
-            columns: result_columns.unwrap_or_default(),
+            columns: result_columns
+                .unwrap_or_else(|| agg_static_columns(&select.projection, col_meta)),
             rows: result_rows,
         })
     }
@@ -512,7 +540,8 @@ impl Executor {
         }
 
         Ok(ExecResult::Select {
-            columns: result_columns.unwrap_or_default(),
+            columns: result_columns
+                .unwrap_or_else(|| agg_static_columns(&select.projection, col_meta)),
             rows: all_result_rows,
         })
     }

@@ -4608,8 +4608,8 @@ impl Executor {
                     String::new()
                 };
                 self.execute_create_trigger(
-                    &ct.name.to_string(),
-                    &ct.table_name.to_string(),
+                    &crate::sql::object_name_key(&ct.name),
+                    &crate::sql::object_name_key(&ct.table_name),
                     timing,
                     events,
                     for_each_row,
@@ -4810,14 +4810,20 @@ impl Executor {
     ) -> Result<usize, ExecError> {
         if let Some(tbl) = table {
             // Qualified: table.column (case-insensitive table match for
-            // pseudo-tables like EXCLUDED and regular table references)
+            // pseudo-tables like EXCLUDED and regular table references).
+            // A schema-qualified relation keeps its dotted label (e.g. the
+            // virtual "pg_catalog.pg_class"), so the qualifier also matches
+            // the label's final segment — SQLAlchemy writes
+            // pg_catalog.pg_class.relname against exactly that shape.
             col_meta
                 .iter()
                 .position(|c| {
-                    c.table
-                        .as_deref()
-                        .is_some_and(|t| t.eq_ignore_ascii_case(tbl))
-                        && c.name == name
+                    c.table.as_deref().is_some_and(|t| {
+                        t.eq_ignore_ascii_case(tbl)
+                            || t.rsplit('.')
+                                .next()
+                                .is_some_and(|last| last.eq_ignore_ascii_case(tbl))
+                    }) && c.name == name
                 })
                 .ok_or_else(|| ExecError::ColumnNotFound(format!("{tbl}.{name}")))
         } else {
@@ -5895,6 +5901,84 @@ impl Executor {
                         name: "udt_name".into(),
                         dtype: DataType::Text,
                     },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "udt_schema".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "character_maximum_length".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "numeric_precision".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "numeric_scale".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "numeric_precision_radix".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "datetime_precision".into(),
+                        dtype: DataType::Int32,
+                    },
+                    // Identity/generated-column facets (ORM introspection reads
+                    // them). Nucleus has neither feature: is_generated=NEVER,
+                    // is_identity=NO, every identity_* facet NULL.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "is_generated".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "generation_expression".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "is_identity".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "identity_generation".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "identity_start".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "identity_increment".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "identity_maximum".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "identity_minimum".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "identity_cycle".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
                 let mut rows = Vec::new();
                 for t in &tables {
@@ -5911,6 +5995,40 @@ impl Executor {
                             Value::Text(if c.nullable { "YES" } else { "NO" }.into()),
                             Value::Text(c.data_type.to_string()),
                             Value::Text(datatype_to_udt_name(&c.data_type).into()),
+                            Value::Text("pg_catalog".into()),
+                            Value::Null,
+                            match &c.data_type {
+                                DataType::Int32 => Value::Int32(32),
+                                DataType::Int64 => Value::Int32(64),
+                                DataType::Float64 => Value::Int32(53),
+                                DataType::Numeric => Value::Null,
+                                _ => Value::Null,
+                            },
+                            match &c.data_type {
+                                DataType::Int32 | DataType::Int64 => Value::Int32(0),
+                                _ => Value::Null,
+                            },
+                            match &c.data_type {
+                                DataType::Int32 | DataType::Int64 | DataType::Float64 => {
+                                    Value::Int32(2)
+                                }
+                                DataType::Numeric => Value::Int32(10),
+                                _ => Value::Null,
+                            },
+                            match &c.data_type {
+                                DataType::Timestamp | DataType::TimestampTz => Value::Int32(6),
+                                DataType::Date => Value::Int32(0),
+                                _ => Value::Null,
+                            },
+                            Value::Text("NEVER".into()),
+                            Value::Null,
+                            Value::Text("NO".into()),
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Text("NO".into()),
                         ]);
                     }
                 }
@@ -6276,6 +6394,18 @@ impl Executor {
                         name: "reltoastrelid".into(),
                         dtype: DataType::Int32,
                     },
+                    // Prisma's schema engine selects these two: no table
+                    // inheritance and no storage options exist, so false/NULL.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "relhassubclass".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "reloptions".into(),
+                        dtype: DataType::Text,
+                    },
                 ];
                 let rls_tables: std::collections::HashSet<String> = {
                     let sec = self.security.read();
@@ -6307,6 +6437,8 @@ impl Executor {
                         Value::Text("p".into()),
                         Value::Text("d".into()),
                         Value::Int32(0),
+                        Value::Bool(false),
+                        Value::Null,
                     ]);
                 }
                 for (i, idx) in indexes.iter().enumerate() {
@@ -6331,6 +6463,8 @@ impl Executor {
                         Value::Text("p".into()),
                         Value::Text("n".into()),
                         Value::Int32(0),
+                        Value::Bool(false),
+                        Value::Null,
                     ]);
                 }
                 Ok(Some((cols, rows)))
@@ -6525,6 +6659,11 @@ impl Executor {
                         name: "prosrc".into(),
                         dtype: DataType::Text,
                     },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "prolang".into(),
+                        dtype: DataType::Int32,
+                    },
                 ];
                 let mut rows = Vec::new();
                 for (i, (fname, fdef)) in functions.iter().enumerate() {
@@ -6554,8 +6693,28 @@ impl Executor {
                         Value::Int32(pronargs),
                         Value::Text(proargtypes),
                         Value::Text(fdef.body.clone()),
+                        // All user functions are SQL-language (OID 14).
+                        Value::Int32(14),
                     ]);
                 }
+                Ok(Some((cols, rows)))
+            }
+            // pg_language: the three built-in languages. User functions are
+            // SQL-language, so prolang joins resolve to 'sql'.
+            "pg_catalog.pg_language" | "pg_language" => {
+                let cols = [("oid", DataType::Int32), ("lanname", DataType::Text)]
+                    .into_iter()
+                    .map(|(n, dt)| ColMeta {
+                        table: Some(label.into()),
+                        name: n.into(),
+                        dtype: dt,
+                    })
+                    .collect();
+                let rows = vec![
+                    vec![Value::Int32(12), Value::Text("internal".into())],
+                    vec![Value::Int32(13), Value::Text("c".into())],
+                    vec![Value::Int32(14), Value::Text("sql".into())],
+                ];
                 Ok(Some((cols, rows)))
             }
             "pg_catalog.pg_roles" | "pg_roles" => {
@@ -6639,6 +6798,381 @@ impl Executor {
                     .collect();
                 Ok(Some((cols, rows)))
             }
+            // pg_sequence (raw catalog, singular): SQLAlchemy's reflection
+            // joins it for identity/serial detection. Sequences back SERIAL
+            // columns internally but aren't exposed as catalog objects — empty.
+            "pg_catalog.pg_sequence" | "pg_sequence" => {
+                let names = [
+                    ("seqrelid", DataType::Int32),
+                    ("seqtypid", DataType::Int32),
+                    ("seqstart", DataType::Int64),
+                    ("seqincrement", DataType::Int64),
+                    ("seqmax", DataType::Int64),
+                    ("seqmin", DataType::Int64),
+                    ("seqcache", DataType::Int64),
+                    ("seqcycle", DataType::Bool),
+                ];
+                let cols = names
+                    .iter()
+                    .map(|(n, t)| ColMeta {
+                        table: Some(label.into()),
+                        name: (*n).into(),
+                        dtype: t.clone(),
+                    })
+                    .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            // pg_sequences: sequence inventory view (drizzle-kit/SQLAlchemy pull
+            // it during introspection). Nucleus has no sequence objects, so the
+            // truthful answer is the empty set — NOT an error.
+            "pg_catalog.pg_sequences" | "pg_sequences" => {
+                let names = [
+                    ("schemaname", DataType::Text),
+                    ("sequencename", DataType::Text),
+                    ("sequenceowner", DataType::Text),
+                    ("data_type", DataType::Text),
+                    ("start_value", DataType::Int64),
+                    ("min_value", DataType::Int64),
+                    ("max_value", DataType::Int64),
+                    ("increment_by", DataType::Int64),
+                    ("cycle", DataType::Bool),
+                    ("cache_size", DataType::Int64),
+                    ("last_value", DataType::Int64),
+                ];
+                let cols = names
+                    .iter()
+                    .map(|(n, t)| ColMeta {
+                        table: Some(label.into()),
+                        name: (*n).into(),
+                        dtype: t.clone(),
+                    })
+                    .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            // pg_enum: enum-label catalog. CREATE TYPE ... AS ENUM values live in
+            // the type catalog, not a pg_enum-shaped store; ORM introspection
+            // (drizzle-kit) only needs the relation to resolve on a fresh DB.
+            "pg_catalog.pg_enum" | "pg_enum" => {
+                let cols = [
+                    ("oid", DataType::Int32),
+                    ("enumtypid", DataType::Int32),
+                    ("enumsortorder", DataType::Float64),
+                    ("enumlabel", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            // pg_opclass: operator classes — Nucleus indexes have no opclass
+            // concept; empty so index-introspection joins resolve.
+            "pg_catalog.pg_opclass" | "pg_opclass" => {
+                let cols = [
+                    ("oid", DataType::Int32),
+                    ("opcmethod", DataType::Int32),
+                    ("opcname", DataType::Text),
+                    ("opcnamespace", DataType::Int32),
+                    ("opcdefault", DataType::Bool),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            // pg_views: view inventory. Nucleus views live in the view
+            // registry; surface names so introspection sees them (definition
+            // SQL is not stored in catalog form — NULL).
+            "pg_catalog.pg_views" | "pg_views" => {
+                let cols = [
+                    ("schemaname", DataType::Text),
+                    ("viewname", DataType::Text),
+                    ("viewowner", DataType::Text),
+                    ("definition", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                let views = self.views.read().await;
+                let rows: Vec<Row> = views
+                    .keys()
+                    .map(|name| {
+                        vec![
+                            Value::Text("public".into()),
+                            Value::Text(name.clone()),
+                            Value::Text("nucleus".into()),
+                            Value::Null,
+                        ]
+                    })
+                    .collect();
+                Ok(Some((cols, rows)))
+            }
+            // pg_matviews: materialized-view inventory — Nucleus has none.
+            "pg_catalog.pg_matviews" | "pg_matviews" => {
+                let cols = [
+                    ("schemaname", DataType::Text),
+                    ("matviewname", DataType::Text),
+                    ("matviewowner", DataType::Text),
+                    ("hasindexes", DataType::Bool),
+                    ("ispopulated", DataType::Bool),
+                    ("definition", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            // pg_policies: human-readable RLS view (pg_policy is the raw
+            // catalog). Populated from the live RLS engine like pg_policy;
+            // qual/with_check render NULL for the same reason as polqual.
+            "pg_catalog.pg_policies" | "pg_policies" => {
+                let cols = [
+                    ("schemaname", DataType::Text),
+                    ("tablename", DataType::Text),
+                    ("policyname", DataType::Text),
+                    ("permissive", DataType::Text),
+                    ("roles", DataType::Text),
+                    ("cmd", DataType::Text),
+                    ("qual", DataType::Text),
+                    ("with_check", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                let sec = self.security.read();
+                let rows: Vec<Row> = sec
+                    .rls
+                    .all_policies()
+                    .iter()
+                    .map(|p| {
+                        let cmd = match p.command {
+                            crate::security::PolicyCommand::Select => "SELECT",
+                            crate::security::PolicyCommand::Insert => "INSERT",
+                            crate::security::PolicyCommand::Update => "UPDATE",
+                            crate::security::PolicyCommand::Delete => "DELETE",
+                            crate::security::PolicyCommand::All => "ALL",
+                        };
+                        vec![
+                            Value::Text("public".into()),
+                            Value::Text(p.table.clone()),
+                            Value::Text(p.name.clone()),
+                            Value::Text("PERMISSIVE".into()),
+                            Value::Text("{public}".into()),
+                            Value::Text(cmd.into()),
+                            Value::Null,
+                            Value::Null,
+                        ]
+                    })
+                    .collect();
+                Ok(Some((cols, rows)))
+            }
+            // information_schema constraint views: synthesized from table
+            // metadata. PRIMARY KEY only — Nucleus's FK/unique enforcement
+            // lives in table metadata without named constraint objects, and a
+            // fresh-DB ORM pull only needs PKs to round-trip.
+            "information_schema.table_constraints" => {
+                let tables = self.catalog.list_tables().await;
+                let cols = [
+                    ("constraint_catalog", DataType::Text),
+                    ("constraint_schema", DataType::Text),
+                    ("constraint_name", DataType::Text),
+                    ("table_catalog", DataType::Text),
+                    ("table_schema", DataType::Text),
+                    ("table_name", DataType::Text),
+                    ("constraint_type", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                let rows: Vec<Row> = tables
+                    .iter()
+                    .filter(|t| t.primary_key_columns().is_some_and(|pk| !pk.is_empty()))
+                    .map(|t| {
+                        vec![
+                            Value::Text("nucleus".into()),
+                            Value::Text("public".into()),
+                            Value::Text(format!("{}_pkey", t.name)),
+                            Value::Text("nucleus".into()),
+                            Value::Text("public".into()),
+                            Value::Text(t.name.clone()),
+                            Value::Text("PRIMARY KEY".into()),
+                        ]
+                    })
+                    .collect();
+                Ok(Some((cols, rows)))
+            }
+            "information_schema.key_column_usage" | "information_schema.constraint_column_usage" => {
+                let tables = self.catalog.list_tables().await;
+                let cols = [
+                    ("constraint_catalog", DataType::Text),
+                    ("constraint_schema", DataType::Text),
+                    ("constraint_name", DataType::Text),
+                    ("table_catalog", DataType::Text),
+                    ("table_schema", DataType::Text),
+                    ("table_name", DataType::Text),
+                    ("column_name", DataType::Text),
+                    ("ordinal_position", DataType::Int32),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                let mut rows = Vec::new();
+                for t in &tables {
+                    let Some(pk_cols) = t.primary_key_columns() else {
+                        continue;
+                    };
+                    for (i, pk_col) in pk_cols.iter().enumerate() {
+                        rows.push(vec![
+                            Value::Text("nucleus".into()),
+                            Value::Text("public".into()),
+                            Value::Text(format!("{}_pkey", t.name)),
+                            Value::Text("nucleus".into()),
+                            Value::Text("public".into()),
+                            Value::Text(t.name.clone()),
+                            Value::Text(pk_col.clone()),
+                            Value::Int32((i + 1) as i32),
+                        ]);
+                    }
+                }
+                Ok(Some((cols, rows)))
+            }
+            "information_schema.sequences" => {
+                // No sequence objects — empty, mirroring pg_sequences.
+                let cols = [
+                    ("sequence_catalog", DataType::Text),
+                    ("sequence_schema", DataType::Text),
+                    ("sequence_name", DataType::Text),
+                    ("data_type", DataType::Text),
+                    ("start_value", DataType::Text),
+                    ("minimum_value", DataType::Text),
+                    ("maximum_value", DataType::Text),
+                    ("increment", DataType::Text),
+                    ("cycle_option", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            "information_schema.views" => {
+                let cols = [
+                    ("table_catalog", DataType::Text),
+                    ("table_schema", DataType::Text),
+                    ("table_name", DataType::Text),
+                    ("view_definition", DataType::Text),
+                ]
+                .into_iter()
+                .map(|(n, dt)| ColMeta {
+                    table: Some(label.into()),
+                    name: n.into(),
+                    dtype: dt,
+                })
+                .collect();
+                Ok(Some((cols, Vec::new())))
+            }
+            // pg_user is the legacy login-role view (drizzle-kit joins it on
+            // usesysid = nspowner during schema pull). Same source as pg_roles;
+            // usesysid mirrors pg_roles.oid so cross-catalog joins line up.
+            "pg_catalog.pg_user" | "pg_user" => {
+                let roles = self.roles.read().await;
+                let cols = vec![
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "usename".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "usesysid".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "usecreatedb".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "usesuper".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "userepl".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "usebypassrls".into(),
+                        dtype: DataType::Bool,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "passwd".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "valuntil".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "useconfig".into(),
+                        dtype: DataType::Text,
+                    },
+                ];
+                let rows: Vec<Row> = roles
+                    .values()
+                    .enumerate()
+                    .filter(|(_, r)| r.can_login)
+                    .map(|(i, r)| {
+                        vec![
+                            Value::Text(r.name.clone()),
+                            Value::Int32(10 + i as i32),
+                            Value::Bool(r.is_superuser),
+                            Value::Bool(r.is_superuser),
+                            Value::Bool(false),
+                            Value::Bool(r.is_superuser),
+                            Value::Text("********".into()),
+                            Value::Null,
+                            Value::Null,
+                        ]
+                    })
+                    .collect();
+                Ok(Some((cols, rows)))
+            }
             "pg_catalog.pg_attribute" | "pg_attribute" => {
                 let tables = self.catalog.list_tables().await;
                 let cols = vec![
@@ -6700,6 +7234,14 @@ impl Executor {
                         name: "attisdropped".into(),
                         dtype: DataType::Bool,
                     },
+                    // Array dimensionality (drizzle-kit selects it) — Nucleus
+                    // arrays don't track declared dims; 0 matches "not an
+                    // array" for every scalar column.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "attndims".into(),
+                        dtype: DataType::Int32,
+                    },
                 ];
                 let mut rows = Vec::new();
                 for (ti, t) in tables.iter().enumerate() {
@@ -6723,6 +7265,7 @@ impl Executor {
                             Value::Text(String::new()),
                             Value::Text(String::new()),
                             Value::Bool(false),
+                            Value::Int32(0),
                         ]);
                     }
                 }
@@ -6904,12 +7447,20 @@ impl Executor {
                 let names = [
                     ("oid", DataType::Int32),
                     ("conname", DataType::Text),
+                    ("connamespace", DataType::Int32),
                     ("conrelid", DataType::Int32),
+                    ("contypid", DataType::Int32),
                     ("conindid", DataType::Int32),
+                    ("confrelid", DataType::Int32),
                     ("contype", DataType::Text),
                     ("condeferrable", DataType::Bool),
                     ("condeferred", DataType::Bool),
                     ("convalidated", DataType::Bool),
+                    ("conkey", DataType::Text),
+                    ("confkey", DataType::Text),
+                    ("confupdtype", DataType::Text),
+                    ("confdeltype", DataType::Text),
+                    ("confmatchtype", DataType::Text),
                 ];
                 let cols = names
                     .into_iter()
@@ -6982,6 +7533,34 @@ impl Executor {
                         name: "indisreplident".into(),
                         dtype: DataType::Bool,
                     },
+                    // Index-reflection columns (SQLAlchemy autoload): per-key
+                    // option flags (all 0 — ASC NULLS LAST), key-column count,
+                    // no expression indexes, no partial-index predicates.
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indoption".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indnkeyatts".into(),
+                        dtype: DataType::Int32,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indexprs".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indpred".into(),
+                        dtype: DataType::Text,
+                    },
+                    ColMeta {
+                        table: Some(label.into()),
+                        name: "indnullsnotdistinct".into(),
+                        dtype: DataType::Bool,
+                    },
                 ];
                 let table_oid_map: HashMap<String, i32> = tables
                     .iter()
@@ -7013,6 +7592,7 @@ impl Executor {
                         .find(|t| t.name == idx.table_name)
                         .and_then(|t| t.primary_key_columns())
                         .is_some_and(|pk_cols| pk_cols == idx.columns.as_slice());
+                    let ncols = idx.columns.len();
                     rows.push(vec![
                         Value::Int32(index_oid),
                         Value::Int32(table_oid),
@@ -7021,6 +7601,11 @@ impl Executor {
                         Value::Text(indkey),
                         Value::Bool(false),
                         Value::Bool(true),
+                        Value::Bool(false),
+                        Value::Text(vec!["0"; ncols].join(" ")),
+                        Value::Int32(ncols as i32),
+                        Value::Null,
+                        Value::Null,
                         Value::Bool(false),
                     ]);
                 }

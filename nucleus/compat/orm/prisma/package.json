@@ -1,0 +1,16 @@
+{
+  "name": "nucleus-orm-compat-prisma",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@prisma/client": "^6.8.0"
+  },
+  "devDependencies": {
+    "prisma": "^6.8.0"
+  },
+  "allowScripts": {
+    "@prisma/client@6.19.3": true,
+    "@prisma/engines@6.19.3": true,
+    "prisma@6.19.3": true
+  }
+}
