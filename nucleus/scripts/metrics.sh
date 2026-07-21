@@ -26,7 +26,6 @@ DECLARED_TESTS=$((UNIT_DECLARED + INTEGRATION_DECLARED))
 UNIT_IGNORED=$(count_matching_lines "$SRC" '^[[:space:]]*#\[ignore([^]]*)?\]')
 INTEGRATION_IGNORED=$(count_matching_lines "$TEST_DIR" '^[[:space:]]*#\[ignore([^]]*)?\]')
 IGNORED_TESTS=$((UNIT_IGNORED + INTEGRATION_IGNORED))
-BINARY_PROTOCOL_STUBS=$(count_matching_lines "$SRC/binary_wire/tests" '^[[:space:]]*#\[ignore([^]]*)?\]')
 STRESS_IGNORED=$(find "$TEST_DIR" -type f -name '*.rs' -exec grep -Ehi \
     '^[[:space:]]*#\[ignore([^]]*)?(stress|scale|large|concurrent|crash|overflow|expression)' {} + \
     2>/dev/null | wc -l | tr -d ' ')
@@ -44,7 +43,6 @@ print_metrics() {
     echo "IGNORED_UNIT_TESTS=$UNIT_IGNORED"
     echo "IGNORED_INTEGRATION_TESTS=$INTEGRATION_IGNORED"
     echo "IGNORED_TESTS=$IGNORED_TESTS"
-    echo "BINARY_PROTOCOL_STUBS=$BINARY_PROTOCOL_STUBS"
     echo "INTENTIONAL_STRESS_IGNORES=$STRESS_IGNORED"
     echo "UNCLASSIFIED_INTEGRATION_IGNORES=$UNCLASSIFIED_INTEGRATION_IGNORES"
     echo "WAL_SOURCE_FILES=$WAL_FILES"
@@ -82,7 +80,6 @@ assert_plan_value "Top-level modules" "$MODULES" || fail=1
 assert_plan_value "Declared unit tests" "$UNIT_DECLARED" || fail=1
 assert_plan_value "Declared integration tests" "$INTEGRATION_DECLARED" || fail=1
 assert_plan_value "Ignored tests" "$IGNORED_TESTS" || fail=1
-assert_plan_value "Binary-protocol stubs" "$BINARY_PROTOCOL_STUBS" || fail=1
 if [ "$UNCLASSIFIED_INTEGRATION_IGNORES" -ne 0 ]; then
     echo "FAIL: $UNCLASSIFIED_INTEGRATION_IGNORES integration ignores are not categorized" >&2
     fail=1

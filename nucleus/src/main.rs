@@ -135,11 +135,6 @@ enum Commands {
         #[arg(long, default_value_t = 6379)]
         resp_port: u16,
 
-        /// Port for the binary wire protocol server.
-        /// Set to 0 to disable (default: 0). Use 9999 for standard binary protocol port.
-        #[arg(long, default_value_t = 0)]
-        binary_port: u16,
-
         /// Port for the S3-compatible gateway (default: 0 = disabled).
         /// Requires NUCLEUS_S3_ACCESS_KEY and NUCLEUS_S3_SECRET_KEY.
         #[arg(long, default_value_t = 0)]
@@ -330,7 +325,6 @@ struct StartConfig {
     encrypt: bool,
     compress: bool,
     resp_port: u16,
-    binary_port: u16,
     s3_port: u16,
     otlp_endpoint: Option<String>,
     max_memory: usize,
@@ -364,7 +358,6 @@ async fn main() {
             encrypt,
             compress,
             resp_port,
-            binary_port,
             s3_port,
             otlp_endpoint,
             max_memory,
@@ -388,7 +381,6 @@ async fn main() {
                 encrypt,
                 compress,
                 resp_port,
-                binary_port,
                 s3_port,
                 otlp_endpoint,
                 max_memory,
@@ -464,7 +456,6 @@ async fn main() {
                 encrypt: false,
                 compress: false,
                 resp_port: 6379,
-                binary_port: 0,
                 s3_port: 0,
                 otlp_endpoint: None,
                 max_memory: 512,
@@ -498,7 +489,6 @@ async fn cmd_start(cfg: StartConfig) {
         encrypt,
         compress,
         resp_port,
-        binary_port,
         s3_port,
         otlp_endpoint,
         max_memory,
@@ -1082,7 +1072,6 @@ async fn cmd_start(cfg: StartConfig) {
         }
     }
     let resolved_password_for_resp = resolved_password.clone();
-    let resolved_password_for_binary = resolved_password.clone();
     let handler = if let Some(ref bootstrap_password) = resolved_password {
         executor.set_bootstrap_password(bootstrap_password).await;
         Arc::new(NucleusHandler::with_catalog_auth(executor.clone()))
@@ -1853,27 +1842,6 @@ async fn cmd_start(cfg: StartConfig) {
         }
     }
 
-    // Spawn binary wire protocol server
-    if binary_port > 0 {
-        let binary_addr = format!("{host}:{binary_port}");
-        let binary_exec = executor.clone();
-        let binary_pw = resolved_password_for_binary.clone();
-        let binary_shutdown = shutdown_notify.clone();
-        tokio::spawn(async move {
-            if let Err(e) = nucleus::binary_wire::server::start_binary_server(
-                binary_addr,
-                binary_exec,
-                binary_pw,
-                binary_shutdown,
-            )
-            .await
-            {
-                tracing::error!("Binary protocol server error: {e}");
-            }
-        });
-        tracing::info!("Binary protocol server on port {binary_port}");
-    }
-
     // Spawn metrics HTTP endpoint
     let metrics_port = config.metrics.port;
     let metrics_enabled = config.metrics.enabled;
@@ -1972,9 +1940,6 @@ async fn cmd_start(cfg: StartConfig) {
     }
     if resp_port > 0 {
         println!("  RESP port:    {resp_port}");
-    }
-    if binary_port > 0 {
-        println!("  Binary port:  {binary_port}");
     }
     if s3_port > 0 {
         println!("  S3 port:      {s3_port}");

@@ -1,70 +1,12 @@
 //! Optimization-specific metrics for Phase 4.
 //!
 //! Tracks performance and effectiveness of:
-//! - Binary protocol (wire optimization)
 //! - Zone maps (granule-level pruning)
 //! - GROUP BY specialization (type-specialized paths)
 //! - Lazy materialization (deferred evaluation)
 //! - SIMD aggregates (vectorized operations)
 
 use crate::metrics::{Counter, Gauge, Histogram};
-
-/// Binary protocol metrics.
-pub struct BinaryProtocolMetrics {
-    pub connections_active: Gauge,
-    pub latency_histogram: Histogram, // microseconds: [1, 5, 10, 50, 100, 500, 1000, 5000]
-    pub parse_errors_total: Counter,
-    pub message_size_bytes: Histogram, // bytes: [100, 1K, 10K, 100K, 1M]
-    pub handshake_failures: Counter,
-    pub protocol_violations: Counter,
-}
-
-impl BinaryProtocolMetrics {
-    pub fn new() -> Self {
-        Self {
-            connections_active: Gauge::new(
-                "nucleus_binary_connections_active",
-                "Active binary protocol connections",
-            ),
-            latency_histogram: Histogram::new(
-                "nucleus_binary_latency_microseconds",
-                "Binary protocol query latency in microseconds",
-                vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0],
-            ),
-            parse_errors_total: Counter::new(
-                "nucleus_binary_parse_errors_total",
-                "Total binary protocol parse errors",
-            ),
-            message_size_bytes: Histogram::new(
-                "nucleus_binary_message_size_bytes",
-                "Binary protocol message size in bytes",
-                vec![100.0, 1000.0, 10000.0, 100000.0, 1000000.0],
-            ),
-            handshake_failures: Counter::new(
-                "nucleus_binary_handshake_failures_total",
-                "Binary protocol handshake failures",
-            ),
-            protocol_violations: Counter::new(
-                "nucleus_binary_protocol_violations_total",
-                "Binary protocol violations detected",
-            ),
-        }
-    }
-
-    pub fn record_query(&self, latency_us: f64) {
-        self.latency_histogram.observe(latency_us);
-    }
-
-    pub fn record_message(&self, size_bytes: u64) {
-        self.message_size_bytes.observe(size_bytes as f64);
-    }
-}
-
-impl Default for BinaryProtocolMetrics {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Zone map metrics.
 pub struct ZoneMapMetrics {
@@ -433,7 +375,6 @@ impl Default for FilterLazyMetrics {
 
 /// Combined Phase 4 optimization metrics.
 pub struct Phase4Metrics {
-    pub binary_protocol: BinaryProtocolMetrics,
     pub zone_maps: ZoneMapMetrics,
     pub group_by: GroupByMetrics,
     pub lazy_materialization: LazyMaterializationMetrics,
@@ -444,7 +385,6 @@ pub struct Phase4Metrics {
 impl Phase4Metrics {
     pub fn new() -> Self {
         Self {
-            binary_protocol: BinaryProtocolMetrics::new(),
             zone_maps: ZoneMapMetrics::new(),
             group_by: GroupByMetrics::new(),
             lazy_materialization: LazyMaterializationMetrics::new(),
@@ -463,19 +403,6 @@ impl Default for Phase4Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn binary_protocol_metrics() {
-        let m = BinaryProtocolMetrics::new();
-        m.connections_active.set(5);
-        m.record_query(12.3);
-        m.record_message(1024);
-        m.parse_errors_total.inc();
-
-        assert_eq!(m.connections_active.get(), 5);
-        assert_eq!(m.parse_errors_total.get(), 1);
-        assert_eq!(m.latency_histogram.count(), 1);
-    }
 
     #[test]
     fn zone_map_metrics() {

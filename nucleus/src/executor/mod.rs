@@ -805,10 +805,13 @@ impl Executor {
             // upgrades it via `with_spill_encryptor` so sensitive runs spill
             // ciphertext. u64::MAX ceiling for now (a configurable disk budget is
             // a follow-up); the budget still tracks usage, it just never denies.
-            let spill_dir = dir.join("spill");
-            if let Ok(mgr) = spill::SpillManager::new(&spill_dir, u64::MAX, None) {
-                let _ = mgr.sweep_orphans();
-                exec.spill_manager = Some(std::sync::Arc::new(mgr));
+            #[cfg(feature = "server")]
+            {
+                let spill_dir = dir.join("spill");
+                if let Ok(mgr) = spill::SpillManager::new(&spill_dir, u64::MAX, None) {
+                    let _ = mgr.sweep_orphans();
+                    exec.spill_manager = Some(std::sync::Arc::new(mgr));
+                }
             }
         }
 

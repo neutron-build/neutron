@@ -24,11 +24,11 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 257002; Source Rust files: 237; Top-level modules: 51.
-- Declared unit tests: 4045; Declared integration tests: 319; Ignored tests: 156;
-  Binary-protocol stubs: 113. These are static declarations, not executed-test claims.
-- The most recent full library run executed 3,768 passing tests and 113 ignored native-binary
-  test stubs. Core-only executed 1,853 passing tests with no ignores.
+- Source LOC: 250504; Source Rust files: 220; Top-level modules: 50.
+- Declared unit tests: 3850; Declared integration tests: 316; Ignored tests: 43.
+  These are static declarations, not executed-test claims.
+- The most recent full library run executed 3,835 passing tests. Core-only executed 1,853
+  passing tests with no ignores.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
   families, specialty indexes, encryption, TLS, embedded mode, physical backup v1, probes, Raft
   state-machine/runtime scaffolding, trusted SCRAM identities, role assumption, and RLS enforcement
@@ -74,7 +74,7 @@ Goal: every supported configuration builds and all normal correctness regression
 - [x] Make full integration tests a required CI job alongside library tests.
 - [x] Reconcile the stale ignored SSI/concurrency findings with their active fixed regressions.
 - [x] Keep storage-engine differential tests active for MVCC, memory, LSM, and columnar paths.
-- [x] Categorize every remaining ignored test as stress/scale (42) or binary-protocol defect (113).
+- [x] Categorize every remaining ignored test as stress/scale (42).
 - [x] Run non-stress correctness tests without `#[ignore]`.
 - [x] Schedule stress, crash, scale, sanitizer, and probe suites with retained failure commands/logs.
 - [x] Add dependency, license, unsafe-code, and vulnerability checks.
@@ -253,13 +253,15 @@ Exit gate:
 
 Goal: eliminate the current advertised-but-stubbed protocol state.
 
-- [ ] Decide to support or remove the native binary protocol from the supported product surface.
-- [ ] If supported, implement authenticated handshake, framing, value codecs, typed parameters,
-      statement lifecycle, cancellation, limits, errors, and session isolation.
-- [ ] Replace all 113 ignored TODO tests with active behavior tests.
-- [ ] Add malformed-frame property/fuzz tests and pgwire result-parity tests.
-- [ ] Propagate the trusted principal and RLS context; reject bootstrap/principal-less execution.
-- [ ] If removed, delete listener/config/public claims while retaining only deliberately internal codecs.
+- [x] Decided: REMOVED (2026-07-21). The TLV binary protocol measured a 10% error rate at 4
+      concurrent connections with broken multi-param prepared statements and weaker auth than
+      pgwire. Protocol posture is pgwire (SQL door) + RESP (hot KV) + embedded (in-process);
+      the future fast lane is Arrow Flight SQL. Rationale and design summary preserved in
+      `_internal/PROTOCOL_STRATEGY_2026-07.md`; the code survives in git history.
+- [x] Deleted `src/binary_wire/` (module, server, 113 ignored test stubs), the `--binary-port`
+      flag and startup path, the decoder fuzzer bin, the stress-harness section, the config and
+      metrics structs, and the CI workflow. The node-to-node RPC transport (`src/transport/`)
+      is unrelated and remains.
 
 Exit gate:
 

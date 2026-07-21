@@ -1,6 +1,6 @@
 //! Phase 4 optimization configuration.
 //!
-//! Runtime flags for controlling binary protocol, zone maps, GROUP BY specialization,
+//! Runtime flags for controlling zone maps, GROUP BY specialization,
 //! lazy materialization, and SIMD aggregates.
 
 use clap::{Parser, ValueEnum};
@@ -8,10 +8,6 @@ use clap::{Parser, ValueEnum};
 /// Optimization configuration for Phase 4.
 #[derive(Parser, Debug, Clone)]
 pub struct OptimizationConfig {
-    /// Binary protocol settings
-    #[command(flatten)]
-    pub binary_protocol: BinaryProtocolConfig,
-
     /// Zone map settings
     #[command(flatten)]
     pub zone_maps: ZoneMapConfig,
@@ -31,34 +27,6 @@ pub struct OptimizationConfig {
     /// Metrics and monitoring
     #[command(flatten)]
     pub metrics: MetricsConfig,
-}
-
-/// Binary protocol configuration.
-#[derive(Parser, Debug, Clone)]
-pub struct BinaryProtocolConfig {
-    /// Disable binary protocol (use SQL/PostgreSQL protocol only)
-    #[arg(long, default_value = "false")]
-    pub disable_binary_protocol: bool,
-
-    /// Port for binary protocol server (in addition to SQL on 5432)
-    #[arg(long, default_value = "5433")]
-    pub binary_port: u16,
-
-    /// Maximum message size for binary protocol (bytes)
-    #[arg(long, default_value = "67108864")]  // 64 MB
-    pub binary_max_message_size: u32,
-
-    /// Number of binary protocol handler threads
-    #[arg(long, default_value = "4")]
-    pub binary_thread_pool_size: usize,
-
-    /// Enable binary protocol handshake compression
-    #[arg(long, default_value = "true")]
-    pub binary_compression_enabled: bool,
-
-    /// Binary protocol read timeout (seconds)
-    #[arg(long, default_value = "30")]
-    pub binary_read_timeout_secs: u64,
 }
 
 /// Zone map configuration.
@@ -201,7 +169,6 @@ impl OptimizationConfig {
     /// Create default configuration.
     pub fn default() -> Self {
         Self {
-            binary_protocol: BinaryProtocolConfig::default(),
             zone_maps: ZoneMapConfig::default(),
             group_by: GroupByConfig::default(),
             lazy_materialization: LazyMaterializationConfig::default(),
@@ -213,14 +180,6 @@ impl OptimizationConfig {
     /// All optimizations enabled.
     pub fn all_enabled() -> Self {
         Self {
-            binary_protocol: BinaryProtocolConfig {
-                disable_binary_protocol: false,
-                binary_port: 5433,
-                binary_max_message_size: 67108864,
-                binary_thread_pool_size: 4,
-                binary_compression_enabled: true,
-                binary_read_timeout_secs: 30,
-            },
             zone_maps: ZoneMapConfig {
                 disable_zone_maps: false,
                 zone_map_threshold_rows: 1000000,  // 1M rows for full optimization
@@ -260,10 +219,6 @@ impl OptimizationConfig {
     /// All optimizations disabled (baseline).
     pub fn all_disabled() -> Self {
         Self {
-            binary_protocol: BinaryProtocolConfig {
-                disable_binary_protocol: true,
-                ..BinaryProtocolConfig::default()
-            },
             zone_maps: ZoneMapConfig {
                 disable_zone_maps: true,
                 ..ZoneMapConfig::default()
@@ -286,8 +241,7 @@ impl OptimizationConfig {
 
     /// Check if all optimizations are enabled.
     pub fn all_enabled_check(&self) -> bool {
-        !self.binary_protocol.disable_binary_protocol
-            && !self.zone_maps.disable_zone_maps
+        !self.zone_maps.disable_zone_maps
             && !self.group_by.disable_group_by_specialization
             && !self.lazy_materialization.disable_lazy_materialization
             && !self.simd.disable_simd
@@ -295,8 +249,7 @@ impl OptimizationConfig {
 
     /// Check if all optimizations are disabled.
     pub fn all_disabled_check(&self) -> bool {
-        self.binary_protocol.disable_binary_protocol
-            && self.zone_maps.disable_zone_maps
+        self.zone_maps.disable_zone_maps
             && self.group_by.disable_group_by_specialization
             && self.lazy_materialization.disable_lazy_materialization
             && self.simd.disable_simd
@@ -304,19 +257,6 @@ impl OptimizationConfig {
 }
 
 // Implement Default for sub-configs
-impl Default for BinaryProtocolConfig {
-    fn default() -> Self {
-        Self {
-            disable_binary_protocol: false,
-            binary_port: 5433,
-            binary_max_message_size: 67108864,
-            binary_thread_pool_size: 4,
-            binary_compression_enabled: true,
-            binary_read_timeout_secs: 30,
-        }
-    }
-}
-
 impl Default for ZoneMapConfig {
     fn default() -> Self {
         Self {
@@ -395,7 +335,6 @@ mod tests {
     fn test_default_config() {
         let cfg = OptimizationConfig::default();
         // Default should have most optimizations enabled
-        assert!(!cfg.binary_protocol.disable_binary_protocol);
         assert!(!cfg.simd.disable_simd);
     }
 

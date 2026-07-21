@@ -44,7 +44,6 @@ cargo build --release --features bench-tools 2>&1 | tail -20
 ```bash
 # Start Nucleus with metrics
 ./target/release/nucleus \
-  --binary-port 5433 \
   --metrics-port 9090 \
   --zone-map-threshold-rows 1000000 &
 
