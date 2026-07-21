@@ -16,6 +16,39 @@
 use nucleus::bench_paired::{VectorDist, bench_fts, bench_graph, bench_vector_dist};
 
 fn main() {
+    // One-shot scale mode: `bench_paired scale [n] [dim] [k] [queries]` —
+    // builds one clustered HNSW at the given size (default 1M x 64d), asserts
+    // the recall floor holds there, prints build time + search latency. This
+    // is the Phase-2 "vector at scale" gate; the default matrix below stays
+    // the fast everyday run.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("scale") {
+        let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+        let dim: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
+        let k: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10);
+        let queries: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(50);
+        let seed = 0xB0BA_CAFEu64;
+        println!("VECTOR SCALE — clustered, n={n} dim={dim} k={k} queries={queries}");
+        let t0 = std::time::Instant::now();
+        let r = bench_vector_dist(n, dim, k, queries, seed, VectorDist::Clustered);
+        println!(
+            "  total {:.1}s  hnsw_us {:.1}  brute_us {:.1}  qps {:.0}  recall {:.3}  min_rec {:.3}",
+            t0.elapsed().as_secs_f64(),
+            r.hnsw_avg_us,
+            r.brute_avg_us,
+            r.qps,
+            r.avg_recall,
+            r.min_recall
+        );
+        // Same floors as the lib-test gate: clustered data must stay near-exact.
+        if r.avg_recall < 0.98 || r.min_recall < 0.80 {
+            println!("SCALE RECALL FLOOR FAILED (avg>=0.98, min>=0.80 required)");
+            std::process::exit(1);
+        }
+        println!("scale recall floor holds ✅");
+        return;
+    }
+
     let seed: u64 = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())

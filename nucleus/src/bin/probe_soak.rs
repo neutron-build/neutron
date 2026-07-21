@@ -247,12 +247,13 @@ async fn row_count(db: &Database) -> i64 {
     }
 }
 
-fn parse_args() -> (u64, usize, u64, u64) {
+fn parse_args() -> (u64, usize, u64, u64, u64) {
     let args: Vec<String> = std::env::args().collect();
     let mut duration_secs = 20u64;
     let mut concurrency = 8usize;
     let mut seed = 0x50AC_BEEF_1234u64;
     let mut leak_limit_mb = 96u64;
+    let mut rows_target = 0u64;
     let mut i = 1;
     while i < args.len() {
         let take = |i: &mut usize| -> Option<String> {
@@ -280,30 +281,50 @@ fn parse_args() -> (u64, usize, u64, u64) {
                     leak_limit_mb = v;
                 }
             }
+            // Scale mode: bulk-load a separate `big` table to this many rows
+            // BEFORE the churn phase, then keep every invariant (bounded RSS,
+            // coherence, durability) with multi-million-row data resident.
+            "--rows-target" => {
+                if let Some(v) = take(&mut i).and_then(|s| s.parse().ok()) {
+                    rows_target = v;
+                }
+            }
             _ => {}
         }
         i += 1;
     }
-    (seed, concurrency, duration_secs, leak_limit_mb)
+    (seed, concurrency, duration_secs, leak_limit_mb, rows_target)
 }
 
 fn main() {
     unsafe {
         std::env::set_var("NUCLEUS_ENCRYPTION_KEY", "0123456789abcdef0123456789abcdef");
     }
-    let (seed, concurrency, duration_secs, leak_limit_mb) = parse_args();
+    let (seed, concurrency, duration_secs, leak_limit_mb, rows_target) = parse_args();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads((concurrency + 2).min(16))
         .enable_all()
         .build()
         .unwrap();
-    let failed = rt.block_on(run_soak(seed, concurrency, duration_secs, leak_limit_mb));
+    let failed = rt.block_on(run_soak(
+        seed,
+        concurrency,
+        duration_secs,
+        leak_limit_mb,
+        rows_target,
+    ));
     if failed {
         std::process::exit(1);
     }
 }
 
-async fn run_soak(seed: u64, concurrency: usize, duration_secs: u64, leak_limit_mb: u64) -> bool {
+async fn run_soak(
+    seed: u64,
+    concurrency: usize,
+    duration_secs: u64,
+    leak_limit_mb: u64,
+    rows_target: u64,
+) -> bool {
     let dir = std::env::temp_dir().join(format!("nucleus_soak_{seed:x}"));
     let _ = std::fs::remove_dir_all(&dir);
     println!(
@@ -315,6 +336,75 @@ async fn run_soak(seed: u64, concurrency: usize, duration_secs: u64, leak_limit_
     if let Err(e) = create_schema(&db).await {
         println!("FAIL: schema setup: {e}");
         return true;
+    }
+
+    // ── Scale phase: grow `big` to rows_target before churn ──────────────
+    let mut big_expected: i64 = 0;
+    if rows_target > 0 {
+        if let Err(e) = run(
+            &db,
+            "CREATE TABLE big (id BIGINT PRIMARY KEY, grp INT, payload TEXT)",
+        )
+        .await
+        {
+            println!("FAIL: big-table setup: {e}");
+            return true;
+        }
+        if let Err(e) = run(&db, "CREATE INDEX big_grp ON big (grp)").await {
+            println!("FAIL: big-table index: {e}");
+            return true;
+        }
+        let t0 = Instant::now();
+        const BATCH: u64 = 1000;
+        // Load with synchronous_commit=off: batches stay autocommit (an
+        // explicit transaction would force the in-txn seq-scan unique check —
+        // O(n) per insert on a growing table) while the WAL force is deferred
+        // to the explicit sync below, exactly the bulk-load posture the docs
+        // recommend. Durability of the load is still asserted: sync() runs
+        // before the count check and again before the reopen check.
+        let _ = run(&db, "SET synchronous_commit = off").await;
+        let mut loaded = 0u64;
+        while loaded < rows_target {
+            let n = BATCH.min(rows_target - loaded);
+            let mut sql = String::with_capacity(64 * n as usize);
+            sql.push_str("INSERT INTO big VALUES ");
+            for k in 0..n {
+                let id = loaded + k;
+                if k > 0 {
+                    sql.push(',');
+                }
+                sql.push_str(&format!("({id}, {}, 'p{id}')", id % 1000));
+            }
+            if let Err(e) = run(&db, &sql).await {
+                println!("FAIL: bulk load at row {loaded}: {e}");
+                return true;
+            }
+            loaded += n;
+            if loaded.is_multiple_of(1_000_000) {
+                println!(
+                    "  bulk load: {loaded}/{rows_target} rows  ({:.0} rows/s, RSS {} MB)",
+                    loaded as f64 / t0.elapsed().as_secs_f64().max(0.001),
+                    rss_bytes() / (1024 * 1024)
+                );
+            }
+        }
+        let _ = run(&db, "SET synchronous_commit = on").await;
+        let _ = db.sync();
+        big_expected = rows_target as i64;
+        let counted = match db.query_one("SELECT COUNT(*) FROM big").await {
+            Ok(Some(Value::Int64(n))) => n,
+            Ok(Some(Value::Int32(n))) => n as i64,
+            _ => -1,
+        };
+        println!(
+            "  bulk load done: {rows_target} rows in {:.1}s (COUNT(*)={counted}, RSS {} MB)",
+            t0.elapsed().as_secs_f64(),
+            rss_bytes() / (1024 * 1024)
+        );
+        if counted != big_expected {
+            println!("FAIL: bulk load count mismatch: expected {big_expected}, got {counted}");
+            return true;
+        }
     }
 
     let shared = Arc::new(Shared {
@@ -408,12 +498,83 @@ async fn run_soak(seed: u64, concurrency: usize, duration_secs: u64, leak_limit_
         failed = true;
         println!("FAIL: durability: {rows_before} rows before close, {rows_after} after reopen");
     }
+
+    // 4b. scale table: the churn phase never touches `big`, so its count must
+    // be exactly rows_target after the run AND after reopen, and an indexed
+    // group lookup must return its slice.
+    if big_expected > 0 {
+        let big_after = match db2.query_one("SELECT COUNT(*) FROM big").await {
+            Ok(Some(Value::Int64(n))) => n,
+            Ok(Some(Value::Int32(n))) => n as i64,
+            _ => -1,
+        };
+        if big_after != big_expected {
+            failed = true;
+            println!("FAIL: scale table after reopen: expected {big_expected} rows, got {big_after}");
+        }
+        let grp = match db2
+            .query_one("SELECT COUNT(*) FROM big WHERE grp = 7")
+            .await
+        {
+            Ok(Some(Value::Int64(n))) => n,
+            Ok(Some(Value::Int32(n))) => n as i64,
+            _ => -1,
+        };
+        let expect_grp = big_expected / 1000 + i64::from(big_expected % 1000 > 7);
+        if grp != expect_grp {
+            failed = true;
+            println!("FAIL: scale table indexed group count: expected {expect_grp}, got {grp}");
+        }
+    }
     let recover_fails = coherence_failures(&db2).await;
     if !recover_fails.is_empty() {
         failed = true;
         println!("FAIL: post-recovery coherence:");
         for f in &recover_fails {
             println!("      {f}");
+        }
+    }
+
+    // 5. dump/restore at size: a logical dump of the post-churn database must
+    // replay into a fresh in-memory instance with identical row counts. Only
+    // run in scale mode — this is the "backup works at multi-million rows"
+    // gate, and the dump of a tiny churn table adds no signal.
+    if big_expected > 0 {
+        let t0 = Instant::now();
+        match db2.executor().dump_logical().await {
+            Ok(script) => {
+                println!(
+                    "  dump: {:.1} MB in {:.1}s",
+                    script.len() as f64 / (1024.0 * 1024.0),
+                    t0.elapsed().as_secs_f64()
+                );
+                let mem = Database::mvcc();
+                let t1 = Instant::now();
+                match mem.executor().restore_logical(&script).await {
+                    Ok(()) => {
+                        let n = match mem.query_one("SELECT COUNT(*) FROM big").await {
+                            Ok(Some(Value::Int64(n))) => n,
+                            Ok(Some(Value::Int32(n))) => n as i64,
+                            _ => -1,
+                        };
+                        println!("  restore: {:.1}s", t1.elapsed().as_secs_f64());
+                        if n != big_expected {
+                            failed = true;
+                            println!(
+                                "FAIL: dump/restore row count: expected {big_expected}, got {n}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        failed = true;
+                        println!("FAIL: restore_logical: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                failed = true;
+                println!("FAIL: dump_logical: {e}");
+            }
         }
     }
 
@@ -430,6 +591,9 @@ async fn run_soak(seed: u64, concurrency: usize, duration_secs: u64, leak_limit_
         ops as f64 / duration_secs.max(1) as f64
     );
     println!("rows before/after reopen: {rows_before} / {rows_after}");
+    if big_expected > 0 {
+        println!("scale table     : {big_expected} rows (bulk-loaded, verified after reopen)");
+    }
     println!(
         "RSS start/peak/end: {} / {} / {} MB",
         leak.first_mb, leak.peak_mb, leak.last_mb

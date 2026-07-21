@@ -314,6 +314,13 @@ impl Database {
         drop(self);
     }
 
+    /// The underlying executor — for administrative flows the SQL surface
+    /// doesn't cover (logical dump/restore, metrics). Most callers should
+    /// stay on `execute`/`query`.
+    pub fn executor(&self) -> &Arc<Executor> {
+        &self.executor
+    }
+
     // ========================================================================
     // Direct multi-model store access (bypass SQL parsing)
     // ========================================================================
