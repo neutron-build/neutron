@@ -1152,10 +1152,11 @@ impl NucleusHandler {
 }
 
 fn sanitize_sql_text_literal(value: &str) -> String {
-    value
-        .replace('\0', "")
-        .replace('\\', "\\\\")
-        .replace('\'', "''")
+    // Nucleus parses with PostgreSqlDialect, which is standard-conforming:
+    // backslashes inside '...' are LITERAL characters, so they must NOT be
+    // doubled here (doubling corrupted any text parameter containing '\',
+    // e.g. Windows paths). Only quote-doubling and NUL-stripping apply.
+    value.replace('\0', "").replace('\'', "''")
 }
 
 fn substitute_positional_placeholders(sql: &str, replacements: &[String]) -> String {
@@ -2606,6 +2607,147 @@ enum DecodedParam {
 /// Decode a portal parameter into a `DecodedParam` regardless of whether the
 /// client sent it in text or binary format.  Returns `None` only when the
 /// portal index is out of bounds.
+/// Decode a BINARY-format parameter for the typed OIDs whose wire encoding is
+/// NOT a fixed-width integer: temporal, uuid, bytea, numeric, interval. Returns
+/// the text-literal form the SQL substitution path expects (the same form a
+/// text-mode driver would send), so both formats flow through one path.
+///
+/// Pure so unit tests can hit it with raw byte patterns. Returns `None` when
+/// the OID isn't one of these types (caller falls through to its other arms)
+/// and a loud `Some(Err)`-style corrupt-length rejection is expressed by the
+/// caller mapping `None` from a matched-but-malformed payload — here malformed
+/// lengths return `None` too, which the caller treats as NULL (matching the
+/// pre-existing convention for undecodable params).
+fn decode_binary_param_typed(oid: u32, bytes: &[u8]) -> Option<DecodedParam> {
+    match oid {
+        // timestamp / timestamptz: i64 BE microseconds since 2000-01-01.
+        // Value::Timestamp's Display renders "YYYY-MM-DD HH:MM:SS[.ffffff]",
+        // which parse_timestamp accepts for both ts and tstz columns.
+        1114 | 1184 => {
+            if bytes.len() != 8 {
+                return None;
+            }
+            let us = i64::from_be_bytes(bytes.try_into().ok()?);
+            Some(DecodedParam::Text(Value::Timestamp(us).to_string()))
+        }
+        // date: i32 BE days since 2000-01-01 → "YYYY-MM-DD".
+        1082 => {
+            if bytes.len() != 4 {
+                return None;
+            }
+            let days = i32::from_be_bytes(bytes.try_into().ok()?);
+            Some(DecodedParam::Text(Value::Date(days).to_string()))
+        }
+        // uuid: 16 raw bytes → canonical hyphenated lowercase hex.
+        2950 => {
+            if bytes.len() != 16 {
+                return None;
+            }
+            let h: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let s = format!(
+                "{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}",
+                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12],
+                h[13], h[14], h[15]
+            );
+            Some(DecodedParam::Text(s))
+        }
+        // bytea: raw bytes → Postgres hex text form. The '\' is literal under
+        // the standard-conforming dialect; Value's Text→Bytea cast hex-decodes
+        // the "\x" prefix, so this round-trips exactly.
+        17 => {
+            let mut s = String::with_capacity(2 + bytes.len() * 2);
+            s.push_str("\\x");
+            for b in bytes {
+                s.push_str(&format!("{b:02x}"));
+            }
+            Some(DecodedParam::Text(s))
+        }
+        // numeric: NBASE-10000 (ndigits, weight, sign, dscale, digit words).
+        // Decoded exactly to a decimal string — no float round-trip.
+        1700 => decode_binary_numeric(bytes).map(DecodedParam::Numeric),
+        // interval: i64 μs, i32 days, i32 months → unit literal the interval
+        // parser accepts.
+        1186 => {
+            if bytes.len() != 16 {
+                return None;
+            }
+            let us = i64::from_be_bytes(bytes[0..8].try_into().ok()?);
+            let days = i32::from_be_bytes(bytes[8..12].try_into().ok()?);
+            let months = i32::from_be_bytes(bytes[12..16].try_into().ok()?);
+            let secs = us / 1_000_000;
+            let frac = (us % 1_000_000).unsigned_abs();
+            let mut s = format!("{months} months {days} days {secs}");
+            if frac != 0 {
+                s.push_str(&format!(".{frac:06}"));
+            }
+            s.push_str(" seconds");
+            Some(DecodedParam::Text(s))
+        }
+        _ => None,
+    }
+}
+
+/// Decode PostgreSQL's binary NUMERIC wire format into an exact decimal
+/// string. Layout: u16 ndigits, i16 weight (in NBASE-10000 words), u16 sign
+/// (0x0000 +, 0x4000 -, 0xC000 NaN), u16 dscale, then ndigits u16 words.
+fn decode_binary_numeric(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let ndigits = u16::from_be_bytes(bytes[0..2].try_into().ok()?) as usize;
+    let weight = i16::from_be_bytes(bytes[2..4].try_into().ok()?) as i32;
+    let sign = u16::from_be_bytes(bytes[4..6].try_into().ok()?);
+    let dscale = u16::from_be_bytes(bytes[6..8].try_into().ok()?) as usize;
+    if bytes.len() != 8 + ndigits * 2 {
+        return None;
+    }
+    if sign == 0xC000 {
+        return None; // NaN has no SQL literal Nucleus accepts; treat as undecodable
+    }
+    let digits: Vec<u16> = (0..ndigits)
+        .map(|i| u16::from_be_bytes([bytes[8 + i * 2], bytes[9 + i * 2]]))
+        .collect();
+
+    // Integer part: words with index <= weight (each word = 4 decimal digits).
+    let mut int_part = String::new();
+    for w in 0..=weight.max(-1) {
+        let d = digits.get(w as usize).copied().unwrap_or(0);
+        if int_part.is_empty() {
+            int_part.push_str(&d.to_string());
+        } else {
+            int_part.push_str(&format!("{d:04}"));
+        }
+    }
+    if int_part.is_empty() {
+        int_part.push('0');
+    }
+    // Fraction part: words after the weight position, 4 digits each.
+    let mut frac_part = String::new();
+    let mut idx = (weight + 1).max(0) as usize;
+    // Leading zero-words for numbers like 0.0001 (weight < -1).
+    let mut lead = -1 - weight;
+    while lead > 0 {
+        frac_part.push_str("0000");
+        lead -= 1;
+    }
+    while idx < ndigits {
+        frac_part.push_str(&format!("{:04}", digits[idx]));
+        idx += 1;
+    }
+    // Scale the fraction to dscale exactly (pad or trim trailing digits).
+    if frac_part.len() < dscale {
+        frac_part.push_str(&"0".repeat(dscale - frac_part.len()));
+    } else {
+        frac_part.truncate(dscale);
+    }
+    let sign_str = if sign == 0x4000 { "-" } else { "" };
+    Some(if frac_part.is_empty() {
+        format!("{sign_str}{int_part}")
+    } else {
+        format!("{sign_str}{int_part}.{frac_part}")
+    })
+}
+
 fn decode_pg_param(
     portal: &Portal<ParsedStatement>,
     idx: usize,
@@ -2616,6 +2758,19 @@ fn decode_pg_param(
         return Some(DecodedParam::Null);
     };
     let is_binary = portal.parameter_format.is_binary(idx);
+
+    // Typed non-integer binary encodings (temporal/uuid/bytea/numeric/interval)
+    // — previously these fell through to the fixed-width-integer catch-all and
+    // were silently reinterpreted as integers (data corruption for binary-mode
+    // drivers: tokio-postgres, pgx default, JDBC).
+    if is_binary
+        && let Some(decoded) = decode_binary_param_typed(type_hint.oid(), bytes)
+    {
+        return Some(decoded);
+    }
+    // Text-format bytea arrives as the '\x...' literal already; other text
+    // formats for these OIDs are likewise the literal forms — the existing
+    // text handling below passes them through correctly.
 
     match type_hint.oid() {
         23 => {
@@ -3530,6 +3685,133 @@ mod tests {
     #![allow(clippy::approx_constant)]
     use super::*;
 
+    // ── Binary-parameter typed decoding (corruption-class regression) ──
+
+    #[test]
+    fn binary_param_timestamp_decodes_to_literal() {
+        // day 8851 after 2000-01-01 = 2024-03-26, 12:34:56.789012
+        let us: i64 = 8851 * 86_400_000_000 + 45_296_789_012;
+        let got = decode_binary_param_typed(1114, &us.to_be_bytes()).unwrap();
+        match got {
+            DecodedParam::Text(s) => {
+                assert_eq!(s, Value::Timestamp(us).to_string());
+                assert_eq!(s, "2024-03-26 12:34:56.789012");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+        // timestamptz shares the encoding
+        assert!(decode_binary_param_typed(1184, &us.to_be_bytes()).is_some());
+        // wrong length → undecodable, NOT reinterpreted
+        assert!(decode_binary_param_typed(1114, &[0u8; 4]).is_none());
+    }
+
+    #[test]
+    fn binary_param_date_decodes_to_literal() {
+        let days: i32 = 8845; // 2024-03-19
+        match decode_binary_param_typed(1082, &days.to_be_bytes()).unwrap() {
+            DecodedParam::Text(s) => assert_eq!(s, Value::Date(days).to_string()),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_param_uuid_decodes_canonical() {
+        let bytes: [u8; 16] = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ];
+        match decode_binary_param_typed(2950, &bytes).unwrap() {
+            DecodedParam::Text(s) => {
+                assert_eq!(s, "550e8400-e29b-41d4-a716-446655440000");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_param_bytea_decodes_hex_form() {
+        match decode_binary_param_typed(17, &[0x00, 0xde, 0xad, 0xbe, 0xef]).unwrap() {
+            DecodedParam::Text(s) => assert_eq!(s, "\\x00deadbeef"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_param_numeric_decodes_exact() {
+        // 12345.6789: ndigits=3 weight=1 sign=0 dscale=4 digits=[1,2345,6789]
+        let mut b = Vec::new();
+        b.extend_from_slice(&3u16.to_be_bytes());
+        b.extend_from_slice(&1i16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&4u16.to_be_bytes());
+        for d in [1u16, 2345, 6789] {
+            b.extend_from_slice(&d.to_be_bytes());
+        }
+        match decode_binary_param_typed(1700, &b).unwrap() {
+            DecodedParam::Numeric(s) => assert_eq!(s, "12345.6789"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+
+        // -0.0001: ndigits=1 weight=-1 sign=0x4000 dscale=4 digits=[1]
+        // (NBASE word at weight -1 covers the first 4 fraction digits)
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(-1i16).to_be_bytes());
+        b.extend_from_slice(&0x4000u16.to_be_bytes());
+        b.extend_from_slice(&4u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        match decode_binary_param_typed(1700, &b).unwrap() {
+            DecodedParam::Numeric(s) => assert_eq!(s, "-0.0001"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+
+        // 0.00001: weight=-2 (one leading zero word), digits=[1000], dscale=5
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&(-2i16).to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&5u16.to_be_bytes());
+        b.extend_from_slice(&1000u16.to_be_bytes());
+        match decode_binary_param_typed(1700, &b).unwrap() {
+            DecodedParam::Numeric(s) => assert_eq!(s, "0.00001"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+
+        // 42 integer: ndigits=1 weight=0 sign=0 dscale=0
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b.extend_from_slice(&0i16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&42u16.to_be_bytes());
+        match decode_binary_param_typed(1700, &b).unwrap() {
+            DecodedParam::Numeric(s) => assert_eq!(s, "42"),
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_param_interval_decodes_to_unit_literal() {
+        // 1 month, 2 days, 3.5 seconds
+        let mut b = Vec::new();
+        b.extend_from_slice(&3_500_000i64.to_be_bytes());
+        b.extend_from_slice(&2i32.to_be_bytes());
+        b.extend_from_slice(&1i32.to_be_bytes());
+        match decode_binary_param_typed(1186, &b).unwrap() {
+            DecodedParam::Text(s) => assert_eq!(s, "1 months 2 days 3.500000 seconds"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sanitize_preserves_backslashes_literally() {
+        // Standard-conforming dialect: '\' is literal inside '...'. Doubling
+        // it (the old behavior) corrupted any text param containing '\'.
+        assert_eq!(sanitize_sql_text_literal(r"C:\temp\x"), r"C:\temp\x");
+        assert_eq!(sanitize_sql_text_literal("it's"), "it''s");
+        assert_eq!(sanitize_sql_text_literal("nul\0byte"), "nulbyte");
+    }
+
     // ── UserAuthenticator unit tests ───────────────────────────────────
 
     #[test]
@@ -4319,12 +4601,21 @@ mod security_tests {
     }
 
     #[test]
-    fn parameter_substitution_escapes_backslashes() {
+    fn parameter_substitution_preserves_backslashes() {
+        // PostgreSqlDialect is standard-conforming: '\' is a LITERAL character
+        // inside '...', so doubling it (the old behavior this test used to
+        // assert) corrupted stored values. Injection safety comes from
+        // quote-doubling — a param ending in '\' followed by a quote still
+        // cannot escape the literal because the quote itself is doubled.
         let result = NucleusHandler::substitute_parameters_raw("SELECT $1", &["back\\slash"]);
         assert_eq!(
-            result, "SELECT 'back\\\\slash'",
-            "Backslashes in parameter values must be doubled"
+            result, "SELECT 'back\\slash'",
+            "Backslashes in parameter values must be preserved literally"
         );
+        // Attempted escape-out: backslash + quote → quote is doubled, string
+        // stays closed exactly where the substitution closes it.
+        let tricky = NucleusHandler::substitute_parameters_raw("SELECT $1", &["a\\', 1); --"]);
+        assert_eq!(tricky, "SELECT 'a\\'', 1); --'");
     }
 
     // ── COPY helper tests ──────────────────────────────────────────────

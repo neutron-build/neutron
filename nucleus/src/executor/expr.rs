@@ -1621,7 +1621,11 @@ impl Executor {
             },
             ast::DataType::Bytea => match val {
                 Value::Bytea(_) => Ok(val),
-                Value::Text(s) => Ok(Value::Bytea(s.into_bytes())),
+                // Delegate to Value::cast so the '\x' hex text form decodes
+                // identically here and in the storage coercion path.
+                Value::Text(_) => val
+                    .cast(&crate::types::DataType::Bytea)
+                    .map_err(ExecError::Runtime),
                 _ => Err(ExecError::Unsupported("cannot cast to BYTEA".to_string())),
             },
             ast::DataType::Numeric(_) | ast::DataType::Decimal(_) | ast::DataType::Dec(_) => {
