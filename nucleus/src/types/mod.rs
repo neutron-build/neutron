@@ -29,6 +29,31 @@ pub(crate) fn canonical_numeric(value: &str) -> Result<String, String> {
     parse_numeric(value).map(|decimal| decimal.normalize().to_string())
 }
 
+/// Parse the text form of a BYTEA value. The PostgreSQL standard text/wire
+/// form is hex: `\x` followed by an even number of hex digits (this is also
+/// exactly what `Value::Bytea`'s Display emits, so casts round-trip). Malformed
+/// hex fails loudly instead of storing garbage. A string without the `\x`
+/// prefix keeps the legacy raw-bytes behavior.
+pub(crate) fn parse_bytea_text(s: &str) -> Result<Vec<u8>, String> {
+    let Some(hex) = s.strip_prefix("\\x") else {
+        return Ok(s.as_bytes().to_vec());
+    };
+    if hex.len() % 2 != 0 {
+        return Err("invalid bytea hex literal: odd number of hex digits".into());
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let b = hex.as_bytes();
+    for i in (0..b.len()).step_by(2) {
+        let hi = (b[i] as char).to_digit(16);
+        let lo = (b[i + 1] as char).to_digit(16);
+        match (hi, lo) {
+            (Some(h), Some(l)) => out.push(((h << 4) | l) as u8),
+            _ => return Err(format!("invalid bytea hex literal at byte {i}")),
+        }
+    }
+    Ok(out)
+}
+
 /// A value in Nucleus. All data flows through this enum.
 ///
 /// `PartialEq`/`Eq`/`Hash`/`Ord` are hand-implemented (not derived) so integer widths
@@ -503,7 +528,7 @@ impl Value {
             (Value::Text(s), DataType::Timestamp) => parse_timestamp(s).map(Value::Timestamp),
             (Value::Text(s), DataType::TimestampTz) => parse_timestamp(s).map(Value::TimestampTz),
             (Value::Text(s), DataType::Uuid) => parse_uuid(s).map(Value::Uuid),
-            (Value::Text(s), DataType::Bytea) => Ok(Value::Bytea(s.as_bytes().to_vec())),
+            (Value::Text(s), DataType::Bytea) => parse_bytea_text(s).map(Value::Bytea),
             (Value::Text(s), DataType::Jsonb) => serde_json::from_str(s)
                 .map(Value::Jsonb)
                 .map_err(|error| format!("invalid JSON: {error}")),
@@ -923,6 +948,22 @@ pub fn numeric_abs(a: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bytea_text_hex_form_decodes() {
+        // Postgres standard hex form — also what Value::Bytea Display emits.
+        assert_eq!(parse_bytea_text("\\x00deadbeef").unwrap(), vec![0x00, 0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(parse_bytea_text("\\x").unwrap(), Vec::<u8>::new());
+        // Display → cast round-trip is exact.
+        let original = Value::Bytea(vec![1, 2, 250, 255]);
+        let text = Value::Text(original.to_string());
+        assert_eq!(text.cast(&DataType::Bytea).unwrap(), original);
+        // Malformed hex fails loudly instead of storing garbage.
+        assert!(parse_bytea_text("\\x0").is_err());
+        assert!(parse_bytea_text("\\xzz").is_err());
+        // Non-hex strings keep the legacy raw-bytes behavior.
+        assert_eq!(parse_bytea_text("plain").unwrap(), b"plain".to_vec());
+    }
 
     #[test]
     fn test_date_roundtrip() {
