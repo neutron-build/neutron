@@ -338,6 +338,13 @@ struct MvccIdx {
 /// - Inner per-table `rows` lock: held for the duration of row-level operations
 ///
 /// This allows operations on different tables to proceed in parallel.
+/// Candidate-version probe the storage adapter hands the engine's unique
+/// checks: (column index, key value) -> version indices that may hold that
+/// key, or None when no index covers the column (the engine then falls back
+/// to its full scan). Keeps the adapter-owned MvccIdx out of the engine's
+/// type surface.
+pub type UniqueKeyProbe<'a> = dyn Fn(usize, &Value) -> Option<Vec<usize>> + 'a;
+
 pub struct MvccMemoryEngine {
     tables: RwLock<HashMap<String, Arc<MvccTable>>>,
     txn_mgr: Arc<TransactionManager>,
@@ -373,6 +380,7 @@ impl MvccMemoryEngine {
         txn_id: u64,
         row: Row,
         unique_col_sets: &[Vec<usize>],
+        candidates: Option<&UniqueKeyProbe<'_>>,
     ) -> Result<usize, MvccError> {
         let tbl = self.get_table(table)?;
 
@@ -417,7 +425,7 @@ impl MvccMemoryEngine {
                 });
             }
             // (b) committed-live row with this key?
-            if self.has_committed_live_key(&tbl, &unique_col_sets[*cid], key, None) {
+            if self.has_committed_live_key(candidates, &tbl, &unique_col_sets[*cid], key, None) {
                 return Err(MvccError::UniqueViolation {
                     table: table.to_string(),
                     key: format!("{key:?}"),
@@ -443,11 +451,47 @@ impl MvccMemoryEngine {
     /// latest committed state, which is what uniqueness must be enforced against.
     fn has_committed_live_key(
         &self,
+        candidates: Option<&UniqueKeyProbe<'_>>,
         tbl: &MvccTable,
         cols: &[usize],
         key: &[Value],
         exclude_vidx: Option<usize>,
     ) -> bool {
+        // Index-assisted probe for the single-column case. Scanning every row
+        // per inserted row made bulk loads O(n²) — measured 100x per-batch
+        // slowdown by 200k rows and ~55 rows/s at 1.7M rows. The adapter's
+        // incrementally-maintained version_map supplies candidate versions
+        // for a key (via the probe callback); the same committed-live
+        // visibility filter then runs over just those candidates. The full
+        // scan remains for multi-column constraints and unindexed columns.
+        if cols.len() == 1
+            && let Some(cands) = candidates.and_then(|probe| probe(cols[0], &key[0]))
+        {
+            let rows = tbl.rows.read();
+            for vidx in cands {
+                if Some(vidx) == exclude_vidx {
+                    continue;
+                }
+                let Some(r) = rows.get(vidx) else { continue };
+                if self.txn_mgr.get_status(r.version.created_by) != TxnStatus::Committed {
+                    continue;
+                }
+                let del = r.version.deleted_by.load(Ordering::Acquire);
+                if del != TXN_INVALID && self.txn_mgr.get_status(del) == TxnStatus::Committed {
+                    continue;
+                }
+                // Re-verify against the row itself — index candidates may
+                // include coerced variants or stale entries.
+                if r.data
+                    .get(cols[0])
+                    .is_some_and(|v| value_eq_coerced(v, &key[0]))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         let rows = tbl.rows.read();
         for (vidx, r) in rows.iter().enumerate() {
             // Skip the row being updated in-place (its own version must not
@@ -488,6 +532,7 @@ impl MvccMemoryEngine {
         old_version_idx: usize,
         new_row: Row,
         unique_col_sets: &[Vec<usize>],
+        candidates: Option<&UniqueKeyProbe<'_>>,
     ) -> Result<usize, MvccError> {
         let tbl = self.get_table(table)?;
         let old_row = self.row_at(table, old_version_idx);
@@ -535,7 +580,7 @@ impl MvccMemoryEngine {
                     key: format!("{key:?}"),
                 });
             }
-            if self.has_committed_live_key(&tbl, &unique_col_sets[*cid], key, Some(old_version_idx))
+            if self.has_committed_live_key(candidates, &tbl, &unique_col_sets[*cid], key, Some(old_version_idx))
             {
                 return Err(MvccError::UniqueViolation {
                     table: table.to_string(),
@@ -802,6 +847,45 @@ impl Default for MvccStorageAdapter {
 }
 
 impl MvccStorageAdapter {
+    /// Candidate-version probe over this adapter's incrementally-maintained
+    /// indexes, for the engine's unique checks (see `UniqueKeyProbe`). Probes
+    /// the exact key plus its integer-width siblings so a coerced-equal
+    /// duplicate (Int32(5) vs Int64(5)) cannot slip past the hash lookup that
+    /// the scan path's `value_eq_coerced` would have caught.
+    fn unique_probe(&self, table: &str) -> impl Fn(usize, &Value) -> Option<Vec<usize>> + '_ {
+        let names: Vec<String> = {
+            let m = self.table_idx_names.read();
+            m.get(table).cloned().unwrap_or_default()
+        };
+        move |col_idx: usize, value: &Value| -> Option<Vec<usize>> {
+            if names.is_empty() {
+                return None;
+            }
+            let indexes = self.indexes.read();
+            let idx = names
+                .iter()
+                .filter_map(|n| indexes.get(n))
+                .find(|idx| idx.col_idx == col_idx)?;
+            let mut variants: Vec<Value> = vec![value.clone()];
+            match value {
+                Value::Int32(n) => variants.push(Value::Int64(i64::from(*n))),
+                Value::Int64(n) => {
+                    if let Ok(n32) = i32::try_from(*n) {
+                        variants.push(Value::Int32(n32));
+                    }
+                }
+                _ => {}
+            }
+            let mut cands = Vec::new();
+            for v in &variants {
+                if let Some(vidxs) = idx.version_map.get(v) {
+                    cands.extend_from_slice(vidxs);
+                }
+            }
+            Some(cands)
+        }
+    }
+
     pub fn new() -> Self {
         let txn_mgr = Arc::new(TransactionManager::new());
         Self {
@@ -1438,9 +1522,10 @@ impl StorageEngine for MvccStorageAdapter {
         unique_col_sets: &[Vec<usize>],
     ) -> Result<(), StorageError> {
         let (txn_id, _snap, auto) = self.current_or_auto()?;
+        let probe = self.unique_probe(table);
         let version_idx = self
             .engine
-            .insert_unique(table, txn_id, row.clone(), unique_col_sets)
+            .insert_unique(table, txn_id, row.clone(), unique_col_sets, Some(&probe))
             .map_err(|e| match e {
                 MvccError::TableNotFound(t) => StorageError::TableNotFound(t),
                 MvccError::WriteConflict { table, row_idx } => {
@@ -4652,7 +4737,14 @@ impl MvccStorageAdapter {
             let new_vidx = match unique {
                 Some(sets) => {
                     self.engine
-                        .update_unique(table, txn_id, *version_idx, new_row.clone(), sets)
+                        .update_unique(
+                            table,
+                            txn_id,
+                            *version_idx,
+                            new_row.clone(),
+                            sets,
+                            Some(&self.unique_probe(table)),
+                        )
                 }
                 None => self
                     .engine
