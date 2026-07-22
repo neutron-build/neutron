@@ -249,6 +249,66 @@ fn random_doc(rng: &mut Rng, words: usize) -> String {
 
 /// Build a synthetic corpus, then time `queries` searches while checking each
 /// returned doc-set against an independent term-set reference match.
+/// Scale diagnostic: build ONE clustered index at `n`, then measure recall
+/// and per-query min-recall across an ef sweep on the same index. Answers
+/// "is a scale-recall dip a navigability defect (min stays 0 at high ef) or
+/// an ef-tuning matter (recall climbs to ~1)?" without rebuilding per point.
+pub fn bench_vector_scale_sweep(n: usize, dim: usize, k: usize, queries: usize, seed: u64) {
+    let mut rng = Rng::new(seed);
+    let config = HnswConfig {
+        m: 16,
+        m_max0: 32,
+        ef_construction: 200,
+        ef_search: 64,
+        metric: DistanceMetric::L2,
+    };
+    let mut index = HnswIndex::new(config);
+    let t0 = Instant::now();
+    let corpus = gen_vectors(&mut rng, n, dim, VectorDist::Clustered);
+    let reference: Vec<(u64, Vector)> = corpus
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i as u64, v.clone()))
+        .collect();
+    for (id, v) in corpus.iter().enumerate() {
+        index.insert(id as u64, v.clone());
+    }
+    println!("  build: {:.1}s for n={n} dim={dim} (clustered)", t0.elapsed().as_secs_f64());
+
+    let qs: Vec<Vector> = (0..queries)
+        .map(|_| gen_query(&mut rng, dim, VectorDist::Clustered, &corpus))
+        .collect();
+    let truths: Vec<Vec<(u64, f32)>> = qs
+        .iter()
+        .map(|q| exact_search(&reference, q, k, DistanceMetric::L2))
+        .collect();
+
+    println!("   {:>5} {:>8} {:>8} {:>10}", "ef", "recall", "min_rec", "avg_us");
+    for &ef in &[64usize, 128, 256, 512, 1024] {
+        let mut recall_sum = 0.0f64;
+        let mut recall_min = 1.0f64;
+        let mut nanos = 0u128;
+        for (q, truth) in qs.iter().zip(&truths) {
+            let t = Instant::now();
+            let got = index.search_ef(q, k, ef);
+            nanos += t.elapsed().as_nanos();
+            let truth_ids: HashSet<u64> = truth.iter().map(|(id, _)| *id).collect();
+            let hits = got.iter().filter(|(id, _)| truth_ids.contains(id)).count();
+            let r = hits as f64 / k.max(1) as f64;
+            recall_sum += r;
+            recall_min = recall_min.min(r);
+        }
+        let qn = qs.len() as f64;
+        println!(
+            "   {:>5} {:>8.3} {:>8.3} {:>10.1}",
+            ef,
+            recall_sum / qn,
+            recall_min,
+            (nanos as f64 / qn) / 1000.0
+        );
+    }
+}
+
 pub fn bench_fts(docs: usize, queries: usize, seed: u64) -> FtsBenchResult {
     let mut rng = Rng::new(seed);
     let mut index = InvertedIndex::new();
