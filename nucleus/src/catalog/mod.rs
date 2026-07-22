@@ -429,6 +429,33 @@ impl Catalog {
     ///
     /// Fails if an index with the same name already exists, or if the
     /// referenced table does not exist.
+    /// Synchronous index registration for startup/recovery, mirroring
+    /// `create_table_sync` — the catalog is exclusively ours then, so
+    /// try_write always succeeds.
+    pub fn create_index_sync(&self, def: IndexDef) -> Result<(), CatalogError> {
+        {
+            let tables = self
+                .tables
+                .try_read()
+                .map_err(|_| CatalogError::TableNotFound("catalog lock contention".into()))?;
+            if !tables.contains_key(&def.table_name) {
+                return Err(CatalogError::TableNotFound(def.table_name.clone()));
+            }
+        }
+        let table_name = def.table_name.clone();
+        let mut indexes = self
+            .indexes
+            .try_write()
+            .map_err(|_| CatalogError::TableNotFound("catalog lock contention".into()))?;
+        if indexes.contains_key(&def.name) {
+            return Err(CatalogError::IndexExists(def.name));
+        }
+        indexes.insert(def.name.clone(), Arc::new(def));
+        self.index_cache.write().remove(&table_name);
+        self.catalog_epoch.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub async fn create_index(&self, def: IndexDef) -> Result<(), CatalogError> {
         // Verify the target table exists.
         {

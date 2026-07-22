@@ -138,7 +138,31 @@ impl DatabaseBuilder {
             }
         };
 
-        // Register WAL-recovered table schemas in the catalog (synchronous — safe during startup).
+        // Durable modes: restore the persisted catalog FIRST — it carries the
+        // full TableDefs including CONSTRAINTS. The WAL schema records below
+        // only know column names/types, so recovering from them alone
+        // silently dropped PK/UNIQUE/FK enforcement after a reopen.
+        // DurableMvcc carries a data DIRECTORY; Disk carries the DB FILE path —
+        // the catalog sidecar lives next to whichever one it is.
+        #[cfg(feature = "server")]
+        let catalog_path = match self.mode {
+            StorageMode::DurableMvcc(ref d) => Some(d.join("catalog.json")),
+            StorageMode::Disk(ref f) => f.parent().map(|p| p.join("catalog.json")),
+            _ => None,
+        };
+        #[cfg(not(feature = "server"))]
+        let catalog_path: Option<std::path::PathBuf> = None;
+        if let Some(ref cp) = catalog_path {
+            let persistence = crate::storage::persistence::CatalogPersistence::new(cp);
+            if let Err(e) = persistence.load_catalog_sync(&catalog) {
+                return Err(DatabaseError::Storage(format!("catalog load: {e}")));
+            }
+        }
+
+        // Register WAL-recovered table schemas in the catalog (synchronous —
+        // safe during startup). Tables already restored from catalog.json win
+        // (create_table_sync rejects duplicates; the error is ignored) — this
+        // path only fills in tables missing from an absent/older catalog file.
         for (name, columns) in recovered_schemas {
             use crate::catalog::{ColumnDef, TableDef};
             let cols: Vec<ColumnDef> = columns
@@ -165,7 +189,7 @@ impl DatabaseBuilder {
             Arc::new(Executor::new_with_persistence(
                 catalog.clone(),
                 storage.clone(),
-                None,
+                catalog_path.clone(),
                 Some(dir.as_path()),
             ))
         } else {
@@ -173,6 +197,8 @@ impl DatabaseBuilder {
         };
         // Let streaming producers recover an owned Arc across the drain boundary.
         executor.install_self_ref();
+        executor.warm_table_caches_sync();
+        executor.load_sequences_sync();
         Ok(Database {
             executor,
             _catalog: catalog,

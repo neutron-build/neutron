@@ -17,11 +17,17 @@ Ignored local status/roadmap files are historical scratch material and are not r
 | Trusted SCRAM roles and relational RLS | Implemented; broader surface and masking audit remains |
 | RESP and specialty data models | Experimental until durability, policy, and compatibility gates pass |
 | Browser/WASM | Experimental build target |
-| Native binary protocol | Unsupported stub; do not deploy or integrate against it |
 | Distributed/Raft mode | Incomplete and unsupported |
 
-Cross-model rollback works in-process, but crash-atomic commit across model-specific WALs is not yet
-claimed. Backup/PITR, full client compatibility, and operational hardening are also incomplete.
+Protocol posture: pgwire (SQL door), RESP (hot KV), and the embedded library are the three
+supported surfaces. The former native binary TLV protocol has been REMOVED (it was an
+unsupported stub with weaker auth); Arrow Flight SQL is the planned future fast lane.
+
+Cross-model rollback works in-process, but crash-atomic commit across model-specific WALs is not
+yet claimed. Physical backup v1, logical dump/restore, and PITR over the SQL WAL exist; encrypted
+and model-specific-WAL PITR do not. Client compatibility validated so far: psql 17 meta-commands,
+tokio-postgres, psycopg v3, and three ORMs end-to-end (Drizzle, Prisma, SQLAlchemy — see
+`compat/orm/`). Operational hardening is incomplete.
 
 ## Quick Start
 

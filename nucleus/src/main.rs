@@ -979,6 +979,9 @@ async fn cmd_start(cfg: StartConfig) {
     // Install the weak self-reference so streaming producers can hold an owned
     // Arc<Executor> across the wire-drain boundary (streaming WHERE filter, etc.).
     executor.install_self_ref();
+    // Seed the sync column cache for restored tables so size-keyed fast paths
+    // (O(1) COUNT most visibly) work from the first query after a restart.
+    executor.warm_table_caches_sync();
     tracing::info!("Cache: {} MB", config.cache.max_memory_mb);
 
     // Query execution memory budget (T1.2): make the operator's configured
