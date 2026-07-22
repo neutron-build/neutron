@@ -743,8 +743,20 @@ impl HnswIndex {
 
     /// Search for the k nearest neighbors of a query vector.
     /// Returns (id, distance) pairs sorted by distance ascending.
+    ///
+    /// The DEFAULT beam width scales with index size: a fixed ef that is
+    /// ample at 10k–100k vectors starts fully trapping occasional queries in
+    /// the wrong cluster at a few hundred thousand (measured: clustered data,
+    /// ef=64 → min-recall 0.0 at 300k/1M while ef=128/256 recovers to ≥0.9
+    /// with recall ≥0.996). Postgres-style "document a fixed default" would
+    /// leave out-of-the-box zero-recall queries at scale — instead the
+    /// default follows n (n/2048, clamped to [configured ef, 512]) so recall
+    /// floors hold at every size, and an explicit `SET hnsw.ef_search` (the
+    /// `search_ef` path) still wins in BOTH directions for callers choosing
+    /// their own point on the recall/latency frontier.
     pub fn search(&self, query: &Vector, k: usize) -> Vec<(u64, f32)> {
-        self.search_ef(query, k, self.config.ef_search)
+        let auto = self.config.ef_search.max((self.nodes.len() / 2048).min(512));
+        self.search_ef(query, k, auto)
     }
 
     /// Like [`search`] but with an explicit layer-0 beam width `ef` for this one
@@ -794,7 +806,9 @@ impl HnswIndex {
     where
         F: Fn(u64) -> bool,
     {
-        self.search_filtered_ef(query, k, self.config.ef_search, filter)
+        // Same size-scaled default beam as `search` (see its doc comment).
+        let auto = self.config.ef_search.max((self.nodes.len() / 2048).min(512));
+        self.search_filtered_ef(query, k, auto, filter)
     }
 
     /// Like [`search_filtered`] but with an explicit base beam width `ef` for

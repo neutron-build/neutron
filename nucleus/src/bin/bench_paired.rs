@@ -13,7 +13,9 @@
 //! (see `nucleus::bench_paired` tests); this bin exists to surface the raw
 //! latency/throughput/recall numbers a human wants to eyeball.
 
-use nucleus::bench_paired::{VectorDist, bench_fts, bench_graph, bench_vector_dist};
+use nucleus::bench_paired::{
+    VectorDist, bench_fts, bench_graph, bench_vector_dist, bench_vector_scale_sweep,
+};
 
 fn main() {
     // One-shot scale mode: `bench_paired scale [n] [dim] [k] [queries]` —
@@ -22,6 +24,18 @@ fn main() {
     // is the Phase-2 "vector at scale" gate; the default matrix below stays
     // the fast everyday run.
     let args: Vec<String> = std::env::args().collect();
+    // `bench_paired sweep [n] [dim] [k] [queries]` — one clustered build,
+    // recall/min-recall across an ef sweep (scale-dip diagnosis).
+    if args.get(1).map(String::as_str) == Some("sweep") {
+        let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+        let dim: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
+        let k: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10);
+        let queries: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(50);
+        println!("VECTOR SCALE SWEEP — clustered, n={n} dim={dim} k={k} queries={queries}");
+        bench_vector_scale_sweep(n, dim, k, queries, 0xB0BA_CAFE);
+        return;
+    }
+
     if args.get(1).map(String::as_str) == Some("scale") {
         let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
         let dim: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
