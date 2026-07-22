@@ -24,10 +24,10 @@ behavior satisfies the relevant gate above.
 
 ## Current baseline
 
-- Source LOC: 252356; Source Rust files: 220; Top-level modules: 50.
-- Declared unit tests: 3851; Declared integration tests: 317; Ignored tests: 43.
+- Source LOC: 252517; Source Rust files: 220; Top-level modules: 50.
+- Declared unit tests: 3851; Declared integration tests: 319; Ignored tests: 43.
   These are static declarations, not executed-test claims.
-- The most recent full library run executed 3,835 passing tests. Core-only executed 1,853
+- The most recent full library run executed 3,836 passing tests. Core-only executed 1,853
   passing tests with no ignores.
 - Relational SQL, MVCC, multiple storage engines, PostgreSQL wire support, twelve public data-model
   families, specialty indexes, encryption, TLS, embedded mode, physical backup v1, probes, Raft
@@ -241,8 +241,14 @@ Goal: common PostgreSQL clients behave predictably across the declared compatibi
 - [ ] Complete COPY text/binary behavior for the supported subset.
 - [ ] Normalize SQLSTATE/error fields, notices, command tags, row descriptions, and type OIDs.
 - [ ] Verify TLS/SCRAM negotiation and pooler reconnect/session-reset behavior.
-- [ ] Test psql, pgcli, libpq/psycopg, JDBC, Npgsql, tokio-postgres, SQLAlchemy, and one JS ORM.
-- [ ] Add compatibility tests for migrations, introspection, transactions, prepared queries, and pools.
+- [x] Test psql, libpq/psycopg, tokio-postgres, SQLAlchemy, and TWO JS ORMs (Drizzle via
+      postgres-js, Prisma via quaint): the `compat/orm` harness runs each ORM's canonical
+      migrate→CRUD→transaction→reflection flow against a release server and all three PASS
+      (2026-07-21; findings log in `compat/orm/README.md`). psql meta-commands live-verified
+      against psql 17. pgcli, JDBC, and Npgsql remain untested.
+- [x] Add compatibility tests for migrations, introspection, transactions, and prepared queries
+      (`compat/orm` harness: drizzle-kit push, prisma db push, SQLAlchemy create_all + inspector
+      reflection, interactive transactions, prepared statements). Pooler behavior remains untested.
 
 Exit gate:
 
@@ -343,7 +349,14 @@ Goal: establish repeatable performance and capacity boundaries without correctne
 - [ ] Define representative OLTP, analytical, mixed, specialty, and distributed workloads.
 - [ ] Benchmark 1M–100M row scales and sustained concurrency with p50/p95/p99 latency.
 - [ ] Track memory, disk, write amplification, WAL/checkpoint cost, cache hit rate, and recovery time.
-- [ ] Measure vector recall/latency, filtered ANN behavior, FTS relevance, graph traversal, and TS ingest.
+- [x] Measure vector recall/latency at scale, correctness-paired (`bench_paired` scale/sweep,
+      2026-07-21): 1M clustered vectors, recall 0.992 / min 0.90 at ~2.1ms/query vs 45ms brute
+      force. This gate CAUGHT and fixed two shipping defects: a fixed default beam fully
+      trapped occasional queries at 300k+ (min-recall 0.0 — the default now scales with index
+      size), and O(n)-per-insert unique checks made bulk loads quadratic (200k-row load
+      189s→0.4s after the index-assisted probe). 5M-row soak: load 27.5s, 2h churn 184k ops /
+      0 errors, exact counts after reopen, logical dump/restore round-trip verified. Filtered
+      ANN, FTS relevance, graph traversal, and TS ingest at scale remain unmeasured.
 - [ ] Add regression budgets for critical workloads and retain machine/config metadata.
 - [ ] Test memory pressure, disk pressure, long transactions, connection storms, and multi-day soak.
 - [ ] Optimize only after differential correctness gates cover the affected fast path.

@@ -975,6 +975,15 @@ impl Executor {
         }
 
         // Override sequences with dedicated sequences.json if it exists (more up-to-date).
+        self.load_sequences_sync();
+    }
+
+    /// Restore sequence state from `sequences.json` (sync — callable from the
+    /// embedded builder, which has no runtime). Without this, an embedded
+    /// durable database reset every SERIAL to 1 on reopen; with PK
+    /// enforcement now also restored across reopen, that would turn every
+    /// post-restart SERIAL insert into a loud duplicate-key error.
+    pub fn load_sequences_sync(&self) {
         if let Some(ref cp) = self.catalog_path
             && let Some(dir) = cp.parent()
         {
@@ -1582,6 +1591,28 @@ impl Executor {
     /// a second call is ignored (the `OnceLock` keeps the first).
     pub fn install_self_ref(self: &Arc<Self>) {
         let _ = self.self_ref.set(Arc::downgrade(self));
+    }
+
+    /// Seed the sync per-table column cache from the catalog. Call once at
+    /// startup after recovery has registered tables: `table_columns` is
+    /// otherwise only populated by CREATE TABLE, so every fast path keyed on
+    /// it (the O(1) COUNT/aggregate arm most visibly) silently degraded to a
+    /// full materializing scan for RECOVERED tables — at 5M rows that scan
+    /// tripped the query-memory ceiling and a plain `SELECT COUNT(*)` errored
+    /// after reopen while working before it.
+    pub fn warm_table_caches_sync(&self) {
+        let Some(tables) = self.catalog.list_tables_sync() else {
+            return;
+        };
+        let mut cache = self.table_columns.write();
+        for t in tables {
+            cache.entry(t.name.clone()).or_insert_with(|| {
+                t.columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.data_type.clone()))
+                    .collect()
+            });
+        }
     }
 
     /// Recover the owning `Arc<Executor>` if one was installed via

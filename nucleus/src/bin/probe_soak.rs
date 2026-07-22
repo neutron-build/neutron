@@ -443,6 +443,13 @@ async fn run_soak(
     let ops = shared.ops.load(Ordering::Relaxed);
     let errors = shared.errors.load(Ordering::Relaxed);
     let rows_before = row_count(&db).await;
+    if big_expected > 0 {
+        match db.query_one("SELECT COUNT(*) FROM big").await {
+            Ok(Some(v)) => println!("  scale count before close: {v:?}"),
+            Ok(None) => println!("  scale count before close: none"),
+            Err(e) => println!("  scale count ERROR before close: {e}"),
+        }
+    }
 
     // ---- crash-recovery: close and reopen the durable DB ----
     let _ = db.sync();
@@ -506,7 +513,14 @@ async fn run_soak(
         let big_after = match db2.query_one("SELECT COUNT(*) FROM big").await {
             Ok(Some(Value::Int64(n))) => n,
             Ok(Some(Value::Int32(n))) => n as i64,
-            _ => -1,
+            Ok(other) => {
+                println!("  scale count returned unexpected value: {other:?}");
+                -1
+            }
+            Err(e) => {
+                println!("  scale count ERROR after reopen: {e}");
+                -1
+            }
         };
         if big_after != big_expected {
             failed = true;

@@ -357,6 +357,66 @@ impl CatalogPersistence {
     }
 
     /// Deserialize the catalog from the JSON file and populate the given Catalog.
+    /// Synchronous variant of [`load_catalog`] for startup paths that run
+    /// outside (or inside) an async runtime — embedded `DatabaseBuilder::build`
+    /// is a sync fn, and durable-embedded recovery was silently rebuilding
+    /// tables WITHOUT their constraints (a duplicate PK insert was accepted
+    /// after reopen). Uses the catalog's `*_sync` registration, which is safe
+    /// during single-threaded startup.
+    pub fn load_catalog_sync(&self, catalog: &Catalog) -> Result<(), PersistenceError> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let json = fs::read_to_string(&self.path).map_err(PersistenceError::Io)?;
+        let snapshot: CatalogSnapshot = serde_json::from_str(&json)
+            .map_err(|e| PersistenceError::Serialization(e.to_string()))?;
+
+        for t in &snapshot.tables {
+            let columns: Result<Vec<ColumnDef>, PersistenceError> = t
+                .columns
+                .iter()
+                .map(|c| {
+                    Ok(ColumnDef {
+                        name: c.name.clone(),
+                        data_type: string_to_data_type(&c.data_type)?,
+                        nullable: c.nullable,
+                        default_expr: c.default_expr.clone(),
+                    })
+                })
+                .collect();
+            let constraints: Vec<TableConstraint> =
+                t.constraints.iter().map(ser_to_constraint).collect();
+            let table_def = TableDef {
+                name: t.name.clone(),
+                columns: columns?,
+                constraints,
+                append_only: t.append_only,
+                epoch: t.epoch,
+            };
+            catalog
+                .create_table_sync(table_def)
+                .map_err(|e| PersistenceError::Catalog(e.to_string()))?;
+        }
+
+        let max_epoch = snapshot.tables.iter().map(|t| t.epoch).max().unwrap_or(0);
+        catalog.restore_table_epoch_counter(snapshot.next_table_epoch.max(max_epoch + 1));
+
+        for i in &snapshot.indexes {
+            let index_def = IndexDef {
+                name: i.name.clone(),
+                table_name: i.table_name.clone(),
+                columns: i.columns.clone(),
+                unique: i.unique,
+                index_type: string_to_index_type(&i.index_type)?,
+                options: i.options.clone().unwrap_or_default(),
+            };
+            catalog
+                .create_index_sync(index_def)
+                .map_err(|e| PersistenceError::Catalog(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub async fn load_catalog(&self, catalog: &Catalog) -> Result<(), PersistenceError> {
         if !self.path.exists() {
             return Ok(()); // No catalog file yet — fresh database
