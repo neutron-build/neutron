@@ -182,6 +182,15 @@ pub trait StorageEngine: Send + Sync {
     /// backfill performs (the incremental index maintenance during that rewrite
     /// reads pre-widen tuples against the post-widen schema and can leave stale
     /// entries). Default: no-op, for engines that don't keep secondary indexes.
+    /// Bracket a wholesale table REWRITE (e.g. ALTER TABLE ADD COLUMN's
+    /// scan→update→rebuild). While at least one rewrite is active, engines
+    /// whose unique checks consult secondary structures must fall back to
+    /// authoritative row scans — mid-rewrite those structures are not a
+    /// reliable superset of live rows. Default: no-op.
+    fn begin_table_rewrite(&self, _table: &str) {}
+    /// See [`begin_table_rewrite`](Self::begin_table_rewrite). Default: no-op.
+    fn end_table_rewrite(&self, _table: &str) {}
+
     async fn rebuild_table_indexes(&self, _table: &str) -> Result<(), StorageError> {
         Ok(())
     }

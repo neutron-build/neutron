@@ -393,9 +393,14 @@ impl CatalogPersistence {
                 append_only: t.append_only,
                 epoch: t.epoch,
             };
-            catalog
-                .create_table_sync(table_def)
-                .map_err(|e| PersistenceError::Catalog(e.to_string()))?;
+            // Another recovery source may have registered this table already
+            // (DiskEngine::open populates the catalog from its on-disk
+            // directory before this loader runs). Existing entries win — this
+            // loader only fills gaps, so a duplicate is not an error.
+            match catalog.create_table_sync(table_def) {
+                Ok(()) | Err(crate::catalog::CatalogError::TableExists(_)) => {}
+                Err(e) => return Err(PersistenceError::Catalog(e.to_string())),
+            }
         }
 
         let max_epoch = snapshot.tables.iter().map(|t| t.epoch).max().unwrap_or(0);
@@ -410,9 +415,12 @@ impl CatalogPersistence {
                 index_type: string_to_index_type(&i.index_type)?,
                 options: i.options.clone().unwrap_or_default(),
             };
-            catalog
-                .create_index_sync(index_def)
-                .map_err(|e| PersistenceError::Catalog(e.to_string()))?;
+            match catalog.create_index_sync(index_def) {
+                Ok(())
+                | Err(crate::catalog::CatalogError::IndexExists(_))
+                | Err(crate::catalog::CatalogError::TableNotFound(_)) => {}
+                Err(e) => return Err(PersistenceError::Catalog(e.to_string())),
+            }
         }
         Ok(())
     }

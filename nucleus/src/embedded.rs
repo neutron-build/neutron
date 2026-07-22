@@ -142,12 +142,16 @@ impl DatabaseBuilder {
         // full TableDefs including CONSTRAINTS. The WAL schema records below
         // only know column names/types, so recovering from them alone
         // silently dropped PK/UNIQUE/FK enforcement after a reopen.
-        // DurableMvcc carries a data DIRECTORY; Disk carries the DB FILE path —
-        // the catalog sidecar lives next to whichever one it is.
+        // Catalog sidecar: DurableMvcc ONLY. Its data directory is exclusive
+        // to one database, so catalog.json/sequences.json live inside it and
+        // vanish with it. Disk mode gets NO sidecar: the .ndb file already
+        // persists schemas WITH constraints through the engine's own
+        // directory (verified by the disk recovery suites), and a sidecar
+        // next to the file would be shared by every .ndb in that directory —
+        // one database's tables would leak into another's recovery.
         #[cfg(feature = "server")]
         let catalog_path = match self.mode {
             StorageMode::DurableMvcc(ref d) => Some(d.join("catalog.json")),
-            StorageMode::Disk(ref f) => f.parent().map(|p| p.join("catalog.json")),
             _ => None,
         };
         #[cfg(not(feature = "server"))]

@@ -822,6 +822,18 @@ impl MvccSessionState {
     }
 }
 
+/// RAII guard decrementing the adapter's in-flight-writes gauge on drop.
+struct WriteGauge<'a> {
+    counter: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl Drop for WriteGauge<'_> {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub struct MvccStorageAdapter {
     engine: MvccMemoryEngine,
     /// Per-session MVCC state, keyed by session ID.
@@ -835,6 +847,24 @@ pub struct MvccStorageAdapter {
     table_idx_names: parking_lot::RwLock<HashMap<String, Vec<String>>>,
     /// Committed row counts per table — enables O(1) COUNT(*) fast path.
     committed_counts: parking_lot::RwLock<HashMap<String, i64>>,
+    /// Number of wholesale table rewrites currently in flight (ALTER column
+    /// add/drop etc.). While nonzero, the unique-probe candidates are not
+    /// trusted and unique checks use the authoritative full scan.
+    rewrites_active: std::sync::atomic::AtomicUsize,
+    /// Number of write operations currently in flight across all sessions.
+    /// The index-assisted unique probe is only trusted when the CALLER is the
+    /// sole active writer — with concurrent writers, index maintenance
+    /// interleavings are not provably a superset of live rows, so unique
+    /// checks fall back to the authoritative scan. Single-writer bulk loads
+    /// (the case the probe exists for) keep the fast path.
+    writes_active: std::sync::atomic::AtomicUsize,
+    /// Tables that have EVER seen an update/delete/rewrite/late index build —
+    /// for these, version indices and version_map completeness are not
+    /// provable under concurrency, so the unique probe falls back to the
+    /// authoritative scan. Pure-append tables (the bulk-load case the probe
+    /// exists for) stay on the fast path: inserts only ever ADD version_map
+    /// entries, and publish precedes reservation release.
+    mutated_tables: parking_lot::RwLock<std::collections::HashSet<String>>,
     /// Optional WAL for crash-safe durability.
     #[cfg(feature = "server")]
     wal: Option<Arc<MvccWal>>,
@@ -847,6 +877,23 @@ impl Default for MvccStorageAdapter {
 }
 
 impl MvccStorageAdapter {
+    /// Permanently mark a table as non-append-only (see `mutated_tables`).
+    fn mark_mutated(&self, table: &str) {
+        let mut m = self.mutated_tables.write();
+        if !m.contains(table) {
+            m.insert(table.to_string());
+        }
+    }
+
+    /// RAII increment of `writes_active` for the duration of one write op.
+    fn write_gauge(&self) -> WriteGauge<'_> {
+        self.writes_active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        WriteGauge {
+            counter: &self.writes_active,
+        }
+    }
+
     /// Candidate-version probe over this adapter's incrementally-maintained
     /// indexes, for the engine's unique checks (see `UniqueKeyProbe`). Probes
     /// the exact key plus its integer-width siblings so a coerced-equal
@@ -857,8 +904,21 @@ impl MvccStorageAdapter {
             let m = self.table_idx_names.read();
             m.get(table).cloned().unwrap_or_default()
         };
+        let table_key = table.to_string();
         move |col_idx: usize, value: &Value| -> Option<Vec<usize>> {
             if names.is_empty() {
+                return None;
+            }
+            // Candidates are trusted only when the calling write is the SOLE
+            // in-flight write and no wholesale rewrite (ALTER ...) is active.
+            // Concurrent writers/rewrites fall back to the authoritative scan.
+            if self
+                .rewrites_active
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != 0
+                || self.writes_active.load(std::sync::atomic::Ordering::SeqCst) > 1
+                || self.mutated_tables.read().contains(table_key.as_str())
+            {
                 return None;
             }
             let indexes = self.indexes.read();
@@ -895,6 +955,9 @@ impl MvccStorageAdapter {
             indexes: parking_lot::RwLock::new(HashMap::new()),
             table_idx_names: parking_lot::RwLock::new(HashMap::new()),
             committed_counts: parking_lot::RwLock::new(HashMap::new()),
+                rewrites_active: std::sync::atomic::AtomicUsize::new(0),
+                writes_active: std::sync::atomic::AtomicUsize::new(0),
+                mutated_tables: parking_lot::RwLock::new(std::collections::HashSet::new()),
             #[cfg(feature = "server")]
             wal: None,
         }
@@ -946,6 +1009,9 @@ impl MvccStorageAdapter {
                 indexes: parking_lot::RwLock::new(HashMap::new()),
                 table_idx_names: parking_lot::RwLock::new(HashMap::new()),
                 committed_counts: parking_lot::RwLock::new(committed_counts),
+                rewrites_active: std::sync::atomic::AtomicUsize::new(0),
+                writes_active: std::sync::atomic::AtomicUsize::new(0),
+                mutated_tables: parking_lot::RwLock::new(std::collections::HashSet::new()),
                 wal: Some(Arc::new(wal)),
             },
             recovered_schemas,
@@ -977,21 +1043,23 @@ impl MvccStorageAdapter {
         }
     }
 
-    /// Fully rebuild indexes for a table from the given row set with version indices.
-    fn rebuild_indexes_for_table(&self, table: &str, rows_with_vidx: &[(usize, Arc<Row>)]) {
+    /// Fully rebuild indexes for a table. The SCAN runs inside the indexes
+    /// write lock — same reasoning as `create_index`: a scan taken outside the
+    /// lock races per-row maintenance, and the clear+rebuild then silently
+    /// drops the raced rows from the index, which the unique checks trust.
+    fn rebuild_indexes_for_table(&self, table: &str, snap: &Snapshot) -> Option<usize> {
         let names: Vec<String> = {
             let m = self.table_idx_names.read();
             m.get(table).cloned().unwrap_or_default()
         };
-        if names.is_empty() {
-            return;
-        }
         let mut indexes = self.indexes.write();
+        let rows_with_vidx = self.engine.scan(table, snap).ok()?;
+        let n = rows_with_vidx.len();
         for name in &names {
             if let Some(idx) = indexes.get_mut(name) {
                 idx.map.clear();
                 idx.version_map.clear();
-                for (version_idx, row) in rows_with_vidx {
+                for (version_idx, row) in &rows_with_vidx {
                     let val = row.get(idx.col_idx).cloned().unwrap_or(Value::Null);
                     idx.map
                         .entry(val.clone())
@@ -1001,6 +1069,7 @@ impl MvccStorageAdapter {
                 }
             }
         }
+        Some(n)
     }
 
     /// Incrementally update indexes after UPDATE: remove old values, insert new values.
@@ -1022,18 +1091,20 @@ impl MvccStorageAdapter {
                     let new_val = new_row.get(idx.col_idx).unwrap_or(&Value::Null);
 
                     if old_val == new_val {
-                        // Indexed column value unchanged — O(1) update via version_idx key
-                        if let Some(vidxs) = idx.version_map.get_mut(old_val) {
-                            if let Some(i) = vidxs.iter().position(|&v| v == old_vidx) {
-                                vidxs[i] = new_vidx;
-                            } else {
+                        // Indexed column value unchanged. version_map is
+                        // ADD-ONLY here: the old version may still be the
+                        // committed-live one (this maintenance runs before the
+                        // updater's commit), and the unique probe trusts
+                        // version_map absence — replacing old with new hid the
+                        // live version behind an uncommitted one and let a
+                        // concurrent same-key INSERT through. Stale entries
+                        // are pruned by the next under-lock rebuild; the probe
+                        // re-verifies liveness+value per candidate anyway.
+                        {
+                            let vidxs = idx.version_map.entry(old_val.clone()).or_default();
+                            if !vidxs.contains(&new_vidx) {
                                 vidxs.push(new_vidx);
                             }
-                        } else {
-                            idx.version_map
-                                .entry(old_val.clone())
-                                .or_default()
-                                .push(new_vidx);
                         }
                         // O(1) HashMap update: remove old version, insert new
                         if let Some(entries) = idx.map.get_mut(old_val) {
@@ -1048,15 +1119,9 @@ impl MvccStorageAdapter {
                         // Indexed column value changed — remove from old, insert to new
                         let old_val = old_val.clone();
                         let new_val = new_val.clone();
-                        // Remove old version_idx from version_map
-                        if let Some(vidxs) = idx.version_map.get_mut(&old_val) {
-                            if let Some(i) = vidxs.iter().position(|&v| v == old_vidx) {
-                                vidxs.swap_remove(i);
-                            }
-                            if vidxs.is_empty() {
-                                idx.version_map.remove(&old_val);
-                            }
-                        }
+                        // version_map keeps the old version_idx (see the
+                        // unchanged-value branch: superset invariant for the
+                        // unique probe; rebuilds prune).
                         // Remove from map by version_idx (O(1))
                         if let Some(entries) = idx.map.get_mut(&old_val) {
                             entries.remove(&old_vidx);
@@ -1471,6 +1536,7 @@ impl StorageEngine for MvccStorageAdapter {
     }
 
     async fn insert(&self, table: &str, row: Row) -> Result<(), StorageError> {
+        let _writes = self.write_gauge();
         let (txn_id, _snap, auto) = self.current_or_auto()?;
         let version_idx = self
             .engine
@@ -1521,6 +1587,7 @@ impl StorageEngine for MvccStorageAdapter {
         row: Row,
         unique_col_sets: &[Vec<usize>],
     ) -> Result<(), StorageError> {
+        let _writes = self.write_gauge();
         let (txn_id, _snap, auto) = self.current_or_auto()?;
         let probe = self.unique_probe(table);
         let version_idx = self
@@ -1549,10 +1616,16 @@ impl StorageEngine for MvccStorageAdapter {
             }
         )?;
         if auto {
-            // auto_commit releases this txn's unique reservations (the now-committed
-            // row keeps the key taken via the committed-live chain check).
-            self.auto_commit(txn_id);
+            // Index maintenance MUST precede auto_commit: auto_commit releases
+            // this txn's unique reservations, and the index-assisted unique
+            // probe trusts version_map absence. If the reservation dropped
+            // before the index entry existed, a concurrent same-key insert in
+            // that window saw neither and BOTH rows landed (caught by
+            // concurrent_unique_constraint_regression, 2/40 rounds). With the
+            // entry published first, a prober always sees the reservation or
+            // the candidate.
             self.update_indexes_for_new_rows(table, &[(&row, version_idx)]);
+            self.auto_commit(txn_id);
             *self
                 .committed_counts
                 .write()
@@ -1568,6 +1641,7 @@ impl StorageEngine for MvccStorageAdapter {
     }
 
     async fn insert_batch(&self, table: &str, rows: Vec<Row>) -> Result<(), StorageError> {
+        let _writes = self.write_gauge();
         if rows.is_empty() {
             return Ok(());
         }
@@ -2121,6 +2195,8 @@ impl StorageEngine for MvccStorageAdapter {
     }
 
     async fn delete(&self, table: &str, positions: &[usize]) -> Result<usize, StorageError> {
+        let _writes = self.write_gauge();
+        self.mark_mutated(table);
         let (txn_id, _snap, auto) = self.current_or_auto()?;
 
         // `positions` are stable MVCC version indices (from scan_where_eq_positions
@@ -2283,30 +2359,32 @@ impl StorageEngine for MvccStorageAdapter {
         if is_serializable {
             self.engine.txn_mgr().cleanup_ssi(commit_txn_id);
         }
-        if commit_txn_id != 0 {
-            // Committed: release in-flight unique reservations (the committed rows
-            // now hold their keys via the committed-live check).
-            self.engine.release_unique(commit_txn_id);
-            wal_log_commit!(self, commit_txn_id)?;
-        }
-        sess.savepoints.write().clear();
-        // Rebuild indexes for all tables that were mutated in this transaction.
-        // Also refresh committed_counts from the post-commit view.
+        // Rebuild indexes for mutated tables BEFORE releasing unique
+        // reservations: the index-assisted unique probe must always see the
+        // reservation or the (now committed) rows in version_map — releasing
+        // first opened a window where a concurrent same-key INSERT saw
+        // neither. The rebuild snapshot begins after txn_mgr commit, so it
+        // includes this transaction's rows.
         let dirty: Vec<String> = sess.dirty_tables.write().drain().collect();
-        for table in dirty {
+        for table in &dirty {
             let mut read_txn = self
                 .engine
                 .txn_mgr()
                 .try_begin(IsolationLevel::Snapshot)
                 .map_err(|_| StorageError::TransactionIdExhausted)?;
             let snap = read_txn.snapshot.clone();
-            if let Ok(rows_with_vidx) = self.engine.scan(&table, &snap) {
-                let n = rows_with_vidx.len() as i64;
-                self.rebuild_indexes_for_table(&table, &rows_with_vidx);
-                self.committed_counts.write().insert(table.clone(), n);
+            if let Some(n) = self.rebuild_indexes_for_table(table, &snap) {
+                self.committed_counts.write().insert(table.clone(), n as i64);
             }
             self.engine.txn_mgr().abort(&mut read_txn);
         }
+        if commit_txn_id != 0 {
+            // Committed: release in-flight unique reservations (the committed rows
+            // now hold their keys via the committed-live check + rebuilt index).
+            self.engine.release_unique(commit_txn_id);
+            wal_log_commit!(self, commit_txn_id)?;
+        }
+        sess.savepoints.write().clear();
         Ok(())
     }
 
@@ -2453,28 +2531,44 @@ impl StorageEngine for MvccStorageAdapter {
         index_name: &str,
         col_idx: usize,
     ) -> Result<(), StorageError> {
-        // Scan committed rows (with version indices) and build the index.
         let (txn_id, snap, auto) = self.current_or_auto()?;
-        let results = self
-            .engine
-            .scan(table, &snap)
-            .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
-        if auto {
-            self.auto_commit(txn_id);
-        }
 
-        let mut map: std::collections::BTreeMap<Value, HashMap<usize, Row>> =
-            std::collections::BTreeMap::new();
-        let mut version_map: HashMap<Value, Vec<usize>> = HashMap::new();
-        for (version_idx, row) in &results {
-            let val = row.get(col_idx).cloned().unwrap_or(Value::Null);
-            map.entry(val.clone())
-                .or_default()
-                .insert(*version_idx, (**row).clone());
-            version_map.entry(val).or_default().push(*version_idx);
-        }
+        // Build AND install while holding the indexes write lock. Scanning
+        // outside it left a window where a concurrent insert's per-row index
+        // maintenance ran against the OLD map (or no map) and the freshly
+        // installed one was missing that row FOREVER — harmless while indexes
+        // were pure accelerators, but the unique checks now trust version_map
+        // absence, so a stale install manufactured duplicate PKs under
+        // concurrent DDL (caught by concurrency_schema_constraints_probe).
+        // Holding the lock serializes maintenance behind the build: rows
+        // pushed before/during our scan are in the scan; rows whose
+        // maintenance is waiting on the lock apply right after install.
         {
+            // Lock ORDER matters: per-row maintenance acquires table_idx_names
+            // BEFORE indexes, so this path must too (taking them inverted
+            // deadlocked the concurrency probe).
+            let mut tnames = self.table_idx_names.write();
             let mut indexes = self.indexes.write();
+            let results = self
+                .engine
+                .scan(table, &snap)
+                .map_err(|e| StorageError::TableNotFound(e.to_string()))?;
+            let mut map: std::collections::BTreeMap<Value, HashMap<usize, Row>> =
+                std::collections::BTreeMap::new();
+            let mut version_map: HashMap<Value, Vec<usize>> = HashMap::new();
+            for (version_idx, row) in &results {
+                let val = row.get(col_idx).cloned().unwrap_or(Value::Null);
+                map.entry(val.clone())
+                    .or_default()
+                    .insert(*version_idx, (**row).clone());
+                version_map.entry(val).or_default().push(*version_idx);
+            }
+            if !results.is_empty() {
+                // A late index build's snapshot can miss rows committed after
+                // the snapshot began — only an index born with the table (or
+                // on an empty table) is provably complete for the probe.
+                self.mark_mutated(table);
+            }
             indexes.insert(
                 index_name.to_string(),
                 MvccIdx {
@@ -2483,9 +2577,6 @@ impl StorageEngine for MvccStorageAdapter {
                     version_map,
                 },
             );
-        }
-        {
-            let mut tnames = self.table_idx_names.write();
             let names = tnames.entry(table.to_string()).or_default();
             // Idempotent: re-creating an existing index (e.g. a derived-state
             // rebuild) must not double-register the name, or per-name index
@@ -2493,6 +2584,9 @@ impl StorageEngine for MvccStorageAdapter {
             if !names.iter().any(|n| n == index_name) {
                 names.push(index_name.to_string());
             }
+        }
+        if auto {
+            self.auto_commit(txn_id);
         }
         Ok(())
     }
@@ -2651,6 +2745,17 @@ impl StorageEngine for MvccStorageAdapter {
             .insert(id, Arc::new(MvccSessionState::new()));
     }
 
+    fn begin_table_rewrite(&self, table: &str) {
+        self.mark_mutated(table);
+        self.rewrites_active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn end_table_rewrite(&self, _table: &str) {
+        self.rewrites_active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn drop_storage_session(&self, id: u64) {
         self.mvcc_sessions.write().remove(&id);
     }
@@ -2695,9 +2800,7 @@ impl StorageEngine for MvccStorageAdapter {
                 .try_begin(IsolationLevel::Snapshot)
                 .map_err(|_| StorageError::TransactionIdExhausted)?;
             let snapshot = observer.snapshot.clone();
-            if let Ok(rows) = self.engine.scan(&affected, &snapshot) {
-                self.rebuild_indexes_for_table(&affected, &rows);
-            }
+            let _ = self.rebuild_indexes_for_table(&affected, &snapshot);
             self.engine.txn_mgr().commit(&mut observer);
         }
         // (pages_scanned, dead_tuples_reclaimed, pages_freed, bytes_reclaimed)
@@ -4717,6 +4820,8 @@ impl MvccStorageAdapter {
         updates: &[(usize, Row)],
         unique: Option<&[Vec<usize>]>,
     ) -> Result<usize, StorageError> {
+        let _writes = self.write_gauge();
+        self.mark_mutated(table);
         let (txn_id, _snap, auto) = self.current_or_auto()?;
 
         // `updates` keys are stable MVCC version indices (from
@@ -4780,8 +4885,10 @@ impl MvccStorageAdapter {
         }
 
         if auto {
-            self.auto_commit(txn_id);
-            // Incremental index update: only touch changed rows, not entire table.
+            // Publish index entries BEFORE auto_commit releases unique
+            // reservations — same ordering contract as insert_unique (see
+            // there): a concurrent unique probe must find the reservation or
+            // the candidate, never neither.
             let index_updates: Vec<(usize, usize, &Row, &Row)> = applied
                 .iter()
                 .map(|(old_vidx, new_vidx, old_row, new_row)| {
@@ -4791,6 +4898,7 @@ impl MvccStorageAdapter {
             if !index_updates.is_empty() {
                 self.update_indexes_incremental(table, &index_updates);
             }
+            self.auto_commit(txn_id);
         } else {
             self.mvcc_session()
                 .dirty_tables
