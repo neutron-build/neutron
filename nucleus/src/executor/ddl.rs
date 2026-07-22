@@ -34,6 +34,31 @@ use super::types::{
 };
 use super::{ExecError, ExecResult, Executor};
 
+/// RAII bracket for a wholesale table rewrite (ALTER column add/drop): tells
+/// the storage engine unique-probe candidates are unreliable until the
+/// rewrite (including its index rebuild) finishes — released on drop so an
+/// error path cannot leave the engine in fallback mode forever.
+struct RewriteGuard {
+    engine: std::sync::Arc<dyn crate::storage::StorageEngine>,
+    table: String,
+}
+
+impl RewriteGuard {
+    fn new(engine: std::sync::Arc<dyn crate::storage::StorageEngine>, table: &str) -> Self {
+        engine.begin_table_rewrite(table);
+        Self {
+            engine,
+            table: table.to_string(),
+        }
+    }
+}
+
+impl Drop for RewriteGuard {
+    fn drop(&mut self) {
+        self.engine.end_table_rewrite(&self.table);
+    }
+}
+
 /// Sidecar metadata (`<data_dir>/engines.json`) describing per-table engine
 /// overrides so they can be re-registered at boot. Without this, a table
 /// created `WITH (engine='mergetree')` silently fell back to the default
@@ -1831,16 +1856,20 @@ impl Executor {
                     };
 
                     let engine = self.storage_for(&table_name);
+                    let _rewrite = RewriteGuard::new(engine.clone(), &table_name);
                     // Read existing rows with the engine's pre-ALTER schema so
                     // old tuples deserialize at their original width, then widen
-                    // each with the new column's default value.
-                    let rows = engine.scan(&table_name).await?;
+                    // each with the new column's default value. scan_physical:
+                    // update() addresses VERSION indices — a plain scan's
+                    // enumeration positions drift from them under concurrent
+                    // churn, and the rewrite then lands on the WRONG rows
+                    // (duplicated PKs under the concurrency probe).
+                    let rows = engine.scan_physical(&table_name).await?;
                     let updates: Vec<(usize, Row)> = rows
                         .into_iter()
-                        .enumerate()
-                        .map(|(i, mut r)| {
+                        .map(|(vidx, mut r)| {
                             r.push(default_val.clone());
-                            (i, r)
+                            (vidx, r)
                         })
                         .collect();
                     // Sync the engine's cached column schema to the new shape
@@ -1967,20 +1996,21 @@ impl Executor {
                     }
                     self.catalog.update_table(updated).await?;
 
-                    // Remove column data from existing rows
+                    // Remove column data from existing rows (scan_physical:
+                    // version indices, not scan positions — see AddColumn).
                     let engine = self.storage_for(&table_name);
-                    let rows = engine.scan(&table_name).await?;
+                    let _rewrite = RewriteGuard::new(engine.clone(), &table_name);
+                    let rows = engine.scan_physical(&table_name).await?;
                     let updates: Vec<(usize, Row)> = rows
                         .into_iter()
-                        .enumerate()
-                        .map(|(i, r)| {
+                        .map(|(vidx, r)| {
                             let new_row: Vec<Value> = r
                                 .into_iter()
                                 .enumerate()
                                 .filter(|(j, _)| !drop_indices.contains(j))
                                 .map(|(_, v)| v)
                                 .collect();
-                            (i, new_row)
+                            (vidx, new_row)
                         })
                         .collect();
                     if !updates.is_empty() {
